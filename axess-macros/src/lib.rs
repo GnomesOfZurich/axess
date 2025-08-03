@@ -1,0 +1,239 @@
+//! Authentication/authorization middleware macros for Axess.
+//!
+//! This module provides macros for generating Axum middleware to enforce authentication and partial authentication requirements.
+//! The macros are intended for use in Axum route definitions and support both status code and redirect-based responses.
+//!
+#![forbid(unsafe_code)]
+
+pub use axess_core::{
+    authn::session::auth_session::AuthSession,
+    axum::{
+        self,
+        http::{self, Uri},
+    },
+    tracing,
+};
+// use crate::authn::session::AuthError;
+
+fn update_query(uri: &Uri, new_query: String) -> Result<Uri, http::Error> {
+    let query = form_urlencoded::parse(uri.query().map(|q| q.as_bytes()).unwrap_or_default());
+    let updated_query = form_urlencoded::Serializer::new(new_query)
+        .extend_pairs(query)
+        .finish();
+
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(format!("{}?{}", uri.path(), updated_query).parse()?);
+
+    Ok(Uri::from_parts(parts)?)
+}
+
+/// This is intended for internal use only and subject to change in the future
+/// without warning!
+#[doc(hidden)]
+pub fn url_with_redirect_query(
+    url: &str,
+    redirect_field: &str,
+    redirect_uri: Uri,
+) -> Result<Uri, http::Error> {
+    let uri = url.parse::<Uri>()?;
+
+    if uri.query().is_some_and(|q| q.contains(redirect_field)) {
+        return Ok(uri);
+    };
+
+    let redirect_uri_string = redirect_uri.to_string();
+    let redirect_uri_encoded = urlencoding::encode(&redirect_uri_string);
+    let redirect_query = format!("{redirect_field}={redirect_uri_encoded}");
+
+    update_query(&uri, redirect_query)
+}
+
+/// Predicate middleware.
+///
+/// Can be specified with a login URL and next redirect field or an alternative
+/// which implements [`IntoResponse`](axum::response::IntoResponse).
+///
+/// When the predicate passes, the request processes normally. On failure,
+/// either a redirect to the specified login URL is issued or the alternative is
+/// used as the response.
+#[macro_export]
+macro_rules! predicate_required {
+    ($predicate:expr, $alternative:expr) => {{
+        use axum::{
+            middleware::{from_fn, Next},
+            response::IntoResponse,
+        };
+
+        from_fn(
+            |auth_session: $crate::AuthSession<_>, req, next: Next| async move {
+                if $predicate(auth_session).await {
+                    next.run(req).await
+                } else {
+                    $alternative.into_response()
+                }
+            },
+        )
+    }};
+
+    ($predicate:expr, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
+        use axum::{
+            extract::OriginalUri,
+            middleware::{from_fn, Next},
+            response::{IntoResponse, Redirect},
+        };
+
+        from_fn(
+            |auth_session: $crate::AuthSession<_>,
+             OriginalUri(original_uri): OriginalUri,
+             req,
+             next: Next| async move {
+                if $predicate(auth_session).await {
+                    next.run(req).await
+                } else {
+                    match $crate::url_with_redirect_query(
+                        $login_url,
+                        $redirect_field,
+                        original_uri
+                    ) {
+                        Ok(login_url) => {
+                            Redirect::temporary(&login_url.to_string()).into_response()
+                        }
+
+                        Err(err) => {
+                            $crate::tracing::error!(err = %err);
+                            $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
+                    }
+                }
+            },
+        )
+    }};
+}
+
+/// Login-required middleware macro.
+///
+/// This macro generates Axum middleware that ensures the user is authenticated before allowing access to a route.
+/// If the user is not authenticated, it either returns an HTTP 401 Unauthorized response or redirects to a login page,
+/// depending on the macro parameters.
+///
+/// # Usage
+///
+/// - To require authentication and return 401 Unauthorized if not authenticated:
+///   ```ignore
+///   login_required!(MyBackendType)
+///   ```
+///
+/// - To require authentication and redirect to a login page if not authenticated:
+///   ```ignore
+///   login_required!(MyBackendType, login_url = "/login")
+///   ```
+///
+/// - To require authentication and redirect to a login page with a custom redirect field:
+///   ```ignore
+///   login_required!(MyBackendType, login_url = "/login", redirect_field = "next")
+///   ```
+///
+/// # Parameters
+///
+/// - `$backend_type`: The authentication backend type implementing the required session trait.
+/// - `login_url`: (Optional) The URL to redirect unauthenticated users to.
+/// - `redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
+///
+/// # Notes
+///
+/// This macro is intended for use with Axum extractors and middleware. It is subject to change in future versions.
+#[macro_export]
+macro_rules! login_required {
+    ($backend_type:ty) => {{
+        async fn is_authenticated(auth_session: $crate::AuthSession<$backend_type>) -> bool {
+            auth_session.is_authenticated()
+        }
+
+        $crate::predicate_required!(
+            is_authenticated,
+            $crate::axum::http::StatusCode::UNAUTHORIZED
+        )
+    }};
+
+    ($backend_type:ty, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
+        async fn is_authenticated(auth_session: $crate::AuthSession<$backend_type>) -> bool {
+            auth_session.is_authenticated()
+        }
+
+        $crate::predicate_required!(
+            is_authenticated,
+            login_url = $login_url,
+            redirect_field = $redirect_field
+        )
+    }};
+
+    ($backend_type:ty, login_url = $login_url:expr) => {
+        $crate::login_required!(
+            $backend_type,
+            login_url = $login_url,
+            redirect_field = "next"
+        )
+    };
+}
+
+/// Partial authentication-required middleware macro.
+///
+/// This macro generates Axum middleware that ensures the user is partially authenticated before allowing access to a route.
+/// "Partial authentication" typically means the user has completed some, but not all, authentication steps (e.g., username/password but not MFA).
+///
+/// # Usage
+///
+/// - To require partial authentication and return 401 Unauthorized if not partially authenticated:
+///   ```ignore
+///   require_partial_authn!(MyBackendType)
+///   ```
+///
+/// - To require partial authentication and redirect to a login page if not partially authenticated:
+///   ```ignore
+///   require_partial_authn!(MyBackendType, login_url = "/login")
+///   ```
+///
+/// - To require partial authentication and redirect to a login page with a custom redirect field:
+///   ```ignore
+///   require_partial_authn!(MyBackendType, login_url = "/login", redirect_field = "next")
+///   ```
+///
+/// # Parameters
+///
+/// - `$backend_type`: The authentication backend type implementing the required session trait.
+/// - `login_url`: (Optional) The URL to redirect unauthenticated users to.
+/// - `redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
+///
+/// # Notes
+///
+/// This macro is intended for use with Axum extractors and middleware. It is subject to change in future versions.
+/// Use this macro for routes that require the user to have started, but not necessarily completed, the authentication process (e.g., before completing MFA).
+#[macro_export]
+macro_rules! require_partial_authn {
+    ($backend_type:ty) => {{
+        async fn is_partial_authenticated(
+            auth_session: $crate::AuthSession<$backend_type>,
+        ) -> bool {
+            auth_session.is_partial_authenticated()
+        }
+
+        $crate::predicate_required!(
+            is_partial_authenticated,
+            $crate::axum::http::StatusCode::UNAUTHORIZED
+        )
+    }};
+
+    ($backend_type:ty, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
+        async fn is_partial_authenticated(
+            auth_session: $crate::AuthSession<$backend_type>,
+        ) -> bool {
+            auth_session.is_partial_authenticated()
+        }
+
+        $crate::predicate_required!(
+            is_partial_authenticated,
+            login_url = $login_url,
+            redirect_field = $redirect_field
+        )
+    }};
+}

@@ -1,0 +1,38 @@
+[package]
+name = "axess"
+version = "0.0.1"
+publish = false
+edition = "2024"
+resolver = "3"
+description = """
+Authentication and Authorization for the Axum webframework. Providing a set of convenient middleware and related request extractors.
+Built on top of the tower-sessions crate for authentication and Cedar Policy for authorization. Additionally including helpers for
+request tracing and request id generation.
+"""
+authors = ["Gnomes <info@gnomes.ch>"]
+license = "MIT"
+repository = "https://github.com/GnomesOfZurich/axess"
+# homepage = "https://getgnomes.com/tech/axum-access"
+# documentation = "https://docs.rs/axum-access"
+keywords = ["authentication", "authorization", "axum", "login", "session", "tower", "cedar"]
+categories = ["web-programming"]
+exclude = ["/.github", "/examples", "/scripts"]
+
+[dependencies]
+axess-core = { path = "../axess-core" }
+axess-macros = { path = "../axess-macros" }
+tower-sessions = { version = "0.14.0" }
+tower-cookies = { version = "0.11.0", features = ["axum-core", "private", "signed"] }
+tower-layer = "0.3.3"
+tower-service = "0.3.3"
+
+[features]
+authn = []
+authz = []
+admin = []
+request_id = []
+trace_id = []
+memory = []
+valkey = []
+full = ["authn", "authz", "admin", "request_id", "trace_id", "valkey"]
+default = ["authn", "authz"]
