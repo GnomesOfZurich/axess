@@ -31,6 +31,7 @@ pub use axess_core::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession, SessionRegistry,
         },
     },
+    storage,
     utils::validation::verify_totp,
 };
 
