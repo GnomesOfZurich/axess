@@ -31,12 +31,22 @@ pub use axess_core::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession, SessionRegistry,
         },
     },
-    extras,
-    storage,
     utils::validation::verify_totp,
 };
 
 #[cfg(feature = "authz")]
 pub mod authorization;
+
+#[cfg(feature = "request_id")]
+pub use axess_core::extras::request_id;
+
+#[cfg(feature = "trace_id")]
+pub use axess_core::extras::trace_id;
+
+#[cfg(feature = "memory")]
+pub use axess_core::storage::in_memory;
+
+#[cfg(feature = "valkey")]
+pub use axess_core::storage::valkey;
 
 pub use axess_macros::{login_required, require_partial_authn};
