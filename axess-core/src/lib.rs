@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "authn")]
 pub mod authn;
 
 #[cfg(feature = "authz")]
@@ -7,11 +8,25 @@ pub mod authz;
 
 pub mod utils;
 
+// Declare and re-export extras submodules
 #[cfg(any(feature = "request_id", feature = "trace_id"))]
-pub mod extras;
+pub mod extras {
+    #[cfg(feature = "request_id")]
+    pub mod request_id;
+    
+    #[cfg(feature = "trace_id")]
+    pub mod trace_id;
+}
 
+// Declare and re-export storage submodules  
 #[cfg(any(feature = "memory", feature = "valkey"))]
-pub mod storage;
+pub mod storage {
+    #[cfg(feature = "memory")]
+    pub mod in_memory;
+    
+    #[cfg(feature = "valkey")]
+    pub mod valkey;
+}
 
 // Re-export axum and tracing for macro hygiene and version consistency
 // This ensures our macros work correctly regardless of the user's axum version
