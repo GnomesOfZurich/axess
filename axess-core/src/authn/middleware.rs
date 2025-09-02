@@ -191,7 +191,7 @@ impl<B: AuthnBackend, Sessions: SessionStore, C: CookieController>
     }
 
     /// Configure the `data_key` optional property of the builder. If not
-    /// configured it will default to "axum-login.data".
+    /// configured it will default to "axess.data".
     pub fn with_data_key(mut self, data_key: &'static str) -> AuthnLayerBuilder<B, Sessions, C> {
         self.data_key = Some(data_key);
         self
@@ -201,7 +201,7 @@ impl<B: AuthnBackend, Sessions: SessionStore, C: CookieController>
     pub fn build(self) -> AuthnLayer<B, Sessions, C> {
         AuthnLayer::new(
             self.backend,
-            self.data_key.unwrap_or("axum-login.data"),
+            self.data_key.unwrap_or("axess.data"),
             self.session_manager_layer,
             // self.session_registry,
         )
