@@ -52,6 +52,8 @@ pub mod trace_id {
 pub use axess_core::storage::in_memory;
 
 #[cfg(feature = "valkey")]
-pub use axess_core::storage::valkey;
+pub mod valkey {
+    pub use axess_core::storage::valkey::*;
+}
 
 pub use axess_macros::{login_required, require_partial_authn};
