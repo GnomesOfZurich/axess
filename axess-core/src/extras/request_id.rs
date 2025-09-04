@@ -133,6 +133,7 @@ impl<S, G> Service<Request<Body>> for RequestIdService<S, G>
 where
     S: Service<Request<Body>, Response = Response<Body>> + Send + Clone + 'static,
     S::Future: Send + 'static,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     G: RequestIdGenerator + Send + Sync + Clone + 'static,
 {
     type Response = S::Response;
