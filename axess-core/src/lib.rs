@@ -13,17 +13,17 @@ pub mod utils;
 pub mod extras {
     #[cfg(feature = "request_id")]
     pub mod request_id;
-    
+
     #[cfg(feature = "trace_id")]
     pub mod trace_id;
 }
 
-// Declare and re-export storage submodules  
+// Declare and re-export storage submodules
 #[cfg(any(feature = "memory", feature = "valkey"))]
 pub mod storage {
     #[cfg(feature = "memory")]
     pub mod in_memory;
-    
+
     #[cfg(feature = "valkey")]
     pub mod valkey;
 }

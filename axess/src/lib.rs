@@ -22,7 +22,8 @@ pub use axess_core::{
     authn::{
         self,
         backend::{
-            AuthTenant, AuthUser, AuthnBackend, EntityState, EntityStateInfo, FactorId, MethodId, TenantId, UserId,
+            AuthTenant, AuthUser, AuthnBackend, EntityState, EntityStateInfo, FactorId, MethodId,
+            TenantId, UserId,
         },
         errors::{AuthError, FormError},
         methods::{AuthFactorKind, EnablementState, FactorForm, PermissionScope},
@@ -38,10 +39,14 @@ pub use axess_core::{
 pub mod authorization;
 
 #[cfg(feature = "request_id")]
-pub use axess_core::extras::request_id;
+pub mod request_id {
+    pub use axess_core::extras::request_id::*;
+}
 
 #[cfg(feature = "trace_id")]
-pub use axess_core::extras::trace_id;
+pub mod trace_id {
+    pub use axess_core::extras::trace_id::*;
+}
 
 #[cfg(feature = "memory")]
 pub use axess_core::storage::in_memory;

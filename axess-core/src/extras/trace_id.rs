@@ -45,7 +45,6 @@ impl<S: Default> Default for TraceIdMiddleware<S> {
 impl<S, B> Service<Request<B>> for TraceIdMiddleware<S>
 where
     S: Service<Request<B>, Response = Response> + Send + 'static,
-    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     S::Future: Send + 'static,
     B: Send + 'static,
 {
@@ -88,15 +87,12 @@ where
 
         // Update the headers with the trace ID if found
         if !trace_id.is_empty() {
-            // info!("Trace ID from span: {}", trace_id);
-            req.headers_mut().insert(
-                header_name.clone(),
-                HeaderValue::from_str(&trace_id).unwrap(),
-            );
-            // } else {
-            //     info!("No trace ID found in the current span.");
+            if let Ok(header_value) = HeaderValue::from_str(&trace_id) {
+                req.headers_mut().insert(header_name, header_value);
+            } else {
+                tracing::warn!("Failed to create header value from trace ID: {}", trace_id);
+            }
         }
-        // info!("Request headers: {:?}", req.headers());
 
         let fut = self.inner.call(req);
         Box::pin(async move {
@@ -139,12 +135,7 @@ impl<S> Layer<S> for TraceIdLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        convert::Infallible,
-        sync::Once,
-        // thread,
-        // time::Duration,
-    };
+    use std::{convert::Infallible, sync::Once};
     // use http::Request;
     use axum::{
         body::Body,
@@ -164,7 +155,7 @@ mod tests {
         Level,
         info_span,
     };
-    use tracing_subscriber::{self, util::SubscriberInitExt};
+    use tracing_subscriber;
 
     // type ServiceBuilderType = ServiceBuilder<Stack<TraceIdLayer, tower::layer::util::Identity>>;
 
@@ -172,10 +163,11 @@ mod tests {
 
     fn init_tracing() {
         INIT.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
+            // Try to initialize tracing subscriber, ignore if already set
+            // This is safe for test environments where subscriber might already exist
+            let _ = tracing_subscriber::fmt()
                 .with_max_level(Level::INFO)
-                .finish();
-            subscriber.init();
+                .try_init();
         });
     }
 

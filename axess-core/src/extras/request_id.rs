@@ -131,7 +131,7 @@ where
 
 impl<S, G> Service<Request<Body>> for RequestIdService<S, G>
 where
-    S: Service<Request<Body>, Response = Response<Body>, Error = IoError> + Send + Clone + 'static,
+    S: Service<Request<Body>, Response = Response<Body>> + Send + Clone + 'static,
     S::Future: Send + 'static,
     G: RequestIdGenerator + Send + Sync + Clone + 'static,
 {
@@ -147,14 +147,10 @@ where
         let request_id = match self.ensure_request_id(&mut req) {
             Ok(id) => id,
             Err(_) => {
-                // Handle the error by returning a future that resolves to an error
-                // return Box::pin(std::future::ready(Err(std::io::Error::new(
-                //     std::io::ErrorKind::Other,
-                //     "Failed to generate request ID",
-                // ))));
-                return Box::pin(std::future::ready(Err(std::io::Error::other(
-                    "Failed to generate request ID",
-                ))));
+                // If we can't generate a request ID, we'll skip it and continue
+                // This is more robust than failing the entire request
+                tracing::warn!("Failed to generate request ID, continuing without it");
+                HeaderValue::from_static("unknown")
             }
         };
 

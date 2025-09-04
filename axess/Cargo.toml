@@ -1,6 +1,6 @@
 [package]
 name = "axess"
-version = "0.0.1"
+version = "0.0.2"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -32,6 +32,7 @@ authz = ["axess-core/authz"]
 admin = ["axess-core/admin"]
 request_id = ["axess-core/request_id"]
 trace_id = ["axess-core/trace_id"]
+accept_client_id = ["axess-core/accept_client_id"]
 memory = ["axess-core/memory"]
 valkey = ["axess-core/valkey"]
 full = ["authn", "authz", "admin", "request_id", "trace_id", "valkey"]

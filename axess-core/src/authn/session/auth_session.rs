@@ -271,17 +271,17 @@ where
 
         let factor_kind = form.factor_kind();
         let form_kind = form.form_kind();
-        if form_kind == FactorFormKind::Verify {
-            if let Some(partial_state) = self.get_partial_inner_state() {
-                let expected_kind = partial_state.next_factor_kind();
-                if expected_kind != Some(factor_kind.clone()) {
-                    tracing::warn!(
-                        "Submitted factor kind {:?} does not match expected next factor {:?}",
-                        form.factor_kind(),
-                        expected_kind
-                    );
-                    return Err(StatusCode::BAD_REQUEST);
-                }
+        if form_kind == FactorFormKind::Verify
+            && let Some(partial_state) = self.get_partial_inner_state()
+        {
+            let expected_kind = partial_state.next_factor_kind();
+            if expected_kind != Some(factor_kind.clone()) {
+                tracing::warn!(
+                    "Submitted factor kind {:?} does not match expected next factor {:?}",
+                    form.factor_kind(),
+                    expected_kind
+                );
+                return Err(StatusCode::BAD_REQUEST);
             }
         }
 
@@ -482,11 +482,11 @@ where
         for method in &methods {
             if let Some(next_factor_id) = method.factors.first() {
                 let factor = self.backend.get_auth_factor(next_factor_id).await.ok();
-                if let Some(factor) = factor {
-                    if factor.kind == factor_kind {
-                        matched_method = Some(method.clone());
-                        break;
-                    }
+                if let Some(factor) = factor
+                    && factor.kind == factor_kind
+                {
+                    matched_method = Some(method.clone());
+                    break;
                 }
             }
         }
@@ -517,10 +517,10 @@ where
         };
 
         // Remove the just-submitted factor from remaining_factors
-        if let Some(first_factor) = partial_state.remaining_factors.first() {
-            if first_factor.kind == factor_kind {
-                partial_state.remaining_factors.remove(0);
-            }
+        if let Some(first_factor) = partial_state.remaining_factors.first()
+            && first_factor.kind == factor_kind
+        {
+            partial_state.remaining_factors.remove(0);
         }
 
         self.state = AuthState::PartialAuthn(partial_state.clone());
