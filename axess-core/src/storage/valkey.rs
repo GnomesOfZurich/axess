@@ -25,7 +25,7 @@ use tower_sessions::{
     session_store,
 };
 use tracing::{error, info};
-use uuid::Uuid;
+
 // use crate::cache::SessionStore;
 
 #[derive(Debug, thiserror::Error)]
@@ -132,7 +132,7 @@ impl ValkeyStore {
 
     pub async fn get_session(
         &self,
-        user_id: Uuid,
+        user_id: impl std::fmt::Display,
         id: Id,
     ) -> Result<Option<Record>, ValkeyStoreError> {
         let key = format!("session:{user_id}:{id}");
@@ -141,7 +141,7 @@ impl ValkeyStore {
             .get::<Option<Vec<u8>>, Key>(Key::from(key.as_bytes()))
             .await?
         {
-            let decrypted_value = Self::decrypt_session_data(&value, &self.encryption_key);
+            let decrypted_value = Self::decrypt_session_data(&value, &self.encryption_key)?;
             let record: Record = rmp_serde::from_slice(&decrypted_value)?;
             // info!("Session retrieved for ID: {}", id);
             Ok(Some(record))
@@ -151,7 +151,7 @@ impl ValkeyStore {
         }
     }
 
-    pub async fn delete_session(&self, user_id: Uuid, id: Id) -> Result<i32, ValkeyStoreError> {
+    pub async fn delete_session(&self, user_id: impl std::fmt::Display, id: Id) -> Result<i32, ValkeyStoreError> {
         // let key = format!("session:{}:{}", user_id, id);
         // let deleted_count = self.client.del::<i32, String>(key).await?;
         // info!("Session deleted for ID: {}", id);
@@ -176,25 +176,46 @@ impl ValkeyStore {
     }
 
     // Encrypt session data
-    pub fn encrypt_session_data(data: &[u8], key: &AesKey<Aes256Gcm>) -> Vec<u8> {
+    pub fn encrypt_session_data(data: &[u8], key: &AesKey<Aes256Gcm>) -> Result<Vec<u8>, ValkeyStoreError> {
         let cipher = Aes256Gcm::new(key);
         let nonce = Aes256Gcm::generate_nonce(&mut OsRng); // 96-bits
 
-        let mut encrypted_data = cipher.encrypt(&nonce, data).expect("encryption failure!");
-        encrypted_data.extend_from_slice(&nonce);
-
-        encrypted_data
+        let encrypted_data = cipher.encrypt(&nonce, data).map_err(|e| {
+            error!("Session data encryption failed: {}", e);
+            ValkeyStoreError::Valkey(Error::new(
+                fred::error::ErrorKind::Unknown,
+                format!("Encryption failure: {}", e)
+            ))
+        })?;
+        
+        let mut result = encrypted_data;
+        result.extend_from_slice(&nonce);
+        Ok(result)
     }
 
     // Decrypt session data
-    pub fn decrypt_session_data(data: &[u8], key: &AesKey<Aes256Gcm>) -> Vec<u8> {
+    pub fn decrypt_session_data(data: &[u8], key: &AesKey<Aes256Gcm>) -> Result<Vec<u8>, ValkeyStoreError> {
+        if data.len() < 12 {
+            error!("Invalid encrypted session data: too short (length: {})", data.len());
+            return Err(ValkeyStoreError::Valkey(Error::new(
+                fred::error::ErrorKind::Unknown,
+                "Invalid encrypted session data: insufficient length"
+            )));
+        }
+        
         let cipher = Aes256Gcm::new(key);
         let (ciphertext, nonce) = data.split_at(data.len() - 12);
         let nonce = Nonce::from_slice(nonce);
 
         cipher
             .decrypt(nonce, ciphertext)
-            .expect("decryption failure!")
+            .map_err(|e| {
+                error!("Session data decryption failed: {}", e);
+                ValkeyStoreError::Valkey(Error::new(
+                    fred::error::ErrorKind::Unknown,
+                    format!("Decryption failure: {}", e)
+                ))
+            })
     }
 
     // async fn create_with_expiry(
@@ -248,7 +269,8 @@ impl SessionStore for ValkeyStore {
 
         if let Some(data) = data {
             // Decrypt the session data
-            let decrypted_data = Self::decrypt_session_data(&data, &self.encryption_key);
+            let decrypted_data = Self::decrypt_session_data(&data, &self.encryption_key)
+                .map_err(|e| session_store::Error::Backend(e.to_string()))?;
             Ok(Some(
                 rmp_serde::from_slice(decrypted_data.as_slice())
                     .map_err(ValkeyStoreError::Decode)?,
@@ -267,21 +289,46 @@ impl SessionStore for ValkeyStore {
     }
 }
 
-/// Initialize a Valkey cluster client, taking a vector of node adresses as inparameter (addresses expressed as "host:port" &str).
+/// Initialize a Valkey cluster client, taking a vector of node addresses as input parameter (addresses expressed as "host:port" &str).
 #[allow(dead_code)]
 pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, ValkeyStoreError> {
     info!(
         "Creating Valkey cluster configuration with nodes: {:?}",
         nodes
     );
-    // Split the vector of addresses into a vector of Server structs
-    let servers: Vec<Server> = nodes
-        .into_iter()
-        .map(|addr| {
-            let parts: Vec<&str> = addr.split(':').collect();
-            Server::new(parts[0].to_string(), parts[1].parse().unwrap())
-        })
-        .collect();
+    
+    // Validate input nodes
+    if nodes.is_empty() {
+        error!("Cannot initialize Valkey cluster with empty node list");
+        return Err(ValkeyStoreError::Valkey(Error::new(
+            fred::error::ErrorKind::Config,
+            "Empty node list provided for cluster initialization"
+        )));
+    }
+    
+    // Split the vector of addresses into a vector of Server structs with proper error handling
+    let mut servers = Vec::new();
+    for addr in &nodes {
+        let parts: Vec<&str> = addr.split(':').collect();
+        if parts.len() != 2 {
+            error!("Invalid node address format: '{}'. Expected 'host:port'", addr);
+            return Err(ValkeyStoreError::Valkey(Error::new(
+                fred::error::ErrorKind::Config,
+                format!("Invalid node address format: '{}'", addr)
+            )));
+        }
+        
+        let host = parts[0].to_string();
+        let port = parts[1].parse::<u16>().map_err(|e| {
+            error!("Invalid port number '{}' in address '{}': {}", parts[1], addr, e);
+            ValkeyStoreError::Valkey(Error::new(
+                fred::error::ErrorKind::Config,
+                format!("Invalid port number in address '{}': {}", addr, e)
+            ))
+        })?;
+        
+        servers.push(Server::new(host, port));
+    }
 
     // Create the Config client configuration
     let config = Config {
@@ -290,10 +337,12 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
             policy: ClusterDiscoveryPolicy::ConfigEndpoint,
         },
         version: RespVersion::RESP3,
+        // TLS configuration can be added here if needed:
         // tls: Some(TlsConfig {
         //   connector: create_rustls_config(),
         //   hostnames: TlsHostMapping::DefaultHost,
         // }),
+        // Authentication can be added here if needed:
         // username: Some(read_redis_username()),
         // password: Some(read_redis_password()),
         ..Default::default()
@@ -303,95 +352,317 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
     info!("Initializing Valkey cluster client...");
     let client = Client::new(config, None, None, None::<ReconnectPolicy>);
 
-    // Connect to the cluster asynchronously
+    // Connect to the cluster asynchronously with proper error handling
+    info!("Connecting to Valkey cluster...");
     client.connect();
+    
+    // Wait for connection with detailed error context
     client
         .wait_for_connect()
         .await
         .map_err(|e| {
-            error!("Failed to connect to Valkey cluster: {:?}", e);
+            error!("Failed to connect to Valkey cluster nodes {:?}: {}", 
+                   nodes, e);
+            error!("Connection error details: {:?}", e);
+            error!("Please ensure:");
+            error!("1. Valkey cluster is running on the specified nodes");
+            error!("2. Network connectivity is available");
+            error!("3. Firewall rules allow connections");
+            error!("4. Cluster configuration is correct");
             ValkeyStoreError::Valkey(e)
         })?;
 
-    info!("Valkey cluster client connected successfully");
+    info!("Successfully connected to Valkey cluster");
     Ok(client)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    // use uuid::Uuid;
+    use std::collections::HashMap;
+    use tracing::warn;
 
+    /// Comprehensive test suite for Valkey store session management in fintech environment
     #[tokio::test]
-    #[ignore]
-    async fn test_valkey_store_session_management() {
-        // Initialize a Valkey cluster client
-        println!("TEST 01: Initialize Valkey cluster client...");
-        let cluster_addresses = vec!["0.0.0.0:6379", "0.0.0.0:6380", "0.0.0.0:6381"];
+    #[ignore] // Requires running Valkey cluster
+    async fn test_valkey_store_session_management_comprehensive() {
+        // Test configuration for fintech security compliance
+        let cluster_addresses = vec!["127.0.0.1:6379", "127.0.0.1:6380", "127.0.0.1:6381"];
+        
+        // Initialize Valkey cluster client with proper error handling
+        info!("Initializing Valkey cluster client for fintech session storage");
         let client = match init_valkey_cluster_client(cluster_addresses).await {
-            Ok(client) => client,
+            Ok(client) => {
+                info!("Successfully connected to Valkey cluster");
+                client
+            }
             Err(e) => {
-                eprintln!("Failed to connect to Valkey cluster: {:?}", e);
+                error!("Failed to connect to Valkey cluster: {:?}", e);
+                warn!("Ensure Valkey cluster is running on specified ports");
                 return;
             }
         };
 
+        // Generate encryption key for financial data protection
         let encryption_key = Aes256Gcm::generate_key(OsRng);
         let store = ValkeyStore::new(client, encryption_key);
 
+        // Test 1: Session Creation and Encryption
+        info!("TEST 01: Creating encrypted session for financial user data");
         let session_id = Id::default();
-        let mut data = std::collections::HashMap::new();
-        data.insert(
-            "test".to_string(),
-            serde_json::Value::String("session_data".to_string()),
+        let mut session_data = HashMap::new();
+        
+        // Simulate financial session data
+        session_data.insert(
+            "user_id".to_string(),
+            serde_json::Value::String("user_12345".to_string()),
         );
-        let record = Record {
+        session_data.insert(
+            "account_id".to_string(),
+            serde_json::Value::String("acc_67890".to_string()),
+        );
+        session_data.insert(
+            "permissions".to_string(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("read_accounts".to_string()),
+                serde_json::Value::String("transfer_funds".to_string()),
+            ]),
+        );
+        session_data.insert(
+            "login_timestamp".to_string(),
+            serde_json::Value::String(OffsetDateTime::now_utc().to_string()),
+        );
+
+        let mut record = Record {
             id: session_id,
-            data,
-            expiry_date: (time::OffsetDateTime::now_utc() + time::Duration::hours(24)),
+            data: session_data,
+            expiry_date: OffsetDateTime::now_utc() + time::Duration::hours(1), // 1-hour expiry for security
         };
 
-        // Test create session record
-        store.create(&mut record.clone()).await.unwrap();
+        // Create session with encryption
+        store.create(&mut record).await
+            .expect("Failed to create encrypted financial session");
+        info!("Session created successfully with ID: {}", record.id);
 
-        // Test load session
-        println!("TEST 10: Test load session...");
-        let loaded_record = store.load(&session_id).await.unwrap();
-        println!("TEST 11: Loaded record --> {:?}", loaded_record);
-        assert!(loaded_record.is_some());
-        println!("TEST 12: ...");
+        // Test 2: Session Loading and Decryption
+        info!("TEST 02: Loading and decrypting financial session");
+        let loaded_record = store.load(&session_id).await
+            .expect("Failed to load session from Valkey");
+        
+        assert!(loaded_record.is_some(), "Session should exist after creation");
+        
+        let loaded_record = loaded_record.unwrap();
+        assert_eq!(loaded_record.id, session_id, "Session ID should match");
+        
+        // Verify financial data integrity
         assert_eq!(
-            loaded_record.unwrap().data.get("test").unwrap(),
-            &serde_json::Value::String("session_data".to_string())
+            loaded_record.data.get("user_id").unwrap(),
+            &serde_json::Value::String("user_12345".to_string()),
+            "User ID should be preserved after encryption/decryption"
+        );
+        assert_eq!(
+            loaded_record.data.get("account_id").unwrap(),
+            &serde_json::Value::String("acc_67890".to_string()),
+            "Account ID should be preserved after encryption/decryption"
+        );
+        
+        info!("Session data successfully decrypted and validated");
+
+        // Test 3: Session Update with Financial Data Modification
+        info!("TEST 03: Updating financial session with new permissions");
+        let mut updated_data = HashMap::new();
+        updated_data.insert(
+            "user_id".to_string(),
+            serde_json::Value::String("user_12345".to_string()),
+        );
+        updated_data.insert(
+            "account_id".to_string(),
+            serde_json::Value::String("acc_67890".to_string()),
+        );
+        updated_data.insert(
+            "permissions".to_string(),
+            serde_json::Value::Array(vec![
+                serde_json::Value::String("read_accounts".to_string()),
+                serde_json::Value::String("transfer_funds".to_string()),
+                serde_json::Value::String("admin_access".to_string()), // Elevated permissions
+            ]),
+        );
+        updated_data.insert(
+            "last_activity".to_string(),
+            serde_json::Value::String(OffsetDateTime::now_utc().to_string()),
         );
 
-        // Test save session
-        println!("TEST 20: Test save session...");
-        let mut updated_data = std::collections::HashMap::new();
-        updated_data.insert(
-            "test".to_string(),
-            serde_json::Value::String("updated_data".to_string()),
-        );
-        println!("TEST 21: Initial data --> {:?}", updated_data);
         let updated_record = Record {
             id: session_id,
             data: updated_data,
-            expiry_date: (time::OffsetDateTime::now_utc() + time::Duration::hours(24)),
+            expiry_date: OffsetDateTime::now_utc() + time::Duration::hours(1),
         };
-        store.save(&updated_record).await.unwrap();
-        let loaded_record = store.load(&session_id).await.unwrap();
-        println!("TEST 22: Loaded stored updated record: {:?}", loaded_record);
-        assert!(loaded_record.is_some());
-        assert_eq!(
-            loaded_record.unwrap().data.get("test").unwrap(),
-            &serde_json::Value::String("updated_data".to_string())
+
+        store.save(&updated_record).await
+            .expect("Failed to update financial session");
+
+        // Verify update
+        let loaded_updated = store.load(&session_id).await
+            .expect("Failed to load updated session");
+        
+        assert!(loaded_updated.is_some(), "Updated session should exist");
+        
+        let loaded_updated = loaded_updated.unwrap();
+        let permissions = loaded_updated.data.get("permissions").unwrap();
+        if let serde_json::Value::Array(perms) = permissions {
+            assert!(
+                perms.contains(&serde_json::Value::String("admin_access".to_string())),
+                "Admin access permission should be present after update"
+            );
+        } else {
+            panic!("Permissions should be an array");
+        }
+        
+        info!("Session update completed successfully");
+
+        // Test 4: Session Expiry Behavior
+        info!("TEST 04: Testing session expiry for security compliance");
+        let expired_session_id = Id::default();
+        let mut expired_data = HashMap::new();
+        expired_data.insert(
+            "test_data".to_string(),
+            serde_json::Value::String("expired_session".to_string()),
         );
 
-        // Test delete session
-        println!("TEST 30: Test delete session...");
-        store.delete(&session_id).await.unwrap();
-        let loaded_record = store.load(&session_id).await.unwrap();
-        println!("TEST 31: Loading of deleted record --> {:?}", loaded_record);
-        assert!(loaded_record.is_none());
+        let mut expired_record = Record {
+            id: expired_session_id,
+            data: expired_data,
+            expiry_date: OffsetDateTime::now_utc() - time::Duration::seconds(1), // Already expired
+        };
+
+        store.create(&mut expired_record).await
+            .expect("Failed to create expired session for testing");
+
+        // Note: Valkey will automatically expire the session, but the exact timing depends on configuration
+        // In a real test environment, you would wait for the expiry to be processed
+        info!("Expired session created for testing");
+
+        // Test 5: Session Deletion for Security
+        info!("TEST 05: Testing secure session deletion");
+        store.delete(&session_id).await
+            .expect("Failed to delete financial session");
+
+        let deleted_check = store.load(&session_id).await
+            .expect("Error checking deleted session");
+        
+        assert!(deleted_check.is_none(), "Session should not exist after deletion");
+        info!("Session successfully deleted from Valkey store");
+
+        // Test 6: Encryption/Decryption Edge Cases
+        info!("TEST 06: Testing encryption edge cases for security validation");
+        
+        // Test empty session data
+        let empty_session_id = Id::default();
+        let mut empty_record = Record {
+            id: empty_session_id,
+            data: HashMap::new(),
+            expiry_date: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+
+        store.create(&mut empty_record).await
+            .expect("Failed to create empty session");
+
+        let loaded_empty = store.load(&empty_session_id).await
+            .expect("Failed to load empty session");
+        
+        assert!(loaded_empty.is_some(), "Empty session should be loadable");
+        assert!(loaded_empty.unwrap().data.is_empty(), "Empty session data should remain empty");
+
+        // Clean up
+        store.delete(&empty_session_id).await
+            .expect("Failed to delete empty session");
+        store.delete(&expired_session_id).await.ok(); // May already be expired
+        
+        info!("All Valkey store tests completed successfully");
+    }
+
+    /// Test encryption and decryption functionality independently
+    #[test]
+    fn test_session_encryption_decryption() {
+        let encryption_key = Aes256Gcm::generate_key(OsRng);
+        
+        // Test data representing financial session information
+        let original_data = b"sensitive_financial_data_user_12345_account_67890";
+        
+        // Test encryption
+        let encrypted = ValkeyStore::encrypt_session_data(original_data, &encryption_key)
+            .expect("Encryption should succeed");
+        
+        assert_ne!(encrypted, original_data, "Encrypted data should differ from original");
+        assert!(encrypted.len() > original_data.len(), "Encrypted data should be longer due to nonce");
+        
+        // Test decryption
+        let decrypted = ValkeyStore::decrypt_session_data(&encrypted, &encryption_key)
+            .expect("Decryption should succeed");
+        
+        assert_eq!(decrypted, original_data, "Decrypted data should match original");
+    }
+
+    /// Test error handling for malformed encrypted data
+    #[test]
+    fn test_encryption_error_handling() {
+        let encryption_key = Aes256Gcm::generate_key(OsRng);
+        
+        // Test decryption with invalid data (too short)
+        let invalid_data = b"short";
+        let result = ValkeyStore::decrypt_session_data(invalid_data, &encryption_key);
+        assert!(result.is_err(), "Decryption should fail with invalid data");
+        
+        // Test decryption with corrupted data
+        let corrupted_data = vec![0u8; 32]; // 32 bytes of zeros
+        let result = ValkeyStore::decrypt_session_data(&corrupted_data, &encryption_key);
+        assert!(result.is_err(), "Decryption should fail with corrupted data");
+    }
+
+    /// Integration test for user-specific session management
+    #[tokio::test]
+    #[ignore] // Requires running Valkey cluster
+    async fn test_user_specific_session_operations() {
+        let cluster_addresses = vec!["127.0.0.1:6379"];
+        let client = init_valkey_cluster_client(cluster_addresses).await
+            .expect("Failed to connect to Valkey for user session test");
+
+        let encryption_key = Aes256Gcm::generate_key(OsRng);
+        let store = ValkeyStore::new(client, encryption_key);
+
+        let user_id = "financial_user_12345";
+        let session_id = Id::default();
+        
+        let mut session_data = HashMap::new();
+        session_data.insert(
+            "balance".to_string(),
+            serde_json::Value::String("1000.00".to_string()), // Financial data
+        );
+
+        let record = Record {
+            id: session_id,
+            data: session_data,
+            expiry_date: OffsetDateTime::now_utc() + time::Duration::hours(1),
+        };
+
+        // Test user-specific session operations
+        store.create(&mut record.clone()).await
+            .expect("Failed to create user session");
+
+        let loaded = store.get_session(user_id, session_id).await
+            .expect("Failed to load user session");
+        
+        assert!(loaded.is_some(), "User session should be retrievable");
+        
+        let deleted_count = store.delete_session(user_id, session_id).await
+            .expect("Failed to delete user session");
+        
+        assert_eq!(deleted_count, 1, "Should delete exactly one session");
+        
+        // Verify deletion
+        let after_delete = store.get_session(user_id, session_id).await
+            .expect("Failed to check deleted user session");
+        
+        assert!(after_delete.is_none(), "User session should not exist after deletion");
     }
 }
