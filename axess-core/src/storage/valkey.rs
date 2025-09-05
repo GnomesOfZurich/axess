@@ -308,7 +308,10 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
     client
         .wait_for_connect()
         .await
-        .expect("Failed to connect to Valkey cluster");
+        .map_err(|e| {
+            error!("Failed to connect to Valkey cluster: {:?}", e);
+            ValkeyStoreError::Valkey(e)
+        })?;
 
     info!("Valkey cluster client connected successfully");
     Ok(client)
