@@ -357,17 +357,22 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
     client.connect();
     
     // Wait for connection with detailed error context
-    match client.wait_for_connect().await {
+    let connection_result = client.wait_for_connect().await;
+    
+    match connection_result {
         Ok(()) => {
             info!("Successfully connected to Valkey cluster");
             Ok(client)
         }
-        Err(e) => {
+        Err(connection_error) => {
             error!("❌ CRITICAL: Valkey cluster connection failed");
             error!("🔧 Attempted nodes: {:?}", nodes);
-            error!("🔧 Error details: {:?}", e);
+            error!("🔧 Error details: {:?}", connection_error);
             error!("💡 This error typically means:");
-            match e.kind() {
+            
+            // Safe error kind matching without potential panics
+            let error_kind = connection_error.kind();
+            match error_kind {
                 fred::error::ErrorKind::IO => {
                     error!("   • Valkey service is not running on the specified ports");
                     error!("   • Network connectivity issues between client and server");
@@ -391,7 +396,8 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
             error!("   • Start Valkey: docker run -p 6379:6379 valkey/valkey");
             error!("   • Check status: docker ps | grep valkey");
             error!("   • Test connection: telnet <host> <port>");
-            Err(ValkeyStoreError::Valkey(e))
+            
+            Err(ValkeyStoreError::Valkey(connection_error))
         }
     }
 }
