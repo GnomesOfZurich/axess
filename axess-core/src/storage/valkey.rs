@@ -357,23 +357,43 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
     client.connect();
     
     // Wait for connection with detailed error context
-    client
-        .wait_for_connect()
-        .await
-        .map_err(|e| {
-            error!("Failed to connect to Valkey cluster nodes {:?}: {}", 
-                   nodes, e);
-            error!("Connection error details: {:?}", e);
-            error!("Please ensure:");
-            error!("1. Valkey cluster is running on the specified nodes");
-            error!("2. Network connectivity is available");
-            error!("3. Firewall rules allow connections");
-            error!("4. Cluster configuration is correct");
-            ValkeyStoreError::Valkey(e)
-        })?;
-
-    info!("Successfully connected to Valkey cluster");
-    Ok(client)
+    match client.wait_for_connect().await {
+        Ok(()) => {
+            info!("Successfully connected to Valkey cluster");
+            Ok(client)
+        }
+        Err(e) => {
+            error!("❌ CRITICAL: Valkey cluster connection failed");
+            error!("🔧 Attempted nodes: {:?}", nodes);
+            error!("🔧 Error details: {:?}", e);
+            error!("💡 This error typically means:");
+            match e.kind() {
+                fred::error::ErrorKind::IO => {
+                    error!("   • Valkey service is not running on the specified ports");
+                    error!("   • Network connectivity issues between client and server");
+                    error!("   • Firewall blocking connections");
+                }
+                fred::error::ErrorKind::Config => {
+                    error!("   • Invalid cluster configuration");
+                    error!("   • Incorrect node addresses or ports");
+                }
+                fred::error::ErrorKind::Auth => {
+                    error!("   • Authentication failure");
+                    error!("   • Invalid credentials or missing auth setup");
+                }
+                _ => {
+                    error!("   • Unexpected connection error");
+                    error!("   • Check Valkey server logs for more details");
+                }
+            }
+            error!("");
+            error!("🚀 Quick fixes:");
+            error!("   • Start Valkey: docker run -p 6379:6379 valkey/valkey");
+            error!("   • Check status: docker ps | grep valkey");
+            error!("   • Test connection: telnet <host> <port>");
+            Err(ValkeyStoreError::Valkey(e))
+        }
+    }
 }
 
 #[cfg(test)]
