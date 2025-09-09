@@ -289,9 +289,9 @@ impl SessionStore for ValkeyStore {
     }
 }
 
-/// Initialize a Valkey cluster client, taking a vector of node addresses as input parameter (addresses expressed as "host:port" &str).
+/// Initialize a Valkey cluster client, taking a vector of node addresses and an optional password for authentication.
 #[allow(dead_code)]
-pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, ValkeyStoreError> {
+pub async fn init_valkey_cluster_client(nodes: Vec<&str>, password: Option<&str>) -> Result<Client, ValkeyStoreError> {
     info!(
         "Creating Valkey cluster configuration with nodes: {:?}",
         nodes
@@ -331,22 +331,19 @@ pub async fn init_valkey_cluster_client(nodes: Vec<&str>) -> Result<Client, Valk
     }
 
     // Create the Config client configuration
-    let config = Config {
+    let mut config = Config {
         server: ServerConfig::Clustered {
             hosts: servers,
             policy: ClusterDiscoveryPolicy::ConfigEndpoint,
         },
         version: RespVersion::RESP3,
-        // TLS configuration can be added here if needed:
-        // tls: Some(TlsConfig {
-        //   connector: create_rustls_config(),
-        //   hostnames: TlsHostMapping::DefaultHost,
-        // }),
-        // Authentication can be added here if needed:
-        // username: Some(read_redis_username()),
-        // password: Some(read_redis_password()),
         ..Default::default()
     };
+
+    // Set password if provided
+    if let Some(pass) = password {
+        config.password = Some(pass.to_string());
+    }
 
     // Initialize the Valkey cluster client
     info!("Initializing Valkey cluster client...");

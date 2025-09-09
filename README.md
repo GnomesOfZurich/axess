@@ -34,7 +34,7 @@ axess = { version="0.0.1", features=["full"]}
 4. Secure your Axum routes.
 
 ## 🤸 Example Usage
-Create a minimal Axum webb applicatiob project and initiate the axess layers of interest from some backend storage and session cache of your choice. The router layers then provide session based authentication for your services:
+Create a minimal Axum web application project and initiate the axess layers of interest from some backend storage and session cache of your choice. The router layers then provide session based authentication for your services:
 ```rust
 use axess::authn::Authenticator;
 use axess::authz::Authorizer;
