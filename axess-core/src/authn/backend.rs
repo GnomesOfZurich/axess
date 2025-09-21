@@ -74,6 +74,7 @@ pub struct SuspensionInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", content = "data")]
 pub enum EntityState {
     Guest,
     Pending(EntityStateInfo),
