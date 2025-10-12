@@ -1,6 +1,6 @@
 use crate::authn::{
     backend::AuthnBackend,
-    session::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
+    session::{AuthFactor, AuthMethod},
 };
 use async_trait::async_trait;
 // use serde::{Deserialize, Serialize};
@@ -13,11 +13,6 @@ pub trait AuthnAdminBackend: AuthnBackend {
     async fn upsert_tenant(&self, tenant: Self::Tenant) -> Result<Self::Tenant, Self::Error>;
     async fn delete_tenant(&self, tenant_id: &Self::TenantId) -> Result<(), Self::Error>;
 
-    async fn upsert_method_state(
-        &self,
-        method_state: AuthMethodState<Self>,
-    ) -> Result<AuthMethodState<Self>, Self::Error>;
-
     async fn delete_method_state(&self, method_state_id: &Self::DataId) -> Result<(), Self::Error>;
 
     async fn upsert_auth_method(
@@ -26,11 +21,6 @@ pub trait AuthnAdminBackend: AuthnBackend {
     ) -> Result<AuthMethod<Self>, Self::Error>;
 
     async fn delete_auth_method(&self, method_id: &Self::MethodId) -> Result<(), Self::Error>;
-
-    async fn upsert_factor_state(
-        &self,
-        factor_state: AuthFactorState<Self>,
-    ) -> Result<AuthFactorState<Self>, Self::Error>;
 
     async fn delete_factor_state(&self, factor_state_id: &Self::DataId) -> Result<(), Self::Error>;
 

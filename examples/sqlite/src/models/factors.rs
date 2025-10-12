@@ -47,7 +47,7 @@ impl From<OurAuthFactorState> for AuthFactorState<OurBackend> {
 impl<'r> FromRow<'r, SqliteRow> for OurAuthFactorState {
     fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(OurAuthFactorState(AuthFactorState::<OurBackend> {
-            id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str()).unwrap(),
+            id: row.try_get::<String, _>("id")?,
             factor_id: Uuid::parse_str(row.try_get::<String, _>("factor_id")?.as_str()).unwrap(),
             tenant_id: Some(
                 Uuid::parse_str(row.try_get::<String, _>("tenant_id")?.as_str()).unwrap(),

@@ -1,7 +1,10 @@
 use crate::{
     authn::{
         backend::{DataId, FactorId, MethodId, TenantId, UserId},
-        methods::scope::{EnablementState, PermissionScope},
+        methods::{
+            factor::FactorInstance,
+            scope::{EnablementState, PermissionScope},
+        },
     },
     tracing::error,
 };
@@ -10,13 +13,55 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
 
+pub struct MethodStateChange<M, T, U>
+where
+    M: MethodId,
+    T: TenantId,
+    U: UserId,
+{
+    pub method_id: M,
+    pub tenant_id: Option<T>,
+    pub user_id: Option<U>,
+    pub state: EnablementState,
+    pub updated_by: U,
+}
+
+impl<M, T, U> MethodStateChange<M, T, U>
+where
+    M: MethodId,
+    T: TenantId,
+    U: UserId,
+{
+    pub fn new(method_id: M, updated_by: U) -> Self {
+        Self {
+            method_id,
+            tenant_id: None,
+            user_id: None,
+            state: EnablementState::Active,
+            updated_by,
+        }
+    }
+
+    pub fn with_scope(mut self, scope: PermissionScope<T, U>) -> Self {
+        self.tenant_id = scope.tenant_id().cloned();
+        self.user_id = scope.user_id().cloned();
+        self
+    }
+
+    pub fn with_state(mut self, state: EnablementState) -> Self {
+        self.state = state;
+        self
+    }
+}
+
+
 #[derive(Debug, Clone, Serialize, Eq, PartialEq)]
-pub struct MethodState<D, M, U, T>
+pub struct MethodState<D, M, T, U>
 where
     D: DataId,
     M: MethodId,
-    U: UserId,
     T: TenantId,
+    U: UserId,
 {
     pub id: D,
     pub method_id: M,
@@ -29,12 +74,12 @@ where
     pub updated_by: U,          // Who last updated this factor
 }
 
-impl<D, M, U, T> MethodState<D, M, U, T>
+impl<D, M, T, U> MethodState<D, M, T, U>
 where
     D: DataId,
     M: MethodId,
-    U: UserId,
     T: TenantId,
+    U: UserId,
 {
     pub fn new(id: D, method_id: M, created_by: U) -> Self {
         let time_now = Utc::now();
@@ -84,7 +129,7 @@ where
     pub id: M,
     pub name: String,
     pub description: String,
-    pub factors: Vec<F>,
+    pub factors: Vec<FactorInstance<F, U>>,
     pub created_at: DateTime<Utc>,
     pub created_by: U,
     pub updated_at: DateTime<Utc>,
@@ -97,7 +142,13 @@ where
     U: UserId + Serialize + DeserializeOwned,
     F: FactorId + Serialize + DeserializeOwned,
 {
-    pub fn new(id: M, name: &str, description: &str, factors: Vec<F>, created_by: U) -> Self {
+    pub fn new(
+        id: M,
+        name: &str,
+        description: &str,
+        factors: Vec<FactorInstance<F, U>>,
+        created_by: U,
+    ) -> Self {
         let time_now = Utc::now();
         Self {
             id,
@@ -109,5 +160,19 @@ where
             updated_at: time_now,
             updated_by: created_by,
         }
+    }
+
+    pub fn get_factor(&self, factor_id: &F) -> Option<&FactorInstance<F, U>> {
+        self.factors.iter().find(|factor| &factor.id == factor_id)
+    }
+
+    pub fn get_factor_ids(&self) -> Vec<F> 
+    where F: Clone
+    {
+        self.factors.iter().map(|factor| factor.id.clone()).collect()
+    }
+
+    pub fn has_factor_kind(&self, kind: &crate::authn::methods::AuthFactorKind) -> bool {
+        self.factors.iter().any(|factor| &factor.kind == kind)
     }
 }

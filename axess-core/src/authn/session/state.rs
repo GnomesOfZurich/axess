@@ -22,7 +22,7 @@ where
     U: UserId + serde::de::DeserializeOwned + serde::Serialize,
 {
     pub current_method: MethodInstance<M, F, U>,
-    pub remaining_factors: Vec<FactorInstance<F, U>>,
+    pub remaining_factors: Vec<F>,
     pub attempt_count: u32,
     pub last_attempt: Option<DateTime<Utc>>,
 }
@@ -42,19 +42,29 @@ where
         }
     }
 
+    /// Marks the given factor as applied by removing it from remaining_factors.
     pub fn apply_factor(&mut self, factor_id: &F) -> Self {
-        self.remaining_factors.retain(|f| &f.id != factor_id);
+        self.remaining_factors.retain(|f| f != factor_id);
         self.clone()
     }
 
     /// Returns the kind of the next required factor, if any.
     pub fn next_factor_kind(&self) -> Option<AuthFactorKind> {
-        self.remaining_factors.first().map(|f| f.kind.clone())
+        self.next_factor().map(|factor| factor.kind.clone())
     }
 
     /// Returns the id of the next required factor, if any.
     pub fn next_factor_id(&self) -> Option<&F> {
-        self.remaining_factors.first().map(|f| &f.id)
+        self.remaining_factors.first()
+    }
+
+    pub fn next_factor(&self) -> Option<&FactorInstance<F, U>> {
+        self.next_factor_id().and_then(|factor_id| {
+            self.current_method
+                .factors
+                .iter()
+                .find(|factor_instance| &factor_instance.id == factor_id)
+        })
     }
 
     pub fn is_complete(&self) -> bool {

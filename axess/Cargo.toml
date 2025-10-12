@@ -1,6 +1,6 @@
 [package]
 name = "axess"
-version = "0.0.2"
+version = "0.0.3"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -12,8 +12,8 @@ request tracing and request id generation.
 authors = ["Gnomes <info@gnomes.ch>"]
 license = "MIT"
 repository = "https://github.com/GnomesOfZurich/axess"
-# homepage = "https://getgnomes.com/tech/axum-access"
-# documentation = "https://docs.rs/axum-access"
+# homepage = "https://getgnomes.com/tech/axess"
+# documentation = "https://docs.rs/axess"
 keywords = ["authentication", "authorization", "axum", "login", "session", "tower", "cedar"]
 categories = ["web-programming"]
 exclude = ["/.github", "/examples", "/scripts"]

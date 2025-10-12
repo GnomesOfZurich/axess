@@ -2,11 +2,12 @@
 use crate::authn::admin::AuthnAdminBackend;
 use crate::authn::{
     backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
-    methods::{EnablementState, FactorForm, PermissionScope},
+    methods::{factor::FactorStateChange, method::MethodStateChange, EnablementState, FactorForm, PermissionScope},
     session::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
 };
 
 use async_trait::async_trait;
+use chrono::Utc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
@@ -21,7 +22,7 @@ use std::fmt::{Display, Formatter};
 
 const SYSTEM_SUPER_USER_ID: &str = "SYSTEM_SUPER_USER_ID";
 const TENANT_SUPER_USER_ID: &str = "TENANT_SUPER_USER_ID";
-const DEFAULT_TENANT_NAME: &'static str = "Default Tenant";
+const DEFAULT_TENANT_NAME: &str = "Default Tenant";
 const DEFAULT_TENANT_ID: &str = "DEFAULT_TENANT_ID";
 const DEFAULT_USER_ID: &str = "DEFAULT_USER_ID";
 
@@ -40,6 +41,30 @@ impl Display for TestTenantId {
     }
 }
 
+impl PartialEq<String> for TestTenantId {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<TestTenantId> for String {
+    fn eq(&self, other: &TestTenantId) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<&str> for TestTenantId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<TestTenantId> for &str {
+    fn eq(&self, other: &TestTenantId) -> bool {
+        *self == other.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MockTenant {
     pub id: TestTenantId,
@@ -49,14 +74,6 @@ pub struct MockTenant {
 }
 
 impl MockTenant {
-    // pub fn new(id: TestTenantId, name: String, description: String) -> Self {
-    //     Self {
-    //         id,
-    //         name,
-    //         description,
-    //     }
-    // }
-
     pub fn with_id(&mut self, id: TestTenantId) -> Self {
         self.id = id;
         self.clone()
@@ -93,17 +110,85 @@ impl AuthTenant for MockTenant {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TestUserId(pub String);
 
+impl Display for TestUserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl From<&str> for TestUserId {
     fn from(s: &str) -> Self {
         TestUserId(s.to_string())
     }
 }
 
-impl Display for TestUserId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+impl PartialEq<String> for TestUserId {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
     }
 }
+
+impl PartialEq<TestUserId> for String {
+    fn eq(&self, other: &TestUserId) -> bool {
+        *self == other.0
+    }
+}
+
+impl PartialEq<&str> for TestUserId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<TestUserId> for &str {
+    fn eq(&self, other: &TestUserId) -> bool {
+        *self == other.0
+    }
+}
+
+
+impl TestUserId {
+    /// Returns the user ID as a string slice
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TestTenantId {
+    /// Returns the tenant ID as a string slice
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for TestUserId {
+    type Target = str;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for TestTenantId {
+    type Target = str;
+    
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for TestUserId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for TestTenantId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MockUser {
@@ -282,7 +367,8 @@ impl AuthnBackend for MockBackend {
         tenant_id: Option<&Self::TenantId>,
     ) -> Result<Self::UserId, Self::Error> {
         match tenant_id {
-            Some(tid) if tid == &DEFAULT_TENANT_ID.into() => {
+            // Compare the inner string explicitly to avoid ambiguous `Into`/`From<&str>` impls
+            Some(tid) if tid.0.as_str() == DEFAULT_TENANT_ID => {
                 Ok(TestUserId(TENANT_SUPER_USER_ID.to_string()))
             }
             Some(_) => Err("User not found".to_string()),
@@ -337,8 +423,8 @@ impl AuthnBackend for MockBackend {
 
     async fn get_scoped_auth_methods(
         &self,
-        _scope: PermissionScope<&Self::TenantId, &Self::UserId>,
-        _state: Option<EnablementState>,
+        _scope: PermissionScope<Self::TenantId, Self::UserId>,
+        _state: EnablementState,
     ) -> Result<Vec<AuthMethod<Self>>, Self::Error> {
         Ok(self
             .auth_methods
@@ -347,16 +433,16 @@ impl AuthnBackend for MockBackend {
             .collect())
     }
 
-    async fn get_factor_states(
+    async fn get_method_states(
         &self,
-        factor_id: &Self::FactorId,
-        scope: PermissionScope<&Self::TenantId, &Self::UserId>,
-    ) -> Result<Vec<AuthFactorState<Self>>, Self::Error> {
+        method_id: &Self::MethodId,
+        scope: PermissionScope<Self::TenantId, Self::UserId>,
+    ) -> Result<Vec<AuthMethodState<Self>>, Self::Error> {
         Ok(self
-            .auth_factor_states
+            .auth_method_states
             .iter()
             .filter(|entry| {
-                entry.value().factor_id.0 == *factor_id
+                &entry.value().method_id == method_id
                     && match &scope {
                         PermissionScope::Global | PermissionScope::Any => true,
                         PermissionScope::Tenant(tenant_id) => {
@@ -366,13 +452,83 @@ impl AuthnBackend for MockBackend {
                         PermissionScope::User(tenant_id, user_id) => {
                             entry.value().tenant_id.as_ref().map(|t| t.as_str())
                                 == Some(tenant_id.0.as_str())
-                                && entry.value().user_id.as_ref().map(|u| u.0.as_str())
+                                && entry.value().user_id.as_ref().map(|u| u.as_str())
                                     == Some(user_id.0.as_str())
                         }
                     }
             })
             .map(|entry| entry.value().clone())
             .collect())
+    }
+
+    /// Upserts (inserts or updates) the authentication method state for the given method.
+    /// If a state for the method already exists, it will be updated; otherwise, it will be inserted.
+    async fn upsert_method_state(
+        &self,
+        change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+    ) -> Result<AuthMethodState<Self>, Self::Error> {
+        // Create natural key from method_id, tenant_id, user_id
+        let key = format!(
+            "{}:{}:{}",
+            change.method_id,
+            change
+                .tenant_id
+                .as_ref()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            change
+                .user_id
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        );
+
+        let now = Utc::now();
+
+        // Check if state exists first (borrow only)
+        let existing_id_and_audit = self.auth_method_states.get(&key).map(|existing| {
+            (
+                existing.id.clone(),
+                existing.created_at,
+                existing.created_by.clone(),
+            )
+        });
+
+        // Build method state based on whether it exists
+        let method_state = if let Some((id, created_at, created_by)) = existing_id_and_audit {
+            // Update: preserve existing audit trail
+            AuthMethodState::<MockBackend> {
+                id,
+                method_id: change.method_id,
+                tenant_id: change.tenant_id,
+                user_id: change.user_id,
+                state: change.state,
+                created_at,
+                created_by,
+                updated_at: now,
+                updated_by: change.updated_by,
+            }
+        } else {
+            // Insert: generate new ID
+            let id = format!("method_state_{}", self.auth_method_states.len());
+
+            AuthMethodState::<MockBackend> {
+                id,
+                method_id: change.method_id,
+                tenant_id: change.tenant_id,
+                user_id: change.user_id,
+                state: change.state,
+                created_at: now,
+                created_by: change.updated_by.clone(),
+                updated_at: now,
+                updated_by: change.updated_by,
+            }
+        };
+
+        // Store and return
+        self.auth_method_states
+            .insert(key, method_state.clone());
+        Ok(method_state)
     }
 
     async fn get_auth_factor(
@@ -395,11 +551,110 @@ impl AuthnBackend for MockBackend {
 
     async fn get_scoped_auth_factors(
         &self,
-        _scope: PermissionScope<&Self::TenantId, &Self::UserId>,
-        _state: Option<EnablementState>,
+        _scope: PermissionScope<Self::TenantId, Self::UserId>,
+        _state: EnablementState,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
         // For mock implementation, return empty vector
         Ok(Vec::new())
+    }
+
+    async fn get_factor_states(
+        &self,
+        factor_id: &Self::FactorId,
+        scope: PermissionScope<Self::TenantId, Self::UserId>,
+    ) -> Result<Vec<AuthFactorState<Self>>, Self::Error> {
+        Ok(self
+            .auth_factor_states
+            .iter()
+            .filter(|entry| {
+                &entry.value().factor_id == factor_id
+                    && match &scope {
+                        PermissionScope::Global | PermissionScope::Any => true,
+                        PermissionScope::Tenant(tenant_id) => {
+                            entry.value().tenant_id.as_ref().map(|t| t.as_str())
+                                == Some(tenant_id.0.as_str())
+                        }
+                        PermissionScope::User(tenant_id, user_id) => {
+                            entry.value().tenant_id.as_ref().map(|t| t.as_str())
+                                == Some(tenant_id.0.as_str())
+                                && entry.value().user_id.as_ref().map(|u| u.as_str())
+                                    == Some(user_id.0.as_str())
+                        }
+                    }
+            })
+            .map(|entry| entry.value().clone())
+            .collect())
+    }
+
+    async fn upsert_factor_state(
+        &self,
+        change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+    ) -> Result<AuthFactorState<Self>, Self::Error> {
+        // Create natural key from factor_id, tenant_id, user_id
+        let key = format!(
+            "{}:{}:{}",
+            change.factor_id,
+            change
+                .tenant_id
+                .as_ref()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            change
+                .user_id
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        );
+
+        let now = Utc::now();
+
+        // Check if state exists first (borrow only)
+        let existing_id_and_audit = self.auth_factor_states.get(&key).map(|existing| {
+            (
+                existing.id.clone(),
+                existing.created_at,
+                existing.created_by.clone(),
+            )
+        });
+
+        // Build factor state based on whether it exists
+        let factor_state = if let Some((id, created_at, created_by)) = existing_id_and_audit {
+            // Update: preserve existing audit trail
+            // AuthFactorState type params: <DataId, FactorId, UserId, TenantId>
+            AuthFactorState::<MockBackend> {
+                id,
+                factor_id: change.factor_id,
+                tenant_id: change.tenant_id,
+                user_id: change.user_id,
+                state: change.state,
+                config: change.config,
+                created_at,
+                created_by,
+                updated_at: now,
+                updated_by: change.updated_by,
+            }
+        } else {
+            // Insert: generate new ID
+            let id = format!("factor_state_{}", self.auth_factor_states.len());
+
+            AuthFactorState::<MockBackend> {
+                id,
+                factor_id: change.factor_id,
+                tenant_id: change.tenant_id,
+                user_id: change.user_id,
+                state: change.state,
+                config: change.config,
+                created_at: now,
+                created_by: change.updated_by.clone(),
+                updated_at: now,
+                updated_by: change.updated_by,
+            }
+        };
+
+        // Store and return
+        self.auth_factor_states
+            .insert(key, factor_state.clone());
+        Ok(factor_state)
     }
 
     async fn authenticate<'a, F>(&self, _creds: &'a F) -> Result<Self::User, Self::Error>
@@ -439,17 +694,6 @@ impl AuthnAdminBackend for MockBackend {
         Ok(())
     }
 
-    /// Upserts (inserts or updates) the authentication method state for the given method.
-    /// If a state for the method already exists, it will be updated; otherwise, it will be inserted.
-    async fn upsert_method_state(
-        &self,
-        state: AuthMethodState<Self>,
-    ) -> Result<AuthMethodState<Self>, Self::Error> {
-        let method_id = state.method_id.to_string();
-        self.auth_method_states
-            .insert(method_id.clone(), state.clone());
-        Ok(state)
-    }
     async fn delete_method_state(
         &self,
         method_state_id: &Self::MethodId,
@@ -470,15 +714,6 @@ impl AuthnAdminBackend for MockBackend {
     async fn delete_auth_method(&self, method_id: &Self::MethodId) -> Result<(), Self::Error> {
         self.auth_methods.remove(method_id);
         Ok(())
-    }
-
-    async fn upsert_factor_state(
-        &self,
-        state: AuthFactorState<Self>,
-    ) -> Result<AuthFactorState<Self>, Self::Error> {
-        let factor_id = state.factor_id.to_string();
-        self.auth_factor_states.insert(factor_id, state.clone());
-        Ok(state)
     }
 
     async fn delete_factor_state(

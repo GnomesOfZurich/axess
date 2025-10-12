@@ -11,6 +11,18 @@ pub enum EnablementState {
     Archived,  // No longer available for new use, but kept for history
 }
 
+// impl EnablementState {
+//     fn new() -> Self {
+//         EnablementState::Pending
+//     }
+// }
+
+// impl Default for EnablementState {
+//     fn default() -> Self {
+//         EnablementState::Inactive
+//     }
+// }
+
 // Scope for permission resolution
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PermissionScope<TenantId, UserId> {

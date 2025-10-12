@@ -2,62 +2,61 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 // use tower_cookies::cookie::time::Date;
-use std::{cmp::PartialEq, fmt::Debug, hash::Hash};
+use std::{cmp::PartialEq, fmt::{Debug, Display}, hash::Hash};
 // use chrono::{DateTime, Utc};
 use crate::authn::{
     methods::{
-        form::FactorForm,
-        scope::{EnablementState, PermissionScope},
+        factor::FactorStateChange, form::FactorForm, method::MethodStateChange, scope::{EnablementState, PermissionScope}
     },
-    session::auth_session::{AuthFactor, AuthFactorState, AuthMethod},
+    session::{auth_session::{AuthFactor, AuthFactorState, AuthMethod}, AuthMethodState},
 };
 
 pub trait TenantId:
-    Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 pub trait UserId:
-    Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 pub trait FactorId:
-    Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 pub trait MethodId:
-    Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 pub trait DataId:
-    Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 impl<T> TenantId for T where
-    T: Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    T: Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 impl<T> UserId for T where
-    T: Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    T: Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 impl<T> FactorId for T where
-    T: Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    T: Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 impl<T> MethodId for T where
-    T: Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    T: Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
 impl<T> DataId for T where
-    T: Clone + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
+    T: Clone + Display + Debug + Eq + PartialEq + Hash + Send + Sync + Serialize + for<'de> Deserialize<'de>
 {
 }
 
@@ -77,6 +76,7 @@ pub struct SuspensionInfo {
 #[serde(tag = "kind", content = "data")]
 pub enum EntityState {
     Guest,
+    Candidate,
     Pending(EntityStateInfo),
     Active,
     Suspended(SuspensionInfo),
@@ -177,15 +177,20 @@ where
     /// Get all Authentication methods for a given scope (global/user/tenant), potentially filtered by state (e.g. 'Active').
     async fn get_scoped_auth_methods(
         &self,
-        scope: PermissionScope<&Self::TenantId, &Self::UserId>,
-        state: Option<EnablementState>,
+        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        state: EnablementState,
     ) -> Result<Vec<AuthMethod<Self>>, Self::Error>;
 
-    async fn get_factor_states(
+    async fn get_method_states(
         &self,
-        factor_id: &Self::FactorId,
-        scope: PermissionScope<&Self::TenantId, &Self::UserId>,
-    ) -> Result<Vec<AuthFactorState<Self>>, Self::Error>;
+        method_id: &Self::MethodId,
+        scope: PermissionScope<Self::TenantId, Self::UserId>,
+    ) -> Result<Vec<AuthMethodState<Self>>, Self::Error>;
+
+    async fn upsert_method_state(
+        &self,
+        change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+    ) -> Result<AuthMethodState<Self>, Self::Error>;
 
     // Get the authentication factor by its ID.
     async fn get_auth_factor(
@@ -198,9 +203,20 @@ where
     /// Get all authentication factors for a given scope (global/user/tenant).
     async fn get_scoped_auth_factors(
         &self,
-        scope: PermissionScope<&Self::TenantId, &Self::UserId>,
-        state: Option<EnablementState>,
+        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        states: EnablementState,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
+
+    async fn get_factor_states(
+        &self,
+        factor_id: &Self::FactorId,
+        scope: PermissionScope<Self::TenantId, Self::UserId>,
+    ) -> Result<Vec<AuthFactorState<Self>>, Self::Error>;
+
+    async fn upsert_factor_state(
+        &self,
+        change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+    ) -> Result<AuthFactorState<Self>, Self::Error>;
 
     async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
     where

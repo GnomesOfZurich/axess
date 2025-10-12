@@ -3,18 +3,18 @@ use crate::{
         backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
         errors::AuthError,
         methods::{
-            EnablementState,
-            factor::{AuthFactorKind, FactorInstance, FactorState},
+            factor::{AuthFactorKind, FactorInstance, FactorState, FactorStateChange},
             form::{FactorForm, FactorFormKind},
             method::{MethodInstance, MethodState},
             scope::PermissionScope,
+            EnablementState,
         },
         session::state::{AuthState, Data, PartialAuthState},
     },
     axum::{
         extract::{Form, Json},
         http::StatusCode,
-        response::{IntoResponse, Redirect},
+        response::{IntoResponse, Redirect, Response},
     },
     // storage::session_registry::{
     //     // SessionRegistry,
@@ -25,7 +25,7 @@ use crate::{
 use std::{
     // collections::HashMap,
     // char::MAX,
-    fmt::{Debug, Display}, // sync::Arc
+    fmt::Debug, // sync::Arc
 };
 
 use tower_sessions::{
@@ -151,12 +151,186 @@ where
         })
     }
 
+    /// Find first method whose first factor matches the criteria
+    async fn find_matching_method(
+        &self,
+        methods: Vec<AuthMethod<B>>,
+        factor_kind: AuthFactorKind,
+        action_kind: FactorFormKind,
+        scope: &PermissionScope<B::TenantId, B::UserId>,
+    ) -> Result<AuthMethod<B>, AuthError<B>> {
+        let expected_state = match action_kind {
+            FactorFormKind::Setup => EnablementState::Pending,
+            FactorFormKind::Verify => EnablementState::Active,
+        };
+
+        for method in methods {
+            let Some(first_factor) = method.factors.first() else {
+                warn!("Method {:?} has no factors, skipping", method.id);
+                continue;
+            };
+
+            // Check if factor kind matches
+            if first_factor.kind != factor_kind {
+                continue;
+            }
+
+            // Fetch and validate factor states
+            match self.validate_factor_state(
+                &first_factor.id, 
+                scope, 
+                &expected_state
+            ).await {
+                Ok(true) => {
+                    debug!(
+                        "Found matching method {:?} with factor {:?} in state {:?}",
+                        method.id, first_factor.id, expected_state
+                    );
+                    return Ok(method);
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    warn!("Error validating factor state: {:?}", e);
+                    continue;
+                }
+            }
+        }
+
+        error!(
+            "No method found with factor kind {:?} in {:?} state for scope {:?}",
+            factor_kind, expected_state, scope
+        );
+        Err(AuthError::MethodNotFound)
+    }
+
+    /// Validate that a factor has the expected state in the given scope
+    async fn validate_factor_state(
+        &self,
+        factor_id: &B::FactorId,
+        scope: &PermissionScope<B::TenantId, B::UserId>,
+        expected_state: &EnablementState,
+    ) -> Result<bool, AuthError<B>> {
+        let factor_states = self
+            .backend
+            .get_factor_states(factor_id, scope.clone())
+            .await
+            .map_err(|e| {
+                error!("Failed to fetch factor states: {:?}", e);
+                AuthError::BackendError(e)
+            })?;
+
+        if factor_states.is_empty() {
+            debug!("No factor states found for factor {:?}", factor_id);
+            return Ok(false);
+        }
+
+        Ok(factor_states.iter().any(|fs| fs.state == *expected_state))
+    }
+
+    /// Find an authentication method suitable for the current session state and
+    /// the provided factor kind and form kind. This is used to determine
+    /// the appropriate authentication method to use for the current session.
+    /// The scope must be `User` to be able to check the method and factor states.
+    /// All users must have at least one method in the `Active` state to be able to login.
+    pub async fn get_assumed_auth_method(
+        &self,
+        scope: PermissionScope<B::TenantId, B::UserId>,
+        factor_kind: AuthFactorKind,
+        action_kind: FactorFormKind,
+    ) -> Result<AuthMethod<B>, AuthError<B>> {
+
+        debug!("Looking for auth method with factor kind {:?} and form kind {:?} in scope {:?}", factor_kind, action_kind, scope);
+        if !matches!(scope, PermissionScope::User(_, _)) {
+            error!("Need to have the User scope to be able to check check the method and factor states.");
+            return Err(AuthError::MethodNotFound);
+        }
+
+        let PermissionScope::User(tid, uid) = &scope else {
+            error!("Need to have the User scope to check method and factor states.");
+            return Err(AuthError::MethodNotFound);
+        };
+
+        // Validate tenant and user match session
+        if Some(tid) != self.get_tenant_id() || Some(uid) != self.get_user_id() {
+            error!("The provided scope does not match the session's tenant and user IDs.");
+            return Err(AuthError::Unauthorized); // More specific error
+        }
+
+        // Validate user state
+        match self.get_user_state() {
+            EntityState::Active | EntityState::Pending(_) => {},
+            _ => {
+                error!("User is not active or pending.");
+                return Err(AuthError::UserNotActive);
+            }
+        }
+        
+        // Fetch all relevant authentication methods for the given scope
+        let methods: Vec<AuthMethod<B>> = self
+            .backend
+            .get_scoped_auth_methods(scope.clone(), EnablementState::Active)
+            .await
+            .map_err(|e| {
+                error!("Failed to fetch scoped auth methods from backend: {:?}", e);
+                AuthError::BackendError(e)
+        })?;
+        if methods.is_empty() {
+            error!("No authentication methods found for scope {:?}", scope);
+            return Err(AuthError::MethodNotFound);
+        }
+
+        // For the found method, check the state of the first factor using get_factor_states.
+        // If action_kind is Setup, accept Pending (user scope) or Active (tenant/global scope).
+        // Iterate over all methods to find one whose first factor matches the requested factor_kind,
+        // and whose first factor's state matches the requirements for the action_kind.
+        let mut found_method = None;
+        for method in methods {
+            if let Some(first_factor) = method.factors.first() {
+                if first_factor.kind != factor_kind {
+                    continue;
+                }
+
+                let factor_states = self.backend.get_factor_states(&first_factor.id, scope.clone())
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to fetch factor states: {:?}", e);
+                        AuthError::BackendError(e)
+                    })?;
+                if factor_states.is_empty() {
+                    warn!("No factor states found for factor ID {:?} in scope {:?}", first_factor.id, scope);
+                    continue;
+                } else {
+                    debug!("Found factor states for factor ID {:?} in scope {:?}: {:?}", first_factor.id, scope, factor_states);
+                    let expected_factor_state = match action_kind {
+                        FactorFormKind::Setup => EnablementState::Pending,
+                        FactorFormKind::Verify => EnablementState::Active,
+                    };
+                    if factor_states.iter().any(|fs| fs.state == expected_factor_state) {
+                        found_method = Some(method.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        match found_method {
+            Some(m) => Ok(m),
+            None => {
+                error!(
+                    "No authentication method found with first factor kind {:?} for scope {:?}",
+                    factor_kind, scope
+                );
+                Err(AuthError::MethodNotFound)
+            }
+        }
+    }
+
     pub fn user(&self) -> Result<B::User, AuthError<B>> {
         Ok(self.user.clone())
     }
 
-    pub fn get_user_state(&self) -> Option<EntityState> {
-        Some(self.data.user_state.clone())
+    pub fn get_user_state(&self) -> EntityState {
+        self.data.user_state.clone()
     }
 
     pub async fn set_user_state(&mut self, new_state: EntityState) -> Result<(), AuthError<B>>
@@ -190,6 +364,16 @@ where
         &self.state
     }
 
+    /// Set the authentication state of the session.
+    pub async fn set_auth_state(&mut self, new_state: SessionState<B>) -> Result<(), AuthError<B>> {
+        self.state = new_state;
+        self.data.auth_state = self.state.clone();
+        self.session
+            .insert(self.data_key, &self.data)
+            .await
+            .map_err(AuthError::SessionError)?;
+        Ok(())
+    }
     /// Get the user associated with the session.
     /// This will return the user if authenticated, or a guest user if not.
     /// Return reference to avoid move
@@ -221,324 +405,284 @@ where
         matches!(self.state, SessionState::<B>::Authenticated)
     }
 
-    pub async fn initiate_auth_from_form<F>(
+    pub async fn authenticate_from_form<F>(
         &mut self,
         form: Form<F>,
-    ) -> Result<impl IntoResponse, StatusCode>
+    ) -> Result<Response, StatusCode>
     where
         F: FactorForm + Send + Sync + 'static,
     {
-        self.initiate_auth_flow(form.0)
+        self.authenticate(form.0)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
 
-    pub async fn initiate_auth_from_json<F>(
+    pub async fn authenticate_from_json<F>(
         &mut self,
         json: Json<F>,
-    ) -> Result<impl IntoResponse, StatusCode>
+    ) -> Result<Response, StatusCode>
     where
         F: FactorForm + Send + Sync + 'static,
     {
-        self.initiate_auth_flow(json.0)
+        self.authenticate(json.0)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
 
     /// Initiate an authentication flow based on the submitted factor form.
-    pub async fn initiate_auth_flow<F>(&mut self, form: F) -> Result<impl IntoResponse, StatusCode>
+    pub async fn authenticate<F>(&mut self, form: F) -> Result<Response, StatusCode>
     where
         F: FactorForm + Send + Sync + 'static,
     {
-        // Increment the attempt count and update last attempt time
-        match &mut self.state {
-            SessionState::<B>::PartialAuthn(partial_state) => {
-                // Increment the attempt count and update last attempt time
-                let updated_partial_state = partial_state.increment_attempt().clone();
-                if updated_partial_state.attempt_count > MAX_ATTEMPTS {
-                    // TODO: Handle too many attempts gracefully, e.g. capture IP addresses and store on user in the backend as locked out...)
-                    error!("Too many authentication attempts, locking out session");
-                    return Err(StatusCode::TOO_MANY_REQUESTS);
-                }
-                self.state = SessionState::<B>::PartialAuthn(updated_partial_state.clone());
-                // updated_partial_state
-            }
-            _ => {
-                error!("Session is not in partial authentication state");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
+        debug!("Starting authentication process from form");
 
-        let factor_kind = form.factor_kind();
+        // 1. Validate form
+        form.validate_form().map_err(|_| StatusCode::BAD_REQUEST)?;
         let form_kind = form.form_kind();
-        if form_kind == FactorFormKind::Verify
-            && let Some(partial_state) = self.get_partial_inner_state()
-        {
-            let expected_kind = partial_state.next_factor_kind();
-            if expected_kind != Some(factor_kind.clone()) {
-                tracing::warn!(
-                    "Submitted factor kind {:?} does not match expected next factor {:?}",
-                    form.factor_kind(),
-                    expected_kind
-                );
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-
-        // Determine desired factor state(s) based on form kind
-        let desired_state = match form_kind {
-            FactorFormKind::Setup => Some(EnablementState::Pending),
-            FactorFormKind::Verify => Some(EnablementState::Active),
-        };
-
-        let fields = form.fields_map();
-
-        // --- OAuth flow: handle OAuth factor kind ---
-        if factor_kind == AuthFactorKind::Oauth {
-            // Extract provider and tenant from form fields
-            let provider_name = fields.get("provider").cloned().ok_or_else(|| {
-                error!("No OAuth provider specified in form");
-                StatusCode::BAD_REQUEST
-            })?;
-
-            // Resolve tenant_id from form, session, or backend default
-            let tenant_id: B::TenantId = if let Some(tenant_name) = fields.get("tenant") {
-                match self.backend.get_tenant_by_name(tenant_name).await {
-                    Ok(tenant) => tenant.id().clone().into(),
-                    Err(e) => {
-                        warn!("Failed to resolve tenant name '{}': {:?}", tenant_name, e);
-                        match self.backend.get_default_tenant_id().await {
-                            Ok(default_id) => default_id,
-                            Err(e) => {
-                                error!(
-                                    "Failed to fetch default tenant id after tenant name resolution failed: {:?}",
-                                    e
-                                );
-                                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                            }
-                        }
-                    }
-                }
-            } else if let Some(tid) = self.get_tenant_id().cloned() {
-                tid
-            } else {
-                match self.backend.get_default_tenant_id().await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        error!("Failed to fetch default tenant id: {:?}", e);
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                    }
-                }
-            };
-
-            // Build the permission scope for OAuth provider lookup
-            let scope = PermissionScope::Tenant(&tenant_id);
-
-            // Get the OAuth provider configuration from backend
-            // Get all factors for this tenant and provider
-            let factors = self
-                .backend
-                .get_scoped_auth_factors(scope, Some(EnablementState::Active))
-                .await
-                .map_err(|e| {
-                    error!("Failed to get scoped auth factors: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-            // Filter for OAuth factors matching the provider name
-            let matching_factors: Vec<_> = factors
-                .iter()
-                .filter(|f| f.kind == AuthFactorKind::Oauth && f.name == provider_name)
-                .collect();
-
-            let factor = match matching_factors.len() {
-                1 => matching_factors[0],
-                0 => {
-                    error!("No OAuth factor found for provider '{}'", provider_name);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-                _ => {
-                    warn!(
-                        "Multiple OAuth factors found for provider '{}' and tenant '{:?}': {:?}",
-                        provider_name, tenant_id, matching_factors
-                    );
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            };
-
-            // Fetch the factor state for this factor
-            let factor_states = self
-                .backend
-                .get_factor_states(&factor.id, PermissionScope::Tenant(&tenant_id))
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to fetch factor state for OAuth factor '{:?}': {:?}",
-                        factor.id, e
-                    );
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-            if factor_states.len() != 1
-                || factor_states.first().map(|fs| &fs.state) != Some(&EnablementState::Active)
-            {
-                error!(
-                    "Expected exactly one active factor state for OAuth factor '{:?}', found: {}",
-                    factor.id,
-                    factor_states.len()
-                );
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-
-            // Get the first factor state (assuming there's at least one)
-            let factor_state = factor_states.first().ok_or_else(|| {
-                error!("No factor state found for OAuth factor '{:?}'", factor.id);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            // Extract the authorization URL from the factor state's config
-            let auth_url: &str = factor_state
-                .config
-                .get("auth_url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    error!("Missing OAuth provider authorization URL in factor state config");
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-            // Store provider and tenant in session for later callback handling
-            self.session
-                .insert("oauth_provider", &provider_name)
-                .await
-                .map_err(|e| {
-                    error!("Failed to store oauth_provider in session: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-            self.session
-                .insert("oauth_tenant_id", &tenant_id)
-                .await
-                .map_err(|e| {
-                    error!("Failed to store oauth_tenant_id in session: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-
-            // Redirect user to the OAuth provider's authorization URL
-            return Ok(Redirect::temporary(auth_url).into_response());
-        }
-
-        // --- Non-OAuth flow: robust and ergonomic ---
-        let tenant_id: B::TenantId = if let Some(tenant_name) = fields.get("tenant") {
-            match self.backend.get_tenant_by_name(tenant_name).await {
-                Ok(tenant) => tenant.id().clone().into(),
-                Err(e) => {
-                    error!("Failed to resolve tenant name '{}': {:?}", tenant_name, e);
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-            }
-        } else if let Some(tid) = self.get_tenant_id().cloned() {
-            tid
-        } else {
-            match self.backend.get_default_tenant_id().await {
-                Ok(id) => id,
-                Err(e) => {
-                    error!("Failed to fetch default tenant id: {:?}", e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-            }
-        };
-
-        // Load user if guest
-        let mut user = self.get_user().clone();
-        if user.get_user_state() == EntityState::Guest {
-            if let Some(username) = fields.get("username") {
-                match self.backend.get_user_by_name(&tenant_id, username).await {
-                    Ok(loaded_user) => user = loaded_user,
-                    Err(e) => {
-                        error!("Failed to load user '{}': {:?}", username, e);
-                        return Err(StatusCode::BAD_REQUEST);
-                    }
-                }
-            } else {
-                error!("No username provided for non-OAuth authentication");
-                return Err(StatusCode::BAD_REQUEST);
-            }
-        }
-
-        let user_id: B::UserId = user.id().clone().into();
-        let scope = PermissionScope::User(&tenant_id, &user_id);
-
-        // Fetch all methods for this user and state
-        let methods = self
-            .backend
-            .get_scoped_auth_methods(scope, desired_state)
-            .await
-            .map_err(|e| {
-                error!("Failed to get scoped auth methods: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-        // Find a method where the next required factor matches the submitted kind
         let factor_kind = form.factor_kind();
-        let mut matched_method = None;
-        for method in &methods {
-            if let Some(next_factor_id) = method.factors.first() {
-                let factor = self.backend.get_auth_factor(next_factor_id).await.ok();
-                if let Some(factor) = factor
-                    && factor.kind == factor_kind
-                {
-                    matched_method = Some(method.clone());
-                    break;
+
+        // 2. Determine authentication state and handle accordingly
+        match &self.state {
+            SessionState::<B>::NotAuthenticated => {
+                self.handle_initial_authentication(&form, factor_kind, form_kind).await
+            }
+            SessionState::<B>::PartialAuthn(partial_state) => {
+                self.handle_partial_authentication(&form, partial_state.clone()).await
+            }
+            SessionState::<B>::Authenticated => {
+                // Only allow setup of additional factors when authenticated
+                if form_kind == FactorFormKind::Setup {
+                    self.handle_factor_setup(&form, factor_kind).await
+                } else {
+                    error!("Already authenticated");
+                    Err(StatusCode::CONFLICT)
                 }
             }
         }
-        let method = matched_method.ok_or_else(|| {
-            error!(
-                "No matching method for submitted factor kind: {:?}",
-                factor_kind
-            );
+    }
+
+    async fn handle_initial_authentication<F>(
+        &mut self,
+        form: &F,
+        factor_kind: AuthFactorKind,
+        form_kind: FactorFormKind,
+    ) -> Result<Response, StatusCode>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        // Only allow verify forms for initial authentication
+        if form_kind != FactorFormKind::Verify {
+            error!("Cannot setup factors without authentication");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // Extract username from form fields
+        let fields = form.fields_map();
+        let username = fields.get("username").ok_or_else(|| {
+            error!("Username not found in form fields");
             StatusCode::BAD_REQUEST
         })?;
 
-        // Fetch all factor instances for this method (MFA chain)
-        let mut factor_instances = Vec::new();
-        for factor_id in &method.factors {
-            let factor = self.backend.get_auth_factor(factor_id).await.map_err(|e| {
-                error!("Failed to fetch factor {:?}: {:?}", factor_id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-            factor_instances.push(factor);
-        }
-
-        // Build PartialAuthState with all factors (remaining_factors)
-        let mut partial_state = PartialAuthState {
-            current_method: method.clone(),
-            remaining_factors: factor_instances,
-            attempt_count: 0,
-            last_attempt: None,
+        // Get tenant from form or use default tenant from session
+        let tenant_name = fields.get("tenant");
+        let tenant_id = if let Some(name) = tenant_name {
+            // Look up tenant by name
+            self.backend
+                .get_tenant_by_name(name)
+                .await
+                .map_err(|e| {
+                    error!("Failed to find tenant by name: {:?}", e);
+                    StatusCode::UNAUTHORIZED
+                })?
+                .id()
+                .clone()
+                .into()
+        } else {
+            // Use session's tenant or default tenant
+            self.get_tenant_id()
+                .cloned()
+                .ok_or_else(|| {
+                    error!("No tenant found in session or form");
+                    StatusCode::BAD_REQUEST
+                })?
         };
 
-        // Remove the just-submitted factor from remaining_factors
-        if let Some(first_factor) = partial_state.remaining_factors.first()
-            && first_factor.kind == factor_kind
-        {
-            partial_state.remaining_factors.remove(0);
-        }
+        // Look up user by username and tenant
+        let user = self
+            .backend
+            .get_user_by_name(&tenant_id, username)
+            .await
+            .map_err(|e| {
+                error!("Failed to find user by username: {:?}", e);
+                StatusCode::UNAUTHORIZED
+            })?;
 
-        self.state = AuthState::PartialAuthn(partial_state.clone());
-        self.save_session_data().await.map_err(|e| {
-            error!("Failed to save session data: {:?}", e);
+        let user_id: B::UserId = user.id().clone().into();
+
+        // Update session with user info before proceeding
+        self.user = user;
+        self.data.user_id = Some(user_id.clone());
+        self.data.tenant_id = Some(tenant_id.clone());
+        self.data.user_state = EntityState::Active;
+
+        let scope = PermissionScope::User(tenant_id, user_id);
+
+        // Find the appropriate authentication method
+        let method = self
+            .get_assumed_auth_method(scope.clone(), factor_kind, form_kind)
+            .await
+            .map_err(|e| {
+                error!("Failed to find authentication method: {:?}", e);
+                StatusCode::UNAUTHORIZED
+            })?;
+
+        // Start authentication flow
+        self.start_authentication(method.clone()).await.map_err(|e| {
+            error!("Failed to start authentication: {:?}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-        let next_factor_kind = partial_state.next_factor_kind();
-        let next_factor_id = partial_state.next_factor_id().cloned();
+        // Verify the first factor
+        self.verify_factor(form, &method.factors[0]).await?;
 
-        Ok(Json(serde_json::json!({
-            "status": "auth_flow_initiated",
-            "method_id": method.id,
-            "next_factor_kind": next_factor_kind,
-            "next_factor_id": next_factor_id,
-        }))
-        .into_response())
+        // Check if there are more factors to verify
+        if method.factors.len() > 1 {
+            let remaining_factors: Vec<_> = method.factors.iter().skip(1).map(|f| f.id.clone()).collect();
+            
+            let partial_state = PartialState::<B> {
+                current_method: method.clone(),
+                remaining_factors,
+                attempt_count: 1,
+                last_attempt: Some(chrono::Utc::now()),
+            };
+
+            self.set_auth_state(SessionState::<B>::PartialAuthn(partial_state))
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            Ok(Json(serde_json::json!({
+                "status": "partial",
+                "next_factor": method.factors[1].id
+            })).into_response())
+        } else {
+            // Single factor authentication complete
+            self.complete_authentication()
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            // Use the 'next' field from form if available, otherwise redirect to default
+            let redirect_url = fields.get("next")
+                .map(|s| s.as_str())
+                .unwrap_or("/");
+
+            Ok(Redirect::to(redirect_url).into_response())
+        }
+    }
+
+    async fn handle_partial_authentication<F>(
+        &mut self,
+        form: &F,
+        mut partial_state: PartialState<B>,
+    ) -> Result<Response, StatusCode>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        // Check attempt count
+        partial_state.attempt_count += 1;
+        partial_state.last_attempt = Some(chrono::Utc::now());
+
+        if partial_state.attempt_count > MAX_ATTEMPTS {
+            error!("Too many authentication attempts");
+            self.logout().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+
+        // Verify the next expected factor
+        let next_factor_id = partial_state.remaining_factors
+            .first()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let factor = self
+            .backend
+            .get_auth_factor(next_factor_id)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Verify factor matches form
+        if factor.kind != form.factor_kind() {
+            error!("Unexpected factor type");
+            return Err(StatusCode::BAD_REQUEST);
+        }
+
+        // Verify the factor
+        self.verify_factor(form, &factor).await?;
+
+        // Remove verified factor from remaining
+        partial_state.remaining_factors.remove(0);
+
+        // Check if authentication is complete
+        if partial_state.remaining_factors.is_empty() {
+            self.complete_authentication().await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            Ok(Redirect::to("/").into_response())
+        } else {
+            // Save updated partial state; capture next factor before moving partial_state
+            let next_factor = partial_state
+                .remaining_factors
+                .first()
+                .cloned()
+                .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            self.set_auth_state(SessionState::<B>::PartialAuthn(partial_state)).await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            
+            // Return info about next factor
+            Ok(Json(serde_json::json!({
+                "status": "partial",
+                "next_factor": next_factor
+            })).into_response())
+        }
+    }
+
+    async fn verify_factor<F>(
+        &mut self,
+        form: &F,
+        factor: &AuthFactor<B>,
+    ) -> Result<(), StatusCode>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        // Get factor state with config
+        let scope = PermissionScope::User(
+            self.get_tenant_id().cloned().ok_or(StatusCode::UNAUTHORIZED)?,
+            self.get_user_id().cloned().ok_or(StatusCode::UNAUTHORIZED)?,
+        );
+
+        let factor_states = self
+            .backend
+            .get_factor_states(&factor.id, scope)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let factor_state = factor_states
+            .first()
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        // Verify form against config
+        // factor_state.config is a HashMap<String, serde_json::Value>, but
+        // verify_against_config expects a &serde_json::Value, so convert it
+        // into a serde_json::Value::Object.
+        let config_value = serde_json::Value::Object(
+            factor_state
+                .config
+                .clone()
+                .into_iter()
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        );
+        form.verify_against_config(&config_value)
+            .map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+        Ok(())
     }
 
     pub async fn start_authentication(
@@ -556,11 +700,17 @@ where
                         "Authentication already in progress for method: {:?}",
                         method
                     );
-                    Ok(())
                 } else {
-                    debug!("Another authentication already in progress, cannot start a new one");
-                    Err(AuthError::InvalidStateTransition)
+                    warn!("Another authentication already in progress, attempt to restart with a different method");
+                    let current_attempt = partial_state.attempt_count;
+                    self.state = SessionState::<B>::PartialAuthn(PartialState::<B> {
+                        current_method: method.clone(),
+                        remaining_factors: method.get_factor_ids(),
+                        attempt_count: current_attempt + 1,
+                        last_attempt: Some(chrono::Utc::now()),
+                    });
                 }
+                Ok(())
             }
             SessionState::<B>::NotAuthenticated => {
                 debug!("Starting authentication for method: {:?}", method);
@@ -574,17 +724,23 @@ where
                 let user_id: B::UserId = user.id().clone().into();
                 let tenant_id: B::TenantId = user.tenant_id().clone().into();
 
-                let scope = PermissionScope::User(&tenant_id, &user_id);
+                let user_id_cloned = user_id.clone();
+                let scope = PermissionScope::User(tenant_id, user_id);
                 let methods_available = self
                     .backend
-                    .get_scoped_auth_methods(scope, Some(EnablementState::Active))
+                    .get_scoped_auth_methods(scope, EnablementState::Active)
                     .await
                     .map_err(AuthError::BackendError)?;
                 if !methods_available.contains(&method) {
-                    debug!("Method {:?} not available for user {:?}", method, user_id);
+                    debug!("Method {:?} not available for user {:?}", method, user_id_cloned);
                     return Err(AuthError::MethodNotSupported);
                 }
-                let partial_state = PartialState::<B>::new(method);
+                let partial_state = PartialState::<B> {
+                    current_method: method.clone(),
+                    remaining_factors: method.get_factor_ids(),
+                    attempt_count: 0,
+                    last_attempt: None,
+                };
                 self.state = SessionState::<B>::PartialAuthn(partial_state);
                 Ok(())
             }
@@ -640,10 +796,10 @@ where
     }
 
     pub async fn complete_authentication(&mut self) -> Result<(), AuthError<B>>
-    where
-        // R: SessionRegistry + Send + Sync + 'static,
-        B::UserId: Display,
-        B::TenantId: Display,
+    // where
+    //     // R: SessionRegistry + Send + Sync + 'static,
+    //     B::UserId: Display,
+    //     B::TenantId: Display,
     {
         self.state = SessionState::<B>::Authenticated;
         self.session
@@ -671,7 +827,7 @@ where
     }
 
     pub async fn logout(&mut self) -> Result<Option<B::User>, AuthError<B>>
-// where
+    // where
     //     R: SessionRegistry + Send + Sync + 'static,
     {
         // // Use registry to invalidate if available
@@ -703,6 +859,97 @@ where
         Ok(user)
     }
 
+    /// Handle factor setup for authenticated users.
+    /// This allows users to add/configure new authentication factors after logging in.
+    async fn handle_factor_setup<F>(
+        &mut self,
+        form: &F,
+        factor_kind: AuthFactorKind,
+    ) -> Result<Response, StatusCode>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        // 1. Ensure user is authenticated
+        if !self.is_authenticated() {
+            error!("Cannot setup factor without authentication");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+
+        // 2. Get user and tenant IDs
+        let tenant_id = self.get_tenant_id().cloned().ok_or_else(|| {
+            error!("No tenant ID in session");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let user_id = self.get_user_id().cloned().ok_or_else(|| {
+            error!("No user ID in session");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let scope = PermissionScope::User(tenant_id.clone(), user_id.clone());
+
+        // 3. Find the factor to setup using the same method as authentication
+        let method = self
+            .get_assumed_auth_method(scope.clone(), factor_kind.clone(), FactorFormKind::Setup)
+            .await
+            .map_err(|e| {
+                error!("Failed to find setup method: {:?}", e);
+                StatusCode::BAD_REQUEST
+            })?;
+
+        let factor = method.factors.first().ok_or_else(|| {
+            error!("Method has no factors");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        // 4. Extract credential from form
+        let credential = form.credential().ok_or_else(|| {
+            error!("No credential found in setup form");
+            StatusCode::BAD_REQUEST
+        })?;
+
+        // 5. Create factor state configuration based on factor kind
+        let mut config = std::collections::HashMap::new();
+        match factor_kind {
+            AuthFactorKind::Password => {
+                // Hash the password before storing
+                let password_hash = password_auth::generate_hash(credential);
+                config.insert("password_hash".to_string(), serde_json::json!(password_hash));
+            }
+            AuthFactorKind::Totp => {
+                // Store the TOTP secret
+                config.insert("totp_secret".to_string(), serde_json::json!(credential));
+            }
+            AuthFactorKind::Oauth => {
+                // Store OAuth provider configuration
+                config.insert("provider".to_string(), serde_json::json!(credential));
+            }
+        }
+
+        // 6. Create FactorStateChange to enable the factor
+        let change = FactorStateChange::new(factor.id.clone(), user_id.clone())
+            .with_scope(scope)
+            .with_state(EnablementState::Active)
+            .with_config(config);
+
+        // 7. Upsert - backend handles all the logic
+        self.backend
+            .upsert_factor_state(change)
+            .await
+            .map_err(|e| {
+                error!("Failed to save factor state: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        debug!("Factor setup successful");
+
+        // 8. Return success response
+        let fields = form.fields_map();
+        let redirect_url = fields.get("next").map(|s| s.as_str()).unwrap_or("/");
+
+        Ok(Redirect::to(redirect_url).into_response())
+    }
+
     // // Add method to register the session after successful authentication
     // pub async fn register_session(&self) -> Result<(), AuthError<B>>
     // where
@@ -729,10 +976,10 @@ where
 pub type AuthFactor<B> = FactorInstance<<B as AuthnBackend>::FactorId, <B as AuthnBackend>::UserId>;
 
 pub type AuthFactorState<B> = FactorState<
+    <B as AuthnBackend>::DataId,
     <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
-    <B as AuthnBackend>::MethodId,
     <B as AuthnBackend>::TenantId,
+    <B as AuthnBackend>::UserId,
 >;
 
 pub type AuthMethod<B> = MethodInstance<
@@ -744,8 +991,8 @@ pub type AuthMethod<B> = MethodInstance<
 pub type AuthMethodState<B> = MethodState<
     <B as AuthnBackend>::MethodId,
     <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
     <B as AuthnBackend>::TenantId,
+    <B as AuthnBackend>::UserId,
 >;
 
 pub type PartialState<B> = PartialAuthState<

@@ -49,6 +49,19 @@ let app = Router::new()
     .layer(AxessLayer::new(authenticator, authorizer));
 ```
 
+## ☑️ Features
+- `authn`: Enable **Authentication** layer and related extractors.
+- `authz`: Enable **Authorization** layer via Cedar Policy.
+- `admin`: Enable **administrative** some additional capabilities for managing users, tenants and various authentication parameters.
+- `request_id`: Enable addition of **Request ID** into headers.
+- `trace_id`: Enables helpers related to **Tracing ID** and tracing.
+- `memory`: Enables **in-memory** session and storage backends for development and testing.
+- `valkey`: Enables support for **Valkey** (Redis-compatible) session and storage backends.
+
+
+## 📃 License
+Licensed under the MIT License.
+
 
 ## 📚 Documentation
 
@@ -56,18 +69,79 @@ let app = Router::new()
 - [Examples](examples/) 
 - [Cedar Policy Language](https://cedarpolicy.com/)
 
-## ☑️ Features
-- `authn`: Enable **Authentication** layer and related extractors.
-- `authz`: Enable **Authorization** layer via Cedar Policy.
-- `admin`: Enable **administrative** capabilities for managing users, tenants and various authentication parameters.
-- `request_id`: Enable addition of **Request ID** into headers.
-- `trace_id`: Enables helpers related to **Tracing ID** and tracing.
-- `valkey`: Enables support for **Valkey** (Redis-compatible) session and storage backends.
+### Authentication Flow:
+
+```mermaid
+---
+title: Authentication Flow
+---
+flowchart LR
+    Start((Start)):::starter -->  LoginForm[/Form:</br>Login Page/]:::form & SignupForm[/Form:</br>Signup Page/]:::form
+    AuthFailure((Authentication</br>Failed)):::failure -->|Not Authenticated| End(( End )):::ender
+    AuthFailure -->|Re-route to Login| LoginForm
+    AuthnSuccess -->|Authenticated| End
+
+    Login:::process
+    Signup:::process
+    FactorSetup:::process
+
+    subgraph Login [ User Login Flow ]
+        direction LR
+        LoginForm -->|Submit Form| InitiateAuthnFlow{Verify Login Details</br>and Method} 
+        InitiateAuthnFlow -->|Failed| LoginForm
+        InitiateAuthnFlow -->|Ok| EvaluateFactorVerification{Verify Next</br>Expected Factor}
+        RedirectToVerify((Redirect to</br>Factor</br>Verification)) --> MfaForm[/Form:</br>Verify Next Factor/]:::form
+        MfaForm -->|Submit Form| EvaluateFactorVerification
+        EvaluateFactorVerification -->|Ok| VerifyMoreFactors{More Factors</br>to Verify?}
+        EvaluateFactorVerification -->|Failed| FailedFactorVerification{Failed</br>Factor Verification</br>try again?}
+        VerifyMoreFactors -->|Yes, Verify Factor| RedirectToVerify
+        VerifyMoreFactors -->|No, Done!| CompletedLogin(Login Successful):::success
+        FailedFactorVerification -->|Yes, Retry| EvaluateFactorVerification
+        FailedFactorVerification -->|No, Max attempts reached| ExponentialLockout((Exponential</br>User Lockout)) 
+        ExponentialLockout -->|Cancel User's Session| AuthFailure
+        CompletedLogin-->AuthnSuccess((Authentication</br>Completed)):::success
+    end
+
+    subgraph FactorSetup [ Authn Factor Setup Flow ]
+        direction LR
+        VerifyMoreFactors -->|Yes, but need</br>Setup of Factor| RedirectToSetup((Redirect to</br>Factor Setup))
+        RedirectToSetup --> SetupNextExpectedFactor[/Form:</br>Setup Expected Factor/]:::form
+        SetupNextExpectedFactor-->|Submit Form| EvaluateFactorSetup{Evaluate</br>New Factor</br>Credentials}
+        EvaluateFactorSetup -->|Ok| SetupMoreFactors{More Factors</br>to Setup?}
+        EvaluateFactorSetup -->|Failed| FailedFactorSetup{Failed</br>Factor Setup,</br>Try Again?}
+        FailedFactorSetup -->|Retry| RedirectToSetup
+        FailedFactorSetup -->|Cancel Flow| AuthFailure
+        UserDeleteOrLockout((User Deleted</br>or Exponentially Locked Out)) -->|Cancel User's Session| AuthFailure
+        EvaluateFactorVerification -->|No, pending Factor Setup</br>setup form| RedirectToSetup
+        CreateUserDefaultAuth((Setup</br>Default Authn</br>Method)) --> SetupMoreFactors{Setup</br>More Factors?}
+        SetupMoreFactors -->|Yes| RedirectToSetup
+        SetupMoreFactors -->|No, Factor is</br>already verified| RedirectToVerify
+    end
+
+    subgraph Signup [ User Signup Flow ]
+        direction LR
+        SignupForm -->|Submit Form| AttemptCreateUserAccount(Create</br>New User Account)
+        AttemptCreateUserAccount -->|Failed| SignupForm
+        AttemptCreateUserAccount -->|Ok| GenerateSignupVerificationEmail((Generate</br>Verification Email))
+        GenerateSignupVerificationEmail -->|Send Email| UserEmailInbox[User's Email Inbox</br>Verification Link]
+        UserEmailInbox -->VerifyEmail[/Form:</br>Verify Email/]:::form
+        VerifyEmail -->|Submit Form| CreateUserDefaultAuth
+        SetupMoreFactors -->|No, Done!| CompletedSignup(Signup Successful):::success
+        CompletedSignup --> AuthnSuccess
+    end
 
 
-## 📃 License
-Licensed under the MIT License.
 
+classDef ender fill:#ffffff,stroke:#ffa0a0,stroke-width:0.4em,color:#ffa0a0,font-size:1.5em,margin:0 2.5em;
+classDef starter fill:#ffffff,stroke:#000,stroke-width:3px,color:#00a000,font-size:1.5em,margin:0 2.5em;
+classDef form fill:#a0d0ff,stroke:#000,stroke-width:3px,color:#0000bb;
+classDef success stroke:#a0ffa0,stroke-width:3px,color:#a0ffa0;
+classDef failure stroke:#ffa0a0,stroke-width:3px,color:#ffa0a0;
+
+%% classDef process fill:#ffffff,stroke:#000,stroke-width:3px,color:#bbbb00;
+classDef process align:left;
+
+```
 ---
 
 *Axess: Secure, policy-driven authentication and authorization for Axum.*

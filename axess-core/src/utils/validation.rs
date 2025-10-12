@@ -1,4 +1,5 @@
 // use lazy_regex::regex;
+#[cfg(feature = "authn")]
 use totp_rs::{Algorithm, TOTP};
 
 // pub(crate) fn is_valid_email(email: &str) -> bool {
@@ -8,6 +9,7 @@ use totp_rs::{Algorithm, TOTP};
 //     re.is_match(email)
 // }
 
+#[cfg(feature = "authn")]
 pub fn verify_totp(secret: &str, code: &str) -> bool {
     let totp = TOTP::new(Algorithm::SHA1, 6, 30, 1, secret.as_bytes().to_vec());
     totp.expect("Failed to get TOTP")

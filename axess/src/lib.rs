@@ -18,6 +18,8 @@
 
 #[cfg(feature = "admin")]
 pub use axess_core::authn::admin::AuthnAdminBackend;
+
+#[cfg(feature = "authn")]
 pub use axess_core::{
     authn::{
         self,
@@ -25,7 +27,7 @@ pub use axess_core::{
             AuthTenant, AuthUser, AuthnBackend, EntityState, EntityStateInfo, FactorId, MethodId,
             TenantId, UserId,
         },
-        errors::{AuthError, FormError},
+        errors::{AuthError, FormError, HandlerError},
         methods::{AuthFactorKind, EnablementState, FactorForm, PermissionScope},
         middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
         session::{

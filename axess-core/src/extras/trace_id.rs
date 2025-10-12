@@ -163,10 +163,9 @@ mod tests {
 
     fn init_tracing() {
         INIT.call_once(|| {
-            // Try to initialize tracing subscriber, ignore if already set
-            // This is safe for test environments where subscriber might already exist
             let _ = tracing_subscriber::fmt()
                 .with_max_level(Level::INFO)
+                // .with_test_writer()
                 .try_init();
         });
     }

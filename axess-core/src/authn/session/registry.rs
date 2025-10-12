@@ -370,9 +370,22 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for StoreSessionRegistry<S> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::testing::mock_tracing::init_tracing;
 
     use tower_sessions::MemoryStore;
+    use std::sync::Once;
+    use tracing_subscriber;
+
+    static INIT: Once = Once::new();
+
+    fn init_tracing() {
+        INIT.call_once(|| {
+            // Use tracing-subscriber for test output
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::INFO)
+                .with_test_writer()
+                .try_init();
+        });
+    }
 
     #[tokio::test]
     async fn test_session_registry_basic_operations() {

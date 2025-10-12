@@ -1,4 +1,7 @@
-use crate::authn::{backend::AuthnBackend, session::registry::SessionRegistryError};
+use crate::{
+    authn::{backend::AuthnBackend, session::registry::SessionRegistryError},
+    axum::{http::StatusCode, response::{IntoResponse, Response}},
+};
 use std::fmt::Debug;
 use thiserror::Error as ThisError;
 use tower_sessions::session::Error as SessionError;
@@ -47,6 +50,11 @@ pub enum AuthError<B: AuthnBackend> {
     NotAuthenticated,
     #[error("Partial authentication required")]
     PartialAuthenticationRequired,
+    
+    #[error("Unauthorized")]
+    Unauthorized,
+    #[error("Invalid scope")]
+    InvalidScope,
 
     #[error("Authentication method not supported")]
     MethodNotSupported,
@@ -84,4 +92,58 @@ pub enum AuthError<B: AuthnBackend> {
     SessionRegistryError(#[from] SessionRegistryError),
     #[error("Backend error: {0}")]
     BackendError(#[source] B::Error),
+}
+
+#[derive(Debug, ThisError)]
+pub enum HandlerError {
+    #[error("Access denied")]
+    AccessDenied,
+
+    #[error("Unauthorized access")]
+    Unauthorized,
+
+    #[error("Invalid TOTP code")]
+    InvalidTOTP,
+
+    #[error("Invalid login credentials")]
+    InvalidCredentials,
+
+    #[error("Wrong format")]
+    WrongFormat,
+
+    #[error("Bad request")]
+    BadRequest,
+
+    #[error("Server error")]
+    ServerError,
+
+    #[error("{0}")]
+    Other(String), // Handle other types of errors
+}
+
+impl<B: AuthnBackend> From<AuthError<B>> for HandlerError {
+    fn from(_err: AuthError<B>) -> HandlerError {
+        HandlerError::ServerError
+    }
+}
+
+impl IntoResponse for HandlerError {
+    fn into_response(self) -> Response {
+        match self {
+            HandlerError::AccessDenied => (StatusCode::FORBIDDEN, "Access denied").into_response(),
+            HandlerError::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
+            HandlerError::InvalidTOTP => {
+                (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+            }
+            HandlerError::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+            }
+            HandlerError::BadRequest => StatusCode::BAD_REQUEST.into_response(),
+            HandlerError::WrongFormat => StatusCode::BAD_REQUEST.into_response(),
+            HandlerError::ServerError => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            HandlerError::Other(message) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
+            }
+        }
+    }
 }

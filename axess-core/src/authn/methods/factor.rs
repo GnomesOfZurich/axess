@@ -55,6 +55,65 @@ impl Display for AuthFactorKind {
     }
 }
 
+/// This type doesn't include an ID because the backend generates it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "F: Serialize, T: Serialize, U: Serialize",
+    deserialize = "F: DeserializeOwned, T: DeserializeOwned, U: DeserializeOwned"
+))]
+pub struct FactorStateChange<F, T, U>
+where
+    F: FactorId,
+    T: TenantId,
+    U: UserId,
+{
+    pub factor_id: F,
+    pub tenant_id: Option<T>,
+    pub user_id: Option<U>,
+    pub state: EnablementState,
+    pub config: HashMap<String, Value>,
+    pub updated_by: U,
+}
+
+impl<F, T, U> FactorStateChange<F, T, U>
+where
+    F: FactorId,
+    T: TenantId,
+    U: UserId,
+{
+    pub fn new(factor_id: F, updated_by: U) -> Self {
+        Self {
+            factor_id,
+            tenant_id: None,
+            user_id: None,
+            state: EnablementState::Active,
+            config: HashMap::new(),
+            updated_by,
+        }
+    }
+
+    pub fn with_scope(mut self, scope: PermissionScope<T, U>) -> Self {
+        self.tenant_id = scope.tenant_id().cloned();
+        self.user_id = scope.user_id().cloned();
+        self
+    }
+
+    pub fn with_state(mut self, state: EnablementState) -> Self {
+        self.state = state;
+        self
+    }
+
+    pub fn with_config(mut self, config: HashMap<String, Value>) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn add_config(mut self, key: String, value: Value) -> Self {
+        self.config.insert(key, value);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound(
     serialize = "D: Serialize, F: Serialize, T: Serialize, U: Serialize",
