@@ -11,7 +11,10 @@ use sqlx::{FromRow, Row, SqlitePool};
 use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
-use axess::{authn::methods::{factor::FactorStateChange, method::MethodStateChange}, verify_totp};
+use axess::{
+    authn::methods::{factor::FactorStateChange, method::MethodStateChange},
+    verify_totp,
+};
 
 use crate::models::{
     entities::{OurTenant, OurUser},
@@ -68,6 +71,10 @@ impl AuthnBackend for OurBackend {
     type MethodId = Uuid;
     type FactorId = Uuid;
     type DataId = DataId;
+
+    async fn get_default_protected_route(&self, _tid: Self::TenantId, _uid: Self::UserId) -> Result<String, Self::Error> {
+        Ok("/main".to_string())
+    }
 
     /// Gets the tenant by provided ID from the backend.
     async fn get_tenant(&self, tenant_id: &Self::TenantId) -> Result<Self::Tenant, Self::Error> {
@@ -377,10 +384,10 @@ impl AuthnBackend for OurBackend {
     }
 
     /// Upsert (insert or update) the state of an authentication method.
-    /// 
+    ///
     /// The backend determines if this is an insert or update based on the
     /// composite key (method_id, tenant_id, user_id).
-    /// 
+    ///
     /// For inserts: Generates new UUID for `id`, uses `created_at`, `created_by`, `updated_at`, and `updated_by` from input.
     /// For updates: Preserves existing `id`, `created_at`, and `created_by` from database, uses `updated_at` and `updated_by` from input.
     async fn upsert_method_state(
@@ -415,12 +422,11 @@ impl AuthnBackend for OurBackend {
         .fetch_one(&mut *conn)
         .await?;
 
-        let our_method_state = OurAuthMethodState::from_row(&row).map_err(|e| {
-            sqlx::Error::ColumnDecode {
+        let our_method_state =
+            OurAuthMethodState::from_row(&row).map_err(|e| sqlx::Error::ColumnDecode {
                 index: "method_state".into(),
                 source: Box::new(e),
-            }
-        })?;
+            })?;
         Ok(AuthMethodState::<OurBackend>::from(our_method_state))
     }
 
@@ -611,10 +617,10 @@ impl AuthnBackend for OurBackend {
     }
 
     /// Upsert (insert or update) the state of an authentication factor.
-    /// 
+    ///
     /// The backend determines if this is an insert or update based on the
     /// composite key (factor_id, tenant_id, user_id).
-    /// 
+    ///
     /// For inserts: Generates new UUID for `id`, preserves `created_at` and `created_by` from input.
     /// For updates: Preserves existing `id`, `created_at`, and `created_by` from database.
     /// In both cases: Uses `updated_at` and `updated_by` from input.
@@ -625,8 +631,8 @@ impl AuthnBackend for OurBackend {
         let mut conn = self.db.acquire().await?;
 
         // Serialize config
-        let config_json = serde_json::to_string(&change.config)
-            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let config_json =
+            serde_json::to_string(&change.config).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
         let now = Utc::now();
 

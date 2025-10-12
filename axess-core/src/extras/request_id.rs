@@ -102,20 +102,18 @@ where
         #[cfg(feature = "accept_client_id")]
         if let Some(existing_id) = req.headers().get(&G::HEADER_NAME) {
             let existing_id = existing_id.clone();
-            if let Ok(id) = existing_id.to_str() {
-                if id.len() == G::ID_LENGTH {
-                    // If the client sent a valid request ID, do nothing with message header.
-                    if let Some(request_id) = req.extensions().get::<RequestId>() {
-                        if request_id.0 != *id {
-                            req.extensions_mut()
-                                // .insert(RequestId(id.to_string()));
-                                .insert(existing_id.clone());
-                        }
-                    } else {
+            if let Ok(id) = existing_id.to_str()
+                && id.len() == G::ID_LENGTH
+            {
+                // If the client sent a valid request ID, do nothing with message header.
+                if let Some(request_id) = req.extensions().get::<RequestId>() {
+                    if request_id.0 != *id {
                         req.extensions_mut().insert(RequestId(id.to_string()));
                     }
-                    return Ok(existing_id);
+                } else {
+                    req.extensions_mut().insert(RequestId(id.to_string()));
                 }
+                return Ok(existing_id);
             }
         }
 

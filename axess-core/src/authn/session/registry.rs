@@ -371,8 +371,8 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for StoreSessionRegistry<S> 
 mod tests {
     use super::*;
 
-    use tower_sessions::MemoryStore;
     use std::sync::Once;
+    use tower_sessions::MemoryStore;
     use tracing_subscriber;
 
     static INIT: Once = Once::new();

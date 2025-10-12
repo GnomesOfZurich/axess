@@ -2,7 +2,10 @@
 use crate::authn::admin::AuthnAdminBackend;
 use crate::authn::{
     backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
-    methods::{factor::FactorStateChange, method::MethodStateChange, EnablementState, FactorForm, PermissionScope},
+    methods::{
+        EnablementState, FactorForm, PermissionScope, factor::FactorStateChange,
+        method::MethodStateChange,
+    },
     session::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
 };
 
@@ -146,7 +149,6 @@ impl PartialEq<TestUserId> for &str {
     }
 }
 
-
 impl TestUserId {
     /// Returns the user ID as a string slice
     pub fn as_str(&self) -> &str {
@@ -163,7 +165,7 @@ impl TestTenantId {
 
 impl std::ops::Deref for TestUserId {
     type Target = str;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -171,7 +173,7 @@ impl std::ops::Deref for TestUserId {
 
 impl std::ops::Deref for TestTenantId {
     type Target = str;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -188,7 +190,6 @@ impl AsRef<str> for TestTenantId {
         &self.0
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MockUser {
@@ -323,6 +324,12 @@ impl AuthnBackend for MockBackend {
     // type FactorState = AuthFactorState<Self>;
     type DataId = String;
     type Error = String;
+
+
+    async fn get_default_protected_route(&self, _tenant_id: Self::TenantId, _user_id: Self::UserId) -> Result<String, Self::Error> {
+        // For mock implementation, return a fixed route
+        Ok("/dashboard".to_string())
+    }
 
     async fn get_tenant(&self, tenant_id: &Self::TenantId) -> Result<Self::Tenant, Self::Error> {
         self.tenants
@@ -526,8 +533,7 @@ impl AuthnBackend for MockBackend {
         };
 
         // Store and return
-        self.auth_method_states
-            .insert(key, method_state.clone());
+        self.auth_method_states.insert(key, method_state.clone());
         Ok(method_state)
     }
 
@@ -652,8 +658,7 @@ impl AuthnBackend for MockBackend {
         };
 
         // Store and return
-        self.auth_factor_states
-            .insert(key, factor_state.clone());
+        self.auth_factor_states.insert(key, factor_state.clone());
         Ok(factor_state)
     }
 

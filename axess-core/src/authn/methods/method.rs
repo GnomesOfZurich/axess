@@ -54,7 +54,6 @@ where
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Eq, PartialEq)]
 pub struct MethodState<D, M, T, U>
 where
@@ -166,10 +165,21 @@ where
         self.factors.iter().find(|factor| &factor.id == factor_id)
     }
 
-    pub fn get_factor_ids(&self) -> Vec<F> 
-    where F: Clone
+    pub fn get_factor_ids(&self) -> Vec<F>
+    where
+        F: Clone,
     {
-        self.factors.iter().map(|factor| factor.id.clone()).collect()
+        self.factors
+            .iter()
+            .map(|factor| factor.id.clone())
+            .collect()
+    }
+
+    pub fn get_first_factor_id(&self) -> Option<F>
+    where
+        F: Clone,
+    {
+        self.factors.first().map(|factor| factor.id.clone())
     }
 
     pub fn has_factor_kind(&self, kind: &crate::authn::methods::AuthFactorKind) -> bool {

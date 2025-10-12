@@ -1,6 +1,9 @@
 use crate::{
     authn::{backend::AuthnBackend, session::registry::SessionRegistryError},
-    axum::{http::StatusCode, response::{IntoResponse, Response}},
+    axum::{
+        http::StatusCode,
+        response::{IntoResponse, Response},
+    },
 };
 use std::fmt::Debug;
 use thiserror::Error as ThisError;
@@ -50,7 +53,11 @@ pub enum AuthError<B: AuthnBackend> {
     NotAuthenticated,
     #[error("Partial authentication required")]
     PartialAuthenticationRequired,
-    
+    #[error("User already authenticated")]
+    AlreadyAuthenticated,
+    #[error("Unexpected authentication state")]
+    UnexpectedAuthState,
+
     #[error("Unauthorized")]
     Unauthorized,
     #[error("Invalid scope")]
@@ -92,6 +99,61 @@ pub enum AuthError<B: AuthnBackend> {
     SessionRegistryError(#[from] SessionRegistryError),
     #[error("Backend error: {0}")]
     BackendError(#[source] B::Error),
+}
+
+impl<B> IntoResponse for AuthError<B>
+where
+    B: AuthnBackend,
+{
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid credentials"),
+            AuthError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "Too many attempts"),
+            AuthError::InvalidStateTransition => (StatusCode::CONFLICT, "Invalid state transition"),
+
+            AuthError::NotAuthenticated => (StatusCode::UNAUTHORIZED, "Not authenticated"),
+            AuthError::PartialAuthenticationRequired => {
+                (StatusCode::UNAUTHORIZED, "Partial authentication required")
+            }
+            AuthError::AlreadyAuthenticated => (StatusCode::CONFLICT, "Already authenticated"),
+            AuthError::UnexpectedAuthState => {
+                (StatusCode::BAD_REQUEST, "Unexpected authentication state")
+            }
+
+            AuthError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized"),
+            AuthError::InvalidScope => (StatusCode::BAD_REQUEST, "Invalid scope"),
+
+            AuthError::MethodNotSupported | AuthError::MethodNotFound => (
+                StatusCode::BAD_REQUEST,
+                "Authentication method not available",
+            ),
+            AuthError::FactorNotSupported | AuthError::FactorNotFound => (
+                StatusCode::BAD_REQUEST,
+                "Authentication factor not available",
+            ),
+            AuthError::UnexpectedFactorKind(_) | AuthError::UnexpectedAuthConfig(_) => (
+                StatusCode::BAD_REQUEST,
+                "Invalid authentication configuration",
+            ),
+
+            AuthError::UserNotFound => (StatusCode::UNAUTHORIZED, "User not found"),
+            AuthError::UserNotActive => (StatusCode::FORBIDDEN, "User account not active"),
+            AuthError::IncorrectUserData => (StatusCode::BAD_REQUEST, "Incorrect user data"),
+            AuthError::TenantNotFound => (StatusCode::NOT_FOUND, "Tenant not found"),
+            AuthError::IncorrectTenantData => (StatusCode::BAD_REQUEST, "Incorrect tenant data"),
+
+            AuthError::SessionNotFound => (StatusCode::UNAUTHORIZED, "Session not found"),
+            AuthError::SessionExpired => (StatusCode::UNAUTHORIZED, "Session expired"),
+            AuthError::SessionLockError => (StatusCode::CONFLICT, "Session lock error"),
+            AuthError::SessionError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Session error"),
+            AuthError::SessionRegistryError(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Session registry error")
+            }
+            AuthError::BackendError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Backend error"),
+        };
+
+        (status, message).into_response()
+    }
 }
 
 #[derive(Debug, ThisError)]
