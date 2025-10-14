@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display};
 use thiserror::Error;
@@ -27,7 +28,9 @@ pub struct SessionMetadata {
     pub session_id: String, // Consider changing to tower_sessions::session::Id
     pub user_id: Option<String>,
     pub tenant_id: Option<String>,
+    pub session_hash: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_activity: chrono::DateTime<chrono::Utc>,
 }
 
 /// Registry for tracking and managing sessions across users and tenants
@@ -39,6 +42,7 @@ pub trait SessionRegistry: Send + Sync + 'static {
         session_id: &str,
         user_id: Option<&UId>,
         tenant_id: Option<&TId>,
+        session_hash: String,
     ) -> Result<(), SessionRegistryError>
     where
         UId: Display + Send + Sync,
@@ -59,6 +63,16 @@ pub trait SessionRegistry: Send + Sync + 'static {
     ) -> Result<Vec<String>, SessionRegistryError>
     where
         TId: Display + Send + Sync;
+
+    /// Validate that a session is registered with the correct hash
+    async fn validate_session(
+        &self,
+        session_id: &str,
+        expected_hash: &str,
+    ) -> Result<bool, SessionRegistryError>;
+
+    /// Update last activity timestamp
+    async fn touch_session(&self, session_id: &str) -> Result<(), SessionRegistryError>;
 
     /// Invalidate a specific session
     async fn invalidate_session(&self, session_id: &str) -> Result<(), SessionRegistryError>;
@@ -84,6 +98,7 @@ pub trait SessionRegistry: Send + Sync + 'static {
 }
 
 /// Session registry implementation that uses a single registry with session metadata
+#[derive(Debug, Clone)]
 pub struct StoreSessionRegistry<S: SessionStore> {
     store: S,
     registry_id: tower_sessions::session::Id,
@@ -247,6 +262,7 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for StoreSessionRegistry<S> 
         session_id: &str,
         user_id: Option<&UId>,
         tenant_id: Option<&TId>,
+        session_hash: String,
     ) -> Result<(), SessionRegistryError>
     where
         UId: Display + Send + Sync,
@@ -262,36 +278,26 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for StoreSessionRegistry<S> 
 
         let mut registry = self.get_registry().await?;
 
-        // Check if session is already registered
-        if registry
-            .iter()
-            .any(|metadata| metadata.session_id == session_id)
-        {
-            debug!("Session {} already registered", session_id);
-            return Ok(());
+        // Check if session already exists - update if so
+        if let Some(existing) = registry.iter_mut().find(|m| m.session_id == session_id) {
+            existing.session_hash = session_hash;
+            existing.last_activity = chrono::Utc::now();
+            debug!("Updated existing session {} registration", session_id);
+        } else {
+            // Add new session
+            let metadata = SessionMetadata {
+                session_id: session_id.to_string(),
+                user_id: user_id.map(|id| id.to_string()),
+                tenant_id: tenant_id.map(|id| id.to_string()),
+                session_hash,
+                created_at: chrono::Utc::now(),
+                last_activity: chrono::Utc::now(),
+            };
+            registry.push(metadata);
+            debug!("Registered new session {}", session_id);
         }
 
-        // Add new session metadata
-        let metadata = SessionMetadata {
-            session_id: session_id.to_string(),
-            user_id: user_id.map(|id| id.to_string()),
-            tenant_id: tenant_id.map(|id| id.to_string()),
-            created_at: chrono::Utc::now(),
-        };
-
-        registry.push(metadata);
         self.save_registry(registry).await?;
-
-        debug!(
-            "Registered session {} for user: {}, tenant: {}",
-            session_id,
-            user_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "None".to_string()),
-            tenant_id
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "None".to_string())
-        );
         Ok(())
     }
 
@@ -315,6 +321,31 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for StoreSessionRegistry<S> 
     {
         let registry = self.get_registry().await?;
         Ok(Self::filter_by_tenant(&registry, tenant_id))
+    }
+
+    async fn validate_session(
+        &self,
+        session_id: &str,
+        expected_hash: &str,
+    ) -> Result<bool, SessionRegistryError> {
+        let registry = self.get_registry().await?;
+
+        Ok(registry
+            .iter()
+            .find(|m| m.session_id == session_id)
+            .map(|m| m.session_hash == expected_hash)
+            .unwrap_or(false))
+    }
+
+    async fn touch_session(&self, session_id: &str) -> Result<(), SessionRegistryError> {
+        let mut registry = self.get_registry().await?;
+
+        if let Some(metadata) = registry.iter_mut().find(|m| m.session_id == session_id) {
+            metadata.last_activity = Utc::now();
+            self.save_registry(registry).await?;
+        }
+
+        Ok(())
     }
 
     async fn invalidate_session(&self, session_id: &str) -> Result<(), SessionRegistryError> {
@@ -400,7 +431,12 @@ mod tests {
 
         // Register a session
         registry
-            .register_session(&session_id, Some(&"user1"), Some(&"tenant1"))
+            .register_session(
+                &session_id,
+                Some(&"user1"),
+                Some(&"tenant1"),
+                "test_hash".to_string(),
+            )
             .await
             .unwrap();
 
@@ -438,15 +474,30 @@ mod tests {
         let session_id3 = tower_sessions::session::Id(3).to_string();
 
         registry
-            .register_session(&session_id1, Some(&"user1"), Some(&"tenant1"))
+            .register_session(
+                &session_id1,
+                Some(&"user1"),
+                Some(&"tenant1"),
+                "hash1".to_string(),
+            )
             .await
             .unwrap();
         registry
-            .register_session(&session_id2, Some(&"user2"), Some(&"tenant1"))
+            .register_session(
+                &session_id2,
+                Some(&"user2"),
+                Some(&"tenant1"),
+                "hash2".to_string(),
+            )
             .await
             .unwrap();
         registry
-            .register_session(&session_id3, Some(&"user1"), Some(&"tenant2"))
+            .register_session(
+                &session_id3,
+                Some(&"user1"),
+                Some(&"tenant2"),
+                "hash3".to_string(),
+            )
             .await
             .unwrap();
 
@@ -480,11 +531,21 @@ mod tests {
         let session_id = tower_sessions::session::Id(10).to_string();
 
         registry
-            .register_session(&session_id, Some(&"user1"), Some(&"tenant1"))
+            .register_session(
+                &session_id,
+                Some(&"user1"),
+                Some(&"tenant1"),
+                "hash".to_string(),
+            )
             .await
             .unwrap();
         registry
-            .register_session(&session_id, Some(&"user1"), Some(&"tenant1"))
+            .register_session(
+                &session_id,
+                Some(&"user1"),
+                Some(&"tenant1"),
+                "hash_updated".to_string(),
+            )
             .await
             .unwrap();
 
@@ -505,15 +566,30 @@ mod tests {
         let session_id3 = tower_sessions::session::Id(13).to_string();
 
         registry
-            .register_session(&session_id1, Some(&"user1"), Some(&"tenant1"))
+            .register_session(
+                &session_id1,
+                Some(&"user1"),
+                Some(&"tenant1"),
+                "hash1".to_string(),
+            )
             .await
             .unwrap();
         registry
-            .register_session(&session_id2, Some(&"user2"), Some(&"tenant1"))
+            .register_session(
+                &session_id2,
+                Some(&"user2"),
+                Some(&"tenant1"),
+                "hash2".to_string(),
+            )
             .await
             .unwrap();
         registry
-            .register_session(&session_id3, Some(&"user1"), None::<&String>)
+            .register_session(
+                &session_id3,
+                Some(&"user1"),
+                None::<&String>,
+                "hash3".to_string(),
+            )
             .await
             .unwrap();
 
@@ -539,7 +615,12 @@ mod tests {
         {
             let registry = StoreSessionRegistry::new(store.clone(), 0);
             registry
-                .register_session(&session_id, Some(&"user1"), Some(&"tenant1"))
+                .register_session(
+                    &session_id,
+                    Some(&"user1"),
+                    Some(&"tenant1"),
+                    "hash".to_string(),
+                )
                 .await
                 .unwrap();
         }
@@ -562,7 +643,12 @@ mod tests {
         let session_id = tower_sessions::session::Id(99).to_string();
 
         registry
-            .register_session(&session_id, None::<&String>, None::<&String>)
+            .register_session(
+                &session_id,
+                None::<&String>,
+                None::<&String>,
+                "hash".to_string(),
+            )
             .await
             .unwrap();
 

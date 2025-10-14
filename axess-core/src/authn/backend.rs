@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+// use core::error;
 // use tower_cookies::cookie::time::Date;
 use std::{
     cmp::PartialEq,
@@ -15,10 +16,8 @@ use crate::authn::{
         method::MethodStateChange,
         scope::{EnablementState, PermissionScope},
     },
-    session::{
-        AuthMethodState,
-        auth_session::{AuthFactor, AuthFactorState, AuthMethod},
-    },
+    session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
+    types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
 };
 
 pub trait TenantId:
@@ -161,14 +160,9 @@ impl<T> DataId for T where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct EntityStateInfo {
+pub struct StateTransitionInfo {
     pub reason: String,
     pub timestamp: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SuspensionInfo {
-    pub reason: String,
     pub until: Option<DateTime<Utc>>,
 }
 
@@ -177,11 +171,11 @@ pub struct SuspensionInfo {
 pub enum EntityState {
     Guest,
     Candidate,
-    Pending(EntityStateInfo),
+    Pending(StateTransitionInfo),
     Active,
-    Suspended(SuspensionInfo),
-    Terminated(EntityStateInfo),
-    Archived(EntityStateInfo),
+    Suspended(StateTransitionInfo),
+    Terminated(StateTransitionInfo),
+    Archived(StateTransitionInfo),
 }
 
 pub trait AuthTenant: Debug + Clone + Send + Sync + Eq + PartialEq {
@@ -235,9 +229,13 @@ where
     fn max_auth_attempts(&self) -> u32 {
         5
     }
-    
+
     /// Gets the default protected route (e.g., dashboard) for authenticated users.
-    async fn get_default_protected_route(&self, tenant_id: Self::TenantId, user_id: Self::UserId) -> Result<String, Self::Error>;
+    async fn get_default_protected_route(
+        &self,
+        tenant_id: Self::TenantId,
+        user_id: Self::UserId,
+    ) -> Result<String, Self::Error>;
 
     /// Gets the tenant by provided ID from the backend.
     async fn get_tenant(&self, tenant_id: &Self::TenantId) -> Result<Self::Tenant, Self::Error>;
@@ -325,6 +323,54 @@ where
         change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
     ) -> Result<AuthFactorState<Self>, Self::Error>;
 
+    /// Get recent authentication events for a user
+    ///
+    /// Results are returned ordered by `event_time` descending (most recent first).
+    ///
+    /// # Arguments
+    /// * `user_id` - The user ID to query events for
+    /// * `event_type` - Optional filter by event type (e.g., only "Login" events)
+    /// * `limit` - Optional maximum number of events to return (defaults to 100 if None)
+    ///
+    /// # Returns
+    /// Vector of authentication events ordered by timestamp descending (most recent first)
+    async fn get_auth_history(
+        &self,
+        user_id: &Self::UserId,
+        event_type: Option<AuthEventType>,
+        event_status: Option<AuthEventStatus>,
+        limit: Option<usize>,
+    ) -> Result<Vec<AuthEvent<Self>>, Self::Error>;
+
+    /// Get last successful login time for a user
+    ///
+    /// This is a convenience method that queries for the most recent successful
+    /// `Authenticated` event.
+    async fn get_last_login(
+        &self,
+        user_id: &Self::UserId,
+    ) -> Result<Option<DateTime<Utc>>, Self::Error> {
+        // Query for most recent successful authentication event
+        let events = self
+            .get_auth_history(
+                user_id,
+                Some(AuthEventType::Authenticated),
+                Some(AuthEventStatus::Success),
+                Some(1),
+            )
+            .await?;
+        if let Some(event) = events.first() {
+            Ok(Some(event.event_time))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get count of failed login attempts since last successful login
+    ///
+    /// This is useful for implementing account lockout policies.
+    async fn record_auth_event(&self, event: AuthEventRecord<'_, Self>) -> Result<(), Self::Error>;
+
     async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
     where
         F: FactorForm + Send + Sync;
@@ -385,8 +431,9 @@ mod tests {
         let updated = backend
             .set_user_state(
                 &TestUserId("u2".to_string()),
-                EntityState::Suspended(SuspensionInfo {
+                EntityState::Suspended(StateTransitionInfo {
                     reason: "test".to_string(),
+                    timestamp: Utc::now(),
                     until: None,
                 }),
             )

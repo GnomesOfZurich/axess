@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Format check
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Clippy lints
+  clippy:
+    name: Clippy Lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  # Tests
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    
+    services:
+      redis:
+        image: valkey/valkey:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Run unit tests
+        run: cargo test --workspace --all-features --lib
+      
+      - name: Run integration tests (with Valkey)
+        run: cargo test --workspace --all-features -- --ignored
+        env:
+          VALKEY_URL: redis://localhost:6379
+      
+      - name: Run doc-tests
+        run: cargo test --doc --workspace --all-features
+
+  # Build check for different platforms
+  build:
+    name: Build Check
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build all targets
+        run: cargo build --workspace --all-features --all-targets
+
+  # Check that examples compile
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build SQLite example
+        run: cargo build --package axess-example-sqlite --all-features
+      
+      - name: Check SQLite example runs
+        run: cargo check --package axess-example-sqlite
+
+  # Security audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cargo-audit
+        run: cargo install cargo-audit
+      
+      - name: Run security audit
+        run: cargo audit --deny warnings
+
+  # Coverage (optional but recommended)
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    
+    services:
+      redis:
+        image: valkey/valkey:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      
+      - name: Generate coverage
+        run: cargo tarpaulin --workspace --all-features --out xml --timeout 300
+        env:
+          VALKEY_URL: redis://localhost:6379
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./cobertura.xml
+          fail_ci_if_error: false

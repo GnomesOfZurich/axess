@@ -4,12 +4,12 @@ use crate::{
         errors::{AuthError, FactorKindError},
         methods::{
             EnablementState,
-            factor::{AuthFactorKind, FactorInstance, FactorState, FactorStateChange},
+            factor::{AuthFactorKind, FactorStateChange},
             form::{FactorForm, FactorFormKind},
-            method::{MethodInstance, MethodState},
             scope::PermissionScope,
         },
-        session::state::{AuthState, Data, PartialAuthState},
+        session::SessionRegistry,
+        types::{AuthMethod, PartialState, SessionData, SessionState},
     },
     axum::{
         extract::{Form, Json},
@@ -22,25 +22,24 @@ use crate::{
     // },
     tracing::{debug, error, warn},
 };
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use std::{
     // collections::HashMap,
     // char::MAX,
-    fmt::Debug, // sync::Arc
+    fmt::Debug,
+    sync::Arc, // sync::Arc
 };
-
-use tower_sessions::{
-    Session,
-    // session::Error as SessionError,
-    // session_store::Error as StoreError,
-};
+use tower_sessions::Session;
 
 // const SESSION_TIMEOUT_SECS: i64 = 30 * 60; // 30 minutes in seconds
 // const SESSION_TIMEOUT: Duration = Duration::seconds(SESSION_TIMEOUT_SECS);
 
 #[derive(Clone)]
-pub struct AuthSession<B>
+pub struct AuthSession<B, R>
 where
     B: AuthnBackend,
+    R: SessionRegistry,
 {
     pub state: SessionState<B>,
 
@@ -55,12 +54,13 @@ where
 
     data: SessionData<B>,
     data_key: &'static str,
-    // session_registry: Option<Arc<R>>,
+    session_registry: Option<Arc<R>>,
 }
 
-impl<B> Debug for AuthSession<B>
+impl<B, R> Debug for AuthSession<B, R>
 where
     B: AuthnBackend + Debug,
+    R: SessionRegistry + Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthSession")
@@ -70,7 +70,7 @@ where
             .field("session", &self.session)
             .field("data", &self.data)
             .field("data_key", &self.data_key)
-            // .field("session_registry", &self.session_registry.is_some())
+            .field("session_registry", &self.session_registry.is_some())
             .finish()
     }
 }
@@ -81,24 +81,24 @@ where
 /// workflow, for example via a frontend login form. There a user would provide
 /// their credentials, such as username and password, and via the backend
 /// the session would authenticate those credentials.
-impl<B> AuthSession<B>
+impl<B, R> AuthSession<B, R>
 where
-    B: AuthnBackend + Debug + PartialEq,
+    B: AuthnBackend + Debug,
     B::TenantId: From<<B::User as AuthUser>::TenantId>,
     B::UserId: From<<B::User as AuthUser>::Id>,
     <B as AuthnBackend>::TenantId: From<<<B as AuthnBackend>::Tenant as AuthTenant>::Id>,
+    R: SessionRegistry + Send + Sync + 'static,
 {
     pub async fn from_session(
         session: Session,
         backend: B,
         data_key: &'static str,
-        // session_registry: Option<Arc<R>>,
+        session_registry: Option<Arc<R>>,
     ) -> Result<Self, AuthError<B>>
     where
         B::User: Clone,
         B::UserId: Clone,
         B::TenantId: Clone,
-        // R: SessionRegistry + Send + Sync + 'static,
     {
         // 1. Load session data from the session store
         let mut data: SessionData<B> = session
@@ -144,14 +144,15 @@ where
             session,
             data,
             data_key,
-            // session_registry,
+            session_registry,
         })
     }
 
     /// Validates that the provided scope matches the current session
-    fn validate_scope(&self, scope: &PermissionScope<B::TenantId, B::UserId>) 
-        -> Result<(), AuthError<B>> 
-    {
+    fn validate_scope(
+        &self,
+        scope: &PermissionScope<B::TenantId, B::UserId>,
+    ) -> Result<(), AuthError<B>> {
         let (tid, uid) = match scope {
             PermissionScope::User(tid, uid) => (tid, uid),
             _ => {
@@ -202,6 +203,58 @@ where
         }
 
         Ok(factor_states.iter().any(|fs| fs.state == *expected_state))
+    }
+
+    /// Validates session is still registered and hash matches
+    async fn validate_session_binding(&self) -> Result<(), AuthError<B>> {
+        let Some(registry) = &self.session_registry else {
+            // No registry configured - skip validation
+            return Ok(());
+        };
+
+        let Some(session_id) = self.session.id() else {
+            error!("Session has no ID");
+            return Err(AuthError::SessionInvalid);
+        };
+
+        let Some(session_hash) = &self.data.auth_hash else {
+            // Session not yet authenticated - skip validation
+            return Ok(());
+        };
+
+        let session_id_str = session_id.to_string();
+
+        match registry
+            .validate_session(&session_id_str, session_hash)
+            .await
+        {
+            Ok(true) => {
+                // Update last activity (best effort)
+                if let Err(e) = registry.touch_session(&session_id_str).await {
+                    debug!(
+                        session_id = %session_id_str,
+                        error = ?e,
+                        "Failed to update session activity timestamp (non-fatal)"
+                    );
+                }
+                Ok(())
+            }
+            Ok(false) => {
+                error!(
+                    session_id = ?session_id,
+                    "Session validation failed - not in registry or hash mismatch"
+                );
+                Err(AuthError::SessionInvalid)
+            }
+            Err(e) => {
+                error!(
+                    session_id = ?session_id,
+                    error = ?e,
+                    "Registry error during session validation"
+                );
+                Err(AuthError::SessionRegistryError(e))
+            }
+        }
     }
 
     /// Find a suitable method for a given action/factor.
@@ -280,7 +333,7 @@ where
                 error!("Failed to fetch scoped auth methods from backend: {:?}", e);
                 AuthError::BackendError(e)
             })?;
-            
+
         if methods.is_empty() {
             error!("No authentication methods found for scope {:?}", scope);
             return Err(AuthError::MethodNotFound);
@@ -495,17 +548,15 @@ where
         next: Option<String>,
     ) -> Result<Response, AuthError<B>> {
         // Extract state without cloning
-        let mut partial_state = match std::mem::replace(
-            &mut self.state,
-            SessionState::<B>::NotAuthenticated
-        ) {
-            SessionState::<B>::PartialAuthn(ps) => ps,
-            other => {
-                self.state = other; // Restore if not partial
-                error!("Session is not in PartialAuthn state");
-                return Err(AuthError::UnexpectedAuthState);
-            }
-        };
+        let mut partial_state =
+            match std::mem::replace(&mut self.state, SessionState::<B>::NotAuthenticated) {
+                SessionState::<B>::PartialAuthn(ps) => ps,
+                other => {
+                    self.state = other; // Restore if not partial
+                    error!("Session is not in PartialAuthn state");
+                    return Err(AuthError::UnexpectedAuthState);
+                }
+            };
 
         partial_state.apply_factor(factor_id);
 
@@ -515,17 +566,28 @@ where
             let redirect_url = self.get_next_route(next).await;
             Ok(Redirect::to(&redirect_url).into_response())
         } else {
-            let next_factor = partial_state.remaining_factors.first()
+            // ✅ Session already registered in start_authentication, just update hash if needed
+            if self.data.auth_hash.is_none() {
+                let session_hash = self.generate_session_hash();
+                self.data.auth_hash = Some(session_hash);
+                // Re-register with new hash (update operation)
+                self.ensure_session_registered().await?;
+            }
+
+            let next_factor = partial_state
+                .remaining_factors
+                .first()
                 .cloned()
                 .ok_or(AuthError::FactorNotFound)?;
 
-            self.set_auth_state(SessionState::<B>::PartialAuthn(partial_state)).await?;
+            self.set_auth_state(SessionState::<B>::PartialAuthn(partial_state))
+                .await?;
 
-            // Return info about next factor
             Ok(Json(serde_json::json!({
                 "status": "partial",
                 "next_factor": next_factor
-            })).into_response())
+            }))
+            .into_response())
         }
     }
 
@@ -683,28 +745,22 @@ where
                     );
                 } else {
                     warn!(
-                        "Another authentication already in progress, attempt to restart with a different method"
+                        "Another authentication already in progress, restarting with different method"
                     );
-                    let current_attempt = partial_state.attempt_count;
-                    self.state = SessionState::<B>::PartialAuthn(PartialState::<B> {
-                        current_method: method.clone(),
-                        remaining_factors: method.get_factor_ids(),
-                        attempt_count: current_attempt + 1,
-                        last_attempt: Some(chrono::Utc::now()),
-                    });
+                    self.state = SessionState::<B>::new_partial(method)
+                        .with_attempt(partial_state.attempt_count + 1);
                 }
                 Ok(())
             }
             SessionState::<B>::NotAuthenticated => {
                 debug!("Starting authentication for method: {:?}", method);
-                
+
                 if self.data.user_state == EntityState::Guest {
                     debug!("No user associated with session, cannot start authentication");
                     // TODO: Convert Guest user to a real user ???
                     return Err(AuthError::UserNotFound);
                 }
 
-                // Add user state validation here:
                 self.validate_user_state()?;
 
                 let user = &self.user;
@@ -712,28 +768,23 @@ where
                 let tenant_id: B::TenantId = user.tenant_id().clone().into();
 
                 let scope = PermissionScope::User(tenant_id, user_id.clone());
-                
+
                 let methods_available = self
                     .backend
                     .get_scoped_auth_methods(scope, EnablementState::Active)
                     .await
                     .map_err(AuthError::BackendError)?;
-                    
+
                 if !methods_available.contains(&method) {
-                    debug!(
-                        "Method {:?} not available for user {:?}",
-                        method, user_id
-                    );
+                    debug!("Method {:?} not available for user {:?}", method, user_id);
                     return Err(AuthError::MethodNotSupported);
                 }
-                
-                let partial_state = PartialState::<B> {
-                    current_method: method.clone(),
-                    remaining_factors: method.get_factor_ids(),
-                    attempt_count: 0,
-                    last_attempt: None,
-                };
-                self.state = SessionState::<B>::PartialAuthn(partial_state);
+
+                self.state = SessionState::<B>::new_partial(method);
+
+                // ✅ Register session when entering PartialAuthn
+                self.ensure_session_registered().await?;
+
                 Ok(())
             }
         }
@@ -774,48 +825,83 @@ where
     //     Ok(())
     // }
 
-    /// Update last activity time stamp and save the current session data to the session store.
+    /// Generates a cryptographically secure hash binding this authentication to a specific session
+    fn generate_session_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        // Session ID
+        if let Some(session_id) = self.session.id() {
+            hasher.update(session_id.to_string().as_bytes());
+        }
+
+        // User ID (use Debug formatting for types that may not implement Display)
+        hasher.update(format!("{:?}", self.user.id()).as_bytes());
+
+        // Tenant ID for additional context
+        hasher.update(format!("{:?}", self.user.tenant_id()).as_bytes());
+
+        // High-precision timestamp
+        let now = chrono::Utc::now();
+        hasher.update(now.timestamp().to_string().as_bytes());
+        hasher.update(now.timestamp_subsec_nanos().to_string().as_bytes());
+
+        // Cryptographically secure random nonce (32 bytes)
+        let mut nonce = [0u8; 32];
+        rand::rng().fill_bytes(&mut nonce);
+        hasher.update(nonce);
+
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Update and save the current session data to the session store.
     pub async fn save_session_data(&mut self) -> Result<(), AuthError<B>> {
-        // Update last_activity timestamp
-        // let mut data = self.data.clone();
-        // data.last_activity = Utc::now();
+        // Insert session data
         self.session
             .insert(self.data_key, &self.data)
             .await
             .map_err(AuthError::SessionError)?;
 
+        // ✅ Always save the session record to persist all changes
+        self.session.save().await.map_err(AuthError::SessionError)?;
+
         Ok(())
     }
 
-    pub async fn complete_authentication(&mut self) -> Result<(), AuthError<B>>
-// where
-    //     // R: SessionRegistry + Send + Sync + 'static,
-    //     B::UserId: Display,
-    //     B::TenantId: Display,
-    {
+    pub async fn complete_authentication(&mut self) -> Result<(), AuthError<B>> {
         self.state = SessionState::<B>::Authenticated;
+
+        // Store old session ID before cycling
+        let old_session_id = self.session.id().map(|id| id.to_string());
+
+        // Cycle session ID for security
         self.session
             .cycle_id()
             .await
-            .map_err(AuthError::SessionError)?; // Cycle session ID to prevent replay attacks
+            .map_err(AuthError::SessionError)?;
 
-        // // Register session for user/tenant using the session registry
-        // if let Some(registry) = &self.session_registry {
-        //     if let Some(session_id) = self.session.id() {
-        //         let session_id_str = session_id.to_string();
-        //         let user_id = self.get_user_id().map(|id| id.to_string());
-        //         let tenant_id = self.get_tenant_id().map(|id| id.to_string());
+        // Invalidate old session in registry if it exists
+        if let (Some(registry), Some(old_id)) = (&self.session_registry, old_session_id)
+            && let Err(e) = registry.invalidate_session(&old_id).await
+        {
+            debug!(
+                old_session_id = %old_id,
+                error = ?e,
+                "Failed to invalidate old session (non-fatal)"
+            );
+        }
 
-        //         if let Err(e) = registry
-        //             .register_session(&session_id_str, user_id.as_ref(), tenant_id.as_ref())
-        //             .await
-        //         {
-        //             tracing::error!("Failed to register session in registry: {}", e);
-        //         }
-        //     }
-        // }
+        // Generate fresh hash after session ID cycle
+        let session_hash = self.generate_session_hash();
+        self.data.auth_hash = Some(session_hash);
+        self.data.auth_state = self.state.clone();
 
-        self.save_session_data().await
+        // Save session data (this now also saves the session record)
+        self.save_session_data().await?;
+
+        // Now register the new session ID
+        self.ensure_session_registered().await?;
+
+        Ok(())
     }
 
     pub async fn get_next_route(&self, next: Option<String>) -> String {
@@ -828,43 +914,33 @@ where
         }
         let tid = self.get_tenant_id().cloned();
         let uid = self.get_user_id().cloned();
-        
+
         match (tid, uid) {
-            (Some(tenant_id), Some(user_id)) => {
-                self.backend.get_default_protected_route(tenant_id, user_id).await
-                    .unwrap_or_else(|_| "/".to_string())
-            }
-            _ => "/".to_string()
+            (Some(tenant_id), Some(user_id)) => self
+                .backend
+                .get_default_protected_route(tenant_id, user_id)
+                .await
+                .unwrap_or_else(|_| "/".to_string()),
+            _ => "/".to_string(),
         }
     }
 
-    pub async fn logout(&mut self) -> Result<Option<B::User>, AuthError<B>>
-// where
-    //     R: SessionRegistry + Send + Sync + 'static,
-    {
-        // // Use registry to invalidate if available
-        // if let Some(registry) = &self.session_registry {
-        //     if let Some(session_id) = self.session.id() {
-        //         let session_id_str = session_id.to_string();
-        //         if let Err(e) = registry.invalidate_session(&session_id_str).await {
-        //             // Log error but continue with local logout
-        //             tracing::error!("Failed to invalidate session in registry: {}", e);
-        //         }
-        //     }
-        // }
+    /// Unregisters the session from the session registry (best effort) and clears out the currentsession.
+    pub async fn logout(&mut self) -> Result<Option<B::User>, AuthError<B>> {
+        // Unregister session (best effort)
+        if let Err(e) = self.unregister_session().await {
+            tracing::warn!("Failed to unregister session during logout: {:?}", e);
+        }
 
-        // Existing logout logic
+        // Clear session
         self.session.clear().await;
         self.session
             .cycle_id()
             .await
             .map_err(AuthError::SessionError)?;
 
-        // Clear user and state
         let user = Some(self.user.clone());
         self.state = SessionState::<B>::NotAuthenticated;
-
-        // Clear session data
         self.data = SessionData::<B>::default();
         self.save_session_data().await?;
 
@@ -887,16 +963,20 @@ where
             error!("Cannot setup factor without authentication");
             return Err(AuthError::NotAuthenticated);
         }
-        // 2. Ensure form is for setup
+
+        // 2. Validate session is still registered
+        self.validate_session_binding().await?;
+
+        // 3. Ensure form is for setup
         if form.form_kind() != FactorFormKind::Setup {
             error!("Form kind must be Setup for factor setup");
             return Err(AuthError::InvalidStateTransition);
         }
-        // 3. Validate form
+        // 4. Validate form
         form.validate_form()
             .map_err(|_| AuthError::InvalidCredentials)?;
 
-        // 4. Validate user state
+        // 5. Validate user state
         self.validate_user_state()?;
 
         let tenant_id = self
@@ -958,66 +1038,444 @@ where
         Ok(Redirect::to(&redirect_url).into_response())
     }
 
-    // // Add method to register the session after successful authentication
-    // pub async fn register_session(&self) -> Result<(), AuthError<B>>
-    // where
-    //     R: SessionRegistry + Send + Sync + 'static,
-    //     <B::User as AuthUser>::Id: Display,
-    //     <B::User as AuthUser>::TenantId: Display,
-    // {
-    //     if let Some(registry) = &self.session_registry {
-    //         if let Some(session_id) = self.session.id() {
-    //             let session_id_str = session_id.to_string();
-    //             let user_id = self.user.id().to_string();
-    //             let tenant_id = self.user.tenant_id().to_string();
-    //             registry
-    //                 .register_session(&session_id_str, Some(&user_id), Some(&tenant_id))
-    //                 .await
-    //                 .map_err(|e| AuthError::SessionRegistryError(e))?;
-    //         }
-    //     }
+    /// Ensures session is registered starting from PartialAuthn state
+    async fn ensure_session_registered(&mut self) -> Result<(), AuthError<B>> {
+        let Some(registry) = &self.session_registry else {
+            // No registry configured - this is OK for guest sessions
+            // but consider warning if not guest
+            if !matches!(self.data.user_state, EntityState::Guest) {
+                warn!("No session registry configured for authenticated session");
+            }
+            return Ok(());
+        };
 
-    //     Ok(())
-    // }
+        let Some(session_id) = self.session.id() else {
+            error!("Cannot register session without ID");
+            return Err(AuthError::SessionInvalid);
+        };
+
+        // Only register if user is identified (not guest)
+        if matches!(self.data.user_state, EntityState::Guest) {
+            debug!("Skipping registration for guest session");
+            return Ok(());
+        }
+
+        // Ensure hash exists
+        if self.data.auth_hash.is_none() {
+            self.data.auth_hash = Some(self.generate_session_hash());
+        }
+
+        let session_hash = self.data.auth_hash.as_ref().unwrap();
+        let session_id_str = session_id.to_string();
+        let user_id = self.get_user_id().map(|id| id.to_string());
+        let tenant_id = self.get_tenant_id().map(|id| id.to_string());
+
+        registry
+            .register_session(
+                &session_id_str,
+                user_id.as_ref(),
+                tenant_id.as_ref(),
+                session_hash.clone(),
+            )
+            .await
+            .map_err(|e| {
+                error!(
+                    session_id = %session_id_str,
+                    error = ?e,
+                    "Failed to register session in registry"
+                );
+                AuthError::SessionRegistryError(e)
+            })
+    }
+
+    /// Removes session from registry (best effort)
+    async fn unregister_session(&self) -> Result<(), AuthError<B>> {
+        let Some(registry) = &self.session_registry else {
+            return Ok(());
+        };
+
+        if let Some(session_id) = self.session.id() {
+            let session_id_str = session_id.to_string();
+            registry
+                .invalidate_session(&session_id_str)
+                .await
+                .map_err(|e| {
+                    warn!(
+                        session_id = %session_id_str,
+                        error = ?e,
+                        "Failed to unregister session (non-fatal)"
+                    );
+                    AuthError::SessionRegistryError(e)
+                })?;
+        }
+        Ok(())
+    }
 }
 
-pub type AuthFactor<B> = FactorInstance<<B as AuthnBackend>::FactorId, <B as AuthnBackend>::UserId>;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        authn::{
+            admin::AuthnAdminBackend, methods::method::MethodInstance,
+            session::registry::StoreSessionRegistry,
+        },
+        utils::testing::mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
+    };
+    use tower_sessions::{
+        MemoryStore, SessionStore,
+        session::{Id, Record},
+    };
 
-pub type AuthFactorState<B> = FactorState<
-    <B as AuthnBackend>::DataId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::TenantId,
-    <B as AuthnBackend>::UserId,
->;
+    fn mock_method() -> AuthMethod<MockBackend> {
+        MethodInstance {
+            id: "method1".to_string(),
+            name: "Test Method".to_string(),
+            factors: vec![],
+            description: "Test authentication method".to_string(),
+            created_at: chrono::Utc::now(),
+            created_by: TestUserId("system".to_string()),
+            updated_at: chrono::Utc::now(),
+            updated_by: TestUserId("system".to_string()),
+        }
+    }
 
-pub type AuthMethod<B> = MethodInstance<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
->;
+    /// Helper to create a session that's properly initialized in the store
+    async fn create_initialized_session(store: MemoryStore) -> Session {
+        // Bring the SessionStore trait into scope so its async methods are available.
 
-pub type AuthMethodState<B> = MethodState<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::TenantId,
-    <B as AuthnBackend>::UserId,
->;
+        // Generate a new session ID
+        let session_id = Id::default();
 
-pub type PartialState<B> = PartialAuthState<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
->;
+        // Create a record with the ID and empty data (mutable because create expects &mut Record)
+        let mut record = Record {
+            id: session_id.clone(),
+            data: Default::default(),
+            expiry_date: time::OffsetDateTime::now_utc() + time::Duration::hours(24),
+        };
 
-pub type SessionState<B> = AuthState<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
->;
+        // Save the record to the store (pass a mutable reference)
+        store
+            .create(&mut record)
+            .await
+            .expect("Failed to create session record in store");
 
-pub type SessionData<B> = Data<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
-    <B as AuthnBackend>::TenantId,
->;
+        // Create Session with this ID - it will be able to load from store
+        Session::new(Some(session_id), std::sync::Arc::new(store), None)
+    }
+
+    async fn create_test_session() -> (
+        AuthSession<MockBackend, StoreSessionRegistry<MemoryStore>>,
+        Arc<StoreSessionRegistry<MemoryStore>>,
+    ) {
+        let backend = MockBackend::default();
+        let store = MemoryStore::default();
+
+        // Create and initialize session (pass a cloned MemoryStore value)
+        let session = create_initialized_session(store.clone()).await;
+
+        let registry = Arc::new(StoreSessionRegistry::new(store, 0));
+
+        // Configure backend with test method
+        let method = mock_method();
+        backend.upsert_auth_method(method.clone()).await.unwrap();
+
+        let auth_session =
+            AuthSession::from_session(session, backend, "test.data", Some(registry.clone()))
+                .await
+                .unwrap();
+
+        (auth_session, registry)
+    }
+
+    #[tokio::test]
+    /// Test that session hash is generated and stored during partial authentication
+    async fn test_session_hash_generation_on_partial_auth() {
+        let (mut auth_session, registry) = create_test_session().await;
+
+        // Setup user
+        let user = MockUser {
+            id: TestUserId("user1".to_string()),
+            tenant_id: TestTenantId("tenant1".to_string()),
+            state: EntityState::Active,
+            session_hash: None,
+        };
+        auth_session.user = user;
+        auth_session.data.user_id = Some(TestUserId("user1".to_string()));
+        auth_session.data.tenant_id = Some(TestTenantId("tenant1".to_string()));
+        auth_session.data.user_state = EntityState::Active;
+
+        // Get the method that backend knows about
+        let method = auth_session
+            .backend
+            .get_scoped_auth_methods(
+                PermissionScope::User(
+                    TestTenantId("tenant1".to_string()),
+                    TestUserId("user1".to_string()),
+                ),
+                EnablementState::Active,
+            )
+            .await
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("Backend should have at least one method configured");
+
+        // Start authentication
+        auth_session.start_authentication(method).await.unwrap();
+
+        // Verify hash was generated
+        assert!(
+            auth_session.data.auth_hash.is_some(),
+            "Session hash should be generated during partial authentication"
+        );
+
+        // Verify session was registered
+        if let Some(session_id) = auth_session.session.id() {
+            let registered = registry
+                .get_user_sessions(&"user1")
+                .await
+                .expect("Should retrieve user sessions");
+            assert_eq!(
+                registered.len(),
+                1,
+                "Exactly one session should be registered"
+            );
+            assert_eq!(
+                registered[0],
+                session_id.to_string(),
+                "Registered session ID should match"
+            );
+        } else {
+            panic!("Session should have an ID");
+        }
+    }
+
+    #[tokio::test]
+    /// Test that session hash is regenerated after complete authentication
+    async fn test_session_hash_regenerated_on_complete() {
+        let (mut auth_session, registry) = create_test_session().await;
+
+        // Setup user for authenticated state
+        let user = MockUser {
+            id: TestUserId("user1".to_string()),
+            tenant_id: TestTenantId("tenant1".to_string()),
+            state: EntityState::Active,
+            session_hash: None,
+        };
+        auth_session.user = user;
+        auth_session.data.user_id = Some(TestUserId("user1".to_string()));
+        auth_session.data.tenant_id = Some(TestTenantId("tenant1".to_string()));
+        auth_session.data.user_state = EntityState::Active;
+
+        // Set partial auth state with initial hash
+        let initial_hash = "initial_hash".to_string();
+        let method = mock_method();
+
+        auth_session.state = SessionState::<MockBackend>::new_partial(method.clone());
+        auth_session.data.auth_hash = Some(initial_hash.clone());
+        auth_session.data.auth_state = auth_session.state.clone();
+
+        // Save current session state before completing
+        auth_session.save_session_data().await.unwrap();
+
+        // Register initial session (simulate partial auth flow)
+        auth_session.ensure_session_registered().await.unwrap();
+
+        // Store the original session ID before cycling
+        let original_session_id = auth_session.session.id().unwrap().to_string();
+
+        // Complete authentication (this will cycle the session ID)
+        auth_session.complete_authentication().await.unwrap();
+
+        // Get the new session ID after cycling
+        let new_session_id = auth_session.session.id().unwrap().to_string();
+
+        // Verify session ID was cycled
+        assert_ne!(
+            original_session_id, new_session_id,
+            "Session ID should change after complete_authentication"
+        );
+
+        // Verify hash was regenerated
+        assert!(
+            auth_session.data.auth_hash.is_some(),
+            "Session hash should exist after complete authentication"
+        );
+        assert_ne!(
+            auth_session.data.auth_hash.as_ref().unwrap(),
+            &initial_hash,
+            "Session hash should be regenerated (different from initial)"
+        );
+
+        // Verify state is now authenticated
+        assert!(
+            matches!(
+                auth_session.state,
+                SessionState::<MockBackend>::Authenticated
+            ),
+            "Session should be in Authenticated state"
+        );
+
+        // Verify the new session is registered in the registry
+        let user_sessions = registry
+            .get_user_sessions(&"user1")
+            .await
+            .expect("Should retrieve user sessions");
+
+        // The old session should be replaced by the new one
+        assert_eq!(
+            user_sessions.len(),
+            1,
+            "Should have exactly one registered session after completion"
+        );
+        assert_eq!(
+            user_sessions[0], new_session_id,
+            "Registered session should be the new (cycled) session ID"
+        );
+    }
+
+    #[tokio::test]
+    /// Test session validation fails with wrong hash
+    async fn test_session_validation_fails_with_wrong_hash() {
+        let (mut auth_session, registry) = create_test_session().await;
+
+        // Register session with one hash
+        let session_id = auth_session
+            .session
+            .id()
+            .expect("Session should have ID")
+            .to_string();
+        registry
+            .register_session(
+                &session_id,
+                Some(&"user1"),
+                Some(&"tenant1"),
+                "correct_hash".to_string(),
+            )
+            .await
+            .unwrap();
+
+        // Set different hash in session
+        auth_session.data.auth_hash = Some("wrong_hash".to_string());
+        auth_session.data.user_state = EntityState::Active;
+
+        // Validation should fail
+        let result = auth_session.validate_session_binding().await;
+        assert!(result.is_err(), "Validation should fail with wrong hash");
+        assert!(
+            matches!(result.unwrap_err(), AuthError::SessionInvalid),
+            "Error should be SessionInvalid"
+        );
+    }
+
+    #[tokio::test]
+    /// Test concurrent session handling
+    async fn test_concurrent_sessions_for_same_user() {
+        let store = MemoryStore::default();
+        let registry = Arc::new(StoreSessionRegistry::new(store.clone(), 0));
+        let backend = MockBackend::default();
+
+        // Create two initialized sessions
+        let session1 = create_initialized_session(store.clone()).await;
+        let session2 = create_initialized_session(store.clone()).await;
+
+        // Verify both have IDs
+        assert!(session1.id().is_some(), "Session1 should have ID");
+        assert!(session2.id().is_some(), "Session2 should have ID");
+
+        let mut auth_session1 = AuthSession::from_session(
+            session1,
+            backend.clone(),
+            "test.data",
+            Some(registry.clone()),
+        )
+        .await
+        .unwrap();
+
+        let mut auth_session2 =
+            AuthSession::from_session(session2, backend, "test.data", Some(registry.clone()))
+                .await
+                .unwrap();
+
+        // Setup both with same user
+        let user = MockUser {
+            id: TestUserId("user1".to_string()),
+            tenant_id: TestTenantId("tenant1".to_string()),
+            state: EntityState::Active,
+            session_hash: None,
+        };
+
+        auth_session1.user = user.clone();
+        auth_session1.data.user_id = Some(TestUserId("user1".to_string()));
+        auth_session1.data.tenant_id = Some(TestTenantId("tenant1".to_string()));
+        auth_session1.data.user_state = EntityState::Active;
+
+        auth_session2.user = user;
+        auth_session2.data.user_id = Some(TestUserId("user1".to_string()));
+        auth_session2.data.tenant_id = Some(TestTenantId("tenant1".to_string()));
+        auth_session2.data.user_state = EntityState::Active;
+
+        // Register both sessions
+        auth_session1.ensure_session_registered().await.unwrap();
+        auth_session2.ensure_session_registered().await.unwrap();
+
+        // Verify both are registered
+        let user_sessions = registry
+            .get_user_sessions(&"user1")
+            .await
+            .expect("Should retrieve user sessions");
+        assert_eq!(user_sessions.len(), 2, "Both sessions should be registered");
+
+        // Logout session1
+        auth_session1.logout().await.unwrap();
+
+        // Verify only session2 remains
+        let user_sessions = registry
+            .get_user_sessions(&"user1")
+            .await
+            .expect("Should retrieve user sessions");
+        assert_eq!(
+            user_sessions.len(),
+            1,
+            "Only one session should remain after logout"
+        );
+    }
+
+    #[tokio::test]
+    /// Test guest sessions are not registered
+    async fn test_guest_sessions_not_registered() {
+        let (mut auth_session, registry) = create_test_session().await;
+
+        // Ensure session is in guest state
+        assert_eq!(
+            auth_session.data.user_state,
+            EntityState::Guest,
+            "Session should start as guest"
+        );
+
+        // Try to register
+        auth_session
+            .ensure_session_registered()
+            .await
+            .expect("Should not error when trying to register guest session");
+
+        // Verify no sessions registered for any user
+        // Since guest sessions shouldn't be registered, there should be no way to look them up
+        // We can verify by checking that the session ID is not in any user's sessions
+        if let Some(session_id) = auth_session.session.id() {
+            let session_id_str = session_id.to_string();
+
+            // Try to get sessions for a non-existent user - should be empty
+            let all_sessions = registry
+                .get_user_sessions(&"nonexistent_user")
+                .await
+                .expect("Should retrieve sessions (empty list)");
+
+            assert!(
+                !all_sessions.contains(&session_id_str),
+                "Guest session should not be registered under any user"
+            );
+        }
+    }
+}

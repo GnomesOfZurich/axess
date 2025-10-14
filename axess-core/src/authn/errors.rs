@@ -93,6 +93,8 @@ pub enum AuthError<B: AuthnBackend> {
     SessionExpired,
     #[error("Failed to acquire Session lock")]
     SessionLockError,
+    #[error("Session is invalid")]
+    SessionInvalid,
     #[error(transparent)]
     SessionError(SessionError),
     #[error("Session registry error: {0}")]
@@ -110,7 +112,6 @@ where
             AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid credentials"),
             AuthError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "Too many attempts"),
             AuthError::InvalidStateTransition => (StatusCode::CONFLICT, "Invalid state transition"),
-
             AuthError::NotAuthenticated => (StatusCode::UNAUTHORIZED, "Not authenticated"),
             AuthError::PartialAuthenticationRequired => {
                 (StatusCode::UNAUTHORIZED, "Partial authentication required")
@@ -119,10 +120,8 @@ where
             AuthError::UnexpectedAuthState => {
                 (StatusCode::BAD_REQUEST, "Unexpected authentication state")
             }
-
             AuthError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized"),
             AuthError::InvalidScope => (StatusCode::BAD_REQUEST, "Invalid scope"),
-
             AuthError::MethodNotSupported | AuthError::MethodNotFound => (
                 StatusCode::BAD_REQUEST,
                 "Authentication method not available",
@@ -135,13 +134,11 @@ where
                 StatusCode::BAD_REQUEST,
                 "Invalid authentication configuration",
             ),
-
             AuthError::UserNotFound => (StatusCode::UNAUTHORIZED, "User not found"),
             AuthError::UserNotActive => (StatusCode::FORBIDDEN, "User account not active"),
             AuthError::IncorrectUserData => (StatusCode::BAD_REQUEST, "Incorrect user data"),
             AuthError::TenantNotFound => (StatusCode::NOT_FOUND, "Tenant not found"),
             AuthError::IncorrectTenantData => (StatusCode::BAD_REQUEST, "Incorrect tenant data"),
-
             AuthError::SessionNotFound => (StatusCode::UNAUTHORIZED, "Session not found"),
             AuthError::SessionExpired => (StatusCode::UNAUTHORIZED, "Session expired"),
             AuthError::SessionLockError => (StatusCode::CONFLICT, "Session lock error"),
@@ -150,6 +147,7 @@ where
                 (StatusCode::INTERNAL_SERVER_ERROR, "Session registry error")
             }
             AuthError::BackendError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Backend error"),
+            AuthError::SessionInvalid => (StatusCode::UNAUTHORIZED, "Session is invalid"),
         };
 
         (status, message).into_response()

@@ -1,7 +1,7 @@
 use crate::{
     authn::{
         backend::{AuthUser, AuthnBackend},
-        session::auth_session::AuthSession,
+        session::{SessionRegistry, auth_session::AuthSession},
     },
     axum::http::{Request, Response, StatusCode},
     // storage::session_registry::SessionRegistry,
@@ -23,17 +23,18 @@ use tower_sessions::{
 };
 
 #[derive(Debug, Clone)]
-pub struct AuthnManager<S, B>
+pub struct AuthnManager<S, B, R>
 where
     B: AuthnBackend,
+    R: SessionRegistry,
 {
     inner: S,
     backend: B,
     data_key: &'static str,
-    // session_registry: Option<Arc<Registry>>,
+    session_registry: Option<Arc<R>>,
 }
 
-impl<ReqBody, ResBody, S, B> Service<Request<ReqBody>> for AuthnManager<S, B>
+impl<ReqBody, ResBody, S, B, R> Service<Request<ReqBody>> for AuthnManager<S, B, R>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
@@ -43,7 +44,7 @@ where
     B::UserId: From<<B::User as AuthUser>::Id>,
     B::TenantId: From<<B::User as AuthUser>::TenantId>,
     B::TenantId: From<<B::Tenant as crate::authn::backend::AuthTenant>::Id>,
-    // Registry: SessionRegistry,
+    R: SessionRegistry + Send + Sync + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -58,7 +59,7 @@ where
         let span = info_span!("call", user.id = field::Empty);
         let backend = self.backend.clone();
         let data_key = self.data_key;
-        // let session_registry = self.session_registry.clone();
+        let session_registry = self.session_registry.clone();
 
         // Because the inner service can panic until ready, we need to ensure we only
         // use the ready service.
@@ -76,19 +77,21 @@ where
                     return Ok(res);
                 };
 
-                let auth_session = match AuthSession::from_session(session, backend, data_key).await
-                {
-                    Ok(auth_session) => auth_session,
-                    Err(err) => {
-                        error!(
-                            err = ?err,
-                            "could not create auth session from session"
-                        );
-                        let mut res = Response::default();
-                        *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                        return Ok(res);
-                    }
-                };
+                let auth_session =
+                    match AuthSession::from_session(session, backend, data_key, session_registry)
+                        .await
+                    {
+                        Ok(auth_session) => auth_session,
+                        Err(err) => {
+                            error!(
+                                err = ?err,
+                                "could not create auth session from session"
+                            );
+                            let mut res = Response::default();
+                            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                            return Ok(res);
+                        }
+                    };
 
                 if let Ok(ref user) = auth_session.user() {
                     Span::current().record("user.id", format!("{:?}", user.id()));
@@ -108,50 +111,45 @@ where
 pub struct AuthnLayer<
     B: AuthnBackend,
     Sessions: SessionStore,
-    // Registry: SessionRegistry,
+    R: SessionRegistry,
     C: CookieController = PlaintextCookie,
 > {
     backend: B,
     session_manager_layer: SessionManagerLayer<Sessions, C>,
     data_key: &'static str,
-    // session_registry: Option<Arc<Registry>>,
+    session_registry: Option<Arc<R>>,
 }
 
-impl<Backend: AuthnBackend, Sessions: SessionStore, C: CookieController>
-    AuthnLayer<Backend, Sessions, C>
+impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
+    AuthnLayer<Backend, Sessions, R, C>
 {
     /// Create a new [`AuthManagerLayer`] with the provided access controller.
     pub(crate) fn new(
         backend: Backend,
         data_key: &'static str,
         session_manager_layer: SessionManagerLayer<Sessions, C>,
-        // session_registry: Option<Arc<Registry>>,
+        session_registry: Option<Arc<R>>,
     ) -> Self {
         Self {
             backend,
             session_manager_layer,
             data_key,
-            // session_registry,
+            session_registry,
         }
     }
 }
 
-impl<
-    S,
-    B: AuthnBackend,
-    Sessions: SessionStore,
-    // Registry: SessionRegistry,
-    C: CookieController,
-> Layer<S> for AuthnLayer<B, Sessions, C>
+impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController> Layer<S>
+    for AuthnLayer<B, Sessions, R, C>
 {
-    type Service = CookieManager<SessionManager<AuthnManager<S, B>, Sessions, C>>;
+    type Service = CookieManager<SessionManager<AuthnManager<S, B, R>, Sessions, C>>;
 
     fn layer(&self, inner: S) -> Self::Service {
         let login_manager = AuthnManager {
             inner,
             backend: self.backend.clone(),
             data_key: self.data_key,
-            // session_registry: self.session_registry.clone(),
+            session_registry: self.session_registry.clone(),
         };
 
         self.session_manager_layer.layer(login_manager)
@@ -162,48 +160,49 @@ impl<
 pub struct AuthnLayerBuilder<
     B: AuthnBackend,
     Sessions: SessionStore,
-    // Registry: SessionRegistry,
+    R: SessionRegistry,
     C: CookieController = PlaintextCookie,
 > {
     backend: B,
     session_manager_layer: SessionManagerLayer<Sessions, C>,
     data_key: Option<&'static str>,
-    // session_registry: Option<Arc<Registry>>,
+    session_registry: Option<Arc<R>>,
 }
 
 // #[derive(Debug, Clone)]
 // pub struct NoOpSessionRegistry;
 
-impl<B: AuthnBackend, Sessions: SessionStore, C: CookieController>
-    AuthnLayerBuilder<B, Sessions, C>
+impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
+    AuthnLayerBuilder<B, Sessions, R, C>
 {
-    pub fn new(
-        backend: B,
-        session_manager_layer: SessionManagerLayer<Sessions, C>,
-        // session_registry: Option<Arc<Registry>>,
-    ) -> Self {
+    pub fn new(backend: B, session_manager_layer: SessionManagerLayer<Sessions, C>) -> Self {
         Self {
             backend,
             session_manager_layer,
             data_key: None,
-            // session_registry,
+            session_registry: None,
         }
+    }
+
+    pub fn with_session_registry(mut self, registry: Arc<R>) -> Self {
+        self.session_registry = Some(registry);
+        self
     }
 
     /// Configure the `data_key` optional property of the builder. If not
     /// configured it will default to "axess.data".
-    pub fn with_data_key(mut self, data_key: &'static str) -> AuthnLayerBuilder<B, Sessions, C> {
+    pub fn with_data_key(mut self, data_key: &'static str) -> AuthnLayerBuilder<B, Sessions, R, C> {
         self.data_key = Some(data_key);
         self
     }
 
     /// Build the [`AuthManagerLayer`].
-    pub fn build(self) -> AuthnLayer<B, Sessions, C> {
+    pub fn build(self) -> AuthnLayer<B, Sessions, R, C> {
         AuthnLayer::new(
             self.backend,
             self.data_key.unwrap_or("axess.data"),
             self.session_manager_layer,
-            // self.session_registry,
+            self.session_registry,
         )
     }
 }

@@ -49,7 +49,7 @@ pub mod post {
 pub mod get {
     use super::*;
     // use crate::backend::OurBackend;
-    use crate::web::app::AuthSession;
+    use crate::web::app::OurAuthSession;
     // use axess::{SessionRegistry, StoreSessionRegistry};
     // use axum::extract::State;
 
@@ -68,7 +68,7 @@ pub mod get {
     }
 
     #[axum::debug_handler]
-    pub async fn logout(mut session: AuthSession) -> impl IntoResponse {
+    pub async fn logout(mut session: OurAuthSession) -> impl IntoResponse {
         match session.logout().await {
             Ok(_) => Redirect::to("/login").into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

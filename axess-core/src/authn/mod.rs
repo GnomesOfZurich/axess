@@ -5,6 +5,7 @@ pub mod errors;
 pub mod methods;
 pub mod middleware;
 pub mod session;
+pub mod types;
 
 // // Re-export key types for ergonomics
 // pub use backend::{AuthTenant, AuthUser, AuthnBackend, FactorId, MethodId, TenantId, UserId, UserState};

@@ -24,14 +24,19 @@ pub use axess_core::{
     authn::{
         self,
         backend::{
-            AuthTenant, AuthUser, AuthnBackend, EntityState, EntityStateInfo, FactorId, MethodId,
-            TenantId, UserId,
+            AuthTenant, AuthUser, AuthnBackend, EntityState, FactorId, MethodId,
+            StateTransitionInfo, TenantId, UserId,
         },
         errors::{AuthError, FormError, HandlerError},
         methods::{AuthFactorKind, EnablementState, FactorForm, PermissionScope},
         middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
         session::{
-            AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession, SessionRegistry,
+            AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthSession,
+            SessionRegistry, StoreSessionRegistry,
+        },
+        types::{
+            AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,
+            SessionState,
         },
     },
     utils::validation::verify_totp,

@@ -6,7 +6,8 @@ use crate::authn::{
         EnablementState, FactorForm, PermissionScope, factor::FactorStateChange,
         method::MethodStateChange,
     },
-    session::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
+    session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
+    types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
 };
 
 use async_trait::async_trait;
@@ -243,6 +244,7 @@ pub struct MockBackend {
     pub auth_factor_states: DashMap<String, MockAuthFactorState>,
     pub auth_methods: DashMap<String, MockAuthMethod>,
     pub auth_method_states: DashMap<String, MockAuthMethodState>,
+    pub authn_history: DashMap<String, Vec<AuthEvent<MockBackend>>>,
 }
 
 impl Clone for MockBackend {
@@ -253,6 +255,7 @@ impl Clone for MockBackend {
         let auth_factor_states = self.auth_factor_states.clone();
         let auth_methods = self.auth_methods.clone();
         let auth_method_states = self.auth_method_states.clone();
+        let authn_history = self.authn_history.clone();
 
         Self {
             users,
@@ -261,42 +264,9 @@ impl Clone for MockBackend {
             auth_factor_states,
             auth_methods,
             auth_method_states,
+            authn_history,
         }
     }
-    // fn clone(&self) -> Self {
-    //     let users = DashMap::new();
-    //     for entry in self.users.iter() {
-    //         users.insert(entry.key().clone(), entry.value().clone());
-    //     }
-    //     let tenants = DashMap::new();
-    //     for entry in self.tenants.iter() {
-    //         tenants.insert(entry.key().clone(), entry.value().clone());
-    //     }
-    //     let auth_factors = DashMap::new();
-    //     for entry in self.auth_factors.iter() {
-    //         auth_factors.insert(entry.key().clone(), entry.value().clone());
-    //     }
-    //     let auth_factor_states = DashMap::new();
-    //     for entry in self.auth_factor_states.iter() {
-    //         auth_factor_states.insert(entry.key().clone(), entry.value().clone());
-    //     }
-    //     let auth_methods = DashMap::new();
-    //     for entry in self.auth_methods.iter() {
-    //         auth_methods.insert(entry.key().clone(), entry.value().clone());
-    //     }
-    //     let auth_method_states = DashMap::new();
-    //     for entry in self.auth_method_states.iter() {
-    //         auth_method_states.insert(entry.key().clone(), entry.value().clone());
-    //     }
-    //     Self {
-    //         users,
-    //         tenants,
-    //         auth_factors,
-    //         auth_factor_states,
-    //         auth_methods,
-    //         auth_method_states,
-    //     }
-    // }
 }
 
 impl Default for MockBackend {
@@ -308,6 +278,7 @@ impl Default for MockBackend {
             auth_factor_states: DashMap::new(),
             auth_methods: DashMap::new(),
             auth_method_states: DashMap::new(),
+            authn_history: DashMap::new(),
         }
     }
 }
@@ -325,8 +296,11 @@ impl AuthnBackend for MockBackend {
     type DataId = String;
     type Error = String;
 
-
-    async fn get_default_protected_route(&self, _tenant_id: Self::TenantId, _user_id: Self::UserId) -> Result<String, Self::Error> {
+    async fn get_default_protected_route(
+        &self,
+        _tenant_id: Self::TenantId,
+        _user_id: Self::UserId,
+    ) -> Result<String, Self::Error> {
         // For mock implementation, return a fixed route
         Ok("/dashboard".to_string())
     }
@@ -660,6 +634,123 @@ impl AuthnBackend for MockBackend {
         // Store and return
         self.auth_factor_states.insert(key, factor_state.clone());
         Ok(factor_state)
+    }
+
+    async fn get_auth_history(
+        &self,
+        user_id: &Self::UserId,
+        event_type: Option<AuthEventType>,
+        event_status: Option<AuthEventStatus>,
+        limit: Option<usize>,
+    ) -> Result<Vec<AuthEvent<Self>>, Self::Error> {
+        let key = user_id.0.as_str();
+
+        // Take references to the optional filters so we can use them inside the closure
+        let filter_type = event_type.as_ref();
+        let filter_status = event_status.as_ref();
+
+        match self.authn_history.get(key) {
+            Some(entry) => {
+                // Filter by optional event_type and event_status
+                let mut filtered: Vec<AuthEvent<MockBackend>> = entry
+                    .value()
+                    .iter()
+                    .filter(|evt| {
+                        if let Some(t) = filter_type {
+                            if &evt.event_type != t {
+                                return false;
+                            }
+                        }
+                        if let Some(s) = filter_status {
+                            if &evt.event_status != s {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .cloned()
+                    .collect();
+
+                // Sort by event_time (most recent first)
+                filtered.sort_by(|a, b| b.event_time.cmp(&a.event_time));
+
+                // Apply limit if requested
+                let result = match limit {
+                    None => filtered,
+                    Some(0) => Vec::new(),
+                    Some(l) => {
+                        if l >= filtered.len() {
+                            filtered
+                        } else {
+                            filtered.into_iter().take(l).collect()
+                        }
+                    }
+                };
+
+                Ok(result)
+            }
+            // No history -> return empty vec rather than an error to simplify callers
+            None => Ok(Vec::new()),
+        }
+    }
+    async fn get_last_login(
+        &self,
+        user_id: &Self::UserId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, Self::Error> {
+        // Reuse get_auth_history to keep filtering/sorting logic in one place.
+        let events = self
+            .get_auth_history(
+                user_id,
+                Some(AuthEventType::LoginAttempt),
+                Some(AuthEventStatus::Success),
+                Some(1),
+            )
+            .await?;
+        Ok(events.into_iter().next().map(|e| e.event_time))
+    }
+
+    async fn record_auth_event(&self, event: AuthEventRecord<'_, Self>) -> Result<(), Self::Error> {
+        // Read the record fields explicitly to avoid type-inference issues with backend-associated types
+        let user_id = event.user_id.clone();
+        let tenant_id = event.tenant_id.clone();
+        let session_id = event.session_id.map(|s| s.to_string());
+        let event_type = event.event_type;
+        let event_status = event.event_status;
+        let method_id = event.method_id.map(|m| m.to_string());
+        let factor_id = event.factor_id.map(|f| f.to_string());
+        let factor_kind = event.factor_kind;
+        let ip_address = event.ip_address.map(|s| s.to_string());
+        let user_agent = event.user_agent.map(|s| s.to_string());
+        let error_message = event.error_message.map(|s| s.to_string());
+
+        // Use the user's id string as the map key before moving `user_id` into `stored`
+        let key = user_id.as_ref().to_string();
+
+        // Build the stored event (assign id and timestamp here)
+        let stored = AuthEvent::<MockBackend> {
+            id: format!("event_{}", self.authn_history.len()),
+            user_id,
+            tenant_id,
+            session_id,
+            event_type,
+            event_status,
+            method_id,
+            factor_id,
+            factor_kind,
+            event_time: Utc::now(),
+            ip_address,
+            user_agent,
+            error_message,
+        };
+
+        // Push into existing history vector or insert a new one
+        if let Some(mut vec_ref) = self.authn_history.get_mut(&key) {
+            vec_ref.push(stored);
+        } else {
+            self.authn_history.insert(key, vec![stored]);
+        }
+
+        Ok(())
     }
 
     async fn authenticate<'a, F>(&self, _creds: &'a F) -> Result<Self::User, Self::Error>

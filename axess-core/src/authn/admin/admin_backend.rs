@@ -1,6 +1,6 @@
 use crate::authn::{
     backend::AuthnBackend,
-    session::{AuthFactor, AuthMethod},
+    types::{AuthFactor, AuthMethod},
 };
 use async_trait::async_trait;
 // use serde::{Deserialize, Serialize};

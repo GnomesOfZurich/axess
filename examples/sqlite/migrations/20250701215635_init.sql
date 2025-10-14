@@ -1,4 +1,6 @@
 -- SQLite-compatible migration file
+
+-- Create the tenants table
 CREATE TABLE IF NOT EXISTS tenants (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -10,6 +12,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     updated_by TEXT NOT NULL
 );
 
+-- Create the user table
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
@@ -18,7 +21,6 @@ CREATE TABLE IF NOT EXISTS users (
     fullname TEXT NOT NULL DEFAULT '',
     email TEXT NOT NULL UNIQUE,
     state TEXT NOT NULL,
-    last_login_at INTEGER,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
     created_by TEXT NOT NULL,
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -27,6 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
+-- Create the auth_factors table
 CREATE TABLE IF NOT EXISTS auth_factors (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -39,6 +42,7 @@ CREATE TABLE IF NOT EXISTS auth_factors (
     UNIQUE(name, kind)
 );
 
+-- Create the factor_states table
 CREATE TABLE IF NOT EXISTS factor_states (
     id TEXT PRIMARY KEY,
     factor_id TEXT NOT NULL,
@@ -56,6 +60,7 @@ CREATE TABLE IF NOT EXISTS factor_states (
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+-- Create the auth_methods table
 CREATE TABLE IF NOT EXISTS auth_methods (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -67,6 +72,7 @@ CREATE TABLE IF NOT EXISTS auth_methods (
     updated_by TEXT NOT NULL
 );
 
+-- Create the method_states table
 CREATE TABLE IF NOT EXISTS method_states (
     id TEXT PRIMARY KEY,
     method_id TEXT NOT NULL,
@@ -81,6 +87,26 @@ CREATE TABLE IF NOT EXISTS method_states (
     FOREIGN KEY (method_id) REFERENCES auth_methods(id) ON DELETE CASCADE,
     FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Create the authn_hist table
+CREATE TABLE IF NOT EXISTS authn_hist (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  tenant_id INTEGER NOT NULL,
+  session_id TEXT,
+  event_type TEXT NOT NULL,      -- e.g., 'login', 'logout', 'mfa', 'password_reset'
+  event_status TEXT NOT NULL,    -- e.g., 'success', 'failure', 'locked', 'expired'
+  event_time INTEGER NOT NULL,   -- Unix epoch timestamp
+  method_id TEXT,                -- References auth_methods(id)
+  factor_id TEXT,                -- References auth_factors(id)
+  factor_kind TEXT,              -- 'Password', 'Totp', 'Oauth', etc.
+  ip_address TEXT,               -- IP address for the event (was login_ip)
+  user_agent TEXT,               -- Full HTTP User-Agent header string
+  error_message TEXT,            -- Optional error message for failed events
+
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
 
 -- Insert default tenants

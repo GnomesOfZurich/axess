@@ -13,7 +13,9 @@ pub use axess_core::{
     },
     tracing,
 };
-// use crate::authn::session::AuthError;
+
+// use form_urlencoded;
+// use urlencoding;
 
 fn update_query(uri: &Uri, new_query: String) -> Result<Uri, http::Error> {
     let query = form_urlencoded::parse(uri.query().map(|q| q.as_bytes()).unwrap_or_default());
@@ -100,7 +102,7 @@ macro_rules! predicate_required {
                         }
 
                         Err(err) => {
-                            $crate::tracing::error!(err = %err);
+                            $crate::tracing::error!(err = %err, "Failed to build redirect URL");
                             $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
@@ -118,62 +120,104 @@ macro_rules! predicate_required {
 ///
 /// # Usage
 ///
-/// - To require authentication and return 401 Unauthorized if not authenticated:
-///   ```ignore
-///   login_required!(MyBackendType)
-///   ```
+/// ## Return 401 Unauthorized (API endpoints)
+/// ```ignore
+/// use axess_macros::login_required;
+/// use axum::{routing::get, Router};
 ///
-/// - To require authentication and redirect to a login page if not authenticated:
-///   ```ignore
-///   login_required!(MyBackendType, login_url = "/login")
-///   ```
+/// let app = Router::new()
+///     .route("/api/protected", get(api_handler))
+///     .layer(login_required!(Backend));
+/// ```
 ///
-/// - To require authentication and redirect to a login page with a custom redirect field:
-///   ```ignore
-///   login_required!(MyBackendType, login_url = "/login", redirect_field = "next")
-///   ```
+/// ## Redirect to login page (web pages)
+/// ```ignore
+/// use axess_macros::login_required;
+/// use axum::{routing::get, Router};
+///
+/// let app = Router::new()
+///     .route("/dashboard", get(dashboard_handler))
+///     .layer(login_required!(Backend, "/login"));
+/// ```
+///
+/// ## Redirect with custom query parameter
+/// ```ignore
+/// use axess_macros::login_required;
+/// use axum::{routing::get, Router};
+///
+/// let app = Router::new()
+///     .route("/admin", get(admin_handler))
+///     .layer(login_required!(Backend, "/auth/login", "return_to"));
+/// ```
 ///
 /// # Parameters
 ///
-/// - `$backend_type`: The authentication backend type implementing the required session trait.
-/// - `login_url`: (Optional) The URL to redirect unauthenticated users to.
-/// - `redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
+/// - `$auth_session_type`: The full `AuthSession` type (e.g., `AuthSession<Backend, Store>`).
+/// - `$login_url`: (Optional) The URL to redirect unauthenticated users to.
+/// - `$redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
 ///
 /// # Notes
 ///
-/// This macro is intended for use with Axum extractors and middleware. It is subject to change in future versions.
+/// When a redirect URL is provided, the middleware will append the original request URI as a query parameter,
+/// allowing the login page to redirect back after successful authentication.
 #[macro_export]
 macro_rules! login_required {
-    ($backend_type:ty) => {{
-        async fn is_authenticated(auth_session: $crate::AuthSession<$backend_type>) -> bool {
-            auth_session.is_authenticated()
-        }
+    // Full form: auth session type, login URL, and custom redirect field
+    ($auth_session_type:ty, $login_url:expr, $redirect_field:expr) => {{
+        use axum::{
+            extract::OriginalUri,
+            middleware::{from_fn, Next},
+            response::{IntoResponse, Redirect},
+        };
 
-        $crate::predicate_required!(
-            is_authenticated,
-            $crate::axum::http::StatusCode::UNAUTHORIZED
+        from_fn(
+            |auth_session: $auth_session_type,
+             OriginalUri(original_uri): OriginalUri,
+             req,
+             next: Next| async move {
+                if auth_session.is_authenticated() {
+                    next.run(req).await
+                } else {
+                    match $crate::url_with_redirect_query(
+                        $login_url,
+                        $redirect_field,
+                        original_uri
+                    ) {
+                        Ok(login_url) => {
+                            Redirect::temporary(&login_url.to_string()).into_response()
+                        }
+                        Err(err) => {
+                            $crate::tracing::error!(err = %err, "Failed to build login redirect URL");
+                            $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                        }
+                    }
+                }
+            },
         )
     }};
 
-    ($backend_type:ty, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
-        async fn is_authenticated(auth_session: $crate::AuthSession<$backend_type>) -> bool {
-            auth_session.is_authenticated()
-        }
-
-        $crate::predicate_required!(
-            is_authenticated,
-            login_url = $login_url,
-            redirect_field = $redirect_field
-        )
-    }};
-
-    ($backend_type:ty, login_url = $login_url:expr) => {
-        $crate::login_required!(
-            $backend_type,
-            login_url = $login_url,
-            redirect_field = "next"
-        )
+    // Redirect with default "next" field
+    ($auth_session_type:ty, $login_url:expr) => {
+        $crate::login_required!($auth_session_type, $login_url, "next")
     };
+
+    // Status code only (no redirect)
+    ($auth_session_type:ty) => {{
+        use axum::{
+            middleware::{from_fn, Next},
+            response::IntoResponse,
+        };
+
+        from_fn(
+            |auth_session: $auth_session_type, req, next: Next| async move {
+                if auth_session.is_authenticated() {
+                    next.run(req).await
+                } else {
+                    $crate::axum::http::StatusCode::UNAUTHORIZED.into_response()
+                }
+            },
+        )
+    }};
 }
 
 /// Partial authentication-required middleware macro.
@@ -183,37 +227,51 @@ macro_rules! login_required {
 ///
 /// # Usage
 ///
-/// - To require partial authentication and return 401 Unauthorized if not partially authenticated:
-///   ```ignore
-///   require_partial_authn!(MyBackendType)
-///   ```
+/// ## Return 401 Unauthorized (API endpoints)
+/// ```ignore
+/// use axess_macros::require_partial_authn;
+/// use axum::{routing::get, Router};
 ///
-/// - To require partial authentication and redirect to a login page if not partially authenticated:
-///   ```ignore
-///   require_partial_authn!(MyBackendType, login_url = "/login")
-///   ```
+/// let app = Router::new()
+///     .route("/mfa/verify", get(mfa_handler))
+///     .layer(require_partial_authn!(Backend));
+/// ```
 ///
-/// - To require partial authentication and redirect to a login page with a custom redirect field:
-///   ```ignore
-///   require_partial_authn!(MyBackendType, login_url = "/login", redirect_field = "next")
-///   ```
+/// ## Redirect to login page (web pages)
+/// ```ignore
+/// use axess_macros::require_partial_authn;
+/// use axum::{routing::get, Router};
+///
+/// let app = Router::new()
+///     .route("/mfa", get(mfa_page))
+///     .layer(require_partial_authn!(Backend, login_url = "/login"));
+/// ```
+///
+/// ## Redirect with custom query parameter
+/// ```ignore
+/// use axess_macros::require_partial_authn;
+/// use axum::{routing::get, Router};
+///
+/// let app = Router::new()
+///     .route("/auth/step2", get(step2_handler))
+///     .layer(require_partial_authn!(Backend, login_url = "/login", redirect_field = "continue"));
+/// ```
 ///
 /// # Parameters
 ///
-/// - `$backend_type`: The authentication backend type implementing the required session trait.
+/// - `$auth_session_type`: The full `AuthSession` type (e.g., `AuthSession<Backend, Store>`).
 /// - `login_url`: (Optional) The URL to redirect unauthenticated users to.
 /// - `redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
 ///
 /// # Notes
 ///
-/// This macro is intended for use with Axum extractors and middleware. It is subject to change in future versions.
-/// Use this macro for routes that require the user to have started, but not necessarily completed, the authentication process (e.g., before completing MFA).
+/// This macro is intended for use with Axum extractors and middleware.
+/// Use this macro for routes that require the user to have started, but not necessarily completed, the authentication process (e.g., MFA verification pages).
 #[macro_export]
 macro_rules! require_partial_authn {
-    ($backend_type:ty) => {{
-        async fn is_partial_authenticated(
-            auth_session: $crate::AuthSession<$backend_type>,
-        ) -> bool {
+    // Status code only
+    ($auth_session_type:ty) => {{
+        async fn is_partial_authenticated(auth_session: $auth_session_type) -> bool {
             auth_session.is_partial_authenticated()
         }
 
@@ -223,10 +281,9 @@ macro_rules! require_partial_authn {
         )
     }};
 
-    ($backend_type:ty, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
-        async fn is_partial_authenticated(
-            auth_session: $crate::AuthSession<$backend_type>,
-        ) -> bool {
+    // Redirect with custom field
+    ($auth_session_type:ty, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
+        async fn is_partial_authenticated(auth_session: $auth_session_type) -> bool {
             auth_session.is_partial_authenticated()
         }
 
@@ -236,4 +293,13 @@ macro_rules! require_partial_authn {
             redirect_field = $redirect_field
         )
     }};
+
+    // Redirect with default "next" field
+    ($auth_session_type:ty, login_url = $login_url:expr) => {
+        $crate::require_partial_authn!(
+            $auth_session_type,
+            login_url = $login_url,
+            redirect_field = "next"
+        )
+    };
 }

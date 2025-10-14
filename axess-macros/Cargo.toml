@@ -1,6 +1,6 @@
 [package]
 name = "axess-macros"
-version = "0.0.3"
+version = "0.0.4"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -8,9 +8,6 @@ description = "Procedural macros for Axess, providing convenient middleware and 
 authors = ["Gnomes <info@gnomes.ch>"]
 license = "MIT"
 repository = "https://github.com/GnomesOfZurich/axess"
-
-# [lib]
-# proc-macro = true
 
 [dependencies]
 axess-core = { path = "../axess-core",  default-features = false, features = ["authn"]  }

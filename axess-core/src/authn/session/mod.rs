@@ -4,5 +4,6 @@ pub mod registry;
 pub mod state;
 
 // Re-export key types for ergonomics
-pub use auth_session::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession};
-pub use registry::SessionRegistry;
+pub use auth_session::AuthSession;
+pub use registry::{SessionRegistry, StoreSessionRegistry};
+pub use state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType};

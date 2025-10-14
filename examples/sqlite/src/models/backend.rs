@@ -22,8 +22,9 @@ use crate::models::{
     methods::{OurAuthMethod, OurAuthMethodState},
 };
 use axess::{
-    AuthFactor, AuthFactorKind, AuthFactorState, AuthMethod, AuthMethodState, AuthnAdminBackend,
-    AuthnBackend, EnablementState, EntityState, FactorForm, PermissionScope,
+    AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind, AuthFactorState,
+    AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, EnablementState, EntityState,
+    FactorForm, PermissionScope,
 };
 
 const DEFAULT_TENANT_NAME: &str = "Default Tenant";
@@ -72,7 +73,11 @@ impl AuthnBackend for OurBackend {
     type FactorId = Uuid;
     type DataId = DataId;
 
-    async fn get_default_protected_route(&self, _tid: Self::TenantId, _uid: Self::UserId) -> Result<String, Self::Error> {
+    async fn get_default_protected_route(
+        &self,
+        _tid: Self::TenantId,
+        _uid: Self::UserId,
+    ) -> Result<String, Self::Error> {
         Ok("/main".to_string())
     }
 
@@ -672,6 +677,160 @@ impl AuthnBackend for OurBackend {
                 source: Box::new(e),
             })?;
         Ok(factor_state)
+    }
+
+    async fn get_auth_history(
+        &self,
+        user_id: &Self::UserId,
+        event_type: Option<AuthEventType>,
+        event_status: Option<AuthEventStatus>,
+        limit: Option<usize>,
+    ) -> Result<Vec<axess::AuthEvent<Self>>, Self::Error> {
+        let mut conn = self.db.acquire().await?;
+
+        let mut query = String::from("SELECT * FROM auth_events WHERE user_id = ?");
+        let mut binds: Vec<String> = vec![user_id.to_string()];
+
+        if let Some(event_type) = event_type {
+            query.push_str(" AND event_type = ?");
+            binds.push(format!("{:?}", event_type));
+        }
+
+        if let Some(event_status) = event_status {
+            query.push_str(" AND event_status = ?");
+            binds.push(format!("{:?}", event_status));
+        }
+
+        query.push_str(" ORDER BY event_time DESC");
+
+        if let Some(limit) = limit {
+            query.push_str(" LIMIT ?");
+            binds.push(limit.to_string());
+        }
+
+        let mut sql = sqlx::query(&query);
+        for bind in binds {
+            sql = sql.bind(bind);
+        }
+
+        let rows = sql.fetch_all(&mut *conn).await?;
+        let events: Vec<axess::AuthEvent<OurBackend>> = rows
+            .into_iter()
+            .map(|row| {
+                // Map the row fields to AuthEvent struct
+                // You'll need to adjust these field names based on your actual schema
+                axess::AuthEvent {
+                    id: row.try_get::<String, _>("id").unwrap_or_default(),
+                    user_id: Uuid::parse_str(
+                        row.try_get::<String, _>("user_id").as_deref().unwrap_or(""),
+                    )
+                    .unwrap_or(Uuid::nil()),
+                    tenant_id: Uuid::parse_str(
+                        row.try_get::<String, _>("tenant_id")
+                            .as_deref()
+                            .unwrap_or(""),
+                    )
+                    .unwrap_or(Uuid::nil()),
+                    session_id: row
+                        .try_get::<Option<String>, _>("session_id")
+                        .ok()
+                        .flatten(),
+                    event_type: row
+                        .try_get::<String, _>("event_type")
+                        .ok()
+                        .and_then(|et| serde_json::from_str(&format!("\"{}\"", et)).ok())
+                        .unwrap_or(AuthEventType::Authenticated),
+                    event_status: row
+                        .try_get::<String, _>("event_status")
+                        .ok()
+                        .and_then(|es| serde_json::from_str(&format!("\"{}\"", es)).ok())
+                        .unwrap_or(AuthEventStatus::Success),
+                    event_time: row
+                        .try_get::<String, _>("event_time")
+                        .ok()
+                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .unwrap_or(Utc::now()),
+                    method_id: row
+                        .try_get::<Option<String>, _>("method_id")
+                        .ok()
+                        .flatten()
+                        .and_then(|mid| Uuid::parse_str(&mid).ok()),
+                    factor_id: row
+                        .try_get::<Option<String>, _>("factor_id")
+                        .ok()
+                        .flatten()
+                        .and_then(|fid| Uuid::parse_str(&fid).ok()),
+                    factor_kind: row
+                        .try_get::<Option<String>, _>("factor_kind")
+                        .ok()
+                        .flatten()
+                        .and_then(|fk| serde_json::from_str(&format!("\"{}\"", fk)).ok()),
+                    ip_address: row
+                        .try_get::<Option<String>, _>("ip_address")
+                        .ok()
+                        .flatten(),
+                    user_agent: row
+                        .try_get::<Option<String>, _>("user_agent")
+                        .ok()
+                        .flatten(),
+                    error_message: row
+                        .try_get::<Option<String>, _>("error_message")
+                        .ok()
+                        .flatten(),
+                }
+            })
+            .collect();
+        Ok(events)
+    }
+
+    async fn get_last_login(
+        &self,
+        user_id: &Self::UserId,
+    ) -> Result<Option<chrono::DateTime<Utc>>, Self::Error> {
+        // Reuse get_auth_history to keep filtering/sorting logic in one place.
+        let events = self
+            .get_auth_history(
+                user_id,
+                Some(AuthEventType::LoginAttempt),
+                Some(AuthEventStatus::Success),
+                Some(1),
+            )
+            .await?;
+        Ok(events.into_iter().next().map(|e| e.event_time))
+    }
+
+    async fn record_auth_event(&self, event: AuthEventRecord<'_, Self>) -> Result<(), Self::Error> {
+        let mut conn = self.db.acquire().await?;
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+                INSERT INTO auth_events (
+                    id, user_id, tenant_id, session_id, event_type, event_status,
+                    event_time, method_id, factor_id, factor_kind, ip_address,
+                    user_agent, error_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(event.user_id.to_string())
+        .bind(event.tenant_id.to_string())
+        .bind(event.session_id)
+        .bind(format!("{:?}", event.event_type))
+        .bind(format!("{:?}", event.event_status))
+        .bind(now.to_rfc3339())
+        .bind(event.method_id.map(|m| m.to_string()))
+        .bind(event.factor_id.map(|f| f.to_string()))
+        .bind(event.factor_kind.map(|fk| format!("{:?}", fk)))
+        .bind(event.ip_address)
+        .bind(event.user_agent)
+        .bind(event.error_message)
+        .execute(&mut *conn)
+        .await?;
+
+        Ok(())
     }
 
     /// Authenticates a user using the provided credentials form.

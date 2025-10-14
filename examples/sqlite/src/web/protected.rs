@@ -6,7 +6,7 @@ use axum::{
     routing::get,
 };
 
-use crate::web::app::AuthSession;
+use crate::web::app::OurAuthSession;
 
 #[derive(Template)]
 #[template(path = "protected.html")]
@@ -22,7 +22,7 @@ pub fn router() -> Router<()> {
 mod get {
     use super::*;
 
-    pub async fn protected(auth_session: AuthSession) -> impl IntoResponse {
+    pub async fn protected(auth_session: OurAuthSession) -> impl IntoResponse {
         match auth_session.user() {
             Ok(user) => Html(
                 ProtectedTemplate {

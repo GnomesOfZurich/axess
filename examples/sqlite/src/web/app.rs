@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum_messages::MessagesManagerLayer;
 use sqlx::SqlitePool;
 use time::Duration;
@@ -10,13 +12,11 @@ use crate::{
     models::backend::OurBackend,
     web::{auth, protected},
 };
-use axess::{
-    AuthnLayerBuilder,
-    // SessionRegistry,
-    login_required,
-};
+use axess::{AuthSession, AuthnLayerBuilder, StoreSessionRegistry, login_required};
 
-pub type AuthSession = axess::AuthSession<OurBackend>;
+pub type OurAuthSession = AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>>;
+
+// pub type AuthSession = AuthSession;
 
 // #[derive(Clone)]
 // pub struct AppState {
@@ -52,7 +52,7 @@ impl App {
         // Generate a cryptographic key to sign the session cookie.
         let key = Key::generate();
 
-        let session_layer = SessionManagerLayer::new(session_store)
+        let session_layer = SessionManagerLayer::new(session_store.clone())
             .with_secure(false)
             .with_expiry(Expiry::OnInactivity(Duration::days(1)))
             .with_signed(key);
@@ -62,26 +62,26 @@ impl App {
         // This combines the session layer with our backend to establish the auth
         // service which will provide the auth session as a request extension.
         let backend = OurBackend::new(self.db.clone());
-        // let session_registry = SessionRegistry::new();  // TODO: Is Registry still needed here ???
-        let auth_layer = AuthnLayerBuilder::new(backend, session_layer).build();
-        // let state = AppState {
-        //     db: self.db.clone(),
-        // };
+        let session_registry = Arc::new(StoreSessionRegistry::new(session_store.clone(), 100));
 
-        let protected_router =
-            protected::router().route_layer(login_required!(OurBackend, login_url = "/login"));
+        let auth_router = auth::router().with_state(backend.clone());
+        let backend: Arc<OurBackend> = Arc::new(backend);
 
-        let auth_router = auth::router().with_state(OurBackend::new(self.db.clone()));
+        let auth_layer = Arc::new(
+            AuthnLayerBuilder::new((*backend).clone(), session_layer)
+                .with_session_registry(session_registry.clone())
+                .build(),
+        );
 
-        let app = protected_router
+        let protected_router = protected::router()
+            .route_layer(login_required!(OurAuthSession, "/login"))
             .merge(auth_router)
             .layer(MessagesManagerLayer)
-            .layer(auth_layer);
-
+            .layer(auth_layer.as_ref().clone());
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 
         // Ensure we use a shutdown signal to abort the deletion task.
-        axum::serve(listener, app.into_make_service())
+        axum::serve(listener, protected_router.into_make_service())
             .with_graceful_shutdown(shutdown_signal(deletion_task.abort_handle()))
             .await?;
 
