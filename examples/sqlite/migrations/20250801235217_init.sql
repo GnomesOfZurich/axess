@@ -16,7 +16,6 @@ CREATE TABLE IF NOT EXISTS tenants (
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL,
-    auth_hash TEXT  NOT NULL DEFAULT '',
     username TEXT NOT NULL,
     fullname TEXT NOT NULL DEFAULT '',
     email TEXT NOT NULL UNIQUE,

@@ -197,7 +197,6 @@ pub struct MockUser {
     pub id: TestUserId,
     pub tenant_id: TestTenantId,
     pub state: EntityState,
-    pub session_hash: Option<String>,
 }
 
 impl Default for MockUser {
@@ -206,7 +205,6 @@ impl Default for MockUser {
             id: TestUserId("default_user".to_string()),
             tenant_id: DEFAULT_TENANT_ID.into(),
             state: EntityState::Active,
-            session_hash: None,
         }
     }
 }
@@ -222,12 +220,6 @@ impl AuthUser for MockUser {
     }
     fn get_user_state(&self) -> EntityState {
         self.state.clone()
-    }
-    fn auth_session_hash(&self) -> Option<&str> {
-        self.session_hash.as_deref()
-    }
-    fn set_auth_session_hash(&mut self, hash: Option<String>) {
-        self.session_hash = hash;
     }
 }
 
@@ -380,7 +372,6 @@ impl AuthnBackend for MockBackend {
                 .cloned()
                 .unwrap_or(TestTenantId("default".to_string())),
             state: EntityState::Guest,
-            session_hash: None,
         })
     }
 
@@ -762,7 +753,6 @@ impl AuthnBackend for MockBackend {
             id: DEFAULT_USER_ID.into(),
             tenant_id: DEFAULT_TENANT_ID.into(),
             state: EntityState::Active,
-            session_hash: Some("mock_session_hash".to_string()),
         })
     }
 }

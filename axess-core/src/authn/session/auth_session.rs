@@ -790,21 +790,6 @@ where
         }
     }
 
-    /// Authenticates the session using the provided credentials and backend.
-    pub async fn submit_credentials<F>(&mut self, creds: &F) -> Result<B::User, AuthError<B>>
-    where
-        F: FactorForm + Send + Sync,
-    {
-        let user = self
-            .backend
-            .authenticate(creds)
-            .await
-            .map_err(AuthError::BackendError)?;
-        self.user = user.clone();
-        self.state = SessionState::<B>::Authenticated;
-        Ok(user)
-    }
-
     pub async fn get_session_data(&self) -> Result<SessionData<B>, AuthError<B>> {
         let session_data_opt: Option<SessionData<B>> = self
             .session
@@ -816,14 +801,6 @@ where
             None => Err(AuthError::SessionNotFound),
         }
     }
-
-    // async fn update_session(&mut self) -> Result<(), AuthError<B>> {
-    //     self.session
-    //         .insert(self.data_key, &self.data)
-    //         .await
-    //         .map_err(AuthError::SessionError)?;
-    //     Ok(())
-    // }
 
     /// Generates a cryptographically secure hash binding this authentication to a specific session
     fn generate_session_hash(&self) -> String {
@@ -1198,7 +1175,6 @@ mod tests {
             id: TestUserId("user1".to_string()),
             tenant_id: TestTenantId("tenant1".to_string()),
             state: EntityState::Active,
-            session_hash: None,
         };
         auth_session.user = user;
         auth_session.data.user_id = Some(TestUserId("user1".to_string()));
@@ -1261,7 +1237,6 @@ mod tests {
             id: TestUserId("user1".to_string()),
             tenant_id: TestTenantId("tenant1".to_string()),
             state: EntityState::Active,
-            session_hash: None,
         };
         auth_session.user = user;
         auth_session.data.user_id = Some(TestUserId("user1".to_string()));
@@ -1403,7 +1378,6 @@ mod tests {
             id: TestUserId("user1".to_string()),
             tenant_id: TestTenantId("tenant1".to_string()),
             state: EntityState::Active,
-            session_hash: None,
         };
 
         auth_session1.user = user.clone();

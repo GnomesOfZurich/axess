@@ -72,12 +72,10 @@ impl<'r> FromRow<'r, SqliteRow> for OurTenant {
 pub struct OurUser {
     pub id: Uuid,
     pub tenant_id: Uuid,
-    pub auth_hash: String,
     pub username: String,
     pub fullname: String,
     pub email: String,
     pub state: EntityState,
-    pub last_login_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub created_by: Uuid,
     pub updated_at: DateTime<Utc>,
@@ -96,12 +94,10 @@ impl OurUser {
         Self {
             id,
             tenant_id,
-            auth_hash: String::new(),
             username,
             fullname,
             email,
             state: EntityState::Active,
-            last_login_at: None,
             created_at: Utc::now(),
             created_by: creator,
             updated_at: Utc::now(),
@@ -113,12 +109,10 @@ impl OurUser {
         Self {
             id: Uuid::new_v4(),
             tenant_id,
-            auth_hash: String::new(),
             username: "guest".to_string(),
             fullname: "Guest User".to_string(),
             email: "".to_string(),
             state: EntityState::Guest,
-            last_login_at: None,
             created_at: Utc::now(),
             created_by: creator_id,
             updated_at: Utc::now(),
@@ -144,21 +138,6 @@ impl AuthUser for OurUser {
         // For simplicity, we return the user's state here.
         self.state.clone()
     }
-
-    fn auth_session_hash(&self) -> Option<&str> {
-        if self.auth_hash.is_empty() {
-            None
-        } else {
-            Some(self.auth_hash.as_str())
-        }
-    }
-
-    fn set_auth_session_hash(&mut self, hash: Option<String>) {
-        match hash {
-            Some(h) => self.auth_hash = h,
-            None => self.auth_hash.clear(),
-        }
-    }
 }
 
 impl<'r> FromRow<'r, SqliteRow> for OurUser {
@@ -166,7 +145,6 @@ impl<'r> FromRow<'r, SqliteRow> for OurUser {
         Ok(Self {
             id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str()).unwrap(),
             tenant_id: Uuid::parse_str(row.try_get::<String, _>("tenant_id")?.as_str()).unwrap(),
-            auth_hash: row.try_get("auth_hash")?,
             username: row.try_get("username")?,
             fullname: row.try_get("fullname")?,
             email: row.try_get("email")?,
@@ -183,10 +161,6 @@ impl<'r> FromRow<'r, SqliteRow> for OurUser {
                     });
                 }
             },
-            last_login_at: row
-                .try_get::<Option<String>, _>("last_login_at")?
-                .as_deref()
-                .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)),
             created_at: row
                 .try_get::<Option<String>, _>("created_at")?
                 .as_deref()

@@ -194,9 +194,6 @@ pub trait AuthUser: Debug + Clone + Send + Sync + Eq + PartialEq {
     fn id(&self) -> &Self::Id;
     fn tenant_id(&self) -> &Self::TenantId;
     fn get_user_state(&self) -> EntityState;
-
-    fn auth_session_hash(&self) -> Option<&str>;
-    fn set_auth_session_hash(&mut self, hash: Option<String>);
 }
 
 #[async_trait]
@@ -404,7 +401,6 @@ mod tests {
             id: TestUserId("u1".to_string()),
             tenant_id: TestTenantId("t1".to_string()),
             state: EntityState::Active,
-            session_hash: Some("session123".to_string()),
         };
         backend.upsert_user(user.clone()).await.unwrap();
 
@@ -413,7 +409,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetched.get_user_state(), EntityState::Active);
-        assert_eq!(fetched.auth_session_hash(), Some("session123"));
     }
 
     #[cfg(feature = "admin")]
@@ -424,7 +419,6 @@ mod tests {
             id: TestUserId("u2".to_string()),
             tenant_id: TestTenantId("t2".to_string()),
             state: EntityState::Active,
-            session_hash: None,
         };
         backend.upsert_user(user.clone()).await.unwrap();
 
@@ -453,7 +447,6 @@ mod tests {
             id: TestUserId("u3".to_string()),
             tenant_id: TestTenantId("t3".to_string()),
             state: EntityState::Active,
-            session_hash: Some("xyz789".to_string()),
         };
         let upserted = backend.upsert_user(user.clone()).await.unwrap();
         assert_eq!(upserted, user);
@@ -502,7 +495,6 @@ mod tests {
             id: TestUserId("u99".to_string()),
             tenant_id: TestTenantId("t99".to_string()),
             state: EntityState::Active,
-            session_hash: Some("hash99".to_string()),
         };
         let json = serde_json::to_string(&user).unwrap();
         let deserialized: MockUser = serde_json::from_str(&json).unwrap();
