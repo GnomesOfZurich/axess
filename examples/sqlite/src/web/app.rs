@@ -9,12 +9,10 @@ use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 
 use crate::{
-    models::backend::OurBackend,
+    models::{authn::OurAuthSession, backend::OurBackend},
     web::{auth, protected},
 };
-use axess::{AuthSession, AuthnLayerBuilder, StoreSessionRegistry, login_required};
-
-pub type OurAuthSession = AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>>;
+use axess::{AuthnLayerBuilder, StoreSessionRegistry, login_required};
 
 // #[derive(Clone)]
 // pub struct AppState {

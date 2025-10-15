@@ -6,7 +6,7 @@ use axum::{
     routing::get,
 };
 
-use crate::web::app::OurAuthSession;
+use crate::models::authn::OurAuthSession;
 
 #[derive(Template)]
 #[template(path = "protected.html")]

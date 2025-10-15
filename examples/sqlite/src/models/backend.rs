@@ -17,9 +17,8 @@ use axess::{
 };
 
 use crate::models::{
+    authn::{OurAuthFactor, OurAuthFactorState, OurAuthMethod, OurAuthMethodState},
     entities::{OurTenant, OurUser},
-    factors::{OurAuthFactor, OurAuthFactorState},
-    methods::{OurAuthMethod, OurAuthMethodState},
 };
 use axess::{
     AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind, AuthFactorState,

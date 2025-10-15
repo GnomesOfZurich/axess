@@ -48,7 +48,7 @@ pub mod post {
 
 pub mod get {
     use super::*;
-    use crate::web::app::OurAuthSession;
+    use crate::models::authn::OurAuthSession;
 
     #[axum::debug_handler]
     pub async fn login(

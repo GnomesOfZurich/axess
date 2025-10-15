@@ -28,7 +28,10 @@ pub use axess_core::{
             TenantId, UserId,
         },
         errors::{AuthError, FormError, HandlerError},
-        methods::{AuthFactorKind, EnablementState, FactorForm, FactorStateChange, MethodStateChange, PermissionScope},
+        methods::{
+            AuthFactorKind, EnablementState, FactorForm, FactorStateChange, MethodStateChange,
+            PermissionScope,
+        },
         middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
         session::{
             AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthSession,
@@ -60,7 +63,7 @@ pub use axess_core::storage::in_memory;
 
 #[cfg(feature = "valkey")]
 pub mod valkey {
-    pub use axess_core::storage::valkey::*;
+    pub use axess_core::storage::valkey::{ValkeyStore, ValkeyStoreError};
 }
 
 pub use axess_macros::{login_required, require_partial_authn};
