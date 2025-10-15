@@ -123,7 +123,7 @@ pub struct AuthnLayer<
 impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
     AuthnLayer<Backend, Sessions, R, C>
 {
-    /// Create a new [`AuthManagerLayer`] with the provided access controller.
+    /// Create a new [`AuthnLayer`] with the provided access controller.
     pub(crate) fn new(
         backend: Backend,
         data_key: &'static str,
@@ -168,9 +168,6 @@ pub struct AuthnLayerBuilder<
     data_key: Option<&'static str>,
     session_registry: Option<Arc<R>>,
 }
-
-// #[derive(Debug, Clone)]
-// pub struct NoOpSessionRegistry;
 
 impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
     AuthnLayerBuilder<B, Sessions, R, C>

@@ -14,9 +14,6 @@ pub use axess_core::{
     tracing,
 };
 
-// use form_urlencoded;
-// use urlencoding;
-
 fn update_query(uri: &Uri, new_query: String) -> Result<Uri, http::Error> {
     let query = form_urlencoded::parse(uri.query().map(|q| q.as_bytes()).unwrap_or_default());
     let updated_query = form_urlencoded::Serializer::new(new_query)

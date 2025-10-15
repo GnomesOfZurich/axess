@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
-// TODO: Consider letting the mock backend be anin-memory SQLite database
+// TODO: Consider letting the mock backend be an in-memory SQLite database
 // use sqlx::SqlitePool;
 
 // async fn create_test_backend() -> OurBackend {

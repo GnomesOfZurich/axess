@@ -48,10 +48,7 @@ pub mod post {
 
 pub mod get {
     use super::*;
-    // use crate::backend::OurBackend;
     use crate::web::app::OurAuthSession;
-    // use axess::{SessionRegistry, StoreSessionRegistry};
-    // use axum::extract::State;
 
     #[axum::debug_handler]
     pub async fn login(

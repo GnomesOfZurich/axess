@@ -134,8 +134,6 @@ impl AuthUser for OurUser {
     }
 
     fn get_user_state(&self) -> EntityState {
-        // Assuming UserState is an enum, you can implement the logic to determine the state.
-        // For simplicity, we return the user's state here.
         self.state.clone()
     }
 }

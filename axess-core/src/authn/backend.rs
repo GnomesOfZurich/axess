@@ -160,10 +160,13 @@ impl<T> DataId for T where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-pub struct StateTransitionInfo {
+pub struct StatusDetail {
     pub reason: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -171,11 +174,11 @@ pub struct StateTransitionInfo {
 pub enum EntityState {
     Guest,
     Candidate,
-    Pending(StateTransitionInfo),
+    Pending(StatusDetail),
     Active,
-    Suspended(StateTransitionInfo),
-    Terminated(StateTransitionInfo),
-    Archived(StateTransitionInfo),
+    Suspended(StatusDetail),
+    Terminated(StatusDetail),
+    Archived(StatusDetail),
 }
 
 pub trait AuthTenant: Debug + Clone + Send + Sync + Eq + PartialEq {
@@ -425,10 +428,11 @@ mod tests {
         let updated = backend
             .set_user_state(
                 &TestUserId("u2".to_string()),
-                EntityState::Suspended(StateTransitionInfo {
+                EntityState::Suspended(StatusDetail {
                     reason: "test".to_string(),
                     timestamp: Utc::now(),
                     until: None,
+                    metadata: None,
                 }),
             )
             .await

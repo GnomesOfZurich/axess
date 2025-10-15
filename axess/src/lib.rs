@@ -24,8 +24,8 @@ pub use axess_core::{
     authn::{
         self,
         backend::{
-            AuthTenant, AuthUser, AuthnBackend, EntityState, FactorId, MethodId,
-            StateTransitionInfo, TenantId, UserId,
+            AuthTenant, AuthUser, AuthnBackend, EntityState, FactorId, MethodId, StatusDetail,
+            TenantId, UserId,
         },
         errors::{AuthError, FormError, HandlerError},
         methods::{AuthFactorKind, EnablementState, FactorForm, PermissionScope},

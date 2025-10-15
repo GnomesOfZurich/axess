@@ -11,18 +11,6 @@ pub enum EnablementState {
     Archived,  // No longer available for new use, but kept for history
 }
 
-// impl EnablementState {
-//     fn new() -> Self {
-//         EnablementState::Pending
-//     }
-// }
-
-// impl Default for EnablementState {
-//     fn default() -> Self {
-//         EnablementState::Inactive
-//     }
-// }
-
 // Scope for permission resolution
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PermissionScope<TenantId, UserId> {
@@ -33,14 +21,6 @@ pub enum PermissionScope<TenantId, UserId> {
 }
 
 impl<T, U> PermissionScope<T, U> {
-    // pub fn ids(&self) -> (Option<&T>, Option<&U>) {
-    //     match self {
-    //         PermissionScope::Global | PermissionScope::Any => (None, None),
-    //         PermissionScope::Tenant(tid) => (Some(tid), None),
-    //         PermissionScope::User(tid, uid) => (Some(tid), Some(uid)),
-    //     }
-    // }
-
     pub fn is_global(&self) -> bool {
         matches!(self, PermissionScope::Global)
     }
@@ -71,15 +51,3 @@ impl<T, U> PermissionScope<T, U> {
         }
     }
 }
-
-// impl<T: Clone, U: Clone> PermissionScope<&T, &U> {
-//     /// Convert a borrowed scope to an owned scope.
-//     pub fn to_owned(&self) -> PermissionScope<T, U> {
-//         match self {
-//             PermissionScope::Global => PermissionScope::Global,
-//             PermissionScope::Any => PermissionScope::Any,
-//             PermissionScope::Tenant(tid) => PermissionScope::Tenant((*tid).clone()),
-//             PermissionScope::User(tid, uid) => PermissionScope::User((*tid).clone(), (*uid).clone()),
-//         }
-//     }
-// }

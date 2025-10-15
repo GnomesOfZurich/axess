@@ -16,8 +16,6 @@ use axess::{AuthSession, AuthnLayerBuilder, StoreSessionRegistry, login_required
 
 pub type OurAuthSession = AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>>;
 
-// pub type AuthSession = AuthSession;
-
 // #[derive(Clone)]
 // pub struct AppState {
 //     pub db: SqlitePool,
