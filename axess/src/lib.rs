@@ -28,7 +28,7 @@ pub use axess_core::{
             TenantId, UserId,
         },
         errors::{AuthError, FormError, HandlerError},
-        methods::{AuthFactorKind, EnablementState, FactorForm, PermissionScope},
+        methods::{AuthFactorKind, EnablementState, FactorForm, FactorStateChange, MethodStateChange, PermissionScope},
         middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
         session::{
             AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthSession,
