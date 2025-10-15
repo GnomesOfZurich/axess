@@ -226,6 +226,7 @@ where
     /// An error which can occur during authentication and authorization.
     type Error: Debug + Send + Sync + 'static;
 
+    /// Maximum number of allowed authentication attempts before temporary lockout.
     fn max_auth_attempts(&self) -> u32 {
         5
     }
@@ -240,13 +241,16 @@ where
     /// Gets the tenant by provided ID from the backend.
     async fn get_tenant(&self, tenant_id: &Self::TenantId) -> Result<Self::Tenant, Self::Error>;
 
+    /// Gets the tenant by provided name from the backend.
     async fn get_tenant_by_name(&self, name: &str) -> Result<Self::Tenant, Self::Error>;
 
+    /// Gets the default tenant ID from the backend.
     async fn get_default_tenant_id(&self) -> Result<Self::TenantId, Self::Error>;
 
     /// Gets the user by provided ID from the backend.
     async fn get_user(&self, user_id: &Self::UserId) -> Result<Self::User, Self::Error>;
 
+    /// Gets the user by username within the specified tenant from the backend.
     async fn get_user_by_name(
         &self,
         tenant_id: &Self::TenantId,
@@ -265,6 +269,7 @@ where
         tenant_id: Option<&Self::TenantId>,
     ) -> Result<Self::User, Self::Error>;
 
+    /// Sets the state of a user (e.g., Active, Suspended, Terminated).
     async fn set_user_state(
         &self,
         user_id: &Self::UserId,
@@ -286,12 +291,14 @@ where
         state: EnablementState,
     ) -> Result<Vec<AuthMethod<Self>>, Self::Error>;
 
+    /// Get all method states for a given method ID and scope (global/user/tenant).
     async fn get_method_states(
         &self,
         method_id: &Self::MethodId,
         scope: PermissionScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthMethodState<Self>>, Self::Error>;
 
+    /// Upsert (insert or update) the state of an authentication method for a given scope (global/user/tenant).
     async fn upsert_method_state(
         &self,
         change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
@@ -303,6 +310,7 @@ where
         factor_id: &Self::FactorId,
     ) -> Result<AuthFactor<Self>, Self::Error>;
 
+    /// Get all authentication factors in the system.
     async fn get_all_auth_factors(&self) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
 
     /// Get all authentication factors for a given scope (global/user/tenant).
@@ -312,6 +320,7 @@ where
         states: EnablementState,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
 
+    /// Get all factor states for a given factor ID and scope (global/user/tenant).
     async fn get_factor_states(
         &self,
         factor_id: &Self::FactorId,
@@ -366,9 +375,18 @@ where
         }
     }
 
-    /// Get count of failed login attempts since last successful login
+    /// Record an authentication event for a user
     ///
-    /// This is useful for implementing account lockout policies.
+    /// This method is used to log authentication-related events such as login attempts,
+    /// logout events, password changes, etc. The event details are provided in the
+    /// `AuthEventRecord` struct.
+    /// # Arguments
+    /// * `event` - The authentication event details to record
+    /// # Returns
+    /// Result indicating success or failure of the operation
+    /// # Errors
+    /// Returns an error if the event could not be recorded
+    ///
     async fn record_auth_event(&self, event: AuthEventRecord<'_, Self>) -> Result<(), Self::Error>;
 
     async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
