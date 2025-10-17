@@ -16,18 +16,21 @@ use std::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AuthFactorKind {
     Password,
     Totp,
     Oauth,
+    Custom(String),
 }
 
 impl AuthFactorKind {
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             AuthFactorKind::Password => "Password",
             AuthFactorKind::Totp => "Totp",
             AuthFactorKind::Oauth => "oauth",
+            AuthFactorKind::Custom(s) => s.as_str(),
         }
     }
 }
@@ -40,18 +43,14 @@ impl FromStr for AuthFactorKind {
             "password" => Ok(AuthFactorKind::Password),
             "totp" => Ok(AuthFactorKind::Totp),
             "oauth" => Ok(AuthFactorKind::Oauth),
-            _ => Err(FactorKindError::UnexpectedValue(s.to_string())),
+            custom => Ok(AuthFactorKind::Custom(custom.to_string())),
         }
     }
 }
 
 impl Display for AuthFactorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AuthFactorKind::Password => write!(f, "password"),
-            AuthFactorKind::Totp => write!(f, "totp"),
-            AuthFactorKind::Oauth => write!(f, "oauth"),
-        }
+        write!(f, "{}", self.as_str())
     }
 }
 

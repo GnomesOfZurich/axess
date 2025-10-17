@@ -16,6 +16,8 @@ pub enum FormError {
     InvalidFormData,
     #[error("Form validation failed: {0}")]
     ValidationFailed(String),
+    #[error("Missing required field: {0}")]
+    MissingField(String),
     #[error("Unable to extract expected stored auth config data for '{:?}' factor kind", { 0 })]
     AuthConfigError(String),
 }
@@ -28,12 +30,13 @@ where
         match err {
             FormError::InvalidFormData => AuthError::InvalidCredentials,
             FormError::ValidationFailed(_) => AuthError::InvalidCredentials,
+            FormError::MissingField(_) => AuthError::InvalidCredentials,
             FormError::AuthConfigError(kind) => AuthError::UnexpectedAuthConfig(kind),
         }
     }
 }
 
-#[derive(ThisError, Debug)]
+#[derive(Debug, ThisError)]
 pub enum FactorKindError {
     #[error("Unexpected factor kind: {0}")]
     UnexpectedValue(String),

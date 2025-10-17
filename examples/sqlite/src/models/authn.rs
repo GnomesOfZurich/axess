@@ -8,6 +8,7 @@ use sqlx::{FromRow, Row, sqlite::SqliteRow};
 use tower_sessions_sqlx_store::SqliteStore;
 use uuid::Uuid;
 
+#[allow(dead_code)]
 pub type OurAuthSession = AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>>;
 
 pub struct OurAuthFactor(pub AuthFactor<OurBackend>);
@@ -22,7 +23,12 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthFactor {
     fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
         Ok(OurAuthFactor(AuthFactor::<OurBackend> {
             id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str()).unwrap(),
-            kind: serde_json::from_str(&row.try_get::<String, _>("kind")?).unwrap(),
+            // DB stores enum as plain text (e.g. Password). Wrap in quotes so serde_json can deserialize.
+            kind: {
+                let kind_txt: String = row.try_get("kind")?;
+                serde_json::from_str(&format!("\"{}\"", kind_txt))
+                    .unwrap_or(axess::AuthFactorKind::Custom(kind_txt))
+            },
             name: row.try_get("name")?,
             description: row.try_get("description")?,
             created_at: row
@@ -71,7 +77,16 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthFactorState {
                     });
                 }
             },
-            config: serde_json::from_str(&row.try_get::<String, _>("config")?).unwrap(),
+            // tolerate NULL/empty config and invalid JSON by defaulting to empty object
+            config: {
+                match row.try_get::<Option<String>, _>("config")? {
+                    Some(s) => serde_json::from_str::<
+                        std::collections::HashMap<String, serde_json::Value>,
+                    >(&s)
+                    .unwrap_or_else(|_| std::collections::HashMap::new()),
+                    None => std::collections::HashMap::new(),
+                }
+            },
             created_at: row
                 .try_get::<Option<String>, _>("created_at")?
                 .as_deref()
@@ -102,7 +117,11 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthMethod {
             id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str()).unwrap(),
             name: row.try_get("name")?,
             description: row.try_get("description")?,
-            factors: serde_json::from_str(&row.try_get::<String, _>("factors")?).unwrap(),
+            // tolerate NULL/empty factors JSON by defaulting to empty vec
+            factors: match row.try_get::<Option<String>, _>("factors")? {
+                Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+                None => Vec::new(),
+            },
             created_at: row
                 .try_get::<Option<String>, _>("created_at")?
                 .as_deref()

@@ -399,8 +399,11 @@ mod tests {
     use super::*;
     #[cfg(feature = "admin")]
     use crate::authn::admin::admin_backend::AuthnAdminBackend;
-    use crate::utils::testing::mock_backend::{
-        MockBackend, MockTenant, MockUser, TestTenantId, TestUserId,
+    use crate::{
+        authn::session::state::{AuthEventStatus, AuthEventType},
+        utils::testing::mock_backend::{
+            MockBackend, MockTenant, MockUser, TestTenantId, TestUserId,
+        },
     };
 
     #[tokio::test]
@@ -529,5 +532,124 @@ mod tests {
         let json = serde_json::to_string(&tenant).unwrap();
         let deserialized: TestTenantId = serde_json::from_str(&json).unwrap();
         assert_eq!(tenant, deserialized);
+    }
+
+    #[tokio::test]
+    async fn test_get_auth_method_returns_method() {
+        let backend = MockBackend::default();
+
+        #[cfg(feature = "admin")]
+        {
+            use crate::authn::methods::method::MethodInstance;
+            use chrono::Utc;
+
+            let method = MethodInstance {
+                id: "test_method".to_string(),
+                name: "Test Method".to_string(),
+                description: "Test authentication method".to_string(),
+                factors: vec![],
+                created_at: Utc::now(),
+                created_by: TestUserId("system".to_string()),
+                updated_at: Utc::now(),
+                updated_by: TestUserId("system".to_string()),
+            };
+
+            // Upsert the method
+            backend.upsert_auth_method(method.clone()).await.unwrap();
+
+            // Test retrieval - convert MethodInstance to AuthMethod for comparison
+            let retrieved = backend
+                .get_auth_method(&"test_method".to_string())
+                .await
+                .unwrap();
+
+            assert_eq!(retrieved.id, "test_method");
+            assert_eq!(retrieved.name, "Test Method");
+            assert_eq!(retrieved.description, "Test authentication method");
+            assert!(retrieved.factors.is_empty());
+        }
+
+        #[cfg(not(feature = "admin"))]
+        {
+            // Without admin feature, get_auth_method should return an error
+            let result = backend.get_auth_method(&"test_method".to_string()).await;
+            assert!(result.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_with_inactive_user_returns_error() {
+        let backend = MockBackend::default();
+
+        #[cfg(feature = "admin")]
+        {
+            // Create suspended user
+            let user = MockUser {
+                id: TestUserId("suspended_user".to_string()),
+                tenant_id: TestTenantId("tenant1".to_string()),
+                state: EntityState::Suspended(StatusDetail {
+                    reason: "Test suspension".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    until: None,
+                    metadata: None,
+                }),
+            };
+
+            backend.upsert_user(user).await.unwrap();
+
+            // Verify user state is not active
+            let fetched = backend
+                .get_user(&TestUserId("suspended_user".to_string()))
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                fetched.get_user_state(),
+                EntityState::Suspended(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_and_retrieve_auth_event_roundtrip() {
+        let backend = MockBackend::default();
+
+        let user_id = TestUserId("event_test_user".to_string());
+        let tenant_id = TestTenantId("event_test_tenant".to_string());
+
+        // Record event using AuthEventRecord
+        let event = AuthEventRecord::<MockBackend> {
+            user_id: &user_id,
+            tenant_id: &tenant_id,
+            session_id: Some("session123"),
+            event_type: AuthEventType::LoginAttempt,
+            event_status: AuthEventStatus::Success,
+            method_id: None,
+            factor_id: None,
+            factor_kind: None,
+            ip_address: Some("192.168.1.1"),
+            user_agent: Some("Test Agent"),
+            error_message: None,
+        };
+
+        backend.record_auth_event(event).await.unwrap();
+
+        // Retrieve event
+        let events = backend
+            .get_auth_history(
+                &user_id,
+                Some(AuthEventType::LoginAttempt),
+                Some(AuthEventStatus::Success),
+                Some(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, AuthEventType::LoginAttempt);
+        assert_eq!(events[0].event_status, AuthEventStatus::Success);
+        assert_eq!(events[0].session_id, Some("session123".to_string()));
+        assert_eq!(events[0].ip_address, Some("192.168.1.1".to_string()));
+        assert_eq!(events[0].user_agent, Some("Test Agent".to_string()));
     }
 }

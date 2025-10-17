@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound(
@@ -214,6 +216,54 @@ pub enum AuthEventType {
     SessionInvalidated,
 }
 
+impl AuthEventType {
+    /// Stable string representation for database storage
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthEventType::Authenticated => "authenticated",
+            AuthEventType::LoginAttempt => "login_attempt",
+            AuthEventType::LogoutAttempt => "logout_attempt",
+            AuthEventType::FactorVerified => "factor_verified",
+            AuthEventType::FactorSetup => "factor_setup",
+            AuthEventType::FactorEnabled => "factor_enabled",
+            AuthEventType::FactorDisabled => "factor_disabled",
+            AuthEventType::MethodEnabled => "method_enabled",
+            AuthEventType::MethodDisabled => "method_disabled",
+            AuthEventType::PasswordReset => "password_reset",
+            AuthEventType::SessionExpired => "session_expired",
+            AuthEventType::SessionInvalidated => "session_invalidated",
+        }
+    }
+}
+
+impl FromStr for AuthEventType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "authenticated" => Ok(AuthEventType::Authenticated),
+            "login_attempt" => Ok(AuthEventType::LoginAttempt),
+            "logout_attempt" => Ok(AuthEventType::LogoutAttempt),
+            "factor_verified" => Ok(AuthEventType::FactorVerified),
+            "factor_setup" => Ok(AuthEventType::FactorSetup),
+            "factor_enabled" => Ok(AuthEventType::FactorEnabled),
+            "factor_disabled" => Ok(AuthEventType::FactorDisabled),
+            "method_enabled" => Ok(AuthEventType::MethodEnabled),
+            "method_disabled" => Ok(AuthEventType::MethodDisabled),
+            "password_reset" => Ok(AuthEventType::PasswordReset),
+            "session_expired" => Ok(AuthEventType::SessionExpired),
+            "session_invalidated" => Ok(AuthEventType::SessionInvalidated),
+            other => Err(format!("Unknown auth event type: {}", other)),
+        }
+    }
+}
+
+impl Display for AuthEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AuthEventStatus {
     Success,
@@ -221,6 +271,40 @@ pub enum AuthEventStatus {
     Locked,
     Expired,
     Suspicious,
+}
+
+impl AuthEventStatus {
+    /// Stable string representation for database storage
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthEventStatus::Success => "success",
+            AuthEventStatus::Failure => "failure",
+            AuthEventStatus::Locked => "locked",
+            AuthEventStatus::Expired => "expired",
+            AuthEventStatus::Suspicious => "suspicious",
+        }
+    }
+}
+
+impl FromStr for AuthEventStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(AuthEventStatus::Success),
+            "failure" => Ok(AuthEventStatus::Failure),
+            "locked" => Ok(AuthEventStatus::Locked),
+            "expired" => Ok(AuthEventStatus::Expired),
+            "suspicious" => Ok(AuthEventStatus::Suspicious),
+            other => Err(format!("Unknown auth event status: {}", other)),
+        }
+    }
+}
+
+impl Display for AuthEventStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

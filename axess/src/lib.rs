@@ -29,8 +29,8 @@ pub use axess_core::{
         },
         errors::{AuthError, FormError, HandlerError},
         methods::{
-            AuthFactorKind, EnablementState, FactorForm, FactorStateChange, MethodStateChange,
-            PermissionScope,
+            AuthFactorKind, EnablementState, FactorForm, FactorFormExt, FactorStateChange,
+            FormField, MethodStateChange, PermissionScope,
         },
         middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
         session::{
@@ -42,7 +42,7 @@ pub use axess_core::{
             SessionState,
         },
     },
-    utils::validation::verify_totp,
+    utils::{self, validation::verify_totp},
 };
 
 #[cfg(feature = "authz")]
@@ -63,7 +63,9 @@ pub use axess_core::storage::in_memory;
 
 #[cfg(feature = "valkey")]
 pub mod valkey {
-    pub use axess_core::storage::valkey::{ValkeyStore, ValkeyStoreError, init_valkey_cluster_client};
+    pub use axess_core::storage::valkey::{
+        ValkeyStore, ValkeyStoreError, init_valkey_cluster_client,
+    };
 }
 
 pub use axess_macros::{login_required, require_partial_authn};

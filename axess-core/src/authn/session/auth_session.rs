@@ -5,7 +5,7 @@ use crate::{
         methods::{
             EnablementState,
             factor::{AuthFactorKind, FactorStateChange},
-            form::{FactorForm, FactorFormKind},
+            form::{FactorForm, FactorFormExt, FactorFormKind, FormField}, // added FactorFormExt
             scope::PermissionScope,
         },
         session::SessionRegistry,
@@ -504,28 +504,59 @@ where
     where
         F: FactorForm + Send + Sync,
     {
-        let fields = form.fields_map();
-        let username = fields.get("username").ok_or(AuthError::UserNotFound)?;
+        // Prefer username lookup (core-friendly, backend-agnostic)
+        let username = form
+            .get_string_field(FormField::Username)
+            .ok_or(AuthError::UserNotFound)?;
 
-        // Resolve tenant
-        let tenant_id = if let Some(name) = fields.get("tenant") {
+        // Resolve tenant: prefer explicit tenant name in form -> session tenant -> backend default.
+        // If session already has a tenant/user, do not allow a different tenant to be selected via form.
+        let tenant_id = if let Some(tenant_name) = form.get_string_field(FormField::Tenant) {
+            // If session already associated with a tenant, ensure it matches the supplied tenant.
+            if let Some(current_tid) = self.get_tenant_id() {
+                // Look up the named tenant to compare ids
+                let named = self
+                    .backend
+                    .get_tenant_by_name(&tenant_name)
+                    .await
+                    .map_err(AuthError::BackendError)?;
+                // convert tenant::Id -> backend::TenantId (From bound exists)
+                let named_tid: B::TenantId = named.id().clone().into();
+                if &named_tid != current_tid {
+                    // Session already tied to another tenant — treat as invalid scope
+                    error!(
+                        "Tenant in form ({}) does not match session tenant ({:?})",
+                        tenant_name, current_tid
+                    );
+                    return Err(AuthError::InvalidScope);
+                }
+                // Use current session tenant
+                current_tid.clone()
+            } else {
+                // No session tenant — use the tenant named in the form
+                let named = self
+                    .backend
+                    .get_tenant_by_name(&tenant_name)
+                    .await
+                    .map_err(AuthError::BackendError)?;
+                // convert and return backend TenantId
+                named.id().clone().into()
+            }
+        } else if let Some(tid) = self.get_tenant_id() {
+            // Use tenant from session if present
+            tid.clone()
+        } else {
+            // Fallback to backend default tenant
             self.backend
-                .get_tenant_by_name(name)
+                .get_default_tenant_id()
                 .await
                 .map_err(AuthError::BackendError)?
-                .id()
-                .clone()
-                .into()
-        } else {
-            self.get_tenant_id()
-                .cloned()
-                .ok_or(AuthError::UserNotFound)?
         };
 
-        // Look up user by username and tenant
+        // Lookup user by tenant + username (backend-agnostic)
         let user = self
             .backend
-            .get_user_by_name(&tenant_id, username)
+            .get_user_by_name(&tenant_id, &username)
             .await
             .map_err(AuthError::BackendError)?;
 
@@ -628,7 +659,7 @@ where
         match self.verify_factor(form, &factor_id).await {
             Ok(()) => {
                 debug!("First factor verified successfully");
-                let requested_next_route = form.fields_map().get("next").cloned();
+                let requested_next_route = form.get_string_field(FormField::Next);
                 self.apply_factor(&factor_id, requested_next_route).await
             }
             Err(_) => {
@@ -681,7 +712,7 @@ where
         self.verify_factor(form, &factor.id).await?;
 
         // Apply the factor to the current state and determine next step (partial or authenticated)
-        let requested_next_route = form.fields_map().get("next").cloned();
+        let requested_next_route = form.get_string_field(FormField::Next);
         self.apply_factor(&factor.id, requested_next_route).await
     }
 
@@ -991,6 +1022,10 @@ where
                 // Store OAuth provider configuration
                 config.insert("provider".to_string(), serde_json::json!(credential));
             }
+            AuthFactorKind::Custom(_) => {
+                // For custom factors, store credential as-is
+                config.insert("credential".to_string(), serde_json::json!(credential));
+            }
         }
 
         // 6. Create FactorStateChange to enable the factor
@@ -1008,8 +1043,7 @@ where
         debug!("Factor setup successful");
 
         // 8. Return success response
-        let fields = form.fields_map();
-        let next = fields.get("next").cloned();
+        let next = form.get_string_field(FormField::Next);
         let redirect_url = self.get_next_route(next).await;
 
         Ok(Redirect::to(&redirect_url).into_response())

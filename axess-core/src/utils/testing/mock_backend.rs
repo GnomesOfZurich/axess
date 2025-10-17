@@ -792,8 +792,8 @@ impl AuthnAdminBackend for MockBackend {
         &self,
         method: AuthMethod<Self>,
     ) -> Result<AuthMethod<Self>, Self::Error> {
-        let method_id = format!("method_{}", self.auth_methods.len());
-        self.auth_methods.insert(method_id, method.clone());
+        // Use the method's actual ID instead of generating a new one
+        self.auth_methods.insert(method.id.clone(), method.clone());
         Ok(method)
     }
 
@@ -814,8 +814,8 @@ impl AuthnAdminBackend for MockBackend {
         &self,
         factor: AuthFactor<Self>,
     ) -> Result<AuthFactor<Self>, Self::Error> {
-        let factor_id = format!("factor_{}", self.auth_factors.len());
-        self.auth_factors.insert(factor_id, factor.clone());
+        // Use the factor's actual ID instead of generating a new one
+        self.auth_factors.insert(factor.id.clone(), factor.clone());
         Ok(factor)
     }
 

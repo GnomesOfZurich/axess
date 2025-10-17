@@ -23,7 +23,7 @@ use crate::models::{
 use axess::{
     AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind, AuthFactorState,
     AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, EnablementState, EntityState,
-    FactorForm, PermissionScope,
+    FactorForm, FactorFormExt, FormField, PermissionScope,
 };
 
 const DEFAULT_TENANT_NAME: &str = "Default Tenant";
@@ -31,16 +31,6 @@ const SYSTEM_SUPER_USER_NAME: &str = "system";
 const TENANT_SUPER_USER_NAME: &str = "tenant";
 
 pub type DataId = String;
-
-/// Trait for extracting password from a factor form.
-pub trait PasswordProvider {
-    fn password(&self) -> &str;
-}
-
-/// Trait for extracting username from a factor form.
-pub trait UsernameProvider {
-    fn username(&self) -> &str;
-}
 
 /// Example backend implementation.
 #[derive(Debug, Clone)]
@@ -58,6 +48,26 @@ impl PartialEq for OurBackend {
     fn eq(&self, _other: &Self) -> bool {
         true
     }
+}
+
+// Small parsing helpers used when reading enum values stored as text in the DB.
+fn parse_enum_or_default<T>(s: Option<String>) -> T
+where
+    T: std::str::FromStr,
+{
+    match s {
+        Some(st) => st.parse::<T>().unwrap_or_else(|_| {
+            panic!("Failed to parse enum from database text: {}", st);
+        }),
+        None => panic!("Missing enum text value in database row"),
+    }
+}
+
+fn parse_enum_option<T>(s: Option<String>) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    s.and_then(|st| st.parse::<T>().ok())
 }
 
 // Implement the AuthnBackend trait for OurBackend to define the associated types.
@@ -107,16 +117,15 @@ impl AuthnBackend for OurBackend {
 
     async fn get_default_tenant_id(&self) -> Result<Self::TenantId, Self::Error> {
         let mut conn = self.db.acquire().await?;
-        let row = sqlx::query("SELECT tenant_id FROM tenants WHERE name = ?")
+        let row = sqlx::query("SELECT id FROM tenants WHERE name = ?")
             .bind(DEFAULT_TENANT_NAME)
             .fetch_one(&mut *conn)
             .await?;
 
-        Uuid::parse_str(row.try_get::<String, _>("tenant_id")?.as_str()).map_err(|e| {
-            sqlx::Error::ColumnDecode {
-                index: "tenant_id".into(),
-                source: Box::new(e),
-            }
+        let id_str: String = row.try_get("id")?;
+        Uuid::parse_str(&id_str).map_err(|e| sqlx::Error::ColumnDecode {
+            index: "tenant".into(),
+            source: Box::new(e),
         })
     }
 
@@ -175,7 +184,7 @@ impl AuthnBackend for OurBackend {
     ) -> Result<Self::User, Self::Error> {
         let mut conn = self.db.acquire().await?;
         let row = sqlx::query(
-            "UPDATE users SET user_state = ? WHERE id = ? RETURNING id, username, password, tenant_id, user_state, factors, methods"
+            "UPDATE users SET state = ? WHERE id = ? RETURNING id, username, password, tenant_id, state, factors, methods"
         )
             .bind(format!("{new_state:?}"))
             .bind(user_id.to_string())
@@ -206,7 +215,7 @@ impl AuthnBackend for OurBackend {
         method_id: &<OurBackend as AuthnBackend>::MethodId,
     ) -> Result<AuthMethod<OurBackend>, Self::Error> {
         let mut conn = self.db.acquire().await?;
-        let row = sqlx::query("SELECT * FROM methods WHERE id = ?")
+        let row = sqlx::query("SELECT * FROM auth_methods WHERE id = ?")
             .bind(method_id.to_string())
             .fetch_one(&mut *conn)
             .await?;
@@ -221,7 +230,7 @@ impl AuthnBackend for OurBackend {
         let mut conn = self.db.acquire().await?;
         let rows: Vec<OurAuthMethod> = sqlx::query_as(
             r#"
-            SELECT * FROM auth_methods
+            SELECT * FROM auth_methods  
             "#,
         )
         .fetch_all(&mut *conn)
@@ -314,6 +323,9 @@ impl AuthnBackend for OurBackend {
 
         let mut conn = self.db.acquire().await?;
         let rows: Vec<OurAuthMethod> = sql.fetch_all(&mut *conn).await?;
+
+        eprintln!("get_scoped_auth_methods returned rows: {}", rows.len());
+
         let methods: Vec<AuthMethod<OurBackend>> = rows
             .into_iter()
             .map(AuthMethod::<OurBackend>::from)
@@ -524,8 +536,11 @@ impl AuthnBackend for OurBackend {
             WHERE EXISTS (
                 SELECT * FROM factor_states s
                 WHERE s.factor_id = f.id
-                AND s.tenant_id = ?1
-                AND s.user_id = ?2
+                AND (
+                    (s.tenant_id IS NULL AND s.user_id IS NULL) -- global
+                    OR (s.tenant_id = ?1 AND s.user_id IS NULL) -- tenant-level
+                    OR (s.tenant_id = ?1 AND s.user_id = ?2)    -- user-level
+                )
                 AND s.state = ?3
             )
             "#,
@@ -537,6 +552,11 @@ impl AuthnBackend for OurBackend {
             ),
         };
 
+        eprintln!(
+            "get_scoped_auth_factors SQL query: {}, binds: {:?}",
+            query, binds
+        );
+
         let mut sql = sqlx::query_as::<_, OurAuthFactor>(query);
         for bind in binds {
             match bind {
@@ -547,6 +567,9 @@ impl AuthnBackend for OurBackend {
 
         let mut conn = self.db.acquire().await?;
         let rows: Vec<OurAuthFactor> = sql.fetch_all(&mut *conn).await?;
+
+        eprintln!("get_scoped_auth_factors returned rows: {}", rows.len());
+
         let factors: Vec<AuthFactor<OurBackend>> = rows
             .into_iter()
             .map(AuthFactor::<OurBackend>::from)
@@ -684,48 +707,80 @@ impl AuthnBackend for OurBackend {
         event_type: Option<AuthEventType>,
         event_status: Option<AuthEventStatus>,
         limit: Option<usize>,
-    ) -> Result<Vec<axess::AuthEvent<Self>>, Self::Error> {
+    ) -> Result<Vec<axess::AuthEvent<OurBackend>>, Self::Error> {
         let mut conn = self.db.acquire().await?;
 
-        let mut query = String::from("SELECT * FROM auth_events WHERE user_id = ?");
+        // Base query selects events for the given user
+        let mut query = String::from("SELECT * FROM authn_hist WHERE user_id = ?");
         let mut binds: Vec<String> = vec![user_id.to_string()];
 
         if let Some(event_type) = event_type {
             query.push_str(" AND event_type = ?");
-            binds.push(format!("{:?}", event_type));
+            binds.push(event_type.as_str().to_string());
         }
 
         if let Some(event_status) = event_status {
             query.push_str(" AND event_status = ?");
-            binds.push(format!("{:?}", event_status));
+            binds.push(event_status.as_str().to_string());
         }
 
+        // Order results by event_time descending so the newest events come first
         query.push_str(" ORDER BY event_time DESC");
 
-        if let Some(limit) = limit {
+        // Apply optional limit if provided
+        if let Some(l) = limit {
             query.push_str(" LIMIT ?");
-            binds.push(limit.to_string());
+            binds.push(l.to_string());
         }
 
+        // Prepare and execute the query, binding the collected parameters to produce `rows`
         let mut sql = sqlx::query(&query);
-        for bind in binds {
-            sql = sql.bind(bind);
+        for b in binds {
+            sql = sql.bind(b);
         }
-
         let rows = sql.fetch_all(&mut *conn).await?;
+
         let events: Vec<axess::AuthEvent<OurBackend>> = rows
             .into_iter()
             .map(|row| {
-                // Map the row fields to AuthEvent struct
-                // You'll need to adjust these field names based on your actual schema
+                // Safely extract optional text fields and parse defensively.
+                let event_type_txt = row
+                    .try_get::<Option<String>, _>("event_type")
+                    .ok()
+                    .flatten();
+                let event_status_txt = row
+                    .try_get::<Option<String>, _>("event_status")
+                    .ok()
+                    .flatten();
+                let method_id_txt = row.try_get::<Option<String>, _>("method_id").ok().flatten();
+                let factor_id_txt = row.try_get::<Option<String>, _>("factor_id").ok().flatten();
+                let factor_kind_txt = row
+                    .try_get::<Option<String>, _>("factor_kind")
+                    .ok()
+                    .flatten();
+                let event_time_txt = row
+                    .try_get::<Option<String>, _>("event_time")
+                    .ok()
+                    .flatten();
+
                 axess::AuthEvent {
-                    id: row.try_get::<String, _>("id").unwrap_or_default(),
+                    id: row
+                        .try_get::<Option<String>, _>("id")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
                     user_id: Uuid::parse_str(
-                        row.try_get::<String, _>("user_id").as_deref().unwrap_or(""),
+                        row.try_get::<Option<String>, _>("user_id")
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            .unwrap_or(""),
                     )
                     .unwrap_or(Uuid::nil()),
                     tenant_id: Uuid::parse_str(
-                        row.try_get::<String, _>("tenant_id")
+                        row.try_get::<Option<String>, _>("tenant_id")
+                            .ok()
+                            .flatten()
                             .as_deref()
                             .unwrap_or(""),
                     )
@@ -734,37 +789,21 @@ impl AuthnBackend for OurBackend {
                         .try_get::<Option<String>, _>("session_id")
                         .ok()
                         .flatten(),
-                    event_type: row
-                        .try_get::<String, _>("event_type")
-                        .ok()
-                        .and_then(|et| serde_json::from_str(&format!("\"{}\"", et)).ok())
-                        .unwrap_or(AuthEventType::Authenticated),
-                    event_status: row
-                        .try_get::<String, _>("event_status")
-                        .ok()
-                        .and_then(|es| serde_json::from_str(&format!("\"{}\"", es)).ok())
-                        .unwrap_or(AuthEventStatus::Success),
-                    event_time: row
-                        .try_get::<String, _>("event_time")
-                        .ok()
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
+                    // use parsing helpers to tolerate empty/null text and parse enums via FromStr
+                    event_type: parse_enum_or_default::<axess::AuthEventType>(
+                        event_type_txt.clone(),
+                    ),
+                    event_status: parse_enum_or_default::<axess::AuthEventStatus>(
+                        event_status_txt.clone(),
+                    ),
+                    event_time: event_time_txt
+                        .as_deref()
+                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or(Utc::now()),
-                    method_id: row
-                        .try_get::<Option<String>, _>("method_id")
-                        .ok()
-                        .flatten()
-                        .and_then(|mid| Uuid::parse_str(&mid).ok()),
-                    factor_id: row
-                        .try_get::<Option<String>, _>("factor_id")
-                        .ok()
-                        .flatten()
-                        .and_then(|fid| Uuid::parse_str(&fid).ok()),
-                    factor_kind: row
-                        .try_get::<Option<String>, _>("factor_kind")
-                        .ok()
-                        .flatten()
-                        .and_then(|fk| serde_json::from_str(&format!("\"{}\"", fk)).ok()),
+                    method_id: method_id_txt.and_then(|mid| Uuid::parse_str(&mid).ok()),
+                    factor_id: factor_id_txt.and_then(|fid| Uuid::parse_str(&fid).ok()),
+                    factor_kind: parse_enum_option::<axess::AuthFactorKind>(factor_kind_txt),
                     ip_address: row
                         .try_get::<Option<String>, _>("ip_address")
                         .ok()
@@ -803,26 +842,26 @@ impl AuthnBackend for OurBackend {
         let mut conn = self.db.acquire().await?;
         let now = Utc::now();
 
+        // omit `id` so SQLite will use AUTOINCREMENT integer key
         sqlx::query(
             r#"
-                INSERT INTO auth_events (
-                    id, user_id, tenant_id, session_id, event_type, event_status,
-                    event_time, method_id, factor_id, factor_kind, ip_address,
-                    user_agent, error_message
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                "#,
+            INSERT INTO authn_hist (
+                user_id, tenant_id, session_id, event_type, event_status,
+                event_time, method_id, factor_id, factor_kind, ip_address,
+                user_agent, error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
         )
-        .bind(Uuid::new_v4().to_string())
         .bind(event.user_id.to_string())
         .bind(event.tenant_id.to_string())
         .bind(event.session_id)
-        .bind(format!("{:?}", event.event_type))
-        .bind(format!("{:?}", event.event_status))
+        .bind(event.event_type.as_str())
+        .bind(event.event_status.as_str())
         .bind(now.to_rfc3339())
         .bind(event.method_id.map(|m| m.to_string()))
         .bind(event.factor_id.map(|f| f.to_string()))
-        .bind(event.factor_kind.map(|fk| format!("{:?}", fk)))
+        .bind(event.factor_kind.map(|fk| fk.to_string()))
         .bind(event.ip_address)
         .bind(event.user_agent)
         .bind(event.error_message)
@@ -837,15 +876,18 @@ impl AuthnBackend for OurBackend {
     where
         F: FactorForm + Send + Sync,
     {
-        let fields = creds.fields_map();
         let factor_kind = creds.factor_kind();
 
-        // 1. Resolve tenant and username from form fields
-        let tenant_id = fields
-            .get("tenant")
-            .and_then(|tid| Uuid::parse_str(tid).ok())
-            .unwrap_or(Uuid::nil());
-        let username = fields.get("username").map(|s| s.as_str()).unwrap_or("");
+        // 1. Resolve tenant and username from the typed helpers
+        let tenant_id = match creds.get_string_field(FormField::Tenant) {
+            Some(t) => Uuid::parse_str(&t).unwrap_or(Uuid::nil()),
+            None => Uuid::nil(),
+        };
+        // keep the owned Option<String> so any borrowed references remain valid,
+        // or simply take an owned String directly to avoid borrowed temporaries.
+        let username = creds
+            .get_string_field(FormField::Username)
+            .unwrap_or_default();
 
         // 2. Lookup user by tenant and username
         let mut conn = self.db.acquire().await?;
@@ -859,8 +901,9 @@ impl AuthnBackend for OurBackend {
 
         // 3. Check user state
         if user.state != EntityState::Active {
-            // TODO: improve error handling in the example app backend !!!
-            return Err(sqlx::Error::RowNotFound);
+            return Err(sqlx::Error::Decode(
+                format!("User account is not active (state: {:?})", user.state).into(),
+            ));
         }
 
         // 4. Lookup factors for this user using the backend's scoped factor lookup
@@ -907,7 +950,8 @@ impl AuthnBackend for OurBackend {
                             "Missing password hash in factor state",
                         )),
                     })?;
-                let password = fields.get("password").map(|s| s.as_str()).unwrap_or("");
+                // prefer the generic credential() accessor for primary auth values
+                let password = creds.credential().unwrap_or("");
                 verify_password(password, password_hash)
                     .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
                 Ok(user)
@@ -925,7 +969,7 @@ impl AuthnBackend for OurBackend {
                             "Missing TOTP secret in factor state",
                         )),
                     })?;
-                let totp_code = fields.get("totp_code").map(|s| s.as_str()).unwrap_or("");
+                let totp_code = creds.credential().unwrap_or("");
                 if !verify_totp(totp_secret, totp_code) {
                     return Err(sqlx::Error::Protocol("Invalid TOTP code".to_string()));
                 }
@@ -937,6 +981,14 @@ impl AuthnBackend for OurBackend {
                 Err(sqlx::Error::Protocol(
                     "OAuth factor authentication not implemented".to_string(),
                 ))
+            }
+            AuthFactorKind::Custom(name) => {
+                // Custom factor kinds are not handled by this backend example.
+                // Return a protocol error indicating the custom kind is unsupported.
+                Err(sqlx::Error::Protocol(format!(
+                    "Custom factor authentication not implemented for kind: {}",
+                    name
+                )))
             }
         }
     }
@@ -958,28 +1010,34 @@ impl AuthnAdminBackend for OurBackend {
             r#"
             INSERT INTO users (
             id,
-            username,
             tenant_id,
-            user_state,
+            username,
+            fullname,
+            email,
+            state,
             created_at,
             created_by,
             updated_at,
             updated_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
             username = excluded.username,
             tenant_id = excluded.tenant_id,
-            user_state = excluded.user_state,
+            fullname = excluded.fullname,
+            email = excluded.email,
+            state = excluded.state,
             created_at = excluded.created_at,
             created_by = excluded.created_by,
             updated_at = excluded.updated_at,
             updated_by = excluded.updated_by
             RETURNING
             id,
-            username,
             tenant_id,
-            user_state,
+            username,
+            fullname,
+            email,
+            state,
             created_at,
             created_by,
             updated_at,
@@ -987,8 +1045,10 @@ impl AuthnAdminBackend for OurBackend {
             "#,
         )
         .bind(user.id.to_string())
+        .bind(user.tenant_id.to_string()) // tenant_id must be second (matches INSERT column order)
         .bind(&user.username)
-        .bind(user.tenant_id.to_string())
+        .bind(&user.fullname)
+        .bind(&user.email)
         .bind(format!("{:?}", user.state))
         .bind(user.created_at.to_rfc3339())
         .bind(user.created_by.to_string())
