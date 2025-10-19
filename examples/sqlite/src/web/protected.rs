@@ -21,18 +21,24 @@ pub fn router() -> Router<()> {
 
 mod get {
     use super::*;
+    use tracing::error;
 
     pub async fn protected(auth_session: OurAuthSession) -> impl IntoResponse {
         match auth_session.user() {
-            Ok(user) => Html(
-                ProtectedTemplate {
+            Ok(user) => {
+                match (ProtectedTemplate {
                     username: &user.username,
-                    messages: &[], // Provide an empty array or actual messages as needed
+                    messages: &[],
                 }
-                .render()
-                .unwrap(),
-            )
-            .into_response(),
+                .render())
+                {
+                    Ok(body) => Html(body).into_response(),
+                    Err(e) => {
+                        error!(error = %e, "failed to render protected template");
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    }
+                }
+            }
             Err(_err) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }

@@ -51,35 +51,53 @@ fn parse_state(s: &str) -> axess::EntityState {
 
 impl<'r> FromRow<'r, SqliteRow> for OurTenant {
     fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
-        Ok(Self {
-            id: Uuid::parse_str(row.try_get::<String, _>("id")?.as_str()).unwrap(),
-            name: row.try_get("name")?,
-            description: row.try_get("description")?,
-            state: match row.try_get::<String, _>("state")?.as_str() {
-                "Active" => EntityState::Active,
-                "Guest" => EntityState::Guest,
-                other => {
-                    return Err(sqlx::Error::ColumnDecode {
-                        index: "state".into(),
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("Unknown tenant state: {other}"),
-                        )),
-                    });
+        // parse id with proper error mapping
+        let id_str: String = row.try_get("id")?;
+        let id = Uuid::parse_str(&id_str).map_err(|e| sqlx::Error::ColumnDecode {
+            index: "id".into(),
+            source: Box::new(e),
+        })?;
+
+        // name/description
+        let name: String = row.try_get("name")?;
+        let description: String = row.try_get("description")?;
+
+        // state: prefer tolerant parsing using parse_state, fall back to Guest if absent
+        let state_txt: Option<String> = row.try_get::<Option<String>, _>("state").ok().flatten();
+        let state = state_txt
+            .as_deref()
+            .map(parse_state)
+            .unwrap_or(axess::EntityState::Guest);
+
+        // created_at / updated_at using shared flexible parser
+        let created_at = parse_datetime_flexible_row(row, "created_at")?.unwrap_or_else(Utc::now);
+        let updated_at = parse_datetime_flexible_row(row, "updated_at")?.unwrap_or_else(Utc::now);
+
+        // created_by / updated_by with UUID error mapping
+        let created_by =
+            Uuid::parse_str(&row.try_get::<String, _>("created_by")?).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "created_by".into(),
+                    source: Box::new(e),
                 }
-            },
-            created_at: row
-                .try_get::<Option<String>, _>("created_at")?
-                .as_deref()
-                .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
-            created_by: Uuid::parse_str(row.try_get::<String, _>("created_by")?.as_str()).unwrap(),
-            updated_at: row
-                .try_get::<Option<String>, _>("updated_at")?
-                .as_deref()
-                .map(|s| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc))
-                .unwrap_or_else(Utc::now),
-            updated_by: Uuid::parse_str(row.try_get::<String, _>("updated_by")?.as_str()).unwrap(),
+            })?;
+        let updated_by =
+            Uuid::parse_str(&row.try_get::<String, _>("updated_by")?).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "updated_by".into(),
+                    source: Box::new(e),
+                }
+            })?;
+
+        Ok(Self {
+            id,
+            name,
+            description,
+            state,
+            created_at,
+            created_by,
+            updated_at,
+            updated_by,
         })
     }
 }
@@ -157,58 +175,58 @@ impl AuthUser for OurUser {
 
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for OurUser {
     fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
-        // read string columns
+        // read string columns defensively
         let id_str: String = row.try_get("id")?;
-        let tenant_id_str: String = row.try_get("tenant_id")?;
-        let username: String = row.try_get("username")?;
-        let fullname: Option<String> = row.try_get("fullname")?;
-        let email: String = row.try_get("email")?;
-
-        // parse UUIDs
-        let id = Uuid::parse_str(id_str.as_str()).map_err(|e| sqlx::Error::ColumnDecode {
+        let tenant_str: String = row.try_get("tenant_id")?;
+        let id = uuid::Uuid::parse_str(&id_str).map_err(|e| sqlx::Error::ColumnDecode {
             index: "id".into(),
             source: Box::new(e),
         })?;
         let tenant_id =
-            Uuid::parse_str(tenant_id_str.as_str()).map_err(|e| sqlx::Error::ColumnDecode {
+            uuid::Uuid::parse_str(&tenant_str).map_err(|e| sqlx::Error::ColumnDecode {
                 index: "tenant_id".into(),
                 source: Box::new(e),
             })?;
 
-        // state: try "user_state" then fallback to "state"
-        let state_txt_opt: Option<String> = match row.try_get("user_state") {
-            Ok(v) => v,
-            Err(_) => row.try_get("state").unwrap_or(None),
-        };
-        let state = state_txt_opt
+        // Prefer user_state then state, fallback to Guest
+        let state_txt: Option<String> = row
+            .try_get::<Option<String>, _>("user_state")
+            .ok()
+            .flatten()
+            .or_else(|| row.try_get::<Option<String>, _>("state").ok().flatten());
+        let state = state_txt
             .as_deref()
             .map(parse_state)
             .unwrap_or(axess::EntityState::Guest);
 
-        // created_at / updated_at: accept either RFC3339 TEXT or INTEGER epoch
+        // created_at/updated_at tolerant parsing
         let created_at = parse_datetime_flexible_row(row, "created_at")?.unwrap_or_else(Utc::now);
         let updated_at = parse_datetime_flexible_row(row, "updated_at")?.unwrap_or(created_at);
 
-        let created_by_str: String = row.try_get("created_by")?;
-        let updated_by_str: String = row.try_get("updated_by")?;
-
+        // created_by/updated_by UUID parsing with error mapping
         let created_by =
-            Uuid::parse_str(created_by_str.as_str()).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "created_by".into(),
-                source: Box::new(e),
+            uuid::Uuid::parse_str(&row.try_get::<String, _>("created_by")?).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "created_by".into(),
+                    source: Box::new(e),
+                }
             })?;
         let updated_by =
-            Uuid::parse_str(updated_by_str.as_str()).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "updated_by".into(),
-                source: Box::new(e),
+            uuid::Uuid::parse_str(&row.try_get::<String, _>("updated_by")?).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "updated_by".into(),
+                    source: Box::new(e),
+                }
             })?;
 
         Ok(OurUser {
             id,
             tenant_id,
-            username,
-            fullname: fullname.unwrap_or_default(),
-            email,
+            username: row.try_get("username")?,
+            fullname: row
+                .try_get::<Option<String>, _>("fullname")?
+                .unwrap_or_default(),
+            email: row.try_get("email")?,
             state,
             created_at,
             created_by,

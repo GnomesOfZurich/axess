@@ -11,22 +11,12 @@ use totp_rs::{Algorithm, TOTP};
 
 #[cfg(feature = "authn")]
 pub fn verify_totp(secret: &str, code: &str) -> bool {
-    let totp = TOTP::new(Algorithm::SHA1, 6, 30, 1, secret.as_bytes().to_vec());
-    totp.expect("Failed to get TOTP")
-        .check_current(code)
-        .unwrap_or(false)
-
-    // async fn verify_totp(&self, user: &User, totp_code: &str) -> Result<bool, Self::Error> {
-    //     // TODO: Implement TOTP verification
-
-    //     let totp = TOTP::new(
-    //         Algorithm::SHA1,
-    //         6,
-    //         1,
-    //         30,
-    //         user.otp_secret.as_ref().unwrap().clone().into_bytes(),
-    //     )?;
-
-    //     Ok(totp.check_current(totp_code)?)
-    // }
+    // Create TOTP safely and return false on any construction/check error
+    match TOTP::new(Algorithm::SHA1, 6, 30, 1, secret.as_bytes().to_vec()) {
+        Ok(totp) => totp.check_current(code).unwrap_or(false),
+        Err(e) => {
+            tracing::error!("TOTP creation failed: {:?}", e);
+            false
+        }
+    }
 }

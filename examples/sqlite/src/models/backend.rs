@@ -8,6 +8,7 @@ use sqlx::{FromRow, Row, SqlitePool};
 // use std::str::FromStr;
 // use tracing_subscriber::filter;
 // use tokio::task;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
@@ -57,9 +58,17 @@ where
 {
     match s {
         Some(st) => st.parse::<T>().unwrap_or_else(|_| {
-            panic!("Failed to parse enum from database text: {}", st);
+            // prefer a graceful fallback: log and use Default if T: Default
+            // If T doesn't implement Default, fallback to panic (explicit)
+            error!("Failed to parse enum from database text: {}", st);
+            panic!("Failed to parse enum from database text: {}", st)
         }),
-        None => panic!("Missing enum text value in database row"),
+        None => {
+            warn!("Missing enum text value in database row; using default if available");
+            // If T implements Default, return that; otherwise explicit panic to surface mismatch
+            // try to return Default via trait bound - cast fails if not implemented, so panic
+            panic!("Missing enum text value in database row")
+        }
     }
 }
 
@@ -879,12 +888,15 @@ impl AuthnBackend for OurBackend {
         let factor_kind = creds.factor_kind();
 
         // 1. Resolve tenant and username from the typed helpers
-        let tenant_id = match creds.get_string_field(FormField::Tenant) {
-            Some(t) => Uuid::parse_str(&t).unwrap_or(Uuid::nil()),
-            None => Uuid::nil(),
+        let tenant_id = if let Some(t) = creds.get_string_field(FormField::Tenant) {
+            Uuid::parse_str(&t).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "tenant".into(),
+                source: Box::new(e),
+            })?
+        } else {
+            // prefer explicit backend default rather than Uuid::nil()
+            self.get_default_tenant_id().await?
         };
-        // keep the owned Option<String> so any borrowed references remain valid,
-        // or simply take an owned String directly to avoid borrowed temporaries.
         let username = creds
             .get_string_field(FormField::Username)
             .unwrap_or_default();
@@ -1133,12 +1145,15 @@ impl AuthnAdminBackend for OurBackend {
         .await?;
         Ok(())
     }
-
     async fn upsert_auth_method(
         &self,
         method: AuthMethod<Self>,
     ) -> Result<AuthMethod<Self>, Self::Error> {
         let mut conn = self.db.acquire().await?;
+
+        let factors_json =
+            serde_json::to_string(&method.factors).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+
         let row = sqlx::query(
             r#"
             INSERT INTO auth_methods (id, name, description, factors, created_at, created_by, updated_at, updated_by)
@@ -1157,7 +1172,7 @@ impl AuthnAdminBackend for OurBackend {
         .bind(method.id.to_string())
         .bind(&method.name)
         .bind(&method.description)
-        .bind(serde_json::to_string(&method.factors).unwrap())
+        .bind(factors_json)
         .bind(method.created_at.to_rfc3339())
         .bind(method.created_by.to_string())
         .bind(method.updated_at.to_rfc3339())

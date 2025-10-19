@@ -571,9 +571,10 @@ mod tests {
         let fields = form.fields();
         assert_eq!(fields.len(), 4);
 
-        match fields.get(&FormField::Username).unwrap() {
-            FormFieldValue::String(s) => assert_eq!(s.as_ref(), "testuser"),
-            _ => panic!("Expected String"),
+        match fields.get(&FormField::Username) {
+            Some(FormFieldValue::String(s)) => assert_eq!(s.as_ref(), "testuser"),
+            Some(_) => panic!("Expected FormFieldValue::String for Username"),
+            None => panic!("Username field is missing from fields()"),
         }
     }
 
@@ -791,10 +792,13 @@ mod tests {
             next: None,
         };
 
-        assert!(form.require_string_field(FormField::Username).is_ok());
         assert_eq!(
-            form.require_string_field(FormField::Tenant).unwrap(),
-            "default"
+            form.require_string_field(FormField::Username),
+            Ok("bob".to_string())
+        );
+        assert_eq!(
+            form.require_string_field(FormField::Tenant),
+            Ok("default".to_string())
         );
     }
 

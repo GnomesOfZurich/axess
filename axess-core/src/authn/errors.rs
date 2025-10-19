@@ -10,7 +10,7 @@ use thiserror::Error as ThisError;
 use tower_sessions::session::Error as SessionError;
 
 /// Form validation errors
-#[derive(ThisError, Debug)]
+#[derive(ThisError, Debug, PartialEq)]
 pub enum FormError {
     #[error("Invalid form data")]
     InvalidFormData,

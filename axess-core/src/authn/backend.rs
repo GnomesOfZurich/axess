@@ -407,44 +407,45 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_get_new_guest_user_returns_guest() {
+    async fn test_get_new_guest_user_returns_guest()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
         let guest = backend
             .get_new_guest_user(Some(&TestTenantId("t1".to_string())))
-            .await
-            .unwrap();
+            .await?;
         assert_eq!(guest.get_user_state(), EntityState::Guest);
         assert_eq!(guest.tenant_id(), &TestTenantId("t1".to_string()));
+        Ok(())
     }
 
     #[cfg(feature = "admin")]
     #[tokio::test]
-    async fn test_get_user_returns_active_user() {
+    async fn test_get_user_returns_active_user()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
         let user = MockUser {
             id: TestUserId("u1".to_string()),
             tenant_id: TestTenantId("t1".to_string()),
             state: EntityState::Active,
         };
-        backend.upsert_user(user.clone()).await.unwrap();
+        backend.upsert_user(user.clone()).await?;
 
-        let fetched = backend
-            .get_user(&TestUserId("u1".to_string()))
-            .await
-            .unwrap();
+        let fetched = backend.get_user(&TestUserId("u1".to_string())).await?;
         assert_eq!(fetched.get_user_state(), EntityState::Active);
+        Ok(())
     }
 
     #[cfg(feature = "admin")]
     #[tokio::test]
-    async fn test_set_user_state_changes_state() {
+    async fn test_set_user_state_changes_state()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
         let user = MockUser {
             id: TestUserId("u2".to_string()),
             tenant_id: TestTenantId("t2".to_string()),
             state: EntityState::Active,
         };
-        backend.upsert_user(user.clone()).await.unwrap();
+        backend.upsert_user(user.clone()).await?;
 
         let updated = backend
             .set_user_state(
@@ -456,37 +457,40 @@ mod tests {
                     metadata: None,
                 }),
             )
-            .await
-            .unwrap();
+            .await?;
         assert!(matches!(
             updated.get_user_state(),
             EntityState::Suspended(_)
         ));
+        Ok(())
     }
-
     #[cfg(feature = "admin")]
     #[tokio::test]
-    async fn test_upsert_user_roundtrip() {
+    async fn test_upsert_user_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
         let user = MockUser {
             id: TestUserId("u3".to_string()),
             tenant_id: TestTenantId("t3".to_string()),
             state: EntityState::Active,
         };
-        let upserted = backend.upsert_user(user.clone()).await.unwrap();
+        let upserted = backend.upsert_user(user.clone()).await?;
         assert_eq!(upserted, user);
+        Ok(())
     }
 
     #[cfg(feature = "admin")]
     #[tokio::test]
-    async fn test_upsert_and_get_tenant_roundtrip() {
+    async fn test_upsert_and_get_tenant_roundtrip()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
         let tenant = MockTenant::default().with_id(TestTenantId("tenant42".to_string()));
-        let upserted = backend.upsert_tenant(tenant.clone()).await.unwrap();
+        let upserted = backend.upsert_tenant(tenant.clone()).await?;
         assert_eq!(upserted, tenant);
 
-        let fetched = backend.get_tenant(&tenant.id()).await.unwrap();
+        let fetched = backend.get_tenant(&tenant.id()).await?;
         assert_eq!(fetched, tenant);
+
+        Ok(())
     }
 
     #[cfg(feature = "admin")]
@@ -499,10 +503,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_default_tenant_id_returns_default() {
+    async fn test_get_default_tenant_id_returns_default()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
-        let tenant = backend.get_default_tenant_id().await.unwrap();
+        let tenant = backend.get_default_tenant_id().await?;
         assert_eq!(tenant, MockTenant::default().id());
+        Ok(())
     }
 
     #[tokio::test]
@@ -515,27 +521,30 @@ mod tests {
     }
 
     #[test]
-    fn test_user_serialization_deserialization() {
+    fn test_user_serialization_deserialization() -> Result<(), serde_json::Error> {
         let user = MockUser {
             id: TestUserId("u99".to_string()),
             tenant_id: TestTenantId("t99".to_string()),
             state: EntityState::Active,
         };
-        let json = serde_json::to_string(&user).unwrap();
-        let deserialized: MockUser = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&user)?;
+        let deserialized: MockUser = serde_json::from_str(&json)?;
         assert_eq!(user, deserialized);
+        Ok(())
     }
 
     #[test]
-    fn test_tenant_serialization_deserialization() {
+    fn test_tenant_serialization_deserialization() -> Result<(), serde_json::Error> {
         let tenant = TestTenantId("tenant_serial".to_string());
-        let json = serde_json::to_string(&tenant).unwrap();
-        let deserialized: TestTenantId = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&tenant)?;
+        let deserialized: TestTenantId = serde_json::from_str(&json)?;
         assert_eq!(tenant, deserialized);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_auth_method_returns_method() {
+    async fn test_get_auth_method_returns_method()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
 
         #[cfg(feature = "admin")]
@@ -555,13 +564,10 @@ mod tests {
             };
 
             // Upsert the method
-            backend.upsert_auth_method(method.clone()).await.unwrap();
+            backend.upsert_auth_method(method.clone()).await?;
 
             // Test retrieval - convert MethodInstance to AuthMethod for comparison
-            let retrieved = backend
-                .get_auth_method(&"test_method".to_string())
-                .await
-                .unwrap();
+            let retrieved = backend.get_auth_method(&"test_method".to_string()).await?;
 
             assert_eq!(retrieved.id, "test_method");
             assert_eq!(retrieved.name, "Test Method");
@@ -575,10 +581,13 @@ mod tests {
             let result = backend.get_auth_method(&"test_method".to_string()).await;
             assert!(result.is_err());
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_authenticate_with_inactive_user_returns_error() {
+    async fn test_authenticate_with_inactive_user_returns_error()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
 
         #[cfg(feature = "admin")]
@@ -595,23 +604,25 @@ mod tests {
                 }),
             };
 
-            backend.upsert_user(user).await.unwrap();
+            backend.upsert_user(user).await?;
 
             // Verify user state is not active
             let fetched = backend
                 .get_user(&TestUserId("suspended_user".to_string()))
-                .await
-                .unwrap();
+                .await?;
 
             assert!(matches!(
                 fetched.get_user_state(),
                 EntityState::Suspended(_)
             ));
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_record_and_retrieve_auth_event_roundtrip() {
+    async fn test_record_and_retrieve_auth_event_roundtrip()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let backend = MockBackend::default();
 
         let user_id = TestUserId("event_test_user".to_string());
@@ -632,7 +643,7 @@ mod tests {
             error_message: None,
         };
 
-        backend.record_auth_event(event).await.unwrap();
+        backend.record_auth_event(event).await?;
 
         // Retrieve event
         let events = backend
@@ -642,8 +653,7 @@ mod tests {
                 Some(AuthEventStatus::Success),
                 Some(1),
             )
-            .await
-            .unwrap();
+            .await?;
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, AuthEventType::LoginAttempt);
@@ -651,5 +661,7 @@ mod tests {
         assert_eq!(events[0].session_id, Some("session123".to_string()));
         assert_eq!(events[0].ip_address, Some("192.168.1.1".to_string()));
         assert_eq!(events[0].user_agent, Some("Test Agent".to_string()));
+
+        Ok(())
     }
 }

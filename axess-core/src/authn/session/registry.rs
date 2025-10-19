@@ -419,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_registry_basic_operations() {
+    async fn test_session_registry_basic_operations() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
@@ -437,19 +437,18 @@ mod tests {
                 Some(&"tenant1"),
                 "test_hash".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let user_sessions = registry.get_user_sessions(&"user1").await.unwrap();
+        let user_sessions = registry.get_user_sessions(&"user1").await?;
         tracing::info!("User sessions after registration: {:?}", user_sessions);
 
-        let tenant_sessions = registry.get_tenant_sessions(&"tenant1").await.unwrap();
+        let tenant_sessions = registry.get_tenant_sessions(&"tenant1").await?;
         tracing::info!("Tenant sessions after registration: {:?}", tenant_sessions);
 
-        let count = registry.invalidate_user_sessions(&"user1").await.unwrap();
+        let count = registry.invalidate_user_sessions(&"user1").await?;
         tracing::info!("Invalidated user sessions count: {}", count);
 
-        let user_sessions_after = registry.get_user_sessions(&"user1").await.unwrap();
+        let user_sessions_after = registry.get_user_sessions(&"user1").await?;
         tracing::info!(
             "User sessions after invalidation: {:?}",
             user_sessions_after
@@ -459,10 +458,12 @@ mod tests {
         assert_eq!(tenant_sessions, vec![session_id.clone()]);
         assert_eq!(count, 1);
         assert!(user_sessions_after.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_session_registry_multiple_users() {
+    async fn test_session_registry_multiple_users() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
@@ -480,8 +481,7 @@ mod tests {
                 Some(&"tenant1"),
                 "hash1".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
         registry
             .register_session(
                 &session_id2,
@@ -489,8 +489,7 @@ mod tests {
                 Some(&"tenant1"),
                 "hash2".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
         registry
             .register_session(
                 &session_id3,
@@ -498,31 +497,29 @@ mod tests {
                 Some(&"tenant2"),
                 "hash3".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let user1_sessions = registry.get_user_sessions(&"user1").await.unwrap();
+        let user1_sessions = registry.get_user_sessions(&"user1").await?;
         assert_eq!(user1_sessions.len(), 2);
         assert!(user1_sessions.contains(&session_id1));
         assert!(user1_sessions.contains(&session_id3));
 
-        let tenant1_sessions = registry.get_tenant_sessions(&"tenant1").await.unwrap();
+        let tenant1_sessions = registry.get_tenant_sessions(&"tenant1").await?;
         assert_eq!(tenant1_sessions.len(), 2);
         assert!(tenant1_sessions.contains(&session_id1));
         assert!(tenant1_sessions.contains(&session_id2));
 
-        let count = registry
-            .invalidate_tenant_sessions(&"tenant1")
-            .await
-            .unwrap();
+        let count = registry.invalidate_tenant_sessions(&"tenant1").await?;
         assert_eq!(count, 2);
 
-        let user1_sessions_after = registry.get_user_sessions(&"user1").await.unwrap();
+        let user1_sessions_after = registry.get_user_sessions(&"user1").await?;
         assert_eq!(user1_sessions_after, vec![session_id3]);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_session_registry_duplicate_registration() {
+    async fn test_session_registry_duplicate_registration() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
@@ -537,8 +534,7 @@ mod tests {
                 Some(&"tenant1"),
                 "hash".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
         registry
             .register_session(
                 &session_id,
@@ -546,16 +542,17 @@ mod tests {
                 Some(&"tenant1"),
                 "hash_updated".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let user_sessions = registry.get_user_sessions(&"user1").await.unwrap();
+        let user_sessions = registry.get_user_sessions(&"user1").await?;
         assert_eq!(user_sessions.len(), 1);
         assert_eq!(user_sessions, vec![session_id]);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_session_registry_cleanup_operations() {
+    async fn test_session_registry_cleanup_operations() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
@@ -572,8 +569,7 @@ mod tests {
                 Some(&"tenant1"),
                 "hash1".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
         registry
             .register_session(
                 &session_id2,
@@ -581,8 +577,7 @@ mod tests {
                 Some(&"tenant1"),
                 "hash2".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
         registry
             .register_session(
                 &session_id3,
@@ -590,23 +585,25 @@ mod tests {
                 None::<&String>,
                 "hash3".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        registry.invalidate_session(&session_id2).await.unwrap();
-        let tenant1_sessions = registry.get_tenant_sessions(&"tenant1").await.unwrap();
+        registry.invalidate_session(&session_id2).await?;
+        let tenant1_sessions = registry.get_tenant_sessions(&"tenant1").await?;
         assert_eq!(tenant1_sessions.len(), 1);
         assert!(tenant1_sessions.contains(&session_id1));
 
-        let count = registry.invalidate_all_sessions().await.unwrap();
+        let count = registry.invalidate_all_sessions().await?;
         assert_eq!(count, 2); // session_id1 and session_id3 should be invalidated
 
-        let user1_sessions = registry.get_user_sessions(&"user1").await.unwrap();
+        let user1_sessions = registry.get_user_sessions(&"user1").await?;
         assert!(user1_sessions.is_empty());
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_session_registry_persistence_across_instances() {
+    async fn test_session_registry_persistence_across_instances() -> Result<(), SessionRegistryError>
+    {
         let store = MemoryStore::default();
 
         let session_id = tower_sessions::session::Id(21).to_string();
@@ -621,20 +618,21 @@ mod tests {
                     Some(&"tenant1"),
                     "hash".to_string(),
                 )
-                .await
-                .unwrap();
+                .await?;
         }
 
         // Second registry instance using same store
         {
             let registry = StoreSessionRegistry::new(store, 0);
-            let user_sessions = registry.get_user_sessions(&"user1").await.unwrap();
+            let user_sessions = registry.get_user_sessions(&"user1").await?;
             assert_eq!(user_sessions, vec![session_id]);
         }
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_session_registry_edge_cases() {
+    async fn test_session_registry_edge_cases() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
@@ -649,16 +647,17 @@ mod tests {
                 None::<&String>,
                 "hash".to_string(),
             )
-            .await
-            .unwrap();
+            .await?;
 
-        let non_existent_sessions = registry.get_user_sessions(&"non_existent").await.unwrap();
+        let non_existent_sessions = registry.get_user_sessions(&"non_existent").await?;
         assert!(non_existent_sessions.is_empty());
 
-        registry.invalidate_session("non_existent").await.unwrap();
+        registry.invalidate_session("non_existent").await?;
 
-        let all_sessions_count = registry.invalidate_all_sessions().await.unwrap();
+        let all_sessions_count = registry.invalidate_all_sessions().await?;
         assert_eq!(all_sessions_count, 1);
+
+        Ok(())
     }
 
     #[tokio::test]

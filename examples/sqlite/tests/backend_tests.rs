@@ -14,24 +14,36 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-/// Helper to create an in-memory SQLite database with migrations applied
-async fn create_test_backend() -> OurBackend {
-    // Use in-memory SQLite for tests
-    let pool = SqlitePool::connect(":memory:").await.unwrap();
+async fn create_test_pool() -> SqlitePool {
+    // in-memory DB used by tests (isolated)
+    let pool = SqlitePool::connect(":memory:")
+        .await
+        .expect("connect sqlite");
+    // run migrations located at examples/sqlite/migrations (path relative to test crate)
+    let migrator = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations"
+    )))
+    .await
+    .expect("load migrations");
+    migrator.run(&pool).await.expect("apply migrations");
+    pool
+}
 
-    // Run migrations from the example project
-    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+async fn create_test_backend() -> OurBackend {
+    let pool = create_test_pool().await;
 
     OurBackend::new(pool)
 }
 
 #[tokio::test]
-async fn test_get_auth_method_returns_method() {
+async fn test_get_auth_method_returns_method()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = create_test_backend().await;
 
     // Create a test method
     let method_id = Uuid::new_v4();
-    let system_user_id = backend.get_system_user_id(None).await.unwrap();
+    let system_user_id = backend.get_system_user_id(None).await?;
 
     let method: MethodInstance<Uuid, Uuid, Uuid> = MethodInstance {
         id: method_id,
@@ -44,24 +56,23 @@ async fn test_get_auth_method_returns_method() {
         updated_by: system_user_id,
     };
 
-    backend
-        .upsert_auth_method(method.clone().into())
-        .await
-        .unwrap();
+    backend.upsert_auth_method(method.clone().into()).await?;
 
     // Test retrieval
-    let retrieved = backend.get_auth_method(&method_id).await.unwrap();
+    let retrieved = backend.get_auth_method(&method_id).await?;
     assert_eq!(retrieved.id, method_id);
     assert_eq!(retrieved.name, "Test Password Method");
-}
 
+    Ok(())
+}
 #[tokio::test]
-async fn test_authenticate_with_inactive_user_returns_error() {
+async fn test_authenticate_with_inactive_user_returns_error()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = create_test_backend().await;
 
     // Get default tenant
-    let tenant_id = backend.get_default_tenant_id().await.unwrap();
-    let system_user_id = backend.get_system_user_id(None).await.unwrap();
+    let tenant_id = backend.get_default_tenant_id().await?;
+    let system_user_id = backend.get_system_user_id(None).await?;
 
     // Create a suspended user
     let user_id = Uuid::new_v4();
@@ -83,10 +94,10 @@ async fn test_authenticate_with_inactive_user_returns_error() {
         updated_by: system_user_id,
     };
 
-    backend.upsert_user(suspended_user).await.unwrap();
+    backend.upsert_user(suspended_user).await?;
 
     // Verify user exists but is not active
-    let fetched = backend.get_user(&user_id).await.unwrap();
+    let fetched = backend.get_user(&user_id).await?;
     assert!(!matches!(fetched.state, EntityState::Active));
 
     // Try to authenticate - should fail
@@ -100,14 +111,16 @@ async fn test_authenticate_with_inactive_user_returns_error() {
 
     let result = backend.authenticate(&form).await;
     assert!(result.is_err());
-}
 
+    Ok(())
+}
 #[tokio::test]
-async fn test_record_and_retrieve_auth_event_roundtrip() {
+async fn test_record_and_retrieve_auth_event_roundtrip()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = create_test_backend().await;
 
-    let tenant_id = backend.get_default_tenant_id().await.unwrap();
-    let system_user_id = backend.get_system_user_id(None).await.unwrap();
+    let tenant_id = backend.get_default_tenant_id().await?;
+    let system_user_id = backend.get_system_user_id(None).await?;
 
     // Record an auth event
     let event: AuthEventRecord<'_, OurBackend> = AuthEventRecord::<OurBackend> {
@@ -124,7 +137,7 @@ async fn test_record_and_retrieve_auth_event_roundtrip() {
         error_message: None,
     };
 
-    backend.record_auth_event(event).await.unwrap();
+    backend.record_auth_event(event).await?;
 
     // Retrieve events
     let events = backend
@@ -134,28 +147,28 @@ async fn test_record_and_retrieve_auth_event_roundtrip() {
             Some(AuthEventStatus::Success),
             Some(10),
         )
-        .await
-        .unwrap();
+        .await?;
 
     assert!(!events.is_empty());
     assert_eq!(events[0].event_type, AuthEventType::LoginAttempt);
     assert_eq!(events[0].event_status, AuthEventStatus::Success);
     assert_eq!(events[0].session_id, Some("session123".to_string()));
     assert_eq!(events[0].ip_address, Some("192.168.1.1".to_string()));
+
+    Ok(())
 }
 
 #[tokio::test]
-async fn test_get_scoped_auth_factors() {
+async fn test_get_scoped_auth_factors() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = create_test_backend().await;
 
-    let tenant_id = backend.get_default_tenant_id().await.unwrap();
-    let system_user_id = backend.get_system_user_id(None).await.unwrap();
+    let tenant_id = backend.get_default_tenant_id().await?;
+    let system_user_id = backend.get_system_user_id(None).await?;
 
     // Get global factors
     let global_factors = backend
         .get_scoped_auth_factors(PermissionScope::Global, EnablementState::Active)
-        .await
-        .unwrap();
+        .await?;
 
     // Should have at least the password factor from migrations
     assert!(!global_factors.is_empty());
@@ -164,26 +177,31 @@ async fn test_get_scoped_auth_factors() {
     let user_scope = PermissionScope::User(tenant_id, system_user_id);
     let user_factors = backend
         .get_scoped_auth_factors(user_scope, EnablementState::Active)
-        .await
-        .unwrap();
+        .await?;
 
     // User may inherit global factors or have specific ones
     assert!(!user_factors.is_empty());
-}
 
+    Ok(())
+}
 #[tokio::test]
-async fn test_upsert_factor_state_roundtrip() {
+async fn test_upsert_factor_state_roundtrip() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
     let backend = create_test_backend().await;
 
-    let tenant_id = backend.get_default_tenant_id().await.unwrap();
-    let system_user_id = backend.get_system_user_id(None).await.unwrap();
+    let tenant_id = backend.get_default_tenant_id().await?;
+    let system_user_id = backend.get_system_user_id(None).await?;
 
     // Get a password factor
-    let factors = backend.get_all_auth_factors().await.unwrap();
+    let factors = backend.get_all_auth_factors().await?;
     let password_factor = factors
         .iter()
         .find(|f| matches!(f.kind, axess::AuthFactorKind::Password))
-        .expect("Should have password factor from migrations");
+        .ok_or_else(|| {
+            Box::<dyn std::error::Error + Send + Sync>::from(
+                "Should have password factor from migrations",
+            )
+        })?;
 
     // Create a factor state change
     let mut config = std::collections::HashMap::new();
@@ -202,18 +220,19 @@ async fn test_upsert_factor_state_roundtrip() {
     };
 
     // Upsert the factor state
-    let upserted = backend.upsert_factor_state(change).await.unwrap();
+    let upserted = backend.upsert_factor_state(change).await?;
 
     assert_eq!(upserted.factor_id, password_factor.id);
     assert!(upserted.config.contains_key("password_hash"));
 
     // Retrieve it back
-    let scope = PermissionScope::User(tenant_id, system_user_id);
+    let scope = PermissionScope::User(tenant_id, system_user_id.clone());
     let states = backend
         .get_factor_states(&password_factor.id, scope)
-        .await
-        .unwrap();
+        .await?;
 
     assert_eq!(states.len(), 1);
     assert_eq!(states[0].factor_id, password_factor.id);
+
+    Ok(())
 }

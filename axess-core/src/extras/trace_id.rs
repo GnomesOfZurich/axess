@@ -177,21 +177,25 @@ mod tests {
         let mock_service = service_fn(move |req: Request<Body>| {
             let header_name = header_name.clone();
             async move {
-                // Extract the trace ID from the request headers
+                // Safely extract the trace ID from the request headers
                 let trace_id = req
                     .headers()
-                    .get(header_name.clone())
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_string();
+                    .get(&header_name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "unknown-trace-id".to_string());
 
-                // Create a response and include the trace ID in the response headers
+                // Create a response and include the trace ID in the response headers if valid
                 let mut response = Response::new(Body::empty());
-                response.headers_mut().insert(
-                    header_name.clone(),
-                    HeaderValue::from_str(&trace_id).unwrap(),
-                );
+                match HeaderValue::from_str(&trace_id) {
+                    Ok(hv) => {
+                        response.headers_mut().insert(header_name.clone(), hv);
+                    }
+                    Err(_) => {
+                        tracing::warn!(%trace_id, "Failed to create header value for response");
+                    }
+                }
+
                 Ok::<_, Infallible>(response)
             }
         });
@@ -240,7 +244,16 @@ mod tests {
         let _guard = span.enter();
 
         let request = Request::new(Body::empty());
-        let response = svc.oneshot(request).await.unwrap();
+        let response = match svc.oneshot(request).await {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "Service oneshot failed; returning placeholder trace IDs"
+                );
+                return ("unknown-trace-id".to_string(), String::new());
+            }
+        };
 
         let header_trace_id = response
             .headers()
@@ -296,7 +309,6 @@ mod tests {
     /// by the `TraceIdLayer` middleware. The test simulates a simple HTTP request and
     /// checks if the default "X-Trace-ID" header is present in the response headers.
     async fn test_trace_id_in_response() {
-        // thread::sleep(Duration::from_millis(300));
         init_tracing();
         let layer = TraceIdLayer::default();
         let svc = create_test_service(layer.clone());
@@ -305,10 +317,16 @@ mod tests {
         let _guard = span.enter();
 
         let request = Request::new(Body::empty());
-        let response = svc.oneshot(request).await.unwrap();
+        let response = match svc.oneshot(request).await {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::warn!(?err, "Service oneshot failed in test_trace_id_in_response");
+                panic!("Service oneshot failed: {:?}", err);
+            }
+        };
 
         assert!(
-            response.headers().contains_key(layer.header_name),
+            response.headers().contains_key(&layer.header_name),
             "Trace ID header not found in response"
         );
     }

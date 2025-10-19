@@ -68,7 +68,8 @@ impl RequestIdGenerator for UuidGenerator {
     const ID_LENGTH: usize = 36;
 
     fn generate(&self) -> HeaderValue {
-        HeaderValue::from_str(&Uuid::new_v4().to_string()).expect("Invalid header value")
+        HeaderValue::from_str(&Uuid::new_v4().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id"))
     }
 }
 
@@ -102,28 +103,44 @@ where
         #[cfg(feature = "accept_client_id")]
         if let Some(existing_id) = req.headers().get(&G::HEADER_NAME) {
             let existing_id = existing_id.clone();
-            if let Ok(id) = existing_id.to_str()
-                && id.len() == G::ID_LENGTH
+            // Collapse nested if into a single condition using let-chains to satisfy clippy
+            if let Ok(id_str) = existing_id.to_str()
+                && id_str.len() == G::ID_LENGTH
             {
-                // If the client sent a valid request ID, do nothing with message header.
-                if let Some(request_id) = req.extensions().get::<RequestId>() {
-                    if request_id.0 != *id {
-                        req.extensions_mut().insert(RequestId(id.to_string()));
+                // Ensure extension contains same ID (avoid cloning if already present)
+                match req.extensions().get::<RequestId>() {
+                    Some(ext) if ext.0 == id_str => return Ok(existing_id),
+                    _ => {
+                        req.extensions_mut().insert(RequestId(id_str.to_string()));
+                        return Ok(existing_id);
                     }
-                } else {
-                    req.extensions_mut().insert(RequestId(id.to_string()));
                 }
-                return Ok(existing_id);
             }
+            // fallthrough: invalid client id -> generate our own below
         }
 
-        let request_id = self.generator.generate();
-        req.headers_mut()
-            .insert(&G::HEADER_NAME, request_id.clone());
-        req.extensions_mut()
-            .insert(RequestId(request_id.to_str().unwrap().to_string()));
+        // Generate header value
+        let header_val = self.generator.generate();
 
-        Ok(request_id)
+        // Ensure header is present
+        req.headers_mut()
+            .insert(&G::HEADER_NAME, header_val.clone());
+
+        // Safely extract string for extensions; if to_str() fails, replace header with a UTF-8 UUID
+        let request_id_str = match header_val.to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                // fallback to safe ASCII UUID and update header
+                let fallback = HeaderValue::from_str(&Uuid::new_v4().to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("unknown"));
+                req.headers_mut().insert(&G::HEADER_NAME, fallback.clone());
+                // .to_str() ok for from_static / valid uuid
+                fallback.to_str().unwrap_or("unknown").to_string()
+            }
+        };
+
+        req.extensions_mut().insert(RequestId(request_id_str));
+        Ok(header_val)
     }
 }
 
@@ -254,7 +271,8 @@ mod tests {
         const ID_LENGTH: usize = 12;
 
         fn generate(&self) -> HeaderValue {
-            HeaderValue::from_str("custom-value").unwrap()
+            // "custom-value" is ASCII-safe, use from_static to avoid Result handling/unwrapping
+            HeaderValue::from_static("custom-value")
         }
     }
 
@@ -299,9 +317,15 @@ mod tests {
     async fn test_request_id_generation() {
         let service = create_service();
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
         assert!(id.starts_with("mock"));
         assert_eq!(id.len(), 8);
     }
@@ -311,7 +335,9 @@ mod tests {
     async fn test_missing_request_id_in_response() {
         let service = create_service();
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
         assert!(res.headers().contains_key(X_REQUEST_ID));
     }
@@ -324,15 +350,16 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..5 {
             let req = Request::new(Body::empty());
-            let res = ServiceExt::oneshot(service.clone(), req).await.unwrap();
+            let res = ServiceExt::oneshot(service.clone(), req)
+                .await
+                .expect("service call failed");
             let id = res
                 .headers()
                 .get(X_REQUEST_ID)
-                .unwrap()
-                .to_str()
-                .unwrap()
+                .and_then(|v| v.to_str().ok())
+                .expect("response missing or contains invalid X_REQUEST_ID header")
                 .to_string();
-            assert!(!ids.contains(&id));
+            assert!(!ids.contains(&id), "duplicate request id generated: {}", id);
             ids.push(id);
         }
     }
@@ -345,8 +372,17 @@ mod tests {
         let mut req = Request::new(Body::empty());
         req.headers_mut()
             .insert(X_REQUEST_ID, HeaderValue::from_static("12345678"));
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
-        assert_eq!(res.headers().get(X_REQUEST_ID).unwrap(), "12345678");
+
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
+
+        let header_value = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok());
+
+        assert_eq!(header_value, Some("12345678"));
     }
 
     #[cfg_attr(feature = "accept_client_id", tokio::test)]
@@ -357,9 +393,15 @@ mod tests {
         let mut req = Request::new(Body::empty());
         req.headers_mut()
             .insert(X_REQUEST_ID, HeaderValue::from_static("invalid")); // Length 7, but invalid format
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
         assert!(id.starts_with("mock"));
         assert_eq!(id.len(), 8);
     }
@@ -375,10 +417,12 @@ mod tests {
 
         impl RequestIdGenerator for ErrorLengthGenerator {
             const HEADER_NAME: HeaderName = X_REQUEST_ID;
+
+            #[cfg(feature = "accept_client_id")]
             const ID_LENGTH: usize = 5; // This is incorrect, should be 7
 
             fn generate(&self) -> HeaderValue {
-                HeaderValue::from_str("12345").unwrap()
+                HeaderValue::from_static("12345")
             }
         }
 
@@ -386,10 +430,19 @@ mod tests {
         let mut req = Request::new(Body::empty());
         req.headers_mut()
             .insert(X_REQUEST_ID, HeaderValue::from_static("1234567"));
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
+
+        let header_value = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
 
         // The service should reject the client ID and use its own, even though it's the wrong length
-        assert_eq!(res.headers().get(X_REQUEST_ID).unwrap(), "12345");
+        assert_eq!(header_value, "12345");
     }
 
     #[tokio::test]
@@ -401,9 +454,15 @@ mod tests {
         let mut req = Request::new(Body::empty());
         req.headers_mut()
             .insert(X_REQUEST_ID, HeaderValue::from_static("existing-id"));
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
         assert_eq!(id, "mock0000");
     }
 
@@ -413,9 +472,16 @@ mod tests {
     async fn test_default_generator() {
         let service = RequestIdService::new(MockService, UuidGenerator);
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
+
         assert!(uuid::Uuid::parse_str(id).is_ok());
     }
 
@@ -425,9 +491,16 @@ mod tests {
     async fn test_custom_header_name() {
         let service = RequestIdService::new(MockService, CustomHeaderGenerator);
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        assert_eq!(res.headers().get("x-custom-id").unwrap(), "custom-value");
+        let header_value = res
+            .headers()
+            .get("x-custom-id")
+            .and_then(|v| v.to_str().ok());
+
+        assert_eq!(header_value, Some("custom-value"));
     }
 
     #[tokio::test]
@@ -442,11 +515,23 @@ mod tests {
             .service(MockService);
 
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        assert_eq!(res.headers().get("x-custom-id").unwrap(), "custom-value");
+        let custom = res
+            .headers()
+            .get("x-custom-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("missing or invalid x-custom-id header");
+        assert_eq!(custom, "custom-value");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("missing or contains invalid X_REQUEST_ID header");
+
         assert!(!id.starts_with("mock"));
         assert_eq!(id.len(), 36);
         assert!(uuid::Uuid::parse_str(id).is_ok());
@@ -467,9 +552,16 @@ mod tests {
             .service(MockService);
 
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
+
         assert_eq!(id, "mock8888");
     }
 
@@ -488,9 +580,16 @@ mod tests {
             .service(MockService);
 
         let req = Request::new(Body::empty());
-        let res = ServiceExt::oneshot(service, req).await.unwrap();
+        let res = ServiceExt::oneshot(service, req)
+            .await
+            .expect("service call failed");
 
-        let id = res.headers().get(X_REQUEST_ID).unwrap().to_str().unwrap();
+        let id = res
+            .headers()
+            .get(X_REQUEST_ID)
+            .and_then(|v| v.to_str().ok())
+            .expect("response missing or contains invalid X_REQUEST_ID header");
+
         assert_eq!(id, "mock5555");
     }
 }

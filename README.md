@@ -22,7 +22,8 @@ The default authorization features of Axess is built on top of [Cedar Policy](ht
 ## 📦 Installation and Getting Started
 1. To use the Axess in your project, run the usual:
 ```bash
-cargo add axess```
+cargo add axess
+```
 
 from your command line or add the following to your `Cargo.toml` file:
 ```toml

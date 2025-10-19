@@ -74,7 +74,9 @@ impl App {
             .merge(auth_router)
             .layer(MessagesManagerLayer)
             .layer(auth_layer.as_ref().clone());
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+
+        // Propagate bind errors instead of panicking.
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
 
         // Ensure we use a shutdown signal to abort the deletion task.
         axum::serve(listener, protected_router.into_make_service())

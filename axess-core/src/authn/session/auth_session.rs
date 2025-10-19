@@ -1071,12 +1071,22 @@ where
             return Ok(());
         }
 
-        // Ensure hash exists
-        if self.data.auth_hash.is_none() {
-            self.data.auth_hash = Some(self.generate_session_hash());
-        }
+        // Ensure hash exists; if not, generate and persist it (best-effort).
+        let session_hash = if let Some(h) = self.data.auth_hash.as_ref() {
+            h.clone()
+        } else {
+            let new_hash = self.generate_session_hash();
+            self.data.auth_hash = Some(new_hash.clone());
+            // Best-effort persist the new hash into the session store (don't fail the flow).
+            if let Err(e) = self.session.insert(self.data_key, &self.data).await {
+                debug!(
+                    error = ?e,
+                    "Failed to persist regenerated auth_hash into session (non-fatal)"
+                );
+            }
+            new_hash
+        };
 
-        let session_hash = self.data.auth_hash.as_ref().unwrap();
         let session_id_str = session_id.to_string();
         let user_id = self.get_user_id().map(|id| id.to_string());
         let tenant_id = self.get_tenant_id().map(|id| id.to_string());
@@ -1086,7 +1096,7 @@ where
                 &session_id_str,
                 user_id.as_ref(),
                 tenant_id.as_ref(),
-                session_hash.clone(),
+                session_hash,
             )
             .await
             .map_err(|e| {
@@ -1175,10 +1185,13 @@ mod tests {
         Session::new(Some(session_id), std::sync::Arc::new(store), None)
     }
 
-    async fn create_test_session() -> (
-        AuthSession<MockBackend, StoreSessionRegistry<MemoryStore>>,
-        Arc<StoreSessionRegistry<MemoryStore>>,
-    ) {
+    async fn create_test_session() -> Result<
+        (
+            AuthSession<MockBackend, StoreSessionRegistry<MemoryStore>>,
+            Arc<StoreSessionRegistry<MemoryStore>>,
+        ),
+        AuthError<MockBackend>,
+    > {
         let backend = MockBackend::default();
         let store = MemoryStore::default();
 
@@ -1189,20 +1202,22 @@ mod tests {
 
         // Configure backend with test method
         let method = mock_method();
-        backend.upsert_auth_method(method.clone()).await.unwrap();
+        backend
+            .upsert_auth_method(method.clone())
+            .await
+            .map_err(AuthError::BackendError)?;
 
         let auth_session =
             AuthSession::from_session(session, backend, "test.data", Some(registry.clone()))
-                .await
-                .unwrap();
+                .await?;
 
-        (auth_session, registry)
+        Ok((auth_session, registry))
     }
 
     #[tokio::test]
     /// Test that session hash is generated and stored during partial authentication
-    async fn test_session_hash_generation_on_partial_auth() {
-        let (mut auth_session, registry) = create_test_session().await;
+    async fn test_session_hash_generation_on_partial_auth() -> Result<(), AuthError<MockBackend>> {
+        let (mut auth_session, registry) = create_test_session().await?;
 
         // Setup user
         let user = MockUser {
@@ -1215,8 +1230,8 @@ mod tests {
         auth_session.data.tenant_id = Some(TestTenantId("tenant1".to_string()));
         auth_session.data.user_state = EntityState::Active;
 
-        // Get the method that backend knows about
-        let method = auth_session
+        // Get the method that backend knows about (handle backend error explicitly)
+        let methods_res = auth_session
             .backend
             .get_scoped_auth_methods(
                 PermissionScope::User(
@@ -1225,14 +1240,25 @@ mod tests {
                 ),
                 EnablementState::Active,
             )
-            .await
-            .unwrap()
-            .first()
-            .cloned()
-            .expect("Backend should have at least one method configured");
+            .await;
 
-        // Start authentication
-        auth_session.start_authentication(method).await.unwrap();
+        let methods = match methods_res {
+            Ok(m) => m,
+            Err(e) => panic!("Failed to fetch scoped auth methods from backend: {:?}", e),
+        };
+
+        assert!(
+            !methods.is_empty(),
+            "Backend should have at least one method configured"
+        );
+
+        // Safely take the first method without unwrap
+        let method = methods[0].clone();
+
+        // Start authentication (handle error explicitly)
+        if let Err(e) = auth_session.start_authentication(method).await {
+            panic!("start_authentication failed: {:?}", e);
+        }
 
         // Verify hash was generated
         assert!(
@@ -1259,12 +1285,14 @@ mod tests {
         } else {
             panic!("Session should have an ID");
         }
+
+        Ok(())
     }
 
     #[tokio::test]
     /// Test that session hash is regenerated after complete authentication
-    async fn test_session_hash_regenerated_on_complete() {
-        let (mut auth_session, registry) = create_test_session().await;
+    async fn test_session_hash_regenerated_on_complete() -> Result<(), AuthError<MockBackend>> {
+        let (mut auth_session, registry) = create_test_session().await?;
 
         // Setup user for authenticated state
         let user = MockUser {
@@ -1286,19 +1314,27 @@ mod tests {
         auth_session.data.auth_state = auth_session.state.clone();
 
         // Save current session state before completing
-        auth_session.save_session_data().await.unwrap();
+        auth_session.save_session_data().await?;
 
         // Register initial session (simulate partial auth flow)
-        auth_session.ensure_session_registered().await.unwrap();
+        auth_session.ensure_session_registered().await?;
 
         // Store the original session ID before cycling
-        let original_session_id = auth_session.session.id().unwrap().to_string();
+        let original_session_id = auth_session
+            .session
+            .id()
+            .map(|id| id.to_string())
+            .ok_or(AuthError::SessionInvalid)?;
 
         // Complete authentication (this will cycle the session ID)
-        auth_session.complete_authentication().await.unwrap();
+        auth_session.complete_authentication().await?;
 
         // Get the new session ID after cycling
-        let new_session_id = auth_session.session.id().unwrap().to_string();
+        let new_session_id = auth_session
+            .session
+            .id()
+            .map(|id| id.to_string())
+            .ok_or(AuthError::SessionInvalid)?;
 
         // Verify session ID was cycled
         assert_ne!(
@@ -1307,13 +1343,13 @@ mod tests {
         );
 
         // Verify hash was regenerated
-        assert!(
-            auth_session.data.auth_hash.is_some(),
-            "Session hash should exist after complete authentication"
-        );
+        let new_hash = auth_session
+            .data
+            .auth_hash
+            .as_ref()
+            .ok_or(AuthError::SessionInvalid)?;
         assert_ne!(
-            auth_session.data.auth_hash.as_ref().unwrap(),
-            &initial_hash,
+            new_hash, &initial_hash,
             "Session hash should be regenerated (different from initial)"
         );
 
@@ -1330,7 +1366,7 @@ mod tests {
         let user_sessions = registry
             .get_user_sessions(&"user1")
             .await
-            .expect("Should retrieve user sessions");
+            .map_err(|e| AuthError::SessionRegistryError(e))?;
 
         // The old session should be replaced by the new one
         assert_eq!(
@@ -1342,19 +1378,22 @@ mod tests {
             user_sessions[0], new_session_id,
             "Registered session should be the new (cycled) session ID"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
     /// Test session validation fails with wrong hash
-    async fn test_session_validation_fails_with_wrong_hash() {
-        let (mut auth_session, registry) = create_test_session().await;
+    async fn test_session_validation_fails_with_wrong_hash() -> Result<(), AuthError<MockBackend>> {
+        let (mut auth_session, registry) = create_test_session().await?;
 
         // Register session with one hash
         let session_id = auth_session
             .session
             .id()
-            .expect("Session should have ID")
+            .ok_or(AuthError::SessionInvalid)?
             .to_string();
+
         registry
             .register_session(
                 &session_id,
@@ -1363,7 +1402,7 @@ mod tests {
                 "correct_hash".to_string(),
             )
             .await
-            .unwrap();
+            .map_err(|e| AuthError::SessionRegistryError(e))?;
 
         // Set different hash in session
         auth_session.data.auth_hash = Some("wrong_hash".to_string());
@@ -1376,11 +1415,13 @@ mod tests {
             matches!(result.unwrap_err(), AuthError::SessionInvalid),
             "Error should be SessionInvalid"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
     /// Test concurrent session handling
-    async fn test_concurrent_sessions_for_same_user() {
+    async fn test_concurrent_sessions_for_same_user() -> Result<(), AuthError<MockBackend>> {
         let store = MemoryStore::default();
         let registry = Arc::new(StoreSessionRegistry::new(store.clone(), 0));
         let backend = MockBackend::default();
@@ -1399,13 +1440,15 @@ mod tests {
             "test.data",
             Some(registry.clone()),
         )
-        .await
-        .unwrap();
+        .await?;
 
-        let mut auth_session2 =
-            AuthSession::from_session(session2, backend, "test.data", Some(registry.clone()))
-                .await
-                .unwrap();
+        let mut auth_session2 = AuthSession::from_session(
+            session2,
+            backend.clone(),
+            "test.data",
+            Some(registry.clone()),
+        )
+        .await?;
 
         // Setup both with same user
         let user = MockUser {
@@ -1425,35 +1468,37 @@ mod tests {
         auth_session2.data.user_state = EntityState::Active;
 
         // Register both sessions
-        auth_session1.ensure_session_registered().await.unwrap();
-        auth_session2.ensure_session_registered().await.unwrap();
+        auth_session1.ensure_session_registered().await?;
+        auth_session2.ensure_session_registered().await?;
 
         // Verify both are registered
         let user_sessions = registry
             .get_user_sessions(&"user1")
             .await
-            .expect("Should retrieve user sessions");
+            .map_err(AuthError::SessionRegistryError)?;
         assert_eq!(user_sessions.len(), 2, "Both sessions should be registered");
 
         // Logout session1
-        auth_session1.logout().await.unwrap();
+        auth_session1.logout().await?;
 
         // Verify only session2 remains
         let user_sessions = registry
             .get_user_sessions(&"user1")
             .await
-            .expect("Should retrieve user sessions");
+            .map_err(AuthError::SessionRegistryError)?;
         assert_eq!(
             user_sessions.len(),
             1,
             "Only one session should remain after logout"
         );
+
+        Ok(())
     }
 
     #[tokio::test]
     /// Test guest sessions are not registered
-    async fn test_guest_sessions_not_registered() {
-        let (mut auth_session, registry) = create_test_session().await;
+    async fn test_guest_sessions_not_registered() -> Result<(), AuthError<MockBackend>> {
+        let (mut auth_session, registry) = create_test_session().await?;
 
         // Ensure session is in guest state
         assert_eq!(
@@ -1462,15 +1507,10 @@ mod tests {
             "Session should start as guest"
         );
 
-        // Try to register
-        auth_session
-            .ensure_session_registered()
-            .await
-            .expect("Should not error when trying to register guest session");
+        // Try to register (should be a no-op and not error)
+        auth_session.ensure_session_registered().await?;
 
         // Verify no sessions registered for any user
-        // Since guest sessions shouldn't be registered, there should be no way to look them up
-        // We can verify by checking that the session ID is not in any user's sessions
         if let Some(session_id) = auth_session.session.id() {
             let session_id_str = session_id.to_string();
 
@@ -1478,12 +1518,14 @@ mod tests {
             let all_sessions = registry
                 .get_user_sessions(&"nonexistent_user")
                 .await
-                .expect("Should retrieve sessions (empty list)");
+                .map_err(AuthError::SessionRegistryError)?;
 
             assert!(
                 !all_sessions.contains(&session_id_str),
                 "Guest session should not be registered under any user"
             );
         }
+
+        Ok(())
     }
 }
