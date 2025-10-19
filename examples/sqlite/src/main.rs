@@ -14,7 +14,7 @@ mod web;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    dotenv::dotenv().ok(); // Loads .env file if present
+    dotenvy::dotenv().ok(); // Loads .env file if present
     let db_url: &str = &std::env::var("DATABASE_URL")?;
     tracing_subscriber::registry()
         .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(
