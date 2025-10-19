@@ -5,8 +5,7 @@ use axum_messages::MessagesManagerLayer;
 use sqlx::{SqlitePool, migrate};
 use time::Duration;
 use tokio::{signal, task::AbortHandle};
-use tower_sessions::cookie::Key;
-use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer};
+use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer, cookie::Key};
 use tower_sessions_sqlx_store::SqliteStore;
 
 use crate::{
@@ -38,6 +37,9 @@ impl App {
         db_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let db = SqlitePool::connect(db_url).await?;
+        // Run migrations from the "migrations" directory at runtime.
+        // static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+        // MIGRATOR.run(&db).await?;
         migrate!().run(&db).await?;
 
         // let session_store = MemoryStore::default();
