@@ -99,13 +99,13 @@ pub trait SessionRegistry: Send + Sync + 'static {
 
 /// Session registry implementation that uses a single registry with session metadata
 #[derive(Debug, Clone)]
-pub struct StoreSessionRegistry<S: SessionStore> {
+pub struct SessionRegistryStore<S: SessionStore> {
     store: S,
     registry_id: tower_sessions::session::Id,
     // registry_id_seed is only used at construction, not stored or logged
 }
 
-impl<S: SessionStore> StoreSessionRegistry<S> {
+impl<S: SessionStore> SessionRegistryStore<S> {
     // TODO: make this into an application configuration parameter
     const REGISTRY_KEY: &'static str = SESSION_REGISTRY_KEY;
 
@@ -256,7 +256,7 @@ impl<S: SessionStore> StoreSessionRegistry<S> {
 }
 
 #[async_trait]
-impl<S: SessionStore + Send + Sync> SessionRegistry for StoreSessionRegistry<S> {
+impl<S: SessionStore + Send + Sync> SessionRegistry for SessionRegistryStore<S> {
     async fn register_session<UId, TId>(
         &self,
         session_id: &str,
@@ -423,7 +423,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = StoreSessionRegistry::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0);
 
         let session_id = tower_sessions::session::Id(42).to_string();
 
@@ -467,7 +467,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = StoreSessionRegistry::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0);
 
         // Use deterministic, valid session IDs
         let session_id1 = tower_sessions::session::Id(1).to_string();
@@ -523,7 +523,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = StoreSessionRegistry::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0);
 
         let session_id = tower_sessions::session::Id(10).to_string();
 
@@ -556,7 +556,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = StoreSessionRegistry::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0);
 
         let session_id1 = tower_sessions::session::Id(11).to_string();
         let session_id2 = tower_sessions::session::Id(12).to_string();
@@ -610,7 +610,7 @@ mod tests {
 
         // First registry instance
         {
-            let registry = StoreSessionRegistry::new(store.clone(), 0);
+            let registry = SessionRegistryStore::new(store.clone(), 0);
             registry
                 .register_session(
                     &session_id,
@@ -623,7 +623,7 @@ mod tests {
 
         // Second registry instance using same store
         {
-            let registry = StoreSessionRegistry::new(store, 0);
+            let registry = SessionRegistryStore::new(store, 0);
             let user_sessions = registry.get_user_sessions(&"user1").await?;
             assert_eq!(user_sessions, vec![session_id]);
         }
@@ -636,7 +636,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = StoreSessionRegistry::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0);
 
         let session_id = tower_sessions::session::Id(99).to_string();
 
@@ -662,8 +662,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_registry_deterministic_id_generation() {
-        let id1 = StoreSessionRegistry::<MemoryStore>::generate_registry_id(0);
-        let id2 = StoreSessionRegistry::<MemoryStore>::generate_registry_id(0);
+        let id1 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0);
+        let id2 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0);
         assert_eq!(id1, id2, "Registry ID generation should be deterministic");
     }
 }

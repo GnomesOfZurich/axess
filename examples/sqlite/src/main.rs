@@ -23,5 +23,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
 
-    App::new(db_url).await?.serve().await
+    App::new().await?.serve("0.0.0.0:3000", db_url).await
 }

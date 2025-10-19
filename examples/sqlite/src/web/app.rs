@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use axum::Router;
 use axum_messages::MessagesManagerLayer;
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, migrate};
 use time::Duration;
 use tokio::{signal, task::AbortHandle};
 use tower_sessions::cookie::Key;
@@ -9,10 +10,10 @@ use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 
 use crate::{
-    models::{authn::OurAuthSession, backend::OurBackend},
-    web::{auth, protected},
+    models::backend::OurBackend,
+    web::{auth::router as auth_router, protected::router as protected_router},
 };
-use axess::{AuthnLayerBuilder, StoreSessionRegistry, login_required};
+use axess::{AuthnServiceBuilder, SessionRegistryStore};
 
 // #[derive(Clone)]
 // pub struct AppState {
@@ -20,23 +21,27 @@ use axess::{AuthnLayerBuilder, StoreSessionRegistry, login_required};
 // }
 
 pub struct App {
-    db: SqlitePool,
+    // db: SqlitePool,
+    // pub backend: std::sync::Arc<OurBackend>,
+    // pub session_store: Arc<SqliteStore>,
+    // pub registry: Arc<StoreSessionRegistry>
 }
 
 impl App {
-    pub async fn new(db_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let db = SqlitePool::connect(db_url).await?;
-        sqlx::migrate!().run(&db).await?;
-
-        Ok(Self { db })
+    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {})
     }
 
-    pub async fn serve(self) -> Result<(), Box<dyn std::error::Error>> {
-        // Session layer.
-        //
-        // This uses `tower-sessions` to establish a layer that will provide the session
-        // as a request extension.
-        let session_store = SqliteStore::new(self.db.clone());
+    pub async fn serve(
+        self,
+        address: &str,
+        db_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let db = SqlitePool::connect(db_url).await?;
+        migrate!().run(&db).await?;
+
+        // let session_store = MemoryStore::default();
+        let session_store = SqliteStore::new(db.clone());
         session_store.migrate().await?;
 
         let deletion_task = tokio::task::spawn(
@@ -48,38 +53,42 @@ impl App {
         // Generate a cryptographic key to sign the session cookie.
         let key = Key::generate();
 
+        let backend = Arc::new(OurBackend::new(db.clone()));
         let session_layer = SessionManagerLayer::new(session_store.clone())
             .with_secure(false)
             .with_expiry(Expiry::OnInactivity(Duration::days(1)))
             .with_signed(key);
 
-        // Auth service.
+        let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100));
+
+        // Authn service.
         //
-        // This combines the session layer with our backend to establish the auth
-        // service which will provide the auth session as a request extension.
-        let backend = OurBackend::new(self.db.clone());
-        let session_registry = Arc::new(StoreSessionRegistry::new(session_store.clone(), 100));
-
-        let auth_router = auth::router().with_state(backend.clone());
-        let backend: Arc<OurBackend> = Arc::new(backend);
-
-        let auth_layer = Arc::new(
-            AuthnLayerBuilder::new((*backend).clone(), session_layer)
+        // This combines the session layer with our backend and session registry to establish an
+        // authentication service layer which will provide the auth session as a request extension.
+        let authn_service = Arc::new(
+            AuthnServiceBuilder::new(backend.clone(), session_layer)
                 .with_session_registry(session_registry.clone())
                 .build(),
         );
 
-        let protected_router = protected::router()
-            .route_layer(login_required!(OurAuthSession, "/login"))
-            .merge(auth_router)
+        // Ensure all merged routers share the same application state (Arc<OurBackend>).
+        // This avoids mismatched Router<State> types when merging by setting the top-level
+        // router state to the backend before merging other routers that expect the same state.
+        let app_router = Router::new()
+            // .with_state(backend.clone())
+            // Apply login_required to protected routes before merging
+            .merge(protected_router())
+            // Auth routes need backend state for handlers that use State extractor
+            .merge(auth_router())
             .layer(MessagesManagerLayer)
-            .layer(auth_layer.as_ref().clone());
+            .layer(authn_service.as_ref().clone());
+        // .with_state(()); // Convert to Router<()> for compatibility
 
         // Propagate bind errors instead of panicking.
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+        let listener = tokio::net::TcpListener::bind(address).await?;
 
         // Ensure we use a shutdown signal to abort the deletion task.
-        axum::serve(listener, protected_router.into_make_service())
+        axum::serve(listener, app_router.into_make_service())
             .with_graceful_shutdown(shutdown_signal(deletion_task.abort_handle()))
             .await?;
 

@@ -29,7 +29,7 @@ where
     R: SessionRegistry,
 {
     inner: S,
-    backend: B,
+    backend: Arc<B>,
     data_key: &'static str,
     session_registry: Option<Arc<R>>,
 }
@@ -108,24 +108,24 @@ where
 
 /// A layer for providing [`AuthSession`] as a request extension.
 #[derive(Debug, Clone)]
-pub struct AuthnLayer<
+pub struct AuthnService<
     B: AuthnBackend,
     Sessions: SessionStore,
     R: SessionRegistry,
     C: CookieController = PlaintextCookie,
 > {
-    backend: B,
+    backend: Arc<B>,
     session_manager_layer: SessionManagerLayer<Sessions, C>,
     data_key: &'static str,
     session_registry: Option<Arc<R>>,
 }
 
 impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
-    AuthnLayer<Backend, Sessions, R, C>
+    AuthnService<Backend, Sessions, R, C>
 {
     /// Create a new [`AuthnLayer`] with the provided access controller.
     pub(crate) fn new(
-        backend: Backend,
+        backend: Arc<Backend>,
         data_key: &'static str,
         session_manager_layer: SessionManagerLayer<Sessions, C>,
         session_registry: Option<Arc<R>>,
@@ -140,7 +140,7 @@ impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: Cooki
 }
 
 impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController> Layer<S>
-    for AuthnLayer<B, Sessions, R, C>
+    for AuthnService<B, Sessions, R, C>
 {
     type Service = CookieManager<SessionManager<AuthnManager<S, B, R>, Sessions, C>>;
 
@@ -157,22 +157,22 @@ impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieCo
 }
 
 #[derive(Debug, Clone)]
-pub struct AuthnLayerBuilder<
+pub struct AuthnServiceBuilder<
     B: AuthnBackend,
     Sessions: SessionStore,
     R: SessionRegistry,
     C: CookieController = PlaintextCookie,
 > {
-    backend: B,
+    backend: Arc<B>,
     session_manager_layer: SessionManagerLayer<Sessions, C>,
     data_key: Option<&'static str>,
     session_registry: Option<Arc<R>>,
 }
 
 impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
-    AuthnLayerBuilder<B, Sessions, R, C>
+    AuthnServiceBuilder<B, Sessions, R, C>
 {
-    pub fn new(backend: B, session_manager_layer: SessionManagerLayer<Sessions, C>) -> Self {
+    pub fn new(backend: Arc<B>, session_manager_layer: SessionManagerLayer<Sessions, C>) -> Self {
         Self {
             backend,
             session_manager_layer,
@@ -188,14 +188,17 @@ impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieContr
 
     /// Configure the `data_key` optional property of the builder. If not
     /// configured it will default to "axess.data".
-    pub fn with_data_key(mut self, data_key: &'static str) -> AuthnLayerBuilder<B, Sessions, R, C> {
+    pub fn with_data_key(
+        mut self,
+        data_key: &'static str,
+    ) -> AuthnServiceBuilder<B, Sessions, R, C> {
         self.data_key = Some(data_key);
         self
     }
 
     /// Build the [`AuthManagerLayer`].
-    pub fn build(self) -> AuthnLayer<B, Sessions, R, C> {
-        AuthnLayer::new(
+    pub fn build(self) -> AuthnService<B, Sessions, R, C> {
+        AuthnService::new(
             self.backend,
             self.data_key.unwrap_or("axess.data"),
             self.session_manager_layer,

@@ -1,4 +1,5 @@
 use askama::Template;
+use axess::login_required;
 use axum::{
     Router,
     http::StatusCode,
@@ -15,8 +16,10 @@ struct ProtectedTemplate<'a> {
     messages: &'a [&'a str],
 }
 
-pub fn router() -> Router<()> {
-    Router::new().route("/", get(self::get::protected))
+pub fn router() -> Router {
+    Router::new()
+        .route("/main", get(get::protected))
+        .route_layer(login_required!(OurAuthSession, "/login"))
 }
 
 mod get {

@@ -32,10 +32,10 @@ pub use axess_core::{
             AuthFactorKind, EnablementState, FactorForm, FactorFormExt, FactorStateChange,
             FormField, MethodStateChange, PermissionScope,
         },
-        middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
+        middleware::{AuthnManager, AuthnService, AuthnServiceBuilder},
         session::{
             AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthSession,
-            SessionRegistry, StoreSessionRegistry,
+            SessionRegistry, SessionRegistryStore,
         },
         types::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,

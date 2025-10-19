@@ -46,8 +46,8 @@ where
     /// The user associated by the backend or a guest user.
     pub user: B::User,
 
-    /// The authentication and authorization backend.
-    pub backend: B,
+    /// Shared reference to the authentication backend (cheap to clone).
+    pub backend: Arc<B>,
 
     /// The underlying session.
     pub session: Session,
@@ -91,7 +91,7 @@ where
 {
     pub async fn from_session(
         session: Session,
-        backend: B,
+        backend: Arc<B>,
         data_key: &'static str,
         session_registry: Option<Arc<R>>,
     ) -> Result<Self, AuthError<B>>
@@ -1139,7 +1139,7 @@ mod tests {
     use crate::{
         authn::{
             admin::AuthnAdminBackend, methods::method::MethodInstance,
-            session::registry::StoreSessionRegistry,
+            session::registry::SessionRegistryStore,
         },
         utils::testing::mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
     };
@@ -1187,18 +1187,18 @@ mod tests {
 
     async fn create_test_session() -> Result<
         (
-            AuthSession<MockBackend, StoreSessionRegistry<MemoryStore>>,
-            Arc<StoreSessionRegistry<MemoryStore>>,
+            AuthSession<MockBackend, SessionRegistryStore<MemoryStore>>,
+            Arc<SessionRegistryStore<MemoryStore>>,
         ),
         AuthError<MockBackend>,
     > {
-        let backend = MockBackend::default();
+        let backend = Arc::new(MockBackend::default());
         let store = MemoryStore::default();
 
         // Create and initialize session (pass a cloned MemoryStore value)
         let session = create_initialized_session(store.clone()).await;
 
-        let registry = Arc::new(StoreSessionRegistry::new(store, 0));
+        let registry = Arc::new(SessionRegistryStore::new(store, 0));
 
         // Configure backend with test method
         let method = mock_method();
@@ -1207,9 +1207,13 @@ mod tests {
             .await
             .map_err(AuthError::BackendError)?;
 
-        let auth_session =
-            AuthSession::from_session(session, backend, "test.data", Some(registry.clone()))
-                .await?;
+        let auth_session = AuthSession::from_session(
+            session,
+            backend.clone(),
+            "test.data",
+            Some(registry.clone()),
+        )
+        .await?;
 
         Ok((auth_session, registry))
     }
@@ -1423,8 +1427,8 @@ mod tests {
     /// Test concurrent session handling
     async fn test_concurrent_sessions_for_same_user() -> Result<(), AuthError<MockBackend>> {
         let store = MemoryStore::default();
-        let registry = Arc::new(StoreSessionRegistry::new(store.clone(), 0));
-        let backend = MockBackend::default();
+        let registry = Arc::new(SessionRegistryStore::new(store.clone(), 0));
+        let backend = Arc::new(MockBackend::default());
 
         // Create two initialized sessions
         let session1 = create_initialized_session(store.clone()).await;

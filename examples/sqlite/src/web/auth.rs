@@ -1,4 +1,7 @@
+// use std::sync::Arc;
+
 use askama::Template;
+use axess::authn::methods::form::PasswordForm;
 use axum::{
     Form, Router,
     extract::Query,
@@ -9,11 +12,9 @@ use axum::{
 use axum_messages::{Message, Messages};
 use serde::Deserialize;
 
-use axess::authn::methods::form::PasswordForm;
+// use crate::models::authn::OurAuthSession;
 
-use crate::models::backend::OurBackend;
-
-pub fn router() -> Router<OurBackend> {
+pub fn router() -> Router {
     Router::new()
         .route("/login", post(self::post::login))
         .route("/login", get(self::get::login))
