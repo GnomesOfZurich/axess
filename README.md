@@ -37,17 +37,47 @@ axess = { version="0.0.1", features=["full"]}
 ## 🤸 Example Usage
 Create a minimal Axum web application project and initiate the axess layers of interest from some backend storage and session cache of your choice. The router layers then provide session based authentication for your services:
 ```rust
-use axess::authn::Authenticator;
-use axess::authz::Authorizer;
-use axess::middleware::AxessLayer;
+use axess::{AuthnServiceBuilder, StoreSessionRegistry, login_required};
 use axum::{Router, routing::get};
+use tower_sessions_sqlx_store::SqliteStore;
+use sqlx::SqlitePool;
+use std::sync::Arc;
+use tokio::net::TcpListener;
+use crate::OurBackend; // Your custom backend implementation
 
-let authenticator = Authenticator::new("secret");
-let authorizer = Authorizer::from_policy_file("policy.cedar");
+// Create your backend and session store
+let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+let backend = Arc::new(OurBackend::new(pool.clone()));
+let session_store = SqliteStore::new(pool.clone());
+let session_registry = Arc::new(StoreSessionRegistry::new(session_store.clone(), 100));
+
+// Build the authentication layer
+let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
+    .with_session_registry(session_registry.clone())
+    .build();
+
+// Protected routes require authentication
+let protected_router = Router::new()
+    .route("/main", get(protected_handler))
+    .route_layer(login_required!(Arc<AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>>>, "/login"));
+
+// Auth routes (login/logout) may need backend state
+let auth_router = Router::new()
+    .route("/login", get(login_handler))
+    .route("/logout", get(logout_handler));
 
 let app = Router::new()
-    .route("/protected", get(protected_handler))
-    .layer(AxessLayer::new(authenticator, authorizer));
+    .merge(protected_router)
+    .merge(auth_router)
+    .layer(auth_layer);
+
+let address = "127.0.0.1:3000".parse()?;
+let listener = TcpListener::bind(address).await?;
+
+// Start servicing the application. For production,
+// ensure to use a shutdown signal to abort the deletion task.
+axum::serve(listener, app_router.into_make_service())
+    .await?;
 ```
 
 ## ☑️ Features

@@ -218,7 +218,7 @@ impl ValkeyStore {
 
         let cipher = Aes256Gcm::new(key);
         let (ciphertext, nonce) = data.split_at(data.len() - 12);
-        let nonce = Nonce::from_slice(nonce);
+        let nonce = Nonce::clone_from_slice(nonce);
 
         cipher.decrypt(nonce, ciphertext).map_err(|e| {
             error!("Session data decryption failed: {}", e);
