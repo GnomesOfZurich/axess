@@ -1,10 +1,17 @@
 use crate::{
     authn::{errors::FormError, methods::factor::AuthFactorKind},
-    tracing::error,
+    tracing::{error, warn},
+    utils::validation::{
+        OtpCharset, OtpConfig, PasswordConfig, is_valid_country_iso, is_valid_email,
+        is_valid_language_code, is_valid_name, is_valid_otp_code, is_valid_password,
+        is_valid_url_format,
+    },
 };
-use password_auth;
+use axess_factors::{verify_hotp, verify_password, verify_totp};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, collections::HashMap, fmt::Debug};
+use std::{borrow::Cow, collections::HashMap, fmt::Debug, time::SystemTime};
+
+pub const TOTP_DIGITS: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FactorFormKind {
@@ -22,6 +29,10 @@ pub enum FormField {
     TotpCode,
     TotpSecret,
     OauthProvider,
+    Email,
+    Language,
+    Domicile,
+    Fullname,
     /// Custom field defined by users
     Custom(&'static str),
 }
@@ -36,6 +47,10 @@ impl FormField {
             FormField::TotpCode => "code",
             FormField::TotpSecret => "secret",
             FormField::OauthProvider => "provider",
+            FormField::Email => "email",
+            FormField::Language => "language",
+            FormField::Domicile => "domicile",
+            FormField::Fullname => "fullname",
             FormField::Custom(s) => s,
         }
     }
@@ -135,6 +150,79 @@ pub trait FactorFormExt: FactorForm {
 impl<T: FactorForm> FactorFormExt for T {}
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct PasswordSetupForm {
+    /// The new password to set.
+    pub new_password: String,
+    /// Optionally, the old password (for authenticated change).
+    pub old_password: Option<String>,
+    /// Optionally, a reset token (for password reminders).
+    pub reset_token: Option<String>,
+    pub tenant: Option<String>,
+    pub next: Option<String>,
+}
+
+impl FactorForm for PasswordSetupForm {
+    fn factor_kind(&self) -> AuthFactorKind {
+        AuthFactorKind::Password
+    }
+
+    fn form_kind(&self) -> FactorFormKind {
+        FactorFormKind::Setup
+    }
+
+    fn validate_form(&self) -> Result<&Self, FormError> {
+        if self.new_password.len() < 8 || self.new_password.len() > 512 {
+            return Err(FormError::ValidationFailed(
+                "New password must be between 8 and 512 characters.".to_string(),
+            ));
+        }
+        // Optionally require old_password for authenticated change
+        Ok(self)
+    }
+
+    fn credential(&self) -> Option<&str> {
+        Some(&self.new_password)
+    }
+
+    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+        self.validate_form()
+    }
+
+    fn fields(&self) -> HashMap<FormField, FormFieldValue> {
+        let mut map = HashMap::new();
+        map.insert(
+            FormField::Password,
+            FormFieldValue::String(Cow::Owned(self.new_password.clone())),
+        );
+        if let Some(old) = &self.old_password {
+            map.insert(
+                FormField::Custom("old_password"),
+                FormFieldValue::String(Cow::Owned(old.clone())),
+            );
+        }
+        if let Some(token) = &self.reset_token {
+            map.insert(
+                FormField::Custom("reset_token"),
+                FormFieldValue::String(Cow::Owned(token.clone())),
+            );
+        }
+        if let Some(tenant) = &self.tenant {
+            map.insert(
+                FormField::Tenant,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
+            );
+        }
+        if let Some(next) = &self.next {
+            map.insert(
+                FormField::Next,
+                FormFieldValue::String(Cow::Owned(next.clone())),
+            );
+        }
+        map
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct PasswordForm {
     pub username: String,
     pub password: String,
@@ -151,17 +239,29 @@ impl FactorForm for PasswordForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.username.is_empty()
-            || self.username.len() > 64
-            || self.password.len() < 8
-            || self.password.len() > 512
-        {
-            Err(FormError::ValidationFailed(
-                "Username must be between 1 and 64 characters, password must be between 8 and 512 characters.".to_string(),
-            ))
-        } else {
-            Ok(self)
+        if self.username.is_empty() {
+            warn!("Username field is empty.");
+            return Err(FormError::InvalidFormData);
         }
+        // Only accept if username is a valid email OR a valid name
+        if !is_valid_email(&self.username) && !is_valid_name(&self.username) {
+            warn!("Username is not a valid email or name.");
+            return Err(FormError::InvalidFormData);
+        }
+        if !is_valid_password(&self.password, PasswordConfig::default()) {
+            return Err(FormError::InvalidFormData);
+        }
+        if self.tenant.is_some() && !is_valid_name(self.tenant.as_ref().unwrap()) {
+            warn!("Data in submitted \"Tenant\" field is invalid.");
+            return Err(FormError::InvalidFormData);
+        }
+        if let Some(next) = &self.next
+            && is_valid_url_format(next)
+        {
+            warn!("PasswordForm submitted with invalid next URL");
+            return Err(FormError::InvalidFormData);
+        }
+        Ok(self)
     }
 
     fn credential(&self) -> Option<&str> {
@@ -172,7 +272,6 @@ impl FactorForm for PasswordForm {
         }
     }
 
-    // ✅ Updated to use FormField enum and FormFieldValue
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
         let capacity = 2 + self.tenant.is_some() as usize + self.next.is_some() as usize;
         let mut map = HashMap::with_capacity(capacity);
@@ -203,7 +302,6 @@ impl FactorForm for PasswordForm {
     }
 
     fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
-        // Expect the stored password hash under "password_hash"
         let credential = self.credential().ok_or_else(|| {
             FormError::ValidationFailed("Missing password credential.".to_string())
         })?;
@@ -213,7 +311,7 @@ impl FactorForm for PasswordForm {
             .and_then(|v| v.as_str())
             .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Password.to_string()))?;
 
-        match password_auth::verify_password(credential, password_hash) {
+        match verify_password(credential, password_hash) {
             Ok(()) => Ok(self),
             Err(_) => {
                 error!("Password verification failed for {:?}", self.username);
@@ -225,21 +323,38 @@ impl FactorForm for PasswordForm {
     }
 }
 
-/// Form for setting up a TOTP factor.
+/// Form for setting up a TOTP factor (default implementation of an OTP factor).
+///
 /// This is used when the user is registering a new TOTP factor.
 /// It includes the TOTP secret and an optional redirect URL after setup.
 /// The secret is typically generated by the server and displayed to the user.
 /// The user will then use this secret to configure their TOTP app.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// By default, this follows the TOTP standard (RFC 6238), but can be configured for other OTP types.
+///
+/// # References
+/// - [RFC 6238: TOTP: Time-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc6238)
+/// - [RFC 4226: HOTP: An HMAC-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc4226)
+#[derive(Clone, Deserialize)]
 pub struct TotpSetupForm {
     pub secret: String,
     pub tenant: Option<String>,
     pub next: Option<String>,
 }
 
+impl Debug for TotpSetupForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpSetupForm")
+            .field("secret", &"***REDACTED***")
+            .field("tenant", &self.tenant)
+            .field("next", &self.next)
+            .finish()
+    }
+}
+
 impl FactorForm for TotpSetupForm {
     fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Totp
+        AuthFactorKind::Otp
     }
 
     fn form_kind(&self) -> FactorFormKind {
@@ -255,6 +370,16 @@ impl FactorForm for TotpSetupForm {
             Err(FormError::ValidationFailed(
                 "TOTP secret must be at least 4 characters long.".to_string(),
             ))
+        } else if self.tenant.is_some() && !is_valid_name(self.tenant.as_ref().unwrap()) {
+            warn!("Data in submitted \"Tenant\" field is invalid.");
+            Err(FormError::InvalidFormData)
+        } else if let Some(next) = &self.next {
+            if !is_valid_url_format(next) {
+                warn!("PasswordForm submitted with invalid next URL");
+                Err(FormError::InvalidFormData)
+            } else {
+                Ok(self)
+            }
         } else {
             Ok(self)
         }
@@ -297,19 +422,27 @@ impl FactorForm for TotpSetupForm {
 }
 
 /// Form for verifying a TOTP code.
-/// This is used when the user is entering a TOTP code to complete authentication.
-/// It includes the TOTP code and an optional redirect URL after verification.
-/// The code is typically generated by the user's TOTP app and must match the expected value.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TotpVerifyForm {
+/// Now supports configurable charset for numeric, hex, or alphanumeric codes.
+#[derive(Clone, Deserialize)]
+pub struct TotpForm {
     pub code: String,
     pub tenant: Option<String>,
     pub next: Option<String>,
 }
 
-impl FactorForm for TotpVerifyForm {
+impl Debug for TotpForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TotpVerifyForm")
+            .field("code", &"***REDACTED***")
+            .field("tenant", &self.tenant)
+            .field("next", &self.next)
+            .finish()
+    }
+}
+
+impl FactorForm for TotpForm {
     fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Totp
+        AuthFactorKind::Otp
     }
 
     fn form_kind(&self) -> FactorFormKind {
@@ -317,13 +450,29 @@ impl FactorForm for TotpVerifyForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.code.len() != 6 {
-            Err(FormError::ValidationFailed(
-                "TOTP code must be exactly 6 characters.".to_string(),
-            ))
-        } else {
-            Ok(self)
+        let config = OtpConfig::default();
+        if !is_valid_otp_code(&self.code, &config) {
+            return Err(FormError::ValidationFailed(format!(
+                "TOTP code must be exactly {} {}.",
+                TOTP_DIGITS,
+                match config.charset {
+                    OtpCharset::Numeric => "digits",
+                    OtpCharset::Hex => "hex characters",
+                    OtpCharset::Alphanumeric => "alphanumeric characters",
+                }
+            )));
         }
+        if self.tenant.is_some() && !is_valid_name(self.tenant.as_ref().unwrap()) {
+            warn!("Data in submitted \"Tenant\" field is invalid.");
+            return Err(FormError::InvalidFormData);
+        }
+        if let Some(next) = &self.next
+            && !is_valid_url_format(next)
+        {
+            warn!("PasswordForm submitted with invalid next URL");
+            return Err(FormError::InvalidFormData);
+        }
+        Ok(self)
     }
 
     fn credential(&self) -> Option<&str> {
@@ -360,58 +509,72 @@ impl FactorForm for TotpVerifyForm {
             FormError::ValidationFailed("Missing TOTP code credential.".to_string())
         })?;
 
-        if let Some(stored_code) = config.get("code").and_then(|v| v.as_str()) {
-            if stored_code == credential {
-                Ok(self)
-            } else {
-                error!("Failed to verify TOTP code versus stored auth config.");
-                Err(FormError::ValidationFailed(
-                    "Invalid TOTP code.".to_string(),
-                ))
-            }
-        } else {
-            Err(FormError::AuthConfigError(AuthFactorKind::Totp.to_string()))
+        let otp_secret = config
+            .get("otp_secret")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Otp.to_string()))?;
+
+        // Use OTP configuration for digit size and allow a small verification window.
+        let otp_config = OtpConfig::default();
+
+        // TOTP verification only (time-based)
+        if !verify_totp(otp_secret, credential, SystemTime::now(), otp_config.digits) {
+            error!("TOTP verification failed");
+            return Err(FormError::ValidationFailed(
+                "Invalid TOTP code.".to_string(),
+            ));
         }
+
+        Ok(self)
     }
 }
-
-/// Form for verifying an OAuth factor.
-/// This is used when the user is authenticating via an OAuth provider.
-/// It includes the OAuth provider name and an optional redirect URL after verification.
-/// The provider is here represented as a string identifier for the OAuth service (e.g., "github", "google", etc.).
-/// The actual OAuth flow would typically involve redirecting the user to the provider's login page.
 #[derive(Debug, Clone, Deserialize)]
-pub struct OauthForm {
-    pub provider: String,
+pub struct HotpSetupForm {
+    /// The new HOTP secret to set up.
+    pub secret: String,
+    /// Optional tenant for multi-tenancy.
     pub tenant: Option<String>,
+    /// Optional redirect URL after setup.
     pub next: Option<String>,
 }
 
-impl FactorForm for OauthForm {
+impl FactorForm for HotpSetupForm {
     fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Oauth
+        AuthFactorKind::Otp
     }
 
     fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+        FactorFormKind::Setup
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.provider.is_empty() {
-            Err(FormError::ValidationFailed(
-                "OAuth provider cannot be empty.".to_string(),
-            ))
-        } else if self.provider.len() > 64 {
-            Err(FormError::ValidationFailed(
-                "OAuth provider name must be between 1 and 64 characters.".to_string(),
-            ))
-        } else {
-            Ok(self)
+        if self.secret.is_empty() {
+            return Err(FormError::ValidationFailed(
+                "HOTP secret cannot be empty.".to_string(),
+            ));
         }
+        if self.secret.len() < 4 {
+            return Err(FormError::ValidationFailed(
+                "HOTP secret must be at least 4 characters long.".to_string(),
+            ));
+        }
+        if let Some(tenant) = &self.tenant
+            && !is_valid_name(tenant)
+        {
+            warn!("Data in submitted \"Tenant\" field is invalid.");
+            return Err(FormError::InvalidFormData);
+        }
+        if let Some(next) = &self.next
+            && !is_valid_url_format(next)
+        {
+            warn!("HotpSetupForm submitted with invalid next URL");
+            return Err(FormError::InvalidFormData);
+        }
+        Ok(self)
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.provider)
+        Some(&self.secret)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -419,10 +582,9 @@ impl FactorForm for OauthForm {
         let mut map = HashMap::with_capacity(capacity);
 
         map.insert(
-            FormField::OauthProvider,
-            FormFieldValue::String(Cow::Owned(self.provider.clone())),
+            FormField::TotpSecret,
+            FormFieldValue::String(Cow::Owned(self.secret.clone())),
         );
-
         if let Some(tenant) = &self.tenant {
             map.insert(
                 FormField::Tenant,
@@ -435,32 +597,294 @@ impl FactorForm for OauthForm {
                 FormFieldValue::String(Cow::Owned(next.clone())),
             );
         }
+        map
+    }
 
+    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+        // For HOTP setup, just validate the form.
+        self.validate_form()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HotpForm {
+    pub code: String,
+    pub counter: u64,
+    pub tenant: Option<String>,
+    pub next: Option<String>,
+}
+
+impl FactorForm for HotpForm {
+    fn factor_kind(&self) -> AuthFactorKind {
+        AuthFactorKind::Otp
+    }
+
+    fn form_kind(&self) -> FactorFormKind {
+        FactorFormKind::Verify
+    }
+
+    fn validate_form(&self) -> Result<&Self, FormError> {
+        let config = OtpConfig::default();
+        if !is_valid_otp_code(&self.code, &config) {
+            return Err(FormError::ValidationFailed(format!(
+                "HOTP code must be exactly {} {}.",
+                config.digits,
+                match config.charset {
+                    OtpCharset::Numeric => "digits",
+                    OtpCharset::Hex => "hex characters",
+                    OtpCharset::Alphanumeric => "alphanumeric characters",
+                }
+            )));
+        }
+        if self.tenant.is_some() && !is_valid_name(self.tenant.as_ref().unwrap()) {
+            warn!("Data in submitted \"Tenant\" field is invalid.");
+            return Err(FormError::InvalidFormData);
+        }
+        if let Some(next) = &self.next
+            && !is_valid_url_format(next)
+        {
+            warn!("HotpForm submitted with invalid next URL");
+            return Err(FormError::InvalidFormData);
+        }
+        Ok(self)
+    }
+
+    fn credential(&self) -> Option<&str> {
+        Some(&self.code)
+    }
+
+    fn fields(&self) -> HashMap<FormField, FormFieldValue> {
+        let mut map = HashMap::with_capacity(4);
+        map.insert(
+            FormField::TotpCode,
+            FormFieldValue::String(Cow::Owned(self.code.clone())),
+        );
+        map.insert(
+            FormField::Custom("counter"),
+            FormFieldValue::Json(serde_json::json!(self.counter)),
+        );
+        if let Some(tenant) = &self.tenant {
+            map.insert(
+                FormField::Tenant,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
+            );
+        }
+        if let Some(next) = &self.next {
+            map.insert(
+                FormField::Next,
+                FormFieldValue::String(Cow::Owned(next.clone())),
+            );
+        }
         map
     }
 
     fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
-        if let Some(stored_provider) = config.get("provider").and_then(|v| v.as_str()) {
-            if stored_provider == self.provider {
-                Ok(self)
-            } else {
-                error!("Failed to verify OAuth provider versus stored auth config.");
+        let secret = config
+            .get("otp_secret")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Otp.to_string()))?;
+
+        let stored_counter = config
+            .get("counter")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| FormError::AuthConfigError("Missing HOTP counter".to_string()))?;
+
+        let window = 5u64;
+        let otp_config = OtpConfig::default();
+
+        match verify_hotp(
+            secret,
+            &self.code,
+            stored_counter,
+            otp_config.digits,
+            window,
+        ) {
+            Some(_used_counter) => Ok(self),
+            None => {
+                error!("HOTP verification failed for counter {}", stored_counter);
                 Err(FormError::ValidationFailed(
-                    "Invalid OAuth provider.".to_string(),
+                    "Invalid HOTP code.".to_string(),
                 ))
             }
-        } else {
-            Err(FormError::AuthConfigError(
-                AuthFactorKind::Oauth.to_string(),
-            ))
         }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EmailVerificationForm {
+    pub email: String,
+    pub tenant: String, // Name of tenant
+    pub token: String,  // The email verification token
+    pub next: Option<String>,
+}
+
+impl FactorForm for EmailVerificationForm {
+    fn factor_kind(&self) -> AuthFactorKind {
+        todo!()
+    }
+
+    fn form_kind(&self) -> FactorFormKind {
+        todo!()
+    }
+
+    fn validate_form(&self) -> Result<&Self, FormError> {
+        todo!()
+    }
+    fn credential(&self) -> Option<&str> {
+        Some(&self.token)
+    }
+
+    fn fields(&self) -> HashMap<FormField, FormFieldValue> {
+        todo!()
+    }
+
+    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+        self.validate_form()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UserSetupForm {
+    pub tenant: String,
+    pub username: String,
+    pub fullname: String,
+    pub email: String,
+    pub language: String, // language code
+    pub domicile: String, // country code
+    pub password: String,
+    pub next: Option<String>,
+}
+
+impl Debug for UserSetupForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSetupForm")
+            .field("tenant", &self.tenant)
+            .field("username", &self.username)
+            .field("fullname", &self.fullname)
+            .field("email", &self.email)
+            .field("language", &self.language)
+            .field("domicile", &self.domicile)
+            .field("password", &"***REDACTED***")
+            .field("next", &self.next)
+            .finish()
+    }
+}
+
+impl FactorForm for UserSetupForm {
+    fn factor_kind(&self) -> AuthFactorKind {
+        AuthFactorKind::Custom("signup".to_owned())
+    }
+
+    fn form_kind(&self) -> FactorFormKind {
+        FactorFormKind::Setup
+    }
+
+    fn validate_form(&self) -> Result<&Self, FormError> {
+        if self.tenant.len() < 3 || self.tenant.len() > 64 || !is_valid_name(&self.tenant) {
+            Err(FormError::ValidationFailed(
+                "Submitted \"tenant\" field is empty or invalid".to_string(),
+            ))
+        } else if self.fullname.len() < 3
+            || self.fullname.len() > 128
+            || !is_valid_name(&self.fullname)
+        {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"fullname\" field is invalid".to_string(),
+            ))
+        } else if !is_valid_language_code(&self.language) {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"lang\" field is invalid".to_string(),
+            ))
+        } else if !is_valid_email(&self.email) {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"email\" field is invalid".to_string(),
+            ))
+        } else if !is_valid_password(&self.password, PasswordConfig::default()) {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"Password\" field is invalid".to_string(),
+            ))
+        } else if self.domicile.len() != 2 || !is_valid_country_iso(&self.domicile) {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"Domicile\" field is invalid".to_string(),
+            ))
+        } else if self.username.is_empty()
+            || self.username.len() > 64
+            || !is_valid_name(&self.username)
+        {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"Username\" field is invalid".to_string(),
+            ))
+        } else if self.fullname.is_empty()
+            || self.fullname.len() > 128
+            || !is_valid_name(&self.fullname)
+        {
+            Err(FormError::ValidationFailed(
+                "Data in submitted \"Fullname\" field is invalid".to_string(),
+            ))
+        } else if let Some(next) = &self.next {
+            if !is_valid_url_format(next) {
+                warn!("PasswordForm submitted with invalid next URL");
+                Err(FormError::InvalidFormData)
+            } else {
+                Ok(self)
+            }
+        } else {
+            Ok(self)
+        }
+    }
+
+    fn credential(&self) -> Option<&str> {
+        Some(&self.password)
+    }
+
+    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+        self.validate_form()
+    }
+
+    fn fields(&self) -> HashMap<FormField, FormFieldValue> {
+        let mut map = HashMap::new();
+        map.insert(
+            FormField::Tenant,
+            FormFieldValue::String(Cow::Owned(self.tenant.clone())),
+        );
+        map.insert(
+            FormField::Username,
+            FormFieldValue::String(Cow::Owned(self.username.clone())),
+        );
+        map.insert(
+            FormField::Fullname,
+            FormFieldValue::String(Cow::Owned(self.fullname.clone())),
+        );
+        map.insert(
+            FormField::Email,
+            FormFieldValue::String(Cow::Owned(self.email.clone())),
+        );
+        map.insert(
+            FormField::Language,
+            FormFieldValue::String(Cow::Owned(self.language.clone())),
+        );
+        map.insert(
+            FormField::Domicile,
+            FormFieldValue::String(Cow::Owned(self.domicile.clone())),
+        );
+        map.insert(
+            FormField::Password,
+            FormFieldValue::String(Cow::Owned(self.password.clone())),
+        );
+        if let Some(next) = &self.next {
+            map.insert(
+                FormField::Next,
+                FormFieldValue::String(Cow::Owned(next.clone())),
+            );
+        }
+        map
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use password_auth::generate_hash;
+    use axess_factors::generate_password_hash;
 
     // ========================================================================
     // FormField Tests
@@ -475,6 +899,10 @@ mod tests {
         assert_eq!(FormField::TotpCode.as_str(), "code");
         assert_eq!(FormField::TotpSecret.as_str(), "secret");
         assert_eq!(FormField::OauthProvider.as_str(), "provider");
+        assert_eq!(FormField::Email.as_str(), "email");
+        assert_eq!(FormField::Language.as_str(), "language");
+        assert_eq!(FormField::Domicile.as_str(), "domicile");
+        assert_eq!(FormField::Fullname.as_str(), "fullname");
         assert_eq!(FormField::Custom("custom_field").as_str(), "custom_field");
     }
 
@@ -527,8 +955,8 @@ mod tests {
     #[test]
     fn test_password_form_validation() {
         let valid = PasswordForm {
-            username: "SomeValidUser".to_string(),
-            password: "verysecurepassword".to_string(),
+            username: "alice@example.com".to_string(),
+            password: "Verysecurepassword1!".to_string(),
             tenant: None,
             next: None,
         };
@@ -536,14 +964,14 @@ mod tests {
 
         let empty_username = PasswordForm {
             username: "".to_string(),
-            password: "verysecurepassword".to_string(),
+            password: "Verysecurepassword1!".to_string(),
             tenant: None,
             next: None,
         };
         assert!(empty_username.validate_form().is_err());
 
         let short_password = PasswordForm {
-            username: "user".to_string(),
+            username: "alice@example.com".to_string(),
             password: "short".to_string(),
             tenant: None,
             next: None,
@@ -551,12 +979,43 @@ mod tests {
         assert!(short_password.validate_form().is_err());
 
         let long_password = PasswordForm {
-            username: "user".to_string(),
-            password: "a".repeat(513),
+            username: "alice@example.com".to_string(),
+            password: "A".repeat(513),
             tenant: None,
             next: None,
         };
         assert!(long_password.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_password_form_invalid_username() {
+        let form = PasswordForm {
+            username: "!!!".to_string(),
+            password: "Validpass1!".to_string(),
+            tenant: None,
+            next: None,
+        };
+        assert!(form.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_password_form_min_max_length() {
+        let min_pass = "Aa1!".repeat(2); // 8 chars
+        let max_pass = "Aa1!".repeat(128); // 512 chars
+        let form_min = PasswordForm {
+            username: "user".to_string(),
+            password: min_pass.clone(),
+            tenant: None,
+            next: None,
+        };
+        let form_max = PasswordForm {
+            username: "user".to_string(),
+            password: max_pass.clone(),
+            tenant: None,
+            next: None,
+        };
+        assert!(form_min.validate_form().is_ok());
+        assert!(form_max.validate_form().is_ok());
     }
 
     #[test]
@@ -600,7 +1059,7 @@ mod tests {
     #[test]
     fn test_password_verify_against_config_success() {
         let password = "correctpassword";
-        let hash = generate_hash(password);
+        let hash = generate_password_hash(password);
 
         let form = PasswordForm {
             username: "user".to_string(),
@@ -617,7 +1076,7 @@ mod tests {
     fn test_password_verify_against_config_wrong_password() {
         let correct_password = "correctpassword";
         let wrong_password = "wrongpassword";
-        let hash = generate_hash(correct_password);
+        let hash = generate_password_hash(correct_password);
 
         let form = PasswordForm {
             username: "user".to_string(),
@@ -679,144 +1138,128 @@ mod tests {
             next: None,
         };
 
-        assert_eq!(form.factor_kind(), AuthFactorKind::Totp);
+        assert_eq!(form.factor_kind(), AuthFactorKind::Otp);
         assert_eq!(form.form_kind(), FactorFormKind::Setup);
     }
 
     // ========================================================================
-    // TotpVerifyForm Tests
+    // TotpForm Tests
     // ========================================================================
 
     #[test]
-    fn test_totp_verify_form_validation() {
-        let valid = TotpVerifyForm {
+    fn test_totp_form_numeric_code() {
+        let form = TotpForm {
             code: "123456".to_string(),
             tenant: None,
             next: None,
         };
-        assert!(valid.validate_form().is_ok());
-
-        let short_code = TotpVerifyForm {
-            code: "12345".to_string(),
-            tenant: None,
-            next: None,
-        };
-        assert!(short_code.validate_form().is_err());
-
-        let long_code = TotpVerifyForm {
-            code: "1234567".to_string(),
-            tenant: None,
-            next: None,
-        };
-        assert!(long_code.validate_form().is_err());
+        assert!(form.validate_form().is_ok());
     }
 
     #[test]
-    fn test_totp_verify_against_config_success() {
-        let form = TotpVerifyForm {
+    fn test_totp_form_invalid_hex_code() {
+        // TOTP only supports numeric codes, hex should fail
+        let form = TotpForm {
+            code: "a1b2c3".to_string(),
+            tenant: None,
+            next: None,
+        };
+        assert!(form.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_totp_form_invalid_alphanumeric_code() {
+        // TOTP only supports numeric codes, alphanumeric should fail
+        let form = TotpForm {
+            code: "A1b2C3".to_string(),
+            tenant: None,
+            next: None,
+        };
+        assert!(form.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_totp_form_default_numeric() {
+        // No charset specified, should default to numeric
+        let form = TotpForm {
             code: "123456".to_string(),
             tenant: None,
             next: None,
         };
+        assert!(form.validate_form().is_ok());
 
-        let config = serde_json::json!({"code": "123456"});
-        assert!(form.verify_against_config(&config).is_ok());
+        let invalid = TotpForm {
+            code: "12ab56".to_string(),
+            tenant: None,
+            next: None,
+        };
+        assert!(invalid.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_totp_form_too_short() {
+        let form = TotpForm {
+            code: "12345".to_string(), // 5 digits, should be 6
+            tenant: None,
+            next: None,
+        };
+        assert!(form.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_totp_form_too_long() {
+        let form = TotpForm {
+            code: "1234567".to_string(), // 7 digits, should be 6
+            tenant: None,
+            next: None,
+        };
+        assert!(form.validate_form().is_err());
+    }
+
+    #[test]
+    fn test_totp_form_invalid_characters() {
+        let form = TotpForm {
+            code: "12a456".to_string(), // contains a letter, should be digits only by default
+            tenant: None,
+            next: None,
+        };
+        assert!(form.validate_form().is_err());
     }
 
     // ========================================================================
-    // OAuthForm Tests
+    // Negative tests for is_valid_otp_code helper
     // ========================================================================
 
     #[test]
-    fn test_oauth_form_validation() {
-        let valid = OauthForm {
-            provider: "github".to_string(),
-            tenant: None,
-            next: None,
+    fn test_is_valid_otp_code_numeric_negative() {
+        let config = OtpConfig {
+            digits: 6,
+            charset: OtpCharset::Numeric,
         };
-        assert!(valid.validate_form().is_ok());
-
-        let empty_provider = OauthForm {
-            provider: "".to_string(),
-            tenant: None,
-            next: None,
-        };
-        assert!(empty_provider.validate_form().is_err());
-
-        let long_provider = OauthForm {
-            provider: "a".repeat(65),
-            tenant: None,
-            next: None,
-        };
-        assert!(long_provider.validate_form().is_err());
+        assert!(!is_valid_otp_code("12345", &config)); // too short
+        assert!(!is_valid_otp_code("1234567", &config)); // too long
+        assert!(!is_valid_otp_code("12ab56", &config)); // contains letters
     }
 
     #[test]
-    fn test_oauth_verify_against_config_success() {
-        let form = OauthForm {
-            provider: "github".to_string(),
-            tenant: None,
-            next: None,
+    fn test_is_valid_otp_code_hex_negative() {
+        let config = OtpConfig {
+            digits: 6,
+            charset: OtpCharset::Hex,
         };
-
-        let config = serde_json::json!({"provider": "github"});
-        assert!(form.verify_against_config(&config).is_ok());
-    }
-
-    // ========================================================================
-    // FactorFormExt Tests
-    // ========================================================================
-
-    #[test]
-    fn test_get_string_field() {
-        let form = PasswordForm {
-            username: "alice".to_string(),
-            password: "secret123".to_string(),
-            tenant: None,
-            next: None,
-        };
-
-        assert_eq!(
-            form.get_string_field(FormField::Username),
-            Some("alice".to_string())
-        );
-        assert_eq!(form.get_string_field(FormField::Tenant), None);
+        assert!(!is_valid_otp_code("a1b2c", &config)); // too short
+        assert!(!is_valid_otp_code("a1b2c3d", &config)); // too long
+        assert!(!is_valid_otp_code("g1b2c3", &config)); // 'g' is not hex
     }
 
     #[test]
-    fn test_require_string_field_success() {
-        let form = PasswordForm {
-            username: "bob".to_string(),
-            password: "password123".to_string(),
-            tenant: Some("default".to_string()),
-            next: None,
+    fn test_is_valid_otp_code_alphanumeric_negative() {
+        let config = OtpConfig {
+            digits: 6,
+            charset: OtpCharset::Alphanumeric,
         };
-
-        assert_eq!(
-            form.require_string_field(FormField::Username),
-            Ok("bob".to_string())
-        );
-        assert_eq!(
-            form.require_string_field(FormField::Tenant),
-            Ok("default".to_string())
-        );
-    }
-
-    #[test]
-    fn test_require_string_field_missing() {
-        let form = PasswordForm {
-            username: "charlie".to_string(),
-            password: "password123".to_string(),
-            tenant: None,
-            next: None,
-        };
-
-        let result = form.require_string_field(FormField::Tenant);
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            FormError::MissingField(field) => assert_eq!(field, "tenant"),
-            _ => panic!("Expected MissingField error"),
-        }
+        assert!(!is_valid_otp_code("A1b2C", &config)); // too short
+        assert!(!is_valid_otp_code("A1b2C3D", &config)); // too long
+        assert!(!is_valid_otp_code("A1b2C!", &config)); // '!' is not alphanumeric
     }
 }

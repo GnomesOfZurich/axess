@@ -22,6 +22,7 @@ use crate::{
     // },
     tracing::{debug, error, warn},
 };
+use axess_factors::generate_password_hash;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::{
@@ -725,7 +726,6 @@ where
     where
         F: FactorForm + Send + Sync,
     {
-        // Create scope from session data
         let scope = PermissionScope::User(
             self.get_tenant_id()
                 .cloned()
@@ -735,16 +735,12 @@ where
 
         let factor_states = self
             .backend
-            .get_factor_states(factor_id, scope)
+            .get_factor_states(factor_id, scope.clone())
             .await
             .map_err(AuthError::BackendError)?;
 
         let factor_state = factor_states.first().ok_or(AuthError::FactorNotFound)?;
 
-        // Verify form against config
-        // factor_state.config is a HashMap<String, serde_json::Value>, but
-        // verify_against_config expects a &serde_json::Value, so convert it
-        // into a serde_json::Value::Object.
         let config_value = serde_json::Value::Object(
             factor_state
                 .config
@@ -753,8 +749,61 @@ where
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
         );
 
+        // Form handles all verification logic
         form.verify_against_config(&config_value)
             .map_err(|_| AuthError::InvalidCredentials)?;
+
+        // ✅ Only check otp_type for OTP factors
+        if form.factor_kind() == AuthFactorKind::Otp
+            && let Some(otp_type) = config_value.get("otp_type").and_then(|v| v.as_str())
+            && otp_type == "hotp"
+        {
+            let current_counter = config_value
+                .get("counter")
+                .and_then(|v| v.as_u64())
+                .ok_or(AuthError::InvalidCredentials)?;
+
+            let otp_secret = config_value
+                .get("otp_secret")
+                .and_then(|v| v.as_str())
+                .ok_or(AuthError::InvalidCredentials)?;
+
+            let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
+            let window = 5u64;
+            let otp_config = crate::utils::validation::OtpConfig::default();
+
+            // ✅ Get the actual counter that was used (not just current_counter)
+            let used_counter = axess_factors::verify_hotp(
+                otp_secret,
+                credential,
+                current_counter,
+                otp_config.digits,
+                window,
+            )
+            .ok_or(AuthError::InvalidCredentials)?;
+
+            // ✅ Increment from the USED counter, not the stored counter
+            let new_counter = used_counter + 1;
+
+            // Update factor config with new counter
+            let mut updated_config = factor_state.config.clone();
+            updated_config.insert("counter".to_string(), serde_json::json!(new_counter));
+
+            let change =
+                FactorStateChange::new(factor_id.clone(), self.get_user_id().cloned().unwrap())
+                    .with_scope(scope)
+                    .with_config(updated_config);
+
+            self.backend
+                .upsert_factor_state(change)
+                .await
+                .map_err(AuthError::BackendError)?;
+
+            debug!(
+                "HOTP counter incremented from {} to {}",
+                used_counter, new_counter
+            );
+        }
 
         Ok(())
     }
@@ -1008,15 +1057,15 @@ where
         match factor_kind {
             AuthFactorKind::Password => {
                 // Hash the password before storing
-                let password_hash = password_auth::generate_hash(credential);
+                let password_hash = generate_password_hash(credential);
                 config.insert(
                     "password_hash".to_string(),
                     serde_json::json!(password_hash),
                 );
             }
-            AuthFactorKind::Totp => {
-                // Store the TOTP secret
-                config.insert("totp_secret".to_string(), serde_json::json!(credential));
+            AuthFactorKind::Otp => {
+                config.insert("otp_type".to_string(), serde_json::json!("totp")); // or "hotp", etc.
+                config.insert("otp_secret".to_string(), serde_json::json!(credential));
             }
             AuthFactorKind::Oauth => {
                 // Store OAuth provider configuration

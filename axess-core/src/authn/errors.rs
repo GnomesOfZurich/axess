@@ -78,6 +78,8 @@ pub enum AuthError<B: AuthnBackend> {
     UnexpectedFactorKind(#[from] FactorKindError),
     #[error("Unexpected auth config for factor kind: {0}")]
     UnexpectedAuthConfig(String),
+    #[error("Unsupported OTP type")]
+    UnsupportedOtpType,
 
     #[error("User not found")]
     UserNotFound,
@@ -123,6 +125,7 @@ where
             AuthError::UnexpectedAuthState => {
                 (StatusCode::BAD_REQUEST, "Unexpected authentication state")
             }
+            AuthError::UnsupportedOtpType => (StatusCode::BAD_REQUEST, "Unsupported OTP type"),
             AuthError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized"),
             AuthError::InvalidScope => (StatusCode::BAD_REQUEST, "Invalid scope"),
             AuthError::MethodNotSupported | AuthError::MethodNotFound => (
@@ -165,9 +168,8 @@ pub enum HandlerError {
     #[error("Unauthorized access")]
     Unauthorized,
 
-    #[error("Invalid TOTP code")]
-    InvalidTOTP,
-
+    // #[error("Invalid OTP code")]
+    // InvalidOTP,
     #[error("Invalid login credentials")]
     InvalidCredentials,
 
@@ -195,9 +197,9 @@ impl IntoResponse for HandlerError {
         match self {
             HandlerError::AccessDenied => (StatusCode::FORBIDDEN, "Access denied").into_response(),
             HandlerError::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
-            HandlerError::InvalidTOTP => {
-                (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
-            }
+            // HandlerError::InvalidOTP => {
+            //     (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
+            // }
             HandlerError::InvalidCredentials => {
                 (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()
             }

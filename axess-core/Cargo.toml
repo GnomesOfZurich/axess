@@ -1,6 +1,6 @@
 [package]
 name = "axess-core"
-version = "0.0.5"
+version = "0.0.6"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -20,6 +20,7 @@ categories = ["web-programming"]
 [dependencies]
 # Core dependencies (always included)
 async-trait = { version = "0.1.89" }
+axess-factors = { path = "../axess-factors" }
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -65,15 +66,11 @@ fred = { version = "10.1.0", features = [
   "blocking-encoding",
   "replicas",
 ], optional = true }
-lazy-regex = { version = "3.4.1", optional = true }
+lazy-regex = { version = "3.4.1" }
 once_cell = { version = "1.21.3", optional = true }
-password-auth = { version = "1.0.0", optional = true }
+
 time = { version = "0.3.44", features = ["serde"], optional = true }
-totp-rs = { version = "5.7.0", features = [
-  "gen_secret",
-  "serde_support",
-  "zeroize",
-], optional = true}
+
 rand = { version = "0.9.2", optional = true }
 sha2 = { version = "0.10.9" }
 uuid = { version = "1.18.1", features = ["v4"], optional = true }
@@ -86,7 +83,7 @@ tracing-subscriber = { version = "0.3.20", features = ["fmt"], default-features 
 [dev-dependencies]
 argon2 = { version = "0.5.3", features = ["default"] }
 axum = "0.8.6"
-password-auth = { version = "1.0.0" }
+# password-auth = { version = "1.0.0" }
 reqwest = { version = "0.12.24", features = ["cookies"] }
 serial_test = "3.2.0" # Allows for the creation of serialised Rust tests
 # tower-sessions-sqlx-store = { version = "0.15.0", features = ["sqlite"] }
@@ -97,10 +94,8 @@ serial_test = "3.2.0" # Allows for the creation of serialised Rust tests
 [features]
 authn = [
   "dep:chrono",
-  "dep:dashmap", 
-  "dep:password-auth",
+  "dep:dashmap",
   "dep:time",
-  "dep:totp-rs",
   "dep:rand",
   "dep:urlencoding",
   "dep:form_urlencoded"

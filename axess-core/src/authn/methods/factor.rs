@@ -19,7 +19,7 @@ use std::{
 #[serde(rename_all = "lowercase")]
 pub enum AuthFactorKind {
     Password,
-    Totp,
+    Otp,
     Oauth,
     Custom(String),
 }
@@ -27,8 +27,8 @@ pub enum AuthFactorKind {
 impl AuthFactorKind {
     pub fn as_str(&self) -> &str {
         match self {
-            AuthFactorKind::Password => "Password",
-            AuthFactorKind::Totp => "Totp",
+            AuthFactorKind::Password => "password",
+            AuthFactorKind::Otp => "otp",
             AuthFactorKind::Oauth => "oauth",
             AuthFactorKind::Custom(s) => s.as_str(),
         }
@@ -41,7 +41,7 @@ impl FromStr for AuthFactorKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "password" => Ok(AuthFactorKind::Password),
-            "totp" => Ok(AuthFactorKind::Totp),
+            "otp" => Ok(AuthFactorKind::Otp),
             "oauth" => Ok(AuthFactorKind::Oauth),
             custom => Ok(AuthFactorKind::Custom(custom.to_string())),
         }

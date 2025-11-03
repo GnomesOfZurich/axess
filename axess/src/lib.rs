@@ -9,7 +9,7 @@
 //         method::MethodInstance,
 //         scope::PermissionScope,
 //     },
-//     middleware::{AuthnLayer, AuthnLayerBuilder, AuthnManager},
+//     middleware::{AuthnService, AuthnServiceBuilder, AuthnManager},
 //     sessions::{
 //         registry::SessionRegistry,
 //         auth_session::{AuthFactor, AuthMethod, AuthSession},
@@ -30,7 +30,7 @@ pub use axess_core::{
         errors::{AuthError, FormError, HandlerError},
         methods::{
             AuthFactorKind, EnablementState, FactorForm, FactorFormExt, FactorStateChange,
-            FormField, MethodStateChange, PermissionScope,
+            FormField, FormFieldValue, MethodStateChange, PermissionScope,
         },
         middleware::{AuthnManager, AuthnService, AuthnServiceBuilder},
         session::{
@@ -42,7 +42,7 @@ pub use axess_core::{
             SessionState,
         },
     },
-    utils::{self, validation::verify_totp},
+    utils,
 };
 
 #[cfg(feature = "authz")]
@@ -68,4 +68,5 @@ pub mod valkey {
     };
 }
 
+pub use axess_factors::{generate_password_hash, verify_hotp, verify_password, verify_totp};
 pub use axess_macros::{login_required, require_partial_authn};

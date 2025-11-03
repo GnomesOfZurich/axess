@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use chrono::Utc;
 // use chrono::{DateTime, Utc};
-use password_auth::verify_password;
 // use serde::{Deserialize, Serialize};
 use serde_json;
 use sqlx::{FromRow, Row, SqlitePool};
+use std::time::SystemTime;
 // use std::str::FromStr;
 // use tracing_subscriber::filter;
 // use tokio::task;
@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
 use axess::{
-    authn::methods::{factor::FactorStateChange, method::MethodStateChange},
-    verify_totp,
+    authn::methods::{factor::FactorStateChange, form::TOTP_DIGITS, method::MethodStateChange},
+    verify_password, verify_totp,
 };
 
 use crate::models::{
@@ -968,11 +968,11 @@ impl AuthnBackend for OurBackend {
                     .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
                 Ok(user)
             }
-            AuthFactorKind::Totp => {
+            AuthFactorKind::Otp => {
                 let totp_secret = factor_state
                     .0
                     .config
-                    .get("totp_secret")
+                    .get("otp_secret")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| sqlx::Error::ColumnDecode {
                         index: "factor_state".into(),
@@ -982,7 +982,7 @@ impl AuthnBackend for OurBackend {
                         )),
                     })?;
                 let totp_code = creds.credential().unwrap_or("");
-                if !verify_totp(totp_secret, totp_code) {
+                if !verify_totp(totp_secret, totp_code, SystemTime::now(), TOTP_DIGITS) {
                     return Err(sqlx::Error::Protocol("Invalid TOTP code".to_string()));
                 }
                 Ok(user)

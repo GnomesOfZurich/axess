@@ -220,7 +220,7 @@ impl ValkeyStore {
         let (ciphertext, nonce) = data.split_at(data.len() - 12);
         let nonce = Nonce::clone_from_slice(nonce);
 
-        cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        cipher.decrypt(&nonce, ciphertext).map_err(|e| {
             error!("Session data decryption failed: {}", e);
             ValkeyStoreError::Valkey(Error::new(
                 fred::error::ErrorKind::Unknown,

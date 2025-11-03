@@ -123,7 +123,7 @@ pub struct AuthnService<
 impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
     AuthnService<Backend, Sessions, R, C>
 {
-    /// Create a new [`AuthnLayer`] with the provided access controller.
+    /// Create a new [`AuthnService`] with the provided access controller.
     pub(crate) fn new(
         backend: Arc<Backend>,
         data_key: &'static str,

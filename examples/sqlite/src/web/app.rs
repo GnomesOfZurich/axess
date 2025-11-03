@@ -55,20 +55,19 @@ impl App {
         // Generate a cryptographic key to sign the session cookie.
         let key = Key::generate();
 
-        let backend = Arc::new(OurBackend::new(db.clone()));
         let session_layer = SessionManagerLayer::new(session_store.clone())
             .with_secure(false)
             .with_expiry(Expiry::OnInactivity(Duration::days(1)))
             .with_signed(key);
 
-        let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100));
-
         // Authn service.
         //
         // This combines the session layer with our backend and session registry to establish an
         // authentication service layer which will provide the auth session as a request extension.
+        let session_registry = Arc::new(SessionRegistryStore::new(session_store, 100));
+        let backend = Arc::new(OurBackend::new(db));
         let authn_service = Arc::new(
-            AuthnServiceBuilder::new(backend.clone(), session_layer)
+            AuthnServiceBuilder::new(backend, session_layer)
                 .with_session_registry(session_registry.clone())
                 .build(),
         );

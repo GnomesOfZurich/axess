@@ -1,5 +1,5 @@
 [workspace]
 members = ["axess", "axess-core", "axess-macros", "examples/*"]
-default-members = ["axess", "axess-core", "axess-macros"]
+default-members = ["axess", "axess-core", "axess-factors", "axess-macros"]
 resolver = "3"
 exclude = ["/.github", "/examples", "/scripts"]
