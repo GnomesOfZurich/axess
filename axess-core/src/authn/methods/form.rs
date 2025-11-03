@@ -149,6 +149,120 @@ pub trait FactorFormExt: FactorForm {
 
 impl<T: FactorForm> FactorFormExt for T {}
 
+/// Default form for requesting an authentication factor reset.
+/// This could be used to implement both self-service, admin-initiated resets or intermediary flows,
+/// such e.g. involving required approvals by a helpdesk or admin users.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FactorResetRequestForm {
+    /// Tenant identifier for multi-tenant systems
+    pub tenant: String,
+    /// Username or email of the user requesting the reset
+    pub username: String,
+    /// The specific factor kind to reset (Password, Otp, etc.)
+    pub factor_kind: AuthFactorKind,
+    /// Optional specific factor ID (if user has multiple factors of same kind)
+    pub factor_id: Option<String>,
+    /// Reason for the reset (strongly recommended for audit trail)
+    pub reason: Option<String>,
+    /// Optional ticket/case ID for compliance tracking
+    pub ticket_id: Option<String>,
+}
+
+impl FactorForm for FactorResetRequestForm {
+    fn factor_kind(&self) -> AuthFactorKind {
+        AuthFactorKind::Password
+    }
+
+    fn form_kind(&self) -> FactorFormKind {
+        FactorFormKind::Setup
+    }
+
+    fn validate_form(&self) -> Result<&Self, FormError> {
+        // 1. Validate tenant
+        if !is_valid_name(&self.tenant) {
+            return Err(FormError::ValidationFailed(
+                "Invalid tenant identifier".to_string(),
+            ));
+        }
+
+        // 2. Validate username (email or name)
+        if !is_valid_email(&self.username) && !is_valid_name(&self.username) {
+            return Err(FormError::ValidationFailed(
+                "Invalid username or email".to_string(),
+            ));
+        }
+
+        // 3. Validate factor_id format if present
+        if let Some(id) = &self.factor_id
+            && !(id.is_empty() || id.len() > 128)
+        {
+            return Err(FormError::ValidationFailed(
+                "Invalid factor ID format".to_string(),
+            ));
+        }
+
+        // 4. Validate reason length if present
+        if let Some(reason) = &self.reason {
+            let len = reason.trim().len();
+            if !(10..=500).contains(&len) {
+                return Err(FormError::ValidationFailed(
+                    "Unexpected length for reset reason".to_string(),
+                ));
+            }
+        }
+
+        // 5. Validate ticket_id if present
+        if let Some(ticket) = &self.ticket_id
+            && (ticket.is_empty() || ticket.len() > 64)
+        {
+            return Err(FormError::ValidationFailed(
+                "Invalid ticket ID format".to_string(),
+            ));
+        }
+
+        Ok(self)
+    }
+
+    fn credential(&self) -> Option<&str> {
+        None
+    }
+
+    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+        self.validate_form()
+    }
+
+    fn fields(&self) -> HashMap<FormField, FormFieldValue> {
+        let mut map = HashMap::new();
+        if let Some(reason) = &self.reason {
+            map.insert(
+                FormField::Custom("reason"),
+                FormFieldValue::String(Cow::Owned(reason.clone())),
+            );
+        }
+        if let Some(old) = &self.factor_id {
+            map.insert(
+                FormField::Custom("factor_id"),
+                FormFieldValue::String(Cow::Owned(old.clone())),
+            );
+        }
+        if let Some(token) = &self.ticket_id {
+            map.insert(
+                FormField::Custom("ticket_id"),
+                FormFieldValue::String(Cow::Owned(token.clone())),
+            );
+        }
+        // tenant is a required String on FactorResetRequestForm; include if non-empty
+        if !self.tenant.is_empty() {
+            map.insert(
+                FormField::Tenant,
+                FormFieldValue::String(Cow::Owned(self.tenant.clone())),
+            );
+        }
+        map
+    }
+}
+
+/// Default form for setting a new password (useful when changing a password)
 #[derive(Debug, Clone, Deserialize)]
 pub struct PasswordSetupForm {
     /// The new password to set.
@@ -222,6 +336,11 @@ impl FactorForm for PasswordSetupForm {
     }
 }
 
+/// Default form for verifying password during login
+///
+/// This form captures the username and password, along with optional tenant and next URL.
+/// It includes validation to ensure the username is a valid email or name,
+/// and that the password meets some basic security requirements.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PasswordForm {
     pub username: String,
@@ -334,7 +453,6 @@ impl FactorForm for PasswordForm {
 ///
 /// # References
 /// - [RFC 6238: TOTP: Time-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc6238)
-/// - [RFC 4226: HOTP: An HMAC-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc4226)
 #[derive(Clone, Deserialize)]
 pub struct TotpSetupForm {
     pub secret: String,
@@ -528,6 +646,15 @@ impl FactorForm for TotpForm {
         Ok(self)
     }
 }
+
+/// Form for setting up an HOTP factor (HMAC-based One-Time Password).
+///
+/// This is used when the user is registering a new HOTP factor.
+/// It includes the HOTP secret and an optional redirect URL after setup.
+/// The secret is typically generated by the server and displayed to the user.
+/// The user will then use this secret to configure their HOTP app.
+///
+/// By default, this follows the HOTP standard ([RFC 4226: HOTP: An HMAC-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc4226)).
 #[derive(Debug, Clone, Deserialize)]
 pub struct HotpSetupForm {
     /// The new HOTP secret to set up.
@@ -606,6 +733,7 @@ impl FactorForm for HotpSetupForm {
     }
 }
 
+/// Form for verifying a HOTP code.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HotpForm {
     pub code: String,
@@ -710,6 +838,9 @@ impl FactorForm for HotpForm {
     }
 }
 
+/// Form for verifying email address during signup or email change
+///
+/// This form captures the email, tenant, verification token, and optional next URL.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EmailVerificationForm {
     pub email: String,
@@ -743,6 +874,10 @@ impl FactorForm for EmailVerificationForm {
     }
 }
 
+/// Default form for setting up a new user account during signup
+///
+/// This form captures a basic set of user details needed for account creation.
+/// It also includes validation ensuring that all fields are properly formatted.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserSetupForm {
     pub tenant: String,
