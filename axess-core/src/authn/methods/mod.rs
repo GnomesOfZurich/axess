@@ -5,6 +5,6 @@ pub mod scope;
 
 // Re-export key types for ergonomics
 pub use factor::{AuthFactorKind, FactorStateChange};
-pub use form::{FactorForm, FactorFormExt, FormField, FormFieldValue};
+pub use form::{FactorForm, FactorFormExt, FactorFormKind, FormField, FormFieldValue};
 pub use method::MethodStateChange;
 pub use scope::{EnablementState, PermissionScope};

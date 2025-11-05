@@ -1,7 +1,7 @@
 use crate::models::backend::OurBackend;
 use axess::{
     AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession, EnablementState,
-    SessionRegistryStore,
+    SessionRegistryStore, SystemRng,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{FromRow, Row, sqlite::SqliteRow};
@@ -10,7 +10,7 @@ use tower_sessions_sqlx_store::SqliteStore;
 use uuid::Uuid;
 
 #[allow(dead_code)]
-pub type OurAuthSession = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>>;
+pub type OurAuthSession = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
 pub struct OurAuthFactor(pub AuthFactor<OurBackend>);
 

@@ -2,7 +2,7 @@ use crate::{
     authn::{errors::FormError, methods::factor::AuthFactorKind},
     tracing::{error, warn},
     utils::validation::{
-        OtpCharset, OtpConfig, PasswordConfig, is_valid_country_iso, is_valid_email,
+        OtpCharset, OtpConfig, OtpType, PasswordConfig, is_valid_country_iso, is_valid_email,
         is_valid_language_code, is_valid_name, is_valid_otp_code, is_valid_password,
         is_valid_url_format,
     },
@@ -26,8 +26,8 @@ pub enum FormField {
     Password,
     Tenant,
     Next,
-    TotpCode,
-    TotpSecret,
+    OtpCode,
+    OtpSecret,
     OauthProvider,
     Email,
     Language,
@@ -44,8 +44,8 @@ impl FormField {
             FormField::Password => "password",
             FormField::Tenant => "tenant",
             FormField::Next => "next",
-            FormField::TotpCode => "code",
-            FormField::TotpSecret => "secret",
+            FormField::OtpCode => "otp_code",
+            FormField::OtpSecret => "otp_secret",
             FormField::OauthProvider => "provider",
             FormField::Email => "email",
             FormField::Language => "language",
@@ -65,6 +65,16 @@ pub enum FormFieldValue {
     Binary(Vec<u8>),
     /// Structured JSON data (e.g., OAuth tokens with metadata)
     Json(serde_json::Value),
+}
+
+impl FormFieldValue {
+    /// Convert to string if possible
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            FormFieldValue::String(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 impl From<String> for FormFieldValue {
@@ -455,7 +465,7 @@ impl FactorForm for PasswordForm {
 /// - [RFC 6238: TOTP: Time-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc6238)
 #[derive(Clone, Deserialize)]
 pub struct TotpSetupForm {
-    pub secret: String,
+    pub otp_secret: String,
     pub tenant: Option<String>,
     pub next: Option<String>,
 }
@@ -463,7 +473,7 @@ pub struct TotpSetupForm {
 impl Debug for TotpSetupForm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TotpSetupForm")
-            .field("secret", &"***REDACTED***")
+            .field("otp_secret", &"***REDACTED***")
             .field("tenant", &self.tenant)
             .field("next", &self.next)
             .finish()
@@ -480,11 +490,11 @@ impl FactorForm for TotpSetupForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.secret.is_empty() {
+        if self.otp_secret.is_empty() {
             Err(FormError::ValidationFailed(
                 "TOTP secret cannot be empty.".to_string(),
             ))
-        } else if self.secret.len() < 4 {
+        } else if self.otp_secret.len() < 4 {
             Err(FormError::ValidationFailed(
                 "TOTP secret must be at least 4 characters long.".to_string(),
             ))
@@ -504,7 +514,7 @@ impl FactorForm for TotpSetupForm {
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.secret)
+        Some(&self.otp_secret)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -512,8 +522,8 @@ impl FactorForm for TotpSetupForm {
         let mut map = HashMap::with_capacity(capacity);
 
         map.insert(
-            FormField::TotpSecret,
-            FormFieldValue::String(Cow::Owned(self.secret.clone())),
+            FormField::OtpSecret,
+            FormFieldValue::String(Cow::Owned(self.otp_secret.clone())),
         );
 
         if let Some(tenant) = &self.tenant {
@@ -543,7 +553,7 @@ impl FactorForm for TotpSetupForm {
 /// Now supports configurable charset for numeric, hex, or alphanumeric codes.
 #[derive(Clone, Deserialize)]
 pub struct TotpForm {
-    pub code: String,
+    pub otp_code: String,
     pub tenant: Option<String>,
     pub next: Option<String>,
 }
@@ -551,7 +561,7 @@ pub struct TotpForm {
 impl Debug for TotpForm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TotpVerifyForm")
-            .field("code", &"***REDACTED***")
+            .field("otp_code", &"***REDACTED***")
             .field("tenant", &self.tenant)
             .field("next", &self.next)
             .finish()
@@ -569,7 +579,7 @@ impl FactorForm for TotpForm {
 
     fn validate_form(&self) -> Result<&Self, FormError> {
         let config = OtpConfig::default();
-        if !is_valid_otp_code(&self.code, &config) {
+        if !is_valid_otp_code(&self.otp_code, &config) {
             return Err(FormError::ValidationFailed(format!(
                 "TOTP code must be exactly {} {}.",
                 TOTP_DIGITS,
@@ -594,7 +604,7 @@ impl FactorForm for TotpForm {
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.code)
+        Some(&self.otp_code)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -602,8 +612,8 @@ impl FactorForm for TotpForm {
         let mut map = HashMap::with_capacity(capacity);
 
         map.insert(
-            FormField::TotpCode,
-            FormFieldValue::String(Cow::Owned(self.code.clone())),
+            FormField::OtpCode,
+            FormFieldValue::String(Cow::Owned(self.otp_code.clone())),
         );
 
         if let Some(tenant) = &self.tenant {
@@ -623,24 +633,34 @@ impl FactorForm for TotpForm {
     }
 
     fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
-        let credential = self.credential().ok_or_else(|| {
-            FormError::ValidationFailed("Missing TOTP code credential.".to_string())
-        })?;
+        // ✅ Use credential() for the OTP code (primary auth value)
+        let code = self
+            .credential()
+            .ok_or_else(|| FormError::ValidationFailed("Missing TOTP code".to_string()))?;
 
-        let otp_secret = config
+        let secret = config
             .get("otp_secret")
             .and_then(|v| v.as_str())
             .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Otp.to_string()))?;
 
-        // Use OTP configuration for digit size and allow a small verification window.
-        let otp_config = OtpConfig::default();
+        // ✅ Verify OTP type matches expectation
+        let otp_type: OtpType = config
+            .get("otp_type")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or(OtpType::Totp);
 
-        // TOTP verification only (time-based)
-        if !verify_totp(otp_secret, credential, SystemTime::now(), otp_config.digits) {
+        if otp_type != OtpType::Totp {
+            return Err(FormError::ValidationFailed(format!(
+                "Expected TOTP factor, found {}",
+                otp_type.as_str()
+            )));
+        }
+
+        // ✅ Use OtpConfig for consistent length handling
+        let otp_config = OtpConfig::default();
+        if !verify_totp(secret, code, SystemTime::now(), otp_config.length) {
             error!("TOTP verification failed");
-            return Err(FormError::ValidationFailed(
-                "Invalid TOTP code.".to_string(),
-            ));
+            return Err(FormError::ValidationFailed("Invalid TOTP code".into()));
         }
 
         Ok(self)
@@ -658,7 +678,7 @@ impl FactorForm for TotpForm {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HotpSetupForm {
     /// The new HOTP secret to set up.
-    pub secret: String,
+    pub otp_secret: String,
     /// Optional tenant for multi-tenancy.
     pub tenant: Option<String>,
     /// Optional redirect URL after setup.
@@ -675,12 +695,12 @@ impl FactorForm for HotpSetupForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.secret.is_empty() {
+        if self.otp_secret.is_empty() {
             return Err(FormError::ValidationFailed(
                 "HOTP secret cannot be empty.".to_string(),
             ));
         }
-        if self.secret.len() < 4 {
+        if self.otp_secret.len() < 4 {
             return Err(FormError::ValidationFailed(
                 "HOTP secret must be at least 4 characters long.".to_string(),
             ));
@@ -701,7 +721,7 @@ impl FactorForm for HotpSetupForm {
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.secret)
+        Some(&self.otp_secret)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -709,8 +729,8 @@ impl FactorForm for HotpSetupForm {
         let mut map = HashMap::with_capacity(capacity);
 
         map.insert(
-            FormField::TotpSecret,
-            FormFieldValue::String(Cow::Owned(self.secret.clone())),
+            FormField::OtpSecret,
+            FormFieldValue::String(Cow::Owned(self.otp_secret.clone())),
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
@@ -736,7 +756,7 @@ impl FactorForm for HotpSetupForm {
 /// Form for verifying a HOTP code.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HotpForm {
-    pub code: String,
+    pub otp_code: String,
     pub counter: u64,
     pub tenant: Option<String>,
     pub next: Option<String>,
@@ -753,10 +773,10 @@ impl FactorForm for HotpForm {
 
     fn validate_form(&self) -> Result<&Self, FormError> {
         let config = OtpConfig::default();
-        if !is_valid_otp_code(&self.code, &config) {
+        if !is_valid_otp_code(&self.otp_code, &config) {
             return Err(FormError::ValidationFailed(format!(
                 "HOTP code must be exactly {} {}.",
-                config.digits,
+                config.length,
                 match config.charset {
                     OtpCharset::Numeric => "digits",
                     OtpCharset::Hex => "hex characters",
@@ -778,14 +798,14 @@ impl FactorForm for HotpForm {
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.code)
+        Some(&self.otp_code)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
         let mut map = HashMap::with_capacity(4);
         map.insert(
-            FormField::TotpCode,
-            FormFieldValue::String(Cow::Owned(self.code.clone())),
+            FormField::OtpCode,
+            FormFieldValue::String(Cow::Owned(self.otp_code.clone())),
         );
         map.insert(
             FormField::Custom("counter"),
@@ -807,6 +827,11 @@ impl FactorForm for HotpForm {
     }
 
     fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
+        // ✅ Use credential() for the OTP code (primary auth value)
+        let code = self
+            .credential()
+            .ok_or_else(|| FormError::ValidationFailed("Missing HOTP code".to_string()))?;
+
         let secret = config
             .get("otp_secret")
             .and_then(|v| v.as_str())
@@ -817,22 +842,34 @@ impl FactorForm for HotpForm {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| FormError::AuthConfigError("Missing HOTP counter".to_string()))?;
 
-        let window = 5u64;
-        let otp_config = OtpConfig::default();
+        // ✅ Verify OTP type matches expectation
+        let otp_type: OtpType = config
+            .get("otp_type")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or(OtpType::Totp);
 
-        match verify_hotp(
-            secret,
-            &self.code,
-            stored_counter,
-            otp_config.digits,
-            window,
-        ) {
-            Some(_used_counter) => Ok(self),
+        if otp_type != OtpType::Hotp {
+            return Err(FormError::ValidationFailed(format!(
+                "Expected HOTP factor, found {}",
+                otp_type.as_str()
+            )));
+        }
+
+        // ✅ Use OtpConfig for consistent length handling
+        let otp_config = OtpConfig::default();
+        let window = 5u64;
+
+        // ✅ Access form-specific field directly (counter is HOTP-specific, not a general credential)
+        // Note: For HOTP, the form's counter field can be used for client-side sync hints,
+        // but verification always uses the stored counter from config
+        match verify_hotp(secret, code, stored_counter, otp_config.length, window) {
+            Some(_used_counter) => {
+                // Note: Counter increment happens in AuthSession::verify_factor, not here
+                Ok(self)
+            }
             None => {
                 error!("HOTP verification failed for counter {}", stored_counter);
-                Err(FormError::ValidationFailed(
-                    "Invalid HOTP code.".to_string(),
-                ))
+                Err(FormError::ValidationFailed("Invalid HOTP code".to_string()))
             }
         }
     }
@@ -1031,8 +1068,8 @@ mod tests {
         assert_eq!(FormField::Password.as_str(), "password");
         assert_eq!(FormField::Tenant.as_str(), "tenant");
         assert_eq!(FormField::Next.as_str(), "next");
-        assert_eq!(FormField::TotpCode.as_str(), "code");
-        assert_eq!(FormField::TotpSecret.as_str(), "secret");
+        assert_eq!(FormField::OtpCode.as_str(), "otp_code");
+        assert_eq!(FormField::OtpSecret.as_str(), "otp_secret");
         assert_eq!(FormField::OauthProvider.as_str(), "provider");
         assert_eq!(FormField::Email.as_str(), "email");
         assert_eq!(FormField::Language.as_str(), "language");
@@ -1244,21 +1281,21 @@ mod tests {
     #[test]
     fn test_totp_setup_form_validation() {
         let valid = TotpSetupForm {
-            secret: "abcd".to_string(),
+            otp_secret: "abcd".to_string(),
             tenant: None,
             next: None,
         };
         assert!(valid.validate_form().is_ok());
 
         let empty_secret = TotpSetupForm {
-            secret: "".to_string(),
+            otp_secret: "".to_string(),
             tenant: None,
             next: None,
         };
         assert!(empty_secret.validate_form().is_err());
 
         let short_secret = TotpSetupForm {
-            secret: "abc".to_string(),
+            otp_secret: "abc".to_string(),
             tenant: None,
             next: None,
         };
@@ -1268,7 +1305,7 @@ mod tests {
     #[test]
     fn test_totp_setup_form_kinds() {
         let form = TotpSetupForm {
-            secret: "secret123".to_string(),
+            otp_secret: "secret123".to_string(),
             tenant: None,
             next: None,
         };
@@ -1284,7 +1321,7 @@ mod tests {
     #[test]
     fn test_totp_form_numeric_code() {
         let form = TotpForm {
-            code: "123456".to_string(),
+            otp_code: "123456".to_string(),
             tenant: None,
             next: None,
         };
@@ -1295,7 +1332,7 @@ mod tests {
     fn test_totp_form_invalid_hex_code() {
         // TOTP only supports numeric codes, hex should fail
         let form = TotpForm {
-            code: "a1b2c3".to_string(),
+            otp_code: "a1b2c3".to_string(),
             tenant: None,
             next: None,
         };
@@ -1306,7 +1343,7 @@ mod tests {
     fn test_totp_form_invalid_alphanumeric_code() {
         // TOTP only supports numeric codes, alphanumeric should fail
         let form = TotpForm {
-            code: "A1b2C3".to_string(),
+            otp_code: "A1b2C3".to_string(),
             tenant: None,
             next: None,
         };
@@ -1317,14 +1354,14 @@ mod tests {
     fn test_totp_form_default_numeric() {
         // No charset specified, should default to numeric
         let form = TotpForm {
-            code: "123456".to_string(),
+            otp_code: "123456".to_string(),
             tenant: None,
             next: None,
         };
         assert!(form.validate_form().is_ok());
 
         let invalid = TotpForm {
-            code: "12ab56".to_string(),
+            otp_code: "12ab56".to_string(),
             tenant: None,
             next: None,
         };
@@ -1334,7 +1371,7 @@ mod tests {
     #[test]
     fn test_totp_form_too_short() {
         let form = TotpForm {
-            code: "12345".to_string(), // 5 digits, should be 6
+            otp_code: "12345".to_string(), // 5 digits, should be 6
             tenant: None,
             next: None,
         };
@@ -1344,7 +1381,7 @@ mod tests {
     #[test]
     fn test_totp_form_too_long() {
         let form = TotpForm {
-            code: "1234567".to_string(), // 7 digits, should be 6
+            otp_code: "1234567".to_string(), // 7 digits, should be 6
             tenant: None,
             next: None,
         };
@@ -1354,7 +1391,7 @@ mod tests {
     #[test]
     fn test_totp_form_invalid_characters() {
         let form = TotpForm {
-            code: "12a456".to_string(), // contains a letter, should be digits only by default
+            otp_code: "12a456".to_string(), // contains a letter, should be digits only by default
             tenant: None,
             next: None,
         };
@@ -1368,7 +1405,7 @@ mod tests {
     #[test]
     fn test_is_valid_otp_code_numeric_negative() {
         let config = OtpConfig {
-            digits: 6,
+            length: 6,
             charset: OtpCharset::Numeric,
         };
         assert!(!is_valid_otp_code("12345", &config)); // too short
@@ -1379,7 +1416,7 @@ mod tests {
     #[test]
     fn test_is_valid_otp_code_hex_negative() {
         let config = OtpConfig {
-            digits: 6,
+            length: 6,
             charset: OtpCharset::Hex,
         };
         assert!(!is_valid_otp_code("a1b2c", &config)); // too short
@@ -1390,7 +1427,7 @@ mod tests {
     #[test]
     fn test_is_valid_otp_code_alphanumeric_negative() {
         let config = OtpConfig {
-            digits: 6,
+            length: 6,
             charset: OtpCharset::Alphanumeric,
         };
         assert!(!is_valid_otp_code("A1b2C", &config)); // too short

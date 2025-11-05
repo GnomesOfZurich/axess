@@ -1,4 +1,5 @@
 use lazy_regex::regex;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 // #[cfg(feature = "authn")]
@@ -149,16 +150,35 @@ pub enum OtpCharset {
     Alphanumeric,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OtpType {
+    Totp,
+    Hotp,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl OtpType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            OtpType::Totp => "totp",
+            OtpType::Hotp => "hotp",
+            OtpType::Custom(s) => s.as_str(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OtpConfig {
-    pub digits: usize,
+    pub length: usize,
     pub charset: OtpCharset,
 }
 
 impl Default for OtpConfig {
     fn default() -> Self {
         Self {
-            digits: 6,
+            length: 6,
             charset: OtpCharset::Numeric,
         }
     }
@@ -166,7 +186,7 @@ impl Default for OtpConfig {
 
 /// Validate a OTP code according to the provided config.
 pub fn is_valid_otp_code(code: &str, config: &OtpConfig) -> bool {
-    if code.len() != config.digits {
+    if code.len() != config.length {
         return false;
     }
     match config.charset {

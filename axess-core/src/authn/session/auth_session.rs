@@ -21,26 +21,26 @@ use crate::{
     //     // SessionRegistryError,
     // },
     tracing::{debug, error, warn},
+    utils::{
+        validation::OtpType,
+        random::{SecureRng, SystemRng},
+    },
 };
 use axess_factors::generate_password_hash;
-use rand::RngCore;
+// use getrandom::getrandom;
 use sha2::{Digest, Sha256};
-use std::{
-    // collections::HashMap,
-    // char::MAX,
-    fmt::Debug,
-    sync::Arc, // sync::Arc
-};
+use std::{fmt::Debug, sync::Arc};
 use tower_sessions::Session;
 
 // const SESSION_TIMEOUT_SECS: i64 = 30 * 60; // 30 minutes in seconds
 // const SESSION_TIMEOUT: Duration = Duration::seconds(SESSION_TIMEOUT_SECS);
 
 #[derive(Clone)]
-pub struct AuthSession<B, R>
+pub struct AuthSession<B, R, Rng>
 where
     B: AuthnBackend,
     R: SessionRegistry,
+    Rng: SecureRng,
 {
     pub state: SessionState<B>,
 
@@ -56,12 +56,14 @@ where
     data: SessionData<B>,
     data_key: &'static str,
     session_registry: Option<Arc<R>>,
+    rng: Rng, // Add RNG field
 }
 
-impl<B, R> Debug for AuthSession<B, R>
+impl<B, R, Rng> Debug for AuthSession<B, R, Rng>
 where
     B: AuthnBackend + Debug,
     R: SessionRegistry + Debug,
+    Rng: SecureRng,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthSession")
@@ -72,7 +74,7 @@ where
             .field("data", &self.data)
             .field("data_key", &self.data_key)
             .field("session_registry", &self.session_registry.is_some())
-            .finish()
+            .finish_non_exhaustive() // Don't debug RNG
     }
 }
 
@@ -82,7 +84,7 @@ where
 /// workflow, for example via a frontend login form. There a user would provide
 /// their credentials, such as username and password, and via the backend
 /// the session would authenticate those credentials.
-impl<B, R> AuthSession<B, R>
+impl<B, R> AuthSession<B, R, SystemRng>
 where
     B: AuthnBackend + Debug,
     B::TenantId: From<<B::User as AuthUser>::TenantId>,
@@ -95,6 +97,32 @@ where
         backend: Arc<B>,
         data_key: &'static str,
         session_registry: Option<Arc<R>>,
+    ) -> Result<Self, AuthError<B>>
+    where
+        B::User: Clone,
+        B::UserId: Clone,
+        B::TenantId: Clone,
+    {
+        Self::from_session_with_rng(session, backend, data_key, session_registry, SystemRng).await
+    }
+}
+
+impl<B, R, Rng> AuthSession<B, R, Rng>
+where
+    B: AuthnBackend + Debug,
+    B::TenantId: From<<B::User as AuthUser>::TenantId>,
+    B::UserId: From<<B::User as AuthUser>::Id>,
+    <B as AuthnBackend>::TenantId: From<<<B as AuthnBackend>::Tenant as AuthTenant>::Id>,
+    R: SessionRegistry + Send + Sync + 'static,
+    Rng: SecureRng,
+{
+    /// Create AuthSession with custom RNG (for testing)
+    pub async fn from_session_with_rng(
+        session: Session,
+        backend: Arc<B>,
+        data_key: &'static str,
+        session_registry: Option<Arc<R>>,
+        rng: Rng,
     ) -> Result<Self, AuthError<B>>
     where
         B::User: Clone,
@@ -146,6 +174,7 @@ where
             data,
             data_key,
             session_registry,
+            rng,
         })
     }
 
@@ -753,56 +782,66 @@ where
         form.verify_against_config(&config_value)
             .map_err(|_| AuthError::InvalidCredentials)?;
 
-        // ✅ Only check otp_type for OTP factors
-        if form.factor_kind() == AuthFactorKind::Otp
-            && let Some(otp_type) = config_value.get("otp_type").and_then(|v| v.as_str())
-            && otp_type == "hotp"
-        {
-            let current_counter = config_value
-                .get("counter")
-                .and_then(|v| v.as_u64())
-                .ok_or(AuthError::InvalidCredentials)?;
+        // ✅ Only check otp_mode for OTP factors
+        if form.factor_kind() == AuthFactorKind::Otp {
+            let otp_type: OtpType = config_value
+                .get("otp_type")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or(OtpType::Totp);
 
-            let otp_secret = config_value
-                .get("otp_secret")
-                .and_then(|v| v.as_str())
-                .ok_or(AuthError::InvalidCredentials)?;
+            match otp_type {
+                OtpType::Hotp => {
+                    let current_counter = config_value
+                        .get("counter")
+                        .and_then(|v| v.as_u64())
+                        .ok_or(AuthError::InvalidCredentials)?;
 
-            let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
-            let window = 5u64;
-            let otp_config = crate::utils::validation::OtpConfig::default();
+                    let otp_secret = config_value
+                        .get("otp_secret")
+                        .and_then(|v| v.as_str())
+                        .ok_or(AuthError::InvalidCredentials)?;
 
-            // ✅ Get the actual counter that was used (not just current_counter)
-            let used_counter = axess_factors::verify_hotp(
-                otp_secret,
-                credential,
-                current_counter,
-                otp_config.digits,
-                window,
-            )
-            .ok_or(AuthError::InvalidCredentials)?;
+                    let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
+                    let window = 5u64;
+                    let otp_config = crate::utils::validation::OtpConfig::default();
 
-            // ✅ Increment from the USED counter, not the stored counter
-            let new_counter = used_counter + 1;
+                    // ✅ Get the actual counter that was used (not just current_counter)
+                    let used_counter = axess_factors::verify_hotp(
+                        otp_secret,
+                        credential,
+                        current_counter,
+                        otp_config.length,
+                        window,
+                    )
+                    .ok_or(AuthError::InvalidCredentials)?;
 
-            // Update factor config with new counter
-            let mut updated_config = factor_state.config.clone();
-            updated_config.insert("counter".to_string(), serde_json::json!(new_counter));
+                    // ✅ Increment from the USED counter, not the stored counter
+                    let new_counter = used_counter + 1;
 
-            let change =
-                FactorStateChange::new(factor_id.clone(), self.get_user_id().cloned().unwrap())
+                    // Update factor config with new counter
+                    let mut updated_config = factor_state.config.clone();
+                    updated_config.insert("counter".to_string(), serde_json::json!(new_counter));
+
+                    let change = FactorStateChange::new(
+                        factor_id.clone(),
+                        self.get_user_id().cloned().unwrap(),
+                    )
                     .with_scope(scope)
                     .with_config(updated_config);
 
-            self.backend
-                .upsert_factor_state(change)
-                .await
-                .map_err(AuthError::BackendError)?;
+                    self.backend
+                        .upsert_factor_state(change)
+                        .await
+                        .map_err(AuthError::BackendError)?;
 
-            debug!(
-                "HOTP counter incremented from {} to {}",
-                used_counter, new_counter
-            );
+                    debug!(
+                        "HOTP counter incremented from {} to {}",
+                        used_counter, new_counter
+                    );
+                }
+                OtpType::Totp => { /* no counter update needed */ }
+                OtpType::Custom(_) => { /* custom logic */ }
+            }
         }
 
         Ok(())
@@ -883,7 +922,7 @@ where
     }
 
     /// Generates a cryptographically secure hash binding this authentication to a specific session
-    fn generate_session_hash(&self) -> String {
+    fn generate_session_hash(&mut self) -> String {
         let mut hasher = Sha256::new();
 
         // Session ID
@@ -891,10 +930,10 @@ where
             hasher.update(session_id.to_string().as_bytes());
         }
 
-        // User ID (use Debug formatting for types that may not implement Display)
+        // User ID
         hasher.update(format!("{:?}", self.user.id()).as_bytes());
 
-        // Tenant ID for additional context
+        // Tenant ID
         hasher.update(format!("{:?}", self.user.tenant_id()).as_bytes());
 
         // High-precision timestamp
@@ -904,7 +943,7 @@ where
 
         // Cryptographically secure random nonce (32 bytes)
         let mut nonce = [0u8; 32];
-        rand::rng().fill_bytes(&mut nonce);
+        SecureRng::fill_bytes(&mut self.rng, &mut nonce);
         hasher.update(nonce);
 
         format!("{:x}", hasher.finalize())
@@ -1013,7 +1052,7 @@ where
     ) -> Result<Response, AuthError<B>>
     // Changed from StatusCode
     where
-        F: FactorForm + Send + Sync,
+        F: FactorForm + Send + Sync + 'static,
     {
         // 1. Ensure user is authenticated
         if !self.is_authenticated() {
@@ -1064,8 +1103,10 @@ where
                 );
             }
             AuthFactorKind::Otp => {
-                config.insert("otp_type".to_string(), serde_json::json!("totp")); // or "hotp", etc.
+                config.insert("otp_type".to_string(), serde_json::json!("totp")); // or "hotp"
                 config.insert("otp_secret".to_string(), serde_json::json!(credential));
+                // For HOTP, also:
+                // config.insert("counter".to_string(), serde_json::json!(0));
             }
             AuthFactorKind::Oauth => {
                 // Store OAuth provider configuration
@@ -1100,7 +1141,10 @@ where
 
     /// Ensures session is registered starting from PartialAuthn state
     async fn ensure_session_registered(&mut self) -> Result<(), AuthError<B>> {
-        let Some(registry) = &self.session_registry else {
+        // Clone ownership of the optional registry so we don't hold an immutable borrow of self
+        // while we later need a mutable borrow for generating a session hash.
+        let registry_opt = self.session_registry.clone();
+        let Some(registry) = registry_opt else {
             // No registry configured - this is OK for guest sessions
             // but consider warning if not guest
             if !matches!(self.data.user_state, EntityState::Guest) {
@@ -1109,9 +1153,13 @@ where
             return Ok(());
         };
 
-        let Some(session_id) = self.session.id() else {
-            error!("Cannot register session without ID");
-            return Err(AuthError::SessionInvalid);
+        // Capture the session id as an owned String so the borrow ends immediately.
+        let session_id_str = match self.session.id() {
+            Some(id) => id.to_string(),
+            None => {
+                error!("Cannot register session without ID");
+                return Err(AuthError::SessionInvalid);
+            }
         };
 
         // Only register if user is identified (not guest)
@@ -1121,6 +1169,7 @@ where
         }
 
         // Ensure hash exists; if not, generate and persist it (best-effort).
+        // This block may call &mut self methods, so previous borrows must have ended.
         let session_hash = if let Some(h) = self.data.auth_hash.as_ref() {
             h.clone()
         } else {
@@ -1136,7 +1185,6 @@ where
             new_hash
         };
 
-        let session_id_str = session_id.to_string();
         let user_id = self.get_user_id().map(|id| id.to_string());
         let tenant_id = self.get_tenant_id().map(|id| id.to_string());
 
@@ -1190,7 +1238,17 @@ mod tests {
             admin::AuthnAdminBackend, methods::method::MethodInstance,
             session::registry::SessionRegistryStore,
         },
-        utils::testing::mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
+        utils::{
+            testing::{
+                mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
+                mock_form::{DummyFailingForm, DummyOkForm},
+                mock_random::MockRng,
+            },
+        },
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use tower_sessions::{
         MemoryStore, SessionStore,
@@ -1236,7 +1294,7 @@ mod tests {
 
     async fn create_test_session() -> Result<
         (
-            AuthSession<MockBackend, SessionRegistryStore<MemoryStore>>,
+            AuthSession<MockBackend, SessionRegistryStore<MemoryStore>, MockRng>,
             Arc<SessionRegistryStore<MemoryStore>>,
         ),
         AuthError<MockBackend>,
@@ -1256,11 +1314,50 @@ mod tests {
             .await
             .map_err(AuthError::BackendError)?;
 
-        let auth_session = AuthSession::from_session(
+        let rng = MockRng::new(42);
+        let auth_session = AuthSession::from_session_with_rng(
             session,
             backend.clone(),
             "test.data",
             Some(registry.clone()),
+            rng,
+        )
+        .await?;
+
+        Ok((auth_session, registry))
+    }
+
+    /// Helper to create a test session with a custom RNG
+    async fn create_test_session_with_custom_rng(
+        rng: MockRng,
+    ) -> Result<
+        (
+            AuthSession<MockBackend, SessionRegistryStore<MemoryStore>, MockRng>,
+            Arc<SessionRegistryStore<MemoryStore>>,
+        ),
+        AuthError<MockBackend>,
+    > {
+        let backend = Arc::new(MockBackend::default());
+        let store = MemoryStore::default();
+
+        // Create and initialize session (pass a cloned MemoryStore value)
+        let session = create_initialized_session(store.clone()).await;
+
+        let registry = Arc::new(SessionRegistryStore::new(store, 0));
+
+        // Configure backend with test method
+        let method = mock_method();
+        backend
+            .upsert_auth_method(method.clone())
+            .await
+            .map_err(AuthError::BackendError)?;
+
+        let auth_session = AuthSession::from_session_with_rng(
+            session,
+            backend.clone(),
+            "test.data",
+            Some(registry.clone()),
+            rng,
         )
         .await?;
 
@@ -1579,6 +1676,100 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    /// Test from_session_with_rng uses injected RNG
+    async fn test_from_session_with_rng_uses_injected_rng() -> Result<(), AuthError<MockBackend>> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let rng = MockRng::with_counter(42, counter.clone());
+        let (mut auth_session, _) = create_test_session_with_custom_rng(rng).await?;
+
+        auth_session.user = MockUser {
+            id: TestUserId("user_rng".to_string()),
+            tenant_id: TestTenantId("tenant_rng".to_string()),
+            state: EntityState::Active,
+        };
+        auth_session.data.user_id = Some(TestUserId("user_rng".to_string()));
+        auth_session.data.tenant_id = Some(TestTenantId("tenant_rng".to_string()));
+        auth_session.data.user_state = EntityState::Active;
+
+        let first = auth_session.generate_session_hash();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Injected RNG should be invoked for hash generation"
+        );
+
+        let second = auth_session.generate_session_hash();
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "Injected RNG should be called each time a hash is generated"
+        );
+
+        assert_ne!(first, second, "Hashes should differ because timestamps change");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_verify_factor_returns_factor_not_found() -> Result<(), AuthError<MockBackend>> {
+        let rng = MockRng::new(42);
+        let (mut auth_session, _) = create_test_session_with_custom_rng(rng).await?;
+
+        auth_session.user = MockUser {
+            id: TestUserId("user-factor-missing".into()),
+            tenant_id: TestTenantId("tenant-factor-missing".into()),
+            state: EntityState::Active,
+        };
+        auth_session.data.user_id = Some(TestUserId("user-factor-missing".into()));
+        auth_session.data.tenant_id = Some(TestTenantId("tenant-factor-missing".into()));
+        auth_session.data.user_state = EntityState::Active;
+
+        let form = DummyOkForm::default();
+        let factor_id = "missing-factor".to_string();
+
+        let result = auth_session.verify_factor(&form, &factor_id).await;
+        assert!(matches!(result, Err(AuthError::FactorNotFound)));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn test_verify_factor_invalid_credentials_when_form_verification_fails(
+    ) -> Result<(), AuthError<MockBackend>> {
+        use std::collections::HashMap;
+
+        let rng = MockRng::new(42);
+        let (mut auth_session, _) = create_test_session_with_custom_rng(rng).await?;
+
+        let user_id = TestUserId("user-form-fail".into());
+        let tenant_id = TestTenantId("tenant-form-fail".into());
+        auth_session.user = MockUser {
+            id: user_id.clone(),
+            tenant_id: tenant_id.clone(),
+            state: EntityState::Active,
+        };
+        auth_session.data.user_id = Some(user_id.clone());
+        auth_session.data.tenant_id = Some(tenant_id.clone());
+        auth_session.data.user_state = EntityState::Active;
+
+        let factor_id = "password-factor".to_string();
+        let scope = PermissionScope::User(tenant_id.clone(), user_id.clone());
+
+        let change = FactorStateChange::new(factor_id.clone(), user_id.clone())
+            .with_scope(scope.clone())
+            .with_state(EnablementState::Active)
+            .with_config(HashMap::new());
+
+        auth_session
+            .backend
+            .upsert_factor_state(change)
+            .await
+            .expect("mock backend upsert should succeed");
+
+        let form = DummyFailingForm::default();
+        let result = auth_session.verify_factor(&form, &factor_id).await;
+        assert!(matches!(result, Err(AuthError::InvalidCredentials)));
         Ok(())
     }
 }

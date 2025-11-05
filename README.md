@@ -59,7 +59,7 @@ let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
 // Protected routes require authentication
 let protected_router = Router::new()
     .route("/main", get(protected_handler))
-    .route_layer(login_required!(Arc<AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>>>, "/login"));
+    .route_layer(login_required!(Arc<AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>, SystemRng>>, "/login"));
 
 // Auth routes (login/logout) may need backend state
 let auth_router = Router::new()
