@@ -28,7 +28,7 @@ cargo add axess
 from your command line or add the following to your `Cargo.toml` file:
 ```toml
 [dependencies]
-axess = { version="0.0.1", features=["full"]}
+axess = { version="0.0.7", features=["full"]}
 ```
 2. Define your Cedar policies if interested in authorization. This is a feature protected by feature toggle `authz` (part of the `default` configuration).
 3. Configure authentication and authorization middleware.
