@@ -5,36 +5,43 @@ use crate::{
         methods::{
             EnablementState,
             factor::{AuthFactorKind, FactorStateChange},
-            form::{FactorForm, FactorFormExt, FactorFormKind, FormField}, // added FactorFormExt
+            form::{FactorForm, FactorFormExt, FactorFormKind, FormField},
             scope::PermissionScope,
         },
         session::SessionRegistry,
-        types::{AuthMethod, PartialState, SessionData, SessionState},
+        types::{AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
     },
     axum::{
         extract::{Form, Json},
-        // http::StatusCode,
         response::{IntoResponse, Redirect, Response},
     },
-    // storage::session_registry::{
-    //     // SessionRegistry,
-    //     // SessionRegistryError,
-    // },
     tracing::{debug, error, warn},
     utils::{
-        validation::OtpType,
         random::{SecureRng, SystemRng},
+        validation::OtpType,
     },
 };
-use axess_factors::generate_password_hash;
-// use getrandom::getrandom;
+use axess_factors::{generate_password_hash, verify_hotp};
 use sha2::{Digest, Sha256};
 use std::{fmt::Debug, sync::Arc};
 use tower_sessions::Session;
 
-// const SESSION_TIMEOUT_SECS: i64 = 30 * 60; // 30 minutes in seconds
-// const SESSION_TIMEOUT: Duration = Duration::seconds(SESSION_TIMEOUT_SECS);
-
+/// `AuthSession` orchestrates authentication workflows for a user session. It handles factor
+/// verification, state transitions, session persistence, and registry bookkeeping.
+///
+/// # Deterministic Simulation Testing (DST)
+/// To keep authentication flows reproducible in tests while remaining secure in production,
+/// the session takes two injectable components:
+/// - `Rng`: any implementor of [`SecureRng`](crate::utils::random::SecureRng). Production code
+///   uses [`SystemRng`](crate::utils::random::SystemRng); tests can provide
+///   [`MockRng`](crate::utils::testing::mock_random::MockRng) for deterministic output.
+/// - `SessionRegistry`: an optional [`SessionRegistry`](crate::authn::session::SessionRegistry)
+///   allowing tests to swap the backing store (see
+///   [`SessionRegistryStore`](crate::authn::session::registry::SessionRegistryStore)) or skip it
+///   entirely for guest scenarios.
+///
+/// Both parameters are injected via [`AuthSession::from_session_with_rng`](self::AuthSession::from_session_with_rng),
+/// ensuring contributors can control randomness and persistence when writing DST-oriented tests.
 #[derive(Clone)]
 pub struct AuthSession<B, R, Rng>
 where
@@ -78,12 +85,6 @@ where
     }
 }
 
-/// Methods for authenticating the session and logging a user in are provided.
-///
-/// Generally this session will be used in the context of some authentication
-/// workflow, for example via a frontend login form. There a user would provide
-/// their credentials, such as username and password, and via the backend
-/// the session would authenticate those credentials.
 impl<B, R> AuthSession<B, R, SystemRng>
 where
     B: AuthnBackend + Debug,
@@ -652,6 +653,111 @@ where
         }
     }
 
+    async fn process_hotp_success<F>(
+        &mut self,
+        form: &F,
+        factor_state: &AuthFactorState<B>,
+        scope: &PermissionScope<B::TenantId, B::UserId>,
+        config: &serde_json::Value,
+    ) -> Result<(), AuthError<B>>
+    where
+        F: FactorForm,
+    {
+        let otp_code = form.credential().ok_or(AuthError::InvalidCredentials)?;
+
+        let secret = config
+            .get("otp_secret")
+            .and_then(|value| value.as_str())
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        let counter = config
+            .get("counter")
+            .and_then(|value| value.as_u64())
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        let digits = config
+            .get("digits")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(6) as usize;
+
+        let window = config
+            .get("window")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(5);
+
+        let used_counter = verify_hotp(secret, otp_code, counter, digits, window)
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        let mut updated_config = factor_state.config.clone();
+        updated_config.insert("counter".to_string(), serde_json::json!(used_counter + 1));
+
+        let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
+
+        let change = FactorStateChange::new(factor_state.factor_id.clone(), updated_by)
+            .with_scope(scope.clone())
+            .with_state(factor_state.state.clone())
+            .with_config(updated_config);
+
+        self.backend
+            .upsert_factor_state(change)
+            .await
+            .map_err(AuthError::BackendError)?;
+
+        Ok(())
+    }
+
+    async fn verify_factor<F>(
+        &mut self,
+        form: &F,
+        factor_id: &B::FactorId,
+    ) -> Result<(), AuthError<B>>
+    // Changed from StatusCode
+    where
+        F: FactorForm + Send + Sync,
+    {
+        let scope = PermissionScope::User(
+            self.get_tenant_id()
+                .cloned()
+                .ok_or(AuthError::Unauthorized)?,
+            self.get_user_id().cloned().ok_or(AuthError::Unauthorized)?,
+        );
+
+        let factor_states = self
+            .backend
+            .get_factor_states(factor_id, scope.clone())
+            .await
+            .map_err(AuthError::BackendError)?;
+
+        let factor_state = factor_states.first().ok_or(AuthError::FactorNotFound)?;
+
+        let config_value = serde_json::Value::Object(
+            factor_state
+                .config
+                .clone()
+                .into_iter()
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        );
+
+        // Form handles all verification logic
+        form.verify_against_config(&config_value)
+            .map_err(|_| AuthError::InvalidCredentials)?;
+
+        // ✅ Only check otp_mode for OTP factors
+        if form.factor_kind() == AuthFactorKind::Otp {
+            let otp_type: OtpType = config_value
+                .get("otp_type")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or(OtpType::Totp);
+
+            if matches!(otp_type, OtpType::Hotp) {
+                self.process_hotp_success(form, factor_state, &scope, &config_value)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_initial_authentication<F>(
         &mut self,
         form: &F,
@@ -744,107 +850,6 @@ where
         // Apply the factor to the current state and determine next step (partial or authenticated)
         let requested_next_route = form.get_string_field(FormField::Next);
         self.apply_factor(&factor.id, requested_next_route).await
-    }
-
-    async fn verify_factor<F>(
-        &mut self,
-        form: &F,
-        factor_id: &B::FactorId,
-    ) -> Result<(), AuthError<B>>
-    // Changed from StatusCode
-    where
-        F: FactorForm + Send + Sync,
-    {
-        let scope = PermissionScope::User(
-            self.get_tenant_id()
-                .cloned()
-                .ok_or(AuthError::Unauthorized)?,
-            self.get_user_id().cloned().ok_or(AuthError::Unauthorized)?,
-        );
-
-        let factor_states = self
-            .backend
-            .get_factor_states(factor_id, scope.clone())
-            .await
-            .map_err(AuthError::BackendError)?;
-
-        let factor_state = factor_states.first().ok_or(AuthError::FactorNotFound)?;
-
-        let config_value = serde_json::Value::Object(
-            factor_state
-                .config
-                .clone()
-                .into_iter()
-                .collect::<serde_json::Map<String, serde_json::Value>>(),
-        );
-
-        // Form handles all verification logic
-        form.verify_against_config(&config_value)
-            .map_err(|_| AuthError::InvalidCredentials)?;
-
-        // ✅ Only check otp_mode for OTP factors
-        if form.factor_kind() == AuthFactorKind::Otp {
-            let otp_type: OtpType = config_value
-                .get("otp_type")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or(OtpType::Totp);
-
-            match otp_type {
-                OtpType::Hotp => {
-                    let current_counter = config_value
-                        .get("counter")
-                        .and_then(|v| v.as_u64())
-                        .ok_or(AuthError::InvalidCredentials)?;
-
-                    let otp_secret = config_value
-                        .get("otp_secret")
-                        .and_then(|v| v.as_str())
-                        .ok_or(AuthError::InvalidCredentials)?;
-
-                    let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
-                    let window = 5u64;
-                    let otp_config = crate::utils::validation::OtpConfig::default();
-
-                    // ✅ Get the actual counter that was used (not just current_counter)
-                    let used_counter = axess_factors::verify_hotp(
-                        otp_secret,
-                        credential,
-                        current_counter,
-                        otp_config.length,
-                        window,
-                    )
-                    .ok_or(AuthError::InvalidCredentials)?;
-
-                    // ✅ Increment from the USED counter, not the stored counter
-                    let new_counter = used_counter + 1;
-
-                    // Update factor config with new counter
-                    let mut updated_config = factor_state.config.clone();
-                    updated_config.insert("counter".to_string(), serde_json::json!(new_counter));
-
-                    let change = FactorStateChange::new(
-                        factor_id.clone(),
-                        self.get_user_id().cloned().unwrap(),
-                    )
-                    .with_scope(scope)
-                    .with_config(updated_config);
-
-                    self.backend
-                        .upsert_factor_state(change)
-                        .await
-                        .map_err(AuthError::BackendError)?;
-
-                    debug!(
-                        "HOTP counter incremented from {} to {}",
-                        used_counter, new_counter
-                    );
-                }
-                OtpType::Totp => { /* no counter update needed */ }
-                OtpType::Custom(_) => { /* custom logic */ }
-            }
-        }
-
-        Ok(())
     }
 
     pub async fn start_authentication(
@@ -1103,10 +1108,28 @@ where
                 );
             }
             AuthFactorKind::Otp => {
-                config.insert("otp_type".to_string(), serde_json::json!("totp")); // or "hotp"
+                config = self
+                    .backend
+                    .get_factor_states(&factor.id, scope.clone())
+                    .await
+                    .map_err(AuthError::BackendError)?
+                    .into_iter()
+                    .find(|state| state.state == EnablementState::Pending)
+                    .map(|state| state.config)
+                    .unwrap_or_default();
+
+                let otp_type = config
+                    .get("otp_type")
+                    .cloned()
+                    .and_then(|raw| serde_json::from_value::<OtpType>(raw).ok())
+                    .unwrap_or(OtpType::Totp);
+
+                config.insert("otp_type".to_string(), serde_json::json!(otp_type.as_str()));
                 config.insert("otp_secret".to_string(), serde_json::json!(credential));
-                // For HOTP, also:
-                // config.insert("counter".to_string(), serde_json::json!(0));
+
+                if matches!(otp_type, OtpType::Hotp) && !config.contains_key("counter") {
+                    config.insert("counter".to_string(), serde_json::json!(0u64));
+                }
             }
             AuthFactorKind::Oauth => {
                 // Store OAuth provider configuration
@@ -1238,12 +1261,10 @@ mod tests {
             admin::AuthnAdminBackend, methods::method::MethodInstance,
             session::registry::SessionRegistryStore,
         },
-        utils::{
-            testing::{
-                mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
-                mock_form::{DummyFailingForm, DummyOkForm},
-                mock_random::MockRng,
-            },
+        utils::testing::{
+            mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
+            mock_form::{DummyFailingForm, DummyOkForm},
+            mock_random::MockRng,
         },
     };
     use std::sync::{
@@ -1709,7 +1730,10 @@ mod tests {
             "Injected RNG should be called each time a hash is generated"
         );
 
-        assert_ne!(first, second, "Hashes should differ because timestamps change");
+        assert_ne!(
+            first, second,
+            "Hashes should differ because timestamps change"
+        );
         Ok(())
     }
 
@@ -1735,8 +1759,8 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn test_verify_factor_invalid_credentials_when_form_verification_fails(
-    ) -> Result<(), AuthError<MockBackend>> {
+    async fn test_verify_factor_invalid_credentials_when_form_verification_fails()
+    -> Result<(), AuthError<MockBackend>> {
         use std::collections::HashMap;
 
         let rng = MockRng::new(42);

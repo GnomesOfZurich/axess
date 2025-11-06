@@ -15,7 +15,7 @@ where
     S: Send + Sync,
     B: AuthnBackend + Send + Sync + 'static,
     R: SessionRegistry + Send + Sync + 'static,
-    Rng: SecureRng
+    Rng: SecureRng,
 {
     type Rejection = (StatusCode, &'static str);
 

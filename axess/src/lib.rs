@@ -42,7 +42,7 @@ pub use axess_core::{
             SessionState,
         },
     },
-    utils::{random::SystemRng, self},
+    utils::{self, random::SystemRng},
 };
 
 #[cfg(feature = "authz")]

@@ -1,4 +1,4 @@
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 
 /// Trait for secure random number generation (DST-friendly)
 pub trait SecureRng: Send + Sync + 'static {
@@ -32,7 +32,10 @@ mod tests {
         rng1.fill_bytes(&mut buf1);
         rng2.fill_bytes(&mut buf2);
 
-        assert_eq!(buf1, buf2, "MockRng should produce identical output for identical seeds");
+        assert_eq!(
+            buf1, buf2,
+            "MockRng should produce identical output for identical seeds"
+        );
     }
 
     #[test]
@@ -46,7 +49,10 @@ mod tests {
         rng1.fill_bytes(&mut buf1);
         rng2.fill_bytes(&mut buf2);
 
-        assert_ne!(buf1, buf2, "MockRng outputs should differ for different seeds");
+        assert_ne!(
+            buf1, buf2,
+            "MockRng outputs should differ for different seeds"
+        );
     }
 
     #[test]
@@ -56,8 +62,7 @@ mod tests {
         rng.fill_bytes(&mut buf);
 
         assert_ne!(
-            buf,
-            [0u8; 32],
+            buf, [0u8; 32],
             "SystemRng should write non-zero data into the buffer (extremely unlikely to fail spuriously)"
         );
     }

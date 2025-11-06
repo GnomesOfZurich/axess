@@ -1,11 +1,8 @@
 use crate::authn::{
     errors::FormError,
-    methods::{
-        AuthFactorKind, FactorForm, FactorFormKind, FormField, FormFieldValue,
-    },
+    methods::{AuthFactorKind, FactorForm, FactorFormKind, FormField, FormFieldValue},
 };
 use std::collections::HashMap;
-
 
 #[derive(Default, Debug, serde::Deserialize, serde::Serialize)]
 pub struct DummyOkForm;

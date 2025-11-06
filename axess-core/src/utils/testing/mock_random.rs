@@ -1,5 +1,8 @@
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use crate::utils::random::SecureRng;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Deterministic RNG for testing (NOT cryptographically secure)
 #[derive(Debug, Clone)]
@@ -14,15 +17,15 @@ impl MockRng {
     }
 
     pub fn with_counter(seed: u64, calls: Arc<AtomicUsize>) -> Self {
-        Self { seed, calls: Some(calls) }
+        Self {
+            seed,
+            calls: Some(calls),
+        }
     }
 
     #[inline]
     fn next_u64(&mut self) -> u64 {
-        self.seed = self
-            .seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.seed
     }
 }
