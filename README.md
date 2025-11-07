@@ -37,29 +37,32 @@ axess = { version="0.0.7", features=["full"]}
 ## 🤸 Example Usage
 Create a minimal Axum web application project and initiate the axess layers of interest from some backend storage and session cache of your choice. The router layers then provide session based authentication for your services:
 ```rust
-use axess::{AuthnServiceBuilder, StoreSessionRegistry, login_required};
+use axess::{AuthnServiceBuilder, AuthSession, SessionRegistryStore, SystemRng, login_required};
 use axum::{Router, routing::get};
 use tower_sessions_sqlx_store::SqliteStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use crate::OurBackend; // Your custom backend implementation
+use crate::OurBackend; // Your custom backend implementation, handling interactions with the database
+
+type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
 // Create your backend and session store
 let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
 let backend = Arc::new(OurBackend::new(pool.clone()));
 let session_store = SqliteStore::new(pool.clone());
-let session_registry = Arc::new(StoreSessionRegistry::new(session_store.clone(), 100));
+let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100));
 
 // Build the authentication layer
 let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
     .with_session_registry(session_registry.clone())
     .build();
 
+
 // Protected routes require authentication
 let protected_router = Router::new()
     .route("/main", get(protected_handler))
-    .route_layer(login_required!(Arc<AuthSession<OurBackend, StoreSessionRegistry<SqliteStore>, SystemRng>>, "/login"));
+    .route_layer(login_required!(Arc<Session>, "/login"));
 
 // Auth routes (login/logout) may need backend state
 let auth_router = Router::new()

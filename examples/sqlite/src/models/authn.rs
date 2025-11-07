@@ -10,7 +10,7 @@ use tower_sessions_sqlx_store::SqliteStore;
 use uuid::Uuid;
 
 #[allow(dead_code)]
-pub type OurAuthSession = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
+pub type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
 pub struct OurAuthFactor(pub AuthFactor<OurBackend>);
 

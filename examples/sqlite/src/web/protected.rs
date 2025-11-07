@@ -7,7 +7,7 @@ use axum::{
     routing::get,
 };
 
-use crate::models::authn::OurAuthSession;
+use crate::models::authn::Session;
 
 #[derive(Template)]
 #[template(path = "protected.html")]
@@ -19,15 +19,15 @@ struct ProtectedTemplate<'a> {
 pub fn router() -> Router {
     Router::new()
         .route("/main", get(get::protected))
-        .route_layer(login_required!(OurAuthSession, "/login"))
+        .route_layer(login_required!(Session, "/login"))
 }
 
 mod get {
     use super::*;
     use tracing::error;
 
-    pub async fn protected(auth_session: OurAuthSession) -> impl IntoResponse {
-        match auth_session.user() {
+    pub async fn protected(session: Session) -> impl IntoResponse {
+        match session.user() {
             Ok(user) => {
                 match (ProtectedTemplate {
                     username: &user.username,

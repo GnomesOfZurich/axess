@@ -12,7 +12,7 @@ use axum::{
 use axum_messages::{Message, Messages};
 use serde::Deserialize;
 
-// use crate::models::authn::OurAuthSession;
+// use crate::models::authn::Session;
 
 pub fn router() -> Router {
     Router::new()
@@ -49,7 +49,7 @@ pub mod post {
 
 pub mod get {
     use super::*;
-    use crate::models::authn::OurAuthSession;
+    use crate::models::authn::Session;
 
     #[axum::debug_handler]
     pub async fn login(
@@ -66,7 +66,7 @@ pub mod get {
     }
 
     #[axum::debug_handler]
-    pub async fn logout(mut session: OurAuthSession) -> impl IntoResponse {
+    pub async fn logout(mut session: Session) -> impl IntoResponse {
         match session.logout().await {
             Ok(_) => Redirect::to("/login").into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),

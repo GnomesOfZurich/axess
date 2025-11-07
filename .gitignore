@@ -19,7 +19,7 @@
 
 # Ignore editor related files
 .idea/
-.vscode/
+.vscode*
 
 #  Other files to ignore:
 **/.env

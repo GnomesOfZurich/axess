@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 // #[cfg(feature = "authn")]
-// pub fn verify_hotp(secret: &str, code: &str, digits: usize, counter: u64) -> bool {
-//     match TOTP::new(Algorithm::SHA1, digits, 30, 1, secret.as_bytes().to_vec()) {
+// pub fn verify_hotp(secret: &str, code: &str, length: usize, counter: u64) -> bool {
+//     match TOTP::new(Algorithm::SHA1, length, 30, 1, secret.as_bytes().to_vec()) {
 //         Ok(totp) => {
 //             let expected = totp.generate_from_input(counter);
 //             expected == code

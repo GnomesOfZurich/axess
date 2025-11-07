@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
 use axess::{
-    authn::methods::{factor::FactorStateChange, form::TOTP_DIGITS, method::MethodStateChange},
+    authn::methods::{factor::FactorStateChange, form::TOTP_LENGTH, method::MethodStateChange},
     verify_password, verify_totp,
 };
 
@@ -982,10 +982,17 @@ impl AuthnBackend for OurBackend {
                         )),
                     })?;
                 let totp_code = creds.credential().unwrap_or("");
-                if !verify_totp(totp_secret, totp_code, SystemTime::now(), TOTP_DIGITS) {
-                    return Err(sqlx::Error::Protocol("Invalid TOTP code".to_string()));
+                match verify_totp(
+                    totp_secret,
+                    totp_code,
+                    SystemTime::now(),
+                    TOTP_LENGTH,
+                    30,
+                    1,
+                ) {
+                    Some(_) => Ok(user),
+                    None => Err(sqlx::Error::Protocol("Invalid TOTP code".to_string())),
                 }
-                Ok(user)
             }
             AuthFactorKind::Oauth => {
                 // Handle OAuth factor authentication

@@ -11,7 +11,7 @@ use axess_factors::{verify_hotp, verify_password, verify_totp};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, collections::HashMap, fmt::Debug, time::SystemTime};
 
-pub const TOTP_DIGITS: usize = 6;
+pub const TOTP_LENGTH: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FactorFormKind {
@@ -582,7 +582,7 @@ impl FactorForm for TotpForm {
         if !is_valid_otp_code(&self.otp_code, &config) {
             return Err(FormError::ValidationFailed(format!(
                 "TOTP code must be exactly {} {}.",
-                TOTP_DIGITS,
+                TOTP_LENGTH,
                 match config.charset {
                     OtpCharset::Numeric => "digits",
                     OtpCharset::Hex => "hex characters",
@@ -633,34 +633,42 @@ impl FactorForm for TotpForm {
     }
 
     fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
-        // ✅ Use credential() for the OTP code (primary auth value)
-        let code = self
-            .credential()
-            .ok_or_else(|| FormError::ValidationFailed("Missing TOTP code".to_string()))?;
-
         let secret = config
             .get("otp_secret")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Otp.to_string()))?;
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                FormError::AuthConfigError("Missing otp_secret in factor configuration".into())
+            })?;
 
-        // ✅ Verify OTP type matches expectation
-        let otp_type: OtpType = config
-            .get("otp_type")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(OtpType::Totp);
+        let length = config
+            .get("length")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(TOTP_LENGTH);
 
-        if otp_type != OtpType::Totp {
-            return Err(FormError::ValidationFailed(format!(
-                "Expected TOTP factor, found {}",
-                otp_type.as_str()
-            )));
-        }
+        let past_window = config
+            .get("past_window")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(1);
 
-        // ✅ Use OtpConfig for consistent length handling
-        let otp_config = OtpConfig::default();
-        if !verify_totp(secret, code, SystemTime::now(), otp_config.length) {
-            error!("TOTP verification failed");
-            return Err(FormError::ValidationFailed("Invalid TOTP code".into()));
+        let future_window = config
+            .get("future_window")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+
+        if verify_totp(
+            secret,
+            &self.otp_code,
+            SystemTime::now(),
+            length,
+            past_window,
+            future_window,
+        )
+        .is_none()
+        {
+            return Err(FormError::ValidationFailed(
+                "Invalid TOTP code.".to_string(),
+            ));
         }
 
         Ok(self)

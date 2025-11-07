@@ -5,7 +5,7 @@ use crate::{
         methods::{
             EnablementState,
             factor::{AuthFactorKind, FactorStateChange},
-            form::{FactorForm, FactorFormExt, FactorFormKind, FormField},
+            form::{FactorForm, FactorFormExt, FactorFormKind, FormField, TOTP_LENGTH},
             scope::PermissionScope,
         },
         session::SessionRegistry,
@@ -21,7 +21,7 @@ use crate::{
         validation::OtpType,
     },
 };
-use axess_factors::{generate_password_hash, verify_hotp};
+use axess_factors::{generate_password_hash, verify_hotp, verify_totp};
 use sha2::{Digest, Sha256};
 use std::{fmt::Debug, sync::Arc};
 use tower_sessions::Session;
@@ -675,21 +675,103 @@ where
             .and_then(|value| value.as_u64())
             .ok_or(AuthError::InvalidCredentials)?;
 
-        let digits = config
-            .get("digits")
+        let length = config
+            .get("length")
             .and_then(|value| value.as_u64())
-            .unwrap_or(6) as usize;
+            .map(|value| value as usize)
+            .unwrap_or(TOTP_LENGTH);
 
         let window = config
             .get("window")
             .and_then(|value| value.as_u64())
             .unwrap_or(5);
 
-        let used_counter = verify_hotp(secret, otp_code, counter, digits, window)
+        let used_counter = verify_hotp(secret, otp_code, counter, length, window)
             .ok_or(AuthError::InvalidCredentials)?;
 
         let mut updated_config = factor_state.config.clone();
         updated_config.insert("counter".to_string(), serde_json::json!(used_counter + 1));
+
+        let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
+
+        let change = FactorStateChange::new(factor_state.factor_id.clone(), updated_by)
+            .with_scope(scope.clone())
+            .with_state(factor_state.state.clone())
+            .with_config(updated_config);
+
+        self.backend
+            .upsert_factor_state(change)
+            .await
+            .map_err(AuthError::BackendError)?;
+
+        Ok(())
+    }
+
+    async fn process_totp_success<F>(
+        &mut self,
+        form: &F,
+        factor_state: &AuthFactorState<B>,
+        scope: &PermissionScope<B::TenantId, B::UserId>,
+        config: &serde_json::Value,
+    ) -> Result<(), AuthError<B>>
+    where
+        F: FactorForm,
+    {
+        use std::time::SystemTime;
+
+        let otp_code = form.credential().ok_or(AuthError::InvalidCredentials)?;
+
+        let secret = config
+            .get("otp_secret")
+            .and_then(|value| value.as_str())
+            .ok_or(AuthError::InvalidCredentials)?;
+
+        let length = config
+            .get("length")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize)
+            .unwrap_or(TOTP_LENGTH);
+
+        let past_window = config
+            .get("past_window")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(1);
+
+        let future_window = config
+            .get("future_window")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+
+        let matched_step = verify_totp(
+            secret,
+            otp_code,
+            SystemTime::now(),
+            length,
+            past_window,
+            future_window,
+        )
+        .ok_or(AuthError::InvalidCredentials)?;
+
+        let last_step = config
+            .get("last_totp_step")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+
+        if matched_step <= last_step {
+            warn!(
+                factor_id = %factor_state.factor_id,
+                matched_step,
+                last_step,
+                "Rejected replayed TOTP code in the same time window"
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        let mut updated_config = factor_state.config.clone();
+        updated_config.insert(
+            "last_totp_step".to_string(),
+            serde_json::json!(matched_step),
+        );
 
         let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
 
@@ -738,20 +820,28 @@ where
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
         );
 
-        // Form handles all verification logic
         form.verify_against_config(&config_value)
             .map_err(|_| AuthError::InvalidCredentials)?;
 
-        // ✅ Only check otp_mode for OTP factors
         if form.factor_kind() == AuthFactorKind::Otp {
             let otp_type: OtpType = config_value
                 .get("otp_type")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or(OtpType::Totp);
 
-            if matches!(otp_type, OtpType::Hotp) {
-                self.process_hotp_success(form, factor_state, &scope, &config_value)
-                    .await?;
+            match otp_type {
+                OtpType::Hotp => {
+                    self.process_hotp_success(form, factor_state, &scope, &config_value)
+                        .await?
+                }
+                OtpType::Totp => {
+                    self.process_totp_success(form, factor_state, &scope, &config_value)
+                        .await?
+                }
+                OtpType::Custom(_) => {
+                    error!("Custom OTP types are not supported for verification");
+                    return Err(AuthError::InvalidCredentials);
+                }
             }
         }
 
@@ -1127,8 +1217,33 @@ where
                 config.insert("otp_type".to_string(), serde_json::json!(otp_type.as_str()));
                 config.insert("otp_secret".to_string(), serde_json::json!(credential));
 
-                if matches!(otp_type, OtpType::Hotp) && !config.contains_key("counter") {
-                    config.insert("counter".to_string(), serde_json::json!(0u64));
+                match otp_type {
+                    OtpType::Totp => {
+                        config
+                            .entry("length".to_string())
+                            .or_insert(serde_json::json!(TOTP_LENGTH as u64));
+                        config
+                            .entry("past_window".to_string())
+                            .or_insert(serde_json::json!(1u64));
+                        config
+                            .entry("future_window".to_string())
+                            .or_insert(serde_json::json!(0u64));
+                        config
+                            .entry("last_totp_step".to_string())
+                            .or_insert(serde_json::json!(0u64));
+                    }
+                    OtpType::Hotp => {
+                        config
+                            .entry("counter".to_string())
+                            .or_insert(serde_json::json!(0u64));
+                        config
+                            .entry("length".to_string())
+                            .or_insert(serde_json::json!(6u64));
+                        config
+                            .entry("window".to_string())
+                            .or_insert(serde_json::json!(5u64));
+                    }
+                    OtpType::Custom(_) => { /* leave config to custom handler */ }
                 }
             }
             AuthFactorKind::Oauth => {
