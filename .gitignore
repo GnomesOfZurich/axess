@@ -24,3 +24,5 @@
 #  Other files to ignore:
 **/.env
 **/coverage/
+
+/TODO.md

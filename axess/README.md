@@ -40,24 +40,40 @@ use tower_sessions_sqlx_store::SqliteStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use crate::{
+    handlers::{protected_handler, login_handler, logout_handler, hello_world, // Your route handlers
+    models::OurBackend, // Your custom backend implementation, handling interactions with the database
+};
 
-type Session = AuthSession<MyBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
+type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
+// Create backend and session store
 let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-let backend = Arc::new(MyBackend::new(pool.clone()));
+let backend = Arc::new(OurBackend::new(pool.clone()));
 let session_store = SqliteStore::new(pool.clone());
 let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100));
 
+// Build the authentication layer
 let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_registry.clone()).build();
 
+// Definition of protected routes
 let protected_router = Router::new()
     .route("/main", get(protected_handler))
     .route_layer(login_required!(Arc<Session>, "/login"));
 
+// Defintion of some other routes
+let public_router = Router::new()
+    .route("/", get(hello_world))
+    .route("/login", get(login_handler))
+    .route("/logout", get(logout_handler));
+
+// Assemble the router
 let app = Router::new()
     .merge(protected_router)
+    .merge(public_router)
     .layer(auth_layer);
 
+// Start serving the application.
 let address = "127.0.0.1:3000".parse()?;
 let listener = TcpListener::bind(address).await?;
 axum::serve(listener, app.into_make_service()).await?;

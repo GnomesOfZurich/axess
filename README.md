@@ -43,11 +43,14 @@ use tower_sessions_sqlx_store::SqliteStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use crate::OurBackend; // Your custom backend implementation, handling interactions with the database
+use crate::{
+    handlers::{protected_handler, login_handler, logout_handler, hello_world, // Your route handlers
+    models::OurBackend, // Your custom backend implementation, handling interactions with the database
+};
 
 type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
-// Create your backend and session store
+// Create backend and session store
 let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
 let backend = Arc::new(OurBackend::new(pool.clone()));
 let session_store = SqliteStore::new(pool.clone());
@@ -65,22 +68,21 @@ let protected_router = Router::new()
     .route_layer(login_required!(Arc<Session>, "/login"));
 
 // Auth routes (login/logout) may need backend state
-let auth_router = Router::new()
+let public_router = Router::new()
+    .route("/", get(hello_world))
     .route("/login", get(login_handler))
     .route("/logout", get(logout_handler));
 
+// Assemble the router
 let app = Router::new()
     .merge(protected_router)
-    .merge(auth_router)
+    .merge(public_router)
     .layer(auth_layer);
 
+// Start serving the application.
 let address = "127.0.0.1:3000".parse()?;
 let listener = TcpListener::bind(address).await?;
-
-// Start servicing the application. For production,
-// ensure to use a shutdown signal to abort the deletion task.
-axum::serve(listener, app_router.into_make_service())
-    .await?;
+axum::serve(listener, app_router.into_make_service()).await?;
 ```
 
 ## ☑️ Features
