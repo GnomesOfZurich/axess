@@ -1,11 +1,11 @@
-// #[cfg(feature = "hotp")]
-// use base32;
-// #[cfg(feature = "hotp")]
-// use hex;
 #[cfg(feature = "hotp")]
 pub use libreauth::oath::HOTPBuilder;
 #[cfg(feature = "password")]
 pub use password_auth::{generate_hash as generate_password_hash, verify_password};
+#[cfg(feature = "totp")]
+use rand::{RngCore, rngs::OsRng};
+#[cfg(feature = "totp")]
+use std::fmt::Write;
 #[cfg(feature = "totp")]
 use std::time::SystemTime;
 #[cfg(feature = "hotp")]
@@ -134,4 +134,48 @@ pub fn verify_hotp(
     }
 
     None
+}
+
+#[cfg(feature = "totp")]
+fn percent_encode_component(input: &str) -> String {
+    const UNRESERVED: [u8; 66] =
+        *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if UNRESERVED.contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            write!(&mut encoded, "%{:02X}", byte).expect("write! to String cannot fail");
+        }
+    }
+    encoded
+}
+
+#[cfg(feature = "totp")]
+pub fn generate_totp_secret() -> String {
+    let mut bytes = [0u8; 20];
+    OsRng.fill_bytes(&mut bytes);
+    base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &bytes)
+}
+
+#[cfg(feature = "totp")]
+pub fn build_totp_uri(
+    label: &str,
+    issuer: &str,
+    secret: &str,
+    digits: usize,
+    period: u64,
+) -> String {
+    let label_enc = percent_encode_component(label);
+    let issuer_enc = percent_encode_component(issuer);
+    let digits = digits.max(1);
+    let period = period.max(5);
+    format!(
+        "otpauth://totp/{issuer}:{label}?secret={secret}&issuer={issuer}&digits={digits}&period={period}",
+        issuer = issuer_enc,
+        label = label_enc,
+        secret = secret,
+        digits = digits,
+        period = period
+    )
 }

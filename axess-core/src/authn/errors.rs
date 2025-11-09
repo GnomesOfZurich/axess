@@ -1,3 +1,5 @@
+//! Authentication error types used across Axess forms, sessions, and handlers.
+
 use crate::{
     authn::{backend::AuthnBackend, session::registry::SessionRegistryError},
     axum::{

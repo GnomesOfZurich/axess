@@ -1,14 +1,14 @@
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-// use core::error;
-// use tower_cookies::cookie::time::Date;
-use std::{
-    cmp::PartialEq,
-    fmt::{Debug, Display},
-    hash::Hash,
-};
-// use chrono::{DateTime, Utc};
+//! Core backend abstraction for Axess authentication.
+//!
+//! This module standardizes how storage backends interact with Axess:
+//! - Identifier traits (`TenantId`, `UserId`, `FactorId`, `MethodId`, `DataId`) that
+//!   downstream crates implement for their domain-specific types.
+//! - [`AuthnBackend`], the async trait every storage adapter must satisfy to support
+//!   credential provisioning, factor/method state transitions, and audit logging.
+//! - Shared [`EntityState`] and [`StatusDetail`] structures for user and tenant lifecycle.
+//! - Reference tests exercising the in-memory [`MockBackend`] to ensure the trait contract
+//!   behaves consistently across implementations.
+
 use crate::authn::{
     methods::{
         factor::FactorStateChange,
@@ -18,6 +18,14 @@ use crate::authn::{
     },
     session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
     types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
+};
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::{
+    cmp::PartialEq,
+    fmt::{Debug, Display},
+    hash::Hash,
 };
 
 pub trait TenantId:
@@ -216,9 +224,7 @@ where
 
     /// Identifier type used for all other authentication reletated data objects associated with the backend.
     type MethodId: MethodId;
-    // type MethodState: Serialize + for<'de> Deserialize<'de> + Debug + Clone + Send + Sync;
     type FactorId: FactorId;
-    // type FactorState: Serialize + for<'de> Deserialize<'de> + Debug + Clone + Send + Sync;
 
     /// Identifier for other general data types associated with the backend.
     type DataId: DataId;
@@ -402,7 +408,7 @@ mod tests {
     use crate::{
         authn::session::state::{AuthEventStatus, AuthEventType},
         utils::testing::mock_backend::{
-            MockBackend, MockTenant, MockUser, TestTenantId, TestUserId,
+            MockBackend, MockTenant, MockUser, TestTenantId, TestUserId, mock_method,
         },
     };
 
@@ -549,30 +555,16 @@ mod tests {
 
         #[cfg(feature = "admin")]
         {
-            use crate::authn::methods::method::MethodInstance;
-            use chrono::Utc;
+            let method = mock_method();
 
-            let method = MethodInstance {
-                id: "test_method".to_string(),
-                name: "Test Method".to_string(),
-                description: "Test authentication method".to_string(),
-                factors: vec![],
-                created_at: Utc::now(),
-                created_by: TestUserId("system".to_string()),
-                updated_at: Utc::now(),
-                updated_by: TestUserId("system".to_string()),
-            };
-
-            // Upsert the method
             backend.upsert_auth_method(method.clone()).await?;
 
-            // Test retrieval - convert MethodInstance to AuthMethod for comparison
-            let retrieved = backend.get_auth_method(&"test_method".to_string()).await?;
+            let retrieved = backend.get_auth_method(&method.id).await?;
 
-            assert_eq!(retrieved.id, "test_method");
-            assert_eq!(retrieved.name, "Test Method");
-            assert_eq!(retrieved.description, "Test authentication method");
-            assert!(retrieved.factors.is_empty());
+            assert_eq!(retrieved.id, method.id);
+            assert_eq!(retrieved.name, method.name);
+            assert_eq!(retrieved.description, method.description);
+            assert_eq!(retrieved.factors.len(), method.factors.len());
         }
 
         #[cfg(not(feature = "admin"))]

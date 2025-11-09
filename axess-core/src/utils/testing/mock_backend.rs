@@ -1,10 +1,17 @@
+//! In-memory mock backend utilities for tests.
+//!
+//! Provides `MockBackend`, its mock tenant/user identifiers, and helpers to
+//! exercise the `AuthnBackend`/`AuthnAdminBackend` contracts without a real
+//! datastore.
+
 #[cfg(feature = "admin")]
 use crate::authn::admin::AuthnAdminBackend;
 use crate::authn::{
     backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
     methods::{
-        EnablementState, FactorForm, PermissionScope, factor::FactorStateChange,
-        method::MethodStateChange,
+        EnablementState, FactorForm, PermissionScope,
+        factor::{AuthFactorKind, FactorInstance, FactorStateChange},
+        method::{MethodBuilder, MethodStateChange},
     },
     session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
     types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
@@ -823,4 +830,25 @@ impl AuthnAdminBackend for MockBackend {
         self.auth_factors.remove(factor_id);
         Ok(())
     }
+}
+
+pub fn mock_method() -> AuthMethod<MockBackend> {
+    let creator = TestUserId("method_creator".into());
+
+    let password_factor = FactorInstance::new(
+        "password-factor".to_string(),
+        AuthFactorKind::Password,
+        "Password",
+        "Mock password factor",
+        creator.clone(),
+    );
+
+    MethodBuilder::new(
+        "password-method".to_string(),
+        "Password Only",
+        "Password based authentication",
+        creator,
+    )
+    .add_factor(password_factor)
+    .build()
 }

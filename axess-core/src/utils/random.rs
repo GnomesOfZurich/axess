@@ -1,3 +1,9 @@
+//! Secure random number generation utilities.
+//!
+//! Defines the [`SecureRng`] trait used across Axess for DST-friendly
+//! randomness, provides the OS-backed [`SystemRng`] implementation for
+//! production, and includes deterministic helpers for testing.
+
 use rand::{RngCore, rngs::OsRng};
 
 /// Trait for secure random number generation (DST-friendly)

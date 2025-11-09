@@ -3,12 +3,12 @@ use crate::{
         backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
         errors::{AuthError, FactorKindError},
         methods::{
-            EnablementState,
-            factor::{AuthFactorKind, FactorStateChange},
+            factor::{AuthFactorKind, FactorStateChange, FactorStateChangeBuilder},
             form::{FactorForm, FactorFormExt, FactorFormKind, FormField, TOTP_LENGTH},
-            scope::PermissionScope,
+            policy::{FactorConfig, FactorConfigBuilder, OtpCharset, OtpRulesBuilder, OtpType},
+            scope::{EnablementState, PermissionScope},
         },
-        session::SessionRegistry,
+        session::registry::SessionRegistry,
         types::{AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
     },
     axum::{
@@ -18,12 +18,13 @@ use crate::{
     tracing::{debug, error, warn},
     utils::{
         random::{SecureRng, SystemRng},
-        validation::OtpType,
+        validation::is_valid_otp_code,
     },
 };
 use axess_factors::{generate_password_hash, verify_hotp, verify_totp};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, str::FromStr, sync::Arc};
 use tower_sessions::Session;
 
 /// `AuthSession` orchestrates authentication workflows for a user session. It handles factor
@@ -658,7 +659,7 @@ where
         form: &F,
         factor_state: &AuthFactorState<B>,
         scope: &PermissionScope<B::TenantId, B::UserId>,
-        config: &serde_json::Value,
+        config: FactorConfig,
     ) -> Result<(), AuthError<B>>
     where
         F: FactorForm,
@@ -666,38 +667,31 @@ where
         let otp_code = form.credential().ok_or(AuthError::InvalidCredentials)?;
 
         let secret = config
-            .get("otp_secret")
-            .and_then(|value| value.as_str())
+            .get_string("otp_secret")
             .ok_or(AuthError::InvalidCredentials)?;
 
         let counter = config
-            .get("counter")
-            .and_then(|value| value.as_u64())
+            .get_u64("counter")
             .ok_or(AuthError::InvalidCredentials)?;
 
-        let length = config
-            .get("length")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-            .unwrap_or(TOTP_LENGTH);
+        let length = config.get_usize("length").unwrap_or(TOTP_LENGTH);
 
-        let window = config
-            .get("window")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(5);
+        let window = config.get_u64("window").unwrap_or(5);
 
         let used_counter = verify_hotp(secret, otp_code, counter, length, window)
             .ok_or(AuthError::InvalidCredentials)?;
 
-        let mut updated_config = factor_state.config.clone();
-        updated_config.insert("counter".to_string(), serde_json::json!(used_counter + 1));
-
         let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
 
-        let change = FactorStateChange::new(factor_state.factor_id.clone(), updated_by)
+        let change = FactorStateChangeBuilder::new(factor_state.factor_id.clone(), updated_by)
             .with_scope(scope.clone())
             .with_state(factor_state.state.clone())
-            .with_config(updated_config);
+            .set_otp_config(
+                config
+                    .to_builder()
+                    .with_field("counter", json!(used_counter + 1)),
+            )
+            .build();
 
         self.backend
             .upsert_factor_state(change)
@@ -712,7 +706,7 @@ where
         form: &F,
         factor_state: &AuthFactorState<B>,
         scope: &PermissionScope<B::TenantId, B::UserId>,
-        config: &serde_json::Value,
+        config: FactorConfig,
     ) -> Result<(), AuthError<B>>
     where
         F: FactorForm,
@@ -722,40 +716,58 @@ where
         let otp_code = form.credential().ok_or(AuthError::InvalidCredentials)?;
 
         let secret = config
-            .get("otp_secret")
-            .and_then(|value| value.as_str())
+            .get_string("otp_secret")
             .ok_or(AuthError::InvalidCredentials)?;
 
-        let length = config
-            .get("length")
-            .and_then(|value| value.as_u64())
-            .map(|value| value as usize)
-            .unwrap_or(TOTP_LENGTH);
+        let length = config.get_usize("length").unwrap_or(TOTP_LENGTH);
 
-        let past_window = config
-            .get("past_window")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(1);
+        let past_window = config.get_u64("past_window").unwrap_or(1);
 
-        let future_window = config
-            .get("future_window")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
+        let future_window = config.get_u64("future_window").unwrap_or(0);
 
-        let matched_step = verify_totp(
+        let charset = config
+            .get_string("charset")
+            .and_then(|raw| OtpCharset::from_str(raw).ok())
+            .unwrap_or(OtpCharset::Numeric);
+
+        let period = config.get_u64("period").unwrap_or(30);
+
+        let otp_rules = OtpRulesBuilder::default()
+            .with_length(length)
+            .with_charset(charset)
+            .with_past_window(past_window)
+            .with_future_window(future_window)
+            .with_period(period)
+            .build();
+
+        if !is_valid_otp_code(otp_code, &otp_rules) {
+            warn!(
+                factor_id = %factor_state.factor_id,
+                "Rejected TOTP code that failed charset/length validation"
+            );
+            return Err(AuthError::InvalidCredentials);
+        }
+
+        // Verify TOTP and get the matched step
+        let matched_step = match verify_totp(
             secret,
             otp_code,
             SystemTime::now(),
-            length,
+            otp_rules.length,
             past_window,
             future_window,
-        )
-        .ok_or(AuthError::InvalidCredentials)?;
+        ) {
+            Some(step) => step,
+            None => {
+                warn!(
+                    factor_id = %factor_state.factor_id,
+                    "Invalid TOTP code provided"
+                );
+                return Err(AuthError::InvalidCredentials);
+            }
+        };
 
-        let last_step = config
-            .get("last_totp_step")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
+        let last_step = config.get_u64("last_totp_step").unwrap_or(0);
 
         if matched_step <= last_step {
             warn!(
@@ -767,19 +779,22 @@ where
             return Err(AuthError::InvalidCredentials);
         }
 
-        let mut updated_config = factor_state.config.clone();
-        updated_config.insert(
-            "last_totp_step".to_string(),
-            serde_json::json!(matched_step),
-        );
+        let config_builder = config
+            .to_builder()
+            .with_length(length)
+            .with_period(period)
+            .with_windows(past_window, future_window)
+            .with_last_totp_step(matched_step);
 
         let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
 
-        let change = FactorStateChange::new(factor_state.factor_id.clone(), updated_by)
+        let change = FactorStateChangeBuilder::new(factor_state.factor_id.clone(), updated_by)
             .with_scope(scope.clone())
             .with_state(factor_state.state.clone())
-            .with_config(updated_config);
+            .set_otp_config(config_builder)
+            .build();
 
+        // Persist updated factor state
         self.backend
             .upsert_factor_state(change)
             .await
@@ -793,10 +808,10 @@ where
         form: &F,
         factor_id: &B::FactorId,
     ) -> Result<(), AuthError<B>>
-    // Changed from StatusCode
     where
         F: FactorForm + Send + Sync,
     {
+        // Validate scope and user state first
         let scope = PermissionScope::User(
             self.get_tenant_id()
                 .cloned()
@@ -812,13 +827,14 @@ where
 
         let factor_state = factor_states.first().ok_or(AuthError::FactorNotFound)?;
 
+        let config_map = factor_state.config.clone();
         let config_value = serde_json::Value::Object(
-            factor_state
-                .config
+            config_map
                 .clone()
                 .into_iter()
                 .collect::<serde_json::Map<String, serde_json::Value>>(),
         );
+        let factor_config = FactorConfig::from_map(config_map);
 
         form.verify_against_config(&config_value)
             .map_err(|_| AuthError::InvalidCredentials)?;
@@ -831,11 +847,11 @@ where
 
             match otp_type {
                 OtpType::Hotp => {
-                    self.process_hotp_success(form, factor_state, &scope, &config_value)
+                    self.process_hotp_success(form, factor_state, &scope, factor_config.clone())
                         .await?
                 }
                 OtpType::Totp => {
-                    self.process_totp_success(form, factor_state, &scope, &config_value)
+                    self.process_totp_success(form, factor_state, &scope, factor_config)
                         .await?
                 }
                 OtpType::Custom(_) => {
@@ -1140,7 +1156,7 @@ where
 
     /// Handle factor setup for authenticated users.
     /// This allows users to add/configure new authentication factors after logging in.
-    async fn handle_factor_setup<F>(
+    pub async fn handle_factor_setup<F>(
         &mut self,
         form: &F,
         factor_kind: AuthFactorKind,
@@ -1187,18 +1203,14 @@ where
 
         let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
 
-        let mut config = std::collections::HashMap::new();
-        match factor_kind {
+        let config_map = match factor_kind {
             AuthFactorKind::Password => {
-                // Hash the password before storing
-                let password_hash = generate_password_hash(credential);
-                config.insert(
-                    "password_hash".to_string(),
-                    serde_json::json!(password_hash),
-                );
+                FactorConfigBuilder::password(generate_password_hash(credential))
+                    .build()
+                    .into_inner()
             }
             AuthFactorKind::Otp => {
-                config = self
+                let stored_config_map = self
                     .backend
                     .get_factor_states(&factor.id, scope.clone())
                     .await
@@ -1208,59 +1220,56 @@ where
                     .map(|state| state.config)
                     .unwrap_or_default();
 
-                let otp_type = config
-                    .get("otp_type")
-                    .cloned()
-                    .and_then(|raw| serde_json::from_value::<OtpType>(raw).ok())
+                let stored_config = FactorConfig::from_map(stored_config_map);
+
+                let otp_type = stored_config
+                    .get_value("otp_type")
+                    .and_then(|raw| serde_json::from_value::<OtpType>(raw.clone()).ok())
                     .unwrap_or(OtpType::Totp);
 
-                config.insert("otp_type".to_string(), serde_json::json!(otp_type.as_str()));
-                config.insert("otp_secret".to_string(), serde_json::json!(credential));
+                let builder = if stored_config.is_empty() {
+                    match otp_type {
+                        OtpType::Totp => FactorConfigBuilder::totp(credential.to_owned()),
+                        OtpType::Hotp => FactorConfigBuilder::hotp(credential.to_owned()),
+                        OtpType::Custom(_) => FactorConfigBuilder::new()
+                            .with_field("otp_type", json!(otp_type))
+                            .with_secret(credential.to_owned()),
+                    }
+                } else {
+                    stored_config
+                        .to_builder()
+                        .with_secret(credential.to_owned())
+                };
 
-                match otp_type {
-                    OtpType::Totp => {
-                        config
-                            .entry("length".to_string())
-                            .or_insert(serde_json::json!(TOTP_LENGTH as u64));
-                        config
-                            .entry("past_window".to_string())
-                            .or_insert(serde_json::json!(1u64));
-                        config
-                            .entry("future_window".to_string())
-                            .or_insert(serde_json::json!(0u64));
-                        config
-                            .entry("last_totp_step".to_string())
-                            .or_insert(serde_json::json!(0u64));
-                    }
-                    OtpType::Hotp => {
-                        config
-                            .entry("counter".to_string())
-                            .or_insert(serde_json::json!(0u64));
-                        config
-                            .entry("length".to_string())
-                            .or_insert(serde_json::json!(6u64));
-                        config
-                            .entry("window".to_string())
-                            .or_insert(serde_json::json!(5u64));
-                    }
-                    OtpType::Custom(_) => { /* leave config to custom handler */ }
-                }
+                let builder = match otp_type {
+                    OtpType::Totp => builder
+                        .with_length(TOTP_LENGTH)
+                        .with_period(30)
+                        .with_windows(1, 0)
+                        .with_last_totp_step(0),
+                    OtpType::Hotp => builder
+                        .with_length(TOTP_LENGTH)
+                        .with_field("counter", json!(0)),
+                    OtpType::Custom(_) => builder,
+                };
+
+                builder.build().into_inner()
             }
-            AuthFactorKind::Oauth => {
-                // Store OAuth provider configuration
-                config.insert("provider".to_string(), serde_json::json!(credential));
-            }
-            AuthFactorKind::Custom(_) => {
-                // For custom factors, store credential as-is
-                config.insert("credential".to_string(), serde_json::json!(credential));
-            }
-        }
+            AuthFactorKind::Oauth => FactorConfigBuilder::new()
+                .with_field("provider", json!(credential))
+                .build()
+                .into_inner(),
+            AuthFactorKind::Custom(_) => FactorConfigBuilder::new()
+                .with_field("credential", json!(credential))
+                .build()
+                .into_inner(),
+        };
 
         // 6. Create FactorStateChange to enable the factor
         let change = FactorStateChange::new(factor.id.clone(), user_id.clone())
             .with_scope(scope)
             .with_state(EnablementState::Active)
-            .with_config(config);
+            .with_config(config_map);
 
         // 7. Upsert - backend handles all the logic
         self.backend
@@ -1372,12 +1381,9 @@ where
 mod tests {
     use super::*;
     use crate::{
-        authn::{
-            admin::AuthnAdminBackend, methods::method::MethodInstance,
-            session::registry::SessionRegistryStore,
-        },
+        authn::{admin::AuthnAdminBackend, session::registry::SessionRegistryStore},
         utils::testing::{
-            mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId},
+            mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId, mock_method},
             mock_form::{DummyFailingForm, DummyOkForm},
             mock_random::MockRng,
         },
@@ -1390,19 +1396,6 @@ mod tests {
         MemoryStore, SessionStore,
         session::{Id, Record},
     };
-
-    fn mock_method() -> AuthMethod<MockBackend> {
-        MethodInstance {
-            id: "method1".to_string(),
-            name: "Test Method".to_string(),
-            factors: vec![],
-            description: "Test authentication method".to_string(),
-            created_at: chrono::Utc::now(),
-            created_by: TestUserId("system".to_string()),
-            updated_at: chrono::Utc::now(),
-            updated_by: TestUserId("system".to_string()),
-        }
-    }
 
     /// Helper to create a session that's properly initialized in the store
     async fn create_initialized_session(store: MemoryStore) -> Session {

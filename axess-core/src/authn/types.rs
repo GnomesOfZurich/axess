@@ -1,3 +1,9 @@
+//! Shared type aliases for backend-specific authentication types.
+//!
+//! These aliases map an [`AuthnBackend`](crate::authn::backend::AuthnBackend)’s
+//! associated identifiers to the generic session and factor structures used
+//! throughout Axess, keeping call sites concise.
+
 use crate::authn::{
     backend::AuthnBackend,
     methods::{

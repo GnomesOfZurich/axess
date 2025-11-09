@@ -1,6 +1,6 @@
 [package]
 name = "axess-core"
-version = "0.0.7"
+version = "0.0.8"
 publish = false
 edition = "2024"
 resolver = "3"

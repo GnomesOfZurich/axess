@@ -1,3 +1,6 @@
+//! Axum extractor for retrieving an [`AuthSession`] that was stored by the
+//! `AuthManagerLayer`.
+
 use crate::{
     authn::{
         backend::AuthnBackend,

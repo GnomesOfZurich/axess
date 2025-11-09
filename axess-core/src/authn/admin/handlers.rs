@@ -1,3 +1,8 @@
+//! Administrative HTTP handlers for session management.
+//!
+//! These helpers expose Axum endpoints that invalidate user, tenant, or all
+//! sessions via the shared [`SessionRegistry`](crate::authn::session::registry::SessionRegistry).
+
 use crate::authn::session::registry::SessionRegistry;
 
 use axum::{

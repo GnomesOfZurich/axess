@@ -1,4 +1,6 @@
-// use crate::authn::backend::{TenantId, UserId};
+//! Factor enablement states and scope helpers used when provisioning or resolving
+//! methods and factors within Axess.
+
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 

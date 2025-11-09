@@ -1,0 +1,44 @@
+<html>
+  <head>
+    <title>Setup TOTP</title>
+  </head>
+
+  <body>
+    <ul>
+      {% for message in messages %}
+      <li><strong>{{ message }}</strong></li>
+      {% endfor %}
+    </ul>
+
+    {% match secret %}
+    {% when Some(secret_value) %}
+    <section>
+      <p>
+        Shared secret:
+        <code>{{ secret_value }}</code>
+      </p>
+      {% match provisioning_uri %}
+      {% when Some(uri_value) %}
+      <p>
+        Provisioning URI:
+        <code>{{ uri_value }}</code>
+      </p>
+      {% when None %}
+      {% endmatch %}
+    </section>
+
+    <form method="post">
+      <input type="hidden" name="otp_secret" value="{{ secret_value }}" />
+      <fieldset>
+        <legend>Confirm TOTP enrollment</legend>
+        <p>Scan the secret in your authenticator, then continue.</p>
+      </fieldset>
+      <button type="submit">Confirm</button>
+    </form>
+    {% when None %}
+    <p>No pending TOTP factor to configure.</p>
+    {% endmatch %}
+    <label for="tenant">Tenant</label>
+    <input id="tenant" name="tenant" type="text" value="Default Tenant" required />
+  </body>
+</html>

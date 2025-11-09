@@ -1,4 +1,11 @@
-/// Middleware to inject a trace ID into request headers.
+//! Trace ID middleware for Axess.
+//!
+//! This module exposes [`TraceIdLayer`] / [`TraceIdMiddleware`], a pair of tower-compatible
+//! components that read the current tracing span ID and inject it into HTTP request headers.
+//! Downstream services and clients can then correlate requests with tracing spans, aiding in
+//! distributed debugging and observability. Tests illustrate default and custom header usage.
+//! Middleware to inject a trace ID into request headers.
+
 use axum::{
     extract::Request,
     http::{HeaderValue, header::HeaderName},

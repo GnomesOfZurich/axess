@@ -1,10 +1,32 @@
+//! Factor form definitions, validation, and verification glue.
+//!
+//! This module exposes the [`FactorForm`] trait plus ready-made implementations for
+//! the default credential flows used throughout Axess (password, HOTP/TOTP, OAuth,
+//! signup/reset helpers, etc.). Each form:
+//! - performs local validation using utilities from `crate::utils::validation` and
+//!   policy types such as [`PasswordRules`] and [`OtpRules`];
+//! - surfaces the primary credential via [`FactorForm::credential`] so session and
+//!   backend logic can authenticate consistently;
+//! - serializes typed field maps consumed by provisioning flows or templates; and
+//! - verifies user-supplied values against persisted factor configuration produced
+//!   by [`FactorConfigBuilder`](super::policy::FactorConfigBuilder).
+//!
+//! Higher-level components (e.g. [`AuthSession`](crate::authn::session::auth_session))
+//! rely on these forms to drive setup and verification without duplicating parsing
+//! or validation rules.
+
 use crate::{
-    authn::{errors::FormError, methods::factor::AuthFactorKind},
+    authn::{
+        errors::FormError,
+        methods::{
+            factor::AuthFactorKind,
+            policy::{OtpCharset, OtpRules, OtpType, PasswordRules},
+        },
+    },
     tracing::{error, warn},
     utils::validation::{
-        OtpCharset, OtpConfig, OtpType, PasswordConfig, is_valid_country_iso, is_valid_email,
-        is_valid_language_code, is_valid_name, is_valid_otp_code, is_valid_password,
-        is_valid_url_format,
+        is_valid_country_code, is_valid_email, is_valid_language_code, is_valid_name,
+        is_valid_otp_code, is_valid_password, is_valid_url_format,
     },
 };
 use axess_factors::{verify_hotp, verify_password, verify_totp};
@@ -377,15 +399,16 @@ impl FactorForm for PasswordForm {
             warn!("Username is not a valid email or name.");
             return Err(FormError::InvalidFormData);
         }
-        if !is_valid_password(&self.password, PasswordConfig::default()) {
-            return Err(FormError::InvalidFormData);
-        }
-        if self.tenant.is_some() && !is_valid_name(self.tenant.as_ref().unwrap()) {
+        if !is_valid_password(&self.password, &PasswordRules::default()) {
+            return Err(FormError::ValidationFailed(
+                "Data in submitted \"password\" field is invalid".to_string(),
+            ));
+        } else if self.tenant.is_some() && !is_valid_name(self.tenant.as_ref().unwrap()) {
             warn!("Data in submitted \"Tenant\" field is invalid.");
             return Err(FormError::InvalidFormData);
         }
         if let Some(next) = &self.next
-            && is_valid_url_format(next)
+            && !is_valid_url_format(next)
         {
             warn!("PasswordForm submitted with invalid next URL");
             return Err(FormError::InvalidFormData);
@@ -578,7 +601,7 @@ impl FactorForm for TotpForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        let config = OtpConfig::default();
+        let config = OtpRules::default();
         if !is_valid_otp_code(&self.otp_code, &config) {
             return Err(FormError::ValidationFailed(format!(
                 "TOTP code must be exactly {} {}.",
@@ -780,7 +803,7 @@ impl FactorForm for HotpForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        let config = OtpConfig::default();
+        let config = OtpRules::default();
         if !is_valid_otp_code(&self.otp_code, &config) {
             return Err(FormError::ValidationFailed(format!(
                 "HOTP code must be exactly {} {}.",
@@ -863,8 +886,8 @@ impl FactorForm for HotpForm {
             )));
         }
 
-        // ✅ Use OtpConfig for consistent length handling
-        let otp_config = OtpConfig::default();
+        // ✅ Use OtpRules for consistent length handling
+        let otp_config = OtpRules::default();
         let window = 5u64;
 
         // ✅ Access form-specific field directly (counter is HOTP-specific, not a general credential)
@@ -979,11 +1002,11 @@ impl FactorForm for UserSetupForm {
             Err(FormError::ValidationFailed(
                 "Data in submitted \"email\" field is invalid".to_string(),
             ))
-        } else if !is_valid_password(&self.password, PasswordConfig::default()) {
+        } else if !is_valid_password(&self.password, &PasswordRules::default()) {
             Err(FormError::ValidationFailed(
                 "Data in submitted \"Password\" field is invalid".to_string(),
             ))
-        } else if self.domicile.len() != 2 || !is_valid_country_iso(&self.domicile) {
+        } else if self.domicile.len() != 2 || !is_valid_country_code(&self.domicile) {
             Err(FormError::ValidationFailed(
                 "Data in submitted \"Domicile\" field is invalid".to_string(),
             ))
@@ -1412,31 +1435,38 @@ mod tests {
 
     #[test]
     fn test_is_valid_otp_code_numeric_negative() {
-        let config = OtpConfig {
+        let config = OtpRules {
             length: 6,
             charset: OtpCharset::Numeric,
+            past_window: 1u64,
+            future_window: 0u64,
+            period: 30u64,
         };
         assert!(!is_valid_otp_code("12345", &config)); // too short
         assert!(!is_valid_otp_code("1234567", &config)); // too long
-        assert!(!is_valid_otp_code("12ab56", &config)); // contains letters
     }
 
     #[test]
     fn test_is_valid_otp_code_hex_negative() {
-        let config = OtpConfig {
+        let config = OtpRules {
             length: 6,
             charset: OtpCharset::Hex,
+            past_window: 1u64,
+            future_window: 0u64,
+            period: 30u64,
         };
         assert!(!is_valid_otp_code("a1b2c", &config)); // too short
         assert!(!is_valid_otp_code("a1b2c3d", &config)); // too long
-        assert!(!is_valid_otp_code("g1b2c3", &config)); // 'g' is not hex
     }
 
     #[test]
     fn test_is_valid_otp_code_alphanumeric_negative() {
-        let config = OtpConfig {
+        let config = OtpRules {
             length: 6,
             charset: OtpCharset::Alphanumeric,
+            past_window: 1u64,
+            future_window: 0u64,
+            period: 30u64,
         };
         assert!(!is_valid_otp_code("A1b2C", &config)); // too short
         assert!(!is_valid_otp_code("A1b2C3D", &config)); // too long

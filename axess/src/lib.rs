@@ -1,21 +1,3 @@
-// pub use axess_core::authn::{
-//     backend::{
-//         AuthTenant, AuthUser, AuthnBackend, FactorId, MethodId, TenantId, UserId, UserState,
-//     },
-//     errors::{AuthError, FormError},
-//     methods::{
-//         factor::FactorInstance,
-//         form::FactorForm,
-//         method::MethodInstance,
-//         scope::PermissionScope,
-//     },
-//     middleware::{AuthnService, AuthnServiceBuilder, AuthnManager},
-//     sessions::{
-//         registry::SessionRegistry,
-//         auth_session::{AuthFactor, AuthMethod, AuthSession},
-//     },
-// };
-
 #[cfg(feature = "admin")]
 pub use axess_core::authn::admin::AuthnAdminBackend;
 
@@ -29,8 +11,9 @@ pub use axess_core::{
         },
         errors::{AuthError, FormError, HandlerError},
         methods::{
-            AuthFactorKind, EnablementState, FactorForm, FactorFormExt, FactorStateChange,
-            FormField, FormFieldValue, MethodStateChange, PermissionScope,
+            AuthFactorKind, EnablementState, FactorForm, FactorFormExt, FactorInstance,
+            FactorStateChange, FormField, FormFieldValue, MethodBuilder, MethodInstance,
+            MethodStateChange, PermissionScope,
         },
         middleware::{AuthnManager, AuthnService, AuthnServiceBuilder},
         session::{
@@ -42,7 +25,7 @@ pub use axess_core::{
             SessionState,
         },
     },
-    utils::{self, random::SystemRng},
+    utils::{self, random::SystemRng, validation},
 };
 
 #[cfg(feature = "authz")]
@@ -68,5 +51,8 @@ pub mod valkey {
     };
 }
 
-pub use axess_factors::{generate_password_hash, verify_hotp, verify_password, verify_totp};
+pub use axess_factors::{
+    build_totp_uri, generate_password_hash, generate_totp_secret, verify_hotp, verify_password,
+    verify_totp,
+};
 pub use axess_macros::{login_required, require_partial_authn};

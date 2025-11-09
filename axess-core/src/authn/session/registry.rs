@@ -1,3 +1,9 @@
+//! Session registry abstractions and the default in-memory store wrapper.
+//!
+//! This module exposes [`SessionRegistry`] for tracking authenticated sessions
+//! plus [`SessionRegistryStore`], a tower-sessions based implementation used by
+//! Axess to register, validate, and invalidate user/tenant sessions.
+
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

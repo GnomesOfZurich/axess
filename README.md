@@ -28,7 +28,7 @@ cargo add axess
 from your command line or add the following to your `Cargo.toml` file:
 ```toml
 [dependencies]
-axess = { version="0.0.7", features=["full"]}
+axess = { version="0.0.8", features=["full"]}
 ```
 2. Define your Cedar policies if interested in authorization. This is a feature protected by feature toggle `authz` (part of the `default` configuration).
 3. Configure authentication and authorization middleware.
@@ -92,6 +92,21 @@ axum::serve(listener, app_router.into_make_service())
 - `memory`: Enables **in-memory** session and storage backends for development and testing.
 - `valkey`: Enables support for **Valkey** (Redis-compatible) session and storage backends.
 
+
+## 🗂 Project Structure
+
+- `axess/` — Main library and middleware
+- `axess-core/` — Core types, traits, and utilities
+- `axess-factors/` — Factor implementations (password, TOTP, HOTP)
+- `axess-macros/` — Procedural macros for Axum integration
+- `examples/` — Example Axum applications
+
+## 🔗 Quick Links
+
+- [axess-core](./axess-core)
+- [axess-factors](./axess-factors)
+- [axess-macros](./axess-macros)
+- [Examples](./examples)
 
 ## 📃 License
 Licensed under the MIT License.

@@ -1,3 +1,8 @@
+//! Authentication session state models and audit event definitions.
+//!
+//! This module tracks in-flight authentication state (`PartialAuthState` / `AuthState`),
+//! stores per-session data payloads, and defines the audit event types emitted by Axess.
+
 use crate::authn::{
     backend::{AuthnBackend, EntityState, FactorId, MethodId, TenantId, UserId},
     methods::{

@@ -1,14 +1,29 @@
+//! Factor definitions, state transitions, and configuration helpers.
+//!
+//! This module centralizes factor-related types used across Axess:
+//! - [`AuthFactorKind`] enumerates supported factor kinds.
+//! - [`FactorInstance`] represents provisioned factors stored by backends.
+//! - [`FactorState`] and [`FactorStateChange`] capture per-scope enablement metadata.
+//! - [`FactorConfigBuilder`] and [`FactorStateChangeBuilder`] provide ergonomic helpers
+//!   for constructing strongly typed factor configurations (password, OTP, OAuth, etc.).
+//!
+//! Higher-level flows (e.g. `AuthSession`) rely on these structures to provision,
+//! activate, and verify authentication factors in a consistent, replay-safe way.
+
 use crate::{
     authn::{
         backend::{DataId, FactorId, TenantId, UserId},
         errors::FactorKindError,
-        methods::scope::{EnablementState, PermissionScope},
+        methods::{
+            policy::{FactorConfig, FactorConfigBuilder},
+            scope::{EnablementState, PermissionScope},
+        },
     },
     tracing::error,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{
     collections::HashMap,
     fmt::{Debug, Display},
@@ -225,5 +240,147 @@ where
             updated_at: time_now,
             updated_by: created_by,
         }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct FactorStateChangeBuilder<F, T, U>
+where
+    F: FactorId,
+    T: TenantId,
+    U: UserId,
+{
+    change: FactorStateChange<F, T, U>,
+}
+
+impl<F, T, U> FactorStateChangeBuilder<F, T, U>
+where
+    F: FactorId,
+    T: TenantId,
+    U: UserId,
+{
+    pub fn new(factor_id: F, updated_by: U) -> Self {
+        Self {
+            change: FactorStateChange::new(factor_id, updated_by),
+        }
+    }
+
+    fn with_factor_config(mut self, config: FactorConfig) -> Self {
+        self.change.config.extend(config.into_inner());
+        self
+    }
+
+    pub fn with_scope(mut self, scope: PermissionScope<T, U>) -> Self {
+        self.change.tenant_id = scope.tenant_id().cloned();
+        self.change.user_id = scope.user_id().cloned();
+        self
+    }
+
+    pub fn with_state(mut self, state: EnablementState) -> Self {
+        self.change.state = state;
+        self
+    }
+
+    pub fn with_config_map(mut self, map: Map<String, Value>) -> Self {
+        // Directly extend the internal config map from the serde_json::Map
+        self.change.config.extend(map);
+        self
+    }
+
+    pub fn insert(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.change.config.insert(key.into(), value);
+        self
+    }
+
+    pub fn set_password_hash(self, hash: impl Into<String>) -> Self {
+        self.with_factor_config(FactorConfigBuilder::password(hash).build())
+    }
+
+    pub fn set_otp_config(self, builder: FactorConfigBuilder) -> Self {
+        self.with_factor_config(builder.build())
+    }
+
+    pub fn set_totp_config(self, builder: FactorConfigBuilder) -> Self {
+        self.set_otp_config(builder)
+    }
+
+    pub fn build(self) -> FactorStateChange<F, T, U> {
+        self.change
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::authn::methods::{policy::FactorConfigBuilder, scope::PermissionScope};
+    use serde_json::json;
+
+    #[test]
+    /// Ensures the convenience constructor sets kind/name/description correctly.
+    fn factor_instance_password_helper_sets_kind() {
+        let factor = FactorInstance::new(1_u64, AuthFactorKind::Password, "pwd", "desc", 7_u64);
+        assert_eq!(factor.kind, AuthFactorKind::Password);
+        assert_eq!(factor.name, "pwd");
+        assert_eq!(factor.description, "desc");
+    }
+
+    #[test]
+    /// Confirms password state changes carry scope and the hash field.
+    fn factor_state_change_builder_sets_password_hash() {
+        let builder = FactorStateChangeBuilder::new(10_u64, 99_u64)
+            .with_scope(PermissionScope::User(1_u64, 2_u64))
+            .with_state(EnablementState::Active)
+            .set_password_hash("hash123");
+        let change = builder.build();
+        assert_eq!(change.state, EnablementState::Active);
+        assert_eq!(change.config.get("password_hash"), Some(&json!("hash123")));
+        assert_eq!(change.tenant_id, Some(1_u64));
+        assert_eq!(change.user_id, Some(2_u64));
+    }
+
+    #[test]
+    /// Verifies TOTP settings are serialized into the config map.
+    fn factor_state_change_builder_sets_totp_config() {
+        let params = FactorConfigBuilder::totp("BASE32SECRET")
+            .with_length(8)
+            .with_period(60)
+            .with_windows(2, 1)
+            .with_last_totp_step(42);
+        let change = FactorStateChangeBuilder::<u64, u64, u64>::new(10_u64, 7_u64)
+            .with_state(EnablementState::Pending)
+            .set_otp_config(params)
+            .build();
+
+        assert_eq!(change.state, EnablementState::Pending);
+        assert_eq!(change.config.get("otp_type"), Some(&json!("totp")));
+        assert_eq!(
+            change.config.get("otp_secret"),
+            Some(&json!("BASE32SECRET"))
+        );
+        assert_eq!(change.config.get("length"), Some(&json!(8)));
+        assert_eq!(change.config.get("period"), Some(&json!(60)));
+        assert_eq!(change.config.get("past_window"), Some(&json!(2)));
+        assert_eq!(change.config.get("future_window"), Some(&json!(1)));
+        assert_eq!(change.config.get("last_totp_step"), Some(&json!(42)));
+    }
+
+    #[test]
+    /// Verifies HOTP defaults carry counter/window fields.
+    fn factor_state_change_builder_sets_hotp_config() {
+        let builder = FactorConfigBuilder::hotp("HOTSECRET")
+            .with_length(7)
+            .with_field("counter", json!(3))
+            .with_field("window", json!(12));
+        let change = FactorStateChangeBuilder::<u64, u64, u64>::new(11_u64, 8_u64)
+            .with_state(EnablementState::Active)
+            .set_otp_config(builder)
+            .build();
+
+        assert_eq!(change.state, EnablementState::Active);
+        assert_eq!(change.config.get("otp_type"), Some(&json!("hotp")));
+        assert_eq!(change.config.get("otp_secret"), Some(&json!("HOTSECRET")));
+        assert_eq!(change.config.get("length"), Some(&json!(7)));
+        assert_eq!(change.config.get("counter"), Some(&json!(3)));
+        assert_eq!(change.config.get("window"), Some(&json!(12)));
+        assert!(change.config.get("period").is_none());
     }
 }

@@ -1,3 +1,10 @@
+//! Authentication method primitives and builders.
+//!
+//! This module defines:
+//! - [`MethodStateChange`] / [`MethodState`] for tracking per-scope method enablement.
+//! - [`MethodInstance`] as the persisted representation of multi-factor flows.
+//! - [`MethodBuilder`] to assemble methods ergonomically from their factor instances.
+
 use crate::{
     authn::{
         backend::{DataId, FactorId, MethodId, TenantId, UserId},
@@ -184,5 +191,63 @@ where
 
     pub fn has_factor_kind(&self, kind: &crate::authn::methods::AuthFactorKind) -> bool {
         self.factors.iter().any(|factor| &factor.kind == kind)
+    }
+}
+
+pub struct MethodBuilder<M, F, U>
+where
+    M: MethodId + Serialize + DeserializeOwned,
+    F: FactorId + Serialize + DeserializeOwned,
+    U: UserId + Serialize + DeserializeOwned,
+{
+    id: M,
+    name: String,
+    description: String,
+    factors: Vec<FactorInstance<F, U>>,
+    created_by: U,
+}
+
+impl<M, F, U> MethodBuilder<M, F, U>
+where
+    M: MethodId + Serialize + DeserializeOwned,
+    F: FactorId + Serialize + DeserializeOwned,
+    U: UserId + Serialize + DeserializeOwned,
+{
+    pub fn new(
+        id: M,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        created_by: U,
+    ) -> Self {
+        Self {
+            id,
+            name: name.into(),
+            description: description.into(),
+            factors: Vec::new(),
+            created_by,
+        }
+    }
+
+    pub fn add_factor(mut self, factor: FactorInstance<F, U>) -> Self {
+        self.factors.push(factor);
+        self
+    }
+
+    pub fn add_factors<I>(mut self, factors: I) -> Self
+    where
+        I: IntoIterator<Item = FactorInstance<F, U>>,
+    {
+        self.factors.extend(factors);
+        self
+    }
+
+    pub fn build(self) -> MethodInstance<M, F, U> {
+        MethodInstance::new(
+            self.id,
+            &self.name,
+            &self.description,
+            self.factors,
+            self.created_by,
+        )
     }
 }

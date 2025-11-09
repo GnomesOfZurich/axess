@@ -1,3 +1,9 @@
+//! Time utilities for Axess.
+//!
+//! Exposes the [`Clock`] trait for deterministic simulation/testing, the OS-backed
+//! [`SystemClock`] implementation, and helpers for common conversions such as RFC3339
+//! formatting and Unix epoch parsing.
+
 use chrono::{DateTime, TimeZone, Utc};
 
 /// Clock trait to enable deterministic simulation/testing.

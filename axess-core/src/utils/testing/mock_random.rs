@@ -1,3 +1,6 @@
+//! Deterministic `SecureRng` implementation for tests, enabling reproducible
+//! simulations and call-count tracking when exercising authentication flows.
+
 use crate::utils::random::SecureRng;
 use std::sync::{
     Arc,

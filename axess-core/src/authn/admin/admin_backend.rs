@@ -1,3 +1,8 @@
+//! Administrative backend extensions for Axess authentication.
+//!
+//! Implement [`AuthnAdminBackend`] to support CRUD operations on tenants, users,
+//! factors, and methods in addition to the core [`AuthnBackend`] contract.
+
 use crate::authn::{
     backend::AuthnBackend,
     types::{AuthFactor, AuthMethod},

@@ -1,10 +1,15 @@
+//! Authentication middleware integrating Axess sessions with tower-sessions.
+//!
+//! Exposes the [`AuthnService`] layer and supporting [`AuthnManager`] service
+//! used to attach [`AuthSession`] instances to incoming requests, while
+//! handling session lookups, registry coordination, and backend wiring.
+
 use crate::{
     authn::{
         backend::{AuthUser, AuthnBackend},
         session::{SessionRegistry, auth_session::AuthSession},
     },
     axum::http::{Request, Response, StatusCode},
-    // storage::session_registry::SessionRegistry,
     tracing::{Instrument, Span, error, field, info_span},
 };
 use std::{

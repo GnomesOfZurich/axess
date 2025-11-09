@@ -1,3 +1,6 @@
+//! Dummy `FactorForm` implementations for exercising session and backend flows
+//! in unit tests without relying on real credentials.
+
 use crate::authn::{
     errors::FormError,
     methods::{AuthFactorKind, FactorForm, FactorFormKind, FormField, FormFieldValue},
