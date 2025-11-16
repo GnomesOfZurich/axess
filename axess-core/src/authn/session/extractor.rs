@@ -144,7 +144,7 @@ where
 
 //         let backend = Arc::new(MockBackend::default());
 //         let store = MemoryStore::default();
-//         let registry = Arc::new(SessionRegistryStore::new(store.clone(), 0));
+//         let registry = Arc::new(SessionRegistryStore::new(store.clone(), 0, None, None));
 //         let session_manager_layer = SessionManagerLayer::new(store.clone());
 //         let auth_layer = AuthnService::new(
 //             backend.clone(),

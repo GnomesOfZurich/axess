@@ -85,7 +85,7 @@ pub async fn create_test_session() -> Result<
     // Create and initialize session (pass a cloned MemoryStore value)
     let session = create_initialized_session(store.clone()).await;
 
-    let registry = Arc::new(SessionRegistryStore::new(store, 0));
+    let registry = Arc::new(SessionRegistryStore::new(store, 0, None, None));
 
     // Configure backend with test method
     let method = mock_method();
@@ -123,7 +123,7 @@ pub async fn create_test_session_with_custom_rng(
     // Create and initialize session (pass a cloned MemoryStore value)
     let session = create_initialized_session(store.clone()).await;
 
-    let registry = Arc::new(SessionRegistryStore::new(store, 0));
+    let registry = Arc::new(SessionRegistryStore::new(store, 0, None, None));
 
     // Configure backend with test method
     let method = mock_method();

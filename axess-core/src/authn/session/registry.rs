@@ -7,18 +7,33 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt::Display};
+use std::{
+    collections::HashMap,
+    fmt::Display,
+    hash::{Hash, Hasher},
+};
 use thiserror::Error;
 use time;
+use time::Duration;
 use tower_sessions::session_store::SessionStore;
 use tracing::{debug, error};
 
 // TODO: turn both these consts into application configuration parameters!
-//    the registry key can be a constant as the hashing of this can use different seeds
-//    for different applications, i.e. allowing for split per tenant or per application
-//
-const SESSION_REGISTRY_KEY: &str = "_axess_session_registry";
-const SESSION_EXPIRY_DURATION: time::Duration = time::Duration::days(365);
+const SESSION_REGISTRY_KEY: &str = "axess_session_registry";
+const SESSION_EXPIRY_DURATION: Duration = Duration::seconds(3600);
+struct FnvHasher(u128);
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        (self.0 & 0xFFFFFFFFFFFFFFFF) as u64
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u128::from(byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SessionRegistryError {
@@ -104,41 +119,36 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
 }
 
 /// Session registry implementation that uses a single registry with session metadata
+/// stored in a tower-sessions compatible session store.
+/// This allows for distributed session registries backed by stores like Redis or Valkey.
+/// Each application instance could use a unique seed to generate its registry ID, however,
+/// to allow for shared registries across instances, a common seed should be used.
+/// The latter allows for an adminstrator to invalidated sessions accross application instances.
 #[derive(Debug, Clone)]
 pub struct SessionRegistryStore<S: SessionStore> {
     store: S,
+    session_max_age: Duration,
+    registry_key: String,
     registry_id: tower_sessions::session::Id,
     // registry_id_seed is only used at construction, not stored or logged
 }
 
 impl<S: SessionStore> SessionRegistryStore<S> {
-    // TODO: make this into an application configuration parameter
-    const REGISTRY_KEY: &'static str = SESSION_REGISTRY_KEY;
-
-    pub fn new(store: S, registry_id_seed: u128) -> Self {
-        let registry_id = Self::generate_registry_id(registry_id_seed);
-        Self { store, registry_id }
+    pub fn new(store: S, id_seed: u128, max_age: Option<Duration>, key: Option<String>) -> Self {
+        let max_age = max_age.unwrap_or(SESSION_EXPIRY_DURATION);
+        let registry_key = key.unwrap_or_else(|| SESSION_REGISTRY_KEY.into());
+        let registry_id = Self::generate_registry_id(id_seed, registry_key.clone());
+        Self {
+            store,
+            session_max_age: max_age,
+            registry_key,
+            registry_id,
+        }
     }
 
-    fn generate_registry_id(seed: u128) -> tower_sessions::session::Id {
-        use std::hash::{Hash, Hasher};
-
-        struct FnvHasher(u128);
-
-        impl Hasher for FnvHasher {
-            fn finish(&self) -> u64 {
-                (self.0 & 0xFFFFFFFFFFFFFFFF) as u64
-            }
-            fn write(&mut self, bytes: &[u8]) {
-                for &byte in bytes {
-                    self.0 ^= u128::from(byte);
-                    self.0 = self.0.wrapping_mul(0x100000001b3);
-                }
-            }
-        }
-
+    fn generate_registry_id(seed: u128, registry_key: String) -> tower_sessions::session::Id {
         let mut hasher = FnvHasher(seed);
-        SESSION_REGISTRY_KEY.hash(&mut hasher);
+        registry_key.hash(&mut hasher);
         let hash = hasher.0;
 
         tower_sessions::session::Id(hash as i128)
@@ -146,6 +156,14 @@ impl<S: SessionStore> SessionRegistryStore<S> {
 
     fn get_registry_id(&self) -> &tower_sessions::session::Id {
         &self.registry_id
+    }
+
+    pub fn get_registry_key(&self) -> &String {
+        &self.registry_key
+    }
+
+    pub fn get_session_max_age(&self) -> Duration {
+        self.session_max_age
     }
 
     /// Get the full session registry
@@ -157,7 +175,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
             tracing::debug!("Loaded registry record: {record:?}");
             let registry: Vec<SessionMetadata> = record
                 .data
-                .get(Self::REGISTRY_KEY)
+                .get(&self.registry_key)
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
             Ok(registry)
@@ -179,7 +197,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
             tower_sessions::session::Record {
                 id: registry_id,
                 data: HashMap::new(),
-                expiry_date: time::OffsetDateTime::now_utc() + SESSION_EXPIRY_DURATION,
+                expiry_date: time::OffsetDateTime::now_utc() + self.get_session_max_age(),
             }
         });
 
@@ -191,7 +209,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
 
         record
             .data
-            .insert(Self::REGISTRY_KEY.to_string(), registry_value);
+            .insert(self.registry_key.clone(), registry_value);
 
         // Save back to store
         self.store.save(&record).await?;
@@ -426,7 +444,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = SessionRegistryStore::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0, None, None);
 
         let session_id = tower_sessions::session::Id(42).to_string();
 
@@ -470,7 +488,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = SessionRegistryStore::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0, None, None);
 
         // Use deterministic, valid session IDs
         let session_id1 = tower_sessions::session::Id(1).to_string();
@@ -526,7 +544,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = SessionRegistryStore::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0, None, None);
 
         let session_id = tower_sessions::session::Id(10).to_string();
 
@@ -559,7 +577,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = SessionRegistryStore::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0, None, None);
 
         let session_id1 = tower_sessions::session::Id(11).to_string();
         let session_id2 = tower_sessions::session::Id(12).to_string();
@@ -613,7 +631,7 @@ mod tests {
 
         // First registry instance
         {
-            let registry = SessionRegistryStore::new(store.clone(), 0);
+            let registry = SessionRegistryStore::new(store.clone(), 0, None, None);
             registry
                 .register_session(
                     &session_id,
@@ -626,7 +644,7 @@ mod tests {
 
         // Second registry instance using same store
         {
-            let registry = SessionRegistryStore::new(store, 0);
+            let registry = SessionRegistryStore::new(store, 0, None, None);
             let user_sessions = registry.get_user_sessions(&"user1").await?;
             assert_eq!(user_sessions, vec![session_id]);
         }
@@ -639,7 +657,7 @@ mod tests {
         init_tracing();
 
         let store = MemoryStore::default();
-        let registry = SessionRegistryStore::new(store, 0);
+        let registry = SessionRegistryStore::new(store, 0, None, None);
 
         let session_id = tower_sessions::session::Id(99).to_string();
 
@@ -665,8 +683,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_registry_deterministic_id_generation() {
-        let id1 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0);
-        let id2 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0);
+        let key = SESSION_REGISTRY_KEY.to_string();
+        let id1 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0, key.clone());
+        let id2 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0, key);
         assert_eq!(id1, id2, "Registry ID generation should be deterministic");
     }
 }

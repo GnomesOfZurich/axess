@@ -312,7 +312,7 @@ mod tests {
 
     fn build_test_app(store: Arc<MemoryStore>) -> axum::Router {
         let backend = Arc::new(MockBackend::default());
-        let registry = Arc::new(SessionRegistryStore::new((*store).clone(), 0));
+        let registry = Arc::new(SessionRegistryStore::new((*store).clone(), 0, None, None));
         let session_manager_layer = SessionManagerLayer::new(store.as_ref().clone());
         let auth_service = AuthnServiceBuilder::new(backend.clone(), session_manager_layer.clone())
             .with_data_key("test.data")

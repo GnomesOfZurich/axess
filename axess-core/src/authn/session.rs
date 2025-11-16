@@ -1726,7 +1726,7 @@ mod tests {
     /// Test concurrent session handling
     async fn test_concurrent_sessions_for_same_user() -> Result<(), AuthError<MockBackend>> {
         let store = MemoryStore::default();
-        let registry = Arc::new(SessionRegistryStore::new(store.clone(), 0));
+        let registry = Arc::new(SessionRegistryStore::new(store.clone(), 0, None, None));
         let backend = Arc::new(MockBackend::default());
 
         // Create two initialized sessions

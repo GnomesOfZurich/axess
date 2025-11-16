@@ -60,11 +60,12 @@ impl App {
             .with_expiry(Expiry::OnInactivity(Duration::days(1)))
             .with_signed(key);
 
-        // Authn service.
-        //
-        // This combines the session layer with our backend and session registry to establish an
-        // authentication service layer which will provide the auth session as a request extension.
-        let session_registry = Arc::new(SessionRegistryStore::new(session_store, 100));
+        /*
+        Authn service.
+        This combines the session layer with our backend and session registry to establish an
+        authentication service layer which will provide the auth session as a request extension.
+        */
+        let session_registry = Arc::new(SessionRegistryStore::new(session_store, 100, None, None));
         let backend = Arc::new(OurBackend::new(db));
         let authn_service = Arc::new(
             AuthnServiceBuilder::new(backend, session_layer)
@@ -72,9 +73,11 @@ impl App {
                 .build(),
         );
 
-        // Ensure all merged routers share the same application state (Arc<OurBackend>).
-        // This avoids mismatched Router<State> types when merging by setting the top-level
-        // router state to the backend before merging other routers that expect the same state.
+        /*
+        Ensure all merged routers share the same application state (Arc<OurBackend>).
+        This avoids mismatched Router<State> types when merging by setting the top-level
+        router state to the backend before merging other routers that expect the same state.
+        */
         let app_router = Router::new()
             // .with_state(backend.clone())
             // Apply login_required to protected routes before merging
