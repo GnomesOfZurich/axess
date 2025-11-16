@@ -19,14 +19,14 @@ Add to your project:
 
 ```toml
 [dependencies]
-axess = { version = "0.0.8", features = ["full"] }
+axess = { version = "0.0.9", features = ["full"] }
 ```
 
 Or select features as needed:
 
 ```toml
 [dependencies]
-axess = { version = "0.0.8", features = ["authn", "authz", "admin", "request_id", "trace_id", "memory", "valkey"] }
+axess = { version = "0.0.9", features = ["authn", "authz", "admin", "request_id", "trace_id", "memory", "valkey"] }
 ```
 
 ## 🤸 Example Usage

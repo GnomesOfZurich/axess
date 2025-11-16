@@ -1,6 +1,6 @@
 [package]
 name = "axess-core"
-version = "0.0.8"
+version = "0.0.9"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -33,12 +33,12 @@ tower-cookies = { version = "0.11.0", features = ["axum-core", "private", "signe
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing = "0.1.41"
-axum = { version = "0.8.6", default-features = false, features = [
+axum = { version = "0.8.7", default-features = false, features = [
   "original-uri",
   "form",
   "json"
 ] }
-# axum = { version = "0.8.4", features = [
+# axum = { version = "0.8.7", features = [
 #   "http2",
 #   "json",
 #   "tokio",
@@ -67,7 +67,7 @@ fred = { version = "10.1.0", features = [
   "blocking-encoding",
   "replicas",
 ], optional = true }
-lazy-regex = { version = "3.4.1" }
+lazy-regex = { version = "3.4.2" }
 once_cell = { version = "1.21.3", optional = true }
 
 time = { version = "0.3.44", features = ["serde"], optional = true }
@@ -83,7 +83,7 @@ tracing-subscriber = { version = "0.3.20", features = ["fmt"], default-features 
 
 [dev-dependencies]
 argon2 = { version = "0.5.3", features = ["default"] }
-axum = "0.8.6"
+axum = "0.8.7"
 # password-auth = { version = "1.0.0" }
 reqwest = { version = "0.12.24", features = ["cookies"] }
 serial_test = "3.2.0" # Allows for the creation of serialised Rust tests
@@ -99,7 +99,8 @@ authn = [
   "dep:time",
   "dep:rand",
   "dep:urlencoding",
-  "dep:form_urlencoded"
+  "dep:form_urlencoded",
+  "dep:uuid"
 ]
 authz = ["authn", "dep:cedar-policy"]
 admin = ["authn"]

@@ -1,6 +1,6 @@
 [package]
 name = "axess"
-version = "0.0.8"
+version = "0.0.9"
 publish = false
 edition = "2024"
 resolver = "3"

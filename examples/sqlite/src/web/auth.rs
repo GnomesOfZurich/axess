@@ -4,9 +4,9 @@ use askama::Template;
 use axess::{
     AuthnAdminBackend, AuthnBackend,
     authn::methods::{
+        MethodBuilder,
         factor::{FactorInstance, FactorStateChangeBuilder},
         form::{PasswordForm, TOTP_LENGTH, TotpForm, TotpSetupForm},
-        method::MethodBuilder,
         policy::FactorConfigBuilder,
     },
     generate_password_hash, generate_totp_secret, verify_totp,
@@ -75,6 +75,7 @@ pub mod post {
 
     use super::*;
     use axess::{AuthFactorKind, EnablementState, MethodStateChange, PermissionScope};
+    use axum::Extension;
 
     #[derive(Deserialize)]
     pub struct SignupRequest {
@@ -97,7 +98,7 @@ pub mod post {
 
     #[axum::debug_handler]
     pub async fn login(
-        mut session: Session,
+        Extension(mut session): Extension<Session>,
         messages: Messages,
         Form(mut form): Form<PasswordForm>,
     ) -> impl IntoResponse {
@@ -121,7 +122,7 @@ pub mod post {
 
     #[axum::debug_handler]
     pub async fn signup(
-        session: Session,
+        Extension(session): Extension<Session>,
         messages: Messages,
         Form(mut payload): Form<SignupRequest>,
     ) -> impl IntoResponse {
@@ -235,7 +236,7 @@ pub mod post {
 
     #[axum::debug_handler]
     pub async fn totp_setup(
-        mut session: Session,
+        Extension(mut session): Extension<Session>,
         messages: Messages,
         Form(payload): Form<TotpSetupRequest>,
     ) -> impl IntoResponse {
@@ -259,20 +260,12 @@ pub mod post {
 
     #[axum::debug_handler]
     pub async fn totp_verify(
-        mut session: Session,
+        Extension(mut session): Extension<Session>,
         messages: Messages,
         Form(payload): Form<TotpVerifyRequest>,
     ) -> impl IntoResponse {
         let otp_code = payload.otp_code.trim().to_string();
-
-        let user = match session.user() {
-            Ok(user) => user.clone(),
-            Err(err) => {
-                messages.error(format!("Authentication required: {err}"));
-                return Redirect::to("/login").into_response();
-            }
-        };
-
+        let user = session.get_user();
         let backend = session.backend.clone();
         let scope = PermissionScope::User(user.tenant_id, user.id);
 
@@ -412,6 +405,7 @@ pub mod post {
 pub mod get {
     use super::*;
     use axess::{AuthFactorKind, EnablementState, PermissionScope, build_totp_uri};
+    use axum::Extension;
 
     #[axum::debug_handler]
     pub async fn login(
@@ -428,7 +422,7 @@ pub mod get {
     }
 
     #[axum::debug_handler]
-    pub async fn logout(mut session: Session) -> impl IntoResponse {
+    pub async fn logout(Extension(mut session): Extension<Session>) -> impl IntoResponse {
         match session.logout().await {
             Ok(_) => Redirect::to("/login").into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -436,17 +430,11 @@ pub mod get {
     }
 
     #[axum::debug_handler]
-    pub async fn totp_setup(session: Session, messages: Messages) -> impl IntoResponse {
-        let user = match session.user() {
-            Ok(user) => user.clone(),
-            Err(err) => {
-                messages
-                    .clone()
-                    .error(format!("Authentication required: {err}"));
-                return Redirect::to("/login").into_response();
-            }
-        };
-
+    pub async fn totp_setup(
+        Extension(session): Extension<Session>,
+        messages: Messages,
+    ) -> impl IntoResponse {
+        let user = session.get_user();
         let backend = session.backend.clone();
         let tenant_name = match backend.get_tenant(&user.tenant_id).await {
             Ok(tenant) => tenant.name,

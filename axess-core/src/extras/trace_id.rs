@@ -142,7 +142,8 @@ impl<S> Layer<S> for TraceIdLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{convert::Infallible, sync::Once};
+    use crate::utils::testing::mock_tracing::init_tracing;
+    use std::convert::Infallible;
     // use http::Request;
     use axum::{
         body::Body,
@@ -156,26 +157,9 @@ mod tests {
     };
     // use hyper::body::to_bytes;
     // use http_body_util::BodyExt;
-    use tracing::{
-        self,
-        // info,
-        Level,
-        info_span,
-    };
-    use tracing_subscriber;
+    use tracing::{self, info_span};
 
     // type ServiceBuilderType = ServiceBuilder<Stack<TraceIdLayer, tower::layer::util::Identity>>;
-
-    static INIT: Once = Once::new();
-
-    fn init_tracing() {
-        INIT.call_once(|| {
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(Level::INFO)
-                // .with_test_writer()
-                .try_init();
-        });
-    }
 
     fn create_test_service(
         layer: TraceIdLayer,

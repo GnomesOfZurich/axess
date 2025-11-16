@@ -3,7 +3,10 @@
 
 use crate::authn::{
     errors::FormError,
-    methods::{AuthFactorKind, FactorForm, FactorFormKind, FormField, FormFieldValue},
+    methods::{
+        factor::AuthFactorKind,
+        form::{FactorForm, FactorFormKind, FormField, FormFieldValue},
+    },
 };
 use std::collections::HashMap;
 

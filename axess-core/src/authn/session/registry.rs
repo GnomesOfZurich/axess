@@ -41,7 +41,7 @@ pub struct SessionMetadata {
 
 /// Registry for tracking and managing sessions across users and tenants
 #[async_trait]
-pub trait SessionRegistry: Send + Sync + 'static {
+pub trait SessionRegistry: Send + Sync + Clone + 'static {
     /// Register a session for a user and tenant
     async fn register_session<UId, TId>(
         &self,
@@ -262,7 +262,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
 }
 
 #[async_trait]
-impl<S: SessionStore + Send + Sync> SessionRegistry for SessionRegistryStore<S> {
+impl<S: SessionStore + Send + Sync + Clone> SessionRegistry for SessionRegistryStore<S> {
     async fn register_session<UId, TId>(
         &self,
         session_id: &str,
@@ -274,12 +274,22 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for SessionRegistryStore<S> 
         UId: Display + Send + Sync,
         TId: Display + Send + Sync,
     {
+        if user_id.is_none() {
+            tracing::debug!("Registering guest session: {}", session_id);
+        }
+        if tenant_id.is_none() {
+            tracing::debug!("Registering guest session: {}", session_id);
+        }
+
         // Defensive: Only allow valid session IDs
         if session_id.parse::<tower_sessions::session::Id>().is_err() {
             error!("Attempted to register invalid session ID: {session_id}");
-            return Err(SessionRegistryError::SerializationError(format!(
-                "Invalid session ID format: {session_id}"
-            )));
+            // return Err(SessionRegistryError::SerializationError(format!(
+            //     "Invalid session ID format: {session_id}"
+            // )));
+
+            // Do NOT register, but do NOT treat this as a fatal error for the caller.
+            return Ok(());
         }
 
         let mut registry = self.get_registry().await?;
@@ -408,21 +418,8 @@ impl<S: SessionStore + Send + Sync> SessionRegistry for SessionRegistryStore<S> 
 mod tests {
     use super::*;
 
-    use std::sync::Once;
+    use crate::utils::testing::mock_tracing::init_tracing;
     use tower_sessions::MemoryStore;
-    use tracing_subscriber;
-
-    static INIT: Once = Once::new();
-
-    fn init_tracing() {
-        INIT.call_once(|| {
-            // Use tracing-subscriber for test output
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .with_test_writer()
-                .try_init();
-        });
-    }
 
     #[tokio::test]
     async fn test_session_registry_basic_operations() -> Result<(), SessionRegistryError> {

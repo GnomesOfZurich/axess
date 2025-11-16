@@ -18,7 +18,8 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
 
     ```sh
     git clone https://github.com/GnomesOfZurich/axess.git
-    cd axess/examples/sqlite
+    cd ./axess/examples/sqlite
+    cargo build
     ```
 
 2. **Set up your environment:**
@@ -27,13 +28,13 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
     - Create a `.env` file with your database URL (optional, defaults to in-memory):
 
       ```
-      DATABASE_URL=sqlite://axess-example.db
+      DATABASE_URL=sqlite://db/axess-example.db
       ```
 
 3. **Run database migrations:**
 
     ```sh
-    cargo run -p axess-example-sqlite --bin migrate
+    cargo run -p axess-example-sqlite
     ```
 
     *(Or let the app run migrations at startup)*
@@ -44,7 +45,7 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
     cargo run -p axess-example-sqlite
     ```
 
-    The app will listen on `0.0.0.0:3000` by default.
+    The app will listen on `127.0.0.1:3000` by default.
 
 5. **Open in your browser:**
 

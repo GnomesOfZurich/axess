@@ -4,24 +4,34 @@
 //! exercise the `AuthnBackend`/`AuthnAdminBackend` contracts without a real
 //! datastore.
 
+// use std::collections::HashMap;
+
 #[cfg(feature = "admin")]
-use crate::authn::admin::AuthnAdminBackend;
-use crate::authn::{
-    backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
-    methods::{
-        EnablementState, FactorForm, PermissionScope,
-        factor::{AuthFactorKind, FactorInstance, FactorStateChange},
-        method::{MethodBuilder, MethodStateChange},
+use crate::authn::backend::admin::AuthnAdminBackend;
+use crate::{
+    authn::{
+        backend::{AuthTenant, AuthnBackend, EntityState},
+        methods::{
+            MethodStateChange,
+            factor::FactorStateChange,
+            form::FactorForm,
+            scope::{EnablementState, PermissionScope},
+        },
+        session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
+        types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
     },
-    session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
-    types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
+    utils::testing::{
+        mock_authn::{MockAuthFactor, MockAuthFactorState, MockAuthMethod, MockAuthMethodState},
+        mock_entities::{
+            DEFAULT_TENANT_ID, DEFAULT_USER_ID, MockTenant, MockUser, SYSTEM_SUPER_USER_ID,
+            TENANT_SUPER_USER_ID, TestTenantId, TestUserId,
+        },
+    },
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
-use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
 
 // TODO: Consider letting the mock backend be an in-memory SQLite database
 // use sqlx::SqlitePool;
@@ -30,210 +40,6 @@ use std::fmt::{Display, Formatter};
 //     let pool = SqlitePool::connect(":memory:").await.unwrap();
 //     OurBackend::new(pool)
 // }
-
-const SYSTEM_SUPER_USER_ID: &str = "SYSTEM_SUPER_USER_ID";
-const TENANT_SUPER_USER_ID: &str = "TENANT_SUPER_USER_ID";
-const DEFAULT_TENANT_NAME: &str = "Default Tenant";
-const DEFAULT_TENANT_ID: &str = "DEFAULT_TENANT_ID";
-const DEFAULT_USER_ID: &str = "DEFAULT_USER_ID";
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TestTenantId(pub String);
-
-impl From<&str> for TestTenantId {
-    fn from(s: &str) -> Self {
-        TestTenantId(s.to_string())
-    }
-}
-
-impl Display for TestTenantId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl PartialEq<String> for TestTenantId {
-    fn eq(&self, other: &String) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<TestTenantId> for String {
-    fn eq(&self, other: &TestTenantId) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialEq<&str> for TestTenantId {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<TestTenantId> for &str {
-    fn eq(&self, other: &TestTenantId) -> bool {
-        *self == other.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MockTenant {
-    pub id: TestTenantId,
-    pub name: String,
-    pub description: String,
-    pub state: EntityState,
-}
-
-impl MockTenant {
-    pub fn with_id(&mut self, id: TestTenantId) -> Self {
-        self.id = id;
-        self.clone()
-    }
-}
-
-impl Default for MockTenant {
-    fn default() -> Self {
-        Self {
-            id: DEFAULT_TENANT_ID.into(),
-            name: DEFAULT_TENANT_NAME.to_string(),
-            description: "This is the default tenant".to_string(),
-            state: EntityState::Active,
-        }
-    }
-}
-
-impl AuthTenant for MockTenant {
-    type Id = TestTenantId;
-
-    fn id(&self) -> Self::Id {
-        self.id.clone()
-    }
-
-    fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    fn get_tenant_state(&self) -> EntityState {
-        self.state.clone()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TestUserId(pub String);
-
-impl Display for TestUserId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<&str> for TestUserId {
-    fn from(s: &str) -> Self {
-        TestUserId(s.to_string())
-    }
-}
-
-impl PartialEq<String> for TestUserId {
-    fn eq(&self, other: &String) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<TestUserId> for String {
-    fn eq(&self, other: &TestUserId) -> bool {
-        *self == other.0
-    }
-}
-
-impl PartialEq<&str> for TestUserId {
-    fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
-    }
-}
-
-impl PartialEq<TestUserId> for &str {
-    fn eq(&self, other: &TestUserId) -> bool {
-        *self == other.0
-    }
-}
-
-impl TestUserId {
-    /// Returns the user ID as a string slice
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TestTenantId {
-    /// Returns the tenant ID as a string slice
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for TestUserId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for TestTenantId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl AsRef<str> for TestUserId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for TestTenantId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MockUser {
-    pub id: TestUserId,
-    pub tenant_id: TestTenantId,
-    pub state: EntityState,
-}
-
-impl Default for MockUser {
-    fn default() -> Self {
-        Self {
-            id: TestUserId("default_user".to_string()),
-            tenant_id: DEFAULT_TENANT_ID.into(),
-            state: EntityState::Active,
-        }
-    }
-}
-
-impl AuthUser for MockUser {
-    type Id = TestUserId;
-    type TenantId = TestTenantId;
-    fn id(&self) -> &Self::Id {
-        &self.id
-    }
-    fn tenant_id(&self) -> &Self::TenantId {
-        &self.tenant_id
-    }
-    fn get_user_state(&self) -> EntityState {
-        self.state.clone()
-    }
-}
-
-type MockAuthFactor = AuthFactor<MockBackend>;
-type MockAuthFactorState = AuthFactorState<MockBackend>;
-type MockAuthMethod = AuthMethod<MockBackend>;
-type MockAuthMethodState = AuthMethodState<MockBackend>;
 
 #[derive(Debug)]
 pub struct MockBackend {
@@ -832,23 +638,122 @@ impl AuthnAdminBackend for MockBackend {
     }
 }
 
-pub fn mock_method() -> AuthMethod<MockBackend> {
-    let creator = TestUserId("method_creator".into());
+impl PartialEq for MockBackend {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare users
+        if self.users.len() != other.users.len() {
+            return false;
+        }
+        for entry in self.users.iter() {
+            let key = entry.key();
+            match other.users.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
 
-    let password_factor = FactorInstance::new(
-        "password-factor".to_string(),
-        AuthFactorKind::Password,
-        "Password",
-        "Mock password factor",
-        creator.clone(),
-    );
+        // Compare tenants
+        if self.tenants.len() != other.tenants.len() {
+            return false;
+        }
+        for entry in self.tenants.iter() {
+            let key = entry.key();
+            match other.tenants.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
 
-    MethodBuilder::new(
-        "password-method".to_string(),
-        "Password Only",
-        "Password based authentication",
-        creator,
-    )
-    .add_factor(password_factor)
-    .build()
+        // Compare auth_factors
+        if self.auth_factors.len() != other.auth_factors.len() {
+            return false;
+        }
+        for entry in self.auth_factors.iter() {
+            let key = entry.key();
+            match other.auth_factors.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // Compare auth_factor_states
+        if self.auth_factor_states.len() != other.auth_factor_states.len() {
+            return false;
+        }
+        for entry in self.auth_factor_states.iter() {
+            let key = entry.key();
+            match other.auth_factor_states.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // Compare auth_methods
+        if self.auth_methods.len() != other.auth_methods.len() {
+            return false;
+        }
+        for entry in self.auth_methods.iter() {
+            let key = entry.key();
+            match other.auth_methods.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // Compare auth_method_states
+        if self.auth_method_states.len() != other.auth_method_states.len() {
+            return false;
+        }
+        for entry in self.auth_method_states.iter() {
+            let key = entry.key();
+            match other.auth_method_states.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // Compare authn_history (Vec<AuthEvent<MockBackend>>)
+        if self.authn_history.len() != other.authn_history.len() {
+            return false;
+        }
+        for entry in self.authn_history.iter() {
+            let key = entry.key();
+            match other.authn_history.get(key) {
+                Some(other_entry) => {
+                    if entry.value() != other_entry.value() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        true
+    }
 }
+
+impl Eq for MockBackend {}

@@ -1,5 +1,5 @@
 #[cfg(feature = "admin")]
-pub use axess_core::authn::admin::AuthnAdminBackend;
+pub use axess_core::authn::backend::admin::AuthnAdminBackend;
 
 #[cfg(feature = "authn")]
 pub use axess_core::{
@@ -11,14 +11,16 @@ pub use axess_core::{
         },
         errors::{AuthError, FormError, HandlerError},
         methods::{
-            AuthFactorKind, EnablementState, FactorForm, FactorFormExt, FactorInstance,
-            FactorStateChange, FormField, FormFieldValue, MethodBuilder, MethodInstance,
-            MethodStateChange, PermissionScope,
+            MethodBuilder, MethodInstance, MethodStateChange,
+            factor::{AuthFactorKind, FactorInstance, FactorStateChange},
+            form::{FactorForm, FactorFormExt, FormField, FormFieldValue},
+            scope::{EnablementState, PermissionScope},
         },
         middleware::{AuthnManager, AuthnService, AuthnServiceBuilder},
         session::{
-            AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthSession,
-            SessionRegistry, SessionRegistryStore,
+            AuthSession,
+            registry::{SessionRegistry, SessionRegistryStore},
+            state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
         },
         types::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,

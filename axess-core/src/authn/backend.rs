@@ -9,11 +9,16 @@
 //! - Reference tests exercising the in-memory [`MockBackend`] to ensure the trait contract
 //!   behaves consistently across implementations.
 
+#[cfg(feature = "admin")]
+pub mod admin;
+#[cfg(feature = "admin")]
+pub mod handlers;
+
 use crate::authn::{
     methods::{
+        MethodStateChange,
         factor::FactorStateChange,
         form::FactorForm,
-        method::MethodStateChange,
         scope::{EnablementState, PermissionScope},
     },
     session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
@@ -404,11 +409,13 @@ where
 mod tests {
     use super::*;
     #[cfg(feature = "admin")]
-    use crate::authn::admin::admin_backend::AuthnAdminBackend;
+    use crate::authn::backend::admin::AuthnAdminBackend;
     use crate::{
         authn::session::state::{AuthEventStatus, AuthEventType},
-        utils::testing::mock_backend::{
-            MockBackend, MockTenant, MockUser, TestTenantId, TestUserId, mock_method,
+        utils::testing::{
+            mock_authn::mock_method,
+            mock_backend::MockBackend,
+            mock_entities::{MockTenant, MockUser, TestTenantId, TestUserId},
         },
     };
 

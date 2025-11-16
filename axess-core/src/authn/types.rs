@@ -7,8 +7,8 @@
 use crate::authn::{
     backend::AuthnBackend,
     methods::{
+        MethodInstance, MethodState,
         factor::{FactorInstance, FactorState},
-        method::{MethodInstance, MethodState},
     },
     session::state::{AuthState, Data, PartialAuthState},
 };

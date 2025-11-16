@@ -4,17 +4,22 @@
 //! - [`MethodStateChange`] / [`MethodState`] for tracking per-scope method enablement.
 //! - [`MethodInstance`] as the persisted representation of multi-factor flows.
 //! - [`MethodBuilder`] to assemble methods ergonomically from their factor instances.
+//!
+
+pub mod factor;
+pub mod form;
+pub mod policy;
+pub mod scope;
 
 use crate::{
     authn::{
         backend::{DataId, FactorId, MethodId, TenantId, UserId},
-        methods::{
-            factor::FactorInstance,
-            scope::{EnablementState, PermissionScope},
-        },
+        methods::factor::AuthFactorKind,
     },
     tracing::error,
 };
+use factor::FactorInstance;
+use scope::{EnablementState, PermissionScope};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -189,7 +194,7 @@ where
         self.factors.first().map(|factor| factor.id.clone())
     }
 
-    pub fn has_factor_kind(&self, kind: &crate::authn::methods::AuthFactorKind) -> bool {
+    pub fn has_factor_kind(&self, kind: &AuthFactorKind) -> bool {
         self.factors.iter().any(|factor| &factor.kind == kind)
     }
 }

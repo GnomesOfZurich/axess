@@ -1,3 +1,7 @@
+pub mod extractor;
+pub mod registry;
+pub mod state;
+
 use crate::{
     authn::{
         backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
@@ -8,7 +12,6 @@ use crate::{
             policy::{FactorConfig, FactorConfigBuilder, OtpCharset, OtpRulesBuilder, OtpType},
             scope::{EnablementState, PermissionScope},
         },
-        session::registry::SessionRegistry,
         types::{AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
     },
     axum::{
@@ -16,14 +19,15 @@ use crate::{
         response::{IntoResponse, Redirect, Response},
     },
     tracing::{debug, error, warn},
-    utils::{
-        random::{SecureRng, SystemRng},
-        validation::is_valid_otp_code,
-    },
+    utils::{random::SecureRng, validation::is_valid_otp_code},
 };
+use registry::SessionRegistry;
+
 use axess_factors::{generate_password_hash, verify_hotp, verify_totp};
+// use base64::DecodeSliceError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+// use uuid::Uuid;
 use std::{fmt::Debug, str::FromStr, sync::Arc};
 use tower_sessions::Session;
 
@@ -43,7 +47,7 @@ use tower_sessions::Session;
 ///
 /// Both parameters are injected via [`AuthSession::from_session_with_rng`](self::AuthSession::from_session_with_rng),
 /// ensuring contributors can control randomness and persistence when writing DST-oriented tests.
-#[derive(Clone)]
+///
 pub struct AuthSession<B, R, Rng>
 where
     B: AuthnBackend,
@@ -64,7 +68,28 @@ where
     data: SessionData<B>,
     data_key: &'static str,
     session_registry: Option<Arc<R>>,
-    rng: Rng, // Add RNG field
+    rng: Rng,
+}
+
+impl<B, R, Rng> Clone for AuthSession<B, R, Rng>
+where
+    B: AuthnBackend + Clone,
+    R: SessionRegistry + Clone,
+    Rng: SecureRng + Clone,
+    B::User: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            user: self.user.clone(),
+            backend: self.backend.clone(),
+            session: self.session.clone(),
+            data: self.data.clone(),
+            data_key: self.data_key,
+            session_registry: self.session_registry.clone(),
+            rng: self.rng.clone(),
+        }
+    }
 }
 
 impl<B, R, Rng> Debug for AuthSession<B, R, Rng>
@@ -86,13 +111,14 @@ where
     }
 }
 
-impl<B, R> AuthSession<B, R, SystemRng>
+impl<B, R, Rng> AuthSession<B, R, Rng>
 where
     B: AuthnBackend + Debug,
     B::TenantId: From<<B::User as AuthUser>::TenantId>,
     B::UserId: From<<B::User as AuthUser>::Id>,
     <B as AuthnBackend>::TenantId: From<<<B as AuthnBackend>::Tenant as AuthTenant>::Id>,
     R: SessionRegistry + Send + Sync + 'static,
+    Rng: SecureRng,
 {
     pub async fn from_session(
         session: Session,
@@ -104,20 +130,12 @@ where
         B::User: Clone,
         B::UserId: Clone,
         B::TenantId: Clone,
+        Rng: Default,
     {
-        Self::from_session_with_rng(session, backend, data_key, session_registry, SystemRng).await
+        Self::from_session_with_rng(session, backend, data_key, session_registry, Rng::default())
+            .await
     }
-}
 
-impl<B, R, Rng> AuthSession<B, R, Rng>
-where
-    B: AuthnBackend + Debug,
-    B::TenantId: From<<B::User as AuthUser>::TenantId>,
-    B::UserId: From<<B::User as AuthUser>::Id>,
-    <B as AuthnBackend>::TenantId: From<<<B as AuthnBackend>::Tenant as AuthTenant>::Id>,
-    R: SessionRegistry + Send + Sync + 'static,
-    Rng: SecureRng,
-{
     /// Create AuthSession with custom RNG (for testing)
     pub async fn from_session_with_rng(
         session: Session,
@@ -137,6 +155,15 @@ where
             .await
             .map_err(AuthError::SessionError)?
             .unwrap_or_default();
+
+        tracing::debug!(
+            "AuthSession::from_session_with_rng: Loaded session data: {:?}, user_state: {:?}, user_id: {:?}, tenant_id: {:?}, auth_state: {:?}",
+            data,
+            data.user_state,
+            data.user_id,
+            data.tenant_id,
+            data.auth_state
+        );
 
         // 2. Load the user based on the session data.
         let user = if data.user_state == EntityState::Guest {
@@ -178,6 +205,167 @@ where
             session_registry,
             rng,
         })
+    }
+
+    // /// Create a new guest AuthSession and persist it in the session store.
+    // pub async fn new_guest_session<S>(
+    //     backend: Arc<B>,
+    //     store: S,
+    //     data_key: &'static str,
+    //     session_registry: Option<Arc<R>>,
+    // ) -> Result<Self, AuthError<B>>
+    // where
+    //     B::User: Clone,
+    //     B::UserId: Clone,
+    //     B::TenantId: Clone,
+    //     S: SessionStore + Clone + Send + Sync + 'static,
+    //     Rng: Default,
+    // {
+    //     // Create a new session
+    //     // Generate a new session ID using uuid
+    //     let session_id = Uuid::new_v4().to_string();
+    //     let session_id_obj = tower_sessions::session::Id::from_str(&session_id)
+    //         .map_err(AuthError::SessionError)?;
+    //     let session = Session::new(
+    //         Some(session_id_obj),
+    //         Arc::new(store.clone()),
+    //         None,
+    //     );
+    //     session.save().await.map_err(AuthError::SessionError)?;
+
+    //     // Create guest user via backend
+    //     let guest_user = backend.get_new_guest_user(None).await.map_err(AuthError::BackendError)?;
+
+    //     // Setup initial session data
+    //     let mut data = SessionData::<B>::default();
+    //     data.user_state = EntityState::Guest;
+    //     // Optionally set other fields
+
+    //     // Persist session data
+    //     session.insert(data_key, &data).await.map_err(AuthError::SessionError)?;
+    //     session.save().await.map_err(AuthError::SessionError)?;
+
+    //     Ok(AuthSession {
+    //         state: SessionState::<B>::NotAuthenticated,
+    //         user: guest_user,
+    //         backend,
+    //         session,
+    //         data,
+    //         data_key,
+    //         session_registry,
+    //         rng: Rng::default(),
+    //     })
+    // }
+
+    /// Get the user associated with the session.
+    /// This will return the user if authenticated, or a guest user if not.
+    /// Return reference to avoid move
+    pub fn get_user(&self) -> &B::User {
+        &self.user
+    }
+
+    /// Set the user object for this session.
+    pub fn set_user(&mut self, user: B::User) {
+        self.user = user;
+    }
+
+    /// Set guest user and update session data accordingly.
+    pub fn set_guest_user(&mut self, guest: B::User) {
+        self.user = guest;
+        self.data.user_id = None;
+        self.data.user_state = EntityState::Guest;
+    }
+
+    /// Set user-related session data.
+    pub fn set_user_data(
+        &mut self,
+        user_id: Option<B::UserId>,
+        tenant_id: Option<B::TenantId>,
+        user_state: EntityState,
+    ) {
+        self.data.user_id = user_id;
+        self.data.tenant_id = tenant_id;
+        self.data.user_state = user_state;
+    }
+
+    /// Persist the current user data to the session store.
+    pub async fn save_user_data(&mut self) -> Result<(), AuthError<B>> {
+        self.session
+            .insert(self.data_key, &self.data)
+            .await
+            .map_err(AuthError::SessionError)?;
+        self.session.save().await.map_err(AuthError::SessionError)?;
+        Ok(())
+    }
+
+    /// Get the user ID associated with the session.
+    /// Returns `None` if the session is not associated with a user.
+    pub fn get_user_id(&self) -> Option<&B::UserId> {
+        self.data.user_id.as_ref()
+    }
+
+    /// Get the tenant ID associated with the session.
+    /// Returns `None` if the session is not associated with a tenant.
+    pub fn get_tenant_id(&self) -> Option<&B::TenantId> {
+        self.data.tenant_id.as_ref()
+    }
+
+    pub fn get_user_state(&self) -> EntityState {
+        self.data.user_state.clone()
+    }
+
+    pub async fn set_user_state(&mut self, new_state: EntityState) -> Result<(), AuthError<B>>
+    where
+        B: AuthnBackend,
+    {
+        self.data.user_state = new_state;
+        self.session
+            .insert(self.data_key, &self.data)
+            .await
+            .map_err(AuthError::SessionError)?;
+        Ok(())
+    }
+
+    /// Get the authentication state of the session.
+    /// This will return the current authentication state, which can be
+    /// `NotAuthenticated`, `PartialAuthn`, or `Authenticated`.
+    pub fn get_auth_state(&self) -> &SessionState<B> {
+        &self.state
+    }
+
+    /// Set the authentication state of the session.
+    pub async fn set_auth_state(&mut self, new_state: SessionState<B>) -> Result<(), AuthError<B>> {
+        self.state = new_state;
+        self.data.auth_state = self.state.clone();
+        self.session
+            .insert(self.data_key, &self.data)
+            .await
+            .map_err(AuthError::SessionError)?;
+        Ok(())
+    }
+
+    /// Get the partial authentication state if it exists.
+    /// This will return `Some(PartialAuthState)` if the session is in a partial authentication state,
+    ///  or `None` if it is not.
+    pub fn get_partial_inner_state(&self) -> Option<&PartialState<B>> {
+        match self.state {
+            SessionState::<B>::PartialAuthn(ref partial_state) => Some(partial_state),
+            _ => None,
+        }
+    }
+
+    /// Check if the session is in a partial authentication state.
+    /// This will return `true` if the session is in a partial authentication state,
+    /// or `false` if it is not.
+    pub fn is_partial_authn(&self) -> bool {
+        matches!(self.state, SessionState::<B>::PartialAuthn(_))
+    }
+
+    /// Check if the session is authenticated.
+    /// This will return `true` if the session is authenticated,
+    /// or `false` if it is not.
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self.state, SessionState::<B>::Authenticated)
     }
 
     /// Validates that the provided scope matches the current session
@@ -384,86 +572,6 @@ where
             factor_kind, scope
         );
         Err(AuthError::MethodNotFound)
-    }
-
-    pub fn user(&self) -> Result<B::User, AuthError<B>> {
-        Ok(self.user.clone())
-    }
-
-    pub fn get_user_state(&self) -> EntityState {
-        self.data.user_state.clone()
-    }
-
-    pub async fn set_user_state(&mut self, new_state: EntityState) -> Result<(), AuthError<B>>
-    where
-        B: AuthnBackend,
-    {
-        self.data.user_state = new_state;
-        self.session
-            .insert(self.data_key, &self.data)
-            .await
-            .map_err(AuthError::SessionError)?;
-        Ok(())
-    }
-
-    /// Get the user ID associated with the session.
-    /// Returns `None` if the session is not associated with a user.
-    pub fn get_user_id(&self) -> Option<&B::UserId> {
-        self.data.user_id.as_ref()
-    }
-
-    /// Get the tenant ID associated with the session.
-    /// Returns `None` if the session is not associated with a tenant.
-    pub fn get_tenant_id(&self) -> Option<&B::TenantId> {
-        self.data.tenant_id.as_ref()
-    }
-
-    /// Get the authentication state of the session.
-    /// This will return the current authentication state, which can be
-    /// `NotAuthenticated`, `PartialAuthn`, or `Authenticated`.
-    pub fn get_auth_state(&self) -> &SessionState<B> {
-        &self.state
-    }
-
-    /// Set the authentication state of the session.
-    pub async fn set_auth_state(&mut self, new_state: SessionState<B>) -> Result<(), AuthError<B>> {
-        self.state = new_state;
-        self.data.auth_state = self.state.clone();
-        self.session
-            .insert(self.data_key, &self.data)
-            .await
-            .map_err(AuthError::SessionError)?;
-        Ok(())
-    }
-    /// Get the user associated with the session.
-    /// This will return the user if authenticated, or a guest user if not.
-    /// Return reference to avoid move
-    pub fn get_user(&self) -> &B::User {
-        &self.user
-    }
-
-    /// Get the partial authentication state if it exists.
-    /// This will return `Some(PartialAuthState)` if the session is in a partial authentication state,
-    ///  or `None` if it is not.
-    pub fn get_partial_inner_state(&self) -> Option<&PartialState<B>> {
-        match self.state {
-            SessionState::<B>::PartialAuthn(ref partial_state) => Some(partial_state),
-            _ => None,
-        }
-    }
-
-    /// Check if the session is in a partial authentication state.
-    /// This will return `true` if the session is in a partial authentication state,
-    /// or `false` if it is not.
-    pub fn is_partial_authn(&self) -> bool {
-        matches!(self.state, SessionState::<B>::PartialAuthn(_))
-    }
-
-    /// Check if the session is authenticated.
-    /// This will return `true` if the session is authenticated,
-    /// or `false` if it is not.
-    pub fn is_authenticated(&self) -> bool {
-        matches!(self.state, SessionState::<B>::Authenticated)
     }
 
     pub async fn authenticate_from_form<F>(
@@ -1032,8 +1140,18 @@ where
         }
     }
 
+    pub async fn set_session_data(&mut self, new_data: SessionData<B>) -> Result<(), AuthError<B>> {
+        self.data = new_data;
+        self.session
+            .insert(self.data_key, &self.data)
+            .await
+            .map_err(AuthError::SessionError)?;
+        self.session.save().await.map_err(AuthError::SessionError)?;
+        Ok(())
+    }
+
     /// Generates a cryptographically secure hash binding this authentication to a specific session
-    fn generate_session_hash(&mut self) -> String {
+    pub fn generate_session_hash(&mut self) -> String {
         let mut hasher = Sha256::new();
 
         // Session ID
@@ -1052,9 +1170,9 @@ where
         hasher.update(now.timestamp().to_string().as_bytes());
         hasher.update(now.timestamp_subsec_nanos().to_string().as_bytes());
 
-        // Cryptographically secure random nonce (32 bytes)
+        // Use the injected RNG instance for DST compatibility
         let mut nonce = [0u8; 32];
-        SecureRng::fill_bytes(&mut self.rng, &mut nonce);
+        self.rng.fill_bytes(&mut nonce);
         hasher.update(nonce);
 
         format!("{:x}", hasher.finalize())
@@ -1381,9 +1499,14 @@ where
 mod tests {
     use super::*;
     use crate::{
-        authn::{admin::AuthnAdminBackend, session::registry::SessionRegistryStore},
+        authn::session::registry::SessionRegistryStore,
         utils::testing::{
-            mock_backend::{MockBackend, MockUser, TestTenantId, TestUserId, mock_method},
+            mock_authn::{
+                create_initialized_session, create_test_session,
+                create_test_session_with_custom_rng, mock_method,
+            },
+            mock_backend::MockBackend,
+            mock_entities::{MockUser, TestTenantId, TestUserId},
             mock_form::{DummyFailingForm, DummyOkForm},
             mock_random::MockRng,
         },
@@ -1392,106 +1515,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    use tower_sessions::{
-        MemoryStore, SessionStore,
-        session::{Id, Record},
-    };
-
-    /// Helper to create a session that's properly initialized in the store
-    async fn create_initialized_session(store: MemoryStore) -> Session {
-        // Bring the SessionStore trait into scope so its async methods are available.
-
-        // Generate a new session ID
-        let session_id = Id::default();
-
-        // Create a record with the ID and empty data (mutable because create expects &mut Record)
-        let mut record = Record {
-            id: session_id.clone(),
-            data: Default::default(),
-            expiry_date: time::OffsetDateTime::now_utc() + time::Duration::hours(24),
-        };
-
-        // Save the record to the store (pass a mutable reference)
-        store
-            .create(&mut record)
-            .await
-            .expect("Failed to create session record in store");
-
-        // Create Session with this ID - it will be able to load from store
-        Session::new(Some(session_id), std::sync::Arc::new(store), None)
-    }
-
-    async fn create_test_session() -> Result<
-        (
-            AuthSession<MockBackend, SessionRegistryStore<MemoryStore>, MockRng>,
-            Arc<SessionRegistryStore<MemoryStore>>,
-        ),
-        AuthError<MockBackend>,
-    > {
-        let backend = Arc::new(MockBackend::default());
-        let store = MemoryStore::default();
-
-        // Create and initialize session (pass a cloned MemoryStore value)
-        let session = create_initialized_session(store.clone()).await;
-
-        let registry = Arc::new(SessionRegistryStore::new(store, 0));
-
-        // Configure backend with test method
-        let method = mock_method();
-        backend
-            .upsert_auth_method(method.clone())
-            .await
-            .map_err(AuthError::BackendError)?;
-
-        let rng = MockRng::new(42);
-        let auth_session = AuthSession::from_session_with_rng(
-            session,
-            backend.clone(),
-            "test.data",
-            Some(registry.clone()),
-            rng,
-        )
-        .await?;
-
-        Ok((auth_session, registry))
-    }
-
-    /// Helper to create a test session with a custom RNG
-    async fn create_test_session_with_custom_rng(
-        rng: MockRng,
-    ) -> Result<
-        (
-            AuthSession<MockBackend, SessionRegistryStore<MemoryStore>, MockRng>,
-            Arc<SessionRegistryStore<MemoryStore>>,
-        ),
-        AuthError<MockBackend>,
-    > {
-        let backend = Arc::new(MockBackend::default());
-        let store = MemoryStore::default();
-
-        // Create and initialize session (pass a cloned MemoryStore value)
-        let session = create_initialized_session(store.clone()).await;
-
-        let registry = Arc::new(SessionRegistryStore::new(store, 0));
-
-        // Configure backend with test method
-        let method = mock_method();
-        backend
-            .upsert_auth_method(method.clone())
-            .await
-            .map_err(AuthError::BackendError)?;
-
-        let auth_session = AuthSession::from_session_with_rng(
-            session,
-            backend.clone(),
-            "test.data",
-            Some(registry.clone()),
-            rng,
-        )
-        .await?;
-
-        Ok((auth_session, registry))
-    }
+    use tower_sessions::MemoryStore;
 
     #[tokio::test]
     /// Test that session hash is generated and stored during partial authentication
@@ -1713,7 +1737,7 @@ mod tests {
         assert!(session1.id().is_some(), "Session1 should have ID");
         assert!(session2.id().is_some(), "Session2 should have ID");
 
-        let mut auth_session1 = AuthSession::from_session(
+        let mut auth_session1 = AuthSession::<_, _, crate::utils::random::SystemRng>::from_session(
             session1,
             backend.clone(),
             "test.data",
@@ -1721,7 +1745,7 @@ mod tests {
         )
         .await?;
 
-        let mut auth_session2 = AuthSession::from_session(
+        let mut auth_session2 = AuthSession::<_, _, crate::utils::random::SystemRng>::from_session(
             session2,
             backend.clone(),
             "test.data",

@@ -81,6 +81,7 @@ impl App {
             .merge(protected_router())
             // Auth routes need backend state for handlers that use State extractor
             .merge(auth_router())
+            .route("/health", axum::routing::get(|| async { "OK" }))
             .layer(MessagesManagerLayer)
             .layer(authn_service.as_ref().clone());
         // .with_state(()); // Convert to Router<()> for compatibility

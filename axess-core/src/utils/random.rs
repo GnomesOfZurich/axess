@@ -7,7 +7,7 @@
 use rand::{RngCore, rngs::OsRng};
 
 /// Trait for secure random number generation (DST-friendly)
-pub trait SecureRng: Send + Sync + 'static {
+pub trait SecureRng: Send + Sync + Clone + 'static {
     fn fill_bytes(&mut self, dest: &mut [u8]);
 }
 

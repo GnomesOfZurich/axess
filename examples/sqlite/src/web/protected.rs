@@ -27,22 +27,22 @@ mod get {
     use tracing::error;
 
     pub async fn protected(session: Session) -> impl IntoResponse {
-        match session.user() {
-            Ok(user) => {
-                match (ProtectedTemplate {
-                    username: &user.username,
-                    messages: &[],
-                }
-                .render())
-                {
-                    Ok(body) => Html(body).into_response(),
-                    Err(e) => {
-                        error!(error = %e, "failed to render protected template");
-                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                    }
-                }
+        let user = session.get_user();
+        match (ProtectedTemplate {
+            username: &user.username,
+            messages: &[],
+        })
+        .render()
+        {
+            Ok(body) => Html(body).into_response(),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    username = %user.username,
+                    "failed to render protected template"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
-            Err(_err) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
 }

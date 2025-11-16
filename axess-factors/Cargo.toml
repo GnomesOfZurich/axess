@@ -1,6 +1,6 @@
 [package]
 name = "axess-factors"
-version = "0.0.8"
+version = "0.0.9"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -19,8 +19,8 @@ totp-rs = { version = "5.7.0", features = [
 ], optional = true}
 base32 = { version = "0.5.1", optional = true }
 hex = { version = "0.4.3", optional = true }
-zeroize = { version = "1.5.7", optional = true }
-subtle = { version = "2.4.1", optional = true }
+zeroize = { version = "1.8.2", optional = true }
+subtle = { version = "2.6.1", optional = true }
 libreauth = { version = "0.18.1", optional = true }
 
 [features]

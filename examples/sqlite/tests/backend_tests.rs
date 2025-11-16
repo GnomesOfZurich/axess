@@ -1,7 +1,7 @@
 use axess::{
     AuthEventRecord, AuthEventStatus, AuthEventType, AuthnAdminBackend, AuthnBackend,
     EnablementState, EntityState, PermissionScope,
-    authn::methods::{factor::FactorStateChange, method::MethodInstance},
+    authn::methods::{MethodInstance, factor::FactorStateChange},
 };
 
 // Include the example crate's models into this integration test crate so we can refer to

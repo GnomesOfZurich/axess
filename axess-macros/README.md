@@ -17,7 +17,7 @@ The macros ship with the main Axess workspace. Enable them via Cargo:
 
 ```toml
 [dependencies]
-axess = { version = "0.0.8", features = ["authn"] }
+axess = { version = "0.0.9", features = ["authn"] }
 ```
 
 ## Quick start

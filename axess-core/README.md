@@ -18,14 +18,14 @@ Add to your workspace or project:
 
 ```toml
 [dependencies]
-axess-core = "0.0.8"
+axess-core = "0.0.9"
 ```
 
 Enable features as needed:
 
 ```toml
 [dependencies]
-axess-core = { version = "0.0.8", features = ["authn", "authz", "admin", "request_id", "trace_id", "memory", "valkey"] }
+axess-core = { version = "0.0.9", features = ["authn", "authz", "admin", "request_id", "trace_id", "memory", "valkey"] }
 ```
 
 ## Usage

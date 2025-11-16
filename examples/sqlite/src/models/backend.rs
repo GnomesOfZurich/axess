@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
 use axess::{
-    authn::methods::{factor::FactorStateChange, form::TOTP_LENGTH, method::MethodStateChange},
+    authn::methods::{MethodStateChange, factor::FactorStateChange, form::TOTP_LENGTH},
     verify_password, verify_totp,
 };
 

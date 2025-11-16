@@ -108,6 +108,8 @@ pub enum AuthError<B: AuthnBackend> {
     SessionRegistryError(#[from] SessionRegistryError),
     #[error("Backend error: {0}")]
     BackendError(#[source] B::Error),
+    #[error("Base64 decode error: {0}")]
+    Base64DecodeError(#[from] base64::DecodeError),
 }
 
 impl<B> IntoResponse for AuthError<B>
@@ -150,12 +152,13 @@ where
             AuthError::SessionNotFound => (StatusCode::UNAUTHORIZED, "Session not found"),
             AuthError::SessionExpired => (StatusCode::UNAUTHORIZED, "Session expired"),
             AuthError::SessionLockError => (StatusCode::CONFLICT, "Session lock error"),
+            AuthError::SessionInvalid => (StatusCode::UNAUTHORIZED, "Session is invalid"),
             AuthError::SessionError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Session error"),
             AuthError::SessionRegistryError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Session registry error")
             }
             AuthError::BackendError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Backend error"),
-            AuthError::SessionInvalid => (StatusCode::UNAUTHORIZED, "Session is invalid"),
+            AuthError::Base64DecodeError(_) => (StatusCode::BAD_REQUEST, "Base64 decode error"),
         };
 
         (status, message).into_response()

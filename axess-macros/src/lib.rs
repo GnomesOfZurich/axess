@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub use axess_core::{
-    authn::session::auth_session::AuthSession,
+    authn::session::AuthSession,
     axum::{
         self,
         http::{self, Uri},

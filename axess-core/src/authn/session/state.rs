@@ -6,8 +6,8 @@
 use crate::authn::{
     backend::{AuthnBackend, EntityState, FactorId, MethodId, TenantId, UserId},
     methods::{
+        MethodInstance,
         factor::{AuthFactorKind, FactorInstance},
-        method::MethodInstance,
     },
 };
 use chrono::{DateTime, Utc};
@@ -205,7 +205,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthEventType {
     Authenticated,
     LoginAttempt,
@@ -269,7 +269,7 @@ impl Display for AuthEventType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthEventStatus {
     Success,
     Failure,
@@ -312,7 +312,7 @@ impl Display for AuthEventStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(bound(
     serialize = "B::DataId: Serialize, B::UserId: Serialize, B::TenantId: Serialize, B::MethodId: Serialize, B::FactorId: Serialize",
     deserialize = "B::DataId: DeserializeOwned, B::UserId: DeserializeOwned, B::TenantId: DeserializeOwned, B::MethodId: DeserializeOwned, B::FactorId: DeserializeOwned"
