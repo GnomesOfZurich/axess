@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
 use axess::{
-    TOTP_LENGTH, TOTP_PERIOD, authn::methods::{MethodStateChange, factor::FactorStateChange},
-    verify_password, verify_totp
+    TOTP_LENGTH, TOTP_PERIOD,
+    authn::methods::{MethodStateChange, factor::FactorStateChange},
+    verify_password, verify_totp,
 };
 
 use crate::models::{
@@ -530,7 +531,10 @@ impl AuthnBackend for OurBackend {
                 .map(|i| format!("?{}", i + offset + 1))
                 .collect::<Vec<_>>()
                 .join(", ");
-            (format!("AND s.state IN ({})", state_placeholders), state_strs.iter().map(|s| Some(s.clone())).collect())
+            (
+                format!("AND s.state IN ({})", state_placeholders),
+                state_strs.iter().map(|s| Some(s.clone())).collect(),
+            )
         };
 
         binds.extend(state_binds);
@@ -547,8 +551,7 @@ impl AuthnBackend for OurBackend {
                 {}
             )
             "#,
-            scope_filter,
-            state_filter
+            scope_filter, state_filter
         );
 
         let mut sql = sqlx::query_as::<_, OurAuthFactor>(&query);
@@ -973,7 +976,8 @@ impl AuthnBackend for OurBackend {
                         let totp_length = factor_config
                             .get("otp_length")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(TOTP_LENGTH as u64) as usize;
+                            .unwrap_or(TOTP_LENGTH as u64)
+                            as usize;
                         let totp_period = factor_config
                             .get("period")
                             .and_then(|v| v.as_u64())
@@ -986,7 +990,7 @@ impl AuthnBackend for OurBackend {
                             .get("future_window")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0u64);
-                        
+
                         match verify_totp(
                             totp_secret,
                             totp_code,

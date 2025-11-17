@@ -23,7 +23,9 @@ use crate::{
 };
 use registry::SessionRegistry;
 
-use axess_factors::{HOTP_LENGTH, TOTP_LENGTH, TOTP_PERIOD, generate_password_hash, verify_hotp, verify_totp};
+use axess_factors::{
+    HOTP_LENGTH, TOTP_LENGTH, TOTP_PERIOD, generate_password_hash, verify_hotp, verify_totp,
+};
 // use base64::DecodeSliceError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -836,8 +838,6 @@ where
             .get_string("charset")
             .and_then(|raw| OtpCharset::from_str(raw).ok())
             .unwrap_or(OtpCharset::Numeric);
-
-        
 
         let otp_rules = OtpRulesBuilder::default()
             .with_length(length)

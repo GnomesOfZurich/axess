@@ -186,7 +186,8 @@ async fn test_get_scoped_auth_factors() -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 #[tokio::test]
-async fn test_get_scoped_auth_factors_with_empty_state_filter() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_get_scoped_auth_factors_with_empty_state_filter()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = create_test_backend().await;
 
     let tenant_id = backend.get_default_tenant_id().await?;
@@ -196,27 +197,37 @@ async fn test_get_scoped_auth_factors_with_empty_state_filter() -> Result<(), Bo
     let global_factors = backend
         .get_scoped_auth_factors(PermissionScope::Global, vec![])
         .await?;
-    assert!(!global_factors.is_empty(), "Should return all global factors when state filter is empty");
+    assert!(
+        !global_factors.is_empty(),
+        "Should return all global factors when state filter is empty"
+    );
 
     // Get all user-scoped factors, regardless of state
     let user_scope = PermissionScope::User(tenant_id, system_user_id);
-    let user_factors = backend
-        .get_scoped_auth_factors(user_scope, vec![])
-        .await?;
-    assert!(!user_factors.is_empty(), "Should return all user factors when state filter is empty");
+    let user_factors = backend.get_scoped_auth_factors(user_scope, vec![]).await?;
+    assert!(
+        !user_factors.is_empty(),
+        "Should return all user factors when state filter is empty"
+    );
 
     // Get all tenant-scoped factors, regardless of state
     let tenant_scope = PermissionScope::Tenant(tenant_id);
     let tenant_factors = backend
         .get_scoped_auth_factors(tenant_scope, vec![])
         .await?;
-    assert!(!tenant_factors.is_empty(), "Should return all tenant factors when state filter is empty");
+    assert!(
+        !tenant_factors.is_empty(),
+        "Should return all tenant factors when state filter is empty"
+    );
 
     // Get all factors with PermissionScope::Any, regardless of state
     let any_factors = backend
         .get_scoped_auth_factors(PermissionScope::Any, vec![])
         .await?;
-    assert!(!any_factors.is_empty(), "Should return all factors when state filter is empty");
+    assert!(
+        !any_factors.is_empty(),
+        "Should return all factors when state filter is empty"
+    );
 
     Ok(())
 }

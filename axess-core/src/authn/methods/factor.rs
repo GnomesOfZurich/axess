@@ -264,7 +264,7 @@ where
         }
     }
 
-    fn with_factor_config(mut self, config: FactorConfig) -> Self {
+    pub fn with_factor_config(mut self, config: FactorConfig) -> Self {
         self.change.config.extend(config.into_inner());
         self
     }

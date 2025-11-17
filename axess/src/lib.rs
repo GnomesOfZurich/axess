@@ -54,7 +54,7 @@ pub mod valkey {
 }
 
 pub use axess_factors::{
-    build_totp_uri, generate_password_hash, generate_totp_secret, verify_hotp, verify_password,
-    verify_totp, HOTP_LENGTH, TOTP_LENGTH, TOTP_PERIOD,
+    HOTP_LENGTH, TOTP_LENGTH, TOTP_PERIOD, build_totp_uri, generate_password_hash,
+    generate_totp_secret, verify_hotp, verify_password, verify_totp,
 };
 pub use axess_macros::{login_required, require_partial_authn};
