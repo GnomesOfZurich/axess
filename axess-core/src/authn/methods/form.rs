@@ -29,11 +29,9 @@ use crate::{
         is_valid_otp_code, is_valid_password, is_valid_url_format,
     },
 };
-use axess_factors::{verify_hotp, verify_password, verify_totp};
+use axess_factors::{TOTP_LENGTH, TOTP_PERIOD, verify_hotp, verify_password, verify_totp};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, collections::HashMap, fmt::Debug, time::SystemTime};
-
-pub const TOTP_LENGTH: usize = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FactorFormKind {
@@ -669,6 +667,11 @@ impl FactorForm for TotpForm {
             .map(|value| value as usize)
             .unwrap_or(TOTP_LENGTH);
 
+        let period = config
+            .get("period")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(TOTP_PERIOD);
+
         let past_window = config
             .get("past_window")
             .and_then(|value| value.as_u64())
@@ -683,9 +686,10 @@ impl FactorForm for TotpForm {
             secret,
             &self.otp_code,
             SystemTime::now(),
-            length,
-            past_window,
-            future_window,
+            Some(length),
+            Some(period),
+            Some(past_window),
+            Some(future_window),
         )
         .is_none()
         {

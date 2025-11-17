@@ -8,7 +8,7 @@ use crate::{
         errors::{AuthError, FactorKindError},
         methods::{
             factor::{AuthFactorKind, FactorStateChange, FactorStateChangeBuilder},
-            form::{FactorForm, FactorFormExt, FactorFormKind, FormField, TOTP_LENGTH},
+            form::{FactorForm, FactorFormExt, FactorFormKind, FormField},
             policy::{FactorConfig, FactorConfigBuilder, OtpCharset, OtpRulesBuilder, OtpType},
             scope::{EnablementState, PermissionScope},
         },
@@ -23,7 +23,7 @@ use crate::{
 };
 use registry::SessionRegistry;
 
-use axess_factors::{generate_password_hash, verify_hotp, verify_totp};
+use axess_factors::{HOTP_LENGTH, TOTP_LENGTH, TOTP_PERIOD, generate_password_hash, verify_hotp, verify_totp};
 // use base64::DecodeSliceError;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -828,9 +828,8 @@ where
             .ok_or(AuthError::InvalidCredentials)?;
 
         let length = config.get_usize("length").unwrap_or(TOTP_LENGTH);
-
+        let period = config.get_u64("period").unwrap_or(30);
         let past_window = config.get_u64("past_window").unwrap_or(1);
-
         let future_window = config.get_u64("future_window").unwrap_or(0);
 
         let charset = config
@@ -838,14 +837,14 @@ where
             .and_then(|raw| OtpCharset::from_str(raw).ok())
             .unwrap_or(OtpCharset::Numeric);
 
-        let period = config.get_u64("period").unwrap_or(30);
+        
 
         let otp_rules = OtpRulesBuilder::default()
             .with_length(length)
             .with_charset(charset)
+            .with_period(period)
             .with_past_window(past_window)
             .with_future_window(future_window)
-            .with_period(period)
             .build();
 
         if !is_valid_otp_code(otp_code, &otp_rules) {
@@ -861,9 +860,10 @@ where
             secret,
             otp_code,
             SystemTime::now(),
-            otp_rules.length,
-            past_window,
-            future_window,
+            Some(length),
+            Some(period),
+            Some(past_window),
+            Some(future_window),
         ) {
             Some(step) => step,
             None => {
@@ -1359,14 +1359,15 @@ where
                         .with_secret(credential.to_owned())
                 };
 
+                // TODO: This should be read from some kind configurable default?
                 let builder = match otp_type {
                     OtpType::Totp => builder
                         .with_length(TOTP_LENGTH)
-                        .with_period(30)
+                        .with_period(TOTP_PERIOD)
                         .with_windows(1, 0)
                         .with_last_totp_step(0),
                     OtpType::Hotp => builder
-                        .with_length(TOTP_LENGTH)
+                        .with_length(HOTP_LENGTH)
                         .with_field("counter", json!(0)),
                     OtpType::Custom(_) => builder,
                 };

@@ -15,6 +15,10 @@ pub use totp_rs::{Algorithm as TotpAlgorithm, TOTP};
 #[cfg(feature = "hotp")]
 use zeroize::Zeroizing;
 
+pub const HOTP_LENGTH: usize = 6;
+pub const TOTP_LENGTH: usize = 6;
+pub const TOTP_PERIOD: u64 = 30;
+
 /// Verify a TOTP code against a secret at a given time.
 ///
 /// # Arguments
@@ -22,6 +26,7 @@ use zeroize::Zeroizing;
 /// * `code` - The TOTP code to verify.
 /// * `now` - The current time to use for verification.
 /// * `length` - The number of characters in the TOTP code.
+/// * `period` - The time step in seconds (default is 30).
 /// * `past_window` - The number of past time steps to check.
 /// * `future_window` - The number of future time steps to check.
 #[cfg(feature = "totp")]
@@ -29,9 +34,10 @@ pub fn verify_totp(
     secret: &str,
     code: &str,
     now: SystemTime,
-    length: usize,
-    past_window: u64,
-    future_window: u64,
+    length: Option<usize>,
+    period: Option<u64>,
+    past_window: Option<u64>,
+    future_window: Option<u64>,
 ) -> Option<u64> {
     use std::time::UNIX_EPOCH;
 
@@ -40,19 +46,24 @@ pub fn verify_totp(
         return None;
     }
 
+    let length = length.unwrap_or(TOTP_LENGTH);
+    let time_step = period.unwrap_or(TOTP_PERIOD);
+    let past_window = past_window.unwrap_or(1);
+    let future_window = future_window.unwrap_or(1);
+
     let secret_trimmed = secret.trim();
     let secret_upper = secret_trimmed.to_ascii_uppercase();
     let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret_upper)
         .or_else(|| base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret_upper))
         .or_else(|| hex::decode(secret_trimmed).ok())?;
 
-    let totp = TOTP::new(TotpAlgorithm::SHA1, length, 0, 30, decoded).ok()?;
+    let totp = TOTP::new(TotpAlgorithm::SHA1, length, 0, time_step, decoded).ok()?;
 
     let seconds = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    let current_step = seconds / 30;
+    let current_step = seconds / time_step;
 
     let check_candidate = |step: u64| -> Option<u64> {
-        let timestamp_secs = step.saturating_mul(30);
+        let timestamp_secs = step.saturating_mul(time_step);
         let expected = totp.generate(timestamp_secs);
         if expected == sanitized_code {
             Some(step)

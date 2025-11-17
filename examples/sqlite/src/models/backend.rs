@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 // Import verify_totp from your utils or totp module
 use axess::{
-    authn::methods::{MethodStateChange, factor::FactorStateChange, form::TOTP_LENGTH},
-    verify_password, verify_totp,
+    TOTP_LENGTH, TOTP_PERIOD, authn::methods::{MethodStateChange, factor::FactorStateChange},
+    verify_password, verify_totp
 };
 
 use crate::models::{
@@ -950,29 +950,60 @@ impl AuthnBackend for OurBackend {
                 Ok(user)
             }
             AuthFactorKind::Otp => {
-                let totp_secret = factor_state
-                    .0
-                    .config
-                    .get("otp_secret")
+                let factor_config = &factor_state.0.config;
+
+                let otp_type = factor_config
+                    .get("otp_type")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| sqlx::Error::ColumnDecode {
-                        index: "factor_state".into(),
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Missing TOTP secret in factor state",
-                        )),
-                    })?;
-                let totp_code = creds.credential().unwrap_or("");
-                match verify_totp(
-                    totp_secret,
-                    totp_code,
-                    SystemTime::now(),
-                    TOTP_LENGTH,
-                    30,
-                    1,
-                ) {
-                    Some(_) => Ok(user),
-                    None => Err(sqlx::Error::Protocol("Invalid TOTP code".to_string())),
+                    .unwrap_or("unknown");
+                match otp_type {
+                    "totp" => {
+                        let totp_code = creds.credential().unwrap_or("");
+
+                        let totp_secret = factor_config
+                            .get("otp_secret")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| sqlx::Error::ColumnDecode {
+                                index: "factor_state".into(),
+                                source: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "Missing TOTP secret in factor state",
+                                )),
+                            })?;
+                        let totp_length = factor_config
+                            .get("otp_length")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(TOTP_LENGTH as u64) as usize;
+                        let totp_period = factor_config
+                            .get("period")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(TOTP_PERIOD);
+                        let past_window = factor_config
+                            .get("past_window")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(1u64);
+                        let future_window = factor_config
+                            .get("future_window")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0u64);
+                        
+                        match verify_totp(
+                            totp_secret,
+                            totp_code,
+                            SystemTime::now(),
+                            Some(totp_length),
+                            Some(totp_period),
+                            Some(past_window),
+                            Some(future_window),
+                        ) {
+                            Some(_) => Ok(user),
+                            None => Err(sqlx::Error::Protocol("Invalid TOTP code".to_string())),
+                        }
+                    }
+                    _ => Err(sqlx::Error::Protocol(format!(
+                        "Unsupported OTP type: {}",
+                        otp_type
+                    ))),
                 }
             }
             AuthFactorKind::Oauth => {

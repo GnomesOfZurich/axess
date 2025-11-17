@@ -6,9 +6,10 @@ use axess::{
     authn::methods::{
         MethodBuilder,
         factor::{FactorInstance, FactorStateChangeBuilder},
-        form::{PasswordForm, TOTP_LENGTH, TotpForm, TotpSetupForm},
+        form::{PasswordForm, TotpForm, TotpSetupForm},
         policy::FactorConfigBuilder,
     },
+    TOTP_LENGTH, TOTP_PERIOD,
     generate_password_hash, generate_totp_secret, verify_totp,
 };
 use axum::{
@@ -74,7 +75,7 @@ pub mod post {
     use crate::models::entities::OurUser;
 
     use super::*;
-    use axess::{AuthFactorKind, EnablementState, MethodStateChange, PermissionScope};
+    use axess::{AuthFactorKind, EnablementState, MethodStateChange, PermissionScope, TOTP_PERIOD};
     use axum::Extension;
 
     #[derive(Deserialize)]
@@ -196,7 +197,7 @@ pub mod post {
             .set_otp_config(
                 FactorConfigBuilder::totp(totp_secret.clone())
                     .with_length(TOTP_LENGTH)
-                    .with_period(30)
+                    .with_period(TOTP_PERIOD)
                     .with_windows(1, 0),
             )
             .build();
@@ -314,6 +315,12 @@ pub mod post {
                     .map(|v| v as usize)
                     .unwrap_or(TOTP_LENGTH);
 
+                let period = state
+                    .config
+                    .get("period")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(TOTP_PERIOD);
+
                 let past_window = state
                     .config
                     .get("past_window")
@@ -326,20 +333,14 @@ pub mod post {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
 
-                // derive period from config (fallback to 30)
-                let period = state
-                    .config
-                    .get("period")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(30u64);
-
                 let matched_step = match verify_totp(
                     secret,
                     &otp_code,
                     SystemTime::now(),
-                    digits,
-                    past_window,
-                    future_window,
+                    Some(digits),
+                    Some(period),
+                    Some(past_window),
+                    Some(future_window),
                 ) {
                     Some(step) => step,
                     None => {
@@ -478,7 +479,7 @@ pub mod get {
                                         .config
                                         .get("period")
                                         .and_then(|v| v.as_u64())
-                                        .unwrap_or(30);
+                                        .unwrap_or(TOTP_PERIOD);
 
                                     secret = Some(value.to_string());
                                     provisioning_uri = Some(build_totp_uri(
