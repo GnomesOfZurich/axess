@@ -491,6 +491,12 @@ impl AuthnBackend for OurBackend {
     }
 
     /// Get all authentication factors for a given scope (global/user/tenant).
+    /// Filters by the provided enablement states.
+    /// Returns factors that have at least one matching state in the specified scope.
+    /// For example, if scope is Tenant(tid) and states are [Active, Inactive],
+    /// it returns factors that are Active or Inactive for that tenant,
+    /// as well as any global factors with those states.
+    /// If `states` is empty, all factors in the scope are returned, regardless of state.
     async fn get_scoped_auth_factors(
         &self,
         scope: PermissionScope<Self::TenantId, Self::UserId>,
