@@ -336,7 +336,7 @@ impl AuthnBackend for MockBackend {
     async fn get_scoped_auth_factors(
         &self,
         _scope: PermissionScope<Self::TenantId, Self::UserId>,
-        _state: EnablementState,
+        _state: Vec<EnablementState>,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
         // For mock implementation, return empty vector
         Ok(Vec::new())

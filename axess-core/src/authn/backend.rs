@@ -325,10 +325,17 @@ where
     async fn get_all_auth_factors(&self) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
 
     /// Get all authentication factors for a given scope (global/user/tenant).
+    /// This includes both enabled and disabled factors.
+    /// # Arguments
+    /// * `scope` - The permission scope to filter factors (global/user/tenant)
+    /// * `states` - Vector of enablement states to filter factors (e.g., Active, Inactive)
+    /// # Returns
+    /// Vector of authentication factors matching the specified scope and states
+    /// Expects the return of an empty vector if no factors match the criteria.
     async fn get_scoped_auth_factors(
         &self,
         scope: PermissionScope<Self::TenantId, Self::UserId>,
-        states: EnablementState,
+        states: Vec<EnablementState>,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
 
     /// Get all factor states for a given factor ID and scope (global/user/tenant).

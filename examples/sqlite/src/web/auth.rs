@@ -270,7 +270,7 @@ pub mod post {
         let scope = PermissionScope::User(user.tenant_id, user.id);
 
         let pending = match backend
-            .get_scoped_auth_factors(scope.clone(), EnablementState::Pending)
+            .get_scoped_auth_factors(scope.clone(), vec![EnablementState::Pending])
             .await
         {
             Ok(factors) => factors,
@@ -451,7 +451,7 @@ pub mod get {
         let mut provisioning_uri: Option<String> = None;
 
         match backend
-            .get_scoped_auth_factors(scope.clone(), EnablementState::Pending)
+            .get_scoped_auth_factors(scope.clone(), vec![EnablementState::Pending])
             .await
         {
             Ok(factors) => {

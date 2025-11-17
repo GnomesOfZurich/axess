@@ -493,80 +493,65 @@ impl AuthnBackend for OurBackend {
     async fn get_scoped_auth_factors(
         &self,
         scope: PermissionScope<Self::TenantId, Self::UserId>,
-        state: EnablementState,
+        states: Vec<EnablementState>,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
-        let state_str = format!("{state:?}");
+        let mut conn = self.db.acquire().await?;
+        let state_strs: Vec<String> = states.iter().map(|s| format!("{:?}", s)).collect();
 
-        let (query, binds): (&str, Vec<Option<String>>) = match scope {
+        // Build scope filter and binds
+        let (scope_filter, mut binds): (String, Vec<Option<String>>) = match scope {
             PermissionScope::Global => (
-                r#"
-            SELECT f.*
-            FROM auth_factors f
-            WHERE EXISTS (
-                SELECT * FROM factor_states s
-                WHERE s.factor_id = f.id
-                AND s.tenant_id IS NULL
-                AND s.user_id IS NULL
-                AND s.state = ?1
-            )
-            "#,
-                vec![Some(state_str.clone())],
+                "s.tenant_id IS NULL AND s.user_id IS NULL".to_string(),
+                vec![],
             ),
             PermissionScope::Any => (
-                r#"
-            SELECT f.*
-            FROM auth_factors f
-            WHERE EXISTS (
-                SELECT * FROM factor_states s
-                WHERE s.factor_id = f.id
-                AND s.state = ?1
-            )
-            "#,
-                vec![Some(state_str.clone())],
+                "1=1".to_string(), // No scope filter
+                vec![],
             ),
             PermissionScope::Tenant(tid) => (
-                r#"
-            SELECT f.*
-            FROM auth_factors f
-            WHERE EXISTS (
-                SELECT * FROM factor_states s
-                WHERE s.factor_id = f.id
-                AND s.tenant_id = ?1
-                AND s.user_id IS NULL
-                AND s.state = ?2
-            )
-            "#,
-                vec![Some(tid.to_string()), Some(state_str)],
+                // Match both tenant-level and global factor states
+                "(s.tenant_id IS NULL AND s.user_id IS NULL) OR (s.tenant_id = ?1 AND s.user_id IS NULL)".to_string(),
+                vec![Some(tid.to_string())],
             ),
             PermissionScope::User(tid, uid) => (
-                r#"
-            SELECT f.*
-            FROM auth_factors f
-            WHERE EXISTS (
-                SELECT * FROM factor_states s
-                WHERE s.factor_id = f.id
-                AND (
-                    (s.tenant_id IS NULL AND s.user_id IS NULL) -- global
-                    OR (s.tenant_id = ?1 AND s.user_id IS NULL) -- tenant-level
-                    OR (s.tenant_id = ?1 AND s.user_id = ?2)    -- user-level
-                )
-                AND s.state = ?3
-            )
-            "#,
-                vec![
-                    Some(tid.to_string()),
-                    Some(uid.to_string()),
-                    Some(state_str),
-                ],
+                "(s.tenant_id IS NULL AND s.user_id IS NULL) \
+                  OR (s.tenant_id = ?1 AND s.user_id IS NULL) \
+                  OR (s.tenant_id = ?2 AND s.user_id = ?3)".to_string(),
+                vec![Some(tid.to_string()), Some(tid.to_string()), Some(uid.to_string())],
             ),
         };
 
-        eprintln!(
-            "get_scoped_auth_factors SQL query: {}, binds: {:?}",
-            query, binds
+        // Build state filter and placeholders
+        let (state_filter, state_binds) = if state_strs.is_empty() {
+            ("".to_string(), vec![])
+        } else {
+            let offset = binds.len();
+            let state_placeholders = (0..state_strs.len())
+                .map(|i| format!("?{}", i + offset + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (format!("AND s.state IN ({})", state_placeholders), state_strs.iter().map(|s| Some(s.clone())).collect())
+        };
+
+        binds.extend(state_binds);
+
+        // Compose final query
+        let query = format!(
+            r#"
+            SELECT f.*
+            FROM auth_factors f
+            WHERE EXISTS (
+                SELECT 1 FROM factor_states s
+                WHERE s.factor_id = f.id
+                AND ({})
+                {}
+            )
+            "#,
+            scope_filter,
+            state_filter
         );
 
-        let mut sql = sqlx::query_as::<_, OurAuthFactor>(query);
+        let mut sql = sqlx::query_as::<_, OurAuthFactor>(&query);
         for bind in binds {
             match bind {
                 Some(val) => sql = sql.bind(val),
@@ -574,11 +559,7 @@ impl AuthnBackend for OurBackend {
             }
         }
 
-        let mut conn = self.db.acquire().await?;
         let rows: Vec<OurAuthFactor> = sql.fetch_all(&mut *conn).await?;
-
-        eprintln!("get_scoped_auth_factors returned rows: {}", rows.len());
-
         let factors: Vec<AuthFactor<OurBackend>> = rows
             .into_iter()
             .map(AuthFactor::<OurBackend>::from)
@@ -921,7 +902,7 @@ impl AuthnBackend for OurBackend {
         // 4. Lookup factors for this user using the backend's scoped factor lookup
         let scope = PermissionScope::User(tenant_id, user.id);
         let factors = self
-            .get_scoped_auth_factors(scope, EnablementState::Active)
+            .get_scoped_auth_factors(scope, vec![EnablementState::Active])
             .await?;
 
         // 5. Find the factor matching the submitted kind
