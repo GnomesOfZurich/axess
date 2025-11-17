@@ -265,7 +265,12 @@ where
     }
 
     pub fn with_factor_config(mut self, config: FactorConfig) -> Self {
-        self.change.config.extend(config.into_inner());
+        self.change.config = config.into_inner();
+        self
+    }
+
+    pub fn with_config(mut self, config: HashMap<String, Value>) -> Self {
+        self.change.config = config;
         self
     }
 
