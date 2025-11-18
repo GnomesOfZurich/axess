@@ -53,6 +53,7 @@ pub enum FormField {
     Language,
     Domicile,
     Fullname,
+    Token,
     /// Custom field defined by users
     Custom(&'static str),
 }
@@ -71,6 +72,7 @@ impl FormField {
             FormField::Language => "language",
             FormField::Domicile => "domicile",
             FormField::Fullname => "fullname",
+            FormField::Token => "token",
             FormField::Custom(s) => s,
         }
     }
@@ -300,7 +302,7 @@ pub struct PasswordSetupForm {
     /// Optionally, the old password (for authenticated change).
     pub old_password: Option<String>,
     /// Optionally, a reset token (for password reminders).
-    pub reset_token: Option<String>,
+    pub token: Option<String>,
     pub tenant: Option<String>,
     pub next: Option<String>,
 }
@@ -344,9 +346,9 @@ impl FactorForm for PasswordSetupForm {
                 FormFieldValue::String(Cow::Owned(old.clone())),
             );
         }
-        if let Some(token) = &self.reset_token {
+        if let Some(token) = &self.token {
             map.insert(
-                FormField::Custom("reset_token"),
+                FormField::Custom("token"),
                 FormFieldValue::String(Cow::Owned(token.clone())),
             );
         }
