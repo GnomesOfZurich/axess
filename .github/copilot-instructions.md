@@ -3,14 +3,15 @@
 ## Project Overview
 This is an authentication and authorization library called "axess" for the Axum web framework in Rust. It provides middleware for request extractors for authentication, authorization via Cedar Policy, and request tracing/ID generation.
 
+## Rust Edition and Toolchain
+
+- Axess targets Rust 2024 edition.
+- Use the latest stable toolchain (`rustup update`).
+
 ## Directory Structure
 
 - `axess/`
     - `src/`
-        - `authn/` — Authentication-related code
-        - `authz/` — Authorization-related code
-        - `storage/` — Storage interfaces and implementations
-        - `utils/` — Utility functions, types, and error handling
         - `authorization.rs` — Top-level authorization logic
         - `lib.rs` — Library entry point
     - `Cargo.toml` — Package manifest for axess
@@ -28,6 +29,10 @@ This is an authentication and authorization library called "axess" for the Axum 
 - `axess-macros/`
     - `src/lib.rs` — Procedural macros for axess
     - `Cargo.toml` — Package manifest for axess-macros
+
+- `axess-factors/`
+    - `src/` — Implementations for authentication factors (TOTP, HOTP, password hashing)
+    - `Cargo.toml` — Package manifest for axess-factors
 
 - `examples/`
     - `sqlite/`
@@ -61,3 +66,49 @@ When answering questions about this code base or when generating code:
     - Improved developer user ergonomics.
 4. Be aware of the depencies in the `Cargo.toml` file and ensure compatibility with the versions specified.
 5. Provide code exampes that follow the Coding Guidelines of the workspace.
+
+## Feature Flags
+
+Axess uses Cargo feature flags to enable/disable major components:
+- `authn`: Authentication layer and extractors
+- `authz`: Authorization via Cedar Policy
+- `admin`: Administrative features for user/tenant management
+- `request_id`: Request ID middleware
+- `trace_id`: Tracing ID middleware
+- `memory`: In-memory session/storage backends
+- `valkey`: Valkey (Redis-compatible) session/storage backends
+
+Enable features as needed in your `Cargo.toml`.
+
+### Feature Flag Combinations
+
+| Use Case         | Features                                    |
+|------------------|---------------------------------------------|
+| Minimal Authn    | `authn`, `memory`                           |
+| Full Suite       | `authn`, `authz`, `admin`, `request_id`, `trace_id`, `memory`, `valkey` |
+| Testing/DST      | `authn`, `memory`, `admin`                  |
+
+## Testing
+
+- Write unit tests for all public functions and methods.
+- Prefer deterministic simulation testing (DST) for reproducibility.
+- Write integration tests for middleware and backend contracts.
+- Include doc-tests for important types and functions.
+- Run all tests with:
+  ```bash
+  cargo test --workspace --all-features
+  ```
+
+## Contributing
+
+See [CONTRIBUTE.md](../CONTRIBUTE.md) for contribution guidelines, coding standards, and maintainer availability.
+
+## Security
+
+See [SECURITY.md](../SECURITY.md) for vulnerability reporting and security recommendations.
+
+## License
+
+Axess is licensed under the MIT License. See [LICENSE](../LICENSE).
+
+---

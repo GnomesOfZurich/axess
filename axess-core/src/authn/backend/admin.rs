@@ -25,7 +25,7 @@ use async_trait::async_trait;
 ///
 /// # Example
 /// ```rust,ignore
-/// use axess_core::authn::backend::admin::AuthnAdminBackend;
+/// use axess_core::authn::backend::{AuthnBackend, admin::AuthnAdminBackend};
 ///
 /// // Upsert a user as an admin
 /// backend.upsert_user(user, admin_id).await?;

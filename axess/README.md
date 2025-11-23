@@ -111,7 +111,11 @@ axum::serve(listener, app.into_make_service()).await?;
 
 ## 📃 License
 
-Licensed under the MIT License.
+Licensed under [MIT License](../LICENSE).
+
+## 🛡️ Security
+
+See [SECURITY.md](../SECURITY.md) for vulnerability reporting and security recommendations.
 
 ---
 

@@ -45,7 +45,7 @@ use std::{
 /// extensibility and integration with non-standard or external factor types.
 ///
 /// # Examples
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::methods::factor::AuthFactorKind;
 ///
 /// let kind = AuthFactorKind::Password;
@@ -232,8 +232,12 @@ where
 /// and pass it to your backend's `upsert_factor_state` method.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::methods::{factor::FactorStateChange, policy::FactorConfigBuilder, scope::{EnablementState, PermissionScope}};
+///
+/// let factor_id = 42_u64;
+/// let tenant_id = 1_u64;
+/// let user_id = 2_u64;
 ///
 /// let change = FactorStateChange::new(factor_id)
 ///     .with_scope(PermissionScope::User(tenant_id, user_id))
@@ -359,7 +363,7 @@ where
 /// The associated state and configuration for a factor are tracked separately via [`FactorState`] and [`FactorStateChange`].
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::methods::factor::{AuthFactorKind, FactorInstance};
 ///
 /// let factor = FactorInstance::new(

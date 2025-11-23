@@ -63,3 +63,15 @@ app.layer(predicate_required!(
 ## Testing
 
 `cargo test -p axess-macros`
+
+## 📃 License
+
+Licensed under [MIT License](../LICENSE).
+
+## 🛡️ Security
+
+See [SECURITY.md](../SECURITY.md) for vulnerability reporting and security recommendations.
+
+---
+
+*Axess: Secure, policy-driven authentication and authorization for Axum.*

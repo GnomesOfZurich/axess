@@ -46,8 +46,12 @@ use std::fmt::Debug;
 /// `upsert_method_state` method.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::methods::{MethodStateChange, scope::{EnablementState, PermissionScope}};
+///
+/// let method_id = 42_u64;
+/// let tenant_id = 1_u64;
+/// let user_id = 2_u64;
 ///
 /// let change = MethodStateChange::new(method_id, user_id)
 ///     .with_scope(PermissionScope::User(tenant_id, user_id))
@@ -131,10 +135,16 @@ where
 /// - Use [`MethodStateChange`] to describe upserts or updates.
 ///
 /// # Example
-/// ```rust,ignore
-/// use axess_core::authn::methods::{MethodState, EnablementState, PermissionScope};
+/// ```rust
+/// use axess_core::authn::methods::{MethodState, scope::{EnablementState, PermissionScope}};
 ///
-/// let state = MethodState::new(id, method_id, created_by)
+/// type TenantId = u64;
+///
+/// let id = 1_u64;
+/// let method_id = 42_u64;
+/// let created_by = 2_u64;
+///
+/// let state: MethodState<u64, u64, TenantId, u64> = MethodState::new(id, method_id, created_by)
 ///     .with_state(EnablementState::Active);
 /// assert_eq!(state.state, EnablementState::Active);
 /// assert_eq!(state.scope(), PermissionScope::Global);
@@ -313,7 +323,7 @@ where
 /// - Call [`build`] to produce a [`MethodInstance`] for persistence or provisioning.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::methods::{MethodBuilder, factor::{AuthFactorKind, FactorInstance}};
 ///
 /// let password_factor = FactorInstance::new(

@@ -49,11 +49,19 @@ let hotp_valid = verify_hotp(&secret, "654321", 0, 6, 10);
 - `verify_hotp(secret: &str, code: &str, counter: u64, length: usize, window: u64) -> Option<u64>`
 - `build_totp_uri(label: &str, issuer: &str, secret: &str, digits: usize, period: u64) -> String`
 
-## License
+## 📃 License
 
-MIT
+Licensed under [MIT License](../LICENSE).
+
+## 🛡️ Security
+
+See [SECURITY.md](../SECURITY.md) for vulnerability reporting and security recommendations.
 
 ## Links
 
 - [Axess Project](https://github.com/GnomesOfZurich/axess)
 - [API Docs](https://docs.rs/axess-factors)
+
+---
+
+*Axess: Secure, policy-driven authentication and authorization for Axum.*

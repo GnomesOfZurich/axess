@@ -110,10 +110,6 @@ axum::serve(listener, app_router.into_make_service()).await?;
 - [axess-macros](./axess-macros)
 - [Examples](./examples)
 
-## 📃 License
-Licensed under the MIT License.
-
-
 ## 📚 Documentation
 
 - [API Docs](https://docs.rs/axess)
@@ -203,6 +199,28 @@ classDef success stroke:#a0ffa0,stroke-width:3px,color:#a0ffa0;
 classDef failure stroke:#ffa0a0,stroke-width:3px,color:#ffa0a0;
 classDef process align:left;
 ```
+
+## 📃 License
+Licensed under the [MIT License](./LICENSE).
+
+## 🛡️ Security
+
+Axess is designed for secure authentication and authorization in web applications.  
+If you discover a security vulnerability, please report it responsibly:
+
+- **Reporting:**  
+  Please email security@gnomes.ch or open a private issue on GitHub.
+- **Best Practices:**  
+  - Always use HTTPS in production.
+  - Keep dependencies up to date.
+  - Review your Cedar policies and backend configuration for least privilege.
+- **Caveats:**  
+  - Axess is provided as-is; review and test before deploying to production.
+  - Multi-factor authentication is recommended for sensitive applications.
+  - Session and credential storage should be secured according to your threat model.
+
+For more details, see [SECURITY.md](./SECURITY.md).
+
 ---
 
 *Axess: Secure, policy-driven authentication and authorization for Axum.*

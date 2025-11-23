@@ -22,7 +22,7 @@ use std::fmt::Debug;
 /// and record state transitions in audit logs.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust,
 /// use axess_core::authn::methods::scope::EnablementState;
 ///
 /// let state = EnablementState::Active;
@@ -59,12 +59,15 @@ pub enum EnablementState {
 /// and enforce policy decisions. Helper methods are provided to extract tenant/user IDs and to check scope type.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::methods::scope::PermissionScope;
 ///
-/// let global = PermissionScope::<String, String>::Global;
-/// let tenant = PermissionScope::Tenant("tenant1".to_string());
-/// let user = PermissionScope::User("tenant1".to_string(), "user42".to_string());
+/// type TenantId = String;
+/// type UserId = String;
+///
+/// let global: PermissionScope<TenantId, UserId> = PermissionScope::Global;
+/// let tenant: PermissionScope<TenantId, UserId> = PermissionScope::Tenant("tenant1".to_string());
+/// let user: PermissionScope<TenantId, UserId> = PermissionScope::User("tenant1".to_string(), "user42".to_string());
 ///
 /// assert!(global.is_global());
 /// assert!(tenant.is_tenant());

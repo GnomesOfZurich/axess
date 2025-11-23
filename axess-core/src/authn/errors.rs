@@ -30,7 +30,7 @@ use tower_sessions::session::Error as SessionError;
 /// - Enables granular error reporting in session flows and UI feedback.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::errors::FormError;
 ///
 /// let err = FormError::ValidationFailed("Password too short".to_string());
@@ -82,7 +82,7 @@ where
 /// - Propagated via [`AuthError::UnexpectedFactorKind`] for HTTP error mapping.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::errors::FactorKindError;
 ///
 /// let err = FactorKindError::UnexpectedValue("webauthn".to_string());
@@ -139,10 +139,10 @@ pub enum FactorKindError {
 /// - Enables granular error handling and user feedback in web applications.
 ///
 /// # Example
-/// ```rust,ignore
-/// use axess_core::authn::errors::AuthError;
+/// ```rust
+/// use axess_core::authn::{backend::AuthnBackend, errors::AuthError};
 ///
-/// fn handle_auth_error<B: AuthnBackend>(err: AuthError<B>) {
+/// fn handle_auth_error<B: AuthnBackend + std::fmt::Debug>(err: AuthError<B>) {
 ///     match err {
 ///         AuthError::InvalidCredentials => println!("Invalid credentials"),
 ///         AuthError::TooManyAttempts => println!("Too many attempts"),
@@ -322,7 +322,7 @@ where
 /// - Enables clear and consistent error handling for web APIs and UIs.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::errors::HandlerError;
 /// use axum::response::IntoResponse;
 ///

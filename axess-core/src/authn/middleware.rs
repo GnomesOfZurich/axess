@@ -325,12 +325,14 @@ impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry + Debug, C: 
 /// - Call [`build`] to produce an [`AuthnService`] for use as an Axum middleware layer.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust, ignore
 /// use axess_core::authn::middleware::{AuthnServiceBuilder, AuthnService};
 /// use axess_core::authn::backend::AuthnBackend;
 /// use axess_core::authn::session::registry::SessionRegistryStore;
 /// use tower_sessions::MemoryStore;
 /// use std::sync::Arc;
+///
+/// use crate::models::MyBackend;
 ///
 /// let backend = Arc::new(MyBackend::new());
 /// let session_store = MemoryStore::default();

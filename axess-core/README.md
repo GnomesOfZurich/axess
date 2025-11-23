@@ -66,12 +66,20 @@ let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
 - [Examples](../../examples/)
 - [Cedar Policy Language](https://cedarpolicy.com/)
 
-## License
+## 📃 License
 
-MIT
+Licensed under [MIT License](../LICENSE).
+
+## 🛡️ Security
+
+See [SECURITY.md](../SECURITY.md) for vulnerability reporting and security recommendations.
 
 ## Links
 
 - [Axess Project](https://github.com/GnomesOfZurich/axess)
 - [Axess-factors](../axess-factors)
 - [Axess-macros](../axess-macros)
+
+---
+
+*Axess: Secure, policy-driven authentication and authorization for Axum.*

@@ -194,7 +194,7 @@ impl<T> DataId for T where
 /// and reason codes to users and administrators.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::backend::StatusDetail;
 /// use chrono::Utc;
 ///
@@ -240,7 +240,7 @@ pub struct StatusDetail {
 /// Status transitions should include a [`StatusDetail`] for audit and compliance.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::backend::{EntityState, StatusDetail};
 /// use chrono::Utc;
 ///
@@ -289,7 +289,7 @@ pub enum EntityState {
 /// - `get_tenant_state(&self) -> EntityState`: Returns the tenant's lifecycle state.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::backend::{AuthTenant, EntityState};
 /// use uuid::Uuid;
 ///
@@ -339,7 +339,7 @@ pub trait AuthTenant: Debug + Clone + Send + Sync + Eq + PartialEq {
 /// - `get_user_state(&self) -> EntityState`: Returns the user's lifecycle state.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::backend::{AuthUser, EntityState};
 /// use uuid::Uuid;
 ///

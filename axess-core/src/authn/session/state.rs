@@ -36,7 +36,7 @@ use std::str::FromStr;
 /// - Supports lockout, audit, and replay protection in authentication flows.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::state::{PartialAuthState, AuthState};
 /// use axess_core::authn::methods::{MethodInstance, factor::{AuthFactorKind, FactorInstance}};
 ///
@@ -216,7 +216,7 @@ where
 /// - Extensible for application-specific session data.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::state::{Data, AuthState};
 /// use axess_core::authn::backend::EntityState;
 /// use std::collections::HashMap;
@@ -322,7 +322,7 @@ where
 /// for audit trails, and for driving session state transitions in authentication flows.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::state::AuthEventType;
 ///
 /// let event = AuthEventType::LoginAttempt;
@@ -422,7 +422,7 @@ impl Display for AuthEventType {
 /// Filter or query events by status for audit, reporting, or security analysis.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::state::AuthEventStatus;
 ///
 /// let status = AuthEventStatus::Success;
@@ -510,7 +510,7 @@ impl Display for AuthEventStatus {
 /// - Supports filtering by event type, status, user, tenant, and session.
 ///
 /// # Example
-/// ```rust,ignore,ignore
+/// ```rust,ignore
 /// use axess_core::authn::session::state::{AuthEvent, AuthEventType, AuthEventStatus};
 /// use axess_core::authn::methods::factor::AuthFactorKind;
 /// use chrono::Utc;
@@ -601,10 +601,35 @@ where
 /// - Supports all event types and statuses for flexible audit logging.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::state::{AuthEventBuilder, AuthEventType, AuthEventStatus};
+/// use serde::{Serialize, Deserialize};
+/// use std::fmt;
+/// use std::hash::Hash;
 ///
-/// let builder = AuthEventBuilder::new(
+/// #[derive(Clone, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+/// struct DummyMethodId(String);
+/// impl fmt::Display for DummyMethodId {
+///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+///         write!(f, "{}", self.0)
+///     }
+/// }
+///
+/// #[derive(Clone, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
+/// struct DummyFactorId(String);
+/// impl fmt::Display for DummyFactorId {
+///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+///         write!(f, "{}", self.0)
+///     }
+/// }
+///
+/// type TenantId = String;
+/// type UserId = String;
+///
+/// let user_id = "user42".to_string();
+/// let tenant_id = "tenantA".to_string();
+///
+/// let builder: AuthEventBuilder<'_, DummyMethodId, DummyFactorId, TenantId, UserId> = AuthEventBuilder::new(
 ///     &user_id,
 ///     &tenant_id,
 ///     AuthEventType::LoginAttempt,

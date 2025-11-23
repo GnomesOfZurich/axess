@@ -54,7 +54,7 @@ impl Hasher for FnvHasher {
 /// It should be handled at the API boundary and logged for audit and debugging purposes.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::registry::{SessionRegistry, SessionRegistryError};
 ///
 /// async fn invalidate_session(registry: &impl SessionRegistry, session_id: &str) {
@@ -96,7 +96,7 @@ pub enum SessionRegistryError {
 /// and invalidate sessions for users and tenants. Enables audit logging and session lifecycle management.
 ///
 /// # Example
-/// ```rust,ignore
+/// ```rust
 /// use axess_core::authn::session::registry::SessionMetadata;
 ///
 /// let metadata = SessionMetadata {
@@ -272,7 +272,7 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
 ///
 /// # Example
 /// ```rust,ignore
-/// use axess_core::authn::session::registry::SessionRegistryStore;
+/// use axess_core::authn::session::registry::{SessionRegistry, SessionRegistryStore};
 /// use tower_sessions::{session, MemoryStore};
 ///
 /// # tokio_test::block_on(async {
