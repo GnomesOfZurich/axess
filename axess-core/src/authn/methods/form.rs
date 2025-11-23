@@ -31,6 +31,7 @@ use crate::{
 };
 use axess_factors::{TOTP_LENGTH, TOTP_PERIOD, verify_hotp, verify_password, verify_totp};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value as JsonValue, from_value, json};
 use std::{borrow::Cow, collections::HashMap, fmt::Debug, time::SystemTime};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,7 +67,7 @@ impl FormField {
             FormField::Tenant => "tenant",
             FormField::Next => "next",
             FormField::OtpCode => "otp_code",
-            FormField::OtpSecret => "otp_secret",
+            FormField::OtpSecret => "secret",
             FormField::OauthProvider => "provider",
             FormField::Email => "email",
             FormField::Language => "language",
@@ -86,7 +87,7 @@ pub enum FormFieldValue {
     /// Binary data (e.g., fingerprints, WebAuthn credentials)
     Binary(Vec<u8>),
     /// Structured JSON data (e.g., OAuth tokens with metadata)
-    Json(serde_json::Value),
+    Json(JsonValue),
 }
 
 impl FormFieldValue {
@@ -117,8 +118,8 @@ impl From<Vec<u8>> for FormFieldValue {
     }
 }
 
-impl From<serde_json::Value> for FormFieldValue {
-    fn from(value: serde_json::Value) -> Self {
+impl From<JsonValue> for FormFieldValue {
+    fn from(value: JsonValue) -> Self {
         FormFieldValue::Json(value)
     }
 }
@@ -133,7 +134,10 @@ pub trait FactorForm: Send + Sync + Debug + for<'de> Deserialize<'de> {
     /// Get the authentication credential from the form, if applicable (password, TOTP code, OAuth provider, etc.)
     fn credential(&self) -> Option<&str>;
     /// Verify credentials against the factor's stored configuration (e.g., password or TOTP secret)
-    fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError>;
+    fn verify_against_config(
+        &self,
+        config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError>;
 
     /// Returns form fields with type-safe keys and flexible values
     ///
@@ -165,7 +169,7 @@ pub trait FactorFormExt: FactorForm {
     }
 
     /// Get a JSON field value (owned)
-    fn get_json_field(&self, field: FormField) -> Option<serde_json::Value> {
+    fn get_json_field(&self, field: FormField) -> Option<JsonValue> {
         match self.fields().get(&field)? {
             FormFieldValue::Json(value) => Some(value.clone()),
             _ => None,
@@ -259,7 +263,10 @@ impl FactorForm for FactorResetRequestForm {
         None
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         self.validate_form()
     }
 
@@ -330,7 +337,10 @@ impl FactorForm for PasswordSetupForm {
         Some(&self.new_password)
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         self.validate_form()
     }
 
@@ -453,7 +463,10 @@ impl FactorForm for PasswordForm {
         map
     }
 
-    fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         let credential = self.credential().ok_or_else(|| {
             FormError::ValidationFailed("Missing password credential.".to_string())
         })?;
@@ -488,7 +501,7 @@ impl FactorForm for PasswordForm {
 /// - [RFC 6238: TOTP: Time-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc6238)
 #[derive(Clone, Deserialize)]
 pub struct TotpSetupForm {
-    pub otp_secret: String,
+    pub secret: String,
     pub tenant: Option<String>,
     pub next: Option<String>,
 }
@@ -496,7 +509,7 @@ pub struct TotpSetupForm {
 impl Debug for TotpSetupForm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TotpSetupForm")
-            .field("otp_secret", &"***REDACTED***")
+            .field("secret", &"***REDACTED***")
             .field("tenant", &self.tenant)
             .field("next", &self.next)
             .finish()
@@ -513,11 +526,11 @@ impl FactorForm for TotpSetupForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.otp_secret.is_empty() {
+        if self.secret.is_empty() {
             Err(FormError::ValidationFailed(
                 "TOTP secret cannot be empty.".to_string(),
             ))
-        } else if self.otp_secret.len() < 4 {
+        } else if self.secret.len() < 4 {
             Err(FormError::ValidationFailed(
                 "TOTP secret must be at least 4 characters long.".to_string(),
             ))
@@ -537,7 +550,7 @@ impl FactorForm for TotpSetupForm {
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.otp_secret)
+        Some(&self.secret)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -546,7 +559,7 @@ impl FactorForm for TotpSetupForm {
 
         map.insert(
             FormField::OtpSecret,
-            FormFieldValue::String(Cow::Owned(self.otp_secret.clone())),
+            FormFieldValue::String(Cow::Owned(self.secret.clone())),
         );
 
         if let Some(tenant) = &self.tenant {
@@ -565,7 +578,10 @@ impl FactorForm for TotpSetupForm {
         map
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         // For factor setup, verification against existing credentials is not meaningful.
         // Instead, just validate the form and allow setup to proceed.
         self.validate_form()
@@ -655,12 +671,15 @@ impl FactorForm for TotpForm {
         map
     }
 
-    fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         let secret = config
-            .get("otp_secret")
+            .get("secret")
             .and_then(|value| value.as_str())
             .ok_or_else(|| {
-                FormError::AuthConfigError("Missing otp_secret in factor configuration".into())
+                FormError::AuthConfigError("Missing secret in factor configuration".into())
             })?;
 
         let length = config
@@ -715,7 +734,7 @@ impl FactorForm for TotpForm {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HotpSetupForm {
     /// The new HOTP secret to set up.
-    pub otp_secret: String,
+    pub secret: String,
     /// Optional tenant for multi-tenancy.
     pub tenant: Option<String>,
     /// Optional redirect URL after setup.
@@ -732,12 +751,12 @@ impl FactorForm for HotpSetupForm {
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
-        if self.otp_secret.is_empty() {
+        if self.secret.is_empty() {
             return Err(FormError::ValidationFailed(
                 "HOTP secret cannot be empty.".to_string(),
             ));
         }
-        if self.otp_secret.len() < 4 {
+        if self.secret.len() < 4 {
             return Err(FormError::ValidationFailed(
                 "HOTP secret must be at least 4 characters long.".to_string(),
             ));
@@ -758,7 +777,7 @@ impl FactorForm for HotpSetupForm {
     }
 
     fn credential(&self) -> Option<&str> {
-        Some(&self.otp_secret)
+        Some(&self.secret)
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -767,7 +786,7 @@ impl FactorForm for HotpSetupForm {
 
         map.insert(
             FormField::OtpSecret,
-            FormFieldValue::String(Cow::Owned(self.otp_secret.clone())),
+            FormFieldValue::String(Cow::Owned(self.secret.clone())),
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
@@ -784,7 +803,10 @@ impl FactorForm for HotpSetupForm {
         map
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         // For HOTP setup, just validate the form.
         self.validate_form()
     }
@@ -846,7 +868,7 @@ impl FactorForm for HotpForm {
         );
         map.insert(
             FormField::Custom("counter"),
-            FormFieldValue::Json(serde_json::json!(self.counter)),
+            FormFieldValue::Json(json!(self.counter)),
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
@@ -863,14 +885,17 @@ impl FactorForm for HotpForm {
         map
     }
 
-    fn verify_against_config(&self, config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         // ✅ Use credential() for the OTP code (primary auth value)
         let code = self
             .credential()
             .ok_or_else(|| FormError::ValidationFailed("Missing HOTP code".to_string()))?;
 
         let secret = config
-            .get("otp_secret")
+            .get("secret")
             .and_then(|v| v.as_str())
             .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Otp.to_string()))?;
 
@@ -882,7 +907,7 @@ impl FactorForm for HotpForm {
         // ✅ Verify OTP type matches expectation
         let otp_type: OtpType = config
             .get("otp_type")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .and_then(|v| from_value(v.clone()).ok())
             .unwrap_or(OtpType::Totp);
 
         if otp_type != OtpType::Hotp {
@@ -943,7 +968,10 @@ impl FactorForm for EmailVerificationForm {
         todo!()
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         self.validate_form()
     }
 }
@@ -1046,7 +1074,10 @@ impl FactorForm for UserSetupForm {
         Some(&self.password)
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         self.validate_form()
     }
 
@@ -1100,13 +1131,14 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// Verifies that FormField::as_str() returns the correct string for each variant.
     fn test_form_field_as_str() {
         assert_eq!(FormField::Username.as_str(), "username");
         assert_eq!(FormField::Password.as_str(), "password");
         assert_eq!(FormField::Tenant.as_str(), "tenant");
         assert_eq!(FormField::Next.as_str(), "next");
         assert_eq!(FormField::OtpCode.as_str(), "otp_code");
-        assert_eq!(FormField::OtpSecret.as_str(), "otp_secret");
+        assert_eq!(FormField::OtpSecret.as_str(), "secret");
         assert_eq!(FormField::OauthProvider.as_str(), "provider");
         assert_eq!(FormField::Email.as_str(), "email");
         assert_eq!(FormField::Language.as_str(), "language");
@@ -1120,6 +1152,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// Checks conversion from String to FormFieldValue::String.
     fn test_form_field_value_from_string() {
         let value = FormFieldValue::from("test".to_string());
         match value {
@@ -1129,6 +1162,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks conversion from &'static str to FormFieldValue::String.
     fn test_form_field_value_from_static_str() {
         let value = FormFieldValue::from("static");
         match value {
@@ -1138,6 +1172,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks conversion from Vec<u8> to FormFieldValue::Binary.
     fn test_form_field_value_from_binary() {
         let data = vec![1, 2, 3, 4];
         let value = FormFieldValue::from(data.clone());
@@ -1148,8 +1183,9 @@ mod tests {
     }
 
     #[test]
+    /// Checks conversion from serde_json::Value to FormFieldValue::Json.
     fn test_form_field_value_from_json() {
-        let json = serde_json::json!({"key": "value"});
+        let json = json!({"key": "value"});
         let value = FormFieldValue::from(json.clone());
         match value {
             FormFieldValue::Json(v) => assert_eq!(v, json),
@@ -1162,6 +1198,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// Validates PasswordForm with various valid and invalid inputs.
     fn test_password_form_validation() {
         let valid = PasswordForm {
             username: "alice@example.com".to_string(),
@@ -1197,6 +1234,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures PasswordForm rejects invalid usernames.
     fn test_password_form_invalid_username() {
         let form = PasswordForm {
             username: "!!!".to_string(),
@@ -1208,8 +1246,9 @@ mod tests {
     }
 
     #[test]
+    /// Checks PasswordForm password length boundaries.
     fn test_password_form_min_max_length() {
-        let min_pass = "Aa1!".repeat(2); // 8 chars
+        let min_pass = "Aa1!".repeat(3); // 12 chars
         let max_pass = "Aa1!".repeat(128); // 512 chars
         let form_min = PasswordForm {
             username: "user".to_string(),
@@ -1228,6 +1267,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies that PasswordForm::fields() returns all expected fields.
     fn test_password_form_fields() {
         let form = PasswordForm {
             username: "testuser".to_string(),
@@ -1247,6 +1287,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks that PasswordForm::credential() returns the password or None.
     fn test_password_form_credential() {
         let form = PasswordForm {
             username: "user".to_string(),
@@ -1266,6 +1307,7 @@ mod tests {
     }
 
     #[test]
+    /// Verifies successful password verification against config.
     fn test_password_verify_against_config_success() {
         let password = "correctpassword";
         let hash = generate_password_hash(password);
@@ -1277,11 +1319,13 @@ mod tests {
             next: None,
         };
 
-        let config = serde_json::json!({"password_hash": hash});
+        let mut config = HashMap::new();
+        config.insert("password_hash".to_string(), json!(hash));
         assert!(form.verify_against_config(&config).is_ok());
     }
 
     #[test]
+    /// Verifies failed password verification against config.
     fn test_password_verify_against_config_wrong_password() {
         let correct_password = "correctpassword";
         let wrong_password = "wrongpassword";
@@ -1294,11 +1338,13 @@ mod tests {
             next: None,
         };
 
-        let config = serde_json::json!({"password_hash": hash});
+        let mut config = HashMap::new();
+        config.insert("password_hash".to_string(), json!(hash));
         assert!(form.verify_against_config(&config).is_err());
     }
 
     #[test]
+    /// Checks that PasswordForm returns correct factor and form kind.
     fn test_password_form_factor_kind() {
         let form = PasswordForm {
             username: "user".to_string(),
@@ -1316,23 +1362,24 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// Validates TotpSetupForm with various valid and invalid secrets.
     fn test_totp_setup_form_validation() {
         let valid = TotpSetupForm {
-            otp_secret: "abcd".to_string(),
+            secret: "abcd".to_string(),
             tenant: None,
             next: None,
         };
         assert!(valid.validate_form().is_ok());
 
         let empty_secret = TotpSetupForm {
-            otp_secret: "".to_string(),
+            secret: "".to_string(),
             tenant: None,
             next: None,
         };
         assert!(empty_secret.validate_form().is_err());
 
         let short_secret = TotpSetupForm {
-            otp_secret: "abc".to_string(),
+            secret: "abc".to_string(),
             tenant: None,
             next: None,
         };
@@ -1340,9 +1387,10 @@ mod tests {
     }
 
     #[test]
+    /// Checks TotpSetupForm returns correct factor and form kind.
     fn test_totp_setup_form_kinds() {
         let form = TotpSetupForm {
-            otp_secret: "secret123".to_string(),
+            secret: "secret123".to_string(),
             tenant: None,
             next: None,
         };
@@ -1356,6 +1404,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// Validates TotpForm with a correct numeric code.
     fn test_totp_form_numeric_code() {
         let form = TotpForm {
             otp_code: "123456".to_string(),
@@ -1366,6 +1415,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures TotpForm rejects hex codes for numeric OTP.
     fn test_totp_form_invalid_hex_code() {
         // TOTP only supports numeric codes, hex should fail
         let form = TotpForm {
@@ -1377,6 +1427,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures TotpForm rejects alphanumeric codes for numeric OTP.
     fn test_totp_form_invalid_alphanumeric_code() {
         // TOTP only supports numeric codes, alphanumeric should fail
         let form = TotpForm {
@@ -1388,6 +1439,7 @@ mod tests {
     }
 
     #[test]
+    /// Checks TotpForm defaults to numeric charset and validates accordingly.
     fn test_totp_form_default_numeric() {
         // No charset specified, should default to numeric
         let form = TotpForm {
@@ -1406,6 +1458,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures TotpForm rejects codes that are too short.
     fn test_totp_form_too_short() {
         let form = TotpForm {
             otp_code: "12345".to_string(), // 5 digits, should be 6
@@ -1416,6 +1469,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures TotpForm rejects codes that are too long.
     fn test_totp_form_too_long() {
         let form = TotpForm {
             otp_code: "1234567".to_string(), // 7 digits, should be 6
@@ -1426,6 +1480,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures TotpForm rejects codes with invalid characters.
     fn test_totp_form_invalid_characters() {
         let form = TotpForm {
             otp_code: "12a456".to_string(), // contains a letter, should be digits only by default
@@ -1440,6 +1495,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    /// Ensures is_valid_otp_code rejects numeric codes with wrong length.
     fn test_is_valid_otp_code_numeric_negative() {
         let config = OtpRules {
             length: 6,
@@ -1453,6 +1509,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures is_valid_otp_code rejects hex codes with wrong length.
     fn test_is_valid_otp_code_hex_negative() {
         let config = OtpRules {
             length: 6,
@@ -1466,6 +1523,7 @@ mod tests {
     }
 
     #[test]
+    /// Ensures is_valid_otp_code rejects alphanumeric codes with wrong length or invalid chars.
     fn test_is_valid_otp_code_alphanumeric_negative() {
         let config = OtpRules {
             length: 6,

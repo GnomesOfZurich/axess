@@ -1,4 +1,4 @@
-//! Session registry abstractions and the default in-memory store wrapper.
+//! Session registry abstractions and the default in-memory store.
 //!
 //! This module exposes [`SessionRegistry`] for tracking authenticated sessions
 //! plus [`SessionRegistryStore`], a tower-sessions based implementation used by
@@ -7,15 +7,18 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use serde_json::{from_value, to_value};
 use std::{
     collections::HashMap,
     fmt::Display,
     hash::{Hash, Hasher},
 };
-use thiserror::Error;
 use time;
 use time::Duration;
-use tower_sessions::session_store::SessionStore;
+use tower_sessions::{
+    session::Id as SessionId,
+    session_store::{Error as SessionStoreError, SessionStore},
+};
 use tracing::{debug, error};
 
 // TODO: turn both these consts into application configuration parameters!
@@ -35,29 +38,140 @@ impl Hasher for FnvHasher {
     }
 }
 
-#[derive(Debug, Error)]
+/// Error type for session registry operations.
+///
+/// `SessionRegistryError` represents all possible failures that can occur when
+/// registering, validating, serializing, or invalidating sessions in the registry.
+/// It wraps errors from the underlying session store and provides context for
+/// serialization and registry management failures.
+///
+/// # Variants
+/// - `StoreError`: Error from the underlying session store (e.g., Redis, Valkey, in-memory).
+/// - `SerializationError`: Failure to serialize or deserialize session metadata or registry state.
+///
+/// # Usage
+/// This error type is returned by all async methods on [`SessionRegistry`] and [`SessionRegistryStore`].
+/// It should be handled at the API boundary and logged for audit and debugging purposes.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::registry::{SessionRegistry, SessionRegistryError};
+///
+/// async fn invalidate_session(registry: &impl SessionRegistry, session_id: &str) {
+///     match registry.invalidate_session(session_id).await {
+///         Ok(_) => println!("Session invalidated"),
+///         Err(SessionRegistryError::StoreError(e)) => eprintln!("Store error: {e}"),
+///         Err(SessionRegistryError::SerializationError(msg)) => eprintln!("Serialization error: {msg}"),
+///     }
+/// }
+/// ```
+#[derive(Debug, thiserror::Error)]
 pub enum SessionRegistryError {
+    /// Error from the underlying session store (e.g., Redis, Valkey, in-memory).
     #[error("Session store error: {0}")]
-    StoreError(#[from] tower_sessions::session_store::Error),
+    StoreError(#[from] SessionStoreError),
+
+    /// Failure to serialize or deserialize session metadata or registry state.
     #[error("Serialization error: {0}")]
     SerializationError(String),
 }
 
-/// Metadata about a registered session
+/// Metadata describing a registered authentication session.
+///
+/// `SessionMetadata` tracks the essential details for each session managed by the registry,
+/// including its unique ID, associated user and tenant (if any), cryptographic session hash,
+/// and timestamps for creation and last activity. This struct enables efficient lookup,
+/// validation, and audit of sessions across users and tenants.
+///
+/// # Fields
+/// - `session_id`: Unique identifier for the session (as a string; typically a UUID or numeric ID).
+/// - `user_id`: Optional user ID associated with the session.
+/// - `tenant_id`: Optional tenant ID associated with the session.
+/// - `session_hash`: Cryptographically secure hash binding the session to its authentication state.
+/// - `created_at`: Timestamp when the session was registered.
+/// - `last_activity`: Timestamp of the most recent activity for this session.
+///
+/// # Usage
+/// Used internally by [`SessionRegistry`] and [`SessionRegistryStore`] to track, validate,
+/// and invalidate sessions for users and tenants. Enables audit logging and session lifecycle management.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::registry::SessionMetadata;
+///
+/// let metadata = SessionMetadata {
+///     session_id: "abc123".to_string(),
+///     user_id: Some("user42".to_string()),
+///     tenant_id: Some("tenantA".to_string()),
+///     session_hash: "crabmeat".to_string(),
+///     created_at: chrono::Utc::now(),
+///     last_activity: chrono::Utc::now(),
+/// };
+/// assert_eq!(metadata.user_id.as_deref(), Some("user42"));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
-    pub session_id: String, // Consider changing to tower_sessions::session::Id
+    /// Unique identifier for the session (as a string; typically a UUID or numeric ID).
+    pub session_id: String, // TODO: Consider changing to tower_sessions::session::Id
+    /// Optional user ID associated with the session.
     pub user_id: Option<String>,
+    /// Optional tenant ID associated with the session.
     pub tenant_id: Option<String>,
+    /// Cryptographically secure hash binding the session to its authentication state.
     pub session_hash: String,
+    /// Timestamp when the session was registered.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Timestamp of the most recent activity for this session.
     pub last_activity: chrono::DateTime<chrono::Utc>,
 }
 
-/// Registry for tracking and managing sessions across users and tenants
+/// Trait for tracking and managing authentication sessions across users and tenants.
+///
+/// `SessionRegistry` provides an abstraction for registering, validating, and invalidating
+/// sessions in a distributed or in-memory store. It supports multi-user and multi-tenant
+/// scenarios, enabling secure session lifecycle management, audit logging, and administrative
+/// operations such as forced logout.
+///
+/// Implementations (such as [`SessionRegistryStore`]) must ensure that session operations
+/// are atomic and consistent, and should support efficient lookup by user, tenant, or session ID.
+///
+/// # Usage
+/// - Register a session when a user authenticates.
+/// - Validate a session's hash to ensure it matches the expected authentication state.
+/// - Invalidate sessions for a user, tenant, or globally for administrative actions.
+/// - Update last activity timestamps for session tracking and expiry.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::registry::{SessionRegistry, SessionRegistryStore};
+/// use tower_sessions::MemoryStore;
+///
+/// let store = MemoryStore::default();
+/// let registry = SessionRegistryStore::new(store, 0, None, None);
+///
+/// // Register a session
+/// registry.register_session(
+///     "session_id",
+///     Some(&"user_id"),
+///     Some(&"tenant_id"),
+///     "session_hash".to_string(),
+/// ).await?;
+///
+/// // Validate session
+/// let valid = registry.validate_session("session_id", "session_hash").await?;
+/// assert!(valid);
+///
+/// // Invalidate all sessions for a user
+/// let count = registry.invalidate_user_sessions(&"user_id").await?;
+/// assert!(count > 0);
+/// ```
 #[async_trait]
 pub trait SessionRegistry: Send + Sync + Clone + 'static {
-    /// Register a session for a user and tenant
+    /// Register a session for a user and tenant.
+    ///
+    /// Stores the session metadata and associates it with the given user and tenant IDs.
+    /// The `session_hash` should be a cryptographically secure value binding the session
+    /// to its authentication state.
     async fn register_session<UId, TId>(
         &self,
         session_id: &str,
@@ -69,7 +183,9 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
         UId: Display + Send + Sync,
         TId: Display + Send + Sync;
 
-    /// Get all session IDs for a user
+    /// Get all session IDs for a user.
+    ///
+    /// Returns a list of session IDs currently registered for the specified user.
     async fn get_user_sessions<UId>(
         &self,
         user_id: &UId,
@@ -77,7 +193,9 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     where
         UId: Display + Send + Sync;
 
-    /// Get all session IDs for a tenant
+    /// Get all session IDs for a tenant.
+    ///
+    /// Returns a list of session IDs currently registered for the specified tenant.
     async fn get_tenant_sessions<TId>(
         &self,
         tenant_id: &TId,
@@ -85,20 +203,29 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     where
         TId: Display + Send + Sync;
 
-    /// Validate that a session is registered with the correct hash
+    /// Validate that a session is registered with the correct hash.
+    ///
+    /// Returns `true` if the session exists and its hash matches the expected value.
     async fn validate_session(
         &self,
         session_id: &str,
         expected_hash: &str,
     ) -> Result<bool, SessionRegistryError>;
 
-    /// Update last activity timestamp
+    /// Update last activity timestamp for a session.
+    ///
+    /// This is used for session expiry and activity tracking.
     async fn touch_session(&self, session_id: &str) -> Result<(), SessionRegistryError>;
 
-    /// Invalidate a specific session
+    /// Invalidate (delete) a specific session by ID.
+    ///
+    /// Removes the session from the registry and underlying store.
     async fn invalidate_session(&self, session_id: &str) -> Result<(), SessionRegistryError>;
 
-    /// Invalidate all sessions for a user
+    /// Invalidate all sessions for a user.
+    ///
+    /// Removes all sessions associated with the specified user.
+    /// Returns the number of sessions invalidated.
     async fn invalidate_user_sessions<UId>(
         &self,
         user_id: &UId,
@@ -106,7 +233,10 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     where
         UId: Display + Send + Sync;
 
-    /// Invalidate all sessions for a tenant
+    /// Invalidate all sessions for a tenant.
+    ///
+    /// Removes all sessions associated with the specified tenant.
+    /// Returns the number of sessions invalidated.
     async fn invalidate_tenant_sessions<TId>(
         &self,
         tenant_id: &TId,
@@ -114,23 +244,60 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     where
         TId: Display + Send + Sync;
 
-    /// Invalidate all sessions globally
+    /// Invalidate all sessions globally.
+    ///
+    /// Removes all sessions from the registry and underlying store.
+    /// Returns the number of sessions invalidated.
     async fn invalidate_all_sessions(&self) -> Result<u64, SessionRegistryError>;
 }
 
-/// Session registry implementation that uses a single registry with session metadata
-/// stored in a tower-sessions compatible session store.
-/// This allows for distributed session registries backed by stores like Redis or Valkey.
-/// Each application instance could use a unique seed to generate its registry ID, however,
-/// to allow for shared registries across instances, a common seed should be used.
-/// The latter allows for an adminstrator to invalidated sessions accross application instances.
+/// Distributed session registry implementation backed by a tower-sessions compatible store.
+///
+/// `SessionRegistryStore` manages the lifecycle of authenticated sessions for users and tenants,
+/// storing session metadata in a pluggable session store (e.g., in-memory, Redis/Valkey).
+/// It supports multi-instance deployments by generating a deterministic registry ID from a seed,
+/// allowing administrators to invalidate sessions across all application instances sharing the same registry.
+///
+/// # Features
+/// - Tracks session metadata (ID, user, tenant, hash, timestamps) for audit and validation.
+/// - Supports efficient lookup and invalidation by user, tenant, or globally.
+/// - Pluggable store: works with any [`SessionStore`] (in-memory, Redis, Valkey, etc.).
+/// - Deterministic registry ID generation for distributed setups.
+/// - Configurable session expiry and registry key.
+///
+/// # Usage
+/// - Create with [`SessionRegistryStore::new`] using a store, seed, optional expiry, and key.
+/// - Use via the [`SessionRegistry`] trait for registration, validation, and invalidation.
+/// - Share the same registry seed/key across instances to enable global session invalidation.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::registry::SessionRegistryStore;
+/// use tower_sessions::{session, MemoryStore};
+///
+/// # tokio_test::block_on(async {
+/// let store = MemoryStore::default();
+/// let registry = SessionRegistryStore::new(store, 42, None, None);
+///
+/// // Register a session
+/// registry.register_session(
+///     "session_id",
+///     Some(&"user_id"),
+///     Some(&"tenant_id"),
+///     "session_hash".to_string(),
+/// ).await.unwrap();
+/// # });
+/// ```
 #[derive(Debug, Clone)]
 pub struct SessionRegistryStore<S: SessionStore> {
+    /// Underlying session store (in-memory, Redis/Valkey, etc.).
     store: S,
+    /// Maximum age for session expiry.
     session_max_age: Duration,
+    /// Key used to store the registry data in the session store.
     registry_key: String,
-    registry_id: tower_sessions::session::Id,
-    // registry_id_seed is only used at construction, not stored or logged
+    /// Deterministically generated registry ID for distributed setups.
+    registry_id: SessionId,
 }
 
 impl<S: SessionStore> SessionRegistryStore<S> {
@@ -146,15 +313,15 @@ impl<S: SessionStore> SessionRegistryStore<S> {
         }
     }
 
-    fn generate_registry_id(seed: u128, registry_key: String) -> tower_sessions::session::Id {
+    fn generate_registry_id(seed: u128, registry_key: String) -> SessionId {
         let mut hasher = FnvHasher(seed);
         registry_key.hash(&mut hasher);
         let hash = hasher.0;
 
-        tower_sessions::session::Id(hash as i128)
+        SessionId(hash as i128)
     }
 
-    fn get_registry_id(&self) -> &tower_sessions::session::Id {
+    fn get_registry_id(&self) -> &SessionId {
         &self.registry_id
     }
 
@@ -176,7 +343,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
             let registry: Vec<SessionMetadata> = record
                 .data
                 .get(&self.registry_key)
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .and_then(|v| from_value(v.clone()).ok())
                 .unwrap_or_default();
             Ok(registry)
         } else {
@@ -202,7 +369,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
         });
 
         // Store the registry data
-        let registry_value = serde_json::to_value(registry).map_err(|e| {
+        let registry_value = to_value(registry).map_err(|e| {
             error!("Failed to serialize session registry: {e}");
             SessionRegistryError::SerializationError(e.to_string())
         })?;
@@ -261,7 +428,7 @@ impl<S: SessionStore> SessionRegistryStore<S> {
 
             // Attempt to invalidate in store - this may fail for non-existent sessions
             // which is fine as we're cleaning up the registry
-            if let Ok(session_id_obj) = session_id.parse::<tower_sessions::session::Id>() {
+            if let Ok(session_id_obj) = session_id.parse::<SessionId>() {
                 tracing::debug!("Parsed session ID: {:?}", session_id_obj);
                 if let Err(e) = self.store.delete(&session_id_obj).await {
                     debug!("Failed to delete session {} from store: {}", session_id, e);
@@ -300,7 +467,7 @@ impl<S: SessionStore + Send + Sync + Clone> SessionRegistry for SessionRegistryS
         }
 
         // Defensive: Only allow valid session IDs
-        if session_id.parse::<tower_sessions::session::Id>().is_err() {
+        if session_id.parse::<SessionId>().is_err() {
             error!("Attempted to register invalid session ID: {session_id}");
             // return Err(SessionRegistryError::SerializationError(format!(
             //     "Invalid session ID format: {session_id}"
@@ -435,18 +602,18 @@ impl<S: SessionStore + Send + Sync + Clone> SessionRegistry for SessionRegistryS
 #[cfg(test)]
 mod tests {
     use super::*;
-
     use crate::utils::testing::mock_tracing::init_tracing;
     use tower_sessions::MemoryStore;
 
     #[tokio::test]
+    /// Verifies basic session registration, lookup, and invalidation for a single user and tenant.
     async fn test_session_registry_basic_operations() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
         let registry = SessionRegistryStore::new(store, 0, None, None);
 
-        let session_id = tower_sessions::session::Id(42).to_string();
+        let session_id = SessionId(42).to_string();
 
         tracing::info!("Registry ID: {:?}", registry.get_registry_id());
 
@@ -484,6 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Checks session registration and invalidation for multiple users and tenants.
     async fn test_session_registry_multiple_users() -> Result<(), SessionRegistryError> {
         init_tracing();
 
@@ -491,9 +659,9 @@ mod tests {
         let registry = SessionRegistryStore::new(store, 0, None, None);
 
         // Use deterministic, valid session IDs
-        let session_id1 = tower_sessions::session::Id(1).to_string();
-        let session_id2 = tower_sessions::session::Id(2).to_string();
-        let session_id3 = tower_sessions::session::Id(3).to_string();
+        let session_id1 = SessionId(1).to_string();
+        let session_id2 = SessionId(2).to_string();
+        let session_id3 = SessionId(3).to_string();
 
         registry
             .register_session(
@@ -540,13 +708,14 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Ensures duplicate registration updates session hash and does not create duplicates.
     async fn test_session_registry_duplicate_registration() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
         let registry = SessionRegistryStore::new(store, 0, None, None);
 
-        let session_id = tower_sessions::session::Id(10).to_string();
+        let session_id = SessionId(10).to_string();
 
         registry
             .register_session(
@@ -573,15 +742,16 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Validates cleanup operations: session invalidation by ID, tenant, and global.
     async fn test_session_registry_cleanup_operations() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
         let registry = SessionRegistryStore::new(store, 0, None, None);
 
-        let session_id1 = tower_sessions::session::Id(11).to_string();
-        let session_id2 = tower_sessions::session::Id(12).to_string();
-        let session_id3 = tower_sessions::session::Id(13).to_string();
+        let session_id1 = SessionId(11).to_string();
+        let session_id2 = SessionId(12).to_string();
+        let session_id3 = SessionId(13).to_string();
 
         registry
             .register_session(
@@ -623,11 +793,12 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Confirms registry persistence across multiple instances using the same store.
     async fn test_session_registry_persistence_across_instances() -> Result<(), SessionRegistryError>
     {
         let store = MemoryStore::default();
 
-        let session_id = tower_sessions::session::Id(21).to_string();
+        let session_id = SessionId(21).to_string();
 
         // First registry instance
         {
@@ -653,13 +824,14 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Tests edge cases: guest session registration, invalid session lookup, and global invalidation.
     async fn test_session_registry_edge_cases() -> Result<(), SessionRegistryError> {
         init_tracing();
 
         let store = MemoryStore::default();
         let registry = SessionRegistryStore::new(store, 0, None, None);
 
-        let session_id = tower_sessions::session::Id(99).to_string();
+        let session_id = SessionId(99).to_string();
 
         registry
             .register_session(
@@ -682,6 +854,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verifies deterministic registry ID generation for distributed setups.
     async fn test_session_registry_deterministic_id_generation() {
         let key = SESSION_REGISTRY_KEY.to_string();
         let id1 = SessionRegistryStore::<MemoryStore>::generate_registry_id(0, key.clone());

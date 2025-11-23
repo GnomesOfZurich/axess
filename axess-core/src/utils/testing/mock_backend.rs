@@ -1,10 +1,32 @@
-//! In-memory mock backend utilities for tests.
+//! In-memory mock backend utilities for Axess tests.
 //!
-//! Provides `MockBackend`, its mock tenant/user identifiers, and helpers to
-//! exercise the `AuthnBackend`/`AuthnAdminBackend` contracts without a real
-//! datastore.
-
-// use std::collections::HashMap;
+//! This module provides [`MockBackend`], mock tenant/user identifiers, and helpers to
+//! exercise the [`AuthnBackend`] and [`AuthnAdminBackend`] contracts without a real datastore.
+//!
+//! Use these types to write deterministic, fast unit and integration tests for authentication flows,
+//! factor/method provisioning, session state transitions, and audit event recording.
+//!
+//! # Features
+//! - Implements all required async methods for [`AuthnBackend`] and [`AuthnAdminBackend`].
+//! - Stores users, tenants, factors, methods, states, and events in thread-safe in-memory maps.
+//! - Provides mock types: [`MockUser`], [`MockTenant`], [`TestUserId`], [`TestTenantId`].
+//! - Compatible with Axess session, factor, and method builders for realistic test scenarios.
+//! - Supports DST (Deterministic Simulation Testing) and parallel test execution.
+//!
+//! # Usage
+//! ```rust
+//! use axess_core::utils::testing::mock_backend::MockBackend;
+//! use axess_core::authn::backend::AuthnBackend;
+//!
+//! #[tokio::test]
+//! async fn test_guest_user_creation() {
+//!     let backend = MockBackend::default();
+//!     let guest = backend.get_new_guest_user(None).await.unwrap();
+//!     assert_eq!(guest.get_user_state().to_string(), "Guest");
+//! }
+//! ```
+//!
+//! See also: [`mock_entities`](mock_entities.rs), [`mock_authn`](mock_authn.rs), [`mock_form`](mock_form.rs)
 
 #[cfg(feature = "admin")]
 use crate::authn::backend::admin::AuthnAdminBackend;
@@ -251,6 +273,7 @@ impl AuthnBackend for MockBackend {
     async fn upsert_method_state(
         &self,
         change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+        actor: Self::UserId,
     ) -> Result<AuthMethodState<Self>, Self::Error> {
         // Create natural key from method_id, tenant_id, user_id
         let key = format!(
@@ -291,7 +314,7 @@ impl AuthnBackend for MockBackend {
                 created_at,
                 created_by,
                 updated_at: now,
-                updated_by: change.updated_by,
+                updated_by: actor,
             }
         } else {
             // Insert: generate new ID
@@ -306,7 +329,7 @@ impl AuthnBackend for MockBackend {
                 created_at: now,
                 created_by: change.updated_by.clone(),
                 updated_at: now,
-                updated_by: change.updated_by,
+                updated_by: actor,
             }
         };
 
@@ -373,6 +396,7 @@ impl AuthnBackend for MockBackend {
     async fn upsert_factor_state(
         &self,
         change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+        actor: Self::UserId,
     ) -> Result<AuthFactorState<Self>, Self::Error> {
         // Create natural key from factor_id, tenant_id, user_id
         let key = format!(
@@ -415,7 +439,7 @@ impl AuthnBackend for MockBackend {
                 created_at,
                 created_by,
                 updated_at: now,
-                updated_by: change.updated_by,
+                updated_by: actor,
             }
         } else {
             // Insert: generate new ID
@@ -429,9 +453,9 @@ impl AuthnBackend for MockBackend {
                 state: change.state,
                 config: change.config,
                 created_at: now,
-                created_by: change.updated_by.clone(),
+                created_by: actor.clone(),
                 updated_at: now,
-                updated_by: change.updated_by,
+                updated_by: actor,
             }
         };
 
@@ -493,7 +517,7 @@ impl AuthnBackend for MockBackend {
 
                 Ok(result)
             }
-            // No history -> return empty vec rather than an error to simplify callers
+            // No history -> return empty vec rather than an error, to simplify for callers.
             None => Ok(Vec::new()),
         }
     }
@@ -573,29 +597,46 @@ impl AuthnBackend for MockBackend {
 #[cfg(feature = "admin")]
 #[async_trait]
 impl AuthnAdminBackend for MockBackend {
-    async fn upsert_user(&self, user: Self::User) -> Result<Self::User, Self::Error> {
+    async fn upsert_user(
+        &self,
+        user: Self::User,
+        _actor: Self::UserId,
+    ) -> Result<Self::User, Self::Error> {
         self.users.insert(user.id.clone(), user.clone());
         Ok(user)
     }
 
-    async fn delete_user(&self, user_id: &Self::UserId) -> Result<(), Self::Error> {
+    async fn delete_user(
+        &self,
+        user_id: &Self::UserId,
+        _actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         self.users.remove(user_id);
         Ok(())
     }
 
-    async fn upsert_tenant(&self, tenant: Self::Tenant) -> Result<Self::Tenant, Self::Error> {
+    async fn upsert_tenant(
+        &self,
+        tenant: Self::Tenant,
+        _actor: Self::UserId,
+    ) -> Result<Self::Tenant, Self::Error> {
         self.tenants.insert(tenant.id.clone(), tenant.clone());
         Ok(tenant)
     }
 
-    async fn delete_tenant(&self, tenant_id: &Self::TenantId) -> Result<(), Self::Error> {
+    async fn delete_tenant(
+        &self,
+        tenant_id: &Self::TenantId,
+        _actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         self.tenants.remove(tenant_id);
         Ok(())
     }
 
     async fn delete_method_state(
         &self,
-        method_state_id: &Self::MethodId,
+        method_state_id: &Self::DataId,
+        _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         self.auth_method_states.remove(method_state_id);
         Ok(())
@@ -604,13 +645,18 @@ impl AuthnAdminBackend for MockBackend {
     async fn upsert_auth_method(
         &self,
         method: AuthMethod<Self>,
+        _actor: Self::UserId,
     ) -> Result<AuthMethod<Self>, Self::Error> {
         // Use the method's actual ID instead of generating a new one
         self.auth_methods.insert(method.id.clone(), method.clone());
         Ok(method)
     }
 
-    async fn delete_auth_method(&self, method_id: &Self::MethodId) -> Result<(), Self::Error> {
+    async fn delete_auth_method(
+        &self,
+        method_id: &Self::MethodId,
+        _actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         self.auth_methods.remove(method_id);
         Ok(())
     }
@@ -618,6 +664,7 @@ impl AuthnAdminBackend for MockBackend {
     async fn delete_factor_state(
         &self,
         factor_state_id: &Self::FactorId,
+        _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         self.auth_factor_states.remove(factor_state_id);
         Ok(())
@@ -626,13 +673,18 @@ impl AuthnAdminBackend for MockBackend {
     async fn upsert_auth_factor(
         &self,
         factor: AuthFactor<Self>,
+        _actor: Self::UserId,
     ) -> Result<AuthFactor<Self>, Self::Error> {
         // Use the factor's actual ID instead of generating a new one
         self.auth_factors.insert(factor.id.clone(), factor.clone());
         Ok(factor)
     }
 
-    async fn delete_auth_factor(&self, factor_id: &Self::FactorId) -> Result<(), Self::Error> {
+    async fn delete_auth_factor(
+        &self,
+        factor_id: &Self::FactorId,
+        _actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         self.auth_factors.remove(factor_id);
         Ok(())
     }

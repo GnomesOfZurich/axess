@@ -1,6 +1,6 @@
 [package]
 name = "axess-macros"
-version = "0.0.9"
+version = "0.0.10"
 publish = false
 edition = "2024"
 resolver = "3"

@@ -1,31 +1,21 @@
 use async_trait::async_trait;
-use chrono::Utc;
-// use chrono::{DateTime, Utc};
-// use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Utc};
 use serde_json;
-use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::{Error as SqlxError, FromRow, Row, SqlitePool};
 use std::time::SystemTime;
-// use std::str::FromStr;
-// use tracing_subscriber::filter;
-// use tokio::task;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-// Import verify_totp from your utils or totp module
 use axess::{
-    TOTP_LENGTH, TOTP_PERIOD,
-    authn::methods::{MethodStateChange, factor::FactorStateChange},
-    verify_password, verify_totp,
+    AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind,
+    AuthFactorState, AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, EnablementState,
+    EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, MethodStateChange,
+    PermissionScope, TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp,
 };
 
 use crate::models::{
     authn::{OurAuthFactor, OurAuthFactorState, OurAuthMethod, OurAuthMethodState},
     entities::{OurTenant, OurUser},
-};
-use axess::{
-    AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind, AuthFactorState,
-    AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, EnablementState, EntityState,
-    FactorForm, FactorFormExt, FormField, PermissionScope,
 };
 
 const DEFAULT_TENANT_NAME: &str = "Default Tenant";
@@ -414,25 +404,28 @@ impl AuthnBackend for OurBackend {
     /// The backend determines if this is an insert or update based on the
     /// composite key (method_id, tenant_id, user_id).
     ///
-    /// For inserts: Generates new UUID for `id`, uses `created_at`, `created_by`, `updated_at`, and `updated_by` from input.
-    /// For updates: Preserves existing `id`, `created_at`, and `created_by` from database, uses `updated_at` and `updated_by` from input.
+    /// For inserts: Generates new UUID for `id`, sets `created_by` to the given `actor`.
+    /// For updates: Preserves existing `created_by` value from the database, sets `updated_by` to the given actor.
+    /// In both cases: Uses `updated_at` and `updated_by` from input.
+    ///
+    /// Returns the upserted method state as loaded from the database.
     async fn upsert_method_state(
         &self,
         change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+        actor: Self::UserId,
     ) -> Result<AuthMethodState<Self>, Self::Error> {
         let tenant_id = change.tenant_id.map(|t| t.to_string());
         let user_id = change.user_id.map(|u| u.to_string());
-        let now = Utc::now();
 
         let mut conn = self.db.acquire().await?;
+        let now = Utc::now();
         let row = sqlx::query(
             r#"
             INSERT INTO method_states (id, method_id, tenant_id, user_id, state, created_at, created_by, updated_at, updated_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(method_id, tenant_id, user_id) DO UPDATE SET 
-                state = excluded.state,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by
+                created_at = method_states.created_at, -- preserve existing value
+                created_by = method_states.created_by  -- preserve existing value
             RETURNING id, method_id, tenant_id, user_id, state, created_at, created_by, updated_at, updated_by
             "#,
         )
@@ -442,9 +435,9 @@ impl AuthnBackend for OurBackend {
         .bind(user_id)
         .bind(format!("{:?}", change.state))
         .bind(now.to_rfc3339())
-        .bind(change.updated_by.to_string())
+        .bind(actor.to_string()) // only used for insert
         .bind(now.to_rfc3339())
-        .bind(change.updated_by.to_string())
+        .bind(actor.to_string()) // always set updated_by to actor
         .fetch_one(&mut *conn)
         .await?;
 
@@ -647,22 +640,22 @@ impl AuthnBackend for OurBackend {
     /// The backend determines if this is an insert or update based on the
     /// composite key (factor_id, tenant_id, user_id).
     ///
-    /// For inserts: Generates new UUID for `id`, preserves `created_at` and `created_by` from input.
-    /// For updates: Preserves existing `id`, `created_at`, and `created_by` from database.
+    /// For inserts: Generates new UUID for `id`, sets `created_by` to the given `updated_by` (actor).
+    /// For updates: Preserves existing `id`, `created_at`, and `created_by` from database, sets `updated_by` to the given actor.
     /// In both cases: Uses `updated_at` and `updated_by` from input.
+    ///
+    /// Returns the upserted factor state as loaded from the database.
     async fn upsert_factor_state(
         &self,
         change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+        actor: Self::UserId,
     ) -> Result<AuthFactorState<Self>, Self::Error> {
         let mut conn = self.db.acquire().await?;
 
-        // Serialize config
         let config_json =
             serde_json::to_string(&change.config).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-
         let now = Utc::now();
 
-        // Upsert using natural key - database handles ID generation
         let row = sqlx::query(
             r#"
             INSERT INTO factor_states (
@@ -671,10 +664,8 @@ impl AuthnBackend for OurBackend {
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(factor_id, tenant_id, user_id) DO UPDATE SET
-                state = excluded.state,
-                config = excluded.config,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by
+                created_at = factor_states.created_at, -- preserve existing value
+                created_by = factor_states.created_by  -- preserve existing value
             RETURNING *
             "#,
         )
@@ -685,9 +676,9 @@ impl AuthnBackend for OurBackend {
         .bind(format!("{:?}", change.state))
         .bind(&config_json)
         .bind(now.to_rfc3339())
-        .bind(change.updated_by.to_string())
+        .bind(actor.to_string()) // only used for insert
         .bind(now.to_rfc3339())
-        .bind(change.updated_by.to_string())
+        .bind(actor.to_string())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -706,7 +697,7 @@ impl AuthnBackend for OurBackend {
         event_type: Option<AuthEventType>,
         event_status: Option<AuthEventStatus>,
         limit: Option<usize>,
-    ) -> Result<Vec<axess::AuthEvent<OurBackend>>, Self::Error> {
+    ) -> Result<Vec<AuthEvent<OurBackend>>, Self::Error> {
         let mut conn = self.db.acquire().await?;
 
         // Base query selects events for the given user
@@ -739,7 +730,7 @@ impl AuthnBackend for OurBackend {
         }
         let rows = sql.fetch_all(&mut *conn).await?;
 
-        let events: Vec<axess::AuthEvent<OurBackend>> = rows
+        let events: Vec<AuthEvent<OurBackend>> = rows
             .into_iter()
             .map(|row| {
                 // Safely extract optional text fields and parse defensively.
@@ -762,7 +753,7 @@ impl AuthnBackend for OurBackend {
                     .ok()
                     .flatten();
 
-                axess::AuthEvent {
+                AuthEvent {
                     id: row
                         .try_get::<Option<String>, _>("id")
                         .ok()
@@ -789,20 +780,18 @@ impl AuthnBackend for OurBackend {
                         .ok()
                         .flatten(),
                     // use parsing helpers to tolerate empty/null text and parse enums via FromStr
-                    event_type: parse_enum_or_default::<axess::AuthEventType>(
-                        event_type_txt.clone(),
-                    ),
-                    event_status: parse_enum_or_default::<axess::AuthEventStatus>(
+                    event_type: parse_enum_or_default::<AuthEventType>(event_type_txt.clone()),
+                    event_status: parse_enum_or_default::<AuthEventStatus>(
                         event_status_txt.clone(),
                     ),
                     event_time: event_time_txt
                         .as_deref()
-                        .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+                        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
                         .map(|dt| dt.with_timezone(&Utc))
                         .unwrap_or(Utc::now()),
                     method_id: method_id_txt.and_then(|mid| Uuid::parse_str(&mid).ok()),
                     factor_id: factor_id_txt.and_then(|fid| Uuid::parse_str(&fid).ok()),
-                    factor_kind: parse_enum_option::<axess::AuthFactorKind>(factor_kind_txt),
+                    factor_kind: parse_enum_option::<AuthFactorKind>(factor_kind_txt),
                     ip_address: row
                         .try_get::<Option<String>, _>("ip_address")
                         .ok()
@@ -824,7 +813,7 @@ impl AuthnBackend for OurBackend {
     async fn get_last_login(
         &self,
         user_id: &Self::UserId,
-    ) -> Result<Option<chrono::DateTime<Utc>>, Self::Error> {
+    ) -> Result<Option<DateTime<Utc>>, Self::Error> {
         // Reuse get_auth_history to keep filtering/sorting logic in one place.
         let events = self
             .get_auth_history(
@@ -970,7 +959,7 @@ impl AuthnBackend for OurBackend {
                         let totp_code = creds.credential().unwrap_or("");
 
                         let totp_secret = factor_config
-                            .get("otp_secret")
+                            .get("secret")
                             .and_then(|v| v.as_str())
                             .ok_or_else(|| sqlx::Error::ColumnDecode {
                                 index: "factor_state".into(),
@@ -1007,10 +996,10 @@ impl AuthnBackend for OurBackend {
                             Some(future_window),
                         ) {
                             Some(_) => Ok(user),
-                            None => Err(sqlx::Error::Protocol("Invalid TOTP code".to_string())),
+                            None => Err(SqlxError::Protocol("Invalid TOTP code".to_string())),
                         }
                     }
-                    _ => Err(sqlx::Error::Protocol(format!(
+                    _ => Err(SqlxError::Protocol(format!(
                         "Unsupported OTP type: {}",
                         otp_type
                     ))),
@@ -1019,14 +1008,14 @@ impl AuthnBackend for OurBackend {
             AuthFactorKind::Oauth => {
                 // Handle OAuth factor authentication
                 // This is a placeholder, actual implementation will depend on your OAuth setup
-                Err(sqlx::Error::Protocol(
+                Err(SqlxError::Protocol(
                     "OAuth factor authentication not implemented".to_string(),
                 ))
             }
             AuthFactorKind::Custom(name) => {
                 // Custom factor kinds are not handled by this backend example.
                 // Return a protocol error indicating the custom kind is unsupported.
-                Err(sqlx::Error::Protocol(format!(
+                Err(SqlxError::Protocol(format!(
                     "Custom factor authentication not implemented for kind: {}",
                     name
                 )))
@@ -1043,94 +1032,81 @@ impl AuthnAdminBackend for OurBackend {
     /// Otherwise, inserts a new user record.
     ///
     /// Returns the upserted user as loaded from the database.
-    async fn upsert_user(&self, user: Self::User) -> Result<Self::User, Self::Error> {
+    async fn upsert_user(
+        &self,
+        user: Self::User,
+        actor: Self::UserId,
+    ) -> Result<Self::User, Self::Error> {
         let mut conn = self.db.acquire().await?;
 
-        // Upsert user record using only the fields present in OurUser
+        let now = Utc::now();
         let row = sqlx::query(
             r#"
             INSERT INTO users (
-            id,
-            tenant_id,
-            username,
-            fullname,
-            email,
-            state,
-            created_at,
-            created_by,
-            updated_at,
-            updated_by
+                id, tenant_id, username, fullname, email, state,
+                created_at, created_by, updated_at, updated_by
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-            username = excluded.username,
-            tenant_id = excluded.tenant_id,
-            fullname = excluded.fullname,
-            email = excluded.email,
-            state = excluded.state,
-            created_at = excluded.created_at,
-            created_by = excluded.created_by,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by
+                created_at = users.created_at, -- preserve existing value
+                created_by = users.created_by  -- preserve existing value
             RETURNING
-            id,
-            tenant_id,
-            username,
-            fullname,
-            email,
-            state,
-            created_at,
-            created_by,
-            updated_at,
-            updated_by
+                id, tenant_id, username, fullname, email, state,
+                created_at, created_by, updated_at, updated_by
             "#,
         )
         .bind(user.id.to_string())
-        .bind(user.tenant_id.to_string()) // tenant_id must be second (matches INSERT column order)
+        .bind(user.tenant_id.to_string())
         .bind(&user.username)
         .bind(&user.fullname)
         .bind(&user.email)
         .bind(format!("{:?}", user.state))
-        .bind(user.created_at.to_rfc3339())
-        .bind(user.created_by.to_string())
-        .bind(user.updated_at.to_rfc3339())
-        .bind(user.updated_by.to_string())
+        .bind(now.to_rfc3339()) // only used for insert
+        .bind(actor.to_string()) // only used for insert
+        .bind(now.to_rfc3339())
+        .bind(actor.to_string())
         .fetch_one(&mut *conn)
         .await?;
 
         OurUser::from_row(&row)
     }
 
-    async fn delete_user(&self, user_id: &Self::UserId) -> Result<(), Self::Error> {
+    async fn delete_user(
+        &self,
+        user_id: &Self::UserId,
+        actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(user_id.to_string())
             .execute(&mut *conn)
             .await?;
+        info!("User with ID {} deleted from 'users' by {}", user_id, actor);
         Ok(())
     }
 
     /// Upserts (inserts or updates) a tenant in the database.
     ///
-    /// If the tenant already exists (matched by `id`), updates all fields.
-    /// Otherwise, inserts a new tenant record.
+    /// If the tenant already exists (matched by `id`), updates all fields except `created_by`.
+    /// For inserts, sets `created_by` to the given `actor`.
+    /// For updates, preserves the existing `created_by` value from the database.
     ///
     /// Returns the upserted tenant as loaded from the database.
-    async fn upsert_tenant(&self, tenant: Self::Tenant) -> Result<Self::Tenant, Self::Error> {
+    async fn upsert_tenant(
+        &self,
+        tenant: Self::Tenant,
+        actor: Self::UserId,
+    ) -> Result<Self::Tenant, Self::Error> {
         let mut conn = self.db.acquire().await?;
 
+        let now = Utc::now();
         let row = sqlx::query(
             r#"
             INSERT INTO tenants (id, name, description, state, created_at, created_by, updated_at, updated_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                description = excluded.description,
-                state = excluded.state,
-                created_at = excluded.created_at,
-                created_by = excluded.created_by,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by
+                created_at = tenants.created_at, -- preserve existing value on update
+                created_by = tenants.created_by  -- preserve existing value on update
             RETURNING id, name, description, state, created_at, created_by, updated_at, updated_by
             "#
         )
@@ -1138,22 +1114,30 @@ impl AuthnAdminBackend for OurBackend {
         .bind(&tenant.name)
         .bind(&tenant.description)
         .bind(format!("{:?}", tenant.state))
-        .bind(tenant.created_at.to_rfc3339())
-        .bind(tenant.created_by.to_string())
-        .bind(tenant.updated_at.to_rfc3339())
-        .bind(tenant.updated_by.to_string())
+        .bind(now.to_rfc3339()) // only used for insert
+        .bind(actor.to_string()) // only used for insert
+        .bind(now.to_rfc3339())
+        .bind(actor.to_string())
         .fetch_one(&mut *conn)
         .await?;
 
         OurTenant::from_row(&row)
     }
 
-    async fn delete_tenant(&self, tenant_id: &Self::TenantId) -> Result<(), Self::Error> {
+    async fn delete_tenant(
+        &self,
+        tenant_id: &Self::TenantId,
+        actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
         sqlx::query("DELETE FROM tenants WHERE id = ?")
             .bind(tenant_id.to_string())
             .execute(&mut *conn)
             .await?;
+        info!(
+            "Tenant with ID {} deleted from 'tenants' by user {}",
+            tenant_id, actor
+        );
         Ok(())
     }
 
@@ -1161,7 +1145,11 @@ impl AuthnAdminBackend for OurBackend {
     ///
     /// The `method_state_id` parameter should be a string encoding the composite key, e.g. "method_id:tenant_id:user_id".
     /// If tenant_id or user_id is missing, use "null" in their place.
-    async fn delete_method_state(&self, method_state_id: &Self::DataId) -> Result<(), Self::Error> {
+    async fn delete_method_state(
+        &self,
+        method_state_id: &Self::DataId,
+        actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
         sqlx::query(
             r#"
@@ -1172,29 +1160,38 @@ impl AuthnAdminBackend for OurBackend {
         .bind(method_state_id)
         .execute(&mut *conn)
         .await?;
+        info!(
+            "MethodState with ID {} deleted from 'method_states' by {}",
+            method_state_id, actor
+        );
         Ok(())
     }
+
+    /// Upserts (inserts or updates) an authentication method in the database.
+    ///
+    /// If the method already exists (matched by `id`), updates all fields except `created_by`.
+    /// For inserts, sets `created_by` to the given `created_by` field from the input.
+    /// For updates, preserves the existing `created_by` value from the database.
+    ///
+    /// Returns the upserted method as loaded from the database.
     async fn upsert_auth_method(
         &self,
         method: AuthMethod<Self>,
+        actor: Self::UserId,
     ) -> Result<AuthMethod<Self>, Self::Error> {
         let mut conn = self.db.acquire().await?;
 
         let factors_json =
             serde_json::to_string(&method.factors).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
+        let now = Utc::now();
         let row = sqlx::query(
             r#"
             INSERT INTO auth_methods (id, name, description, factors, created_at, created_by, updated_at, updated_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                description = excluded.description,
-                factors = excluded.factors,
-                created_at = excluded.created_at,
-                created_by = excluded.created_by,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by
+                created_at = auth_methods.created_at,      -- preserve original
+                created_by = auth_methods.created_by       -- preserve original
             RETURNING id, name, description, factors, created_at, created_by, updated_at, updated_by
             "#
         )
@@ -1202,10 +1199,10 @@ impl AuthnAdminBackend for OurBackend {
         .bind(&method.name)
         .bind(&method.description)
         .bind(factors_json)
-        .bind(method.created_at.to_rfc3339())
-        .bind(method.created_by.to_string())
-        .bind(method.updated_at.to_rfc3339())
-        .bind(method.updated_by.to_string())
+        .bind(now.to_rfc3339()) // only used for insert
+        .bind(actor.to_string()) // only used for insert
+        .bind(now.to_rfc3339())
+        .bind(actor.to_string())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -1213,16 +1210,28 @@ impl AuthnAdminBackend for OurBackend {
         Ok(AuthMethod::<OurBackend>::from(our_method))
     }
 
-    async fn delete_auth_method(&self, method_id: &Self::MethodId) -> Result<(), Self::Error> {
+    async fn delete_auth_method(
+        &self,
+        method_id: &Self::MethodId,
+        actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
         sqlx::query("DELETE FROM auth_methods WHERE id = ?")
             .bind(method_id.to_string())
             .execute(&mut *conn)
             .await?;
+        info!(
+            "Authentication method with ID {} deleted from 'auth_methods' by {}",
+            method_id, actor
+        );
         Ok(())
     }
 
-    async fn delete_factor_state(&self, factor_state_id: &Self::DataId) -> Result<(), Self::Error> {
+    async fn delete_factor_state(
+        &self,
+        factor_state_id: &Self::DataId,
+        actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
         sqlx::query(
             r#"
@@ -1235,26 +1244,34 @@ impl AuthnAdminBackend for OurBackend {
         .bind(factor_state_id.to_string())
         .execute(&mut *conn)
         .await?;
+        info!(
+            "Authentication factor state with ID {} deleted from 'factor_states'by {}",
+            factor_state_id, actor
+        );
         Ok(())
     }
 
+    /// Upserts (inserts or updates) an authentication factor in the database.
+    ///
+    /// If the factor already exists (matched by `id`), updates all fields except `created_by`.
+    /// For inserts, sets `created_by` to the given `created_by` field from the input.
+    /// For updates, preserves the existing `created_by` value from the database.
+    ///
+    /// Returns the upserted factor as loaded from the database.
     async fn upsert_auth_factor(
         &self,
         factor: AuthFactor<Self>,
+        actor: Self::UserId,
     ) -> Result<AuthFactor<Self>, Self::Error> {
         let mut conn = self.db.acquire().await?;
+        let now = Utc::now();
         let row = sqlx::query(
             r#"
             INSERT INTO auth_factors (id, kind, name, description, created_at, created_by, updated_at, updated_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                kind = excluded.kind,
-                name = excluded.name,
-                description = excluded.description,
-                created_at = excluded.created_at,
-                created_by = excluded.created_by,
-                updated_at = excluded.updated_at,
-                updated_by = excluded.updated_by
+                created_at = auth_factors.created_at, -- preserve existing value
+                created_by = auth_factors.created_by  -- preserve existing value
             RETURNING id, kind, name, description, created_at, created_by, updated_at, updated_by
             "#
         )
@@ -1262,10 +1279,10 @@ impl AuthnAdminBackend for OurBackend {
         .bind(factor.kind.as_str())
         .bind(&factor.name)
         .bind(&factor.description)
-        .bind(factor.created_at.to_rfc3339())
-        .bind(factor.created_by.to_string())
-        .bind(factor.updated_at.to_rfc3339())
-        .bind(factor.updated_by.to_string())
+        .bind(now.to_rfc3339()) // only used for insert
+        .bind(actor.to_string()) // only used for insert
+        .bind(now.to_rfc3339())
+        .bind(actor.to_string())
         .fetch_one(&mut *conn)
         .await?;
 
@@ -1273,12 +1290,20 @@ impl AuthnAdminBackend for OurBackend {
         Ok(AuthFactor::<OurBackend>::from(our_factor))
     }
 
-    async fn delete_auth_factor(&self, factor_id: &Self::FactorId) -> Result<(), Self::Error> {
+    async fn delete_auth_factor(
+        &self,
+        factor_id: &Self::FactorId,
+        actor: Self::UserId,
+    ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
         sqlx::query("DELETE FROM auth_factors WHERE id = ?")
             .bind(factor_id.to_string())
             .execute(&mut *conn)
             .await?;
+        info!(
+            "Authentication factor with ID {} deleted from 'auth_factors' by {}",
+            factor_id, actor
+        );
         Ok(())
     }
 }

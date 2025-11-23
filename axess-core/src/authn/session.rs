@@ -7,7 +7,7 @@ use crate::{
         backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
         errors::{AuthError, FactorKindError},
         methods::{
-            factor::{AuthFactorKind, FactorStateChange, FactorStateChangeBuilder},
+            factor::{AuthFactorKind, FactorStateChange},
             form::{FactorForm, FactorFormExt, FactorFormKind, FormField},
             policy::{FactorConfig, FactorConfigBuilder, OtpCharset, OtpRulesBuilder, OtpType},
             scope::{EnablementState, PermissionScope},
@@ -23,14 +23,12 @@ use crate::{
 };
 use registry::SessionRegistry;
 
-use axess_factors::{
-    HOTP_LENGTH, TOTP_LENGTH, TOTP_PERIOD, generate_password_hash, verify_hotp, verify_totp,
-};
+use axess_factors::{TOTP_LENGTH, generate_password_hash, verify_hotp, verify_totp};
 // use base64::DecodeSliceError;
-use serde_json::json;
+use serde_json::{Value as JsonValue, from_value, json};
 use sha2::{Digest, Sha256};
 // use uuid::Uuid;
-use std::{fmt::Debug, str::FromStr, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, str::FromStr, sync::Arc};
 use tower_sessions::Session;
 
 /// `AuthSession` orchestrates authentication workflows for a user session. It handles factor
@@ -311,6 +309,26 @@ where
     pub fn get_tenant_id(&self) -> Option<&B::TenantId> {
         self.data.tenant_id.as_ref()
     }
+
+    // pub async fn get_default_tenant_id(&self) -> Result<B::TenantId, AuthError<B>> {
+    //     self.backend
+    //         .get_default_tenant_id()
+    //         .await
+    //         .map_err(AuthError::BackendError)
+    // }
+
+    // /// Get the system user ID associated with the session.
+    // /// If `tenant_id` is `None`, the global system user ID is returned, but
+    // /// as long as a tenant ID is provided the main administrative
+    // pub async fn get_system_user_id(
+    //     &self,
+    //     tenant_id: Option<&B::TenantId>,
+    // ) -> Result<B::UserId, AuthError<B>> {
+    //     self.backend
+    //         .get_system_user_id(tenant_id)
+    //         .await
+    //         .map_err(AuthError::BackendError)
+    // }
 
     pub fn get_user_state(&self) -> EntityState {
         self.data.user_state.clone()
@@ -777,7 +795,7 @@ where
         let otp_code = form.credential().ok_or(AuthError::InvalidCredentials)?;
 
         let secret = config
-            .get_string("otp_secret")
+            .get_string("secret")
             .ok_or(AuthError::InvalidCredentials)?;
 
         let counter = config
@@ -793,18 +811,19 @@ where
 
         let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
 
-        let change = FactorStateChangeBuilder::new(factor_state.factor_id.clone(), updated_by)
+        let change = FactorStateChange::new(factor_state.factor_id.clone())
             .with_scope(scope.clone())
             .with_state(factor_state.state.clone())
-            .set_otp_config(
+            .with_config(
                 config
                     .to_builder()
-                    .with_field("counter", json!(used_counter + 1)),
-            )
-            .build();
+                    .with_field("counter", json!(used_counter + 1))
+                    .build()
+                    .into_inner(),
+            );
 
         self.backend
-            .upsert_factor_state(change)
+            .upsert_factor_state(change, updated_by)
             .await
             .map_err(AuthError::BackendError)?;
 
@@ -826,7 +845,7 @@ where
         let otp_code = form.credential().ok_or(AuthError::InvalidCredentials)?;
 
         let secret = config
-            .get_string("otp_secret")
+            .get_string("secret")
             .ok_or(AuthError::InvalidCredentials)?;
 
         let length = config.get_usize("length").unwrap_or(TOTP_LENGTH);
@@ -887,24 +906,29 @@ where
             return Err(AuthError::InvalidCredentials);
         }
 
-        let config_builder = config
+        let updated_config: HashMap<String, JsonValue> = config
             .to_builder()
             .with_length(length)
             .with_period(period)
             .with_windows(past_window, future_window)
-            .with_last_totp_step(matched_step);
+            .with_last_totp_step(matched_step)
+            .into();
 
-        let updated_by = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
-
-        let change = FactorStateChangeBuilder::new(factor_state.factor_id.clone(), updated_by)
+        let change = FactorStateChange::new(factor_state.factor_id.clone())
             .with_scope(scope.clone())
             .with_state(factor_state.state.clone())
-            .set_otp_config(config_builder)
-            .build();
+            .with_config(updated_config);
 
         // Persist updated factor state
+        let updated_by = match self.get_user_id().cloned() {
+            Some(uid) => uid,
+            None => {
+                error!("process_totp_success: Failed to find user ID for updating factor state");
+                return Err(AuthError::UserNotFound);
+            }
+        };
         self.backend
-            .upsert_factor_state(change)
+            .upsert_factor_state(change, updated_by)
             .await
             .map_err(AuthError::BackendError)?;
 
@@ -936,21 +960,15 @@ where
         let factor_state = factor_states.first().ok_or(AuthError::FactorNotFound)?;
 
         let config_map = factor_state.config.clone();
-        let config_value = serde_json::Value::Object(
-            config_map
-                .clone()
-                .into_iter()
-                .collect::<serde_json::Map<String, serde_json::Value>>(),
-        );
-        let factor_config = FactorConfig::from_map(config_map);
-
-        form.verify_against_config(&config_value)
+        form.verify_against_config(&config_map)
             .map_err(|_| AuthError::InvalidCredentials)?;
 
+        let factor_config = FactorConfig::from_map(config_map.clone());
+
         if form.factor_kind() == AuthFactorKind::Otp {
-            let otp_type: OtpType = config_value
-                .get("otp_type")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
+            let otp_type: OtpType = factor_config
+                .get_value("otp_type")
+                .and_then(|v| from_value(v.clone()).ok())
                 .unwrap_or(OtpType::Totp);
 
             match otp_type {
@@ -1321,7 +1339,7 @@ where
 
         let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
 
-        let config_map = match factor_kind {
+        let config = match factor_kind {
             AuthFactorKind::Password => {
                 FactorConfigBuilder::password(generate_password_hash(credential))
                     .build()
@@ -1342,10 +1360,10 @@ where
 
                 let otp_type = stored_config
                     .get_value("otp_type")
-                    .and_then(|raw| serde_json::from_value::<OtpType>(raw.clone()).ok())
+                    .and_then(|raw| from_value::<OtpType>(raw.clone()).ok())
                     .unwrap_or(OtpType::Totp);
 
-                let builder = if stored_config.is_empty() {
+                if stored_config.is_empty() {
                     match otp_type {
                         OtpType::Totp => FactorConfigBuilder::totp(credential.to_owned()),
                         OtpType::Hotp => FactorConfigBuilder::hotp(credential.to_owned()),
@@ -1357,42 +1375,26 @@ where
                     stored_config
                         .to_builder()
                         .with_secret(credential.to_owned())
-                };
-
-                // TODO: This should be read from some kind configurable default?
-                let builder = match otp_type {
-                    OtpType::Totp => builder
-                        .with_length(TOTP_LENGTH)
-                        .with_period(TOTP_PERIOD)
-                        .with_windows(1, 0)
-                        .with_last_totp_step(0),
-                    OtpType::Hotp => builder
-                        .with_length(HOTP_LENGTH)
-                        .with_field("counter", json!(0)),
-                    OtpType::Custom(_) => builder,
-                };
-
-                builder.build().into_inner()
+                }
+                .into()
             }
             AuthFactorKind::Oauth => FactorConfigBuilder::new()
                 .with_field("provider", json!(credential))
-                .build()
-                .into_inner(),
+                .into(),
             AuthFactorKind::Custom(_) => FactorConfigBuilder::new()
                 .with_field("credential", json!(credential))
-                .build()
-                .into_inner(),
+                .into(),
         };
 
-        // 6. Create FactorStateChange to enable the factor
-        let change = FactorStateChange::new(factor.id.clone(), user_id.clone())
+        // 6. Create a FactorStateChange to be able to upsert the FactorState.
+        let change = FactorStateChange::new(factor.id.clone())
             .with_scope(scope)
             .with_state(EnablementState::Active)
-            .with_config(config_map);
+            .with_config(config);
 
-        // 7. Upsert - backend handles all the logic
+        // 7. Upsert FactorState to enable the linked FactorInstance.
         self.backend
-            .upsert_factor_state(change)
+            .upsert_factor_state(change, user_id)
             .await
             .map_err(AuthError::BackendError)?;
 
@@ -1891,6 +1893,7 @@ mod tests {
         assert!(matches!(result, Err(AuthError::FactorNotFound)));
         Ok(())
     }
+
     #[tokio::test]
     async fn test_verify_factor_invalid_credentials_when_form_verification_fails()
     -> Result<(), AuthError<MockBackend>> {
@@ -1913,14 +1916,14 @@ mod tests {
         let factor_id = "password-factor".to_string();
         let scope = PermissionScope::User(tenant_id.clone(), user_id.clone());
 
-        let change = FactorStateChange::new(factor_id.clone(), user_id.clone())
+        let change = FactorStateChange::new(factor_id.clone())
             .with_scope(scope.clone())
             .with_state(EnablementState::Active)
             .with_config(HashMap::new());
 
         auth_session
             .backend
-            .upsert_factor_state(change)
+            .upsert_factor_state(change, user_id.clone())
             .await
             .expect("mock backend upsert should succeed");
 

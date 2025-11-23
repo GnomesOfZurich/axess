@@ -17,6 +17,54 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
 
+/// Tracks the in-flight state of a multi-factor authentication session.
+///
+/// `PartialAuthState` is used when a user is progressing through a multi-factor authentication flow.
+/// It records which method is being used, which factors remain to be verified, how many attempts have been made,
+/// and when the last attempt occurred. This struct enables replay-safe, stepwise authentication and supports
+/// lockout and audit features.
+///
+/// # Fields
+/// - `current_method`: The authentication method being verified (may include multiple factors).
+/// - `remaining_factors`: List of factor IDs still required for completion.
+/// - `attempt_count`: Number of verification attempts made in this session.
+/// - `last_attempt`: Timestamp of the most recent attempt (if any).
+///
+/// # Usage
+/// - Used by [`AuthState::PartialAuthn`] to represent sessions that are not yet fully authenticated.
+/// - Methods allow marking factors as applied, querying the next required factor, and incrementing attempt counters.
+/// - Supports lockout, audit, and replay protection in authentication flows.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::state::{PartialAuthState, AuthState};
+/// use axess_core::authn::methods::{MethodInstance, factor::{AuthFactorKind, FactorInstance}};
+///
+/// // Example factor and method construction
+/// let factor = FactorInstance::<String, String>::new(
+///     "factor1".to_string(),
+///     AuthFactorKind::Password,
+///     "Password",
+///     "Primary login password",
+///     "user1".to_string(),
+/// );
+/// let method = MethodInstance::<String, String, String>::new(
+///     "method1".to_string(),
+///     "Password Only",
+///     "Password based authentication",
+///     vec![factor],
+///     "user1".to_string(),
+/// );
+///
+/// let mut partial = PartialAuthState::new(method);
+/// partial.remaining_factors = vec!["factor1".to_string(), "factor2".to_string()];
+/// assert_eq!(partial.next_factor_id(), Some(&"factor1".to_string()));
+/// partial.apply_factor(&"factor1".to_string());
+/// assert_eq!(partial.next_factor_id(), Some(&"factor2".to_string()));
+/// partial.increment_attempt();
+/// ```
+///
+/// See [`AuthState`] for how this is used in session flows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound(
     serialize = "M: Serialize, F: Serialize, U: Serialize",
@@ -28,9 +76,13 @@ where
     F: FactorId + serde::de::DeserializeOwned + serde::Serialize,
     U: UserId + serde::de::DeserializeOwned + serde::Serialize,
 {
+    /// The authentication method being verified (may include multiple factors).
     pub current_method: MethodInstance<M, F, U>,
+    /// List of factor IDs still required for completion.
     pub remaining_factors: Vec<F>,
+    /// Number of verification attempts made in this session.
     pub attempt_count: u32,
+    /// Timestamp of the most recent attempt (if any).
     pub last_attempt: Option<DateTime<Utc>>,
 }
 
@@ -65,6 +117,7 @@ where
         self.remaining_factors.first()
     }
 
+    /// Returns the next expected factor, if some is required.
     pub fn next_factor(&self) -> Option<&FactorInstance<F, U>> {
         self.next_factor_id().and_then(|factor_id| {
             self.current_method
@@ -74,6 +127,7 @@ where
         })
     }
 
+    /// Returns whether there are any remaining factors expecting validation or not.
     pub fn is_complete(&self) -> bool {
         self.remaining_factors.is_empty()
     }
@@ -96,9 +150,12 @@ where
     F: FactorId,
     U: UserId,
 {
+    /// The session has not yet started authentication.
     #[default]
     NotAuthenticated,
+    /// The session is in progress, with one or more factors remaining.
     PartialAuthn(PartialAuthState<M, F, U>),
+    /// The session has completed all required authentication steps.
     Authenticated,
 }
 
@@ -108,6 +165,9 @@ where
     F: FactorId,
     U: UserId,
 {
+    /// Creates a new partial authentication state for the given method.
+    ///
+    /// Initializes the remaining factors from the method's factor list.
     pub fn new_partial(method: MethodInstance<M, F, U>) -> Self {
         let mut partial = PartialAuthState::new(method);
         partial.remaining_factors = partial
@@ -119,6 +179,9 @@ where
         AuthState::PartialAuthn(partial)
     }
 
+    /// Sets the attempt count for a partial authentication state.
+    ///
+    /// Returns the updated state, or self if not in partial authentication.
     pub fn with_attempt(self, attempt: u32) -> Self {
         match self {
             AuthState::PartialAuthn(mut partial) => {
@@ -128,18 +191,40 @@ where
             _ => self,
         }
     }
-
-    // pub fn increment_attempt(self) -> Self {
-    //     match self {
-    //         AuthState::PartialAuthn(mut partial) => {
-    //             partial = partial.increment_attempt();
-    //             AuthState::PartialAuthn(partial)
-    //         }
-    //         _ => self,
-    //     }
-    // }
 }
 
+/// Stores all per-session authentication and user state for an active session.
+///
+/// `Data` is the central payload for session management in Axess. It tracks the current tenant and user,
+/// the user's entity state (e.g., Guest, Active, Suspended), the authentication state (including multi-factor progress),
+/// a hash of the authentication state for replay protection, and any custom session data needed by the application.
+///
+/// This struct is designed to be serializable and extensible, supporting DST (Deterministic Simulation Testing)
+/// and audit logging. It is used by session extractors, middleware, and backend storage.
+///
+/// # Fields
+/// - `tenant_id`: Optional tenant ID if the session is scoped to a tenant.
+/// - `user_id`: Optional user ID if the session is authenticated.
+/// - `user_state`: Current state of the user entity (see [`EntityState`](../backend.rs)).
+/// - `auth_state`: Current authentication state (see [`AuthState`]).
+/// - `auth_hash`: Optional hash of the authentication state for replay protection and audit.
+/// - `custom_data`: Arbitrary custom session data as a map of string keys to JSON values.
+///
+/// # Usage
+/// - Used as the session payload in Axess extractors and middleware.
+/// - Supports multi-tenant and multi-factor authentication flows.
+/// - Extensible for application-specific session data.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::state::{Data, AuthState};
+/// use axess_core::authn::backend::EntityState;
+/// use std::collections::HashMap;
+///
+/// let session_data = Data::<String, String, String, String>::default();
+/// assert_eq!(session_data.user_state, EntityState::Guest);
+/// assert!(matches!(session_data.auth_state, AuthState::NotAuthenticated));
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(bound(
     serialize = "M: Serialize, F: Serialize, U: Serialize, T: Serialize",
@@ -152,12 +237,18 @@ where
     U: UserId,
     T: TenantId,
 {
-    pub tenant_id: Option<T>,                    // Tenant ID if applicable
-    pub user_id: Option<U>,                      // User ID if authenticated
-    pub user_state: EntityState,                 // Current user state
-    pub auth_state: AuthState<M, F, U>,          // Current authentication state
-    pub auth_hash: Option<String>,               // Hash of the authentication state
-    pub custom_data: HashMap<String, JsonValue>, // Additional custom session data
+    /// Tenant ID if applicable.
+    pub tenant_id: Option<T>,
+    /// User ID if authenticated.
+    pub user_id: Option<U>,
+    /// Current user state (see [`EntityState`](../backend.rs)).
+    pub user_state: EntityState,
+    /// Current authentication state (see [`AuthState`]).
+    pub auth_state: AuthState<M, F, U>,
+    /// Hash of the authentication state for replay protection and audit.
+    pub auth_hash: Option<String>,
+    /// Additional custom session data.
+    pub custom_data: HashMap<String, JsonValue>,
 }
 
 impl<M, F, U, T> Data<M, F, U, T>
@@ -167,6 +258,7 @@ where
     U: UserId,
     T: TenantId,
 {
+    /// Constructs a new `Data` instance with all fields specified.
     pub fn new(
         tenant_id: Option<T>,
         user_id: Option<U>,
@@ -195,29 +287,72 @@ where
 {
     fn default() -> Self {
         Self {
-            tenant_id: None,                                    // Default tenant ID
-            user_id: None,                                      // Default user ID
-            user_state: EntityState::Guest,                     // Default user state
-            auth_state: AuthState::<M, F, U>::NotAuthenticated, // Default authentication state
+            tenant_id: None,
+            user_id: None,
+            user_state: EntityState::Guest,
+            auth_state: AuthState::<M, F, U>::NotAuthenticated,
             auth_hash: None,
-            custom_data: HashMap::new(), // Default empty custom data
+            custom_data: HashMap::new(),
         }
     }
 }
 
+/// Enumerates all possible authentication-related events tracked by Axess.
+///
+/// `AuthEventType` is used for audit logging, session state transitions, and backend queries.
+/// Each variant represents a distinct event in the authentication lifecycle, such as login attempts,
+/// factor verification, password resets, and session expiry.
+///
+/// # Variants
+/// - `Authenticated`: Successful completion of all required authentication steps.
+/// - `LoginAttempt`: Attempt to log in (may succeed or fail).
+/// - `LogoutAttempt`: Attempt to log out.
+/// - `FactorVerified`: Successful verification of an authentication factor (e.g., password, TOTP).
+/// - `FactorSetup`: Setup of a new authentication factor.
+/// - `FactorEnabled`: Enabling an authentication factor.
+/// - `FactorDisabled`: Disabling an authentication factor.
+/// - `MethodEnabled`: Enabling an authentication method.
+/// - `MethodDisabled`: Disabling an authentication method.
+/// - `PasswordReset`: Password reset event.
+/// - `SessionExpired`: Session expired due to inactivity or policy.
+/// - `SessionInvalidated`: Session was explicitly invalidated (e.g., admin logout).
+///
+/// # Usage
+/// Use `AuthEventType` for filtering and querying authentication events in the backend,
+/// for audit trails, and for driving session state transitions in authentication flows.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::state::AuthEventType;
+///
+/// let event = AuthEventType::LoginAttempt;
+/// assert_eq!(event.as_str(), "login_attempt");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthEventType {
+    /// Successful completion of all required authentication steps.
     Authenticated,
+    /// Attempt to log in (may succeed or fail).
     LoginAttempt,
+    /// Attempt to log out.
     LogoutAttempt,
+    /// Successful verification of an authentication factor (e.g., password, TOTP).
     FactorVerified,
+    /// Setup of a new authentication factor.
     FactorSetup,
+    /// Enabling an authentication factor.
     FactorEnabled,
+    /// Disabling an authentication factor.
     FactorDisabled,
+    /// Enabling an authentication method.
     MethodEnabled,
+    /// Disabling an authentication method.
     MethodDisabled,
+    /// Password reset event.
     PasswordReset,
+    /// Session expired due to inactivity or policy.
     SessionExpired,
+    /// Session was explicitly invalidated (e.g., admin logout).
     SessionInvalidated,
 }
 
@@ -269,17 +404,46 @@ impl Display for AuthEventType {
     }
 }
 
+/// Enumerates the possible outcomes or statuses for authentication events.
+///
+/// `AuthEventStatus` is used to classify the result of an authentication-related event,
+/// such as login attempts, factor verifications, or session changes. This enables
+/// audit logging, policy enforcement, and analytics on authentication flows.
+///
+/// # Variants
+/// - `Success`: The event completed successfully (e.g., login succeeded, factor verified).
+/// - `Failure`: The event failed (e.g., incorrect credentials, verification failed).
+/// - `Locked`: The event was blocked due to lockout (e.g., too many failed attempts).
+/// - `Expired`: The event failed due to expiry (e.g., session expired).
+/// - `Suspicious`: The event was flagged as suspicious (e.g., anomaly detected).
+///
+/// # Usage
+/// Use `AuthEventStatus` in [`AuthEvent`] and [`AuthEventRecord`] to record the outcome of authentication actions.
+/// Filter or query events by status for audit, reporting, or security analysis.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::state::AuthEventStatus;
+///
+/// let status = AuthEventStatus::Success;
+/// assert_eq!(status.as_str(), "success");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AuthEventStatus {
+    /// The event completed successfully (e.g., login succeeded, factor verified).
     Success,
+    /// The event failed (e.g., incorrect credentials, verification failed).
     Failure,
+    /// The event was blocked due to lockout (e.g., too many failed attempts).
     Locked,
+    /// The event failed due to expiry (e.g., session expired).
     Expired,
+    /// The event was flagged as suspicious (e.g., anomaly detected).
     Suspicious,
 }
 
 impl AuthEventStatus {
-    /// Stable string representation for database storage
+    /// Stable string representation for database storage.
     pub fn as_str(&self) -> &'static str {
         match self {
             AuthEventStatus::Success => "success",
@@ -294,6 +458,9 @@ impl AuthEventStatus {
 impl FromStr for AuthEventStatus {
     type Err = String;
 
+    /// Parses a string into an `AuthEventStatus`.
+    ///
+    /// Accepts `"success"`, `"failure"`, `"locked"`, `"expired"`, or `"suspicious"` (case-sensitive).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "success" => Ok(AuthEventStatus::Success),
@@ -312,6 +479,63 @@ impl Display for AuthEventStatus {
     }
 }
 
+/// Represents a single authentication-related event for audit and analytics.
+///
+/// `AuthEvent` is emitted by the backend whenever a significant authentication action occurs,
+/// such as login attempts, factor verification, password resets, or session changes.
+/// Each event records core identifiers, event type and status, timestamps, and relevant context
+/// (method/factor IDs, IP address, user agent, error details).
+///
+/// This struct is central to audit logging, security analytics, and compliance reporting in Axess.
+/// Events are queryable by user, tenant, session, event type, and status.
+///
+/// # Fields
+/// - `id`: Unique event identifier (backend-specific, e.g., UUID or database key).
+/// - `user_id`: User associated with the event.
+/// - `tenant_id`: Tenant associated with the event.
+/// - `session_id`: Optional session ID for session-related events.
+/// - `event_type`: What happened (see [`AuthEventType`]).
+/// - `event_status`: Outcome of the event (see [`AuthEventStatus`]).
+/// - `event_time`: Timestamp when the event occurred.
+/// - `method_id`: Optional authentication method involved.
+/// - `factor_id`: Optional authentication factor involved.
+/// - `factor_kind`: Optional kind of factor (password, OTP, etc.).
+/// - `ip_address`: Optional IP address for the request.
+/// - `user_agent`: Optional user agent string for the request.
+/// - `error_message`: Optional error details for failed events.
+///
+/// # Usage
+/// - Used by [`AuthnBackend::record_auth_event`] to persist audit events.
+/// - Queried via [`AuthnBackend::get_auth_history`] for user login history, security analytics, and compliance.
+/// - Supports filtering by event type, status, user, tenant, and session.
+///
+/// # Example
+/// ```rust,ignore,ignore
+/// use axess_core::authn::session::state::{AuthEvent, AuthEventType, AuthEventStatus};
+/// use axess_core::authn::methods::factor::AuthFactorKind;
+/// use chrono::Utc;
+///
+/// use crate::models::MyBackend
+///
+/// let user_id = "user42".to_string();
+/// let tenant_id = "tenantA".to_string();
+///
+/// let event = AuthEvent::<MyBackend> {
+///     id: "event123".into(),
+///     user_id,
+///     tenant_id,
+///     session_id: Some("sess456".into()),
+///     event_type: AuthEventType::LoginAttempt,
+///     event_status: AuthEventStatus::Success,
+///     event_time: Utc::now(),
+///     method_id: Some("method1".into()),
+///     factor_id: Some("factor1".into()),
+///     factor_kind: Some(AuthFactorKind::Password),
+///     ip_address: Some("192.168.1.1".into()),
+///     user_agent: Some("Mozilla/5.0".into()),
+///     error_message: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(bound(
     serialize = "B::DataId: Serialize, B::UserId: Serialize, B::TenantId: Serialize, B::MethodId: Serialize, B::FactorId: Serialize",
@@ -321,56 +545,76 @@ pub struct AuthEvent<B>
 where
     B: AuthnBackend,
 {
-    // Core identifiers
+    /// Unique event identifier (backend-specific, e.g., UUID or database key).
     pub id: B::DataId,
+    /// User associated with the event.
     pub user_id: B::UserId,
+    /// Tenant associated with the event.
     pub tenant_id: B::TenantId,
+    /// Optional session ID for session-related events.
     pub session_id: Option<String>,
-
-    // What happened and when
+    /// What happened (see [`AuthEventType`]).
     pub event_type: AuthEventType,
+    /// Outcome of the event (see [`AuthEventStatus`]).
     pub event_status: AuthEventStatus,
+    /// Timestamp when the event occurred.
     pub event_time: DateTime<Utc>,
-
-    // Authentication context (as separate queryable fields)
+    /// Optional authentication method involved.
     pub method_id: Option<B::MethodId>,
+    /// Optional authentication factor involved.
     pub factor_id: Option<B::FactorId>,
+    /// Optional kind of factor (password, OTP, etc.).
     pub factor_kind: Option<AuthFactorKind>,
-
-    // Request context (authentication-related)
+    /// Optional IP address for the request.
     pub ip_address: Option<String>,
+    /// Optional user agent string for the request.
     pub user_agent: Option<String>,
-
-    // Error details (for failures)
+    /// Optional error details for failed events.
     pub error_message: Option<String>,
 }
 
-// impl<B> AuthEvent<B>
-// where
-//     B: AuthnBackend
-// {
-//     pub fn new(
-//             &self, user_id: &B::UserId, tenant_id: &B::TenantId, event_type: AuthEventType, event_status: AuthEventStatus,
-//             session_id: Option<&str>, ip_address: Option<&str>, user_agent: Option<&str>,
-//         ) -> Self {
-//         Self {
-//             id: B::DataId::new(),
-//             user_id: user_id.clone(),
-//             tenant_id: tenant_id.clone(),
-//             event_type,
-//             event_status,
-//             event_time: Utc::now(),
-//             session_id: session_id.map(|s| s.to_string()),
-//             ip_address: ip_address.map(|s| s.to_string()),
-//             user_agent: user_agent.map(|s| s.to_string()),
-//         }
-//     }
-// }
-
-/// Parameters for recording an authentication event.
+/// Builder for constructing authentication event records for audit logging and analytics.
 ///
-/// This struct groups related authentication event data to avoid
-/// passing too many individual parameters to `record_auth_event`.
+/// `AuthEventBuilder` provides an ergonomic way to assemble all relevant fields for an authentication event,
+/// such as login attempts, factor verification, password resets, and session changes. It avoids passing
+/// many individual parameters to [`AuthnBackend::record_auth_event`] by grouping related event data.
+///
+/// Use the builder methods to set optional fields (session ID, method/factor IDs, kind, IP, user agent, error message)
+/// and then pass the builder to the backend for persistence.
+///
+/// # Fields
+/// - `user_id`: Reference to the user associated with the event.
+/// - `tenant_id`: Reference to the tenant associated with the event.
+/// - `session_id`: Optional session ID for session-related events.
+/// - `event_type`: What happened (see [`AuthEventType`]).
+/// - `event_status`: Outcome of the event (see [`AuthEventStatus`]).
+/// - `method_id`: Optional authentication method involved.
+/// - `factor_id`: Optional authentication factor involved.
+/// - `factor_kind`: Optional kind of factor (password, OTP, etc.).
+/// - `ip_address`: Optional IP address for the request.
+/// - `user_agent`: Optional user agent string for the request.
+/// - `error_message`: Optional error details for failed events.
+///
+/// # Usage
+/// - Use in [`AuthnBackend::record_auth_event`] to persist audit events.
+/// - Construct with [`AuthEventBuilder::new`] and set optional fields with builder methods.
+/// - Supports all event types and statuses for flexible audit logging.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::session::state::{AuthEventBuilder, AuthEventType, AuthEventStatus};
+///
+/// let builder = AuthEventBuilder::new(
+///     &user_id,
+///     &tenant_id,
+///     AuthEventType::LoginAttempt,
+///     AuthEventStatus::Success,
+/// )
+/// .with_session_id("sess123")
+/// .with_ip_address("192.168.1.1")
+/// .with_user_agent("Mozilla/5.0")
+/// .with_error_message("none");
+/// ```
 #[derive(Debug, Clone)]
 pub struct AuthEventBuilder<'a, M, F, T, U>
 where
@@ -379,16 +623,27 @@ where
     T: TenantId,
     U: UserId,
 {
+    /// Reference to the user associated with the event.
     pub user_id: &'a U,
+    /// Reference to the tenant associated with the event.
     pub tenant_id: &'a T,
+    /// Optional session ID for session-related events.
     pub session_id: Option<&'a str>,
+    /// What happened (see [`AuthEventType`]).
     pub event_type: AuthEventType,
+    /// Outcome of the event (see [`AuthEventStatus`]).
     pub event_status: AuthEventStatus,
+    /// Optional authentication method involved.
     pub method_id: Option<&'a M>,
+    /// Optional authentication factor involved.
     pub factor_id: Option<&'a F>,
+    /// Optional kind of factor (password, OTP, etc.).
     pub factor_kind: Option<AuthFactorKind>,
+    /// Optional IP address for the request.
     pub ip_address: Option<&'a str>,
+    /// Optional user agent string for the request.
     pub user_agent: Option<&'a str>,
+    /// Optional error details for failed events.
     pub error_message: Option<&'a str>,
 }
 
@@ -399,6 +654,9 @@ where
     T: TenantId,
     U: UserId,
 {
+    /// Creates a new builder for an authentication event.
+    ///
+    /// Sets required fields: user, tenant, event type, and status.
     pub fn new(
         user_id: &'a U,
         tenant_id: &'a T,
@@ -419,43 +677,44 @@ where
             error_message: None,
         }
     }
-    /// Builder method to set session ID
+
+    /// Sets the session ID for the event.
     pub fn with_session_id(mut self, session_id: &'a str) -> Self {
         self.session_id = Some(session_id);
         self
     }
 
-    /// Builder method to set method ID
+    /// Sets the authentication method ID for the event.
     pub fn with_method_id(mut self, method_id: &'a M) -> Self {
         self.method_id = Some(method_id);
         self
     }
 
-    /// Builder method to set factor ID
+    /// Sets the authentication factor ID for the event.
     pub fn with_factor_id(mut self, factor_id: &'a F) -> Self {
         self.factor_id = Some(factor_id);
         self
     }
 
-    /// Builder method to set factor kind
+    /// Sets the kind of authentication factor for the event.
     pub fn with_factor_kind(mut self, factor_kind: AuthFactorKind) -> Self {
         self.factor_kind = Some(factor_kind);
         self
     }
 
-    /// Builder method to set IP address
+    /// Sets the IP address for the event.
     pub fn with_ip_address(mut self, ip_address: &'a str) -> Self {
         self.ip_address = Some(ip_address);
         self
     }
 
-    /// Builder method to set user agent
+    /// Sets the user agent string for the event.
     pub fn with_user_agent(mut self, user_agent: &'a str) -> Self {
         self.user_agent = Some(user_agent);
         self
     }
 
-    /// Builder method to set error message
+    /// Sets an error message for the event.
     pub fn with_error_message(mut self, error_message: &'a str) -> Self {
         self.error_message = Some(error_message);
         self

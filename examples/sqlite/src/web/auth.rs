@@ -2,13 +2,9 @@
 
 use askama::Template;
 use axess::{
-    AuthnAdminBackend, AuthnBackend, TOTP_LENGTH, TOTP_PERIOD,
-    authn::methods::{
-        MethodBuilder,
-        factor::{FactorInstance, FactorStateChangeBuilder},
-        form::{PasswordForm, TotpForm, TotpSetupForm},
-        policy::FactorConfigBuilder,
-    },
+    AuthnAdminBackend, AuthnBackend, FactorConfigBuilder, FactorInstance, MethodBuilder,
+    TOTP_LENGTH, TOTP_PERIOD,
+    form::{PasswordForm, TotpForm, TotpSetupForm},
     generate_password_hash, generate_totp_secret, verify_totp,
 };
 use axum::{
@@ -71,11 +67,17 @@ pub struct NextUrl {
 }
 
 pub mod post {
+    use std::collections::HashMap;
+
     use crate::models::entities::OurUser;
 
     use super::*;
-    use axess::{AuthFactorKind, EnablementState, MethodStateChange, PermissionScope, TOTP_PERIOD};
+    use axess::{
+        AuthFactorKind, EnablementState, FactorStateChange, MethodStateChange, PermissionScope,
+        TOTP_PERIOD,
+    };
     use axum::Extension;
+    use serde_json::Value;
 
     #[derive(Deserialize)]
     pub struct SignupRequest {
@@ -88,7 +90,7 @@ pub mod post {
 
     #[derive(Deserialize)]
     pub struct TotpSetupRequest {
-        pub otp_secret: String,
+        pub secret: String,
     }
 
     #[derive(Deserialize)]
@@ -142,16 +144,17 @@ pub mod post {
             }
         };
 
+        let user_id = Uuid::new_v4();
         let user = OurUser::new(
-            Uuid::new_v4(),
+            user_id,
             tenant.id,
             payload.username.clone(),
             payload.fullname.clone(),
             payload.email.clone(),
-            tenant.created_by,
+            user_id,
         );
 
-        if let Err(err) = backend.upsert_user(user.clone()).await {
+        if let Err(err) = backend.upsert_user(user.clone(), user.id).await {
             messages.error(format!("Failed to create user: {err}"));
             return Redirect::to("/signup").into_response();
         }
@@ -160,48 +163,55 @@ pub mod post {
             AuthFactorKind::Password,
             "password-login",
             "Password factor",
-            user.id,
+            user_id,
         );
         let totp_factor = FactorInstance::new(
             Uuid::new_v4(),
             AuthFactorKind::Otp,
             "totp-login",
             "TOTP factor",
-            user.id,
+            user_id,
         );
 
-        if let Err(err) = backend.upsert_auth_factor(password_factor.clone()).await {
+        if let Err(err) = backend
+            .upsert_auth_factor(password_factor.clone(), user_id)
+            .await
+        {
             messages.error(format!("Failed to persist password factor: {err}"));
             return Redirect::to("/signup").into_response();
         }
-        if let Err(err) = backend.upsert_auth_factor(totp_factor.clone()).await {
+        if let Err(err) = backend
+            .upsert_auth_factor(totp_factor.clone(), user_id)
+            .await
+        {
             messages.error(format!("Failed to persist TOTP factor: {err}"));
             return Redirect::to("/signup").into_response();
         }
-        let password_state = FactorStateChangeBuilder::new(password_factor.id, user.id)
-            .with_scope(PermissionScope::User(user.tenant_id, user.id))
+        let password_state = FactorStateChange::new(password_factor.id)
+            .with_scope(PermissionScope::User(user.tenant_id, user_id))
             .with_state(EnablementState::Active)
-            .set_password_hash(generate_password_hash(&payload.password))
-            .build();
+            .with_config(
+                FactorConfigBuilder::password(generate_password_hash(&payload.password)).into(),
+            );
 
-        if let Err(err) = backend.upsert_factor_state(password_state).await {
+        if let Err(err) = backend.upsert_factor_state(password_state, user_id).await {
             messages.error(format!("Failed to activate password factor: {err}"));
             return Redirect::to("/signup").into_response();
         }
 
         let totp_secret = generate_totp_secret();
-        let totp_state = FactorStateChangeBuilder::new(totp_factor.id, user.id)
-            .with_scope(PermissionScope::User(user.tenant_id, user.id))
+        let totp_state = FactorStateChange::new(totp_factor.id)
+            .with_scope(PermissionScope::User(user.tenant_id, user_id))
             .with_state(EnablementState::Pending)
-            .set_otp_config(
+            .with_config(
                 FactorConfigBuilder::totp(totp_secret.clone())
                     .with_length(TOTP_LENGTH)
                     .with_period(TOTP_PERIOD)
-                    .with_windows(1, 0),
-            )
-            .build();
+                    .with_windows(1, 0)
+                    .into(),
+            );
 
-        if let Err(err) = backend.upsert_factor_state(totp_state).await {
+        if let Err(err) = backend.upsert_factor_state(totp_state, user_id).await {
             messages.error(format!("Failed to stage TOTP factor: {err}"));
             return Redirect::to("/signup").into_response();
         }
@@ -216,16 +226,16 @@ pub mod post {
         )
         .add_factors(factors)
         .build();
-        if let Err(err) = backend.upsert_auth_method(method.clone()).await {
+        if let Err(err) = backend.upsert_auth_method(method.clone(), user_id).await {
             messages.error(format!("Failed to persist auth method: {err}"));
             return Redirect::to("/signup").into_response();
         }
 
-        let method_state = MethodStateChange::new(method.id, user.id)
-            .with_scope(PermissionScope::User(user.tenant_id, user.id))
+        let method_state = MethodStateChange::new(method.id, user_id)
+            .with_scope(PermissionScope::User(user.tenant_id, user_id))
             .with_state(EnablementState::Active);
 
-        if let Err(err) = backend.upsert_method_state(method_state).await {
+        if let Err(err) = backend.upsert_method_state(method_state, user_id).await {
             messages.error(format!("Failed to activate auth method: {err}"));
             return Redirect::to("/signup").into_response();
         }
@@ -241,7 +251,7 @@ pub mod post {
         Form(payload): Form<TotpSetupRequest>,
     ) -> impl IntoResponse {
         let form = TotpSetupForm {
-            otp_secret: payload.otp_secret,
+            secret: payload.secret,
             tenant: None,
             next: None,
         };
@@ -298,7 +308,7 @@ pub mod post {
                 .into_iter()
                 .find(|state| state.state == EnablementState::Pending)
             {
-                let secret = match state.config.get("otp_secret").and_then(|v| v.as_str()) {
+                let secret = match state.config.get("secret").and_then(|v| v.as_str()) {
                     Some(value) => value,
                     None => {
                         messages.error("TOTP factor is missing its shared secret.".to_string());
@@ -349,19 +359,20 @@ pub mod post {
                     }
                 };
 
-                let config_builder = FactorConfigBuilder::from_map(state.config.clone())
-                    .with_length(digits)
-                    .with_period(period)
-                    .with_windows(past_window, future_window)
-                    .with_last_totp_step(matched_step);
+                let config: HashMap<String, Value> =
+                    FactorConfigBuilder::from_map(state.config.clone())
+                        .with_length(digits)
+                        .with_period(period)
+                        .with_windows(past_window, future_window)
+                        .with_last_totp_step(matched_step)
+                        .into();
 
-                let change = FactorStateChangeBuilder::new(factor.id, user.id)
+                let change = FactorStateChange::new(factor.id)
                     .with_scope(scope.clone())
                     .with_state(EnablementState::Active)
-                    .set_otp_config(config_builder)
-                    .build();
+                    .with_config(config);
 
-                if let Err(err) = backend.upsert_factor_state(change).await {
+                if let Err(err) = backend.upsert_factor_state(change, user.id).await {
                     messages.error(format!("Failed to activate TOTP factor: {err}"));
                     return Html(TotpVerifyTemplate.render().unwrap_or_default()).into_response();
                 }
@@ -466,7 +477,7 @@ pub mod get {
                                 .find(|state| state.state == EnablementState::Pending)
                             {
                                 if let Some(value) =
-                                    state.config.get("otp_secret").and_then(|v| v.as_str())
+                                    state.config.get("secret").and_then(|v| v.as_str())
                                 {
                                     let digits = state
                                         .config

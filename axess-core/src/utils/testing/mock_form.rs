@@ -8,6 +8,7 @@ use crate::authn::{
         form::{FactorForm, FactorFormKind, FormField, FormFieldValue},
     },
 };
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
 #[derive(Default, Debug, serde::Deserialize, serde::Serialize)]
@@ -34,7 +35,10 @@ impl FactorForm for DummyOkForm {
         HashMap::new()
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         Ok(self)
     }
 }
@@ -63,7 +67,10 @@ impl FactorForm for DummyFailingForm {
         HashMap::new()
     }
 
-    fn verify_against_config(&self, _config: &serde_json::Value) -> Result<&Self, FormError> {
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
         Err(FormError::ValidationFailed("boom".into()))
     }
 }

@@ -1,7 +1,7 @@
 use axess::{
-    AuthEventRecord, AuthEventStatus, AuthEventType, AuthnAdminBackend, AuthnBackend,
-    EnablementState, EntityState, PermissionScope,
-    authn::methods::{MethodInstance, factor::FactorStateChange},
+    AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactorKind, AuthnAdminBackend,
+    AuthnBackend, EnablementState, EntityState, FactorStateChange, MethodInstance, PermissionScope,
+    StatusDetail, form::PasswordForm,
 };
 
 // Include the example crate's models into this integration test crate so we can refer to
@@ -57,7 +57,9 @@ async fn test_get_auth_method_returns_method()
         updated_by: system_user_id,
     };
 
-    backend.upsert_auth_method(method.clone().into()).await?;
+    backend
+        .upsert_auth_method(method.clone().into(), system_user_id)
+        .await?;
 
     // Test retrieval
     let retrieved = backend.get_auth_method(&method_id).await?;
@@ -83,7 +85,7 @@ async fn test_authenticate_with_inactive_user_returns_error()
         username: "suspended_user".to_string(),
         fullname: "Suspended User".to_string(),
         email: "suspended@example.com".to_string(),
-        state: EntityState::Suspended(axess::StatusDetail {
+        state: EntityState::Suspended(StatusDetail {
             reason: "Test suspension".to_string(),
             timestamp: Utc::now(),
             until: None,
@@ -95,14 +97,13 @@ async fn test_authenticate_with_inactive_user_returns_error()
         updated_by: system_user_id,
     };
 
-    backend.upsert_user(suspended_user).await?;
+    backend.upsert_user(suspended_user, system_user_id).await?;
 
     // Verify user exists but is not active
     let fetched = backend.get_user(&user_id).await?;
     assert!(!matches!(fetched.state, EntityState::Active));
 
     // Try to authenticate - should fail
-    use axess::authn::methods::form::PasswordForm;
     let form = PasswordForm {
         username: "suspended_user".to_string(),
         password: "password123".to_string(),
@@ -244,7 +245,7 @@ async fn test_upsert_factor_state_roundtrip() -> Result<(), Box<dyn std::error::
     let factors = backend.get_all_auth_factors().await?;
     let password_factor = factors
         .iter()
-        .find(|f| matches!(f.kind, axess::AuthFactorKind::Password))
+        .find(|f| matches!(f.kind, AuthFactorKind::Password))
         .ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from(
                 "Should have password factor from migrations",
@@ -264,11 +265,10 @@ async fn test_upsert_factor_state_roundtrip() -> Result<(), Box<dyn std::error::
         user_id: Some(system_user_id.clone()),
         state: EnablementState::Active,
         config,
-        updated_by: system_user_id.clone(),
     };
 
     // Upsert the factor state
-    let upserted = backend.upsert_factor_state(change).await?;
+    let upserted = backend.upsert_factor_state(change, system_user_id).await?;
 
     assert_eq!(upserted.factor_id, password_factor.id);
     assert!(upserted.config.contains_key("password_hash"));

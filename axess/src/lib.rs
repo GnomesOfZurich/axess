@@ -13,14 +13,18 @@ pub use axess_core::{
         methods::{
             MethodBuilder, MethodInstance, MethodStateChange,
             factor::{AuthFactorKind, FactorInstance, FactorStateChange},
-            form::{FactorForm, FactorFormExt, FormField, FormFieldValue},
+            form::{self, FactorForm, FactorFormExt, FormField, FormFieldValue},
+            policy::{FactorConfig, FactorConfigBuilder},
             scope::{EnablementState, PermissionScope},
         },
         middleware::{AuthnManager, AuthnService, AuthnServiceBuilder},
         session::{
             AuthSession,
             registry::{SessionRegistry, SessionRegistryStore},
-            state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
+            state::{
+                AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthState,
+                PartialAuthState,
+            },
         },
         types::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,

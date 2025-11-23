@@ -1,3 +1,30 @@
+//! Mock authentication helpers for Axess unit and integration tests.
+//!
+//! This module provides convenient utilities for constructing mock authentication methods,
+//! factors, sessions, and session registries for testing Axess flows. It is designed to
+//! facilitate deterministic simulation testing (DST), backend contract validation, and
+//! realistic session initialization without requiring a real database or external dependencies.
+//!
+//! # Features
+//! - [`mock_method`]: Quickly create a password-only mock authentication method.
+//! - [`create_initialized_session`]: Initialize a session in a memory store for session-based tests.
+//! - [`create_test_session`]: Create a fully initialized [`AuthSession`] and registry for backend/session tests.
+//! - [`create_test_session_with_custom_rng`]: Same as above, but allows specifying a custom RNG for DST.
+//!
+//! # Usage
+//! ```rust
+//! use axess_core::utils::testing::mock_authn::{create_test_session, mock_method};
+//!
+//! #[tokio::test]
+//! async fn test_auth_session_initialization() {
+//!     let (session, registry) = create_test_session().await.unwrap();
+//!     assert!(session.get_user_id().is_none());
+//!     // Use session and registry for further authentication flow tests...
+//! }
+//! ```
+//!
+//! See also: [`mock_backend`](mock_backend.rs), [`mock_entities`](mock_entities.rs), [`mock_form`](mock_form.rs)
+
 use crate::{
     authn::{
         backend::admin::AuthnAdminBackend,
@@ -9,10 +36,7 @@ use crate::{
         session::{AuthSession, registry::SessionRegistryStore},
         types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
     },
-    utils::{
-        // random::SystemRng,
-        testing::{mock_backend::MockBackend, mock_entities::TestUserId, mock_random::MockRng},
-    },
+    utils::testing::{mock_backend::MockBackend, mock_entities::TestUserId, mock_random::MockRng},
 };
 use std::sync::Arc;
 use tower_sessions::{
@@ -24,8 +48,6 @@ pub type MockAuthFactor = AuthFactor<MockBackend>;
 pub type MockAuthFactorState = AuthFactorState<MockBackend>;
 pub type MockAuthMethod = AuthMethod<MockBackend>;
 pub type MockAuthMethodState = AuthMethodState<MockBackend>;
-
-// pub type MockSession = AuthSession<MockBackend, SessionRegistryStore<MemoryStore>, SystemRng>;
 
 pub fn mock_method() -> AuthMethod<MockBackend> {
     let creator = TestUserId("method_creator".into());
@@ -90,7 +112,7 @@ pub async fn create_test_session() -> Result<
     // Configure backend with test method
     let method = mock_method();
     backend
-        .upsert_auth_method(method.clone())
+        .upsert_auth_method(method.clone(), TestUserId("method_creator".into()))
         .await
         .map_err(AuthError::BackendError)?;
 
@@ -128,7 +150,7 @@ pub async fn create_test_session_with_custom_rng(
     // Configure backend with test method
     let method = mock_method();
     backend
-        .upsert_auth_method(method.clone())
+        .upsert_auth_method(method.clone(), TestUserId("method_creator".into()))
         .await
         .map_err(AuthError::BackendError)?;
 

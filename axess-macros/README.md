@@ -23,8 +23,7 @@ axess = { version = "0.0.9", features = ["authn"] }
 ## Quick start
 
 ```rust
-use axess_macros::login_required;
-use axess::{AuthSession, SessionRegistryStore, SystemRng};
+use axess::{AuthSession, SessionRegistryStore, SystemRng, login_required};
 use axum::{routing::get, Router};
 
 type Session = AuthSession<MyBackend, SessionRegistryStore<MyStore>, SystemRng>;

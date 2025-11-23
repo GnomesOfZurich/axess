@@ -1,8 +1,7 @@
-use axess::utils::time as time_utils;
-use axess::{AuthTenant, AuthUser, EntityState};
+use axess::{AuthTenant, AuthUser, EntityState, StatusDetail, utils::time as time_utils};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, Row, sqlite::SqliteRow};
+use sqlx::{Error as SqlxError, FromRow, Row, sqlite::SqliteRow};
 use uuid::Uuid; // add near other use imports
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -33,13 +32,13 @@ impl AuthTenant for OurTenant {
     }
 }
 
-fn parse_state(s: &str) -> axess::EntityState {
+fn parse_state(s: &str) -> EntityState {
     match s {
-        "Active" => axess::EntityState::Active,
-        "Guest" => axess::EntityState::Guest,
+        "Active" => EntityState::Active,
+        "Guest" => EntityState::Guest,
         other => {
             // preserve original guard behavior by treating unknown as Suspended with detail
-            axess::EntityState::Suspended(axess::StatusDetail {
+            EntityState::Suspended(StatusDetail {
                 reason: format!("Unknown state: {}", other),
                 timestamp: Utc::now(),
                 until: None,
@@ -50,10 +49,10 @@ fn parse_state(s: &str) -> axess::EntityState {
 }
 
 impl<'r> FromRow<'r, SqliteRow> for OurTenant {
-    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, SqlxError> {
         // parse id with proper error mapping
         let id_str: String = row.try_get("id")?;
-        let id = Uuid::parse_str(&id_str).map_err(|e| sqlx::Error::ColumnDecode {
+        let id = Uuid::parse_str(&id_str).map_err(|e| SqlxError::ColumnDecode {
             index: "id".into(),
             source: Box::new(e),
         })?;
@@ -67,7 +66,7 @@ impl<'r> FromRow<'r, SqliteRow> for OurTenant {
         let state = state_txt
             .as_deref()
             .map(parse_state)
-            .unwrap_or(axess::EntityState::Guest);
+            .unwrap_or(EntityState::Guest);
 
         // created_at / updated_at using shared flexible parser
         let created_at = parse_datetime_flexible_row(row, "created_at")?.unwrap_or_else(Utc::now);
@@ -76,14 +75,14 @@ impl<'r> FromRow<'r, SqliteRow> for OurTenant {
         // created_by / updated_by with UUID error mapping
         let created_by =
             Uuid::parse_str(&row.try_get::<String, _>("created_by")?).map_err(|e| {
-                sqlx::Error::ColumnDecode {
+                SqlxError::ColumnDecode {
                     index: "created_by".into(),
                     source: Box::new(e),
                 }
             })?;
         let updated_by =
             Uuid::parse_str(&row.try_get::<String, _>("updated_by")?).map_err(|e| {
-                sqlx::Error::ColumnDecode {
+                SqlxError::ColumnDecode {
                     index: "updated_by".into(),
                     source: Box::new(e),
                 }
@@ -173,20 +172,19 @@ impl AuthUser for OurUser {
     }
 }
 
-impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for OurUser {
-    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+impl<'r> FromRow<'r, SqliteRow> for OurUser {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, SqlxError> {
         // read string columns defensively
         let id_str: String = row.try_get("id")?;
         let tenant_str: String = row.try_get("tenant_id")?;
-        let id = uuid::Uuid::parse_str(&id_str).map_err(|e| sqlx::Error::ColumnDecode {
+        let id = Uuid::parse_str(&id_str).map_err(|e| SqlxError::ColumnDecode {
             index: "id".into(),
             source: Box::new(e),
         })?;
-        let tenant_id =
-            uuid::Uuid::parse_str(&tenant_str).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "tenant_id".into(),
-                source: Box::new(e),
-            })?;
+        let tenant_id = Uuid::parse_str(&tenant_str).map_err(|e| SqlxError::ColumnDecode {
+            index: "tenant_id".into(),
+            source: Box::new(e),
+        })?;
 
         // Prefer user_state then state, fallback to Guest
         let state_txt: Option<String> = row
@@ -197,7 +195,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for OurUser {
         let state = state_txt
             .as_deref()
             .map(parse_state)
-            .unwrap_or(axess::EntityState::Guest);
+            .unwrap_or(EntityState::Guest);
 
         // created_at/updated_at tolerant parsing
         let created_at = parse_datetime_flexible_row(row, "created_at")?.unwrap_or_else(Utc::now);
@@ -205,15 +203,15 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for OurUser {
 
         // created_by/updated_by UUID parsing with error mapping
         let created_by =
-            uuid::Uuid::parse_str(&row.try_get::<String, _>("created_by")?).map_err(|e| {
-                sqlx::Error::ColumnDecode {
+            Uuid::parse_str(&row.try_get::<String, _>("created_by")?).map_err(|e| {
+                SqlxError::ColumnDecode {
                     index: "created_by".into(),
                     source: Box::new(e),
                 }
             })?;
         let updated_by =
-            uuid::Uuid::parse_str(&row.try_get::<String, _>("updated_by")?).map_err(|e| {
-                sqlx::Error::ColumnDecode {
+            Uuid::parse_str(&row.try_get::<String, _>("updated_by")?).map_err(|e| {
+                SqlxError::ColumnDecode {
                     index: "updated_by".into(),
                     source: Box::new(e),
                 }
@@ -239,7 +237,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for OurUser {
 fn parse_datetime_flexible_row(
     row: &SqliteRow,
     col: &str,
-) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+) -> Result<Option<DateTime<Utc>>, SqlxError> {
     // Extract possible TEXT and INTEGER representations and delegate to shared helper.
     let txt_opt = row.try_get::<Option<String>, _>(col).ok().flatten();
     let int_opt = row.try_get::<Option<i64>, _>(col).ok().flatten();

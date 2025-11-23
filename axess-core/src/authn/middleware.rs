@@ -19,7 +19,6 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    // str::FromStr,
 };
 use tower_cookies::CookieManager;
 use tower_layer::Layer;
@@ -29,6 +28,46 @@ use tower_sessions::{
     service::{CookieController, PlaintextCookie},
 };
 
+/// Axess authentication middleware for extracting and managing session state.
+///
+/// `AuthnManager` is a tower service that wraps an inner Axum service, injecting an [`AuthSession`]
+/// into each request's extensions. It coordinates session lookup, guest user initialization,
+/// session registry updates, and session hash generation, ensuring that every request has
+/// authenticated context available for downstream handlers and middleware.
+///
+/// This middleware is central to Axess's authentication flow, supporting multi-tenancy,
+/// session persistence, and deterministic simulation testing (DST). It works with any backend
+/// implementing [`AuthnBackend`] and any session registry implementing [`SessionRegistry`].
+///
+/// # Fields
+/// - `inner`: The wrapped Axum service.
+/// - `backend`: Shared backend implementing [`AuthnBackend`] for user, tenant, and factor management.
+/// - `data_key`: Key used to store session data in the session store.
+/// - `session_registry`: Optional registry for distributed session management.
+///
+/// # Usage
+/// - Used via [`AuthnService`] and [`AuthnServiceBuilder`] to provide authentication context.
+/// - Automatically inserts an [`AuthSession`] into request extensions for extractors and handlers.
+/// - Handles guest user initialization and session hash registration for new sessions.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::middleware::{AuthnManager, AuthnServiceBuilder};
+/// use axess_core::authn::backend::AuthnBackend;
+/// use axess_core::authn::session::{AuthSession, registry::SessionRegistryStore};
+/// use tower_sessions::MemoryStore;
+/// use std::sync::Arc;
+///
+/// let backend = Arc::new(MyBackend::new());
+/// let session_store = MemoryStore::default();
+/// let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+/// let session_manager_layer = tower_sessions::SessionManagerLayer::new(session_store.clone());
+///
+/// let auth_service = AuthnServiceBuilder::new(backend.clone(), session_manager_layer)
+///     .with_session_registry(session_registry.clone())
+///     .build();
+/// // Use `auth_service` as a layer in your Axum router.
+/// ```
 #[derive(Debug, Clone)]
 pub struct AuthnManager<S, B, R>
 where
@@ -52,7 +91,6 @@ where
     B::TenantId: From<<B::User as AuthUser>::TenantId>,
     B::TenantId: From<<B::Tenant as crate::authn::backend::AuthTenant>::Id>,
     R: SessionRegistry + Send + Sync + Debug + 'static,
-    // Rng: SecureRng + Default + Clone + Send + Sync + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -191,7 +229,33 @@ where
     }
 }
 
-/// A layer for providing [`AuthSession`] as a request extension.
+/// Axess authentication and session management layer for Axum applications.
+///
+/// `AuthnService` is a middleware layer that integrates Axess authentication with
+/// tower-sessions, automatically extracting and injecting an [`AuthSession`] into
+/// each request's extensions. It coordinates session persistence, registry updates,
+/// and backend wiring, enabling secure, multi-tenant, and multi-factor authentication flows.
+///
+/// This layer wraps your Axum router or service, ensuring that all downstream handlers
+/// and extractors have access to the current authentication context, including user,
+/// tenant, session state, and factor verification progress.
+///
+/// # Fields
+/// - `backend`: Shared backend implementing [`AuthnBackend`] for user, tenant, and factor management.
+/// - `session_manager_layer`: Layer for session management (e.g., tower-sessions).
+/// - `data_key`: Key used to store session data in the session store (defaults to `"axess.data"`).
+/// - `session_registry`: Optional registry for distributed session management.
+///
+/// # Usage
+/// Use as a layer in your Axum router to enable authentication and session management.
+/// Construct via [`AuthnServiceBuilder`] for ergonomic configuration.
+///
+/// # Example
+/// ```rust,ignore
+/// let app = axum::Router::new()
+///     .route("/protected", axum::routing::get(protected_handler))
+///     .layer(auth_service); // where auth_service is built via AuthnServiceBuilder
+/// ```
 #[derive(Debug, Clone)]
 pub struct AuthnService<
     B: AuthnBackend,
@@ -241,6 +305,44 @@ impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry + Debug, C: 
     }
 }
 
+/// Builder for configuring and constructing the Axess authentication service layer.
+///
+/// `AuthnServiceBuilder` provides a fluent API for assembling an [`AuthnService`] that integrates
+/// Axess authentication and session management into an Axum application. It allows you to specify
+/// the backend, session manager, session registry, and custom session data key, producing a middleware
+/// layer that injects [`AuthSession`] into request extensions for authentication and authorization flows.
+///
+/// # Fields
+/// - `backend`: Shared backend implementing [`AuthnBackend`] for user, tenant, and factor management.
+/// - `session_manager_layer`: Layer for session management (e.g., tower-sessions).
+/// - `data_key`: Optional key used to store session data in the session store (defaults to `"axess.data"`).
+/// - `session_registry`: Optional registry for distributed session management.
+///
+/// # Usage
+/// - Use [`AuthnServiceBuilder::new`] to start configuration.
+/// - Optionally call [`with_session_registry`] to enable distributed session invalidation.
+/// - Optionally call [`with_data_key`] to customize the session data key.
+/// - Call [`build`] to produce an [`AuthnService`] for use as an Axum middleware layer.
+///
+/// # Example
+/// ```rust,ignore
+/// use axess_core::authn::middleware::{AuthnServiceBuilder, AuthnService};
+/// use axess_core::authn::backend::AuthnBackend;
+/// use axess_core::authn::session::registry::SessionRegistryStore;
+/// use tower_sessions::MemoryStore;
+/// use std::sync::Arc;
+///
+/// let backend = Arc::new(MyBackend::new());
+/// let session_store = MemoryStore::default();
+/// let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+/// let session_manager_layer = tower_sessions::SessionManagerLayer::new(session_store.clone());
+///
+/// let auth_service = AuthnServiceBuilder::new(backend.clone(), session_manager_layer)
+///     .with_session_registry(session_registry.clone())
+///     .with_data_key("custom.data.key")
+///     .build();
+/// // Use `auth_service` as a layer in your Axum router.
+/// ```
 #[derive(Debug, Clone)]
 pub struct AuthnServiceBuilder<
     B: AuthnBackend,
@@ -302,13 +404,11 @@ mod tests {
             testing::{mock_backend::MockBackend, mock_tracing::init_tracing},
         },
     };
-    use axum::http::{Request, StatusCode};
-    // use axum::body::Body;
-    use std::str::FromStr;
-    use tower_sessions::{MemoryStore, SessionManagerLayer};
-    // use std::sync::Arc;
     use axum::extract::Extension;
+    use axum::http::{Request, StatusCode};
+    use std::str::FromStr;
     use tower::ServiceExt;
+    use tower_sessions::{MemoryStore, SessionManagerLayer};
 
     fn build_test_app(store: Arc<MemoryStore>) -> axum::Router {
         let backend = Arc::new(MockBackend::default());
@@ -336,8 +436,8 @@ mod tests {
             .layer(auth_service)
     }
 
-    /// Test that the middleware correctly inserts an AuthSession into request extensions.
     #[tokio::test]
+    /// Ensures that AuthSession is available in request extensions after middleware runs.
     async fn test_middleware_inserts_auth_session_extension() {
         init_tracing();
         info!("starting test_middleware_inserts_auth_session_extension");
@@ -358,6 +458,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verifies that a session ID is created and persisted for a new visitor.
     async fn test_session_id_is_created_and_persisted_for_new_visitor() {
         init_tracing();
         info!("starting test_session_id_is_created_and_persisted_for_new_visitor");
@@ -409,6 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Checks that the session manager persists the session after a response is sent.
     async fn test_session_manager_persists_session_on_response() {
         init_tracing();
         info!("starting test_session_manager_persists_session_on_response");

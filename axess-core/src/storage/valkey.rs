@@ -14,10 +14,7 @@ use fred::{
     },
 };
 use rmp_serde::{self, decode::Error as DecodeError, encode::Error as EncodeError};
-use std::{
-    fmt::Debug,
-    // env,
-};
+use std::fmt::Debug;
 use time::OffsetDateTime;
 use tower_sessions::{
     SessionStore,
@@ -25,8 +22,6 @@ use tower_sessions::{
     session_store,
 };
 use tracing::{error, info};
-
-// use crate::cache::SessionStore;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValkeyStoreError {
@@ -38,8 +33,6 @@ pub enum ValkeyStoreError {
 
     #[error(transparent)]
     Encode(#[from] EncodeError),
-    // #[error("An error occurred: {0}")]
-    // GenericError(String),
 }
 
 impl From<ValkeyStoreError> for session_store::Error {
@@ -429,8 +422,9 @@ pub async fn init_valkey_cluster_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde_json::Value as JsonValue;
     use std::collections::HashMap;
-    // use tracing::warn;
 
     #[tokio::test]
     #[ignore]
@@ -549,7 +543,7 @@ mod tests {
         let mut session_data = HashMap::new();
         session_data.insert(
             "balance".to_string(),
-            serde_json::Value::String("1000.00".to_string()), // Financial data
+            JsonValue::String("1000.00".to_string()), // Financial data
         );
 
         let record = Record {

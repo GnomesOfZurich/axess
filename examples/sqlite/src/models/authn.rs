@@ -1,9 +1,10 @@
 use crate::models::backend::OurBackend;
 use axess::{
-    AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession, EnablementState,
-    SessionRegistryStore, SystemRng,
+    AuthFactor, AuthFactorKind, AuthFactorState, AuthMethod, AuthMethodState, AuthSession,
+    EnablementState, SessionRegistryStore, SystemRng,
 };
 use chrono::{DateTime, Utc};
+use serde_json::Value as JsonValue;
 use sqlx::{FromRow, Row, sqlite::SqliteRow};
 use std::collections::HashMap;
 use tower_sessions_sqlx_store::SqliteStore;
@@ -29,8 +30,8 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthFactor {
         })?;
 
         let kind_txt: String = row.try_get("kind")?;
-        let kind = serde_json::from_str::<axess::AuthFactorKind>(&format!("\"{}\"", kind_txt))
-            .unwrap_or(axess::AuthFactorKind::Custom(kind_txt.clone()));
+        let kind = serde_json::from_str::<AuthFactorKind>(&format!("\"{}\"", kind_txt))
+            .unwrap_or(AuthFactorKind::Custom(kind_txt.clone()));
 
         let name: String = row.try_get("name")?;
         let description: String = row.try_get("description")?;
@@ -102,17 +103,15 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthFactorState {
             .and_then(|s| uuid::Uuid::parse_str(&s).ok());
 
         // tolerant config JSON
-        let config: HashMap<String, serde_json::Value> =
-            match row.try_get::<Option<String>, _>("config")? {
-                Some(s) => serde_json::from_str::<HashMap<String, serde_json::Value>>(&s)
-                    .unwrap_or_default(),
-                None => HashMap::new(),
-            };
+        let config: HashMap<String, JsonValue> = match row.try_get::<Option<String>, _>("config")? {
+            Some(s) => serde_json::from_str::<HashMap<String, JsonValue>>(&s).unwrap_or_default(),
+            None => HashMap::new(),
+        };
 
         let state_txt: String = row.try_get("state")?;
         let state = match state_txt.as_str() {
-            "Active" => axess::EnablementState::Active,
-            "Inactive" => axess::EnablementState::Inactive,
+            "Active" => EnablementState::Active,
+            "Inactive" => EnablementState::Inactive,
             other => {
                 return Err(sqlx::Error::ColumnDecode {
                     index: "state".into(),

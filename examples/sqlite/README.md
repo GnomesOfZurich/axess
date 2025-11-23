@@ -71,13 +71,15 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
 ## Example Code Snippet
 
 ```rust
-use axess::{AuthnServiceBuilder, SessionRegistryStore, SystemRng, login_required};
+use axess::{AuthSession, AuthnServiceBuilder, SessionRegistryStore, SystemRng, login_required};
 use axum::{Router, routing::get};
 use tower_sessions_sqlx_store::SqliteStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
-type Session = axess::AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
+use crate::{models::OurBackend, routers::{auth_router, protected_router}};
+
+type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
 let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
 let backend = Arc::new(OurBackend::new(pool.clone()));

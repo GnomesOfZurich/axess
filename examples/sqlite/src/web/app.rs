@@ -7,6 +7,7 @@ use time::Duration;
 use tokio::{signal, task::AbortHandle};
 use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer, cookie::Key};
 use tower_sessions_sqlx_store::SqliteStore;
+use uuid::Uuid;
 
 use crate::{
     models::backend::OurBackend,
@@ -14,12 +15,16 @@ use crate::{
 };
 use axess::{AuthnServiceBuilder, SessionRegistryStore};
 
-// #[derive(Clone)]
-// pub struct AppState {
-//     pub db: SqlitePool,
-// }
+#[derive(Clone)]
+pub struct AppState {
+    pub default_tenant_id: Uuid,
+    pub system_super_user_id: Uuid,
+    pub tenant_super_user_id: Uuid,
+    //     pub db: SqlitePool,
+}
 
 pub struct App {
+    pub state: Arc<AppState>,
     // db: SqlitePool,
     // pub backend: std::sync::Arc<OurBackend>,
     // pub session_store: Arc<SqliteStore>,
@@ -28,7 +33,13 @@ pub struct App {
 
 impl App {
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {})
+        Ok(Self {
+            state: Arc::new(AppState {
+                default_tenant_id: Uuid::nil(),
+                system_super_user_id: Uuid::nil(),
+                tenant_super_user_id: Uuid::nil(),
+            }),
+        })
     }
 
     pub async fn serve(
