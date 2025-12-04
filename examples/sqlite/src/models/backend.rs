@@ -10,7 +10,9 @@ use axess::{
     AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind,
     AuthFactorState, AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, EnablementState,
     EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, MethodStateChange,
-    PermissionScope, TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp,
+    PermissionScope, TOTP_LENGTH, TOTP_PERIOD,
+    // WorkflowState, WorkflowStep, WorkflowStepKind,
+    verify_password, verify_totp,
 };
 
 use crate::models::{
@@ -41,6 +43,32 @@ impl PartialEq for OurBackend {
         true
     }
 }
+
+// /// Helper to build the signup workflow
+// pub fn build_signup_workflow() -> WorkflowState {
+//     WorkflowState {
+//         steps: vec![
+//             WorkflowStep {
+//                 kind: WorkflowStepKind::FactorVerify(AuthFactorKind::Otp), // Email verification
+//                 description: "Verify your email".to_string(),
+//                 completed: false,
+//                 completed_at: None,
+//                 metadata: None,
+//             },
+//             WorkflowStep {
+//                 kind: WorkflowStepKind::FactorSetup(AuthFactorKind::Otp), // TOTP setup
+//                 description: "Setup TOTP".to_string(),
+//                 completed: false,
+//                 completed_at: None,
+//                 metadata: None,
+//             },
+//         ],
+//         current_step: 0,
+//         started_at: Utc::now(),
+//         last_updated: Utc::now(),
+//         blocking: true,
+//     }
+// }
 
 // Small parsing helpers used when reading enum values stored as text in the DB.
 fn parse_enum_or_default<T>(s: Option<String>) -> T

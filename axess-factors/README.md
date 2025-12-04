@@ -15,7 +15,7 @@ Add to your workspace or project:
 
 ```toml
 [dependencies]
-axess-factors = "0.0.10"
+axess-factors = "0.0.11"
 ```
 
 Example:

@@ -1,7 +1,7 @@
 use axess::{
     AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactorKind, AuthnAdminBackend,
     AuthnBackend, EnablementState, EntityState, FactorStateChange, MethodInstance, PermissionScope,
-    StatusDetail, form::PasswordForm,
+    StatusDetail, form::PasswordVerifyForm,
 };
 
 // Include the example crate's models into this integration test crate so we can refer to
@@ -104,7 +104,7 @@ async fn test_authenticate_with_inactive_user_returns_error()
     assert!(!matches!(fetched.state, EntityState::Active));
 
     // Try to authenticate - should fail
-    let form = PasswordForm {
+    let form = PasswordVerifyForm {
         username: "suspended_user".to_string(),
         password: "password123".to_string(),
         tenant: Some(tenant_id.to_string()),

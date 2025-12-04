@@ -9,11 +9,14 @@ pub use axess_core::{
             AuthTenant, AuthUser, AuthnBackend, EntityState, FactorId, MethodId, StatusDetail,
             TenantId, UserId,
         },
-        errors::{AuthError, FormError, HandlerError},
+        errors::{AuthError, FormError, HandlerError, WorkflowError},
         methods::{
             MethodBuilder, MethodInstance, MethodStateChange,
             factor::{AuthFactorKind, FactorInstance, FactorStateChange},
-            form::{self, FactorForm, FactorFormExt, FormField, FormFieldValue},
+            form::{
+                self, FactorForm, FactorFormExt, FactorFormKind, FormField, FormFieldValue,
+                form_fields_to_json,
+            },
             policy::{FactorConfig, FactorConfigBuilder},
             scope::{EnablementState, PermissionScope},
         },
@@ -30,6 +33,7 @@ pub use axess_core::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,
             SessionState,
         },
+        workflows::{Workflow, WorkflowAction, WorkflowState, WorkflowStep, WorkflowStepKind},
     },
     utils::{self, random::SystemRng, validation},
 };

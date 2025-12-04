@@ -1,0 +1,22 @@
+<html>
+  <head><title>Email Change</title></head>
+  <body>
+    <ul>
+      {% for message in messages %}
+      <li><strong>{{ message }}</strong></li>
+      {% endfor %}
+    </ul>
+    <form method="post">
+      <fieldset>
+        <legend>Change your email</legend>
+        <label for="old_email">Current Email</label>
+        <input name="old_email" id="old_email" type="email" required />
+        <label for="new_email">New Email</label>
+        <input name="new_email" id="new_email" type="email" required />
+        <label for="tenant">Tenant</label>
+        <input name="tenant" id="tenant" required />
+      </fieldset>
+      <button type="submit">Change Email</button>
+    </form>
+  </body>
+</html>

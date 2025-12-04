@@ -9,6 +9,7 @@ use crate::authn::{
         MethodInstance,
         factor::{AuthFactorKind, FactorInstance},
     },
+    workflows::{WorkflowState, WorkflowStep},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -19,52 +20,11 @@ use std::str::FromStr;
 
 /// Tracks the in-flight state of a multi-factor authentication session.
 ///
-/// `PartialAuthState` is used when a user is progressing through a multi-factor authentication flow.
-/// It records which method is being used, which factors remain to be verified, how many attempts have been made,
-/// and when the last attempt occurred. This struct enables replay-safe, stepwise authentication and supports
-/// lockout and audit features.
+/// Used when a user is progressing through a multi-factor authentication flow.
+/// Records the current method, remaining factors, attempt count, and last attempt timestamp.
+/// Enables replay-safe, stepwise authentication and supports lockout and audit features.
 ///
-/// # Fields
-/// - `current_method`: The authentication method being verified (may include multiple factors).
-/// - `remaining_factors`: List of factor IDs still required for completion.
-/// - `attempt_count`: Number of verification attempts made in this session.
-/// - `last_attempt`: Timestamp of the most recent attempt (if any).
-///
-/// # Usage
-/// - Used by [`AuthState::PartialAuthn`] to represent sessions that are not yet fully authenticated.
-/// - Methods allow marking factors as applied, querying the next required factor, and incrementing attempt counters.
-/// - Supports lockout, audit, and replay protection in authentication flows.
-///
-/// # Example
-/// ```rust
-/// use axess_core::authn::session::state::{PartialAuthState, AuthState};
-/// use axess_core::authn::methods::{MethodInstance, factor::{AuthFactorKind, FactorInstance}};
-///
-/// // Example factor and method construction
-/// let factor = FactorInstance::<String, String>::new(
-///     "factor1".to_string(),
-///     AuthFactorKind::Password,
-///     "Password",
-///     "Primary login password",
-///     "user1".to_string(),
-/// );
-/// let method = MethodInstance::<String, String, String>::new(
-///     "method1".to_string(),
-///     "Password Only",
-///     "Password based authentication",
-///     vec![factor],
-///     "user1".to_string(),
-/// );
-///
-/// let mut partial = PartialAuthState::new(method);
-/// partial.remaining_factors = vec!["factor1".to_string(), "factor2".to_string()];
-/// assert_eq!(partial.next_factor_id(), Some(&"factor1".to_string()));
-/// partial.apply_factor(&"factor1".to_string());
-/// assert_eq!(partial.next_factor_id(), Some(&"factor2".to_string()));
-/// partial.increment_attempt();
-/// ```
-///
-/// See [`AuthState`] for how this is used in session flows.
+/// See [`AuthState::PartialAuthn`] for usage in session flows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound(
     serialize = "M: Serialize, F: Serialize, U: Serialize",
@@ -76,13 +36,9 @@ where
     F: FactorId + serde::de::DeserializeOwned + serde::Serialize,
     U: UserId + serde::de::DeserializeOwned + serde::Serialize,
 {
-    /// The authentication method being verified (may include multiple factors).
     pub current_method: MethodInstance<M, F, U>,
-    /// List of factor IDs still required for completion.
     pub remaining_factors: Vec<F>,
-    /// Number of verification attempts made in this session.
     pub attempt_count: u32,
-    /// Timestamp of the most recent attempt (if any).
     pub last_attempt: Option<DateTime<Utc>>,
 }
 
@@ -139,10 +95,22 @@ where
     }
 }
 
+/// Represents the overall authentication state of a session in Axess.
+///
+/// Tracks progress and status of a user's authentication session, including multi-factor flows,
+/// completed authentication, and any pending post-authentication workflows (e.g., KYC, identity verification).
+///
+/// - `NotAuthenticated`: No authentication started.
+/// - `PendingActivation`: Awaiting activation via a workflow (e.g., email verification at user signup).
+/// - `PartialAuthn`: In-progress, factors remain.
+/// - `Authenticated`: All required factors complete.
+/// - `PendingWorkflow`: Authenticated, but blocked by a post-auth workflow.
+///
+/// Used as part of the session payload to drive authentication and access control logic.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(bound(
     serialize = "M: Serialize, F: Serialize, U: Serialize",
-    deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned"
+    deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned",
 ))]
 pub enum AuthState<M, F, U>
 where
@@ -150,13 +118,12 @@ where
     F: FactorId,
     U: UserId,
 {
-    /// The session has not yet started authentication.
     #[default]
     NotAuthenticated,
-    /// The session is in progress, with one or more factors remaining.
+    PendingActivation(WorkflowState),
     PartialAuthn(PartialAuthState<M, F, U>),
-    /// The session has completed all required authentication steps.
     Authenticated,
+    PendingWorkflow(WorkflowState),
 }
 
 impl<M, F, U> AuthState<M, F, U>
@@ -191,6 +158,17 @@ where
             _ => self,
         }
     }
+
+    /// Creates a new pending workflow state with the given workflow payload and blocking status.
+    pub fn new_workflow(steps: Vec<WorkflowStep>, blocking: bool) -> Self {
+        AuthState::PendingWorkflow(WorkflowState {
+            steps,
+            current_step: 0,
+            started_at: Utc::now(),
+            last_updated: Utc::now(),
+            blocking,
+        })
+    }
 }
 
 /// Stores all per-session authentication and user state for an active session.
@@ -216,12 +194,17 @@ where
 /// - Extensible for application-specific session data.
 ///
 /// # Example
-/// ```rust
+/// ```rust ignore
 /// use axess_core::authn::session::state::{Data, AuthState};
-/// use axess_core::authn::backend::EntityState;
+/// use axess_core::authn::backend::{EntityState, Workflow};
 /// use std::collections::HashMap;
 ///
-/// let session_data = Data::<String, String, String, String>::default();
+/// // Define a dummy workflow type implementing the Workflow trait.
+/// #[derive(Clone, PartialEq, Eq, Debug, Default)]
+/// struct DummyWorkflow;
+/// impl Workflow for DummyWorkflow {}
+///
+/// let session_data = Data::<String, String, String, String, DummyWorkflow>::default();
 /// assert_eq!(session_data.user_state, EntityState::Guest);
 /// assert!(matches!(session_data.auth_state, AuthState::NotAuthenticated));
 /// ```
@@ -230,12 +213,12 @@ where
     serialize = "M: Serialize, F: Serialize, U: Serialize, T: Serialize",
     deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned, T: DeserializeOwned"
 ))]
-pub struct Data<M, F, U, T>
+pub struct Data<M, F, T, U>
 where
     M: MethodId,
     F: FactorId,
-    U: UserId,
     T: TenantId,
+    U: UserId,
 {
     /// Tenant ID if applicable.
     pub tenant_id: Option<T>,
@@ -251,12 +234,12 @@ where
     pub custom_data: HashMap<String, JsonValue>,
 }
 
-impl<M, F, U, T> Data<M, F, U, T>
+impl<M, F, T, U> Data<M, F, T, U>
 where
     M: MethodId,
     F: FactorId,
-    U: UserId,
     T: TenantId,
+    U: UserId,
 {
     /// Constructs a new `Data` instance with all fields specified.
     pub fn new(
@@ -276,9 +259,32 @@ where
             custom_data,
         }
     }
+
+    pub fn get_tenant_id(&self) -> Option<&T> {
+        self.tenant_id.as_ref()
+    }
+
+    pub fn get_user_id(&self) -> Option<&U> {
+        self.user_id.as_ref()
+    }
+
+    pub fn get_user_state(&self) -> &EntityState {
+        &self.user_state
+    }
+
+    pub fn get_auth_state(&self) -> &AuthState<M, F, U> {
+        &self.auth_state
+    }
+    pub fn get_auth_hash(&self) -> Option<&String> {
+        self.auth_hash.as_ref()
+    }
+
+    pub fn get_custom_data(&self) -> &HashMap<String, JsonValue> {
+        &self.custom_data
+    }
 }
 
-impl<M, F, U, T> Default for Data<M, F, U, T>
+impl<M, F, T, U> Default for Data<M, F, T, U>
 where
     M: MethodId,
     F: FactorId,
@@ -664,9 +670,9 @@ where
     pub factor_id: Option<&'a F>,
     /// Optional kind of factor (password, OTP, etc.).
     pub factor_kind: Option<AuthFactorKind>,
-    /// Optional IP address for the request.
+    /// Optional IP address for the event.
     pub ip_address: Option<&'a str>,
-    /// Optional user agent string for the request.
+    /// Optional user agent string for the event.
     pub user_agent: Option<&'a str>,
     /// Optional error details for failed events.
     pub error_message: Option<&'a str>,

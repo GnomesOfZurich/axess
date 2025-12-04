@@ -8,11 +8,13 @@ use crate::{
         errors::{AuthError, FactorKindError},
         methods::{
             factor::{AuthFactorKind, FactorStateChange},
-            form::{FactorForm, FactorFormExt, FactorFormKind, FormField},
+            form::{FactorForm, FactorFormExt, FactorFormKind, FormField, form_fields_to_json},
             policy::{FactorConfig, FactorConfigBuilder, OtpCharset, OtpRulesBuilder, OtpType},
             scope::{EnablementState, PermissionScope},
         },
+        session::registry::SessionRegistry,
         types::{AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
+        workflows::WorkflowAction,
     },
     axum::{
         extract::{Form, Json},
@@ -21,10 +23,10 @@ use crate::{
     tracing::{debug, error, warn},
     utils::{random::SecureRng, validation::is_valid_otp_code},
 };
-use registry::SessionRegistry;
 
 use axess_factors::{TOTP_LENGTH, generate_password_hash, verify_hotp, verify_totp};
 // use base64::DecodeSliceError;
+use hex;
 use serde_json::{Value as JsonValue, from_value, json};
 use sha2::{Digest, Sha256};
 // use uuid::Uuid;
@@ -120,6 +122,68 @@ where
     R: SessionRegistry + Send + Sync + 'static,
     Rng: SecureRng,
 {
+    /// Generate a session hash using the injected RNG and session/user data.
+    pub fn generate_session_hash(&mut self) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut hasher = Sha256::new();
+
+        // Use session id, user id, tenant id, and random bytes for hash
+        if let Some(session_id) = self.session.id() {
+            hasher.update(session_id.to_string().as_bytes());
+        }
+        if let Some(user_id) = &self.data.user_id {
+            hasher.update(format!("{:?}", user_id).as_bytes());
+        }
+        if let Some(tenant_id) = &self.data.tenant_id {
+            hasher.update(format!("{:?}", tenant_id).as_bytes());
+        }
+        hasher.update(now.to_le_bytes());
+
+        // Add random bytes from RNG
+        let mut random_bytes = [0u8; 32];
+        self.rng.fill_bytes(&mut random_bytes);
+        hasher.update(random_bytes);
+
+        let result = hasher.finalize();
+        hex::encode(result)
+    }
+
+    /// Logs out the current user, clears session data, and deregisters the session if applicable.
+    pub async fn logout(&mut self) -> Result<(), AuthError<B>> {
+        // Remove session data
+        self.session
+            .remove::<SessionData<B>>(self.data_key)
+            .await
+            .map_err(AuthError::SessionError)?;
+        self.session.save().await.map_err(AuthError::SessionError)?;
+
+        // Deregister session from registry if present
+        if let Some(registry) = &self.session_registry
+            && let Some(session_id) = self.session.id()
+        {
+            let session_id_str = session_id.to_string();
+            registry
+                .invalidate_session(&session_id_str)
+                .await
+                .map_err(AuthError::SessionRegistryError)?;
+        }
+
+        // Reset session state to guest
+        self.state = SessionState::<B>::NotAuthenticated;
+        self.data = SessionData::<B>::default();
+        self.user = self
+            .backend
+            .get_new_guest_user(None)
+            .await
+            .map_err(AuthError::BackendError)?;
+
+        Ok(())
+    }
+
     pub async fn from_session(
         session: Session,
         backend: Arc<B>,
@@ -166,34 +230,40 @@ where
         );
 
         // 2. Load the user based on the session data.
-        let user = if data.user_state == EntityState::Guest {
-            backend
-                .get_new_guest_user(data.tenant_id.as_ref())
-                .await
-                .map_err(AuthError::BackendError)?
-        } else {
-            match data.user_id.as_ref() {
-                Some(user_id) => {
-                    let user = backend
-                        .get_user(user_id)
-                        .await
-                        .map_err(AuthError::BackendError)?;
-                    if user.get_user_state() == EntityState::Active {
-                        if data.user_state != EntityState::Active {
-                            debug!("Updating user state to Active in Session Data");
-                            data.user_state = EntityState::Active;
-                        }
-                        user
-                    } else {
-                        warn!("User is not active, cannot authenticate");
-                        return Err(AuthError::UserNotActive);
-                    }
+        let user: <B as AuthnBackend>::User = match data.get_user_id() {
+            Some(user_id) => {
+                let user = backend
+                    .get_user(user_id)
+                    .await
+                    .map_err(AuthError::BackendError)?;
+
+                if user.get_user_state() != EntityState::Active {
+                    warn!(
+                        "User is not active (state: {:?}), cannot authenticate",
+                        user.get_user_state()
+                    );
+                    return Err(AuthError::UnexpectedUserState);
                 }
-                None => return Err(AuthError::UserNotFound),
+
+                if data.user_state != EntityState::Active {
+                    debug!("Updating user state to Active in Session Data");
+                    data.user_state = EntityState::Active;
+                }
+                user
+            }
+            None => {
+                if data.user_state == EntityState::Guest {
+                    backend
+                        .get_new_guest_user(None)
+                        .await
+                        .map_err(AuthError::BackendError)?
+                } else {
+                    return Err(AuthError::UserNotFound);
+                }
             }
         };
 
-        let auth_state = data.auth_state.clone();
+        let auth_state: SessionState<B> = data.auth_state.clone();
 
         Ok(AuthSession {
             state: auth_state,
@@ -276,6 +346,10 @@ where
         self.data.user_state = EntityState::Guest;
     }
 
+    pub fn get_data(&self) -> &SessionData<B> {
+        &self.data
+    }
+
     /// Set user-related session data.
     pub fn set_user_data(
         &mut self,
@@ -289,7 +363,7 @@ where
     }
 
     /// Persist the current user data to the session store.
-    pub async fn save_user_data(&mut self) -> Result<(), AuthError<B>> {
+    pub async fn save_session_data(&mut self) -> Result<(), AuthError<B>> {
         self.session
             .insert(self.data_key, &self.data)
             .await
@@ -356,7 +430,7 @@ where
     /// Set the authentication state of the session.
     pub async fn set_auth_state(&mut self, new_state: SessionState<B>) -> Result<(), AuthError<B>> {
         self.state = new_state;
-        self.data.auth_state = self.state.clone();
+        self.data.auth_state = SessionState::<B>::from(self.state.clone());
         self.session
             .insert(self.data_key, &self.data)
             .await
@@ -382,10 +456,17 @@ where
     }
 
     /// Check if the session is authenticated.
-    /// This will return `true` if the session is authenticated,
-    /// or `false` if it is not.
+    /// Returns `true` if the session is authenticated or in a pending workflow,
+    /// otherwise returns `false`.
     pub fn is_authenticated(&self) -> bool {
-        matches!(self.state, SessionState::<B>::Authenticated)
+        matches!(
+            self.state,
+            SessionState::<B>::Authenticated | SessionState::<B>::PendingWorkflow(_)
+        )
+    }
+
+    pub fn is_pending_workflow(&self) -> bool {
+        matches!(self.state, SessionState::<B>::PendingWorkflow(_))
     }
 
     /// Validates that the provided scope matches the current session
@@ -416,7 +497,7 @@ where
             EntityState::Active | EntityState::Pending(_) => Ok(()),
             state => {
                 error!("User is not active or pending: {:?}", state);
-                Err(AuthError::UserNotActive)
+                Err(AuthError::UnexpectedUserState)
             }
         }
     }
@@ -449,6 +530,7 @@ where
     async fn validate_session_binding(&self) -> Result<(), AuthError<B>> {
         let Some(registry) = &self.session_registry else {
             // No registry configured - skip validation
+            warn!("Unable to find session registry!");
             return Ok(());
         };
 
@@ -509,6 +591,7 @@ where
         let expected_state = match action_kind {
             FactorFormKind::Setup => EnablementState::Pending,
             FactorFormKind::Verify => EnablementState::Active,
+            FactorFormKind::Change => EnablementState::Active, // TODO: Review; now require factor to be active?
         };
 
         for method in methods {
@@ -623,6 +706,7 @@ where
     {
         debug!("Starting authentication process from form");
 
+        // Validate form before proceeding
         form.validate_form()
             .map_err(|_| AuthError::InvalidCredentials)?;
 
@@ -630,27 +714,93 @@ where
         let factor_kind = form.factor_kind();
 
         match (&self.state, &form_kind) {
+            // Standard login flow: not authenticated, verifying credentials
             (SessionState::<B>::NotAuthenticated, FactorFormKind::Verify) => {
                 self.handle_initial_authentication(&form, factor_kind, form_kind)
                     .await
             }
+            // MFA flow: in-progress partial authentication, verifying next factor
             (SessionState::<B>::PartialAuthn(partial_state), FactorFormKind::Verify) => {
                 self.handle_partial_authentication(&form, partial_state.clone())
                     .await
             }
+            // Setup flow: authenticated user adding new factor
             (SessionState::<B>::Authenticated, FactorFormKind::Setup) => {
                 self.handle_factor_setup(&form, factor_kind).await
             }
+            // Workflow-based onboarding or post-auth flows
+            (SessionState::<B>::PendingActivation(workflow_state), _) => {
+                // Clone to get owned, mutable workflow state
+                let mut workflow_state = workflow_state.clone();
+                // Advance onboarding workflow (e.g., email verification, TOTP setup)
+                let action = WorkflowAction::FactorForm {
+                    kind: factor_kind,
+                    form_kind,
+                    fields: form_fields_to_json(&form.fields()),
+                };
+                match workflow_state.advance(&action) {
+                    Ok(_) => {
+                        if workflow_state.is_complete() {
+                            self.state = SessionState::<B>::Authenticated;
+                            self.save_session_data().await?;
+                            Ok(Redirect::to("/dashboard").into_response())
+                        } else {
+                            self.state = SessionState::<B>::PendingActivation(workflow_state);
+                            self.save_session_data().await?;
+                            Ok(Redirect::to("/next_step").into_response())
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to advance onboarding workflow: {e:?}");
+                        Err(AuthError::InvalidStateTransition)
+                    }
+                }
+            }
+            (SessionState::<B>::PendingWorkflow(workflow_state), _) => {
+                // Clone to get owned, mutable workflow state
+                let mut workflow_state = workflow_state.clone();
+                // Advance post-auth workflow (e.g., KYC, admin approval)
+                let action = WorkflowAction::FactorForm {
+                    kind: factor_kind,
+                    form_kind,
+                    fields: form_fields_to_json(&form.fields()),
+                };
+                match workflow_state.advance(&action) {
+                    Ok(_) => {
+                        if workflow_state.is_complete() {
+                            self.state = SessionState::<B>::Authenticated;
+                            self.save_session_data().await?;
+                            Ok(Redirect::to("/dashboard").into_response())
+                        } else {
+                            self.state = SessionState::<B>::PendingWorkflow(workflow_state);
+                            self.save_session_data().await?;
+                            Ok(Redirect::to("/next_step").into_response())
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to advance post-auth workflow: {e:?}");
+                        Err(AuthError::InvalidStateTransition)
+                    }
+                }
+            }
+            // Disallow factor setup if not authenticated
             (SessionState::<B>::NotAuthenticated, FactorFormKind::Setup) => {
                 error!("Cannot setup factors without authentication");
                 Err(AuthError::InvalidStateTransition)
             }
+            // Disallow factor setup during partial authentication
+            (SessionState::<B>::PartialAuthn(_), FactorFormKind::Setup) => {
+                error!("Cannot setup factors during partial authentication");
+                Err(AuthError::InvalidStateTransition)
+            }
+            // Disallow verification if already authenticated
             (SessionState::<B>::Authenticated, FactorFormKind::Verify) => {
                 error!("Already authenticated");
                 Err(AuthError::AlreadyAuthenticated)
             }
-            (SessionState::<B>::PartialAuthn(_), FactorFormKind::Setup) => {
-                error!("Cannot setup factors during partial authentication");
+            // Disallow change forms in all states (unless you implement change logic)
+            (_, FactorFormKind::Change) => {
+                error!("Change forms are not supported in this flow");
                 Err(AuthError::InvalidStateTransition)
             }
         }
@@ -759,9 +909,7 @@ where
         } else {
             // ✅ Session already registered in start_authentication, just update hash if needed
             if self.data.auth_hash.is_none() {
-                let session_hash = self.generate_session_hash();
-                self.data.auth_hash = Some(session_hash);
-                // Re-register with new hash (update operation)
+                // Re-register with new hash (update operation) if missing.
                 self.ensure_session_registered().await?;
             }
 
@@ -980,6 +1128,10 @@ where
                     self.process_totp_success(form, factor_state, &scope, factor_config)
                         .await?
                 }
+                OtpType::Email => {
+                    error!("Email OTP verification not implemented");
+                    return Err(AuthError::InvalidCredentials);
+                }
                 OtpType::Custom(_) => {
                     error!("Custom OTP types are not supported for verification");
                     return Err(AuthError::InvalidCredentials);
@@ -1084,36 +1236,42 @@ where
         self.apply_factor(&factor.id, requested_next_route).await
     }
 
+    /// Initiate an authentication flow for the given method.
+    /// Handles all possible session states, including onboarding and workflow states.
     pub async fn start_authentication(
         &mut self,
         method: AuthMethod<B>,
     ) -> Result<(), AuthError<B>> {
         match &mut self.state {
+            // Already authenticated: do not start a new flow
             SessionState::<B>::Authenticated => {
                 debug!("User is already authenticated, skipping authentication");
                 Err(AuthError::AlreadyAuthenticated)
             }
+            // Partial authentication in progress: restart if method differs, else continue
             SessionState::<B>::PartialAuthn(partial_state) => {
                 if partial_state.current_method == method {
                     debug!(
                         "Authentication already in progress for method: {:?}",
                         method
                     );
+                    Ok(())
                 } else {
                     warn!(
                         "Another authentication already in progress, restarting with different method"
                     );
                     self.state = SessionState::<B>::new_partial(method)
                         .with_attempt(partial_state.attempt_count + 1);
+                    self.ensure_session_registered().await?;
+                    Ok(())
                 }
-                Ok(())
             }
+            // Not authenticated: start new partial authentication
             SessionState::<B>::NotAuthenticated => {
                 debug!("Starting authentication for method: {:?}", method);
 
                 if self.data.user_state == EntityState::Guest {
                     debug!("No user associated with session, cannot start authentication");
-                    // TODO: Convert Guest user to a real user ???
                     return Err(AuthError::UserNotFound);
                 }
 
@@ -1137,77 +1295,34 @@ where
                 }
 
                 self.state = SessionState::<B>::new_partial(method);
-
-                // ✅ Register session when entering PartialAuthn
                 self.ensure_session_registered().await?;
-
                 Ok(())
             }
+            // Onboarding workflow: allow authentication start if workflow is complete
+            SessionState::<B>::PendingActivation(workflow_state) => {
+                if workflow_state.is_complete() {
+                    debug!("Onboarding workflow complete, transitioning to authentication");
+                    self.state = SessionState::<B>::new_partial(method);
+                    self.ensure_session_registered().await?;
+                    Ok(())
+                } else {
+                    warn!("Cannot start authentication: onboarding workflow not complete");
+                    Err(AuthError::InvalidStateTransition)
+                }
+            }
+            // Post-auth workflow: allow authentication start if workflow is complete
+            SessionState::<B>::PendingWorkflow(workflow_state) => {
+                if workflow_state.is_complete() {
+                    debug!("Post-auth workflow complete, transitioning to authentication");
+                    self.state = SessionState::<B>::new_partial(method);
+                    self.ensure_session_registered().await?;
+                    Ok(())
+                } else {
+                    warn!("Cannot start authentication: post-auth workflow not complete");
+                    Err(AuthError::InvalidStateTransition)
+                }
+            }
         }
-    }
-
-    pub async fn get_session_data(&self) -> Result<SessionData<B>, AuthError<B>> {
-        let session_data_opt: Option<SessionData<B>> = self
-            .session
-            .get(self.data_key)
-            .await
-            .map_err(AuthError::SessionError)?;
-        match session_data_opt {
-            Some(session_data) => Ok(session_data),
-            None => Err(AuthError::SessionNotFound),
-        }
-    }
-
-    pub async fn set_session_data(&mut self, new_data: SessionData<B>) -> Result<(), AuthError<B>> {
-        self.data = new_data;
-        self.session
-            .insert(self.data_key, &self.data)
-            .await
-            .map_err(AuthError::SessionError)?;
-        self.session.save().await.map_err(AuthError::SessionError)?;
-        Ok(())
-    }
-
-    /// Generates a cryptographically secure hash binding this authentication to a specific session
-    pub fn generate_session_hash(&mut self) -> String {
-        let mut hasher = Sha256::new();
-
-        // Session ID
-        if let Some(session_id) = self.session.id() {
-            hasher.update(session_id.to_string().as_bytes());
-        }
-
-        // User ID
-        hasher.update(format!("{:?}", self.user.id()).as_bytes());
-
-        // Tenant ID
-        hasher.update(format!("{:?}", self.user.tenant_id()).as_bytes());
-
-        // High-precision timestamp
-        let now = chrono::Utc::now();
-        hasher.update(now.timestamp().to_string().as_bytes());
-        hasher.update(now.timestamp_subsec_nanos().to_string().as_bytes());
-
-        // Use the injected RNG instance for DST compatibility
-        let mut nonce = [0u8; 32];
-        self.rng.fill_bytes(&mut nonce);
-        hasher.update(nonce);
-
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// Update and save the current session data to the session store.
-    pub async fn save_session_data(&mut self) -> Result<(), AuthError<B>> {
-        // Insert session data
-        self.session
-            .insert(self.data_key, &self.data)
-            .await
-            .map_err(AuthError::SessionError)?;
-
-        // ✅ Always save the session record to persist all changes
-        self.session.save().await.map_err(AuthError::SessionError)?;
-
-        Ok(())
     }
 
     pub async fn complete_authentication(&mut self) -> Result<(), AuthError<B>> {
@@ -1244,50 +1359,11 @@ where
         // Now register the new session ID
         self.ensure_session_registered().await?;
 
+        // TODO: register the authentication event ???
+        // 6. Optionally emit audit event (recommended)
+        // self.backend.record_auth_event(...).await?;
+
         Ok(())
-    }
-
-    pub async fn get_next_route(&self, next: Option<String>) -> String {
-        if let Some(route) = next {
-            if route.starts_with('/') && !route.contains("//") && route.len() < 2048 {
-                return route;
-            } else {
-                warn!("Invalid next route provided: {}", route);
-            }
-        }
-        let tid = self.get_tenant_id().cloned();
-        let uid = self.get_user_id().cloned();
-
-        match (tid, uid) {
-            (Some(tenant_id), Some(user_id)) => self
-                .backend
-                .get_default_protected_route(tenant_id, user_id)
-                .await
-                .unwrap_or_else(|_| "/".to_string()),
-            _ => "/".to_string(),
-        }
-    }
-
-    /// Unregisters the session from the session registry (best effort) and clears out the currentsession.
-    pub async fn logout(&mut self) -> Result<Option<B::User>, AuthError<B>> {
-        // Unregister session (best effort)
-        if let Err(e) = self.unregister_session().await {
-            tracing::warn!("Failed to unregister session during logout: {:?}", e);
-        }
-
-        // Clear session
-        self.session.clear().await;
-        self.session
-            .cycle_id()
-            .await
-            .map_err(AuthError::SessionError)?;
-
-        let user = Some(self.user.clone());
-        self.state = SessionState::<B>::NotAuthenticated;
-        self.data = SessionData::<B>::default();
-        self.save_session_data().await?;
-
-        Ok(user)
     }
 
     /// Handle factor setup for authenticated users.
@@ -1301,26 +1377,21 @@ where
     where
         F: FactorForm + Send + Sync + 'static,
     {
-        // 1. Ensure user is authenticated
-        if !self.is_authenticated() {
-            error!("Cannot setup factor without authentication");
-            return Err(AuthError::NotAuthenticated);
-        }
-
-        // 2. Validate session is still registered
-        self.validate_session_binding().await?;
-
-        // 3. Ensure form is for setup
+        // 1. Ensure form is for setup
         if form.form_kind() != FactorFormKind::Setup {
             error!("Form kind must be Setup for factor setup");
             return Err(AuthError::InvalidStateTransition);
         }
-        // 4. Validate form
+
+        // 2. Validate form
         form.validate_form()
             .map_err(|_| AuthError::InvalidCredentials)?;
 
-        // 5. Validate user state
+        // 3. Validate user state
         self.validate_user_state()?;
+
+        // 4. Validate session is still registered
+        self.validate_session_binding().await?;
 
         let tenant_id = self
             .get_tenant_id()
@@ -1335,6 +1406,7 @@ where
             .get_assumed_auth_method(scope.clone(), factor_kind.clone(), FactorFormKind::Setup)
             .await?;
 
+        // TODO: Adjust so that the method can handle multiple factors of type OTP in a method if needed (or of any other type)!
         let factor = method.factors.first().ok_or(AuthError::FactorNotFound)?;
 
         let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
@@ -1367,6 +1439,12 @@ where
                     match otp_type {
                         OtpType::Totp => FactorConfigBuilder::totp(credential.to_owned()),
                         OtpType::Hotp => FactorConfigBuilder::hotp(credential.to_owned()),
+                        OtpType::Email => {
+                            let email = form
+                                .get_string_field(FormField::Email)
+                                .ok_or(AuthError::InvalidCredentials)?;
+                            FactorConfigBuilder::email(email)
+                        }
                         OtpType::Custom(_) => FactorConfigBuilder::new()
                             .with_field("otp_type", json!(otp_type))
                             .with_secret(credential.to_owned()),
@@ -1407,35 +1485,29 @@ where
         Ok(Redirect::to(&redirect_url).into_response())
     }
 
+    pub async fn get_next_route(&self, next: Option<String>) -> String {
+        if let Some(route) = next {
+            if route.starts_with('/') && !route.contains("//") && route.len() < 2048 {
+                return route;
+            } else {
+                warn!("Invalid next route provided: {}", route);
+            }
+        }
+        let tid = self.get_tenant_id().cloned();
+        let uid = self.get_user_id().cloned();
+
+        match (tid, uid) {
+            (Some(tenant_id), Some(user_id)) => self
+                .backend
+                .get_default_protected_route(tenant_id, user_id)
+                .await
+                .unwrap_or_else(|_| "/".to_string()),
+            _ => "/".to_string(),
+        }
+    }
+
     /// Ensures session is registered starting from PartialAuthn state
     async fn ensure_session_registered(&mut self) -> Result<(), AuthError<B>> {
-        // Clone ownership of the optional registry so we don't hold an immutable borrow of self
-        // while we later need a mutable borrow for generating a session hash.
-        let registry_opt = self.session_registry.clone();
-        let Some(registry) = registry_opt else {
-            // No registry configured - this is OK for guest sessions
-            // but consider warning if not guest
-            if !matches!(self.data.user_state, EntityState::Guest) {
-                warn!("No session registry configured for authenticated session");
-            }
-            return Ok(());
-        };
-
-        // Capture the session id as an owned String so the borrow ends immediately.
-        let session_id_str = match self.session.id() {
-            Some(id) => id.to_string(),
-            None => {
-                error!("Cannot register session without ID");
-                return Err(AuthError::SessionInvalid);
-            }
-        };
-
-        // Only register if user is identified (not guest)
-        if matches!(self.data.user_state, EntityState::Guest) {
-            debug!("Skipping registration for guest session");
-            return Ok(());
-        }
-
         // Ensure hash exists; if not, generate and persist it (best-effort).
         // This block may call &mut self methods, so previous borrows must have ended.
         let session_hash = if let Some(h) = self.data.auth_hash.as_ref() {
@@ -1445,7 +1517,7 @@ where
             self.data.auth_hash = Some(new_hash.clone());
             // Best-effort persist the new hash into the session store (don't fail the flow).
             if let Err(e) = self.session.insert(self.data_key, &self.data).await {
-                debug!(
+                warn!(
                     error = ?e,
                     "Failed to persist regenerated auth_hash into session (non-fatal)"
                 );
@@ -1453,49 +1525,70 @@ where
             new_hash
         };
 
-        let user_id = self.get_user_id().map(|id| id.to_string());
-        let tenant_id = self.get_tenant_id().map(|id| id.to_string());
-
-        registry
-            .register_session(
-                &session_id_str,
-                user_id.as_ref(),
-                tenant_id.as_ref(),
-                session_hash,
-            )
-            .await
-            .map_err(|e| {
-                error!(
-                    session_id = %session_id_str,
-                    error = ?e,
-                    "Failed to register session in registry"
-                );
-                AuthError::SessionRegistryError(e)
-            })
-    }
-
-    /// Removes session from registry (best effort)
-    async fn unregister_session(&self) -> Result<(), AuthError<B>> {
-        let Some(registry) = &self.session_registry else {
+        // Only register if user is identified (not guest)
+        if matches!(self.data.user_state, EntityState::Guest) {
+            debug!("Skipping registration for guest session");
             return Ok(());
+        }
+
+        let user_id = self.get_user_id().map(|uid| uid.to_string());
+        let tenant_id = self.get_tenant_id().map(|tid| tid.to_string());
+
+        // session_id_str is missing in this block, so we need to define it
+        // If the session ID is missing, this is a fatal error: session lifecycle is broken.
+        let session_id_str = match self.session.id() {
+            Some(id) => id.to_string(),
+            None => {
+                error!("Cannot register session without ID; session lifecycle error");
+                return Err(AuthError::SessionInvalid);
+            }
         };
 
-        if let Some(session_id) = self.session.id() {
-            let session_id_str = session_id.to_string();
+        if let Some(registry) = &self.session_registry {
             registry
-                .invalidate_session(&session_id_str)
+                .register_session(
+                    &session_id_str,
+                    user_id.as_ref(),
+                    tenant_id.as_ref(),
+                    session_hash,
+                )
                 .await
                 .map_err(|e| {
-                    warn!(
+                    error!(
                         session_id = %session_id_str,
                         error = ?e,
-                        "Failed to unregister session (non-fatal)"
+                        "Failed to register session in registry"
                     );
                     AuthError::SessionRegistryError(e)
-                })?;
+                })
+        } else {
+            warn!("No session registry configured for authenticated session");
+            Err(AuthError::SessionRegistryNotFound)
         }
-        Ok(())
     }
+
+    // /// Removes session from registry (best effort)
+    // async fn unregister_session(&self) -> Result<(), AuthError<B>> {
+    //     let Some(registry) = &self.session_registry else {
+    //         return Ok(());
+    //     };
+
+    //     if let Some(session_id) = self.session.id() {
+    //         let session_id_str = session_id.to_string();
+    //         registry
+    //             .invalidate_session(&session_id_str)
+    //             .await
+    //             .map_err(|e| {
+    //                 warn!(
+    //                     session_id = %session_id_str,
+    //                     error = ?e,
+    //                     "Failed to unregister session (non-fatal)"
+    //                 );
+    //                 AuthError::SessionRegistryError(e)
+    //             })?;
+    //     }
+    //     Ok(())
+    // }
 }
 
 #[cfg(test)]
@@ -1672,7 +1765,7 @@ mod tests {
         let user_sessions = registry
             .get_user_sessions(&"user1")
             .await
-            .map_err(|e| AuthError::SessionRegistryError(e))?;
+            .map_err(AuthError::SessionRegistryError)?;
 
         // The old session should be replaced by the new one
         assert_eq!(
@@ -1873,6 +1966,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Test verify_factor returns FactorNotFound when factor is missing
     async fn test_verify_factor_returns_factor_not_found() -> Result<(), AuthError<MockBackend>> {
         let rng = MockRng::new(42);
         let (mut auth_session, _) = create_test_session_with_custom_rng(rng).await?;
@@ -1895,6 +1989,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Test verify_factor returns InvalidCredentials when form verification fails
     async fn test_verify_factor_invalid_credentials_when_form_verification_fails()
     -> Result<(), AuthError<MockBackend>> {
         use std::collections::HashMap;

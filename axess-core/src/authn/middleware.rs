@@ -157,7 +157,7 @@ where
                         if let Some(guest) = guest_user {
                             info!("TEST: Guest user created successfully...");
                             auth_session.set_guest_user(guest);
-                            auth_session.save_user_data().await.ok();
+                            auth_session.save_session_data().await.ok();
                             info!("TEST: Successfully saved new Guest user and related data...");
                         }
                     }
@@ -169,7 +169,7 @@ where
                         auth_session.get_tenant_id(),
                         auth_session.get_auth_state(),
                         auth_session.get_user_state(),
-                        auth_session.get_session_data().await,
+                        auth_session.get_data(),
                     );
 
                     // Always generate and persist a session hash, even for guests

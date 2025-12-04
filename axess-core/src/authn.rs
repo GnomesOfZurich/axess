@@ -4,3 +4,4 @@ pub mod methods;
 pub mod middleware;
 pub mod session;
 pub mod types;
+pub mod workflows;

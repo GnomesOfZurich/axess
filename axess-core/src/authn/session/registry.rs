@@ -15,11 +15,10 @@ use std::{
 };
 use time;
 use time::Duration;
-use tower_sessions::{
-    session::Id as SessionId,
-    session_store::{Error as SessionStoreError, SessionStore},
-};
+use tower_sessions::{session::Id as SessionId, session_store::SessionStore};
 use tracing::{debug, error};
+
+use crate::authn::errors::SessionRegistryError;
 
 // TODO: turn both these consts into application configuration parameters!
 const SESSION_REGISTRY_KEY: &str = "axess_session_registry";
@@ -36,44 +35,6 @@ impl Hasher for FnvHasher {
             self.0 = self.0.wrapping_mul(0x100000001b3);
         }
     }
-}
-
-/// Error type for session registry operations.
-///
-/// `SessionRegistryError` represents all possible failures that can occur when
-/// registering, validating, serializing, or invalidating sessions in the registry.
-/// It wraps errors from the underlying session store and provides context for
-/// serialization and registry management failures.
-///
-/// # Variants
-/// - `StoreError`: Error from the underlying session store (e.g., Redis, Valkey, in-memory).
-/// - `SerializationError`: Failure to serialize or deserialize session metadata or registry state.
-///
-/// # Usage
-/// This error type is returned by all async methods on [`SessionRegistry`] and [`SessionRegistryStore`].
-/// It should be handled at the API boundary and logged for audit and debugging purposes.
-///
-/// # Example
-/// ```rust
-/// use axess_core::authn::session::registry::{SessionRegistry, SessionRegistryError};
-///
-/// async fn invalidate_session(registry: &impl SessionRegistry, session_id: &str) {
-///     match registry.invalidate_session(session_id).await {
-///         Ok(_) => println!("Session invalidated"),
-///         Err(SessionRegistryError::StoreError(e)) => eprintln!("Store error: {e}"),
-///         Err(SessionRegistryError::SerializationError(msg)) => eprintln!("Serialization error: {msg}"),
-///     }
-/// }
-/// ```
-#[derive(Debug, thiserror::Error)]
-pub enum SessionRegistryError {
-    /// Error from the underlying session store (e.g., Redis, Valkey, in-memory).
-    #[error("Session store error: {0}")]
-    StoreError(#[from] SessionStoreError),
-
-    /// Failure to serialize or deserialize session metadata or registry state.
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
 }
 
 /// Metadata describing a registered authentication session.

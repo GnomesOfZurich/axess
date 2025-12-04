@@ -1,7 +1,7 @@
 //! Authentication error types used across Axess forms, sessions, and handlers.
 
 use crate::{
-    authn::{backend::AuthnBackend, session::registry::SessionRegistryError},
+    authn::backend::AuthnBackend,
     axum::{
         http::StatusCode,
         response::{IntoResponse, Response},
@@ -9,7 +9,7 @@ use crate::{
 };
 use std::fmt::Debug;
 use thiserror::Error as ThisError;
-use tower_sessions::session::Error as SessionError;
+use tower_sessions::{session::Error as SessionError, session_store::Error as SessionStoreError};
 
 /// Error type for authentication factor form validation and extraction.
 ///
@@ -95,6 +95,44 @@ pub enum FactorKindError {
     UnexpectedValue(String),
 }
 
+/// Error type for session registry operations.
+///
+/// `SessionRegistryError` represents all possible failures that can occur when
+/// registering, validating, serializing, or invalidating sessions in the registry.
+/// It wraps errors from the underlying session store and provides context for
+/// serialization and registry management failures.
+///
+/// # Variants
+/// - `StoreError`: Error from the underlying session store (e.g., Redis, Valkey, in-memory).
+/// - `SerializationError`: Failure to serialize or deserialize session metadata or registry state.
+///
+/// # Usage
+/// This error type is returned by all async methods on [`SessionRegistry`] and [`SessionRegistryStore`].
+/// It should be handled at the API boundary and logged for audit and debugging purposes.
+///
+/// # Example
+/// ```rust
+/// use axess_core::authn::{session::registry::SessionRegistry, errors::SessionRegistryError};
+///
+/// async fn invalidate_session(registry: &impl SessionRegistry, session_id: &str) {
+///     match registry.invalidate_session(session_id).await {
+///         Ok(_) => println!("Session invalidated"),
+///         Err(SessionRegistryError::StoreError(e)) => eprintln!("Store error: {e}"),
+///         Err(SessionRegistryError::SerializationError(msg)) => eprintln!("Serialization error: {msg}"),
+///     }
+/// }
+/// ```
+#[derive(Debug, thiserror::Error)]
+pub enum SessionRegistryError {
+    /// Error from the underlying session store (e.g., Redis, Valkey, in-memory).
+    #[error("Session store error: {0}")]
+    StoreError(#[from] SessionStoreError),
+
+    /// Failure to serialize or deserialize session metadata or registry state.
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+}
+
 /// Comprehensive error type for authentication flows in Axess.
 ///
 /// `AuthError` is used throughout Axess to represent all possible failures that can occur
@@ -120,7 +158,7 @@ pub enum FactorKindError {
 /// - `UnexpectedAuthConfig(String)`: Unexpected or invalid configuration for factor kind.
 /// - `UnsupportedOtpType`: OTP type is not supported.
 /// - `UserNotFound`: User not found in backend.
-/// - `UserNotActive`: User is not active (e.g., suspended, terminated).
+/// - `UnexpectedUserState`: User is not in the expected state (e.g., suspended, terminated).
 /// - `IncorrectUserData`: User data is incorrect or malformed.
 /// - `TenantNotFound`: Tenant not found in backend.
 /// - `IncorrectTenantData`: Tenant data is incorrect or malformed.
@@ -210,8 +248,8 @@ pub enum AuthError<B: AuthnBackend> {
     #[error("User not found")]
     UserNotFound,
     /// User is not active (e.g., suspended, terminated).
-    #[error("User not active")]
-    UserNotActive,
+    #[error("Unexpected user state")]
+    UnexpectedUserState,
     /// User data is incorrect or malformed.
     #[error("Incorrect user data")]
     IncorrectUserData,
@@ -237,6 +275,9 @@ pub enum AuthError<B: AuthnBackend> {
     /// Error from session store.
     #[error(transparent)]
     SessionError(SessionError),
+    /// Session Registry not found.
+    #[error("Session Registry not found")]
+    SessionRegistryNotFound,
     /// Error from session registry.
     #[error("Session registry error: {0}")]
     SessionRegistryError(#[from] SessionRegistryError),
@@ -281,7 +322,7 @@ where
                 "Invalid authentication configuration",
             ),
             AuthError::UserNotFound => (StatusCode::UNAUTHORIZED, "User not found"),
-            AuthError::UserNotActive => (StatusCode::FORBIDDEN, "User account not active"),
+            AuthError::UnexpectedUserState => (StatusCode::FORBIDDEN, "Unexpected user state"),
             AuthError::IncorrectUserData => (StatusCode::BAD_REQUEST, "Incorrect user data"),
             AuthError::TenantNotFound => (StatusCode::NOT_FOUND, "Tenant not found"),
             AuthError::IncorrectTenantData => (StatusCode::BAD_REQUEST, "Incorrect tenant data"),
@@ -290,6 +331,10 @@ where
             AuthError::SessionLockError => (StatusCode::CONFLICT, "Session lock error"),
             AuthError::SessionInvalid => (StatusCode::UNAUTHORIZED, "Session is invalid"),
             AuthError::SessionError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Session error"),
+            AuthError::SessionRegistryNotFound => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session registry not found",
+            ),
             AuthError::SessionRegistryError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Session registry error")
             }
@@ -384,6 +429,71 @@ impl IntoResponse for HandlerError {
             HandlerError::Other(message) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
             }
+        }
+    }
+}
+
+/// Error type for workflow state transitions and handling.
+#[derive(Debug, ThisError)]
+pub enum WorkflowError {
+    #[error("Workflow is blocking further progress")]
+    Blocking,
+    #[error("Workflow is not complete")]
+    Incomplete,
+    #[error("Invalid workflow state transition")]
+    InvalidTransition,
+    #[error("Workflow failed: {0}")]
+    Failed(String),
+    #[error("Unknown workflow error")]
+    Unknown,
+}
+
+/// Converts a `WorkflowError` into an `AuthError`.
+///
+/// This implementation maps specific variants of `WorkflowError` to corresponding
+/// `AuthError` variants, ensuring that authentication errors are handled consistently
+/// within the authentication workflow. This mapping is particularly relevant after
+/// the introduction of the `Workflow` trait and `WorkflowError`, aligning error handling
+/// with the new workflow-based authentication logic.
+///
+/// # Mapping
+/// - `WorkflowError::Blocking` and `WorkflowError::InvalidTransition` are mapped to `AuthError::InvalidStateTransition`.
+/// - `WorkflowError::Incomplete` is mapped to `AuthError::PartialAuthenticationRequired`.
+/// - `WorkflowError::Failed(msg)` is mapped to `AuthError::UnexpectedAuthConfig(msg)`.
+/// - `WorkflowError::Unknown` is mapped to `AuthError::UnexpectedAuthState`.
+///
+/// # Examples
+/// ```rust ignore
+/// use axess_core::authn::{errors::{AuthError, WorkflowError}, backend::AuthnBackend};
+/// use crate::DummyBackend;
+///
+/// let err = WorkflowError::Blocking;
+/// let auth_err: AuthError<DummyBackend> = AuthError::from(err);
+/// assert!(matches!(auth_err, AuthError::InvalidStateTransition));
+///
+/// let err = WorkflowError::Incomplete;
+/// let auth_err: AuthError<DummyBackend> = AuthError::from(err);
+/// assert!(matches!(auth_err, AuthError::PartialAuthenticationRequired));
+///
+/// let err = WorkflowError::Failed("config error".to_string());
+/// let auth_err: AuthError<DummyBackend> = AuthError::from(err);
+/// if let AuthError::UnexpectedAuthConfig(msg) = auth_err {
+///     assert_eq!(msg, "config error");
+/// } else {
+///     panic!("Expected UnexpectedAuthConfig");
+/// }
+/// ```
+impl<B> From<WorkflowError> for AuthError<B>
+where
+    B: AuthnBackend,
+{
+    fn from(err: WorkflowError) -> Self {
+        match err {
+            WorkflowError::Blocking => AuthError::InvalidStateTransition,
+            WorkflowError::Incomplete => AuthError::PartialAuthenticationRequired,
+            WorkflowError::InvalidTransition => AuthError::InvalidStateTransition,
+            WorkflowError::Failed(msg) => AuthError::UnexpectedAuthConfig(msg),
+            WorkflowError::Unknown => AuthError::UnexpectedAuthState,
         }
     }
 }

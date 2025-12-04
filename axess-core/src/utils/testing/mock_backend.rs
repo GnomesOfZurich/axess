@@ -33,6 +33,7 @@ use crate::authn::backend::admin::AuthnAdminBackend;
 use crate::{
     authn::{
         backend::{AuthTenant, AuthnBackend, EntityState},
+        // errors::WorkflowError,
         methods::{
             MethodStateChange,
             factor::FactorStateChange,
@@ -41,6 +42,7 @@ use crate::{
         },
         session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
         types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
+        // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
     },
     utils::testing::{
         mock_authn::{MockAuthFactor, MockAuthFactorState, MockAuthMethod, MockAuthMethodState},
@@ -54,6 +56,9 @@ use crate::{
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
+// use serde::{Deserialize, Serialize};
+// use std::{fmt::Debug, hash::Hash};
+use std::fmt::Debug;
 
 // TODO: Consider letting the mock backend be an in-memory SQLite database
 // use sqlx::SqlitePool;
@@ -63,6 +68,61 @@ use dashmap::DashMap;
 //     OurBackend::new(pool)
 // }
 
+// #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+// pub struct MockWorkflow;
+
+// impl MockWorkflow {
+//     // pub fn new() -> Self {
+//     //     MockWorkflow
+//     // }
+
+//     fn start_workflow<M>(&mut self, _method: &M) -> Result<WorkflowState, WorkflowError> {
+//         // For mock, return a default state with required fields
+//         Ok(WorkflowState {
+//             steps: vec![WorkflowStep {
+//                 kind: WorkflowStepKind::Custom("mock_step".to_string()),
+//                 description: "Mock step for testing".to_string(),
+//                 completed: false,
+//                 completed_at: None,
+//                 metadata: None,
+//             }],
+//             current_step: 0,
+//             started_at: chrono::Utc::now(),
+//             last_updated: chrono::Utc::now(),
+//             blocking: false,
+//         })
+//     }
+// }
+
+// impl std::fmt::Display for MockWorkflow {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         write!(f, "MockWorkflow")
+//     }
+// }
+
+// impl Workflow for MockWorkflow {
+//     fn advance(&mut self) -> Result<(), WorkflowError> {
+//         Ok(())
+//     }
+
+//     fn current_step(&self) -> String {
+//         "complete".to_string()
+//     }
+
+//     fn is_blocking(&self) -> bool {
+//         false
+//     }
+
+//     fn is_complete(&self) -> bool {
+//         true
+//     }
+
+//     fn blocking_reason(&self) -> Option<String> {
+//         None
+//     }
+// }
+
+/// Unit type for mock workflow implementation.
 #[derive(Debug)]
 pub struct MockBackend {
     pub users: DashMap<TestUserId, MockUser>,
@@ -117,9 +177,7 @@ impl AuthnBackend for MockBackend {
     type Tenant = MockTenant;
     type TenantId = TestTenantId;
     type MethodId = String;
-    // type MethodState: AuthMethodState<Self>;
     type FactorId = String;
-    // type FactorState = AuthFactorState<Self>;
     type DataId = String;
     type Error = String;
 

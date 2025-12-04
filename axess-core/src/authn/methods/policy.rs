@@ -317,6 +317,8 @@ pub enum OtpType {
     Totp,
     /// HMAC-based One-Time Password (RFC 4226).
     Hotp,
+    /// One-Time Confirmations sent via Email.
+    Email,
     /// Custom OTP type, identified by a string.
     #[serde(untagged)]
     Custom(String),
@@ -330,6 +332,7 @@ impl OtpType {
         match self {
             OtpType::Totp => "totp",
             OtpType::Hotp => "hotp",
+            OtpType::Email => "email",
             OtpType::Custom(s) => s.as_str(),
         }
     }
@@ -696,6 +699,17 @@ impl FactorConfigBuilder {
             .with_length(6)
             .with_field("counter", JsonValue::Number(JsonNumber::from(0u64)))
             .with_field("window", JsonValue::Number(JsonNumber::from(10u64)))
+    }
+
+    /// Creates a One-Time Confirmation factor config builder with the given email.
+    ///
+    /// Sets `"otp_type"`, `"email"`, `"length"`, `"counter"`, and `"window"`.
+    pub fn email(email: impl Into<String>) -> Self {
+        Self::new()
+            .with_field("otp_type", JsonValue::String("email".into()))
+            .with_field("email", JsonValue::String(email.into()))
+            .with_field("token", JsonValue::String("".into()))
+            .with_length(6)
     }
 
     /// Inserts or updates a field in the config.

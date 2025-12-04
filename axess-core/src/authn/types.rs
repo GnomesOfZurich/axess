@@ -50,6 +50,6 @@ pub type SessionState<B> = AuthState<
 pub type SessionData<B> = Data<
     <B as AuthnBackend>::MethodId,
     <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
     <B as AuthnBackend>::TenantId,
+    <B as AuthnBackend>::UserId,
 >;

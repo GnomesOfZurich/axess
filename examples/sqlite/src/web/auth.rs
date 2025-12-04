@@ -1,39 +1,66 @@
 // use std::sync::Arc;
 
+use crate::models::{authn::Session, backend::OurBackend};
 use askama::Template;
 use axess::{
-    AuthnAdminBackend, AuthnBackend, FactorConfigBuilder, FactorInstance, MethodBuilder,
-    TOTP_LENGTH, TOTP_PERIOD,
-    form::{PasswordForm, TotpForm, TotpSetupForm},
-    generate_password_hash, generate_totp_secret, verify_totp,
+    AuthFactorKind, AuthnAdminBackend, AuthnBackend, FactorConfigBuilder, FactorForm,
+    FactorFormKind, FactorInstance, TOTP_LENGTH, TOTP_PERIOD,
+    form::{
+        EmailChangeForm, FactorResetForm, PasswordChangeForm, PasswordSetupForm,
+        PasswordVerifyForm, TotpChangeForm, TotpSetupForm, TotpVerifyForm,
+    },
+    generate_password_hash, generate_totp_secret,
 };
 use axum::{
     Form, Router,
     extract::Query,
     http::StatusCode,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use axum_messages::{Message, Messages};
 use serde::Deserialize;
-use std::time::SystemTime;
 use uuid::Uuid;
-
-use crate::models::authn::Session;
 
 const DEFAULT_TENANT_NAME: &str = "Default Tenant";
 
+fn redirect_after_auth(next: Option<String>, fallback: &str) -> Response {
+    if let Some(url) = next {
+        Redirect::to(&url).into_response()
+    } else {
+        Redirect::to(fallback).into_response()
+    }
+}
+
 pub fn router() -> Router {
     Router::new()
-        .route("/login", post(self::post::login))
-        .route("/login", get(self::get::login))
-        .route("/logout", get(self::get::logout))
+        // Web-facing GET endpoints (serve forms/pages)
+        .route("/login", get(get::login))
+        .route("/logout", get(get::logout))
         .route("/signup", get(get::signup))
-        .route("/signup", post(post::signup))
-        .route("/factors/totp/setup", get(get::totp_setup))
-        .route("/factors/totp/setup", post(post::totp_setup))
-        .route("/factors/totp/verify", get(get::totp_verify))
-        .route("/factors/totp/verify", post(post::totp_verify))
+        .route("/password/setup", get(get::password_setup))
+        .route("/password/change", get(get::password_change))
+        .route("/email/verify", get(get::email_verify))
+        .route("/email/change", get(get::email_change))
+        .route("/totp/setup", get(get::totp_setup))
+        .route("/totp/verify", get(get::totp_verify))
+        .route("/totp/change", get(get::totp_change))
+        .route("/factor/reset", get(get::factor_reset))
+        // API POST endpoints (handle submissions)
+        .nest(
+            "/api/v1",
+            Router::new()
+                .route("/login", post(post::login))
+                .route("/signup", post(post::signup))
+                .route("/password/setup", post(post::password_setup))
+                .route("/password/change", post(post::password_change))
+                .route("/email/verify", post(post::email_verify))
+                .route("/email/change", post(post::email_change))
+                .route("/totp/setup", post(post::totp_setup))
+                .route("/totp/verify", post(post::totp_verify))
+                .route("/totp/change", post(post::totp_change))
+                .route("/factor/reset", post(post::factor_reset)),
+        )
 }
 
 #[derive(Template)]
@@ -67,17 +94,15 @@ pub struct NextUrl {
 }
 
 pub mod post {
-    use std::collections::HashMap;
 
     use crate::models::entities::OurUser;
 
     use super::*;
     use axess::{
-        AuthFactorKind, EnablementState, FactorStateChange, MethodStateChange, PermissionScope,
-        TOTP_PERIOD,
+        AuthFactorKind, EnablementState, FactorStateChange, PermissionScope, SessionState,
+        TOTP_PERIOD, WorkflowAction, form::EmailVerifyForm, form_fields_to_json,
     };
     use axum::Extension;
-    use serde_json::Value;
 
     #[derive(Deserialize)]
     pub struct SignupRequest {
@@ -102,7 +127,7 @@ pub mod post {
     pub async fn login(
         Extension(mut session): Extension<Session>,
         messages: Messages,
-        Form(mut form): Form<PasswordForm>,
+        Form(mut form): Form<PasswordVerifyForm>,
     ) -> impl IntoResponse {
         if form
             .tenant
@@ -114,7 +139,7 @@ pub mod post {
         }
 
         match session.authenticate_from_form(Form(form)).await {
-            Ok(response) => response,
+            Ok(response) => response.into_response(),
             Err(err) => {
                 messages.error(format!("Login failed: {}", err));
                 Redirect::to("/login").into_response()
@@ -122,9 +147,10 @@ pub mod post {
         }
     }
 
+    /// Handle signup requests
     #[axum::debug_handler]
     pub async fn signup(
-        Extension(session): Extension<Session>,
+        Extension(mut session): Extension<Session>,
         messages: Messages,
         Form(mut payload): Form<SignupRequest>,
     ) -> impl IntoResponse {
@@ -158,6 +184,8 @@ pub mod post {
             messages.error(format!("Failed to create user: {err}"));
             return Redirect::to("/signup").into_response();
         }
+
+        // Create factors
         let password_factor = FactorInstance::new(
             Uuid::new_v4(),
             AuthFactorKind::Password,
@@ -165,40 +193,42 @@ pub mod post {
             "Password factor",
             user_id,
         );
+        let email_factor = FactorInstance::new(
+            Uuid::new_v4(),
+            AuthFactorKind::Otp,
+            "email-verification",
+            "Email verification factor",
+            user_id,
+        );
         let totp_factor = FactorInstance::new(
             Uuid::new_v4(),
             AuthFactorKind::Otp,
-            "totp-login",
-            "TOTP factor",
+            "totp-setup",
+            "TOTP setup factor",
             user_id,
         );
 
-        if let Err(err) = backend
-            .upsert_auth_factor(password_factor.clone(), user_id)
-            .await
-        {
-            messages.error(format!("Failed to persist password factor: {err}"));
-            return Redirect::to("/signup").into_response();
+        // Persist factors
+        for factor in [&password_factor, &email_factor, &totp_factor] {
+            if let Err(err) = backend.upsert_auth_factor(factor.clone(), user_id).await {
+                messages.error(format!("Failed to persist factor: {err}"));
+                return Redirect::to("/signup").into_response();
+            }
         }
-        if let Err(err) = backend
-            .upsert_auth_factor(totp_factor.clone(), user_id)
-            .await
-        {
-            messages.error(format!("Failed to persist TOTP factor: {err}"));
-            return Redirect::to("/signup").into_response();
-        }
+
+        // Activate password factor
         let password_state = FactorStateChange::new(password_factor.id)
             .with_scope(PermissionScope::User(user.tenant_id, user_id))
             .with_state(EnablementState::Active)
             .with_config(
                 FactorConfigBuilder::password(generate_password_hash(&payload.password)).into(),
             );
-
         if let Err(err) = backend.upsert_factor_state(password_state, user_id).await {
             messages.error(format!("Failed to activate password factor: {err}"));
             return Redirect::to("/signup").into_response();
         }
 
+        // Stage TOTP factor as pending
         let totp_secret = generate_totp_secret();
         let totp_state = FactorStateChange::new(totp_factor.id)
             .with_scope(PermissionScope::User(user.tenant_id, user_id))
@@ -210,204 +240,253 @@ pub mod post {
                     .with_windows(1, 0)
                     .into(),
             );
-
         if let Err(err) = backend.upsert_factor_state(totp_state, user_id).await {
             messages.error(format!("Failed to stage TOTP factor: {err}"));
             return Redirect::to("/signup").into_response();
         }
 
-        let factors = vec![password_factor.clone(), totp_factor.clone()];
+        // Generate email verification code (for demo, just a UUID)
+        let email_code = Uuid::new_v4().to_string();
 
-        let method = MethodBuilder::new(
-            Uuid::new_v4(),
-            "password+totp",
-            "Password followed by TOTP",
-            user.id,
-        )
-        .add_factors(factors)
-        .build();
-        if let Err(err) = backend.upsert_auth_method(method.clone(), user_id).await {
-            messages.error(format!("Failed to persist auth method: {err}"));
-            return Redirect::to("/signup").into_response();
+        // Build workflow steps using axess-core's WorkflowState
+        use axess::{WorkflowState, WorkflowStep, WorkflowStepKind};
+        let workflow = WorkflowState {
+            steps: vec![
+                WorkflowStep {
+                    kind: WorkflowStepKind::FactorVerify(AuthFactorKind::Otp), // Email verification
+                    description: format!("Verify your email (code: {})", email_code),
+                    completed: false,
+                    completed_at: None,
+                    metadata: Some({
+                        let mut m = std::collections::HashMap::new();
+                        m.insert(
+                            "email_code".to_string(),
+                            serde_json::Value::String(email_code.clone()),
+                        );
+                        m
+                    }),
+                },
+                WorkflowStep {
+                    kind: WorkflowStepKind::FactorSetup(AuthFactorKind::Otp), // TOTP setup
+                    description: "Setup TOTP".to_string(),
+                    completed: false,
+                    completed_at: None,
+                    metadata: None,
+                },
+            ],
+            current_step: 0,
+            started_at: chrono::Utc::now(),
+            last_updated: chrono::Utc::now(),
+            blocking: true,
+        };
+
+        session.state = SessionState::<OurBackend>::PendingWorkflow(workflow);
+        session.save_session_data().await.ok();
+
+        messages.success(format!(
+            "Account created! Please verify your email using this code: {}",
+            email_code
+        ));
+        Redirect::to("/email/verify").into_response()
+    }
+
+    /// Handle password setup requests
+    #[axum::debug_handler]
+    pub async fn password_setup(
+        Extension(mut session): Extension<Session>,
+        messages: Messages,
+        Form(form): Form<PasswordSetupForm>,
+    ) -> impl IntoResponse {
+        match session
+            .handle_factor_setup(&form, AuthFactorKind::Password)
+            .await
+        {
+            Ok(_) => {
+                messages.success("Password setup complete!");
+                Redirect::to("/login").into_response()
+            }
+            Err(err) => {
+                messages.error(format!("Password setup failed: {}", err));
+                Redirect::to("/password/setup").into_response()
+            }
         }
+    }
 
-        let method_state = MethodStateChange::new(method.id, user_id)
-            .with_scope(PermissionScope::User(user.tenant_id, user_id))
-            .with_state(EnablementState::Active);
-
-        if let Err(err) = backend.upsert_method_state(method_state, user_id).await {
-            messages.error(format!("Failed to activate auth method: {err}"));
-            return Redirect::to("/signup").into_response();
+    /// Handle password change requests
+    #[axum::debug_handler]
+    pub async fn password_change(
+        Extension(mut session): Extension<Session>,
+        messages: Messages,
+        Form(form): Form<PasswordChangeForm>,
+    ) -> impl IntoResponse {
+        match session
+            .handle_factor_setup(&form, AuthFactorKind::Password)
+            .await
+        {
+            Ok(_) => {
+                messages.success("Password changed successfully!");
+                Redirect::to("/dashboard").into_response()
+            }
+            Err(err) => {
+                messages.error(format!("Password change failed: {}", err));
+                Redirect::to("/password/change").into_response()
+            }
         }
-
-        messages.success("Account created. Please enter your password.");
-        Redirect::to("/login").into_response()
     }
 
     #[axum::debug_handler]
     pub async fn totp_setup(
         Extension(mut session): Extension<Session>,
         messages: Messages,
-        Form(payload): Form<TotpSetupRequest>,
+        Form(form): Form<TotpSetupForm>,
     ) -> impl IntoResponse {
-        let form = TotpSetupForm {
-            secret: payload.secret,
-            tenant: None,
-            next: None,
-        };
+        if let SessionState::<OurBackend>::PendingWorkflow(ref mut workflow) = session.state {
+            let action = WorkflowAction::FactorForm {
+                kind: AuthFactorKind::Otp,
+                form_kind: FactorFormKind::Setup,
+                fields: form_fields_to_json(&form.fields()),
+            };
 
-        match session
-            .handle_factor_setup(&form, AuthFactorKind::Otp)
-            .await
-        {
-            Ok(_) => Redirect::to("/factors/totp/verify").into_response(),
-            Err(err) => {
-                messages.error(format!("TOTP setup failed: {}", err));
-                Redirect::to("/factors/totp/setup").into_response()
+            match workflow.advance(&action) {
+                Ok(_) => {
+                    // After advancing, check if workflow is complete and transition to authenticated
+                    if workflow.is_complete() {
+                        session.state = SessionState::<OurBackend>::Authenticated;
+                        session.save_session_data().await.ok();
+                        messages.success("TOTP setup complete! You are now authenticated.");
+                        redirect_after_auth(form.next.clone(), "/dashboard")
+                    } else {
+                        session.save_session_data().await.ok();
+                        messages.success("TOTP setup step complete.");
+                        redirect_after_auth(form.next.clone(), "/dashboard")
+                    }
+                }
+                Err(err) => {
+                    messages.error(format!("TOTP setup failed: {}", err));
+                    Redirect::to("/totp/setup").into_response()
+                }
             }
+        } else {
+            messages.error("No pending workflow for TOTP setup. This is unexpected after signup.");
+            Redirect::to("/login").into_response()
         }
     }
 
     #[axum::debug_handler]
+    pub async fn totp_change(
+        Extension(mut session): Extension<Session>,
+        messages: Messages,
+        Form(form): Form<TotpChangeForm>,
+    ) -> impl IntoResponse {
+        match session
+            .handle_factor_setup(&form, AuthFactorKind::Otp)
+            .await
+        {
+            Ok(_) => {
+                messages.success("TOTP changed successfully!");
+                Redirect::to("/dashboard").into_response()
+            }
+            Err(err) => {
+                messages.error(format!("TOTP change failed: {}", err));
+                Redirect::to("/factors/totp/change").into_response()
+            }
+        }
+    }
+
+    /// Handle TOTP verification requests
+    #[axum::debug_handler]
     pub async fn totp_verify(
         Extension(mut session): Extension<Session>,
         messages: Messages,
-        Form(payload): Form<TotpVerifyRequest>,
+        Form(form): Form<TotpVerifyForm>,
     ) -> impl IntoResponse {
-        let otp_code = payload.otp_code.trim().to_string();
-        let user = session.get_user();
-        let backend = session.backend.clone();
-        let scope = PermissionScope::User(user.tenant_id, user.id);
-
-        let pending = match backend
-            .get_scoped_auth_factors(scope.clone(), vec![EnablementState::Pending])
-            .await
-        {
-            Ok(factors) => factors,
-            Err(err) => {
-                messages.error(format!("Failed to load pending factors: {err}"));
-                return Html(TotpVerifyTemplate.render().unwrap_or_default()).into_response();
-            }
-        };
-
-        let mut activated = false;
-
-        for factor in pending
-            .into_iter()
-            .filter(|factor| matches!(factor.kind, AuthFactorKind::Otp))
-        {
-            let states = match backend.get_factor_states(&factor.id, scope.clone()).await {
-                Ok(states) => states,
-                Err(err) => {
-                    messages.error(format!("Failed to load factor state: {err}"));
-                    return Html(TotpVerifyTemplate.render().unwrap_or_default()).into_response();
-                }
-            };
-
-            if let Some(state) = states
-                .into_iter()
-                .find(|state| state.state == EnablementState::Pending)
-            {
-                let secret = match state.config.get("secret").and_then(|v| v.as_str()) {
-                    Some(value) => value,
-                    None => {
-                        messages.error("TOTP factor is missing its shared secret.".to_string());
-                        return Html(TotpVerifyTemplate.render().unwrap_or_default())
-                            .into_response();
-                    }
-                };
-
-                let digits = state
-                    .config
-                    .get("length")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(TOTP_LENGTH);
-
-                let period = state
-                    .config
-                    .get("period")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(TOTP_PERIOD);
-
-                let past_window = state
-                    .config
-                    .get("past_window")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
-
-                let future_window = state
-                    .config
-                    .get("future_window")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-
-                let matched_step = match verify_totp(
-                    secret,
-                    &otp_code,
-                    SystemTime::now(),
-                    Some(digits),
-                    Some(period),
-                    Some(past_window),
-                    Some(future_window),
-                ) {
-                    Some(step) => step,
-                    None => {
-                        messages.error("Invalid TOTP code.".to_string());
-                        return Html(TotpVerifyTemplate.render().unwrap_or_default())
-                            .into_response();
-                    }
-                };
-
-                let config: HashMap<String, Value> =
-                    FactorConfigBuilder::from_map(state.config.clone())
-                        .with_length(digits)
-                        .with_period(period)
-                        .with_windows(past_window, future_window)
-                        .with_last_totp_step(matched_step)
-                        .into();
-
-                let change = FactorStateChange::new(factor.id)
-                    .with_scope(scope.clone())
-                    .with_state(EnablementState::Active)
-                    .with_config(config);
-
-                if let Err(err) = backend.upsert_factor_state(change, user.id).await {
-                    messages.error(format!("Failed to activate TOTP factor: {err}"));
-                    return Html(TotpVerifyTemplate.render().unwrap_or_default()).into_response();
-                }
-
-                activated = true;
-                break;
-            }
-        }
-
-        if !activated {
-            messages.error("No pending TOTP factor available for verification.".to_string());
-            return Html(TotpVerifyTemplate.render().unwrap_or_default()).into_response();
-        }
-
-        let tenant_name = match backend.get_tenant(&user.tenant_id).await {
-            Ok(tenant) => tenant.name,
-            Err(err) => {
-                messages
-                    .clone()
-                    .info(format!("Using default tenant because lookup failed: {err}"));
-                DEFAULT_TENANT_NAME.to_string()
-            }
-        };
-
-        let form = TotpForm {
-            otp_code,
-            tenant: Some(tenant_name),
-            next: None,
-        };
-
         match session.authenticate_from_form(Form(form)).await {
             Ok(response) => response,
             Err(err) => {
                 messages.error(format!("TOTP verification failed: {}", err));
-                Html(TotpVerifyTemplate.render().unwrap_or_default()).into_response()
+                Redirect::to("/factors/totp/verify").into_response()
+            }
+        }
+    }
+
+    /// Handle email verification requests
+    #[axum::debug_handler]
+    pub async fn email_verify(
+        Extension(mut session): Extension<Session>,
+        messages: Messages,
+        Form(form): Form<EmailVerifyForm>,
+    ) -> impl IntoResponse {
+        if let SessionState::<OurBackend>::PendingWorkflow(ref mut workflow) = session.state {
+            let action = WorkflowAction::FactorForm {
+                kind: AuthFactorKind::Otp,
+                form_kind: FactorFormKind::Verify,
+                fields: form_fields_to_json(&form.fields()),
+            };
+            match workflow.advance(&action) {
+                Ok(_) => {
+                    // Drop mutable borrow of workflow before using session again
+                    let workflow_complete = workflow.is_complete();
+                    // End the mutable borrow of workflow here by limiting its scope
+
+                    session.save_session_data().await.ok();
+                    if workflow_complete {
+                        session.state = SessionState::<OurBackend>::Authenticated;
+                        session.save_session_data().await.ok();
+                        messages.success("Signup complete! You are now authenticated.");
+                        redirect_after_auth(form.next.clone(), "/dashboard")
+                    } else {
+                        messages.success("Email verified! Please setup TOTP.");
+                        Redirect::to("/totp/setup").into_response()
+                    }
+                }
+                Err(err) => {
+                    messages.error(format!("Email verification failed: {}", err));
+                    Redirect::to("/email/verify").into_response()
+                }
+            }
+        } else {
+            messages.error("No pending workflow for email verification.");
+            Redirect::to("/login").into_response()
+        }
+    }
+
+    /// Handle email change requests
+    #[axum::debug_handler]
+    pub async fn email_change(
+        Extension(mut session): Extension<Session>,
+        messages: Messages,
+        Form(form): Form<EmailChangeForm>,
+    ) -> impl IntoResponse {
+        match session
+            .handle_factor_setup(&form, AuthFactorKind::Otp)
+            .await
+        {
+            Ok(_) => {
+                messages.success("Email changed successfully!");
+                Redirect::to("/dashboard").into_response()
+            }
+            Err(err) => {
+                messages.error(format!("Email change failed: {}", err));
+                Redirect::to("/email/change").into_response()
+            }
+        }
+    }
+
+    /// Handle factor reset requests
+    #[axum::debug_handler]
+    pub async fn factor_reset(
+        Extension(mut session): Extension<Session>,
+        messages: Messages,
+        Form(form): Form<FactorResetForm>,
+    ) -> impl IntoResponse {
+        match session.handle_factor_setup(&form, form.factor_kind()).await {
+            Ok(_) => {
+                messages.success("Factor reset request submitted!");
+                Redirect::to("/dashboard").into_response()
+            }
+            Err(err) => {
+                messages.error(format!("Factor reset failed: {}", err));
+                Redirect::to("/factor/reset").into_response()
             }
         }
     }
@@ -415,7 +494,7 @@ pub mod post {
 
 pub mod get {
     use super::*;
-    use axess::{AuthFactorKind, EnablementState, PermissionScope, build_totp_uri};
+    use axess::{EnablementState, PermissionScope, build_totp_uri};
     use axum::Extension;
 
     #[axum::debug_handler]
@@ -550,4 +629,107 @@ pub mod get {
     pub async fn totp_verify() -> impl IntoResponse {
         Html(TotpVerifyTemplate.render().unwrap_or_default())
     }
+
+    #[axum::debug_handler]
+    pub async fn password_setup(messages: Messages) -> impl IntoResponse {
+        Html(
+            PasswordSetupTemplate {
+                messages: messages.into_iter().map(|m| m.to_string()).collect(),
+            }
+            .render()
+            .unwrap_or_default(),
+        )
+    }
+
+    #[axum::debug_handler]
+    pub async fn password_change(messages: Messages) -> impl IntoResponse {
+        Html(
+            PasswordChangeTemplate {
+                messages: messages.into_iter().map(|m| m.to_string()).collect(),
+            }
+            .render()
+            .unwrap_or_default(),
+        )
+    }
+
+    #[axum::debug_handler]
+    pub async fn email_verify(messages: Messages) -> impl IntoResponse {
+        Html(
+            EmailVerifyTemplate {
+                messages: messages.into_iter().map(|m| m.to_string()).collect(),
+            }
+            .render()
+            .unwrap_or_default(),
+        )
+    }
+
+    #[axum::debug_handler]
+    pub async fn email_change(messages: Messages) -> impl IntoResponse {
+        Html(
+            EmailChangeTemplate {
+                messages: messages.into_iter().map(|m| m.to_string()).collect(),
+            }
+            .render()
+            .unwrap_or_default(),
+        )
+    }
+
+    #[axum::debug_handler]
+    pub async fn totp_change(messages: Messages) -> impl IntoResponse {
+        Html(
+            TotpChangeTemplate {
+                messages: messages.into_iter().map(|m| m.to_string()).collect(),
+            }
+            .render()
+            .unwrap_or_default(),
+        )
+    }
+
+    #[axum::debug_handler]
+    pub async fn factor_reset(messages: Messages) -> impl IntoResponse {
+        Html(
+            FactorResetTemplate {
+                messages: messages.into_iter().map(|m| m.to_string()).collect(),
+            }
+            .render()
+            .unwrap_or_default(),
+        )
+    }
+}
+
+// Add these Askama templates at the top of the file or in a suitable module:
+#[derive(Template)]
+#[template(path = "password_setup.html")]
+struct PasswordSetupTemplate {
+    messages: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "password_change.html")]
+struct PasswordChangeTemplate {
+    messages: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "email_verify.html")]
+struct EmailVerifyTemplate {
+    messages: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "email_change.html")]
+struct EmailChangeTemplate {
+    messages: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "totp_change.html")]
+struct TotpChangeTemplate {
+    messages: Vec<String>,
+}
+
+#[derive(Template)]
+#[template(path = "factor_reset.html")]
+struct FactorResetTemplate {
+    messages: Vec<String>,
 }
