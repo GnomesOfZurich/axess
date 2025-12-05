@@ -33,7 +33,6 @@ use crate::authn::backend::admin::AuthnAdminBackend;
 use crate::{
     authn::{
         backend::{AuthTenant, AuthnBackend, EntityState},
-        // errors::WorkflowError,
         methods::{
             MethodStateChange,
             factor::FactorStateChange,
@@ -41,8 +40,7 @@ use crate::{
             scope::{EnablementState, PermissionScope},
         },
         session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
-        types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
-        // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
+        types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState}, // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
     },
     utils::testing::{
         mock_authn::{MockAuthFactor, MockAuthFactorState, MockAuthMethod, MockAuthMethodState},
@@ -50,6 +48,7 @@ use crate::{
             DEFAULT_TENANT_ID, DEFAULT_USER_ID, MockTenant, MockUser, SYSTEM_SUPER_USER_ID,
             TENANT_SUPER_USER_ID, TestTenantId, TestUserId,
         },
+        mock_form::DummyFailingForm,
     },
 };
 
@@ -59,6 +58,16 @@ use dashmap::DashMap;
 // use serde::{Deserialize, Serialize};
 // use std::{fmt::Debug, hash::Hash};
 use std::fmt::Debug;
+use thiserror::Error;
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum MockBackendError {
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("Other error: {0}")]
+    Other(String),
+}
 
 // TODO: Consider letting the mock backend be an in-memory SQLite database
 // use sqlx::SqlitePool;
@@ -122,8 +131,6 @@ use std::fmt::Debug;
 //     }
 // }
 
-/// Unit type for mock workflow implementation.
-#[derive(Debug)]
 pub struct MockBackend {
     pub users: DashMap<TestUserId, MockUser>,
     pub tenants: DashMap<TestTenantId, MockTenant>,
@@ -131,7 +138,13 @@ pub struct MockBackend {
     pub auth_factor_states: DashMap<String, MockAuthFactorState>,
     pub auth_methods: DashMap<String, MockAuthMethod>,
     pub auth_method_states: DashMap<String, MockAuthMethodState>,
-    pub authn_history: DashMap<String, Vec<AuthEvent<MockBackend>>>,
+    pub authn_history: DashMap<String, Vec<AuthEvent<Self>>>,
+}
+
+impl std::fmt::Debug for MockBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MockBackend {{ ... }}")
+    }
 }
 
 impl Clone for MockBackend {
@@ -156,6 +169,9 @@ impl Clone for MockBackend {
     }
 }
 
+#[async_trait]
+// Removed duplicate and incomplete impl AuthnBackend for MockBackend
+
 impl Default for MockBackend {
     fn default() -> Self {
         Self {
@@ -179,14 +195,13 @@ impl AuthnBackend for MockBackend {
     type MethodId = String;
     type FactorId = String;
     type DataId = String;
-    type Error = String;
+    type Error = MockBackendError;
 
     async fn get_default_protected_route(
         &self,
         _tenant_id: Self::TenantId,
         _user_id: Self::UserId,
     ) -> Result<String, Self::Error> {
-        // For mock implementation, return a fixed route
         Ok("/dashboard".to_string())
     }
 
@@ -194,7 +209,7 @@ impl AuthnBackend for MockBackend {
         self.tenants
             .get(tenant_id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| "Tenant not found".to_string())
+            .ok_or_else(|| MockBackendError::NotFound("Tenant not found".to_string()))
     }
 
     async fn get_tenant_by_name(&self, name: &str) -> Result<Self::Tenant, Self::Error> {
@@ -202,7 +217,7 @@ impl AuthnBackend for MockBackend {
             .iter()
             .find(|entry| entry.value().name == name)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| "Tenant not found".to_string())
+            .ok_or_else(|| MockBackendError::NotFound("Tenant not found".to_string()))
     }
 
     async fn get_default_tenant_id(&self) -> Result<Self::TenantId, Self::Error> {
@@ -213,7 +228,7 @@ impl AuthnBackend for MockBackend {
         self.users
             .get(user_id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| "User not found".to_string())
+            .ok_or_else(|| MockBackendError::NotFound("User not found".to_string()))
     }
 
     async fn get_user_by_name(
@@ -225,7 +240,7 @@ impl AuthnBackend for MockBackend {
             .iter()
             .find(|entry| entry.value().tenant_id == *tenant_id && entry.value().id.0 == username)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| "User not found".to_string())
+            .ok_or_else(|| MockBackendError::NotFound("User not found".to_string()))
     }
 
     async fn get_system_user_id(
@@ -237,7 +252,7 @@ impl AuthnBackend for MockBackend {
             Some(tid) if tid.0.as_str() == DEFAULT_TENANT_ID => {
                 Ok(TestUserId(TENANT_SUPER_USER_ID.to_string()))
             }
-            Some(_) => Err("User not found".to_string()),
+            Some(_) => Err(MockBackendError::NotFound("User not found".to_string())),
             None => Ok(TestUserId(SYSTEM_SUPER_USER_ID.to_string())),
         }
     }
@@ -246,12 +261,15 @@ impl AuthnBackend for MockBackend {
         &self,
         user_id: &Self::UserId,
         new_state: EntityState,
+        _actor: Self::UserId,
     ) -> Result<Self::User, Self::Error> {
         if let Some(mut entry) = self.users.get_mut(user_id) {
             entry.state = new_state;
+            // entry.updated_at = Utc::now();
+            // entry.updated_by = actor;
             Ok(entry.clone())
         } else {
-            Err("User not found".to_string())
+            Err(MockBackendError::NotFound("User not found".to_string()))
         }
     }
 
@@ -275,7 +293,7 @@ impl AuthnBackend for MockBackend {
         self.auth_methods
             .get(method_id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| "Method not found".to_string())
+            .ok_or_else(|| MockBackendError::NotFound("Method not found".to_string()))
     }
 
     async fn get_all_auth_methods(&self) -> Result<Vec<AuthMethod<Self>>, Self::Error> {
@@ -403,7 +421,7 @@ impl AuthnBackend for MockBackend {
         self.auth_factors
             .get(factor_id)
             .map(|entry| entry.value().clone())
-            .ok_or_else(|| "Factor not found".to_string())
+            .ok_or_else(|| MockBackendError::NotFound("Factor not found".to_string()))
     }
 
     async fn get_all_auth_factors(&self) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
@@ -639,11 +657,41 @@ impl AuthnBackend for MockBackend {
         Ok(())
     }
 
-    async fn authenticate<'a, F>(&self, _creds: &'a F) -> Result<Self::User, Self::Error>
+    async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
     where
         F: FactorForm + Send + Sync,
     {
-        // For mock implementation, return a default active user
+        // If the form is DummyFailingForm, return an error
+        if std::any::type_name_of_val(creds) == std::any::type_name::<DummyFailingForm>() {
+            return Err(MockBackendError::Other("Invalid credentials".to_string()));
+        }
+
+        // If there are no users, or only a guest user, fail authentication
+        let only_guest = self.users.len() == 1
+            && self
+                .users
+                .get(&TestUserId("guest".to_string()))
+                .map(|u| u.state == EntityState::Guest)
+                .unwrap_or(false);
+
+        let no_users = self.users.is_empty();
+
+        if only_guest || no_users {
+            return Err(MockBackendError::Other(
+                "Guest users cannot authenticate".to_string(),
+            ));
+        }
+
+        // If a user with id "guest" exists and is a guest, fail authentication
+        if let Some(user) = self.users.get(&TestUserId("guest".to_string())) {
+            if user.state == EntityState::Guest {
+                return Err(MockBackendError::Other(
+                    "Guest users cannot authenticate".to_string(),
+                ));
+            }
+        }
+
+        // Otherwise, return a valid user
         Ok(MockUser {
             id: DEFAULT_USER_ID.into(),
             tenant_id: DEFAULT_TENANT_ID.into(),
@@ -687,8 +735,12 @@ impl AuthnAdminBackend for MockBackend {
         tenant_id: &Self::TenantId,
         _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
-        self.tenants.remove(tenant_id);
-        Ok(())
+        // Only return Ok if the tenant existed and was removed
+        if self.tenants.remove(tenant_id).is_some() {
+            Ok(())
+        } else {
+            Err(MockBackendError::NotFound("Tenant not found".to_string()))
+        }
     }
 
     async fn delete_method_state(

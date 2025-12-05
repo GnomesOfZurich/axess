@@ -7,12 +7,30 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use axess::{
-    AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorKind,
-    AuthFactorState, AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, EnablementState,
-    EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, MethodStateChange,
-    PermissionScope, TOTP_LENGTH, TOTP_PERIOD,
+    AuthEvent,
+    AuthEventRecord,
+    AuthEventStatus,
+    AuthEventType,
+    AuthFactor,
+    AuthFactorKind,
+    AuthFactorState,
+    AuthMethod,
+    AuthMethodState,
+    AuthnAdminBackend,
+    AuthnBackend,
+    EnablementState,
+    EntityState,
+    FactorForm,
+    FactorFormExt,
+    FactorStateChange,
+    FormField,
+    MethodStateChange,
+    PermissionScope,
+    TOTP_LENGTH,
+    TOTP_PERIOD,
     // WorkflowState, WorkflowStep, WorkflowStepKind,
-    verify_password, verify_totp,
+    verify_password,
+    verify_totp,
 };
 
 use crate::models::{
@@ -204,23 +222,32 @@ impl AuthnBackend for OurBackend {
         Ok(super_user.id)
     }
 
-    /// Gets the super user for the given tenant, or the super user for the global system if none is provided.
+    /// Set the state of a user (e.g., Active, Inactive, Suspended).
     async fn set_user_state(
         &self,
         user_id: &Self::UserId,
         new_state: EntityState,
+        actor: Self::UserId,
     ) -> Result<Self::User, Self::Error> {
         let mut conn = self.db.acquire().await?;
+        let now = Utc::now();
         let row = sqlx::query(
-            "UPDATE users SET state = ? WHERE id = ? RETURNING id, username, password, tenant_id, state, factors, methods"
+            r#"
+            UPDATE users
+            SET state = ?, updated_at = ?, updated_by = ?
+            WHERE id = ?
+            RETURNING id, tenant_id, username, fullname, email, state,
+                      created_at, created_by, updated_at, updated_by, version
+            "#,
         )
-            .bind(format!("{new_state:?}"))
-            .bind(user_id.to_string())
-            .fetch_one(&mut *conn)
-            .await?;
+        .bind(format!("{:?}", new_state))
+        .bind(now.to_rfc3339())
+        .bind(actor.to_string())
+        .bind(user_id.to_string())
+        .fetch_one(&mut *conn)
+        .await?;
 
-        let user = OurUser::from_row(&row)?;
-        Ok(user)
+        OurUser::from_row(&row)
     }
 
     /// Create a new guest user in the backend.
