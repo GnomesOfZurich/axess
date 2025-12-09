@@ -13,10 +13,10 @@ pub mod scope;
 
 use crate::{
     authn::{
-        backend::{DataId, FactorId, MethodId, TenantId, UserId},
+        backend::{AuthId, TenantId, UserId},
         methods::{
-            factor::{AuthFactorKind, FactorInstance},
-            scope::{EnablementState, PermissionScope},
+            factor::{FactorInstance, Kind},
+            scope::{AuthnScope, EnablementState},
         },
     },
     tracing::error,
@@ -47,24 +47,24 @@ use std::fmt::Debug;
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::{MethodStateChange, scope::{EnablementState, PermissionScope}};
+/// use axess_core::authn::methods::{MethodStateChange, scope::{EnablementState, AuthnScope}};
 ///
 /// let method_id = 42_u64;
 /// let tenant_id = 1_u64;
 /// let user_id = 2_u64;
 ///
 /// let change = MethodStateChange::new(method_id, user_id)
-///     .with_scope(PermissionScope::User(tenant_id, user_id))
+///     .with_scope(AuthnScope::User(tenant_id, user_id))
 ///     .with_state(EnablementState::Active);
 /// ```
-pub struct MethodStateChange<M, T, U>
+pub struct MethodStateChange<A, T, U>
 where
-    M: MethodId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// The ID of the method to change.
-    pub method_id: M,
+    pub method_id: A,
     /// Optional tenant scope; `None` for global methods.
     pub tenant_id: Option<T>,
     /// Optional user scope; `None` for tenant/global methods.
@@ -75,16 +75,16 @@ where
     pub updated_by: U,
 }
 
-impl<M, T, U> MethodStateChange<M, T, U>
+impl<A, T, U> MethodStateChange<A, T, U>
 where
-    M: MethodId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Creates a new `MethodStateChange` for the given method and actor.
     ///
     /// By default, sets the state to `Active` and leaves scope empty.
-    pub fn new(method_id: M, updated_by: U) -> Self {
+    pub fn new(method_id: A, updated_by: U) -> Self {
         Self {
             method_id,
             tenant_id: None,
@@ -96,8 +96,8 @@ where
 
     /// Sets the scope (global, tenant, or user) for this change.
     ///
-    /// This will populate `tenant_id` and `user_id` according to the provided [`PermissionScope`].
-    pub fn with_scope(mut self, scope: PermissionScope<T, U>) -> Self {
+    /// This will populate `tenant_id` and `user_id` according to the provided [`AuthnScope`].
+    pub fn with_scope(mut self, scope: AuthnScope<T, U>) -> Self {
         self.tenant_id = scope.tenant_id().cloned();
         self.user_id = scope.user_id().cloned();
         self
@@ -136,7 +136,7 @@ where
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::{MethodState, scope::{EnablementState, PermissionScope}};
+/// use axess_core::authn::methods::{MethodState, scope::{EnablementState, AuthnScope}};
 ///
 /// type TenantId = u64;
 ///
@@ -144,23 +144,22 @@ where
 /// let method_id = 42_u64;
 /// let created_by = 2_u64;
 ///
-/// let state: MethodState<u64, u64, TenantId, u64> = MethodState::new(id, method_id, created_by)
+/// let state: MethodState<u64, TenantId, u64> = MethodState::new(id, method_id, created_by)
 ///     .with_state(EnablementState::Active);
 /// assert_eq!(state.state, EnablementState::Active);
-/// assert_eq!(state.scope(), PermissionScope::Global);
+/// assert_eq!(state.scope(), AuthnScope::Global);
 /// ```
 #[derive(Debug, Clone, Serialize, Eq, PartialEq)]
-pub struct MethodState<D, M, T, U>
+pub struct MethodState<A, T, U>
 where
-    D: DataId,
-    M: MethodId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Unique identifier for this method state (usually a UUID or database key).
-    pub id: D,
+    pub id: A,
     /// The ID of the authentication method.
-    pub method_id: M,
+    pub method_id: A,
     /// Optional tenant scope; `None` for global methods.
     pub tenant_id: Option<T>,
     /// Optional user scope; `None` for tenant/global methods.
@@ -177,17 +176,16 @@ where
     pub updated_by: U,
 }
 
-impl<D, M, T, U> MethodState<D, M, T, U>
+impl<A, T, U> MethodState<A, T, U>
 where
-    D: DataId,
-    M: MethodId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Creates a new `MethodState` with default values.
     ///
     /// Sets `state` to `Pending` and initializes timestamps.
-    pub fn new(id: D, method_id: M, created_by: U) -> Self {
+    pub fn new(id: A, method_id: A, created_by: U) -> Self {
         let time_now = Utc::now();
         Self {
             id,
@@ -208,12 +206,12 @@ where
         self
     }
 
-    /// Returns the [`PermissionScope`] for this method state (global, tenant, or user).
-    pub fn scope(&self) -> PermissionScope<T, U> {
+    /// Returns the [`AuthnScope`] for this method state (global, tenant, or user).
+    pub fn scope(&self) -> AuthnScope<T, U> {
         match (&self.tenant_id, &self.user_id) {
-            (None, None) => PermissionScope::Global,
-            (Some(tid), None) => PermissionScope::Tenant(tid.clone()),
-            (Some(tid), Some(uid)) => PermissionScope::User(tid.clone(), uid.clone()),
+            (None, None) => AuthnScope::Global,
+            (Some(tid), None) => AuthnScope::Tenant(tid.clone()),
+            (Some(tid), Some(uid)) => AuthnScope::User(tid.clone(), uid.clone()),
             (None, Some(_)) => {
                 error!("user_id without tenant_id should not occur");
                 unreachable!("user_id without tenant_id should not occur")
@@ -224,23 +222,22 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound(
-    serialize = "M: Serialize, F: Serialize, U: Serialize",
-    deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned"
+    serialize = "A: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, U: DeserializeOwned"
 ))]
-pub struct MethodInstance<M, F, U>
+pub struct MethodInstance<A, U>
 where
-    M: MethodId + Serialize + DeserializeOwned,
+    A: AuthId + Serialize + DeserializeOwned,
     U: UserId + Serialize + DeserializeOwned,
-    F: FactorId + Serialize + DeserializeOwned,
 {
     /// Unique identifier for this method (e.g., UUID, string).
-    pub id: M,
+    pub id: A,
     /// Human-readable name for the method (e.g., "Password + TOTP").
     pub name: String,
     /// Optional description or display text for the method.
     pub description: String,
     /// List of factors that must be verified for this method.
-    pub factors: Vec<FactorInstance<F, U>>,
+    pub factors: Vec<FactorInstance<A, U>>,
     /// Timestamp when this method was created.
     pub created_at: DateTime<Utc>,
     /// Who created this method.
@@ -251,17 +248,16 @@ where
     pub updated_by: U,
 }
 
-impl<M, F, U> MethodInstance<M, F, U>
+impl<A, U> MethodInstance<A, U>
 where
-    M: MethodId + Serialize + DeserializeOwned,
+    A: AuthId + Serialize + DeserializeOwned,
     U: UserId + Serialize + DeserializeOwned,
-    F: FactorId + Serialize + DeserializeOwned,
 {
     pub fn new(
-        id: M,
+        id: A,
         name: &str,
         description: &str,
-        factors: Vec<FactorInstance<F, U>>,
+        factors: Vec<FactorInstance<A, U>>,
         created_by: U,
     ) -> Self {
         let time_now = Utc::now();
@@ -277,13 +273,13 @@ where
         }
     }
 
-    pub fn get_factor(&self, factor_id: &F) -> Option<&FactorInstance<F, U>> {
+    pub fn get_factor(&self, factor_id: &A) -> Option<&FactorInstance<A, U>> {
         self.factors.iter().find(|factor| &factor.id == factor_id)
     }
 
-    pub fn get_factor_ids(&self) -> Vec<F>
+    pub fn get_factor_ids(&self) -> Vec<A>
     where
-        F: Clone,
+        A: Clone,
     {
         self.factors
             .iter()
@@ -291,14 +287,14 @@ where
             .collect()
     }
 
-    pub fn get_first_factor_id(&self) -> Option<F>
+    pub fn get_first_factor_id(&self) -> Option<A>
     where
-        F: Clone,
+        A: Clone,
     {
         self.factors.first().map(|factor| factor.id.clone())
     }
 
-    pub fn has_factor_kind(&self, kind: &AuthFactorKind) -> bool {
+    pub fn has_factor_kind(&self, kind: &Kind) -> bool {
         self.factors.iter().any(|factor| &factor.kind == kind)
     }
 }
@@ -324,11 +320,11 @@ where
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::{MethodBuilder, factor::{AuthFactorKind, FactorInstance}};
+/// use axess_core::authn::methods::{MethodBuilder, factor::{Kind, FactorInstance}};
 ///
 /// let password_factor = FactorInstance::new(
 ///     "password-factor".to_string(),
-///     AuthFactorKind::Password,
+///     Kind::Password,
 ///     "Password",
 ///     "Primary login password",
 ///     "user-id".to_string(),
@@ -345,30 +341,28 @@ where
 /// assert_eq!(method.name, "Password Only");
 /// assert_eq!(method.factors.len(), 1);
 /// ```
-pub struct MethodBuilder<M, F, U>
+pub struct MethodBuilder<A, U>
 where
-    M: MethodId + Serialize + DeserializeOwned,
-    F: FactorId + Serialize + DeserializeOwned,
+    A: AuthId + Serialize + DeserializeOwned,
     U: UserId + Serialize + DeserializeOwned,
 {
-    id: M,
+    id: A,
     name: String,
     description: String,
-    factors: Vec<FactorInstance<F, U>>,
+    factors: Vec<FactorInstance<A, U>>,
     created_by: U,
 }
 
-impl<M, F, U> MethodBuilder<M, F, U>
+impl<A, U> MethodBuilder<A, U>
 where
-    M: MethodId + Serialize + DeserializeOwned,
-    F: FactorId + Serialize + DeserializeOwned,
+    A: AuthId + Serialize + DeserializeOwned,
     U: UserId + Serialize + DeserializeOwned,
 {
     /// Creates a new builder for an authentication method.
     ///
     /// Sets the method's ID, name, description, and creator.
     pub fn new(
-        id: M,
+        id: A,
         name: impl Into<String>,
         description: impl Into<String>,
         created_by: U,
@@ -385,7 +379,7 @@ where
     /// Adds a single factor to the method.
     ///
     /// Can be chained for ergonomic construction.
-    pub fn add_factor(mut self, factor: FactorInstance<F, U>) -> Self {
+    pub fn add_factor(mut self, factor: FactorInstance<A, U>) -> Self {
         self.factors.push(factor);
         self
     }
@@ -395,7 +389,7 @@ where
     /// Accepts any iterator of [`FactorInstance`]s.
     pub fn add_factors<I>(mut self, factors: I) -> Self
     where
-        I: IntoIterator<Item = FactorInstance<F, U>>,
+        I: IntoIterator<Item = FactorInstance<A, U>>,
     {
         self.factors.extend(factors);
         self
@@ -404,7 +398,7 @@ where
     /// Builds and returns a [`MethodInstance`] from the builder.
     ///
     /// Consumes the builder and produces a fully constructed method.
-    pub fn build(self) -> MethodInstance<M, F, U> {
+    pub fn build(self) -> MethodInstance<A, U> {
         MethodInstance::new(
             self.id,
             &self.name,

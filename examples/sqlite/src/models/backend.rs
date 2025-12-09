@@ -7,30 +7,10 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use axess::{
-    AuthEvent,
-    AuthEventRecord,
-    AuthEventStatus,
-    AuthEventType,
-    AuthFactor,
-    AuthFactorKind,
-    AuthFactorState,
-    AuthMethod,
-    AuthMethodState,
-    AuthnAdminBackend,
-    AuthnBackend,
-    EnablementState,
-    EntityState,
-    FactorForm,
-    FactorFormExt,
-    FactorStateChange,
-    FormField,
-    MethodStateChange,
-    PermissionScope,
-    TOTP_LENGTH,
-    TOTP_PERIOD,
-    // WorkflowState, WorkflowStep, WorkflowStepKind,
-    verify_password,
-    verify_totp,
+    AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorState,
+    AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, AuthnScope, EnablementState,
+    EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, Kind, MethodStateChange,
+    TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp,
 };
 
 use crate::models::{
@@ -42,7 +22,23 @@ const DEFAULT_TENANT_NAME: &str = "Default Tenant";
 const SYSTEM_SUPER_USER_NAME: &str = "system";
 const TENANT_SUPER_USER_NAME: &str = "tenant";
 
-pub type DataId = String;
+// Helper to build the SQL state filter clause and bind values
+fn build_state_filter(states: &[EnablementState], column: &str) -> (String, Vec<String>) {
+    if states.is_empty() {
+        // No filtering
+        (String::new(), vec![])
+    } else {
+        let state_list: Vec<String> = states.iter().map(|s| format!("{:?}", s)).collect();
+        let placeholders = state_list
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(", ");
+        (format!("AND {column} IN ({})", placeholders), state_list)
+    }
+}
+
+// pub type AuthId = String;
 
 /// Example backend implementation.
 #[derive(Debug, Clone)]
@@ -67,14 +63,14 @@ impl PartialEq for OurBackend {
 //     WorkflowState {
 //         steps: vec![
 //             WorkflowStep {
-//                 kind: WorkflowStepKind::FactorVerify(AuthFactorKind::Otp), // Email verification
+//                 kind: WorkflowStepKind::FactorVerify(Kind::Otp), // Email verification
 //                 description: "Verify your email".to_string(),
 //                 completed: false,
 //                 completed_at: None,
 //                 metadata: None,
 //             },
 //             WorkflowStep {
-//                 kind: WorkflowStepKind::FactorSetup(AuthFactorKind::Otp), // TOTP setup
+//                 kind: WorkflowStepKind::FactorSetup(Kind::Otp), // TOTP setup
 //                 description: "Setup TOTP".to_string(),
 //                 completed: false,
 //                 completed_at: None,
@@ -123,10 +119,8 @@ impl AuthnBackend for OurBackend {
     type UserId = Uuid;
     type Tenant = OurTenant;
     type TenantId = Uuid;
+    type AuthId = Uuid;
     type Error = sqlx::Error;
-    type MethodId = Uuid;
-    type FactorId = Uuid;
-    type DataId = DataId;
 
     async fn get_default_protected_route(
         &self,
@@ -267,7 +261,7 @@ impl AuthnBackend for OurBackend {
     /// Get the authentication method by its ID.
     async fn get_auth_method(
         &self,
-        method_id: &<OurBackend as AuthnBackend>::MethodId,
+        method_id: &<OurBackend as AuthnBackend>::AuthId,
     ) -> Result<AuthMethod<OurBackend>, Self::Error> {
         let mut conn = self.db.acquire().await?;
         let row = sqlx::query("SELECT * FROM auth_methods WHERE id = ?")
@@ -280,95 +274,197 @@ impl AuthnBackend for OurBackend {
         Ok(method)
     }
 
-    /// Get all authentication methods for a given scope (global/user/tenant), disregarding activation state.
-    async fn get_all_auth_methods(&self) -> Result<Vec<AuthMethod<Self>>, Self::Error> {
+    /// Get an authentication method by its name, filtered by enablement state(s) and scope.
+    ///
+    /// Returns the first matching method, or an error if not found.
+    async fn get_auth_method_by_name(
+        &self,
+        name: &str,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
+    ) -> Result<AuthMethod<Self>, Self::Error> {
+        let (state_filter, state_binds) = build_state_filter(&states, "ms.state");
+
+        let (query, mut binds): (String, Vec<Option<String>>) = match scope {
+            AuthnScope::Global => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE m.name = ?1
+                    AND EXISTS (
+                        SELECT 1 FROM method_states ms
+                        WHERE ms.method_id = m.id
+                        AND ms.tenant_id IS NULL
+                        AND ms.user_id IS NULL
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![Some(name.to_string())],
+            ),
+            AuthnScope::Any => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE m.name = ?1
+                    AND EXISTS (
+                        SELECT 1 FROM method_states ms
+                        WHERE ms.method_id = m.id
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![Some(name.to_string())],
+            ),
+            AuthnScope::Tenant(tid) => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE m.name = ?1
+                    AND EXISTS (
+                        SELECT 1 FROM method_states ms
+                        WHERE ms.method_id = m.id
+                        AND ms.tenant_id = ?2
+                        AND ms.user_id IS NULL
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![Some(name.to_string()), Some(tid.to_string())],
+            ),
+            AuthnScope::User(tid, uid) => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE m.name = ?1
+                    AND EXISTS (
+                        SELECT 1 FROM method_states ms
+                        WHERE ms.method_id = m.id
+                        AND ms.tenant_id = ?2
+                        AND ms.user_id = ?3
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![
+                    Some(name.to_string()),
+                    Some(tid.to_string()),
+                    Some(uid.to_string()),
+                ],
+            ),
+        };
+
+        for s in state_binds {
+            binds.push(Some(s));
+        }
+
         let mut conn = self.db.acquire().await?;
-        let rows: Vec<OurAuthMethod> = sqlx::query_as(
-            r#"
-            SELECT * FROM auth_methods  
-            "#,
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-
-        let methods: Vec<AuthMethod<OurBackend>> = rows
-            .into_iter()
-            .map(|row: OurAuthMethod| AuthMethod::<OurBackend>::from(row))
-            .collect();
-
-        Ok(methods)
+        let mut sql = sqlx::query_as::<_, OurAuthMethod>(&query);
+        for bind in binds {
+            match bind {
+                Some(val) => sql = sql.bind(val),
+                None => sql = sql.bind(None::<String>),
+            }
+        }
+        let method = sql.fetch_one(&mut *conn).await?;
+        Ok(AuthMethod::<OurBackend>::from(method))
     }
 
     /// Get all active Authentication methods for a given scope (global/user/tenant) and filtered by the enablement state.
     async fn get_scoped_auth_methods(
         &self,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
-        state: EnablementState,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
     ) -> Result<Vec<AuthMethod<Self>>, Self::Error> {
-        let state_str = format!("{:?}", state);
+        let (state_filter, state_binds) = build_state_filter(&states, "s.state");
 
-        let (query, binds): (&str, Vec<Option<String>>) = match scope {
-            PermissionScope::Global => (
-                r#"
-                SELECT m.*
-                FROM auth_methods m
-                WHERE EXISTS (
-                    SELECT * FROM method_states s
-                    WHERE s.method_id = m.id
-                    AND s.tenant_id IS NULL
-                    AND s.user_id IS NULL
-                    AND s.state = ?1
-                )
-                "#,
-                vec![Some(state_str.clone())],
+        let (query, mut binds): (String, Vec<Option<String>>) = match scope {
+            AuthnScope::Global => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE EXISTS (
+                        SELECT 1 FROM method_states s
+                        WHERE s.method_id = m.id
+                        AND s.tenant_id IS NULL
+                        AND s.user_id IS NULL
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
+                vec![],
             ),
-            PermissionScope::Any => (
-                r#"
-                SELECT m.*
-                FROM auth_methods m
-                WHERE EXISTS (
-                    SELECT * FROM method_states s
-                    WHERE s.method_id = m.id
-                    AND s.state = ?1
-                )
-                "#,
-                vec![Some(state_str.clone())],
+            AuthnScope::Any => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE EXISTS (
+                        SELECT 1 FROM method_states s
+                        WHERE s.method_id = m.id
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
+                vec![],
             ),
-            PermissionScope::Tenant(tid) => (
-                r#"
-                SELECT m.*
-                FROM auth_methods m
-                WHERE EXISTS (
-                    SELECT * FROM method_states s
-                    WHERE s.method_id = m.id
-                    AND s.tenant_id = ?1
-                    AND s.user_id IS NULL
-                    AND s.state = ?2
-                )
-                "#,
-                vec![Some(tid.to_string()), Some(state_str.clone())],
+            AuthnScope::Tenant(tid) => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE EXISTS (
+                        SELECT 1 FROM method_states s
+                        WHERE s.method_id = m.id
+                        AND s.tenant_id = ?1
+                        AND s.user_id IS NULL
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
+                vec![Some(tid.to_string())],
             ),
-            PermissionScope::User(tid, uid) => (
-                r#"
-                SELECT m.*
-                FROM auth_methods m
-                WHERE EXISTS (
-                    SELECT * FROM method_states s
-                    WHERE s.method_id = m.id
-                    AND s.tenant_id = ?1
-                    AND s.user_id = ?2
-                    AND s.state = ?3
-                )
-                "#,
-                vec![
-                    Some(tid.to_string()),
-                    Some(uid.to_string()),
-                    Some(state_str.clone()),
-                ],
+            AuthnScope::User(tid, uid) => (
+                format!(
+                    r#"
+                    SELECT m.*
+                    FROM auth_methods m
+                    WHERE EXISTS (
+                        SELECT 1 FROM method_states s
+                        WHERE s.method_id = m.id
+                        AND s.tenant_id = ?1
+                        AND s.user_id = ?2
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
+                vec![Some(tid.to_string()), Some(uid.to_string())],
             ),
         };
 
-        let mut sql = sqlx::query_as::<_, OurAuthMethod>(query);
+        // Append state_binds to binds
+        for state in state_binds {
+            binds.push(Some(state));
+        }
+
+        let mut sql = sqlx::query_as::<_, OurAuthMethod>(&query);
         for bind in binds {
             match bind {
                 Some(val) => sql = sql.bind(val),
@@ -378,26 +474,22 @@ impl AuthnBackend for OurBackend {
 
         let mut conn = self.db.acquire().await?;
         let rows: Vec<OurAuthMethod> = sql.fetch_all(&mut *conn).await?;
-
-        eprintln!("get_scoped_auth_methods returned rows: {}", rows.len());
-
         let methods: Vec<AuthMethod<OurBackend>> = rows
             .into_iter()
             .map(AuthMethod::<OurBackend>::from)
             .collect();
-
         Ok(methods)
     }
 
     /// Get all states of an authentication method for a given scope (global/user/tenant).
     async fn get_method_states(
         &self,
-        method_id: &Self::MethodId,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        method_id: &Self::AuthId,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthMethodState<Self>>, Self::Error> {
         let mut conn = self.db.acquire().await?;
         let (query, binds): (&str, Vec<Option<String>>) = match scope {
-            PermissionScope::Global => (
+            AuthnScope::Global => (
                 r#"
                 SELECT * FROM method_states
                 WHERE method_id = ?1
@@ -406,14 +498,14 @@ impl AuthnBackend for OurBackend {
                 "#,
                 vec![Some(method_id.to_string())],
             ),
-            PermissionScope::Any => (
+            AuthnScope::Any => (
                 r#"
                 SELECT * FROM method_states
                 WHERE method_id = ?1
                 "#,
                 vec![Some(method_id.to_string())],
             ),
-            PermissionScope::Tenant(tid) => (
+            AuthnScope::Tenant(tid) => (
                 r#"
                 SELECT * FROM method_states
                 WHERE method_id = ?1
@@ -422,7 +514,7 @@ impl AuthnBackend for OurBackend {
                 "#,
                 vec![Some(method_id.to_string()), Some(tid.to_string())],
             ),
-            PermissionScope::User(tid, uid) => (
+            AuthnScope::User(tid, uid) => (
                 r#"
                 SELECT * FROM method_states
                 WHERE method_id = ?1
@@ -466,7 +558,7 @@ impl AuthnBackend for OurBackend {
     /// Returns the upserted method state as loaded from the database.
     async fn upsert_method_state(
         &self,
-        change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+        change: MethodStateChange<Self::AuthId, Self::TenantId, Self::UserId>,
         actor: Self::UserId,
     ) -> Result<AuthMethodState<Self>, Self::Error> {
         let tenant_id = change.tenant_id.map(|t| t.to_string());
@@ -507,106 +599,222 @@ impl AuthnBackend for OurBackend {
     // Get the authentication factor by its ID.
     async fn get_auth_factor(
         &self,
-        factor_id: &Self::FactorId,
+        factor_id: &Self::AuthId,
     ) -> Result<AuthFactor<Self>, Self::Error> {
         let mut conn = self.db.acquire().await?;
-        let row = sqlx::query("SELECT * FROM auth_factors WHERE id = ?")
+        let factor = sqlx::query_as::<_, OurAuthFactor>("SELECT * FROM auth_factors WHERE id = ?")
             .bind(factor_id.to_string())
             .fetch_one(&mut *conn)
             .await?;
 
-        let factor = OurAuthFactor::from_row(&row)?;
         Ok(AuthFactor::<OurBackend>::from(factor))
     }
 
-    /// Get all authentication factors for a given scope (global/user/tenant), disregarding activation state.
-    async fn get_all_auth_factors(&self) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
+    /// Get an authentication factor by its name, filtered by enablement states and scope.
+    ///
+    /// Returns the first matching factor, or an error if not found.
+    async fn get_auth_factor_by_name(
+        &self,
+        name: &str,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
+    ) -> Result<AuthFactor<Self>, Self::Error> {
+        let (state_filter, state_binds) = build_state_filter(&states, "fs.state");
+
+        let (query, mut binds): (String, Vec<Option<String>>) = match scope {
+            AuthnScope::Global => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE f.name = ?
+                    AND EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        AND fs.tenant_id IS NULL
+                        AND fs.user_id IS NULL
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![Some(name.to_string())],
+            ),
+            AuthnScope::Any => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE f.name = ?
+                    AND EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![Some(name.to_string())],
+            ),
+            AuthnScope::Tenant(tid) => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE f.name = ?
+                    AND EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        AND (
+                            (fs.tenant_id = ? AND fs.user_id IS NULL)
+                            OR (fs.tenant_id IS NULL AND fs.user_id IS NULL)
+                        )
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                vec![Some(name.to_string()), Some(tid.to_string())],
+            ),
+            AuthnScope::User(tid, uid) => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE f.name = ?
+                    AND EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        AND (
+                            (fs.tenant_id = ? AND fs.user_id = ?)
+                            OR (fs.tenant_id = ? AND fs.user_id IS NULL)
+                            OR (fs.tenant_id IS NULL AND fs.user_id IS NULL)
+                        )
+                        {}
+                    )
+                    LIMIT 1
+                    "#,
+                    state_filter
+                ),
+                // Order of ? appearance:
+                // 1. f.name = ?
+                // 2. fs.tenant_id = ?
+                // 3. fs.user_id = ?
+                // 4. fs.tenant_id = ? (reusing tid)
+                vec![
+                    Some(name.to_string()),
+                    Some(tid.to_string()),
+                    Some(uid.to_string()),
+                    Some(tid.to_string()),
+                ],
+            ),
+        };
+
+        for s in state_binds {
+            binds.push(Some(s));
+        }
+
         let mut conn = self.db.acquire().await?;
-        let rows: Vec<OurAuthFactor> = sqlx::query_as(
-            r#"
-            SELECT * FROM auth_factors
-            "#,
-        )
-        .fetch_all(&mut *conn)
-        .await?;
-
-        let factors: Vec<AuthFactor<OurBackend>> = rows
-            .into_iter()
-            .map(|row: OurAuthFactor| AuthFactor::<OurBackend>::from(row))
-            .collect();
-
-        Ok(factors)
+        let mut sql = sqlx::query_as::<_, OurAuthFactor>(&query);
+        for bind in binds {
+            match bind {
+                Some(val) => sql = sql.bind(val),
+                None => sql = sql.bind(None::<String>),
+            }
+        }
+        let factor = sql.fetch_one(&mut *conn).await?;
+        Ok(AuthFactor::<OurBackend>::from(factor))
     }
 
-    /// Get all authentication factors for a given scope (global/user/tenant).
-    /// Filters by the provided enablement states.
-    /// Returns factors that have at least one matching state in the specified scope.
-    /// For example, if scope is Tenant(tid) and states are [Active, Inactive],
-    /// it returns factors that are Active or Inactive for that tenant,
-    /// as well as any global factors with those states.
-    /// If `states` is empty, all factors in the scope are returned, regardless of state.
+    /// Get all active Authentication factors for a given scope (global/user/tenant) and filtered by the enablement state.
     async fn get_scoped_auth_factors(
         &self,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
         states: Vec<EnablementState>,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
-        let mut conn = self.db.acquire().await?;
-        let state_strs: Vec<String> = states.iter().map(|s| format!("{:?}", s)).collect();
+        let (state_filter, state_binds) = build_state_filter(&states, "fs.state");
 
-        // Build scope filter and binds
-        let (scope_filter, mut binds): (String, Vec<Option<String>>) = match scope {
-            PermissionScope::Global => (
-                "s.tenant_id IS NULL AND s.user_id IS NULL".to_string(),
+        let (query, mut binds): (String, Vec<Option<String>>) = match scope {
+            AuthnScope::Global => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        AND fs.tenant_id IS NULL
+                        AND fs.user_id IS NULL
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
                 vec![],
             ),
-            PermissionScope::Any => (
-                "1=1".to_string(), // No scope filter
+            AuthnScope::Any => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
                 vec![],
             ),
-            PermissionScope::Tenant(tid) => (
-                // Match both tenant-level and global factor states
-                "(s.tenant_id IS NULL AND s.user_id IS NULL) OR (s.tenant_id = ?1 AND s.user_id IS NULL)".to_string(),
+            AuthnScope::Tenant(tid) => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        AND (
+                            (fs.tenant_id = ? AND fs.user_id IS NULL)
+                            OR (fs.tenant_id IS NULL AND fs.user_id IS NULL)
+                        )
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
                 vec![Some(tid.to_string())],
             ),
-            PermissionScope::User(tid, uid) => (
-                "(s.tenant_id IS NULL AND s.user_id IS NULL) \
-                  OR (s.tenant_id = ?1 AND s.user_id IS NULL) \
-                  OR (s.tenant_id = ?2 AND s.user_id = ?3)".to_string(),
-                vec![Some(tid.to_string()), Some(tid.to_string()), Some(uid.to_string())],
+            AuthnScope::User(tid, uid) => (
+                format!(
+                    r#"
+                    SELECT f.*
+                    FROM auth_factors f
+                    WHERE EXISTS (
+                        SELECT 1 FROM factor_states fs
+                        WHERE fs.factor_id = f.id
+                        AND (
+                            (fs.tenant_id = ? AND fs.user_id = ?)
+                            OR (fs.tenant_id = ? AND fs.user_id IS NULL)
+                            OR (fs.tenant_id IS NULL AND fs.user_id IS NULL)
+                        )
+                        {}
+                    )
+                    "#,
+                    state_filter
+                ),
+                vec![Some(tid.to_string()), Some(uid.to_string())],
             ),
         };
 
-        // Build state filter and placeholders
-        let (state_filter, state_binds) = if state_strs.is_empty() {
-            ("".to_string(), vec![])
-        } else {
-            let offset = binds.len();
-            let state_placeholders = (0..state_strs.len())
-                .map(|i| format!("?{}", i + offset + 1))
-                .collect::<Vec<_>>()
-                .join(", ");
-            (
-                format!("AND s.state IN ({})", state_placeholders),
-                state_strs.iter().map(|s| Some(s.clone())).collect(),
-            )
-        };
-
-        binds.extend(state_binds);
-
-        // Compose final query
-        let query = format!(
-            r#"
-            SELECT f.*
-            FROM auth_factors f
-            WHERE EXISTS (
-                SELECT 1 FROM factor_states s
-                WHERE s.factor_id = f.id
-                AND ({})
-                {}
-            )
-            "#,
-            scope_filter, state_filter
-        );
+        // Append state_binds to binds
+        for state in state_binds {
+            binds.push(Some(state));
+        }
 
         let mut sql = sqlx::query_as::<_, OurAuthFactor>(&query);
         for bind in binds {
@@ -615,25 +823,24 @@ impl AuthnBackend for OurBackend {
                 None => sql = sql.bind(None::<String>),
             }
         }
-
+        let mut conn = self.db.acquire().await?;
         let rows: Vec<OurAuthFactor> = sql.fetch_all(&mut *conn).await?;
         let factors: Vec<AuthFactor<OurBackend>> = rows
             .into_iter()
             .map(AuthFactor::<OurBackend>::from)
             .collect();
-
         Ok(factors)
     }
 
     /// Get all states of an authentication factor for a given scope (global/user/tenant).
     async fn get_factor_states(
         &self,
-        factor_id: &Self::FactorId,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        factor_id: &Self::AuthId,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthFactorState<Self>>, Self::Error> {
         let mut conn = self.db.acquire().await?;
         let (query, binds): (&str, Vec<Option<String>>) = match scope {
-            PermissionScope::Global => (
+            AuthnScope::Global => (
                 r#"
                 SELECT * FROM factor_states
                 WHERE factor_id = ?1
@@ -642,14 +849,14 @@ impl AuthnBackend for OurBackend {
                 "#,
                 vec![Some(factor_id.to_string())],
             ),
-            PermissionScope::Any => (
+            AuthnScope::Any => (
                 r#"
                 SELECT * FROM factor_states
                 WHERE factor_id = ?1
                 "#,
                 vec![Some(factor_id.to_string())],
             ),
-            PermissionScope::Tenant(tid) => (
+            AuthnScope::Tenant(tid) => (
                 r#"
                 SELECT * FROM factor_states
                 WHERE factor_id = ?1
@@ -658,7 +865,7 @@ impl AuthnBackend for OurBackend {
                 "#,
                 vec![Some(factor_id.to_string()), Some(tid.to_string())],
             ),
-            PermissionScope::User(tid, uid) => (
+            AuthnScope::User(tid, uid) => (
                 r#"
                 SELECT * FROM factor_states
                 WHERE factor_id = ?1
@@ -702,7 +909,7 @@ impl AuthnBackend for OurBackend {
     /// Returns the upserted factor state as loaded from the database.
     async fn upsert_factor_state(
         &self,
-        change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+        change: FactorStateChange<Self::AuthId, Self::TenantId, Self::UserId>,
         actor: Self::UserId,
     ) -> Result<AuthFactorState<Self>, Self::Error> {
         let mut conn = self.db.acquire().await?;
@@ -813,7 +1020,8 @@ impl AuthnBackend for OurBackend {
                         .try_get::<Option<String>, _>("id")
                         .ok()
                         .flatten()
-                        .unwrap_or_default(),
+                        .and_then(|id_str| Uuid::parse_str(&id_str).ok())
+                        .unwrap_or(Uuid::nil()),
                     user_id: Uuid::parse_str(
                         row.try_get::<Option<String>, _>("user_id")
                             .ok()
@@ -846,7 +1054,7 @@ impl AuthnBackend for OurBackend {
                         .unwrap_or(Utc::now()),
                     method_id: method_id_txt.and_then(|mid| Uuid::parse_str(&mid).ok()),
                     factor_id: factor_id_txt.and_then(|fid| Uuid::parse_str(&fid).ok()),
-                    factor_kind: parse_enum_option::<AuthFactorKind>(factor_kind_txt),
+                    factor_kind: parse_enum_option::<Kind>(factor_kind_txt),
                     ip_address: row
                         .try_get::<Option<String>, _>("ip_address")
                         .ok()
@@ -915,14 +1123,14 @@ impl AuthnBackend for OurBackend {
     }
 
     /// Authenticates a user using the provided credentials form.
-    async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
+    async fn authenticate<'a, F>(&self, form: &'a F) -> Result<Self::User, Self::Error>
     where
         F: FactorForm + Send + Sync,
     {
-        let factor_kind = creds.factor_kind();
+        let factor_kind = form.kind();
 
         // 1. Resolve tenant and username from the typed helpers
-        let tenant_id = if let Some(t) = creds.get_string_field(FormField::Tenant) {
+        let tenant_id = if let Some(t) = form.get_string_field(FormField::TenantName) {
             Uuid::parse_str(&t).map_err(|e| sqlx::Error::ColumnDecode {
                 index: "tenant".into(),
                 source: Box::new(e),
@@ -931,11 +1139,11 @@ impl AuthnBackend for OurBackend {
             // prefer explicit backend default rather than Uuid::nil()
             self.get_default_tenant_id().await?
         };
-        let username = creds
+
+        // 3. Lookup user by tenant and username
+        let username = form
             .get_string_field(FormField::Username)
             .unwrap_or_default();
-
-        // 2. Lookup user by tenant and username
         let mut conn = self.db.acquire().await?;
         let row = sqlx::query("SELECT * FROM users WHERE tenant_id = ? AND username = ?")
             .bind(tenant_id.to_string())
@@ -945,7 +1153,7 @@ impl AuthnBackend for OurBackend {
 
         let user = OurUser::from_row(&row)?;
 
-        // 3. Check user state
+        // 4. Check user state
         if user.state != EntityState::Active {
             return Err(sqlx::Error::Decode(
                 format!("User account is not active (state: {:?})", user.state).into(),
@@ -953,22 +1161,20 @@ impl AuthnBackend for OurBackend {
         }
 
         // 4. Lookup factors for this user using the backend's scoped factor lookup
-        let scope = PermissionScope::User(tenant_id, user.id);
-        let factors = self
-            .get_scoped_auth_factors(scope, vec![EnablementState::Active])
-            .await?;
-
-        // 5. Find the factor matching the submitted kind
-        let factor = factors
-            .iter()
-            .find(|f| f.kind == factor_kind)
+        let factor_name = form
+            .get_string_field(FormField::FactorName)
             .ok_or_else(|| sqlx::Error::ColumnDecode {
-                index: "factors".into(),
+                index: "factor_name".into(),
                 source: Box::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("Missing active factor for kind: {factor_kind}"),
+                    "Missing factor name in authentication form",
                 )),
             })?;
+        let scope = AuthnScope::User(tenant_id, user.id);
+        let status_filter = vec![EnablementState::Active];
+        let factor = self
+            .get_auth_factor_by_name(&factor_name, scope, status_filter)
+            .await?;
 
         // 6. Lookup factor state for this factor
         let factor_state_row = sqlx::query("SELECT * FROM factor_states WHERE factor_id = ? AND tenant_id = ? AND user_id = ? AND state = ?")
@@ -983,7 +1189,7 @@ impl AuthnBackend for OurBackend {
 
         // 7. Verify credentials according to factor kind
         match factor_kind {
-            AuthFactorKind::Password => {
+            Kind::Password => {
                 let password_hash = factor_state
                     .0
                     .config
@@ -997,82 +1203,61 @@ impl AuthnBackend for OurBackend {
                         )),
                     })?;
                 // prefer the generic credential() accessor for primary auth values
-                let password = creds.credential().unwrap_or("");
+                let password = form.credential().unwrap_or("");
                 verify_password(password, password_hash)
                     .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
                 Ok(user)
             }
-            AuthFactorKind::Otp => {
+            Kind::Totp => {
                 let factor_config = &factor_state.0.config;
+                let totp_code = form.credential().unwrap_or("");
 
-                let otp_type = factor_config
-                    .get("otp_type")
+                let totp_secret = factor_config
+                    .get("secret")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                match otp_type {
-                    "totp" => {
-                        let totp_code = creds.credential().unwrap_or("");
+                    .ok_or_else(|| sqlx::Error::ColumnDecode {
+                        index: "factor_state".into(),
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Missing TOTP secret in factor state",
+                        )),
+                    })?;
+                let totp_length = factor_config
+                    .get("otp_length")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(TOTP_LENGTH as u64);
+                let totp_period = factor_config
+                    .get("period")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(TOTP_PERIOD);
+                let past_window = factor_config
+                    .get("past_window")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1u64);
+                let future_window = factor_config
+                    .get("future_window")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0u64);
 
-                        let totp_secret = factor_config
-                            .get("secret")
-                            .and_then(|v| v.as_str())
-                            .ok_or_else(|| sqlx::Error::ColumnDecode {
-                                index: "factor_state".into(),
-                                source: Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "Missing TOTP secret in factor state",
-                                )),
-                            })?;
-                        let totp_length = factor_config
-                            .get("otp_length")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(TOTP_LENGTH as u64)
-                            as usize;
-                        let totp_period = factor_config
-                            .get("period")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(TOTP_PERIOD);
-                        let past_window = factor_config
-                            .get("past_window")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(1u64);
-                        let future_window = factor_config
-                            .get("future_window")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0u64);
-
-                        match verify_totp(
-                            totp_secret,
-                            totp_code,
-                            SystemTime::now(),
-                            Some(totp_length),
-                            Some(totp_period),
-                            Some(past_window),
-                            Some(future_window),
-                        ) {
-                            Some(_) => Ok(user),
-                            None => Err(SqlxError::Protocol("Invalid TOTP code".to_string())),
-                        }
-                    }
-                    _ => Err(SqlxError::Protocol(format!(
-                        "Unsupported OTP type: {}",
-                        otp_type
-                    ))),
+                match verify_totp(
+                    totp_secret,
+                    totp_code,
+                    SystemTime::now(),
+                    Some(totp_length as usize),
+                    Some(totp_period),
+                    Some(past_window),
+                    Some(future_window),
+                ) {
+                    Some(_) => Ok(user),
+                    None => Err(SqlxError::Protocol("Invalid TOTP code".to_string())),
                 }
             }
-            AuthFactorKind::Oauth => {
-                // Handle OAuth factor authentication
-                // This is a placeholder, actual implementation will depend on your OAuth setup
-                Err(SqlxError::Protocol(
-                    "OAuth factor authentication not implemented".to_string(),
-                ))
-            }
-            AuthFactorKind::Custom(name) => {
+            kind => {
                 // Custom factor kinds are not handled by this backend example.
                 // Return a protocol error indicating the custom kind is unsupported.
                 Err(SqlxError::Protocol(format!(
                     "Custom factor authentication not implemented for kind: {}",
-                    name
+                    kind
                 )))
             }
         }
@@ -1160,8 +1345,8 @@ impl AuthnAdminBackend for OurBackend {
             INSERT INTO tenants (id, name, description, state, created_at, created_by, updated_at, updated_by)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                created_at = tenants.created_at, -- preserve existing value on update
-                created_by = tenants.created_by  -- preserve existing value on update
+                created_at = tenants.created_at, -- preserve original
+                created_by = tenants.created_by  -- preserve original
             RETURNING id, name, description, state, created_at, created_by, updated_at, updated_by
             "#
         )
@@ -1202,7 +1387,7 @@ impl AuthnAdminBackend for OurBackend {
     /// If tenant_id or user_id is missing, use "null" in their place.
     async fn delete_method_state(
         &self,
-        method_state_id: &Self::DataId,
+        method_state_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
@@ -1212,7 +1397,7 @@ impl AuthnAdminBackend for OurBackend {
             WHERE id = ?
             "#,
         )
-        .bind(method_state_id)
+        .bind(method_state_id.to_string())
         .execute(&mut *conn)
         .await?;
         info!(
@@ -1267,7 +1452,7 @@ impl AuthnAdminBackend for OurBackend {
 
     async fn delete_auth_method(
         &self,
-        method_id: &Self::MethodId,
+        method_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
@@ -1284,7 +1469,7 @@ impl AuthnAdminBackend for OurBackend {
 
     async fn delete_factor_state(
         &self,
-        factor_state_id: &Self::DataId,
+        factor_state_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;
@@ -1347,7 +1532,7 @@ impl AuthnAdminBackend for OurBackend {
 
     async fn delete_auth_factor(
         &self,
-        factor_id: &Self::FactorId,
+        factor_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         let mut conn = self.db.acquire().await?;

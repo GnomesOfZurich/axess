@@ -84,10 +84,10 @@ type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, System
 let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
 let backend = Arc::new(OurBackend::new(pool.clone()));
 let session_store = SqliteStore::new(pool.clone());
-let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+let registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
 
 let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
-    .with_session_registry(session_registry.clone())
+    .with_session_registry(registry.clone())
     .build();
 
 let app = Router::new()

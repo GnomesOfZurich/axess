@@ -6,6 +6,7 @@
 
 use crate::authn::{
     backend::AuthnBackend,
+    // scope::AuthnScope,
     methods::{
         MethodInstance, MethodState,
         factor::{FactorInstance, FactorState},
@@ -13,43 +14,31 @@ use crate::authn::{
     session::state::{AuthState, Data, PartialAuthState},
 };
 
-pub type AuthFactor<B> = FactorInstance<<B as AuthnBackend>::FactorId, <B as AuthnBackend>::UserId>;
+pub type AuthFactor<B> = FactorInstance<<B as AuthnBackend>::AuthId, <B as AuthnBackend>::UserId>;
 
 pub type AuthFactorState<B> = FactorState<
-    <B as AuthnBackend>::DataId,
-    <B as AuthnBackend>::FactorId,
+    <B as AuthnBackend>::AuthId,
     <B as AuthnBackend>::TenantId,
     <B as AuthnBackend>::UserId,
 >;
 
-pub type AuthMethod<B> = MethodInstance<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
->;
+pub type AuthMethod<B> = MethodInstance<<B as AuthnBackend>::AuthId, <B as AuthnBackend>::UserId>;
 
 pub type AuthMethodState<B> = MethodState<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
+    <B as AuthnBackend>::AuthId,
     <B as AuthnBackend>::TenantId,
     <B as AuthnBackend>::UserId,
 >;
 
-pub type PartialState<B> = PartialAuthState<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
->;
+pub type PartialState<B> =
+    PartialAuthState<<B as AuthnBackend>::AuthId, <B as AuthnBackend>::UserId>;
 
-pub type SessionState<B> = AuthState<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::UserId,
->;
+pub type SessionState<B> = AuthState<<B as AuthnBackend>::AuthId, <B as AuthnBackend>::UserId>;
 
-pub type SessionData<B> = Data<
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
-    <B as AuthnBackend>::TenantId,
-    <B as AuthnBackend>::UserId,
->;
+pub type SessionData<B> =
+    Data<<B as AuthnBackend>::AuthId, <B as AuthnBackend>::TenantId, <B as AuthnBackend>::UserId>;
+
+// pub type SessionScope<B> = AuthnScope<
+//     <B as AuthnBackend>::TenantId,
+//     <B as AuthnBackend>::UserId,
+// >;

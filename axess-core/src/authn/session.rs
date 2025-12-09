@@ -7,14 +7,13 @@ use crate::{
         backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
         errors::{AuthError, FactorKindError},
         methods::{
-            factor::{AuthFactorKind, FactorStateChange},
-            form::{FactorForm, FactorFormExt, FactorFormKind, FormField, form_fields_to_json},
-            policy::{FactorConfig, FactorConfigBuilder, OtpCharset, OtpRulesBuilder, OtpType},
-            scope::{EnablementState, PermissionScope},
+            factor::{FactorStateChange, Kind},
+            form::{Action, FactorForm, FactorFormExt, Flow, FormField},
+            policy::{FactorConfig, FactorConfigBuilder, OtpRulesBuilder, TokenCharset},
+            scope::{AuthnScope, EnablementState},
         },
         session::registry::SessionRegistry,
-        types::{AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
-        workflows::WorkflowAction,
+        types::{AuthFactor, AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
     },
     axum::{
         extract::{Form, Json},
@@ -67,9 +66,13 @@ where
     /// The underlying session.
     pub session: Session,
 
+    /// The session data associated with this authentication session.
     data: SessionData<B>,
+    /// Key used to store/retrieve session data in the session store.
     data_key: &'static str,
-    session_registry: Option<Arc<R>>,
+    /// Optional session registry for session binding and validation.
+    registry: Option<Arc<R>>,
+    /// Secure RNG for generating session hashes and nonces.
     rng: Rng,
 }
 
@@ -88,7 +91,7 @@ where
             session: self.session.clone(),
             data: self.data.clone(),
             data_key: self.data_key,
-            session_registry: self.session_registry.clone(),
+            registry: self.registry.clone(),
             rng: self.rng.clone(),
         }
     }
@@ -108,7 +111,7 @@ where
             .field("session", &self.session)
             .field("data", &self.data)
             .field("data_key", &self.data_key)
-            .field("session_registry", &self.session_registry.is_some())
+            .field("registry", &self.registry.is_some())
             .finish_non_exhaustive() // Don't debug RNG
     }
 }
@@ -162,7 +165,7 @@ where
         self.session.save().await.map_err(AuthError::SessionError)?;
 
         // Deregister session from registry if present
-        if let Some(registry) = &self.session_registry
+        if let Some(registry) = &self.registry
             && let Some(session_id) = self.session.id()
         {
             let session_id_str = session_id.to_string();
@@ -188,7 +191,7 @@ where
         session: Session,
         backend: Arc<B>,
         data_key: &'static str,
-        session_registry: Option<Arc<R>>,
+        registry: Option<Arc<R>>,
     ) -> Result<Self, AuthError<B>>
     where
         B::User: Clone,
@@ -196,8 +199,7 @@ where
         B::TenantId: Clone,
         Rng: Default,
     {
-        Self::from_session_with_rng(session, backend, data_key, session_registry, Rng::default())
-            .await
+        Self::from_session_with_rng(session, backend, data_key, registry, Rng::default()).await
     }
 
     /// Create AuthSession with custom RNG (for testing)
@@ -205,7 +207,7 @@ where
         session: Session,
         backend: Arc<B>,
         data_key: &'static str,
-        session_registry: Option<Arc<R>>,
+        registry: Option<Arc<R>>,
         rng: Rng,
     ) -> Result<Self, AuthError<B>>
     where
@@ -272,7 +274,7 @@ where
             session,
             data,
             data_key,
-            session_registry,
+            registry,
             rng,
         })
     }
@@ -282,7 +284,7 @@ where
     //     backend: Arc<B>,
     //     store: S,
     //     data_key: &'static str,
-    //     session_registry: Option<Arc<R>>,
+    //     registry: Option<Arc<R>>,
     // ) -> Result<Self, AuthError<B>>
     // where
     //     B::User: Clone,
@@ -322,7 +324,7 @@ where
     //         session,
     //         data,
     //         data_key,
-    //         session_registry,
+    //         registry,
     //         rng: Rng::default(),
     //     })
     // }
@@ -469,28 +471,6 @@ where
         matches!(self.state, SessionState::<B>::PendingWorkflow(_))
     }
 
-    /// Validates that the provided scope matches the current session
-    fn validate_scope(
-        &self,
-        scope: &PermissionScope<B::TenantId, B::UserId>,
-    ) -> Result<(), AuthError<B>> {
-        let (tid, uid) = match scope {
-            PermissionScope::User(tid, uid) => (tid, uid),
-            _ => {
-                error!("Need User scope to check method and factor states");
-                return Err(AuthError::MethodNotFound);
-            }
-        };
-
-        // Validate that scope matches session
-        if Some(tid) != self.get_tenant_id() || Some(uid) != self.get_user_id() {
-            error!("Scope does not match session's tenant/user IDs");
-            return Err(AuthError::Unauthorized);
-        }
-
-        Ok(())
-    }
-
     /// Validates that the user is in an acceptable state for authentication
     fn validate_user_state(&self) -> Result<(), AuthError<B>> {
         match self.get_user_state() {
@@ -502,33 +482,9 @@ where
         }
     }
 
-    /// Validate that a factor has the expected state in the given scope
-    async fn validate_factor_state(
-        &self,
-        factor_id: &B::FactorId,
-        scope: &PermissionScope<B::TenantId, B::UserId>,
-        expected_state: &EnablementState,
-    ) -> Result<bool, AuthError<B>> {
-        let factor_states = self
-            .backend
-            .get_factor_states(factor_id, scope.clone())
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch factor states: {:?}", e);
-                AuthError::BackendError(e)
-            })?;
-
-        if factor_states.is_empty() {
-            debug!("No factor states found for factor {:?}", factor_id);
-            return Ok(false);
-        }
-
-        Ok(factor_states.iter().any(|fs| fs.state == *expected_state))
-    }
-
     /// Validates session is still registered and hash matches
     async fn validate_session_binding(&self) -> Result<(), AuthError<B>> {
-        let Some(registry) = &self.session_registry else {
+        let Some(registry) = &self.registry else {
             // No registry configured - skip validation
             warn!("Unable to find session registry!");
             return Ok(());
@@ -579,102 +535,62 @@ where
         }
     }
 
-    /// Find a suitable method for a given action/factor.
-    /// Returns a reference to avoid cloning in the loop; caller clones once if needed.
-    async fn select_method_for_action<'a>(
-        &'a self,
-        methods: &'a [AuthMethod<B>],
-        factor_kind: &AuthFactorKind,
-        action_kind: FactorFormKind,
-        scope: &PermissionScope<B::TenantId, B::UserId>,
-    ) -> Result<Option<&'a AuthMethod<B>>, AuthError<B>> {
-        let expected_state = match action_kind {
-            FactorFormKind::Setup => EnablementState::Pending,
-            FactorFormKind::Verify => EnablementState::Active,
-            FactorFormKind::Change => EnablementState::Active, // TODO: Review; now require factor to be active?
-        };
-
-        for method in methods {
-            let Some(first_factor) = method.factors.first() else {
-                warn!("Method {:?} has no factors, skipping", method.id);
-                continue;
-            };
-
-            if first_factor.kind != *factor_kind {
-                continue;
-            }
-
-            if self
-                .validate_factor_state(&first_factor.id, scope, &expected_state)
-                .await?
-            {
-                debug!(
-                    "Found method {:?} with factor {:?} in expected state {:?}",
-                    method.id, first_factor.id, expected_state
-                );
-                return Ok(Some(method));
-            }
-        }
-
-        Ok(None) // Return None instead of Err when no method matches
-    }
-
-    /// Finds an authentication method suitable for the current session state.
-    ///
-    /// # Arguments
-    /// * `scope` - Must be `PermissionScope::User` containing the tenant and user IDs
-    /// * `factor_kind` - The type of authentication factor (Password, TOTP, OAuth)
-    /// * `action_kind` - Whether this is for Setup (Pending) or Verify (Active)
-    ///
-    /// # Errors
-    /// Returns `AuthError::MethodNotFound` if:
-    /// - No methods exist for the scope
-    /// - No method has a first factor matching `factor_kind`
-    /// - No method's first factor is in the required state
-    ///
-    /// Returns `AuthError::Unauthorized` if the scope doesn't match the session
-    pub async fn get_assumed_auth_method(
-        &self,
-        scope: PermissionScope<B::TenantId, B::UserId>,
-        factor_kind: AuthFactorKind,
-        action_kind: FactorFormKind,
-    ) -> Result<AuthMethod<B>, AuthError<B>> {
-        debug!(
-            "Looking for auth method with factor {:?} and action {:?} in scope {:?}",
-            factor_kind, action_kind, scope
-        );
-        // Validate scope and user state first
-        self.validate_scope(&scope)?;
-        self.validate_user_state()?;
-
-        // Fetch all relevant authentication methods for the given scope
-        let methods: Vec<AuthMethod<B>> = self
-            .backend
-            .get_scoped_auth_methods(scope.clone(), EnablementState::Active)
-            .await
-            .map_err(|e| {
-                error!("Failed to fetch scoped auth methods from backend: {:?}", e);
-                AuthError::BackendError(e)
+    /// Resolve the given authentication method from the form and current session.
+    async fn get_method_from_form<F>(&mut self, form: &F) -> Result<AuthMethod<B>, AuthError<B>>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        let method_name = form
+            .fields()
+            .get(&FormField::MethodName)
+            .cloned()
+            .ok_or_else(|| {
+                error!("Method name not provided in form");
+                AuthError::<B>::UnexpectedFormContent
             })?;
 
-        if methods.is_empty() {
-            error!("No authentication methods found for scope {:?}", scope);
-            return Err(AuthError::MethodNotFound);
-        }
-        // For the found methods, check the state of the first factor using get_factor_states.
-        // If action_kind is Setup, accept Pending (user scope) or Active (tenant/global
-        if let Some(m_ref) = self
-            .select_method_for_action(&methods, &factor_kind, action_kind, &scope)
-            .await?
-        {
-            return Ok(m_ref.clone());
-        }
+        let scope = self.resolve_user_and_scope(form).await?;
+        let method_name_ref = method_name
+            .as_str()
+            .ok_or(AuthError::<B>::UnexpectedFormContent)?;
 
-        error!(
-            "No authentication method found with first factor kind {:?} for scope {:?}",
-            factor_kind, scope
-        );
-        Err(AuthError::MethodNotFound)
+        self.backend
+            .get_auth_method_by_name(
+                method_name_ref,
+                scope.clone(),
+                vec![EnablementState::Active],
+            )
+            .await
+            .map_err(AuthError::BackendError)
+    }
+
+    /// Resolve the given authentication factor from the form and current session.
+    async fn get_factor_from_form<F>(&mut self, form: &F) -> Result<AuthFactor<B>, AuthError<B>>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        let factor_name = form
+            .fields()
+            .get(&FormField::FactorName)
+            .cloned()
+            .ok_or_else(|| {
+                error!("Factor name not provided in form");
+                AuthError::<B>::UnexpectedFormContent
+            })?;
+
+        let scope = self.resolve_user_and_scope(form).await?;
+        let factor_name_ref = factor_name
+            .as_str()
+            .ok_or(AuthError::<B>::UnexpectedFormContent)?;
+
+        self.backend
+            .get_auth_factor_by_name(
+                factor_name_ref,
+                scope.clone(),
+                vec![EnablementState::Active],
+            )
+            .await
+            .map_err(AuthError::BackendError)
     }
 
     pub async fn authenticate_from_form<F>(
@@ -710,35 +626,27 @@ where
         form.validate_form()
             .map_err(|_| AuthError::InvalidCredentials)?;
 
-        let form_kind = form.form_kind();
-        let factor_kind = form.factor_kind();
+        let form_action = form.action();
+        if form_action != Action::Verify && form_action != Action::Setup {
+            error!("Form action is missing");
+            return Err(AuthError::UnexpectedFormAction);
+        }
 
-        match (&self.state, &form_kind) {
-            // Standard login flow: not authenticated, verifying credentials
-            (SessionState::<B>::NotAuthenticated, FactorFormKind::Verify) => {
-                self.handle_initial_authentication(&form, factor_kind, form_kind)
-                    .await
+        match (&self.state, &form_action) {
+            (SessionState::<B>::NotAuthenticated, Action::Verify) => {
+                self.handle_initial_authentication(&form).await
             }
-            // MFA flow: in-progress partial authentication, verifying next factor
-            (SessionState::<B>::PartialAuthn(partial_state), FactorFormKind::Verify) => {
+            (SessionState::<B>::PartialAuthn(partial_state), Action::Verify) => {
                 self.handle_partial_authentication(&form, partial_state.clone())
                     .await
             }
-            // Setup flow: authenticated user adding new factor
-            (SessionState::<B>::Authenticated, FactorFormKind::Setup) => {
-                self.handle_factor_setup(&form, factor_kind).await
+            (SessionState::<B>::Authenticated, Action::Setup) => {
+                self.handle_factor_setup(&form).await
             }
-            // Workflow-based onboarding or post-auth flows
             (SessionState::<B>::PendingActivation(workflow_state), _) => {
                 // Clone to get owned, mutable workflow state
                 let mut workflow_state = workflow_state.clone();
-                // Advance onboarding workflow (e.g., email verification, TOTP setup)
-                let action = WorkflowAction::FactorForm {
-                    kind: factor_kind,
-                    form_kind,
-                    fields: form_fields_to_json(&form.fields()),
-                };
-                match workflow_state.advance(&action) {
+                match workflow_state.advance() {
                     Ok(_) => {
                         if workflow_state.is_complete() {
                             self.state = SessionState::<B>::Authenticated;
@@ -759,13 +667,7 @@ where
             (SessionState::<B>::PendingWorkflow(workflow_state), _) => {
                 // Clone to get owned, mutable workflow state
                 let mut workflow_state = workflow_state.clone();
-                // Advance post-auth workflow (e.g., KYC, admin approval)
-                let action = WorkflowAction::FactorForm {
-                    kind: factor_kind,
-                    form_kind,
-                    fields: form_fields_to_json(&form.fields()),
-                };
-                match workflow_state.advance(&action) {
+                match workflow_state.advance() {
                     Ok(_) => {
                         if workflow_state.is_complete() {
                             self.state = SessionState::<B>::Authenticated;
@@ -783,24 +685,20 @@ where
                     }
                 }
             }
-            // Disallow factor setup if not authenticated
-            (SessionState::<B>::NotAuthenticated, FactorFormKind::Setup) => {
+            (SessionState::<B>::NotAuthenticated, Action::Setup) => {
                 error!("Cannot setup factors without authentication");
                 Err(AuthError::InvalidStateTransition)
             }
-            // Disallow factor setup during partial authentication
-            (SessionState::<B>::PartialAuthn(_), FactorFormKind::Setup) => {
+            (SessionState::<B>::PartialAuthn(_), Action::Setup) => {
                 error!("Cannot setup factors during partial authentication");
                 Err(AuthError::InvalidStateTransition)
             }
-            // Disallow verification if already authenticated
-            (SessionState::<B>::Authenticated, FactorFormKind::Verify) => {
+            (SessionState::<B>::Authenticated, Action::Verify) => {
                 error!("Already authenticated");
                 Err(AuthError::AlreadyAuthenticated)
             }
-            // Disallow change forms in all states (unless you implement change logic)
-            (_, FactorFormKind::Change) => {
-                error!("Change forms are not supported in this flow");
+            (_, _) => {
+                error!("The given form is not supported by the standard authentication flow");
                 Err(AuthError::InvalidStateTransition)
             }
         }
@@ -810,7 +708,7 @@ where
     async fn resolve_user_and_scope<F>(
         &mut self,
         form: &F,
-    ) -> Result<PermissionScope<B::TenantId, B::UserId>, AuthError<B>>
+    ) -> Result<AuthnScope<B::TenantId, B::UserId>, AuthError<B>>
     where
         F: FactorForm + Send + Sync,
     {
@@ -821,7 +719,7 @@ where
 
         // Resolve tenant: prefer explicit tenant name in form -> session tenant -> backend default.
         // If session already has a tenant/user, do not allow a different tenant to be selected via form.
-        let tenant_id = if let Some(tenant_name) = form.get_string_field(FormField::Tenant) {
+        let tenant_id = if let Some(tenant_name) = form.get_string_field(FormField::TenantName) {
             // If session already associated with a tenant, ensure it matches the supplied tenant.
             if let Some(current_tid) = self.get_tenant_id() {
                 // Look up the named tenant to compare ids
@@ -878,14 +776,14 @@ where
         self.data.tenant_id = Some(tenant_id.clone());
         self.data.user_state = EntityState::Active;
 
-        Ok(PermissionScope::User(tenant_id, user_id))
+        Ok(AuthnScope::User(tenant_id, user_id))
     }
 
     /// applies a given approved factor to the current method and determines next action
     /// if all factors are applied, completes authentication.
     async fn apply_factor(
         &mut self,
-        factor_id: &B::FactorId,
+        factor_id: &B::AuthId,
         next: Option<String>,
     ) -> Result<Response, AuthError<B>> {
         // Extract state without cloning
@@ -934,7 +832,7 @@ where
         &mut self,
         form: &F,
         factor_state: &AuthFactorState<B>,
-        scope: &PermissionScope<B::TenantId, B::UserId>,
+        scope: &AuthnScope<B::TenantId, B::UserId>,
         config: FactorConfig,
     ) -> Result<(), AuthError<B>>
     where
@@ -982,7 +880,7 @@ where
         &mut self,
         form: &F,
         factor_state: &AuthFactorState<B>,
-        scope: &PermissionScope<B::TenantId, B::UserId>,
+        scope: &AuthnScope<B::TenantId, B::UserId>,
         config: FactorConfig,
     ) -> Result<(), AuthError<B>>
     where
@@ -1003,8 +901,8 @@ where
 
         let charset = config
             .get_string("charset")
-            .and_then(|raw| OtpCharset::from_str(raw).ok())
-            .unwrap_or(OtpCharset::Numeric);
+            .and_then(|raw| TokenCharset::from_str(raw).ok())
+            .unwrap_or(TokenCharset::Numeric);
 
         let otp_rules = OtpRulesBuilder::default()
             .with_length(length)
@@ -1086,13 +984,18 @@ where
     async fn verify_factor<F>(
         &mut self,
         form: &F,
-        factor_id: &B::FactorId,
+        factor_id: &B::AuthId,
     ) -> Result<(), AuthError<B>>
     where
         F: FactorForm + Send + Sync,
     {
+        if form.action() != Action::Verify {
+            error!("Factor verification requires Verify action");
+            return Err(AuthError::UnexpectedFormAction);
+        }
+
         // Validate scope and user state first
-        let scope = PermissionScope::User(
+        let scope = AuthnScope::User(
             self.get_tenant_id()
                 .cloned()
                 .ok_or(AuthError::Unauthorized)?,
@@ -1113,68 +1016,64 @@ where
 
         let factor_config = FactorConfig::from_map(config_map.clone());
 
-        if form.factor_kind() == AuthFactorKind::Otp {
-            let otp_type: OtpType = factor_config
-                .get_value("otp_type")
-                .and_then(|v| from_value(v.clone()).ok())
-                .unwrap_or(OtpType::Totp);
-
-            match otp_type {
-                OtpType::Hotp => {
-                    self.process_hotp_success(form, factor_state, &scope, factor_config.clone())
-                        .await?
-                }
-                OtpType::Totp => {
-                    self.process_totp_success(form, factor_state, &scope, factor_config)
-                        .await?
-                }
-                OtpType::Email => {
-                    error!("Email OTP verification not implemented");
-                    return Err(AuthError::InvalidCredentials);
-                }
-                OtpType::Custom(_) => {
-                    error!("Custom OTP types are not supported for verification");
-                    return Err(AuthError::InvalidCredentials);
-                }
+        match form.kind() {
+            Kind::Hotp => {
+                self.process_hotp_success(form, factor_state, &scope, factor_config)
+                    .await?
+            }
+            Kind::Totp => {
+                self.process_totp_success(form, factor_state, &scope, factor_config)
+                    .await?
+            }
+            Kind::EmailOtp => {
+                error!("Email OTP verification not implemented");
+                return Err(AuthError::UnexpectedFactorKind(
+                    FactorKindError::UnexpectedValue(
+                        "Email OTP verification not implemented".to_string(),
+                    ),
+                ));
+            }
+            _ => {
+                error!("The authentication factor type is not supported for verification");
+                return Err(AuthError::UnexpectedFactorKind(
+                    FactorKindError::UnexpectedValue(
+                        "The authentication factor type is not supported for verification"
+                            .to_string(),
+                    ),
+                ));
             }
         }
 
         Ok(())
     }
 
-    async fn handle_initial_authentication<F>(
-        &mut self,
-        form: &F,
-        factor_kind: AuthFactorKind,
-        form_kind: FactorFormKind,
-    ) -> Result<Response, AuthError<B>>
-    // Changed from StatusCode to AuthError
+    async fn handle_initial_authentication<F>(&mut self, form: &F) -> Result<Response, AuthError<B>>
     where
         F: FactorForm + Send + Sync,
     {
         // 1. Only allow verify forms for initial authentication
-        if form_kind != FactorFormKind::Verify {
-            error!("Cannot setup factors without authentication");
-            return Err(AuthError::InvalidStateTransition);
+        let form_action = form.action();
+        if form_action != Action::Verify {
+            error!("Wrong form type for initial authentication");
+            return Err(AuthError::UnexpectedFormAction);
+        }
+        if form.validate_form().is_err() {
+            error!("Form validation failed");
+            return Err(AuthError::UnexpectedFormContent);
         }
 
-        // 2. Resolve user and scope
-        let scope = self.resolve_user_and_scope(form).await?;
+        // 2. Find authentication method
+        let method = self.get_method_from_form(form).await?;
 
-        // 3. Find authentication method
-        let method = self
-            .get_assumed_auth_method(scope.clone(), factor_kind, form_kind)
-            .await?;
-
-        // 4. Start authentication flow
-        self.start_authentication(method.clone()).await?;
-
-        // 5. Get the first factor ID
+        // 3. Get the first factor ID
         let factor_id = method
             .get_first_factor_id()
             .ok_or(AuthError::FactorNotFound)?;
 
-        // 6. Verify first factor
+        // 4. Start authentication flow
+        self.start_authentication(method).await?;
+
+        // 5. Verify first factor
         debug!("First factor ID to verify: {:?}", factor_id);
         match self.verify_factor(form, &factor_id).await {
             Ok(()) => {
@@ -1221,10 +1120,10 @@ where
             .map_err(AuthError::BackendError)?;
 
         // Verify factor matches form
-        if factor.kind != form.factor_kind() {
+        if factor.kind != form.kind() {
             error!("Unexpected factor type");
             return Err(AuthError::UnexpectedFactorKind(
-                FactorKindError::UnexpectedValue(format!("{:?}", form.factor_kind())),
+                FactorKindError::UnexpectedValue(format!("{:?}", form.kind())),
             ));
         }
 
@@ -1281,11 +1180,11 @@ where
                 let user_id: B::UserId = user.id().clone().into();
                 let tenant_id: B::TenantId = user.tenant_id().clone().into();
 
-                let scope = PermissionScope::User(tenant_id, user_id.clone());
+                let scope = AuthnScope::User(tenant_id, user_id.clone());
 
                 let methods_available = self
                     .backend
-                    .get_scoped_auth_methods(scope, EnablementState::Active)
+                    .get_scoped_auth_methods(scope, vec![EnablementState::Active])
                     .await
                     .map_err(AuthError::BackendError)?;
 
@@ -1338,7 +1237,7 @@ where
             .map_err(AuthError::SessionError)?;
 
         // Invalidate old session in registry if it exists
-        if let (Some(registry), Some(old_id)) = (&self.session_registry, old_session_id)
+        if let (Some(registry), Some(old_id)) = (&self.registry, old_session_id)
             && let Err(e) = registry.invalidate_session(&old_id).await
         {
             debug!(
@@ -1368,18 +1267,14 @@ where
 
     /// Handle factor setup for authenticated users.
     /// This allows users to add/configure new authentication factors after logging in.
-    pub async fn handle_factor_setup<F>(
-        &mut self,
-        form: &F,
-        factor_kind: AuthFactorKind,
-    ) -> Result<Response, AuthError<B>>
+    pub async fn handle_factor_setup<F>(&mut self, form: &F) -> Result<Response, AuthError<B>>
     // Changed from StatusCode
     where
         F: FactorForm + Send + Sync + 'static,
     {
         // 1. Ensure form is for setup
-        if form.form_kind() != FactorFormKind::Setup {
-            error!("Form kind must be Setup for factor setup");
+        if form.action() != Action::Setup {
+            error!("Form action must be `Setup` for factor setup method");
             return Err(AuthError::InvalidStateTransition);
         }
 
@@ -1393,31 +1288,23 @@ where
         // 4. Validate session is still registered
         self.validate_session_binding().await?;
 
-        let tenant_id = self
-            .get_tenant_id()
-            .cloned()
-            .ok_or(AuthError::InvalidScope)?;
-
-        let user_id = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
-
-        let scope = PermissionScope::User(tenant_id.clone(), user_id.clone());
-
-        let method = self
-            .get_assumed_auth_method(scope.clone(), factor_kind.clone(), FactorFormKind::Setup)
-            .await?;
-
-        // TODO: Adjust so that the method can handle multiple factors of type OTP in a method if needed (or of any other type)!
-        let factor = method.factors.first().ok_or(AuthError::FactorNotFound)?;
+        // 5. Find authentication factor
+        let factor = self.get_factor_from_form(form).await?;
 
         let credential = form.credential().ok_or(AuthError::InvalidCredentials)?;
+        let scope = self.resolve_user_and_scope(form).await?;
 
-        let config = match factor_kind {
-            AuthFactorKind::Password => {
+        let config = match form.flow() {
+            Flow::Knowledge => {
+                if factor.get_flow() != &Flow::Knowledge {
+                    error!("Knowledge factors other than Password are not supported");
+                    return Err(AuthError::UnexpectedFormContent);
+                }
                 FactorConfigBuilder::password(generate_password_hash(credential))
                     .build()
                     .into_inner()
             }
-            AuthFactorKind::Otp => {
+            Flow::Otp => {
                 let stored_config_map = self
                     .backend
                     .get_factor_states(&factor.id, scope.clone())
@@ -1430,24 +1317,27 @@ where
 
                 let stored_config = FactorConfig::from_map(stored_config_map);
 
-                let otp_type = stored_config
-                    .get_value("otp_type")
-                    .and_then(|raw| from_value::<OtpType>(raw.clone()).ok())
-                    .unwrap_or(OtpType::Totp);
+                let stored_factor_kind = stored_config
+                    .get_value("kind")
+                    .and_then(|raw| from_value::<Kind>(raw.clone()).ok())
+                    .unwrap_or(Kind::Totp);
 
                 if stored_config.is_empty() {
-                    match otp_type {
-                        OtpType::Totp => FactorConfigBuilder::totp(credential.to_owned()),
-                        OtpType::Hotp => FactorConfigBuilder::hotp(credential.to_owned()),
-                        OtpType::Email => {
+                    match stored_factor_kind {
+                        Kind::Totp => FactorConfigBuilder::totp(credential.to_owned()),
+                        Kind::Hotp => FactorConfigBuilder::hotp(credential.to_owned()),
+                        Kind::EmailOtp => {
                             let email = form
                                 .get_string_field(FormField::Email)
                                 .ok_or(AuthError::InvalidCredentials)?;
                             FactorConfigBuilder::email(email)
                         }
-                        OtpType::Custom(_) => FactorConfigBuilder::new()
-                            .with_field("otp_type", json!(otp_type))
-                            .with_secret(credential.to_owned()),
+                        kind => {
+                            error!("Setup of factor kind {:?} is unsupported", kind);
+                            return Err(AuthError::UnexpectedFactorKind(
+                                FactorKindError::UnexpectedValue(format!("{:?}", kind)),
+                            ));
+                        }
                     }
                 } else {
                     stored_config
@@ -1456,21 +1346,22 @@ where
                 }
                 .into()
             }
-            AuthFactorKind::Oauth => FactorConfigBuilder::new()
-                .with_field("provider", json!(credential))
-                .into(),
-            AuthFactorKind::Custom(_) => FactorConfigBuilder::new()
-                .with_field("credential", json!(credential))
-                .into(),
+            flow => {
+                error!("Setup of factor flow {:?} is unsupported", flow);
+                return Err(AuthError::UnexpectedFactorKind(
+                    FactorKindError::UnexpectedValue(format!("{:?}", flow)),
+                ));
+            }
         };
 
         // 6. Create a FactorStateChange to be able to upsert the FactorState.
         let change = FactorStateChange::new(factor.id.clone())
-            .with_scope(scope)
+            .with_scope(scope.clone())
             .with_state(EnablementState::Active)
             .with_config(config);
 
         // 7. Upsert FactorState to enable the linked FactorInstance.
+        let user_id = self.get_user_id().cloned().ok_or(AuthError::UserNotFound)?;
         self.backend
             .upsert_factor_state(change, user_id)
             .await
@@ -1509,7 +1400,6 @@ where
     /// Ensures session is registered starting from PartialAuthn state
     async fn ensure_session_registered(&mut self) -> Result<(), AuthError<B>> {
         // Ensure hash exists; if not, generate and persist it (best-effort).
-        // This block may call &mut self methods, so previous borrows must have ended.
         let session_hash = if let Some(h) = self.data.auth_hash.as_ref() {
             h.clone()
         } else {
@@ -1544,7 +1434,7 @@ where
             }
         };
 
-        if let Some(registry) = &self.session_registry {
+        if let Some(registry) = &self.registry {
             registry
                 .register_session(
                     &session_id_str,
@@ -1569,7 +1459,7 @@ where
 
     // /// Removes session from registry (best effort)
     // async fn unregister_session(&self) -> Result<(), AuthError<B>> {
-    //     let Some(registry) = &self.session_registry else {
+    //     let Some(registry) = &self.registry else {
     //         return Ok(());
     //     };
 
@@ -1633,11 +1523,11 @@ mod tests {
         let methods_res = auth_session
             .backend
             .get_scoped_auth_methods(
-                PermissionScope::User(
+                AuthnScope::User(
                     TestTenantId("tenant1".to_string()),
                     TestUserId("user1".to_string()),
                 ),
-                EnablementState::Active,
+                vec![EnablementState::Active],
             )
             .await;
 
@@ -2009,7 +1899,7 @@ mod tests {
         auth_session.data.user_state = EntityState::Active;
 
         let factor_id = "password-factor".to_string();
-        let scope = PermissionScope::User(tenant_id.clone(), user_id.clone());
+        let scope = AuthnScope::User(tenant_id.clone(), user_id.clone());
 
         let change = FactorStateChange::new(factor_id.clone())
             .with_scope(scope.clone())

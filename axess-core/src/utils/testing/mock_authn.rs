@@ -31,7 +31,7 @@ use crate::{
         errors::AuthError,
         methods::{
             MethodBuilder,
-            factor::{AuthFactorKind, FactorInstance},
+            factor::{FactorInstance, Kind},
         },
         session::{AuthSession, registry::SessionRegistryStore},
         types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
@@ -54,7 +54,7 @@ pub fn mock_method() -> AuthMethod<MockBackend> {
 
     let password_factor = FactorInstance::new(
         "password-factor".to_string(),
-        AuthFactorKind::Password,
+        Kind::Password,
         "Password",
         "Mock password factor",
         creator.clone(),

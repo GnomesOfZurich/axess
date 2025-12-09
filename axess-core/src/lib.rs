@@ -41,6 +41,6 @@ pub use tracing;
 // pub use authn::{
 //     session::{AuthSession, AuthError},
 //     service::{AuthManager, AuthManagerLayer},
-//     backend::{AuthnBackend, AuthUser, AuthTenant, MethodId, FactorId, UserId, UserState},
+//     backend::{AuthnBackend, AuthUser, AuthTenant, AuthId, UserId, UserState},
 //     methods::{AuthMethod, AuthFactor, FactorForm},
 // };

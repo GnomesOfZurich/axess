@@ -1,7 +1,7 @@
 use crate::models::backend::OurBackend;
 use axess::{
-    AuthFactor, AuthFactorKind, AuthFactorState, AuthMethod, AuthMethodState, AuthSession,
-    EnablementState, SessionRegistryStore, SystemRng,
+    AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthSession, EnablementState, Kind,
+    SessionRegistryStore, SystemRng,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
@@ -30,8 +30,12 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthFactor {
         })?;
 
         let kind_txt: String = row.try_get("kind")?;
-        let kind = serde_json::from_str::<AuthFactorKind>(&format!("\"{}\"", kind_txt))
-            .unwrap_or(AuthFactorKind::Custom(kind_txt.clone()));
+        let kind = serde_json::from_str::<Kind>(&format!("\"{}\"", kind_txt)).map_err(|e| {
+            sqlx::Error::ColumnDecode {
+                index: "kind".into(),
+                source: Box::new(e),
+            }
+        })?;
 
         let name: String = row.try_get("name")?;
         let description: String = row.try_get("description")?;
@@ -154,7 +158,13 @@ impl<'r> FromRow<'r, SqliteRow> for OurAuthFactorState {
             })?;
 
         Ok(OurAuthFactorState(AuthFactorState::<OurBackend> {
-            id: row.try_get::<String, _>("id")?,
+            id: {
+                let id_str = row.try_get::<String, _>("id")?;
+                uuid::Uuid::parse_str(&id_str).map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "id".into(),
+                    source: Box::new(e),
+                })?
+            },
             factor_id,
             tenant_id,
             user_id,

@@ -1,8 +1,6 @@
 //! Axum extractor for retrieving an [`AuthSession`] that was stored by the
 //! `AuthnService` middleware.
 
-// use std::sync::Arc;
-
 use crate::{
     authn::{
         backend::AuthnBackend,
@@ -15,6 +13,43 @@ use crate::{
     tracing::{error, info},
     utils::random::SecureRng,
 };
+// use async_trait::async_trait;
+
+// #[async_trait]
+// impl<S, B, R, Rng> FromRequestParts<S> for AuthSession<B, R, Rng>
+// where
+//     S: Send + Sync,
+//     B: AuthnBackend + Send + Sync + 'static,
+//     R: SessionRegistry + Send + Sync + Clone + 'static,
+//     Rng: SecureRng + Clone + 'static,
+// {
+//     type Rejection = (StatusCode, &'static str);
+
+//     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+//         info!(
+//             "Attempting to extract AuthSession<{}, {}, {}> from extensions",
+//             std::any::type_name::<B>(),
+//             std::any::type_name::<R>(),
+//             std::any::type_name::<Rng>()
+//         );
+
+//         let found = parts.extensions.get::<AuthSession<B, R, Rng>>().is_some();
+//         info!("AuthSession present in extensions: {}", found);
+
+//         if let Some(session) = parts.extensions.get::<AuthSession<B, R, Rng>>() {
+//             info!("AuthSession found in request extensions (direct)");
+//             return Ok(session.clone());
+//         }
+//         error!(
+//             "AuthSession NOT found in request extensions. Extensions: {:?}",
+//             parts.extensions
+//         );
+//         Err((
+//             StatusCode::INTERNAL_SERVER_ERROR,
+//             "Unable to extract authentication session from middleware; ensure AuthnService is applied.",
+//         ))
+//     }
+// }
 
 impl<S, B, R, Rng> FromRequestParts<S> for AuthSession<B, R, Rng>
 where

@@ -41,6 +41,9 @@ pub enum FormError {
     /// The form contains invalid or malformed data (e.g., bad format, empty fields).
     #[error("Invalid form data")]
     InvalidFormData,
+    /// The form action is unexpected or unsupported.
+    #[error("Unexpected form action")]
+    UnexpectedFormAction,
     /// The form failed a specific validation rule, with a message describing the reason.
     #[error("Form validation failed: {0}")]
     ValidationFailed(String),
@@ -58,9 +61,10 @@ where
 {
     fn from(err: FormError) -> Self {
         match err {
-            FormError::InvalidFormData => AuthError::InvalidCredentials,
+            FormError::InvalidFormData => AuthError::UnexpectedFormContent,
+            FormError::UnexpectedFormAction => AuthError::UnexpectedFormAction,
             FormError::ValidationFailed(_) => AuthError::InvalidCredentials,
-            FormError::MissingField(_) => AuthError::InvalidCredentials,
+            FormError::MissingField(_) => AuthError::UnexpectedFormContent,
             FormError::AuthConfigError(kind) => AuthError::UnexpectedAuthConfig(kind),
         }
     }
@@ -77,7 +81,7 @@ where
 /// - `UnexpectedValue(String)`: The factor kind is not recognized or supported; includes the unexpected value.
 ///
 /// # Usage
-/// - Returned by [`AuthFactorKind::from_str`] when parsing an unknown factor kind.
+/// - Returned by [`Kind::from_str`] when parsing an unknown factor kind.
 /// - Used in session flows and backend logic to reject unsupported factor kinds.
 /// - Propagated via [`AuthError::UnexpectedFactorKind`] for HTTP error mapping.
 ///
@@ -195,6 +199,9 @@ pub enum AuthError<B: AuthnBackend> {
     /// Submitted credentials are invalid or do not match backend records.
     #[error("Invalid credentials")]
     InvalidCredentials,
+    /// The form contains invalid or malformed fields or field values.
+    #[error("Unexpected form content")]
+    UnexpectedFormContent,
     /// Exceeded maximum allowed authentication attempts (lockout).
     #[error("Too many authentication attempts")]
     TooManyAttempts,
@@ -237,6 +244,9 @@ pub enum AuthError<B: AuthnBackend> {
     /// Unexpected or unsupported factor kind.
     #[error("Unexpected factor kind: {0}")]
     UnexpectedFactorKind(#[from] FactorKindError),
+    /// The form action is unexpected or unsupported.
+    #[error("Unexpected form action")]
+    UnexpectedFormAction,
     /// Unexpected or invalid configuration for factor kind.
     #[error("Unexpected auth config for factor kind: {0}")]
     UnexpectedAuthConfig(String),
@@ -296,6 +306,9 @@ where
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid credentials"),
+            AuthError::UnexpectedFormContent => {
+                (StatusCode::BAD_REQUEST, "Unexpected form content")
+            }
             AuthError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "Too many attempts"),
             AuthError::InvalidStateTransition => (StatusCode::CONFLICT, "Invalid state transition"),
             AuthError::NotAuthenticated => (StatusCode::UNAUTHORIZED, "Not authenticated"),
@@ -321,6 +334,7 @@ where
                 StatusCode::BAD_REQUEST,
                 "Invalid authentication configuration",
             ),
+            AuthError::UnexpectedFormAction => (StatusCode::BAD_REQUEST, "Unexpected form action"),
             AuthError::UserNotFound => (StatusCode::UNAUTHORIZED, "User not found"),
             AuthError::UnexpectedUserState => (StatusCode::FORBIDDEN, "Unexpected user state"),
             AuthError::IncorrectUserData => (StatusCode::BAD_REQUEST, "Incorrect user data"),

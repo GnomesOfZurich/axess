@@ -6,19 +6,18 @@ pub use axess_core::{
     authn::{
         self,
         backend::{
-            AuthTenant, AuthUser, AuthnBackend, EntityState, FactorId, MethodId, StatusDetail,
-            TenantId, UserId,
+            AuthId, AuthTenant, AuthUser, AuthnBackend, EntityState, StatusDetail, TenantId, UserId,
         },
         errors::{AuthError, FormError, HandlerError, WorkflowError},
         methods::{
             MethodBuilder, MethodInstance, MethodStateChange,
-            factor::{AuthFactorKind, FactorInstance, FactorStateChange},
+            factor::{FactorInstance, FactorStateChange, Kind, Operation, FederatedProvider},
             form::{
-                self, FactorForm, FactorFormExt, FactorFormKind, FormField, FormFieldValue,
+                self, Action, FactorForm, FactorFormExt, FormField, FormFieldValue,
                 form_fields_to_json,
             },
             policy::{FactorConfig, FactorConfigBuilder},
-            scope::{EnablementState, PermissionScope},
+            scope::{AuthnScope, EnablementState},
         },
         middleware::{AuthnManager, AuthnService, AuthnServiceBuilder},
         session::{

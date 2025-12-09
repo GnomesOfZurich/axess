@@ -43,7 +43,7 @@ use tower_sessions::{
 /// - `inner`: The wrapped Axum service.
 /// - `backend`: Shared backend implementing [`AuthnBackend`] for user, tenant, and factor management.
 /// - `data_key`: Key used to store session data in the session store.
-/// - `session_registry`: Optional registry for distributed session management.
+/// - `registry`: Optional registry for distributed session management.
 ///
 /// # Usage
 /// - Used via [`AuthnService`] and [`AuthnServiceBuilder`] to provide authentication context.
@@ -60,11 +60,11 @@ use tower_sessions::{
 ///
 /// let backend = Arc::new(MyBackend::new());
 /// let session_store = MemoryStore::default();
-/// let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+/// let registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
 /// let session_manager_layer = tower_sessions::SessionManagerLayer::new(session_store.clone());
 ///
 /// let auth_service = AuthnServiceBuilder::new(backend.clone(), session_manager_layer)
-///     .with_session_registry(session_registry.clone())
+///     .with_session_registry(registry.clone())
 ///     .build();
 /// // Use `auth_service` as a layer in your Axum router.
 /// ```
@@ -77,7 +77,7 @@ where
     inner: S,
     backend: Arc<B>,
     data_key: &'static str,
-    session_registry: Option<Arc<R>>,
+    registry: Option<Arc<R>>,
 }
 
 impl<ReqBody, ResBody, S, B, R> Service<Request<ReqBody>> for AuthnManager<S, B, R>
@@ -104,7 +104,7 @@ where
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let backend = self.backend.clone();
         let data_key = self.data_key;
-        let session_registry = self.session_registry.clone();
+        let registry = self.registry.clone();
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
@@ -140,7 +140,7 @@ where
                 session.clone(),
                 backend.clone(),
                 data_key,
-                session_registry.clone(),
+                registry.clone(),
                 SystemRng,
             )
             .await
@@ -174,7 +174,7 @@ where
 
                     // Always generate and persist a session hash, even for guests
                     let session_hash = auth_session.generate_session_hash();
-                    if let Some(registry) = &session_registry {
+                    if let Some(registry) = &registry {
                         if let Some(session_id) = auth_session.session.id() {
                             registry
                                 .register_session(
@@ -244,7 +244,7 @@ where
 /// - `backend`: Shared backend implementing [`AuthnBackend`] for user, tenant, and factor management.
 /// - `session_manager_layer`: Layer for session management (e.g., tower-sessions).
 /// - `data_key`: Key used to store session data in the session store (defaults to `"axess.data"`).
-/// - `session_registry`: Optional registry for distributed session management.
+/// - `registry`: Optional registry for distributed session management.
 ///
 /// # Usage
 /// Use as a layer in your Axum router to enable authentication and session management.
@@ -266,7 +266,7 @@ pub struct AuthnService<
     backend: Arc<B>,
     session_manager_layer: SessionManagerLayer<Sessions, C>,
     data_key: &'static str,
-    session_registry: Option<Arc<R>>,
+    registry: Option<Arc<R>>,
 }
 
 impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
@@ -277,13 +277,13 @@ impl<Backend: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: Cooki
         backend: Arc<Backend>,
         data_key: &'static str,
         session_manager_layer: SessionManagerLayer<Sessions, C>,
-        session_registry: Option<Arc<R>>,
+        registry: Option<Arc<R>>,
     ) -> Self {
         Self {
             backend,
             session_manager_layer,
             data_key,
-            session_registry,
+            registry,
         }
     }
 }
@@ -298,7 +298,7 @@ impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry + Debug, C: 
             inner,
             backend: self.backend.clone(),
             data_key: self.data_key,
-            session_registry: self.session_registry.clone(),
+            registry: self.registry.clone(),
         };
 
         self.session_manager_layer.layer(login_manager)
@@ -316,7 +316,7 @@ impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry + Debug, C: 
 /// - `backend`: Shared backend implementing [`AuthnBackend`] for user, tenant, and factor management.
 /// - `session_manager_layer`: Layer for session management (e.g., tower-sessions).
 /// - `data_key`: Optional key used to store session data in the session store (defaults to `"axess.data"`).
-/// - `session_registry`: Optional registry for distributed session management.
+/// - `registry`: Optional registry for distributed session management.
 ///
 /// # Usage
 /// - Use [`AuthnServiceBuilder::new`] to start configuration.
@@ -336,11 +336,11 @@ impl<S, B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry + Debug, C: 
 ///
 /// let backend = Arc::new(MyBackend::new());
 /// let session_store = MemoryStore::default();
-/// let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+/// let registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
 /// let session_manager_layer = tower_sessions::SessionManagerLayer::new(session_store.clone());
 ///
 /// let auth_service = AuthnServiceBuilder::new(backend.clone(), session_manager_layer)
-///     .with_session_registry(session_registry.clone())
+///     .with_session_registry(registry.clone())
 ///     .with_data_key("custom.data.key")
 ///     .build();
 /// // Use `auth_service` as a layer in your Axum router.
@@ -355,7 +355,7 @@ pub struct AuthnServiceBuilder<
     backend: Arc<B>,
     session_manager_layer: SessionManagerLayer<Sessions, C>,
     data_key: Option<&'static str>,
-    session_registry: Option<Arc<R>>,
+    registry: Option<Arc<R>>,
 }
 
 impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieController>
@@ -366,12 +366,12 @@ impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieContr
             backend,
             session_manager_layer,
             data_key: None,
-            session_registry: None,
+            registry: None,
         }
     }
 
     pub fn with_session_registry(mut self, registry: Arc<R>) -> Self {
-        self.session_registry = Some(registry);
+        self.registry = Some(registry);
         self
     }
 
@@ -391,7 +391,7 @@ impl<B: AuthnBackend, Sessions: SessionStore, R: SessionRegistry, C: CookieContr
             self.backend,
             self.data_key.unwrap_or("axess.data"),
             self.session_manager_layer,
-            self.session_registry,
+            self.registry,
         )
     }
 }

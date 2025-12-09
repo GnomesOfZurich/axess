@@ -44,7 +44,7 @@ pub enum EnablementState {
 
 /// Describes the scope at which authentication factors or methods are defined and resolved.
 ///
-/// `PermissionScope` is used throughout Axess to specify whether a factor or method applies globally,
+/// `AuthnScope` is used throughout Axess to specify whether a factor or method applies globally,
 /// to a specific tenant, or to a specific user within a tenant. This enables fine-grained control
 /// over authentication and authorization flows, supporting multi-tenancy and per-user overrides.
 ///
@@ -55,19 +55,19 @@ pub enum EnablementState {
 /// - `User(TenantId, UserId)`: Applies to a specific user within a tenant.
 ///
 /// # Usage
-/// Use `PermissionScope` to filter factors/methods in backend queries, resolve authentication flows,
+/// Use `AuthnScope` to filter factors/methods in backend queries, resolve authentication flows,
 /// and enforce policy decisions. Helper methods are provided to extract tenant/user IDs and to check scope type.
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::scope::PermissionScope;
+/// use axess_core::authn::methods::scope::AuthnScope;
 ///
 /// type TenantId = String;
 /// type UserId = String;
 ///
-/// let global: PermissionScope<TenantId, UserId> = PermissionScope::Global;
-/// let tenant: PermissionScope<TenantId, UserId> = PermissionScope::Tenant("tenant1".to_string());
-/// let user: PermissionScope<TenantId, UserId> = PermissionScope::User("tenant1".to_string(), "user42".to_string());
+/// let global: AuthnScope<TenantId, UserId> = AuthnScope::Global;
+/// let tenant: AuthnScope<TenantId, UserId> = AuthnScope::Tenant("tenant1".to_string());
+/// let user: AuthnScope<TenantId, UserId> = AuthnScope::User("tenant1".to_string(), "user42".to_string());
 ///
 /// assert!(global.is_global());
 /// assert!(tenant.is_tenant());
@@ -76,7 +76,7 @@ pub enum EnablementState {
 /// assert_eq!(user.user_id(), Some(&"user42".to_string()));
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PermissionScope<TenantId, UserId> {
+pub enum AuthnScope<TenantId, UserId> {
     /// Matches all defined states—global, tenant, and user-level.
     Any,
     /// Applies to all globally defined states (not tied to any tenant or user).
@@ -87,39 +87,39 @@ pub enum PermissionScope<TenantId, UserId> {
     User(TenantId, UserId),
 }
 
-impl<T, U> PermissionScope<T, U> {
+impl<T, U> AuthnScope<T, U> {
     /// Returns `true` if this scope is global.
     pub fn is_global(&self) -> bool {
-        matches!(self, PermissionScope::Global)
+        matches!(self, AuthnScope::Global)
     }
 
     /// Returns `true` if this scope is tenant-specific.
     pub fn is_tenant(&self) -> bool {
-        matches!(self, PermissionScope::Tenant(_))
+        matches!(self, AuthnScope::Tenant(_))
     }
 
     /// Returns `true` if this scope is user-specific.
     pub fn is_user(&self) -> bool {
-        matches!(self, PermissionScope::User(_, _))
+        matches!(self, AuthnScope::User(_, _))
     }
 
     /// Returns the tenant ID if present, or `None` otherwise.
     pub fn tenant_id(&self) -> Option<&T> {
         match self {
-            PermissionScope::Global => None,
-            PermissionScope::Tenant(tid) => Some(tid),
-            PermissionScope::User(tid, _) => Some(tid),
-            PermissionScope::Any => None,
+            AuthnScope::Global => None,
+            AuthnScope::Tenant(tid) => Some(tid),
+            AuthnScope::User(tid, _) => Some(tid),
+            AuthnScope::Any => None,
         }
     }
 
     /// Returns the user ID if present, or `None` otherwise.
     pub fn user_id(&self) -> Option<&U> {
         match self {
-            PermissionScope::Global => None,
-            PermissionScope::Tenant(_) => None,
-            PermissionScope::User(_, uid) => Some(uid),
-            PermissionScope::Any => None,
+            AuthnScope::Global => None,
+            AuthnScope::Tenant(_) => None,
+            AuthnScope::User(_, uid) => Some(uid),
+            AuthnScope::Any => None,
         }
     }
 }

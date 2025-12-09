@@ -1,4 +1,10 @@
-use crate::authn::{errors::WorkflowError, methods::factor::AuthFactorKind};
+use crate::authn::{
+    errors::WorkflowError,
+    methods::{
+        factor::{Kind, Operation},
+        form::Action,
+    },
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,12 +43,10 @@ pub trait Workflow:
 
 /// Describes the kind of step in a workflow.
 /// Can be a factor verification, setup, or a custom business step.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum WorkflowStepKind {
-    /// Verify a factor (e.g., email, TOTP, password).
-    FactorVerify(AuthFactorKind),
-    /// Setup a factor (e.g., provision TOTP).
-    FactorSetup(AuthFactorKind),
+    /// Verification or setup of some authentication factor
+    FactorAction(Operation),
     /// Custom business logic (e.g., KYC, admin approval).
     Custom(String),
 }
@@ -68,8 +72,8 @@ pub struct WorkflowStep {
 pub enum WorkflowAction {
     /// Submitted a factor form (setup, verify, change).
     FactorForm {
-        kind: AuthFactorKind,
-        form_kind: crate::authn::methods::form::FactorFormKind,
+        kind: Kind,
+        action: Action,
         fields: HashMap<String, serde_json::Value>,
     },
     /// Custom action (e.g., admin approval, document upload).
@@ -108,44 +112,16 @@ impl WorkflowState {
 
     /// Advances the workflow based on an action.
     /// Returns Ok if the step was completed, Err otherwise.
-    pub fn advance(
-        &mut self,
-        action: &WorkflowAction,
-    ) -> Result<(), crate::authn::errors::WorkflowError> {
+    pub fn advance(&mut self) -> Result<(), crate::authn::errors::WorkflowError> {
         if let Some(step) = self.steps.get_mut(self.current_step) {
-            match (&step.kind, action) {
-                (
-                    WorkflowStepKind::FactorVerify(kind),
-                    WorkflowAction::FactorForm { kind: k, .. },
-                )
-                | (
-                    WorkflowStepKind::FactorSetup(kind),
-                    WorkflowAction::FactorForm { kind: k, .. },
-                ) if kind == k => {
-                    // Here you could add more logic to validate the form_kind, fields, etc.
-                    step.completed = true;
-                    step.completed_at = Some(Utc::now());
-                    self.current_step += 1;
-                    self.last_updated = Utc::now();
-                    if self.current_step >= self.steps.len() {
-                        self.blocking = false;
-                    }
-                    Ok(())
-                }
-                (WorkflowStepKind::Custom(expected), WorkflowAction::Custom { name, .. })
-                    if expected == name =>
-                {
-                    step.completed = true;
-                    step.completed_at = Some(Utc::now());
-                    self.current_step += 1;
-                    self.last_updated = Utc::now();
-                    if self.current_step >= self.steps.len() {
-                        self.blocking = false;
-                    }
-                    Ok(())
-                }
-                _ => Err(crate::authn::errors::WorkflowError::InvalidTransition),
+            step.completed = true;
+            step.completed_at = Some(Utc::now());
+            self.current_step += 1;
+            self.last_updated = Utc::now();
+            if self.current_step >= self.steps.len() {
+                self.blocking = false;
             }
+            Ok(())
         } else {
             Err(crate::authn::errors::WorkflowError::Incomplete)
         }

@@ -89,7 +89,7 @@ pub trait AuthnAdminBackend: AuthnBackend {
     /// The `actor` is the user performing the operation (for audit and authorization).
     async fn delete_auth_method(
         &self,
-        method_id: &Self::MethodId,
+        method_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error>;
 
@@ -98,7 +98,7 @@ pub trait AuthnAdminBackend: AuthnBackend {
     /// The `actor` is the user performing the operation (for audit and authorization).
     async fn delete_method_state(
         &self,
-        method_state_id: &Self::DataId,
+        method_state_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error>;
 
@@ -119,7 +119,7 @@ pub trait AuthnAdminBackend: AuthnBackend {
     /// The `actor` is the user performing the operation (for audit and authorization).
     async fn delete_auth_factor(
         &self,
-        factor_id: &Self::FactorId,
+        factor_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error>;
 
@@ -128,7 +128,7 @@ pub trait AuthnAdminBackend: AuthnBackend {
     /// The `actor` is the user performing the operation (for audit and authorization).
     async fn delete_factor_state(
         &self,
-        factor_state_id: &Self::DataId,
+        factor_state_id: &Self::AuthId,
         actor: Self::UserId,
     ) -> Result<(), Self::Error>;
 }

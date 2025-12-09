@@ -37,7 +37,7 @@ use crate::{
             MethodStateChange,
             factor::FactorStateChange,
             form::FactorForm,
-            scope::{EnablementState, PermissionScope},
+            scope::{AuthnScope, EnablementState},
         },
         session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
         types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState}, // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
@@ -192,9 +192,7 @@ impl AuthnBackend for MockBackend {
     type UserId = TestUserId;
     type Tenant = MockTenant;
     type TenantId = TestTenantId;
-    type MethodId = String;
-    type FactorId = String;
-    type DataId = String;
+    type AuthId = String;
     type Error = MockBackendError;
 
     async fn get_default_protected_route(
@@ -288,7 +286,7 @@ impl AuthnBackend for MockBackend {
 
     async fn get_auth_method(
         &self,
-        method_id: &Self::MethodId,
+        method_id: &Self::AuthId,
     ) -> Result<AuthMethod<Self>, Self::Error> {
         self.auth_methods
             .get(method_id)
@@ -296,18 +294,61 @@ impl AuthnBackend for MockBackend {
             .ok_or_else(|| MockBackendError::NotFound("Method not found".to_string()))
     }
 
-    async fn get_all_auth_methods(&self) -> Result<Vec<AuthMethod<Self>>, Self::Error> {
-        Ok(self
+    /// Get the authentication method by its name, optionally filtered on enablement state(s) and scope.
+    /// An empty array of enablement states means that all states are acceptable (i.e. no filtering).
+    async fn get_auth_method_by_name(
+        &self,
+        name: &str,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
+    ) -> Result<AuthMethod<Self>, Self::Error> {
+        // 1. Find all methods with the given name
+        let methods: Vec<_> = self
             .auth_methods
             .iter()
+            .filter(|entry| entry.value().name == name)
             .map(|entry| entry.value().clone())
-            .collect())
+            .collect();
+
+        // 2. For each method, check if there is a matching state for the scope and enablement state
+        for method in methods {
+            let method_states: Vec<_> = self
+                .auth_method_states
+                .iter()
+                .filter(|entry| {
+                    entry.value().method_id == method.id
+                        && match &scope {
+                            AuthnScope::Global | AuthnScope::Any => true,
+                            AuthnScope::Tenant(tenant_id) => {
+                                entry.value().tenant_id.as_ref().map(|t| t.as_str())
+                                    == Some(tenant_id.0.as_str())
+                            }
+                            AuthnScope::User(tenant_id, user_id) => {
+                                entry.value().tenant_id.as_ref().map(|t| t.as_str())
+                                    == Some(tenant_id.0.as_str())
+                                    && entry.value().user_id.as_ref().map(|u| u.as_str())
+                                        == Some(user_id.0.as_str())
+                            }
+                        }
+                        && (states.is_empty() || states.contains(&entry.value().state))
+                })
+                .collect();
+
+            if !method_states.is_empty() {
+                return Ok(method);
+            }
+        }
+
+        Err(MockBackendError::NotFound(format!(
+            "Method '{}' not found for scope and state",
+            name
+        )))
     }
 
     async fn get_scoped_auth_methods(
         &self,
-        _scope: PermissionScope<Self::TenantId, Self::UserId>,
-        _state: EnablementState,
+        _scope: AuthnScope<Self::TenantId, Self::UserId>,
+        _states: Vec<EnablementState>,
     ) -> Result<Vec<AuthMethod<Self>>, Self::Error> {
         Ok(self
             .auth_methods
@@ -318,8 +359,8 @@ impl AuthnBackend for MockBackend {
 
     async fn get_method_states(
         &self,
-        method_id: &Self::MethodId,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        method_id: &Self::AuthId,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthMethodState<Self>>, Self::Error> {
         Ok(self
             .auth_method_states
@@ -327,12 +368,12 @@ impl AuthnBackend for MockBackend {
             .filter(|entry| {
                 &entry.value().method_id == method_id
                     && match &scope {
-                        PermissionScope::Global | PermissionScope::Any => true,
-                        PermissionScope::Tenant(tenant_id) => {
+                        AuthnScope::Global | AuthnScope::Any => true,
+                        AuthnScope::Tenant(tenant_id) => {
                             entry.value().tenant_id.as_ref().map(|t| t.as_str())
                                 == Some(tenant_id.0.as_str())
                         }
-                        PermissionScope::User(tenant_id, user_id) => {
+                        AuthnScope::User(tenant_id, user_id) => {
                             entry.value().tenant_id.as_ref().map(|t| t.as_str())
                                 == Some(tenant_id.0.as_str())
                                 && entry.value().user_id.as_ref().map(|u| u.as_str())
@@ -348,7 +389,7 @@ impl AuthnBackend for MockBackend {
     /// If a state for the method already exists, it will be updated; otherwise, it will be inserted.
     async fn upsert_method_state(
         &self,
-        change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+        change: MethodStateChange<Self::AuthId, Self::TenantId, Self::UserId>,
         actor: Self::UserId,
     ) -> Result<AuthMethodState<Self>, Self::Error> {
         // Create natural key from method_id, tenant_id, user_id
@@ -416,7 +457,7 @@ impl AuthnBackend for MockBackend {
 
     async fn get_auth_factor(
         &self,
-        factor_id: &Self::FactorId,
+        factor_id: &Self::AuthId,
     ) -> Result<AuthFactor<Self>, Self::Error> {
         self.auth_factors
             .get(factor_id)
@@ -424,7 +465,62 @@ impl AuthnBackend for MockBackend {
             .ok_or_else(|| MockBackendError::NotFound("Factor not found".to_string()))
     }
 
-    async fn get_all_auth_factors(&self) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
+    /// Get the authentication factor by its name, optionally filtered on enablement state(s) and scope.
+    /// An empty array of enablement states means that all states are acceptable (i.e. no filtering).
+    async fn get_auth_factor_by_name(
+        &self,
+        name: &str,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
+    ) -> Result<AuthFactor<Self>, Self::Error> {
+        // 1. Find all factors with the given name
+        let factors: Vec<_> = self
+            .auth_factors
+            .iter()
+            .filter(|entry| entry.value().name == name)
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        // 2. For each factor, check if there is a matching state for the scope and enablement state
+        for factor in factors {
+            let factor_states: Vec<_> = self
+                .auth_factor_states
+                .iter()
+                .filter(|entry| {
+                    entry.value().factor_id == factor.id
+                        && match &scope {
+                            AuthnScope::Tenant(tenant_id) => entry
+                                .value()
+                                .tenant_id
+                                .as_ref()
+                                .map(|t| t == tenant_id)
+                                .unwrap_or(false),
+                            AuthnScope::User(tenant_id, user_id) => {
+                                entry.value().tenant_id.as_ref() == Some(tenant_id)
+                                    && entry.value().user_id.as_ref() == Some(user_id)
+                            }
+                            _ => true,
+                        }
+                        && (states.is_empty() || states.contains(&entry.value().state))
+                })
+                .collect();
+
+            if !factor_states.is_empty() {
+                return Ok(factor);
+            }
+        }
+
+        Err(MockBackendError::NotFound(format!(
+            "Factor '{}' not found for scope and state",
+            name
+        )))
+    }
+
+    async fn get_scoped_auth_factors(
+        &self,
+        _scope: AuthnScope<Self::TenantId, Self::UserId>,
+        _states: Vec<EnablementState>,
+    ) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
         Ok(self
             .auth_factors
             .iter()
@@ -432,19 +528,10 @@ impl AuthnBackend for MockBackend {
             .collect())
     }
 
-    async fn get_scoped_auth_factors(
-        &self,
-        _scope: PermissionScope<Self::TenantId, Self::UserId>,
-        _state: Vec<EnablementState>,
-    ) -> Result<Vec<AuthFactor<Self>>, Self::Error> {
-        // For mock implementation, return empty vector
-        Ok(Vec::new())
-    }
-
     async fn get_factor_states(
         &self,
-        factor_id: &Self::FactorId,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        factor_id: &Self::AuthId,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthFactorState<Self>>, Self::Error> {
         Ok(self
             .auth_factor_states
@@ -452,12 +539,12 @@ impl AuthnBackend for MockBackend {
             .filter(|entry| {
                 &entry.value().factor_id == factor_id
                     && match &scope {
-                        PermissionScope::Global | PermissionScope::Any => true,
-                        PermissionScope::Tenant(tenant_id) => {
+                        AuthnScope::Global | AuthnScope::Any => true,
+                        AuthnScope::Tenant(tenant_id) => {
                             entry.value().tenant_id.as_ref().map(|t| t.as_str())
                                 == Some(tenant_id.0.as_str())
                         }
-                        PermissionScope::User(tenant_id, user_id) => {
+                        AuthnScope::User(tenant_id, user_id) => {
                             entry.value().tenant_id.as_ref().map(|t| t.as_str())
                                 == Some(tenant_id.0.as_str())
                                 && entry.value().user_id.as_ref().map(|u| u.as_str())
@@ -471,7 +558,7 @@ impl AuthnBackend for MockBackend {
 
     async fn upsert_factor_state(
         &self,
-        change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+        change: FactorStateChange<Self::AuthId, Self::TenantId, Self::UserId>,
         actor: Self::UserId,
     ) -> Result<AuthFactorState<Self>, Self::Error> {
         // Create natural key from factor_id, tenant_id, user_id
@@ -504,7 +591,7 @@ impl AuthnBackend for MockBackend {
         // Build factor state based on whether it exists
         let factor_state = if let Some((id, created_at, created_by)) = existing_id_and_audit {
             // Update: preserve existing audit trail
-            // AuthFactorState type params: <DataId, FactorId, UserId, TenantId>
+            // AuthFactorState type params: <AuthId, UserId, TenantId>
             AuthFactorState::<MockBackend> {
                 id,
                 factor_id: change.factor_id,
@@ -745,7 +832,7 @@ impl AuthnAdminBackend for MockBackend {
 
     async fn delete_method_state(
         &self,
-        method_state_id: &Self::DataId,
+        method_state_id: &Self::AuthId,
         _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         self.auth_method_states.remove(method_state_id);
@@ -764,7 +851,7 @@ impl AuthnAdminBackend for MockBackend {
 
     async fn delete_auth_method(
         &self,
-        method_id: &Self::MethodId,
+        method_id: &Self::AuthId,
         _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         self.auth_methods.remove(method_id);
@@ -773,7 +860,7 @@ impl AuthnAdminBackend for MockBackend {
 
     async fn delete_factor_state(
         &self,
-        factor_state_id: &Self::FactorId,
+        factor_state_id: &Self::AuthId,
         _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         self.auth_factor_states.remove(factor_state_id);
@@ -792,7 +879,7 @@ impl AuthnAdminBackend for MockBackend {
 
     async fn delete_auth_factor(
         &self,
-        factor_id: &Self::FactorId,
+        factor_id: &Self::AuthId,
         _actor: Self::UserId,
     ) -> Result<(), Self::Error> {
         self.auth_factors.remove(factor_id);

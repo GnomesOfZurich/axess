@@ -4,10 +4,10 @@
 //! stores per-session data payloads, and defines the audit event types emitted by Axess.
 
 use crate::authn::{
-    backend::{AuthnBackend, EntityState, FactorId, MethodId, TenantId, UserId},
+    backend::{AuthId, AuthnBackend, EntityState, TenantId, UserId},
     methods::{
         MethodInstance,
-        factor::{AuthFactorKind, FactorInstance},
+        factor::{FactorInstance, Kind},
     },
     workflows::{WorkflowState, WorkflowStep},
 };
@@ -27,28 +27,26 @@ use std::str::FromStr;
 /// See [`AuthState::PartialAuthn`] for usage in session flows.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(bound(
-    serialize = "M: Serialize, F: Serialize, U: Serialize",
-    deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned"
+    serialize = "A: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, U: DeserializeOwned"
 ))]
-pub struct PartialAuthState<M, F, U>
+pub struct PartialAuthState<A, U>
 where
-    M: MethodId + serde::de::DeserializeOwned + serde::Serialize,
-    F: FactorId + serde::de::DeserializeOwned + serde::Serialize,
+    A: AuthId + serde::de::DeserializeOwned + serde::Serialize,
     U: UserId + serde::de::DeserializeOwned + serde::Serialize,
 {
-    pub current_method: MethodInstance<M, F, U>,
-    pub remaining_factors: Vec<F>,
+    pub current_method: MethodInstance<A, U>,
+    pub remaining_factors: Vec<A>,
     pub attempt_count: u32,
     pub last_attempt: Option<DateTime<Utc>>,
 }
 
-impl<M, F, U> PartialAuthState<M, F, U>
+impl<A, U> PartialAuthState<A, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     U: UserId,
 {
-    pub fn new(method: MethodInstance<M, F, U>) -> Self {
+    pub fn new(method: MethodInstance<A, U>) -> Self {
         Self {
             current_method: method,
             remaining_factors: Vec::new(),
@@ -58,23 +56,23 @@ where
     }
 
     /// Marks the given factor as applied by removing it from remaining_factors.
-    pub fn apply_factor(&mut self, factor_id: &F) -> Self {
+    pub fn apply_factor(&mut self, factor_id: &A) -> Self {
         self.remaining_factors.retain(|f| f != factor_id);
         self.clone()
     }
 
     /// Returns the kind of the next required factor, if any.
-    pub fn next_factor_kind(&self) -> Option<AuthFactorKind> {
+    pub fn next_factor_kind(&self) -> Option<Kind> {
         self.next_factor().map(|factor| factor.kind.clone())
     }
 
     /// Returns the id of the next required factor, if any.
-    pub fn next_factor_id(&self) -> Option<&F> {
+    pub fn next_factor_id(&self) -> Option<&A> {
         self.remaining_factors.first()
     }
 
     /// Returns the next expected factor, if some is required.
-    pub fn next_factor(&self) -> Option<&FactorInstance<F, U>> {
+    pub fn next_factor(&self) -> Option<&FactorInstance<A, U>> {
         self.next_factor_id().and_then(|factor_id| {
             self.current_method
                 .factors
@@ -109,33 +107,31 @@ where
 /// Used as part of the session payload to drive authentication and access control logic.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(bound(
-    serialize = "M: Serialize, F: Serialize, U: Serialize",
-    deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned",
+    serialize = "A: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, U: DeserializeOwned",
 ))]
-pub enum AuthState<M, F, U>
+pub enum AuthState<A, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     U: UserId,
 {
     #[default]
     NotAuthenticated,
     PendingActivation(WorkflowState),
-    PartialAuthn(PartialAuthState<M, F, U>),
+    PartialAuthn(PartialAuthState<A, U>),
     Authenticated,
     PendingWorkflow(WorkflowState),
 }
 
-impl<M, F, U> AuthState<M, F, U>
+impl<A, U> AuthState<A, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     U: UserId,
 {
     /// Creates a new partial authentication state for the given method.
     ///
     /// Initializes the remaining factors from the method's factor list.
-    pub fn new_partial(method: MethodInstance<M, F, U>) -> Self {
+    pub fn new_partial(method: MethodInstance<A, U>) -> Self {
         let mut partial = PartialAuthState::new(method);
         partial.remaining_factors = partial
             .current_method
@@ -210,13 +206,12 @@ where
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(bound(
-    serialize = "M: Serialize, F: Serialize, U: Serialize, T: Serialize",
-    deserialize = "M: DeserializeOwned, F: DeserializeOwned, U: DeserializeOwned, T: DeserializeOwned"
+    serialize = "A: Serialize, T: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, T: DeserializeOwned, U: DeserializeOwned"
 ))]
-pub struct Data<M, F, T, U>
+pub struct Data<A, T, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
@@ -227,17 +222,16 @@ where
     /// Current user state (see [`EntityState`](../backend.rs)).
     pub user_state: EntityState,
     /// Current authentication state (see [`AuthState`]).
-    pub auth_state: AuthState<M, F, U>,
+    pub auth_state: AuthState<A, U>,
     /// Hash of the authentication state for replay protection and audit.
     pub auth_hash: Option<String>,
     /// Additional custom session data.
     pub custom_data: HashMap<String, JsonValue>,
 }
 
-impl<M, F, T, U> Data<M, F, T, U>
+impl<A, T, U> Data<A, T, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
@@ -246,7 +240,7 @@ where
         tenant_id: Option<T>,
         user_id: Option<U>,
         user_state: EntityState,
-        auth_state: AuthState<M, F, U>,
+        auth_state: AuthState<A, U>,
         auth_hash: Option<String>,
         custom_data: HashMap<String, JsonValue>,
     ) -> Self {
@@ -272,7 +266,7 @@ where
         &self.user_state
     }
 
-    pub fn get_auth_state(&self) -> &AuthState<M, F, U> {
+    pub fn get_auth_state(&self) -> &AuthState<A, U> {
         &self.auth_state
     }
     pub fn get_auth_hash(&self) -> Option<&String> {
@@ -284,19 +278,18 @@ where
     }
 }
 
-impl<M, F, T, U> Default for Data<M, F, T, U>
+impl<A, T, U> Default for Data<A, T, U>
 where
-    M: MethodId,
-    F: FactorId,
-    U: UserId,
+    A: AuthId,
     T: TenantId,
+    U: UserId,
 {
     fn default() -> Self {
         Self {
             tenant_id: None,
             user_id: None,
             user_state: EntityState::Guest,
-            auth_state: AuthState::<M, F, U>::NotAuthenticated,
+            auth_state: AuthState::<A, U>::NotAuthenticated,
             auth_hash: None,
             custom_data: HashMap::new(),
         }
@@ -518,7 +511,7 @@ impl Display for AuthEventStatus {
 /// # Example
 /// ```rust,ignore
 /// use axess_core::authn::session::state::{AuthEvent, AuthEventType, AuthEventStatus};
-/// use axess_core::authn::methods::factor::AuthFactorKind;
+/// use axess_core::authn::methods::factor::Kind;
 /// use chrono::Utc;
 ///
 /// use crate::models::MyBackend
@@ -536,7 +529,7 @@ impl Display for AuthEventStatus {
 ///     event_time: Utc::now(),
 ///     method_id: Some("method1".into()),
 ///     factor_id: Some("factor1".into()),
-///     factor_kind: Some(AuthFactorKind::Password),
+///     factor_kind: Some(Kind::Password),
 ///     ip_address: Some("192.168.1.1".into()),
 ///     user_agent: Some("Mozilla/5.0".into()),
 ///     error_message: None,
@@ -544,15 +537,15 @@ impl Display for AuthEventStatus {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(bound(
-    serialize = "B::DataId: Serialize, B::UserId: Serialize, B::TenantId: Serialize, B::MethodId: Serialize, B::FactorId: Serialize",
-    deserialize = "B::DataId: DeserializeOwned, B::UserId: DeserializeOwned, B::TenantId: DeserializeOwned, B::MethodId: DeserializeOwned, B::FactorId: DeserializeOwned"
+    serialize = "B::AuthId: Serialize, B::UserId: Serialize, B::TenantId: Serialize",
+    deserialize = "B::AuthId: DeserializeOwned, B::UserId: DeserializeOwned, B::TenantId: DeserializeOwned",
 ))]
 pub struct AuthEvent<B>
 where
     B: AuthnBackend,
 {
     /// Unique event identifier (backend-specific, e.g., UUID or database key).
-    pub id: B::DataId,
+    pub id: B::AuthId,
     /// User associated with the event.
     pub user_id: B::UserId,
     /// Tenant associated with the event.
@@ -566,11 +559,11 @@ where
     /// Timestamp when the event occurred.
     pub event_time: DateTime<Utc>,
     /// Optional authentication method involved.
-    pub method_id: Option<B::MethodId>,
+    pub method_id: Option<B::AuthId>,
     /// Optional authentication factor involved.
-    pub factor_id: Option<B::FactorId>,
+    pub factor_id: Option<B::AuthId>,
     /// Optional kind of factor (password, OTP, etc.).
-    pub factor_kind: Option<AuthFactorKind>,
+    pub factor_kind: Option<Kind>,
     /// Optional IP address for the request.
     pub ip_address: Option<String>,
     /// Optional user agent string for the request.
@@ -622,8 +615,8 @@ where
 /// }
 ///
 /// #[derive(Clone, PartialEq, Eq, Debug, Hash, Serialize, Deserialize)]
-/// struct DummyFactorId(String);
-/// impl fmt::Display for DummyFactorId {
+/// struct DummyAuthId(String);
+/// impl fmt::Display for DummyAuthId {
 ///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 ///         write!(f, "{}", self.0)
 ///     }
@@ -635,7 +628,7 @@ where
 /// let user_id = "user42".to_string();
 /// let tenant_id = "tenantA".to_string();
 ///
-/// let builder: AuthEventBuilder<'_, DummyMethodId, DummyFactorId, TenantId, UserId> = AuthEventBuilder::new(
+/// let builder: AuthEventBuilder<'_, DummyAuthId, TenantId, UserId> = AuthEventBuilder::new(
 ///     &user_id,
 ///     &tenant_id,
 ///     AuthEventType::LoginAttempt,
@@ -647,10 +640,9 @@ where
 /// .with_error_message("none");
 /// ```
 #[derive(Debug, Clone)]
-pub struct AuthEventBuilder<'a, M, F, T, U>
+pub struct AuthEventBuilder<'a, A, T, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
@@ -665,11 +657,11 @@ where
     /// Outcome of the event (see [`AuthEventStatus`]).
     pub event_status: AuthEventStatus,
     /// Optional authentication method involved.
-    pub method_id: Option<&'a M>,
+    pub method_id: Option<&'a A>,
     /// Optional authentication factor involved.
-    pub factor_id: Option<&'a F>,
+    pub factor_id: Option<&'a A>,
     /// Optional kind of factor (password, OTP, etc.).
-    pub factor_kind: Option<AuthFactorKind>,
+    pub factor_kind: Option<Kind>,
     /// Optional IP address for the event.
     pub ip_address: Option<&'a str>,
     /// Optional user agent string for the event.
@@ -678,10 +670,9 @@ where
     pub error_message: Option<&'a str>,
 }
 
-impl<'a, M, F, T, U> AuthEventBuilder<'a, M, F, T, U>
+impl<'a, A, T, U> AuthEventBuilder<'a, A, T, U>
 where
-    M: MethodId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
@@ -716,19 +707,19 @@ where
     }
 
     /// Sets the authentication method ID for the event.
-    pub fn with_method_id(mut self, method_id: &'a M) -> Self {
+    pub fn with_method_id(mut self, method_id: &'a A) -> Self {
         self.method_id = Some(method_id);
         self
     }
 
     /// Sets the authentication factor ID for the event.
-    pub fn with_factor_id(mut self, factor_id: &'a F) -> Self {
+    pub fn with_factor_id(mut self, factor_id: &'a A) -> Self {
         self.factor_id = Some(factor_id);
         self
     }
 
     /// Sets the kind of authentication factor for the event.
-    pub fn with_factor_kind(mut self, factor_kind: AuthFactorKind) -> Self {
+    pub fn with_factor_kind(mut self, factor_kind: Kind) -> Self {
         self.factor_kind = Some(factor_kind);
         self
     }
@@ -754,8 +745,7 @@ where
 
 pub type AuthEventRecord<'a, B> = AuthEventBuilder<
     'a,
-    <B as AuthnBackend>::MethodId,
-    <B as AuthnBackend>::FactorId,
+    <B as AuthnBackend>::AuthId,
     <B as AuthnBackend>::TenantId,
     <B as AuthnBackend>::UserId,
 >;

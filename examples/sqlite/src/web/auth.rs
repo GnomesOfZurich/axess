@@ -3,8 +3,8 @@
 use crate::models::{authn::Session, backend::OurBackend};
 use askama::Template;
 use axess::{
-    AuthFactorKind, AuthnAdminBackend, AuthnBackend, FactorConfigBuilder, FactorForm,
-    FactorFormKind, FactorInstance, TOTP_LENGTH, TOTP_PERIOD,
+    Action, AuthnAdminBackend, AuthnBackend, FactorConfigBuilder, FactorInstance, Kind,
+    TOTP_LENGTH, TOTP_PERIOD,
     form::{
         EmailChangeForm, FactorResetForm, PasswordChangeForm, PasswordSetupForm,
         PasswordVerifyForm, TotpChangeForm, TotpSetupForm, TotpVerifyForm,
@@ -99,8 +99,8 @@ pub mod post {
 
     use super::*;
     use axess::{
-        AuthFactorKind, EnablementState, FactorStateChange, PermissionScope, SessionState,
-        TOTP_PERIOD, WorkflowAction, form::EmailVerifyForm, form_fields_to_json,
+        AuthnScope, EnablementState, FactorStateChange, Kind, Operation, SessionState, TOTP_PERIOD,
+        form::EmailVerifyForm,
     };
     use axum::Extension;
 
@@ -188,21 +188,21 @@ pub mod post {
         // Create factors
         let password_factor = FactorInstance::new(
             Uuid::new_v4(),
-            AuthFactorKind::Password,
+            Kind::Password,
             "password-login",
             "Password factor",
             user_id,
         );
         let email_factor = FactorInstance::new(
             Uuid::new_v4(),
-            AuthFactorKind::Otp,
+            Kind::EmailOtp,
             "email-verification",
             "Email verification factor",
             user_id,
         );
         let totp_factor = FactorInstance::new(
             Uuid::new_v4(),
-            AuthFactorKind::Otp,
+            Kind::Totp,
             "totp-setup",
             "TOTP setup factor",
             user_id,
@@ -218,7 +218,7 @@ pub mod post {
 
         // Activate password factor
         let password_state = FactorStateChange::new(password_factor.id)
-            .with_scope(PermissionScope::User(user.tenant_id, user_id))
+            .with_scope(AuthnScope::User(user.tenant_id, user_id))
             .with_state(EnablementState::Active)
             .with_config(
                 FactorConfigBuilder::password(generate_password_hash(&payload.password)).into(),
@@ -231,7 +231,7 @@ pub mod post {
         // Stage TOTP factor as pending
         let totp_secret = generate_totp_secret();
         let totp_state = FactorStateChange::new(totp_factor.id)
-            .with_scope(PermissionScope::User(user.tenant_id, user_id))
+            .with_scope(AuthnScope::User(user.tenant_id, user_id))
             .with_state(EnablementState::Pending)
             .with_config(
                 FactorConfigBuilder::totp(totp_secret.clone())
@@ -253,7 +253,10 @@ pub mod post {
         let workflow = WorkflowState {
             steps: vec![
                 WorkflowStep {
-                    kind: WorkflowStepKind::FactorVerify(AuthFactorKind::Otp), // Email verification
+                    kind: WorkflowStepKind::FactorAction(Operation::new(
+                        Kind::EmailOtp,
+                        Action::Verify,
+                    )), // Email verification
                     description: format!("Verify your email (code: {})", email_code),
                     completed: false,
                     completed_at: None,
@@ -267,7 +270,7 @@ pub mod post {
                     }),
                 },
                 WorkflowStep {
-                    kind: WorkflowStepKind::FactorSetup(AuthFactorKind::Otp), // TOTP setup
+                    kind: WorkflowStepKind::FactorAction(Operation::new(Kind::Totp, Action::Setup)), // TOTP setup
                     description: "Setup TOTP".to_string(),
                     completed: false,
                     completed_at: None,
@@ -297,10 +300,7 @@ pub mod post {
         messages: Messages,
         Form(form): Form<PasswordSetupForm>,
     ) -> impl IntoResponse {
-        match session
-            .handle_factor_setup(&form, AuthFactorKind::Password)
-            .await
-        {
+        match session.handle_factor_setup(&form).await {
             Ok(_) => {
                 messages.success("Password setup complete!");
                 Redirect::to("/login").into_response()
@@ -319,10 +319,7 @@ pub mod post {
         messages: Messages,
         Form(form): Form<PasswordChangeForm>,
     ) -> impl IntoResponse {
-        match session
-            .handle_factor_setup(&form, AuthFactorKind::Password)
-            .await
-        {
+        match session.handle_factor_setup(&form).await {
             Ok(_) => {
                 messages.success("Password changed successfully!");
                 Redirect::to("/dashboard").into_response()
@@ -341,13 +338,7 @@ pub mod post {
         Form(form): Form<TotpSetupForm>,
     ) -> impl IntoResponse {
         if let SessionState::<OurBackend>::PendingWorkflow(ref mut workflow) = session.state {
-            let action = WorkflowAction::FactorForm {
-                kind: AuthFactorKind::Otp,
-                form_kind: FactorFormKind::Setup,
-                fields: form_fields_to_json(&form.fields()),
-            };
-
-            match workflow.advance(&action) {
+            match workflow.advance() {
                 Ok(_) => {
                     // After advancing, check if workflow is complete and transition to authenticated
                     if workflow.is_complete() {
@@ -378,10 +369,7 @@ pub mod post {
         messages: Messages,
         Form(form): Form<TotpChangeForm>,
     ) -> impl IntoResponse {
-        match session
-            .handle_factor_setup(&form, AuthFactorKind::Otp)
-            .await
-        {
+        match session.handle_factor_setup(&form).await {
             Ok(_) => {
                 messages.success("TOTP changed successfully!");
                 Redirect::to("/dashboard").into_response()
@@ -417,12 +405,7 @@ pub mod post {
         Form(form): Form<EmailVerifyForm>,
     ) -> impl IntoResponse {
         if let SessionState::<OurBackend>::PendingWorkflow(ref mut workflow) = session.state {
-            let action = WorkflowAction::FactorForm {
-                kind: AuthFactorKind::Otp,
-                form_kind: FactorFormKind::Verify,
-                fields: form_fields_to_json(&form.fields()),
-            };
-            match workflow.advance(&action) {
+            match workflow.advance() {
                 Ok(_) => {
                     // Drop mutable borrow of workflow before using session again
                     let workflow_complete = workflow.is_complete();
@@ -457,10 +440,7 @@ pub mod post {
         messages: Messages,
         Form(form): Form<EmailChangeForm>,
     ) -> impl IntoResponse {
-        match session
-            .handle_factor_setup(&form, AuthFactorKind::Otp)
-            .await
-        {
+        match session.handle_factor_setup(&form).await {
             Ok(_) => {
                 messages.success("Email changed successfully!");
                 Redirect::to("/dashboard").into_response()
@@ -479,7 +459,7 @@ pub mod post {
         messages: Messages,
         Form(form): Form<FactorResetForm>,
     ) -> impl IntoResponse {
-        match session.handle_factor_setup(&form, form.factor_kind()).await {
+        match session.handle_factor_setup(&form).await {
             Ok(_) => {
                 messages.success("Factor reset request submitted!");
                 Redirect::to("/dashboard").into_response()
@@ -494,7 +474,7 @@ pub mod post {
 
 pub mod get {
     use super::*;
-    use axess::{EnablementState, PermissionScope, build_totp_uri};
+    use axess::{AuthnScope, EnablementState, build_totp_uri};
     use axum::Extension;
 
     #[axum::debug_handler]
@@ -536,7 +516,7 @@ pub mod get {
             }
         };
 
-        let scope = PermissionScope::User(user.tenant_id, user.id);
+        let scope = AuthnScope::User(user.tenant_id, user.id);
         let mut secret: Option<String> = None;
         let mut provisioning_uri: Option<String> = None;
 
@@ -547,7 +527,7 @@ pub mod get {
             Ok(factors) => {
                 if let Some(factor) = factors
                     .into_iter()
-                    .find(|factor| matches!(factor.kind, AuthFactorKind::Otp))
+                    .find(|factor| matches!(factor.kind, Kind::Totp))
                 {
                     match backend.get_factor_states(&factor.id, scope.clone()).await {
                         Ok(states) => {

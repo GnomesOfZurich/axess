@@ -28,7 +28,7 @@ cargo add axess
 from your command line or add the following to your `Cargo.toml` file:
 ```toml
 [dependencies]
-axess = { version = "0.0.11", features = ["full"] }
+axess = { version = "0.0.12", features = ["full"] }
 ```
 2. Define your Cedar policies if interested in authorization. This is a feature protected by feature toggle `authz` (part of the `default` configuration).
 3. Configure authentication and authorization middleware.
@@ -54,11 +54,11 @@ type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, System
 let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
 let backend = Arc::new(OurBackend::new(pool.clone()));
 let session_store = SqliteStore::new(pool.clone());
-let session_registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+let registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
 
 // Build the authentication layer
 let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
-    .with_session_registry(session_registry.clone())
+    .with_session_registry(registry.clone())
     .build();
 
 

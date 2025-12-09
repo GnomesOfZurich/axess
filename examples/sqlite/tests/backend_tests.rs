@@ -1,7 +1,7 @@
 use axess::{
-    AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactorKind, AuthnAdminBackend,
-    AuthnBackend, EnablementState, EntityState, FactorStateChange, MethodInstance, PermissionScope,
-    StatusDetail, form::PasswordVerifyForm,
+    AuthEventRecord, AuthEventStatus, AuthEventType, AuthnAdminBackend, AuthnBackend, AuthnScope,
+    EnablementState, EntityState, FactorStateChange, Kind, MethodInstance, StatusDetail,
+    form::PasswordVerifyForm,
 };
 
 // Include the example crate's models into this integration test crate so we can refer to
@@ -46,7 +46,7 @@ async fn test_get_auth_method_returns_method()
     let method_id = Uuid::new_v4();
     let system_user_id = backend.get_system_user_id(None).await?;
 
-    let method: MethodInstance<Uuid, Uuid, Uuid> = MethodInstance {
+    let method: MethodInstance<Uuid, Uuid> = MethodInstance {
         id: method_id,
         name: "Test Password Method".to_string(),
         description: "Test method for password authentication".to_string(),
@@ -105,6 +105,8 @@ async fn test_authenticate_with_inactive_user_returns_error()
 
     // Try to authenticate - should fail
     let form = PasswordVerifyForm {
+        method: "password".to_string(),
+        factor: "password".to_string(),
         username: "suspended_user".to_string(),
         password: "password123".to_string(),
         tenant: Some(tenant_id.to_string()),
@@ -161,31 +163,45 @@ async fn test_record_and_retrieve_auth_event_roundtrip()
 }
 
 #[tokio::test]
-async fn test_get_scoped_auth_factors() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn test_get_auth_factor_by_name() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = create_test_backend().await;
 
     let tenant_id = backend.get_default_tenant_id().await?;
-    let system_user_id = backend.get_system_user_id(None).await?;
+    let default_tenant_admin_user_id = backend.get_system_user_id(Some(&tenant_id)).await?;
+    // let system_user_id = backend.get_system_user_id(None).await?;
 
-    // Get global factors
-    let global_factors = backend
-        .get_scoped_auth_factors(PermissionScope::Global, vec![EnablementState::Active])
+    let factor_name = "Password";
+
+    // Get global factor
+    let global_factor = backend
+        .get_auth_factor_by_name(
+            factor_name,
+            AuthnScope::Global,
+            vec![EnablementState::Active],
+        )
         .await?;
 
     // Should have at least the password factor from migrations
-    assert!(!global_factors.is_empty());
+    assert!(
+        global_factor.name == factor_name,
+        "Should return at least the global password factor from migrations"
+    );
 
     // Get user-specific factors
-    let user_scope = PermissionScope::User(tenant_id, system_user_id);
+    let user_scope = AuthnScope::User(tenant_id, default_tenant_admin_user_id);
     let user_factors = backend
-        .get_scoped_auth_factors(user_scope, vec![EnablementState::Active])
+        .get_auth_factor_by_name(factor_name, user_scope, vec![EnablementState::Active])
         .await?;
 
     // User may inherit global factors or have specific ones
-    assert!(!user_factors.is_empty());
+    assert!(
+        user_factors.name == factor_name,
+        "Should return the password factor for user scope"
+    );
 
     Ok(())
 }
+
 #[tokio::test]
 async fn test_get_scoped_auth_factors_with_empty_state_filter()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -196,38 +212,38 @@ async fn test_get_scoped_auth_factors_with_empty_state_filter()
 
     // Get all global factors, regardless of state
     let global_factors = backend
-        .get_scoped_auth_factors(PermissionScope::Global, vec![])
+        .get_scoped_auth_factors(AuthnScope::Global, vec![])
         .await?;
     assert!(
-        !global_factors.is_empty(),
-        "Should return all global factors when state filter is empty"
+        global_factors.iter().any(|f| f.name == "Password"),
+        "Should return the password factor when state filter is empty"
     );
 
     // Get all user-scoped factors, regardless of state
-    let user_scope = PermissionScope::User(tenant_id, system_user_id);
+    let user_scope = AuthnScope::User(tenant_id, system_user_id);
     let user_factors = backend.get_scoped_auth_factors(user_scope, vec![]).await?;
     assert!(
-        !user_factors.is_empty(),
-        "Should return all user factors when state filter is empty"
+        user_factors.iter().any(|f| f.name == "Password"),
+        "Should return the password factor for user scope when state filter is empty"
     );
 
     // Get all tenant-scoped factors, regardless of state
-    let tenant_scope = PermissionScope::Tenant(tenant_id);
+    let tenant_scope = AuthnScope::Tenant(tenant_id);
     let tenant_factors = backend
         .get_scoped_auth_factors(tenant_scope, vec![])
         .await?;
     assert!(
-        !tenant_factors.is_empty(),
-        "Should return all tenant factors when state filter is empty"
+        tenant_factors.iter().any(|f| f.name == "Password"),
+        "Should return the password factor for tenant scope when state filter is empty"
     );
 
-    // Get all factors with PermissionScope::Any, regardless of state
+    // Get all factors with AuthnScope::Any, regardless of state
     let any_factors = backend
-        .get_scoped_auth_factors(PermissionScope::Any, vec![])
+        .get_scoped_auth_factors(AuthnScope::Any, vec![])
         .await?;
     assert!(
-        !any_factors.is_empty(),
-        "Should return all factors when state filter is empty"
+        any_factors.iter().any(|f| f.name == "Password"),
+        "Should return the password factor for any scope when state filter is empty"
     );
 
     Ok(())
@@ -241,11 +257,13 @@ async fn test_upsert_factor_state_roundtrip() -> Result<(), Box<dyn std::error::
     let tenant_id = backend.get_default_tenant_id().await?;
     let system_user_id = backend.get_system_user_id(None).await?;
 
-    // Get a password factor
-    let factors = backend.get_all_auth_factors().await?;
+    // Use get_scoped_auth_factors to get password factor (global scope, no state filter)
+    let factors = backend
+        .get_scoped_auth_factors(AuthnScope::Any, vec![])
+        .await?;
     let password_factor = factors
         .iter()
-        .find(|f| matches!(f.kind, AuthFactorKind::Password))
+        .find(|f| matches!(f.kind, Kind::Password))
         .ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from(
                 "Should have password factor from migrations",
@@ -274,7 +292,7 @@ async fn test_upsert_factor_state_roundtrip() -> Result<(), Box<dyn std::error::
     assert!(upserted.config.contains_key("password_hash"));
 
     // Retrieve it back
-    let scope = PermissionScope::User(tenant_id, system_user_id.clone());
+    let scope = AuthnScope::User(tenant_id, system_user_id.clone());
     let states = backend
         .get_factor_states(&password_factor.id, scope)
         .await?;

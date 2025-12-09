@@ -19,8 +19,8 @@ use crate::{
     authn::{
         errors::FormError,
         methods::{
-            factor::AuthFactorKind,
-            policy::{OtpCharset, OtpRules, OtpType, PasswordRules},
+            factor::Kind,
+            policy::{OtpRules, PasswordRules, TokenCharset},
         },
     },
     tracing::{error, warn},
@@ -33,10 +33,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, from_value, json};
 use std::{borrow::Cow, collections::HashMap, fmt::Debug, time::SystemTime};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FactorFormKind {
+/// High-level flow for a factor (knowledge, possession, crypto, federated, etc.)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Flow {
+    Knowledge,
+    Otp,
+    Crypto,
+    Federated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum Action {
     Setup,
-    Change,
+    Update,
+    Recover,
     Verify,
 }
 
@@ -45,11 +56,14 @@ pub enum FactorFormKind {
 pub enum FormField {
     Username,
     Password,
-    Tenant,
+    TenantName,
+    FactorName,
+    FactorKind,
+    MethodName,
     Next,
     OtpCode,
     OtpSecret,
-    OauthProvider,
+    Provider,
     Email,
     Language,
     Domicile,
@@ -64,11 +78,14 @@ impl FormField {
         match self {
             FormField::Username => "username",
             FormField::Password => "password",
-            FormField::Tenant => "tenant",
+            FormField::TenantName => "tenant",
+            FormField::FactorName => "factor",
+            FormField::FactorKind => "kind",
+            FormField::MethodName => "method",
             FormField::Next => "next",
             FormField::OtpCode => "otp_code",
             FormField::OtpSecret => "secret",
-            FormField::OauthProvider => "provider",
+            FormField::Provider => "provider",
             FormField::Email => "email",
             FormField::Language => "language",
             FormField::Domicile => "domicile",
@@ -143,26 +160,33 @@ pub fn form_fields_to_json(
         .collect()
 }
 
+/// Trait for all authentication factor forms in Axess.
+///
+/// Implement this trait for each supported form (password, TOTP, HOTP, OAuth, etc.).
+/// This enables generic session flows, type-safe validation, and ergonomic UI integration.
 pub trait FactorForm: Send + Sync + Debug + for<'de> Deserialize<'de> {
-    /// Which factor is this form for?
-    fn factor_kind(&self) -> AuthFactorKind;
-    /// Is this a setup or verification form?
-    fn form_kind(&self) -> FactorFormKind;
-    /// Validate the form before backend processing
+    /// The high-level flow category for this factor (knowledge, possession, etc.).
+    fn flow(&self) -> Flow;
+
+    /// The specific kind of factor (password, otp, oauth, etc.).
+    fn kind(&self) -> Kind;
+
+    /// The action/operation being performed (setup, verify, change, etc.).
+    fn action(&self) -> Action;
+
+    /// Validate the form before backend processing.
     fn validate_form(&self) -> Result<&Self, FormError>;
-    /// Get the authentication credential from the form, if applicable (password, TOTP code, OAuth provider, etc.)
+
+    /// Get the authentication credential from the form, if applicable (password, TOTP code, etc.).
     fn credential(&self) -> Option<&str>;
-    /// Verify credentials against the factor's stored configuration (e.g., password or TOTP secret)
+
+    /// Verify credentials against the factor's stored configuration (e.g., password or TOTP secret).
     fn verify_against_config(
         &self,
         config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError>;
 
-    /// Returns form fields with type-safe keys and flexible values
-    ///
-    /// This method supports string, binary, and JSON field values.
-    /// The default built-in forms use string values for simplicity,
-    /// but custom forms can use any type.
+    /// Returns form fields with type-safe keys and flexible values.
     fn fields(&self) -> HashMap<FormField, FormFieldValue>;
 }
 
@@ -207,18 +231,29 @@ impl<T: FactorForm> FactorFormExt for T {}
 /// Default form for setting a new password
 #[derive(Clone, Deserialize)]
 pub struct PasswordSetupForm {
+    /// Name of the factor (must be unique per user/tenant)
+    pub factor: String,
+    /// The new password to set.
     pub new_password: String,
+    /// Optionally, the tenant name.
     pub tenant: Option<String>,
+    /// Optionally, the next URL to redirect to after setup.
     pub next: Option<String>,
 }
 
 impl FactorForm for PasswordSetupForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Password
+    fn flow(&self) -> Flow {
+        Flow::Knowledge
     }
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Setup
+
+    fn kind(&self) -> Kind {
+        Kind::Password
     }
+
+    fn action(&self) -> Action {
+        Action::Setup
+    }
+
     fn validate_form(&self) -> Result<&Self, FormError> {
         if self.new_password.len() < 8 || self.new_password.len() > 512 {
             return Err(FormError::ValidationFailed(
@@ -227,15 +262,24 @@ impl FactorForm for PasswordSetupForm {
         }
         Ok(self)
     }
+
     fn credential(&self) -> Option<&str> {
         Some(&self.new_password)
     }
+
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Password);
+
         self.validate_form()
     }
+
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
         let mut map = HashMap::new();
         map.insert(
@@ -244,7 +288,7 @@ impl FactorForm for PasswordSetupForm {
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -271,6 +315,8 @@ impl Debug for PasswordSetupForm {
 /// Default form for setting a new password (useful when changing a password)
 #[derive(Clone, Deserialize)]
 pub struct PasswordChangeForm {
+    /// Name of the factor (must be unique per user/tenant)
+    pub factor: String,
     /// The new password to set.
     pub new_password: String,
     /// Optionally, the old password (for authenticated change).
@@ -285,12 +331,16 @@ pub struct PasswordChangeForm {
 /// This form captures the new password, and optionally the old password or a reset token.
 /// It includes validation to ensure the new password meets basic security requirements.
 impl FactorForm for PasswordChangeForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Password
+    fn flow(&self) -> Flow {
+        Flow::Knowledge
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Change
+    fn kind(&self) -> Kind {
+        Kind::Password
+    }
+
+    fn action(&self) -> Action {
+        Action::Update
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -309,8 +359,14 @@ impl FactorForm for PasswordChangeForm {
 
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Password);
+
         self.validate_form()
     }
 
@@ -334,7 +390,7 @@ impl FactorForm for PasswordChangeForm {
         }
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -370,19 +426,31 @@ impl Debug for PasswordChangeForm {
 /// and that the password meets some basic security requirements.
 #[derive(Clone, Deserialize)]
 pub struct PasswordVerifyForm {
+    /// Name of the authentication method (must be unique per tenant)
+    pub method: String,
+    /// Name of the factor (must be unique per  user/tenant)
+    pub factor: String,
+    /// Username of the user attempting to verify their password
     pub username: String,
+    /// Password of the user attempting to verify their password
     pub password: String,
+    /// Optional tenant identifier
     pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful login
     pub next: Option<String>,
 }
 
 impl FactorForm for PasswordVerifyForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Password
+    fn flow(&self) -> Flow {
+        Flow::Knowledge
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+    fn kind(&self) -> Kind {
+        Kind::Password
+    }
+
+    fn action(&self) -> Action {
+        Action::Verify
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -421,9 +489,7 @@ impl FactorForm for PasswordVerifyForm {
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
-        let capacity = 2 + self.tenant.is_some() as usize + self.next.is_some() as usize;
-        let mut map = HashMap::with_capacity(capacity);
-
+        let mut map = HashMap::new();
         map.insert(
             FormField::Username,
             FormFieldValue::String(Cow::Owned(self.username.clone())),
@@ -432,10 +498,9 @@ impl FactorForm for PasswordVerifyForm {
             FormField::Password,
             FormFieldValue::String(Cow::Owned(self.password.clone())),
         );
-
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -445,7 +510,15 @@ impl FactorForm for PasswordVerifyForm {
                 FormFieldValue::String(Cow::Owned(next.clone())),
             );
         }
-
+        // method and factor are required on PasswordVerifyForm — insert them directly
+        map.insert(
+            FormField::MethodName,
+            FormFieldValue::String(Cow::Owned(self.method.clone())),
+        );
+        map.insert(
+            FormField::FactorName,
+            FormFieldValue::String(Cow::Owned(self.factor.clone())),
+        );
         map
     }
 
@@ -453,6 +526,12 @@ impl FactorForm for PasswordVerifyForm {
         &self,
         config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Password);
+
         let credential = self.credential().ok_or_else(|| {
             FormError::ValidationFailed("Missing password credential.".to_string())
         })?;
@@ -460,7 +539,7 @@ impl FactorForm for PasswordVerifyForm {
         let password_hash = config
             .get("password_hash")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Password.to_string()))?;
+            .ok_or_else(|| FormError::AuthConfigError(Kind::Password.to_string()))?;
 
         match verify_password(credential, password_hash) {
             Ok(()) => Ok(self),
@@ -498,18 +577,27 @@ impl Debug for PasswordVerifyForm {
 /// - [RFC 6238: TOTP: Time-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc6238)
 #[derive(Clone, Deserialize)]
 pub struct TotpSetupForm {
+    /// Name of the factor (must be unique per user/tenant)
+    pub factor: String,
+    /// The TOTP secret provided to the user for setup
     pub secret: String,
+    /// Optional tenant identifier
     pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful setup
     pub next: Option<String>,
 }
 
 impl FactorForm for TotpSetupForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Setup
+    fn kind(&self) -> Kind {
+        Kind::Totp
+    }
+
+    fn action(&self) -> Action {
+        Action::Setup
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -551,7 +639,7 @@ impl FactorForm for TotpSetupForm {
 
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -567,8 +655,14 @@ impl FactorForm for TotpSetupForm {
 
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Totp);
+
         // For factor setup, verification against existing credentials is not meaningful.
         // Instead, just validate the form and allow setup to proceed.
         self.validate_form()
@@ -587,18 +681,27 @@ impl Debug for TotpSetupForm {
 
 #[derive(Clone, Deserialize)]
 pub struct TotpChangeForm {
+    /// Name of the factor (must be unique per user/tenant)
+    pub factor: String,
+    /// The old TOTP secret to be replaced
     pub old_secret: String,
+    /// The new TOTP secret to set
     pub new_secret: String,
+    /// Optional tenant identifier
     pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful setup
     pub next: Option<String>,
 }
 
 impl FactorForm for TotpChangeForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Change
+    fn kind(&self) -> Kind {
+        Kind::Totp
+    }
+    fn action(&self) -> Action {
+        Action::Update
     }
     fn validate_form(&self) -> Result<&Self, FormError> {
         if self.old_secret.is_empty() || self.new_secret.is_empty() {
@@ -613,8 +716,14 @@ impl FactorForm for TotpChangeForm {
     }
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Totp);
+
         self.validate_form()
     }
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -629,7 +738,7 @@ impl FactorForm for TotpChangeForm {
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -658,18 +767,29 @@ impl Debug for TotpChangeForm {
 /// Now supports configurable charset for numeric, hex, or alphanumeric codes.
 #[derive(Clone, Deserialize)]
 pub struct TotpVerifyForm {
+    /// Name of the authentication method (must be unique per user/tenant)
+    pub method: String,
+    /// Name of the factor (must be unique per user/tenant)
+    pub factor: String,
+    /// The TOTP code to verify
     pub otp_code: String,
+    /// Optional tenant identifiers
     pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful verification
     pub next: Option<String>,
 }
 
 impl FactorForm for TotpVerifyForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+    fn kind(&self) -> Kind {
+        Kind::Totp
+    }
+
+    fn action(&self) -> Action {
+        Action::Verify
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -679,9 +799,9 @@ impl FactorForm for TotpVerifyForm {
                 "TOTP code must be exactly {} {}.",
                 TOTP_LENGTH,
                 match config.charset {
-                    OtpCharset::Numeric => "digits",
-                    OtpCharset::Hex => "hex characters",
-                    OtpCharset::Alphanumeric => "alphanumeric characters",
+                    TokenCharset::Numeric => "digits",
+                    TokenCharset::Hex => "hex characters",
+                    TokenCharset::Alphanumeric => "alphanumeric characters",
                 }
             )));
         }
@@ -703,17 +823,14 @@ impl FactorForm for TotpVerifyForm {
     }
 
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
-        let capacity = 1 + self.tenant.is_some() as usize + self.next.is_some() as usize;
-        let mut map = HashMap::with_capacity(capacity);
-
+        let mut map = HashMap::new();
         map.insert(
             FormField::OtpCode,
             FormFieldValue::String(Cow::Owned(self.otp_code.clone())),
         );
-
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -724,6 +841,14 @@ impl FactorForm for TotpVerifyForm {
             );
         }
 
+        map.insert(
+            FormField::MethodName,
+            FormFieldValue::String(Cow::Owned(self.method.clone())),
+        );
+        map.insert(
+            FormField::FactorName,
+            FormFieldValue::String(Cow::Owned(self.factor.clone())),
+        );
         map
     }
 
@@ -731,6 +856,12 @@ impl FactorForm for TotpVerifyForm {
         &self,
         config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Totp);
+
         let secret = config
             .get("secret")
             .and_then(|value| value.as_str())
@@ -799,6 +930,8 @@ impl Debug for TotpVerifyForm {
 /// By default, this follows the HOTP standard ([RFC 4226: HOTP: An HMAC-Based One-Time Password Algorithm](https://datatracker.ietf.org/doc/html/rfc4226)).
 #[derive(Clone, Deserialize)]
 pub struct HotpSetupForm {
+    /// Name of the factor (must be unique per  user/tenant)
+    pub factor: String,
     /// The new HOTP secret to set up.
     pub secret: String,
     /// Optional tenant for multi-tenancy.
@@ -808,12 +941,16 @@ pub struct HotpSetupForm {
 }
 
 impl FactorForm for HotpSetupForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Setup
+    fn kind(&self) -> Kind {
+        Kind::Hotp
+    }
+
+    fn action(&self) -> Action {
+        Action::Setup
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -857,7 +994,7 @@ impl FactorForm for HotpSetupForm {
 
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -873,9 +1010,14 @@ impl FactorForm for HotpSetupForm {
 
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
-        // For HOTP setup, just validate the form.
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Hotp);
+
         self.validate_form()
     }
 }
@@ -893,18 +1035,27 @@ impl Debug for HotpSetupForm {
 /// Form for changing an HOTP factor (HMAC-based One-Time Password).
 #[derive(Clone, Deserialize)]
 pub struct HotpChangeForm {
+    /// Name of the factor (must be unique per  user/tenant)
+    pub factor: String,
+    /// The old HOTP secret to be replaced
     pub old_secret: String,
+    /// The new HOTP secret to set
     pub new_secret: String,
+    /// Optional tenant identifier
     pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful setup
     pub next: Option<String>,
 }
 
 impl FactorForm for HotpChangeForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Change
+    fn kind(&self) -> Kind {
+        Kind::Hotp
+    }
+    fn action(&self) -> Action {
+        Action::Update
     }
     fn validate_form(&self) -> Result<&Self, FormError> {
         if self.old_secret.is_empty() || self.new_secret.is_empty() {
@@ -919,8 +1070,14 @@ impl FactorForm for HotpChangeForm {
     }
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Hotp);
+
         self.validate_form()
     }
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
@@ -935,7 +1092,7 @@ impl FactorForm for HotpChangeForm {
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -963,19 +1120,31 @@ impl Debug for HotpChangeForm {
 /// Form for verifying a HOTP code.
 #[derive(Clone, Deserialize)]
 pub struct HotpVerifyForm {
+    /// Name of the authentication method (must be unique per tenant)
+    pub method: String,
+    /// Name of the factor (must be unique per  user/tenant)
+    pub factor: String,
+    /// The TOTP code to verify
     pub otp_code: String,
+    /// The counter value provided by the client
     pub counter: u64,
+    /// Optional tenant identifier
     pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful verification
     pub next: Option<String>,
 }
 
 impl FactorForm for HotpVerifyForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+    fn kind(&self) -> Kind {
+        Kind::Hotp
+    }
+
+    fn action(&self) -> Action {
+        Action::Verify
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -985,9 +1154,9 @@ impl FactorForm for HotpVerifyForm {
                 "HOTP code must be exactly {} {}.",
                 config.length,
                 match config.charset {
-                    OtpCharset::Numeric => "digits",
-                    OtpCharset::Hex => "hex characters",
-                    OtpCharset::Alphanumeric => "alphanumeric characters",
+                    TokenCharset::Numeric => "digits",
+                    TokenCharset::Hex => "hex characters",
+                    TokenCharset::Alphanumeric => "alphanumeric characters",
                 }
             )));
         }
@@ -1020,7 +1189,7 @@ impl FactorForm for HotpVerifyForm {
         );
         if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
+                FormField::TenantName,
                 FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
@@ -1030,6 +1199,15 @@ impl FactorForm for HotpVerifyForm {
                 FormFieldValue::String(Cow::Owned(next.clone())),
             );
         }
+        // method and factor are required on PasswordVerifyForm — insert them directly
+        map.insert(
+            FormField::MethodName,
+            FormFieldValue::String(Cow::Owned(self.method.clone())),
+        );
+        map.insert(
+            FormField::FactorName,
+            FormFieldValue::String(Cow::Owned(self.factor.clone())),
+        );
         map
     }
 
@@ -1037,6 +1215,12 @@ impl FactorForm for HotpVerifyForm {
         &self,
         config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::Hotp);
+
         // ✅ Use credential() for the OTP code (primary auth value)
         let code = self
             .credential()
@@ -1045,25 +1229,12 @@ impl FactorForm for HotpVerifyForm {
         let secret = config
             .get("secret")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| FormError::AuthConfigError(AuthFactorKind::Otp.to_string()))?;
+            .ok_or_else(|| FormError::AuthConfigError(Kind::Hotp.to_string()))?;
 
         let stored_counter = config
             .get("counter")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| FormError::AuthConfigError("Missing HOTP counter".to_string()))?;
-
-        // ✅ Verify OTP type matches expectation
-        let otp_type: OtpType = config
-            .get("otp_type")
-            .and_then(|v| from_value(v.clone()).ok())
-            .unwrap_or(OtpType::Totp);
-
-        if otp_type != OtpType::Hotp {
-            return Err(FormError::ValidationFailed(format!(
-                "Expected HOTP factor, found {}",
-                otp_type.as_str()
-            )));
-        }
 
         // ✅ Use OtpRules for consistent length handling
         let otp_config = OtpRules::default();
@@ -1100,19 +1271,29 @@ impl Debug for HotpVerifyForm {
 // TODO: This form needs to be reviewed !!!
 #[derive(Clone, Deserialize)]
 pub struct EmailSetupForm {
-    pub tenant: String,
-    pub user: String,
+    /// Name of the authentication factor (must be unique per  user/tenant)
+    pub factor: String,
+    /// Display name of the user setting up the email factor
+    pub name: String,
+    /// Email address to set up
     pub email: String,
+    /// Optional tenant identifier
+    pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful setup
     pub next: Option<String>,
 }
 
 impl FactorForm for EmailSetupForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Setup
+    fn kind(&self) -> Kind {
+        Kind::EmailOtp
+    }
+
+    fn action(&self) -> Action {
+        Action::Setup
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -1121,13 +1302,17 @@ impl FactorForm for EmailSetupForm {
                 "Invalid old email address".to_string(),
             ));
         }
-        if !is_valid_name(&self.tenant) {
+        if let Some(tenant) = &self.tenant
+            && !is_valid_name(tenant)
+        {
             return Err(FormError::ValidationFailed(
                 "Invalid tenant name".to_string(),
             ));
         }
-        if !is_valid_name(&self.user) {
-            return Err(FormError::ValidationFailed("Invalid user name".to_string()));
+        if !is_valid_name(&self.name) {
+            return Err(FormError::ValidationFailed(
+                "Invalid name of email owner".to_string(),
+            ));
         }
         if let Some(next) = &self.next
             && !is_valid_url_format(next)
@@ -1145,12 +1330,11 @@ impl FactorForm for EmailSetupForm {
         &self,
         config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
-        let _otp_type = config
-            .get("otp_type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                FormError::AuthConfigError("Missing expected 'otp_type' in config".to_string())
-            })?;
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::EmailOtp);
 
         let email = config
             .get("email")
@@ -1172,10 +1356,12 @@ impl FactorForm for EmailSetupForm {
             FormField::Email,
             FormFieldValue::String(Cow::Owned(self.email.clone())),
         );
-        map.insert(
-            FormField::Tenant,
-            FormFieldValue::String(Cow::Owned(self.tenant.clone())),
-        );
+        if let Some(tenant) = &self.tenant {
+            map.insert(
+                FormField::TenantName,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
+            );
+        }
         if let Some(next) = &self.next {
             map.insert(
                 FormField::Next,
@@ -1190,7 +1376,7 @@ impl Debug for EmailSetupForm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmailSetupForm")
             .field("tenant", &self.tenant)
-            .field("user", &self.user)
+            .field("name", &self.name)
             .field("email", &self.email)
             .field("next", &self.next)
             .finish()
@@ -1200,19 +1386,31 @@ impl Debug for EmailSetupForm {
 /// Form for verifying email address during signup.
 #[derive(Clone, Deserialize)]
 pub struct EmailVerifyForm {
+    /// Name of the authentication method (must be unique per tenant)
+    pub method: Option<String>,
+    /// Name of the factor (must be unique per  user/tenant)
+    pub factor: Option<String>,
+    /// Email address to verify
     pub email: String,
-    pub tenant: String,
+    /// Optional tenant identifier
+    pub tenant: Option<String>,
+    /// Verification token sent to the email address
     pub token: String,
+    /// Optional URL to redirect to after successful verification
     pub next: Option<String>,
 }
 
 impl FactorForm for EmailVerifyForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+    fn kind(&self) -> Kind {
+        Kind::EmailOtp
+    }
+
+    fn action(&self) -> Action {
+        Action::Verify
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -1226,7 +1424,9 @@ impl FactorForm for EmailVerifyForm {
                 "Missing verification token".to_string(),
             ));
         }
-        if !is_valid_name(&self.tenant) {
+        if let Some(tenant) = &self.tenant
+            && !is_valid_name(tenant)
+        {
             return Err(FormError::ValidationFailed(
                 "Invalid tenant name".to_string(),
             ));
@@ -1247,6 +1447,12 @@ impl FactorForm for EmailVerifyForm {
         &self,
         config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::EmailOtp);
+
         let expected_token = config
             .get("token")
             .and_then(|v| v.as_str())
@@ -1265,10 +1471,12 @@ impl FactorForm for EmailVerifyForm {
             FormField::Email,
             FormFieldValue::String(Cow::Owned(self.email.clone())),
         );
-        map.insert(
-            FormField::Tenant,
-            FormFieldValue::String(Cow::Owned(self.tenant.clone())),
-        );
+        if let Some(tenant) = &self.tenant {
+            map.insert(
+                FormField::TenantName,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
+            );
+        }
         map.insert(
             FormField::Token,
             FormFieldValue::String(Cow::Owned(self.token.clone())),
@@ -1277,6 +1485,18 @@ impl FactorForm for EmailVerifyForm {
             map.insert(
                 FormField::Next,
                 FormFieldValue::String(Cow::Owned(next.clone())),
+            );
+        }
+        if let Some(method_name) = &self.method {
+            map.insert(
+                FormField::Custom("method_name"),
+                FormFieldValue::String(Cow::Owned(method_name.clone())),
+            );
+        }
+        if let Some(factor_name) = &self.factor {
+            map.insert(
+                FormField::Custom("factor_name"),
+                FormFieldValue::String(Cow::Owned(factor_name.clone())),
             );
         }
         map
@@ -1297,19 +1517,29 @@ impl Debug for EmailVerifyForm {
 /// Email change request (change form)
 #[derive(Clone, Deserialize)]
 pub struct EmailChangeForm {
+    /// Name of the authentication factor (must be unique per user/tenant)
+    pub factor: String,
+    /// Old email address
     pub old_email: String,
+    /// New email address
     pub new_email: String,
-    pub tenant: String,
+    /// Optional tenant identifier
+    pub tenant: Option<String>,
+    /// Optional URL to redirect to after successful change
     pub next: Option<String>,
 }
 
 impl FactorForm for EmailChangeForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Otp
+    fn flow(&self) -> Flow {
+        Flow::Otp
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Change
+    fn kind(&self) -> Kind {
+        Kind::EmailOtp
+    }
+
+    fn action(&self) -> Action {
+        Action::Update
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -1325,10 +1555,17 @@ impl FactorForm for EmailChangeForm {
     }
     fn verify_against_config(
         &self,
-        _config: &HashMap<String, JsonValue>,
+        config: &HashMap<String, JsonValue>,
     ) -> Result<&Self, FormError> {
+        // ✅ Verify that factor kind matches expectation
+        let _kind: Kind = config
+            .get("kind")
+            .and_then(|v| from_value(v.clone()).ok())
+            .unwrap_or(Kind::EmailOtp);
+
         self.validate_form()
     }
+
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
         let mut map = HashMap::new();
         map.insert(
@@ -1339,10 +1576,12 @@ impl FactorForm for EmailChangeForm {
             FormField::Custom("old_email"),
             FormFieldValue::String(Cow::Owned(self.old_email.clone())),
         );
-        map.insert(
-            FormField::Tenant,
-            FormFieldValue::String(Cow::Owned(self.tenant.clone())),
-        );
+        if let Some(tenant) = &self.tenant {
+            map.insert(
+                FormField::TenantName,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
+            );
+        }
         if let Some(next) = &self.next {
             map.insert(
                 FormField::Next,
@@ -1369,32 +1608,40 @@ impl Debug for EmailChangeForm {
 /// such e.g. involving required approvals by a helpdesk or admin users.
 #[derive(Clone, Deserialize)]
 pub struct FactorResetForm {
-    /// Tenant identifier for multi-tenant systems
-    pub tenant: String,
+    /// Name of the factor (must be unique per user/tenant)
+    pub factor: String,
+    /// Kind of factor to reset (e.g., "totp", "hotp", "email_otp")
+    pub kind: Kind,
     /// Username or email of the user requesting the reset
     pub username: String,
-    /// The specific factor kind to reset (Password, Otp, etc.)
-    pub factor_kind: AuthFactorKind,
-    /// Optional specific factor ID (if user has multiple factors of same kind)
-    pub factor_id: Option<String>,
+    /// Optional tenant identifier
+    pub tenant: Option<String>,
     /// Reason for the reset (strongly recommended for audit trail)
     pub reason: Option<String>,
     /// Optional ticket/case ID for compliance tracking
     pub ticket_id: Option<String>,
+    /// Optional URL to redirect to after successful reset initiation
+    pub next: Option<String>,
 }
 
 impl FactorForm for FactorResetForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        self.factor_kind.clone()
+    fn flow(&self) -> Flow {
+        Flow::Knowledge
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Setup
+    fn kind(&self) -> Kind {
+        self.kind.clone()
+    }
+
+    fn action(&self) -> Action {
+        Action::Setup
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
         // 1. Validate tenant
-        if !is_valid_name(&self.tenant) {
+        if let Some(tenant) = &self.tenant
+            && !is_valid_name(tenant)
+        {
             return Err(FormError::ValidationFailed(
                 "Invalid tenant identifier".to_string(),
             ));
@@ -1408,9 +1655,7 @@ impl FactorForm for FactorResetForm {
         }
 
         // 3. Validate factor_id format if present
-        if let Some(id) = &self.factor_id
-            && !(id.is_empty() || id.len() > 128)
-        {
+        if self.factor.is_empty() || self.factor.len() > 128 {
             return Err(FormError::ValidationFailed(
                 "Invalid factor ID format".to_string(),
             ));
@@ -1457,12 +1702,11 @@ impl FactorForm for FactorResetForm {
                 FormFieldValue::String(Cow::Owned(reason.clone())),
             );
         }
-        if let Some(old) = &self.factor_id {
-            map.insert(
-                FormField::Custom("factor_id"),
-                FormFieldValue::String(Cow::Owned(old.clone())),
-            );
-        }
+        map.insert(
+            FormField::FactorName,
+            FormFieldValue::String(Cow::Owned(self.factor.clone())),
+        );
+
         if let Some(token) = &self.ticket_id {
             map.insert(
                 FormField::Custom("ticket_id"),
@@ -1470,10 +1714,10 @@ impl FactorForm for FactorResetForm {
             );
         }
         // tenant is a required String on FactorResetRequestForm; include if non-empty
-        if !self.tenant.is_empty() {
+        if let Some(tenant) = &self.tenant {
             map.insert(
-                FormField::Tenant,
-                FormFieldValue::String(Cow::Owned(self.tenant.clone())),
+                FormField::TenantName,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
             );
         }
         map
@@ -1485,8 +1729,8 @@ impl std::fmt::Debug for FactorResetForm {
         f.debug_struct("FactorResetForm")
             .field("tenant", &self.tenant)
             .field("username", &self.username)
-            .field("factor_kind", &self.factor_kind)
-            .field("factor_id", &self.factor_id)
+            .field("kind", &self.kind)
+            .field("factor", &self.factor)
             .field("reason", &self.reason.as_ref().map(|_| "***REDACTED***"))
             .field("ticket_id", &self.ticket_id)
             .finish()

@@ -1,7 +1,7 @@
 //! Core backend abstraction for Axess authentication.
 //!
 //! This module standardizes how storage backends interact with Axess:
-//! - Identifier traits (`TenantId`, `UserId`, `FactorId`, `MethodId`, `DataId`) that
+//! - Identifier traits (`TenantId`, `UserId`, `AuthId`) that
 //!   downstream crates implement for their domain-specific types.
 //! - [`AuthnBackend`], the async trait every storage adapter must satisfy to support
 //!   credential provisioning, factor/method state transitions, and audit logging.
@@ -19,7 +19,7 @@ use crate::authn::{
         MethodStateChange,
         factor::FactorStateChange,
         form::FactorForm,
-        scope::{EnablementState, PermissionScope},
+        scope::{AuthnScope, EnablementState},
     },
     session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
     types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
@@ -62,34 +62,7 @@ pub trait UserId:
 {
 }
 
-pub trait FactorId:
-    Clone
-    + Display
-    + Debug
-    + Eq
-    + PartialEq
-    + Hash
-    + Send
-    + Sync
-    + Serialize
-    + for<'de> Deserialize<'de>
-{
-}
-pub trait MethodId:
-    Clone
-    + Display
-    + Debug
-    + Eq
-    + PartialEq
-    + Hash
-    + Send
-    + Sync
-    + Serialize
-    + for<'de> Deserialize<'de>
-{
-}
-
-pub trait DataId:
+pub trait AuthId:
     Clone
     + Display
     + Debug
@@ -131,35 +104,7 @@ impl<T> UserId for T where
 {
 }
 
-impl<T> FactorId for T where
-    T: Clone
-        + Display
-        + Debug
-        + Eq
-        + PartialEq
-        + Hash
-        + Send
-        + Sync
-        + Serialize
-        + for<'de> Deserialize<'de>
-{
-}
-
-impl<T> MethodId for T where
-    T: Clone
-        + Display
-        + Debug
-        + Eq
-        + PartialEq
-        + Hash
-        + Send
-        + Sync
-        + Serialize
-        + for<'de> Deserialize<'de>
-{
-}
-
-impl<T> DataId for T where
+impl<T> AuthId for T where
     T: Clone
         + Display
         + Debug
@@ -422,9 +367,7 @@ pub trait AuthUser: Debug + Clone + Send + Sync + Eq + PartialEq {
 /// - `UserId`: User identifier type.
 /// - `Tenant`: Tenant entity type, must implement [`AuthTenant`].
 /// - `TenantId`: Tenant identifier type.
-/// - `MethodId`: Authentication method identifier type.
-/// - `FactorId`: Authentication factor identifier type.
-/// - `DataId`: General-purpose data identifier type.
+/// - `AuthId`: Generic identifier type for factors, methods, and data.
 /// - `Error`: Error type for backend operations.
 ///
 /// # Required Methods
@@ -458,9 +401,7 @@ pub trait AuthUser: Debug + Clone + Send + Sync + Eq + PartialEq {
 ///     type UserId = String;
 ///     type Tenant = MyTenant;
 ///     type TenantId = String;
-///     type MethodId = String;
-///     type FactorId = String;
-///     type DataId = String;
+///     type AuthId = String;
 ///     type Error = anyhow::Error;
 ///     // Implement all required async methods...
 /// }
@@ -484,11 +425,7 @@ where
     type TenantId: TenantId;
 
     /// Identifier type used for all other authentication related data objects associated with the backend.
-    type MethodId: MethodId;
-    type FactorId: FactorId;
-
-    /// Identifier for other general data types associated with the backend.
-    type DataId: DataId;
+    type AuthId: AuthId;
 
     /// An error which can occur during authentication and authorization.
     type Error: Debug + Send + Sync + 'static;
@@ -544,70 +481,75 @@ where
         actor: Self::UserId,
     ) -> Result<Self::User, Self::Error>;
 
-    /// Get the authentication method by its ID.
+    /// Get the authentication method by its' ID.
     async fn get_auth_method(
         &self,
-        method_id: &Self::MethodId,
+        method_id: &Self::AuthId,
     ) -> Result<AuthMethod<Self>, Self::Error>;
 
-    /// Get all authentication methods in the system.
-    async fn get_all_auth_methods(&self) -> Result<Vec<AuthMethod<Self>>, Self::Error>;
+    /// Get the authentication method by its' name, optionally filtered on enablement state(s) and scope.
+    /// an empty array of enablement states means that all states are acceptable (i.e. no filtering)
+    async fn get_auth_method_by_name(
+        &self,
+        name: &str,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
+    ) -> Result<AuthMethod<Self>, Self::Error>;
 
     /// Get all Authentication methods for a given scope (global/user/tenant), potentially filtered by state (e.g. 'Active').
     async fn get_scoped_auth_methods(
         &self,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
-        state: EnablementState,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
     ) -> Result<Vec<AuthMethod<Self>>, Self::Error>;
 
     /// Get all method states for a given method ID and scope (global/user/tenant).
     async fn get_method_states(
         &self,
-        method_id: &Self::MethodId,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        method_id: &Self::AuthId,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthMethodState<Self>>, Self::Error>;
 
     /// Upsert (insert or update) the state of an authentication method for a given scope (global/user/tenant).
     async fn upsert_method_state(
         &self,
-        change: MethodStateChange<Self::MethodId, Self::TenantId, Self::UserId>,
+        change: MethodStateChange<Self::AuthId, Self::TenantId, Self::UserId>,
         actor: Self::UserId,
     ) -> Result<AuthMethodState<Self>, Self::Error>;
 
     /// Get the authentication factor by its ID.
     async fn get_auth_factor(
         &self,
-        factor_id: &Self::FactorId,
+        factor_id: &Self::AuthId,
     ) -> Result<AuthFactor<Self>, Self::Error>;
 
-    /// Get all authentication factors in the system.
-    async fn get_all_auth_factors(&self) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
+    /// Get the authentication factor by its' name, optionally filtered on enablement state(s) and scope.
+    /// an empty array of enablement states means that all states are acceptable (i.e. no filtering)
+    async fn get_auth_factor_by_name(
+        &self,
+        name: &str,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
+        states: Vec<EnablementState>,
+    ) -> Result<AuthFactor<Self>, Self::Error>;
 
-    /// Get all authentication factors for a given scope (global/user/tenant).
-    /// This includes both enabled and disabled factors.
-    /// # Arguments
-    /// * `scope` - The permission scope to filter factors (global/user/tenant)
-    /// * `states` - Vector of enablement states to filter factors (e.g., Active, Inactive)
-    /// # Returns
-    /// Vector of authentication factors matching the specified scope and states
-    /// Expects the return of an empty vector if no factors match the criteria.
+    /// Get all Authentication factors for a given scope (global/user/tenant), potentially filtered by state (e.g. 'Active').
     async fn get_scoped_auth_factors(
         &self,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
         states: Vec<EnablementState>,
     ) -> Result<Vec<AuthFactor<Self>>, Self::Error>;
 
     /// Get all factor states for a given factor ID and scope (global/user/tenant).
     async fn get_factor_states(
         &self,
-        factor_id: &Self::FactorId,
-        scope: PermissionScope<Self::TenantId, Self::UserId>,
+        factor_id: &Self::AuthId,
+        scope: AuthnScope<Self::TenantId, Self::UserId>,
     ) -> Result<Vec<AuthFactorState<Self>>, Self::Error>;
 
     /// Upsert (insert or update) the state of an authentication factor for a given scope (global/user/tenant).
     async fn upsert_factor_state(
         &self,
-        change: FactorStateChange<Self::FactorId, Self::TenantId, Self::UserId>,
+        change: FactorStateChange<Self::AuthId, Self::TenantId, Self::UserId>,
         actor: Self::UserId,
     ) -> Result<AuthFactorState<Self>, Self::Error>;
 
@@ -970,7 +912,7 @@ mod tests {
         let method_id = "test_method_id".to_string();
         let system_user_id = backend.get_system_user_id(None).await?;
 
-        let method: MethodInstance<String, String, TestUserId> = MethodInstance {
+        let method: MethodInstance<String, TestUserId> = MethodInstance {
             id: method_id.clone(),
             name: "Test Password Method".to_string(),
             description: "Test method for password authentication".to_string(),
@@ -982,7 +924,7 @@ mod tests {
         };
         // Upsert auth method with robust error handling so test logs failures explicitly.
         match backend
-            .upsert_auth_method(method.clone().into(), system_user_id.clone())
+            .upsert_auth_method(method.clone(), system_user_id.clone())
             .await
         {
             Ok(_) => {}
@@ -1130,13 +1072,13 @@ mod tests {
         let user_id = TestUserId("u1".to_string());
         let config = serde_json::json!({"password_hash": "test_hash"});
         let change = FactorStateChange::new(factor_id.clone())
-            .with_scope(PermissionScope::User(tenant_id.clone(), user_id.clone()))
+            .with_scope(AuthnScope::User(tenant_id.clone(), user_id.clone()))
             .with_state(EnablementState::Active)
             .with_config(serde_json::from_value(config).unwrap());
         let upserted = backend.upsert_factor_state(change, user_id.clone()).await?;
         assert_eq!(upserted.factor_id, factor_id);
         let states = backend
-            .get_factor_states(&factor_id, PermissionScope::User(tenant_id, user_id))
+            .get_factor_states(&factor_id, AuthnScope::User(tenant_id, user_id))
             .await?;
         assert!(!states.is_empty());
         assert_eq!(states[0].factor_id, factor_id);

@@ -1,7 +1,7 @@
 //! Factor definitions, state transitions, and configuration helpers.
 //!
 //! This module centralizes factor-related types used across Axess:
-//! - [`AuthFactorKind`] enumerates supported factor kinds.
+//! - [`Kind`] enumerates supported factor kinds.
 //! - [`FactorInstance`] represents provisioned factors stored by backends.
 //! - [`FactorState`] and [`FactorStateChange`] capture per-scope enablement metadata,
 //!   with the latter providing ergonomic helpers for constructing strongly typed
@@ -12,9 +12,12 @@
 
 use crate::{
     authn::{
-        backend::{DataId, FactorId, TenantId, UserId},
+        backend::{AuthId, TenantId, UserId},
         errors::FactorKindError,
-        methods::scope::{EnablementState, PermissionScope},
+        methods::{
+            form::{Action, Flow},
+            scope::{AuthnScope, EnablementState},
+        },
     },
     tracing::error,
 };
@@ -27,6 +30,81 @@ use std::{
     str::FromStr,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub enum FederatedProtocol {
+    OAuth2,
+    OIDC,
+    SAML,
+}
+
+// Manual implementation of Hash for FederatedProvider, since HashMap is not Hash.
+// We only hash the name and protocol for Custom, ignoring config for Hash/PartialEq/Eq.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FederatedProvider {
+    Github,
+    Google,
+    Facebook,
+    AzureAD,
+    Auth0,
+    Custom {
+        name: String,
+        protocol: FederatedProtocol,
+        config: HashMap<String, serde_json::Value>,
+    },
+}
+
+impl std::hash::Hash for FederatedProvider {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        use FederatedProvider::*;
+        match self {
+            Github => "Github".hash(state),
+            Google => "Google".hash(state),
+            Facebook => "Facebook".hash(state),
+            AzureAD => "AzureAD".hash(state),
+            Auth0 => "Auth0".hash(state),
+            Custom { name, protocol, .. } => {
+                "Custom".hash(state);
+                name.hash(state);
+                protocol.hash(state);
+                // config is intentionally not hashed (for now...)
+            }
+        }
+    }
+}
+
+impl FederatedProvider {
+    /// Returns the canonical string representation of the federated provider.
+    pub fn as_str(&self) -> &str {
+        match self {
+            FederatedProvider::Github => "github",
+            FederatedProvider::Google => "google",
+            FederatedProvider::Facebook => "facebook",
+            FederatedProvider::AzureAD => "azuread",
+            FederatedProvider::Auth0 => "auth0",
+            FederatedProvider::Custom { name, .. } => name.as_str(),
+        }
+    }
+}
+
+impl FromStr for FederatedProvider {
+    type Err = FactorKindError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "github" => Ok(FederatedProvider::Github),
+            "google" => Ok(FederatedProvider::Google),
+            "facebook" => Ok(FederatedProvider::Facebook),
+            "azuread" => Ok(FederatedProvider::AzureAD),
+            "auth0" => Ok(FederatedProvider::Auth0),
+            other => Ok(FederatedProvider::Custom {
+                name: other.to_string(),
+                protocol: FederatedProtocol::OIDC, // or OAuth2, or configurable
+                config: HashMap::new(),
+            }),
+        }
+    }
+}
+
 /// Enumerates the supported kinds of authentication factors in Axess.
 ///
 /// This enum is used to distinguish between different factor types in authentication flows,
@@ -35,68 +113,113 @@ use std::{
 ///
 /// # Variants
 /// - `Password`: Standard password-based authentication.
-/// - `Otp`: One-time password (TOTP/HOTP) authentication.
-/// - `Oauth`: OAuth/OpenID Connect or similar federated authentication.
-/// - `Custom(String)`: Custom or vendor-specific factor kind, identified by a string.
+/// - `Totp`: One-time password (TOTP) authentication.
+/// - `Hotp`: HMAC-based one-time password (HOTP) authentication.
+/// - `EmailOtp`: One-time password sent via email.
+/// - `OauthProvider(String)`: OAuth-based federated authentication.
+/// - `OidcProvider(String)`: OpenID Connect-based federated authentication.
 ///
 /// # Usage
-/// Use `AuthFactorKind` to select, provision, and verify factors in session flows,
-/// backend queries, and configuration builders. The `Custom` variant allows for
-/// extensibility and integration with non-standard or external factor types.
+/// Use `Kind` to select, provision, and verify factors in session flows,
+/// backend queries, and configuration builders.
 ///
 /// # Examples
 /// ```rust
-/// use axess_core::authn::methods::factor::AuthFactorKind;
+/// use axess_core::authn::methods::factor::{FederatedProvider, Kind};
 ///
-/// let kind = AuthFactorKind::Password;
-/// assert_eq!(kind.as_str(), "password");
+/// let password_factor_kind = Kind::Password;
+/// assert_eq!(password_factor_kind.as_str(), "password");
 ///
-/// let custom_kind = AuthFactorKind::Custom("webauthn".to_string());
-/// assert_eq!(custom_kind.as_str(), "webauthn");
+/// let oauth_factor_kind = Kind::Federated(FederatedProvider::Github);
+/// assert_eq!(oauth_factor_kind.as_str(), "github");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "lowercase")]
-pub enum AuthFactorKind {
-    /// Standard password-based authentication.
+pub enum Kind {
+    // // Knowledge based factors
     Password,
-    /// One-time password (TOTP/HOTP) authentication.
-    Otp,
-    /// OAuth/OpenID Connect or similar federated authentication.
-    Oauth,
-    /// Custom or vendor-specific factor kind, identified by a string.
-    Custom(String),
+    // Pin,
+    // FactorKind,
+
+    //
+    Totp,
+    Hotp,
+    EmailOtp,
+    // SmsOtp,
+    // MagicLink,
+    // YubikeyOtp,
+
+    // // Crypto
+    // WebAuthn,
+    // U2f,
+    // Smartcard,
+
+    // Federated (OAuth/OpenID Connect or similar federated authentication)
+    Federated(FederatedProvider),
 }
 
-impl AuthFactorKind {
+impl Kind {
     /// Returns the canonical string representation of the factor kind.
-    ///
-    /// This is used for serialization, logging, and backend queries.
     pub fn as_str(&self) -> &str {
         match self {
-            AuthFactorKind::Password => "password",
-            AuthFactorKind::Otp => "otp",
-            AuthFactorKind::Oauth => "oauth",
-            AuthFactorKind::Custom(s) => s.as_str(),
+            Kind::Password => "password",
+            Kind::Totp => "totp",
+            Kind::Hotp => "hotp",
+            Kind::EmailOtp => "email_otp",
+            Kind::Federated(provider) => provider.as_str(),
         }
+    }
+
+    /// Returns the high-level flow type for this factor kind.
+    pub fn flow_type(&self) -> &Flow {
+        match self {
+            Kind::Password => &Flow::Knowledge,
+            Kind::Totp | Kind::Hotp | Kind::EmailOtp => &Flow::Otp,
+            Kind::Federated(_) => &Flow::Federated,
+        }
+    }
+
+    /// Convenience constructor for federated providers.
+    pub fn from_provider_str(s: &str) -> Self {
+        Kind::Federated(FederatedProvider::from_str(s).unwrap_or_else(|_| {
+            FederatedProvider::Custom {
+                name: s.to_string(),
+                protocol: FederatedProtocol::OIDC,
+                config: HashMap::new(),
+            }
+        }))
     }
 }
 
-impl FromStr for AuthFactorKind {
+impl FromStr for Kind {
     type Err = FactorKindError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "password" => Ok(AuthFactorKind::Password),
-            "otp" => Ok(AuthFactorKind::Otp),
-            "oauth" => Ok(AuthFactorKind::Oauth),
-            custom => Ok(AuthFactorKind::Custom(custom.to_string())),
+            "password" => Ok(Kind::Password),
+            "totp" => Ok(Kind::Totp),
+            "hotp" => Ok(Kind::Hotp),
+            "email_otp" => Ok(Kind::EmailOtp),
+            provider => Ok(Kind::from_provider_str(provider)),
         }
     }
 }
 
-impl Display for AuthFactorKind {
+impl Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+pub struct Operation {
+    pub kind: Kind,
+    pub action: Action,
+}
+
+impl Operation {
+    pub fn new(kind: Kind, action: Action) -> Self {
+        Self { kind, action }
     }
 }
 
@@ -124,20 +247,19 @@ impl Display for AuthFactorKind {
 /// as a new or updated `FactorState`.
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound(
-    serialize = "D: Serialize, F: Serialize, T: Serialize, U: Serialize",
-    deserialize = "D: DeserializeOwned, F: DeserializeOwned, T: DeserializeOwned, U: DeserializeOwned"
+    serialize = "A: Serialize, T: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, T: DeserializeOwned, U: DeserializeOwned"
 ))]
-pub struct FactorState<D, F, T, U>
+pub struct FactorState<A, T, U>
 where
-    D: DataId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Unique identifier for this factor state (e.g., UUID or database key).
-    pub id: D,
+    pub id: A,
     /// The ID of the factor this state belongs to.
-    pub factor_id: F,
+    pub factor_id: A,
     /// Optional tenant scope; `None` for global factors.
     pub tenant_id: Option<T>,
     /// Optional user scope; `None` for tenant/global factors.
@@ -156,17 +278,16 @@ where
     pub updated_by: U,
 }
 
-impl<D, F, T, U> FactorState<D, F, T, U>
+impl<A, T, U> FactorState<A, T, U>
 where
-    D: DataId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Creates a new `FactorState` with default values.
     ///
     /// Sets `state` to `Pending` and initializes timestamps.
-    pub fn new(id: D, factor_id: F, created_by: U) -> Self {
+    pub fn new(id: A, factor_id: A, created_by: U) -> Self {
         let time_now = Utc::now();
         Self {
             id,
@@ -199,12 +320,12 @@ where
         self.config.get(key)
     }
 
-    /// Returns the [`PermissionScope`] for this factor state (global, tenant, or user).
-    pub fn scope(&self) -> PermissionScope<T, U> {
+    /// Returns the [`AuthnScope`] for this factor state (global, tenant, or user).
+    pub fn scope(&self) -> AuthnScope<T, U> {
         match (&self.tenant_id, &self.user_id) {
-            (None, None) => PermissionScope::Global,
-            (Some(tid), None) => PermissionScope::Tenant(tid.clone()),
-            (Some(tid), Some(uid)) => PermissionScope::User(tid.clone(), uid.clone()),
+            (None, None) => AuthnScope::Global,
+            (Some(tid), None) => AuthnScope::Tenant(tid.clone()),
+            (Some(tid), Some(uid)) => AuthnScope::User(tid.clone(), uid.clone()),
             (None, Some(_)) => {
                 error!("user_id without tenant_id should not occur");
                 unreachable!("user_id without tenant_id should not occur")
@@ -233,30 +354,30 @@ where
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::{factor::FactorStateChange, policy::FactorConfigBuilder, scope::{EnablementState, PermissionScope}};
+/// use axess_core::authn::methods::{factor::FactorStateChange, policy::FactorConfigBuilder, scope::{EnablementState, AuthnScope}};
 ///
 /// let factor_id = 42_u64;
 /// let tenant_id = 1_u64;
 /// let user_id = 2_u64;
 ///
 /// let change = FactorStateChange::new(factor_id)
-///     .with_scope(PermissionScope::User(tenant_id, user_id))
+///     .with_scope(AuthnScope::User(tenant_id, user_id))
 ///     .with_state(EnablementState::Active)
 ///     .with_config(FactorConfigBuilder::password("hash123").into());
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "F: Serialize, T: Serialize, U: Serialize",
-    deserialize = "F: DeserializeOwned, T: DeserializeOwned, U: DeserializeOwned"
+    serialize = "A: Serialize, T: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, T: DeserializeOwned, U: DeserializeOwned"
 ))]
-pub struct FactorStateChange<F, T, U>
+pub struct FactorStateChange<A, T, U>
 where
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// The ID of the factor to change.
-    pub factor_id: F,
+    pub factor_id: A,
     /// Optional tenant scope; `None` for global factors.
     pub tenant_id: Option<T>,
     /// Optional user scope; `None` for tenant/global factors.
@@ -267,16 +388,16 @@ where
     pub config: HashMap<String, JsonValue>,
 }
 
-impl<F, T, U> FactorStateChange<F, T, U>
+impl<A, T, U> FactorStateChange<A, T, U>
 where
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Creates a new `FactorStateChange` for the given factor.
     ///
     /// By default, sets the state to `Active` and leaves scope/config empty.
-    pub fn new(factor_id: F) -> Self {
+    pub fn new(factor_id: A) -> Self {
         Self {
             factor_id,
             tenant_id: None,
@@ -288,8 +409,8 @@ where
 
     /// Sets the scope (global, tenant, or user) for this change.
     ///
-    /// This will populate `tenant_id` and `user_id` according to the provided [`PermissionScope`].
-    pub fn with_scope(mut self, scope: PermissionScope<T, U>) -> Self {
+    /// This will populate `tenant_id` and `user_id` according to the provided [`AuthnScope`].
+    pub fn with_scope(mut self, scope: AuthnScope<T, U>) -> Self {
         self.tenant_id = scope.tenant_id().cloned();
         self.user_id = scope.user_id().cloned();
         self
@@ -320,17 +441,16 @@ where
     }
 }
 
-impl<D, F, T, U> From<&FactorState<D, F, T, U>> for FactorStateChange<F, T, U>
+impl<A, T, U> From<&FactorState<A, T, U>> for FactorStateChange<A, T, U>
 where
-    D: DataId,
-    F: FactorId,
+    A: AuthId,
     T: TenantId,
     U: UserId,
 {
     /// Converts a persisted [`FactorState`] into a change intent.
     ///
     /// This is useful for updating or cloning an existing factor state.
-    fn from(state: &FactorState<D, F, T, U>) -> Self {
+    fn from(state: &FactorState<A, T, U>) -> Self {
         FactorStateChange {
             factor_id: state.factor_id.clone(),
             tenant_id: state.tenant_id.clone(),
@@ -364,33 +484,33 @@ where
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::factor::{AuthFactorKind, FactorInstance};
+/// use axess_core::authn::methods::factor::{Kind, FactorInstance};
 ///
 /// let factor = FactorInstance::new(
 ///     1_u64,
-///     AuthFactorKind::Password,
+///     Kind::Password,
 ///     "Password",
 ///     "Primary login password",
 ///     42_u64,
 /// );
-/// assert_eq!(factor.kind, AuthFactorKind::Password);
+/// assert_eq!(factor.kind, Kind::Password);
 /// assert_eq!(factor.name, "Password");
 /// assert_eq!(factor.description, "Primary login password");
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(bound(
-    serialize = "F: Serialize, U: Serialize",
-    deserialize = "F: DeserializeOwned, U: DeserializeOwned"
+    serialize = "A: Serialize, U: Serialize",
+    deserialize = "A: DeserializeOwned, U: DeserializeOwned"
 ))]
-pub struct FactorInstance<F, U>
+pub struct FactorInstance<A, U>
 where
-    F: FactorId + Serialize + DeserializeOwned,
+    A: AuthId + Serialize + DeserializeOwned,
     U: UserId + Serialize + DeserializeOwned,
 {
     /// Unique identifier for this factor instance (e.g., UUID or database key).
-    pub id: F,
+    pub id: A,
     /// The kind of factor (e.g., Password, Otp, Oauth, Custom).
-    pub kind: AuthFactorKind,
+    pub kind: Kind,
     /// Human-readable name for the factor (e.g., "Password", "Authenticator App").
     pub name: String,
     /// Optional description or display text for the factor.
@@ -405,12 +525,12 @@ where
     pub updated_by: U,
 }
 
-impl<F, U> FactorInstance<F, U>
+impl<A, U> FactorInstance<A, U>
 where
-    F: FactorId + Serialize + DeserializeOwned,
+    A: AuthId + Serialize + DeserializeOwned,
     U: UserId + Serialize + DeserializeOwned,
 {
-    pub fn new(id: F, kind: AuthFactorKind, name: &str, description: &str, created_by: U) -> Self {
+    pub fn new(id: A, kind: Kind, name: &str, description: &str, created_by: U) -> Self {
         let time_now = Utc::now();
         Self {
             id,
@@ -423,19 +543,31 @@ where
             updated_by: created_by,
         }
     }
+
+    // pub fn get_name(&self) -> &str {
+    //     &self.name
+    // }
+
+    pub fn get_kind(&self) -> &Kind {
+        &self.kind
+    }
+
+    pub fn get_flow(&self) -> &Flow {
+        self.kind.flow_type()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authn::methods::{policy::FactorConfigBuilder, scope::PermissionScope};
+    use crate::authn::methods::{policy::FactorConfigBuilder, scope::AuthnScope};
     use serde_json::json;
 
     #[test]
     /// Ensures the convenience constructor sets kind/name/description correctly.
     fn factor_instance_password_helper_sets_kind() {
-        let factor = FactorInstance::new(1_u64, AuthFactorKind::Password, "pwd", "desc", 7_u64);
-        assert_eq!(factor.kind, AuthFactorKind::Password);
+        let factor = FactorInstance::new(1_u64, Kind::Password, "pwd", "desc", 7_u64);
+        assert_eq!(factor.kind, Kind::Password);
         assert_eq!(factor.name, "pwd");
         assert_eq!(factor.description, "desc");
     }
@@ -444,7 +576,7 @@ mod tests {
     /// Confirms password state changes carry scope and the hash field.
     fn factor_state_change_with_password_hash() {
         let change = FactorStateChange::new(10_u64)
-            .with_scope(PermissionScope::User(1_u64, 2_u64))
+            .with_scope(AuthnScope::User(1_u64, 2_u64))
             .with_state(EnablementState::Active)
             .with_config(FactorConfigBuilder::password("hash123").into());
         assert_eq!(change.state, EnablementState::Active);
@@ -467,7 +599,7 @@ mod tests {
             .with_config(config);
 
         assert_eq!(change.state, EnablementState::Pending);
-        assert_eq!(change.config.get("otp_type"), Some(&json!("totp")));
+        assert_eq!(change.config.get("kind"), Some(&json!("totp")));
         assert_eq!(change.config.get("secret"), Some(&json!("BASE32SECRET")));
         assert_eq!(change.config.get("length"), Some(&json!(8)));
         assert_eq!(change.config.get("period"), Some(&json!(60)));
@@ -489,7 +621,7 @@ mod tests {
             .with_config(config);
 
         assert_eq!(change.state, EnablementState::Active);
-        assert_eq!(change.config.get("otp_type"), Some(&json!("hotp")));
+        assert_eq!(change.config.get("kind"), Some(&json!("hotp")));
         assert_eq!(change.config.get("secret"), Some(&json!("HOTSECRET")));
         assert_eq!(change.config.get("length"), Some(&json!(7)));
         assert_eq!(change.config.get("counter"), Some(&json!(3)));

@@ -45,10 +45,10 @@ use axess_core::{
 
 let backend = Arc::new(MyBackend::new());
 let session_store = MySessionStore::new();
-let session_registry = Arc::new(SessionRegistryStore::new(session_store, 100, None, None));
+let registry = Arc::new(SessionRegistryStore::new(session_store, 100, None, None));
 
 let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
-    .with_session_registry(session_registry.clone())
+    .with_session_registry(registry.clone())
     .build();
 ```
 

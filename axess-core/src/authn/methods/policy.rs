@@ -222,7 +222,7 @@ impl PasswordRulesBuilder {
 
 /// Character set used for validating and generating OTP codes.
 ///
-/// `OtpCharset` determines which characters are allowed in a one-time password (OTP) code.
+/// `TokenCharset` determines which characters are allowed in a one-time password (OTP) code.
 /// This is used for both TOTP (time-based) and HOTP (counter-based) authentication factors,
 /// and ensures that codes are validated according to the expected format.
 ///
@@ -232,19 +232,19 @@ impl PasswordRulesBuilder {
 /// - `Alphanumeric`: Only ASCII alphanumeric characters (`0-9`, `a-z`, `A-Z`) are allowed.
 ///
 /// # Usage
-/// Use `OtpCharset` in [`OtpRules`] to specify the allowed code format for a factor.
+/// Use `TokenCharset` in [`OtpRules`] to specify the allowed code format for a factor.
 /// The charset is checked during code validation and can be configured for custom OTP flows.
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::policy::OtpCharset;
+/// use axess_core::authn::methods::policy::TokenCharset;
 ///
-/// assert_eq!(OtpCharset::Numeric.as_str(), "numeric");
-/// assert_eq!(OtpCharset::Hex.as_str(), "hex");
-/// assert_eq!(OtpCharset::Alphanumeric.as_str(), "alphanumeric");
+/// assert_eq!(TokenCharset::Numeric.as_str(), "numeric");
+/// assert_eq!(TokenCharset::Hex.as_str(), "hex");
+/// assert_eq!(TokenCharset::Alphanumeric.as_str(), "alphanumeric");
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OtpCharset {
+pub enum TokenCharset {
     /// Only ASCII digits (`0-9`) are allowed.
     Numeric,
     /// Only ASCII hexadecimal characters (`0-9`, `a-f`, `A-F`) are allowed.
@@ -253,87 +253,31 @@ pub enum OtpCharset {
     Alphanumeric,
 }
 
-impl OtpCharset {
+impl TokenCharset {
     /// Returns the canonical string representation of the charset.
     ///
     /// This is used for serialization, logging, and config storage.
     pub fn as_str(&self) -> &'static str {
         match self {
-            OtpCharset::Numeric => "numeric",
-            OtpCharset::Hex => "hex",
-            OtpCharset::Alphanumeric => "alphanumeric",
+            TokenCharset::Numeric => "numeric",
+            TokenCharset::Hex => "hex",
+            TokenCharset::Alphanumeric => "alphanumeric",
         }
     }
 }
 
-impl FromStr for OtpCharset {
+impl FromStr for TokenCharset {
     type Err = ();
 
-    /// Parses a string into an `OtpCharset`.
+    /// Parses a string into an `TokenCharset`.
     ///
     /// Accepts `"numeric"`, `"hex"`, or `"alphanumeric"` (case-insensitive).
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "numeric" => Ok(OtpCharset::Numeric),
-            "hex" => Ok(OtpCharset::Hex),
-            "alphanumeric" => Ok(OtpCharset::Alphanumeric),
+            "numeric" => Ok(TokenCharset::Numeric),
+            "hex" => Ok(TokenCharset::Hex),
+            "alphanumeric" => Ok(TokenCharset::Alphanumeric),
             _ => Err(()),
-        }
-    }
-}
-
-/// Enumerates supported One-Time Password (OTP) factor types.
-///
-/// `OtpType` distinguishes between TOTP (time-based), HOTP (counter-based), and custom OTP mechanisms.
-/// This is used in factor configuration, verification logic, and provisioning flows to select the correct
-/// algorithm and validation rules.
-///
-/// # Variants
-/// - `Totp`: Time-based One-Time Password (RFC 6238).
-/// - `Hotp`: HMAC-based One-Time Password (RFC 4226).
-/// - `Custom(String)`: Custom OTP type, identified by a string (for extensibility).
-///
-/// # Usage
-/// Use `OtpType` in factor configs and session flows to determine which OTP algorithm to use.
-/// The string representation is used for serialization and config storage.
-///
-/// # Example
-/// ```rust
-/// use axess_core::authn::methods::policy::OtpType;
-///
-/// let totp = OtpType::Totp;
-/// assert_eq!(totp.as_str(), "totp");
-///
-/// let hotp = OtpType::Hotp;
-/// assert_eq!(hotp.as_str(), "hotp");
-///
-/// let custom = OtpType::Custom("steam_guard".to_string());
-/// assert_eq!(custom.as_str(), "steam_guard");
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OtpType {
-    /// Time-based One-Time Password (RFC 6238).
-    Totp,
-    /// HMAC-based One-Time Password (RFC 4226).
-    Hotp,
-    /// One-Time Confirmations sent via Email.
-    Email,
-    /// Custom OTP type, identified by a string.
-    #[serde(untagged)]
-    Custom(String),
-}
-
-impl OtpType {
-    /// Returns the canonical string representation of the OTP type.
-    ///
-    /// This is used for serialization, logging, and config storage.
-    pub fn as_str(&self) -> &str {
-        match self {
-            OtpType::Totp => "totp",
-            OtpType::Hotp => "hotp",
-            OtpType::Email => "email",
-            OtpType::Custom(s) => s.as_str(),
         }
     }
 }
@@ -357,11 +301,11 @@ impl OtpType {
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::policy::{OtpRules, OtpCharset};
+/// use axess_core::authn::methods::policy::{OtpRules, TokenCharset};
 ///
 /// let rules = OtpRules {
 ///     length: 6,
-///     charset: OtpCharset::Numeric,
+///     charset: TokenCharset::Numeric,
 ///     past_window: 1,
 ///     future_window: 0,
 ///     period: 30,
@@ -375,7 +319,7 @@ pub struct OtpRules {
     /// Number of digits or characters in the OTP code.
     pub length: usize,
     /// Allowed character set for the code (numeric, hex, alphanumeric).
-    pub charset: OtpCharset,
+    pub charset: TokenCharset,
     /// Number of previous time steps/counters to accept (for clock drift or sync).
     pub past_window: u64,
     /// Number of future time steps/counters to accept.
@@ -389,7 +333,7 @@ impl Default for OtpRules {
     fn default() -> Self {
         Self {
             length: 6,
-            charset: OtpCharset::Numeric,
+            charset: TokenCharset::Numeric,
             past_window: 1,
             future_window: 0,
             period: 30,
@@ -412,7 +356,7 @@ impl OtpRules {
     pub fn hotp_defaults() -> Self {
         Self {
             length: 6,
-            charset: OtpCharset::Numeric,
+            charset: TokenCharset::Numeric,
             past_window: 0,
             future_window: 10,
             period: 0,
@@ -427,9 +371,9 @@ impl OtpRules {
             return false;
         }
         match self.charset {
-            OtpCharset::Numeric => code.chars().all(|c| c.is_ascii_digit()),
-            OtpCharset::Hex => code.chars().all(|c| c.is_ascii_hexdigit()),
-            OtpCharset::Alphanumeric => code.chars().all(|c| c.is_ascii_alphanumeric()),
+            TokenCharset::Numeric => code.chars().all(|c| c.is_ascii_digit()),
+            TokenCharset::Hex => code.chars().all(|c| c.is_ascii_hexdigit()),
+            TokenCharset::Alphanumeric => code.chars().all(|c| c.is_ascii_alphanumeric()),
         }
     }
 }
@@ -442,18 +386,18 @@ impl OtpRules {
 ///
 /// # Example
 /// ```rust
-/// use axess_core::authn::methods::policy::{OtpRules, OtpRulesBuilder, OtpCharset};
+/// use axess_core::authn::methods::policy::{OtpRules, OtpRulesBuilder, TokenCharset};
 ///
 /// let rules = OtpRulesBuilder::default()
 ///     .with_length(8)
-///     .with_charset(OtpCharset::Alphanumeric)
+///     .with_charset(TokenCharset::Alphanumeric)
 ///     .with_period(60)
 ///     .with_past_window(2)
 ///     .with_future_window(1)
 ///     .build();
 ///
 /// assert_eq!(rules.length, 8);
-/// assert_eq!(rules.charset, OtpCharset::Alphanumeric);
+/// assert_eq!(rules.charset, TokenCharset::Alphanumeric);
 /// assert_eq!(rules.period, 60);
 /// assert_eq!(rules.past_window, 2);
 /// assert_eq!(rules.future_window, 1);
@@ -461,7 +405,7 @@ impl OtpRules {
 #[derive(Default)]
 pub struct OtpRulesBuilder {
     length: Option<usize>,
-    charset: Option<OtpCharset>,
+    charset: Option<TokenCharset>,
     past_window: Option<u64>,
     future_window: Option<u64>,
     period: Option<u64>,
@@ -475,7 +419,7 @@ impl OtpRulesBuilder {
     }
 
     /// Sets the allowed character set for the OTP code.
-    pub fn with_charset(mut self, value: OtpCharset) -> Self {
+    pub fn with_charset(mut self, value: TokenCharset) -> Self {
         self.charset = Some(value);
         self
     }
@@ -503,7 +447,7 @@ impl OtpRulesBuilder {
     pub fn build(self) -> OtpRules {
         OtpRules {
             length: self.length.unwrap_or(6),
-            charset: self.charset.unwrap_or(OtpCharset::Numeric),
+            charset: self.charset.unwrap_or(TokenCharset::Numeric),
             past_window: self.past_window.unwrap_or(1),
             future_window: self.future_window.unwrap_or(0),
             period: self.period.unwrap_or(30),
@@ -673,15 +617,17 @@ impl FactorConfigBuilder {
     ///
     /// Sets the `"password_hash"` field.
     pub fn password(hash: impl Into<String>) -> Self {
-        Self::new().with_field("password_hash", JsonValue::String(hash.into()))
+        Self::new()
+            .with_field("kind", JsonValue::String("password".into()))
+            .with_field("password_hash", JsonValue::String(hash.into()))
     }
 
     /// Creates a TOTP factor config builder with the given secret.
     ///
-    /// Sets `"otp_type"`, `"secret"`, `"length"`, `"period"`, `"past_window"`, `"future_window"`, and `"last_totp_step"`.
+    /// Sets `"kind"`, `"secret"`, `"length"`, `"period"`, `"past_window"`, `"future_window"`, and `"last_totp_step"`.
     pub fn totp(secret: impl Into<String>) -> Self {
         Self::new()
-            .with_field("otp_type", JsonValue::String("totp".into()))
+            .with_field("kind", JsonValue::String("totp".into()))
             .with_secret(secret)
             .with_length(6)
             .with_period(30)
@@ -691,10 +637,10 @@ impl FactorConfigBuilder {
 
     /// Creates a HOTP factor config builder with the given secret.
     ///
-    /// Sets `"otp_type"`, `"secret"`, `"length"`, `"counter"`, and `"window"`.
+    /// Sets `"kind"`, `"secret"`, `"length"`, `"counter"`, and `"window"`.
     pub fn hotp(secret: impl Into<String>) -> Self {
         Self::new()
-            .with_field("otp_type", JsonValue::String("hotp".into()))
+            .with_field("kind", JsonValue::String("hotp".into()))
             .with_secret(secret)
             .with_length(6)
             .with_field("counter", JsonValue::Number(JsonNumber::from(0u64)))
@@ -703,10 +649,10 @@ impl FactorConfigBuilder {
 
     /// Creates a One-Time Confirmation factor config builder with the given email.
     ///
-    /// Sets `"otp_type"`, `"email"`, `"length"`, `"counter"`, and `"window"`.
+    /// Sets `"kind"`, `"email"`, `"length"`, `"counter"`, and `"window"`.
     pub fn email(email: impl Into<String>) -> Self {
         Self::new()
-            .with_field("otp_type", JsonValue::String("email".into()))
+            .with_field("kind", JsonValue::String("email_otp".into()))
             .with_field("email", JsonValue::String(email.into()))
             .with_field("token", JsonValue::String("".into()))
             .with_length(6)
@@ -787,7 +733,7 @@ mod tests {
     fn config_builder_totp_defaults() {
         let config = FactorConfigBuilder::totp("SECRET").build();
 
-        assert_eq!(config.get_string("otp_type"), Some("totp"));
+        assert_eq!(config.get_string("kind"), Some("totp"));
         assert_eq!(config.get_string("secret"), Some("SECRET"));
         assert_eq!(config.get_u64("length"), Some(6));
         assert_eq!(config.get_u64("period"), Some(30));
@@ -804,7 +750,7 @@ mod tests {
             .with_field("window", JsonValue::Number(JsonNumber::from(5u64)))
             .build();
 
-        assert_eq!(config.get_string("otp_type"), Some("hotp"));
+        assert_eq!(config.get_string("kind"), Some("hotp"));
         assert_eq!(config.get_string("secret"), Some("HOTSECRET"));
         assert_eq!(config.get_u64("length"), Some(6));
         assert_eq!(config.get_u64("counter"), Some(7));

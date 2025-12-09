@@ -4,8 +4,8 @@
 use crate::authn::{
     errors::FormError,
     methods::{
-        factor::AuthFactorKind,
-        form::{FactorForm, FactorFormKind, FormField, FormFieldValue},
+        factor::Kind,
+        form::{Action, FactorForm, Flow, FormField, FormFieldValue},
     },
 };
 use serde_json::Value as JsonValue;
@@ -15,12 +15,16 @@ use std::collections::HashMap;
 pub struct DummyOkForm;
 
 impl FactorForm for DummyOkForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Password
+    fn flow(&self) -> Flow {
+        Flow::Knowledge
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+    fn kind(&self) -> Kind {
+        Kind::Password
+    }
+
+    fn action(&self) -> Action {
+        Action::Verify
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
@@ -47,12 +51,16 @@ impl FactorForm for DummyOkForm {
 pub struct DummyFailingForm;
 
 impl FactorForm for DummyFailingForm {
-    fn factor_kind(&self) -> AuthFactorKind {
-        AuthFactorKind::Password
+    fn flow(&self) -> Flow {
+        Flow::Knowledge
     }
 
-    fn form_kind(&self) -> FactorFormKind {
-        FactorFormKind::Verify
+    fn kind(&self) -> Kind {
+        Kind::Password
+    }
+
+    fn action(&self) -> Action {
+        Action::Verify
     }
 
     fn validate_form(&self) -> Result<&Self, FormError> {
