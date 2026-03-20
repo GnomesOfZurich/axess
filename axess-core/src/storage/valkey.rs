@@ -293,6 +293,60 @@ impl SessionStore for ValkeyStore {
     }
 }
 
+/// Initialize a Valkey standalone (single-node) client.
+/// Use this for development where Valkey runs without clustering enabled.
+pub async fn init_valkey_standalone_client(
+    addr: &str,
+    password: Option<&str>,
+    reconnect_policy: Option<ReconnectPolicy>,
+) -> Result<Client, ValkeyStoreError> {
+    info!("Creating Valkey standalone configuration for node: {}", addr);
+
+    let parts: Vec<&str> = addr.split(':').collect();
+    if parts.len() != 2 {
+        return Err(ValkeyStoreError::Valkey(Error::new(
+            fred::error::ErrorKind::Config,
+            format!("Invalid node address format: '{}'. Expected 'host:port'", addr),
+        )));
+    }
+    let host = parts[0].to_string();
+    let port = parts[1].parse::<u16>().map_err(|e| {
+        ValkeyStoreError::Valkey(Error::new(
+            fred::error::ErrorKind::Config,
+            format!("Invalid port number in address '{}': {}", addr, e),
+        ))
+    })?;
+
+    let mut config = Config {
+        server: ServerConfig::Centralized {
+            server: Server::new(host, port),
+        },
+        version: RespVersion::RESP3,
+        ..Default::default()
+    };
+
+    if let Some(pass) = password {
+        config.password = Some(pass.to_string());
+    }
+
+    let reconnect = reconnect_policy
+        .unwrap_or_else(|| ReconnectPolicy::new_exponential(5, 1000, 30000, 2));
+
+    info!("Initializing Valkey standalone client...");
+    let client = Client::new(config, None, None, Some(reconnect));
+    client.connect();
+
+    client.wait_for_connect().await.map_err(|e| {
+        error!("❌ CRITICAL: Valkey standalone connection failed");
+        error!("🔧 Attempted node: {}", addr);
+        error!("🔧 Error details: {:?}", e);
+        ValkeyStoreError::Valkey(e)
+    })?;
+
+    info!("✅ Successfully connected to Valkey standalone node");
+    Ok(client)
+}
+
 /// Initialize a Valkey cluster client, taking a vector of node addresses, an optional password, and an optional reconnect policy.
 #[allow(dead_code)]
 pub async fn init_valkey_cluster_client(

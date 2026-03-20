@@ -56,7 +56,7 @@ pub use axess_core::storage::in_memory;
 #[cfg(feature = "valkey")]
 pub mod valkey {
     pub use axess_core::storage::valkey::{
-        ValkeyStore, ValkeyStoreError, init_valkey_cluster_client,
+        ValkeyStore, ValkeyStoreError, init_valkey_cluster_client, init_valkey_standalone_client,
     };
 }
 
