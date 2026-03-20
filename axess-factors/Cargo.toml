@@ -1,6 +1,6 @@
 [package]
 name = "axess-factors"
-version = "0.0.12"
+version = "0.0.13"
 publish = false
 edition = "2024"
 resolver = "3"
@@ -11,8 +11,8 @@ repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
 password-auth = { version = "1.0.0", optional = true }
-rand = { version = "0.8.5", optional = true }
-totp-rs = { version = "5.7.0", features = [
+rand = { version = "0.9.2", optional = true }
+totp-rs = { version = "5.7.1", features = [
   "gen_secret",
   "serde_support",
   "zeroize",
