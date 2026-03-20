@@ -4,35 +4,6 @@ use cedar_policy::{
 use std::str::FromStr;
 use tracing::warn;
 
-/// System role names — must match the Cedar policy file and the DB seed.
-pub const ROLE_PLATFORM_ADMIN: &str = "platform-admin";
-pub const ROLE_FINANCE_VIEWER: &str = "finance-viewer";
-pub const ROLE_FINANCE_MEMBER: &str = "finance-member";
-pub const ROLE_FINANCE_ADMIN: &str = "finance-admin";
-pub const ROLE_DOC_VIEWER: &str = "doc-viewer";
-pub const ROLE_DOC_MEMBER: &str = "doc-member";
-pub const ROLE_DOC_ADMIN: &str = "doc-admin";
-
-/// All system role names in canonical order.
-pub const SYSTEM_ROLES: &[(&str, &str)] = &[
-    (
-        ROLE_PLATFORM_ADMIN,
-        "Full access to all modules and platform management",
-    ),
-    (
-        ROLE_FINANCE_VIEWER,
-        "Read-only access to ledgers and journal entries",
-    ),
-    (ROLE_FINANCE_MEMBER, "View and post journal entries"),
-    (
-        ROLE_FINANCE_ADMIN,
-        "Full finance access including chart-of-accounts management",
-    ),
-    (ROLE_DOC_VIEWER, "Read-only access to documents"),
-    (ROLE_DOC_MEMBER, "Read and write documents"),
-    (ROLE_DOC_ADMIN, "Full document access including delete"),
-];
-
 // ── Cedar entity namespace ───────────────────────────────────────────────────
 
 pub const NS: &str = "Ekekrantz";

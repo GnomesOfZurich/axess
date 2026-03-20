@@ -1,121 +1,318 @@
 # Axess
 
-## 🔆 Authentication and Authorization made easy for Axum webservers
+## Authentication and Authorization for Axum
 
-**Axess** is an authentication and authorization library for the [Axum](https://github.com/tokio-rs/axum) web framework in Rust. It provides robust and modular middleware and extractors, for secure, session-based, policy-driven access control of web services.
+**Axess** is a modular, policy-driven authentication and authorization middleware library for the [Axum](https://github.com/tokio-rs/axum) web framework. It provides secure, session-based multi-factor authentication and fine-grained authorization via [Cedar Policy](https://cedarpolicy.com/), built around a trait-based design that supports deterministic simulation testing (DST) from the ground up.
 
-The authentication system is built on top of the [tower-sessions](https://github.com/maxcountryman/tower-sessions) crate and was originally intended as a simple fork of the [axum-login](https://github.com/maxcountryman/axum-login) crate. The justification for creating *Axess* was that the authentication features of *axum-login* at the time unfortunately didn't support 2FA easily out-of-the-box and and that too many of its' useful inner workings was hidden as privates. Also, its' authorization feature doesn't support Relationship-Based Access Control models nor would it be easy to make use of Cedar Policy without a lot of further customizations.
+Axess was created because the existing landscape of Axum authentication crates — notably [axum-login](https://github.com/maxcountryman/axum-login) — does not easily support multi-factor authentication, exposes too little of its inner workings for extension, and cannot accommodate Relationship-Based Access Control (ReBAC) or Cedar Policy without significant custom work.
 
-The default authorization features of Axess is built on top of [Cedar Policy](https://www.cedarpolicy.com/), a domain specific language and related tooling that were all originally developed and open sourced by Amazon Web Services (*AWS*). This makes the library somewhat agnostic to whether a user's project needs to support *Role Based Access Control* (__RBAC__ ), *Attribute Based Access Control* (__ABAC__ ), or *Relationship Based Access Control* (__ReBAC__). Source Code for the Cedar project can be found on GitHub [here](https://github.com/cedar-policy). Additionally, features related to **Tracing ID** and **Request ID** management were added to the project as these were found to be useful and nice to have during testing.
+> **Status:** Pre-release (`v0.0.13`). Not yet published to crates.io. API is stabilising but may change between minor versions.
 
+---
 
-## 💡 Concepts
+## Design concepts
 
-- **Authentication Middleware:** Easily authenticate requests using sessions and pluggable backends.
-- **Authorization via Cedar Policy:** Integrates with [Cedar](https://cedarpolicy.com/) for flexible, fine-grained authorization policies (supporting ABAC, RBAC and ReBAC).
-- **Request Tracing & ID Generation:** Built-in support for request IDs and tracing.
-- **Extensible Storage:** Abstract storage interfaces for authentication policies, sessions and user data.
-- **Idiomatic Rust:** Follows Rust best practices, async-first APIs, and strong type safety.
-- **Deterministic Simulation Testing (DST):** Designed for testability and reproducibility.
+Three ideas shape the library's architecture. Understanding them makes the rest of the code easier to reason about.
 
+### Explicit session state machine
 
-## 📦 Installation and Getting Started
-1. To use the Axess in your project, run the usual:
-```bash
-cargo add axess
-```
+Authentication is modelled as an enum — `AuthState` — rather than a boolean flag. The states are `NotAuthenticated`, `PartialAuthn`, `Authenticated`, and `PendingWorkflow`.
 
-from your command line or add the following to your `Cargo.toml` file:
+The practical consequence is that multi-factor authentication has nowhere to hide: each transition is validated before any mutation takes place, invalid transitions return a typed error, and the session always reflects the exact point in the flow the user has reached. A partially-authenticated session cannot be mistaken for a fully-authenticated one; the type system enforces the distinction. `PartialAuthn` carries the remaining factors, attempt counts, and timestamps as first-class data, not as ad-hoc fields scattered across multiple tables.
+
+This matters most for security code: a state machine with explicit transitions is easier to audit, easier to test for edge cases (what if factor B arrives before factor A has been verified?), and produces clearer audit events.
+
+### Deterministic simulation testing (DST)
+
+Any code that calls `rand::rng()` or `SystemTime::now()` is non-deterministic: two runs of the same test can produce different results. For authentication code this is a problem — session hash generation, OTP window calculations, lockout timing, and nonce creation all depend on time and randomness.
+
+Axess uses injectable `SecureRng` and `Clock` traits throughout. In production, `SystemRng` and `SystemClock` delegate to the OS. In tests, `MockRng::new(seed)` produces the same byte sequence for the same seed, and `MockClock` can be advanced to any timestamp. This makes it possible to write a deterministic test for "what happens if the user submits a TOTP code from the previous time step" without sleeping or depending on the system clock.
+
+`MockBackend` and `MockRegistry` extend this to the full authentication flow — a complete login including session registry interactions can be exercised without a database.
+
+### Cedar Policy for authorization
+
+Most authorization in web services is implemented as imperative checks in handler code: `if user.roles.contains("admin")`. This works for simple cases but does not compose well: the rules are scattered across the codebase, RBAC and ownership-based checks use different patterns, and there is no schema to validate that the entities you are passing to the check actually have the attributes the policy assumes.
+
+Cedar Policy is a declarative policy language with a formal semantics. Policies live in `.cedar` files, are validated against a `.cedar.json` schema at startup, and are evaluated by a Cedar runtime that is deny-by-default. The same policy file can express RBAC (`principal in Role::"finance-viewer"`), ABAC (`context.ip_address like "192.168.*"`), and ReBAC (`resource.owner == principal`) in a single language. Any evaluation error — malformed entity UID, attribute missing from schema, type mismatch — produces `Deny`, never `Allow`.
+
+In Axess, `PolicyStore` is loaded once at startup and is `Send + Sync`. Entity sets are built per-request from the backend and passed to Cedar for evaluation. The policies themselves remain outside the Rust code, which means they can be reviewed, tested, and audited independently of the application logic.
+
+---
+
+## Workspace layout
+
+| Crate | Purpose |
+|---|---|
+| `axess` | Public API surface — middleware builder, re-exports, feature gates |
+| `axess-core` | Core types, traits, session orchestrator, Cedar authz integration |
+| `axess-factors` | Authentication factor implementations (password, TOTP, HOTP) |
+| `axess-macros` | Procedural macros for route-level authentication guards |
+| `examples/sqlite` | Reference SQLite + tower-sessions example application |
+
+---
+
+## Key capabilities
+
+- **Multi-factor authentication** — sequential factor verification (password → TOTP → HOTP → email OTP); factors are composable into methods, methods are scoped per tenant or per user
+- **Cedar Policy authorization** — RBAC, ABAC, and ReBAC from a single policy language; fail-closed by default
+- **Session lifecycle management** — session ID cycling on authentication (prevents fixation), registry-based forced logout per user or tenant, hash-bound session validation
+- **Multi-tenancy** — three-tier scope hierarchy: Global → Tenant → User; factor and method configuration can vary at each level
+- **Extensible backends** — implement `AuthnBackend` to connect any database or identity provider
+- **Deterministic simulation testing** — injectable `SecureRng` and `Clock` traits; `MockBackend`, `MockRng`, and `MockRegistry` included for reproducible unit tests
+- **Audit logging** — all authentication state transitions emit structured `AuthEventRecord` entries via the backend trait
+
+---
+
+## Installation
+
+Axess is not yet published to crates.io. Add it as a path or git dependency:
+
 ```toml
 [dependencies]
-axess = { version = "0.0.13", features = ["full"] }
-```
-2. Define your Cedar policies if interested in authorization. This is a feature protected by feature toggle `authz` (part of the `default` configuration).
-3. Configure authentication and authorization middleware.
-4. Secure your Axum routes.
+axess = { path = "../axess" }
 
-## 🤸 Example Usage
-Create a minimal Axum web application project and initiate the axess layers of interest from some backend storage and session cache of your choice. The router layers then provide session based authentication for your services:
+# or, once published:
+# axess = { version = "0.1", features = ["authn", "authz"] }
+```
+
+### Feature flags
+
+| Feature | What it enables | Default |
+|---|---|---|
+| `authn` | Authentication layer, extractors, session middleware | yes |
+| `authz` | Cedar Policy authorization, `PolicyStore`, entity builders | yes |
+| `admin` | Admin backend trait + handlers (user/tenant management) | no |
+| `request_id` | UUID-based request ID injected into response headers | no |
+| `trace_id` | OpenTelemetry span ID propagation via headers | no |
+| `memory` | In-memory session registry (dev/test) | no |
+| `valkey` | Valkey/Redis-compatible encrypted session backend | no |
+| `full` | All of the above | no |
+
+---
+
+## Quick start
+
 ```rust
 use axess::{AuthnServiceBuilder, AuthSession, SessionRegistryStore, SystemRng, login_required};
 use axum::{Router, routing::get};
+use tower_sessions::SessionManagerLayer;
 use tower_sessions_sqlx_store::SqliteStore;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use crate::{
-    handlers::{protected_handler, login_handler, logout_handler, hello_world, // Your route handlers
-    models::OurBackend, // Your custom backend implementation, handling interactions with the database
-};
 
+// Type alias — avoids repeating the three type parameters everywhere.
 type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
 
-// Create backend and session store
-let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-let backend = Arc::new(OurBackend::new(pool.clone()));
-let session_store = SqliteStore::new(pool.clone());
-let registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let pool = SqlitePool::connect("sqlite:app.db").await?;
 
-// Build the authentication layer
-let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
-    .with_session_registry(registry.clone())
-    .build();
+    // Session store (tower-sessions) + registry (axess invalidation layer).
+    let session_store = SqliteStore::new(pool.clone());
+    let session_layer = SessionManagerLayer::new(session_store.clone());
+    let registry = Arc::new(SessionRegistryStore::new(session_store, 3600, None, None));
 
+    // Your backend: connects to the DB, validates credentials, manages factor state.
+    let backend = Arc::new(OurBackend::new(pool));
 
-// Protected routes require authentication
-let protected_router = Router::new()
-    .route("/main", get(protected_handler))
-    .route_layer(login_required!(Arc<Session>, "/login"));
+    let auth_layer = AuthnServiceBuilder::new(backend, session_layer)
+        .with_session_registry(registry)
+        .build();
 
-// Auth routes (login/logout) may need backend state
-let public_router = Router::new()
-    .route("/", get(hello_world))
-    .route("/login", get(login_handler))
-    .route("/logout", get(logout_handler));
+    // Protected routes — unauthenticated requests redirect to /login.
+    let protected = Router::new()
+        .route("/dashboard", get(dashboard_handler))
+        .route_layer(login_required!(Arc<Session>, "/login"));
 
-// Assemble the router
-let app = Router::new()
-    .merge(protected_router)
-    .merge(public_router)
-    .layer(auth_layer);
+    let public = Router::new()
+        .route("/", get(index_handler))
+        .route("/login", get(login_page).post(login_submit))
+        .route("/logout", get(logout_handler));
 
-// Start serving the application.
-let address = "127.0.0.1:3000".parse()?;
-let listener = TcpListener::bind(address).await?;
-axum::serve(listener, app_router.into_make_service()).await?;
+    let app = Router::new()
+        .merge(protected)
+        .merge(public)
+        .layer(auth_layer);
+
+    axum::serve(TcpListener::bind("0.0.0.0:3000").await?, app).await?;
+    Ok(())
+}
 ```
 
-## ☑️ Features
-- `authn`: Enable **Authentication** layer and related extractors.
-- `authz`: Enable **Authorization** layer via Cedar Policy.
-- `admin`: Enable **administrative** some additional capabilities for managing users, tenants and various authentication parameters.
-- `request_id`: Enable addition of **Request ID** into headers.
-- `trace_id`: Enables helpers related to **Tracing ID** and tracing.
-- `memory`: Enables **in-memory** session and storage backends for development and testing.
-- `valkey`: Enables support for **Valkey** (Redis-compatible) session and storage backends.
+See [`examples/sqlite`](examples/sqlite/) for a complete working example including backend implementation, factor setup, and route handlers.
 
-## 🗂 Project Structure
+---
 
-- `axess/` — Main library and middleware
-- `axess-core/` — Core types, traits, and utilities
-- `axess-factors/` — Factor implementations (password, TOTP, HOTP)
-- `axess-macros/` — Procedural macros for Axum integration
-- `examples/` — Example Axum applications
+## Authentication
 
-## 🔗 Quick Links
+### Core concepts
 
-- [axess-core](./axess-core)
-- [axess-factors](./axess-factors)
-- [axess-macros](./axess-macros)
-- [Examples](./examples)
+**Authentication method** — a named, ordered sequence of factors that a user must complete. A method belongs to a scope (global, tenant, or user).
 
-## 📚 Documentation
+**Factor** — a single verification step. Supported kinds:
 
-- [API Docs](https://docs.rs/axess)
-- [Examples](examples/) 
-- [Cedar Policy Language](https://cedarpolicy.com/)
+| Kind | Crate | Notes |
+|---|---|---|
+| `Password` | `password-auth` (argon2) | Constant-time verification |
+| `Totp` | `totp-rs` | RFC 6238; configurable period and window |
+| `Hotp` | `libreauth` | RFC 4226; counter-based, constant-time |
+| `EmailOtp` | _(application-provided)_ | Code generation/delivery is application-specific |
 
-### Authentication Flow:
+**Session state machine** — the `AuthState` enum models the session lifecycle:
+
+```
+NotAuthenticated → PartialAuthn → Authenticated
+                                  ↓ (if post-auth workflow required)
+                              PendingWorkflow
+```
+
+`PartialAuthn` tracks which factors remain, attempt counts, and last attempt timestamps. State transitions are validated before any mutation — invalid transitions return `AuthError`.
+
+### Security properties
+
+- **Session fixation protection** — session ID is cycled immediately after all factors pass; the old ID is invalidated in the registry before the new one is committed.
+- **Replay protection** — session state is bound to a SHA-256 hash; any tampering or replay of an old session token is detected.
+- **Exponential lockout** — configurable attempt limit per factor; exceeding it invalidates the session and applies a back-off record via the backend.
+- **TOTP replay protection** — the last-used time step is stored and enforced; the same OTP cannot be reused within its validity window.
+- **Constant-time comparisons** — HOTP verification uses `subtle::ConstantTimeEq`; password verification delegates to `password-auth` which uses constant-time argon2 comparison.
+- **Audit trail** — every state transition emits a structured `AuthEventRecord` (event type, factor kind, success/failure, timestamps) via `AuthnBackend::log_event`.
+
+### Implementing `AuthnBackend`
+
+Your backend is the bridge between Axess and your data layer. It must implement:
+
+```rust
+#[async_trait]
+impl AuthnBackend for MyBackend {
+    type TenantId = Uuid;
+    type UserId = Uuid;
+    type AuthId = Uuid;  // identifies a specific factor/method instance
+
+    // Resolve tenant and user from a login credential identifier
+    async fn get_tenant(&self, id: &Self::TenantId) -> Result<Option<Tenant>, ...>;
+    async fn get_user(&self, id: &Self::UserId) -> Result<Option<User>, ...>;
+    async fn get_user_by_identifier(&self, credential: &str) -> Result<Option<User>, ...>;
+
+    // Factor and method state queries (scope-aware)
+    async fn get_factor_state(&self, scope: AuthnScope<...>, kind: Kind) -> Result<...>;
+    async fn get_method_for_scope(&self, scope: AuthnScope<...>) -> Result<...>;
+
+    // Persist factor configuration after setup
+    async fn upsert_factor_state(&self, ...) -> Result<...>;
+
+    // Audit
+    async fn log_event(&self, record: AuthEventRecord<...>) -> Result<...>;
+}
+```
+
+See [`axess-core/src/authn/backend.rs`](axess-core/src/authn/backend.rs) for the full trait definition and [`examples/sqlite/src/models`](examples/sqlite/src/models/) for a complete SQLite implementation.
+
+---
+
+## Authorization
+
+Authorization uses [Cedar Policy](https://cedarpolicy.com/) — a policy language that natively supports RBAC, ABAC, and ReBAC. Axess provides the evaluation plumbing; you author the policies.
+
+### Setup
+
+```rust
+use axess::authorization::{PolicyStore, AuthzRequest, require, role_uid, user_uid, action_uid};
+
+// Load once at startup — Arc<PolicyStore> is Send + Sync.
+let policy_store = Arc::new(PolicyStore::from_text(
+    include_str!("policies/app.cedar"),
+    include_str!("policies/app.cedar.json"),  // JSON schema
+)?);
+```
+
+### Checking a permission
+
+```rust
+async fn my_handler(
+    State(store): State<Arc<PolicyStore>>,
+    State(db): State<SqlitePool>,
+    session: Session,
+) -> Result<impl IntoResponse, AppError> {
+    // Build the Cedar entity set for this request
+    let entities = build_entities_for_ledger(&db, user_id, tenant_id, ledger_id).await?;
+
+    // Fail-closed: any error or policy deny → 403
+    require(&store, entities, &AuthzRequest {
+        principal: user_uid(user_id)?,
+        action:    action_uid("ViewLedger")?,
+        resource:  ledger_uid(ledger_id)?,
+    })?;
+
+    // ...handler body
+}
+```
+
+### Policy model
+
+Axess provides entity UID builder functions for common types (`user_uid`, `role_uid`, `ledger_uid`, `document_uid`, `platform_uid`, `action_uid`). The Cedar namespace is currently `"Ekekrantz"` — making this configurable is on the roadmap.
+
+Entity attributes carry the data needed by your policies:
+
+```cedar
+// RBAC: role membership
+permit (
+    principal in Ekekrantz::Role::"finance-viewer",
+    action == Ekekrantz::Action::"ViewLedger",
+    resource is Ekekrantz::Ledger
+) when { principal.tenant == resource.tenant };
+
+// ReBAC: ownership
+permit (
+    principal is Ekekrantz::User,
+    action in [Ekekrantz::Action::"ViewLedger", Ekekrantz::Action::"PostEntry"],
+    resource is Ekekrantz::Ledger
+) when {
+    principal.tenant == resource.tenant &&
+    resource has owner && resource.owner == principal
+};
+```
+
+---
+
+## Testing
+
+Axess is designed for deterministic, reproducible tests via injectable abstractions:
+
+```rust
+use axess_core::utils::testing::mock_random::MockRng;
+use axess_core::utils::testing::mock_backend::MockBackend;
+
+let rng = MockRng::new(42);          // deterministic randomness
+let backend = Arc::new(MockBackend::new());
+let registry = Arc::new(MockRegistry::new());
+
+let session = AuthSession::new(backend, registry, rng, /* ... */);
+```
+
+`MockRng::new(seed)` produces identical byte sequences for the same seed, ensuring session hash generation and nonce creation are reproducible across test runs. `MockBackend` is an in-memory store with the full `AuthnBackend` interface.
+
+---
+
+## Macros
+
+Three procedural macros are available from `axess-macros`:
+
+```rust
+// Redirect unauthenticated requests to /login with ?next= set
+.route_layer(login_required!(Arc<Session>, "/login"))
+
+// Restrict to sessions in the PartialAuthn state (mid-MFA)
+.route_layer(require_partial_authn!(Arc<Session>, "/login"))
+
+// Restrict by arbitrary async predicate; return 401 or redirect
+.route_layer(predicate_required!(Arc<Session>, my_async_predicate, "/forbidden"))
+```
+
+---
+
+## Authentication flow
 
 ```mermaid
 ---
@@ -178,7 +375,7 @@ flowchart LR
         SetupMoreFactors -->|No| RedirectToVerify
     end
 
-    subgraph Signup [ User Signup Flow - Not Yet Implemented ]
+    subgraph Signup [ User Signup Flow — Not Yet Implemented ]
         direction LR
         SignupForm -->|Submit Form| AttemptCreateUserAccount(Create</br>New User Account</br>in Backend)
         AttemptCreateUserAccount -->|Failed| SignupForm
@@ -199,27 +396,35 @@ classDef failure stroke:#ffa0a0,stroke-width:3px,color:#ffa0a0;
 classDef process align:left;
 ```
 
-## 📃 License
-Licensed under the [MIT License](./LICENSE).
+---
 
-## 🛡️ Security
+## Known limitations
 
-Axess is designed for secure authentication and authorization in web applications.  
-If you discover a security vulnerability, please report it responsibly:
-
-- **Reporting:**  
-  Please email security@gnomes.ch or open a private issue on GitHub.
-- **Best Practices:**  
-  - Always use HTTPS in production.
-  - Keep dependencies up to date.
-  - Review your Cedar policies and backend configuration for least privilege.
-- **Caveats:**  
-  - Axess is provided as-is; review and test before deploying to production.
-  - Multi-factor authentication is recommended for sensitive applications.
-  - Session and credential storage should be secured according to your threat model.
-
-For more details, see [SECURITY.md](./SECURITY.md).
+- **Cedar namespace is hardcoded** to `"Ekekrantz"` in `axess-core/src/authz.rs`. Applications using the entity UID builders must use this namespace. A configurable namespace is planned.
+- **Valkey backend** (`feature = "valkey"`) — the AES-256-GCM encrypted session store is partially implemented. Do not use in production until complete.
+- **In-memory session store** (`feature = "memory"`) — stub only; not yet functional. Use `MockRegistry` for testing instead.
+- **Signup flow** — the flow is documented and modelled in the state machine but not yet implemented in the library itself.
+- **WebAuthn / passkeys** — modelled as a future `Kind` variant but not implemented.
+- **Session expiry** — currently a module-level constant (3600 s). Will become a configuration parameter.
+- **Application-specific roles** — `SYSTEM_ROLES` and individual role name constants belong in the consuming application, not in this library. The library provides infrastructure only; role taxonomy is the application's responsibility.
 
 ---
 
-*Axess: Secure, policy-driven authentication and authorization for Axum.*
+## Security
+
+- No `unsafe` code (`#![forbid(unsafe_code)]` enforced across all crates).
+- All cryptographic operations delegate to audited crates (`password-auth`, `totp-rs`, `libreauth`, `aes-gcm`).
+- Constant-time comparisons used throughout factor verification.
+- Cedar Policy is deny-by-default: any evaluation error produces `Deny`.
+
+**Reporting vulnerabilities:** email security@gnomes.ch or open a private GitHub issue.
+
+Please review Cedar policies and backend configuration for least-privilege before deploying. MFA is strongly recommended for any application handling sensitive data.
+
+See [SECURITY.md](./SECURITY.md) for the full disclosure policy.
+
+---
+
+## License
+
+[MIT](./LICENSE) — Gnomes, 2024–2025.

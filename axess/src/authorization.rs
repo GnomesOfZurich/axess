@@ -3,7 +3,7 @@ use axum::response::{IntoResponse, Response};
 use cedar_policy::Entities;
 
 pub use axess_core::authz::{
-    AuthzDecision, AuthzError, AuthzRequest, PolicyStore, SYSTEM_ROLES, action_uid, document_uid,
+    AuthzDecision, AuthzError, AuthzRequest, PolicyStore, action_uid, document_uid,
     ledger_uid, platform_uid, role_uid, user_uid,
 };
 
