@@ -3,14 +3,11 @@ use chrono::{DateTime, Utc};
 use serde_json;
 use sqlx::{Error as SqlxError, FromRow, Row, SqlitePool};
 use std::time::SystemTime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use axess::{
-    AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorState,
-    AuthMethod, AuthMethodState, AuthnAdminBackend, AuthnBackend, AuthnScope, EnablementState,
-    EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, Kind, MethodStateChange,
-    TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp,
+    Action, AuthError, AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthUser, AuthnAdminBackend, AuthnBackend, AuthnScope, EnablementState, EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, Kind, MethodStateChange, TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp
 };
 
 use crate::models::{
@@ -115,12 +112,13 @@ where
 // Implement the AuthnBackend trait for OurBackend to define the associated types.
 #[async_trait]
 impl AuthnBackend for OurBackend {
+    
     type User = OurUser;
     type UserId = Uuid;
     type Tenant = OurTenant;
     type TenantId = Uuid;
     type AuthId = Uuid;
-    type Error = sqlx::Error;
+    type Error = SqlxError;
 
     async fn get_default_protected_route(
         &self,
@@ -214,6 +212,71 @@ impl AuthnBackend for OurBackend {
 
         let super_user = self.get_user_by_name(&tenant_id, &username).await?;
         Ok(super_user.id)
+    }
+
+    /// Creates a new user in the backend using a FactorForm.
+    async fn create_new_user<F>(&self, form: &F) -> Result<Self::User, Self::Error>
+    where
+        F: FactorForm + Send + Sync,
+    {
+        let mut conn = self.db.acquire().await?;
+        let now = Utc::now();
+        let user_id = Uuid::new_v4();
+
+        // Extract tenant_id, username, and creator_id from the form
+        let tenant_id = if let Some(t) = form.get_string_field(FormField::TenantName) {
+            Uuid::parse_str(&t).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "tenant".into(),
+                source: Box::new(e),
+            })?
+        } else {
+            self.get_default_tenant_id().await?
+        };
+
+        let username = form
+            .get_string_field(FormField::UserName)
+            .unwrap_or_default();
+
+        // No CreatedBy field in FormField, so use Uuid::nil() as the creator_id by default
+        let creator_id = Uuid::nil();
+
+        let user = OurUser {
+            id: user_id,
+            tenant_id,
+            username: username.to_string(),
+            fullname: "".to_string(),
+            email: "".to_string(),
+            state: EntityState::Active,
+            created_at: now,
+            created_by: creator_id,
+            updated_at: now,
+            updated_by: creator_id,
+        };
+        let row = sqlx::query(
+            r#"
+            INSERT INTO users (
+                id, tenant_id, username, fullname, email, state,
+                created_at, created_by, updated_at, updated_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id, tenant_id, username, fullname, email, state,
+                    created_at, created_by, updated_at, updated_by, version
+            "#,
+        )
+        .bind(user.id.to_string())
+        .bind(user.tenant_id.to_string())
+        .bind(&user.username)
+        .bind(&user.fullname)
+        .bind(&user.email)
+        .bind(format!("{:?}", user.state))
+        .bind(now.to_rfc3339())
+        .bind(creator_id.to_string())
+        .bind(now.to_rfc3339())
+        .bind(creator_id.to_string())
+        .fetch_one(&mut *conn)
+        .await?;
+
+        OurUser::from_row(&row)
     }
 
     /// Set the state of a user (e.g., Active, Inactive, Suspended).
@@ -1123,94 +1186,127 @@ impl AuthnBackend for OurBackend {
     }
 
     /// Authenticates a user using the provided credentials form.
-    async fn authenticate<'a, F>(&self, form: &'a F) -> Result<Self::User, Self::Error>
+    async fn authenticate<'a, F>(&self, form: &'a F) -> Result<Self::User, AuthError<Self>>
     where
         F: FactorForm + Send + Sync,
     {
-        let factor_kind = form.kind();
-
-        // 1. Resolve tenant and username from the typed helpers
-        let tenant_id = if let Some(t) = form.get_string_field(FormField::TenantName) {
-            Uuid::parse_str(&t).map_err(|e| sqlx::Error::ColumnDecode {
-                index: "tenant".into(),
-                source: Box::new(e),
-            })?
-        } else {
-            // prefer explicit backend default rather than Uuid::nil()
-            self.get_default_tenant_id().await?
-        };
-
-        // 3. Lookup user by tenant and username
-        let username = form
-            .get_string_field(FormField::Username)
-            .unwrap_or_default();
-        let mut conn = self.db.acquire().await?;
-        let row = sqlx::query("SELECT * FROM users WHERE tenant_id = ? AND username = ?")
-            .bind(tenant_id.to_string())
-            .bind(username)
-            .fetch_one(&mut *conn)
-            .await?;
-
-        let user = OurUser::from_row(&row)?;
-
-        // 4. Check user state
-        if user.state != EntityState::Active {
-            return Err(sqlx::Error::Decode(
-                format!("User account is not active (state: {:?})", user.state).into(),
-            ));
+        // 1. Validate form and action
+        if form.validate_form().is_err() {
+            return Err(AuthError::UnexpectedFormContent);
+        } else if form.action() != Action::Verify {
+            return Err(AuthError::UnexpectedFormAction);
         }
 
-        // 4. Lookup factors for this user using the backend's scoped factor lookup
-        let factor_name = form
-            .get_string_field(FormField::FactorName)
-            .ok_or_else(|| sqlx::Error::ColumnDecode {
-                index: "factor_name".into(),
-                source: Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Missing factor name in authentication form",
-                )),
-            })?;
+        // 2. Get tenant ID from form
+        let tenant_id = match form.get_string_field(FormField::TenantName) {
+            Some(name) => {
+                self.get_tenant_by_name(&name.to_string())
+                    .await
+                    .map_err(|_| AuthError::<Self>::TenantNotFound)
+                    .unwrap()
+                    .id
+            }
+            None => {
+                // If no tenant name is provided, fall back to the backend's default tenant ID
+                debug!("No tenant name provided in form; using default tenant ID");
+                self.get_default_tenant_id()
+                    .await
+                    .map_err(|_| AuthError::<Self>::TenantNotFound)?
+            }
+        };
+
+        // 3. Lookup user by username and tenant ID
+        let user = match form.get_string_field(FormField::UserName) {
+            Some(name) => self
+                .get_user_by_name(&tenant_id, &name.to_string())
+                .await
+                .map_err(|_| {
+                    info!("User not found: {} in tenant {}", name, tenant_id);
+                    return AuthError::<Self>::UserNotFound;
+                })
+                .unwrap(),
+            None => return Err(AuthError::<Self>::UserNotFound),
+        };
+
+        // 4. Check user state and return appropriate error if user is deactivated
+        let user_state = user.get_user_state();
+        if !user_state.is_deactivated() {
+            info!("User {} is {:?}", user.id, user_state);
+            return Err(AuthError::UserDeactivated(Box::new(user_state)));
+        } 
+
+        // 4. Lookup factor name from form
+        let factor_name = match form.get_string_field(FormField::FactorName) {
+            Some(name) => name,
+            None => {
+                error!("Missing factor name in authentication form");
+                return Err(AuthError::UnexpectedFormContent.into());
+            }
+        };
+
+        // 5. Get factor from backend, filtered on user, tenant and active state
         let scope = AuthnScope::User(tenant_id, user.id);
         let status_filter = vec![EnablementState::Active];
-        let factor = self
-            .get_auth_factor_by_name(&factor_name, scope, status_filter)
-            .await?;
+        let factor = match self.get_auth_factor_by_name(
+            &factor_name,
+            scope,
+            status_filter
+        ).await {
+            Ok(factor) => factor,
+            Err(sqlx::Error::RowNotFound) => {
+                error!("Authentication factor '{}' not found for user {} in tenant {}", factor_name, user.id, tenant_id);
+                return Err(AuthError::<Self>::FactorNotFound);
+            }
+            Err(e) => {
+                error!("Error retrieving authentication factor '{}': {:?}", factor_name, e);
+                return Err(AuthError::<Self>::BackendError(SqlxError::from(e)));
+            }
+        };
 
-        // 6. Lookup factor state for this factor
-        let factor_state_row = sqlx::query("SELECT * FROM factor_states WHERE factor_id = ? AND tenant_id = ? AND user_id = ? AND state = ?")
-            .bind(factor.id.to_string())
-            .bind(tenant_id.to_string())
-            .bind(user.id.to_string())
-            .bind("Active")
-            .fetch_one(&mut *conn)
-            .await?;
-
-        let factor_state = OurAuthFactorState::from_row(&factor_state_row)?;
+        // 6. Get factor state for user and tenant
+        let factor_states = self
+            .get_factor_states(
+                &factor.id,
+                scope,
+            )
+            .await
+            .map_err(|e| {
+                error!("Error retrieving factor state for factor '{}': {:?}", factor_name, e);
+                AuthError::<Self>::BackendError(SqlxError::from(e))
+            })?;
+        
+        let factor_state = if factor_states.is_empty() {
+            error!("No factor state found for factor '{}' and user {} at tenant {}", factor_name, user.id, tenant_id);
+            return Err(AuthError::<Self>::FactorStateNotFound);
+        } else if factor_states.len() == 1 {
+            factor_states.into_iter().next().unwrap()
+        } else {
+            // Multiple factor states should not be found for a scoped user, if so, then something has gone wrong in the database.
+            error!("Multiple factor states found for factor '{}' and user {} at tenant {}", factor_name, user.id, tenant_id);
+            return Err(AuthError::<Self>::FactorStateNotFound);
+        };
 
         // 7. Verify credentials according to factor kind
-        match factor_kind {
+        match factor.get_kind() {
             Kind::Password => {
                 let password_hash = factor_state
-                    .0
-                    .config
-                    .get("password_hash")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| sqlx::Error::ColumnDecode {
-                        index: "factor_state".into(),
-                        source: Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Missing password hash in factor state",
-                        )),
+                    .get_config_value("password_hash")
+                    .and_then(|hash_json| hash_json.as_str())
+                    .ok_or_else(|| {
+                        warn!("Missing or invalid password_hash in factor state config for factor '{}'", factor_name);
+                        AuthError::UnexpectedAuthConfig(
+                            "Missing or invalid password_hash in factor state config".to_string(),
+                        )
                     })?;
                 // prefer the generic credential() accessor for primary auth values
-                let password = form.credential().unwrap_or("");
+                let password = form.credential().ok_or(AuthError::UnexpectedFormContent)?;
                 verify_password(password, password_hash)
-                    .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+                    .map_err(|e| AuthError::InvalidCredentials)?;
                 Ok(user)
-            }
+            },
             Kind::Totp => {
                 let factor_config = &factor_state.0.config;
-                let totp_code = form.credential().unwrap_or("");
+                let totp_code = form.credential().ok_or(AuthError::UnexpectedFormContent)?;
 
                 let totp_secret = factor_config
                     .get("secret")
@@ -1249,16 +1345,54 @@ impl AuthnBackend for OurBackend {
                     Some(future_window),
                 ) {
                     Some(_) => Ok(user),
-                    None => Err(SqlxError::Protocol("Invalid TOTP code".to_string())),
+                    None => Err(AuthError::InvalidCredentials),
                 }
-            }
+            },
+            Kind::Hotp => {
+                let factor_config = &factor_state.0.config;
+                let hotp_code = form.credential().ok_or(AuthError::UnexpectedFormContent)?;
+
+                let hotp_secret = factor_config
+                    .get("secret")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| sqlx::Error::ColumnDecode {
+                        index: "factor_state".into(),
+                        source: Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Missing HOTP secret in factor state",
+                        )),
+                    })?;
+                let hotp_length = factor_config
+                    .get("otp_length")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(TOTP_LENGTH as u64);
+                let counter = factor_config
+                    .get("counter")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0u64);
+                let look_ahead = factor_config
+                    .get("look_ahead")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0u64);
+
+                match verify_hotp(
+                    hotp_secret,
+                    hotp_code,
+                    counter,
+                    Some(hotp_length as usize),
+                    Some(look_ahead),
+                ) {
+                    Some(_) => Ok(user),
+                    None => Err(AuthError::InvalidCredentials),
+                }
+            },
             kind => {
                 // Custom factor kinds are not handled by this backend example.
                 // Return a protocol error indicating the custom kind is unsupported.
-                Err(SqlxError::Protocol(format!(
+                Err(AuthError::BackendError(SqlxError::Protocol(format!(
                     "Custom factor authentication not implemented for kind: {}",
                     kind
-                )))
+                ))))
             }
         }
     }

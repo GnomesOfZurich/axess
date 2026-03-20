@@ -6,6 +6,7 @@ pub const SYSTEM_SUPER_USER_ID: &str = "SYSTEM_SUPER_USER_ID";
 pub const TENANT_SUPER_USER_ID: &str = "TENANT_SUPER_USER_ID";
 pub const DEFAULT_TENANT_NAME: &str = "Default Tenant";
 pub const DEFAULT_TENANT_ID: &str = "DEFAULT_TENANT_ID";
+#[allow(dead_code)] // WIP: used when default-user test fixtures are wired up
 pub const DEFAULT_USER_ID: &str = "DEFAULT_USER_ID";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

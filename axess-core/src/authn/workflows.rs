@@ -44,7 +44,7 @@ pub trait Workflow:
 /// Describes the kind of step in a workflow.
 /// Can be a factor verification, setup, or a custom business step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
-pub enum WorkflowStepKind {
+pub enum StepKind {
     /// Verification or setup of some authentication factor
     FactorAction(Operation),
     /// Custom business logic (e.g., KYC, admin approval).
@@ -55,7 +55,7 @@ pub enum WorkflowStepKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStep {
     /// The kind of step (factor verify, setup, or custom).
-    pub kind: WorkflowStepKind,
+    pub kind: StepKind,
     /// Human-readable description for UI/audit.
     pub description: String,
     /// Whether this step is completed.
@@ -91,8 +91,8 @@ pub struct WorkflowState {
     pub steps: Vec<WorkflowStep>,
     /// Index of the current step.
     pub current_step: usize,
-    /// When the workflow started.
-    pub started_at: DateTime<Utc>,
+    /// When the workflow was initiated.
+    pub initiated_at: DateTime<Utc>,
     /// When the workflow was last updated.
     pub last_updated: DateTime<Utc>,
     /// Whether the workflow is currently blocking access.

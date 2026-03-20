@@ -249,11 +249,11 @@ pub mod post {
         let email_code = Uuid::new_v4().to_string();
 
         // Build workflow steps using axess-core's WorkflowState
-        use axess::{WorkflowState, WorkflowStep, WorkflowStepKind};
+        use axess::{WorkflowState, WorkflowStep, StepKind};
         let workflow = WorkflowState {
             steps: vec![
                 WorkflowStep {
-                    kind: WorkflowStepKind::FactorAction(Operation::new(
+                    kind: StepKind::FactorAction(Operation::new(
                         Kind::EmailOtp,
                         Action::Verify,
                     )), // Email verification
@@ -270,7 +270,7 @@ pub mod post {
                     }),
                 },
                 WorkflowStep {
-                    kind: WorkflowStepKind::FactorAction(Operation::new(Kind::Totp, Action::Setup)), // TOTP setup
+                    kind: StepKind::FactorAction(Operation::new(Kind::Totp, Action::Setup)), // TOTP setup
                     description: "Setup TOTP".to_string(),
                     completed: false,
                     completed_at: None,

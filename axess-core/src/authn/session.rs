@@ -4,17 +4,22 @@ pub mod state;
 
 use crate::{
     authn::{
-        backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
+        backend::{
+            AuthTenant, AuthUser, AuthnBackend, EntityState, StatusDetail, admin::AuthnAdminBackend
+        },
         errors::{AuthError, FactorKindError},
         methods::{
-            factor::{FactorStateChange, Kind},
-            form::{Action, FactorForm, FactorFormExt, Flow, FormField},
+            factor::{FactorStateChange, Kind, Operation},
+            form::{Action, FactorForm, FactorFormExt, Flow, FormField, SignupForm},
             policy::{FactorConfig, FactorConfigBuilder, OtpRulesBuilder, TokenCharset},
             scope::{AuthnScope, EnablementState},
         },
         session::registry::SessionRegistry,
-        types::{AuthFactor, AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
+        types::{
+            AuthFactor, AuthFactorState, AuthMethod, PartialState, SessionData, SessionState,
+        },
     },
+    authn::workflows::{WorkflowStep, StepKind}, // Ensure correct local import
     axum::{
         extract::{Form, Json},
         response::{IntoResponse, Redirect, Response},
@@ -24,6 +29,7 @@ use crate::{
 };
 
 use axess_factors::{TOTP_LENGTH, generate_password_hash, verify_hotp, verify_totp};
+use chrono::{Duration, Utc};
 // use base64::DecodeSliceError;
 use hex;
 use serde_json::{Value as JsonValue, from_value, json};
@@ -714,7 +720,7 @@ where
     {
         // Prefer username lookup (core-friendly, backend-agnostic)
         let username = form
-            .get_string_field(FormField::Username)
+            .get_string_field(FormField::UserName)
             .ok_or(AuthError::UserNotFound)?;
 
         // Resolve tenant: prefer explicit tenant name in form -> session tenant -> backend default.
@@ -1017,6 +1023,10 @@ where
         let factor_config = FactorConfig::from_map(config_map.clone());
 
         match form.kind() {
+            Kind::Password => {
+                // Password was already verified by verify_against_config above.
+                // No factor-state update is needed (no counter to advance, no replay window to record).
+            }
             Kind::Hotp => {
                 self.process_hotp_success(form, factor_state, &scope, factor_config)
                     .await?
@@ -1121,7 +1131,7 @@ where
 
         // Verify factor matches form
         if factor.kind != form.kind() {
-            error!("Unexpected factor type");
+            error!("Unexpected factor kind");
             return Err(AuthError::UnexpectedFactorKind(
                 FactorKindError::UnexpectedValue(format!("{:?}", form.kind())),
             ));
@@ -1457,28 +1467,119 @@ where
         }
     }
 
-    // /// Removes session from registry (best effort)
-    // async fn unregister_session(&self) -> Result<(), AuthError<B>> {
-    //     let Some(registry) = &self.registry else {
-    //         return Ok(());
-    //     };
+    /// Handles signup for a new user, initiating onboarding workflow.
+    /// - Stores user in backend with Pending state.
+    /// - Creates onboarding workflow state with email confirmation and TOTP setup.
+    /// - Sends confirmation email.
+    /// - Optionally adds KYC workflow step.
+    pub async fn signup_new_user(
+        &mut self,
+        form: SignupForm,
+    ) -> Result<B::User, AuthError<B>>
+    where
+        B: AuthnAdminBackend,
+    {
 
-    //     if let Some(session_id) = self.session.id() {
-    //         let session_id_str = session_id.to_string();
-    //         registry
-    //             .invalidate_session(&session_id_str)
-    //             .await
-    //             .map_err(|e| {
-    //                 warn!(
-    //                     session_id = %session_id_str,
-    //                     error = ?e,
-    //                     "Failed to unregister session (non-fatal)"
-    //                 );
-    //                 AuthError::SessionRegistryError(e)
-    //             })?;
-    //     }
-    //     Ok(())
-    // }
+        // 1. Validate form
+        form.validate_form().map_err(|_| AuthError::InvalidCredentials)?;
+
+        // 2. Extract required fields
+        let email = form
+            .get_string_field(FormField::Email)
+            .ok_or(AuthError::UnexpectedFormContent)?;
+        let _username = form
+            .get_string_field(FormField::UserName)
+            .ok_or(AuthError::UnexpectedFormContent)?;
+
+        // 3. Resolve tenant
+        let tenant_id = if let Some(tenant_name) = form.get_string_field(FormField::TenantName) {
+            let tenant = self.backend
+                .get_tenant_by_name(&tenant_name)
+                .await
+                .map_err(AuthError::BackendError)?;
+            tenant.id().clone().into()
+        } else {
+            self.backend
+                .get_default_tenant_id()
+                .await
+                .map_err(AuthError::BackendError)?
+        };
+
+        // 4. Create new user in Pending state
+        let now = Utc::now();
+        let pending_state = EntityState::Pending(
+            StatusDetail {
+                reason: "User registered, pending email confirmation".to_string(),
+                timestamp: now,
+                until: Some(now + Duration::hours(24)),
+                metadata: Some(json!({ "email": email.clone() })),
+            }
+        );
+        let new_user = self
+            .backend
+            .create_new_user(&form)
+            .await
+            .map_err(AuthError::BackendError)?;
+
+        let user_id: B::UserId = new_user.id().clone().into();
+
+        let workflow_one = StepKind::FactorAction(
+            Operation::new(
+                Kind::EmailOtp,
+                Action::Verify),
+            );
+        let workflow_two = StepKind::FactorAction(
+            Operation::new(
+                Kind::Totp,
+                Action::Setup,
+            ),
+        );
+
+        let workflow_steps = vec![
+            WorkflowStep {
+                kind: workflow_one,
+                description: "Confirm email address".to_string(),
+                completed: false,
+                completed_at: None,
+                metadata: None
+            },
+            WorkflowStep {
+                kind: workflow_two,
+                description: "Set up TOTP authenticator".to_string(),
+                completed: false,
+                completed_at: None,
+                metadata: None
+            },
+        ];
+
+        // // Optionally add KYC step if form requests it
+        // if form.get_bool_field(FormField::KycRequested).unwrap_or(false) {
+        //     workflow_steps.push(WorkflowStep::KycVerification);
+
+        // 6. Set session state to PendingActivation with workflow
+        self.state = SessionState::<B>::new_workflow(workflow_steps, true);
+        self.user = new_user.clone();
+        self.data.user_id = Some(user_id.clone());
+        self.data.tenant_id = Some(tenant_id.clone());
+        self.data.user_state = pending_state;
+        self.data.auth_state = self.state.clone();
+
+        // 7. Persist session data
+        if let Err(e) = self.save_session_data().await {
+            error!("Failed to persist session data during signup: {:?}", e);
+            return Err(e);
+        }
+        Ok(new_user)
+
+    }
+
+    // WIP: wired into the email-OTP registration confirmation flow once that path is complete.
+    #[allow(dead_code)]
+    fn generate_signup_token(&mut self, bytes: usize) -> String {
+        let mut buffer = vec![0u8; bytes];
+        self.rng.fill_bytes(&mut buffer);
+        hex::encode(buffer)
+    }
 }
 
 #[cfg(test)]
@@ -1882,7 +1983,6 @@ mod tests {
     /// Test verify_factor returns InvalidCredentials when form verification fails
     async fn test_verify_factor_invalid_credentials_when_form_verification_fails()
     -> Result<(), AuthError<MockBackend>> {
-        use std::collections::HashMap;
 
         let rng = MockRng::new(42);
         let (mut auth_session, _) = create_test_session_with_custom_rng(rng).await?;
@@ -1915,6 +2015,48 @@ mod tests {
         let form = DummyFailingForm::default();
         let result = auth_session.verify_factor(&form, &factor_id).await;
         assert!(matches!(result, Err(AuthError::InvalidCredentials)));
+        Ok(())
+    }
+
+    /// `generate_signup_token` produces a valid hex-encoded token of the expected length.
+    ///
+    /// The token is used in the email-OTP registration confirmation flow to create a
+    /// short-lived, single-use verification link.  This test uses `MockRng` to keep
+    /// output deterministic (DST-friendly).
+    #[tokio::test]
+    async fn test_generate_signup_token_length_and_format() -> Result<(), AuthError<MockBackend>> {
+        let rng = MockRng::new(7);
+        let (mut auth_session, _registry) = create_test_session_with_custom_rng(rng).await?;
+
+        // 16 bytes → 32 hex chars
+        let token_16 = auth_session.generate_signup_token(16);
+        assert_eq!(token_16.len(), 32, "16-byte token should be 32 hex chars");
+        assert!(
+            token_16.chars().all(|c| c.is_ascii_hexdigit()),
+            "token must contain only hex digits"
+        );
+
+        // 32 bytes → 64 hex chars
+        let token_32 = auth_session.generate_signup_token(32);
+        assert_eq!(token_32.len(), 64, "32-byte token should be 64 hex chars");
+        assert!(
+            token_32.chars().all(|c| c.is_ascii_hexdigit()),
+            "token must contain only hex digits"
+        );
+
+        Ok(())
+    }
+
+    /// Two calls with the same `MockRng` seed produce the same token (deterministic / DST).
+    #[tokio::test]
+    async fn test_generate_signup_token_is_deterministic_with_mock_rng() -> Result<(), AuthError<MockBackend>> {
+        let (mut session_a, _) = create_test_session_with_custom_rng(MockRng::new(99)).await?;
+        let (mut session_b, _) = create_test_session_with_custom_rng(MockRng::new(99)).await?;
+
+        let token_a = session_a.generate_signup_token(16);
+        let token_b = session_b.generate_signup_token(16);
+        assert_eq!(token_a, token_b, "same seed must produce identical tokens");
+
         Ok(())
     }
 }

@@ -32,29 +32,26 @@
 use crate::authn::backend::admin::AuthnAdminBackend;
 use crate::{
     authn::{
-        backend::{AuthTenant, AuthnBackend, EntityState},
-        methods::{
+        backend::{AuthTenant, AuthUser, AuthnBackend, EntityState}, errors::AuthError, methods::{
             MethodStateChange,
             factor::FactorStateChange,
-            form::FactorForm,
+            form::{FactorForm, FactorFormExt, FormField, Action},
             scope::{AuthnScope, EnablementState},
-        },
-        session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
-        types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState}, // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
+        }, session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType}, types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState} // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
     },
     utils::testing::{
         mock_authn::{MockAuthFactor, MockAuthFactorState, MockAuthMethod, MockAuthMethodState},
         mock_entities::{
-            DEFAULT_TENANT_ID, DEFAULT_USER_ID, MockTenant, MockUser, SYSTEM_SUPER_USER_ID,
+            DEFAULT_TENANT_ID, MockTenant, MockUser, SYSTEM_SUPER_USER_ID,
             TENANT_SUPER_USER_ID, TestTenantId, TestUserId,
         },
-        mock_form::DummyFailingForm,
     },
 };
 
 use async_trait::async_trait;
 use chrono::Utc;
 use dashmap::DashMap;
+use tracing::{debug, info};
 // use serde::{Deserialize, Serialize};
 // use std::{fmt::Debug, hash::Hash};
 use std::fmt::Debug;
@@ -253,6 +250,44 @@ impl AuthnBackend for MockBackend {
             Some(_) => Err(MockBackendError::NotFound("User not found".to_string())),
             None => Ok(TestUserId(SYSTEM_SUPER_USER_ID.to_string())),
         }
+    }
+
+    async fn create_new_user<F>(
+        &self,
+        form: &F,
+    ) -> Result<Self::User, Self::Error>
+    where
+        F: crate::authn::methods::form::FactorForm + Send + Sync,
+    {
+        if form.validate_form().is_err() {
+            return Err(MockBackendError::Other(
+                "Form validation failed".to_string(),
+            ));
+        }
+        // For the mock, generate a user from the form (if possible) or use defaults
+        let fields = form.fields();
+        let tenant_name: String = fields
+            .get(&FormField::TenantName)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| MockTenant::default().name());
+        let tenant_id = self.get_tenant_by_name(&tenant_name).await?.id();
+        let user_name: String = form
+            .fields()
+            .get(&FormField::UserName)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| MockUser::default().id.0.clone());
+        let user = self.get_user_by_name(&tenant_id, &user_name).await?;
+        let user_id = user.id();
+        let state = EntityState::Active;
+        let user = MockUser {
+            id: user_id.clone(),
+            tenant_id: tenant_id.clone(),
+            state,
+        };
+        self.users.insert(user_id.clone(), user.clone());
+        Ok(user)
     }
 
     async fn set_user_state(
@@ -744,46 +779,63 @@ impl AuthnBackend for MockBackend {
         Ok(())
     }
 
-    async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
+    async fn authenticate<'a, F>(&self, form: &'a F) -> Result<Self::User, AuthError<MockBackend>>
     where
         F: FactorForm + Send + Sync,
     {
-        // If the form is DummyFailingForm, return an error
-        if std::any::type_name_of_val(creds) == std::any::type_name::<DummyFailingForm>() {
-            return Err(MockBackendError::Other("Invalid credentials".to_string()));
+        // 1. Validate form and action
+        if form.validate_form().is_err() {
+            return Err(AuthError::UnexpectedFormContent);
+        } else if form.action() != Action::Verify {
+            return Err(AuthError::UnexpectedFormAction);
         }
 
-        // If there are no users, or only a guest user, fail authentication
-        let only_guest = self.users.len() == 1
-            && self
-                .users
-                .get(&TestUserId("guest".to_string()))
-                .map(|u| u.state == EntityState::Guest)
-                .unwrap_or(false);
-
-        let no_users = self.users.is_empty();
-
-        if only_guest || no_users {
-            return Err(MockBackendError::Other(
-                "Guest users cannot authenticate".to_string(),
-            ));
-        }
-
-        // If a user with id "guest" exists and is a guest, fail authentication
-        if let Some(user) = self.users.get(&TestUserId("guest".to_string())) {
-            if user.state == EntityState::Guest {
-                return Err(MockBackendError::Other(
-                    "Guest users cannot authenticate".to_string(),
-                ));
+        // 2. Get tenant ID from form
+        let tenant_id = match form.get_string_field(FormField::TenantName) {
+            Some(name) => {
+                self.get_tenant_by_name(&name.to_string())
+                    .await
+                    .map_err(|_| AuthError::<Self>::TenantNotFound)
+                    .unwrap()
+                    .id
             }
+            None => {
+                // If no tenant name is provided, fall back to the backend's default tenant ID
+                debug!("No tenant name provided in form; using default tenant ID");
+                self.get_default_tenant_id()
+                    .await
+                    .map_err(|_| AuthError::<Self>::TenantNotFound)?
+            }
+        };
+
+        // 3. Get user by name from form and together with tenant ID then fetch user from backend
+        let db_user = match form.get_string_field(FormField::UserName) {
+            Some(name) => self
+                .get_user_by_name(&tenant_id, &name.to_string())
+                .await
+                .map_err(|_| {
+                    info!("User not found: {} in tenant {}", name, tenant_id);
+                    return AuthError::<Self>::UserNotFound;
+                })
+                .unwrap(),
+            None => return Err(AuthError::<Self>::UserNotFound),
+        };
+
+        // 4. Check user state and return appropriate error if not active
+        let user_state = db_user.get_user_state();
+        if !user_state.is_deactivated() {
+            info!("User {} is {:?}", db_user.id, user_state);
+            return Err(AuthError::UserDeactivated(Box::new(user_state)));
+        } else if user_state == EntityState::Guest {
+            info!("Guest users cannot authenticate: {}", db_user.id);
+            return Err(AuthError::UnexpectedUserState);
         }
+
+        // 5. For the mock, we currently assume authentication is always successful if we reach this point
+        // TODO: Consider adding a bit more mocking logic for processing of form.
 
         // Otherwise, return a valid user
-        Ok(MockUser {
-            id: DEFAULT_USER_ID.into(),
-            tenant_id: DEFAULT_TENANT_ID.into(),
-            state: EntityState::Active,
-        })
+        Ok(MockUser::default())
     }
 }
 

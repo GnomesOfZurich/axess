@@ -15,14 +15,12 @@ pub mod admin;
 pub mod handlers;
 
 use crate::authn::{
-    methods::{
+    errors::AuthError, methods::{
         MethodStateChange,
         factor::FactorStateChange,
         form::FactorForm,
         scope::{AuthnScope, EnablementState},
-    },
-    session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
-    types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
+    }, session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType}, types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState}
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -252,6 +250,27 @@ impl EntityState {
             None
         }
     }
+
+    pub fn is_deactivated(&self) -> bool {
+        matches!(
+            self,
+            EntityState::Suspended(_) | EntityState::Terminated(_) | EntityState::Archived(_)
+        )
+    }
+}
+
+impl Display for EntityState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntityState::Guest => write!(f, "guest"),
+            EntityState::Candidate => write!(f, "candidate"),
+            EntityState::Pending(_) => write!(f, "pending"),
+            EntityState::Active => write!(f, "active"),
+            EntityState::Suspended(_) => write!(f, "suspended"),
+            EntityState::Terminated(_) => write!(f, "terminated"),
+            EntityState::Archived(_) => write!(f, "archived"),
+        }
+    }
 }
 
 /// Trait for tenant entities in Axess authentication backends.
@@ -473,6 +492,11 @@ where
         tenant_id: Option<&Self::TenantId>,
     ) -> Result<Self::User, Self::Error>;
 
+    /// Registers a new user from a given form.
+    async fn create_new_user<F>(&self, form: &F) -> Result<Self::User, Self::Error>
+    where
+        F: FactorForm;
+
     /// Sets the state of a user (e.g., Active, Suspended, Terminated).
     async fn set_user_state(
         &self,
@@ -613,7 +637,7 @@ where
     ///
     /// This is the main entry point for factor-based authentication flows.
     /// The form is validated and checked against the backend's stored factor state.
-    async fn authenticate<'a, F>(&self, creds: &'a F) -> Result<Self::User, Self::Error>
+    async fn authenticate<'a, F>(&self, form: &'a F) -> Result<Self::User, AuthError<Self>>
     where
         F: FactorForm + Send + Sync;
 }

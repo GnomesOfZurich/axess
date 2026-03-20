@@ -25,7 +25,7 @@ use crate::{
     },
     tracing::{error, warn},
     utils::validation::{
-        is_valid_email, is_valid_name, is_valid_otp_code, is_valid_password, is_valid_url_format,
+        is_valid_country_code, is_valid_email, is_valid_language_code, is_valid_name, is_valid_otp_code, is_valid_password, is_valid_url_format
     },
 };
 use axess_factors::{TOTP_LENGTH, TOTP_PERIOD, verify_hotp, verify_password, verify_totp};
@@ -37,6 +37,7 @@ use std::{borrow::Cow, collections::HashMap, fmt::Debug, time::SystemTime};
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Flow {
+    Workflow,
     Knowledge,
     Otp,
     Crypto,
@@ -54,7 +55,7 @@ pub enum Action {
 /// Type-safe field identifiers for factor forms
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FormField {
-    Username,
+    UserName,
     Password,
     TenantName,
     FactorName,
@@ -76,7 +77,7 @@ pub enum FormField {
 impl FormField {
     pub const fn as_str(&self) -> &'static str {
         match self {
-            FormField::Username => "username",
+            FormField::UserName => "username",
             FormField::Password => "password",
             FormField::TenantName => "tenant",
             FormField::FactorName => "factor",
@@ -180,7 +181,7 @@ pub trait FactorForm: Send + Sync + Debug + for<'de> Deserialize<'de> {
     /// Get the authentication credential from the form, if applicable (password, TOTP code, etc.).
     fn credential(&self) -> Option<&str>;
 
-    /// Verify credentials against the factor's stored configuration (e.g., password or TOTP secret).
+    /// Verify the form's credentials against the configuration as stored on the relevant factor state
     fn verify_against_config(
         &self,
         config: &HashMap<String, JsonValue>,
@@ -215,6 +216,13 @@ pub trait FactorFormExt: FactorForm {
     fn get_json_field(&self, field: FormField) -> Option<JsonValue> {
         match self.fields().get(&field)? {
             FormFieldValue::Json(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    fn get_bool_field(&self, field: FormField) -> Option<bool> {
+        match self.fields().get(&field)? {
+            FormFieldValue::Json(value) => value.as_bool(),
             _ => None,
         }
     }
@@ -491,7 +499,7 @@ impl FactorForm for PasswordVerifyForm {
     fn fields(&self) -> HashMap<FormField, FormFieldValue> {
         let mut map = HashMap::new();
         map.insert(
-            FormField::Username,
+            FormField::UserName,
             FormFieldValue::String(Cow::Owned(self.username.clone())),
         );
         map.insert(
@@ -1733,6 +1741,150 @@ impl std::fmt::Debug for FactorResetForm {
             .field("factor", &self.factor)
             .field("reason", &self.reason.as_ref().map(|_| "***REDACTED***"))
             .field("ticket_id", &self.ticket_id)
+            .finish()
+    }
+}
+
+#[derive(Clone, Deserialize)]
+pub struct SignupForm {
+    pub tenant: Option<String>,
+    pub username: String,
+    pub fullname: String,
+    pub email: String,
+    pub domicile: Option<String>,  // iso_3 country code
+    pub language: Option<String>,  // language code
+    pub password: String,
+    pub next: Option<String>,
+}
+
+impl FactorForm for SignupForm {
+    fn flow(&self) -> Flow {
+        Flow::Workflow
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Workflow
+    }
+
+    fn action(&self) -> Action {
+        Action::Setup
+    }
+
+    fn validate_form(&self) -> Result<&Self, FormError> {
+        // 1. Validate tenant
+        if let Some(tenant) = &self.tenant && !is_valid_name(tenant) {
+            return Err(FormError::ValidationFailed(
+                "Invalid tenant identifier".to_string(),
+            ));
+        }
+
+        // 2. Validate username (email)
+        if !is_valid_email(&self.username) {
+            return Err(FormError::ValidationFailed(
+                "Invalid email".to_string(),
+            ));
+        }
+
+        // 3. Validate fullname
+        if !is_valid_name(&self.fullname) {
+            return Err(FormError::ValidationFailed(
+                "Invalid fullname".to_string(),
+            ));
+        }
+
+        // 4. Validate email
+        if !is_valid_email(&self.email) {
+            return Err(FormError::ValidationFailed(
+                "Invalid email address".to_string(),
+            ));
+        }
+
+        // 5. Validate domicile
+        if let Some(domicile) = &self.domicile && !is_valid_country_code(domicile) {
+            return Err(FormError::ValidationFailed(
+                "Invalid domicile country code".to_string(),
+            ));
+        }
+
+        // 6. Validate language
+        if let Some(language) = &self.language && !is_valid_language_code(language) {
+            return Err(FormError::ValidationFailed(
+                "Invalid language code".to_string(),
+            ));
+        }
+
+        // 7. Validate password
+        if !&self.password.is_empty() && !is_valid_password(&self.password, &PasswordRules::default()) {
+            return Err(FormError::ValidationFailed(
+                "Invalid password".to_string(),
+            ));
+        }
+
+        // 8. Validate next field
+        if let Some(next) = &self.next && !is_valid_url_format(next) {
+            return Err(FormError::ValidationFailed(
+                "Invalid next URL".to_string(),
+            ));
+        }
+
+        Ok(self)
+    }
+
+    fn credential(&self) -> Option<&str> {
+        Some(&self.email)
+    }
+
+    fn verify_against_config(
+        &self,
+        _config: &HashMap<String, JsonValue>,
+    ) -> Result<&Self, FormError> {
+        self.validate_form()
+    }
+
+    fn fields(&self) -> HashMap<FormField, FormFieldValue> {
+        let mut map = HashMap::new();
+        if let Some(tenant) = &self.tenant {
+            map.insert(
+                FormField::TenantName,
+                FormFieldValue::String(Cow::Owned(tenant.clone())),
+            );
+        }
+        map.insert(
+            FormField::UserName,
+            FormFieldValue::String(Cow::Owned(self.username.clone())),
+        );
+        map.insert(
+            FormField::Fullname,
+            FormFieldValue::String(Cow::Owned(self.fullname.clone())),
+        );
+        map.insert(
+            FormField::Email,
+            FormFieldValue::String(Cow::Owned(self.email.clone())),
+        );
+        map.insert(
+            FormField::Password,
+            FormFieldValue::String(Cow::Owned(self.password.clone())),
+        );
+        if let Some(next) = &self.next {
+            map.insert(
+                FormField::Custom("next"),
+                FormFieldValue::String(Cow::Owned(next.clone())),
+            );
+        }
+        map
+    }
+}
+impl Debug for SignupForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignupForm")
+            .field("tenant", &self.tenant)
+            .field("username", &self.username)
+            .field("fullname", &self.fullname)
+            .field("email", &self.email)
+            .field("domicile", &self.domicile)
+            .field("language", &self.language)
+            .field("password", &"***REDACTED***")
+            .field("next", &self.next)
             .finish()
     }
 }

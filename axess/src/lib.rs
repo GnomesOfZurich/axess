@@ -32,7 +32,7 @@ pub use axess_core::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,
             SessionState,
         },
-        workflows::{Workflow, WorkflowAction, WorkflowState, WorkflowStep, WorkflowStepKind},
+        workflows::{Workflow, WorkflowAction, WorkflowState, WorkflowStep, StepKind},
     },
     utils::{self, random::SystemRng, validation},
 };

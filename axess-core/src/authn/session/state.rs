@@ -157,11 +157,12 @@ where
 
     /// Creates a new pending workflow state with the given workflow payload and blocking status.
     pub fn new_workflow(steps: Vec<WorkflowStep>, blocking: bool) -> Self {
+        let now = Utc::now();
         AuthState::PendingWorkflow(WorkflowState {
             steps,
             current_step: 0,
-            started_at: Utc::now(),
-            last_updated: Utc::now(),
+            initiated_at: now,
+            last_updated: now,
             blocking,
         })
     }

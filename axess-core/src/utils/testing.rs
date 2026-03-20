@@ -10,3 +10,5 @@ pub(crate) mod mock_form;
 pub(crate) mod mock_random;
 #[cfg(test)]
 pub(crate) mod mock_tracing;
+#[cfg(test)]
+pub(crate) mod mock_workflow;

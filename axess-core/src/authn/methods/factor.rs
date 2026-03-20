@@ -136,6 +136,9 @@ impl FromStr for FederatedProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
+    // High-level flow type for this factor kind.
+    Workflow,
+
     // // Knowledge based factors
     Password,
     // Pin,
@@ -162,6 +165,7 @@ impl Kind {
     /// Returns the canonical string representation of the factor kind.
     pub fn as_str(&self) -> &str {
         match self {
+            Kind::Workflow => "workflow",
             Kind::Password => "password",
             Kind::Totp => "totp",
             Kind::Hotp => "hotp",
@@ -173,6 +177,7 @@ impl Kind {
     /// Returns the high-level flow type for this factor kind.
     pub fn flow_type(&self) -> &Flow {
         match self {
+            Kind::Workflow => &Flow::Workflow,
             Kind::Password => &Flow::Knowledge,
             Kind::Totp | Kind::Hotp | Kind::EmailOtp => &Flow::Otp,
             Kind::Federated(_) => &Flow::Federated,
@@ -196,6 +201,7 @@ impl FromStr for Kind {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "workflow" => Ok(Kind::Workflow),
             "password" => Ok(Kind::Password),
             "totp" => Ok(Kind::Totp),
             "hotp" => Ok(Kind::Hotp),
