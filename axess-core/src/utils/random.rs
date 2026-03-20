@@ -4,7 +4,7 @@
 //! randomness, provides the OS-backed [`SystemRng`] implementation for
 //! production, and includes deterministic helpers for testing.
 
-use rand::{RngCore, rngs::OsRng};
+use rand::RngCore;
 
 /// Trait for secure random number generation (DST-friendly)
 pub trait SecureRng: Send + Sync + Clone + 'static {
@@ -17,8 +17,7 @@ pub struct SystemRng;
 
 impl SecureRng for SystemRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        let mut rng = OsRng;
-        rng.fill_bytes(dest);
+        rand::rng().fill_bytes(dest);
     }
 }
 

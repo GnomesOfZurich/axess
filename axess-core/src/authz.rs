@@ -1,4 +1,6 @@
-use cedar_policy::{Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema};
+use cedar_policy::{
+    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema,
+};
 use std::str::FromStr;
 use tracing::warn;
 
@@ -13,10 +15,19 @@ pub const ROLE_DOC_ADMIN: &str = "doc-admin";
 
 /// All system role names in canonical order.
 pub const SYSTEM_ROLES: &[(&str, &str)] = &[
-    (ROLE_PLATFORM_ADMIN, "Full access to all modules and platform management"),
-    (ROLE_FINANCE_VIEWER, "Read-only access to ledgers and journal entries"),
+    (
+        ROLE_PLATFORM_ADMIN,
+        "Full access to all modules and platform management",
+    ),
+    (
+        ROLE_FINANCE_VIEWER,
+        "Read-only access to ledgers and journal entries",
+    ),
     (ROLE_FINANCE_MEMBER, "View and post journal entries"),
-    (ROLE_FINANCE_ADMIN, "Full finance access including chart-of-accounts management"),
+    (
+        ROLE_FINANCE_ADMIN,
+        "Full finance access including chart-of-accounts management",
+    ),
     (ROLE_DOC_VIEWER, "Read-only access to documents"),
     (ROLE_DOC_MEMBER, "Read and write documents"),
     (ROLE_DOC_ADMIN, "Full document access including delete"),

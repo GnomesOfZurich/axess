@@ -11,7 +11,7 @@ pub use axess_core::{
         errors::{AuthError, FormError, HandlerError, WorkflowError},
         methods::{
             MethodBuilder, MethodInstance, MethodStateChange,
-            factor::{FactorInstance, FactorStateChange, Kind, Operation, FederatedProvider},
+            factor::{FactorInstance, FactorStateChange, FederatedProvider, Kind, Operation},
             form::{
                 self, Action, FactorForm, FactorFormExt, FormField, FormFieldValue,
                 form_fields_to_json,
@@ -32,7 +32,7 @@ pub use axess_core::{
             AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, PartialState, SessionData,
             SessionState,
         },
-        workflows::{Workflow, WorkflowAction, WorkflowState, WorkflowStep, StepKind},
+        workflows::{StepKind, Workflow, WorkflowAction, WorkflowState, WorkflowStep},
     },
     utils::{self, random::SystemRng, validation},
 };

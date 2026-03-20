@@ -7,7 +7,10 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use axess::{
-    Action, AuthError, AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor, AuthFactorState, AuthMethod, AuthMethodState, AuthUser, AuthnAdminBackend, AuthnBackend, AuthnScope, EnablementState, EntityState, FactorForm, FactorFormExt, FactorStateChange, FormField, Kind, MethodStateChange, TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp
+    Action, AuthError, AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType, AuthFactor,
+    AuthFactorState, AuthMethod, AuthMethodState, AuthUser, AuthnAdminBackend, AuthnBackend,
+    AuthnScope, EnablementState, EntityState, FactorForm, FactorFormExt, FactorStateChange,
+    FormField, Kind, MethodStateChange, TOTP_LENGTH, TOTP_PERIOD, verify_password, verify_totp,
 };
 
 use crate::models::{
@@ -112,7 +115,6 @@ where
 // Implement the AuthnBackend trait for OurBackend to define the associated types.
 #[async_trait]
 impl AuthnBackend for OurBackend {
-    
     type User = OurUser;
     type UserId = Uuid;
     type Tenant = OurTenant;
@@ -1233,7 +1235,7 @@ impl AuthnBackend for OurBackend {
         if !user_state.is_deactivated() {
             info!("User {} is {:?}", user.id, user_state);
             return Err(AuthError::UserDeactivated(Box::new(user_state)));
-        } 
+        }
 
         // 4. Lookup factor name from form
         let factor_name = match form.get_string_field(FormField::FactorName) {
@@ -1247,42 +1249,53 @@ impl AuthnBackend for OurBackend {
         // 5. Get factor from backend, filtered on user, tenant and active state
         let scope = AuthnScope::User(tenant_id, user.id);
         let status_filter = vec![EnablementState::Active];
-        let factor = match self.get_auth_factor_by_name(
-            &factor_name,
-            scope,
-            status_filter
-        ).await {
+        let factor = match self
+            .get_auth_factor_by_name(&factor_name, scope, status_filter)
+            .await
+        {
             Ok(factor) => factor,
             Err(sqlx::Error::RowNotFound) => {
-                error!("Authentication factor '{}' not found for user {} in tenant {}", factor_name, user.id, tenant_id);
+                error!(
+                    "Authentication factor '{}' not found for user {} in tenant {}",
+                    factor_name, user.id, tenant_id
+                );
                 return Err(AuthError::<Self>::FactorNotFound);
             }
             Err(e) => {
-                error!("Error retrieving authentication factor '{}': {:?}", factor_name, e);
+                error!(
+                    "Error retrieving authentication factor '{}': {:?}",
+                    factor_name, e
+                );
                 return Err(AuthError::<Self>::BackendError(SqlxError::from(e)));
             }
         };
 
         // 6. Get factor state for user and tenant
         let factor_states = self
-            .get_factor_states(
-                &factor.id,
-                scope,
-            )
+            .get_factor_states(&factor.id, scope)
             .await
             .map_err(|e| {
-                error!("Error retrieving factor state for factor '{}': {:?}", factor_name, e);
+                error!(
+                    "Error retrieving factor state for factor '{}': {:?}",
+                    factor_name, e
+                );
                 AuthError::<Self>::BackendError(SqlxError::from(e))
             })?;
-        
+
         let factor_state = if factor_states.is_empty() {
-            error!("No factor state found for factor '{}' and user {} at tenant {}", factor_name, user.id, tenant_id);
+            error!(
+                "No factor state found for factor '{}' and user {} at tenant {}",
+                factor_name, user.id, tenant_id
+            );
             return Err(AuthError::<Self>::FactorStateNotFound);
         } else if factor_states.len() == 1 {
             factor_states.into_iter().next().unwrap()
         } else {
             // Multiple factor states should not be found for a scoped user, if so, then something has gone wrong in the database.
-            error!("Multiple factor states found for factor '{}' and user {} at tenant {}", factor_name, user.id, tenant_id);
+            error!(
+                "Multiple factor states found for factor '{}' and user {} at tenant {}",
+                factor_name, user.id, tenant_id
+            );
             return Err(AuthError::<Self>::FactorStateNotFound);
         };
 
@@ -1303,7 +1316,7 @@ impl AuthnBackend for OurBackend {
                 verify_password(password, password_hash)
                     .map_err(|e| AuthError::InvalidCredentials)?;
                 Ok(user)
-            },
+            }
             Kind::Totp => {
                 let factor_config = &factor_state.0.config;
                 let totp_code = form.credential().ok_or(AuthError::UnexpectedFormContent)?;
@@ -1347,7 +1360,7 @@ impl AuthnBackend for OurBackend {
                     Some(_) => Ok(user),
                     None => Err(AuthError::InvalidCredentials),
                 }
-            },
+            }
             Kind::Hotp => {
                 let factor_config = &factor_state.0.config;
                 let hotp_code = form.credential().ok_or(AuthError::UnexpectedFormContent)?;
@@ -1385,7 +1398,7 @@ impl AuthnBackend for OurBackend {
                     Some(_) => Ok(user),
                     None => Err(AuthError::InvalidCredentials),
                 }
-            },
+            }
             kind => {
                 // Custom factor kinds are not handled by this backend example.
                 // Return a protocol error indicating the custom kind is unsupported.

@@ -300,13 +300,19 @@ pub async fn init_valkey_standalone_client(
     password: Option<&str>,
     reconnect_policy: Option<ReconnectPolicy>,
 ) -> Result<Client, ValkeyStoreError> {
-    info!("Creating Valkey standalone configuration for node: {}", addr);
+    info!(
+        "Creating Valkey standalone configuration for node: {}",
+        addr
+    );
 
     let parts: Vec<&str> = addr.split(':').collect();
     if parts.len() != 2 {
         return Err(ValkeyStoreError::Valkey(Error::new(
             fred::error::ErrorKind::Config,
-            format!("Invalid node address format: '{}'. Expected 'host:port'", addr),
+            format!(
+                "Invalid node address format: '{}'. Expected 'host:port'",
+                addr
+            ),
         )));
     }
     let host = parts[0].to_string();
@@ -329,8 +335,8 @@ pub async fn init_valkey_standalone_client(
         config.password = Some(pass.to_string());
     }
 
-    let reconnect = reconnect_policy
-        .unwrap_or_else(|| ReconnectPolicy::new_exponential(5, 1000, 30000, 2));
+    let reconnect =
+        reconnect_policy.unwrap_or_else(|| ReconnectPolicy::new_exponential(5, 1000, 30000, 2));
 
     info!("Initializing Valkey standalone client...");
     let client = Client::new(config, None, None, Some(reconnect));

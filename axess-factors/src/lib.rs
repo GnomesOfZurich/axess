@@ -3,7 +3,7 @@ pub use libreauth::oath::HOTPBuilder;
 #[cfg(feature = "password")]
 pub use password_auth::{generate_hash as generate_password_hash, verify_password};
 #[cfg(feature = "totp")]
-use rand::{RngCore, rngs::OsRng};
+use rand::RngCore;
 #[cfg(feature = "totp")]
 use std::fmt::Write;
 #[cfg(feature = "totp")]
@@ -165,7 +165,7 @@ fn percent_encode_component(input: &str) -> String {
 #[cfg(feature = "totp")]
 pub fn generate_totp_secret() -> String {
     let mut bytes = [0u8; 20];
-    OsRng.fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &bytes)
 }
 

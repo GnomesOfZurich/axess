@@ -307,21 +307,43 @@ where
 {
     fn into_response(self) -> Response {
         let (status, message): (StatusCode, String) = match self {
-            AuthError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()),
-            AuthError::UnexpectedFormContent => (StatusCode::BAD_REQUEST, "Unexpected form content".to_string()),
-            AuthError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, "Too many attempts".to_string()),
-            AuthError::InvalidStateTransition => (StatusCode::CONFLICT, "Invalid state transition".to_string()),
-            AuthError::NotAuthenticated => (StatusCode::UNAUTHORIZED, "Not authenticated".to_string()),
-            AuthError::PartialAuthenticationRequired => (StatusCode::UNAUTHORIZED, "Partial authentication required".to_string()),
-            AuthError::AlreadyAuthenticated => (StatusCode::CONFLICT, "Already authenticated".to_string()),
-            AuthError::UnexpectedAuthState => (StatusCode::BAD_REQUEST, "Unexpected authentication state".to_string()),
+            AuthError::InvalidCredentials => {
+                (StatusCode::UNAUTHORIZED, "Invalid credentials".to_string())
+            }
+            AuthError::UnexpectedFormContent => (
+                StatusCode::BAD_REQUEST,
+                "Unexpected form content".to_string(),
+            ),
+            AuthError::TooManyAttempts => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many attempts".to_string(),
+            ),
+            AuthError::InvalidStateTransition => {
+                (StatusCode::CONFLICT, "Invalid state transition".to_string())
+            }
+            AuthError::NotAuthenticated => {
+                (StatusCode::UNAUTHORIZED, "Not authenticated".to_string())
+            }
+            AuthError::PartialAuthenticationRequired => (
+                StatusCode::UNAUTHORIZED,
+                "Partial authentication required".to_string(),
+            ),
+            AuthError::AlreadyAuthenticated => {
+                (StatusCode::CONFLICT, "Already authenticated".to_string())
+            }
+            AuthError::UnexpectedAuthState => (
+                StatusCode::BAD_REQUEST,
+                "Unexpected authentication state".to_string(),
+            ),
             AuthError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
             AuthError::InvalidScope => (StatusCode::BAD_REQUEST, "Invalid scope".to_string()),
             AuthError::MethodNotSupported | AuthError::MethodNotFound => (
                 StatusCode::BAD_REQUEST,
                 "Authentication method not available".to_string(),
             ),
-            AuthError::FactorNotSupported | AuthError::FactorNotFound | AuthError::FactorStateNotFound => (
+            AuthError::FactorNotSupported
+            | AuthError::FactorNotFound
+            | AuthError::FactorStateNotFound => (
                 StatusCode::BAD_REQUEST,
                 "Authentication factor not available".to_string(),
             ),
@@ -329,21 +351,36 @@ where
                 StatusCode::BAD_REQUEST,
                 "Invalid authentication configuration".to_string(),
             ),
-            AuthError::UnexpectedFormAction => (StatusCode::BAD_REQUEST, "Unexpected form action".to_string()),
-            AuthError::UserNotFound => (StatusCode::UNAUTHORIZED, "User not found".to_string()),
-            AuthError::UserDeactivated(state) => (
-                StatusCode::UNAUTHORIZED,
-                format!("User is {:?}", state),
+            AuthError::UnexpectedFormAction => (
+                StatusCode::BAD_REQUEST,
+                "Unexpected form action".to_string(),
             ),
-            AuthError::UnexpectedUserState => (StatusCode::FORBIDDEN, "Unexpected user state".to_string()),
-            AuthError::IncorrectUserData => (StatusCode::BAD_REQUEST, "Incorrect user data".to_string()),
+            AuthError::UserNotFound => (StatusCode::UNAUTHORIZED, "User not found".to_string()),
+            AuthError::UserDeactivated(state) => {
+                (StatusCode::UNAUTHORIZED, format!("User is {:?}", state))
+            }
+            AuthError::UnexpectedUserState => {
+                (StatusCode::FORBIDDEN, "Unexpected user state".to_string())
+            }
+            AuthError::IncorrectUserData => {
+                (StatusCode::BAD_REQUEST, "Incorrect user data".to_string())
+            }
             AuthError::TenantNotFound => (StatusCode::NOT_FOUND, "Tenant not found".to_string()),
-            AuthError::IncorrectTenantData => (StatusCode::BAD_REQUEST, "Incorrect tenant data".to_string()),
-            AuthError::SessionNotFound => (StatusCode::UNAUTHORIZED, "Session not found".to_string()),
+            AuthError::IncorrectTenantData => {
+                (StatusCode::BAD_REQUEST, "Incorrect tenant data".to_string())
+            }
+            AuthError::SessionNotFound => {
+                (StatusCode::UNAUTHORIZED, "Session not found".to_string())
+            }
             AuthError::SessionExpired => (StatusCode::UNAUTHORIZED, "Session expired".to_string()),
             AuthError::SessionLockError => (StatusCode::CONFLICT, "Session lock error".to_string()),
-            AuthError::SessionInvalid => (StatusCode::UNAUTHORIZED, "Session is invalid".to_string()),
-            AuthError::SessionError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Session error".to_string()),
+            AuthError::SessionInvalid => {
+                (StatusCode::UNAUTHORIZED, "Session is invalid".to_string())
+            }
+            AuthError::SessionError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session error".to_string(),
+            ),
             AuthError::SessionRegistryNotFound => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Session registry not found".to_string(),
@@ -352,8 +389,13 @@ where
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Session registry error".to_string(),
             ),
-            AuthError::BackendError(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Backend error".to_string()),
-            AuthError::Base64DecodeError(_) => (StatusCode::BAD_REQUEST, "Base64 decode error".to_string()),
+            AuthError::BackendError(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Backend error".to_string(),
+            ),
+            AuthError::Base64DecodeError(_) => {
+                (StatusCode::BAD_REQUEST, "Base64 decode error".to_string())
+            }
         };
 
         (status, message).into_response()

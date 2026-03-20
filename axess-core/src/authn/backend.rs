@@ -15,12 +15,15 @@ pub mod admin;
 pub mod handlers;
 
 use crate::authn::{
-    errors::AuthError, methods::{
+    errors::AuthError,
+    methods::{
         MethodStateChange,
         factor::FactorStateChange,
         form::FactorForm,
         scope::{AuthnScope, EnablementState},
-    }, session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType}, types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState}
+    },
+    session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
+    types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState},
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

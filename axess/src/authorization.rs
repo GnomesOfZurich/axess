@@ -3,8 +3,8 @@ use axum::response::{IntoResponse, Response};
 use cedar_policy::Entities;
 
 pub use axess_core::authz::{
-    AuthzDecision, AuthzError, AuthzRequest, PolicyStore, SYSTEM_ROLES,
-    action_uid, document_uid, ledger_uid, platform_uid, role_uid, user_uid,
+    AuthzDecision, AuthzError, AuthzRequest, PolicyStore, SYSTEM_ROLES, action_uid, document_uid,
+    ledger_uid, platform_uid, role_uid, user_uid,
 };
 
 /// Returned (and converted to a 403 response) when a Cedar policy check denies access.

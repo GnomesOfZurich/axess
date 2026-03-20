@@ -3,9 +3,10 @@ pub mod registry;
 pub mod state;
 
 use crate::{
+    authn::workflows::{StepKind, WorkflowStep}, // Ensure correct local import
     authn::{
         backend::{
-            AuthTenant, AuthUser, AuthnBackend, EntityState, StatusDetail, admin::AuthnAdminBackend
+            AuthTenant, AuthUser, AuthnBackend, EntityState, StatusDetail, admin::AuthnAdminBackend,
         },
         errors::{AuthError, FactorKindError},
         methods::{
@@ -15,11 +16,8 @@ use crate::{
             scope::{AuthnScope, EnablementState},
         },
         session::registry::SessionRegistry,
-        types::{
-            AuthFactor, AuthFactorState, AuthMethod, PartialState, SessionData, SessionState,
-        },
+        types::{AuthFactor, AuthFactorState, AuthMethod, PartialState, SessionData, SessionState},
     },
-    authn::workflows::{WorkflowStep, StepKind}, // Ensure correct local import
     axum::{
         extract::{Form, Json},
         response::{IntoResponse, Redirect, Response},
@@ -1472,16 +1470,13 @@ where
     /// - Creates onboarding workflow state with email confirmation and TOTP setup.
     /// - Sends confirmation email.
     /// - Optionally adds KYC workflow step.
-    pub async fn signup_new_user(
-        &mut self,
-        form: SignupForm,
-    ) -> Result<B::User, AuthError<B>>
+    pub async fn signup_new_user(&mut self, form: SignupForm) -> Result<B::User, AuthError<B>>
     where
         B: AuthnAdminBackend,
     {
-
         // 1. Validate form
-        form.validate_form().map_err(|_| AuthError::InvalidCredentials)?;
+        form.validate_form()
+            .map_err(|_| AuthError::InvalidCredentials)?;
 
         // 2. Extract required fields
         let email = form
@@ -1493,7 +1488,8 @@ where
 
         // 3. Resolve tenant
         let tenant_id = if let Some(tenant_name) = form.get_string_field(FormField::TenantName) {
-            let tenant = self.backend
+            let tenant = self
+                .backend
                 .get_tenant_by_name(&tenant_name)
                 .await
                 .map_err(AuthError::BackendError)?;
@@ -1507,14 +1503,12 @@ where
 
         // 4. Create new user in Pending state
         let now = Utc::now();
-        let pending_state = EntityState::Pending(
-            StatusDetail {
-                reason: "User registered, pending email confirmation".to_string(),
-                timestamp: now,
-                until: Some(now + Duration::hours(24)),
-                metadata: Some(json!({ "email": email.clone() })),
-            }
-        );
+        let pending_state = EntityState::Pending(StatusDetail {
+            reason: "User registered, pending email confirmation".to_string(),
+            timestamp: now,
+            until: Some(now + Duration::hours(24)),
+            metadata: Some(json!({ "email": email.clone() })),
+        });
         let new_user = self
             .backend
             .create_new_user(&form)
@@ -1523,17 +1517,8 @@ where
 
         let user_id: B::UserId = new_user.id().clone().into();
 
-        let workflow_one = StepKind::FactorAction(
-            Operation::new(
-                Kind::EmailOtp,
-                Action::Verify),
-            );
-        let workflow_two = StepKind::FactorAction(
-            Operation::new(
-                Kind::Totp,
-                Action::Setup,
-            ),
-        );
+        let workflow_one = StepKind::FactorAction(Operation::new(Kind::EmailOtp, Action::Verify));
+        let workflow_two = StepKind::FactorAction(Operation::new(Kind::Totp, Action::Setup));
 
         let workflow_steps = vec![
             WorkflowStep {
@@ -1541,14 +1526,14 @@ where
                 description: "Confirm email address".to_string(),
                 completed: false,
                 completed_at: None,
-                metadata: None
+                metadata: None,
             },
             WorkflowStep {
                 kind: workflow_two,
                 description: "Set up TOTP authenticator".to_string(),
                 completed: false,
                 completed_at: None,
-                metadata: None
+                metadata: None,
             },
         ];
 
@@ -1570,7 +1555,6 @@ where
             return Err(e);
         }
         Ok(new_user)
-
     }
 
     // WIP: wired into the email-OTP registration confirmation flow once that path is complete.
@@ -1983,7 +1967,6 @@ mod tests {
     /// Test verify_factor returns InvalidCredentials when form verification fails
     async fn test_verify_factor_invalid_credentials_when_form_verification_fails()
     -> Result<(), AuthError<MockBackend>> {
-
         let rng = MockRng::new(42);
         let (mut auth_session, _) = create_test_session_with_custom_rng(rng).await?;
 
@@ -2049,7 +2032,8 @@ mod tests {
 
     /// Two calls with the same `MockRng` seed produce the same token (deterministic / DST).
     #[tokio::test]
-    async fn test_generate_signup_token_is_deterministic_with_mock_rng() -> Result<(), AuthError<MockBackend>> {
+    async fn test_generate_signup_token_is_deterministic_with_mock_rng()
+    -> Result<(), AuthError<MockBackend>> {
         let (mut session_a, _) = create_test_session_with_custom_rng(MockRng::new(99)).await?;
         let (mut session_b, _) = create_test_session_with_custom_rng(MockRng::new(99)).await?;
 

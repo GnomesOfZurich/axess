@@ -8,7 +8,7 @@ use crate::authn::session::registry::SessionRegistry;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse
+    response::IntoResponse,
 };
 use std::{fmt::Display, sync::Arc};
 

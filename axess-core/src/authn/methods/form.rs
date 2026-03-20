@@ -25,7 +25,8 @@ use crate::{
     },
     tracing::{error, warn},
     utils::validation::{
-        is_valid_country_code, is_valid_email, is_valid_language_code, is_valid_name, is_valid_otp_code, is_valid_password, is_valid_url_format
+        is_valid_country_code, is_valid_email, is_valid_language_code, is_valid_name,
+        is_valid_otp_code, is_valid_password, is_valid_url_format,
     },
 };
 use axess_factors::{TOTP_LENGTH, TOTP_PERIOD, verify_hotp, verify_password, verify_totp};
@@ -1751,8 +1752,8 @@ pub struct SignupForm {
     pub username: String,
     pub fullname: String,
     pub email: String,
-    pub domicile: Option<String>,  // iso_3 country code
-    pub language: Option<String>,  // language code
+    pub domicile: Option<String>, // iso_3 country code
+    pub language: Option<String>, // language code
     pub password: String,
     pub next: Option<String>,
 }
@@ -1772,7 +1773,9 @@ impl FactorForm for SignupForm {
 
     fn validate_form(&self) -> Result<&Self, FormError> {
         // 1. Validate tenant
-        if let Some(tenant) = &self.tenant && !is_valid_name(tenant) {
+        if let Some(tenant) = &self.tenant
+            && !is_valid_name(tenant)
+        {
             return Err(FormError::ValidationFailed(
                 "Invalid tenant identifier".to_string(),
             ));
@@ -1780,16 +1783,12 @@ impl FactorForm for SignupForm {
 
         // 2. Validate username (email)
         if !is_valid_email(&self.username) {
-            return Err(FormError::ValidationFailed(
-                "Invalid email".to_string(),
-            ));
+            return Err(FormError::ValidationFailed("Invalid email".to_string()));
         }
 
         // 3. Validate fullname
         if !is_valid_name(&self.fullname) {
-            return Err(FormError::ValidationFailed(
-                "Invalid fullname".to_string(),
-            ));
+            return Err(FormError::ValidationFailed("Invalid fullname".to_string()));
         }
 
         // 4. Validate email
@@ -1800,31 +1799,35 @@ impl FactorForm for SignupForm {
         }
 
         // 5. Validate domicile
-        if let Some(domicile) = &self.domicile && !is_valid_country_code(domicile) {
+        if let Some(domicile) = &self.domicile
+            && !is_valid_country_code(domicile)
+        {
             return Err(FormError::ValidationFailed(
                 "Invalid domicile country code".to_string(),
             ));
         }
 
         // 6. Validate language
-        if let Some(language) = &self.language && !is_valid_language_code(language) {
+        if let Some(language) = &self.language
+            && !is_valid_language_code(language)
+        {
             return Err(FormError::ValidationFailed(
                 "Invalid language code".to_string(),
             ));
         }
 
         // 7. Validate password
-        if !&self.password.is_empty() && !is_valid_password(&self.password, &PasswordRules::default()) {
-            return Err(FormError::ValidationFailed(
-                "Invalid password".to_string(),
-            ));
+        if !&self.password.is_empty()
+            && !is_valid_password(&self.password, &PasswordRules::default())
+        {
+            return Err(FormError::ValidationFailed("Invalid password".to_string()));
         }
 
         // 8. Validate next field
-        if let Some(next) = &self.next && !is_valid_url_format(next) {
-            return Err(FormError::ValidationFailed(
-                "Invalid next URL".to_string(),
-            ));
+        if let Some(next) = &self.next
+            && !is_valid_url_format(next)
+        {
+            return Err(FormError::ValidationFailed("Invalid next URL".to_string()));
         }
 
         Ok(self)

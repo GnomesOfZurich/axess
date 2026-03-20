@@ -249,14 +249,11 @@ pub mod post {
         let email_code = Uuid::new_v4().to_string();
 
         // Build workflow steps using axess-core's WorkflowState
-        use axess::{WorkflowState, WorkflowStep, StepKind};
+        use axess::{StepKind, WorkflowState, WorkflowStep};
         let workflow = WorkflowState {
             steps: vec![
                 WorkflowStep {
-                    kind: StepKind::FactorAction(Operation::new(
-                        Kind::EmailOtp,
-                        Action::Verify,
-                    )), // Email verification
+                    kind: StepKind::FactorAction(Operation::new(Kind::EmailOtp, Action::Verify)), // Email verification
                     description: format!("Verify your email (code: {})", email_code),
                     completed: false,
                     completed_at: None,

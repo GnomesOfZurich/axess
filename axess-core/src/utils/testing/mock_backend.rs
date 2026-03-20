@@ -32,18 +32,22 @@
 use crate::authn::backend::admin::AuthnAdminBackend;
 use crate::{
     authn::{
-        backend::{AuthTenant, AuthUser, AuthnBackend, EntityState}, errors::AuthError, methods::{
+        backend::{AuthTenant, AuthUser, AuthnBackend, EntityState},
+        errors::AuthError,
+        methods::{
             MethodStateChange,
             factor::FactorStateChange,
-            form::{FactorForm, FactorFormExt, FormField, Action},
+            form::{Action, FactorForm, FactorFormExt, FormField},
             scope::{AuthnScope, EnablementState},
-        }, session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType}, types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState} // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
+        },
+        session::state::{AuthEvent, AuthEventRecord, AuthEventStatus, AuthEventType},
+        types::{AuthFactor, AuthFactorState, AuthMethod, AuthMethodState}, // workflows::{Workflow, WorkflowState, WorkflowStep, WorkflowStepKind},
     },
     utils::testing::{
         mock_authn::{MockAuthFactor, MockAuthFactorState, MockAuthMethod, MockAuthMethodState},
         mock_entities::{
-            DEFAULT_TENANT_ID, MockTenant, MockUser, SYSTEM_SUPER_USER_ID,
-            TENANT_SUPER_USER_ID, TestTenantId, TestUserId,
+            DEFAULT_TENANT_ID, MockTenant, MockUser, SYSTEM_SUPER_USER_ID, TENANT_SUPER_USER_ID,
+            TestTenantId, TestUserId,
         },
     },
 };
@@ -252,10 +256,7 @@ impl AuthnBackend for MockBackend {
         }
     }
 
-    async fn create_new_user<F>(
-        &self,
-        form: &F,
-    ) -> Result<Self::User, Self::Error>
+    async fn create_new_user<F>(&self, form: &F) -> Result<Self::User, Self::Error>
     where
         F: crate::authn::methods::form::FactorForm + Send + Sync,
     {
