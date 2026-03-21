@@ -1,139 +1,51 @@
-use std::sync::Arc;
-
-use axum::Router;
-use axum_messages::MessagesManagerLayer;
-use sqlx::{SqlitePool, migrate};
-use time::Duration;
-use tokio::{signal, task::AbortHandle};
-use tower_sessions::{ExpiredDeletion, Expiry, SessionManagerLayer, cookie::Key};
-use tower_sessions_sqlx_store::SqliteStore;
-use uuid::Uuid;
+//! Router construction: SessionLayer + AuthnService in Axum state + routes.
 
 use crate::{
     models::backend::OurBackend,
-    web::{auth::router as auth_router, protected::router as protected_router},
+    web::{auth, protected},
 };
-use axess::{AuthnServiceBuilder, SessionRegistryStore};
+use axess::{AuthnService, SessionLayer, SqliteSessionStore};
+use axum::{Router, routing::get, routing::post};
+use sqlx::SqlitePool;
+use std::{sync::Arc, time::Duration};
 
+/// Application state shared across all handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub default_tenant_id: Uuid,
-    pub system_super_user_id: Uuid,
-    pub tenant_super_user_id: Uuid,
-    //     pub db: SqlitePool,
+    pub service: Arc<AuthnService<OurBackend, OurBackend>>,
 }
 
-pub struct App {
-    pub state: Arc<AppState>,
-    // db: SqlitePool,
-    // pub backend: std::sync::Arc<OurBackend>,
-    // pub session_store: Arc<SqliteStore>,
-    // pub registry: Arc<StoreSessionRegistry>
-}
+/// Build the top-level Axum [`Router`].
+///
+/// Call once at startup, after migrations have run.
+pub async fn build_router(pool: SqlitePool) -> Router {
+    let backend = OurBackend::new(pool.clone());
 
-impl App {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            state: Arc::new(AppState {
-                default_tenant_id: Uuid::nil(),
-                system_super_user_id: Uuid::nil(),
-                tenant_super_user_id: Uuid::nil(),
-            }),
-        })
-    }
+    // SQLite-backed session store — creates the `sessions` table if absent.
+    let session_store = SqliteSessionStore::new(pool.clone());
+    session_store
+        .init_schema()
+        .await
+        .expect("failed to create sessions table");
 
-    pub async fn serve(
-        self,
-        address: &str,
-        db_url: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let db = SqlitePool::connect(db_url).await?;
-        // Run migrations from the "migrations" directory at runtime.
-        // static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-        // MIGRATOR.run(&db).await?;
-        migrate!().run(&db).await?;
+    // IMPORTANT: Use a real random key loaded from config in production.
+    // This fixed zero key means sessions are valid across restarts but is NOT
+    // secure against an attacker who can read the binary or its memory.
+    let signing_key: [u8; 32] = [0u8; 32];
 
-        // let session_store = MemoryStore::default();
-        let session_store = SqliteStore::new(db.clone());
-        session_store.migrate().await?;
+    let session_layer = SessionLayer::new(session_store, signing_key)
+        .with_ttl(Duration::from_secs(86400))
+        .with_secure(false); // Allow HTTP in local dev; set true behind TLS in prod.
 
-        let deletion_task = tokio::task::spawn(
-            session_store
-                .clone()
-                .continuously_delete_expired(tokio::time::Duration::from_secs(60)),
-        );
+    let service = Arc::new(AuthnService::new(backend.clone(), backend));
+    let state = AppState { service };
 
-        // Generate a cryptographic key to sign the session cookie.
-        let key = Key::generate();
-
-        let session_layer = SessionManagerLayer::new(session_store.clone())
-            .with_secure(false)
-            .with_expiry(Expiry::OnInactivity(Duration::days(1)))
-            .with_signed(key);
-
-        /*
-        Authn service.
-        This combines the session layer with our backend and session registry to establish an
-        authentication service layer which will provide the auth session as a request extension.
-        */
-        let registry = Arc::new(SessionRegistryStore::new(session_store, 100, None, None));
-        let backend = Arc::new(OurBackend::new(db));
-        let authn_service = Arc::new(
-            AuthnServiceBuilder::new(backend, session_layer)
-                .with_session_registry(registry.clone())
-                .build(),
-        );
-
-        /*
-        Ensure all merged routers share the same application state (Arc<OurBackend>).
-        This avoids mismatched Router<State> types when merging by setting the top-level
-        router state to the backend before merging other routers that expect the same state.
-        */
-        let app_router = Router::new()
-            // .with_state(backend.clone())
-            // Apply login_required to protected routes before merging
-            .merge(protected_router())
-            // Auth routes need backend state for handlers that use State extractor
-            .merge(auth_router())
-            .route("/health", axum::routing::get(|| async { "OK" }))
-            .layer(MessagesManagerLayer)
-            .layer(authn_service.as_ref().clone());
-        // .with_state(()); // Convert to Router<()> for compatibility
-
-        // Propagate bind errors instead of panicking.
-        let listener = tokio::net::TcpListener::bind(address).await?;
-
-        // Ensure we use a shutdown signal to abort the deletion task.
-        axum::serve(listener, app_router.into_make_service())
-            .with_graceful_shutdown(shutdown_signal(deletion_task.abort_handle()))
-            .await?;
-
-        deletion_task.await??;
-
-        Ok(())
-    }
-}
-
-async fn shutdown_signal(deletion_task_abort_handle: AbortHandle) {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => { deletion_task_abort_handle.abort() },
-        _ = terminate => { deletion_task_abort_handle.abort() },
-    }
+    Router::new()
+        .route("/login", get(auth::login_page).post(auth::post_login))
+        .route("/totp", get(auth::totp_page).post(auth::post_totp))
+        .route("/logout", post(auth::logout))
+        .route("/dashboard", get(protected::dashboard))
+        .route("/health", get(|| async { "OK" }))
+        .with_state(state)
+        .layer(session_layer)
 }

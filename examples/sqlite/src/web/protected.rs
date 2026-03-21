@@ -1,48 +1,43 @@
-use askama::Template;
-use axess::login_required;
+//! Protected routes — accessible only to fully authenticated users.
+
+use crate::web::app::AppState;
+use axess::{AuthSession, login_required};
 use axum::{
     Router,
-    http::StatusCode,
+    extract::State,
     response::{Html, IntoResponse},
     routing::get,
 };
 
-use crate::models::authn::Session;
-
-#[derive(Template)]
-#[template(path = "protected.html")]
-struct ProtectedTemplate<'a> {
-    username: &'a str,
-    messages: &'a [&'a str],
-}
-
-pub fn router() -> Router {
+/// Build the sub-router for protected routes.
+///
+/// All routes are guarded by `login_required!` — unauthenticated requests are
+/// redirected to `/login`.
+pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/main", get(get::protected))
-        .route_layer(login_required!(Session, "/login"))
+        .route("/dashboard", get(dashboard))
+        .route_layer(login_required!(AuthSession, "/login"))
 }
 
-mod get {
-    use super::*;
-    use tracing::error;
+/// GET /dashboard — requires authentication.
+pub async fn dashboard(
+    session: AuthSession,
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
+    let user_id = session
+        .user_id()
+        .await
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
 
-    pub async fn protected(session: Session) -> impl IntoResponse {
-        let user = session.get_user();
-        match (ProtectedTemplate {
-            username: &user.username,
-            messages: &[],
-        })
-        .render()
-        {
-            Ok(body) => Html(body).into_response(),
-            Err(e) => {
-                error!(
-                    error = %e,
-                    username = %user.username,
-                    "failed to render protected template"
-                );
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        }
-    }
+    Html(format!(
+        r#"<!doctype html>
+<html><head><title>Dashboard</title></head><body>
+<h1>Welcome, {user_id}!</h1>
+<p>You are authenticated.</p>
+<form method="POST" action="/logout">
+  <button type="submit">Logout</button>
+</form>
+</body></html>"#
+    ))
 }

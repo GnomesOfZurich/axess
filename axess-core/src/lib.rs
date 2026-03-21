@@ -1,15 +1,69 @@
 #![forbid(unsafe_code)]
 
-#[cfg(feature = "authn")]
+// ── Session layer ──────────────────────────────────────────────────────────────
+
+/// Custom tower session layer with HMAC-signed cookies and typed session data.
+pub mod session;
+
+pub use session::{
+    AuthSession, AuthState, MemorySessionRegistry, MemorySessionStore, SessionData, SessionId,
+    SessionLayer, SessionRegistry, SessionStore,
+};
+
+// ── Authentication ─────────────────────────────────────────────────────────────
+
+/// Authentication service — identity lookup, factor verification, session management.
 pub mod authn;
+
+pub use authn::{
+    AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType, AuthMethod, AuthnBackend,
+    AuthnError, AuthnScope, AuthnService, EmailOtpConfig, EntityState, FactorConfig,
+    FactorCredential, FactorKind, FactorOutcome, FactorStore, FederatedProvider, Fido2Config,
+    HotpConfig, IdentityStore, LockoutPolicy, LoginOutcome, OtpAlgorithm, PasswordConfig,
+    PasswordRules, StatusDetail, Tenant, TotpConfig, User, ZeroizedString,
+};
+
+// ── Authorization (unchanged) ──────────────────────────────────────────────────
 
 #[cfg(feature = "authz")]
 pub mod authz;
 
+#[cfg(feature = "authz")]
+pub use authz::{
+    AuthzDecision, AuthzDenied, AuthzEntityProvider, AuthzError, AuthzSession, AuthzStore,
+    BuildRequestContext, NoContext, PolicyEvaluator, PolicyStore, StandardRequestContext,
+    ip_from_headers,
+};
+
+// ── Storage backends ───────────────────────────────────────────────────────────
+
+pub mod storage {
+    /// In-memory store (now a redirect notice — see `crate::session::store`).
+    pub mod in_memory;
+
+    #[cfg(feature = "sqlite")]
+    pub mod sqlite;
+
+    #[cfg(feature = "valkey")]
+    pub mod valkey;
+}
+
+#[cfg(feature = "sqlite")]
+pub use storage::sqlite::SqliteSessionStore;
+
+// ── DST utilities ──────────────────────────────────────────────────────────────
+
 pub mod utils;
 
-// Declare and re-export extras submodules
-#[cfg(any(feature = "request_id", feature = "trace_id"))]
+pub use utils::random::{SecureRng, SystemRng};
+pub use utils::time::{Clock, SystemClock};
+pub use utils::testing::{MockClock, MockFactorStore, MockIdentityStore, MockRng};
+
+#[cfg(feature = "authz")]
+pub use utils::testing::mock_policy::{MockEntityProvider, MockPolicyEvaluator};
+
+// ── Extras ─────────────────────────────────────────────────────────────────────
+
 pub mod extras {
     #[cfg(feature = "request_id")]
     pub mod request_id;
@@ -18,29 +72,15 @@ pub mod extras {
     pub mod trace_id;
 }
 
-// Declare and re-export storage submodules
-#[cfg(any(feature = "memory", feature = "valkey"))]
-pub mod storage {
-    #[cfg(feature = "memory")]
-    pub mod in_memory;
+#[cfg(feature = "request_id")]
+pub use extras::request_id::RequestIdLayer;
 
-    #[cfg(feature = "valkey")]
-    pub mod valkey;
-}
+#[cfg(feature = "trace_id")]
+pub use extras::trace_id::TraceIdLayer;
 
-// Re-export axum and tracing for macro hygiene and version consistency
-// This ensures our macros work correctly regardless of the user's axum version
+// ── Re-export axum and tracing for macro hygiene ────────────────────────────────
+
 #[doc(hidden)]
 pub use axum;
 #[doc(hidden)]
 pub use tracing;
-
-// TODO: Consider re-exporting important types/traits for easier access
-//
-// // Re-export the most important types/traits for easy access
-// pub use authn::{
-//     session::{AuthSession, AuthError},
-//     service::{AuthManager, AuthManagerLayer},
-//     backend::{AuthnBackend, AuthUser, AuthTenant, AuthId, UserId, UserState},
-//     methods::{AuthMethod, AuthFactor, FactorForm},
-// };

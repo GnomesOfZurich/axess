@@ -1,19 +1,17 @@
 [package]
 name = "axess"
-version = "0.0.13"
+version = "0.0.14"
 publish = false
 edition = "2024"
 resolver = "3"
 description = """
 Authentication and Authorization for the Axum webframework. Providing a set of convenient middleware and related request extractors.
-Built on top of the tower-sessions crate for authentication and Cedar Policy for authorization. Additionally including helpers for
+Custom session layer with HMAC-signed cookies and Cedar Policy for authorization. Additionally including helpers for
 request tracing and request id generation.
 """
 authors = ["Gnomes <info@gnomes.ch>"]
 license = "MIT"
 repository = "https://github.com/GnomesOfZurich/axess"
-# homepage = "https://getgnomes.com/tech/axess"
-# documentation = "https://docs.rs/axess"
 keywords = ["authentication", "authorization", "axum", "login", "session", "tower", "cedar"]
 categories = ["web-programming"]
 exclude = ["/.github", "/examples", "/scripts"]
@@ -25,19 +23,16 @@ axess-factors = { path = "../axess-factors" }
 axum = { version = "0.8.8", default-features = false, features = ["json"] }
 cedar-policy = { version = "4.9.1", optional = true }
 serde_json = "1.0.149"
-tower-sessions = { version = "0.15.0" }
-tower-cookies = { version = "0.11.0", features = ["axum-core", "private", "signed"] }
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 
 [features]
-authn = ["axess-core/authn"]
 authz = ["axess-core/authz", "dep:cedar-policy"]
-admin = ["axess-core/admin"]
 request_id = ["axess-core/request_id"]
 trace_id = ["axess-core/trace_id"]
 accept_client_id = ["axess-core/accept_client_id"]
-memory = ["axess-core/memory"]
+memory = []
+sqlite = ["axess-core/sqlite"]
 valkey = ["axess-core/valkey"]
-full = ["authn", "authz", "admin", "request_id", "trace_id", "valkey"]
-default = ["authn", "authz"]
+full = ["authz", "request_id", "trace_id", "sqlite", "valkey"]
+default = ["authz"]

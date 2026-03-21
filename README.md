@@ -213,64 +213,117 @@ See [`axess-core/src/authn/backend.rs`](axess-core/src/authn/backend.rs) for the
 
 ## Authorization
 
-Authorization uses [Cedar Policy](https://cedarpolicy.com/) — a policy language that natively supports RBAC, ABAC, and ReBAC. Axess provides the evaluation plumbing; you author the policies.
+Authorization uses [Cedar Policy](https://cedarpolicy.com/) — a policy language that natively supports RBAC, ABAC, and ReBAC. Axess provides the evaluation plumbing; you implement `AuthzEntityProvider` and author the policies.
 
 ### Setup
 
 ```rust
-use axess::authorization::{PolicyStore, AuthzRequest, require, role_uid, user_uid, action_uid};
+use axess::authorization::{AuthzStore, PolicyStore};
+use std::sync::Arc;
 
-// Load once at startup — Arc<PolicyStore> is Send + Sync.
+// 1. Compile policy + schema once at startup.
 let policy_store = Arc::new(PolicyStore::from_text(
     include_str!("policies/app.cedar"),
-    include_str!("policies/app.cedar.json"),  // JSON schema
+    include_str!("policies/app.cedar.json"),
 )?);
+
+// 2. Wrap in AuthzStore with your entity provider and Cedar namespace.
+let authz = Arc::new(AuthzStore::new(
+    policy_store,
+    Arc::new(MyEntityProvider::new(db.clone())),
+    "MyApp",    // Cedar namespace — must match your .cedar schema
+));
+authz.validate()?;  // assert provider ↔ schema at startup
 ```
 
 ### Checking a permission
 
 ```rust
-async fn my_handler(
-    State(store): State<Arc<PolicyStore>>,
-    State(db): State<SqlitePool>,
-    session: Session,
+async fn view_ledger(
+    State(state): State<AppState>,
+    session: AuthSession<OurBackend, OurRegistry, SystemRng>,
+    Path(ledger_id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Build the Cedar entity set for this request
-    let entities = build_entities_for_ledger(&db, user_id, tenant_id, ledger_id).await?;
+    let user_id = session.get_user_id().ok_or(AuthzDenied)?;
 
-    // Fail-closed: any error or policy deny → 403
-    require(&store, entities, &AuthzRequest {
-        principal: user_uid(user_id)?,
-        action:    action_uid("ViewLedger")?,
-        resource:  ledger_uid(ledger_id)?,
-    })?;
+    // Fail-closed: entity error or policy deny → Err(AuthzDenied) → 403
+    let authz = state.authz.for_user_id(&user_id.to_string())?;
+    authz.require("ViewLedger", &ledger_id).await?;
 
     // ...handler body
 }
 ```
 
+With ABAC context (MFA requirement, IP restriction):
+
+```rust
+use axess::authorization::{StandardRequestContext, ip_from_headers};
+
+let ctx = StandardRequestContext {
+    mfa_verified: session.is_mfa_complete(),
+    ip_address: ip_from_headers(request.headers()),
+};
+let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
+authz.require("PostJournalEntry", &ledger_id).await?;
+```
+
+### Implementing `AuthzEntityProvider`
+
+Your entity provider builds the Cedar entity graph for each check:
+
+```rust
+#[async_trait]
+impl AuthzEntityProvider for MyEntityProvider {
+    type ResourceId = Uuid;
+    type Error = sqlx::Error;
+
+    async fn entities_for(
+        &self,
+        principal: &EntityUid,
+        resource_id: &Uuid,
+        _action: &EntityUid,
+    ) -> Result<Entities, sqlx::Error> {
+        // Load user's roles, the resource, build cedar_policy::Entities
+        // Must include: principal (with role parents), role entities, resource
+        todo!()
+    }
+
+    fn resource_uid(&self, id: &Uuid) -> Result<EntityUid, AuthzError> {
+        EntityUid::from_str(&format!(r#"MyApp::Ledger::"{id}""#))
+            .map_err(|e| AuthzError::InvalidEntityUid(e.to_string()))
+    }
+}
+```
+
 ### Policy model
 
-Axess provides entity UID builder functions for common types (`user_uid`, `role_uid`, `ledger_uid`, `document_uid`, `platform_uid`, `action_uid`). The Cedar namespace is currently `"Ekekrantz"` — making this configurable is on the roadmap.
-
-Entity attributes carry the data needed by your policies:
+The Cedar namespace is configured per application via `AuthzStore::new`. Entity UID builders are methods on `AuthzStore`: `store.user_uid(id)`, `store.role_uid(name)`, `store.action_uid(name)`, `store.tenant_uid(id)`, `store.entity_uid(type_name, id)`.
 
 ```cedar
 // RBAC: role membership
 permit (
-    principal in Ekekrantz::Role::"finance-viewer",
-    action == Ekekrantz::Action::"ViewLedger",
-    resource is Ekekrantz::Ledger
+    principal in MyApp::Role::"finance-viewer",
+    action == MyApp::Action::"ViewLedger",
+    resource is MyApp::Ledger
 ) when { principal.tenant == resource.tenant };
 
 // ReBAC: ownership
 permit (
-    principal is Ekekrantz::User,
-    action in [Ekekrantz::Action::"ViewLedger", Ekekrantz::Action::"PostEntry"],
-    resource is Ekekrantz::Ledger
+    principal is MyApp::User,
+    action in [MyApp::Action::"ViewLedger", MyApp::Action::"PostEntry"],
+    resource is MyApp::Ledger
 ) when {
     principal.tenant == resource.tenant &&
     resource has owner && resource.owner == principal
+};
+
+// ABAC: require recent MFA for sensitive writes
+permit (
+    principal in MyApp::Role::"finance-member",
+    action == MyApp::Action::"PostJournalEntry",
+    resource is MyApp::Ledger
+) when {
+    context.mfa_verified == true
 };
 ```
 
@@ -400,13 +453,12 @@ classDef process align:left;
 
 ## Known limitations
 
-- **Cedar namespace is hardcoded** to `"Ekekrantz"` in `axess-core/src/authz.rs`. Applications using the entity UID builders must use this namespace. A configurable namespace is planned.
 - **Valkey backend** (`feature = "valkey"`) — the AES-256-GCM encrypted session store is partially implemented. Do not use in production until complete.
 - **In-memory session store** (`feature = "memory"`) — stub only; not yet functional. Use `MockRegistry` for testing instead.
 - **Signup flow** — the flow is documented and modelled in the state machine but not yet implemented in the library itself.
-- **WebAuthn / passkeys** — modelled as a future `Kind` variant but not implemented.
+- **FIDO2 / passkeys** — on the roadmap; not yet implemented.
 - **Session expiry** — currently a module-level constant (3600 s). Will become a configuration parameter.
-- **Application-specific roles** — `SYSTEM_ROLES` and individual role name constants belong in the consuming application, not in this library. The library provides infrastructure only; role taxonomy is the application's responsibility.
+- **Application-specific roles** — role name constants and taxonomies belong in the consuming application. The library provides Cedar evaluation infrastructure only.
 
 ---
 

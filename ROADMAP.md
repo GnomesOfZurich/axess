@@ -36,10 +36,16 @@ These govern every change. New features that contradict these principles need a 
 
 ### Authorization (`axess-core`)
 - [x] Cedar Policy evaluation — `PolicyStore` (compiled policy set + schema + authorizer)
-- [x] Entity UID helpers — `user_uid`, `role_uid`, `ledger_uid`, `document_uid`, `platform_uid`, `action_uid`
+- [x] `PolicyEvaluator` trait — injectable; `MockPolicyEvaluator` for DST tests without policy files
+- [x] `AuthzEntityProvider` trait — application implements entity graph materialisation; decouples DB schema from Cedar
+- [x] `AuthzStore` — holds evaluator, provider, configurable Cedar namespace; UID builder methods (`user_uid`, `role_uid`, `action_uid`, `tenant_uid`, `entity_uid`)
+- [x] `AuthzSession` — per-request handle with `require`, `is_permitted`, `batch_check`; request-scoped entity cache deduplicates repeated checks
+- [x] `BuildRequestContext` trait + `StandardRequestContext` — ABAC context (MFA status, IP, timestamp) passed to Cedar; `NoContext` zero-overhead default
 - [x] RBAC via Cedar — `principal in Role::"name"` patterns
 - [x] ReBAC via Cedar — `resource has owner && resource.owner == principal` patterns
-- [x] Fail-closed: any Cedar request validation error returns `Deny`
+- [x] ABAC via Cedar context — `context.mfa_verified`, `context.ip_address`, `context.timestamp`
+- [x] Fail-closed: any error in entity building, UID construction, or Cedar evaluation returns `Deny`
+- [x] Configurable Cedar namespace — set per application via `AuthzStore::new`
 
 ### Session management
 - [x] SQLite session backend (via `tower-sessions-sqlx-store`)
@@ -83,13 +89,14 @@ The `valkey` feature flag builds but the backend is not production-ready.
 
 ## Planned
 
-### Configurable Cedar namespace
+### Authorization example
 **Priority: High**
-The Cedar entity namespace is hardcoded to `"Ekekrantz"` in `axess-core/src/authz.rs`. Every consuming application must use that string in their policy files.
+The SQLite example demonstrates authentication but not authorization. A working `AuthzEntityProvider` implementation with Cedar policies and schema would be the primary onboarding reference.
 
-- [ ] Add `namespace: String` field to `PolicyStore`; expose via builder
-- [ ] Update `user_uid`, `role_uid`, etc. helpers to accept a namespace parameter or read from store
-- [ ] Update the SQLite example to demonstrate a custom namespace
+- [ ] Add `AuthzEntityProvider` implementation to `examples/sqlite` backed by the SQLite schema
+- [ ] Add Cedar policy file + JSON schema to `examples/sqlite/policies/`
+- [ ] Demonstrate RBAC, ReBAC, and a simple ABAC (MFA) check in the example handlers
+- [ ] Show `MockPolicyEvaluator` usage in the example's test suite
 
 ### Session expiry as configuration parameter
 **Priority: High**
