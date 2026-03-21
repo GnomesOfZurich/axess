@@ -18,7 +18,7 @@ pub mod store;
 pub use data::{AuthState, SessionData, WorkflowKind, WorkflowState};
 pub use extractor::{AuthSession, SessionMissing};
 pub use id::SessionId;
-pub use layer::{SessionHandle, SessionInner, SessionLayer};
+pub use layer::SessionLayer;
 pub use store::{
     MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError,
     SessionRegistry, SessionStore,

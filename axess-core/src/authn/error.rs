@@ -12,19 +12,11 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     #[error("store error: {0}")]
     Store(#[source] E),
 
-    /// A session operation failed (e.g., the session layer is not installed).
-    #[error("session error")]
-    Session,
-
     /// No active authentication flow found in the session.
     ///
     /// Returned by `verify_factor` when the session is not in `Authenticating` state.
     #[error("no active authentication flow")]
     NoFlow,
-
-    /// The account is locked due to too many failed attempts.
-    #[error("account locked")]
-    Locked,
 
     /// The account exists but is not in a state that permits login.
     #[error("account not active: {0:?}")]

@@ -111,20 +111,20 @@ macro_rules! predicate_required {
 
 /// Login-required middleware macro.
 ///
-/// This macro generates Axum middleware that ensures the user is authenticated before allowing access to a route.
-/// If the user is not authenticated, it either returns an HTTP 401 Unauthorized response or redirects to a login page,
-/// depending on the macro parameters.
+/// Generates Axum middleware that ensures the user is authenticated before
+/// allowing access. If not authenticated, returns 401 or redirects to a login
+/// page depending on parameters.
 ///
 /// # Usage
 ///
 /// ## Return 401 Unauthorized (API endpoints)
 /// ```ignore
-/// use axesse_macros::login_required;
+/// use axess_macros::login_required;
 /// use axum::{routing::get, Router};
 ///
 /// let app = Router::new()
 ///     .route("/api/protected", get(api_handler))
-///     .layer(login_required!(AuthSession));
+///     .layer(login_required!());
 /// ```
 ///
 /// ## Redirect to login page (web pages)
@@ -134,7 +134,7 @@ macro_rules! predicate_required {
 ///
 /// let app = Router::new()
 ///     .route("/dashboard", get(dashboard_handler))
-///     .layer(login_required!(AuthSession, "/login"));
+///     .layer(login_required!("/login"));
 /// ```
 ///
 /// ## Redirect with custom query parameter
@@ -144,23 +144,12 @@ macro_rules! predicate_required {
 ///
 /// let app = Router::new()
 ///     .route("/admin", get(admin_handler))
-///     .layer(login_required!(AuthSession, "/auth/login", "return_to"));
+///     .layer(login_required!("/auth/login", "return_to"));
 /// ```
-///
-/// # Parameters
-///
-/// - `$auth_session_type`: The `AuthSession` type.
-/// - `$login_url`: (Optional) The URL to redirect unauthenticated users to.
-/// - `$redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
-///
-/// # Notes
-///
-/// When a redirect URL is provided, the middleware will append the original request URI as a query parameter,
-/// allowing the login page to redirect back after successful authentication.
 #[macro_export]
 macro_rules! login_required {
-    // Full form: auth session type, login URL, and custom redirect field
-    ($auth_session_type:ty, $login_url:expr, $redirect_field:expr) => {{
+    // Full form: login URL and custom redirect field
+    ($login_url:expr, $redirect_field:expr) => {{
         use axum::{
             extract::OriginalUri,
             middleware::{from_fn, Next},
@@ -168,7 +157,7 @@ macro_rules! login_required {
         };
 
         from_fn(
-            |auth_session: $auth_session_type,
+            |auth_session: $crate::AuthSession,
              OriginalUri(original_uri): OriginalUri,
              req,
              next: Next| async move {
@@ -194,19 +183,19 @@ macro_rules! login_required {
     }};
 
     // Redirect with default "next" field
-    ($auth_session_type:ty, $login_url:expr) => {
-        $crate::login_required!($auth_session_type, $login_url, "next")
+    ($login_url:expr) => {
+        $crate::login_required!($login_url, "next")
     };
 
     // Status code only (no redirect)
-    ($auth_session_type:ty) => {{
+    () => {{
         use axum::{
             middleware::{from_fn, Next},
             response::IntoResponse,
         };
 
         from_fn(
-            |auth_session: $auth_session_type, req, next: Next| async move {
+            |auth_session: $crate::AuthSession, req, next: Next| async move {
                 if auth_session.is_authenticated().await {
                     next.run(req).await
                 } else {
@@ -219,7 +208,7 @@ macro_rules! login_required {
 
 /// Partial authentication-required middleware macro.
 ///
-/// This macro generates Axum middleware that ensures the user is in the `Authenticating`
+/// Generates Axum middleware that ensures the user is in the `Authenticating`
 /// state (i.e., has started but not completed a multi-factor flow) before allowing access.
 ///
 /// # Usage
@@ -231,7 +220,7 @@ macro_rules! login_required {
 ///
 /// let app = Router::new()
 ///     .route("/mfa/verify", get(mfa_handler))
-///     .layer(require_partial_authn!(AuthSession));
+///     .layer(require_partial_authn!());
 /// ```
 ///
 /// ## Redirect to login page (web pages)
@@ -241,19 +230,13 @@ macro_rules! login_required {
 ///
 /// let app = Router::new()
 ///     .route("/mfa", get(mfa_page))
-///     .layer(require_partial_authn!(AuthSession, login_url = "/login"));
+///     .layer(require_partial_authn!(login_url = "/login"));
 /// ```
-///
-/// # Parameters
-///
-/// - `$auth_session_type`: The `AuthSession` type.
-/// - `login_url`: (Optional) The URL to redirect unauthenticated users to.
-/// - `redirect_field`: (Optional) The query parameter name for the original URI (default: `"next"`).
 #[macro_export]
 macro_rules! require_partial_authn {
     // Status code only
-    ($auth_session_type:ty) => {{
-        async fn is_partial_authenticated(auth_session: $auth_session_type) -> bool {
+    () => {{
+        async fn is_partial_authenticated(auth_session: $crate::AuthSession) -> bool {
             auth_session.auth_state().await.is_authenticating()
         }
 
@@ -264,8 +247,8 @@ macro_rules! require_partial_authn {
     }};
 
     // Redirect with custom field
-    ($auth_session_type:ty, login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
-        async fn is_partial_authenticated(auth_session: $auth_session_type) -> bool {
+    (login_url = $login_url:expr, redirect_field = $redirect_field:expr) => {{
+        async fn is_partial_authenticated(auth_session: $crate::AuthSession) -> bool {
             auth_session.auth_state().await.is_authenticating()
         }
 
@@ -277,11 +260,7 @@ macro_rules! require_partial_authn {
     }};
 
     // Redirect with default "next" field
-    ($auth_session_type:ty, login_url = $login_url:expr) => {
-        $crate::require_partial_authn!(
-            $auth_session_type,
-            login_url = $login_url,
-            redirect_field = "next"
-        )
+    (login_url = $login_url:expr) => {
+        $crate::require_partial_authn!(login_url = $login_url, redirect_field = "next")
     };
 }

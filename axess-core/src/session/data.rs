@@ -124,6 +124,18 @@ pub struct WorkflowState {
     pub initiated_at: DateTime<Utc>,
 }
 
+impl WorkflowState {
+    /// Create a new workflow. Pass `clock.now()` as `now` for DST compatibility.
+    pub fn new(kind: WorkflowKind, total_steps: u32, now: DateTime<Utc>) -> Self {
+        Self {
+            kind,
+            current_step: 0,
+            total_steps,
+            initiated_at: now,
+        }
+    }
+}
+
 /// The classification of a post-authentication workflow.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WorkflowKind {

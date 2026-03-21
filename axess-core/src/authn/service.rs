@@ -1,8 +1,42 @@
 //! Authentication service — orchestrates identity lookup, factor verification,
 //! and session management.
 //!
-//! Hold an `Arc<AuthnService<…>>` in Axum state. Login handlers call
-//! [`AuthnService::begin_login`] then [`AuthnService::verify_factor`].
+//! Hold an `Arc<AuthnService<…>>` in Axum state. The login flow is:
+//!
+//! 1. [`AuthnService::begin_login`] — identifies the user, starts the MFA chain.
+//! 2. [`AuthnService::prepare_factor`] — for challenge-based factors (EmailOtp),
+//!    generates and stores the challenge, returns data for the app to deliver.
+//!    For simple factors (Password, TOTP, HOTP), returns `Ready` immediately.
+//! 3. [`AuthnService::verify_factor`] — verifies the credential the user submits.
+//!
+//! # Enforcing session validity on protected routes
+//!
+//! The [`login_required!`] macro checks `is_authenticated()` on the session
+//! state, but does **not** consult the session registry. If you use
+//! [`AuthnService::with_registry`] for forced-logout support, you should add
+//! a middleware layer that calls [`AuthnService::check_session`]:
+//!
+//! ```rust,ignore
+//! use axess::{AuthSession, AuthnService};
+//! use axum::{middleware::from_fn, response::IntoResponse, http::StatusCode};
+//!
+//! let authn: Arc<AuthnService<_, _, _, _>> = /* … */;
+//!
+//! let app = Router::new()
+//!     .route("/api/protected", get(my_handler))
+//!     .layer(from_fn(move |session: AuthSession, req, next: axum::middleware::Next| {
+//!         let authn = authn.clone();
+//!         async move {
+//!             if !authn.check_session(&session).await {
+//!                 return StatusCode::UNAUTHORIZED.into_response();
+//!             }
+//!             next.run(req).await
+//!         }
+//!     }));
+//! ```
+//!
+//! This gives full control over which routes enforce registry checks and what
+//! the rejection response looks like, without adding any new types to the library.
 
 use crate::{
     authn::{
@@ -23,11 +57,10 @@ use std::{future::Future, pin::Pin, sync::Arc};
 // ── Outcome types ─────────────────────────────────────────────────────────────
 
 /// Result of beginning a login attempt.
+#[derive(Debug)]
 pub enum LoginOutcome {
-    /// Single-factor method complete — session is now `Authenticated`.
-    Authenticated,
-    /// Multi-factor — first factor passed, session is `Authenticating`.
-    /// The UI should present the next factor.
+    /// The first factor is required — session is now `Authenticating`.
+    /// Call `prepare_factor` then present the factor UI.
     FactorRequired(FactorKind),
     /// The account is locked out.
     Locked {
@@ -38,7 +71,61 @@ pub enum LoginOutcome {
     InvalidCredentials,
 }
 
+/// Result of preparing a factor challenge.
+///
+/// Returned by [`AuthnService::prepare_factor`]. Challenge-based factors
+/// (EmailOtp, Fido2) return data the application must act on — e.g. sending
+/// an email or forwarding a WebAuthn challenge to the browser. Simple factors
+/// (Password, TOTP, HOTP) are always [`Ready`](PrepareOutcome::Ready).
+pub enum PrepareOutcome {
+    /// No preparation needed — the UI can present the input form immediately.
+    Ready,
+    /// An OTP code was generated and stored. The application must deliver it
+    /// to the user via the indicated channel (email address).
+    ///
+    /// The `code` is plaintext — the hashed version is already persisted in the
+    /// factor store. After delivery, the application calls `verify_factor` with
+    /// the code the user enters.
+    SendOtp {
+        /// The plaintext OTP code to deliver.
+        code: String,
+        /// Where to send it (email address for EmailOtp).
+        destination: Arc<str>,
+    },
+    /// A challenge was already sent and hasn't expired yet (cooldown active).
+    /// The application should show a "code already sent" message rather than
+    /// sending a new one.
+    AlreadySent {
+        /// Where the code was sent (email address for EmailOtp).
+        destination: Arc<str>,
+    },
+    /// A FIDO2/WebAuthn challenge was generated (placeholder for future use).
+    Fido2Challenge {
+        /// Opaque challenge data to forward to the browser's WebAuthn API.
+        challenge: serde_json::Value,
+    },
+}
+
+impl std::fmt::Debug for PrepareOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready => write!(f, "Ready"),
+            Self::SendOtp { destination, .. } => f
+                .debug_struct("SendOtp")
+                .field("code", &"***")
+                .field("destination", destination)
+                .finish(),
+            Self::AlreadySent { destination } => f
+                .debug_struct("AlreadySent")
+                .field("destination", destination)
+                .finish(),
+            Self::Fido2Challenge { .. } => f.debug_struct("Fido2Challenge").finish_non_exhaustive(),
+        }
+    }
+}
+
 /// Result of verifying a factor step.
+#[derive(Debug)]
 pub enum FactorOutcome {
     /// This was the last factor — session is now `Authenticated`.
     Authenticated,
@@ -60,20 +147,19 @@ pub enum FactorOutcome {
 /// Generic over:
 /// - `I`: [`IdentityStore`]
 /// - `F`: [`FactorStore`] (same error type as `I`)
-/// - `Rng`: [`SecureRng`] (default: `SystemRng`)
+/// - `R`: [`SecureRng`] (default: `SystemRng`)
 /// - `C`: [`Clock`] (default: `SystemClock`)
-pub struct AuthnService<I, F, Rng = SystemRng, C = SystemClock>
+pub struct AuthnService<I, F, R = SystemRng, C = SystemClock>
 where
     I: IdentityStore,
     F: FactorStore,
-    Rng: SecureRng,
+    R: SecureRng,
     C: Clock,
 {
     identity: Arc<I>,
     factors: Arc<F>,
-    registry: Option<Arc<dyn ErasedRegistry>>,
-    #[allow(dead_code)]
-    rng: Rng,
+    registry: Option<Arc<dyn RegistryHandle>>,
+    rng: R,
     clock: C,
 }
 
@@ -82,7 +168,7 @@ where
 // Uses the `Pin<Box<dyn Future>>` pattern (BoxFuture) so callers can `.await`
 // registry operations in async contexts — no `block_in_place` / `block_on`
 // which deadlock on single-threaded runtimes and hold the thread under load.
-trait ErasedRegistry: Send + Sync + 'static {
+trait RegistryHandle: Send + Sync + 'static {
     fn is_valid<'a>(
         &'a self,
         user_id: &'a str,
@@ -101,9 +187,9 @@ trait ErasedRegistry: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
-struct RegistryWrapper<R: SessionRegistry>(R);
+struct RegistryWrapper<T: SessionRegistry>(T);
 
-impl<R: SessionRegistry + 'static> ErasedRegistry for RegistryWrapper<R> {
+impl<T: SessionRegistry + 'static> RegistryHandle for RegistryWrapper<T> {
     fn is_valid<'a>(
         &'a self,
         user_id: &'a str,
@@ -149,15 +235,15 @@ where
     }
 }
 
-impl<I, F, Rng, C> AuthnService<I, F, Rng, C>
+impl<I, F, R, C> AuthnService<I, F, R, C>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
-    Rng: SecureRng,
+    R: SecureRng,
     C: Clock,
 {
     /// Replace the RNG (for DST).
-    pub fn with_rng<R: SecureRng>(self, rng: R) -> AuthnService<I, F, R, C> {
+    pub fn with_rng<R2: SecureRng>(self, rng: R2) -> AuthnService<I, F, R2, C> {
         AuthnService {
             identity: self.identity,
             factors: self.factors,
@@ -168,7 +254,7 @@ where
     }
 
     /// Replace the clock (for DST).
-    pub fn with_clock<Cl: Clock>(self, clock: Cl) -> AuthnService<I, F, Rng, Cl> {
+    pub fn with_clock<Cl: Clock>(self, clock: Cl) -> AuthnService<I, F, R, Cl> {
         AuthnService {
             identity: self.identity,
             factors: self.factors,
@@ -216,7 +302,13 @@ where
         let user = match user_opt {
             Some(u) => u,
             None => {
-                // Return generic error — no user enumeration.
+                // Two-step MFA flows (identify → verify) inherently reveal
+                // whether an identifier maps to a valid account — the response
+                // must differ so the UI can show the correct next step.
+                // This is the same trade-off Gmail, Microsoft, and most banks
+                // accept. A dummy Argon2 hash is NOT used here because no
+                // password is verified at this stage — it would create an
+                // *inverted* timing channel (not-found slower than found).
                 return Ok(LoginOutcome::InvalidCredentials);
             }
         };
@@ -278,6 +370,126 @@ where
         Ok(LoginOutcome::FactorRequired(first_kind))
     }
 
+    /// Prepare the current factor challenge, if the factor kind requires it.
+    ///
+    /// Call this after `begin_login` (or after a successful `verify_factor`
+    /// that returns `FactorRequired`) to set up the next factor step.
+    ///
+    /// - **Password / TOTP / HOTP** → returns [`PrepareOutcome::Ready`].
+    ///   The UI can show the input form immediately.
+    /// - **EmailOtp** → generates a random code, hashes it with Argon2id,
+    ///   persists it in the factor store, and returns
+    ///   [`PrepareOutcome::SendOtp`] with the plaintext code and the
+    ///   destination email. The application is responsible for delivering the
+    ///   code (via SMTP, SendGrid, etc.).
+    /// - **Fido2** → placeholder, currently returns `Ready`.
+    ///
+    /// The session must be in [`AuthState::Authenticating`].
+    pub async fn prepare_factor(
+        &self,
+        session: &AuthSession,
+    ) -> Result<PrepareOutcome, AuthnError<I::Error>> {
+        let auth_state = session.auth_state().await;
+
+        let (user_id, tenant_id, remaining) = match &auth_state {
+            crate::session::data::AuthState::Authenticating {
+                user_id,
+                tenant_id,
+                remaining,
+                ..
+            } => (user_id.clone(), tenant_id.clone(), remaining.clone()),
+            _ => return Err(AuthnError::NoFlow),
+        };
+
+        // Check account status — a locked/suspended account must not trigger
+        // challenge delivery (e.g. email sends).
+        let status = self
+            .identity
+            .account_status(&user_id)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        if status.is_locked() {
+            return Err(AuthnError::NotActive(status));
+        }
+        if !status.allows_login() {
+            return Err(AuthnError::NotActive(status));
+        }
+
+        let current_kind = remaining.first().ok_or(AuthnError::NoFlow)?.clone();
+
+        match current_kind {
+            FactorKind::Password | FactorKind::Totp | FactorKind::Hotp => Ok(PrepareOutcome::Ready),
+
+            FactorKind::EmailOtp => {
+                // Load the EmailOtp config to get the destination and parameters.
+                let user_scope = AuthnScope::User {
+                    tenant_id: tenant_id.clone(),
+                    user_id: user_id.clone(),
+                };
+                let config = self
+                    .load_factor_with_fallback(&user_scope, &tenant_id, FactorKind::EmailOtp)
+                    .await?;
+
+                let FactorConfig::EmailOtp(ref cfg) = config else {
+                    return Err(AuthnError::NoFlow);
+                };
+
+                // Cooldown: reject if a pending code hasn't expired yet.
+                // This prevents email bombing — the application can only trigger
+                // one send per TTL window.
+                let now = self.clock.now();
+                if cfg.pending_until.is_some_and(|until| now < until) {
+                    return Ok(PrepareOutcome::AlreadySent {
+                        destination: cfg.email.clone(),
+                    });
+                }
+
+                let email = cfg.email.clone();
+                let code_length = cfg.code_length as usize;
+                let ttl_secs = cfg.ttl_secs;
+
+                // Generate a random numeric code using the injectable RNG.
+                let mut rng = self.rng.clone();
+                let code = generate_otp_code(&mut rng, code_length);
+
+                // Hash the code with Argon2id for storage.
+                let hash = axess_factors::generate_password_hash(&code);
+
+                // Compute expiry from config TTL.
+                let expires = now + chrono::Duration::seconds(ttl_secs as i64);
+
+                // Build the updated config with the pending hash.
+                let FactorConfig::EmailOtp(mut updated_cfg) = config else {
+                    unreachable!();
+                };
+                updated_cfg.pending_hash = Some(crate::authn::factor::ZeroizedString::new(hash));
+                updated_cfg.pending_until = Some(expires);
+
+                // Save to user scope (per-user pending state).
+                self.factors
+                    .save_factor(&user_scope, FactorConfig::EmailOtp(updated_cfg))
+                    .await
+                    .map_err(AuthnError::Store)?;
+
+                Ok(PrepareOutcome::SendOtp {
+                    code,
+                    destination: email,
+                })
+            }
+
+            FactorKind::Fido2 => {
+                // Placeholder — FIDO2 challenge generation not yet implemented.
+                Ok(PrepareOutcome::Ready)
+            }
+
+            FactorKind::Federated(_) => {
+                // Federated auth is handled externally (OAuth redirect flow).
+                Ok(PrepareOutcome::Ready)
+            }
+        }
+    }
+
     /// Verify a factor credential during an in-progress authentication flow.
     ///
     /// The session must be in [`AuthState::Authenticating`].
@@ -334,9 +546,9 @@ where
             .load_factor_with_fallback(&user_scope, &tenant_id, current_kind.clone())
             .await?;
 
-        // Verify the credential. Clock is injected so TOTP is deterministically testable.
-        let now: std::time::SystemTime = self.clock.now().into();
-        let outcome = verify_credential(credential, &config, &current_kind, now);
+        // Verify the credential. Clock is injected so TOTP/expiry are DST-testable.
+        let now_utc = self.clock.now();
+        let outcome = verify_credential(credential, &config, &current_kind, now_utc);
 
         if matches!(outcome, VerifyOutcome::Fail) {
             // Record the failed attempt in the store — this is the authoritative counter.
@@ -374,18 +586,18 @@ where
         // Credential verified — persist any updated factor state.
         // For TOTP this records the accepted step (replay prevention).
         // For HOTP this advances the counter past the matched value.
+        //
+        // The updated config is always saved to the user scope, even when the
+        // original config was loaded from a tenant or global scope via fallback.
+        // This is intentional: per-user mutable state (TOTP last_step, HOTP
+        // counter) must be stored per-user, while the inherited template
+        // (secret, digits, period) remains at the higher scope.
         if let VerifyOutcome::PassWithUpdate(updated_config) = outcome {
             self.factors
                 .save_factor(&user_scope, updated_config)
                 .await
                 .map_err(AuthnError::Store)?;
         }
-
-        // Reset the failed-attempt counter in the store.
-        self.identity
-            .reset_failed_attempts(&user_id)
-            .await
-            .map_err(AuthnError::Store)?;
 
         // Advance the factor in the session.
         let now = self.clock.now();
@@ -394,6 +606,15 @@ where
         // Check if all factors are satisfied.
         let new_state = session.auth_state().await;
         if new_state.is_authenticated() {
+            // Only reset the failed-attempt counter after ALL factors are
+            // satisfied. Resetting per-factor would let an attacker who knows
+            // an earlier factor (e.g. password) brute-force later factors
+            // (e.g. TOTP/EmailOtp) in unlimited batches of max_attempts.
+            self.identity
+                .reset_failed_attempts(&user_id)
+                .await
+                .map_err(AuthnError::Store)?;
+
             let sid = session.session_id().await;
             if let Some(reg) = &self.registry {
                 reg.register(&user_id, &sid).await;
@@ -524,13 +745,14 @@ enum VerifyOutcome {
 /// Verify a credential against a factor config.
 ///
 /// `now` is supplied by the caller (from an injectable [`Clock`]) rather than
-/// reading `SystemTime::now()` directly, keeping the function deterministically
-/// testable under DST.
+/// reading `Utc::now()` directly, keeping the function deterministically
+/// testable under DST. Converted to `SystemTime` only for the TOTP path
+/// which requires it.
 fn verify_credential(
     credential: &FactorCredential,
     config: &FactorConfig,
     kind: &FactorKind,
-    now: std::time::SystemTime,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> VerifyOutcome {
     match (credential, config, kind) {
         (FactorCredential::Password(pwd), FactorConfig::Password(cfg), FactorKind::Password) => {
@@ -544,10 +766,11 @@ fn verify_credential(
         }
 
         (FactorCredential::OtpCode(code), FactorConfig::Totp(cfg), FactorKind::Totp) => {
+            let now_system: std::time::SystemTime = now.into();
             let matched = axess_factors::verify_totp(
                 cfg.secret.as_ref(),
                 code.as_ref(),
-                now,
+                now_system,
                 Some(cfg.digits as usize),
                 Some(cfg.period_secs as u64),
                 Some(cfg.past_window as u64),
@@ -588,11 +811,56 @@ fn verify_credential(
             }
         }
 
+        (FactorCredential::OtpCode(code), FactorConfig::EmailOtp(cfg), FactorKind::EmailOtp) => {
+            // Verify: pending hash must exist and code must not have expired.
+            let hash = match &cfg.pending_hash {
+                Some(h) => h,
+                None => return VerifyOutcome::Fail,
+            };
+
+            // Check expiry using the injected clock time.
+            if cfg.pending_until.is_some_and(|until| now > until) {
+                return VerifyOutcome::Fail;
+            }
+
+            // Constant-time hash comparison via Argon2id verify.
+            if axess_factors::verify_password(code.as_ref(), hash.as_ref()).is_err() {
+                return VerifyOutcome::Fail;
+            }
+
+            // Clear the pending state to prevent reuse.
+            let mut updated = cfg.clone();
+            updated.pending_hash = None;
+            updated.pending_until = None;
+            VerifyOutcome::PassWithUpdate(FactorConfig::EmailOtp(updated))
+        }
+
         (FactorCredential::Fido2Assertion(_), FactorConfig::Fido2(_), FactorKind::Fido2) => {
             // FIDO2 is a placeholder — always fail until implemented.
             VerifyOutcome::Fail
         }
 
         _ => VerifyOutcome::Fail,
+    }
+}
+
+// ── OTP code generation ────────────────────────────────────────────────────────
+
+/// Generate a random numeric OTP code of the given length using the injectable RNG.
+///
+/// Returns a zero-padded decimal string (e.g. `"042817"` for length 6).
+fn generate_otp_code(rng: &mut impl SecureRng, length: usize) -> String {
+    let modulus = 10u64.pow(length as u32);
+    // Rejection sampling to eliminate modulo bias: discard values from the
+    // partial final bucket that would skew the distribution.
+    let max_fair = u64::MAX - (u64::MAX % modulus);
+    loop {
+        let mut bytes = [0u8; 8];
+        rng.fill_bytes(&mut bytes);
+        let value = u64::from_le_bytes(bytes);
+        if value < max_fair {
+            return format!("{:0>width$}", value % modulus, width = length);
+        }
+        // Extremely rare (~5.4e-14 probability per iteration for 6-digit codes).
     }
 }

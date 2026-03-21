@@ -25,6 +25,6 @@ libreauth = { version = "0.18.1", optional = true }
 
 [features]
 password = ["dep:password-auth"]
-totp = ["dep:totp-rs", "dep:rand"]
+totp = ["dep:totp-rs", "dep:rand", "dep:subtle"]
 hotp = ["dep:libreauth", "dep:base32", "dep:hex", "dep:zeroize", "dep:subtle"]
 default = ["password", "totp", "hotp"]

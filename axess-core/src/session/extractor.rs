@@ -5,7 +5,7 @@
 
 use crate::authn::factor::FactorKind;
 use crate::session::{
-    data::{AuthState, SessionData, WorkflowKind, WorkflowState},
+    data::{AuthState, SessionData, WorkflowState},
     id::SessionId,
     layer::SessionHandle,
 };
@@ -13,7 +13,6 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 /// Axum request extractor providing typed, mutable session access.
 ///
@@ -29,16 +28,6 @@ use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 pub struct AuthSession(pub(crate) SessionHandle);
 
 impl AuthSession {
-    /// Read-lock the session data. The lock is released when the guard is dropped.
-    pub async fn state(&self) -> RwLockReadGuard<'_, crate::session::layer::SessionInner> {
-        self.0.0.read().await
-    }
-
-    /// Write-lock the session data. The lock is released when the guard is dropped.
-    pub async fn state_mut(&self) -> RwLockWriteGuard<'_, crate::session::layer::SessionInner> {
-        self.0.0.write().await
-    }
-
     /// Return the authenticated user ID, if any.
     pub async fn user_id(&self) -> Option<Arc<str>> {
         self.0.0.read().await.data.auth_state.user_id().cloned()
@@ -125,7 +114,9 @@ impl AuthSession {
                 remaining,
                 ..
             } => {
-                remaining.retain(|k| k != kind);
+                if let Some(pos) = remaining.iter().position(|k| k == kind) {
+                    remaining.remove(pos);
+                }
                 if remaining.is_empty() {
                     let uid = user_id.clone();
                     let tid = tenant_id.clone();
@@ -230,16 +221,6 @@ impl AuthSession {
         guard.data.custom[key.into()] = value;
         guard.modified = true;
     }
-
-    /// Create a new [`WorkflowState`] with the given kind and step count.
-    pub fn make_workflow(kind: WorkflowKind, total_steps: u32) -> WorkflowState {
-        WorkflowState {
-            kind,
-            current_step: 0,
-            total_steps,
-            initiated_at: Utc::now(),
-        }
-    }
 }
 
 // ── Axum extractor impl ────────────────────────────────────────────────────────
@@ -252,7 +233,7 @@ impl axum::response::IntoResponse for SessionMissing {
     fn into_response(self) -> axum::response::Response {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Session layer not installed",
+            "Internal Server Error",
         )
             .into_response()
     }

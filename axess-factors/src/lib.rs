@@ -8,7 +8,7 @@ use rand::Rng;
 use std::fmt::Write;
 #[cfg(feature = "totp")]
 use std::time::SystemTime;
-#[cfg(feature = "hotp")]
+#[cfg(any(feature = "hotp", feature = "totp"))]
 use subtle::ConstantTimeEq;
 #[cfg(feature = "totp")]
 pub use totp_rs::{Algorithm as TotpAlgorithm, TOTP};
@@ -65,7 +65,7 @@ pub fn verify_totp(
     let check_candidate = |step: u64| -> Option<u64> {
         let timestamp_secs = step.saturating_mul(time_step);
         let expected = totp.generate(timestamp_secs);
-        if expected == sanitized_code {
+        if expected.as_bytes().ct_eq(sanitized_code.as_bytes()).into() {
             Some(step)
         } else {
             None

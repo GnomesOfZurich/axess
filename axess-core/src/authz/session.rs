@@ -32,10 +32,10 @@
 //! ```rust,ignore
 //! use axess_core::authz::context::StandardRequestContext;
 //!
-//! let ctx = StandardRequestContext {
-//!     mfa_verified: session.is_mfa_complete(),
-//!     ip_address: ip_from_headers(request.headers()),
-//! };
+//! let ctx = StandardRequestContext::new(
+//!     session.is_mfa_complete(),
+//!     ip_from_headers(request.headers()),
+//! );
 //! let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
 //! authz.require("PostJournalEntry", &ledger_id).await?;
 //! ```

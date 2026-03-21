@@ -36,6 +36,23 @@ use tower_cookies::cookie::{Cookie, SameSite};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// HMAC signing key that is zeroed from memory on drop.
+#[derive(Clone)]
+struct SigningKey([u8; 32]);
+
+impl Drop for SigningKey {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl std::ops::Deref for SigningKey {
+    type Target = [u8; 32];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 const DEFAULT_COOKIE_NAME: &str = "axess.sid";
 const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 
@@ -54,9 +71,9 @@ pub struct SessionInner {
     /// The typed session payload.
     pub data: SessionData,
     /// Set to `true` when any field of `data` is changed — triggers a save on response.
-    pub modified: bool,
+    pub(crate) modified: bool,
     /// Set to `true` to cycle the session ID before saving (session fixation prevention).
-    pub regenerate: bool,
+    pub(crate) regenerate: bool,
 }
 
 // ── SessionLayer ──────────────────────────────────────────────────────────────
@@ -75,7 +92,7 @@ pub struct SessionInner {
 pub struct SessionLayer<S> {
     store: S,
     cookie_name: Arc<str>,
-    signing_key: Arc<[u8; 32]>,
+    signing_key: Arc<SigningKey>,
     ttl: Duration,
     secure: bool,
     same_site: SameSite,
@@ -87,7 +104,7 @@ impl<S: SessionStore> SessionLayer<S> {
         Self {
             store,
             cookie_name: DEFAULT_COOKIE_NAME.into(),
-            signing_key: Arc::new(signing_key),
+            signing_key: Arc::new(SigningKey(signing_key)),
             ttl: DEFAULT_TTL,
             secure: true,
             same_site: SameSite::Lax,
@@ -148,7 +165,7 @@ pub struct SessionService<S, Inner> {
     inner: Inner,
     store: S,
     cookie_name: Arc<str>,
-    signing_key: Arc<[u8; 32]>,
+    signing_key: Arc<SigningKey>,
     ttl: Duration,
     secure: bool,
     same_site: SameSite,
@@ -191,14 +208,10 @@ where
                     .get(axum::http::header::COOKIE)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| {
-                        // Parse Cookie header manually — format: name=value; name2=value2
-                        s.split(';').find_map(|part| {
-                            let trimmed = part.trim();
-                            trimmed
-                                .strip_prefix(cookie_name.as_ref())
-                                .and_then(|rest| rest.strip_prefix('='))
-                                .map(|v| v.trim().to_string())
-                        })
+                        Cookie::split_parse(s.to_string())
+                            .filter_map(Result::ok)
+                            .find(|c| c.name() == cookie_name.as_ref())
+                            .map(|c| c.value().to_string())
                     });
 
                 let verified_id = cookie_value
@@ -269,6 +282,9 @@ where
                 cookie.set_secure(secure);
                 cookie.set_same_site(same_site);
                 cookie.set_path("/");
+                cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(
+                    ttl.as_secs() as i64,
+                ));
 
                 if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie.to_string()) {
                     response

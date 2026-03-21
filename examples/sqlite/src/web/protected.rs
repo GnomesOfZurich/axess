@@ -1,7 +1,7 @@
 //! Protected routes — accessible only to fully authenticated users.
 
 use crate::web::app::AppState;
-use axess::{AuthSession, login_required};
+use axess::{AuthSession, login_required}; // AuthSession used in handler signature
 use axum::{
     Router,
     extract::State,
@@ -16,7 +16,7 @@ use axum::{
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/dashboard", get(dashboard))
-        .route_layer(login_required!(AuthSession, "/login"))
+        .route_layer(login_required!("/login"))
 }
 
 /// GET /dashboard — requires authentication.

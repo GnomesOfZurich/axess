@@ -1,16 +1,77 @@
 # Axess Example: SQLite Backend
 
+> **Note:** This example has not yet been updated to the current Axess API (v0.0.14).
+> The code references the old `tower-sessions` / `AuthnServiceBuilder` / generic `AuthSession`
+> API that was replaced in the v0.0.14 rewrite. See the roadmap for the update plan.
+
 This example demonstrates how to use the [Axess](https://github.com/GnomesOfZurich/axess) authentication and authorization library with an Axum web application backed by SQLite for session and credential storage.
 
 ## Features
 
-- **Session-based authentication** using Axess middleware
+- **Session-based authentication** using Axess custom `SessionLayer` with HMAC-signed cookies
 - **Multi-factor authentication**: password + TOTP (Time-based One-Time Password)
 - **Tenant and user management**
 - **Account signup, login, logout, and factor setup flows**
 - **Protected routes requiring authentication**
 - **Axum integration with Askama templates**
-- **Persistent session storage via [tower-sessions-sqlx-store](https://crates.io/crates/tower-sessions-sqlx-store)**
+- **Persistent session storage via `SqliteSessionStore`**
+
+## Current API (v0.0.14)
+
+The example code below reflects the target API after the planned update:
+
+```rust
+use axess::{
+    AuthSession, AuthnService, SessionLayer, MemorySessionStore,
+    LoginOutcome, PrepareOutcome, FactorOutcome, FactorCredential,
+    login_required,
+};
+use axum::{Router, routing::{get, post}};
+use std::sync::Arc;
+
+// 1. Create session layer with HMAC signing key.
+let store = MemorySessionStore::new(); // or SqliteSessionStore
+let signing_key: [u8; 32] = /* load from secrets */;
+let session_layer = SessionLayer::new(store, signing_key)
+    .with_ttl(std::time::Duration::from_secs(24 * 60 * 60))
+    .with_secure(false); // set true in production
+
+// 2. Create the authentication service.
+let authn = Arc::new(AuthnService::new(my_identity_store, my_factor_store));
+
+// 3. Build the router.
+let app = Router::new()
+    .route("/dashboard", get(dashboard_handler))
+    .layer(login_required!("/login"))
+    .route("/login", post(login_handler))
+    .layer(session_layer);
+```
+
+### Login handler pattern
+
+```rust
+async fn login_handler(
+    session: AuthSession,
+    State(authn): State<Arc<AuthnService<MyStore, MyStore>>>,
+    Form(form): Form<LoginForm>,
+) -> impl IntoResponse {
+    // Step 1: Identify the user.
+    let outcome = authn.begin_login(&form.email, &form.tenant, &session).await?;
+
+    match outcome {
+        LoginOutcome::FactorRequired(kind) => {
+            // Step 2: Prepare the factor (generates OTP for EmailOtp, no-op for Password).
+            let prep = authn.prepare_factor(&session).await?;
+            if let PrepareOutcome::SendOtp { code, destination } = prep {
+                email_service.send_otp(&destination, &code).await?;
+            }
+            // Render factor input form...
+        }
+        LoginOutcome::InvalidCredentials => { /* show error */ }
+        LoginOutcome::Locked { until } => { /* show lockout message */ }
+    }
+}
+```
 
 ## Running the Example
 
@@ -31,15 +92,7 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
       DATABASE_URL=sqlite://db/axess-example.db
       ```
 
-3. **Run database migrations:**
-
-    ```sh
-    cargo run -p axess-example-sqlite
-    ```
-
-    *(Or let the app run migrations at startup)*
-
-4. **Start the web server:**
+3. **Run the application:**
 
     ```sh
     cargo run -p axess-example-sqlite
@@ -47,16 +100,10 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
 
     The app will listen on `127.0.0.1:3000` by default.
 
-5. **Open in your browser:**
-
-    ```
-    http://localhost:3000/login
-    ```
-
 ## Project Structure
 
 - `src/web/` — Axum routes, templates, and handlers
-- `src/models/` — Backend implementation, entities, and database logic
+- `src/models/` — Backend implementation (`IdentityStore` + `FactorStore`), entities, and database logic
 - `templates/` — Askama HTML templates for login, signup, protected pages, factor setup
 - `migrations/` — SQLx migration scripts for SQLite schema
 - `.env` — Optional environment configuration
@@ -64,37 +111,9 @@ This example demonstrates how to use the [Axess](https://github.com/GnomesOfZuri
 ## Key Flows
 
 - **Signup:** Create a new user and tenant, stage password and TOTP factors
-- **Login:** Authenticate with password, then verify TOTP if enabled
+- **Login:** `begin_login` → `prepare_factor` → `verify_factor` (password, then TOTP if enabled)
 - **TOTP Setup:** Provision TOTP secret and URI for authenticator apps
-- **Protected Route:** `/main` requires authentication via Axess middleware
-
-## Example Code Snippet
-
-```rust
-use axess::{AuthSession, AuthnServiceBuilder, SessionRegistryStore, SystemRng, login_required};
-use axum::{Router, routing::get};
-use tower_sessions_sqlx_store::SqliteStore;
-use sqlx::SqlitePool;
-use std::sync::Arc;
-
-use crate::{models::OurBackend, routers::{auth_router, protected_router}};
-
-type Session = AuthSession<OurBackend, SessionRegistryStore<SqliteStore>, SystemRng>;
-
-let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-let backend = Arc::new(OurBackend::new(pool.clone()));
-let session_store = SqliteStore::new(pool.clone());
-let registry = Arc::new(SessionRegistryStore::new(session_store.clone(), 100, None, None));
-
-let auth_layer = AuthnServiceBuilder::new(backend.clone(), session_layer)
-    .with_session_registry(registry.clone())
-    .build();
-
-let app = Router::new()
-    .merge(auth_router())
-    .merge(protected_router())
-    .layer(auth_layer);
-```
+- **Protected Route:** `/main` requires authentication via `login_required!()` macro
 
 ## License
 
@@ -103,5 +122,4 @@ MIT
 ## Links
 
 - [Axess Project](https://github.com/GnomesOfZurich/axess)
-- [API Docs](https://docs.rs/axess)
 - [Axum](https://github.com/tokio-rs/axum)

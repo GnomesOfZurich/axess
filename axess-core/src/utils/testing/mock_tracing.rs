@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Available for future integration tests.
+
 use std::sync::Once;
 use tracing::Level;
 use tracing_subscriber;

@@ -177,7 +177,7 @@ impl SessionStore for MemorySessionStore {
 /// Maps `user_id -> Set<SessionId>`. Suitable for tests and single-node dev.
 #[derive(Clone, Default)]
 pub struct MemorySessionRegistry {
-    valid: Arc<DashMap<String, HashSet<SessionId>>>,
+    valid: Arc<DashMap<Arc<str>, HashSet<SessionId>>>,
 }
 
 impl MemorySessionRegistry {
@@ -196,7 +196,7 @@ impl SessionRegistry for MemorySessionRegistry {
 
     async fn register(&self, user_id: &str, session_id: &SessionId) -> Result<(), Self::Error> {
         self.valid
-            .entry(user_id.to_string())
+            .entry(Arc::from(user_id))
             .or_default()
             .insert(*session_id);
         Ok(())

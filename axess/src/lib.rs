@@ -14,7 +14,7 @@ pub use axess_core::{
     AuthnError, AuthnScope, AuthnService, EmailOtpConfig, EntityState, FactorConfig,
     FactorCredential, FactorKind, FactorOutcome, FactorStore, FederatedProvider, Fido2Config,
     HotpConfig, IdentityStore, LockoutPolicy, LoginOutcome, OtpAlgorithm, PasswordConfig,
-    PasswordRules, StatusDetail, Tenant, TotpConfig, User, ZeroizedString,
+    PasswordRules, PrepareOutcome, StatusDetail, Tenant, TotpConfig, User, ZeroizedString,
 };
 
 // Authorization

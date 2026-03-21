@@ -12,11 +12,18 @@
 //! ```rust,ignore
 //! use axess_core::authz::context::StandardRequestContext;
 //!
-//! // Build from data available at the call site
-//! let ctx = StandardRequestContext {
-//!     mfa_verified: session.is_mfa_complete(),
-//!     ip_address: Some("192.168.1.1".parse().unwrap()),
-//! };
+//! // Production — uses wall-clock time internally:
+//! let ctx = StandardRequestContext::new(
+//!     session.is_mfa_complete(),
+//!     Some("192.168.1.1".parse().unwrap()),
+//! );
+//!
+//! // DST — explicit timestamp from injectable Clock:
+//! let ctx = StandardRequestContext::at(
+//!     session.is_mfa_complete(),
+//!     ip_from_headers(request.headers()),
+//!     clock.now(),
+//! );
 //!
 //! let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
 //! authz.require("PostJournalEntry", &ledger_id).await?;
@@ -42,7 +49,7 @@
 //! ```
 
 use cedar_policy::{Context, RestrictedExpression};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use super::error::AuthzError;
 
@@ -104,6 +111,34 @@ pub struct StandardRequestContext {
     /// Source IP address, if available. Passed as a string; use Cedar's
     /// `ip()` extension function in policies if you need range checks.
     pub ip_address: Option<std::net::IpAddr>,
+
+    /// Request timestamp. Pass `clock.now()` so DST controls the value.
+    /// Defaults to [`Utc::now()`] via [`StandardRequestContext::new`].
+    pub timestamp: DateTime<Utc>,
+}
+
+impl StandardRequestContext {
+    /// Create a context with the current wall-clock time.
+    pub fn new(mfa_verified: bool, ip_address: Option<std::net::IpAddr>) -> Self {
+        Self {
+            mfa_verified,
+            ip_address,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Create a context with an explicit timestamp (for DST).
+    pub fn at(
+        mfa_verified: bool,
+        ip_address: Option<std::net::IpAddr>,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            mfa_verified,
+            ip_address,
+            timestamp,
+        }
+    }
 }
 
 impl BuildRequestContext for StandardRequestContext {
@@ -115,7 +150,7 @@ impl BuildRequestContext for StandardRequestContext {
             ),
             (
                 "timestamp".to_string(),
-                RestrictedExpression::new_string(Utc::now().to_rfc3339()),
+                RestrictedExpression::new_string(self.timestamp.to_rfc3339()),
             ),
         ];
 
