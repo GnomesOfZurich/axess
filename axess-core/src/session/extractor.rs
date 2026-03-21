@@ -144,8 +144,14 @@ impl AuthSession {
         }
     }
 
-    /// Record a failed attempt for rate-limiting purposes.
-    pub async fn record_attempt(&self) {
+    /// Record a failed attempt at the given time (for UI display / rate-limit feedback).
+    ///
+    /// Callers should supply `clock.now()` rather than `Utc::now()` so that
+    /// deterministic simulation tests control the timestamp.
+    ///
+    /// **This does not enforce lockout** — lockout is based exclusively on the
+    /// DB counter returned by `IdentityStore::record_failed_attempt`.
+    pub async fn record_attempt_at(&self, now: DateTime<Utc>) {
         let mut guard = self.0.0.write().await;
         if let AuthState::Authenticating {
             attempt_count,
@@ -154,8 +160,22 @@ impl AuthSession {
         } = &mut guard.data.auth_state
         {
             *attempt_count += 1;
-            *last_attempt = Some(Utc::now());
+            *last_attempt = Some(now);
             guard.modified = true;
+        }
+    }
+
+    /// Return `(user_id, tenant_id)` if the session is fully authenticated, `None` otherwise.
+    ///
+    /// Acquires the read lock once — more efficient than calling `user_id()` and
+    /// `tenant_id()` separately.
+    pub async fn authenticated_ids(&self) -> Option<(Arc<str>, Arc<str>)> {
+        let guard = self.0.0.read().await;
+        match &guard.data.auth_state {
+            AuthState::Authenticated {
+                user_id, tenant_id, ..
+            } => Some((user_id.clone(), tenant_id.clone())),
+            _ => None,
         }
     }
 

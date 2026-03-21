@@ -132,10 +132,7 @@ pub struct AuthMethod {
 /// with the same error type.
 ///
 /// Most applications implement both traits on the same database-backed struct.
-pub trait AuthnBackend:
-    IdentityStore<Error = <Self as FactorStore>::Error> + FactorStore
-{
-}
+pub trait AuthnBackend: IdentityStore<Error = <Self as FactorStore>::Error> + FactorStore {}
 
 impl<T> AuthnBackend for T where
     T: IdentityStore + FactorStore + IdentityStore<Error = <T as FactorStore>::Error>

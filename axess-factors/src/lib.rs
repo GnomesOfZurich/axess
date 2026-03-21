@@ -3,7 +3,7 @@ pub use libreauth::oath::HOTPBuilder;
 #[cfg(feature = "password")]
 pub use password_auth::{generate_hash as generate_password_hash, verify_password};
 #[cfg(feature = "totp")]
-use rand::RngCore;
+use rand::Rng;
 #[cfg(feature = "totp")]
 use std::fmt::Write;
 #[cfg(feature = "totp")]

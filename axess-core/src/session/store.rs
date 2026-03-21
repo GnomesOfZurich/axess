@@ -145,7 +145,8 @@ impl SessionStore for MemorySessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
-        self.sessions.insert(*id, (data.clone(), Instant::now(), ttl));
+        self.sessions
+            .insert(*id, (data.clone(), Instant::now(), ttl));
         Ok(())
     }
 
@@ -163,7 +164,8 @@ impl SessionStore for MemorySessionStore {
     ) -> Result<SessionId, Self::Error> {
         self.sessions.remove(old_id);
         let new_id = SessionId::new(rng);
-        self.sessions.insert(new_id, (data.clone(), Instant::now(), ttl));
+        self.sessions
+            .insert(new_id, (data.clone(), Instant::now(), ttl));
         Ok(new_id)
     }
 }

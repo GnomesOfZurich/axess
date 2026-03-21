@@ -20,10 +20,7 @@ pub fn router() -> Router<AppState> {
 }
 
 /// GET /dashboard — requires authentication.
-pub async fn dashboard(
-    session: AuthSession,
-    State(_state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn dashboard(session: AuthSession, State(_state): State<AppState>) -> impl IntoResponse {
     let user_id = session
         .user_id()
         .await

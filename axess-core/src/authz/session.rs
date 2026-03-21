@@ -207,11 +207,7 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
     /// with `?`.
     ///
     /// Fail-closed: any error in entity building or evaluation returns `Deny`.
-    pub async fn require(
-        &self,
-        action: &str,
-        resource: &P::ResourceId,
-    ) -> Result<(), AuthzDenied> {
+    pub async fn require(&self, action: &str, resource: &P::ResourceId) -> Result<(), AuthzDenied> {
         match self.check(action, resource).await {
             AuthzDecision::Allow => Ok(()),
             AuthzDecision::Deny => Err(AuthzDenied),

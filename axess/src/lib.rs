@@ -44,7 +44,10 @@ pub mod trace_id {
 pub use axess_core::SqliteSessionStore;
 
 // DST utilities
-pub use axess_core::{Clock, MockClock, MockFactorStore, MockIdentityStore, MockRng, SecureRng, SystemClock, SystemRng};
+pub use axess_core::{
+    Clock, MockClock, MockFactorStore, MockIdentityStore, MockRng, SecureRng, SystemClock,
+    SystemRng,
+};
 
 // Factor verification functions from axess-factors
 pub use axess_factors::{

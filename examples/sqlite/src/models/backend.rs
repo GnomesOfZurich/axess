@@ -79,33 +79,29 @@ impl IdentityStore for OurBackend {
     }
 
     async fn find_tenant(&self, identifier: &str) -> Result<Option<Tenant>, Self::Error> {
-        let row = sqlx::query(
-            "SELECT id, identifier, name, status FROM tenants WHERE identifier = ?1",
-        )
-        .bind(identifier)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT id, identifier, name, status FROM tenants WHERE identifier = ?1")
+                .bind(identifier)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row.map(|r| tenant_from_row(&r)))
     }
 
     async fn default_tenant(&self) -> Result<Tenant, Self::Error> {
-        let row = sqlx::query(
-            "SELECT id, identifier, name, status FROM tenants ORDER BY rowid LIMIT 1",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT id, identifier, name, status FROM tenants ORDER BY rowid LIMIT 1")
+                .fetch_one(&self.pool)
+                .await?;
 
         Ok(tenant_from_row(&row))
     }
 
     async fn account_status(&self, user_id: &str) -> Result<EntityState, Self::Error> {
-        let row = sqlx::query(
-            "SELECT status, locked_until FROM users WHERE id = ?1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT status, locked_until FROM users WHERE id = ?1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(match row {
             None => EntityState::Guest,
@@ -160,12 +156,10 @@ impl IdentityStore for OurBackend {
     }
 
     async fn record_failed_attempt(&self, user_id: &str) -> Result<u32, Self::Error> {
-        sqlx::query(
-            "UPDATE users SET failed_attempts = failed_attempts + 1 WHERE id = ?1",
-        )
-        .bind(user_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE users SET failed_attempts = failed_attempts + 1 WHERE id = ?1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
 
         let row = sqlx::query("SELECT failed_attempts FROM users WHERE id = ?1")
             .bind(user_id)
@@ -237,13 +231,15 @@ impl FactorStore for OurBackend {
                 }
                 fetch_factor_config(&self.pool, kind_str, None, None).await
             }
-            AuthnScope::Global => {
-                fetch_factor_config(&self.pool, kind_str, None, None).await
-            }
+            AuthnScope::Global => fetch_factor_config(&self.pool, kind_str, None, None).await,
         }
     }
 
-    async fn save_factor(&self, scope: &AuthnScope, config: FactorConfig) -> Result<(), Self::Error> {
+    async fn save_factor(
+        &self,
+        scope: &AuthnScope,
+        config: FactorConfig,
+    ) -> Result<(), Self::Error> {
         let kind_str = config.kind().as_str().to_string();
         let config_json = serde_json::to_string(&config)?;
         let id = Uuid::new_v4().to_string();
@@ -298,8 +294,8 @@ impl FactorStore for OurBackend {
             let factors_json: String = row.get("factors_json");
             let row_user_id: Option<String> = row.get("user_id");
 
-            let factors: Vec<FactorKind> = serde_json::from_str(&factors_json)
-                .unwrap_or_else(|err| {
+            let factors: Vec<FactorKind> =
+                serde_json::from_str(&factors_json).unwrap_or_else(|err| {
                     warn!(
                         method_id = %id,
                         error = %err,
@@ -342,9 +338,9 @@ async fn fetch_factor_config(
     // Build the WHERE clause dynamically based on which scope fields are provided.
     let (user_clause, tenant_clause) = match (user_id, tenant_id) {
         (Some(_), Some(_)) => ("user_id = ?2", "tenant_id = ?3"),
-        (None, Some(_))    => ("user_id IS NULL", "tenant_id = ?2"),
-        (None, None)       => ("user_id IS NULL", "tenant_id IS NULL"),
-        (Some(_), None)    => ("user_id = ?2", "tenant_id IS NULL"),
+        (None, Some(_)) => ("user_id IS NULL", "tenant_id = ?2"),
+        (None, None) => ("user_id IS NULL", "tenant_id IS NULL"),
+        (Some(_), None) => ("user_id = ?2", "tenant_id IS NULL"),
     };
 
     let sql = format!(
@@ -354,8 +350,12 @@ async fn fetch_factor_config(
     );
 
     let mut q = sqlx::query(&sql).bind(kind);
-    if let Some(uid) = user_id { q = q.bind(uid); }
-    if let Some(tid) = tenant_id { q = q.bind(tid); }
+    if let Some(uid) = user_id {
+        q = q.bind(uid);
+    }
+    if let Some(tid) = tenant_id {
+        q = q.bind(tid);
+    }
 
     let row = q.fetch_optional(pool).await?;
     match row {

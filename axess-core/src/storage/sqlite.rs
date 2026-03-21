@@ -147,14 +147,12 @@ impl SessionStore for SqliteSessionStore {
             .execute(&mut *tx)
             .await?;
 
-        sqlx::query(
-            "INSERT INTO sessions (id, data, expires_at) VALUES (?1, ?2, ?3)",
-        )
-        .bind(&new_str)
-        .bind(&json)
-        .bind(expires_at)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?1, ?2, ?3)")
+            .bind(&new_str)
+            .bind(&json)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await?;
 
         tx.commit().await?;
         Ok(new_id)

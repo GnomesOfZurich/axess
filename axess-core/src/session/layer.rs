@@ -16,11 +16,7 @@
 //! 5. If the session was modified, save it back to the store (or cycle the ID first).
 //! 6. Set the session cookie on the response.
 
-use crate::session::{
-    data::SessionData,
-    id::SessionId,
-    store::SessionStore,
-};
+use crate::session::{data::SessionData, id::SessionId, store::SessionStore};
 use crate::utils::random::SystemRng;
 use axum::{body::Body, http::Request, response::Response};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -188,7 +184,6 @@ where
         std::mem::swap(&mut inner, &mut self.inner);
 
         Box::pin(async move {
-
             // 1. Extract and verify the session cookie.
             let (existing_id, session_data) = {
                 let cookie_value = req
@@ -238,44 +233,48 @@ where
 
             // 4. Persist session if modified.
             let mut guard = handle.0.write().await;
-            let final_id = if guard.modified || guard.regenerate || existing_id.is_none() {
-                let id = if guard.regenerate || existing_id.is_none() {
+            let session_changed = guard.modified || guard.regenerate || existing_id.is_none();
+            let final_id = if session_changed {
+                if guard.regenerate || existing_id.is_none() {
                     // Cycle the session ID (session fixation prevention or new session).
                     let old_id = guard.id;
                     let new_id = store
                         .cycle(&old_id, &guard.data, ttl, &mut rng)
                         .await
-                        .unwrap_or_else(|_| old_id);
+                        .unwrap_or(old_id);
                     guard.id = new_id;
                     new_id
                 } else {
                     let _ = store.save(&guard.id, &guard.data, ttl).await;
                     guard.id
-                };
-                id
+                }
             } else {
                 guard.id
             };
             drop(guard);
 
-            // 5. Set the cookie on the response.
-            let cookie_value = {
-                let id_enc = URL_SAFE_NO_PAD.encode(final_id.as_bytes());
-                let mac = signing_sign_bytes(final_id.as_bytes(), &signing_key);
-                format!("{}.{}", id_enc, mac)
-            };
-
-            let mut cookie = Cookie::new(cookie_name.as_ref().to_string(), cookie_value);
-            cookie.set_http_only(true);
-            cookie.set_secure(secure);
-            cookie.set_same_site(same_site);
-            cookie.set_path("/");
-
+            // 5. Set the cookie only when the session was created or changed.
+            //    Omitting Set-Cookie on unmodified responses reduces header bloat
+            //    and prevents spurious cache invalidation on CDN / reverse proxies.
             let mut response = response;
-            if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie.to_string()) {
-                response
-                    .headers_mut()
-                    .append(axum::http::header::SET_COOKIE, hv);
+            if session_changed {
+                let cookie_value = {
+                    let id_enc = URL_SAFE_NO_PAD.encode(final_id.as_bytes());
+                    let mac = signing_sign_bytes(final_id.as_bytes(), &signing_key);
+                    format!("{}.{}", id_enc, mac)
+                };
+
+                let mut cookie = Cookie::new(cookie_name.as_ref().to_string(), cookie_value);
+                cookie.set_http_only(true);
+                cookie.set_secure(secure);
+                cookie.set_same_site(same_site);
+                cookie.set_path("/");
+
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&cookie.to_string()) {
+                    response
+                        .headers_mut()
+                        .append(axum::http::header::SET_COOKIE, hv);
+                }
             }
 
             Ok(response)

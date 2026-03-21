@@ -6,7 +6,9 @@
 //! [`MockPolicyEvaluator`][crate::utils::testing::mock_policy::MockPolicyEvaluator]
 //! in tests to evaluate authz flows without any Cedar policy files.
 
-use cedar_policy::{Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema};
+use cedar_policy::{
+    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema,
+};
 use std::str::FromStr;
 use tracing::warn;
 
@@ -98,13 +100,8 @@ impl PolicyEvaluator for PolicyStore {
         resource: EntityUid,
         context: Context,
     ) -> AuthzDecision {
-        let cedar_req = match Request::new(
-            principal,
-            action,
-            resource,
-            context,
-            Some(&self.schema),
-        ) {
+        let cedar_req = match Request::new(principal, action, resource, context, Some(&self.schema))
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!("Cedar request validation failed: {e:?}");

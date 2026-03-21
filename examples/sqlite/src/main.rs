@@ -64,12 +64,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Database path: {}", db_path.display());
 
-    let connect_options = SqliteConnectOptions::from_str(&format!(
-        "sqlite://{}",
-        db_path.display()
-    ))?
-    .create_if_missing(true)
-    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let connect_options =
+        SqliteConnectOptions::from_str(&format!("sqlite://{}", db_path.display()))?
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
     let pool = SqlitePoolOptions::new()
         .max_connections(5)

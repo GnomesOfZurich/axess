@@ -126,8 +126,7 @@ impl BuildRequestContext for StandardRequestContext {
             ));
         }
 
-        Context::from_pairs(pairs)
-            .map_err(|e| AuthzError::Context(format!("{e:?}")))
+        Context::from_pairs(pairs).map_err(|e| AuthzError::Context(format!("{e:?}")))
     }
 }
 
@@ -144,9 +143,7 @@ pub fn ip_from_headers(headers: &axum::http::HeaderMap) -> Option<std::net::IpAd
         .and_then(|v| v.to_str().ok())?;
 
     // X-Forwarded-For may be a comma-separated list; take the first entry.
-    raw.split(',')
-        .next()
-        .and_then(|s| s.trim().parse().ok())
+    raw.split(',').next().and_then(|s| s.trim().parse().ok())
 }
 
 // ── Blanket impl for Arc<T> ───────────────────────────────────────────────────

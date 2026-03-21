@@ -28,7 +28,7 @@ impl MockClock {
     /// Advance the clock forward by `secs` seconds.
     pub fn advance_secs(&self, secs: i64) {
         let mut guard = self.current.lock().unwrap();
-        *guard = *guard + chrono::Duration::seconds(secs);
+        *guard += chrono::Duration::seconds(secs);
     }
 
     /// Set the clock to an exact time.

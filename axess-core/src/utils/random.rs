@@ -4,7 +4,7 @@
 //! randomness, provides the OS-backed [`SystemRng`] implementation for
 //! production, and includes deterministic helpers for testing.
 
-use rand::RngCore;
+use rand::Rng;
 
 /// Trait for secure random number generation (DST-friendly)
 pub trait SecureRng: Send + Sync + Clone + 'static {

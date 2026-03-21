@@ -19,7 +19,7 @@ pub mod types;
 pub use error::AuthnError;
 pub use event::{AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType};
 pub use factor::{
-    EmailOtpConfig, Fido2Config, FactorConfig, FactorCredential, FactorKind, FederatedProvider,
+    EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FederatedProvider, Fido2Config,
     HotpConfig, OtpAlgorithm, PasswordConfig, PasswordRules, TotpConfig, ZeroizedString,
 };
 pub use service::{AuthnService, FactorOutcome, LoginOutcome};

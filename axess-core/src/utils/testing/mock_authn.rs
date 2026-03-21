@@ -82,15 +82,18 @@ impl MockIdentityStore {
 
     /// Register a tenant (indexed by ID and by identifier/slug).
     pub fn with_tenant(self, tenant: Tenant) -> Self {
-        self.tenants_by_id.insert(tenant.id.to_string(), tenant.clone());
+        self.tenants_by_id
+            .insert(tenant.id.to_string(), tenant.clone());
         self.tenants.insert(tenant.identifier.to_string(), tenant);
         self
     }
 
     /// Set the default tenant returned by `default_tenant()`.
     pub fn with_default_tenant(mut self, tenant: Tenant) -> Self {
-        self.tenants_by_id.insert(tenant.id.to_string(), tenant.clone());
-        self.tenants.insert(tenant.identifier.to_string(), tenant.clone());
+        self.tenants_by_id
+            .insert(tenant.id.to_string(), tenant.clone());
+        self.tenants
+            .insert(tenant.identifier.to_string(), tenant.clone());
         self.default_tenant = Some(tenant);
         self
     }

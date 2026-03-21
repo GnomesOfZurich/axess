@@ -1,7 +1,7 @@
 //! Authentication handlers: login page, login POST, TOTP verify, logout.
 
 use crate::web::app::AppState;
-use axess::{AuthSession, FactorCredential, FactorKind, LoginOutcome, FactorOutcome};
+use axess::{AuthSession, FactorCredential, FactorKind, FactorOutcome, LoginOutcome};
 use axum::{
     Form,
     extract::State,
@@ -45,7 +45,11 @@ pub async fn post_login(
 
     // begin_login finds the user, checks account status, and starts the factor flow.
     // It stores intermediate state in the session so verify_factor can continue.
-    let outcome = match state.service.begin_login(&form.identifier, tenant, &session).await {
+    let outcome = match state
+        .service
+        .begin_login(&form.identifier, tenant, &session)
+        .await
+    {
         Ok(o) => o,
         Err(err) => {
             tracing::warn!(error = %err, "begin_login error");
@@ -66,12 +70,10 @@ pub async fn post_login(
                 Ok(FactorOutcome::InvalidCredential) => {
                     Html(login_with_error("Invalid username or password.")).into_response()
                 }
-                Ok(FactorOutcome::Locked { .. }) => {
-                    Html(login_with_error(
-                        "Account locked due to too many failed attempts. Try again later.",
-                    ))
-                    .into_response()
-                }
+                Ok(FactorOutcome::Locked { .. }) => Html(login_with_error(
+                    "Account locked due to too many failed attempts. Try again later.",
+                ))
+                .into_response(),
                 Ok(FactorOutcome::FactorRequired(other)) => {
                     tracing::warn!(kind = ?other, "unexpected factor kind after password");
                     error_page("Unsupported factor type.").into_response()
@@ -85,12 +87,10 @@ pub async fn post_login(
         LoginOutcome::InvalidCredentials => {
             Html(login_with_error("Invalid username or password.")).into_response()
         }
-        LoginOutcome::Locked { .. } => {
-            Html(login_with_error(
-                "Account locked due to too many failed attempts. Try again later.",
-            ))
-            .into_response()
-        }
+        LoginOutcome::Locked { .. } => Html(login_with_error(
+            "Account locked due to too many failed attempts. Try again later.",
+        ))
+        .into_response(),
         other => {
             tracing::warn!(outcome = ?std::mem::discriminant(&other), "unexpected login outcome");
             Html(login_with_error("Unexpected error. Please try again.")).into_response()
@@ -134,10 +134,7 @@ pub async fn post_totp(
 
 // ── POST /logout ──────────────────────────────────────────────────────────────
 
-pub async fn logout(
-    State(state): State<AppState>,
-    session: AuthSession,
-) -> impl IntoResponse {
+pub async fn logout(State(state): State<AppState>, session: AuthSession) -> impl IntoResponse {
     if let Err(err) = state.service.logout(&session).await {
         tracing::warn!(error = %err, "logout error");
     }

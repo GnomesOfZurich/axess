@@ -1,7 +1,7 @@
+pub mod mock_authn;
+pub mod mock_clock;
 /// DST mocks — always available for any code that pulls in `axess-core` in `[dev-dependencies]`.
 pub mod mock_random;
-pub mod mock_clock;
-pub mod mock_authn;
 
 // Tracing mock is test-only.
 #[cfg(test)]

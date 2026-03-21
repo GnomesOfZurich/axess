@@ -56,8 +56,8 @@ pub use storage::sqlite::SqliteSessionStore;
 pub mod utils;
 
 pub use utils::random::{SecureRng, SystemRng};
-pub use utils::time::{Clock, SystemClock};
 pub use utils::testing::{MockClock, MockFactorStore, MockIdentityStore, MockRng};
+pub use utils::time::{Clock, SystemClock};
 
 #[cfg(feature = "authz")]
 pub use utils::testing::mock_policy::{MockEntityProvider, MockPolicyEvaluator};
