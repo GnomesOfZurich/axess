@@ -40,16 +40,18 @@
 - `MemorySessionStore`, `SqliteSessionStore`, `ValkeySessionStore` (encrypted, key rotation)
 - `MemorySessionRegistry`, `ValkeySessionRegistry`
 - Session fixation prevention, configurable TTL, `Max-Age`, signing key zeroized
+- `SessionBinding` trait + `UserAgentBinding` — session-to-client fingerprinting for hijacking detection
 
 ### Testing
 - `MockIdentityStore`, `MockFactorStore`, `MockRng`, `MockClock`, `MockPolicyEvaluator`, `MockFido2Provider`
-- **78 tests total** (69 passing + 9 Valkey + 2 ignored):
+- **90 tests total** (81 passing + 9 Valkey + 2 ignored):
   - 5 unit tests (SessionId, RNG)
   - 4 Valkey crypto unit tests (encrypt/decrypt, key rotation, wrong key)
   - 16 authn integration tests (password, TOTP, HOTP, Email OTP, lockout, replay, fixation, registry)
+  - 9 signup integration tests (signup flow, suspend/activate, audit events, edge cases)
   - 30 unit tests (authz require/is_permitted/batch_check, session data serialization, scope resolution chain, edge cases, session extractor methods)
   - 8 SQLite session store tests (save/load/delete/cycle, expiry, cleanup, overwrite)
-  - 3 HTTP session layer tests (cookie signing, HMAC format, conditional Set-Cookie)
+  - 6 HTTP session layer tests (cookie signing, HMAC format, conditional Set-Cookie, session binding)
   - 4 macro tests (login_required 401/redirect/custom field, require_partial_authn)
   - 3 OAuth integration tests (CSRF, expiry, unknown provider)
   - 1 ignored Valkey integration test (needs running Valkey)
@@ -104,11 +106,21 @@ Remaining:
 - [ ] **Per-ceremony UV/attestation policy** — blocked on webauthn-rs 0.6
 - [ ] **FIDO2 example** — standalone example with browser-side JS
 
-### Signup flow
-**Priority: Medium**
+### Signup flow & user lifecycle
+**Priority: Medium** — ✅ Core done
 
-- [ ] Signup trait methods on `IdentityStore` (`create_user`, `set_initial_factor`)
-- [ ] `SignupOrchestrator` driving the `PendingWorkflow` state machine
+Done:
+- [x] `IdentityStore::create_user`, `activate_user`, `suspend_user` trait methods
+- [x] `AuthnService::begin_signup` — validates tenant, checks uniqueness, creates user, sets `PendingWorkflow(Signup)`
+- [x] `AuthnService::complete_signup` — activates user, transitions to `Authenticated`
+- [x] `AuthnService::suspend_user` / `activate_user` — admin lifecycle with audit events
+- [x] `SignupOutcome` enum (`Started`, `AlreadyExists`, `TenantNotActive`)
+- [x] Audit events: `SignupStarted`, `SignupCompleted`, `AccountSuspended`, `AccountActivated`
+- [x] `MockIdentityStore` support for all new methods
+- [x] 9 integration tests (signup flow, suspend/activate, audit events)
+
+Remaining:
+- [ ] Signup example with email verification (application-level, using `EmailOtp` or JWT token)
 
 ### crates.io publication
 **Priority: Low**

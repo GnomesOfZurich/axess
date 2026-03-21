@@ -37,6 +37,14 @@ pub enum AuthEventType {
     SessionExpired,
     /// Session was explicitly invalidated (e.g., admin logout).
     SessionInvalidated,
+    /// A new user account was created (signup started).
+    SignupStarted,
+    /// A signup workflow was completed (user activated).
+    SignupCompleted,
+    /// A user account was suspended by an admin or the system.
+    AccountSuspended,
+    /// A user account was activated (e.g., after suspension or signup verification).
+    AccountActivated,
 }
 
 impl AuthEventType {
@@ -55,6 +63,10 @@ impl AuthEventType {
             AuthEventType::PasswordReset => "password_reset",
             AuthEventType::SessionExpired => "session_expired",
             AuthEventType::SessionInvalidated => "session_invalidated",
+            AuthEventType::SignupStarted => "signup_started",
+            AuthEventType::SignupCompleted => "signup_completed",
+            AuthEventType::AccountSuspended => "account_suspended",
+            AuthEventType::AccountActivated => "account_activated",
         }
     }
 }
@@ -76,6 +88,10 @@ impl FromStr for AuthEventType {
             "password_reset" => Ok(AuthEventType::PasswordReset),
             "session_expired" => Ok(AuthEventType::SessionExpired),
             "session_invalidated" => Ok(AuthEventType::SessionInvalidated),
+            "signup_started" => Ok(AuthEventType::SignupStarted),
+            "signup_completed" => Ok(AuthEventType::SignupCompleted),
+            "account_suspended" => Ok(AuthEventType::AccountSuspended),
+            "account_activated" => Ok(AuthEventType::AccountActivated),
             other => Err(format!("Unknown auth event type: {}", other)),
         }
     }

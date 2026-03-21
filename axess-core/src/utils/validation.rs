@@ -79,3 +79,42 @@ pub fn is_valid_name(name: &str) -> bool {
 pub fn is_valid_otp_code(code: &str, length: u8) -> bool {
     code.len() == length as usize && code.chars().all(|c| c.is_ascii_digit())
 }
+
+// ── Security boundary limits ────────────────────────────────────────────────
+//
+// Hard limits enforced inside the library to prevent CPU/memory DoS even if the
+// application layer omits its own validation. These are safety nets — applications
+// should still validate earlier for better UX (meaningful error messages).
+
+/// Maximum password length accepted before Argon2 hashing (bytes).
+///
+/// Argon2 technically accepts up to 4 GiB, but hashing even a few MB is a CPU DoS.
+/// 1024 bytes covers any realistic password (including passphrase generators).
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+
+/// Maximum OTP code length accepted before hash verification (bytes).
+///
+/// Real OTP codes are 4–8 digits. 64 bytes allows some margin for whitespace
+/// and alternate formats while preventing Argon2 DoS via multi-MB "codes."
+pub const MAX_OTP_CODE_BYTES: usize = 64;
+
+/// Maximum length of a login/signup identifier (bytes).
+///
+/// Covers email addresses (RFC 5321: 254 chars) and UUIDs. Prevents
+/// oversized database queries and log-line inflation.
+pub const MAX_IDENTIFIER_BYTES: usize = 256;
+
+/// Maximum length of a user display name (bytes).
+pub const MAX_DISPLAY_NAME_BYTES: usize = 256;
+
+/// Maximum length of an OAuth authorization code or state parameter (bytes).
+///
+/// OAuth 2.0 does not specify a max, but real IdPs return < 2 KiB.
+pub const MAX_OAUTH_PARAM_BYTES: usize = 4096;
+
+/// Returns `true` if the string contains only printable characters (no control
+/// characters except space). Rejects null bytes, tabs, newlines, etc.
+pub fn is_printable(s: &str) -> bool {
+    s.chars()
+        .all(|c| c == ' ' || (!c.is_control() && c != '\u{FEFF}'))
+}

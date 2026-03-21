@@ -90,9 +90,15 @@ where
         session: &AuthSession,
     ) -> Result<crate::authn::oauth::OAuthClaims, crate::authn::oauth::OAuthError> {
         use crate::authn::oauth::{OAuthClaims, OAuthError, keys as oauth_keys};
+        use crate::utils::validation::MAX_OAUTH_PARAM_BYTES;
         use openidconnect::{
             AuthorizationCode, Nonce, OAuth2TokenResponse, PkceCodeVerifier, TokenResponse,
         };
+
+        // Reject oversized callback parameters before processing.
+        if code.len() > MAX_OAUTH_PARAM_BYTES || state.len() > MAX_OAUTH_PARAM_BYTES {
+            return Err(OAuthError::InvalidParameter);
+        }
 
         let get_str = |v: serde_json::Value| v.as_str().map(|s| s.to_string());
 

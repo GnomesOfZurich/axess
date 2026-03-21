@@ -247,6 +247,9 @@ pub enum OAuthError {
 
     #[error("OAuth ceremony expired")]
     Expired,
+
+    #[error("invalid OAuth callback parameter")]
+    InvalidParameter,
 }
 
 // ── OAuthProviderRegistry ────────────────────────────────────────────────────

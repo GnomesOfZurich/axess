@@ -44,9 +44,13 @@ use crate::{
         event::{AuthEventBuilder, AuthEventStatus, AuthEventType},
         factor::{FactorConfig, FactorCredential, FactorKind},
         store::{FactorStore, IdentityStore},
-        types::{AuthnScope, EntityState},
+        types::{AuthnScope, EntityState, StatusDetail},
     },
-    session::{extractor::AuthSession, store::SessionRegistry},
+    session::{
+        data::{WorkflowKind, WorkflowState},
+        extractor::AuthSession,
+        store::SessionRegistry,
+    },
     utils::{
         random::{SecureRng, SystemRng},
         time::{Clock, SystemClock},
@@ -137,6 +141,18 @@ pub enum FactorOutcome {
     Locked {
         until: Option<chrono::DateTime<chrono::Utc>>,
     },
+}
+
+/// Result of beginning a signup flow.
+#[derive(Debug)]
+pub enum SignupOutcome {
+    /// User account created, session moved to `PendingWorkflow(Signup)`.
+    /// The application should now send a verification email or similar.
+    Started,
+    /// A user with this identifier already exists in the tenant.
+    AlreadyExists,
+    /// The target tenant does not exist or is not active.
+    TenantNotActive,
 }
 
 // ── AuthnService ──────────────────────────────────────────────────────────────
@@ -362,6 +378,17 @@ where
         tenant_identifier: &str,
         session: &AuthSession,
     ) -> Result<LoginOutcome, AuthnError<I::Error>> {
+        use crate::utils::validation::MAX_IDENTIFIER_BYTES;
+
+        // 0. Reject oversized identifiers before hitting the database.
+        if identifier.is_empty()
+            || identifier.len() > MAX_IDENTIFIER_BYTES
+            || tenant_identifier.is_empty()
+            || tenant_identifier.len() > MAX_IDENTIFIER_BYTES
+        {
+            return Ok(LoginOutcome::InvalidCredentials);
+        }
+
         // 1. Find tenant.
         let tenant = self
             .identity
@@ -796,6 +823,228 @@ where
         Ok(())
     }
 
+    // ── Signup ─────────────────────────────────────────────────────────────────
+
+    /// Begin a signup flow: create a new user and transition the session to
+    /// [`PendingWorkflow(Signup)`](WorkflowKind::Signup).
+    ///
+    /// The user is created in whatever [`EntityState`] the caller provides
+    /// (typically [`Candidate`](EntityState::Candidate)). The application
+    /// is responsible for what happens next — typically sending a verification
+    /// email and calling [`complete_signup`](Self::complete_signup) after the
+    /// user confirms.
+    ///
+    /// `tenant_identifier` is the tenant slug/domain (looked up via
+    /// [`IdentityStore::find_tenant`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthnError::Store`] if the store operation fails.
+    pub async fn begin_signup(
+        &self,
+        user: crate::authn::types::User,
+        tenant_identifier: &str,
+        session: &AuthSession,
+    ) -> Result<SignupOutcome, AuthnError<I::Error>> {
+        use crate::utils::validation::{
+            MAX_DISPLAY_NAME_BYTES, MAX_IDENTIFIER_BYTES, is_printable,
+        };
+
+        // 0. Reject oversized or invalid inputs before hitting the database.
+        if user.identifier.is_empty()
+            || user.identifier.len() > MAX_IDENTIFIER_BYTES
+            || user.display_name.len() > MAX_DISPLAY_NAME_BYTES
+            || tenant_identifier.is_empty()
+            || tenant_identifier.len() > MAX_IDENTIFIER_BYTES
+            || !is_printable(&user.identifier)
+            || !is_printable(&user.display_name)
+        {
+            return Err(AuthnError::InvalidAssertion);
+        }
+
+        // 1. Validate tenant exists and is active.
+        let tenant = self
+            .identity
+            .find_tenant(tenant_identifier)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        let tenant = match tenant {
+            Some(t) if t.status.is_active() => t,
+            Some(_) => return Ok(SignupOutcome::TenantNotActive),
+            None => return Ok(SignupOutcome::TenantNotActive),
+        };
+
+        // 2. Check if user already exists.
+        let existing = self
+            .identity
+            .find_user(&user.identifier, &tenant.id)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        if existing.is_some() {
+            return Ok(SignupOutcome::AlreadyExists);
+        }
+
+        // 3. Create the user.
+        let user_id = user.id.clone();
+        let tenant_id = tenant.id.clone();
+
+        self.identity
+            .create_user(user)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        // 4. Transition session to PendingWorkflow(Signup).
+        let now = self.clock.now();
+        let workflow = WorkflowState::new(WorkflowKind::Signup, 1, now);
+        session
+            .set_pending_workflow(user_id.clone(), tenant_id.clone(), workflow)
+            .await;
+
+        // 5. Record audit event.
+        let _ = self
+            .identity
+            .record_event(
+                AuthEventBuilder::new(
+                    user_id,
+                    tenant_id,
+                    AuthEventType::SignupStarted,
+                    AuthEventStatus::Success,
+                )
+                .build_at(now),
+            )
+            .await;
+
+        Ok(SignupOutcome::Started)
+    }
+
+    /// Complete a signup flow: activate the user and transition the session
+    /// to [`AuthState::Authenticated`].
+    ///
+    /// Call this after the user has completed whatever verification the
+    /// application requires (e.g. email confirmation). The session must be
+    /// in [`PendingWorkflow`](crate::session::data::AuthState::PendingWorkflow)
+    /// state with a [`Signup`](WorkflowKind::Signup) workflow.
+    pub async fn complete_signup(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
+        let state = session.auth_state().await;
+
+        let (user_id, tenant_id) = match &state {
+            crate::session::data::AuthState::PendingWorkflow {
+                user_id,
+                tenant_id,
+                workflow,
+            } if workflow.kind == WorkflowKind::Signup => (user_id.clone(), tenant_id.clone()),
+            _ => return Err(AuthnError::NoFlow),
+        };
+
+        // Activate the user.
+        self.identity
+            .activate_user(&user_id)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        // Transition to Authenticated.
+        let now = self.clock.now();
+        session
+            .set_authenticated(user_id.clone(), tenant_id.clone(), now)
+            .await;
+
+        // Register in session registry if configured.
+        let sid = session.session_id().await;
+        if let Some(reg) = &self.registry {
+            reg.register(&user_id, &sid).await;
+        }
+
+        // Record audit event.
+        let _ = self
+            .identity
+            .record_event(
+                AuthEventBuilder::new(
+                    user_id,
+                    tenant_id,
+                    AuthEventType::SignupCompleted,
+                    AuthEventStatus::Success,
+                )
+                .with_session(sid)
+                .build_at(now),
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Suspend a user account.
+    ///
+    /// This updates the user's status in the identity store. It does **not**
+    /// invalidate existing sessions — use [`SessionRegistry::invalidate_user`]
+    /// or a middleware that checks [`account_status`](IdentityStore::account_status)
+    /// on each request.
+    pub async fn suspend_user(
+        &self,
+        user_id: &str,
+        detail: StatusDetail,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let user = self
+            .identity
+            .get_user(user_id)
+            .await
+            .map_err(AuthnError::Store)?
+            .ok_or(AuthnError::NoFlow)?;
+
+        self.identity
+            .suspend_user(user_id, detail)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        let _ = self
+            .identity
+            .record_event(
+                AuthEventBuilder::new(
+                    user.id.clone(),
+                    user.tenant_id.clone(),
+                    AuthEventType::AccountSuspended,
+                    AuthEventStatus::Success,
+                )
+                .build_at(self.clock.now()),
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Activate a user account (e.g. unsuspend, or complete a manual review).
+    ///
+    /// Transitions the user to [`EntityState::Active`] regardless of current state.
+    pub async fn activate_user(&self, user_id: &str) -> Result<(), AuthnError<I::Error>> {
+        let user = self
+            .identity
+            .get_user(user_id)
+            .await
+            .map_err(AuthnError::Store)?
+            .ok_or(AuthnError::NoFlow)?;
+
+        self.identity
+            .activate_user(user_id)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        let _ = self
+            .identity
+            .record_event(
+                AuthEventBuilder::new(
+                    user.id.clone(),
+                    user.tenant_id.clone(),
+                    AuthEventType::AccountActivated,
+                    AuthEventStatus::Success,
+                )
+                .build_at(self.clock.now()),
+            )
+            .await;
+
+        Ok(())
+    }
+
     // ── Internal helpers ───────────────────────────────────────────────────────
 
     /// Load a factor config, trying User → Tenant → Global scope in order.
@@ -922,9 +1171,15 @@ fn verify_credential(
     kind: &FactorKind,
     now: chrono::DateTime<chrono::Utc>,
 ) -> VerifyOutcome {
+    use crate::utils::validation::{MAX_OTP_CODE_BYTES, MAX_PASSWORD_BYTES};
+
     match (credential, config, kind) {
         (FactorCredential::Password(pwd), FactorConfig::Password(cfg), FactorKind::Password) => {
             let pwd_str: &str = pwd.as_ref();
+            // Reject oversized passwords before Argon2 — prevents CPU DoS.
+            if pwd_str.len() > MAX_PASSWORD_BYTES {
+                return VerifyOutcome::Fail;
+            }
             let hash_str: &str = cfg.hash.as_ref();
             if axess_factors::verify_password(pwd_str, hash_str).is_ok() {
                 VerifyOutcome::Pass
@@ -934,6 +1189,9 @@ fn verify_credential(
         }
 
         (FactorCredential::OtpCode(code), FactorConfig::Totp(cfg), FactorKind::Totp) => {
+            if code.as_ref().len() > MAX_OTP_CODE_BYTES {
+                return VerifyOutcome::Fail;
+            }
             let now_system: std::time::SystemTime = now.into();
             let matched = axess_factors::verify_totp(
                 cfg.secret.as_ref(),
@@ -961,6 +1219,9 @@ fn verify_credential(
         }
 
         (FactorCredential::OtpCode(code), FactorConfig::Hotp(cfg), FactorKind::Hotp) => {
+            if code.as_ref().len() > MAX_OTP_CODE_BYTES {
+                return VerifyOutcome::Fail;
+            }
             let matched = axess_factors::verify_hotp(
                 cfg.secret.as_ref(),
                 code.as_ref(),
@@ -980,6 +1241,10 @@ fn verify_credential(
         }
 
         (FactorCredential::OtpCode(code), FactorConfig::EmailOtp(cfg), FactorKind::EmailOtp) => {
+            // Reject oversized codes before Argon2 — prevents CPU DoS.
+            if code.as_ref().len() > MAX_OTP_CODE_BYTES {
+                return VerifyOutcome::Fail;
+            }
             // Verify: pending hash must exist and code must not have expired.
             let hash = match &cfg.pending_hash {
                 Some(h) => h,

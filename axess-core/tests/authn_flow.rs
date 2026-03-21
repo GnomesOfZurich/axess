@@ -70,6 +70,31 @@ fn user_scope() -> AuthnScope {
     }
 }
 
+fn make_password_service(
+    user_id: &str,
+    identifier: &str,
+    password: &str,
+) -> AuthnService<MockIdentityStore, MockFactorStore> {
+    let scope = AuthnScope::User {
+        tenant_id: "t1".into(),
+        user_id: user_id.into(),
+    };
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user(user_id, identifier));
+    let factors = MockFactorStore::new()
+        .with_factor(scope.clone(), password_config(password))
+        .with_method(
+            user_id,
+            AuthMethod {
+                name: "password".into(),
+                factors: vec![FactorKind::Password],
+                scope,
+            },
+        );
+    AuthnService::new(identity, factors)
+}
+
 fn password_method() -> AuthMethod {
     AuthMethod {
         name: "password".into(),
@@ -751,4 +776,92 @@ async fn audit_events_recorded_on_login() {
     let types: Vec<_> = events.iter().map(|e| &e.event_type).collect();
     assert!(types.contains(&&AuthEventType::LoginAttempt));
     assert!(types.contains(&&AuthEventType::Authenticated));
+}
+
+// ── Input validation boundary tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn oversized_identifier_returns_invalid_credentials() {
+    let service = make_password_service("u1", "alice", "secret");
+    let session = test_session();
+
+    // 300-byte identifier should be rejected (limit is 256).
+    let huge_identifier = "a".repeat(300);
+    let outcome = service
+        .begin_login(&huge_identifier, "default", &session)
+        .await
+        .unwrap();
+    assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
+}
+
+#[tokio::test]
+async fn empty_identifier_returns_invalid_credentials() {
+    let service = make_password_service("u1", "alice", "secret");
+    let session = test_session();
+
+    let outcome = service.begin_login("", "default", &session).await.unwrap();
+    assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
+}
+
+#[tokio::test]
+async fn oversized_password_rejected_before_argon2() {
+    let service = make_password_service("u1", "alice", "secret");
+    let session = test_session();
+
+    service
+        .begin_login("alice", "default", &session)
+        .await
+        .unwrap();
+
+    // 2000-byte password should be rejected before reaching Argon2.
+    let huge_password = "a".repeat(2000);
+    let result = service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new(huge_password)),
+            &session,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, FactorOutcome::InvalidCredential));
+}
+
+#[tokio::test]
+async fn oversized_otp_code_rejected() {
+    // Start a password+TOTP flow to get into Authenticating state with TOTP pending.
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("secret"))
+        .with_factor(user_scope(), totp_config("JBSWY3DPEHPK3PXP"))
+        .with_method(
+            "u1",
+            AuthMethod {
+                name: "pw+totp".into(),
+                factors: vec![FactorKind::Password, FactorKind::Totp],
+                scope: user_scope(),
+            },
+        );
+    let service = AuthnService::new(identity, factors);
+    let session = test_session();
+
+    service
+        .begin_login("alice", "default", &session)
+        .await
+        .unwrap();
+    service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new("secret")),
+            &session,
+        )
+        .await
+        .unwrap();
+
+    // Now try a 200-byte OTP code (limit is 64).
+    let huge_otp = "1".repeat(200);
+    let result = service
+        .verify_factor(&FactorCredential::OtpCode(huge_otp.into()), &session)
+        .await
+        .unwrap();
+    assert!(matches!(result, FactorOutcome::InvalidCredential));
 }

@@ -6,7 +6,7 @@
 //! - [`factor`] — [`FactorKind`], [`FactorConfig`], [`FactorCredential`], [`ZeroizedString`]
 //! - [`event`] — [`AuthEvent`], [`AuthEventBuilder`], [`AuthEventType`], [`AuthEventStatus`]
 //! - [`store`] — [`IdentityStore`], [`FactorStore`], [`AuthnBackend`], [`AuthMethod`]
-//! - [`service`] — [`AuthnService`], [`LoginOutcome`], [`FactorOutcome`]
+//! - [`service`] — [`AuthnService`], [`LoginOutcome`], [`SignupOutcome`], [`FactorOutcome`]
 //! - [`error`] — [`AuthnError`]
 //!
 //! # Naming conventions
@@ -43,6 +43,6 @@ pub use factor::{
     EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FederatedProvider, Fido2Config,
     HotpConfig, OtpAlgorithm, PasswordConfig, PasswordRules, TotpConfig, ZeroizedString,
 };
-pub use service::{AuthnService, FactorOutcome, LoginOutcome, PrepareOutcome};
+pub use service::{AuthnService, FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome};
 pub use store::{AuthMethod, AuthnBackend, FactorStore, IdentityStore};
 pub use types::{AuthnScope, EntityState, LockoutPolicy, StatusDetail, Tenant, User};

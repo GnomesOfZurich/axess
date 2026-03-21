@@ -6,7 +6,7 @@
 use crate::authn::{
     event::AuthEvent,
     factor::{FactorConfig, FactorKind},
-    types::{AuthnScope, EntityState, LockoutPolicy, Tenant, User},
+    types::{AuthnScope, EntityState, LockoutPolicy, StatusDetail, Tenant, User},
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -73,6 +73,36 @@ pub trait IdentityStore: Send + Sync + Clone + 'static {
     fn lockout_policy(&self) -> LockoutPolicy {
         LockoutPolicy::default()
     }
+
+    // ── Lifecycle management ──────────────────────────────────────────────────
+
+    /// Create a new user. The user should typically be in [`EntityState::Candidate`]
+    /// or [`EntityState::Pending`] state.
+    ///
+    /// Returns an error if a user with the same identifier already exists in the tenant.
+    fn create_user(
+        &self,
+        user: User,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Transition a user to [`EntityState::Active`].
+    ///
+    /// Called after completing a signup workflow (e.g. email verification).
+    fn activate_user(
+        &self,
+        user_id: &str,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Transition a user to [`EntityState::Suspended`] with the given reason.
+    ///
+    /// Existing authenticated sessions are not automatically invalidated —
+    /// use middleware that checks [`account_status`](Self::account_status) on
+    /// each request, or combine with [`SessionRegistry::invalidate_user`](crate::session::store::SessionRegistry::invalidate_user).
+    fn suspend_user(
+        &self,
+        user_id: &str,
+        detail: StatusDetail,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 // ── FactorStore ───────────────────────────────────────────────────────────────

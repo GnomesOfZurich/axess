@@ -7,7 +7,7 @@ use crate::authn::{
     event::AuthEvent,
     factor::{FactorConfig, FactorKind},
     store::{AuthMethod, FactorStore, IdentityStore},
-    types::{AuthnScope, EntityState, LockoutPolicy, Tenant, User},
+    types::{AuthnScope, EntityState, LockoutPolicy, StatusDetail, Tenant, User},
 };
 use dashmap::DashMap;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 pub enum MockStoreError {
     #[error("entity not found")]
     NotFound,
+    #[error("entity already exists")]
+    AlreadyExists,
     #[error("no default tenant configured")]
     NoDefaultTenant,
 }
@@ -172,6 +174,35 @@ impl IdentityStore for MockIdentityStore {
 
     fn lockout_policy(&self) -> LockoutPolicy {
         self.lockout_policy.clone()
+    }
+
+    async fn create_user(&self, user: User) -> Result<(), Self::Error> {
+        // Check for duplicate identifier within the tenant.
+        let key = (user.tenant_id.to_string(), user.identifier.to_string());
+        if self.by_identifier.contains_key(&key) {
+            return Err(MockStoreError::AlreadyExists);
+        }
+        self.by_identifier.insert(key, user.id.to_string());
+        self.users.insert(user.id.to_string(), user);
+        Ok(())
+    }
+
+    async fn activate_user(&self, user_id: &str) -> Result<(), Self::Error> {
+        let mut entry = self
+            .users
+            .get_mut(user_id)
+            .ok_or(MockStoreError::NotFound)?;
+        entry.status = EntityState::Active;
+        Ok(())
+    }
+
+    async fn suspend_user(&self, user_id: &str, detail: StatusDetail) -> Result<(), Self::Error> {
+        let mut entry = self
+            .users
+            .get_mut(user_id)
+            .ok_or(MockStoreError::NotFound)?;
+        entry.status = EntityState::Suspended(detail);
+        Ok(())
     }
 }
 

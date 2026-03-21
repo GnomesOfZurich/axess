@@ -184,6 +184,47 @@ impl IdentityStore for OurBackend {
             duration: Some(std::time::Duration::from_secs(15 * 60)),
         }
     }
+
+    async fn create_user(&self, user: User) -> Result<(), Self::Error> {
+        sqlx::query(
+            "INSERT INTO users (id, tenant_id, identifier, display_name, status)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(user.id.as_ref())
+        .bind(user.tenant_id.as_ref())
+        .bind(user.identifier.as_ref())
+        .bind(user.display_name.as_ref())
+        .bind(match &user.status {
+            EntityState::Active => "active",
+            EntityState::Candidate => "candidate",
+            EntityState::Pending(_) => "pending",
+            EntityState::Suspended(_) => "suspended",
+            EntityState::Terminated(_) => "terminated",
+            EntityState::Archived(_) => "archived",
+            EntityState::Guest => "guest",
+        })
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn activate_user(&self, user_id: &str) -> Result<(), Self::Error> {
+        sqlx::query("UPDATE users SET status = 'active' WHERE id = ?1")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn suspend_user(&self, user_id: &str, detail: StatusDetail) -> Result<(), Self::Error> {
+        let until = detail.until.map(|u| u.to_rfc3339());
+        sqlx::query("UPDATE users SET status = 'suspended', locked_until = ?2 WHERE id = ?1")
+            .bind(user_id)
+            .bind(until)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 // ── FactorStore impl ──────────────────────────────────────────────────────────
