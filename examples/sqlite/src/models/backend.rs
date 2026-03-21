@@ -381,6 +381,7 @@ fn user_from_row(row: &sqlx::sqlite::SqliteRow) -> User {
         identifier: Arc::from(identifier.as_str()),
         display_name: Arc::from(display_name.as_str()),
         status: entity_state_from_db(&status, locked_until.as_deref()),
+        webauthn_id: None,
     }
 }
 
@@ -401,16 +402,16 @@ fn tenant_from_row(row: &sqlx::sqlite::SqliteRow) -> Tenant {
 /// Map the DB status string (and optional `locked_until` datetime) to [`EntityState`].
 fn entity_state_from_db(status: &str, locked_until: Option<&str>) -> EntityState {
     // A locked_until in the future takes priority over the status column.
-    if let Some(until_str) = locked_until {
-        if let Ok(until) = DateTime::parse_from_rfc3339(until_str) {
-            let until: DateTime<Utc> = until.into();
-            if until > Utc::now() {
-                return EntityState::Suspended(StatusDetail {
-                    reason: "account locked due to failed login attempts".into(),
-                    since: Utc::now(),
-                    until: Some(until),
-                });
-            }
+    if let Some(until_str) = locked_until
+        && let Ok(until) = DateTime::parse_from_rfc3339(until_str)
+    {
+        let until: DateTime<Utc> = until.into();
+        if until > Utc::now() {
+            return EntityState::Suspended(StatusDetail {
+                reason: "account locked due to failed login attempts".into(),
+                since: Utc::now(),
+                until: Some(until),
+            });
         }
     }
 
@@ -490,7 +491,7 @@ pub async fn seed(pool: &SqlitePool) -> Result<String, Box<dyn std::error::Error
     .await?;
 
     // Password hash for "hunter2".
-    let password_hash = axess_factors::generate_password_hash("hunter2");
+    let password_hash = axess::generate_password_hash("hunter2");
 
     // Alice: password factor config at user scope.
     let alice_pw_config = FactorConfig::Password(PasswordConfig {
@@ -560,10 +561,10 @@ pub async fn seed(pool: &SqlitePool) -> Result<String, Box<dyn std::error::Error
         if let FactorConfig::Totp(ref tc) = config {
             tc.secret.to_string()
         } else {
-            axess_factors::generate_totp_secret()
+            axess::generate_totp_secret()
         }
     } else {
-        let secret = axess_factors::generate_totp_secret();
+        let secret = axess::generate_totp_secret();
         let bob_totp_config = FactorConfig::Totp(TotpConfig {
             secret: ZeroizedString::new(secret.clone()),
             ..TotpConfig::default()

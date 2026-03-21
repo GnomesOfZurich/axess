@@ -115,36 +115,35 @@ macro_rules! predicate_required {
 /// allowing access. If not authenticated, returns 401 or redirects to a login
 /// page depending on parameters.
 ///
-/// # Usage
+/// Works with both `.layer()` (all routes) and `.route_layer()` (specific routes):
+///
+/// ```text
+/// // Protect all routes in this router:
+/// Router::new()
+///     .route("/api/data", get(data_handler))
+///     .layer(login_required!())
+///
+/// // Protect only the routes defined on this router (not nested):
+/// Router::new()
+///     .route("/dashboard", get(dashboard_handler))
+///     .route_layer(login_required!("/login"))
+/// ```
+///
+/// # Variants
 ///
 /// ## Return 401 Unauthorized (API endpoints)
 /// ```ignore
-/// use axess_macros::login_required;
-/// use axum::{routing::get, Router};
-///
-/// let app = Router::new()
-///     .route("/api/protected", get(api_handler))
-///     .layer(login_required!());
+/// .layer(login_required!())
 /// ```
 ///
 /// ## Redirect to login page (web pages)
 /// ```ignore
-/// use axess_macros::login_required;
-/// use axum::{routing::get, Router};
-///
-/// let app = Router::new()
-///     .route("/dashboard", get(dashboard_handler))
-///     .layer(login_required!("/login"));
+/// .layer(login_required!("/login"))
 /// ```
 ///
 /// ## Redirect with custom query parameter
 /// ```ignore
-/// use axess_macros::login_required;
-/// use axum::{routing::get, Router};
-///
-/// let app = Router::new()
-///     .route("/admin", get(admin_handler))
-///     .layer(login_required!("/auth/login", "return_to"));
+/// .layer(login_required!("/auth/login", "return_to"))
 /// ```
 #[macro_export]
 macro_rules! login_required {
@@ -209,28 +208,28 @@ macro_rules! login_required {
 /// Partial authentication-required middleware macro.
 ///
 /// Generates Axum middleware that ensures the user is in the `Authenticating`
-/// state (i.e., has started but not completed a multi-factor flow) before allowing access.
+/// state (i.e., has started but not completed a multi-factor flow) before
+/// allowing access. Use this to guard MFA verification routes — it prevents
+/// users from accessing the TOTP/FIDO2 input page without first having
+/// entered their username/password.
 ///
-/// # Usage
+/// Works with both `.layer()` and `.route_layer()`.
+///
+/// # Variants
 ///
 /// ## Return 401 Unauthorized (API endpoints)
 /// ```ignore
-/// use axess_macros::require_partial_authn;
-/// use axum::{routing::get, Router};
-///
-/// let app = Router::new()
-///     .route("/mfa/verify", get(mfa_handler))
-///     .layer(require_partial_authn!());
+/// .route_layer(require_partial_authn!())
 /// ```
 ///
-/// ## Redirect to login page (web pages)
+/// ## Redirect to login page
 /// ```ignore
-/// use axess_macros::require_partial_authn;
-/// use axum::{routing::get, Router};
+/// .route_layer(require_partial_authn!(login_url = "/login"))
+/// ```
 ///
-/// let app = Router::new()
-///     .route("/mfa", get(mfa_page))
-///     .layer(require_partial_authn!(login_url = "/login"));
+/// ## Redirect with custom query parameter
+/// ```ignore
+/// .route_layer(require_partial_authn!(login_url = "/login", redirect_field = "next"))
 /// ```
 #[macro_export]
 macro_rules! require_partial_authn {

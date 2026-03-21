@@ -34,5 +34,12 @@ accept_client_id = ["axess-core/accept_client_id"]
 memory = []
 sqlite = ["axess-core/sqlite"]
 valkey = ["axess-core/valkey"]
-full = ["authz", "request_id", "trace_id", "sqlite", "valkey"]
+fido2 = ["axess-core/fido2"]
+oauth = ["axess-core/oauth"]
+full = ["authz", "request_id", "trace_id", "sqlite", "valkey", "fido2", "oauth"]
 default = ["authz"]
+
+[dev-dependencies]
+axum = { version = "0.8.8", features = ["macros"] }
+tokio = { version = "1.50.0", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }

@@ -4,8 +4,8 @@
 
 // Session layer
 pub use axess_core::{
-    AuthSession, AuthState, MemorySessionRegistry, MemorySessionStore, SessionData, SessionId,
-    SessionLayer, SessionRegistry, SessionStore,
+    AuthSession, AuthState, MemorySessionRegistry, MemorySessionStore, SessionBinding, SessionData,
+    SessionId, SessionLayer, SessionRegistry, SessionStore, UserAgentBinding,
 };
 
 // Authentication
@@ -17,15 +17,9 @@ pub use axess_core::{
     PasswordRules, PrepareOutcome, StatusDetail, Tenant, TotpConfig, User, ZeroizedString,
 };
 
-// Authorization
+// Authorization — re-exports from axess-core with module-level docs.
 #[cfg(feature = "authz")]
-pub mod authorization {
-    pub use axess_core::{
-        AuthzDecision, AuthzDenied, AuthzEntityProvider, AuthzError, AuthzSession, AuthzStore,
-        BuildRequestContext, NoContext, PolicyEvaluator, PolicyStore, StandardRequestContext,
-        ip_from_headers,
-    };
-}
+pub mod authorization;
 
 // Request ID middleware
 #[cfg(feature = "request_id")]
@@ -43,11 +37,19 @@ pub mod trace_id {
 #[cfg(feature = "sqlite")]
 pub use axess_core::SqliteSessionStore;
 
+// Valkey session store + registry
+#[cfg(feature = "valkey")]
+pub use axess_core::{ValkeySessionRegistry, ValkeySessionStore, ValkeyStoreError};
+
 // DST utilities
 pub use axess_core::{
     Clock, MockClock, MockFactorStore, MockIdentityStore, MockRng, SecureRng, SystemClock,
     SystemRng,
 };
+
+// OAuth/OIDC
+#[cfg(feature = "oauth")]
+pub use axess_core::{OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProviderConfig};
 
 // Factor verification functions from axess-factors
 pub use axess_factors::{

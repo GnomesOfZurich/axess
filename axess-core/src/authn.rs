@@ -8,10 +8,31 @@
 //! - [`store`] — [`IdentityStore`], [`FactorStore`], [`AuthnBackend`], [`AuthMethod`]
 //! - [`service`] — [`AuthnService`], [`LoginOutcome`], [`FactorOutcome`]
 //! - [`error`] — [`AuthnError`]
+//!
+//! # Naming conventions
+//!
+//! **`Authn` prefix** — types specific to the authentication layer: `AuthnService`,
+//! `AuthnError`, `AuthnScope`, `AuthnBackend`. These are internal to `authn/`.
+//!
+//! **`Auth` prefix** — types shared across authentication and authorization:
+//! `AuthSession` (wraps session state for both layers), `AuthState` (session
+//! state machine), `AuthEvent` (audit log entries from any auth operation),
+//! `AuthMethod` (factor chain definition).
+//!
+//! **`Authz` prefix** — types specific to the authorization layer: `AuthzStore`,
+//! `AuthzSession`, `AuthzError`, `AuthzDenied`.
+//!
+//! **Submodule files** use a `_factor` or `_service` suffix when a same-named
+//! file exists at the parent level (e.g. `factor/fido2_factor.rs` alongside
+//! `authn/fido2.rs`) to keep IDE tabs distinguishable.
 
 pub mod error;
 pub mod event;
 pub mod factor;
+#[cfg(feature = "fido2")]
+pub mod fido2;
+#[cfg(feature = "oauth")]
+pub mod oauth;
 pub mod service;
 pub mod store;
 pub mod types;

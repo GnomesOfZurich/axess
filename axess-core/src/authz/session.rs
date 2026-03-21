@@ -41,9 +41,8 @@
 //! ```
 
 use cedar_policy::{Context, Entities, EntityUid};
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 use super::{
@@ -60,7 +59,7 @@ use super::{
 /// Holds the policy evaluator, entity provider, and Cedar namespace. Construct
 /// once at startup and store in `Arc<AuthzStore<P>>` inside your Axum state.
 ///
-/// ```rust,ignore
+/// ```text
 /// let authz_store = Arc::new(
 ///     AuthzStore::new(Arc::new(policy_store), Arc::new(my_entity_provider), "MyApp")
 /// );
@@ -155,7 +154,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
             store: Arc::clone(self),
             principal,
             context: Context::empty(),
-            cache: RefCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
             _ctx: std::marker::PhantomData,
         })
     }
@@ -175,7 +174,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
             store: Arc::clone(self),
             principal,
             context,
-            cache: RefCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
             _ctx: std::marker::PhantomData,
         })
     }
@@ -186,15 +185,16 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
 /// Per-request authorization session.
 ///
 /// Created by [`AuthzStore::for_user_id`] or [`AuthzStore::for_user_id_with_context`].
-/// Not `Sync` (holds a `RefCell` for the entity cache); intended to be used
-/// within a single request task.
+/// `Send` — safe to hold across `.await` in Axum handlers.
 pub struct AuthzSession<P: AuthzEntityProvider, Ctx = NoContext> {
     store: Arc<AuthzStore<P>>,
     principal: EntityUid,
     context: Context,
     // Per-request entity cache: (action_uid_str, resource_uid_str) → entities.
     // Deduplicates repeated identical checks within one request.
-    cache: RefCell<HashMap<(String, String), Arc<Entities>>>,
+    // Uses Mutex (not RefCell) so the session is Send for Axum handlers.
+    // The lock is never held across .await points.
+    cache: Mutex<HashMap<(String, String), Arc<Entities>>>,
     _ctx: std::marker::PhantomData<Ctx>,
 }
 
@@ -272,7 +272,7 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
         // 3. Check per-request entity cache.
         let cache_key = (action_uid.to_string(), resource_uid.to_string());
         let entities = {
-            let cached = self.cache.borrow().get(&cache_key).cloned();
+            let cached = self.cache.lock().unwrap().get(&cache_key).cloned();
             if let Some(arc) = cached {
                 arc
             } else {
@@ -285,7 +285,10 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                 {
                     Ok(ent) => {
                         let arc = Arc::new(ent);
-                        self.cache.borrow_mut().insert(cache_key, Arc::clone(&arc));
+                        self.cache
+                            .lock()
+                            .unwrap()
+                            .insert(cache_key, Arc::clone(&arc));
                         arc
                     }
                     Err(e) => {

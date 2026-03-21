@@ -6,8 +6,8 @@
 pub mod session;
 
 pub use session::{
-    AuthSession, AuthState, MemorySessionRegistry, MemorySessionStore, SessionData, SessionId,
-    SessionLayer, SessionRegistry, SessionStore,
+    AuthSession, AuthState, MemorySessionRegistry, MemorySessionStore, SessionBinding, SessionData,
+    SessionId, SessionLayer, SessionRegistry, SessionStore, UserAgentBinding,
 };
 
 // ── Authentication ─────────────────────────────────────────────────────────────
@@ -23,7 +23,7 @@ pub use authn::{
     PasswordRules, PrepareOutcome, StatusDetail, Tenant, TotpConfig, User, ZeroizedString,
 };
 
-// ── Authorization (unchanged) ──────────────────────────────────────────────────
+// ── Authorization ──────────────────────────────────────────────────
 
 #[cfg(feature = "authz")]
 pub mod authz;
@@ -38,7 +38,7 @@ pub use authz::{
 // ── Storage backends ───────────────────────────────────────────────────────────
 
 pub mod storage {
-    /// In-memory store (now a redirect notice — see `crate::session::store`).
+    /// In-memory store. Not suitable for production but useful for testing and examples.
     pub mod in_memory;
 
     #[cfg(feature = "sqlite")]
@@ -50,6 +50,12 @@ pub mod storage {
 
 #[cfg(feature = "sqlite")]
 pub use storage::sqlite::SqliteSessionStore;
+
+#[cfg(feature = "valkey")]
+pub use storage::valkey::{ValkeySessionRegistry, ValkeySessionStore, ValkeyStoreError};
+
+#[cfg(feature = "oauth")]
+pub use authn::oauth::{OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProviderConfig};
 
 // ── DST utilities ──────────────────────────────────────────────────────────────
 
@@ -76,7 +82,7 @@ pub mod extras {
 pub use extras::request_id::RequestIdLayer;
 
 #[cfg(feature = "trace_id")]
-pub use extras::trace_id::TraceIdLayer;
+pub use extras::trace_id::{TraceContext, TraceContextLayer, TraceIdLayer};
 
 // ── Re-export axum and tracing for macro hygiene ────────────────────────────────
 

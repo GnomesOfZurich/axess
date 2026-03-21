@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// Zero generic parameters — wraps the [`SessionHandle`] inserted by [`SessionLayer`].
 /// Obtain one in a handler by listing it as a parameter:
 ///
-/// ```rust,ignore
+/// ```text
 /// async fn my_handler(session: AuthSession) -> impl IntoResponse { ... }
 /// ```
 ///

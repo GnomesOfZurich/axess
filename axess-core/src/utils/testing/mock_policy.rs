@@ -8,19 +8,16 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust
+//! # tokio_test::block_on(async {
 //! use axess_core::authz::{AuthzStore, AuthzDecision};
 //! use axess_core::utils::testing::mock_policy::{MockEntityProvider, MockPolicyEvaluator};
 //! use std::sync::Arc;
 //!
-//! // Allow everything:
-//! let evaluator = Arc::new(MockPolicyEvaluator::allow_all());
-//!
-//! // Or build a decision table:
+//! // Build a decision table:
 //! let evaluator = Arc::new(
 //!     MockPolicyEvaluator::new()
-//!         .permit("ViewLedger",    "ledger-abc")
-//!         .deny("DeleteLedger",   "ledger-abc"),
+//!         .permit_ns("TestApp", "ViewLedger", "Resource", "ledger-abc")
 //! );
 //!
 //! let store = Arc::new(AuthzStore::new(
@@ -31,6 +28,7 @@
 //!
 //! let authz = store.for_user_id("user-1").unwrap();
 //! assert!(authz.is_permitted("ViewLedger", &"ledger-abc".to_string()).await);
+//! # });
 //! ```
 
 use std::collections::HashMap;
@@ -98,9 +96,10 @@ impl MockPolicyEvaluator {
     /// action and resource names and builds the full UID strings using the
     /// given namespace.
     ///
-    /// ```rust,ignore
-    /// MockPolicyEvaluator::new()
-    ///     .permit_ns("TestApp", "ViewLedger", "Ledger", "ledger-1")
+    /// ```rust
+    /// use axess_core::utils::testing::mock_policy::MockPolicyEvaluator;
+    /// let evaluator = MockPolicyEvaluator::new()
+    ///     .permit_ns("TestApp", "ViewLedger", "Ledger", "ledger-1");
     /// ```
     pub fn permit_ns(
         mut self,

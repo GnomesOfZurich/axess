@@ -64,11 +64,27 @@ fred = { version = "10.1.0", features = [
   "replicas",
 ], optional = true }
 
+webauthn-rs = { version = "0.6.0-dev", features = [
+  "danger-allow-state-serialisation",
+  "conditional-ui",
+], optional = true }
+url = { version = "2", optional = true }
+openidconnect = { version = "4.0.1", features = ["reqwest", "rustls-tls"], optional = true }
+traceparent = { version = "0.0.3", optional = true }
+
 
 [dev-dependencies]
 argon2 = { version = "0.5.3", features = ["default"] }
 reqwest = { version = "0.13.2", features = ["cookies"] }
 serial_test = "3.4.0"
+totp-rs = { version = "5.7.1", features = ["gen_secret"] }
+base32 = "0.5.1"
+libreauth = "0.18.1"
+oauth2-test-server = { version = "0.2.2" }
+tokio-test = "0.4"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["full"] }
 
 
 [features]
@@ -76,7 +92,7 @@ authz = ["dep:cedar-policy"]
 admin = []
 accept_client_id = []
 request_id = []
-trace_id = []
+trace_id = ["dep:traceparent"]
 memory = []
 sqlite = ["dep:sqlx"]
 valkey = [
@@ -86,5 +102,7 @@ valkey = [
   "dep:once_cell",
   "dep:hex",
 ]
+fido2 = ["dep:webauthn-rs", "dep:url"]
+oauth = ["dep:openidconnect", "dep:url"]
 default = ["authz"]
-full = ["default", "request_id", "trace_id", "sqlite", "valkey"]
+full = ["default", "request_id", "trace_id", "sqlite", "valkey", "fido2", "oauth"]

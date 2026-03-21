@@ -60,7 +60,7 @@ impl SqliteSessionStore {
 
 /// Error type for the SQLite session store.
 #[derive(Debug, thiserror::Error)]
-pub enum SqliteSessionStoreError {
+pub enum SqliteStoreError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -69,7 +69,7 @@ pub enum SqliteSessionStoreError {
 }
 
 impl SessionStore for SqliteSessionStore {
-    type Error = SqliteSessionStoreError;
+    type Error = SqliteStoreError;
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         let id_str = id.to_string();

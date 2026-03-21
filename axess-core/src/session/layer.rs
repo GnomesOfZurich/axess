@@ -16,7 +16,12 @@
 //! 5. If the session was modified, save it back to the store (or cycle the ID first).
 //! 6. Set the session cookie on the response.
 
-use crate::session::{data::SessionData, id::SessionId, store::SessionStore};
+use crate::session::{
+    binding::{self, SessionBinding},
+    data::SessionData,
+    id::SessionId,
+    store::SessionStore,
+};
 use crate::utils::random::SystemRng;
 use axum::{body::Body, http::Request, response::Response};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -83,7 +88,7 @@ pub struct SessionInner {
 /// Add this layer to your Axum router. Handlers receive an [`AuthSession`] extractor
 /// which wraps the [`SessionHandle`] stored in request extensions.
 ///
-/// ```rust,ignore
+/// ```text
 /// let app = Router::new()
 ///     .route("/login", post(login_handler))
 ///     .layer(SessionLayer::new(store, signing_key));
@@ -96,6 +101,7 @@ pub struct SessionLayer<S> {
     ttl: Duration,
     secure: bool,
     same_site: SameSite,
+    binding: Option<Arc<dyn SessionBinding>>,
 }
 
 impl<S: SessionStore> SessionLayer<S> {
@@ -108,6 +114,7 @@ impl<S: SessionStore> SessionLayer<S> {
             ttl: DEFAULT_TTL,
             secure: true,
             same_site: SameSite::Lax,
+            binding: None,
         }
     }
 
@@ -136,6 +143,25 @@ impl<S: SessionStore> SessionLayer<S> {
         self.same_site = same_site;
         self
     }
+
+    /// Enable session-to-client binding for hijacking detection.
+    ///
+    /// When enabled, the library hashes client-specific request properties
+    /// (determined by the [`SessionBinding`] implementation) and stores the
+    /// hash in the session upon authentication. On every subsequent request
+    /// the hash is recomputed and compared — a mismatch resets the session
+    /// to `Guest` (the cookie may have been stolen by a different client).
+    ///
+    /// ```text
+    /// use axess::session::UserAgentBinding;
+    ///
+    /// let layer = SessionLayer::new(store, key)
+    ///     .with_binding(UserAgentBinding);
+    /// ```
+    pub fn with_binding(mut self, binding: impl SessionBinding) -> Self {
+        self.binding = Some(Arc::new(binding));
+        self
+    }
 }
 
 impl<S, Inner> Layer<Inner> for SessionLayer<S>
@@ -153,6 +179,7 @@ where
             ttl: self.ttl,
             secure: self.secure,
             same_site: self.same_site,
+            binding: self.binding.clone(),
         }
     }
 }
@@ -169,6 +196,7 @@ pub struct SessionService<S, Inner> {
     ttl: Duration,
     secure: bool,
     same_site: SameSite,
+    binding: Option<Arc<dyn SessionBinding>>,
 }
 
 impl<S, Inner, ResBody> Service<Request<Body>> for SessionService<S, Inner>
@@ -195,14 +223,20 @@ where
         let secure = self.secure;
         let same_site = self.same_site;
         let signing_key = self.signing_key.clone();
+        let session_binding = self.binding.clone();
 
         // Clone inner *before* the async block — required by tower's contract.
         let mut inner = self.inner.clone();
         std::mem::swap(&mut inner, &mut self.inner);
 
+        // Pre-compute the binding hash from the request before moving it.
+        let current_fingerprint = session_binding
+            .as_deref()
+            .and_then(|b| binding::compute_fingerprint(b, &req));
+
         Box::pin(async move {
             // 1. Extract and verify the session cookie.
-            let (existing_id, session_data) = {
+            let (existing_id, mut session_data) = {
                 let cookie_value = req
                     .headers()
                     .get(axum::http::header::COOKIE)
@@ -227,6 +261,19 @@ where
                 }
             };
 
+            // 1b. Session binding check — invalidate on mismatch.
+            let mut binding_invalidated = false;
+            if let (Some(stored_hash), Some(current_hash)) =
+                (&session_data.fingerprint, &current_fingerprint)
+                && stored_hash != current_hash
+            {
+                tracing::warn!(
+                    "session fingerprint mismatch — invalidating session (possible hijacking)"
+                );
+                session_data = SessionData::default();
+                binding_invalidated = true;
+            }
+
             // Generate a new session ID if none exists.
             let mut rng = SystemRng;
             let session_id = existing_id.unwrap_or_else(|| SessionId::new(&mut rng));
@@ -235,8 +282,8 @@ where
             let inner_state = SessionInner {
                 id: session_id,
                 data: session_data,
-                modified: false,
-                regenerate: false,
+                modified: binding_invalidated,
+                regenerate: binding_invalidated,
             };
             let handle = SessionHandle(Arc::new(RwLock::new(inner_state)));
             req.extensions_mut().insert(handle.clone());
@@ -246,6 +293,17 @@ where
 
             // 4. Persist session if modified.
             let mut guard = handle.0.write().await;
+
+            // 4b. Auto-set fingerprint when session becomes authenticated.
+            if session_binding.is_some()
+                && guard.data.fingerprint.is_none()
+                && guard.data.auth_state.is_authenticated()
+                && guard.modified
+                && let Some(fp) = &current_fingerprint
+            {
+                guard.data.fingerprint = Some(fp.clone());
+            }
+
             let session_changed = guard.modified || guard.regenerate || existing_id.is_none();
             let final_id = if session_changed {
                 if guard.regenerate || existing_id.is_none() {

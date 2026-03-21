@@ -8,7 +8,7 @@
 //! └──────────────────┬──────────────────────────┘
 //!                    │ per-request
 //! ┌──────────────────▼──────────────────────────┐
-//! │  AuthzSession  — principal + context + cache│
+//! │  AuthzSession  — principal + context + cache │
 //! └────────┬──────────────────┬─────────────────┘
 //!          │                  │
 //! ┌────────▼────────┐ ┌───────▼───────────────────┐
@@ -25,19 +25,41 @@
 //! # Quick start
 //!
 //! ```rust,ignore
-//! // At startup:
-//! let store = Arc::new(PolicyStore::from_text(
-//!     include_str!("policies/app.cedar"),
-//!     include_str!("policies/app.cedar.json"),
+//! use axess::authorization::{AuthzStore, PolicyStore, StandardRequestContext};
+//! use std::sync::Arc;
+//!
+//! // At startup — load Cedar policies and configure the store:
+//! let policy_store = Arc::new(PolicyStore::from_text(
+//!     include_str!("../policies/app.cedar"),
+//!     include_str!("../policies/app.cedarschema.json"),
 //! )?);
+//! let authz = Arc::new(AuthzStore::new(
+//!     policy_store,
+//!     Arc::new(MyEntityProvider::new(db)),
+//!     "MyApp",
+//! ));
+//! authz.validate()?; // catch provider ↔ schema mismatches at startup
 //!
-//! let authz = Arc::new(AuthzStore::new(store, Arc::new(MyProvider::new(db)), "MyApp"));
-//! authz.validate()?; // assert provider ↔ schema consistency at startup
-//!
-//! // In a handler:
-//! let authz_session = state.authz.for_user_id(&user_id.to_string())?;
+//! // In a handler — RBAC/ReBAC check:
+//! let authz_session = state.authz.for_user_id(&user_id)?;
 //! authz_session.require("ViewLedger", &ledger_id).await?;
+//!
+//! // With ABAC context (MFA status, IP address):
+//! let ctx = StandardRequestContext::new(session.is_mfa_complete(), ip_address);
+//! let authz_session = state.authz.for_user_id_with_context(&user_id, ctx)?;
+//! authz_session.require("PostJournalEntry", &ledger_id).await?;
 //! ```
+//!
+//! # Testing
+//!
+//! Use [`MockPolicyEvaluator`](crate::utils::testing::mock_policy::MockPolicyEvaluator)
+//! and [`MockEntityProvider`](crate::utils::testing::mock_policy::MockEntityProvider)
+//! for deterministic tests without Cedar policy files.
+//!
+//! # Example
+//!
+//! See `examples/authz/` for a complete working example with RBAC, ReBAC
+//! (ownership), and ABAC (MFA requirement) patterns.
 
 pub mod context;
 pub mod error;

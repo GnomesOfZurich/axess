@@ -23,6 +23,14 @@ pub struct User {
     pub display_name: Arc<str>,
     /// Current lifecycle state of the user account.
     pub status: EntityState,
+    /// Stable opaque user handle for WebAuthn (FIDO2).
+    ///
+    /// Must be a random UUID assigned once at user creation and persisted.
+    /// The WebAuthn spec requires this to be non-PII and stable across
+    /// multiple credential registrations for the same user.
+    /// `None` if the user has never been involved in a FIDO2 flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webauthn_id: Option<uuid::Uuid>,
 }
 
 /// A tenant as seen by the authentication layer.

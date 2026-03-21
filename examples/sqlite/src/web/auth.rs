@@ -44,7 +44,9 @@ pub async fn post_login(
         .unwrap_or("default");
 
     // begin_login finds the user, checks account status, and starts the factor flow.
-    // It stores intermediate state in the session so verify_factor can continue.
+    // Since this form submits username + password together, we skip prepare_factor
+    // (it returns Ready for passwords) and call verify_factor immediately.
+    // For EmailOtp or FIDO2 flows, call prepare_factor first to generate the challenge.
     let outcome = match state
         .service
         .begin_login(&form.identifier, tenant, &session)

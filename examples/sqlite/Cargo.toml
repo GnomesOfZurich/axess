@@ -12,7 +12,6 @@ categories = ["web-programming"]
 
 [dependencies]
 axess = { path = "../../axess", features = ["sqlite"] }
-axess-factors = { path = "../../axess-factors" }
 axum = { version = "0.8.8", features = ["macros", "form"] }
 chrono = { version = "0.4.44", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }

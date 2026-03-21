@@ -9,12 +9,14 @@
 //! - [`SessionStore`] / [`SessionRegistry`] — the traits storage backends implement.
 //! - [`MemorySessionStore`] / [`MemorySessionRegistry`] — in-memory implementations for tests.
 
+pub mod binding;
 pub mod data;
 pub mod extractor;
 pub mod id;
 pub mod layer;
 pub mod store;
 
+pub use binding::{SessionBinding, UserAgentBinding};
 pub use data::{AuthState, SessionData, WorkflowKind, WorkflowState};
 pub use extractor::{AuthSession, SessionMissing};
 pub use id::SessionId;

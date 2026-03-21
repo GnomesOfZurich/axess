@@ -6,7 +6,7 @@ use axum::response::{IntoResponse, Response};
 /// Returned (and converted to a 403 response) when a Cedar policy check denies access.
 ///
 /// Implements [`IntoResponse`] so handlers can use `?` directly:
-/// ```rust,ignore
+/// ```text
 /// authz.require("ViewLedger", &ledger_id).await?;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

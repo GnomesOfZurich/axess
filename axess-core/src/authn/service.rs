@@ -161,6 +161,12 @@ where
     registry: Option<Arc<dyn RegistryHandle>>,
     rng: R,
     clock: C,
+    #[cfg(feature = "fido2")]
+    fido2: Option<Arc<dyn crate::authn::fido2::Fido2Provider>>,
+    #[cfg(feature = "fido2")]
+    fido2_options: crate::authn::factor::Fido2Options,
+    #[cfg(feature = "oauth")]
+    oauth_providers: crate::authn::oauth::OAuthProviderRegistry,
 }
 
 // Trait-object-safe async wrapper for SessionRegistry.
@@ -231,6 +237,12 @@ where
             registry: None,
             rng: SystemRng,
             clock: SystemClock,
+            #[cfg(feature = "fido2")]
+            fido2: None,
+            #[cfg(feature = "fido2")]
+            fido2_options: Default::default(),
+            #[cfg(feature = "oauth")]
+            oauth_providers: Default::default(),
         }
     }
 }
@@ -250,6 +262,12 @@ where
             registry: self.registry,
             rng,
             clock: self.clock,
+            #[cfg(feature = "fido2")]
+            fido2: self.fido2,
+            #[cfg(feature = "fido2")]
+            fido2_options: self.fido2_options,
+            #[cfg(feature = "oauth")]
+            oauth_providers: self.oauth_providers,
         }
     }
 
@@ -261,7 +279,67 @@ where
             registry: self.registry,
             rng: self.rng,
             clock,
+            #[cfg(feature = "fido2")]
+            fido2: self.fido2,
+            #[cfg(feature = "fido2")]
+            fido2_options: self.fido2_options,
+            #[cfg(feature = "oauth")]
+            oauth_providers: self.oauth_providers,
         }
+    }
+
+    /// Attach a FIDO2/WebAuthn provider.
+    ///
+    /// Use [`DefaultFido2Provider`](crate::authn::fido2::DefaultFido2Provider)
+    /// for production or [`MockFido2Provider`](crate::authn::fido2::MockFido2Provider)
+    /// for testing.
+    ///
+    /// ```rust,ignore
+    /// use axess::authn::fido2::DefaultFido2Provider;
+    /// use axess::authn::factor::Fido2Options;
+    ///
+    /// let provider = DefaultFido2Provider::new(
+    ///     "example.com",
+    ///     &url::Url::parse("https://example.com")?,
+    ///     Fido2Options::default(),
+    /// )?;
+    /// let authn = AuthnService::new(identity, factors).with_fido2(provider);
+    /// ```
+    #[cfg(feature = "fido2")]
+    pub fn with_fido2(mut self, provider: impl crate::authn::fido2::Fido2Provider) -> Self {
+        self.fido2 = Some(Arc::new(provider));
+        self
+    }
+
+    /// Configure FIDO2 ceremony timeout and other options stored on the service.
+    ///
+    /// The UV policy, attestation, and authenticator attachment are configured
+    /// on the [`Fido2Provider`](crate::authn::fido2::Fido2Provider) itself
+    /// (via [`Fido2Options`](crate::authn::factor::Fido2Options) on
+    /// [`DefaultFido2Provider`](crate::authn::fido2::DefaultFido2Provider)).
+    /// This method controls the ceremony timeout applied at the service level.
+    #[cfg(feature = "fido2")]
+    pub fn with_fido2_options(mut self, options: crate::authn::factor::Fido2Options) -> Self {
+        self.fido2_options = options;
+        self
+    }
+
+    /// Register an OAuth/OIDC identity provider.
+    ///
+    /// Call once per provider at startup. Multiple providers can be registered
+    /// (e.g. Google + GitHub + corporate IdP).
+    ///
+    /// ```rust,ignore
+    /// let google = OAuthProviderConfig::discover(
+    ///     "google", "https://accounts.google.com",
+    ///     "client-id", "client-secret", "https://app.com/auth/callback/google",
+    /// ).await?;
+    /// let authn = AuthnService::new(identity, factors).with_oauth_provider(google);
+    /// ```
+    #[cfg(feature = "oauth")]
+    pub fn with_oauth_provider(mut self, config: crate::authn::oauth::OAuthProviderConfig) -> Self {
+        self.oauth_providers.add(config);
+        self
     }
 
     /// Attach a session registry for forced-logout support.
@@ -479,8 +557,58 @@ where
             }
 
             FactorKind::Fido2 => {
-                // Placeholder — FIDO2 challenge generation not yet implemented.
-                Ok(PrepareOutcome::Ready)
+                #[cfg(feature = "fido2")]
+                {
+                    let webauthn = match &self.fido2 {
+                        Some(w) => w,
+                        None => return Ok(PrepareOutcome::Ready),
+                    };
+
+                    // Load stored credentials.
+                    let user_scope = AuthnScope::User {
+                        tenant_id: tenant_id.clone(),
+                        user_id: user_id.clone(),
+                    };
+                    let config = self
+                        .load_factor_with_fallback(&user_scope, &tenant_id, FactorKind::Fido2)
+                        .await?;
+
+                    let FactorConfig::Fido2(cfg) = &config else {
+                        return Err(AuthnError::NoFlow);
+                    };
+
+                    if cfg.credentials.is_empty() {
+                        return Err(AuthnError::NoFlow);
+                    }
+
+                    // Extract raw passkeys for the ceremony.
+                    let passkeys: Vec<_> =
+                        cfg.credentials.iter().map(|c| c.passkey.clone()).collect();
+
+                    // Start the authentication ceremony.
+                    let (challenge, auth_state) =
+                        webauthn.start_authentication(&passkeys).map_err(|e| {
+                            tracing::warn!("FIDO2 start_passkey_authentication failed: {e:?}");
+                            AuthnError::NoFlow
+                        })?;
+
+                    // Store the ceremony state and timestamp in the session.
+                    let state_json =
+                        serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
+                    session.set_custom(fido2_keys::AUTH_STATE, state_json).await;
+                    self.stamp_ceremony_start(session).await;
+
+                    let challenge_json =
+                        serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
+                    Ok(PrepareOutcome::Fido2Challenge {
+                        challenge: challenge_json,
+                    })
+                }
+
+                #[cfg(not(feature = "fido2"))]
+                {
+                    Ok(PrepareOutcome::Ready)
+                }
             }
 
             FactorKind::Federated(_) => {
@@ -546,6 +674,22 @@ where
             .load_factor_with_fallback(&user_scope, &tenant_id, current_kind.clone())
             .await?;
 
+        // FIDO2 verification is handled separately because it needs:
+        // (a) the Webauthn instance, (b) ceremony state from the session.
+        #[cfg(feature = "fido2")]
+        if current_kind == FactorKind::Fido2 {
+            return self
+                .verify_fido2_factor(
+                    credential,
+                    &config,
+                    &user_scope,
+                    &user_id,
+                    &tenant_id,
+                    session,
+                )
+                .await;
+        }
+
         // Verify the credential. Clock is injected so TOTP/expiry are DST-testable.
         let now_utc = self.clock.now();
         let outcome = verify_credential(credential, &config, &current_kind, now_utc);
@@ -603,49 +747,8 @@ where
         let now = self.clock.now();
         session.advance_factor(&current_kind, now).await;
 
-        // Check if all factors are satisfied.
-        let new_state = session.auth_state().await;
-        if new_state.is_authenticated() {
-            // Only reset the failed-attempt counter after ALL factors are
-            // satisfied. Resetting per-factor would let an attacker who knows
-            // an earlier factor (e.g. password) brute-force later factors
-            // (e.g. TOTP/EmailOtp) in unlimited batches of max_attempts.
-            self.identity
-                .reset_failed_attempts(&user_id)
-                .await
-                .map_err(AuthnError::Store)?;
-
-            let sid = session.session_id().await;
-            if let Some(reg) = &self.registry {
-                reg.register(&user_id, &sid).await;
-            }
-
-            let _ = self
-                .identity
-                .record_event(
-                    AuthEventBuilder::new(
-                        user_id.clone(),
-                        tenant_id.clone(),
-                        AuthEventType::Authenticated,
-                        AuthEventStatus::Success,
-                    )
-                    .with_session(sid)
-                    .build_at(now),
-                )
-                .await;
-
-            return Ok(FactorOutcome::Authenticated);
-        }
-
-        // More factors remain — return the next kind.
-        let next_kind = match &session.auth_state().await {
-            crate::session::data::AuthState::Authenticating { remaining, .. } => {
-                remaining.first().cloned()
-            }
-            _ => None,
-        };
-
-        Ok(next_kind.map_or(FactorOutcome::Authenticated, FactorOutcome::FactorRequired))
+        self.complete_factor_step(&user_id, &tenant_id, session)
+            .await
     }
 
     /// Check whether the current session is valid (consults the registry if installed).
@@ -725,7 +828,72 @@ where
             .map_err(AuthnError::Store)?
             .ok_or(AuthnError::NoFlow)
     }
+
+    /// Shared post-factor-success logic: check if all factors are complete,
+    /// and if so, reset the failed-attempt counter, register in the session
+    /// registry, and emit an Authenticated audit event.
+    ///
+    /// Returns `FactorOutcome::Authenticated` or `FactorOutcome::FactorRequired(next)`.
+    async fn complete_factor_step(
+        &self,
+        user_id: &Arc<str>,
+        tenant_id: &Arc<str>,
+        session: &AuthSession,
+    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
+        let new_state = session.auth_state().await;
+        if new_state.is_authenticated() {
+            // Only reset the failed-attempt counter after ALL factors pass.
+            self.identity
+                .reset_failed_attempts(user_id)
+                .await
+                .map_err(AuthnError::Store)?;
+
+            let sid = session.session_id().await;
+            if let Some(reg) = &self.registry {
+                reg.register(user_id, &sid).await;
+            }
+
+            let _ = self
+                .identity
+                .record_event(
+                    AuthEventBuilder::new(
+                        user_id.clone(),
+                        tenant_id.clone(),
+                        AuthEventType::Authenticated,
+                        AuthEventStatus::Success,
+                    )
+                    .with_session(sid)
+                    .build_at(self.clock.now()),
+                )
+                .await;
+
+            return Ok(FactorOutcome::Authenticated);
+        }
+
+        // More factors remain — return the next kind.
+        let next_kind = match &new_state {
+            crate::session::data::AuthState::Authenticating { remaining, .. } => {
+                remaining.first().cloned()
+            }
+            _ => None,
+        };
+
+        Ok(next_kind.map_or(FactorOutcome::Authenticated, FactorOutcome::FactorRequired))
+    }
 }
+
+// ── Feature-gated submodules ──────────────────────────────────────────────────
+//
+// FIDO2 and OAuth impl blocks live in their own files to keep mod.rs focused
+// on the core authentication flow.
+
+#[cfg(feature = "fido2")]
+mod fido2_service;
+#[cfg(feature = "fido2")]
+pub(crate) use fido2_service::fido2_keys;
+
+#[cfg(feature = "oauth")]
+mod oauth_service;
 
 // ── Credential verification ────────────────────────────────────────────────────
 

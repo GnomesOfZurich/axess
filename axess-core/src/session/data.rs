@@ -13,8 +13,12 @@ use std::sync::Arc;
 pub struct SessionData {
     /// Authentication state of the session principal.
     pub auth_state: AuthState,
-    /// SHA-256 hash of the browser fingerprint string, for session binding.
-    pub fingerprint_hash: Option<String>,
+    /// Fingerprint identifying the expected client for this session.
+    ///
+    /// Set automatically by [`SessionBinding`](super::binding::SessionBinding)
+    /// when the session first becomes authenticated. Checked on every subsequent
+    /// request — a mismatch invalidates the session (possible hijacking).
+    pub fingerprint: Option<String>,
     /// Escape hatch for application-specific data stored alongside the session.
     pub custom: serde_json::Value,
 }

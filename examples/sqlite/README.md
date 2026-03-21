@@ -1,9 +1,5 @@
 # Axess Example: SQLite Backend
 
-> **Note:** This example has not yet been updated to the current Axess API (v0.0.14).
-> The code references the old `tower-sessions` / `AuthnServiceBuilder` / generic `AuthSession`
-> API that was replaced in the v0.0.14 rewrite. See the roadmap for the update plan.
-
 This example demonstrates how to use the [Axess](https://github.com/GnomesOfZurich/axess) authentication and authorization library with an Axum web application backed by SQLite for session and credential storage.
 
 ## Features

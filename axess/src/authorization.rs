@@ -32,15 +32,15 @@ pub use axess_core::authz::{
     // Core types
     AuthzDecision,
     AuthzDenied,
-    AuthzError,
     // Traits
     AuthzEntityProvider,
-    BuildRequestContext,
-    PolicyEvaluator,
+    AuthzError,
     // Concrete types
     AuthzSession,
     AuthzStore,
+    BuildRequestContext,
     NoContext,
+    PolicyEvaluator,
     PolicyStore,
     StandardRequestContext,
     // Helpers

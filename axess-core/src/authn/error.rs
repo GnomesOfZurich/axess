@@ -21,4 +21,18 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     /// The account exists but is not in a state that permits login.
     #[error("account not active: {0:?}")]
     NotActive(EntityState),
+
+    /// The account is locked due to too many failed authentication attempts.
+    ///
+    /// Returned by discoverable FIDO2 login when the lockout threshold is
+    /// reached. Callers should display a generic "account locked" message.
+    #[error("account locked")]
+    Locked,
+
+    /// A FIDO2/WebAuthn assertion or registration failed validation.
+    ///
+    /// Distinct from [`NoFlow`] (no ceremony in progress) — this means a
+    /// ceremony was in progress but the cryptographic validation failed.
+    #[error("invalid FIDO2 assertion")]
+    InvalidAssertion,
 }

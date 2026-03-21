@@ -4,9 +4,9 @@
 
 **Axess** is a modular, policy-driven authentication and authorization middleware library for the [Axum](https://github.com/tokio-rs/axum) web framework. It provides secure, session-based multi-factor authentication and fine-grained authorization via [Cedar Policy](https://cedarpolicy.com/), built around a trait-based design that supports deterministic simulation testing (DST) from the ground up.
 
-Axess was created because the existing landscape of Axum authentication crates — notably [axum-login](https://github.com/maxcountryman/axum-login) — does not easily support multi-factor authentication, exposes too little of its inner workings for extension, and cannot accommodate Relationship-Based Access Control (ReBAC) or Cedar Policy without significant custom work.
+Axess was created because the existing landscape of Axum authentication crates — notably [axum-login](https://github.com/maxcountryman/axum-login) — does not easily support multi-factor authentication, exposed too little of its inner workings for convenient extension, and that it couldn't accommodate Relationship-Based Access Control (ReBAC) or Cedar Policy without significant custom work.
 
-> **Status:** Pre-release (`v0.0.13`). Not yet published to crates.io. API is stabilising but may change between minor versions.
+> **Status:** Pre-release (`v0.0.14`). Not yet published to crates.io. API is stabilising but may change between minor versions.
 
 ---
 
