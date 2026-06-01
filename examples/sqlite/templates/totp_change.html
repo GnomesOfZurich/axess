@@ -1,0 +1,22 @@
+<html>
+  <head><title>TOTP Change</title></head>
+  <body>
+    <ul>
+      {% for message in messages %}
+      <li><strong>{{ message }}</strong></li>
+      {% endfor %}
+    </ul>
+    <form method="post">
+      <fieldset>
+        <legend>Change TOTP Setup</legend>
+        <label for="old_secret">Current Secret</label>
+        <input name="old_secret" id="old_secret" required />
+        <label for="new_secret">New Secret</label>
+        <input name="new_secret" id="new_secret" required />
+        <label for="tenant">Tenant</label>
+        <input name="tenant" id="tenant" required />
+      </fieldset>
+      <button type="submit">Change TOTP</button>
+    </form>
+  </body>
+</html>

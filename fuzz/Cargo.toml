@@ -1,0 +1,54 @@
+[package]
+name = "axess-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.87"
+
+# opt out of the workspace so the fuzz crate's nightly-only
+# dependencies (libfuzzer-sys) don't infect the main `cargo build`.
+# Run with `cd fuzz && cargo +nightly fuzz run <target>`.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+rmp-serde = "1.3"
+base64 = "0.22"
+axess-core = { path = "../axess-core", features = ["memory", "oauth", "sqlite", "valkey"] }
+
+# Each fuzz target is a separate `[[bin]]` so cargo-fuzz can build them
+# individually. `path = "fuzz_targets/<name>.rs"` matches the layout
+# `cargo fuzz init` would produce — kept manual so the layout is visible
+# in source control.
+
+[[bin]]
+name = "session_data_msgpack"
+path = "fuzz_targets/session_data_msgpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_data_json"
+path = "fuzz_targets/session_data_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_payload_split"
+path = "fuzz_targets/jwt_payload_split.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkce_verifier_predicate"
+path = "fuzz_targets/pkce_verifier_predicate.rs"
+test = false
+doc = false
+bench = false

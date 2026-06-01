@@ -1,0 +1,33 @@
+[package]
+name = "axess-clock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess-clock"
+readme = "README.md"
+description = """
+Injectable Clock trait for deterministic simulation testing (DST). Foundational
+primitive used by axess and adjacent crates: production code depends on the
+`Clock` trait, tests inject `MockClock` to make time-dependent behaviour
+reproducible.
+"""
+keywords = ["clock", "time", "simulation", "deterministic", "testing"]
+categories = ["date-and-time", "development-tools::testing"]
+exclude = ["tests/", "benches/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# Always-on test fixtures (`MockClock`) live under [`testing`]. Adopters
+# enabling this feature get the mock in their dev-deps without forcing
+# every production consumer of the trait to compile the test surface.
+testing = []
+
+[dependencies]
+chrono = { workspace = true, features = ["serde"] }

@@ -1,0 +1,51 @@
+[package]
+name = "axess-events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess-events"
+readme = "README.md"
+description = """
+Shared event vocabulary for the axess workspace and platform domains.
+The Event<P> envelope carries cross-cutting metadata (id, time, tenant, kind,
+subject, actor, trace context, status) while leaving the payload
+type-parameterised per domain. EventSink<P> is the trait every producer rides;
+concrete sinks include a no-op default and a LogAndSwallow wrapper for
+best-effort emission paths.
+"""
+keywords = ["events", "audit", "envelope", "iggy", "observability"]
+categories = ["data-structures", "asynchronous"]
+exclude = ["tests/", "benches/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+axess-identity = { workspace = true, default-features = false }
+axess-strings = { workspace = true, default-features = false }
+rkyv = { workspace = true, optional = true }
+serde = { version = "1.0.228", optional = true, default-features = false, features = ["alloc", "derive"] }
+serde_json = { workspace = true, optional = true, default-features = false, features = ["alloc"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Direct dep for non-id uses (KindTag namespace, encrypted-blob key ids)
+# and the rkyv `uuid-1` integration. Typed-id storage comes from axess-identity.
+uuid = { workspace = true, default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, default-features = false, features = ["rt", "macros", "sync"] }
+
+[features]
+# `serde` on by default: JSON is the dominant external surface. `rkyv` is
+# opt-in for binary streams (Iggy producers/consumers, replay archives).
+default = ["serde"]
+rkyv = ["dep:rkyv", "axess-strings/rkyv", "axess-identity/rkyv"]
+serde = ["dep:serde", "dep:serde_json", "axess-strings/serde", "axess-identity/serde", "uuid/serde"]
+
+full = ["serde", "rkyv"]

@@ -1,0 +1,58 @@
+# mdBook configuration for the axess docs.
+#
+# Layout choice: chapters live alongside this file (src = ".") rather
+# than under the conventional docs/src/, so every markdown file keeps
+# its existing GitHub-rendered path (referenced from README.md,
+# CONTRIBUTING.md, ROADMAP.md, CHANGELOG.md, and examples/*). The book
+# is the same files viewed through mdBook's nav + search shell.
+#
+# Build:   mdbook build       (writes docs/book/)
+# Serve:   mdbook serve       (http://localhost:3000, live-reload)
+#
+# The build output (docs/book/) is gitignored — GH Pages produces it.
+
+[book]
+title = "Axess"
+description = "Policy-driven authentication and authorization for Axum"
+authors = ["Gnomes of Zurich"]
+language = "en"
+src = "."
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/GnomesOfZurich/axess"
+edit-url-template = "https://github.com/GnomesOfZurich/axess/edit/main/docs/{path}"
+site-url = "/axess/"
+no-section-label = true
+# Mermaid JS assets — written into docs/ by `mdbook-mermaid install docs`
+# (CI runs that step). Listed here so mdBook embeds the <script> tags.
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
+
+[output.html.fold]
+enable = true
+level = 1
+
+# mdbook-mermaid preprocessor — renders ```mermaid code blocks as
+# SVG diagrams. Required for the state-machine diagram in
+# session-state-machine.md and the crate dependency graph in
+# architecture.md. The preprocessor is installed in CI by the docs
+# workflow; locally run `cargo install mdbook-mermaid` once and then
+# `mdbook-mermaid install docs` to drop the JS assets into docs/.
+#
+# `optional = true` lets local previews build without the
+# preprocessor installed (the mermaid blocks render as plain code
+# fences). CI installs the preprocessor and gets real SVG output.
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+optional = true

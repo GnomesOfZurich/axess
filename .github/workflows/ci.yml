@@ -1,0 +1,642 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_call:
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Format check
+  fmt:
+    name: Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ban `#[non_exhaustive]` from first-party Rust source. The
+  # attribute trades one breakage class (adding variants) for another
+  # (every downstream `match` needs a wildcard arm forever, even when
+  # the caller wants compile-time exhaustiveness on a closed set).
+  # Project policy is to bump the version and let downstream `match`
+  # failures be loud. Enforce the rule here so a future contributor
+  # cannot reintroduce the attribute without removing this gate.
+  ban_non_exhaustive:
+    name: Ban #[non_exhaustive]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject any non_exhaustive in first-party crates
+        run: |
+          set -eu
+          # `--include` keeps the search to Rust sources; the explicit
+          # crate roots avoid scanning `target/` or vendored deps.
+          if grep -RIn --include='*.rs' \
+              -e '#\[non_exhaustive\]' \
+              -e '#\[ *non_exhaustive *\]' \
+              axess axess-core axess-factors axess-macros examples; then
+            echo "::error::#[non_exhaustive] is forbidden in first-party crates."
+            echo "See ROADMAP.md / feedback_no_non_exhaustive memory."
+            exit 1
+          fi
+          echo "OK: no #[non_exhaustive] occurrences."
+
+  # (2026-05-16): block `cargo-mutants` mutation markers from
+  # landing on `main`. A local `cargo mutants` run in-place (or one
+  # that crashed mid-flight) leaves `/* ~ changed by cargo-mutants ~ */`
+  # markers in the source tree; if the developer subsequently `git add`s
+  # without inspecting the diff, the mutation lands as a stub body that
+  # silently breaks the affected function. This guard runs on every push
+  # and PR — catches the marker before review, regardless of whether
+  # the developer's local pre-commit setup is configured to reject it.
+  ban_cargo_mutants_markers:
+    name: Ban cargo-mutants markers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject committed cargo-mutants mutation markers
+        run: |
+          set -eu
+          # First-party Rust source only. The marker can legitimately
+          # appear in docs/comments (`docs/`, `ROADMAP.md`, `CHANGELOG.md`,
+          # `axess-core/src/.../*.rs` `///` lines describing how the
+          # mutator interacts with a given function) — those are
+          # documentation about cargo-mutants, not mutations. We grep
+          # for the literal injection marker (`~ changed by cargo-mutants ~`)
+          # inside .rs files; the marker only appears in the form
+          # cargo-mutants injects it (lowercase, tilde-bracketed).
+          if grep -RIn --include='*.rs' \
+              -e '~ changed by cargo-mutants ~' \
+              axess axess-core axess-factors axess-macros axess-cache axess-clock axess-rng axess-events axess-identity axess-strings examples; then
+            echo "::error::cargo-mutants mutation marker found in committed source."
+            echo "A local cargo-mutants run left a stub body (e.g. \`() /* ~ changed by cargo-mutants ~ */\`)"
+            echo "in the source. Revert the file to its real implementation before merging."
+            echo "See ROADMAP.md for the systemic fix."
+            exit 1
+          fi
+          echo "OK: no cargo-mutants mutation markers in source."
+
+  # lockfile-drift check. Cargo.lock is tracked (axess workspace
+  # policy — see `.gitignore` comment). Without this gate, a `cargo build`
+  # inside the test job silently refreshes the lockfile when a Cargo.toml
+  # change isn't accompanied by a corresponding lockfile bump, and the
+  # uncommitted Cargo.lock update lands on `main` invisibly. `--locked`
+  # makes cargo fail fast when the lockfile needs regeneration; the
+  # follow-up `git diff` catches the case where it didn't need
+  # regeneration but a contributor's local `cargo` ran without `--locked`
+  # and shipped a drifted lockfile in the same PR.
+  lockfile_drift:
+    name: Lockfile Drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify Cargo.lock is up-to-date and unchanged
+        run: |
+          set -eu
+          # 1. Build with --locked. If Cargo.toml moved without the
+          #    corresponding lockfile bump, cargo refuses to proceed.
+          cargo metadata --locked --format-version 1 > /dev/null
+          # 2. Re-check that no step somehow mutated Cargo.lock anyway
+          #    (would mean we're rebuilding against a different lockfile
+          #    than the committed one — defence in depth).
+          git diff --exit-code Cargo.lock
+
+  # Detect orphan source files: any `.rs` under `src/` (other than the
+  # crate entry points) must be reachable from its parent module file
+  # via a `mod NAME;` declaration. The Phase A/B/C restructure left two
+  # orphans behind that `cargo build` silently ignored (the compiler
+  # only reads files it is told to read); this gate catches a repeat.
+  #
+  # Convention: modern Rust module layout (`foo.rs` + sibling `foo/`).
+  # For `crate/src/A/B/X.rs` the parent file is `crate/src/A/B.rs`
+  # (or `crate/src/lib.rs` at depth 1). Legacy `mod.rs` is honoured as
+  # a fallback parent but is not used in this workspace.
+  unreachable_sources:
+    name: Detect orphan .rs files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify every src/*.rs is reachable from its crate root
+        run: |
+          set -eu
+          errors=0
+          crates="axess axess-core axess-factors axess-macros axess-cache axess-clock axess-rng axess-events axess-identity axess-strings"
+          for crate_root in $crates; do
+            src="$crate_root/src"
+            [ -d "$src" ] || continue
+            while IFS= read -r f; do
+              base=$(basename "$f" .rs)
+              dir=$(dirname "$f")
+              if [ "$dir" = "$src" ]; then
+                parent="$src/lib.rs"
+                [ -f "$parent" ] || parent="$src/main.rs"
+              else
+                parent="${dir}.rs"
+                [ -f "$parent" ] || parent="$dir/mod.rs"
+              fi
+              if [ ! -f "$parent" ]; then
+                echo "::error file=$f::No parent module file (looked for ${dir}.rs and $dir/mod.rs)"
+                errors=$((errors+1))
+                continue
+              fi
+              # `mod NAME;` with optional `pub` prefix and any whitespace.
+              # Also accept `#[path = "..NAME.rs"]` indirection.
+              if ! grep -qE "(^|[[:space:]])mod[[:space:]]+${base}[[:space:];{]" "$parent" \
+                 && ! grep -qE "#\[path[[:space:]]*=[[:space:]]*\"[^\"]*${base}\.rs\"\]" "$parent"; then
+                echo "::error file=$f::Orphan source — not reachable via 'mod ${base};' in $parent"
+                errors=$((errors+1))
+              fi
+            done < <(find "$src" -name '*.rs' -type f ! -name lib.rs ! -name main.rs ! -name mod.rs)
+          done
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::$errors orphan .rs file(s) found. Either declare them with 'mod NAME;' or delete."
+            exit 1
+          fi
+          echo "OK: every src .rs file is reachable from its crate root."
+
+  # Clippy lints
+  clippy:
+    name: Clippy Lints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+
+  # `cargo doc` under `-D warnings` so broken intradoc links and other
+  # rustdoc-level rot fail the build instead of degrading docs.rs
+  # output silently. Run against the two crates that ship to docs.rs
+  # under `all-features` (`axess` + `axess-core`); leaf crates compile
+  # transitively under those.
+  rustdoc:
+    name: Rustdoc (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build rustdoc with warnings as errors
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features -p axess -p axess-core
+
+  # Tests
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    
+    services:
+      # Valkey (Redis-compatible). Service name and redis-cli are standard;
+      # Valkey maintains full wire-protocol compatibility with Redis.
+      redis:
+        image: valkey/valkey:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:latest
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mysql:
+        image: mysql:8
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: axess_test
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u root -pmysql"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run unit tests
+        run: cargo test --workspace --all-features --lib
+
+      - name: Run integration tests (with Valkey + Postgres + MySQL)
+        run: cargo test --workspace --all-features -- --ignored
+        env:
+          VALKEY_URL: redis://localhost:6379
+          POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+          MYSQL_URL: mysql://root:mysql@localhost:3306/axess_test
+
+      - name: Run doc-tests
+        run: cargo test --doc --workspace --all-features
+
+  # CockroachDB wire-protocol compatibility. Cockroach speaks the Postgres
+  # wire protocol, so the existing `postgres` backend (sqlx::PgPool) should
+  # work unmodified. This job runs the postgres integration suite against
+  # a Cockroach single-node instance to catch divergence early —
+  # transaction-retry semantics, `ON CONFLICT DO UPDATE` quirks, and
+  # `DATEADD`-equivalent edge cases that Cockroach handles slightly
+  # differently from real Postgres.
+  #
+  # Caveats are documented in `docs/sessions/backends.md`. If a test fails here
+  # but passes against Postgres, the divergence is either a Cockroach
+  # bug (file upstream) or one we'll document and work around.
+  cockroach_compat:
+    name: CockroachDB Compatibility
+    runs-on: ubuntu-latest
+    services:
+      cockroach:
+        image: cockroachdb/cockroach:latest
+        ports:
+          - 26257:26257
+          - 8080:8080
+        # `start-single-node --insecure` is the standard CI shape — no
+        # TLS, in-memory store ok for the duration of the job. The
+        # health-cmd polls Cockroach's HTTP admin endpoint which is
+        # available only after the node has fully started.
+        options: >-
+          --health-cmd "curl -fs http://localhost:8080/health?ready=1 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+        env:
+          COCKROACH_ARGS: "start-single-node --insecure"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Cockroach defaults to user `root` with no password on `--insecure`
+      # mode. We point the existing postgres integration suite at port
+      # 26257 — same `POSTGRES_URL` env var consumed by the tests, just
+      # against a different backend speaking the same wire protocol.
+      - name: Run postgres integration tests against CockroachDB
+        run: cargo test -p axess-core --features postgres,testing -- --ignored
+        env:
+          POSTGRES_URL: postgres://root@localhost:26257/defaultdb?sslmode=disable
+
+  # MSRV check — verify the declared minimum supported Rust version still
+  # builds and tests. Bump in lockstep with `rust-version` in each Cargo.toml.
+  msrv:
+    name: MSRV (1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with MSRV
+        run: cargo build --workspace --all-features
+      - name: Test with MSRV
+        run: cargo test --workspace --all-features --lib
+
+  # Build check for different platforms
+  build:
+    name: Build Check
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build all targets
+        run: cargo build --workspace --all-features --all-targets
+
+  # Feature isolation matrix. The default `--all-features` build hides
+  # gate regressions: a `pub use Foo` that should live behind
+  # `cfg(feature = "memory")` (or `testing`) compiles fine under
+  # `--all-features` and only breaks for adopters who opt out. This
+  # matrix builds three feature-minimal slices so a missing gate fails CI
+  # instead of an adopter's prod build.
+  feature_isolation:
+    name: Feature Isolation (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No optional features. Catches accidentally-public types from
+          # gated modules (`MemorySessionStore`, `MockIdentityStore`, …).
+          - profile: no-default-features
+            flags: --no-default-features
+          # Defaults only. Catches a default feature accidentally pulling
+          # in `memory` or `testing` transitively.
+          - profile: default-features
+            flags: ""
+          # `memory` on, `testing` off. Catches a type that's supposed
+          # to be `memory`-only leaking a `testing` dep.
+          - profile: memory-only
+            flags: --no-default-features --features memory
+          # SQLite-only: catches a re-export from a sibling crate (e.g.
+          # `axess-identity`) that fails to gate properly when the
+          # caller enables a storage feature without also enabling
+          # `testing`. Previously regressed once — see the
+          # `pub use axess_identity::testing` fix in `axess-core/src/authn/ids.rs`.
+          - profile: sqlite-only
+            flags: --no-default-features --features sqlite
+          # Postgres-only: same shape as sqlite-only, different backend.
+          - profile: postgres-only
+            flags: --no-default-features --features postgres
+          # MySQL-only: confirms the MySQL session backend compiles with
+          # nothing else turned on (no postgres, no sqlite, no
+          # device-store). Catches `MysqlSessionStore` accidentally
+          # pulling in a postgres-gated symbol.
+          - profile: mysql-only
+            flags: --no-default-features --features mysql
+          # Valkey-only: same shape; also exercises the SessionRegistry
+          # backend path which only Valkey carries.
+          - profile: valkey-only
+            flags: --no-default-features --features valkey
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo check --lib` rather than `cargo build` — faster (skips
+      # link), and matches what catches the missing-cfg-gate class of
+      # bugs locally. `--lib` keeps the check scoped to library targets
+      # only so the absence of a feature can't be masked by an
+      # integration-test target pulling extra deps.
+      - name: Check axess-core (${{ matrix.profile }})
+        run: cargo check -p axess-core --lib ${{ matrix.flags }}
+      - name: Check axess facade (${{ matrix.profile }})
+        run: cargo check -p axess --lib ${{ matrix.flags }}
+
+  # Check that examples compile
+  examples:
+    name: Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: dtolnay/rust-toolchain@stable
+      
+      - uses: Swatinem/rust-cache@v2
+      
+      - name: Build all examples
+        run: |
+          cargo build --package axess-example-sqlite
+          cargo build --package axess-example-oauth
+          cargo build --package axess-example-authz
+
+  # coverage-guided fuzzing of decode hot-paths. Smoke run only
+  # on PR/push — 30 s per target catches the easy crashes without
+  # blocking CI on a deeper soak. Schedule a longer run in a separate
+  # workflow if/when needed.
+  fuzz:
+    name: Fuzz Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+      - name: Run each target for 30 s
+        working-directory: fuzz
+        run: |
+          set -eu
+          for target in session_data_msgpack session_data_json jwt_payload_split pkce_verifier_predicate; do
+            echo "::group::fuzz $target"
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            echo "::endgroup::"
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+
+  # Benchmarks — compile check + run to catch regressions.
+  # Results are uploaded as artifacts for comparison across runs.
+  bench:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks
+        run: cargo bench -p axess-core --all-features -- --output-format bencher | tee bench-output.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-output.txt
+
+  # Verify each library crate can be packaged for crates.io. Catches
+  # missing license/readme files, ungated path dependencies, and oversized
+  # packages BEFORE a release tag forces the issue. Runs the leaf crates
+  # (no internal deps) end-to-end via dry-run; the downstream crates would
+  # need bottom-up registry publishes to pass dry-run, so they're verified
+  # via `cargo package` (which produces the .crate file without uploading
+  # and without resolving the path deps via the registry).
+  publish_dryrun:
+    name: Publish Dry-Run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `cargo publish --dry-run` for leaf crates: a true end-to-end check
+      # including the registry-resolution step. Catches the long tail of
+      # crates.io packaging issues that `cargo package` alone misses.
+      - name: Dry-run publish leaf crates (no internal deps)
+        run: |
+          set -eu
+          for c in axess-strings axess-clock axess-rng; do
+            echo "::group::dry-run $c"
+            cargo publish --dry-run -p "$c"
+            echo "::endgroup::"
+          done
+      # `cargo package --list` for the rest. We cannot dry-run-publish
+      # them on CI because dry-run resolves internal deps against the live
+      # registry, and the dependency versions only exist after the actual
+      # publish steps begin. `--list` still validates the package manifest
+      # and lets us inspect the shipped file set; the registry-resolution
+      # path is exercised for real by `release.yml`.
+      - name: Package check for non-leaf crates
+        run: |
+          set -eu
+          for c in axess-identity axess-events axess-cache axess-factors axess-core axess-macros axess; do
+            echo "::group::package $c"
+            cargo package --list -p "$c" >/dev/null
+            echo "::endgroup::"
+          done
+
+  semver_checks:
+    name: SemVer Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-semver-checks --locked
+      - run: |
+          set -o pipefail
+          if cargo semver-checks check-release --workspace 2>&1 | tee semver.log; then
+            echo "SemVer: OK"
+          elif grep -q "not found in registry" semver.log; then
+            echo "::notice::No registry baseline; SemVer check skipped."
+          else
+            exit 1
+          fi
+
+  # Security audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install audit tools
+        run: cargo install cargo-audit cargo-deny@0.18.3 --locked cargo-cyclonedx
+      - name: Run security audit
+        run: cargo audit --deny warnings
+      # Keep advisories on cargo-audit until cargo-deny 0.18.x handles CVSS 4.0.
+      - name: Run cargo-deny (bans + licenses + sources)
+        run: cargo deny check bans licenses sources
+      - name: Generate SBOM (CycloneDX)
+        run: cargo cyclonedx --all --format json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "**/*.cdx.json"
+          retention-days: 90
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+
+    services:
+      # Valkey (Redis-compatible); see note in Integration Tests job above.
+      redis:
+        image: valkey/valkey:latest
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      postgres:
+        image: postgres:latest
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-llvm-cov
+      - name: Generate coverage
+        run: |
+          cargo llvm-cov --workspace --all-features --summary-only 2>&1 | tee coverage-summary.txt
+          cargo llvm-cov --workspace --all-features --html --output-dir coverage-html
+        env:
+          VALKEY_URL: redis://localhost:6379
+          POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Extract coverage percentage
+        id: cov
+        run: |
+          pct=$(cargo llvm-cov report --json --summary-only | jq -r '.data[0].totals.lines.percent | round')
+          echo "pct=${pct}" >> $GITHUB_OUTPUT
+          echo "Coverage: ${pct}%"
+      - name: Print summary
+        run: |
+          echo "## Coverage: ${{ steps.cov.outputs.pct }}%" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat coverage-summary.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage-html/
+      - name: Update coverage badge
+        if: github.ref == 'refs/heads/main'
+        run: |
+          pct=${{ steps.cov.outputs.pct }}
+          if [ $(echo "$pct >= 80" | bc) -eq 1 ]; then color="brightgreen";
+          elif [ $(echo "$pct >= 60" | bc) -eq 1 ]; then color="yellow";
+          else color="red"; fi
+          ./scripts/generate-badge.sh coverage "${pct}%" "$color" .github/badges/coverage.svg
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/coverage.svg
+          git diff --cached --quiet || (git commit -m "ci: update coverage badge to ${pct}%" && git push)
+
+  # Drift check for the derived badges (version, license). Regenerates
+  # both from [workspace.package] in Cargo.toml and fails if the
+  # committed SVGs are out of date. Coverage uses the auto-commit
+  # pattern above; this job is deliberately separate because
+  # version/license changes are rare, deliberate edits — drift is a
+  # signal to the contributor, not something CI should silently fix.
+  # Pure bash + sed + awk — no Rust toolchain needed.
+  badges:
+    name: Badges in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Regenerate derived badges
+        run: ./scripts/update-badges.sh
+      - name: Fail if badge drift
+        run: |
+          if ! git diff --exit-code .github/badges/version.svg .github/badges/license.svg; then
+            echo ""
+            echo "Version/license badges are out of sync with Cargo.toml."
+            echo "Locally run: ./scripts/update-badges.sh && git add .github/badges/ && git commit"
+            exit 1
+          fi

@@ -1,0 +1,48 @@
+[package]
+name = "axess-strings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess-strings"
+readme = "README.md"
+description = """
+Short, hot-path string primitive for the axess workspace. ShortString is
+optimized for the workload of short identifiers that are hashed, compared,
+and cloned at high volume: event taxonomy tags, factor names, routing
+discriminators. The current internal representation is a placeholder
+(heap Box<str> + &'static str) suitable for getting the API contract in
+place; it will be swapped to an Umbra-style 16-byte representation in a
+follow-up commit. The public API is stable across the swap.
+"""
+keywords = ["string", "intern", "umbra", "short-string", "compact"]
+categories = ["data-structures", "no-std"]
+exclude = ["tests/", "benches/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# `serde` is on by default: JSON is the dominant axum / frontend / SQL
+# audit-log surface for any axess consumer. `rkyv` is opt-in: enable it
+# when publishing events to Iggy or other binary streams. `full` is a
+# convenience for org-internal builds that want both.
+default = ["serde"]
+serde = ["dep:serde"]
+rkyv = ["dep:rkyv"]
+full = ["serde", "rkyv"]
+
+[dependencies]
+serde = { version = "1.0.228", optional = true, default-features = false, features = ["alloc"] }
+# axess-strings only needs `["alloc", "bytecheck"]`; the workspace pin
+# adds `uuid-1` which is harmless here (no uuid types used) but keeps
+# the feature set uniform across the workspace.
+rkyv = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }

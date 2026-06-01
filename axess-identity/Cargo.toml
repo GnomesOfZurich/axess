@@ -1,0 +1,85 @@
+[package]
+name = "axess-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess-identity"
+readme = "README.md"
+description = """
+Identity primitives for the axess workspace: typed identifiers
+(TenantId, UserId, DeviceId, SessionId, EventId; all `FooId(Uuid)`
+newtypes via the `define_id!` macro) plus the principal abstraction
+(unified `Principal` enum with `Human` + `Workload` variants,
+SPIFFE-shaped `WorkloadId` / `TrustDomain` / `Issuer`, and the async
+`PrincipalResolver` trait + `CliResolver` impl).
+
+Foundation crate, deliberately small: depends only on `axess-rng`
+(for the DST-injectable `SecureRng` trait), `uuid`, and `thiserror`.
+No tokio, no axum, no Cedar; axess-core layers session integration
+plus Cedar entity emission on top of these primitives.
+
+See `docs/workload-identity/README.md` for the broader design.
+"""
+keywords = ["identity", "uuid", "principal", "workload", "spiffe"]
+categories = ["authentication", "data-structures"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# `serde` on by default: JSON is the dominant external surface (sqlx
+# columns, HTTP wire, audit logs). `rkyv` opt-in for binary streams
+# (Iggy, replay archives). `sqlx` opt-in for typed-id column codecs.
+# `full` enables all of them.
+default = ["serde"]
+serde = ["dep:serde", "uuid/serde"]
+rkyv = ["dep:rkyv"]
+# Always-on test fixtures (`MockResolver`, label-driven id helpers) live
+# under [`testing`]. Adopters enabling this feature get the deterministic
+# fixture surface in dev-deps without forcing production consumers of the
+# typed-id newtypes to compile it.
+testing = []
+# sqlx integration for typed ids. `Type<DB>` + `Encode<'q, DB>` +
+# `Decode<'r, DB>` impls in the `define_id!` macro expansion, gated on
+# this feature, delegate to the underlying `Uuid`'s sqlx integration. The
+# platform schema today stores ids as TEXT (hyphenated UUID); the uuid
+# crate's native sqlx-uuid feature uses BLOB(16) for sqlite + UUID for
+# postgres, so we encode through `String` here to match the existing
+# schema. A future BLOB(16) migration would let us swap to the zero-copy
+# native form by switching this feature's body to `["dep:sqlx", "uuid/sqlx"]`.
+sqlx = ["dep:sqlx"]
+full = ["serde", "rkyv", "sqlx"]
+
+[dependencies]
+axess-rng = { workspace = true }
+# `v5` is enabled so `TenantId::from_namespaced_str` can map a non-UUID
+# adopter identifier (slug, OAuth subject, integer-stringified) to a
+# stable Uuid at the auth boundary. v4 minting goes through axess-rng +
+# `Uuid::Builder::from_random_bytes` and needs no uuid feature.
+uuid = { workspace = true, default-features = false, features = ["v5"] }
+thiserror = { workspace = true, default-features = false }
+
+serde = { version = "1.0.228", optional = true, default-features = false, features = ["derive", "alloc"] }
+serde_json = { workspace = true, default-features = false, features = ["alloc"] }
+# rkyv pulls its uuid-1 integration when enabled; `Uuid` archives as
+# 16 raw bytes, so any newtype declared with `define_id!` is byte-
+# equivalent to the legacy `[u8; 16]` storage on the rkyv wire.
+rkyv = { workspace = true, optional = true }
+# Only the trait surface is needed at the foundation-crate level.
+# Consumers enable concrete database drivers (`sqlx/sqlite`, `sqlx/postgres`,
+# `sqlx/runtime-tokio`) themselves, keeping the dep tree here minimal.
+sqlx = { version = "0.9.0", optional = true, default-features = false }
+
+[dev-dependencies]
+# Internal `#[cfg(test)] mod tests` uses `axess_rng::testing::MockRng`;
+# enabling `testing` here makes that surface visible during `cargo test`
+# without forcing the production `[dependencies]` row to carry it.
+axess-rng = { workspace = true, features = ["testing"] }
+serde_json = { workspace = true }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

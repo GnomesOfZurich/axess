@@ -1,0 +1,171 @@
+name: Mutants
+
+# AX-028 — mutation-testing sweep. Runs on every PR (touch-only via
+# `--in-diff`) and on a weekly schedule for a fuller pass over the
+# whole workspace. Per-file kill rate is summarised on the workflow
+# job summary so a regression on a previously-clean file shows up at
+# review time.
+
+on:
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Sunday 03:00 UTC — full sweep so mainline kill rates have a
+    # weekly reference point even when no PR has been opened.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      full_sweep:
+        description: 'Run the full sweep across all files (vs PR-diff only)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mutants:
+    name: cargo-mutants
+    runs-on: ubuntu-latest
+
+    # No `services:` block — mutants invokes `cargo test --lib` per the
+    # workspace `mutants.toml`, which excludes infra-dependent
+    # integration tests. Bringing up Valkey / Postgres here would just
+    # slow the sweep down. If a future mutants run depends on
+    # integration tests, mirror the services block from `ci.yml`.
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # cargo-mutants `--in-diff` needs the merge-base to compare
+          # against. fetch-depth=0 grabs the full history; for PRs on
+          # large repos a shallower fetch with `git fetch origin main`
+          # would also work.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Mutants rebuilds the workspace per probe; a warm target
+          # cache is the difference between minutes and hours.
+          shared-key: mutants
+
+      - name: Install cargo-mutants
+        # Pin a known-good version. Bump in lockstep with the local
+        # dev environment to avoid silent behaviour drift between CI
+        # and local runs.
+        run: cargo install cargo-mutants --version 27.0.0 --locked
+
+      - name: Determine sweep scope
+        id: scope
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "schedule" ] || \
+             [ "${{ inputs.full_sweep }}" = "true" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "args=" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=in-diff" >> "$GITHUB_OUTPUT"
+            # `--in-diff` consumes a unified diff on stdin or a file path.
+            # We materialise the PR diff once so the run is self-contained.
+            git fetch origin "${{ github.base_ref }}"
+            git diff "origin/${{ github.base_ref }}"...HEAD > pr.diff
+            wc -l pr.diff
+            echo "args=--in-diff pr.diff" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run cargo-mutants
+        id: mutants
+        # `--no-shuffle` keeps the per-file ordering stable across
+        # runs so the summary diff is meaningful.
+        # `--json` emits machine-readable output to a directory we
+        # can post-process for the per-file kill rate.
+        run: |
+          set +e
+          cargo mutants \
+            ${{ steps.scope.outputs.args }} \
+            --no-shuffle \
+            --output mutants.out \
+            --json
+          status=$?
+          echo "exit_status=$status" >> "$GITHUB_OUTPUT"
+          # Don't fail the step yet — we want the summary to render
+          # before exiting. Final fail/pass decision is in the next
+          # step.
+          exit 0
+
+      - name: Summarise per-file kill rate
+        if: always()
+        run: |
+          set -eu
+          if [ ! -f mutants.out/outcomes.json ]; then
+            echo "::warning::cargo-mutants produced no outcomes.json — sweep may have aborted before producing output."
+            exit 0
+          fi
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import pathlib
+
+          # cargo-mutants 27.x JSON shape:
+          #   {"outcomes": [{"scenario": "Baseline" | {"Mutant": {"file": "..."}}, "summary": "Success"|"Caught"|"Missed"|...}]}
+          # The Baseline entry has `scenario == "Baseline"` (string); skip it.
+          outcomes_path = pathlib.Path("mutants.out/outcomes.json")
+          data = json.loads(outcomes_path.read_text())
+          per_file = collections.defaultdict(lambda: {"total": 0, "caught": 0, "missed": 0, "timeout": 0, "unviable": 0})
+          for entry in data.get("outcomes", []):
+              scenario = entry.get("scenario")
+              if not isinstance(scenario, dict) or "Mutant" not in scenario:
+                  continue
+              src = scenario["Mutant"].get("file") or "unknown"
+              status = (entry.get("summary") or "").lower()
+              bucket = per_file[src]
+              bucket["total"] += 1
+              if status in bucket:
+                  bucket[status] += 1
+          rows = []
+          for src, b in sorted(per_file.items()):
+              # Kill rate excludes unviable mutants from the denominator
+              # (an unviable mutant is one that doesn't compile — it's
+              # not a "missed" coverage gap, it's an artifact of the
+              # mutation operator). Keeps the rate honest.
+              denom = b["total"] - b["unviable"]
+              kill_rate = (b["caught"] / denom) * 100.0 if denom else 100.0
+              rows.append((kill_rate, src, b))
+
+          summary = pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a") as f:
+              f.write("## cargo-mutants per-file kill rate\n\n")
+              f.write("| Kill rate | File | caught/missed/timeout/unviable / total |\n")
+              f.write("|----------:|------|---------------------------------------:|\n")
+              for kr, src, b in sorted(rows):
+                  marker = "✅" if kr >= 80.0 else ("⚠️" if kr >= 50.0 else "❌")
+                  f.write(
+                      f"| {marker} {kr:5.1f}% | `{src}` | "
+                      f"{b['caught']}/{b['missed']}/{b['timeout']}/{b['unviable']} / {b['total']} |\n"
+                  )
+
+          # Also print a brief stdout so the raw log is useful.
+          print("Per-file kill rate (lowest first):")
+          for kr, src, b in sorted(rows):
+              print(f"  {kr:5.1f}%  {src}  ({b['caught']}/{b['total']} caught)")
+          PY
+
+      - name: Upload mutants output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ steps.scope.outputs.mode }}
+          path: mutants.out/
+          retention-days: 30
+
+      - name: Enforce no surviving mutants on PRs
+        if: github.event_name == 'pull_request' && steps.mutants.outputs.exit_status != '0'
+        run: |
+          echo "::error::cargo-mutants reported survived mutants on this PR."
+          echo "Inspect the per-file kill-rate summary above and the uploaded artifact."
+          exit 1

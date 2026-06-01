@@ -1,0 +1,62 @@
+# cargo-deny configuration — CRA supply chain policy
+# https://embarkstudios.github.io/cargo-deny/
+#
+# Run: cargo deny check licenses sources bans
+# CI:  cargo deny check licenses sources bans
+#
+# `cargo deny check advisories` currently fails on cargo-deny 0.18.x because
+# the upstream RustSec advisory database contains CVSS 4.0 entries that the
+# crate's parser does not yet accept (parse error on libcrux-poly1305 et al.,
+# even though those crates are not in our dependency tree). Re-enable the
+# `advisories` check once cargo-deny ships CVSS 4.0 support.
+
+[graph]
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+ignore = [
+    # rsa: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
+    # Severity: 5.9 (medium). No fixed version available.
+    # Pulled transitively by: sqlx-mysql, openidconnect, crypto-glue (webauthn-rs).
+    # Risk to axess: low. We do not use RSA for session encryption or key
+    # exchange. The crate is used by upstream deps for JWT signature verification
+    # and by our dev-dependency for test key generation.
+    # Resolution: wait for rsa crate maintainers to release a fix.
+    "RUSTSEC-2023-0071",
+
+    # rand 0.8.x: unsound with custom logger using rand::rng() (RUSTSEC-2026-0097)
+    # Transitive dep. Axess doesn't use rand::rng() with a custom logger.
+    # Resolution: wait for upstream deps to bump to rand 0.9+.
+    "RUSTSEC-2026-0097",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "OpenSSL",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Examples depend on workspace members via path = "..." without a version
+# (they are `publish = false` and never resolved from a registry). Allow
+# wildcards on path entries only; published crates still need a version pin.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

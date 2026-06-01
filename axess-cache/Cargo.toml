@@ -1,0 +1,74 @@
+[package]
+name = "axess-cache"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess-cache"
+readme = "README.md"
+description = """
+DST-friendly local hot-path cache primitives for the axess auth library.
+All time-dependent decisions go through an injected `Clock` from the
+`axess-clock` crate, so TTL eviction is reproducible under MockClock.
+The flagship type, `ClockTtlCache`, is a TTL+LRU cache that replaces
+moka in any code path where DST or compliance forbids wall-clock
+internal timers.
+"""
+keywords = ["cache", "lru", "ttl", "deterministic", "simulation"]
+categories = ["caching", "development-tools::testing"]
+exclude = ["tests/", "benches/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# `cfg(loom)` is a runtime-toggled flag (set via `RUSTFLAGS='--cfg loom'`)
+# that activates the permutation-checked tests in `tests/loom_invariants.rs`.
+# Registering it here so rustc doesn't warn about an unknown cfg name.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dependencies]
+axess-clock = { workspace = true }
+lru = "0.18.0"
+parking_lot = "0.12.5"
+# Only `sync`: `tokio::sync::OnceCell` powers `get_or_try_insert_with`'s
+# single-flight semantics. Runtime-agnostic primitive (no executor needed).
+tokio = { workspace = true, default-features = false, features = ["sync"] }
+# `tracing` spans wrap the load/invalidation operations so callers can
+# attribute cache latency in their tracing pipelines. Subscriber-less
+# consumers pay only the span-creation cost (~ns); the macro is a no-op
+# without a global subscriber.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `chrono` is only used in tests/doctests to construct fixed wall-clock times
+# for `MockClock::at(...)`; runtime never imports chrono directly, all time
+# decisions go through the injected `Clock`.
+chrono = { workspace = true }
+# Tokio runtime for the `#[tokio::test]` single-flight tests. Production
+# code only needs `tokio::sync` (already in the `[dependencies]` block).
+tokio = { workspace = true, default-features = false, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+# `criterion` powers the empirical baselines in `benches/cache_bench.rs`.
+# The `async_tokio` feature unlocks `b.to_async(&rt).iter(...)` for the
+# single-flight benches (which require an async harness because
+# `get_or_try_insert_with` is `async fn`).
+criterion = { workspace = true, features = ["async_tokio"] }
+# `proptest` powers the randomised invariant tests in
+# `tests/proptest_invariants.rs`. Default features are fine; they
+# include the shrinker we want for finding minimal counterexamples.
+proptest = { workspace = true }
+
+[[bench]]
+name = "cache_bench"
+harness = false
+
+# `loom` is a permutation-checking test harness that enumerates concurrent
+# thread interleavings under a relaxed memory model. Only compiled when the
+# build is invoked with `--cfg loom` (see `tests/loom_invariants.rs`); the
+# regular `cargo test` workflow doesn't depend on it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7.2"

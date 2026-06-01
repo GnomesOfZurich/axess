@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in axess misbehaves at runtime, fails to compile, or returns the wrong result.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug.
+
+        **Security issues** — do not file here. See
+        [`SECURITY.md`](https://github.com/GnomesOfZurich/axess/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: axess version
+      description: Output of `cargo pkgid axess` (e.g. `axess 0.2.0`).
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: rustc
+    attributes:
+      label: Rust toolchain
+      description: Output of `rustc --version`.
+      placeholder: "rustc 1.87.0 (… 2026-04-…)"
+    validations:
+      required: true
+  - type: textarea
+    id: features
+    attributes:
+      label: Enabled features
+      description: The `[dependencies] axess = { … features = [...] }` line, or relevant subset.
+      render: toml
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you saw, what you expected, and any error message / stack trace verbatim.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Smallest code or steps that show the problem. A failing test case is gold.
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Backend (Postgres / SQLite / Valkey / MySQL), DB version, deployment shape, anything else relevant.

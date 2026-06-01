@@ -1,0 +1,70 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'CONTRIBUTING.md'
+      - 'OPERATIONS.md'
+      - 'SECURITY.md'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# Allow only one concurrent deployment; cancel in-progress runs but
+# don't cancel runs already mid-deploy (so a half-published Pages
+# update doesn't get stuck).
+concurrency:
+  group: docs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build mdBook
+    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook + mdbook-mermaid
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C "$HOME/.cargo/bin"
+          curl -sSL https://github.com/badboy/mdbook-mermaid/releases/download/v0.14.1/mdbook-mermaid-v0.14.1-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C "$HOME/.cargo/bin"
+          chmod +x "$HOME/.cargo/bin/mdbook" "$HOME/.cargo/bin/mdbook-mermaid"
+
+      - name: Install mermaid assets
+        run: mdbook-mermaid install docs
+
+      - name: Build book
+        run: mdbook build docs
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,22 @@
+<html>
+  <head><title>Email Verification</title></head>
+  <body>
+    <ul>
+      {% for message in messages %}
+      <li><strong>{{ message }}</strong></li>
+      {% endfor %}
+    </ul>
+    <form method="post">
+      <fieldset>
+        <legend>Verify your email</legend>
+        <label for="email">Email</label>
+        <input name="email" id="email" type="email" required />
+        <label for="token">Verification Code</label>
+        <input name="token" id="token" required />
+        <label for="tenant">Tenant</label>
+        <input name="tenant" id="tenant" required />
+      </fieldset>
+      <button type="submit">Verify Email</button>
+    </form>
+  </body>
+</html>

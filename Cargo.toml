@@ -1,0 +1,119 @@
+[workspace]
+members = [
+    "axess",
+    "axess-cache",
+    "axess-clock",
+    "axess-core",
+    "axess-events",
+    "axess-factors",
+    "axess-identity",
+    "axess-macros",
+    "axess-rng",
+    "axess-strings",
+    "examples/*",
+]
+# `default-members` is what `cargo test`, `cargo build`, `cargo clippy` etc.
+# operate on when no `--workspace` / `-p` flag is given. Keeping examples out
+# of the default set means the bare commands stay fast (library crates only)
+# while `cargo test --workspace --all-features` continues to cover everything.
+default-members = [
+    "axess",
+    "axess-cache",
+    "axess-clock",
+    "axess-core",
+    "axess-events",
+    "axess-factors",
+    "axess-identity",
+    "axess-macros",
+    "axess-rng",
+    "axess-strings",
+]
+resolver = "3"
+
+# Shared `[package]` fields. Members reference these via `field.workspace = true`
+# so a release bump or repository move is a single edit in this file.
+# Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
+# stay local because they genuinely differ.
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.87"
+authors = ["Gnomes"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GnomesOfZurich/axess"
+homepage = "https://github.com/GnomesOfZurich/axess"
+# `documentation` is per-crate (each crate gets its own docs.rs landing page,
+# https://docs.rs/<crate-name>) so it lives in each member's `[package]`, not
+# here.
+
+# Workspace-pinned versions for the RustCrypto family + x509-parser.
+#
+# Every member crate that takes a direct dep on one of these uses
+# `workspace = true` so the version stays consistent across the
+# workspace (axess-core's session fingerprint HMAC matches axess-factors'
+# HOTP HMAC, etc.). Transitive duplicate-majors pulled in by upstreams
+# — `openidconnect`/`totp-rs` on `sha2 v0.10` + `hmac v0.12`,
+# `webauthn-rs v0.6.0-dev` on `x509-parser v0.16` — are out of our
+# control and accepted until the respective upstreams bump; see
+# `docs/architecture.md` (crypto-backend posture) for the full
+# rationale. `x509-parser` is pre-pinned for the mTLS resolver
+# work — no current direct consumer.
+[workspace.dependencies]
+# Internal axess crates. Members write `axess-foo = { workspace = true }`
+# (optionally `features = [...]` or `optional = true`); path + version
+# stay declared once here. The literal "0.2.0" appears alongside
+# `[workspace.package].version` above (Cargo schema does not let
+# `[workspace.dependencies]` entries reference `[workspace.package]`); a
+# release bump touches both lines in this file only.
+#
+# `default-features = false` on axess-core / axess-identity / axess-strings
+# is REQUIRED because at least one member (axess-macros, axess-events) opts
+# out of defaults: Cargo refuses a member-side `default-features = false`
+# override unless the workspace entry has it too. Members that want the
+# defaults restate them via `features = [...]`. The other entries leave
+# defaults enabled so the common case stays terse.
+axess-cache    = { path = "axess-cache",    version = "0.2.0" }
+axess-clock    = { path = "axess-clock",    version = "0.2.0" }
+axess-core     = { path = "axess-core",     version = "0.2.0", default-features = false }
+axess-events   = { path = "axess-events",   version = "0.2.0" }
+axess-factors  = { path = "axess-factors",  version = "0.2.0" }
+axess-identity = { path = "axess-identity", version = "0.2.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "0.2.0" }
+axess-rng      = { path = "axess-rng",      version = "0.2.0" }
+axess-strings  = { path = "axess-strings",  version = "0.2.0", default-features = false }
+
+# RustCrypto family + x509-parser; see preamble above.
+aes-gcm = "0.10.3"
+hmac = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+x509-parser = "0.18.1"
+quick-xml = { version = "0.40.1", features = ["serialize"] }
+
+# Workspace-pinned non-RustCrypto deps. Each member crate that takes a
+# direct dep on one of these should write `dep = { workspace = true }`
+# and layer feature flags on top as needed (e.g. axess-core ships
+# `tokio = { workspace = true, features = ["full"] }` while axess-cache
+# narrows to `["sync"]`). Versions chosen as the latest semver-compatible
+# pin already in use anywhere in the workspace, so promotion does not
+# bump anything; the goal is to stop new drift from accumulating.
+axum = { version = "0.8.9", default-features = false }
+base32 = "0.5.1"
+base64 = "0.22.1"
+chrono = "0.4.44"
+criterion = "0.8.2"
+hex = "0.4.3"
+once_cell = "1.21.4"
+proptest = "1.11.0"
+rand = "0.10.1"
+rkyv = { version = "0.8.16", default-features = false, features = ["alloc", "bytecheck", "uuid-1"] }
+serde_json = { version = "1.0.150", default-features = false }
+subtle = "2.6.1"
+thiserror = { version = "2.0.18", default-features = false }
+tokio = { version = "1.52.3", default-features = false }
+tokio-test = "0.4.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
+url = "2.5.8"
+uuid = { version = "1.23.2", default-features = false }
+zeroize = { version = "1.8.2", features = ["zeroize_derive"] }

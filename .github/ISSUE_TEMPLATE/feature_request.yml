@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a new capability, trait, or behaviour for axess.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [`ROADMAP.md`](https://github.com/GnomesOfZurich/axess/blob/main/ROADMAP.md)
+        first — your idea may already be tracked (or explicitly
+        out-of-scope under "Not planned").
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that's awkward, impossible, or unsafe today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: |
+        Rough trait / type / API surface. A sketch is fine — we'll refine
+        in review. Cite related crates or RFCs if your shape mirrors them.
+      render: rust
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What did you try first that didn't fit?
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope check
+      description: |
+        Is this a library concern (axess), an application concern
+        (your handler code), or somewhere in between? See
+        [`docs/intro/architecture.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/intro/architecture.md)
+        for the library's stated scope.

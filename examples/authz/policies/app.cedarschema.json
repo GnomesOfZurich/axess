@@ -1,0 +1,76 @@
+{
+    "DocApp": {
+        "entityTypes": {
+            "User": {
+                "memberOfTypes": ["Role"],
+                "shape": {
+                    "type": "Record",
+                    "attributes": {}
+                }
+            },
+            "Role": {
+                "memberOfTypes": [],
+                "shape": {
+                    "type": "Record",
+                    "attributes": {}
+                }
+            },
+            "Document": {
+                "memberOfTypes": [],
+                "shape": {
+                    "type": "Record",
+                    "attributes": {
+                        "owner": {
+                            "type": "Entity",
+                            "name": "DocApp::User"
+                        }
+                    }
+                }
+            }
+        },
+        "actions": {
+            "ViewDocument": {
+                "appliesTo": {
+                    "principalTypes": ["User"],
+                    "resourceTypes": ["Document"],
+                    "context": {
+                        "type": "Record",
+                        "attributes": {
+                            "mfa_verified": { "type": "Boolean", "required": false },
+                            "ip_address": { "type": "String", "required": false },
+                            "timestamp": { "type": "String", "required": false }
+                        }
+                    }
+                }
+            },
+            "EditDocument": {
+                "appliesTo": {
+                    "principalTypes": ["User"],
+                    "resourceTypes": ["Document"],
+                    "context": {
+                        "type": "Record",
+                        "attributes": {
+                            "mfa_verified": { "type": "Boolean", "required": false },
+                            "ip_address": { "type": "String", "required": false },
+                            "timestamp": { "type": "String", "required": false }
+                        }
+                    }
+                }
+            },
+            "DeleteDocument": {
+                "appliesTo": {
+                    "principalTypes": ["User"],
+                    "resourceTypes": ["Document"],
+                    "context": {
+                        "type": "Record",
+                        "attributes": {
+                            "mfa_verified": { "type": "Boolean" },
+                            "ip_address": { "type": "String", "required": false },
+                            "timestamp": { "type": "String", "required": false }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

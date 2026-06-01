@@ -1,0 +1,113 @@
+[package]
+name = "axess"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/axess"
+readme = "README.md"
+description = """
+Modular authentication and authorization for Axum. Typed session state machine,
+multi-factor authentication (password, TOTP, FIDO2, OAuth/OIDC), Cedar Policy
+authorization, and deterministic simulation testing.
+"""
+keywords = ["authentication", "authorization", "axum", "mfa", "session"]
+categories = ["web-programming", "authentication"]
+exclude = ["/.github", "/examples", "/scripts", "tests/"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+# `features` restates axess-core's defaults: the workspace entry sets
+# `default-features = false` so axess-macros can opt out, and this re-adds
+# the surface the facade has always relied on.
+axess-core = { workspace = true, features = ["authz", "device", "default-error-response", "serde"] }
+axess-factors = { workspace = true }
+# Re-exports `testing::tenant` / `testing::user` so consumers can write
+# `axess::testing::tenant("alice")` without taking an axess-identity dep.
+# `features = ["serde"]` restores the default the workspace entry strips.
+axess-identity = { workspace = true, features = ["serde"] }
+axess-macros = { workspace = true }
+axum = { workspace = true, default-features = false, features = ["json"] }
+cedar-policy = { version = "4.11.0", optional = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true, features = ["macros"] }
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
+
+[features]
+default = ["authz", "device"]
+
+# Core capabilities
+authz = ["axess-core/authz", "axess-macros/authz", "dep:cedar-policy"]
+device = ["axess-core/device"]
+memory = ["axess-core/memory"]
+testing = ["axess-core/testing", "axess-identity/testing", "memory"]
+
+# HTTP middleware
+accept-client-id = ["axess-core/accept-client-id"]
+request-id = ["axess-core/request-id"]
+trace-id = ["axess-core/trace-id"]
+ws = ["axess-core/ws"]
+
+# Federated authn
+fapi = ["axess-core/fapi"]
+fido2 = ["axess-core/fido2"]
+# Generic JWT-bearer workload identity. Pulls the `WorkloadResolver`
+# adopters wire against GitHub Actions OIDC, Kubernetes SA, GitLab CI,
+# Okta, Azure AD, Auth0, etc. via a custom claim parser. SPIFFE
+# adopters get the same primitives via `jwt-svid`.
+jwt = ["axess-core/jwt"]
+jwt-svid = ["jwt", "axess-core/jwt-svid"]
+ldap = ["axess-core/ldap"]
+mtls = ["axess-core/mtls"]
+oauth = ["axess-core/oauth"]
+# Plain-OAuth-2.0 user login. OFF BY DEFAULT — see
+# `axess::social` module docs for the security model and when to reach
+# for this vs OIDC.
+social = ["axess-core/social"]
+
+# Outbound + cloud STS
+aws-sts = ["axess-core/aws-sts"]
+azure-fic = ["axess-core/azure-fic"]
+cloud-sts = ["axess-core/cloud-sts"]
+gcp-wif = ["axess-core/gcp-wif"]
+outbound-mtls = ["axess-core/outbound-mtls"]
+outbound-oauth = ["axess-core/outbound-oauth"]
+
+# OBO
+delegated = ["axess-core/delegated"]
+delegated-exchange = ["axess-core/delegated-exchange"]
+delegated-stored = ["axess-core/delegated-stored"]
+delegated-stored-encrypted = ["axess-core/delegated-stored-encrypted"]
+
+# In-process IdP
+local-idp = ["axess-core/local-idp"]
+
+# Session storage backends
+mysql = ["axess-core/mysql"]
+postgres = ["axess-core/postgres"]
+sqlite = ["axess-core/sqlite"]
+valkey = ["axess-core/valkey"]
+
+# Authz entity cache decorators (opt-in alternatives to `EntityCache`)
+moka-cache = ["axess-core/moka-cache"]
+valkey-cache = ["axess-core/valkey-cache", "valkey"]
+
+# Umbrellas
+#
+# No `full` umbrella by design. It bundled mutually-exclusive session
+# backends (sqlite + postgres + mysql + valkey), pulled `testing` /
+# `memory` into production builds, and duplicated `--all-features`
+# without serving a real adopter shape. Pick one session backend +
+# the federation / middleware / workload features you actually need;
+# use `cargo … --all-features` for CI / docs.rs only.
+workload-id = ["axess-core/workload-id"]

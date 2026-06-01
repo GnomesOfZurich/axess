@@ -1,0 +1,82 @@
+name: webauthn-rs upstream watch
+
+# poll crates.io for a non-`-dev` release of `webauthn-rs` in the
+# 0.6.x line. axess pins `webauthn-rs = "0.6.0-dev"` today; the cascade
+# of unblocks (AX-001 per-ceremony UV policy, AX-002 FIDO2 example,
+# AX-012 stable pin, AX-207 Cross-Device Authentication) all fire when
+# upstream cuts a stable. Without this watch the unblock is discovered
+# weeks late at the next manual quarterly check.
+#
+# Trigger: weekly cron (Monday 09:00 UTC) + manual dispatch for ad-hoc
+# checks. On a hit, opens a single tracking issue with a sentinel title
+# so re-runs don't spam.
+
+on:
+  schedule:
+    # Every Monday at 09:00 UTC.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  check_upstream:
+    name: Check webauthn-rs upstream
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Poll crates.io for stable 0.6+ release
+        id: poll
+        run: |
+          set -eu
+          # cargo search prints `name = "<ver>"    # description`. Parse
+          # the first non-dev 0.6+ line; emit empty `stable` output if
+          # none found.
+          search_output=$(cargo search webauthn-rs --limit 10)
+          echo "search results:"
+          echo "$search_output"
+          # Match `webauthn-rs = "0.6.X"` where X is one or more digits
+          # (excludes `0.6.0-dev`, `0.6.1-dev`, etc.).
+          stable=$(echo "$search_output" \
+            | grep -E '^webauthn-rs = "0\.[6-9][0-9]*\.[0-9]+"' \
+            | head -1 \
+            | sed -E 's/^webauthn-rs = "([^"]+)".*/\1/')
+          echo "stable=$stable" >> "$GITHUB_OUTPUT"
+
+      - name: Open tracking issue if stable found
+        if: steps.poll.outputs.stable != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STABLE_VER: ${{ steps.poll.outputs.stable }}
+        run: |
+          set -eu
+          # Sentinel title so subsequent runs don't open duplicates.
+          title="webauthn-rs $STABLE_VER stable available — unblock AX-001 / AX-002 / AX-012 / AX-207"
+          existing=$(gh issue list \
+            --state open \
+            --search "$title in:title" \
+            --json number \
+            --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "Tracking issue #$existing already open — no-op."
+            exit 0
+          fi
+          body=$(cat <<EOF
+          \`webauthn-rs\` $STABLE_VER (non-\`-dev\`) is available on crates.io.
+
+          This unblocks the FIDO2 cascade tracked in [ROADMAP.md](../blob/main/ROADMAP.md):
+
+          - **AX-001** — Per-ceremony UV/attestation policy
+          - **AX-002** — FIDO2 standalone example
+          - **AX-012** — Pin \`webauthn-rs\` to stable release
+          - **AX-207** — Cross-Device Authentication (CDA)
+
+          Suggested order: AX-012 first (single-file bump), then AX-001 + AX-002 together, then AX-207.
+
+          Closes nothing yet — this is a notification.
+          EOF
+          )
+          gh issue create --title "$title" --body "$body" --label "deps" --label "fido2"

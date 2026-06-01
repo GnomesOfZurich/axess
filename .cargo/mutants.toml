@@ -1,0 +1,107 @@
+# cargo-mutants configuration for the axess workspace.
+#
+# Drives the mutation-testing sweep. Used by both local
+# developer runs and the CI job in `.github/workflows/mutants.yml`
+# (which adds `--in-diff origin/main` so PRs only mutate the files
+# they touch).
+#
+# # Local-run isolation
+#
+# Do NOT invoke `cargo mutants` directly against the primary working
+# tree. Cargo-mutants edits source files in-place during each probe
+# (injecting a `~ changed by cargo-mutants ~` stub body), and any
+# concurrent tooling — `cargo test`, `rust-analyzer`, another agent's
+# `clippy` — observes whichever transient mutation is in flight.
+# Past symptoms: tests failing differently each run, mutation markers
+# landing in commits because a crash left rollback halfway done, and
+# `clippy -D warnings` tripping on stub bodies.
+#
+# Use `scripts/mutants.sh` instead. It creates a dedicated git
+# worktree at `.mutants-worktree/` (ignored), syncs it to your
+# current HEAD, and runs cargo-mutants there so the primary checkout
+# is never touched. CI runners are already isolated per-job, so the
+# `.github/workflows/mutants.yml` invocation does not go through the
+# wrapper.
+#
+# # Scope
+#
+# - We mutate library code (`*/src/**`). Tests, examples, benches,
+#   fuzz harnesses, and build scripts are excluded — mutating them
+#   would just generate mutants the existing tests can't kill.
+# - We exclude infrastructure derive-impl files where mutation is
+#   either uninteresting (Display/From/serde glue) or known to
+#   exhaust the test runtime budget (large procedural-macro outputs).
+#
+# # Test invocation
+#
+# `--all-features` is non-negotiable: many mutation sites only get
+# exercised under specific feature combinations (device, sqlite,
+# postgres, valkey, fido2, oauth, …). Running anything narrower
+# reports false survivors on code that's only built into one
+# feature combination.
+#
+# # Timeouts
+#
+# Default baseline timeout × 5. Some axess-core integration tests
+# (proptest, fuzz-style property checks, sqlx in-memory database
+# setup) routinely take > 30s; multiplied per-mutant build the
+# default 1.5× often falsely fails healthy mutants on slow CI
+# runners. The 5× multiplier matches what the first sweep
+# already used in CHANGELOG entries.
+
+# Pattern syntax mirrors `.gitignore`. Globs match relative to the
+# workspace root.
+
+# Files we want mutation testing to examine.
+examine_globs = [
+    "axess/src/**/*.rs",
+    "axess-core/src/**/*.rs",
+    "axess-cache/src/**/*.rs",
+    "axess-clock/src/**/*.rs",
+    "axess-rng/src/**/*.rs",
+    "axess-factors/src/**/*.rs",
+    "axess-events/src/**/*.rs",
+    "axess-identity/src/**/*.rs",
+    "axess-strings/src/**/*.rs",
+]
+
+# Hard excludes — never mutate these even if they match `examine_globs`.
+exclude_globs = [
+    # Test-only modules and integration tests are themselves the
+    # oracles; mutating them would just produce noise.
+    "**/tests/**",
+    "**/examples/**",
+    "**/benches/**",
+    "**/fuzz/**",
+    # In-source `mod tests` blocks live under `cfg(test)` and are
+    # already invisible to the production build, but listing them
+    # explicitly speeds up cargo-mutants's planning pass.
+    "**/test_*.rs",
+    # Macros emit code at expansion time; mutating the macro source
+    # produces mutants we can rarely kill without test-only macro
+    # invocations. axess-macros has its own dedicated tests.
+    "axess-macros/src/**",
+    # Build / generated boilerplate.
+    "**/build.rs",
+]
+
+# Extra arguments passed to `cargo` (BOTH `cargo test --no-run` and
+# the test phase). `--all-features` ensures every feature gate's
+# code path is exercised — without it, mutants on files behind
+# `cfg(feature = "sqlite")` etc. would be tested against a build
+# that hasn't compiled the gating tests, producing false survivors.
+# `#[ignore]`'d integration tests (Postgres, Valkey) don't run by
+# default, so we don't need `--lib` to gate them out.
+#
+# In cargo-mutants 27.x, `additional_cargo_args` flows to both
+# build and test invocations as cargo-side arguments (before `--`);
+# `additional_cargo_test_args` flows AFTER `--` to the test runner
+# (e.g. `--test-threads=N`). `--all-features` is a cargo-side flag,
+# hence the `additional_cargo_args` slot here.
+additional_cargo_args = ["--all-features"]
+
+# Multiplier on the unmutated baseline test time. Slow CI runners
+# need headroom; without this, healthy mutants get falsely flagged
+# as "Timeout" instead of "Caught" / "Missed". 5× has been the
+# operating point for the first wave of files.
+timeout_multiplier = 5.0

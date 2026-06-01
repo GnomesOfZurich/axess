@@ -1,0 +1,97 @@
+{
+  "realm": "fapi",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "accessTokenLifespan": 300,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "alice@bank.example.com",
+      "firstName": "Alice",
+      "lastName": "Example",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice",
+          "temporary": false
+        }
+      ],
+      "realmRoles": ["portfolio-viewer"],
+      "groups": ["/finance-team"]
+    }
+  ],
+  "groups": [
+    {
+      "name": "finance-team",
+      "path": "/finance-team"
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "portfolio-viewer",
+        "description": "Read-only access to portfolio data"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "axess-fapi-client",
+      "name": "Axess FAPI Example",
+      "description": "Demo client for the axess FAPI 2.0 example",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "clientAuthenticatorType": "client-secret",
+      "secret": "axess-fapi-secret",
+      "publicClient": false,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "implicitFlowEnabled": false,
+      "redirectUris": [
+        "http://localhost:3000/auth/callback",
+        "http://127.0.0.1:3000/auth/callback"
+      ],
+      "webOrigins": [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+      ],
+      "fullScopeAllowed": true,
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "require.pushed.authorization.requests": "true",
+        "dpop.bound.access.tokens": "true",
+        "post.logout.redirect.uris": "http://localhost:3000/##http://127.0.0.1:3000/##http://localhost:3000##http://127.0.0.1:3000",
+        "access.token.lifespan": "300",
+        "client.session.idle.timeout": "1800",
+        "client.session.max.lifespan": "36000",
+        "id.token.as.detached.signature": "false",
+        "tls.client.certificate.bound.access.tokens": "false",
+        "require.signed.request.object": "false"
+      },
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "email"
+      ],
+      "optionalClientScopes": [
+        "offline_access",
+        "address",
+        "phone",
+        "microprofile-jwt"
+      ]
+    }
+  ]
+}

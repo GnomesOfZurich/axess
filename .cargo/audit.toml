@@ -1,0 +1,24 @@
+# Acknowledged security advisories for transitive dependencies.
+#
+# Each entry documents why the advisory is accepted and what would resolve it.
+# Review periodically — remove entries when upstream fixes land.
+
+[advisories]
+ignore = [
+    # rsa: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
+    # Severity: 5.9 (medium). No fixed version available.
+    # Pulled transitively by: sqlx-mysql, openidconnect, crypto-glue (webauthn-rs).
+    # Risk to axess: low. We do not use RSA for session encryption or key
+    # exchange. The crate is used by upstream deps for JWT signature verification
+    # and by our dev-dependency for test key generation.
+    # Resolution: wait for rsa crate maintainers to release a fix.
+    "RUSTSEC-2023-0071",
+
+    # rand 0.8.x: unsound with custom logger using rand::rng() (RUSTSEC-2026-0097)
+    # Pulled transitively by: sqlx-postgres, sqlx-mysql, openidconnect, fred, crypto-glue.
+    # Risk to axess: none. Axess does not use rand::rng() with a custom logger.
+    # The unsoundness requires a specific interaction between rand::rng() and
+    # a custom global logger that calls rand — not a pattern axess uses.
+    # Resolution: wait for upstream deps to bump to rand 0.9+.
+    "RUSTSEC-2026-0097",
+]

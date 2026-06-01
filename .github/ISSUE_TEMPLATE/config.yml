@@ -1,0 +1,12 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/GnomesOfZurich/axess/security/policy
+    about: |
+      Do NOT file security issues in the public tracker. See SECURITY.md
+      for the private reporting channel and disclosure timeline.
+  - name: Question or design discussion
+    url: https://github.com/GnomesOfZurich/axess/discussions
+    about: |
+      For open-ended questions ("how do I…?", "should I model X as…?")
+      please use Discussions rather than the issue tracker.
