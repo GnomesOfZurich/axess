@@ -4,7 +4,7 @@
 [![Status](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/status.svg)](https://github.com/GnomesOfZurich/axess)
 [![License](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/license.svg)](https://github.com/GnomesOfZurich/axess#licence)
 
-[crates.io](https://crates.io/crates/axess-macros) · [docs.rs](https://docs.rs/axess-macros) · [GitHub](https://github.com/GnomesOfZurich/axess)
+[crates.io](https://crates.io/crates/axess-macros) · [docs.rs](https://docs.rs/axess-macros) · [Book](https://gnomesofzurich.github.io/axess/) · [GitHub](https://github.com/GnomesOfZurich/axess)
 
 Procedural macros for the [Axess](https://github.com/GnomesOfZurich/axess) authentication library. Generates Axum middleware layers that enforce authentication state on routes.
 

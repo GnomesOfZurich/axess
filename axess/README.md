@@ -5,7 +5,7 @@
 [![Status](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/status.svg)](https://github.com/GnomesOfZurich/axess)
 [![License](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/license.svg)](https://github.com/GnomesOfZurich/axess#licence)
 
-[crates.io](https://crates.io/crates/axess) · [docs.rs](https://docs.rs/axess) · [GitHub](https://github.com/GnomesOfZurich/axess)
+[crates.io](https://crates.io/crates/axess) · [docs.rs](https://docs.rs/axess) · [Book](https://gnomesofzurich.github.io/axess/) · [GitHub](https://github.com/GnomesOfZurich/axess)
 
 Public API facade for the [Axess](https://github.com/GnomesOfZurich/axess) authentication and authorization library for [Axum](https://github.com/tokio-rs/axum).
 
@@ -70,10 +70,15 @@ Default features `["authz", "device"]` cover the most common build. Storage back
 
 | Crate | Purpose |
 |---|---|
-| [axess-core](https://crates.io/crates/axess-core) | Core types, traits, session orchestrator |
-| [axess-factors](https://crates.io/crates/axess-factors) | Password / TOTP / HOTP primitives; usable standalone |
+| [axess-core](https://crates.io/crates/axess-core) | Orchestrator: session/authn/authz flow, device identity, workload hub, delegated/OBO, storage, middleware |
+| [axess-factors](https://crates.io/crates/axess-factors) | Verifier and protocol primitives: password/TOTP/HOTP, FIDO2, LDAP, OAuth/OIDC/JWT, mTLS, bearer |
 | [axess-identity](https://crates.io/crates/axess-identity) | Typed identifiers and the `Principal { Human, Workload }` model |
-| [axess-macros](https://crates.io/crates/axess-macros) | `require_authn!`, `require_partial_authn!` |
+| [axess-macros](https://crates.io/crates/axess-macros) | `require_authn!`, `require_partial_authn!`, `require_authz!` |
+| [axess-clock](https://crates.io/crates/axess-clock) | `Clock` / `MockClock`, the time seam for deterministic simulation testing |
+| [axess-rng](https://crates.io/crates/axess-rng) | `SecureRng` / `MockRng`, the entropy seam for deterministic simulation testing |
+| [axess-cache](https://crates.io/crates/axess-cache) | TTL + LRU cache with single-flight, DST-friendly |
+| [axess-events](https://crates.io/crates/axess-events) | rkyv-serialisable audit-event payloads |
+| [axess-strings](https://crates.io/crates/axess-strings) | `Arc<str>` interning |
 
 ## Licence
 

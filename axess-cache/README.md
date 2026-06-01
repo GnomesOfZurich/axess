@@ -4,7 +4,7 @@
 [![Status](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/status.svg)](https://github.com/GnomesOfZurich/axess)
 [![License](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/license.svg)](https://github.com/GnomesOfZurich/axess#licence)
 
-[crates.io](https://crates.io/crates/axess-cache) · [docs.rs](https://docs.rs/axess-cache) · [GitHub](https://github.com/GnomesOfZurich/axess)
+[crates.io](https://crates.io/crates/axess-cache) · [docs.rs](https://docs.rs/axess-cache) · [Book](https://gnomesofzurich.github.io/axess/) · [GitHub](https://github.com/GnomesOfZurich/axess)
 
 DST-friendly local hot-path cache primitives for [Axess](https://github.com/GnomesOfZurich/axess).
 

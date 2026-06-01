@@ -1,18 +1,18 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="146" height="20">
+<svg xmlns="http://www.w3.org/2000/svg" width="153" height="20">
   <linearGradient id="b" x2="0" y2="100%">
     <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
     <stop offset="1" stop-opacity=".1"/>
   </linearGradient>
-  <clipPath id="a"><rect width="146" height="20" rx="3" fill="#fff"/></clipPath>
+  <clipPath id="a"><rect width="153" height="20" rx="3" fill="#fff"/></clipPath>
   <g clip-path="url(#a)">
     <path fill="#555" d="M0 0h52v20H0z"/>
-    <path fill="#dfb317" d="M52 0h94v20H52z"/>
-    <path fill="url(#b)" d="M0 0h146v20H0z"/>
+    <path fill="#007ec6" d="M52 0h101v20H52z"/>
+    <path fill="url(#b)" d="M0 0h153v20H0z"/>
   </g>
   <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
     <text x="26.0" y="15" fill="#010101" fill-opacity=".3">status</text>
     <text x="26.0" y="14">status</text>
-    <text x="99.0" y="15" fill="#010101" fill-opacity=".3">v0.x pre-1.0</text>
-    <text x="99.0" y="14">v0.x pre-1.0</text>
+    <text x="102.5" y="15" fill="#010101" fill-opacity=".3">early release</text>
+    <text x="102.5" y="14">early release</text>
   </g>
 </svg>

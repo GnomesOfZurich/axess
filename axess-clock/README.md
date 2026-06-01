@@ -4,7 +4,7 @@
 [![Status](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/status.svg)](https://github.com/GnomesOfZurich/axess)
 [![License](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/license.svg)](https://github.com/GnomesOfZurich/axess#licence)
 
-[crates.io](https://crates.io/crates/axess-clock) · [docs.rs](https://docs.rs/axess-clock) · [GitHub](https://github.com/GnomesOfZurich/axess)
+[crates.io](https://crates.io/crates/axess-clock) · [docs.rs](https://docs.rs/axess-clock) · [Book](https://gnomesofzurich.github.io/axess/) · [GitHub](https://github.com/GnomesOfZurich/axess)
 
 Injectable `Clock` trait for deterministic simulation testing (DST). Foundational primitive used by [Axess](https://github.com/GnomesOfZurich/axess) and adjacent crates.
 

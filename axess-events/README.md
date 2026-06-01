@@ -4,9 +4,9 @@
 [![Status](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/status.svg)](https://github.com/GnomesOfZurich/axess)
 [![License](https://raw.githubusercontent.com/GnomesOfZurich/axess/main/.github/badges/license.svg)](https://github.com/GnomesOfZurich/axess#licence)
 
-[crates.io](https://crates.io/crates/axess-events) · [docs.rs](https://docs.rs/axess-events) · [GitHub](https://github.com/GnomesOfZurich/axess)
+[crates.io](https://crates.io/crates/axess-events) · [docs.rs](https://docs.rs/axess-events) · [Book](https://gnomesofzurich.github.io/axess/) · [GitHub](https://github.com/GnomesOfZurich/axess)
 
-Shared event vocabulary for the [Axess](https://github.com/GnomesOfZurich/axess)workspace and adjacent domains.
+Shared event vocabulary for the [Axess](https://github.com/GnomesOfZurich/axess) workspace and adjacent domains.
 
 The `Event<P>` envelope carries cross-cutting metadata (id, time, tenant, kind, subject, actor, trace context, status) while leaving the payload type-parameterised per domain. `EventSink<P>` is the trait every producer rides; concrete sinks include a no-op default and a `LogAndSwallow` wrapper for fail-soft dispatch.
 
