@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.2.2] - 2026-07-19
+
+### Security
+
+Transitive-dependency security patch — no adopter-facing API changes,
+same public surface as 0.2.1.
+
+- `crossbeam-epoch` 0.9.18 → 0.9.20 (fixes [RUSTSEC-2026-0204]: invalid pointer dereference in the `fmt::Pointer` impl for `Atomic` / `Shared`).
+- `quinn-proto` 0.11.14 → 0.11.16 (fixes [RUSTSEC-2026-0185], severity 7.5 high: remote memory exhaustion via unbounded out-of-order stream reassembly). Pulled by `reqwest` for HTTP/3.
+- `anyhow` 1.0.102 → 1.0.104 (fixes [RUSTSEC-2026-0190]: unsoundness in `Error::downcast_mut()`).
+- `spin` 0.9.8 → 0.9.9 (0.9.8 was yanked upstream).
+
+Lockfile-only update; no `Cargo.toml` semver constraints changed. All
+1469 tests still pass under the new lockfile; `cargo audit --deny warnings`
+now clean.
+
+[RUSTSEC-2026-0204]: https://rustsec.org/advisories/RUSTSEC-2026-0204
+[RUSTSEC-2026-0185]: https://rustsec.org/advisories/RUSTSEC-2026-0185
+[RUSTSEC-2026-0190]: https://rustsec.org/advisories/RUSTSEC-2026-0190
+
+---
+
 ## [0.2.1] - 2026-07-19
 
 ### Security
