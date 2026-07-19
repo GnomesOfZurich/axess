@@ -69,9 +69,9 @@ Applied so far across several files where the tests-to-production ratio exceeded
 
 Per-app workflow mutations (`set_identifying`, `set_pending_workflow`, `clear`, `regenerate`) remain `pub`; apps build their own two-step identify / workflow-step / logout flows on top.
 
-### No `#[deprecated]` pre-v0.1.0
+### No `#[deprecated]` pre-1.0
 
-Breaking changes happen freely in the unreleased `[0.2.0]` window; adopters get one coordinated migration window, not a long `#[deprecated]` trail. CHANGELOG documents each break under `### Changed (breaking)`.
+Breaking changes happen freely across the 0.x line; adopters get one coordinated migration window per minor bump, not a long `#[deprecated]` trail. CHANGELOG documents each break under `### Changed (breaking)`.
 
 ### MSRV bumps are breaking changes
 

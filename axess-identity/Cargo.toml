@@ -64,7 +64,7 @@ axess-rng = { workspace = true }
 uuid = { workspace = true, default-features = false, features = ["v5"] }
 thiserror = { workspace = true, default-features = false }
 
-serde = { version = "1.0.228", optional = true, default-features = false, features = ["derive", "alloc"] }
+serde = { version = "1.0.229", optional = true, default-features = false, features = ["derive", "alloc"] }
 serde_json = { workspace = true, default-features = false, features = ["alloc"] }
 # rkyv pulls its uuid-1 integration when enabled; `Uuid` archives as
 # 16 raw bytes, so any newtype declared with `define_id!` is byte-

@@ -77,9 +77,9 @@ impl SessionCrypto {
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         self.rng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| CryptoError)?;
 
-        let ciphertext = cipher.encrypt(nonce, plaintext).map_err(|_| CryptoError)?;
+        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|_| CryptoError)?;
 
         let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
@@ -95,11 +95,11 @@ impl SessionCrypto {
         }
 
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| CryptoError)?;
 
         let cipher = Aes256Gcm::new_from_slice(&self.current.0).map_err(|_| CryptoError)?;
 
-        if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
+        if let Ok(plaintext) = cipher.decrypt(&nonce, ciphertext) {
             return Ok(plaintext);
         }
 
@@ -109,7 +109,7 @@ impl SessionCrypto {
             );
             let old_cipher = Aes256Gcm::new_from_slice(&prev.0).map_err(|_| CryptoError)?;
 
-            if let Ok(plaintext) = old_cipher.decrypt(nonce, ciphertext) {
+            if let Ok(plaintext) = old_cipher.decrypt(&nonce, ciphertext) {
                 tracing::debug!("session decrypted with previous (rotated) key");
                 return Ok(plaintext);
             }

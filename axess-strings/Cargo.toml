@@ -37,7 +37,7 @@ rkyv = ["dep:rkyv"]
 full = ["serde", "rkyv"]
 
 [dependencies]
-serde = { version = "1.0.228", optional = true, default-features = false, features = ["alloc"] }
+serde = { version = "1.0.229", optional = true, default-features = false, features = ["alloc"] }
 # axess-strings only needs `["alloc", "bytecheck"]`; the workspace pin
 # adds `uuid-1` which is harmless here (no uuid types used) but keeps
 # the feature set uniform across the workspace.

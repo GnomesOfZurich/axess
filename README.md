@@ -12,7 +12,7 @@
 
 Axess is a session-based multi-factor authentication and Cedar Policy authorization library, built around a trait-based design that supports deterministic simulation testing (DST) from the ground up. It exists because the existing landscape (primarily [axum-login](https://github.com/maxcountryman/axum-login)) did not expose enough of its internals to extend with arbitrary factor chains or compose with Cedar / ReBAC without significant custom work.
 
-> **Status:** `v0.2.0` on crates.io. The 0.x line is pre-1.0; the public
+> **Status:** `v0.2.1` on crates.io. The 0.x line is pre-1.0; the public
 > API may evolve between minor versions based on adopter feedback before
 > stabilising.
 

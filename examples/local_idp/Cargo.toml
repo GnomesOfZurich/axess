@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-local-idp"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.87"
 publish = false
@@ -13,12 +13,12 @@ repository = "https://github.com/GnomesOfZurich/axess"
 [dependencies]
 axess = { path = "../../axess", features = ["local-idp"] }
 axum = { version = "0.8.9", features = ["json"] }
-chrono = "0.4.44"
-jsonwebtoken = "10.3.0"
+chrono = "0.4.45"
+jsonwebtoken = "10.4.0"
 rsa = { version = "0.9.10", features = ["pem"] }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
-thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
+thiserror = "2.0.19"
+tokio = { version = "1.53.0", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -135,12 +135,11 @@ must be set explicitly, and both chapters name them.
 
 ## Status
 
-Axess is at `v0.2.0`, pre-publication. The API is stabilising, with
-(the crates.io publish) named as the next milestone. The breaking
-changes accumulated against the previous stable line are catalogued in
-*Migration guide*. Until the first crates.io release, minor versions
-may break source compatibility; the goal post-publish is to maintain
-the SemVer discipline that Rust libraries are held to elsewhere.
+Axess is published on crates.io at `v0.2.1`. The 0.x line is pre-1.0:
+minor versions may break source compatibility, and each break is
+catalogued in [*Migration guide*](../production/migrating.md). The goal
+post-1.0 is to maintain the SemVer discipline that Rust libraries are
+held to elsewhere.
 
 Vulnerability reports go through the private channel described in
 [`SECURITY.md`](https://github.com/GnomesOfZurich/axess/blob/main/SECURITY.md).

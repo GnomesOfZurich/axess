@@ -15,7 +15,29 @@ change (the same code does something subtly different). The
 sections below group by symptom; finding your case is faster than
 reading the full changelog.
 
-## Upcoming: 0.1.x to 0.2.0
+## 0.2.0 to 0.2.1
+
+`v0.2.1` is a patch release. The only behavioural change is a
+CSRF hardening: the double-submit token now binds to the session
+id (`HMAC(signing_key, nonce || session_id)`) rather than to the
+signing key alone, and `CsrfLayer` fails closed with 403 when the
+session-id extension is missing on a state-changing request. Two
+adopter-facing consequences:
+
+Adopters MUST layer `CsrfLayer` inside (i.e. run after) the
+session layer so the `SessionHandle` request extension is present
+by the time CSRF validation runs. In `axum`, later `.layer(...)`
+calls wrap earlier ones, so `.layer(csrf).layer(session_layer)`
+is the correct order. Stacks that had the layers in the opposite
+order silently validated an unbound token before 0.2.1; that shape
+now returns 403.
+
+Clients that cache the CSRF token across a session change (login,
+session regeneration) MUST re-read the token after the change or
+their first post-change state-changing request will 403. Tokens
+minted under one session id no longer verify against another.
+
+## 0.1.x to 0.2.0
 
 The first crates.io publish is the 0.2.0 release. The accumulated
 changes since the previous stable line are catalogued
@@ -173,7 +195,7 @@ behavioural impact is bounded.
 
 ## Future migrations
 
-The pattern from 0.1.x to 0.2.0 is the pattern future migrations
+The pattern from 0.2.0 to 0.2.1 is the pattern future migrations
 will follow. Each migration documents itself here, sorted by
 release. The pattern:
 

@@ -33,7 +33,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
 axess-clock = { workspace = true }
-lru = "0.18.0"
+lru = "0.18.1"
 parking_lot = "0.12.5"
 # Only `sync`: `tokio::sync::OnceCell` powers `get_or_try_insert_with`'s
 # single-flight semantics. Runtime-agnostic primitive (no executor needed).

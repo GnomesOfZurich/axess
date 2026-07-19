@@ -329,7 +329,7 @@ pub struct AuthEvent {
     pub event_type: AuthEventType,
     /// Outcome of the event.
     pub event_status: AuthEventStatus,
-    /// Timestamp when the event occurred, as epoch microseconds.
+    /// Timestamp when the event occurred, as `i64` epoch microseconds.
     ///
     /// Stored as `i64` rather than `chrono::DateTime<Utc>` so the event
     /// is rkyv-archivable end-to-end (chrono 0.4 still pins rkyv 0.7

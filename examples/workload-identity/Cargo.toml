@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-workload-identity"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.87"
 publish = false
@@ -22,7 +22,7 @@ categories = ["authentication"]
 axess = { path = "../../axess", features = ["jwt"] }
 axess-factors = { path = "../../axess-factors", features = ["jwt"] }
 axess-identity = { path = "../../axess-identity" }
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
 tracing = "0.1.44"
 
@@ -34,10 +34,10 @@ axess-identity = { path = "../../axess-identity" }
 # `MockClock` pins JwtVerifier's notion of "now" so the pinned JWT
 # timestamps validate deterministically under DST.
 axess-clock = { path = "../../axess-clock", features = ["testing"] }
-base64 = "0.22"
-chrono = "0.4.44"
+base64 = "0.22.1"
+chrono = "0.4.45"
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 # `pkcs5` matches the workspace pin. The `pkcs1` *module* (used to
 # DER-encode the test signing key) is unconditionally available.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
-tokio = { version = "1.52.1", features = ["macros", "rt"] }
+tokio = { version = "1.53.0", features = ["macros", "rt"] }

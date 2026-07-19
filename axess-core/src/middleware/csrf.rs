@@ -7,9 +7,33 @@
 //! cookie itself is sent automatically by the browser, but cannot be read or
 //! forged by cross-origin code thanks to the same-origin policy.
 //!
-//! The token is HMAC-bound to the session id, so a stolen token from one
-//! session cannot be replayed against another. Tokens are constant-time
-//! verified against the cookie.
+//! The token is `HMAC(signing_key, nonce || session_id)`, so it is bound to
+//! the session that was current when it was minted: a token minted under one
+//! session id fails validation once the request carries a different session
+//! id (e.g. after the session is regenerated on login). A token stolen from
+//! one session therefore cannot be replayed against another. Tokens are
+//! constant-time verified against the cookie.
+//!
+//! # Layering requirement
+//!
+//! The [`CsrfLayer`](crate::middleware::csrf::CsrfLayer) reads the current session id from the session-handle
+//! request extension that the session layer injects. It MUST therefore be
+//! layered **inside** (i.e. run after) the session layer so the handle is
+//! present by the time this middleware runs. In an `axum` `Router`, layers
+//! applied later wrap earlier ones, so add the session layer *after*
+//! `CsrfLayer`:
+//!
+//! ```rust,ignore
+//! let app = Router::new()
+//!     .route("/api/transfer", post(transfer))
+//!     .layer(CsrfLayer::new(csrf_config)) // inner: runs second, sees the handle
+//!     .layer(session_layer);              // outer: runs first, injects the handle
+//! ```
+//!
+//! If the session-handle extension is absent on a state-changing request,
+//! the middleware **fails closed** (403) rather than validating an unbound
+//! token, so a mis-ordered stack surfaces as a hard failure instead of a
+//! silent loss of the session-binding property.
 //!
 //! # Threat model
 //!
@@ -29,11 +53,15 @@
 //!
 //! let app = Router::new()
 //!     .route("/api/transfer", post(transfer))
-//!     .layer(csrf);
+//!     .layer(csrf)           // inner: sees the session handle
+//!     .layer(session_layer); // outer: injects the session handle first
 //! ```
 //!
 //! Read the token from the `CsrfToken` request extension and inject it into
-//! HTML forms or expose it to your SPA via a `/csrf` endpoint.
+//! HTML forms or expose it to your SPA via a `/csrf` endpoint. Because the
+//! token is bound to the session id, a client that caches the token across a
+//! session change (e.g. login, which regenerates the session) must re-read
+//! it afterwards or its first post-login state-changing request will 403.
 
 use axess_rng::{SecureRng, SystemRng};
 use axum::{
@@ -49,6 +77,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
+
+use crate::session::layer::SessionHandle;
 
 /// Default cookie name for the CSRF token.
 pub const DEFAULT_CSRF_COOKIE: &str = "axess.csrf";
@@ -187,13 +217,42 @@ where
             let cookie_token = extract_cookie_token(&req, &config.cookie_name);
             let method = req.method().clone();
 
+            // Read the current session id from the handle the session layer
+            // injects. The token is HMAC-bound to this id, so the session
+            // layer MUST wrap this middleware (see the module docs). Clone
+            // the handle out first so the request borrow ends before we await
+            // the read lock.
+            let session_handle = req.extensions().get::<SessionHandle>().cloned();
+            let session_id = match &session_handle {
+                Some(handle) => Some(handle.0.read().await.id.to_string()),
+                None => None,
+            };
+
             // Validate on state-changing methods. GET/HEAD/OPTIONS pass through
             // because they must be safe (idempotent, no side effects) per
             // RFC 9110 section 9.2.1; and CSRF only matters for unsafe verbs.
             if is_state_changing(&method) {
+                // Fail closed: without a session id we cannot verify the
+                // binding, so a mis-ordered layer stack (CsrfLayer outside the
+                // session layer) is rejected rather than silently validating
+                // an unbound token.
+                let Some(session_id) = session_id.as_deref() else {
+                    tracing::warn!(
+                        method = %method,
+                        path = %req.uri().path(),
+                        "csrf: no session id on state-changing request \
+                         (CsrfLayer must be layered inside the session layer)"
+                    );
+                    return Ok((StatusCode::FORBIDDEN, "CSRF validation failed").into_response());
+                };
                 let presented = extract_token_from_request(&req, &config);
                 let cookie_present = cookie_token.as_deref();
-                if !validate_pair(cookie_present, presented.as_deref(), &config.signing_key) {
+                if !validate_pair(
+                    cookie_present,
+                    presented.as_deref(),
+                    session_id,
+                    &config.signing_key,
+                ) {
                     tracing::warn!(
                         method = %method,
                         path = %req.uri().path(),
@@ -207,11 +266,15 @@ where
 
             // Issue a fresh token on responses where the request had no
             // cookie. Once a token is in the cookie it is reused until the
-            // session cycles (caller can force rotation by clearing the
-            // cookie alongside the session cycle).
-            let token_to_set = match &cookie_token {
-                Some(existing) if !existing.is_empty() => None,
-                _ => Some(mint_token(&config.signing_key)),
+            // session cycles (a session-id change invalidates the old token
+            // via the HMAC binding, so the next request mints a fresh one).
+            // A token can only be minted when a session id is present to bind
+            // it to; without one we leave the client tokenless rather than
+            // issue an unbound token.
+            let token_to_set = match (&cookie_token, session_id.as_deref()) {
+                (Some(existing), _) if !existing.is_empty() => None,
+                (_, Some(session_id)) => Some(mint_token(session_id, &config.signing_key)),
+                (_, None) => None,
             };
             let extension_token = token_to_set
                 .clone()
@@ -266,23 +329,30 @@ fn extract_token_from_request(req: &Request<Body>, config: &CsrfConfig) -> Optio
     Some(s.to_string())
 }
 
-fn mint_token(signing_key: &[u8; 32]) -> String {
+fn mint_token(session_id: &str, signing_key: &[u8; 32]) -> String {
     let mut nonce = [0u8; TOKEN_NONCE_BYTES];
     SystemRng.fill_bytes(&mut nonce);
-    let tag = compute_tag(&nonce, signing_key);
+    let tag = compute_tag(&nonce, session_id, signing_key);
     let mut combined = Vec::with_capacity(TOKEN_NONCE_BYTES + tag.len());
     combined.extend_from_slice(&nonce);
     combined.extend_from_slice(&tag);
     URL_SAFE_NO_PAD.encode(&combined)
 }
 
-fn compute_tag(nonce: &[u8], signing_key: &[u8; 32]) -> Vec<u8> {
+fn compute_tag(nonce: &[u8], session_id: &str, signing_key: &[u8; 32]) -> Vec<u8> {
+    // MAC over `nonce || session_id`. Binding the session id into the tag is
+    // what makes a token minted under one session fail validation under
+    // another: the nonce is echoed in the token but the id is not, so an
+    // attacker cannot recompute the tag for a different session without the
+    // key. The nonce has a fixed length (`TOKEN_NONCE_BYTES`), so the
+    // concatenation is unambiguous and needs no separator.
     let mut mac = crate::hmac::new_signer(signing_key);
     mac.update(nonce);
+    mac.update(session_id.as_bytes());
     mac.finalize().into_bytes().to_vec()
 }
 
-fn validate_token(token: &str, signing_key: &[u8; 32]) -> bool {
+fn validate_token(token: &str, session_id: &str, signing_key: &[u8; 32]) -> bool {
     let bytes = match URL_SAFE_NO_PAD.decode(token) {
         Ok(b) => b,
         Err(_) => return false,
@@ -291,13 +361,14 @@ fn validate_token(token: &str, signing_key: &[u8; 32]) -> bool {
         return false;
     }
     let (nonce, tag) = bytes.split_at(TOKEN_NONCE_BYTES);
-    let expected = compute_tag(nonce, signing_key);
+    let expected = compute_tag(nonce, session_id, signing_key);
     expected.as_slice().ct_eq(tag).into()
 }
 
 fn validate_pair(
     cookie_token: Option<&str>,
     presented: Option<&str>,
+    session_id: &str,
     signing_key: &[u8; 32],
 ) -> bool {
     let (Some(c), Some(p)) = (cookie_token, presented) else {
@@ -307,9 +378,10 @@ fn validate_pair(
         return false;
     }
     // Cookie and presented must match exactly (double-submit) AND the token
-    // must verify against the signing key (so an attacker who can set
-    // cookies cannot inject a self-chosen value).
-    bool::from(c.as_bytes().ct_eq(p.as_bytes())) && validate_token(c, signing_key)
+    // must verify against the signing key *and* the current session id (so an
+    // attacker who can set cookies cannot inject a self-chosen value, and a
+    // token stolen from another session cannot be replayed here).
+    bool::from(c.as_bytes().ct_eq(p.as_bytes())) && validate_token(c, session_id, signing_key)
 }
 
 fn build_cookie(config: &CsrfConfig, token: &str) -> String {
@@ -329,52 +401,116 @@ fn build_cookie(config: &CsrfConfig, token: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A stand-in session id for the crypto-level tests. Real ids are
+    /// `SessionId` strings; the binding only cares that the same string is
+    /// threaded through mint and validate.
+    const SID: &str = "session-a";
+
+    /// Build a `SessionHandle` carrying a deterministic session id derived
+    /// from `seed`, matching the extension the session layer injects. Two
+    /// calls with the same seed yield the same id (so a token minted under
+    /// one can be replayed under a handle built from the same seed); distinct
+    /// seeds yield distinct ids (so the cross-session tests can prove
+    /// isolation).
+    fn session_handle(seed: u64) -> SessionHandle {
+        use crate::session::data::SessionData;
+        use crate::session::id::SessionId;
+        use crate::session::layer::SessionInner;
+        use crate::testing::mock_random::MockRng;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let rng = MockRng::new(seed);
+        let inner = SessionInner {
+            id: SessionId::new(&rng),
+            data: SessionData::default(),
+            modified: false,
+            regenerate: false,
+            pre_cycle_id: None,
+            pending_fingerprint: None,
+            max_custom_bytes: 64 * 1024,
+        };
+        SessionHandle(Arc::new(RwLock::new(inner)))
+    }
+
     #[test]
     fn token_round_trip_validates() {
         let key = [7u8; 32];
-        let token = mint_token(&key);
-        assert!(validate_token(&token, &key));
+        let token = mint_token(SID, &key);
+        assert!(validate_token(&token, SID, &key));
     }
 
     #[test]
     fn token_with_wrong_key_rejected() {
         let key = [7u8; 32];
         let other_key = [9u8; 32];
-        let token = mint_token(&key);
-        assert!(!validate_token(&token, &other_key));
+        let token = mint_token(SID, &key);
+        assert!(!validate_token(&token, SID, &other_key));
     }
 
     #[test]
     fn truncated_token_rejected() {
         let key = [7u8; 32];
-        let token = mint_token(&key);
+        let token = mint_token(SID, &key);
         let truncated = &token[..token.len() - 4];
-        assert!(!validate_token(truncated, &key));
+        assert!(!validate_token(truncated, SID, &key));
     }
 
     #[test]
     fn empty_token_rejected() {
         let key = [7u8; 32];
-        assert!(!validate_token("", &key));
+        assert!(!validate_token("", SID, &key));
+    }
+
+    /// A token minted under session "A" validates under "A" but is rejected
+    /// under a different session id "B" (same key, same nonce echoed in the
+    /// token) — the documented cross-session isolation property. Pins the
+    /// `mac.update(session_id.as_bytes())` line: dropping it would make the
+    /// tag independent of the session id and this test would then accept the
+    /// token under "B".
+    #[test]
+    fn token_bound_to_session_rejects_other_session() {
+        let key = [7u8; 32];
+        let token = mint_token("session-A", &key);
+        // Same session: accepted.
+        assert!(
+            validate_token(&token, "session-A", &key),
+            "token must validate under the session it was minted for"
+        );
+        // Different session: rejected even though key and token bytes are
+        // identical.
+        assert!(
+            !validate_token(&token, "session-B", &key),
+            "token minted under session A must NOT validate under session B"
+        );
+        // Same property through the double-submit path.
+        assert!(
+            validate_pair(Some(&token), Some(&token), "session-A", &key),
+            "cookie==header token must validate under its own session"
+        );
+        assert!(
+            !validate_pair(Some(&token), Some(&token), "session-B", &key),
+            "cookie==header token must NOT validate under a different session"
+        );
     }
 
     #[test]
     fn validate_pair_requires_both_match_and_signature() {
         let key = [7u8; 32];
-        let valid = mint_token(&key);
+        let valid = mint_token(SID, &key);
         // Both match and valid signature.
-        assert!(validate_pair(Some(&valid), Some(&valid), &key));
+        assert!(validate_pair(Some(&valid), Some(&valid), SID, &key));
         // Mismatch.
-        let other = mint_token(&key);
-        assert!(!validate_pair(Some(&valid), Some(&other), &key));
+        let other = mint_token(SID, &key);
+        assert!(!validate_pair(Some(&valid), Some(&other), SID, &key));
         // Missing cookie.
-        assert!(!validate_pair(None, Some(&valid), &key));
+        assert!(!validate_pair(None, Some(&valid), SID, &key));
         // Missing header.
-        assert!(!validate_pair(Some(&valid), None, &key));
+        assert!(!validate_pair(Some(&valid), None, SID, &key));
         // Same value but invalid signature (cookie set by attacker).
         let forged =
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        assert!(!validate_pair(Some(forged), Some(forged), &key));
+        assert!(!validate_pair(Some(forged), Some(forged), SID, &key));
     }
 
     #[test]
@@ -391,16 +527,16 @@ mod tests {
     #[test]
     fn validate_pair_rejects_empty_strings() {
         let key = [7u8; 32];
-        assert!(!validate_pair(Some(""), Some(""), &key));
-        let valid = mint_token(&key);
-        assert!(!validate_pair(Some(""), Some(&valid), &key));
-        assert!(!validate_pair(Some(&valid), Some(""), &key));
+        assert!(!validate_pair(Some(""), Some(""), SID, &key));
+        let valid = mint_token(SID, &key);
+        assert!(!validate_pair(Some(""), Some(&valid), SID, &key));
+        assert!(!validate_pair(Some(&valid), Some(""), SID, &key));
     }
 
     #[test]
     fn validate_token_rejects_non_base64() {
         let key = [7u8; 32];
-        assert!(!validate_token("not-valid-base64!!!", &key));
+        assert!(!validate_token("not-valid-base64!!!", SID, &key));
     }
 
     #[test]
@@ -408,7 +544,7 @@ mod tests {
         let key = [7u8; 32];
         // Valid base64 but wrong length (too short to contain nonce + tag).
         let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"too_short");
-        assert!(!validate_token(&short, &key));
+        assert!(!validate_token(&short, SID, &key));
     }
 
     #[test]
@@ -564,11 +700,17 @@ mod tests {
         let config = CsrfConfig::new(key);
         let service = CsrfLayer::new(config.clone()).layer(echo_body);
 
+        // A single session handle threaded through every request below so the
+        // token minted in step 1 stays bound to the same session id it is
+        // replayed under in step 3.
+        let handle = session_handle(1);
+
         // 1. GET without cookie → response carries Set-Cookie minting a
         //    fresh token.
         let req = Request::builder()
             .method(Method::GET)
             .uri("/safe")
+            .extension(handle.clone())
             .body(Body::empty())
             .unwrap();
         let resp = service.clone().oneshot(req).await.unwrap();
@@ -601,7 +743,8 @@ mod tests {
         let req = Request::builder()
             .method(Method::GET)
             .uri("/safe")
-            .header("cookie", format!("{}={}", config.cookie_name, &token))
+            .header("cookie", format!("{}={}", config.cookie_name, token))
+            .extension(handle.clone())
             .body(Body::empty())
             .unwrap();
         let resp = service.clone().oneshot(req).await.unwrap();
@@ -620,6 +763,7 @@ mod tests {
             .method(Method::GET)
             .uri("/safe")
             .header("cookie", format!("{}=", config.cookie_name))
+            .extension(handle.clone())
             .body(Body::empty())
             .unwrap();
         let resp = service.clone().oneshot(req).await.unwrap();
@@ -648,8 +792,9 @@ mod tests {
         let req = Request::builder()
             .method(Method::POST)
             .uri("/state-changing")
-            .header("cookie", format!("{}={}", config.cookie_name, &token))
+            .header("cookie", format!("{}={}", config.cookie_name, token))
             .header(config.header_name.as_ref(), &token)
+            .extension(handle.clone())
             .body(Body::empty())
             .unwrap();
         let resp = service.clone().oneshot(req).await.unwrap();
@@ -660,10 +805,11 @@ mod tests {
             ; pins `delete !` on the `if !validate_pair(...)` guard at line 201"
         );
 
-        // 4. POST without any token → 403 FORBIDDEN.
+        // 4. POST without any token (but with a session handle) → 403.
         let req = Request::builder()
             .method(Method::POST)
             .uri("/state-changing")
+            .extension(handle.clone())
             .body(Body::empty())
             .unwrap();
         let resp = service.clone().oneshot(req).await.unwrap();
@@ -671,6 +817,125 @@ mod tests {
             resp.status(),
             StatusCode::FORBIDDEN,
             "state-changing request without tokens must be rejected as 403"
+        );
+    }
+
+    /// End-to-end proof of the session-binding property through the full
+    /// middleware stack: a token minted while carrying session A's handle is
+    /// accepted on a POST that carries session A's handle, but rejected on an
+    /// otherwise-identical POST that carries session B's handle. This is the
+    /// behaviour the module docs promise — cross-session replay fails.
+    #[tokio::test]
+    async fn csrf_service_rejects_token_replayed_under_different_session() {
+        use axum::http::{Method, Request};
+        use std::convert::Infallible;
+        use tower::{Layer, ServiceExt, service_fn};
+
+        let echo_body = service_fn(|_req: Request<Body>| async move {
+            Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
+        });
+
+        let key = [21u8; 32];
+        let config = CsrfConfig::new(key);
+        let service = CsrfLayer::new(config.clone()).layer(echo_body);
+
+        let handle_a = session_handle(1);
+        let handle_b = session_handle(2);
+
+        // Mint a token under session A via a safe GET.
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/safe")
+            .extension(handle_a.clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.clone().oneshot(req).await.unwrap();
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("GET under session A must mint a token")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let token = set_cookie
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(!token.is_empty());
+
+        // Replay the A-minted token on a POST carrying session B → 403.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/state-changing")
+            .header("cookie", format!("{}={}", config.cookie_name, token))
+            .header(config.header_name.as_ref(), &token)
+            .extension(handle_b.clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a token minted under session A must be rejected under session B"
+        );
+
+        // The same token on a POST carrying session A → 200.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/state-changing")
+            .header("cookie", format!("{}={}", config.cookie_name, token))
+            .header(config.header_name.as_ref(), &token)
+            .extension(handle_a.clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "the A-minted token must still be accepted under session A"
+        );
+    }
+
+    /// Fail-closed: a state-changing request with an otherwise-valid
+    /// cookie+header pair but NO session handle (as happens when `CsrfLayer`
+    /// is mis-ordered outside the session layer) is rejected rather than
+    /// validated against an unbound token. Pins the `let Some(session_id) =
+    /// ... else { return 403 }` guard.
+    #[tokio::test]
+    async fn csrf_service_fails_closed_without_session_handle() {
+        use axum::http::{Method, Request};
+        use std::convert::Infallible;
+        use tower::{Layer, ServiceExt, service_fn};
+
+        let echo_body = service_fn(|_req: Request<Body>| async move {
+            Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
+        });
+
+        let key = [23u8; 32];
+        let config = CsrfConfig::new(key);
+        let service = CsrfLayer::new(config.clone()).layer(echo_body);
+
+        // A token that is internally valid for *some* session.
+        let token = mint_token("some-session", &key);
+
+        // POST with matching cookie+header but no session handle in the
+        // extensions → fail closed with 403.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/state-changing")
+            .header("cookie", format!("{}={}", config.cookie_name, token))
+            .header(config.header_name.as_ref(), &token)
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "no session handle on a state-changing request must fail closed (403)"
         );
     }
 }

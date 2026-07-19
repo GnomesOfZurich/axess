@@ -34,7 +34,7 @@ axess-rng = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
 axum = { workspace = true, default-features = false, features = ["original-uri", "form", "json", "query", "tokio"] }
 base64 = { workspace = true }
-cedar-policy = { version = "4.11.0", optional = true }
+cedar-policy = { version = "4.11.2", optional = true }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { version = "6.2.1", features = ["serde"] }
 fred = { version = "10.1.0", features = ["transactions", "i-std", "i-cluster", "blocking-encoding", "replicas"], optional = true }
@@ -50,7 +50,7 @@ moka = { version = "0.12.15", features = ["future"], optional = true }
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }
 p256 = { version = "0.13.2", features = ["ecdsa", "jwk"], optional = true }
 quick-xml = { workspace = true, optional = true }
-regex = { version = "1.12.3", default-features = false, features = ["std", "unicode-perl"] }
+regex = { version = "1.13.1", default-features = false, features = ["std", "unicode-perl"] }
 # 0.12 to match openidconnect's transitive pin; avoids a duplicate-major.
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"], optional = true }
 rkyv = { workspace = true, optional = true }
@@ -61,8 +61,8 @@ rsa = { version = "0.9.10", features = ["pkcs5"], optional = true }
 # Adopter installs the CryptoProvider at process startup (aws-lc-rs / ring) —
 # this crate stays cipher-agnostic.
 rustls = { version = "0.23.40", default-features = false, features = ["std", "tls12", "aws_lc_rs"], optional = true }
-rustls-pki-types = { version = "1.14.1", optional = true }
-serde = { version = "1.0.228", features = ["derive"] }
+rustls-pki-types = { version = "1.15.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { version = "0.9.0", features = ["runtime-tokio"], optional = true }
@@ -94,7 +94,7 @@ axess-rng = { workspace = true, features = ["testing"] }
 argon2 = { version = "0.5.3", features = ["default"] }
 base32 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
-http-body-util = "0.1.3"
+http-body-util = "0.1.4"
 hyper = { version = "1.10.1", features = ["full"] }
 proptest = { workspace = true }
 # rcgen mints X509-SVID certs with SPIFFE URIs in SAN for mTLS resolver tests.
@@ -105,12 +105,12 @@ reqwest = { version = "0.12.28", features = ["cookies"] }
 # dev-deps so the wire-format proptest suite runs independently of storage.
 rmp-serde = "1.3.1"
 rsa = { version = "0.9.10", features = ["pkcs5"] }
-serial_test = "3.4.0"
+serial_test = "3.5.0"
 sha1 = { workspace = true }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres"] }
 subtle = { workspace = true }
 tokio-test = { workspace = true }
-totp-rs = { version = "5.7.1", features = ["gen_secret"] }
+totp-rs = { version = "5.7.2", features = ["gen_secret"] }
 # In-crate `#[cfg(test)]` mods build wiremock fixtures directly; an optional
 # regular-dep entry of the same crate (under `testing-oauth`) re-exposes
 # wiremock to adopters via `axess_core::testing::oauth_wiremock`.

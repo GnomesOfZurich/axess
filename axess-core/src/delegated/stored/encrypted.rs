@@ -421,11 +421,11 @@ fn encrypt_envelope(
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     axess_rng::SystemRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| EnvelopeError::Encrypt)?;
 
     let ct = cipher
         .encrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: plaintext.as_bytes(),
                 aad,
@@ -474,11 +474,11 @@ fn decrypt_envelope<K: KeyProvider>(
         .ok_or_else(|| EnvelopeError::UnknownKeyId(key_id.to_string()))?;
 
     let cipher = Aes256Gcm::new_from_slice(key.as_array()).map_err(|_| EnvelopeError::Decrypt)?;
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| EnvelopeError::Decrypt)?;
 
     let plaintext = cipher
         .decrypt(
-            nonce,
+            &nonce,
             Payload {
                 msg: ciphertext,
                 aad,

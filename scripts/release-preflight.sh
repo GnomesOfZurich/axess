@@ -57,9 +57,9 @@ step 8 "Non-leaf package preflight" bash -c '
   set -euo pipefail
   package_args=("$@")
   for c in axess-identity axess-events axess-cache axess-factors axess-core axess-macros axess; do
-    cargo package --list -p "$c" "${package_args[@]}" >/dev/null
+    cargo package --list -p "$c" ${package_args[@]+"${package_args[@]}"} >/dev/null
   done
-' bash "${PACKAGE_ARGS[@]}"
+' bash ${PACKAGE_ARGS[@]+"${PACKAGE_ARGS[@]}"}
 
 echo ""
 echo "Release preflight: OK"

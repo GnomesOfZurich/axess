@@ -42,9 +42,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "CDLA-Permissive-2.0",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Zlib",
-    "OpenSSL",
 ]
 
 [bans]
@@ -54,6 +52,47 @@ wildcards = "deny"
 # (they are `publish = false` and never resolved from a registry). Allow
 # wildcards on path entries only; published crates still need a version pin.
 allow-wildcard-paths = true
+
+# Known-accepted transitive duplicate roots. Each entry documents why the
+# upstream cannot yet consolidate; see the workspace-preamble comment on
+# `[workspace.dependencies]` in Cargo.toml for the wider policy. Revisit
+# annually when upstream release cadence catches up.
+#
+# `skip-tree` matches any duplicate whose dependency path traces through
+# the named root, so one entry covers the whole RustCrypto cohort under a
+# git-pinned crate rather than 15+ individual `skip` lines.
+skip-tree = [
+    # `webauthn-rs v0.6.0-dev` (git-pinned dev release) sits on the
+    # RustCrypto 0.10 cohort — aead 0.5, aes 0.8, aes-gcm 0.10, cipher 0.4,
+    # block-buffer 0.10, crypto-common 0.1, ctr 0.9, digest 0.10, ghash 0.5,
+    # hkdf 0.12, hmac 0.12, inout 0.1, polyval 0.6, sha1 0.10, sha2 0.10,
+    # universal-hash 0.5, cpufeatures 0.2 — while axess uses the 0.11
+    # cohort (aes-gcm 0.11 via the workspace pin). The whole tree
+    # underneath webauthn-rs is a mirrored old-cohort. Also carries older
+    # asn1-rs / der-parser / oid-registry / const-oid via x509-parser 0.16.
+    { crate = "webauthn-rs@0.6.0-dev", reason = "git-pinned dev release, still on the RustCrypto 0.10 / x509-parser 0.16 cohort" },
+
+    # `getrandom` fans two WASI stdlib shims (`wasip3 → wit-bindgen 0.51`,
+    # `wasip2 → wit-bindgen 0.57`) plus `r-efi` for UEFI targets. None
+    # of these are linked in a non-WASI / non-UEFI axess build.
+    { crate = "getrandom@0.3.4", reason = "wasi/uefi shim tree (wit-bindgen, r-efi); not linked in axess targets" },
+    { crate = "getrandom@0.4.2", reason = "wasi/uefi shim tree (wit-bindgen, r-efi); not linked in axess targets" },
+
+    # `openidconnect 4.0.1` + `oauth2 5.0.0` still on rand 0.8 / rand_core
+    # 0.6 / base64 0.21 / syn 1.x transitives; axess itself is on rand
+    # 0.10 / rand_core 0.10 / base64 0.22 / syn 2.x directly.
+    { crate = "openidconnect@4.0.1", reason = "still on rand 0.8, base64 0.21, syn 1.x cohort" },
+
+    # `sqlx 0.9` pulls its own copies of hashbrown, thiserror, itertools,
+    # socket2, windows-sys at older majors from the database-driver
+    # ecosystem. Not adopter-controllable.
+    { crate = "sqlx@0.9.0", reason = "database-driver ecosystem carries its own hashbrown/thiserror/socket2/windows-sys majors" },
+
+    # `cedar-policy-core` transitively pulls `lalrpop` for grammar
+    # generation; lalrpop 0.22 carries older unicode-width / hashbrown
+    # majors that don't reach runtime.
+    { crate = "cedar-policy-core@4.11.2", reason = "lalrpop build-time transitives carry older unicode-width/hashbrown" },
+]
 
 [sources]
 unknown-registry = "deny"
