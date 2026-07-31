@@ -35,9 +35,9 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.93.1"
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
@@ -61,7 +61,7 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 [workspace.dependencies]
 # Internal axess crates. Members write `axess-foo = { workspace = true }`
 # (optionally `features = [...]` or `optional = true`); path + version
-# stay declared once here. The literal "0.2.2" appears alongside
+# stay declared once here. The literal "0.3.0" appears alongside
 # `[workspace.package].version` above (Cargo schema does not let
 # `[workspace.dependencies]` entries reference `[workspace.package]`); a
 # release bump touches both lines in this file only.
@@ -72,15 +72,15 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "0.2.2" }
-axess-clock    = { path = "axess-clock",    version = "0.2.2" }
-axess-core     = { path = "axess-core",     version = "0.2.2", default-features = false }
-axess-events   = { path = "axess-events",   version = "0.2.2" }
-axess-factors  = { path = "axess-factors",  version = "0.2.2" }
-axess-identity = { path = "axess-identity", version = "0.2.2", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "0.2.2" }
-axess-rng      = { path = "axess-rng",      version = "0.2.2" }
-axess-strings  = { path = "axess-strings",  version = "0.2.2", default-features = false }
+axess-cache    = { path = "axess-cache",    version = "=0.3.0" }
+axess-clock    = { path = "axess-clock",    version = "=0.3.0" }
+axess-core     = { path = "axess-core",     version = "=0.3.0", default-features = false }
+axess-events   = { path = "axess-events",   version = "=0.3.0" }
+axess-factors  = { path = "axess-factors",  version = "=0.3.0" }
+axess-identity = { path = "axess-identity", version = "=0.3.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.3.0" }
+axess-rng      = { path = "axess-rng",      version = "=0.3.0" }
+axess-strings  = { path = "axess-strings",  version = "=0.3.0", default-features = false }
 
 # RustCrypto family + x509-parser; see preamble above.
 aes-gcm = "0.11.0"
@@ -99,7 +99,7 @@ quick-xml = { version = "0.41.0", features = ["serialize"] }
 # bump anything; the goal is to stop new drift from accumulating.
 axum = { version = "0.8.9", default-features = false }
 base32 = "0.5.1"
-base64 = "0.22.1"
+base64 = "0.23.0"
 chrono = "0.4.45"
 criterion = "0.8.2"
 hex = "0.4.3"
@@ -109,11 +109,11 @@ rand = "0.10.2"
 rkyv = { version = "0.8.16", default-features = false, features = ["alloc", "bytecheck", "uuid-1"] }
 serde_json = { version = "1.0.150", default-features = false }
 subtle = "2.6.1"
-thiserror = { version = "2.0.18", default-features = false }
-tokio = { version = "1.52.3", default-features = false }
+thiserror = { version = "2.0.19", default-features = false }
+tokio = { version = "1.53.1", default-features = false }
 tokio-test = "0.4.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", default-features = false }
-zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }

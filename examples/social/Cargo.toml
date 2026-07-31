@@ -1,8 +1,8 @@
 [package]
 name = "axess-example-social"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.93.1"
 publish = false
 resolver = "3"
 description = """
@@ -16,11 +16,11 @@ repository = "https://github.com/GnomesOfZurich/axess"
 categories = ["web-programming", "authentication"]
 
 [dependencies]
-axess = { path = "../../axess", features = ["social", "memory"] }
+axess = { path = "../../axess", version = "=0.3.0", features = ["social", "memory"] }
 axum = { version = "0.8.9", features = ["macros", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.150"
-tokio = { version = "1.53.0", features = ["full"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
 tower-cookies = { version = "0.11.0", features = ["axum-core"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

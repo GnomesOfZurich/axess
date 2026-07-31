@@ -21,7 +21,7 @@ rationale and a tour of the production-shaped example.
 
 ## Prerequisites
 
-You need Rust 1.87 or later on the stable channel (the workspace MSRV),
+You need Rust 1.93.1 or later on the stable channel (the workspace MSRV),
 Axum 0.8.x, and a Tokio runtime in your binary (`#[tokio::main]` is
 fine). Axess does not depend on system libraries, message brokers, or
 external IdPs by default. The defaults are deliberately zero-infra: the
@@ -47,7 +47,7 @@ turn on `memory`, the in-memory session store used for development and
 tests.
 
 ```toml
-axess = { version = "0.2", features = ["memory"] }
+axess = { version = "0.3.0", features = ["memory"] }
 ```
 
 The complete feature reference lives in the

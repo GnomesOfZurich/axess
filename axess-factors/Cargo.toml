@@ -33,7 +33,7 @@ dashmap = { version = "6.2.1", features = ["serde"], optional = true }
 hex = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 # `aws_lc_rs` keeps one TLS provider across the workspace.
-jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"], optional = true }
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"], optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # `timing-resistant-secret-traits` makes secret types refuse `PartialEq` / `Hash`.
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }

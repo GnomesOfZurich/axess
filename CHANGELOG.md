@@ -6,6 +6,48 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.3.0] - 2026-08-01
+
+Breaking release: the MSRV rises and `jsonwebtoken`'s `Algorithm` type —
+re-exposed through this crate's public API — becomes `#[non_exhaustive]`.
+
+### Added
+
+- `EventSubjectRef<'a>` and `EventPayload::subject_ref()` — a borrowed,
+  zero-allocation view of the entity an event is *about*
+  (`User` / `Tenant` / `Device` / `Session` / `Other { kind, id }`),
+  mirroring the owned envelope-level `EventSubject`. Fills the hot-path gap
+  the owned type doesn't cover: per-tick routing, per-tenant fan-out,
+  per-subject bucketing, and tracing-span tagging without allocating.
+  Additive — `subject_ref()` defaults to `None`, so existing `EventPayload`
+  implementations are unaffected.
+
+### Changed
+
+- **BREAKING:** `jsonwebtoken` 10 → 11. Its `Algorithm` enum is now
+  `#[non_exhaustive]` and is re-exposed via `ALLOWED_ALGORITHMS`,
+  `JwtVerifier::with_algorithms`, and the local-IdP helpers, so exhaustive
+  `match`es on it downstream must add a wildcard arm. Internally, the
+  `alg_family` mirror is replaced by the now-public `Algorithm::family()`.
+- **BREAKING:** MSRV raised to **1.93.1**. The library itself builds on 1.88
+  (raised from 1.87 by `jsonwebtoken` 11); the declared floor is set to the
+  workspace-wide requirement so the full build+test suite runs on a single
+  toolchain — `serial_test` 4.0.1 (dev-only) requires 1.93.1.
+- Dependency bumps: `base64` 0.22 → **0.23** (SIMD engines; API unchanged for
+  our usage), `cedar-policy` → **4.12.0** (unified across the workspace),
+  `tokio` → **1.53.1**, `thiserror` → **2.0.19**, `zeroize` → **1.9.0**,
+  `serial_test` (dev) → **4.0.1**; versions unified across the workspace.
+- Inter-crate and example `axess-*` dependencies are now pinned exactly
+  (`=0.3.0`) so the family always resolves as one tested, audited unit.
+
+### Security
+
+- Transitive `event-listener` 5.4.1 → **5.4.2**, closing
+  [RUSTSEC-2026-0221] (`!Send` tags could cross thread boundaries via
+  `StackSlot`). Lockfile-only; no public-API change.
+
+[RUSTSEC-2026-0221]: https://rustsec.org/advisories/RUSTSEC-2026-0221
+
 ## [0.2.2] - 2026-07-19
 
 ### Security

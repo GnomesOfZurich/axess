@@ -15,6 +15,54 @@ change (the same code does something subtly different). The
 sections below group by symptom; finding your case is faster than
 reading the full changelog.
 
+## 0.2.2 to 0.3.0
+
+`v0.3.0` upgrades the `jsonwebtoken` dependency from 10 to 11 and
+raises the workspace MSRV. Two adopter-facing changes. (There is no
+`0.2.1 to 0.2.2` entry: 0.2.2 was a transitive-dependency security
+patch with no public-API change — see *What does not migrate*.)
+
+### Compile errors you will see
+
+An exhaustive `match` on a `jsonwebtoken::Algorithm` obtained from
+axess no longer compiles — `non-exhaustive patterns: '_' not
+covered`. `jsonwebtoken` 11 marks `Algorithm` `#[non_exhaustive]`,
+and axess re-exposes that type through its public surface:
+`ALLOWED_ALGORITHMS`, `JwtVerifier::with_algorithms`, and the
+local-IdP `algorithm` / `verifier_algorithms` helpers. Add a
+wildcard arm to any such match:
+
+```rust
+match alg {
+    Algorithm::RS256 => ...,
+    Algorithm::ES256 => ...,
+    _ => ...,            // required by jsonwebtoken 11
+}
+```
+
+The rationale is upstream's: `#[non_exhaustive]` lets `jsonwebtoken`
+add algorithms in a future minor without that being a breaking
+change for them, which moves the "handle the unknown" obligation
+onto callers. For a verifier the safe default is to fail closed —
+treat the `_` arm as "unsupported algorithm, reject".
+
+### Toolchain
+
+The workspace MSRV is now **1.93.1** (up from 1.87). The library
+itself builds on 1.88 — `jsonwebtoken` 11 raised that — but the
+declared floor is set to the workspace-wide requirement so the full
+build-and-test suite runs on one toolchain. Bump your toolchain to
+1.93.1 or later.
+
+### What is not a break
+
+The new `EventSubjectRef` and `EventPayload::subject_ref()` are
+purely additive — `subject_ref()` defaults to `None`, so existing
+`EventPayload` implementations need no change. The inter-crate
+version pins moving to exact `=0.3.0` are internal to the axess
+workspace; adopters depend on the `axess` facade with their own
+version requirement and are unaffected.
+
 ## 0.2.0 to 0.2.1
 
 `v0.2.1` is a patch release. The only behavioural change is a

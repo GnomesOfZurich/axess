@@ -26,7 +26,7 @@ This is the crate most applications should depend on. It re-exports the curated 
 
 ```toml
 [dependencies]
-axess = { version = "0.2", features = ["sqlite", "authz"] }
+axess = { version = "0.2.2", features = ["sqlite", "authz"] }
 ```
 
 ```rust,no_run

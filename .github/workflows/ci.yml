@@ -307,11 +307,11 @@ jobs:
   # MSRV check — verify the declared minimum supported Rust version still
   # builds and tests. Bump in lockstep with `rust-version` in each Cargo.toml.
   msrv:
-    name: MSRV (1.87)
+    name: MSRV (1.93.1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.87.0
+      - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
       - name: Build with MSRV
         run: cargo build --workspace --all-features

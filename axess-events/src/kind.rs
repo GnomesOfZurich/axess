@@ -12,6 +12,8 @@
 use axess_strings::ShortString;
 use core::fmt;
 
+use crate::subject::EventSubjectRef;
+
 /// Wire-form event kind discriminator. A short, hashable, comparable
 /// string like `"auth.login_attempt.v2"`.
 ///
@@ -131,6 +133,41 @@ pub trait EventPayload: Clone + fmt::Debug + Send + Sync + 'static {
     /// for marginal savings.
     #[cfg(feature = "serde")]
     fn to_inner_json(&self) -> serde_json::Value;
+
+    /// The entity this event is *about*, borrowed for zero-allocation
+    /// introspection. Default `None` for payloads without a
+    /// well-defined subject; override in payload enums that carry an
+    /// identifier a subscriber would filter by.
+    ///
+    /// Fills the hot-path gap that [`EventSubject`](crate::EventSubject)
+    /// (owned, envelope-level) doesn't cover: per-tick routing,
+    /// per-tenant fan-out, per-subject bucketing, tracing-span tagging.
+    /// See [`EventSubjectRef`] for the borrowed-vs-owned rationale.
+    ///
+    /// Override example — a payload carrying an instrument id:
+    ///
+    /// ```ignore
+    /// use axess_events::{EventPayload, EventSubjectRef, KindTag};
+    ///
+    /// impl EventPayload for MyPayload {
+    ///     fn kind_tag(&self) -> KindTag { /* … */ }
+    ///     #[cfg(feature = "serde")]
+    ///     fn to_inner_json(&self) -> serde_json::Value { /* … */ }
+    ///
+    ///     fn subject_ref(&self) -> Option<EventSubjectRef<'_>> {
+    ///         Some(match self {
+    ///             Self::BarrierBreached(v) =>
+    ///                 EventSubjectRef::Other { kind: "Instrument", id: &v.instrument_id },
+    ///             Self::ApprovalRequested(v) =>
+    ///                 EventSubjectRef::Other { kind: &v.target_type, id: &v.target_id },
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    #[inline]
+    fn subject_ref(&self) -> Option<EventSubjectRef<'_>> {
+        None
+    }
 }
 
 #[cfg(test)]

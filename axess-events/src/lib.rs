@@ -75,7 +75,7 @@ pub use id::{DeviceId, EventId, SessionId, TenantId, UserId};
 pub use kind::{EventPayload, KindTag};
 pub use sink::{EventSink, LogAndSwallow, NoopEventSink, SinkError};
 pub use status::EventStatus;
-pub use subject::EventSubject;
+pub use subject::{EventSubject, EventSubjectRef};
 pub use trace::TraceContext;
 
 /// Cross-cutting event envelope. Domain-specific payload `P` lives in

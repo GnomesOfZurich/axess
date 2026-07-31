@@ -360,12 +360,11 @@ where
                     last_used_at,
                     ..
                 } = binding
+                    && cid == &credential_id
                 {
-                    if cid == &credential_id {
-                        *last_used_at = now;
-                        touched = true;
-                        break;
-                    }
+                    *last_used_at = now;
+                    touched = true;
+                    break;
                 }
             }
 

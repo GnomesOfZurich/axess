@@ -47,32 +47,6 @@ pub const ALLOWED_ALGORITHMS: &[Algorithm] = &[
     Algorithm::ES384,
 ];
 
-/// Algorithm family discriminant. `jsonwebtoken` 10.x requires all algorithms in
-/// a `Validation` to share the same family as the verifying key, but
-/// `Algorithm::family()` is `pub(crate)`. This mirrors the classification so
-/// callers can pass a mixed RSA+EC allowlist without tripping the family check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AlgFamily {
-    Rsa,
-    Ec,
-    Hmac,
-    Ed,
-}
-
-fn alg_family(alg: Algorithm) -> AlgFamily {
-    match alg {
-        Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => AlgFamily::Hmac,
-        Algorithm::RS256
-        | Algorithm::RS384
-        | Algorithm::RS512
-        | Algorithm::PS256
-        | Algorithm::PS384
-        | Algorithm::PS512 => AlgFamily::Rsa,
-        Algorithm::ES256 | Algorithm::ES384 => AlgFamily::Ec,
-        Algorithm::EdDSA => AlgFamily::Ed,
-    }
-}
-
 /// Errors from JWT signature verification.
 ///
 /// Deliberately free of any OAuth types so this module stays reusable
@@ -237,11 +211,11 @@ pub fn verify_jwt(
     // jsonwebtoken 10.x requires all algorithms in the Validation list to share
     // the same family as the verifying key. Filter the caller's allowlist to the
     // header algorithm's family so mixed RSA+EC allowlists don't trip the check.
-    let family = alg_family(header.alg);
+    let family = header.alg.family();
     validation.algorithms = allowed_algorithms
         .iter()
         .copied()
-        .filter(|a| alg_family(*a) == family)
+        .filter(|a| a.family() == family)
         .collect();
 
     if let Some(aud) = config.audience.as_deref() {

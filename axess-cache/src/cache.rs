@@ -112,13 +112,13 @@ where
         let mut guard = self.inner.lock();
         // LruCache::get updates recency, which is what we want on a hit;
         // on an expired-hit we then `pop` to evict.
-        if let Some(entry) = guard.get(key) {
-            if entry.expires_at_micros >= now_micros {
-                let v = entry.value.clone();
-                drop(guard);
-                self.stats.hits.fetch_add(1, Ordering::Relaxed);
-                return Some(v);
-            }
+        if let Some(entry) = guard.get(key)
+            && entry.expires_at_micros >= now_micros
+        {
+            let v = entry.value.clone();
+            drop(guard);
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(v);
         }
         // Either absent or stale. `pop` is a no-op for the absent case;
         // we count both as a miss (TTL-expired hits are semantically

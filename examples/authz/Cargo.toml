@@ -1,8 +1,8 @@
 [package]
 name = "axess-example-authz"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.93.1"
 publish = false
 resolver = "3"
 description = "Cedar Policy authorization example for the Axess library."
@@ -11,12 +11,12 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", features = ["authz"] }
+axess = { path = "../../axess", version = "=0.3.0", features = ["authz"] }
 axum = { version = "0.8.9", features = ["json"] }
-cedar-policy = "4.11.2"
+cedar-policy = "4.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.150"
-tokio = { version = "1.53.0", features = ["full"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 thiserror = "2.0.19"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

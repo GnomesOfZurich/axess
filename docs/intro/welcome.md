@@ -135,7 +135,7 @@ must be set explicitly, and both chapters name them.
 
 ## Status
 
-Axess is published on crates.io at `v0.2.1`. The 0.x line is pre-1.0:
+Axess is published on crates.io at `v0.3.0`. The 0.x line is pre-1.0:
 minor versions may break source compatibility, and each break is
 catalogued in [*Migration guide*](../production/migrating.md). The goal
 post-1.0 is to maintain the SemVer discipline that Rust libraries are

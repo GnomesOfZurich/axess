@@ -1,8 +1,8 @@
 [package]
 name = "axess-example-oauth"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.93.1"
 publish = false
 resolver = "3"
 description = "OAuth 2.0 / OIDC login example for the Axess library."
@@ -11,10 +11,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", features = ["oauth", "testing"] }
+axess = { path = "../../axess", version = "=0.3.0", features = ["oauth", "testing"] }
 axum = { version = "0.8.9", features = ["json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.150"
-tokio = { version = "1.53.0", features = ["full"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
