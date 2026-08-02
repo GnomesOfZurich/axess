@@ -35,7 +35,7 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.93.1"
 authors = ["Gnomes"]
@@ -72,15 +72,15 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "=0.3.0" }
-axess-clock    = { path = "axess-clock",    version = "=0.3.0" }
-axess-core     = { path = "axess-core",     version = "=0.3.0", default-features = false }
-axess-events   = { path = "axess-events",   version = "=0.3.0" }
-axess-factors  = { path = "axess-factors",  version = "=0.3.0" }
-axess-identity = { path = "axess-identity", version = "=0.3.0", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "=0.3.0" }
-axess-rng      = { path = "axess-rng",      version = "=0.3.0" }
-axess-strings  = { path = "axess-strings",  version = "=0.3.0", default-features = false }
+axess-cache    = { path = "axess-cache",    version = "=0.3.1" }
+axess-clock    = { path = "axess-clock",    version = "=0.3.1" }
+axess-core     = { path = "axess-core",     version = "=0.3.1", default-features = false }
+axess-events   = { path = "axess-events",   version = "=0.3.1" }
+axess-factors  = { path = "axess-factors",  version = "=0.3.1" }
+axess-identity = { path = "axess-identity", version = "=0.3.1", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.3.1" }
+axess-rng      = { path = "axess-rng",      version = "=0.3.1" }
+axess-strings  = { path = "axess-strings",  version = "=0.3.1", default-features = false }
 
 # RustCrypto family + x509-parser; see preamble above.
 aes-gcm = "0.11.0"

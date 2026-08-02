@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-device"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.93.1"
 publish = false
@@ -19,8 +19,8 @@ categories = ["web-programming"]
 
 [dependencies]
 # `device` is in axess default features; `sqlite` opts the storage backend in.
-axess = { path = "../../axess", version = "=0.3.0", features = ["sqlite", "testing"] }
-axess-clock = { path = "../../axess-clock", version = "=0.3.0" }
+axess = { path = "../../axess", version = "=0.3.1", features = ["sqlite", "testing"] }
+axess-clock = { path = "../../axess-clock", version = "=0.3.1" }
 axum = { version = "0.8.9", features = ["macros"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }

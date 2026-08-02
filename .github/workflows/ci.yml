@@ -509,10 +509,22 @@ jobs:
   semver_checks:
     name: SemVer Checks
     runs-on: ubuntu-latest
+    # SemVer only matters for release-relevant triggers: pull requests
+    # (where a break would land on main), workflow_dispatch (the release
+    # workflow reuses this job via `uses:`, and its caller event
+    # propagates here), and version-tag pushes. Ordinary branch pushes
+    # skip — they'll be revalidated at PR time and by
+    # `scripts/release-preflight.sh` before tagging. Cuts the multi-
+    # minute install-and-baseline-build off every non-release push.
+    if: |
+      github.event_name != 'push' ||
+      startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: semver
       - run: cargo install cargo-semver-checks --locked
       - run: |
           set -o pipefail
@@ -579,15 +591,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      # Instrumented builds use a different profile than the clippy/test
+      # cache, so scope this cache separately — sharing the default key
+      # thrashed both caches.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: coverage
       - run: cargo install cargo-llvm-cov
-      - name: Generate coverage
-        run: |
-          cargo llvm-cov --workspace --all-features --summary-only 2>&1 | tee coverage-summary.txt
-          cargo llvm-cov --workspace --all-features --html --output-dir coverage-html
+      # Run the instrumented test suite ONCE, then render summary + HTML
+      # from the same profile data. The old version invoked
+      # `cargo llvm-cov` twice (`--summary-only`, then `--html`), each
+      # rebuilding and re-running the full workspace under instrumentation
+      # — an easy ~50% wall-clock cut here.
+      - name: Run instrumented tests
+        run: cargo llvm-cov --workspace --all-features --no-report
         env:
           VALKEY_URL: redis://localhost:6379
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - name: Render coverage summary
+        run: cargo llvm-cov report --summary-only 2>&1 | tee coverage-summary.txt
+      - name: Render coverage HTML
+        run: cargo llvm-cov report --html --output-dir coverage-html
       - name: Extract coverage percentage
         id: cov
         run: |

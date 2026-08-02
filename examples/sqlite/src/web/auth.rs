@@ -62,6 +62,14 @@ pub async fn post_login(
 
     // begin_login returns FactorRequired even for the first factor; call verify_factor
     // immediately with the password credential.
+    //
+    // The Guest→Authenticated session-id rotation that closes the login-side
+    // session-fixation window is done inside `verify_factor` itself (see
+    // `AuthSession::regenerate` docs), so no explicit `session.regenerate()`
+    // call is required here. Every application-defined privilege boundary
+    // (MFA add, tenant switch, impersonation, etc.) still needs its own
+    // `regenerate()` — the library only auto-cycles at login-completion and
+    // OAuth-callback finish.
     match outcome {
         LoginOutcome::FactorRequired(FactorKind::Password) => {
             let cred = FactorCredential::Password(form.password.into());

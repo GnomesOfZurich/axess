@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "axess"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess-core",
  "axess-factors",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "axess-cache"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess-clock",
  "chrono",
@@ -353,14 +353,14 @@ dependencies = [
 
 [[package]]
 name = "axess-clock"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "axess-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "argon2",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "axess-events"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess-identity",
  "axess-strings",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-authz"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axum",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-device"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axess-clock",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-fapi"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axum",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-local-idp"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axum",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-oauth"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axum",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-social"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axum",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-sqlite"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axum",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-workload-identity"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess",
  "axess-clock",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "axess-factors"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess-clock",
  "axess-identity",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "axess-identity"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess-rng",
  "rkyv",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "axess-macros"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "axess-core",
  "cedar-policy",
@@ -625,14 +625,14 @@ dependencies = [
 
 [[package]]
 name = "axess-rng"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "rand 0.10.2",
 ]
 
 [[package]]
 name = "axess-strings"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "proptest",
  "rkyv",

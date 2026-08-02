@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-fapi"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.93.1"
 publish = false
@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.3.0", features = ["oauth", "fapi", "testing"] }
+axess = { path = "../../axess", version = "=0.3.1", features = ["oauth", "fapi", "testing"] }
 axum = { version = "0.8.9", features = ["json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

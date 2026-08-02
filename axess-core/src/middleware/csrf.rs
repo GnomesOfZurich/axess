@@ -264,25 +264,66 @@ where
                 }
             }
 
-            // Issue a fresh token on responses where the request had no
-            // cookie. Once a token is in the cookie it is reused until the
-            // session cycles (a session-id change invalidates the old token
-            // via the HMAC binding, so the next request mints a fresh one).
-            // A token can only be minted when a session id is present to bind
-            // it to; without one we leave the client tokenless rather than
-            // issue an unbound token.
-            let token_to_set = match (&cookie_token, session_id.as_deref()) {
+            // Provisional mint decision before the handler runs. Handlers
+            // that read `CsrfToken` from the request extension (to embed
+            // in an HTML form, say) need SOME value; give them either
+            // the presented cookie or a fresh mint bound to the current
+            // session id. A token can only be minted when a session id
+            // is present to bind it to; without one we leave the client
+            // tokenless rather than issue an unbound token.
+            let provisional_mint = match (&cookie_token, session_id.as_deref()) {
                 (Some(existing), _) if !existing.is_empty() => None,
-                (_, Some(session_id)) => Some(mint_token(session_id, &config.signing_key)),
+                (_, Some(sid_at_entry)) => Some(mint_token(sid_at_entry, &config.signing_key)),
                 (_, None) => None,
             };
-            let extension_token = token_to_set
+            let extension_token = provisional_mint
                 .clone()
                 .or_else(|| cookie_token.clone())
                 .unwrap_or_default();
             req.extensions_mut().insert(CsrfToken(extension_token));
 
             let mut response = inner.call(req).await?;
+
+            // Re-read the session id after the handler runs. If the
+            // handler regenerated (login-success, MFA add, tenant switch),
+            // the cookie the client currently holds — even if it was
+            // valid at request entry — no longer validates against the
+            // new id. Left alone the client would 403 on every state-
+            // changing request until the browser cookie expires. Deciding
+            // the mint post-handler closes that gap: if the cookie the
+            // client will present next no longer verifies against the
+            // effective (post-handler) session id, mint a fresh one and
+            // ship it as Set-Cookie on this response.
+            let session_id_after = match &session_handle {
+                Some(handle) => Some(handle.0.read().await.id.to_string()),
+                None => None,
+            };
+            // The token the client would present next request: either the
+            // freshly-provisioned mint (if we issued one) or the cookie
+            // they sent this request. Empty string means "no token to
+            // present" — treat as absent.
+            let effective_cookie = provisional_mint
+                .as_deref()
+                .or(cookie_token.as_deref())
+                .filter(|t| !t.is_empty());
+            let token_to_set = match (effective_cookie, session_id_after.as_deref()) {
+                (Some(existing), Some(sid_after))
+                    if validate_token(existing, sid_after, &config.signing_key) =>
+                {
+                    // Cookie still binds to the post-handler session id
+                    // (usually because the handler didn't rotate). Mint
+                    // only if we chose to at entry.
+                    provisional_mint
+                }
+                (_, Some(sid_after)) => {
+                    // Either no effective cookie, or the effective cookie
+                    // no longer binds to the current session id (typical
+                    // after `session.regenerate()`). Mint fresh so the
+                    // client's next request presents a valid pair.
+                    Some(mint_token(sid_after, &config.signing_key))
+                }
+                (_, None) => None,
+            };
 
             if let Some(new_token) = token_to_set {
                 let cookie = build_cookie(&config, &new_token);
@@ -936,6 +977,147 @@ mod tests {
             resp.status(),
             StatusCode::FORBIDDEN,
             "no session handle on a state-changing request must fail closed (403)"
+        );
+    }
+
+    /// Post-handler re-mint: a safe GET that carries a cookie no longer
+    /// bound to the current session id (as happens after any handler
+    /// upstream of a `session.regenerate()`, or when the handler itself
+    /// regenerates) receives a fresh `Set-Cookie` in the response bound
+    /// to the current session id. Without this, the client would be stuck
+    /// with a permanently-stale cookie and every subsequent state-
+    /// changing request would 403 until the browser cookie expired.
+    #[tokio::test]
+    async fn csrf_service_remints_stale_cookie_on_safe_verb() {
+        use axum::http::{Method, Request};
+        use std::convert::Infallible;
+        use tower::{Layer, ServiceExt, service_fn};
+
+        let echo_body = service_fn(|_req: Request<Body>| async move {
+            Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
+        });
+
+        let key = [29u8; 32];
+        let config = CsrfConfig::new(key);
+        let service = CsrfLayer::new(config.clone()).layer(echo_body);
+
+        // A handle for session A carries a cookie that was minted under
+        // a different session. This mirrors what happens after a
+        // regenerate: the cookie is stale relative to the session id
+        // that the request now carries.
+        let handle_a = session_handle(1);
+        let stale_token = mint_token("some-other-session", &key);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/safe")
+            .header("cookie", format!("{}={}", config.cookie_name, stale_token))
+            .extension(handle_a.clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200, "safe verb must pass through");
+
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("stale cookie on safe verb must trigger a fresh mint")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let refreshed = set_cookie
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(!refreshed.is_empty(), "refreshed cookie must not be empty");
+        assert_ne!(
+            refreshed, stale_token,
+            "refreshed cookie must differ from the stale one"
+        );
+
+        // The refreshed cookie must validate against session A (the id
+        // on the handle at request time), not the stale binding.
+        let sid_a = handle_a.0.read().await.id.to_string();
+        assert!(
+            validate_token(&refreshed, &sid_a, &key),
+            "refreshed cookie must be HMAC-bound to the current session id"
+        );
+    }
+
+    /// Post-handler re-mint after mid-request rotation: a safe GET whose
+    /// inner service calls `regenerate()` on the session handle (as a
+    /// factor-chain-completion path would) receives a fresh `Set-Cookie`
+    /// bound to the post-rotation id. This is the case that makes the
+    /// login flow survive `AuthnService::verify_factor` cycling the id
+    /// without leaving the client tokenless.
+    #[tokio::test]
+    async fn csrf_service_remints_when_handler_rotates_session() {
+        use axum::http::{Method, Request};
+        use std::convert::Infallible;
+        use tower::{Layer, ServiceExt, service_fn};
+
+        // Inner service that rotates the session id via the handle in
+        // the request extensions before responding — mirrors what
+        // `complete_factor_step` does today after Guest→Authenticated.
+        let rotating_body = service_fn(|req: Request<Body>| async move {
+            if let Some(handle) = req.extensions().get::<SessionHandle>() {
+                let mut guard = handle.0.write().await;
+                guard.rotate_id();
+                guard.modified = true;
+            }
+            Ok::<_, Infallible>(Response::builder().status(200).body(Body::empty()).unwrap())
+        });
+
+        let key = [31u8; 32];
+        let config = CsrfConfig::new(key);
+        let service = CsrfLayer::new(config.clone()).layer(rotating_body);
+
+        let handle = session_handle(1);
+        let sid_before = handle.0.read().await.id.to_string();
+        let token_before = mint_token(&sid_before, &key);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/rotate")
+            .header("cookie", format!("{}={}", config.cookie_name, token_before))
+            .extension(handle.clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let sid_after = handle.0.read().await.id.to_string();
+        assert_ne!(
+            sid_before, sid_after,
+            "test precondition: inner service rotated the session id"
+        );
+
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("session rotation mid-request must trigger a fresh Set-Cookie")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let refreshed = set_cookie
+            .split('=')
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            refreshed, token_before,
+            "refreshed cookie must differ from the pre-rotation token"
+        );
+        assert!(
+            validate_token(&refreshed, &sid_after, &key),
+            "refreshed cookie must bind to the post-rotation session id"
         );
     }
 }

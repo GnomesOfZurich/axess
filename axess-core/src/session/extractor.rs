@@ -369,9 +369,11 @@ impl AuthSession {
     ///
     /// Call at any **privilege boundary**; i.e. any change to the
     /// session's authentication context, scope, or subject identity.
-    /// Login is already auto-cycled; the rest is the app's call.
-    /// Canonical list (OWASP ASVS V3, OWASP Session Management Cheat
-    /// Sheet, NIST SP 800-63B AAL transitions):
+    /// Login (`AuthnService::verify_factor` completing a factor chain
+    /// with `FactorOutcome::Authenticated`) and OAuth callback finish
+    /// are cycled inside the library; every other boundary listed below
+    /// is the app's call. Canonical list (OWASP ASVS V3, OWASP Session
+    /// Management Cheat Sheet, NIST SP 800-63B AAL transitions):
     ///
     /// - MFA factor added (TOTP, WebAuthn, recovery codes, …)
     /// - MFA factor removed or disabled (AAL drops)

@@ -31,6 +31,15 @@ mutants.out.old/
 **/mutants.out/
 **/mutants.out.old/
 
+# Fuzz crate lockfile. `fuzz/` uses `[workspace]` (empty) to opt out of
+# the main workspace, and its axess-core dep is path-only with no version
+# pin, so `cargo` regenerates this lockfile on every `cargo +nightly
+# fuzz` invocation (locally and in CI). No external consumer resolves
+# against it. Committing it just accumulated stale entries that
+# misrepresented what CI actually tested against — dropping it removes
+# the drift without changing what runs. See fuzz/README.md.
+fuzz/Cargo.lock
+
 .mutants-worktree/
 
 # Claude Code artifacts
