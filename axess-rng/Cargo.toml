@@ -28,6 +28,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 # enabling this feature get the seeded PRNG in their dev-deps without
 # forcing every production consumer of the trait to compile it.
 testing = []
+# Number-oriented reproducible RNG surface (`NumericRng` trait +
+# `Xoshiro256pp`) for Monte Carlo, statistical sampling, and DST.
+# Opt-in so downstream consumers that only need the byte-oriented
+# cryptographic surface (`SecureRng`) don't pay for the numeric code
+# path. Enables `MockNumericRng` under `testing`.
+numeric = []
 
 [dependencies]
 rand = { workspace = true, features = ["std"] }

@@ -46,6 +46,14 @@ use rand::Rng;
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing;
 
+#[cfg(feature = "numeric")]
+#[cfg_attr(docsrs, doc(cfg(feature = "numeric")))]
+pub mod numeric;
+
+#[cfg(feature = "numeric")]
+#[cfg_attr(docsrs, doc(cfg(feature = "numeric")))]
+pub use numeric::{NumericRng, Xoshiro256pp};
+
 /// Trait for secure random number generation (DST-friendly).
 ///
 /// Uses interior mutability: `fill_bytes` takes `&self`, not `&mut self`,

@@ -6,63 +6,37 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.3.2] - 2026-08-06
+
+### Added
+
+- `axess-rng`: opt-in `numeric` feature adds a reproducible statistical
+  RNG surface alongside the always-on cryptographic `SecureRng`:
+  - `NumericRng` trait: number-oriented (`next_u64`, `next_uniform`),
+    stateful, deterministic given a seed. For Monte Carlo, statistical
+    sampling, and DST.
+  - `Xoshiro256pp`: xoshiro256++ 256-bit PRNG (Blackman & Vigna 2019).
+    Bit-exact reproducible: same seed yields the same sequence
+    permanently, independent of any dependency updates.
+  - `MockNumericRng` (under `testing`): DST test mock with two
+    constructors. `from_seed(u64)` wraps a seeded `Xoshiro256pp` behind
+    a `Mutex`; `from_sequence(...)` replays a pre-programmed `u64`
+    sequence and panics on exhaustion.
+- Default consumers (feature not enabled) see zero API surface change;
+  additive minor. Downstream integrators opt in via
+  `axess-rng = { version = "0.3.2", features = ["numeric"] }`.
+
+---
+
 ## [0.3.1] - 2026-08-02
 
 ### Fixed
 
-- `CsrfLayer` now self-heals a stale double-submit cookie by minting a
-  fresh one on the response, instead of leaving the client stuck. The
-  fail-closed reject on state-changing requests is unchanged; what was
-  missing was recovery — after any `AuthSession::regenerate()` (login-
-  completion, MFA add, tenant switch), the cookie was HMAC-bound to
-  the old session id and never validated again. The layer now reads
-  the session id after the inner service runs and re-mints when the
-  cookie no longer verifies against it.
-
-### Documentation
-
-- `AuthSession::regenerate` docstring names the auto-cycled points
-  explicitly: `verify_factor` completing a factor chain (via
-  `advance_factor`) and OAuth callback finish.
-- `examples/sqlite/src/web/auth.rs::post_login` comment spells out
-  that the library auto-cycles on `FactorOutcome::Authenticated`, so
-  the example does not (and should not) call `session.regenerate()`
-  on success.
-
-### Tooling
-
-- `scripts/release-preflight.sh` grows two mandatory steps and one
-  opt-in flag: `cargo audit --deny warnings` (RUSTSEC advisories,
-  complementary to `cargo deny check`), the `#[non_exhaustive]` ban
-  (mirrors the CI job), and `--with-fuzz` (nightly + cargo-fuzz;
-  runs the 4 fuzz-smoke targets for 30 s each; off by default since
-  CI runs them on every PR).
-- `fuzz/Cargo.lock` is now gitignored. The crate opts out of the
-  main workspace and its `axess-core` dep is path-only, so cargo
-  regenerates the lockfile on every `cargo +nightly fuzz` invocation
-  and no external consumer resolves against it. The prior committed
-  value had drifted to `axess-core = 0.0.16` while the workspace
-  was on 0.3.0; dropping the file removes the drift without changing
-  what CI runs. See `fuzz/README.md § Cargo.lock`.
-- `fuzz/Cargo.toml` version bumped to `0.3.1` (aligned with the
-  workspace; still `publish = false`), and dev-dep floors tightened
-  (`libfuzzer-sys` 0.4 → 0.4.13, `serde_json` 1.0 → 1.0.151,
-  `rmp-serde` 1.3 → 1.3.1) to lock the minimum-supported versions
-  in step with the rest of the workspace.
-- CI: `Coverage` job now runs the instrumented test suite once
-  (`cargo llvm-cov --no-report`, then `report --summary-only`, then
-  `report --html`) instead of twice — the old flow rebuilt and re-ran
-  the whole workspace to render HTML, adding roughly a full run's
-  worth of wall-clock. A dedicated `shared-key: coverage` on
-  `Swatinem/rust-cache` also keeps the instrumented profile from
-  thrashing the clippy/test cache entry, and `SemVer Checks` gets its
-  own `shared-key: semver` for the same reason.
-- CI: `SemVer Checks` job now skips on ordinary branch pushes
-  (`event_name == 'push'` on a non-tag ref). It still runs on pull
-  requests, on `refs/tags/v*` pushes, and when the release workflow
-  invokes it via `workflow_call` (the caller's event propagates). The
-  local `scripts/release-preflight.sh` step 8 remains as the pre-tag
-  gate.
+- `CsrfLayer` self-heals a stale double-submit cookie by re-minting on
+  the response when the session id changes mid-request (e.g. after
+  `AuthSession::regenerate()` on login completion, MFA add, or tenant
+  switch). The fail-closed reject on state-changing requests is
+  unchanged; only the recovery path is new.
 
 ---
 

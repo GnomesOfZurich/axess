@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "axess"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess-core",
  "axess-factors",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "axess-cache"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess-clock",
  "chrono",
@@ -353,14 +353,14 @@ dependencies = [
 
 [[package]]
 name = "axess-clock"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "axess-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes-gcm 0.11.0",
  "argon2",
@@ -371,7 +371,7 @@ dependencies = [
  "axess-rng",
  "axum",
  "base32",
- "base64 0.23.0",
+ "base64 0.23.1",
  "cedar-policy",
  "chrono",
  "criterion",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "axess-events"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess-identity",
  "axess-strings",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-authz"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axum",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-device"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axess-clock",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-fapi"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axum",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-local-idp"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axum",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-oauth"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axum",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-social"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axum",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-sqlite"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axum",
@@ -543,13 +543,13 @@ dependencies = [
 
 [[package]]
 name = "axess-example-workload-identity"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess",
  "axess-clock",
  "axess-factors",
  "axess-identity",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "jsonwebtoken",
  "rsa",
@@ -561,14 +561,14 @@ dependencies = [
 
 [[package]]
 name = "axess-factors"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess-clock",
  "axess-identity",
  "axess-rng",
  "axum",
  "base32",
- "base64 0.23.0",
+ "base64 0.23.1",
  "chrono",
  "dashmap",
  "hex",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "axess-identity"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess-rng",
  "rkyv",
@@ -616,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "axess-macros"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "axess-core",
  "cedar-policy",
@@ -625,14 +625,14 @@ dependencies = [
 
 [[package]]
 name = "axess-rng"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "rand 0.10.2",
 ]
 
 [[package]]
 name = "axess-strings"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "proptest",
  "rkyv",
@@ -733,9 +733,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -4128,9 +4128,9 @@ dependencies = [
 
 [[package]]
 name = "rkyv"
-version = "0.8.16"
+version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73389e0c99e664f919275ab5b5b0471391fe9a8de61e1dff9b1eaf56a90f16e3"
+checksum = "d9776093b7ca170454ab1406954f7b7d97a57c51dc6c0642957fb2ef25c2d399"
 dependencies = [
  "bytecheck",
  "hashbrown 0.17.0",
@@ -4145,13 +4145,13 @@ dependencies = [
 
 [[package]]
 name = "rkyv_derive"
-version = "0.8.16"
+version = "0.8.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d2ed0b54125315fb36bd021e82d314d1c126548f871634b483f46b31d13cac6"
+checksum = "1c25ef604ac7dd839d44d64648952ea23c97866f124ff671b0ed2cf3ad9bb06e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.0",
 ]
 
 [[package]]
@@ -5076,7 +5076,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

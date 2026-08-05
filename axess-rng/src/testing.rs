@@ -65,3 +65,69 @@ impl SecureRng for MockRng {
         }
     }
 }
+
+// ── Numeric surface (feature-gated) ──────────────────────────────────────
+
+#[cfg(feature = "numeric")]
+use crate::numeric::{NumericRng, Xoshiro256pp};
+
+#[cfg(feature = "numeric")]
+use std::collections::VecDeque;
+
+/// Deterministic [`NumericRng`] for DST tests.
+///
+/// Two construction styles:
+///
+/// - [`MockNumericRng::from_seed`]: wraps a seeded [`Xoshiro256pp`].
+///   Reproducible sequence, same as production but under caller-controlled
+///   seed.
+/// - [`MockNumericRng::from_sequence`]: replays a pre-programmed `u64`
+///   sequence. Lets DST tests inject exact draws and observe MC pricers
+///   with controlled uniforms and normals. Panics if the sequence is
+///   exhausted; a test that consumes more draws than expected should
+///   fail loudly, not silently start emitting zeros.
+///
+/// No interior mutability: [`NumericRng::next_u64`] takes `&mut self`, so
+/// the mock has exclusive access and needs no `Mutex`. Callers wanting
+/// shared ownership across threads wrap this in `Arc<Mutex<_>>` themselves.
+#[cfg(feature = "numeric")]
+#[derive(Debug)]
+pub enum MockNumericRng {
+    /// Seeded xoshiro256++.
+    Seeded(Xoshiro256pp),
+    /// Pre-programmed sequence of `u64` draws.
+    Sequence(VecDeque<u64>),
+}
+
+#[cfg(feature = "numeric")]
+impl MockNumericRng {
+    /// Construct a deterministic `NumericRng` from a `u64` seed.
+    ///
+    /// Yields the same sequence as production [`Xoshiro256pp::new`] under
+    /// the caller's control.
+    pub fn from_seed(seed: u64) -> Self {
+        MockNumericRng::Seeded(Xoshiro256pp::new(seed))
+    }
+
+    /// Construct a `NumericRng` that replays a pre-programmed sequence of
+    /// `u64` draws.
+    ///
+    /// Once the sequence is exhausted, [`NumericRng::next_u64`] panics.
+    /// This is deliberate: a test that over-consumes should surface the
+    /// mistake immediately, not silently emit zeros.
+    pub fn from_sequence(values: impl IntoIterator<Item = u64>) -> Self {
+        MockNumericRng::Sequence(values.into_iter().collect())
+    }
+}
+
+#[cfg(feature = "numeric")]
+impl NumericRng for MockNumericRng {
+    fn next_u64(&mut self) -> u64 {
+        match self {
+            MockNumericRng::Seeded(rng) => rng.next_u64(),
+            MockNumericRng::Sequence(queue) => queue.pop_front().expect(
+                "MockNumericRng sequence exhausted: test consumed more draws than programmed",
+            ),
+        }
+    }
+}

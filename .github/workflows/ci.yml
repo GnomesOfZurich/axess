@@ -522,10 +522,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # `cache-bin: "true"` (default in v2, pinned explicitly here) keeps
+      # ~/.cargo/bin/cargo-semver-checks across runs, so the install step
+      # below is a no-op on warm cache. The first run under `shared-key:
+      # semver` pays a full cold-cache tax; every run after is fast.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: semver
-      - run: cargo install cargo-semver-checks --locked
+          cache-bin: "true"
+      # Guard on `command -v` so we skip the cargo-install registry check
+      # entirely when the cached binary is already present. Saves ~15 s on
+      # every warm run.
+      - name: Install cargo-semver-checks
+        run: |
+          command -v cargo-semver-checks >/dev/null \
+            || cargo install cargo-semver-checks --locked
       - run: |
           set -o pipefail
           if cargo semver-checks check-release --workspace 2>&1 | tee semver.log; then
