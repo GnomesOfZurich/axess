@@ -1120,4 +1120,89 @@ mod tests {
             "refreshed cookie must bind to the post-rotation session id"
         );
     }
+
+    /// End-to-end through the REAL `SessionLayer` (not a mock handle): a CSRF
+    /// token minted for a fresh guest on a safe GET must validate on that
+    /// guest's next state-changing POST — the shape of the login flow. The
+    /// token is HMAC-bound to the session id the request ran under, so the
+    /// response cookie MUST carry that same id.
+    ///
+    /// Regression guard for the 0.3.3 fix: pre-fix, `finalize_session` minted a
+    /// *second*, different id for a fresh guest's response cookie (it took the
+    /// id-cycle branch on `existing_id.is_none()`), so the token was bound to
+    /// one id while `axess.sid` carried another and this POST returned `403`.
+    /// The mock-handle tests above stub the session id and so cannot see this
+    /// cross-layer interaction; stacking the real `SessionLayer` here is what
+    /// exposes it. Runs under `cargo test --lib`.
+    #[tokio::test]
+    async fn csrf_token_for_fresh_guest_survives_session_finalize() {
+        use crate::session::layer::SessionLayer;
+        use crate::session::store::MemorySessionStore;
+        use axum::Router;
+        use axum::http::Method;
+        use axum::routing::{get, post};
+        use tower::ServiceExt;
+
+        let session_layer =
+            SessionLayer::new(MemorySessionStore::new(), [42u8; 32]).with_secure(false);
+        let csrf_layer = CsrfLayer::new(CsrfConfig::new([7u8; 32]).secure(false));
+        let app = Router::new()
+            .route("/safe", get(|| async { "ok" }))
+            .route("/change", post(|| async { "changed" }))
+            .layer(csrf_layer) // inner: sees the SessionHandle
+            .layer(session_layer); // outer: injects the handle first
+
+        // 1. Safe GET, no cookies → mints axess.sid + the CSRF cookie, both
+        //    bound to the same fresh-guest session id.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/safe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cookie = |name: &str| {
+            resp.headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|hv| hv.to_str().ok())
+                .find_map(|c| {
+                    let (k, v) = c.split(';').next()?.split_once('=')?;
+                    (k.trim() == name).then(|| v.trim().to_string())
+                })
+        };
+        let sid = cookie("axess.sid").expect("GET must set the session cookie");
+        let csrf = cookie(DEFAULT_CSRF_COOKIE).expect("GET must mint the CSRF cookie");
+
+        // 2. The fresh guest's first state-changing request — the login POST
+        //    shape: double-submit cookie + header, carrying the same session id.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/change")
+                    .header(
+                        "cookie",
+                        format!("axess.sid={sid}; {DEFAULT_CSRF_COOKIE}={csrf}"),
+                    )
+                    .header(DEFAULT_CSRF_HEADER, &csrf)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a CSRF token minted for a fresh guest must validate on its next \
+             state-changing request; a 403 here means finalize handed the \
+             response cookie a different session id than the token was bound to"
+        );
+    }
 }

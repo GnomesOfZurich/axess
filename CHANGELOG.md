@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.3.3] - 2026-08-08
+
+### Fixed
+
+- `session` + `csrf`: a fresh guest's session id is now stable across
+  `finalize_session`, so a CSRF token minted during a request stays valid on
+  the client's next state-changing request. Previously a fresh guest (no
+  trusted `existing_id`) took the id-cycling branch and minted a *second*,
+  different id for the response cookie — even though the request, and the
+  `CsrfLayer` token HMAC-bound to it, already ran under the id `load_session`
+  minted. The client was left holding a `csrf-token` bound to the old id and an
+  `axess.sid` carrying the new one, so its next state-changing request
+  (typically the login `POST`) failed validation with `csrf: token validation
+  failed` → `403`. The id-cycle branch is now gated on `regenerate` alone; a
+  fresh guest is saved under its already-fixation-safe load-minted id. Session
+  fixation protection is unchanged — privilege changes and binding-mismatch
+  resets still rotate the id via the `regenerate` path.
+
+---
+
 ## [0.3.2] - 2026-08-06
 
 ### Added

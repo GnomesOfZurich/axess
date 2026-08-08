@@ -147,9 +147,14 @@ where
 /// fail-closed for the response.
 ///
 /// `existing_id` is the trusted id from [`load_session`]'s outcome:
-/// `None` means "no trusted prior session, the response must cycle to
-/// the current id." `guard.regenerate` (set by handler-side
-/// `rotate_id` calls or by binding invalidation) also forces cycle.
+/// `None` means "no trusted prior session" — a fresh guest whose id was
+/// already minted safely by `load_session` (never the client's cookie
+/// id). Its data is *saved* under that same id; the response cookie
+/// carries it unchanged. This is deliberate: a CSRF token minted during
+/// the request is HMAC-bound to this id, so minting a *second*, different
+/// id for the response cookie here would invalidate that token and 403
+/// the next state-changing request (the login POST). Only `guard.regenerate`
+/// (handler-side `rotate_id`, or binding invalidation) forces an id change.
 ///
 /// Cycle order matters: the handler-side state-transition methods
 /// already minted the new id and stashed the old one in
@@ -200,7 +205,7 @@ where
     }
 
     let final_id = if session_changed {
-        if guard.regenerate || existing_id.is_none() {
+        if guard.regenerate {
             let rng = SystemRng;
             let old_id = guard.pre_cycle_id.take().unwrap_or_else(|| {
                 let prev = guard.id;
@@ -221,6 +226,17 @@ where
                 }
             }
         } else {
+            // Persist under the id the request already ran under. For a fresh
+            // guest (`existing_id.is_none()`) that id was minted safely by
+            // `load_session` (never the client-supplied cookie id — session
+            // fixation is prevented there and, on privilege change, by the
+            // `regenerate` branch above). Keeping it — rather than minting a
+            // second, different id for the response cookie — is what lets a
+            // CSRF token minted *during* this request (bound to the same id)
+            // still validate on the client's next request. Minting a fresh id
+            // here would orphan both the token and any handler-time work keyed
+            // to `guard.id`, and every subsequent state-changing request would
+            // 403 until the cookie expired.
             if let Err(e) = store.save(&guard.id, &guard.data, config.ttl).await {
                 tracing::warn!(
                     error = %e,
@@ -606,12 +622,17 @@ mod helper_tests {
         );
     }
 
-    /// Line 766 / 773: `(guard.regenerate || existing_id.is_none())`
-    /// drives the cycle-vs-save decision. With `existing_id=None`
-    /// alone (no regenerate, but no prior id), the helper must take
-    /// the cycle path. Kills `||→&&` on lines 766 and 773.
+    /// A fresh guest (`existing_id=None`, no `regenerate`) is *saved* under
+    /// the id the request already ran under — it is NOT cycled to a second,
+    /// different id. The id `load_session` minted is already fixation-safe
+    /// (never the client's cookie id), so keeping it costs nothing in security
+    /// and is load-bearing for CSRF: a token minted during this request is
+    /// HMAC-bound to this id, so re-minting a different id for the response
+    /// cookie here would 403 the client's next state-changing request (the
+    /// login POST). Only `regenerate` (privilege change / binding-mismatch)
+    /// cycles to a new id — covered by the regenerate-alone test above.
     #[tokio::test]
-    async fn finalize_session_no_existing_id_takes_cycle_path() {
+    async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
         let store = CallCountingStore::new();
         let cfg = SessionConfig::default();
         let id = SessionId::new(&MockRng::new(6));
@@ -620,13 +641,22 @@ mod helper_tests {
         inner.regenerate = false;
         let handle = handle_from(inner);
 
-        let _ = finalize_session(&store, &cfg, None, &handle, None).await;
+        let outcome = finalize_session(&store, &cfg, None, &handle, None).await;
+        assert_eq!(
+            store.save_calls.load(Ordering::SeqCst),
+            1,
+            "fresh guest must be persisted under its load-minted id"
+        );
         assert_eq!(
             store.cycle_calls.load(Ordering::SeqCst),
-            1,
-            "existing_id=None must cycle (kills `||→&&` on lines 766/773)"
+            0,
+            "fresh guest must NOT mint a second id (would invalidate this request's CSRF token)"
         );
-        assert_eq!(store.save_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            outcome.final_id, id,
+            "the response cookie must carry the same id the request ran under, \
+             so a CSRF token bound to it validates on the next request"
+        );
     }
 
     // ── load_session: fingerprint binding ──────────────────────────────
