@@ -127,8 +127,8 @@ pub use hotp::{HOTP_LENGTH, HotpAlgorithm, HotpConfig, verify_hotp};
 
 #[cfg(feature = "totp")]
 pub use totp::{
-    TOTP, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpConfig, TotpVerifyParams, build_totp_uri,
-    generate_totp_secret, verify_totp,
+    TOTP_LENGTH, TOTP_PERIOD, Totp, TotpAlgorithm, TotpBuilder, TotpConfig, TotpVerifyParams,
+    build_totp_uri, generate_totp_secret, verify_totp,
 };
 
 #[cfg(feature = "email_otp")]
@@ -180,7 +180,7 @@ pub(crate) const MAX_HOTP_DIGITS: usize = 10;
 /// Maximum TOTP digit length accepted by verification.
 ///
 /// Lower than [`MAX_HOTP_DIGITS`] because the underlying `totp-rs` crate
-/// enforces RFC 6238 §1.2's 6..=8 digit range in `TOTP::new`; values above
+/// enforces RFC 6238 §1.2's 6..=8 digit range in `TotpBuilder::build`; values above
 /// 8 are rejected by the upstream library before our own guard runs.
 /// Tracking the real limit here keeps the guard meaningful and prevents
 /// silent rejection from a future caller that assumes the constant is

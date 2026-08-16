@@ -250,11 +250,22 @@ calls. The defences against the remaining surface:
 
 - Use POST (or PUT, DELETE, PATCH) for state-changing requests.
   GET requests should be safe.
-- Add a CSRF token to state-changing forms. The token is set in
-  the session and read from a hidden form field; the server
-  checks that they match. Axess does not include a CSRF middleware
-  out of the box; the convention is to use `tower-http`'s
-  middleware or to write a small one.
+- Mount [`axess_core::middleware::csrf::CsrfLayer`] inside the
+  session layer. It implements the signed double-submit cookie
+  pattern: the token is HMAC-bound to the current session id, so a
+  token minted under one session fails validation once the session
+  regenerates (on login, MFA add, tenant switch). The middleware
+  accepts the token from the `X-CSRF-Token` header (AJAX) or the
+  `_csrf` form field (HTML forms — `application/x-www-form-urlencoded`
+  only; JS-driven multipart uploads should use the header). Adopters
+  who need cross-origin/deferred use cases can layer `tower-http`'s
+  middleware instead.
+- Enable Origin/Referer validation as defence in depth via
+  [`CsrfConfig::require_origin`]. Off by default (would break
+  server-to-server bearer-token clients hitting browser routes); on
+  when configured, state-changing requests must present an `Origin`
+  (or `Referer`-derived) that matches one of the allowed origins,
+  AND pass the token check.
 - For applications that need cross-origin embedded use,
   `SameSite=None` plus a strict CSRF token check is the
   combination. `SameSite=None` requires `Secure`, so the

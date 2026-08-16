@@ -97,7 +97,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
     /// your provider and the compiled policy schema before accepting traffic.
     pub fn validate(&self) -> Result<(), AuthzError> {
         if let Some(schema) = self.evaluator.schema() {
-            self.provider.validate_against_schema(schema)?;
+            self.provider.validate_schema(schema)?;
         }
         Ok(())
     }
@@ -374,11 +374,11 @@ mod authz_session_tests {
             super::super::store::make_uid("TestApp", "Resource", id)
         }
 
-        fn validate_against_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
+        fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
             tracing::trace!(
                 target: "axess::authz::test_stub",
                 ?schema,
-                "ErroringProvider::validate_against_schema: synthetic failure",
+                "ErroringProvider::validate_schema: synthetic failure",
             );
             Err(AuthzError::SchemaParse(
                 "synthetic schema validation failure".to_string(),
@@ -389,7 +389,7 @@ mod authz_session_tests {
     #[test]
     fn validate_propagates_provider_validation_error() {
         // Pins `AuthzStore::validate -> Ok(())` mutation. The
-        // mutation skips the inner `provider.validate_against_schema`
+        // mutation skips the inner `provider.validate_schema`
         // call. With a provider that errors, the genuine path returns
         // `Err`; the mutation would silently return `Ok(())` and
         // mask startup-time schema mismatches.
@@ -399,7 +399,7 @@ mod authz_session_tests {
         let result = store.validate();
         assert!(
             matches!(result, Err(AuthzError::SchemaParse(_))),
-            "validate() must propagate provider's validate_against_schema error, got {result:?}"
+            "validate() must propagate provider's validate_schema error, got {result:?}"
         );
     }
 }

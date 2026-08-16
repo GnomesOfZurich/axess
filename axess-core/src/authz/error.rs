@@ -33,6 +33,7 @@ impl IntoResponse for AuthzDenied {
 /// |---------|----------------------|-----------|
 /// | `PolicyParse` | 500 | Server misconfiguration |
 /// | `SchemaParse` | 500 | Server misconfiguration |
+/// | `PolicyValidation` | 500 | Policy set does not conform to compiled schema |
 /// | `InvalidEntityUid` | 500 | Programming error |
 /// | `EntityBuild` | 500 | Entity graph construction failed |
 /// | `NoPrincipal` | 401 | Unauthenticated, no session |
@@ -47,6 +48,16 @@ pub enum AuthzError {
     /// Cedar schema text failed to parse at startup.
     #[error("Failed to parse Cedar schema: {0}")]
     SchemaParse(String),
+
+    /// Cedar policy set does not conform to the compiled schema.
+    ///
+    /// Raised by [`validate_policies`](super::store::validate_policies) when
+    /// Cedar's own strict validator finds type errors: policies referencing
+    /// undeclared entity types or actions, wrong attribute types, or
+    /// scope-variable misuse. Distinct from `PolicyParse` (syntax) and
+    /// `SchemaParse` (schema syntax); this is the policy⇔schema cross-check.
+    #[error("Cedar policy validation failed: {0}")]
+    PolicyValidation(String),
 
     /// Constructed entity UID is not valid Cedar syntax.
     #[error("Invalid entity UID: {0}")]

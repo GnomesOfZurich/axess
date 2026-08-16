@@ -45,13 +45,17 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- ── Factor + method composition ─────────────────────────────────────
 
--- factor_configs — typed factor configuration per user/tenant/global scope.
--- Scope: user_id + tenant_id = user scope; tenant_id only = tenant scope;
--- both NULL = global.
+-- factor_configs — typed factor configuration per user/tenant/system scope.
+-- Scope encoding:
+--   user_id set,  tenant_id = <tenant>          → User { tenant, user }
+--   user_id NULL, tenant_id = <tenant>          → Tenant(tenant)
+--   user_id NULL, tenant_id = TenantId::SYSTEM  → System
+-- `tenant_id` is NEVER NULL for configuration scope; system-owned rows
+-- live under the reserved SYSTEM tenant (seeded below).
 CREATE TABLE IF NOT EXISTS factor_configs (
     id          TEXT PRIMARY KEY,
     user_id     TEXT REFERENCES users(id),
-    tenant_id   TEXT REFERENCES tenants(id),
+    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
     kind        TEXT NOT NULL,              -- 'password', 'totp', 'hotp', 'email_otp'
     config_json TEXT NOT NULL,              -- JSON-encoded FactorConfig enum value
     enabled     INTEGER NOT NULL DEFAULT 1,
@@ -59,18 +63,38 @@ CREATE TABLE IF NOT EXISTS factor_configs (
     UNIQUE(user_id, tenant_id, kind)
 );
 
--- auth_methods — ordered factor sequences available per user.
+-- auth_methods — ordered factor sequences available per user or tenant.
 -- One row per method. `steps_json` serialises a full `Vec<FactorStep>` so
 -- both simple sequential flows and `FactorStep::AnyOf(..)` compositions
 -- round-trip through storage.
+--
+-- Scope encoding matches factor_configs; there is no runtime System-scope
+-- auth method (the SQLite `FactorStore` impl rejects System scope on
+-- save/remove/set_enabled).
 CREATE TABLE IF NOT EXISTS auth_methods (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL,            -- e.g. 'password+totp'
     steps_json  TEXT NOT NULL,            -- JSON: [{"Required":"Password"},{"Required":"Totp"}]
     user_id     TEXT REFERENCES users(id),
-    tenant_id   TEXT REFERENCES tenants(id),
+    tenant_id   TEXT NOT NULL REFERENCES tenants(id),
     enabled     INTEGER NOT NULL DEFAULT 1,
     UNIQUE(user_id, tenant_id, name)
+);
+
+-- ── System-tenant bootstrap ─────────────────────────────────────────
+--
+-- The reserved SYSTEM tenant is the storage anchor for AuthnScope::System
+-- rows in factor_configs. The row must exist before any system-scope
+-- factor is inserted (FK integrity). UUID is `TenantId::SYSTEM` /
+-- `Uuid::nil()`.
+INSERT OR IGNORE INTO tenants (id, identifier, name, status, created_by, updated_by)
+VALUES (
+    '00000000-0000-0000-0000-000000000000',
+    'system',
+    'System',
+    'active',
+    '00000000-0000-0000-0000-000000000001',   -- UserId::SYSTEM
+    '00000000-0000-0000-0000-000000000001'
 );
 
 -- ── Audit + sessions ────────────────────────────────────────────────

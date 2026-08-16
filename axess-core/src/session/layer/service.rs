@@ -7,12 +7,12 @@
 
 #[cfg(feature = "device")]
 use crate::device::resolver::ErasedDeviceResolver;
-use crate::session::binding::{self, SessionBinding};
+use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
 use crate::session::layer::SessionLayer;
 use crate::session::layer::handle::{SessionHandle, SessionInner};
 use crate::session::layer::lifecycle::{build_set_cookie, finalize_session, load_session};
-use crate::session::layer::signing::SigningKeys;
+use crate::session::layer::signing::SigningKeyRing;
 use crate::session::store::SessionStore;
 use axum::{body::Body, http::Request, response::Response};
 use std::{
@@ -37,7 +37,7 @@ use tower::{Layer, Service};
 pub struct SessionService<S, Inner> {
     inner: Inner,
     store: S,
-    signing_keys: Arc<SigningKeys>,
+    signing_keys: Arc<SigningKeyRing>,
     /// Shared with [`SessionLayer`] via `Arc` to keep
     /// `Layer::layer` and per-request `Service::call` cloning cheap.
     config: Arc<SessionConfig>,
@@ -97,12 +97,20 @@ where
         let mut inner = self.inner.clone();
         std::mem::swap(&mut inner, &mut self.inner);
 
-        // Pre-compute the binding HMAC from the request before moving it.
-        // Use the dedicated fingerprint sub-key; distinct from the
-        // cookie-signing key.
-        let current_fingerprint = session_binding
-            .as_deref()
-            .and_then(|b| binding::compute_fingerprint(b, &req, &signing_keys.fingerprint));
+        // Pre-compute the binding fingerprint pair from the request
+        // before moving it. `compute_binding_fingerprints` returns
+        // (current, previous) — `previous` is only `Some` when a
+        // rotation window is active. The pair is threaded into
+        // `load_session` so verification can fall back to the previous
+        // key and re-store the fingerprint under the current key.
+        let (current_fingerprint, previous_fingerprint) =
+            match session_binding.as_deref().and_then(|b| b.extract(&req)) {
+                Some(material) => {
+                    let (curr, prev) = signing_keys.compute_binding_fingerprints(&material);
+                    (Some(curr), prev)
+                }
+                None => (None, None),
+            };
 
         Box::pin(async move {
             // 1. Load session; cookie verify, store load, fingerprint check, fresh-mint.
@@ -113,6 +121,7 @@ where
                 metrics.as_deref(),
                 req.headers(),
                 current_fingerprint.as_deref(),
+                previous_fingerprint.as_deref(),
             )
             .await;
 
@@ -166,7 +175,12 @@ where
             let inner_state = SessionInner {
                 id: load.id,
                 data: load.data,
-                modified: load.binding_invalidated || device_changed,
+                // `rotation_fallback_used` is folded into `modified`
+                // so the finalize path persists the (possibly-updated)
+                // fingerprint AND flips `session_changed = true`, which
+                // in turn triggers the Set-Cookie emission below —
+                // re-issuing the cookie under the current signing key.
+                modified: load.binding_invalidated || device_changed || load.rotation_fallback_used,
                 regenerate: load.binding_invalidated,
                 pre_cycle_id: None,
                 pending_fingerprint: pending_fp,

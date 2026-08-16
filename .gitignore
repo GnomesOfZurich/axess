@@ -1,6 +1,9 @@
 # Rust compiled files and executables
 **/debug/
 **/target/
+# Per-agent CARGO_TARGET_DIR overrides — concurrent-agent build isolation
+# (see multi-agent workflow notes).
+**/target-*/
 
 # System Files
 **/.DS_Store

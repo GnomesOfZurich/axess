@@ -56,7 +56,7 @@ sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros"], optional = true }
-totp-rs = { version = "5.7.2", features = ["gen_secret", "serde_support", "zeroize"], optional = true }
+totp-rs = { version = "6.0.0", features = ["gen_secret", "serde", "zeroize"], optional = true }
 tower = { version = "0.5.3", features = ["util"], optional = true }
 tracing = { workspace = true }
 url = { workspace = true, optional = true }
@@ -117,7 +117,7 @@ social = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-r
 # (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, …) via
 # an adopter-supplied claim parser plus mapping closure; see the
 # `axess-example-workload-identity` crate for ready-made recipes.
-jwt-svid = ["jwt"]
+jwt-svid = ["jwt", "axess-identity/serde"]
 outbound-oauth = ["jwt", "dep:reqwest", "dep:tokio", "dep:url", "dep:uuid", "dep:axess-clock", "dep:axess-rng", "dep:chrono", "dep:base64", "dep:thiserror"]
 
 # Umbrella over the full federation surface

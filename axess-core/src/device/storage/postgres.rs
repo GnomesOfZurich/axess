@@ -1,5 +1,12 @@
 //! PostgreSQL-backed [`DeviceStore`] using sqlx.
 //!
+//! # Cross-dialect parity contract
+//!
+//! See [`crate::device::storage::sqlite`] for the cross-dialect
+//! contract: this file MUST stay column-for-column in sync with its
+//! [`sqlite`](crate::device::storage::sqlite) and
+//! [`mysql`](crate::device::storage::mysql) siblings.
+//!
 //! # Schema
 //!
 //! ```sql

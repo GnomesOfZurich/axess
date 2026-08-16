@@ -1,14 +1,32 @@
 //! Authentication handlers: login page, login POST, TOTP verify, logout.
 
 use crate::web::app::AppState;
+use crate::web::csrf_hidden_input;
 use axess::AuthSession;
 use axess::authn::{FactorCredential, FactorKind, FactorOutcome, LoginOutcome};
+use axess::csrf::CsrfToken;
 use axum::{
-    Form,
+    Extension, Form,
     extract::State,
     response::{Html, IntoResponse, Redirect},
 };
 use serde::Deserialize;
+
+// ── CSRF rendering helper ────────────────────────────────────────────────────
+//
+// Templates carry the literal marker `__CSRF_INPUT__` where the hidden
+// `_csrf` form field should appear. `render_with_csrf` replaces the
+// marker with the actual hidden input carrying the current token
+// (HTML-escaped defensively even though the token is a URL-safe base64
+// string with no special characters).
+//
+// The value comes from the `CsrfToken` request extension injected by
+// [`axess::middleware::csrf::CsrfLayer`], which the app wires inside
+// the session layer in [`crate::web::app::build_router`].
+
+fn render_with_csrf(template: &'static str, csrf: &CsrfToken) -> Html<String> {
+    Html(template.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf)))
+}
 
 // ── Form types ────────────────────────────────────────────────────────────────
 
@@ -27,8 +45,8 @@ pub struct TotpForm {
 
 // ── GET /login ────────────────────────────────────────────────────────────────
 
-pub async fn login_page() -> Html<&'static str> {
-    Html(LOGIN_HTML)
+pub async fn login_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> {
+    render_with_csrf(LOGIN_HTML, &csrf)
 }
 
 // ── POST /login ───────────────────────────────────────────────────────────────
@@ -36,6 +54,7 @@ pub async fn login_page() -> Html<&'static str> {
 pub async fn post_login(
     State(state): State<AppState>,
     session: AuthSession,
+    Extension(csrf): Extension<CsrfToken>,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
     let tenant = form
@@ -79,10 +98,11 @@ pub async fn post_login(
                     Redirect::to("/totp").into_response()
                 }
                 Ok(FactorOutcome::InvalidCredential) => {
-                    Html(login_with_error("Invalid username or password.")).into_response()
+                    Html(login_with_error("Invalid username or password.", &csrf)).into_response()
                 }
                 Ok(FactorOutcome::Locked { .. }) => Html(login_with_error(
                     "Account locked due to too many failed attempts. Try again later.",
+                    &csrf,
                 ))
                 .into_response(),
                 Ok(FactorOutcome::FactorRequired(other)) => {
@@ -96,23 +116,28 @@ pub async fn post_login(
             }
         }
         LoginOutcome::InvalidCredentials => {
-            Html(login_with_error("Invalid username or password.")).into_response()
+            Html(login_with_error("Invalid username or password.", &csrf)).into_response()
         }
         LoginOutcome::Locked { .. } => Html(login_with_error(
             "Account locked due to too many failed attempts. Try again later.",
+            &csrf,
         ))
         .into_response(),
         other => {
             tracing::warn!(outcome = ?std::mem::discriminant(&other), "unexpected login outcome");
-            Html(login_with_error("Unexpected error. Please try again.")).into_response()
+            Html(login_with_error(
+                "Unexpected error. Please try again.",
+                &csrf,
+            ))
+            .into_response()
         }
     }
 }
 
 // ── GET /totp ─────────────────────────────────────────────────────────────────
 
-pub async fn totp_page() -> Html<&'static str> {
-    Html(TOTP_HTML)
+pub async fn totp_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> {
+    render_with_csrf(TOTP_HTML, &csrf)
 }
 
 // ── POST /totp ────────────────────────────────────────────────────────────────
@@ -120,13 +145,14 @@ pub async fn totp_page() -> Html<&'static str> {
 pub async fn post_totp(
     State(state): State<AppState>,
     session: AuthSession,
+    Extension(csrf): Extension<CsrfToken>,
     Form(form): Form<TotpForm>,
 ) -> impl IntoResponse {
     let cred = FactorCredential::OtpCode(form.code.into());
     match state.service.verify_factor(&cred, &session).await {
         Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
         Ok(FactorOutcome::InvalidCredential) => {
-            Html(totp_with_error("Wrong code; please try again.")).into_response()
+            Html(totp_with_error("Wrong code; please try again.", &csrf)).into_response()
         }
         Ok(FactorOutcome::Locked { .. }) => {
             // Session is locked; send back to login to start fresh.
@@ -154,8 +180,8 @@ pub async fn logout(State(state): State<AppState>, session: AuthSession) -> impl
 
 // ── GET /signup ──────────────────────────────────────────────────────────────
 
-pub async fn signup_page() -> Html<&'static str> {
-    Html(SIGNUP_HTML)
+pub async fn signup_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> {
+    render_with_csrf(SIGNUP_HTML, &csrf)
 }
 
 // ── POST /signup ─────────────────────────────────────────────────────────────
@@ -172,6 +198,7 @@ pub struct SignupForm {
 pub async fn post_signup(
     State(state): State<AppState>,
     session: AuthSession,
+    Extension(csrf): Extension<CsrfToken>,
     Form(form): Form<SignupForm>,
 ) -> impl IntoResponse {
     use axess::authn::{
@@ -200,7 +227,9 @@ pub async fn post_signup(
         state.backend.clock().now(),
     ) {
         Ok(u) => u,
-        Err(e) => return Html(signup_with_error(&format!("Invalid input: {e}"))).into_response(),
+        Err(e) => {
+            return Html(signup_with_error(&format!("Invalid input: {e}"), &csrf)).into_response();
+        }
     };
 
     match state.service.begin_signup(user, tenant, &session).await {
@@ -257,10 +286,12 @@ pub async fn post_signup(
         }
         Ok(SignupOutcome::AlreadyExists) => Html(signup_with_error(
             "A user with that username already exists.",
+            &csrf,
         ))
         .into_response(),
         Ok(SignupOutcome::TenantNotActive) => Html(signup_with_error(
             "That tenant does not exist or is not active.",
+            &csrf,
         ))
         .into_response(),
         Err(e) => {
@@ -275,6 +306,7 @@ pub async fn post_signup(
 pub async fn setup_totp_page(
     State(state): State<AppState>,
     session: AuthSession,
+    Extension(csrf): Extension<CsrfToken>,
 ) -> impl IntoResponse {
     use axess::authn::{AuthnScope, FactorKind, FactorStore};
 
@@ -305,6 +337,7 @@ pub async fn setup_totp_page(
     let secret = axess::generate_totp_secret(&axess::SystemRng);
     let uri = axess::build_totp_uri(&username, "axess-example", &secret, 6, 30);
     let qr_svg = totp_qr_svg(&uri);
+    let csrf_input = csrf_hidden_input(&csrf);
 
     Html(format!(
         r#"<!doctype html>
@@ -315,6 +348,7 @@ pub async fn setup_totp_page(
 <p>Or enter the secret manually: <pre style="background:#f0f0f0; padding:10px; font-size:1.2em">{secret}</pre></p>
 <details><summary>Show otpauth:// URI</summary><p><code>{uri}</code></p></details>
 <form method="POST" action="/setup-totp">
+  {csrf_input}
   <input type="hidden" name="secret" value="{secret}">
   <label>Enter the 6-digit code to verify enrollment:<br>
     <input type="text" name="code" inputmode="numeric" pattern="[0-9]*"
@@ -357,6 +391,7 @@ pub struct SetupTotpForm {
 pub async fn post_setup_totp(
     State(state): State<AppState>,
     session: AuthSession,
+    Extension(csrf): Extension<CsrfToken>,
     Form(form): Form<SetupTotpForm>,
 ) -> impl IntoResponse {
     use axess::authn::{AuthnScope, FactorConfig, FactorStore, TotpConfig, ZeroizedString};
@@ -375,20 +410,22 @@ pub async fn post_setup_totp(
     ) {
         Some(_step) => {} // Valid code; proceed.
         None => {
+            let csrf_input = csrf_hidden_input(&csrf);
             return Html(format!(
                 r#"<!doctype html><html><head><title>Setup TOTP</title></head><body>
 <h1>Enroll TOTP</h1>
 <p style="color:red">Invalid code; please try again.</p>
-<p>Secret: <pre>{}</pre></p>
+<p>Secret: <pre>{secret}</pre></p>
 <form method="POST" action="/setup-totp">
-  <input type="hidden" name="secret" value="{}">
+  {csrf_input}
+  <input type="hidden" name="secret" value="{secret}">
   <label>6-digit code:<br>
     <input type="text" name="code" inputmode="numeric" required autofocus maxlength="6">
   </label><br><br>
   <button type="submit">Verify & Enable TOTP</button>
 </form>
 </body></html>"#,
-                form.secret, form.secret
+                secret = form.secret,
             ))
             .into_response();
         }
@@ -452,8 +489,8 @@ pub async fn post_setup_totp(
 
 // ── GET /forgot-password ─────────────────────────────────────────────────────
 
-pub async fn forgot_password_page() -> Html<&'static str> {
-    Html(FORGOT_PASSWORD_HTML)
+pub async fn forgot_password_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> {
+    render_with_csrf(FORGOT_PASSWORD_HTML, &csrf)
 }
 
 // ── POST /forgot-password ───────────────────────────────────────────────────
@@ -512,8 +549,8 @@ pub async fn post_forgot_password(
 
 // ── GET /reset-password ─────────────────────────────────────────────────────
 
-pub async fn reset_password_page() -> Html<&'static str> {
-    Html(RESET_PASSWORD_HTML)
+pub async fn reset_password_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> {
+    render_with_csrf(RESET_PASSWORD_HTML, &csrf)
 }
 
 // ── POST /reset-password ────────────────────────────────────────────────────
@@ -571,22 +608,24 @@ pub async fn post_reset_password(
 
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
-fn login_with_error(msg: &str) -> String {
+fn login_with_error(msg: &str, csrf: &CsrfToken) -> String {
+    let form = LOGIN_FORM.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
         r#"<!doctype html><html><head><title>Login</title></head><body>
 <h1>Login</h1>
 <p style="color:red">{msg}</p>
-{LOGIN_FORM}
+{form}
 </body></html>"#
     )
 }
 
-fn totp_with_error(msg: &str) -> String {
+fn totp_with_error(msg: &str, csrf: &CsrfToken) -> String {
+    let form = TOTP_FORM.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
         r#"<!doctype html><html><head><title>TOTP Verification</title></head><body>
 <h1>Enter TOTP Code</h1>
 <p style="color:red">{msg}</p>
-{TOTP_FORM}
+{form}
 </body></html>"#
     )
 }
@@ -602,6 +641,7 @@ fn error_page(msg: &str) -> Html<String> {
 
 const LOGIN_FORM: &str = r#"
 <form method="POST" action="/login">
+  __CSRF_INPUT__
   <label>Identifier (username):<br>
     <input type="text" name="identifier" required autofocus>
   </label><br><br>
@@ -616,6 +656,7 @@ const LOGIN_FORM: &str = r#"
 
 const TOTP_FORM: &str = r#"
 <form method="POST" action="/totp">
+  __CSRF_INPUT__
   <label>6-digit code:<br>
     <input type="text" name="code" inputmode="numeric" pattern="[0-9]*"
            autocomplete="one-time-code" required autofocus maxlength="6">
@@ -627,6 +668,7 @@ const LOGIN_HTML: &str = r#"<!doctype html>
 <html><head><title>Login</title></head><body>
 <h1>Login</h1>
 <form method="POST" action="/login">
+  __CSRF_INPUT__
   <label>Identifier (username):<br>
     <input type="text" name="identifier" required autofocus>
   </label><br><br>
@@ -648,18 +690,20 @@ const LOGIN_HTML: &str = r#"<!doctype html>
 <p><a href="/forgot-password">Forgot your password?</a></p>
 </body></html>"#;
 
-fn signup_with_error(msg: &str) -> String {
+fn signup_with_error(msg: &str, csrf: &CsrfToken) -> String {
+    let form = SIGNUP_FORM.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
         r#"<!doctype html><html><head><title>Sign Up</title></head><body>
 <h1>Create Account</h1>
 <p style="color:red">{msg}</p>
-{SIGNUP_FORM}
+{form}
 </body></html>"#
     )
 }
 
 const SIGNUP_FORM: &str = r#"
 <form method="POST" action="/signup">
+  __CSRF_INPUT__
   <label>Tenant (leave blank for "default"):<br>
     <input type="text" name="tenant" placeholder="default">
   </label><br><br>
@@ -682,6 +726,7 @@ const SIGNUP_HTML: &str = r#"<!doctype html>
 <html><head><title>Sign Up</title></head><body>
 <h1>Create Account</h1>
 <form method="POST" action="/signup">
+  __CSRF_INPUT__
   <label>Tenant (leave blank for "default"):<br>
     <input type="text" name="tenant" placeholder="default">
   </label><br><br>
@@ -707,6 +752,7 @@ const FORGOT_PASSWORD_HTML: &str = r#"<!doctype html>
 <html><head><title>Forgot Password</title></head><body>
 <h1>Reset Your Password</h1>
 <form method="POST" action="/forgot-password">
+  __CSRF_INPUT__
   <label>Username:<br>
     <input type="text" name="identifier" required autofocus>
   </label><br><br>
@@ -724,6 +770,7 @@ const RESET_PASSWORD_HTML: &str = r#"<!doctype html>
 <h1>Set New Password</h1>
 <p>Enter the reset token from the server log (or email in production), your user ID, and a new password.</p>
 <form method="POST" action="/reset-password">
+  __CSRF_INPUT__
   <label>User ID (username):<br>
     <input type="text" name="user_id" required autofocus>
   </label><br><br>
@@ -741,6 +788,7 @@ const TOTP_HTML: &str = r#"<!doctype html>
 <html><head><title>TOTP Verification</title></head><body>
 <h1>Enter TOTP Code</h1>
 <form method="POST" action="/totp">
+  __CSRF_INPUT__
   <label>6-digit code:<br>
     <input type="text" name="code" inputmode="numeric" pattern="[0-9]*"
            autocomplete="one-time-code" required autofocus maxlength="6">

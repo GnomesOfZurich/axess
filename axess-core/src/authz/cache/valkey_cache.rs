@@ -57,15 +57,40 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// already serialisable text and unique enough that no extra hashing is
 /// needed.
 ///
+/// # Invalidation contract (load-bearing for security)
+///
+/// The cached value is the entity graph Cedar sees for
+/// `(principal, resource, action)`. Role parents, tenant attributes,
+/// ownership fields, and any ABAC attribute the provider set are all
+/// baked into that graph. A cache hit RE-USES that graph unchanged
+/// until TTL expiry.
+///
+/// This means every application-side mutation that changes the
+/// **authorization-relevant state of a principal** — role assignment,
+/// role removal, group membership change, account suspension, tenant
+/// switch — MUST be paired with a call to
+/// [`invalidate_principal`](Self::invalidate_principal) (or
+/// [`invalidate_tenant`](Self::invalidate_tenant) for tenant-scoped
+/// changes) on the mutating pod. Forgetting this leaves the affected
+/// user acting under their old rights for up to [`ttl`](Self::with_ttl)
+/// seconds — a real vulnerability for revocation.
+///
+/// TTL is a safety net, not a substitute. Short TTLs (60s default)
+/// bound the worst-case exposure; explicit invalidation on mutation is
+/// the correctness path.
+///
 /// # Cross-pod invalidation
 ///
-/// Apps that need cross-pod invalidation publish on the channel
-/// `{prefix}:authz-entities-invalidated:{principal}` and have each pod
-/// subscribe at startup. Because the cache key includes the principal
-/// UID first, listeners can match by prefix or wildcard. axess does not
-/// auto-subscribe; invalidation policy is application-specific (which
-/// data mutations require which scope of cache eviction). See the design
-/// doc for the recommended pattern.
+/// [`invalidate_principal`](Self::invalidate_principal) evicts on the
+/// caller pod only. For multi-pod deployments, invalidation must
+/// propagate: publish on the channel
+/// `{prefix}:authz-entities-invalidated:{principal}` after any local
+/// eviction and have each pod subscribe at startup, calling its own
+/// invalidator on receipt. Because the cache key includes the
+/// principal UID first, listeners can match by prefix or wildcard.
+/// axess does not auto-subscribe; invalidation policy is
+/// application-specific (which data mutations require which scope of
+/// cache eviction). See the design doc for the recommended pattern.
 ///
 /// # Errors
 ///
@@ -274,6 +299,21 @@ where
 
             // Cache lookup. Failures (network, deser) degrade to miss
             // with a warn; never break authorization for a cache fault.
+            //
+            // `Entities::from_json_value` is called with `None` (no schema
+            // re-validation) as a deliberate hot-path optimisation. The
+            // stored value was produced on our own miss path (below) by
+            // the inner provider, which is validated once at startup via
+            // `AuthzEntityProvider::validate_schema`. Re-validating every
+            // cache read costs O(entities × attributes) on the critical
+            // path with no correctness gain against our own writer. It
+            // does NOT defend against Valkey being written to by anything
+            // other than axess — that's a distinct trust boundary
+            // (network segmentation, Valkey ACLs) and MUST NOT be relied
+            // on cache-side. Note also the mutation-invalidation contract
+            // documented on the struct: semantic staleness (a revoked
+            // role still cached) is invisible to schema validation
+            // regardless.
             match self.client.get::<Option<String>, _>(&key).await {
                 Ok(Some(json_str)) => match serde_json::from_str::<serde_json::Value>(&json_str) {
                     Ok(json) => match Entities::from_json_value(json, None) {

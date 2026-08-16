@@ -613,36 +613,91 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
     }
 }
 
+// ── ResolvedFactor ────────────────────────────────────────────────────────────
+
+/// A factor config together with the scope it was resolved from.
+///
+/// Returned by [`FactorStore::resolve_factor`]. Callers use `resolved_from`
+/// to CAS at the correct scope (as the internal factor-verification
+/// pipeline does) and to log which tier of the User → Tenant → System
+/// chain served the request.
+#[derive(Debug, Clone)]
+pub struct ResolvedFactor {
+    /// The factor configuration.
+    pub config: FactorConfig,
+    /// The scope where `config` was found (never broader than the scope
+    /// the caller passed to `resolve_factor`).
+    pub resolved_from: AuthnScope,
+}
+
 // ── FactorStore ───────────────────────────────────────────────────────────────
 
 /// Factor credential storage. Implement alongside [`IdentityStore`] (usually same DB struct).
 ///
 /// Provides typed [`FactorConfig`], not `HashMap<String, JsonValue>`.
+///
+/// # Two loaders, two intents
+///
+/// Configuration lookup in axess separates the runtime auth path from the
+/// admin/display path. Mixing the two on one method invites the bug where
+/// admin code silently walks a fallback chain, or auth code returns a
+/// system default when the caller wanted "no config at this exact scope."
+///
+/// - [`resolve_factor`](Self::resolve_factor) — RUNTIME auth. Walks
+///   the User → Tenant → System resolution chain (see
+///   [`AuthnScope::resolution_chain`]) and returns the first hit as
+///   [`ResolvedFactor`], carrying the config AND the scope it lives at.
+///   Backends should implement this as a single storage query that
+///   walks the chain in one round trip.
+///
+/// - [`load_factor`](Self::load_factor) — ADMIN / display. Fetches
+///   the config at EXACTLY the requested scope with no fallback. Use for
+///   configuration UIs, provisioning tooling, migration scripts, and
+///   anything answering "what did this tenant / user explicitly configure?"
+///
+/// The service layer's authentication code path uses
+/// [`resolve_factor`](Self::resolve_factor) exclusively;
+/// [`load_factor`](Self::load_factor) is never on the auth hot path.
+///
+/// # System-scope semantics
+///
+/// [`AuthnScope::System`] holds platform-owned defaults. Tenants adopt
+/// system defaults explicitly (at provisioning or later reconfiguration);
+/// nothing silent about it. Storage-wise, System rows live under the
+/// reserved [`TenantId::system`] tenant — there is no NULL-tenant
+/// encoding for configuration scope. See `docs/authentication/scope.md`.
 pub trait FactorStore: Send + Sync + 'static {
     /// Error type returned by storage operations.
     type Error: std::error::Error + Send + Sync + 'static;
 
-    /// Load the factor configuration for a given scope and kind.
+    /// Runtime factor-config resolution: walk User → Tenant → System and
+    /// return the first hit, or `Ok(None)` if the chain is empty end to end.
     ///
-    /// ## Resolution contract
+    /// The returned [`ResolvedFactor`] carries both the config and the
+    /// scope it was resolved from. Callers use `resolved_from` to CAS
+    /// at the right scope (a config that resolved from Tenant scope must
+    /// not be CAS-swapped against a User-scope row).
     ///
-    /// - For [`AuthnScope::User { user_id, tenant_id }`]: try the
-    ///   user-scoped row first, then fall back to the tenant-scoped row.
-    ///   Return `None` if neither exists.
-    /// - For [`AuthnScope::Tenant`]: return the tenant-scoped row only.
-    ///   Return `None` if the tenant has not adopted this factor.
-    /// - For [`AuthnScope::Global`]: the contract is **no runtime fallback
-    ///   to a platform-wide default row**. Global config in axess is
-    ///   expressed via [`FactorTemplate`](crate::authn::factor::FactorTemplate)
-    ///   catalog entries that tenants adopt explicitly at provisioning
-    ///   time. Implementations may return the matching catalog template's
-    ///   `default_config` for display purposes, but must **not** route
-    ///   runtime auth decisions through a global row.
+    /// Backends SHOULD implement this as a single query that walks the
+    /// resolution chain in-storage (e.g. `ORDER BY` with a `CASE` on
+    /// scope narrowness). A naïve implementation that iterates over
+    /// [`AuthnScope::resolution_chain`] and issues one
+    /// [`load_factor`](Self::load_factor) call per tier is correct
+    /// but pays N storage round trips per authentication step.
+    fn resolve_factor(
+        &self,
+        scope: &AuthnScope,
+        kind: FactorKind,
+    ) -> impl std::future::Future<Output = Result<Option<ResolvedFactor>, Self::Error>> + Send;
+
+    /// Admin / display factor-config lookup: fetch the config at EXACTLY
+    /// this scope, with no fallback. Returns `Ok(None)` if no row matches.
     ///
-    /// The rationale is documented in `docs/identity/tenancy.md`: silent global
-    /// inheritance leaks information about factors a tenant admin chose
-    /// not to enable, and makes platform-wide config changes surprise
-    /// tenants. Tenants own their auth menu explicitly.
+    /// Use for configuration UIs answering "what did this tenant
+    /// explicitly configure?", for provisioning tooling that needs to
+    /// know whether a User-scope override exists before writing, and
+    /// for admin export / migration. Never on the runtime auth path —
+    /// use [`resolve_factor`](Self::resolve_factor) there.
     fn load_factor(
         &self,
         scope: &AuthnScope,

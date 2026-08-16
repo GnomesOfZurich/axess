@@ -7,12 +7,42 @@
 //! in tests to evaluate authz flows without any Cedar policy files.
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema,
+    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema, ValidationMode,
+    Validator,
 };
 use std::str::FromStr;
 use tracing::warn;
 
 use super::error::AuthzError;
+
+// ── validate_policies ────────────────────────────────────────────────────────
+
+/// Cross-check a Cedar policy set against a schema using Cedar's strict
+/// validator.
+///
+/// Runs [`cedar_policy::Validator`] in [`ValidationMode::Strict`]: rejects
+/// policies that reference undeclared entity types, undeclared actions,
+/// wrong attribute types, or scope-variable misuse. Separate from
+/// parse-time syntax checking ([`AuthzError::PolicyParse`],
+/// [`AuthzError::SchemaParse`]); both are required.
+///
+/// Extracted as a free function so it is callable both at startup (from
+/// [`PolicyStore::from_text`]) **and** at future policy hot-swap time,
+/// where the invariant is **validate-before-swap**: never leave the
+/// authorizer holding a policy set that fails validation.
+///
+/// All validation errors are collected and joined into a single
+/// [`AuthzError::PolicyValidation`] payload so operators see every
+/// mismatch, not just the first.
+pub fn validate_policies(policies: &PolicySet, schema: &Schema) -> Result<(), AuthzError> {
+    let validator = Validator::new(schema.clone());
+    let result = validator.validate(policies, ValidationMode::Strict);
+    if result.validation_passed() {
+        return Ok(());
+    }
+    let errors: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
+    Err(AuthzError::PolicyValidation(errors.join("; ")))
+}
 
 // ── AuthzDecision ─────────────────────────────────────────────────────────────
 
@@ -57,7 +87,7 @@ pub trait PolicyEvaluator: Send + Sync {
     ) -> AuthzDecision;
 
     /// Return the Cedar schema if available. Used to validate entity providers
-    /// at startup via [`AuthzEntityProvider::validate_against_schema`][super::provider::AuthzEntityProvider::validate_against_schema].
+    /// at startup via [`AuthzEntityProvider::validate_schema`][super::provider::AuthzEntityProvider::validate_schema].
     fn schema(&self) -> Option<&Schema> {
         None
     }
@@ -88,6 +118,8 @@ impl PolicyStore {
 
         let schema = Schema::from_json_str(schema_json)
             .map_err(|e| AuthzError::SchemaParse(format!("{e:?}")))?;
+
+        validate_policies(&policy_set, &schema)?;
 
         Ok(Self {
             policy_set,
@@ -240,7 +272,7 @@ mod authz_store_tests {
         // -> None` mutation. The trait default body returns `None`,
         // but `PolicyStore` overrides with `Some(&self.schema)`. The
         // mutation collapses the override back to the default; this
-        // would silently disable schema-driven `validate_against_schema`
+        // would silently disable schema-driven `validate_schema`
         // checks at startup.
         let store = build_store();
         assert!(

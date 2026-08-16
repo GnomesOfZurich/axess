@@ -260,7 +260,7 @@ fn session_config_accepts_valid() {
     let config = SessionConfig::builder()
         .ttl(std::time::Duration::from_secs(3600))
         .build();
-    assert_eq!(config.ttl, std::time::Duration::from_secs(3600));
+    assert_eq!(config.ttl(), std::time::Duration::from_secs(3600));
 }
 
 // ── MemorySessionStore auto-purge ──────────────────────────────────────────

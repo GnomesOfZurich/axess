@@ -5,6 +5,7 @@ use crate::{
     web::{auth, protected},
 };
 use axess::authn::AuthnService;
+use axess::csrf::{CsrfConfig, CsrfLayer};
 use axess::session::SessionCrypto;
 use axess::{
     AuthSession, AuthnMetrics, CompositeHealthCheck, KeyExtractor, RateLimitConfig, RateLimitLayer,
@@ -107,6 +108,16 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         .with_ttl(Duration::from_secs(86400))
         .with_secure(false); // Allow HTTP in local dev; set true behind TLS in prod.
 
+    // CSRF layer: signed double-submit cookie bound to the session id.
+    // Uses a distinct HMAC key from the session layer (a compromise of one
+    // key should not compromise the other). Sits INSIDE the session layer
+    // so its handler runs after `SessionLayer` has injected the session
+    // handle into the request extension. Set `secure(false)` here for
+    // local HTTP dev; leave the default (`true`) behind TLS.
+    let mut csrf_key = [0u8; 32];
+    SystemRng.fill_bytes(&mut csrf_key);
+    let csrf_layer = CsrfLayer::new(CsrfConfig::new(csrf_key).secure(false));
+
     let metrics = Arc::new(AppMetrics::new());
 
     // Rate limiting: 10 requests per minute per IP on authentication endpoints.
@@ -159,6 +170,11 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .with_state(state)
+        // Layer order: CSRF inner, session outer. `session_layer` runs
+        // FIRST on request entry (injecting the session handle) so that
+        // `csrf_layer` (running SECOND) sees the handle and can bind
+        // tokens to the current session id. See CsrfLayer's module docs.
+        .layer(csrf_layer)
         .layer(session_layer);
 
     (router, session_store)

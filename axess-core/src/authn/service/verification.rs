@@ -168,8 +168,12 @@ pub(crate) fn verify_credential(
                 Some(counter) => {
                     // Advance counter past the matched value to prevent reuse.
                     // Reset attempt_count for the new counter window.
+                    // `saturating_add` matches the failure path above; a
+                    // counter at `u64::MAX` (18e18 verifications) sticks
+                    // rather than wraps back to zero, keeping the
+                    // never-decreases invariant that anti-reuse relies on.
                     let mut updated = cfg.clone();
-                    updated.counter = counter + 1;
+                    updated.counter = counter.saturating_add(1);
                     updated.attempt_count = 0;
                     VerifyOutcome::PassWithUpdate(FactorConfig::Hotp(updated))
                 }
@@ -230,7 +234,22 @@ pub(crate) fn verify_credential(
         }
 
         (FactorCredential::Fido2Assertion(_), FactorConfig::Fido2(_), FactorKind::Fido2) => {
-            // FIDO2 is a placeholder; always fail until implemented.
+            // Defensive fail-closed for `#[cfg(not(feature = "fido2"))]` builds.
+            //
+            // With the `fido2` feature ON, this arm is unreachable in normal
+            // flows: `service::login::verify_factor` short-circuits
+            // `FactorKind::Fido2` to `verify_fido2_factor` BEFORE ever calling
+            // `verify_credential`. See `service/login.rs` — the
+            // `#[cfg(feature = "fido2")]` branch dispatches to
+            // `Fido2Service::verify_fido2_factor` and returns.
+            //
+            // With the feature OFF, that short-circuit is compiled out, but
+            // `FactorKind::Fido2` / `FactorConfig::Fido2` /
+            // `FactorCredential::Fido2Assertion` variants still exist (they
+            // are not feature-gated on the enum surface). A caller who
+            // constructs one and dispatches through `verify_credential`
+            // reaches this arm; `Fail` is the correct answer because no
+            // WebAuthn verifier is available in the build.
             VerifyOutcome::Fail
         }
 

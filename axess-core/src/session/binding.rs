@@ -36,7 +36,9 @@
 //! User-Agent with IP subnet or TLS channel binding).
 
 use axum::{body::Body, http::Request};
+#[cfg(test)]
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(test)]
 use hmac::Mac;
 
 /// Extracts a binding value from a request for session-to-client binding.
@@ -84,8 +86,20 @@ pub trait SessionBinding: Send + Sync + 'static {
 
 /// Compute the HMAC-SHA256 fingerprint used for storage and comparison.
 ///
-/// Keyed with the session signing key so that an attacker who reads the session
-/// data from the store cannot recompute a valid fingerprint without the key.
+/// Keyed with the session signing key so that an attacker who reads
+/// the session data from the store cannot recompute a valid
+/// fingerprint without the key.
+///
+/// # Test-only
+///
+/// Production callers reach the fingerprint pair through
+/// [`SigningKeyRing::compute_binding_fingerprints`](crate::session::layer::signing::SigningKeyRing::compute_binding_fingerprints),
+/// which computes both the current-key and (optional) previous-key
+/// values in one pass for rotation support. This standalone helper is
+/// retained under `#[cfg(test)]` so the binding-level determinism,
+/// material-sensitivity, and key-sensitivity properties can be
+/// exercised without a full `SigningKeyRing` fixture.
+#[cfg(test)]
 pub(crate) fn compute_fingerprint(
     binding: &dyn SessionBinding,
     req: &Request<Body>,

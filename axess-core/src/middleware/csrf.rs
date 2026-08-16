@@ -3,9 +3,26 @@
 //! Implements the **signed double-submit cookie** pattern: the server issues
 //! a token bound to the session id via HMAC and the client must echo it back
 //! on every state-changing request (POST/PUT/PATCH/DELETE) either as the
-//! `X-CSRF-Token` header (AJAX) or the `_csrf` form field (HTML forms). The
-//! cookie itself is sent automatically by the browser, but cannot be read or
+//! `X-CSRF-Token` header (AJAX) or the `_csrf` form field on
+//! `application/x-www-form-urlencoded` bodies (HTML forms). The cookie
+//! itself is sent automatically by the browser, but cannot be read or
 //! forged by cross-origin code thanks to the same-origin policy.
+//!
+//! `multipart/form-data` bodies (file uploads) are NOT scanned for the
+//! form field — extracting one field would parse the whole upload. Use
+//! the header path for multipart. Field name and buffer cap are
+//! configurable via [`CsrfConfig::form_field_name`](crate::middleware::csrf::CsrfConfig::form_field_name)
+//! and [`CsrfConfig::form_body_limit`](crate::middleware::csrf::CsrfConfig::form_body_limit)
+//! (default 64 KiB); requests that exceed the cap fail closed.
+//!
+//! Optional Origin/Referer validation via
+//! [`CsrfConfig::require_origin`](crate::middleware::csrf::CsrfConfig::require_origin)
+//! adds a second gate: state-changing requests must present an
+//! `Origin` (or `Referer`-derived) matching one of the configured
+//! allowed origins. Both the token check and the Origin check must
+//! pass. Off by default — enabling it rejects bearer-token clients
+//! (native mobile, server-to-server) that hit the same routes without
+//! an `Origin` header.
 //!
 //! The token is `HMAC(signing_key, nonce || session_id)`, so it is bound to
 //! the session that was current when it was minted: a token minted under one
@@ -62,6 +79,17 @@
 //! token is bound to the session id, a client that caches the token across a
 //! session change (e.g. login, which regenerates the session) must re-read
 //! it afterwards or its first post-login state-changing request will 403.
+//!
+//! **Rotation-mid-request footgun.** The token in the request extension
+//! is bound to the session id observed at request entry. If the handler
+//! both (a) reads `CsrfToken` from the extensions to embed in a body
+//! rendered on the same response AND (b) rotates the session
+//! (e.g. `handle.rotate_id()` after login), the response `Set-Cookie`
+//! ships a *different* token bound to the post-rotation id; the
+//! embedded value silently mismatches and the client's next
+//! state-changing request 403s. Handlers that rotate MUST redirect
+//! (302) rather than render inline, or re-read the token from the
+//! post-rotation `SessionHandle` before embedding.
 
 use axess_rng::{SecureRng, SystemRng};
 use axum::{
@@ -77,6 +105,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
+use url::Url;
 
 use crate::session::layer::SessionHandle;
 
@@ -85,6 +114,15 @@ pub const DEFAULT_CSRF_COOKIE: &str = "axess.csrf";
 
 /// Default header name for the CSRF token on AJAX requests.
 pub const DEFAULT_CSRF_HEADER: &str = "x-csrf-token";
+
+/// Default form-field name for the CSRF token on HTML form submissions.
+pub const DEFAULT_CSRF_FORM_FIELD: &str = "_csrf";
+
+/// Default cap on buffered `application/x-www-form-urlencoded` bodies
+/// during CSRF form-field extraction. Requests declaring a Content-Length
+/// larger than this fail closed (413-shaped 403); requests without a
+/// declared length are read up to this cap and then aborted.
+pub const DEFAULT_CSRF_FORM_BODY_LIMIT: usize = 64 * 1024;
 
 /// Number of random bytes in the token nonce. 32 bytes = 256 bits.
 const TOKEN_NONCE_BYTES: usize = 32;
@@ -97,9 +135,15 @@ pub struct CsrfConfig {
     signing_key: Arc<[u8; 32]>,
     cookie_name: Arc<str>,
     header_name: Arc<str>,
+    form_field_name: Arc<str>,
+    form_body_limit: usize,
     secure: bool,
     same_site: tower_cookies::cookie::SameSite,
     path: Arc<str>,
+    /// If populated, state-changing requests must present an `Origin`
+    /// (or `Referer`-derived origin) matching one of these exact strings
+    /// in addition to passing the token check.
+    allowed_origins: Arc<[Arc<str>]>,
 }
 
 impl CsrfConfig {
@@ -111,9 +155,12 @@ impl CsrfConfig {
             signing_key: Arc::new(signing_key),
             cookie_name: DEFAULT_CSRF_COOKIE.into(),
             header_name: DEFAULT_CSRF_HEADER.into(),
+            form_field_name: DEFAULT_CSRF_FORM_FIELD.into(),
+            form_body_limit: DEFAULT_CSRF_FORM_BODY_LIMIT,
             secure: true,
             same_site: tower_cookies::cookie::SameSite::Lax,
             path: "/".into(),
+            allowed_origins: Arc::from(Vec::new()),
         }
     }
 
@@ -129,6 +176,22 @@ impl CsrfConfig {
         self
     }
 
+    /// Override the form-field name used when the request is
+    /// `application/x-www-form-urlencoded` and no header token is
+    /// present (default `_csrf`).
+    pub fn form_field_name(mut self, name: impl Into<Arc<str>>) -> Self {
+        self.form_field_name = name.into();
+        self
+    }
+
+    /// Cap on bytes buffered when scanning a form-urlencoded body for
+    /// the token field. Requests larger than this fail closed rather
+    /// than let a hostile client exhaust memory (default 64 KiB).
+    pub fn form_body_limit(mut self, limit: usize) -> Self {
+        self.form_body_limit = limit;
+        self
+    }
+
     /// Set the cookie `Secure` attribute (default: true). Set to `false`
     /// only in local development over HTTP.
     pub fn secure(mut self, secure: bool) -> Self {
@@ -139,6 +202,60 @@ impl CsrfConfig {
     /// Set the cookie `SameSite` attribute. Default `Lax`.
     pub fn same_site(mut self, same_site: tower_cookies::cookie::SameSite) -> Self {
         self.same_site = same_site;
+        self
+    }
+
+    /// Enable Origin/Referer validation as defence in depth.
+    ///
+    /// When configured, state-changing requests must present an `Origin`
+    /// header (or, if `Origin` is absent, a `Referer` whose origin
+    /// component) matches one of `origins` — in addition to passing the
+    /// signed-double-submit token check. Both checks must pass.
+    ///
+    /// Off by default: adopters serving bearer-token clients (native
+    /// mobile apps, server-to-server RPC) on the same routes would see
+    /// legitimate `Origin`-less requests rejected. Enable only for
+    /// browser-scoped routers.
+    ///
+    /// `origins` are matched against the browser's `Origin` / `Referer`
+    /// after both sides are canonicalized via [`url::Url::origin`]
+    /// (scheme + host case-folded, `userinfo@` stripped, default port
+    /// dropped for `http`/`https`). Adopters can therefore pass any
+    /// RFC-6454-equivalent form. Wildcard / regex matching is deliberately
+    /// not supported; if several subdomains are legitimate, list them
+    /// explicitly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `origins` yielded at least one input but every entry
+    /// failed to canonicalize (missing scheme, opaque-origin scheme,
+    /// unparseable URL). Silently dropping every entry would leave
+    /// `allowed_origins` empty, which the request-time gate treats as
+    /// "Origin check disabled" — the adopter would think Origin
+    /// validation was on when it was actually off. Fail-fast at
+    /// construction matches `SessionConfigBuilder::build`'s discipline
+    /// for the same misconfig class.
+    pub fn require_origin(mut self, origins: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
+        let mut normalized: Vec<Arc<str>> = Vec::new();
+        let mut supplied_any = false;
+        let mut rejected: Vec<String> = Vec::new();
+        for raw in origins {
+            supplied_any = true;
+            let raw = raw.as_ref();
+            match normalize_origin(raw) {
+                Some(n) => normalized.push(Arc::from(n)),
+                None => rejected.push(raw.to_owned()),
+            }
+        }
+        assert!(
+            !(supplied_any && normalized.is_empty()),
+            "CsrfConfig::require_origin: all {} supplied origin(s) failed to canonicalize \
+             (missing scheme, opaque-origin scheme, or unparseable URL): {:?}. \
+             Leaving the list empty would silently disable the Origin/Referer gate.",
+            rejected.len(),
+            rejected,
+        );
+        self.allowed_origins = normalized.into();
         self
     }
 }
@@ -224,7 +341,7 @@ where
             // the read lock.
             let session_handle = req.extensions().get::<SessionHandle>().cloned();
             let session_id = match &session_handle {
-                Some(handle) => Some(handle.0.read().await.id.to_string()),
+                Some(handle) => Some(handle.0.read().await.id),
                 None => None,
             };
 
@@ -236,7 +353,7 @@ where
                 // binding, so a mis-ordered layer stack (CsrfLayer outside the
                 // session layer) is rejected rather than silently validating
                 // an unbound token.
-                let Some(session_id) = session_id.as_deref() else {
+                let Some(session_id) = session_id else {
                     tracing::warn!(
                         method = %method,
                         path = %req.uri().path(),
@@ -245,12 +362,44 @@ where
                     );
                     return Ok((StatusCode::FORBIDDEN, "CSRF validation failed").into_response());
                 };
-                let presented = extract_token_from_request(&req, &config);
+
+                // Origin/Referer defence in depth, if configured. Runs
+                // BEFORE the body-buffering path so a mismatched Origin
+                // never triggers form-body extraction.
+                if !config.allowed_origins.is_empty()
+                    && !origin_matches_allowed(&req, &config.allowed_origins)
+                {
+                    tracing::warn!(
+                        method = %method,
+                        path = %req.uri().path(),
+                        "csrf: Origin/Referer validation failed"
+                    );
+                    return Ok((StatusCode::FORBIDDEN, "CSRF validation failed").into_response());
+                }
+
+                // Extract the presented token, possibly by buffering a
+                // form-urlencoded body. `req` may be re-created with its
+                // body restored.
+                let (extracted, req_after) = match extract_presented_token(req, &config).await {
+                    Ok(pair) => pair,
+                    Err(reason) => {
+                        tracing::warn!(
+                            method = %method,
+                            reason = %reason,
+                            "csrf: request rejected during token extraction"
+                        );
+                        return Ok(
+                            (StatusCode::FORBIDDEN, "CSRF validation failed").into_response()
+                        );
+                    }
+                };
+                req = req_after;
+                let presented = extracted;
                 let cookie_present = cookie_token.as_deref();
                 if !validate_pair(
                     cookie_present,
                     presented.as_deref(),
-                    session_id,
+                    session_id.as_bytes(),
                     &config.signing_key,
                 ) {
                     tracing::warn!(
@@ -271,9 +420,11 @@ where
             // session id. A token can only be minted when a session id
             // is present to bind it to; without one we leave the client
             // tokenless rather than issue an unbound token.
-            let provisional_mint = match (&cookie_token, session_id.as_deref()) {
+            let provisional_mint = match (&cookie_token, session_id.as_ref()) {
                 (Some(existing), _) if !existing.is_empty() => None,
-                (_, Some(sid_at_entry)) => Some(mint_token(sid_at_entry, &config.signing_key)),
+                (_, Some(sid_at_entry)) => {
+                    Some(mint_token(sid_at_entry.as_bytes(), &config.signing_key))
+                }
                 (_, None) => None,
             };
             let extension_token = provisional_mint
@@ -295,7 +446,7 @@ where
             // effective (post-handler) session id, mint a fresh one and
             // ship it as Set-Cookie on this response.
             let session_id_after = match &session_handle {
-                Some(handle) => Some(handle.0.read().await.id.to_string()),
+                Some(handle) => Some(handle.0.read().await.id),
                 None => None,
             };
             // The token the client would present next request: either the
@@ -306,9 +457,9 @@ where
                 .as_deref()
                 .or(cookie_token.as_deref())
                 .filter(|t| !t.is_empty());
-            let token_to_set = match (effective_cookie, session_id_after.as_deref()) {
+            let token_to_set = match (effective_cookie, session_id_after.as_ref()) {
                 (Some(existing), Some(sid_after))
-                    if validate_token(existing, sid_after, &config.signing_key) =>
+                    if validate_token(existing, sid_after.as_bytes(), &config.signing_key) =>
                 {
                     // Cookie still binds to the post-handler session id
                     // (usually because the handler didn't rotate). Mint
@@ -320,7 +471,7 @@ where
                     // no longer binds to the current session id (typical
                     // after `session.regenerate()`). Mint fresh so the
                     // client's next request presents a valid pair.
-                    Some(mint_token(sid_after, &config.signing_key))
+                    Some(mint_token(sid_after.as_bytes(), &config.signing_key))
                 }
                 (_, None) => None,
             };
@@ -355,22 +506,128 @@ fn extract_cookie_token(req: &Request<Body>, cookie_name: &str) -> Option<String
     crate::cookies::extract_named_cookie(req.headers(), cookie_name, MAX_COOKIE_VALUE_BYTES)
 }
 
-fn extract_token_from_request(req: &Request<Body>, config: &CsrfConfig) -> Option<String> {
-    // Form-field extraction would require buffering the body, which would
-    // make the middleware unfriendly to streaming uploads. Applications
-    // that need form-field CSRF should set the token in the
-    // `X-CSRF-Token` header instead (e.g., via a hidden input read by
-    // JavaScript). This matches the OWASP CSRF cheat sheet's recommended
-    // approach for SPAs.
-    let value = req.headers().get(config.header_name.as_ref())?;
-    let s = value.to_str().ok()?;
-    if s.is_empty() {
-        return None;
+/// Return the presented CSRF token and the (possibly-rebuilt) request.
+///
+/// Extraction order:
+///
+/// 1. Header (`config.header_name`) — no body cost. Standard for AJAX.
+/// 2. Form field (`config.form_field_name`) — only if the request is
+///    `application/x-www-form-urlencoded`. Buffers the body up to
+///    `config.form_body_limit` bytes, parses for the field, then restores
+///    the (in-memory) body into the request so downstream handlers still
+///    read the form normally.
+///
+/// Multipart form data (`multipart/form-data`) is deliberately NOT
+/// supported: extracting one field would parse the entire upload,
+/// which is the wrong tradeoff for CSRF middleware. JS-driven multipart
+/// clients should set the header instead.
+///
+/// Returns `Err(reason)` when the request declares (or streams) a
+/// body larger than `form_body_limit` on the form-field path — the
+/// caller fails the request closed rather than let a hostile client
+/// exhaust memory.
+async fn extract_presented_token(
+    req: Request<Body>,
+    config: &CsrfConfig,
+) -> Result<(Option<String>, Request<Body>), &'static str> {
+    // Header path first; if present, the body stays untouched.
+    if let Some(value) = req.headers().get(config.header_name.as_ref())
+        && let Ok(s) = value.to_str()
+        && !s.is_empty()
+    {
+        return Ok((Some(s.to_string()), req));
     }
-    Some(s.to_string())
+
+    // Form-field path is scoped to state-changing requests carrying an
+    // urlencoded body. Anything else: no form field to look at, return
+    // `None` with the request untouched.
+    let is_urlencoded = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let base = s.split(';').next().unwrap_or("").trim();
+            base.eq_ignore_ascii_case("application/x-www-form-urlencoded")
+        })
+        .unwrap_or(false);
+    if !is_urlencoded {
+        return Ok((None, req));
+    }
+
+    // Reject up front if the client declared a body larger than the cap.
+    if let Some(declared) = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        && declared > config.form_body_limit
+    {
+        return Err("form body exceeds csrf buffer cap");
+    }
+
+    // Split, buffer, parse, restore. `axum::body::to_bytes` enforces
+    // the cap even for chunked bodies with no Content-Length.
+    let (parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, config.form_body_limit).await {
+        Ok(b) => b,
+        Err(_) => return Err("form body exceeds csrf buffer cap"),
+    };
+    let field = form_urlencoded::parse(&bytes)
+        .find(|(k, _)| k.as_ref() == config.form_field_name.as_ref())
+        .map(|(_, v)| v.into_owned())
+        .filter(|s| !s.is_empty());
+    let restored = Request::from_parts(parts, Body::from(bytes));
+    Ok((field, restored))
 }
 
-fn mint_token(session_id: &str, signing_key: &[u8; 32]) -> String {
+/// Canonicalize an origin string ("scheme://host[:port]") to a form suitable
+/// for exact-match comparison against the allow-list.
+///
+/// Delegates to [`url::Url::origin`] so the comparison honours RFC 6454:
+/// scheme + host are compared case-insensitively, `userinfo@` is stripped,
+/// and the default port is dropped for `http` / `https`. Tuple origins
+/// serialize to `"scheme://host[:port]"`; opaque origins (`"null"`,
+/// non-tuple-origin schemes) are rejected.
+fn normalize_origin(raw: &str) -> Option<String> {
+    let parsed = Url::parse(raw).ok()?;
+    match parsed.origin() {
+        url::Origin::Tuple(..) => Some(parsed.origin().ascii_serialization()),
+        url::Origin::Opaque(_) => None,
+    }
+}
+
+/// Compare the request's `Origin` (fallback `Referer`-derived) origin
+/// against the allowed list. Any missing / malformed / non-matching
+/// case fails closed.
+fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) -> bool {
+    // Origin first: browsers set it on cross-origin state-changing
+    // requests. `Origin: null` (opaque origin, cross-origin redirect,
+    // sandboxed iframe) is normalized to `None` and treated as failure.
+    if let Some(header) = req.headers().get(header::ORIGIN) {
+        let Ok(s) = header.to_str() else { return false };
+        let Some(origin) = normalize_origin(s) else {
+            return false;
+        };
+        return allowed.iter().any(|a| a.as_ref() == origin);
+    }
+
+    // Fall back to Referer: some browsers omit Origin on same-origin
+    // POSTs. Extract the origin component and match. If Referer is
+    // absent AND Origin was absent, fail closed (attacker can strip
+    // both).
+    let Some(referer) = req.headers().get(header::REFERER) else {
+        return false;
+    };
+    let Ok(referer_str) = referer.to_str() else {
+        return false;
+    };
+    let Some(origin) = normalize_origin(referer_str) else {
+        return false;
+    };
+    allowed.iter().any(|a| a.as_ref() == origin)
+}
+
+fn mint_token(session_id: &[u8], signing_key: &[u8; 32]) -> String {
     let mut nonce = [0u8; TOKEN_NONCE_BYTES];
     SystemRng.fill_bytes(&mut nonce);
     let tag = compute_tag(&nonce, session_id, signing_key);
@@ -380,7 +637,7 @@ fn mint_token(session_id: &str, signing_key: &[u8; 32]) -> String {
     URL_SAFE_NO_PAD.encode(&combined)
 }
 
-fn compute_tag(nonce: &[u8], session_id: &str, signing_key: &[u8; 32]) -> Vec<u8> {
+fn compute_tag(nonce: &[u8], session_id: &[u8], signing_key: &[u8; 32]) -> [u8; 32] {
     // MAC over `nonce || session_id`. Binding the session id into the tag is
     // what makes a token minted under one session fail validation under
     // another: the nonce is echoed in the token but the id is not, so an
@@ -389,11 +646,11 @@ fn compute_tag(nonce: &[u8], session_id: &str, signing_key: &[u8; 32]) -> Vec<u8
     // concatenation is unambiguous and needs no separator.
     let mut mac = crate::hmac::new_signer(signing_key);
     mac.update(nonce);
-    mac.update(session_id.as_bytes());
-    mac.finalize().into_bytes().to_vec()
+    mac.update(session_id);
+    mac.finalize().into_bytes().into()
 }
 
-fn validate_token(token: &str, session_id: &str, signing_key: &[u8; 32]) -> bool {
+fn validate_token(token: &str, session_id: &[u8], signing_key: &[u8; 32]) -> bool {
     let bytes = match URL_SAFE_NO_PAD.decode(token) {
         Ok(b) => b,
         Err(_) => return false,
@@ -403,13 +660,13 @@ fn validate_token(token: &str, session_id: &str, signing_key: &[u8; 32]) -> bool
     }
     let (nonce, tag) = bytes.split_at(TOKEN_NONCE_BYTES);
     let expected = compute_tag(nonce, session_id, signing_key);
-    expected.as_slice().ct_eq(tag).into()
+    expected.ct_eq(tag).into()
 }
 
 fn validate_pair(
     cookie_token: Option<&str>,
     presented: Option<&str>,
-    session_id: &str,
+    session_id: &[u8],
     signing_key: &[u8; 32],
 ) -> bool {
     let (Some(c), Some(p)) = (cookie_token, presented) else {
@@ -443,9 +700,9 @@ mod tests {
     use super::*;
 
     /// A stand-in session id for the crypto-level tests. Real ids are
-    /// `SessionId` strings; the binding only cares that the same string is
-    /// threaded through mint and validate.
-    const SID: &str = "session-a";
+    /// `SessionId::as_bytes()` slices; the binding only cares that the same
+    /// bytes are threaded through mint and validate.
+    const SID: &[u8] = b"session-a";
 
     /// Build a `SessionHandle` carrying a deterministic session id derived
     /// from `seed`, matching the extension the session layer injects. Two
@@ -512,25 +769,25 @@ mod tests {
     #[test]
     fn token_bound_to_session_rejects_other_session() {
         let key = [7u8; 32];
-        let token = mint_token("session-A", &key);
+        let token = mint_token(b"session-A".as_slice(), &key);
         // Same session: accepted.
         assert!(
-            validate_token(&token, "session-A", &key),
+            validate_token(&token, b"session-A".as_slice(), &key),
             "token must validate under the session it was minted for"
         );
         // Different session: rejected even though key and token bytes are
         // identical.
         assert!(
-            !validate_token(&token, "session-B", &key),
+            !validate_token(&token, b"session-B".as_slice(), &key),
             "token minted under session A must NOT validate under session B"
         );
         // Same property through the double-submit path.
         assert!(
-            validate_pair(Some(&token), Some(&token), "session-A", &key),
+            validate_pair(Some(&token), Some(&token), b"session-A".as_slice(), &key),
             "cookie==header token must validate under its own session"
         );
         assert!(
-            !validate_pair(Some(&token), Some(&token), "session-B", &key),
+            !validate_pair(Some(&token), Some(&token), b"session-B".as_slice(), &key),
             "cookie==header token must NOT validate under a different session"
         );
     }
@@ -662,14 +919,14 @@ mod tests {
         assert_eq!(empty.as_str(), "");
     }
 
-    /// `extract_token_from_request` reads the configured header
-    /// and returns its value as `Option<String>`. Pins three body
+    /// `extract_presented_token` reads the configured header first and
+    /// returns its value as `Option<String>`. Pins three body
     /// replacements: `-> None` (would break header-based double-submit
     /// for every request), `Some(String::new())` (would compare the
     /// presented token as empty, defeating ct_eq match), and
     /// `Some("xyzzy")` (would brick header extraction to a constant).
-    #[test]
-    fn extract_token_from_request_returns_header_value() {
+    #[tokio::test]
+    async fn extract_presented_token_returns_header_value() {
         use axum::http::Request;
 
         let key = [9u8; 32];
@@ -680,29 +937,265 @@ mod tests {
             .header(config.header_name.as_ref(), "presented-csrf-value")
             .body(Body::empty())
             .unwrap();
+        let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
         assert_eq!(
-            extract_token_from_request(&req, &config),
+            extracted,
             Some("presented-csrf-value".to_string()),
             "must return the exact header value, not None / empty / 'xyzzy'"
         );
 
-        // Header absent → None.
+        // Header absent → None (and no urlencoded body to fall back to).
         let req = Request::builder().body(Body::empty()).unwrap();
+        let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
         assert!(
-            extract_token_from_request(&req, &config).is_none(),
+            extracted.is_none(),
             "missing header must return None, not Some(...)"
         );
 
-        // Empty header value → None (the function explicitly normalises
-        // empty → None so callers don't have to recheck).
+        // Empty header value → falls through to form-field path (empty
+        // header is treated as absent). No form body, so overall None.
         let req = Request::builder()
             .header(config.header_name.as_ref(), "")
             .body(Body::empty())
             .unwrap();
-        assert!(
-            extract_token_from_request(&req, &config).is_none(),
-            "empty header must return None"
+        let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
+        assert!(extracted.is_none(), "empty header must return None");
+    }
+
+    /// Form-field fallback: when the header is absent and the request
+    /// carries an `application/x-www-form-urlencoded` body containing
+    /// `_csrf=<token>`, the extractor returns the token AND restores
+    /// the body so the handler can still parse the form.
+    #[tokio::test]
+    async fn extract_presented_token_reads_form_field_and_restores_body() {
+        use axum::http::Request;
+        use http_body_util::BodyExt;
+
+        let config = CsrfConfig::new([9u8; 32]);
+        let body_str = "username=alice&_csrf=form-token-value&password=x";
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(Body::from(body_str))
+            .unwrap();
+        let (extracted, restored) = extract_presented_token(req, &config).await.unwrap();
+        assert_eq!(
+            extracted,
+            Some("form-token-value".to_string()),
+            "must extract the _csrf field from the urlencoded body"
         );
+        let bytes = restored.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &bytes[..],
+            body_str.as_bytes(),
+            "body must be restored verbatim so handlers can still parse the form"
+        );
+    }
+
+    /// Multipart bodies deliberately do NOT trigger form-field
+    /// extraction — no body is buffered and no field is returned.
+    #[tokio::test]
+    async fn extract_presented_token_skips_multipart_body() {
+        use axum::http::Request;
+
+        let config = CsrfConfig::new([9u8; 32]);
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "multipart/form-data; boundary=xxx",
+            )
+            .body(Body::from(b"unused".as_slice()))
+            .unwrap();
+        let (extracted, _req) = extract_presented_token(req, &config).await.unwrap();
+        assert!(
+            extracted.is_none(),
+            "multipart Content-Type must skip form-field extraction"
+        );
+    }
+
+    /// Bodies larger than `form_body_limit` fail closed. Ensures a
+    /// hostile client can't force axess to buffer a gigabyte of form
+    /// data hunting for `_csrf`.
+    #[tokio::test]
+    async fn extract_presented_token_rejects_oversized_body() {
+        use axum::http::Request;
+
+        let config = CsrfConfig::new([9u8; 32]).form_body_limit(64);
+        // Declared Content-Length above the cap.
+        let big_body = "a=".to_string() + &"x".repeat(500);
+        let req = Request::builder()
+            .method(axum::http::Method::POST)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header(axum::http::header::CONTENT_LENGTH, big_body.len())
+            .body(Body::from(big_body))
+            .unwrap();
+        let err = extract_presented_token(req, &config).await.unwrap_err();
+        assert!(
+            err.contains("cap"),
+            "oversized body must return a cap-related error, got {err:?}"
+        );
+    }
+
+    /// Origin allow-list matches the request's `Origin` header exactly.
+    #[test]
+    fn origin_matches_allowed_exact_origin() {
+        use axum::http::Request;
+
+        let allowed: Vec<Arc<str>> = vec!["https://app.example.com".into()];
+        let req = Request::builder()
+            .header(axum::http::header::ORIGIN, "https://app.example.com")
+            .body(Body::empty())
+            .unwrap();
+        assert!(origin_matches_allowed(&req, &allowed));
+
+        // Wrong scheme.
+        let req = Request::builder()
+            .header(axum::http::header::ORIGIN, "http://app.example.com")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!origin_matches_allowed(&req, &allowed));
+
+        // Wrong host.
+        let req = Request::builder()
+            .header(axum::http::header::ORIGIN, "https://evil.example.com")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!origin_matches_allowed(&req, &allowed));
+    }
+
+    /// `Origin: null` (cross-origin redirect, opaque origin, sandboxed
+    /// iframe) is treated as failure — never as a match.
+    #[test]
+    fn origin_matches_allowed_rejects_null_origin() {
+        use axum::http::Request;
+
+        let allowed: Vec<Arc<str>> = vec!["https://app.example.com".into()];
+        let req = Request::builder()
+            .header(axum::http::header::ORIGIN, "null")
+            .body(Body::empty())
+            .unwrap();
+        assert!(
+            !origin_matches_allowed(&req, &allowed),
+            "'Origin: null' must be treated as failure"
+        );
+    }
+
+    /// Referer fallback when Origin is absent: derive origin from URL,
+    /// match against allow-list.
+    #[test]
+    fn origin_matches_allowed_falls_back_to_referer() {
+        use axum::http::Request;
+
+        let allowed: Vec<Arc<str>> = vec!["https://app.example.com".into()];
+        let req = Request::builder()
+            .header(
+                axum::http::header::REFERER,
+                "https://app.example.com/login?next=/dashboard",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert!(
+            origin_matches_allowed(&req, &allowed),
+            "Referer with matching origin component must match when Origin is absent"
+        );
+
+        // Referer from a disallowed origin.
+        let req = Request::builder()
+            .header(axum::http::header::REFERER, "https://evil.example.com/pwn")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!origin_matches_allowed(&req, &allowed));
+    }
+
+    /// Both Origin and Referer absent must fail closed — attackers can
+    /// strip both, and the token check alone would otherwise carry the
+    /// day.
+    #[test]
+    fn origin_matches_allowed_fails_when_both_headers_absent() {
+        use axum::http::Request;
+
+        let allowed: Vec<Arc<str>> = vec!["https://app.example.com".into()];
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert!(!origin_matches_allowed(&req, &allowed));
+    }
+
+    /// Origin comparison is case-insensitive on scheme and host per RFC
+    /// 6454 §4. A pre-normalization bug would let a raw-string comparison
+    /// treat `HTTPS://APP.example.com` as distinct from the allow-list
+    /// entry and admit it under other bypass paths.
+    #[test]
+    fn origin_matches_allowed_is_case_insensitive() {
+        use axum::http::Request;
+
+        let allowed: Vec<Arc<str>> = vec!["https://app.example.com".into()];
+        let req = Request::builder()
+            .header(axum::http::header::ORIGIN, "HTTPS://APP.EXAMPLE.COM")
+            .body(Body::empty())
+            .unwrap();
+        assert!(
+            origin_matches_allowed(&req, &allowed),
+            "scheme+host comparison must be case-insensitive"
+        );
+    }
+
+    /// `userinfo@` in a Referer must not survive origin extraction —
+    /// otherwise `https://attacker@app.example.com/…` would mismatch the
+    /// allow-list even though the browser treats it as same-origin.
+    #[test]
+    fn origin_matches_allowed_strips_userinfo_from_referer() {
+        use axum::http::Request;
+
+        let allowed: Vec<Arc<str>> = vec!["https://app.example.com".into()];
+        let req = Request::builder()
+            .header(
+                axum::http::header::REFERER,
+                "https://attacker@app.example.com/",
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert!(
+            origin_matches_allowed(&req, &allowed),
+            "userinfo must be stripped before origin comparison"
+        );
+    }
+
+    /// Adopters passing the default port explicitly must still match a
+    /// browser-sent `Origin` (which never carries default ports).
+    #[test]
+    fn require_origin_normalizes_default_port() {
+        let config = CsrfConfig::new([0u8; 32]).require_origin(["https://app.example.com:443"]);
+        assert_eq!(
+            config.allowed_origins.as_ref(),
+            &[Arc::<str>::from("https://app.example.com")]
+        );
+    }
+
+    /// Passing origins where every entry fails to canonicalize must
+    /// panic: silently emptying `allowed_origins` would turn the
+    /// runtime `!allowed_origins.is_empty() && ...` gate into a no-op,
+    /// leaving the adopter thinking Origin validation was on when it
+    /// was actually off. This mirrors `SessionConfigBuilder::build`'s
+    /// fail-fast discipline for `__Host-` misconfig.
+    #[test]
+    #[should_panic(expected = "all 2 supplied origin(s) failed to canonicalize")]
+    fn require_origin_panics_when_all_inputs_are_malformed() {
+        let _ = CsrfConfig::new([0u8; 32]).require_origin(["not-a-url", "javascript:alert(1)"]);
+    }
+
+    /// The empty iterator is legitimate ("no Origin gate configured")
+    /// and must NOT panic — that's the default state.
+    #[test]
+    fn require_origin_with_no_inputs_stays_disabled() {
+        let empty: [&str; 0] = [];
+        let config = CsrfConfig::new([0u8; 32]).require_origin(empty);
+        assert!(config.allowed_origins.is_empty());
     }
 
     /// Drives `CsrfService` end-to-end via the full tower
@@ -961,7 +1454,7 @@ mod tests {
         let service = CsrfLayer::new(config.clone()).layer(echo_body);
 
         // A token that is internally valid for *some* session.
-        let token = mint_token("some-session", &key);
+        let token = mint_token(b"some-session", &key);
 
         // POST with matching cookie+header but no session handle in the
         // extensions → fail closed with 403.
@@ -1006,7 +1499,7 @@ mod tests {
         // regenerate: the cookie is stale relative to the session id
         // that the request now carries.
         let handle_a = session_handle(1);
-        let stale_token = mint_token("some-other-session", &key);
+        let stale_token = mint_token(b"some-other-session", &key);
 
         let req = Request::builder()
             .method(Method::GET)
@@ -1041,9 +1534,9 @@ mod tests {
 
         // The refreshed cookie must validate against session A (the id
         // on the handle at request time), not the stale binding.
-        let sid_a = handle_a.0.read().await.id.to_string();
+        let sid_a = handle_a.0.read().await.id;
         assert!(
-            validate_token(&refreshed, &sid_a, &key),
+            validate_token(&refreshed, sid_a.as_bytes(), &key),
             "refreshed cookie must be HMAC-bound to the current session id"
         );
     }
@@ -1077,8 +1570,8 @@ mod tests {
         let service = CsrfLayer::new(config.clone()).layer(rotating_body);
 
         let handle = session_handle(1);
-        let sid_before = handle.0.read().await.id.to_string();
-        let token_before = mint_token(&sid_before, &key);
+        let sid_before = handle.0.read().await.id;
+        let token_before = mint_token(sid_before.as_bytes(), &key);
 
         let req = Request::builder()
             .method(Method::GET)
@@ -1090,7 +1583,7 @@ mod tests {
         let resp = service.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
 
-        let sid_after = handle.0.read().await.id.to_string();
+        let sid_after = handle.0.read().await.id;
         assert_ne!(
             sid_before, sid_after,
             "test precondition: inner service rotated the session id"
@@ -1116,7 +1609,7 @@ mod tests {
             "refreshed cookie must differ from the pre-rotation token"
         );
         assert!(
-            validate_token(&refreshed, &sid_after, &key),
+            validate_token(&refreshed, sid_after.as_bytes(), &key),
             "refreshed cookie must bind to the post-rotation session id"
         );
     }

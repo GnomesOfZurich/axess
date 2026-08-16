@@ -246,8 +246,12 @@ where
                 // Load the EmailOtp config to get the destination and parameters.
                 let user_scope = AuthnScope::User { tenant_id, user_id };
                 let config = self
-                    .load_factor_with_fallback(&user_scope, &tenant_id, FactorKind::EmailOtp)
-                    .await?;
+                    .factors
+                    .resolve_factor(&user_scope, FactorKind::EmailOtp)
+                    .await
+                    .map_err(AuthnError::Store)?
+                    .ok_or(AuthnError::NoFlow)?
+                    .config;
 
                 // Take ownership of the inner cfg up front so we don't
                 // need a second destructure (which used to require an
@@ -316,8 +320,12 @@ where
                     // Load stored credentials.
                     let user_scope = AuthnScope::User { tenant_id, user_id };
                     let config = self
-                        .load_factor_with_fallback(&user_scope, &tenant_id, FactorKind::Fido2)
-                        .await?;
+                        .factors
+                        .resolve_factor(&user_scope, FactorKind::Fido2)
+                        .await
+                        .map_err(AuthnError::Store)?
+                        .ok_or(AuthnError::NoFlow)?
+                        .config;
 
                     let FactorConfig::Fido2(cfg) = &config else {
                         return Err(AuthnError::NoFlow);
@@ -396,11 +404,15 @@ where
 
         let current_kind = remaining.first().ok_or(AuthnError::NoFlow)?.clone();
 
-        // Load factor config; try User → Tenant → Global scope in order.
+        // Runtime resolution: User → Tenant → System, single-query in the store.
         let user_scope = AuthnScope::User { tenant_id, user_id };
         let config = self
-            .load_factor_with_fallback(&user_scope, &tenant_id, current_kind.clone())
-            .await?;
+            .factors
+            .resolve_factor(&user_scope, current_kind.clone())
+            .await
+            .map_err(AuthnError::Store)?
+            .ok_or(AuthnError::NoFlow)?
+            .config;
 
         // FIDO2 + LDAP have their own verification methods (different
         // ceremony shape, network call) and short-circuit with their

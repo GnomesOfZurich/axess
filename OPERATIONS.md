@@ -8,12 +8,24 @@ Session signing keys and encryption keys can be rotated without invalidating act
 
 ### Signing key rotation
 
-The signing key authenticates session cookies via HMAC-SHA256. Rotation requires a code change (new key), but `SessionLayer` does not support a previous signing key; rotating the signing key invalidates all active sessions.
+The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_key)`. HKDF-Expand derives two sub-keys from it: one for session-cookie HMAC and one for session-binding fingerprint HMAC. `SessionLayer` supports zero-downtime rotation via `with_previous_signing_key(old_master)`; sessions signed under the previous master transparently re-authenticate and their cookies + stored fingerprints are re-issued under the new master.
 
 **Procedure:**
-1. Generate a new 32-byte signing key in your secrets manager.
-2. Deploy the new key. All active sessions become invalid (users must re-authenticate).
-3. Schedule signing key rotation during low-traffic windows.
+1. Generate a new 32-byte signing master in your secrets manager.
+2. Deploy with both masters wired: new as current, old as previous.
+   ```rust
+   let layer = SessionLayer::new(store, new_master)
+       .with_previous_signing_key(old_master);
+   ```
+3. On every request, the layer tries current-master verification first; on mismatch it falls back to the previous master. Fallback matches trigger:
+   - A fresh `Set-Cookie` header signed under the current master.
+   - An update to the stored session fingerprint (computed under the current master) so the next request hits the fast path without falling back.
+4. Watch for the `"session cookie verified with previous (rotated) signing key"` and `"session fingerprint verified with previous (rotated) signing key"` `tracing::debug!` events to gauge migration progress.
+5. After one full session-TTL window (the longest a legit cookie signed under the old master can still be in flight), retire the previous slot — either drop the `with_previous_signing_key(...)` call from the deployment, or call `SessionLayer::remove_previous_signing_key()` on the freshly-built layer (same "mutate before cloning" contract). `SessionLayer::has_previous_signing_key()` returns `false` after that.
+
+**Operational rule — only one previous slot.** Plan rotations so at most one is in flight per session-TTL window. Rotating again while the previous slot is still populated overwrites it — the pre-first-rotation master falls out of the ring and its cookies fail both current and previous verification. This is the correct security behavior for emergency chained rotations (a compromised previous master must not remain valid) but it forces re-authentication for any session still holding a pre-first-rotation cookie. In the non-emergency case, wait one full session-TTL between rotations.
+
+**CSRF / adopter-derived sub-keys.** Sub-keys derived from the session master via `SessionLayer::derive_subkey(info)` (e.g. an adopter's own CSRF signing key) do NOT get rotation-aware verify-with-fallback for free. The returned bytes come from the CURRENT master only. Adopters that rotate through `derive_subkey` must maintain their own previous-key state and implement their own try-current-then-previous verification. axess's own CSRF layer takes an independent key and is unaffected.
 
 ### Encryption key rotation
 
@@ -190,7 +202,7 @@ The thresholds below are starting points for a single-region deployment serving 
 |--------|-----------|----------------|
 | `factor_failure / factor_attempt` (per factor kind) | `> 30%` for 15 min | Targeted factor probe (e.g. TOTP guessing) or a regression in the factor verification code. |
 | `rate_limit_rejected / (rate_limit_allowed + rate_limit_rejected)` | `> 5%` for 10 min | Either the rate limit is mis-tuned for legitimate traffic or an attacker is sustained-firing requests. |
-| `sid_map capacity reached; evicted oldest mapping` log | `> 1 / minute` | OAuth login throughput exceeds the 10 K-entry `sid_map` cap; back-channel logout precision degrades (some `sid` lookups will miss). Increase `MAX_SID_MAP_ENTRIES` or shorten the TTL. |
+| `sid_map capacity reached; evicted oldest mapping` log | `> 1 / minute` | OAuth login throughput exceeds the configured `sid_map` cap (default 10 000, `DEFAULT_SID_MAP_CAPACITY`); back-channel logout precision degrades (some `sid` lookups will miss). Raise via `AuthnService::with_sid_map_capacity(N)` on startup, or shorten the TTL if the churn is real. |
 | `session decrypted with previous (rotated) key` log | persists `> 7 days` after rotation | Long-lived sessions are still on the old key. The next rotation will invalidate them; communicate the cutover. |
 | `account_locked` rate | `> 1 / minute` for 5 min | Background brute force or aggressive credential stuffing. Below paging threshold but worth watching. |
 | `session custom data exceeds size limit` log | any occurrence | Application is writing too much to the session; investigate before users hit it in production. |

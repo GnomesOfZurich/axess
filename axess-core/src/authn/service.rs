@@ -108,7 +108,20 @@ where
     /// The timestamp enables TTL-based eviction of stale entries.
     #[cfg(feature = "oauth")]
     pub(crate) sid_map: crate::federation::backchannel_logout::SidMap,
+    /// Capacity cap for [`sid_map`](Self::sid_map). When at/over this
+    /// count, `maintain_oidc_sid_map` evicts a batch of oldest entries.
+    /// High-throughput OAuth deployments raise this via
+    /// [`with_sid_map_capacity`](Self::with_sid_map_capacity); the
+    /// default matches the historical hardcoded value.
+    #[cfg(feature = "oauth")]
+    pub(crate) sid_map_capacity: usize,
 }
+
+/// Default capacity cap for the OIDC `sid` → local-session map. High-throughput
+/// OAuth deployments can override via
+/// [`AuthnService::with_sid_map_capacity`].
+#[cfg(feature = "oauth")]
+pub const DEFAULT_SID_MAP_CAPACITY: usize = 10_000;
 
 // ── Constructors and builders ────────────────────────────────────────────────
 
@@ -137,6 +150,8 @@ where
             oauth_providers: Default::default(),
             #[cfg(feature = "oauth")]
             sid_map: Default::default(),
+            #[cfg(feature = "oauth")]
+            sid_map_capacity: DEFAULT_SID_MAP_CAPACITY,
         }
     }
 }
@@ -236,6 +251,13 @@ where
     }
 
     /// Attach a FIDO2/WebAuthn provider.
+    ///
+    /// **Single-instance by design.** Calling `with_fido2` twice replaces
+    /// the previously attached provider silently — one deployment, one
+    /// relying-party configuration is the assumption. Multi-tenant apps
+    /// that need per-tenant relying-party ids (e.g. distinct RP-IDs per
+    /// customer domain) must wrap dispatch in the application layer;
+    /// axess-core does not maintain a per-tenant FIDO2 registry.
     #[cfg(feature = "fido2")]
     pub fn with_fido2(mut self, provider: impl axess_factors::fido2::Fido2Provider) -> Self {
         self.fido2 = Some(Arc::new(provider));
@@ -255,6 +277,12 @@ where
     /// service will verify their password via an LDAP simple bind against
     /// this provider instead of checking a local password hash.
     ///
+    /// **Single-instance by design.** Calling `with_ldap` twice replaces
+    /// the previously attached provider silently — one deployment, one
+    /// directory is the assumption. Multi-tenant apps that need
+    /// per-subsidiary directories must wrap dispatch in the application
+    /// layer; axess-core does not maintain a per-tenant LDAP registry.
+    ///
     /// ```rust,ignore
     /// let ldap = LdapProviderConfig::new(
     ///     "ldaps://ad.corp.example.com",
@@ -271,31 +299,44 @@ where
     /// Register an OAuth/OIDC identity provider.
     ///
     /// Call once per provider at startup. Multiple providers can be registered
-    /// (e.g. Google + GitHub + corporate IdP).
+    /// (e.g. Google + GitHub + corporate IdP), each under a distinct name.
+    ///
+    /// **Duplicate name safety.** Registering two providers under the same
+    /// `provider.name()` is a real security-relevant misconfiguration
+    /// (token exchanges for that IdP would then run against whichever
+    /// credentials won the race). The registry emits `tracing::warn!` on
+    /// overwrite and `debug_assert!`s in debug builds; production builds
+    /// keep the new registration and continue, so operators still notice
+    /// via logs.
     ///
     /// # Tenancy
     ///
     /// **Providers are registered globally on `AuthnService`, not per-tenant.**
-    /// Two consequences operators must plan for:
+    /// The library does not maintain a per-tenant OAuth registry; that is
+    /// out of scope by design. Two supported patterns:
     ///
-    /// 1. **Same IdP, multiple tenants**: when tenant A and tenant B both
-    ///    federate to the same IdP (e.g. a single Azure AD app for two
-    ///    SaaS tenants), the OAuth callback alone cannot tell them apart.
-    ///    The application MUST use
+    /// 1. **Same IdP, multiple tenants (single shared client).** Tenant A
+    ///    and tenant B both federate to the same IdP (e.g. one Azure AD
+    ///    app serving two SaaS tenants). The callback alone cannot tell
+    ///    them apart; the application MUST use
     ///    [`begin_oauth_login_in_tenant`](Self::begin_oauth_login_in_tenant)
     ///    to bind the ceremony to a tenant up-front, and the
     ///    claims→user resolver MUST scope its lookup to the bound tenant.
-    /// 2. **Per-tenant IdP configurations**: if every tenant has its own
-    ///    IdP (each with distinct `client_id`/`client_secret`), use a
-    ///    distinct `name` per provider (e.g. `format!("azure-tenant-{tid}")`)
-    ///    and route based on the bound tenant. The library does not
-    ///    enforce a per-tenant lookup; the application owns this routing.
+    /// 2. **Distinct IdPs, one per set of tenants.** Register one provider
+    ///    per IdP under a stable name (`"acme-corp-azure"`, `"beta-corp-okta"`,
+    ///    etc.); the application maps a tenant → provider-name in its own
+    ///    tenant record and calls [`begin_oauth_login`](Self::begin_oauth_login)
+    ///    with the resolved name. Provider names are stable identifiers,
+    ///    NOT dynamic per-tenant strings — do not derive them from
+    ///    `tenant_id` at registration time (would require re-registration
+    ///    on every tenant create/delete, would collide with reserved
+    ///    identifier characters, and would defeat the introspection story
+    ///    on [`oauth_providers`](Self::oauth_providers)).
     ///
-    /// Per-tenant provider registration is intentionally not built in:
-    /// most deployments use either (a) a single platform-wide IdP or
-    /// (b) one provider per IdP, and the application's claims-resolver
-    /// is the right place to enforce tenant binding (it already needs
-    /// tenant context to look up the local user).
+    /// If you need genuinely dynamic per-tenant IdP configuration
+    /// (each tenant admin uploads their own client_secret through a UI,
+    /// changing at runtime), that requires provider hot-swap which
+    /// axess-core does not yet support — see the roadmap.
     #[cfg(feature = "oauth")]
     pub fn with_oauth_provider(
         mut self,
@@ -312,6 +353,48 @@ where
     #[cfg(feature = "oauth")]
     pub fn oauth_providers(&self) -> &crate::federation::oauth::OAuthProviderRegistry {
         &self.oauth_providers
+    }
+
+    /// Override the capacity cap for the OIDC `sid` → local-session map that
+    /// powers back-channel logout by `sid`.
+    ///
+    /// The map is populated per successful OAuth login that returns an
+    /// `oidc_sid` claim; when at/over this cap, the maintenance path
+    /// evicts a batch of oldest entries. Default:
+    /// [`DEFAULT_SID_MAP_CAPACITY`] (10 000). Raise for high-throughput
+    /// deployments where legitimate concurrent OIDC sessions exceed the
+    /// default and back-channel logout precision degrades on eviction.
+    #[cfg(feature = "oauth")]
+    pub fn with_sid_map_capacity(mut self, capacity: usize) -> Self {
+        self.sid_map_capacity = capacity;
+        self
+    }
+
+    /// `true` when at least one OAuth/OIDC provider has been registered
+    /// via [`with_oauth_provider`](Self::with_oauth_provider). Sugar over
+    /// [`oauth_providers`](Self::oauth_providers)`.provider_count() > 0`
+    /// for the common yes/no check.
+    #[cfg(feature = "oauth")]
+    pub fn has_oauth_providers(&self) -> bool {
+        self.oauth_providers.provider_count() > 0
+    }
+
+    /// `true` when a FIDO2/WebAuthn provider has been attached via
+    /// [`with_fido2`](Self::with_fido2). Adopters typically already hold
+    /// a handle to the provider they wired in; this predicate exists so
+    /// adopters that only need "is it configured?" don't have to keep
+    /// their own bookkeeping in sync with the service.
+    #[cfg(feature = "fido2")]
+    pub fn has_fido2(&self) -> bool {
+        self.fido2.is_some()
+    }
+
+    /// `true` when an LDAP provider has been attached via
+    /// [`with_ldap`](Self::with_ldap). See [`has_fido2`](Self::has_fido2)
+    /// for rationale.
+    #[cfg(feature = "ldap")]
+    pub fn has_ldap(&self) -> bool {
+        self.ldap.is_some()
     }
 
     /// Attach a session registry for forced-logout support.

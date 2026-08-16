@@ -86,7 +86,11 @@ pub struct RefreshToken {
 }
 
 /// Configuration for refresh token behavior.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] is implemented manually so `hash_pepper` prints as
+/// `Some(<redacted N bytes>)` rather than leaking the pepper via
+/// `tracing::debug!(?config)` / `dbg!`.
+#[derive(Clone)]
 pub struct RefreshTokenConfig {
     /// Token time-to-live. Default: 30 days.
     pub ttl: Duration,
@@ -107,6 +111,29 @@ pub struct RefreshTokenConfig {
     /// `None` to `Some`) invalidates every existing refresh token. Plan
     /// the rollout accordingly. Default `None` for backward compat.
     pub hash_pepper: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for RefreshTokenConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `hash_pepper` is a deployment secret whose leak enables
+        // offline pre-image scans of the token-hash table; the manual
+        // Debug redacts it while preserving structural context.
+        struct RedactedPepper<'a>(&'a Option<Vec<u8>>);
+        impl<'a> std::fmt::Debug for RedactedPepper<'a> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.0 {
+                    Some(p) => write!(f, "Some(<redacted {} bytes>)", p.len()),
+                    None => f.write_str("None"),
+                }
+            }
+        }
+        f.debug_struct("RefreshTokenConfig")
+            .field("ttl", &self.ttl)
+            .field("max_per_user", &self.max_per_user)
+            .field("rotation", &self.rotation)
+            .field("hash_pepper", &RedactedPepper(&self.hash_pepper))
+            .finish()
+    }
 }
 
 impl Default for RefreshTokenConfig {
@@ -464,6 +491,23 @@ pub async fn refresh_session<S: RefreshTokenStore>(
         .map_err(RefreshError::Store)?
         .ok_or(RefreshError::NotFound)?;
 
+    refresh_session_from_record(record, store, config, rng, now, device_info).await
+}
+
+/// Validate + rotate a refresh token given an already-loaded
+/// [`RefreshToken`] record.
+///
+/// Extracted from [`refresh_session`] so
+/// [`refresh_session_with_status_check`] can gate on `user_id` without
+/// having to re-run `find_token` on the happy path.
+async fn refresh_session_from_record<S: RefreshTokenStore>(
+    record: RefreshToken,
+    store: &S,
+    config: &RefreshTokenConfig,
+    rng: &impl SecureRng,
+    now: DateTime<Utc>,
+    device_info: Option<&str>,
+) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
     if record.revoked {
         // Reuse of a revoked token is a compromise signal; revoke the
         // entire token family so the attacker's stolen token (and any
@@ -584,14 +628,18 @@ pub async fn refresh_session<S: RefreshTokenStore>(
 /// family is preserved unchanged so a later un-suspension restores
 /// access without forcing a full re-login.
 ///
-/// The status check runs AFTER the token is found-and-not-expired-not-
-/// revoked-not-device-mismatched but BEFORE the rotation: same
-/// ordering rationale as the cascade in
-/// `complete_factor_step`: a mid-flight suspension lands its
-/// `invalidate_user` against an empty registry slot (the new session
-/// id has not been registered yet) and the post-check refusal closes
-/// the race that would otherwise produce an authenticated-but-
-/// unregistered session.
+/// Ordering: `Revoked` → `Expired` → `status_check` →
+/// device-binding → rotation. `Revoked` runs first so a compromise
+/// signal on a revoked token still triggers the family-revocation
+/// cascade even for an inactive account. `status_check` runs before
+/// the device-binding check, so a token holder with both a mismatched
+/// device fingerprint AND an inactive account surfaces as
+/// [`RefreshError::AccountInactive`]; revealing device-binding state
+/// to a caller whose account is already refused has no upside.
+/// Rotation is last, giving the same
+/// [`SessionRegistry`](crate::session::store::SessionRegistry)-
+/// invalidation-cascade protection as
+/// `complete_factor_step` (see the TOCTOU note below).
 ///
 /// # When to use this vs [`refresh_session`]
 ///
@@ -648,10 +696,6 @@ where
 {
     let token_hash = hash_token(plaintext, config.hash_pepper.as_deref());
 
-    // Resolve the user_id from the token without touching rotation
-    // state. Reusing `find_token` rather than threading the result into
-    // `refresh_session` keeps the rotation atomicity owned by
-    // `refresh_session`'s own `rotate_token` call.
     let record = store
         .find_token(&token_hash)
         .await
@@ -659,15 +703,13 @@ where
         .ok_or(RefreshError::NotFound)?;
 
     // Mirror the early-return ordering of `refresh_session` so a
-    // suspended-user check on a revoked token still surfaces the
-    // compromise signal (Revoked) rather than masking it as
-    // AccountInactive. Pre-rotation refusals only.
+    // status check on a revoked token still surfaces the compromise
+    // signal (Revoked) rather than masking it as AccountInactive.
+    // Revoked → run the shared path so its family-revocation cascade
+    // still fires; the priority on this branch is the compromise
+    // response, not the account state.
     if record.revoked {
-        // Defer to refresh_session so its family-revocation cascade
-        // (and the device cascade) runs unchanged. The status
-        // check is intentionally skipped on this branch; the priority
-        // is the compromise response, not the account state.
-        return refresh_session(plaintext, store, config, rng, now, device_info).await;
+        return refresh_session_from_record(record, store, config, rng, now, device_info).await;
     }
     if now >= record.expires_at {
         return Err(RefreshError::Expired);
@@ -681,13 +723,10 @@ where
         return Err(RefreshError::AccountInactive);
     }
 
-    // Status OK: continue with the standard validate-and-rotate path.
-    // `find_token` will run again here, but it's a hash lookup;
-    // amortized cost is negligible compared to the network round-trip
-    // the rotation itself implies, and the duplicated read keeps the
-    // rotation atomicity owned by `refresh_session` rather than
-    // re-implementing it inline here.
-    refresh_session(plaintext, store, config, rng, now, device_info).await
+    // Status OK: continue with the standard validate-and-rotate path,
+    // passing the already-loaded record so the happy path avoids a
+    // redundant `find_token` round-trip.
+    refresh_session_from_record(record, store, config, rng, now, device_info).await
 }
 
 /// Gather the unique `(tenant, device)` pairs participating in a
@@ -927,5 +966,32 @@ mod refresh_unit_tests {
                 std::mem::discriminant(&err)
             );
         }
+    }
+
+    /// `Debug` on `RefreshTokenConfig` MUST NOT print the raw pepper
+    /// bytes: the pepper is a per-deployment secret whose leak enables
+    /// offline pre-image scans of the stored refresh-token-hash table.
+    /// Pins the manual Debug impl against a future accidental
+    /// `#[derive(Debug)]` reintroduction.
+    #[test]
+    fn refresh_token_config_debug_redacts_hash_pepper() {
+        let pepper = b"super-secret-pepper-bytes".to_vec();
+        let config = RefreshTokenConfig {
+            hash_pepper: Some(pepper.clone()),
+            ..RefreshTokenConfig::default()
+        };
+        let dbg = format!("{:?}", config);
+        assert!(
+            dbg.contains("<redacted 25 bytes>"),
+            "Debug must redact the pepper via the manual impl; got {dbg}"
+        );
+        assert!(
+            !dbg.contains("super-secret") && !dbg.contains("pepper-bytes"),
+            "raw pepper bytes must not appear in Debug output; got {dbg}"
+        );
+        // The `None` case still round-trips cleanly.
+        let empty = RefreshTokenConfig::default();
+        let dbg_empty = format!("{:?}", empty);
+        assert!(dbg_empty.contains("hash_pepper: None"), "got {dbg_empty}");
     }
 }

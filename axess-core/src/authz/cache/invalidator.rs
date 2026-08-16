@@ -1,5 +1,16 @@
 //! Scope-aware cache invalidation contract.
 //!
+//! **This is load-bearing for security.** The entity-resolution cache
+//! stores the full Cedar entity graph (roles, group parents, tenant
+//! attributes, ownership fields) for `(principal, resource, action)`.
+//! A cache hit re-uses that graph unchanged until TTL expiry, so any
+//! mutation that changes a principal's authorization-relevant state
+//! (role grant / revoke, group membership, account suspension, tenant
+//! reassignment) MUST call the appropriate invalidator on the mutating
+//! pod, or the affected user acts under their old rights until TTL runs
+//! out. TTL is a bounded-exposure safety net, not a substitute for
+//! explicit invalidation on mutation.
+//!
 //! Policy updates, role changes, and tenant suspensions need to reach
 //! the authz hot-path cache so the new state takes effect at the next
 //! request, not the next TTL expiry. TTL-only invalidation means

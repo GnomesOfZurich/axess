@@ -71,6 +71,9 @@ pub mod store;
 
 pub use context::{BuildRequestContext, NoContext, StandardRequestContext, ip_from_headers};
 pub use error::{AuthzDenied, AuthzError};
-pub use provider::{AuthzEntityProvider, RequestEntityProvider, make_action_uid, make_entity_uid};
+pub use provider::{
+    AuthzEntityProvider, RequestEntityProvider, make_action_uid, make_entity_uid,
+    validate_sample_entities,
+};
 pub use session::{AuthzSession, AuthzStore};
-pub use store::{AuthzDecision, PolicyEvaluator, PolicyStore};
+pub use store::{AuthzDecision, PolicyEvaluator, PolicyStore, validate_policies};

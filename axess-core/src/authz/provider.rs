@@ -59,9 +59,52 @@
 //! }
 //! ```
 
-use cedar_policy::{Entities, EntityUid, Schema};
+use cedar_policy::{Entities, Entity, EntityUid, Schema};
 
 use super::error::AuthzError;
+
+// ── validate_sample_entities ────────────────────────────────────────────────
+
+/// Cross-check a provider's canonical sample entities against a Cedar schema.
+///
+/// The intended body of most [`AuthzEntityProvider::validate_schema`]
+/// implementations: build one exemplar entity per type the provider
+/// emits at runtime (realistic attributes, correct parent references)
+/// and pass them here. Cedar's own [`Entities::from_entities`] with the
+/// schema attached rejects unknown types, missing required attributes,
+/// wrong scalar types, and malformed parent references.
+///
+/// This is startup-only work; the same helper is safe to call at future
+/// hot-reload time if you ever swap providers.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use axess_core::authz::{AuthzEntityProvider, AuthzError, validate_sample_entities};
+/// use cedar_policy::Schema;
+///
+/// impl AuthzEntityProvider for MyProvider {
+///     // ...
+///     fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
+///         validate_sample_entities(
+///             [
+///                 self.sample_user()?,
+///                 self.sample_document()?,
+///                 self.sample_tenant()?,
+///             ],
+///             schema,
+///         )
+///     }
+/// }
+/// ```
+pub fn validate_sample_entities(
+    samples: impl IntoIterator<Item = Entity>,
+    schema: &Schema,
+) -> Result<(), AuthzError> {
+    Entities::from_entities(samples, Some(schema))
+        .map(|_| ())
+        .map_err(|e| AuthzError::EntityBuild(format!("{e:?}")))
+}
 
 /// Application-supplied bridge between the data layer and Cedar entity graphs.
 ///
@@ -128,15 +171,17 @@ pub trait AuthzEntityProvider: Send + Sync {
     /// time from the same value passed to [`AuthzStore::new`][super::session::AuthzStore::new].
     fn resource_uid(&self, id: &Self::ResourceId) -> Result<EntityUid, AuthzError>;
 
-    /// Optional startup validation: assert that this provider's entity types
+    /// Startup validation: assert that this provider's entity types
     /// exist in the compiled Cedar schema.
     ///
     /// Called by [`AuthzStore::validate`][super::session::AuthzStore::validate]
-    /// if you invoke it at startup. Default implementation is a no-op.
-    fn validate_against_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
-        let _ = schema;
-        Ok(())
-    }
+    /// if you invoke it at startup. **No default implementation** — every
+    /// adopter must type the body explicitly. If your application has no
+    /// tenant model (single-tenant or system-only) and no schema invariants
+    /// to enforce, write `Ok(())` as a deliberate acknowledgement. A silent
+    /// default is a footgun: it lets a multi-tenant adopter ship without
+    /// ever checking that entity UIDs are tenant-qualified.
+    fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError>;
 }
 
 // ── RequestEntityProvider ───────────────────────────────────────────────────

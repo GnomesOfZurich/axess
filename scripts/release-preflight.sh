@@ -88,10 +88,12 @@ step 8 "Semver checks" cargo semver-checks check-release --manifest-path "$AXESS
 step 9 "Leaf crate publish dry-runs" bash -c '
   set -euo pipefail
   cd "$0"
+  shift
+  publish_args=("$@")
   for c in axess-strings axess-clock axess-rng; do
-    cargo publish --dry-run -p "$c"
+    cargo publish --dry-run -p "$c" ${publish_args[@]+"${publish_args[@]}"}
   done
-' "$AXESS_DIR"
+' "$AXESS_DIR" bash ${PACKAGE_ARGS[@]+"${PACKAGE_ARGS[@]}"}
 
 step 10 "Non-leaf package preflight" bash -c '
   set -euo pipefail

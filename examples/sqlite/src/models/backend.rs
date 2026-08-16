@@ -80,10 +80,18 @@ pub enum BackendError {
     Json(#[from] serde_json::Error),
 
     /// `FactorStore::save_method` / `remove_method` / `set_method_enabled`
-    /// do not accept `AuthnScope::Global`; methods must be materialised
-    /// per tenant (see `docs/tenancy.md`).
-    #[error("auth methods cannot be stored at global scope")]
-    InvalidGlobalMethod,
+    /// do not accept [`AuthnScope::System`](axess::authn::AuthnScope::System);
+    /// methods must be materialised per tenant (see `docs/tenancy.md`).
+    #[error("auth methods cannot be stored at system scope")]
+    InvalidSystemMethod,
+
+    /// A row read from storage carries a malformed `tenant_id` /
+    /// `user_id` / other schema-invariant field that cannot be decoded
+    /// back to a typed identifier. Distinct from [`Self::Db`] (SQL
+    /// error) and [`Self::Json`] (JSON parse) — this is a semantic
+    /// integrity failure on data axess assumes valid.
+    #[error("backend integrity: {0}")]
+    Backend(String),
 }
 
 // ── Shared row codecs ────────────────────────────────────────────────────────

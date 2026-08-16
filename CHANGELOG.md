@@ -6,6 +6,173 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.4.0] - 2026-08-16
+
+Breaking security-first release: authorization, factor-scope model,
+CSRF, provider registration, session-key rotation.
+
+### Added
+
+- **Session signing-key rotation.** `SessionLayer::with_previous_signing_key(...)`
+  mirrors `SessionCrypto::with_previous_key`; cookie AND fingerprint
+  verify try current → previous, on fallback re-issue the cookie
+  under the current key and update the stored fingerprint. One
+  previous slot — see `OPERATIONS.md#signing-key-rotation`.
+  Companion `SessionLayer::remove_previous_signing_key()` retires
+  the slot at the end of the overlap window.
+- **Cedar validator at startup.** `PolicyStore::from_text` runs
+  `cedar_policy::Validator` in strict mode; `validate_policies` +
+  `validate_sample_entities` exposed for reuse.
+- **CSRF form-field + Origin/Referer.** `_csrf` hidden-input
+  extraction (`form_field_name`, `form_body_limit` capped at 64 KiB
+  by default; multipart not scanned) and opt-in
+  `CsrfConfig::require_origin(...)`. `examples/sqlite` wires the
+  full flow.
+- **Provider hardening.** `OAuthProviderRegistry::add` warns +
+  `debug_assert!`s on duplicate name. Predicates
+  `has_oauth_providers()` / `has_fido2()` / `has_ldap()` /
+  `has_previous_signing_key()`. `with_sid_map_capacity(n)` replaces
+  the hardcoded 10 000 OIDC `sid_map` cap.
+
+### Changed (breaking)
+
+- `AuthnScope::Global` → `AuthnScope::System`; storage encodes as
+  `(tenant_id = TenantId::SYSTEM, user_id = NULL)` — no NULL-tenant
+  for configuration scope anywhere.
+- `ScopeColumns.tenant_id`: `Option<TenantId>` → `TenantId`.
+- `AuthnScope::lookup_chain` → `resolution_chain`, returns
+  `Vec<AuthnScope>`.
+- `FactorStore` gains `resolve_factor` (runtime, chain-walking,
+  returns `ResolvedFactor`). `load_factor` keeps its name but its
+  contract is now "exact scope only" — the within-scope fallback
+  the docs used to describe moved into `resolve_factor`. Every
+  `FactorStore` impl must add `resolve_factor`; every runtime
+  auth call site must switch from `load_factor` to `resolve_factor`
+  or it silently loses the chain walk.
+- `AuthzEntityProvider::validate_against_schema` → `validate_schema`;
+  default `Ok(())` removed — adopters type it explicitly.
+- `AuthzError::PolicyValidation` new variant (wildcard-less matches
+  break).
+- `MockStoreError` / `examples/sqlite::BackendError`:
+  `InvalidGlobalMethod` → `InvalidSystemMethod`.
+- `SessionConfig` fields are `pub(crate)`; adopters read via getters
+  (`ttl()`, `cookie_name()`, `secure()`, `same_site()`,
+  `http_only()`, `path()`, `max_custom_bytes()`) and construct via
+  `SessionConfig::builder()`. Closes a hole where struct-literal
+  construction bypassed the `__Host-` / `__Secure-` + non-zero-TTL
+  assertions in `SessionConfigBuilder::build`.
+- `KeyExtractor::UserId` / `TenantId` no longer read
+  `x-user-id` / `x-tenant-id` request headers as a fallback: an
+  unauthenticated caller could steer any user's rate-limit bucket
+  and lock them out. Only the typed `RateLimitUserId` /
+  `RateLimitTenantId` extensions the auth layer injects count.
+- `axess-factors` re-exports `Totp` (renamed from `TOTP`) and adds
+  `TotpBuilder`; both come from `totp-rs 6.0`. `Totp::generate()`
+  now returns a `Token` instead of a `String`. The upstream feature
+  `serde_support` was renamed to `serde`.
+- `url` is now an unconditional `axess-core` dependency (previously
+  optional, pulled by `fido2` / `oauth` / `delegated-*` / `*-sts`).
+  CSRF-origin canonicalization needs it on every build; adopters
+  compiling with only `authz` / `memory` now pick it up too. No
+  functional break — the crate was already present transitively for
+  most feature combinations.
+
+### Fixed
+
+- Fingerprint verification under rotation no longer invalidates
+  sessions whose stored value was written under a previous master.
+- CSRF Origin/Referer comparison delegates to `url::Url::origin`:
+  scheme + host are case-folded, `userinfo@` is stripped, default
+  port is dropped. Allow-list entries are canonicalized on
+  `require_origin(...)`, so adopter-supplied forms and browser-sent
+  headers now compare consistently.
+- Cedar validator now explicitly requests `ValidationMode::Strict`
+  instead of relying on the crate default.
+- `examples/sqlite` `resolve_factor` is a single ordered
+  `SELECT ... UNION ALL ... LIMIT 1` (was three sequential trips).
+- `refresh_session_with_status_check` no longer runs `find_token`
+  twice on the happy path — the status check and the rotation share
+  the loaded record via a private `refresh_session_from_record`
+  helper.
+- Cookie verify skips the `base64(HMAC) → decode` round-trip on
+  every session-cookie request; `hmac_bytes` returns the raw tag and
+  the verifier compares directly against the decoded MAC bytes.
+- `RequestIdService::ensure_request_id` sheds its fake `Result`
+  return: `UuidGenerator` is documented as ASCII-only, the dead
+  fallback branch is deleted.
+- Bumped `lru` 0.18.1 → 0.18.2 to resolve **RUSTSEC-2026-0253**
+  (potential use-after-free in `LruCache::pop()` under panic).
+- HOTP `verify_hotp` no longer overflows the u64 counter when
+  `counter + offset` approaches `u64::MAX` (panic in debug, wrap-to-0
+  in release — the wrap would then compare against the counter-0 code
+  and could pass). Loop now uses `checked_add` and stops iterating on
+  overflow.
+- HOTP verification success arm advances the stored counter via
+  `saturating_add` (was `counter + 1`); a counter at `u64::MAX` now
+  sticks instead of wrapping back to zero and re-admitting a
+  previously-consumed code. Matches the failure arm's existing
+  discipline.
+- `CsrfConfig::require_origin` fails fast when every supplied origin
+  fails to canonicalize: adopters passing typos (`"not-a-url"`,
+  missing scheme, opaque-origin schemes) previously ended up with the
+  Origin/Referer gate silently disabled — the empty allow-list is
+  what the runtime treats as "no gate configured". Now panics with
+  the rejected inputs listed, matching `SessionConfigBuilder::build`'s
+  fail-fast discipline for the same misconfig class.
+- `RefreshTokenConfig` now implements `Debug` manually and redacts
+  `hash_pepper` as `Some(<redacted N bytes>)`. The derived `Debug`
+  leaked the pepper via `tracing::debug!(?config)` / `dbg!`; a leaked
+  pepper enables offline pre-image scans of the stored token-hash
+  table.
+- CSRF module docs now warn about the rotation-mid-request footgun:
+  a handler that both reads `CsrfToken` from request extensions AND
+  rotates the session ships a token bound to the pre-rotation id
+  while the response cookie carries the post-rotation token — the
+  next state-changing request 403s. Recommendation: redirect (302)
+  after rotation rather than render inline with the request-extension
+  token.
+- Misleading docs corrected in `verification.rs`,
+  `docs/sessions/security.md`, `axess-strings/README.md`.
+
+### Migration
+
+- Rename `AuthnScope::Global` → `System`; `lookup_chain` →
+  `resolution_chain`.
+- `FactorStore` impls: add `resolve_factor`; keep `load_factor`
+  but audit every runtime auth call — the old within-scope
+  fallback is now `resolve_factor`'s job.
+- `AuthzEntityProvider::validate_against_schema` → `validate_schema`
+  with an explicit body.
+- `ScopeColumns.tenant_id` pattern matches: no more `Option` —
+  `TenantId::SYSTEM` for the system tier.
+- SQL schema: `factor_configs.tenant_id` and `auth_methods.tenant_id`
+  become `NOT NULL` with FK to `tenants(id)`; seed the reserved
+  system tenant (`UUID::nil()`). Reference migration in
+  `examples/sqlite/migrations/`.
+- Reads of `SessionConfig` fields → call the matching getter
+  (`config.ttl` → `config.ttl()`, etc.). Struct-literal construction
+  is no longer possible — use `SessionConfig::builder()` (which
+  panics on the `__Host-` / non-zero-TTL / non-empty-cookie-name
+  violations the fields used to admit silently).
+- `KeyExtractor::UserId` / `TenantId`: any adopter relying on the
+  `x-user-id` / `x-tenant-id` header fallback must instead inject
+  `RateLimitUserId` / `RateLimitTenantId` request extensions from
+  a trusted upstream layer (typically the auth layer itself). The
+  header was spoofable by unauthenticated callers.
+- `axess_factors::TOTP` → `Totp`. Constructors move to `TotpBuilder`:
+  `TotpBuilder::new().with_algorithm(alg).with_digits(d).with_skew(0)
+  .with_step_duration(step).with_secret(secret).build()`. Verify
+  returns `Token`; call `.to_string()` to get the zero-padded numeric
+  code. If your `Cargo.toml` enables `totp-rs/serde_support`, rename
+  it to `totp-rs/serde`.
+- `CsrfConfig::require_origin` now panics if every supplied origin is
+  malformed. Audit adopter code that assembles origin lists from
+  environment / config for typos before deploying 0.4.0; a mistyped
+  value that used to silently disable the Origin gate now surfaces
+  at startup.
+
+---
+
 ## [0.3.3] - 2026-08-08
 
 ### Fixed

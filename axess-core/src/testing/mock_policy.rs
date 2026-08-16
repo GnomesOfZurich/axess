@@ -216,4 +216,9 @@ impl AuthzEntityProvider for MockEntityProvider {
         EntityUid::from_str(&format!(r#"{}::Resource::"{id}""#, self.namespace))
             .map_err(|e| AuthzError::InvalidEntityUid(format!("Resource/{id}: {e:?}")))
     }
+
+    fn validate_schema(&self, schema: &cedar_policy::Schema) -> Result<(), AuthzError> {
+        let _ = schema;
+        Ok(())
+    }
 }

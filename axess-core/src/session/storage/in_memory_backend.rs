@@ -136,7 +136,7 @@ impl InMemoryBackend {
 
         // Register the password method.
         let method =
-            AuthMethod::sequential("password", vec![FactorKind::Password], AuthnScope::Global);
+            AuthMethod::sequential("password", vec![FactorKind::Password], AuthnScope::System);
         self.factors = self.factors.with_method(&user_id, method);
 
         self
@@ -254,6 +254,14 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
 
 impl FactorStore for InMemoryBackend {
     type Error = MockStoreError;
+
+    async fn resolve_factor(
+        &self,
+        scope: &AuthnScope,
+        kind: FactorKind,
+    ) -> Result<Option<crate::authn::store::ResolvedFactor>, Self::Error> {
+        self.factors.resolve_factor(scope, kind).await
+    }
 
     async fn load_factor(
         &self,
@@ -566,8 +574,8 @@ mod in_memory_backend_tests {
         // Kills `save_method -> Ok(())`, `remove_method -> Ok(())`,
         // and `set_method_enabled -> Ok(true|false)`.
         //
-        // `MockFactorStore` rejects `AuthnScope::Global` for these
-        // CRUD calls (returns `InvalidGlobalMethod`). User-scope and
+        // `MockFactorStore` rejects `AuthnScope::System` for these
+        // CRUD calls (returns `InvalidSystemMethod`). User-scope and
         // Tenant-scope rows are stored in a separate `scoped_methods`
         // map and surface alongside the seeded user-id-keyed methods
         // in `available_methods`.

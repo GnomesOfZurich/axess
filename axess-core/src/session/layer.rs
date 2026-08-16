@@ -35,7 +35,7 @@ use crate::device::resolver::{DeviceResolver, ErasedDeviceResolver};
 use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
 use crate::session::store::SessionStore;
-use signing::{SigningKeys, hkdf_expand_subkey};
+use signing::SigningKeyRing;
 use std::{sync::Arc, time::Duration};
 use tower_cookies::cookie::SameSite;
 
@@ -63,7 +63,7 @@ use tower_cookies::cookie::SameSite;
 #[derive(Clone)]
 pub struct SessionLayer<S> {
     pub(super) store: S,
-    pub(super) signing_keys: Arc<SigningKeys>,
+    pub(super) signing_keys: Arc<SigningKeyRing>,
     /// Shared via `Arc` so the `Layer::layer` clone (per inner
     /// service) and the per-request `Service::call` clone are both
     /// pointer copies, not full struct copies. `SessionConfig` carries
@@ -116,14 +116,99 @@ impl<S: SessionStore> SessionLayer<S> {
             store,
             // Derive distinct cookie / fingerprint HMAC sub-keys
             // from the master so a side-channel on one path cannot be
-            // replayed against the other.
-            signing_keys: Arc::new(SigningKeys::from_master(signing_key)),
+            // replayed against the other. Rotation slot starts empty;
+            // adopters opt in via
+            // [`with_previous_signing_key`](Self::with_previous_signing_key).
+            signing_keys: Arc::new(SigningKeyRing::from_master(signing_key)),
             config: Arc::new(SessionConfig::default()),
             binding: None,
             metrics: None,
             #[cfg(feature = "device")]
             device_resolver: None,
         }
+    }
+
+    /// Configure a previous signing master key for zero-downtime
+    /// rotation.
+    ///
+    /// On every request, cookie and fingerprint verification tries the
+    /// CURRENT key first; on mismatch, falls back to this PREVIOUS key.
+    /// When the previous key produces the match, the response re-issues
+    /// the cookie under the current key and (for fingerprint fallback)
+    /// updates the stored fingerprint in the session data so subsequent
+    /// requests hit the fast path without falling back.
+    ///
+    /// Mirrors [`SessionCrypto::with_previous_key`](crate::session::SessionCrypto::with_previous_key)
+    /// for the at-rest encryption side. The two rotations are
+    /// independent: rotate the signing key without touching encryption,
+    /// or vice versa, or plan both to overlap.
+    ///
+    /// # Operational rule
+    ///
+    /// **Only one previous slot is maintained.** Plan rotations so at
+    /// most one is in flight per session-TTL window. A chained rotation
+    /// (rotate again while the previous slot is still populated) drops
+    /// the pre-first-rotation key entirely; cookies signed under it
+    /// then fail both current and previous verification and their
+    /// holders are forced to re-authenticate. This is the correct
+    /// security behavior for an emergency-rotate-again scenario
+    /// (compromised previous key must not remain valid) — see
+    /// `OPERATIONS.md#signing-key-rotation`.
+    pub fn with_previous_signing_key(mut self, previous_master: [u8; 32]) -> Self {
+        // Same "mutate before cloning" contract as `config_mut`. When
+        // the Arc has been shared, `Arc::make_mut` deep-copies the
+        // ring (key material included) into a fresh Arc and mutates
+        // that; the previously-cloned service keeps the un-rotated
+        // ring — usually not what the caller intended, and it also
+        // means the master key bytes exist in two places briefly.
+        // The debug_assert catches this in dev; release builds allow
+        // it (matches SessionConfig setter behavior).
+        debug_assert!(
+            Arc::strong_count(&self.signing_keys) == 1,
+            "SessionLayer::with_previous_signing_key called after the layer was cloned \
+             (strong_count = {}). The rotation slot will only affect this clone; the \
+             previously-cloned service keeps its original ring. Configure the layer fully \
+             before passing it to `tower::Layer` / `Router::layer`.",
+            Arc::strong_count(&self.signing_keys),
+        );
+        Arc::make_mut(&mut self.signing_keys).set_previous(previous_master);
+        self
+    }
+
+    /// `true` when a previous signing key is configured — i.e. the
+    /// layer is currently in a signing-key rotation window. Adopters
+    /// building admin / status endpoints can use this to surface
+    /// "rotation in progress" state without inspecting the master
+    /// directly.
+    pub fn has_previous_signing_key(&self) -> bool {
+        self.signing_keys.has_previous()
+    }
+
+    /// Clear the previous signing key, ending the rotation window.
+    ///
+    /// Companion to [`with_previous_signing_key`](Self::with_previous_signing_key):
+    /// after one session TTL has elapsed since the rotation began, no
+    /// unexpired cookie can still be signed under the previous master,
+    /// so retiring the slot is safe and prevents the previous key
+    /// material from being validated against indefinitely. See
+    /// `OPERATIONS.md#signing-key-rotation` for the procedure.
+    ///
+    /// Same "mutate before cloning" contract as
+    /// [`with_previous_signing_key`](Self::with_previous_signing_key) —
+    /// invoke on the freshly-built layer, before it is handed to
+    /// `tower::Layer` / `Router::layer`; a debug build asserts on the
+    /// footgun. Calling this when no previous key is set is a no-op.
+    pub fn remove_previous_signing_key(mut self) -> Self {
+        debug_assert!(
+            Arc::strong_count(&self.signing_keys) == 1,
+            "SessionLayer::remove_previous_signing_key called after the layer was cloned \
+             (strong_count = {}). The rotation slot will only clear on this clone; the \
+             previously-cloned service keeps its previous key. Configure the layer fully \
+             before passing it to `tower::Layer` / `Router::layer`.",
+            Arc::strong_count(&self.signing_keys),
+        );
+        Arc::make_mut(&mut self.signing_keys).clear_previous();
+        self
     }
 
     /// Borrow the per-request `SessionConfig`. Mutating
@@ -165,7 +250,14 @@ impl<S: SessionStore> SessionLayer<S> {
     /// material is held under the same drop discipline as the master
     /// key. Deref through `*` or `as_ref()` to access the raw `[u8; 32]`.
     pub fn derive_subkey(&self, info: &'static [u8]) -> zeroize::Zeroizing<[u8; 32]> {
-        zeroize::Zeroizing::new(hkdf_expand_subkey(&self.signing_keys.master, info))
+        // Derives from the CURRENT master only. Adopters using
+        // `derive_subkey` to feed their own HMAC sites (CSRF, push
+        // tokens, etc.) do NOT get rotation-aware verify-with-fallback
+        // for free; if they need it, they hold their own previous key
+        // and try-current-then-previous themselves. Wiring rotation
+        // into every downstream sub-key derivation would leak the
+        // rotation state through an otherwise-simple API.
+        zeroize::Zeroizing::new(self.signing_keys.derive_subkey(info))
     }
 
     /// Override the session TTL (default: 24 hours).
@@ -341,5 +433,48 @@ mod with_secure_warning_tests {
             !capture.contains_at_level(tracing::Level::WARN, "Secure cookie flag disabled"),
             "with_secure(true) must NOT warn; `delete !` mutation would invert this"
         );
+    }
+}
+
+/// Layer-level coverage for the signing-key rotation retire path.
+///
+/// `SigningKeyRing::clear_previous` is exercised at the ring level in
+/// `session::layer::signing::rotation_tests::ring_clear_previous_ends_rotation_window`;
+/// these tests pin the layer's `with_*` / `remove_*` orchestration
+/// (the `Arc::make_mut` step + `has_previous_signing_key` predicate)
+/// so an accidental short-circuit of the retire method surfaces here
+/// instead of silently keeping the previous slot alive.
+#[cfg(test)]
+mod signing_key_retire_tests {
+    use super::*;
+    use crate::session::store::MemorySessionStore;
+
+    #[test]
+    fn remove_previous_signing_key_retires_the_slot() {
+        let store = MemorySessionStore::new();
+        let layer = SessionLayer::new(store, [0xBB; 32]).with_previous_signing_key([0xAA; 32]);
+        assert!(
+            layer.has_previous_signing_key(),
+            "with_previous_signing_key must install a slot the predicate observes"
+        );
+
+        let after = layer.remove_previous_signing_key();
+        assert!(
+            !after.has_previous_signing_key(),
+            "remove_previous_signing_key must retire the slot"
+        );
+    }
+
+    /// Idempotency: calling the retire method on a layer that has no
+    /// previous key must be a no-op, not a panic. Operators sometimes
+    /// invoke the retire step unconditionally at startup after a
+    /// scheduled rotation window; a panic would take down the process.
+    #[test]
+    fn remove_previous_signing_key_on_fresh_layer_is_noop() {
+        let store = MemorySessionStore::new();
+        let layer = SessionLayer::new(store, [0xBB; 32]);
+        assert!(!layer.has_previous_signing_key());
+        let after = layer.remove_previous_signing_key();
+        assert!(!after.has_previous_signing_key());
     }
 }

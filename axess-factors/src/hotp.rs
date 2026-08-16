@@ -143,10 +143,17 @@ pub fn verify_hotp(
     // Try each counter value in the window.
     // Always iterate the full window to avoid leaking the match position via timing.
     // The ct_eq comparison runs every iteration; only the first match is recorded.
+    // `checked_add` guards against `counter + window` overflowing near
+    // `u64::MAX`: debug builds would panic, release builds would silently
+    // wrap to 0 and compare against the counter-0 code — a real
+    // authentication bypass under adversarial inputs. On overflow we
+    // stop iterating; matched stays whatever it was on prior iterations.
     let mut matched: Option<u64> = None;
     let trimmed_code = code.trim();
     for offset in 0..=window {
-        let candidate_counter = counter + offset;
+        let Some(candidate_counter) = counter.checked_add(offset) else {
+            break;
+        };
         let expected = hotp_generate(&secret_bytes, candidate_counter, length, algorithm);
         let is_match = bool::from(expected.as_bytes().ct_eq(trimmed_code.as_bytes()));
         if is_match && matched.is_none() {
@@ -383,18 +390,18 @@ mod tests {
     #[cfg(feature = "totp")]
     #[test]
     fn hotp_generate_sha256_matches_totp_rs_oracle() {
-        use totp_rs::{Algorithm as TotpAlgorithm, TOTP};
+        use totp_rs::{Algorithm as TotpAlgorithm, Builder};
         const PERIOD: u64 = 30;
         for counter in [0u64, 1, 7, 42, 1234, 1_000_000] {
-            let oracle_totp = TOTP::new(
-                TotpAlgorithm::SHA256,
-                6,
-                0,
-                PERIOD,
-                RFC_4226_SECRET.to_vec(),
-            )
-            .unwrap();
-            let oracle_code = oracle_totp.generate(counter * PERIOD);
+            let oracle_totp = Builder::new()
+                .with_algorithm(TotpAlgorithm::SHA256)
+                .with_digits(6)
+                .with_skew(0)
+                .with_step_duration(PERIOD)
+                .with_secret(RFC_4226_SECRET.to_vec())
+                .build()
+                .unwrap();
+            let oracle_code = oracle_totp.generate(counter * PERIOD).to_string();
             let axess_code = hotp_generate(RFC_4226_SECRET, counter, 6, HotpAlgorithm::Sha256);
             assert_eq!(
                 axess_code, oracle_code,
@@ -408,18 +415,18 @@ mod tests {
     #[cfg(feature = "totp")]
     #[test]
     fn hotp_generate_sha512_matches_totp_rs_oracle() {
-        use totp_rs::{Algorithm as TotpAlgorithm, TOTP};
+        use totp_rs::{Algorithm as TotpAlgorithm, Builder};
         const PERIOD: u64 = 30;
         for counter in [0u64, 1, 7, 42, 1234, 1_000_000] {
-            let oracle_totp = TOTP::new(
-                TotpAlgorithm::SHA512,
-                6,
-                0,
-                PERIOD,
-                RFC_4226_SECRET.to_vec(),
-            )
-            .unwrap();
-            let oracle_code = oracle_totp.generate(counter * PERIOD);
+            let oracle_totp = Builder::new()
+                .with_algorithm(TotpAlgorithm::SHA512)
+                .with_digits(6)
+                .with_skew(0)
+                .with_step_duration(PERIOD)
+                .with_secret(RFC_4226_SECRET.to_vec())
+                .build()
+                .unwrap();
+            let oracle_code = oracle_totp.generate(counter * PERIOD).to_string();
             let axess_code = hotp_generate(RFC_4226_SECRET, counter, 6, HotpAlgorithm::Sha512);
             assert_eq!(
                 axess_code, oracle_code,

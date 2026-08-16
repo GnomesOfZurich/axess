@@ -15,10 +15,9 @@ use crate::session::config::SessionConfig;
 use crate::session::data::SessionData;
 use crate::session::id::SessionId;
 use crate::session::layer::handle::SessionHandle;
-use crate::session::layer::signing::{SigningKeys, signing_decode_cookie, signing_sign_bytes};
+use crate::session::layer::signing::SigningKeyRing;
 use crate::session::store::SessionStore;
 use axess_rng::SystemRng;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use subtle::ConstantTimeEq;
 use tower_cookies::cookie::Cookie;
 
@@ -31,11 +30,19 @@ use tower_cookies::cookie::Cookie;
 /// is `true` when the fingerprint check actively reset the session
 /// (separate signal from "no cookie at all" because the response must
 /// cycle the id and emit metrics distinctly).
+///
+/// `rotation_fallback_used` is `true` when either the cookie or the
+/// fingerprint verified only against the PREVIOUS signing key (see
+/// [`SigningKeyRing`]). The session is trusted, but the response MUST
+/// emit a fresh `Set-Cookie` under the current key AND any stored
+/// fingerprint value must be re-computed under the current key so
+/// subsequent requests verify without falling back.
 pub(crate) struct LoadOutcome {
     pub(crate) id: SessionId,
     pub(crate) data: SessionData,
     pub(crate) existing_id: Option<SessionId>,
     pub(crate) binding_invalidated: bool,
+    pub(crate) rotation_fallback_used: bool,
 }
 
 /// Outcome of [`finalize_session`].
@@ -59,11 +66,12 @@ pub(crate) struct FinalizeOutcome {
 /// in-flight request executes under that id, the response cycles to it.
 pub(crate) async fn load_session<S>(
     store: &S,
-    signing_keys: &SigningKeys,
+    signing_keys: &SigningKeyRing,
     config: &SessionConfig,
     metrics: Option<&dyn crate::metrics::AuthnMetrics>,
     headers: &axum::http::HeaderMap,
     current_fingerprint: Option<&str>,
+    previous_fingerprint: Option<&str>,
 ) -> LoadOutcome
 where
     S: SessionStore + Send + Sync + 'static,
@@ -80,14 +88,20 @@ where
         MAX_COOKIE_VALUE_BYTES,
     );
 
-    // Cookie verification uses the dedicated cookie sub-key; distinct
-    // from the fingerprint key.
-    let verified_id = cookie_value
+    // Rotation-aware cookie verification: tries the current cookie
+    // sub-key first, falls back to the previous sub-key if configured.
+    // `verified.verified_by_previous` signals whether the response
+    // must re-issue the cookie under the current key.
+    let verified = cookie_value
         .as_deref()
-        .and_then(|v| signing_decode_cookie(v, &signing_keys.cookie));
+        .and_then(|v| signing_keys.decode_cookie(v));
+    let mut rotation_fallback_used = verified
+        .as_ref()
+        .map(|v| v.verified_by_previous)
+        .unwrap_or(false);
 
-    let (mut existing_id, mut session_data) = if let Some(id) = verified_id {
-        match store.load(&id).await {
+    let (mut existing_id, mut session_data) = if let Some(verified) = verified {
+        match store.load(&verified.id).await {
             Ok(Some(mut data)) => {
                 if data.migrate() {
                     tracing::debug!(
@@ -95,7 +109,7 @@ where
                         "session data migrated to newer schema version"
                     );
                 }
-                (Some(id), data)
+                (Some(verified.id), data)
             }
             Ok(None) => (None, SessionData::default()),
             Err(e) => {
@@ -110,26 +124,50 @@ where
         (None, SessionData::default())
     };
 
-    // Session binding check; invalidate on mismatch. Constant-time
-    // comparison prevents timing side-channels that could leak whether
-    // a fingerprint is valid.
+    // Session binding check with rotation fallback. Constant-time
+    // comparison prevents timing side-channels; the previous-key
+    // comparison runs only on current-key mismatch, and only if a
+    // rotated fingerprint was precomputed by the caller.
+    //
+    // On previous-key match, the stored fingerprint is REPLACED with
+    // the current-key value so subsequent requests match on the fast
+    // path without falling back. The session data is thereby marked
+    // for persistence via the modified/rotation_fallback_used signal
+    // read at the finalize + response-cookie stages.
     let mut binding_invalidated = false;
     if let (Some(stored_hash), Some(current_hash)) =
-        (&session_data.fingerprint, current_fingerprint)
-        && !bool::from(stored_hash.as_bytes().ct_eq(current_hash.as_bytes()))
+        (session_data.fingerprint.clone(), current_fingerprint)
     {
-        tracing::warn!("session fingerprint mismatch; invalidating session (possible hijacking)");
-        if let Some(m) = metrics {
-            m.session_binding_mismatch();
+        if bool::from(stored_hash.as_bytes().ct_eq(current_hash.as_bytes())) {
+            // Fast path: current-key fingerprint matches. No action.
+        } else if let Some(previous_hash) = previous_fingerprint
+            && bool::from(stored_hash.as_bytes().ct_eq(previous_hash.as_bytes()))
+        {
+            // Fallback: stored fingerprint was computed under the
+            // previous fingerprint sub-key. Re-store under the current
+            // key so the next request hits the fast path.
+            tracing::debug!(
+                "session fingerprint verified with previous (rotated) signing key; \
+                 re-storing under current key"
+            );
+            session_data.fingerprint = Some(current_hash.to_string());
+            rotation_fallback_used = true;
+        } else {
+            tracing::warn!(
+                "session fingerprint mismatch; invalidating session (possible hijacking)"
+            );
+            if let Some(m) = metrics {
+                m.session_binding_mismatch();
+            }
+            session_data = SessionData::default();
+            binding_invalidated = true;
+            // The cookie's id is now untrusted; clear it so a fresh id is
+            // minted below before the inner handler runs. Without this the
+            // in-flight request would still execute under the
+            // attacker-plantable id (the response cookie would only rotate
+            // it on the way out).
+            existing_id = None;
         }
-        session_data = SessionData::default();
-        binding_invalidated = true;
-        // The cookie's id is now untrusted; clear it so a fresh id is
-        // minted below before the inner handler runs. Without this the
-        // in-flight request would still execute under the
-        // attacker-plantable id (the response cookie would only rotate
-        // it on the way out).
-        existing_id = None;
     }
 
     let rng = SystemRng;
@@ -140,6 +178,7 @@ where
         data: session_data,
         existing_id,
         binding_invalidated,
+        rotation_fallback_used,
     }
 }
 
@@ -263,15 +302,13 @@ where
 /// caller treats `None` as "skip the header" to avoid a panic on a
 /// pathological config.
 pub(crate) fn build_set_cookie(
-    signing_keys: &SigningKeys,
+    signing_keys: &SigningKeyRing,
     config: &SessionConfig,
     id: SessionId,
 ) -> Option<axum::http::HeaderValue> {
-    let cookie_value = {
-        let id_enc = URL_SAFE_NO_PAD.encode(id.as_bytes());
-        let mac = signing_sign_bytes(id.as_bytes(), &signing_keys.cookie);
-        format!("{}.{}", id_enc, mac)
-    };
+    // Always sign new/re-issued cookies under the CURRENT sub-key.
+    // Previous-key signing only exists on the verify side (fallback).
+    let cookie_value = signing_keys.sign_cookie(id);
 
     let mut cookie = Cookie::new(config.cookie_name.as_ref().to_string(), cookie_value);
     cookie.set_http_only(config.http_only);
@@ -378,7 +415,7 @@ mod helper_tests {
     /// `HeaderValue::from_str` accepts them.
     #[test]
     fn build_set_cookie_returns_some_for_default_config() {
-        let keys = SigningKeys::from_master([0x55; 32]);
+        let keys = SigningKeyRing::from_master([0x55; 32]);
         let cfg = SessionConfig::default();
         let id = SessionId::new(&MockRng::new(11));
         let hv = build_set_cookie(&keys, &cfg, id);
@@ -669,7 +706,7 @@ mod helper_tests {
     #[tokio::test]
     async fn load_session_keeps_session_when_fingerprint_matches() {
         let store = MemorySessionStore::new();
-        let keys = SigningKeys::from_master([0xCC; 32]);
+        let keys = SigningKeyRing::from_master([0xCC; 32]);
         let cfg = SessionConfig::default();
 
         let stored_fp = "match-me".to_string();
@@ -681,13 +718,10 @@ mod helper_tests {
         // Mutate so migrate() doesn't bump the version inside load_session.
         store.save(&id, &data, cfg.ttl).await.expect("seed store");
 
-        // Build a cookie carrying the seed id, signed by `keys.cookie`.
-        let id_enc = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            id.as_bytes(),
-        );
-        let mac = signing_sign_bytes(id.as_bytes(), &keys.cookie);
-        let cookie_value = format!("{id_enc}.{mac}");
+        // Build a cookie carrying the seed id, signed under the ring's
+        // current key — mirrors what `build_set_cookie` produces in
+        // production so `load_session` sees a real-shaped input.
+        let cookie_value = keys.sign_cookie(id);
         let mut headers = axum::http::HeaderMap::new();
         let header = format!("{}={}", cfg.cookie_name.as_ref(), cookie_value);
         headers.insert(
@@ -702,6 +736,7 @@ mod helper_tests {
             None,
             &headers,
             Some(stored_fp.as_str()),
+            None,
         )
         .await;
 

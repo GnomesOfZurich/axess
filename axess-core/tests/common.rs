@@ -119,8 +119,15 @@ pub fn generate_totp_code(secret: &str, now: std::time::SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
     let step = secs / 30;
     let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret).unwrap();
-    let totp = totp_rs::TOTP::new(totp_rs::Algorithm::SHA1, 6, 0, 30, decoded).unwrap();
-    totp.generate(step * 30)
+    let totp = totp_rs::Builder::new()
+        .with_algorithm(totp_rs::Algorithm::SHA1)
+        .with_digits(6)
+        .with_skew(0)
+        .with_step_duration(30)
+        .with_secret(decoded)
+        .build()
+        .unwrap();
+    totp.generate(step * 30).to_string()
 }
 
 /// Generate an HOTP code for the given base32 secret at the given counter

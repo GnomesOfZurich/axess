@@ -1,9 +1,15 @@
-//! `FactorStore` trait impl + scoped factor-config lookup helper.
+//! `FactorStore` trait impl.
+//!
+//! Storage encoding: `factor_configs.tenant_id` and `auth_methods.tenant_id`
+//! are NOT NULL and reference `tenants(id)`. System-scope rows live under
+//! [`TenantId::SYSTEM`] — there is no NULL-tenant encoding for
+//! configuration scope. See `docs/authentication/scope.md`.
 
 use axess::authn::{
-    AuthMethod, AuthnScope, FactorConfig, FactorKind, FactorStep, FactorStore, TenantId, UserId,
+    AuthMethod, AuthnScope, FactorConfig, FactorKind, FactorStep, FactorStore, ResolvedFactor,
+    TenantId, UserId,
 };
-use sqlx::{AssertSqlSafe, Row, SqlitePool};
+use sqlx::{AssertSqlSafe, Row};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -12,36 +18,135 @@ use super::{BackendError, OurBackend};
 impl FactorStore for OurBackend {
     type Error = BackendError;
 
+    /// Runtime resolution in ONE query. Walks the User → Tenant → System
+    /// chain via an ordered `SELECT` that ranks rows narrowest-first and
+    /// takes the top hit. Also returns the scope the config was resolved
+    /// from so callers can CAS at the correct tier.
+    async fn resolve_factor(
+        &self,
+        scope: &AuthnScope,
+        kind: FactorKind,
+    ) -> Result<Option<ResolvedFactor>, Self::Error> {
+        let kind_str = kind.as_str();
+        let cols = scope.as_columns();
+        let tenant_str = cols.tenant_id.to_string();
+        let system_str = TenantId::SYSTEM.to_string();
+
+        // Query shape depends on scope narrowness:
+        //   User    → try user@tenant, then anyone@tenant, then anyone@SYSTEM
+        //   Tenant  → try anyone@tenant, then anyone@SYSTEM
+        //   System  → try anyone@SYSTEM
+        // Each `SELECT ... UNION ALL ... ORDER BY rank LIMIT 1` collapses
+        // to a single round trip.
+        let row = match &cols.user_id {
+            Some(user_id) => {
+                let user_str = user_id.to_string();
+                sqlx::query(
+                    "SELECT config_json, user_id, tenant_id, 0 AS rank
+                       FROM factor_configs
+                      WHERE kind = ?1 AND enabled = 1
+                        AND user_id = ?2 AND tenant_id = ?3
+                     UNION ALL
+                     SELECT config_json, user_id, tenant_id, 1 AS rank
+                       FROM factor_configs
+                      WHERE kind = ?1 AND enabled = 1
+                        AND user_id IS NULL AND tenant_id = ?3
+                     UNION ALL
+                     SELECT config_json, user_id, tenant_id, 2 AS rank
+                       FROM factor_configs
+                      WHERE kind = ?1 AND enabled = 1
+                        AND user_id IS NULL AND tenant_id = ?4
+                     ORDER BY rank
+                     LIMIT 1",
+                )
+                .bind(kind_str)
+                .bind(&user_str)
+                .bind(&tenant_str)
+                .bind(&system_str)
+                .fetch_optional(self.pool())
+                .await?
+            }
+            None if tenant_str != system_str => {
+                sqlx::query(
+                    "SELECT config_json, user_id, tenant_id, 0 AS rank
+                   FROM factor_configs
+                  WHERE kind = ?1 AND enabled = 1
+                    AND user_id IS NULL AND tenant_id = ?2
+                 UNION ALL
+                 SELECT config_json, user_id, tenant_id, 1 AS rank
+                   FROM factor_configs
+                  WHERE kind = ?1 AND enabled = 1
+                    AND user_id IS NULL AND tenant_id = ?3
+                 ORDER BY rank
+                 LIMIT 1",
+                )
+                .bind(kind_str)
+                .bind(&tenant_str)
+                .bind(&system_str)
+                .fetch_optional(self.pool())
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT config_json, user_id, tenant_id
+                       FROM factor_configs
+                      WHERE kind = ?1 AND enabled = 1
+                        AND user_id IS NULL AND tenant_id = ?2
+                      LIMIT 1",
+                )
+                .bind(kind_str)
+                .bind(&system_str)
+                .fetch_optional(self.pool())
+                .await?
+            }
+        };
+
+        let Some(r) = row else { return Ok(None) };
+        let json: String = r.get("config_json");
+        let row_user: Option<String> = r.get("user_id");
+        let row_tenant: String = r.get("tenant_id");
+        let resolved_from = decode_scope(&row_tenant, row_user.as_deref())?;
+        let config: FactorConfig = serde_json::from_str(&json)?;
+        Ok(Some(ResolvedFactor {
+            config,
+            resolved_from,
+        }))
+    }
+
+    /// Exact-scope lookup with no fallback. Admin / display path.
     async fn load_factor(
         &self,
         scope: &AuthnScope,
         kind: FactorKind,
     ) -> Result<Option<FactorConfig>, Self::Error> {
-        let kind_str = kind.as_str();
+        let cols = scope.as_columns();
+        let tenant_str = cols.tenant_id.to_string();
+        let user_str = cols.user_id.map(|u| u.to_string());
 
-        // Resolution contract (see `docs/tenancy.md`):
-        //   User  → user row, then tenant row, then None.
-        //   Tenant → tenant row, then None.
-        //   Global → None (platform-wide defaults are expressed via
-        //            `FactorTemplate` catalog entries at provisioning time,
-        //            not as a runtime fallback row).
-        match scope {
-            AuthnScope::User { tenant_id, user_id } => {
-                let user_str = user_id.to_string();
-                let tenant_str = tenant_id.to_string();
-                if let Some(cfg) =
-                    fetch_factor_config(self.pool(), kind_str, Some(&user_str), Some(&tenant_str))
-                        .await?
-                {
-                    return Ok(Some(cfg));
-                }
-                fetch_factor_config(self.pool(), kind_str, None, Some(&tenant_str)).await
+        let (user_clause, bind_offset) = if user_str.is_some() {
+            ("user_id = ?3", true)
+        } else {
+            ("user_id IS NULL", false)
+        };
+
+        let sql = format!(
+            "SELECT config_json FROM factor_configs
+              WHERE kind = ?1 AND {user_clause} AND tenant_id = ?2 AND enabled = 1
+              LIMIT 1"
+        );
+
+        let mut q = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(kind.as_str())
+            .bind(&tenant_str);
+        if bind_offset {
+            q = q.bind(user_str.as_deref().unwrap());
+        }
+        match q.fetch_optional(self.pool()).await? {
+            None => Ok(None),
+            Some(r) => {
+                let json: String = r.get("config_json");
+                Ok(Some(serde_json::from_str(&json)?))
             }
-            AuthnScope::Tenant(tenant_id) => {
-                let tenant_str = tenant_id.to_string();
-                fetch_factor_config(self.pool(), kind_str, None, Some(&tenant_str)).await
-            }
-            AuthnScope::Global => Ok(None),
         }
     }
 
@@ -54,13 +159,9 @@ impl FactorStore for OurBackend {
         let config_json = serde_json::to_string(&config)?;
         let id = Uuid::new_v4().to_string();
 
-        let (user_id, tenant_id): (Option<String>, Option<String>) = match scope {
-            AuthnScope::User { user_id, tenant_id } => {
-                (Some(user_id.to_string()), Some(tenant_id.to_string()))
-            }
-            AuthnScope::Tenant(tid) => (None, Some(tid.to_string())),
-            AuthnScope::Global => (None, None),
-        };
+        let cols = scope.as_columns();
+        let tenant_str = cols.tenant_id.to_string();
+        let user_str = cols.user_id.map(|u| u.to_string());
 
         sqlx::query(
             "INSERT INTO factor_configs (id, user_id, tenant_id, kind, config_json, enabled, updated_at)
@@ -70,8 +171,8 @@ impl FactorStore for OurBackend {
                  updated_at  = excluded.updated_at",
         )
         .bind(&id)
-        .bind(&user_id)
-        .bind(&tenant_id)
+        .bind(&user_str)
+        .bind(&tenant_str)
         .bind(&kind_str)
         .bind(&config_json)
         .execute(self.pool())
@@ -96,22 +197,15 @@ impl FactorStore for OurBackend {
         let prior_json = serde_json::to_string(prior)?;
         let updated_json = serde_json::to_string(&updated)?;
 
-        let (user_id, tenant_id): (Option<String>, Option<String>) = match scope {
-            AuthnScope::User { user_id, tenant_id } => {
-                (Some(user_id.to_string()), Some(tenant_id.to_string()))
-            }
-            AuthnScope::Tenant(tid) => (None, Some(tid.to_string())),
-            AuthnScope::Global => (None, None),
-        };
+        let cols = scope.as_columns();
+        let tenant_str = cols.tenant_id.to_string();
+        let user_str = cols.user_id.map(|u| u.to_string());
 
-        // SQLite NULL doesn't compare equal in `column = ?`, so route
-        // through `IS` for the NULL legs to keep the WHERE clause
-        // tenant/global-scope correct.
-        let (user_clause, tenant_clause) = match (user_id.as_deref(), tenant_id.as_deref()) {
-            (Some(_), Some(_)) => ("user_id = ?3", "tenant_id = ?4"),
-            (None, Some(_)) => ("user_id IS NULL", "tenant_id = ?3"),
-            (None, None) => ("user_id IS NULL", "tenant_id IS NULL"),
-            (Some(_), None) => ("user_id = ?3", "tenant_id IS NULL"),
+        // tenant_id is always populated; only user_id needs the NULL branch.
+        let (user_clause, prior_placeholder) = if user_str.is_some() {
+            ("user_id = ?3", 5_usize)
+        } else {
+            ("user_id IS NULL", 4_usize)
         };
         let sql = format!(
             "UPDATE factor_configs
@@ -119,25 +213,18 @@ impl FactorStore for OurBackend {
                     updated_at  = datetime('now')
               WHERE kind = ?2
                 AND {user_clause}
-                AND {tenant_clause}
-                AND config_json = ?{}",
-            match (user_id.as_deref(), tenant_id.as_deref()) {
-                (Some(_), Some(_)) => 5,
-                (None, Some(_)) | (Some(_), None) => 4,
-                (None, None) => 3,
-            }
+                AND tenant_id = ?{tenant_placeholder}
+                AND config_json = ?{prior_placeholder}",
+            tenant_placeholder = if user_str.is_some() { 4 } else { 3 },
         );
 
         let mut q = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&updated_json)
             .bind(&kind_str);
-        if let Some(uid) = &user_id {
+        if let Some(uid) = &user_str {
             q = q.bind(uid);
         }
-        if let Some(tid) = &tenant_id {
-            q = q.bind(tid);
-        }
-        q = q.bind(&prior_json);
+        q = q.bind(&tenant_str).bind(&prior_json);
 
         let res = q.execute(self.pool()).await?;
         Ok(res.rows_affected() > 0)
@@ -196,16 +283,16 @@ impl FactorStore for OurBackend {
     }
 
     async fn save_method(&self, scope: &AuthnScope, method: AuthMethod) -> Result<(), Self::Error> {
-        let (user_id, tenant_id): (Option<String>, Option<String>) = match scope {
+        let (user_id, tenant_id): (Option<String>, String) = match scope {
             AuthnScope::User { user_id, tenant_id } => {
-                (Some(user_id.to_string()), Some(tenant_id.to_string()))
+                (Some(user_id.to_string()), tenant_id.to_string())
             }
-            AuthnScope::Tenant(t) => (None, Some(t.to_string())),
-            AuthnScope::Global => {
-                // Runtime global auth methods are not supported in this
+            AuthnScope::Tenant(t) => (None, t.to_string()),
+            AuthnScope::System => {
+                // Runtime system auth methods are not supported in this
                 // backend: methods must be materialised per tenant (see
                 // `docs/tenancy.md`). Reject to surface the mistake.
-                return Err(BackendError::InvalidGlobalMethod);
+                return Err(BackendError::InvalidSystemMethod);
             }
         };
 
@@ -233,20 +320,18 @@ impl FactorStore for OurBackend {
     }
 
     async fn remove_method(&self, scope: &AuthnScope, name: &str) -> Result<(), Self::Error> {
-        // Bind scope → (clauses + ids) in one pass so the inner match
-        // remains exhaustive (no impossible-tuple arm).
-        let (user_clause, tenant_clause, user_id, tenant_id) = match scope {
+        let (user_clause, user_id, tenant_id) = match scope {
             AuthnScope::User { user_id, tenant_id } => (
                 "user_id = ?2",
-                "tenant_id = ?3",
                 Some(user_id.to_string()),
                 tenant_id.to_string(),
             ),
-            AuthnScope::Tenant(t) => ("user_id IS NULL", "tenant_id = ?2", None, t.to_string()),
-            AuthnScope::Global => return Err(BackendError::InvalidGlobalMethod),
+            AuthnScope::Tenant(t) => ("user_id IS NULL", None, t.to_string()),
+            AuthnScope::System => return Err(BackendError::InvalidSystemMethod),
         };
         let sql = format!(
-            "DELETE FROM auth_methods WHERE name = ?1 AND {user_clause} AND {tenant_clause}"
+            "DELETE FROM auth_methods WHERE name = ?1 AND {user_clause} AND tenant_id = ?{}",
+            if user_id.is_some() { 3 } else { 2 }
         );
 
         let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(name);
@@ -264,18 +349,18 @@ impl FactorStore for OurBackend {
         name: &str,
         enabled: bool,
     ) -> Result<bool, Self::Error> {
-        let (user_clause, tenant_clause, user_id, tenant_id) = match scope {
+        let (user_clause, user_id, tenant_id) = match scope {
             AuthnScope::User { user_id, tenant_id } => (
                 "user_id = ?3",
-                "tenant_id = ?4",
                 Some(user_id.to_string()),
                 tenant_id.to_string(),
             ),
-            AuthnScope::Tenant(t) => ("user_id IS NULL", "tenant_id = ?3", None, t.to_string()),
-            AuthnScope::Global => return Err(BackendError::InvalidGlobalMethod),
+            AuthnScope::Tenant(t) => ("user_id IS NULL", None, t.to_string()),
+            AuthnScope::System => return Err(BackendError::InvalidSystemMethod),
         };
         let sql = format!(
-            "UPDATE auth_methods SET enabled = ?1 WHERE name = ?2 AND {user_clause} AND {tenant_clause}"
+            "UPDATE auth_methods SET enabled = ?1 WHERE name = ?2 AND {user_clause} AND tenant_id = ?{}",
+            if user_id.is_some() { 4 } else { 3 }
         );
 
         let mut q = sqlx::query(AssertSqlSafe(sql.as_str()))
@@ -290,42 +375,23 @@ impl FactorStore for OurBackend {
     }
 }
 
-/// Fetch a single `FactorConfig` from `factor_configs` for the given exact scope.
-///
-/// Pass `None` for `user_id` / `tenant_id` to query for the global / tenant scope.
-async fn fetch_factor_config(
-    pool: &SqlitePool,
-    kind: &str,
-    user_id: Option<&str>,
-    tenant_id: Option<&str>,
-) -> Result<Option<FactorConfig>, BackendError> {
-    let (user_clause, tenant_clause) = match (user_id, tenant_id) {
-        (Some(_), Some(_)) => ("user_id = ?2", "tenant_id = ?3"),
-        (None, Some(_)) => ("user_id IS NULL", "tenant_id = ?2"),
-        (None, None) => ("user_id IS NULL", "tenant_id IS NULL"),
-        (Some(_), None) => ("user_id = ?2", "tenant_id IS NULL"),
-    };
-
-    let sql = format!(
-        "SELECT config_json FROM factor_configs
-         WHERE kind = ?1 AND {user_clause} AND {tenant_clause} AND enabled = 1
-         LIMIT 1"
-    );
-
-    let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(kind);
-    if let Some(uid) = user_id {
-        q = q.bind(uid);
-    }
-    if let Some(tid) = tenant_id {
-        q = q.bind(tid);
-    }
-
-    let row = q.fetch_optional(pool).await?;
-    match row {
-        None => Ok(None),
-        Some(r) => {
-            let json: String = r.get("config_json");
-            Ok(Some(serde_json::from_str(&json)?))
+/// Decode a (`tenant_id`, `user_id`) storage row back into an
+/// [`AuthnScope`]. `tenant_id` is always populated;
+/// [`TenantId::SYSTEM`] maps to [`AuthnScope::System`].
+fn decode_scope(tenant_id: &str, user_id: Option<&str>) -> Result<AuthnScope, BackendError> {
+    let tenant = TenantId::try_new(tenant_id)
+        .map_err(|e| BackendError::Backend(format!("bad tenant_id in factor_configs: {e}")))?;
+    match user_id {
+        Some(uid) => {
+            let user = UserId::try_new(uid).map_err(|e| {
+                BackendError::Backend(format!("bad user_id in factor_configs: {e}"))
+            })?;
+            Ok(AuthnScope::User {
+                tenant_id: tenant,
+                user_id: user,
+            })
         }
+        None if tenant.is_system() => Ok(AuthnScope::System),
+        None => Ok(AuthnScope::Tenant(tenant)),
     }
 }

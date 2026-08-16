@@ -80,7 +80,7 @@ fn auth_method_factors_extracts_kinds_from_required_steps() {
     let method = AuthMethod::sequential(
         "totp-pw",
         vec![FactorKind::Password, FactorKind::Totp],
-        AuthnScope::Global,
+        AuthnScope::System,
     );
     let kinds = method.factors();
     assert_eq!(
@@ -102,7 +102,7 @@ fn auth_method_factors_picks_first_anyof_choice() {
             FactorKind::Totp,
             FactorKind::Password,
         ])],
-        scope: AuthnScope::Global,
+        scope: AuthnScope::System,
     };
     let kinds = method.factors();
     assert_eq!(kinds, vec![FactorKind::Totp]);

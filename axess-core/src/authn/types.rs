@@ -101,13 +101,13 @@ impl User {
         Ok(())
     }
 
-    /// Classify the user by scope: platform operator (`Scope::Global`) or
-    /// tenant member (`Scope::Tenant(..)`).
+    /// Classify the user by scope: platform operator ([`AuthnScope::System`])
+    /// or tenant member ([`AuthnScope::Tenant`]).
     ///
     /// Prefer this over direct comparison against [`TenantId::system`].
     pub fn scope(&self) -> AuthnScope {
         if self.tenant_id.is_system() {
-            AuthnScope::Global
+            AuthnScope::System
         } else {
             AuthnScope::Tenant(self.tenant_id)
         }
@@ -229,19 +229,26 @@ pub struct StatusDetail {
     pub until: Option<DateTime<Utc>>,
 }
 
-/// Three-tier authorization scope.
+/// Three-tier configuration scope, ordered from narrowest to broadest.
 ///
-/// `Global` is the platform-operator scope: identifiers can be
-/// [`TenantId::system`] / [`UserId::system`] at the storage boundary, but
-/// application code should always pattern-match on this enum rather than
-/// comparing ids directly.
+/// - [`User`](Self::User): a specific user in a specific tenant.
+/// - [`Tenant`](Self::Tenant): every user in a specific tenant.
+/// - [`System`](Self::System): platform-owned defaults that tenants adopt
+///   explicitly at provisioning (or fork later). Storage-wise, System
+///   rows live under the reserved [`TenantId::SYSTEM`] tenant — there is
+///   no NULL-tenant encoding for configuration scope anywhere in axess.
+///
+/// Runtime resolution walks [`resolution_chain`](Self::resolution_chain)
+/// from narrowest to broadest and returns the first hit. Backends
+/// implementing [`FactorStore::resolve_factor`](super::store::FactorStore::resolve_factor)
+/// do this in one query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthnScope {
-    /// Applies globally across all tenants (platform-operator scope).
-    Global,
-    /// Applies to a specific tenant.
+    /// Platform-owned defaults, keyed under [`TenantId::SYSTEM`].
+    System,
+    /// Tenant-owned config; applies to every user in the tenant.
     Tenant(TenantId),
-    /// Applies to a specific user within a tenant.
+    /// User-owned config within a tenant.
     User {
         /// Tenant containing the user.
         tenant_id: TenantId,
@@ -254,7 +261,7 @@ impl AuthnScope {
     /// Return a stable string key for use as a map key.
     pub fn key(&self) -> String {
         match self {
-            AuthnScope::Global => "global".to_string(),
+            AuthnScope::System => "system".to_string(),
             AuthnScope::Tenant(t) => format!("tenant:{t}"),
             AuthnScope::User { tenant_id, user_id } => {
                 format!("user:{tenant_id}:{user_id}")
@@ -262,89 +269,76 @@ impl AuthnScope {
         }
     }
 
-    /// Pair of `(user_id, tenant_id)` columns for storage backends that
-    /// key scope-applicability data (factor configs, auth methods, etc.).
+    /// Storage projection of this scope: `(tenant_id, user_id)` where
+    /// `tenant_id` is ALWAYS populated (with [`TenantId::SYSTEM`] for
+    /// [`AuthnScope::System`]) and `user_id` is populated only for
+    /// [`AuthnScope::User`].
     ///
-    /// **Both columns are `Option`**: `None` encodes "applies at this
-    /// level and below": tenant-level rows with `user_id = None` apply
-    /// to any user in the tenant; global rows with both `None` apply to
-    /// any user in any tenant. This is the NULL-for-default convention
-    /// the axess example backend uses.
+    /// There is no NULL-tenant encoding for configuration scope anywhere
+    /// in axess. Rows always belong to a real tenant; the system tenant
+    /// is what "platform-wide" means. FK integrity works uniformly and
+    /// SQL callers never need `tenant_id IS NULL` special-cases.
     ///
-    /// Note this is **distinct** from the tenant-ownership convention
-    /// used by downstream applications for tenant-owned data, which use
-    /// the reserved [`TenantId::system`] sentinel to preserve NOT NULL
-    /// and FK integrity. Scope applicability is about "who does this
-    /// rule apply to"; tenant ownership is about "who owns this row."
+    /// This is distinct from audit-event storage, where NULL `tenant_id`
+    /// means "tenant not yet known" (pre-authenticated event), never
+    /// "system scope."
     pub fn as_columns(&self) -> ScopeColumns {
         match self {
-            AuthnScope::Global => ScopeColumns {
+            AuthnScope::System => ScopeColumns {
+                tenant_id: TenantId::SYSTEM,
                 user_id: None,
-                tenant_id: None,
             },
             AuthnScope::Tenant(t) => ScopeColumns {
+                tenant_id: *t,
                 user_id: None,
-                tenant_id: Some(*t),
             },
             AuthnScope::User { tenant_id, user_id } => ScopeColumns {
+                tenant_id: *tenant_id,
                 user_id: Some(*user_id),
-                tenant_id: Some(*tenant_id),
             },
         }
     }
 
-    /// Ordered lookup chain for config resolution.
+    /// Ordered scope chain for runtime configuration resolution.
     ///
-    /// Backends try each entry in order until one yields a hit. The
-    /// chain always terminates at `(None, None)` so every scope falls
-    /// back to the global default.
-    pub fn lookup_chain(&self) -> Vec<ScopeColumns> {
+    /// Callers walking the chain in application code should generally
+    /// prefer [`FactorStore::resolve_factor`](super::store::FactorStore::resolve_factor),
+    /// which pushes the walk into the storage backend (one query
+    /// instead of N sequential trips). Use this helper for admin/UI
+    /// paths that need to enumerate the scopes explicitly.
+    ///
+    /// Order is narrowest → broadest. For a `User` scope: `[User, Tenant, System]`.
+    /// For `Tenant`: `[Tenant, System]`. For `System`: `[System]`.
+    pub fn resolution_chain(&self) -> Vec<AuthnScope> {
         match self {
-            AuthnScope::Global => vec![ScopeColumns {
-                user_id: None,
-                tenant_id: None,
-            }],
-            AuthnScope::Tenant(t) => vec![
-                ScopeColumns {
-                    user_id: None,
-                    tenant_id: Some(*t),
-                },
-                ScopeColumns {
-                    user_id: None,
-                    tenant_id: None,
-                },
-            ],
+            AuthnScope::System => vec![AuthnScope::System],
+            AuthnScope::Tenant(t) => vec![AuthnScope::Tenant(*t), AuthnScope::System],
             AuthnScope::User { tenant_id, user_id } => vec![
-                ScopeColumns {
-                    user_id: Some(*user_id),
-                    tenant_id: Some(*tenant_id),
+                AuthnScope::User {
+                    tenant_id: *tenant_id,
+                    user_id: *user_id,
                 },
-                ScopeColumns {
-                    user_id: None,
-                    tenant_id: Some(*tenant_id),
-                },
-                ScopeColumns {
-                    user_id: None,
-                    tenant_id: None,
-                },
+                AuthnScope::Tenant(*tenant_id),
+                AuthnScope::System,
             ],
         }
     }
 }
 
-/// Storage-layer projection of an [`AuthnScope`] onto `(user_id, tenant_id)`
+/// Storage-layer projection of an [`AuthnScope`] onto `(tenant_id, user_id)`
 /// columns for scope-applicability data (factor configs, auth methods).
 ///
-/// Both fields are `Option`: `None` encodes "applies at this level and
-/// below" per the NULL-for-default convention. Do not confuse this with
-/// tenant-ownership storage, where `tenant_id` is always populated (with
-/// the reserved [`TenantId::system`] sentinel for platform-owned rows).
+/// `tenant_id` is always populated ([`TenantId::SYSTEM`] for
+/// [`AuthnScope::System`]); only `user_id` can be absent — `None` means
+/// "applies to any user at the tenant or system level". SQL callers never
+/// need `tenant_id IS NULL` special-cases for configuration scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeColumns {
-    /// User column; `None` encodes "applies to any user at the tenant or global level".
+    /// Tenant column; always populated ([`TenantId::SYSTEM`] for the
+    /// [`AuthnScope::System`] row).
+    pub tenant_id: TenantId,
+    /// User column; `None` encodes "applies to any user at the tenant or system level".
     pub user_id: Option<UserId>,
-    /// Tenant column; `None` encodes "applies globally across tenants".
-    pub tenant_id: Option<TenantId>,
 }
 
 /// Lockout policy configuration.
@@ -610,39 +604,66 @@ mod authn_types_tests {
         assert!(!EntityState::Candidate.is_active());
     }
 
-    /// `lookup_chain` must return a non-empty ordered chain
-    /// for each scope, terminating at `(None, None)`. The mutation
+    /// `resolution_chain` must return a non-empty ordered chain
+    /// for each scope, terminating at [`AuthnScope::System`]. The mutation
     /// `-> vec![]` would silently drop every fall-through branch:
     /// factor-config and method-resolution would only ever look at
-    /// the most-specific row, never the tenant or global default.
+    /// the most-specific row, never the tenant or system default.
     #[test]
-    fn lookup_chain_returns_non_empty_terminated_chain_per_scope() {
-        // Global → exactly the `(None, None)` row.
-        let global = AuthnScope::Global.lookup_chain();
-        assert_eq!(global.len(), 1);
-        assert!(global[0].user_id.is_none() && global[0].tenant_id.is_none());
+    fn resolution_chain_returns_non_empty_terminated_chain_per_scope() {
+        // System → exactly [System].
+        let system = AuthnScope::System.resolution_chain();
+        assert_eq!(system, vec![AuthnScope::System]);
 
-        // Tenant → tenant row, then global fallback.
+        // Tenant → tenant row, then system fallback.
         let tenant = axess_identity::testing::tenant("t1");
-        let tenant_chain = AuthnScope::Tenant(tenant).lookup_chain();
-        assert_eq!(tenant_chain.len(), 2);
-        assert_eq!(tenant_chain[0].tenant_id.as_ref(), Some(&tenant));
-        assert!(tenant_chain[0].user_id.is_none());
-        assert!(tenant_chain[1].user_id.is_none() && tenant_chain[1].tenant_id.is_none());
+        let tenant_chain = AuthnScope::Tenant(tenant).resolution_chain();
+        assert_eq!(
+            tenant_chain,
+            vec![AuthnScope::Tenant(tenant), AuthnScope::System]
+        );
 
-        // User → user row, tenant row, global fallback.
+        // User → user row, tenant row, system fallback.
         let user = axess_identity::testing::user("u1");
         let user_chain = AuthnScope::User {
             tenant_id: tenant,
             user_id: user,
         }
-        .lookup_chain();
-        assert_eq!(user_chain.len(), 3);
-        assert_eq!(user_chain[0].user_id.as_ref(), Some(&user));
-        assert_eq!(user_chain[0].tenant_id.as_ref(), Some(&tenant));
-        assert!(user_chain[1].user_id.is_none());
-        assert_eq!(user_chain[1].tenant_id.as_ref(), Some(&tenant));
-        assert!(user_chain[2].user_id.is_none() && user_chain[2].tenant_id.is_none());
+        .resolution_chain();
+        assert_eq!(
+            user_chain,
+            vec![
+                AuthnScope::User {
+                    tenant_id: tenant,
+                    user_id: user,
+                },
+                AuthnScope::Tenant(tenant),
+                AuthnScope::System,
+            ]
+        );
+    }
+
+    /// Storage projection: `tenant_id` is always populated (SYSTEM for
+    /// the `System` scope); `user_id` is populated only for `User`.
+    #[test]
+    fn as_columns_always_populates_tenant() {
+        let sys = AuthnScope::System.as_columns();
+        assert_eq!(sys.tenant_id, TenantId::SYSTEM);
+        assert!(sys.user_id.is_none());
+
+        let t = axess_identity::testing::tenant("t1");
+        let tenant = AuthnScope::Tenant(t).as_columns();
+        assert_eq!(tenant.tenant_id, t);
+        assert!(tenant.user_id.is_none());
+
+        let u = axess_identity::testing::user("u1");
+        let user = AuthnScope::User {
+            tenant_id: t,
+            user_id: u,
+        }
+        .as_columns();
+        assert_eq!(user.tenant_id, t);
+        assert_eq!(user.user_id, Some(u));
     }
 
     fn make_user_with_identifier(identifier: &str, display_name: &str) -> User {
@@ -733,7 +754,7 @@ mod authn_types_tests {
         let tenant = axess_identity::testing::tenant("t-key");
         let user = axess_identity::testing::user("u-key");
 
-        assert_eq!(AuthnScope::Global.key(), "global");
+        assert_eq!(AuthnScope::System.key(), "system");
 
         let tenant_key = AuthnScope::Tenant(tenant).key();
         assert!(

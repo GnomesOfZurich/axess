@@ -8,7 +8,7 @@
 
 Hot-path string primitive for the [Axess](https://github.com/GnomesOfZurich/axess) workspace.
 
-`ShortString` is optimised for the workload of short identifiers that are hashed, compared, and cloned at high volume; event taxonomy tags, factor names, routing discriminators. The current internal representation is a placeholder (`Box<str>` / `&'static str`) suitable for getting the API contract in place; future work may swap to an inline-storage variant without changing the surface.
+`ShortString` is optimised for the workload of short identifiers that are hashed, compared, and cloned at high volume; event taxonomy tags, factor names, routing discriminators. The internal representation is a 16-byte Umbra-style value with three variants: **Inline** (≤ 12 bytes stored in the value itself, no allocation), **Static** (immutable `&'static [u8]` for compile-time constants via `ShortString::from_static`), and **Heap** (refcounted for longer strings). All three share a 4-byte prefix at a fixed offset so equality can short-circuit without first branching on the variant. See [`src/repr.rs`](src/repr.rs) for the layout, discriminator, and soundness invariants.
 
 ## Licence
 

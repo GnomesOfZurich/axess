@@ -28,48 +28,76 @@ const DEFAULT_MAX_CUSTOM_BYTES: usize = 64 * 1024;
 
 /// Session configuration controlling cookie attributes and session lifetime.
 ///
-/// Use [`SessionConfig::builder()`] for ergonomic construction, or
-/// [`SessionConfig::default()`] for production-safe defaults.
+/// Construct via [`SessionConfig::builder()`] (or
+/// [`SessionConfig::default()`] for production-safe defaults) — fields
+/// are crate-private so struct-literal construction cannot bypass the
+/// validation `SessionConfigBuilder::build` performs (`__Host-` prefix
+/// requires `secure=true`, non-zero TTL, non-empty cookie name).
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
+    pub(crate) ttl: Duration,
+    pub(crate) cookie_name: Arc<str>,
+    pub(crate) secure: bool,
+    pub(crate) same_site: SameSite,
+    pub(crate) http_only: bool,
+    pub(crate) path: Arc<str>,
+    pub(crate) max_custom_bytes: usize,
+}
+
+impl SessionConfig {
     /// Session time-to-live in the store and `Max-Age` on the cookie.
-    pub ttl: Duration,
+    pub fn ttl(&self) -> Duration {
+        self.ttl
+    }
+
     /// Cookie name (default: `"axess.sid"`).
     ///
     /// Prefer the `__Host-` prefix in production (e.g.,
     /// `"__Host-axess.sid"`). Browsers refuse to set a `__Host-` cookie
     /// unless `Secure=true`, `Path="/"`, and the cookie has no `Domain`
     /// attribute: together these prevent subdomain-scoped overwrites and
-    /// cross-host injection that the bare name does not. Using the prefix
-    /// without `Secure=true` panics in `build()` to fail fast on
-    /// misconfiguration. The `__Secure-` prefix is similar but only
-    /// requires `Secure=true`.
-    pub cookie_name: Arc<str>,
-    /// Set the `Secure` flag on the cookie (default: `true`).
-    ///
-    /// Set to `false` for local HTTP development.
-    pub secure: bool,
+    /// cross-host injection that the bare name does not. The
+    /// [`SessionConfigBuilder`] enforces these constraints at
+    /// construction time.
+    pub fn cookie_name(&self) -> &str {
+        &self.cookie_name
+    }
+
+    /// `Secure` cookie flag (default: `true`; disable only for local HTTP dev).
+    pub fn secure(&self) -> bool {
+        self.secure
+    }
+
     /// `SameSite` policy (default: `Lax`).
     ///
     /// `Lax` is the right default for axess: the OAuth/OIDC callback flow
     /// depends on the cookie being delivered on the IdP's top-level GET
-    /// redirect back to the application, which `Strict` would strip. `Lax`
-    /// still blocks the cookie from cross-site sub-resource requests
-    /// (`<img>`, `<iframe>`, `fetch()` without credentials), but **does
-    /// deliver the cookie on top-level navigations from a third-party
-    /// origin**. Applications MUST therefore layer their own CSRF defence
-    /// on every state-changing POST/PUT/DELETE; the bundled
-    /// `axess_core::middleware::csrf` middleware does this, but it is opt-in.
-    pub same_site: SameSite,
-    /// Set the `HttpOnly` flag on the cookie (default: `true`).
-    pub http_only: bool,
+    /// redirect back to the application, which `Strict` would strip.
+    /// Applications MUST therefore layer their own CSRF defence on every
+    /// state-changing POST/PUT/DELETE; the bundled
+    /// [`axess_core::middleware::csrf`](crate::middleware::csrf) module
+    /// does this, but it is opt-in.
+    pub fn same_site(&self) -> SameSite {
+        self.same_site
+    }
+
+    /// `HttpOnly` cookie flag (default: `true`).
+    pub fn http_only(&self) -> bool {
+        self.http_only
+    }
+
     /// Cookie `Path` attribute (default: `"/"`).
-    pub path: Arc<str>,
-    /// Maximum size (in bytes) of serialized custom session data (default: 64 KiB).
-    ///
-    /// Prevents session-bloat DoS where an attacker inflates the custom JSON
-    /// bag to exhaust storage. Set to `0` to disable the limit.
-    pub max_custom_bytes: usize,
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Maximum size (in bytes) of serialized custom session data
+    /// (default: 64 KiB; `0` disables the limit). Prevents session-bloat
+    /// DoS where an attacker inflates the custom JSON bag to exhaust
+    /// storage.
+    pub fn max_custom_bytes(&self) -> usize {
+        self.max_custom_bytes
+    }
 }
 
 impl Default for SessionConfig {

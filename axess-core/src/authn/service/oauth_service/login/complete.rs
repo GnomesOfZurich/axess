@@ -253,10 +253,12 @@ where
     /// 1. **TTL prune**: drop entries older than `SID_MAP_TTL` (24h).
     ///    Steady-state cleanup so an OIDC session the IdP never
     ///    explicitly logged out eventually ages out.
-    /// 2. **Capacity evict**: if at/over `MAX_SID_MAP_ENTRIES` after
-    ///    TTL prune, evict a *batch* of oldest entries via a single
-    ///    bounded scan. Sort + `take(BATCH)` is O(N log K) for K=128,
-    ///    keeping the per-batch cost bounded under burst load.
+    /// 2. **Capacity evict**: if at/over `self.sid_map_capacity`
+    ///    (default `DEFAULT_SID_MAP_CAPACITY = 10 000`; override via
+    ///    [`AuthnService::with_sid_map_capacity`]) after TTL prune,
+    ///    evict a *batch* of oldest entries via a single bounded
+    ///    scan. Sort + `take(BATCH)` is O(N log K) for K=128, keeping
+    ///    the per-batch cost bounded under burst load.
     /// 3. **Atomic swap**: `DashMap::insert` returns any displaced
     ///    value atomically. We invalidate the displaced session in the
     ///    registry after the swap. Doing the swap atomically (not
@@ -279,7 +281,13 @@ where
         // `MAX_KEY_LEN` cap and is well above any realistic OIDC
         // session id (typically <64 chars).
         const MAX_OIDC_SID_BYTES: usize = 256;
-        const MAX_SID_MAP_ENTRIES: usize = 10_000;
+        // Capacity cap is per-service configurable via
+        // `AuthnService::with_sid_map_capacity` (default
+        // `DEFAULT_SID_MAP_CAPACITY = 10_000`). High-throughput OAuth
+        // deployments raise it so legitimate concurrent OIDC sessions
+        // do not trip the batch-eviction path and lose back-channel
+        // logout precision on the evicted mappings.
+        let max_sid_map_entries = self.sid_map_capacity;
         const SID_MAP_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
         const EVICT_BATCH: usize = 128;
 
@@ -328,7 +336,7 @@ where
         }
 
         // Phase 2: capacity-based batch eviction.
-        if self.sid_map.len() >= MAX_SID_MAP_ENTRIES {
+        if self.sid_map.len() >= max_sid_map_entries {
             let mut oldest: Vec<(chrono::DateTime<chrono::Utc>, SidKey)> = self
                 .sid_map
                 .iter()

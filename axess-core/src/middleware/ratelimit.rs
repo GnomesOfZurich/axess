@@ -8,7 +8,7 @@
 //! | Extractor | Source | Use case |
 //! |-----------|--------|----------|
 //! | `KeyExtractor::PeerIp` | `SocketAddr` from `ConnectInfo` | **Default.** Safe for direct connections. |
-//! | `KeyExtractor::ForwardedIp` | `X-Forwarded-For` header | Behind a **trusted** reverse proxy only. |
+//! | `KeyExtractor::ForwardedIp` | `X-Real-IP` (first) then `X-Forwarded-For` | Behind a **trusted** reverse proxy only. |
 //! | `KeyExtractor::UserId` | `RateLimitUserId` request extension | Per-user limits (set after authentication). |
 //! | `KeyExtractor::TenantId` | `RateLimitTenantId` request extension | Per-tenant limits. |
 //! | `KeyExtractor::LoginIdentifier` | `RateLimitLoginIdentifier` request extension | **Required for login routes** to mitigate per-username lockout DoS. |
@@ -98,9 +98,14 @@ pub enum KeyExtractor {
     /// `ConnectInfo` is not available; this is fail-closed (all requests
     /// share one bucket = stricter limiting).
     PeerIp,
-    /// Rate limit by authenticated user (reads `x-user-id` header or request extension).
+    /// Rate limit by authenticated user (reads the [`RateLimitUserId`]
+    /// request extension the auth layer injects). Falls back to a
+    /// shared anonymous bucket if the extension is absent; unauthenticated
+    /// callers cannot select their own bucket.
     UserId,
-    /// Rate limit by tenant (reads `x-tenant-id` header or request extension).
+    /// Rate limit by tenant (reads the [`RateLimitTenantId`] request
+    /// extension the auth layer injects). Falls back to a shared
+    /// anonymous bucket if the extension is absent.
     TenantId,
     /// Rate limit by the **login identifier** (username/email submitted to a
     /// login route). Reads the [`RateLimitLoginIdentifier`] request extension
@@ -414,13 +419,11 @@ fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
             .extensions()
             .get::<RateLimitUserId>()
             .map(|u| u.0.to_string())
-            .or_else(|| header_str(req, "x-user-id"))
             .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
         KeyExtractor::TenantId => req
             .extensions()
             .get::<RateLimitTenantId>()
             .map(|t| t.0.to_string())
-            .or_else(|| header_str(req, "x-tenant-id"))
             .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
         KeyExtractor::LoginIdentifier => req
             .extensions()

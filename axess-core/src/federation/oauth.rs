@@ -23,9 +23,31 @@ pub struct OAuthProviderRegistry {
 }
 
 impl OAuthProviderRegistry {
+    /// Insert a provider under its `provider.name()` key.
+    ///
+    /// **Duplicate-name safety:** if the key already exists, the new
+    /// provider replaces the old one, a `tracing::warn!` is emitted, and
+    /// in debug builds the process aborts via `debug_assert!`. Silent
+    /// overwrite of a provider — especially with different `client_id`
+    /// / `client_secret` — is a real security-relevant misconfiguration
+    /// (token exchange would then execute against the wrong credentials
+    /// for that IdP name); loud-in-dev, discoverable-in-prod is the
+    /// deliberate balance chosen over an API-breaking `Result` return.
     pub(crate) fn add(&mut self, provider: impl OAuthProvider) {
         let name = provider.name().clone();
-        self.providers.insert(name, Arc::new(provider));
+        let existing = self.providers.insert(name.clone(), Arc::new(provider));
+        if existing.is_some() {
+            tracing::warn!(
+                provider_name = %name,
+                "oauth: replacing existing provider registration; \
+                 duplicate `with_oauth_provider` call — the previous \
+                 configuration (client_id, discovery, etc.) is now lost"
+            );
+            debug_assert!(
+                false,
+                "duplicate OAuth provider name `{name}` registered; silent overwrite in release builds"
+            );
+        }
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn OAuthProvider>> {
@@ -80,5 +102,27 @@ mod tests {
         assert_eq!(registry.provider_count(), 1);
         registry.add(MockOAuthProvider::new("github"));
         assert_eq!(registry.provider_count(), 2);
+    }
+
+    /// Duplicate name registration must trip `debug_assert!` so
+    /// operators discover the misconfiguration in dev / CI. Pins the
+    /// silent-overwrite regression: without the assert, two
+    /// `with_oauth_provider("google", ...)` calls quietly keep the
+    /// second one and forget the first (which would be a real
+    /// security-relevant footgun if the two carry different
+    /// `client_secret`s).
+    ///
+    /// Cfg'd on `debug_assertions` because release builds do NOT
+    /// panic — the release path emits a `tracing::warn!` and
+    /// continues, and there is no straightforward way to assert on
+    /// tracing output here without pulling in the mock-tracing
+    /// scaffolding for a one-line check.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "duplicate OAuth provider name")]
+    fn provider_registry_duplicate_name_panics_in_debug() {
+        let mut registry = OAuthProviderRegistry::default();
+        registry.add(MockOAuthProvider::new("google"));
+        registry.add(MockOAuthProvider::new("google"));
     }
 }

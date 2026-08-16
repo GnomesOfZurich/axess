@@ -69,11 +69,12 @@ sqlx = { version = "0.9.0", features = ["runtime-tokio"], optional = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
+form_urlencoded = "1.2.2"
 tower = { version = "0.5.3", features = ["util"] }
 tower-cookies = { version = "0.11.0", features = ["axum-core"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = { workspace = true, optional = true }
+url = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 webauthn-rs = { version = "0.6.0-dev", features = ["danger-allow-state-serialisation", "conditional-ui"], optional = true }
 # Adopter test-fixture surface: `axess_core::testing::oauth_wiremock` stands
@@ -94,7 +95,7 @@ axess-rng = { workspace = true, features = ["testing"] }
 argon2 = { version = "0.5.3", features = ["default"] }
 base32 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
-http-body-util = "0.1.4"
+http-body-util = "0.1.5"
 hyper = { version = "1.11.0", features = ["full"] }
 proptest = { workspace = true }
 # rcgen mints X509-SVID certs with SPIFFE URIs in SAN for mTLS resolver tests.
@@ -110,7 +111,7 @@ sha1 = { workspace = true }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres"] }
 subtle = { workspace = true }
 tokio-test = { workspace = true }
-totp-rs = { version = "5.7.2", features = ["gen_secret"] }
+totp-rs = { version = "6.0.0", features = ["gen_secret"] }
 # In-crate `#[cfg(test)]` mods build wiremock fixtures directly; an optional
 # regular-dep entry of the same crate (under `testing-oauth`) re-exposes
 # wiremock to adopters via `axess_core::testing::oauth_wiremock`.
@@ -156,7 +157,7 @@ ws = ["axum/ws"]
 
 # Federated authn / OIDC
 fapi = ["oauth", "dep:p256", "axess-factors/fapi"]
-fido2 = ["dep:webauthn-rs", "dep:url", "axess-factors/fido2"]
+fido2 = ["dep:webauthn-rs", "axess-factors/fido2"]
 # Generic JWT primitives + `WorkloadResolver` for non-SPIFFE
 # workload-identity flows. Adopters reach for this when wiring
 # GitHub Actions OIDC, Kubernetes SA, GitLab CI, Okta, Azure AD,
@@ -166,7 +167,7 @@ jwt = ["axess-factors/jwt"]
 jwt-svid = ["jwt", "axess-factors/jwt-svid"]
 ldap = ["dep:ldap3", "axess-factors/ldap"]
 mtls = ["dep:x509-parser", "dep:rustls-pki-types", "axess-factors/mtls"]
-oauth = ["dep:openidconnect", "dep:url", "dep:jsonwebtoken", "axess-factors/oauth"]
+oauth = ["dep:openidconnect", "dep:jsonwebtoken", "axess-factors/oauth"]
 # Plain-OAuth-2.0 user login. OFF BY DEFAULT — see
 # `axess_factors::social` module docs for the security model and when
 # to reach for this vs OIDC.
@@ -181,15 +182,15 @@ outbound-oauth = ["axess-factors/outbound-oauth"]
 # `openidconnect` + `url` + `jsonwebtoken`; `dep:reqwest` covers the
 # direct HTTP client the exchange + stored flows use.
 delegated = ["delegated-stored", "delegated-stored-encrypted", "delegated-exchange"]
-delegated-exchange = ["outbound-oauth", "dep:reqwest", "dep:url"]
-delegated-stored = ["oauth", "outbound-oauth", "dep:reqwest", "dep:url"]
+delegated-exchange = ["outbound-oauth", "dep:reqwest"]
+delegated-stored = ["oauth", "outbound-oauth", "dep:reqwest"]
 delegated-stored-encrypted = ["delegated-stored", "dep:aes-gcm"]
 
 # Cloud STS — federated workload-identity → cloud temporary credentials
-aws-sts = ["dep:reqwest", "dep:quick-xml", "dep:url"]
-azure-fic = ["dep:reqwest", "dep:url"]
+aws-sts = ["dep:reqwest", "dep:quick-xml"]
+azure-fic = ["dep:reqwest"]
 cloud-sts = ["aws-sts", "gcp-wif", "azure-fic"]
-gcp-wif = ["dep:reqwest", "dep:url"]
+gcp-wif = ["dep:reqwest"]
 
 # In-process IdP — mints workload JWTs for tests + on-host issuance
 # Primitive types (`LocalIdpSigningKey`, `MintClaims`, `IssuanceListener`)

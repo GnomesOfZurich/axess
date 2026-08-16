@@ -101,9 +101,9 @@ pub use authn::{
     FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
     IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityStore, IpPolicy, LdapBindFactorConfig,
     LockoutPolicy, LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm,
-    PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, SessionValidator,
-    SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
-    ZeroizedString, create_tenant, default_catalog, extract_audit_context,
+    PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor,
+    SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig,
+    User, UserId, ZeroizedString, create_tenant, default_catalog, extract_audit_context,
     extract_audit_context_async, require_valid_session,
 };
 

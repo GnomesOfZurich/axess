@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "axess"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess-core",
  "axess-factors",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "axess-cache"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess-clock",
  "chrono",
@@ -353,14 +353,14 @@ dependencies = [
 
 [[package]]
 name = "axess-clock"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "axess-core"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "aes-gcm 0.11.0",
  "argon2",
@@ -376,6 +376,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
+ "form_urlencoded",
  "fred",
  "hmac 0.13.0",
  "http-body-util",
@@ -420,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "axess-events"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess-identity",
  "axess-strings",
@@ -435,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-authz"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axum",
@@ -450,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-device"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axess-clock",
@@ -466,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-fapi"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axum",
@@ -479,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-local-idp"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axum",
@@ -496,7 +497,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-oauth"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axum",
@@ -509,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-social"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axum",
@@ -523,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-sqlite"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axum",
@@ -543,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-workload-identity"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess",
  "axess-clock",
@@ -561,7 +562,7 @@ dependencies = [
 
 [[package]]
 name = "axess-factors"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess-clock",
  "axess-identity",
@@ -602,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "axess-identity"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess-rng",
  "rkyv",
@@ -616,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "axess-macros"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "axess-core",
  "cedar-policy",
@@ -625,14 +626,14 @@ dependencies = [
 
 [[package]]
 name = "axess-rng"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "rand 0.10.2",
 ]
 
 [[package]]
 name = "axess-strings"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "rkyv",
@@ -1124,9 +1125,9 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "constant_time_eq"
-version = "0.3.1"
+version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "cookie"
@@ -2318,9 +2319,9 @@ dependencies = [
 
 [[package]]
 name = "http-body-util"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f41fd6a08e4d4ec69df65976da761afd5ad5e58a9d4acb46bd1c953a9e3ff2"
+checksum = "23169fe34a5fbcdd3f3862e78fb9b6fccd5f02a6dc6f732547005d45631ce71c"
 dependencies = [
  "bytes",
  "futures-core",
@@ -2931,9 +2932,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b6180140927ee907000b0aa540091f6ea512ead4447c92b8fc35bc72788a5a6"
+checksum = "5d2f2f9b4ba7e6b24d95e7e899329d35be83bcded72c8540cdd5368932d1d90a"
 dependencies = [
  "hashbrown 0.17.0",
 ]
@@ -5324,17 +5325,17 @@ dependencies = [
 
 [[package]]
 name = "totp-rs"
-version = "5.7.2"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50e69a15e21b2ff22c415446983978bded3244195f17d59cb113551c1e806f91"
+checksum = "49d0f9b7aa5def86d3a8d8ba926fe8c1990924dd715d2b5fc54a4aa3788c11c1"
 dependencies = [
  "base32",
  "constant_time_eq",
- "hmac 0.12.1",
- "rand 0.9.4",
+ "hmac 0.13.0",
+ "rand 0.10.2",
  "serde",
- "sha1 0.10.6",
- "sha2 0.10.9",
+ "sha1 0.11.0",
+ "sha2 0.11.0",
  "zeroize",
 ]
 
@@ -5622,9 +5623,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.24.0"
+version = "1.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",

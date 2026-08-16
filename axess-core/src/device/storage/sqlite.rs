@@ -1,5 +1,21 @@
 //! SQLite-backed [`DeviceStore`] using sqlx.
 //!
+//! # Cross-dialect parity contract
+//!
+//! The device / device_bindings_refresh schema is intentionally
+//! duplicated across three dialect siblings in this directory
+//! ([`sqlite`](crate::device::storage::sqlite),
+//! [`postgres`](crate::device::storage::postgres),
+//! [`mysql`](crate::device::storage::mysql)) rather than generated from
+//! a single source; each dialect owns its idempotency quirks
+//! (SQLite/Postgres accept `CREATE INDEX IF NOT EXISTS`; MySQL does
+//! not and declares indexes inline in `CREATE TABLE`). Column
+//! definitions and semantics MUST stay in sync across all three — a
+//! change in one file is a defect until the other two catch up. No
+//! automated parity test exists today; the safeguard is that all
+//! three files live in the same directory and a reviewer touching one
+//! sees the others immediately.
+//!
 //! # Schema
 //!
 //! ```sql

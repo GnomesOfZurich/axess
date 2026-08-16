@@ -52,9 +52,10 @@ pub mod authn {
         FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin,
         IdentityAuthnLog, IdentityLookup, IdentityStore, IpPolicy, LdapBindFactorConfig,
         LockoutPolicy, LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm,
-        PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, SessionValidator,
-        SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
-        ZeroizedString, create_tenant, default_catalog, require_valid_session,
+        PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor,
+        SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId,
+        TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
+        require_valid_session,
     };
     pub use axess_factors::{
         HOTP_LENGTH, HotpAlgorithm, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams,

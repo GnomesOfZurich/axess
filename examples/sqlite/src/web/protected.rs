@@ -1,10 +1,12 @@
 //! Protected routes; accessible only to fully authenticated users.
 
 use crate::web::app::AppState;
+use crate::web::csrf_hidden_input;
 use axess::authn::{AuthnScope, FactorKind, FactorStore};
+use axess::csrf::CsrfToken;
 use axess::{AuthSession, require_authn};
 use axum::{
-    Router,
+    Extension, Router,
     extract::State,
     response::{Html, IntoResponse},
     routing::get,
@@ -21,7 +23,11 @@ pub fn router() -> Router<AppState> {
 }
 
 /// GET /dashboard; requires authentication.
-pub async fn dashboard(session: AuthSession, State(state): State<AppState>) -> impl IntoResponse {
+pub async fn dashboard(
+    session: AuthSession,
+    State(state): State<AppState>,
+    Extension(csrf): Extension<CsrfToken>,
+) -> impl IntoResponse {
     let user_id = session.user_id().await;
     let tenant_id = session.tenant_id().await;
     let user_display = user_id
@@ -53,6 +59,8 @@ pub async fn dashboard(session: AuthSession, State(state): State<AppState>) -> i
         r#"<li><a href="/setup-totp">Enroll TOTP (two-factor authentication)</a></li>"#.to_string()
     };
 
+    let csrf_input = csrf_hidden_input(&csrf);
+
     Html(format!(
         r#"<!doctype html>
 <html><head><title>Dashboard</title></head><body>
@@ -62,6 +70,7 @@ pub async fn dashboard(session: AuthSession, State(state): State<AppState>) -> i
   {totp_block}
 </ul>
 <form method="POST" action="/logout">
+  {csrf_input}
   <button type="submit">Logout</button>
 </form>
 </body></html>"#

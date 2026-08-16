@@ -1,6 +1,6 @@
 # Scope hierarchy
 
-Methods and factor configurations live at three tiers: Global, Tenant,
+Methods and factor configurations live at three tiers: System, Tenant,
 and User. The mechanism is simple, the consequences are not. Done well,
 the three-tier hierarchy makes multi-tenant SaaS deployment feel like
 one configuration with two override surfaces. Done badly, it becomes
@@ -16,74 +16,126 @@ It is a three-variant enum, ordered from broadest to narrowest:
 
 ```rust,ignore
 pub enum AuthnScope {
-    Global,
+    System,
     Tenant(TenantId),
     User { tenant_id: TenantId, user_id: UserId },
 }
 ```
 
-`Global` is the workspace-wide default. A method or factor configured
-at global scope applies to every user in every tenant unless something
-overrides it.
+`System` is the platform-owned default tier. A method or factor
+configured at system scope is a *template* the platform makes
+available; tenants adopt it explicitly (see "Adoption, not silent
+inheritance" below).
 
-`Tenant(TenantId)` is a per-tenant override. A method configured at
-tenant scope applies to every user in that tenant, overriding the
-global default for that tenant.
+`Tenant(TenantId)` is a per-tenant configuration. A method configured
+at tenant scope applies to every user in that tenant.
 
-`User { tenant_id, user_id }` is a per-user override. A method
-configured at user scope applies to that one user, overriding both the
-tenant and global defaults for that user.
+`User { tenant_id, user_id }` is a per-user configuration. A method
+configured at user scope applies to that one user.
 
 The ordering is the ordering of authority. Narrower beats broader.
 
+## Adoption, not silent inheritance
+
+The mental model is important: **System is a template tier, not a
+runtime broadcast tier.** A factor configured at System scope does not
+automatically become a login option for every tenant; a tenant adopts
+the template explicitly at provisioning time or through an
+administrative reconfiguration. The `FactorTemplate` catalog in
+`axess-core::authn::factor` is the surface for this: platform operators
+curate a set of templates; tenant provisioning selects which templates
+this tenant will use and materialises tenant-scoped rows.
+
+This preserves the invariant that a tenant admin never gets surprised
+by a factor they did not opt into. Silent inheritance would make
+platform-wide changes propagate to tenants who had reasons for their
+existing configuration; explicit adoption forces those changes to
+route through the tenant's own configuration surface.
+
+At *runtime*, once a user has an active method that includes some
+factor kind, the store walks the User → Tenant → System resolution
+chain to find the applicable config data (see next section). The
+System row is legitimate as the config *source* for a factor the user
+has already activated (through their method); it is never the *grant*.
+
 ## How resolution works
 
-At `begin_login` time the service needs to know which method this user
-should authenticate against. The resolution walks the scope chain from
-narrowest to broadest, returning the first match it finds.
+At `begin_login` time and again at each `verify_factor` step, the
+service asks the factor store for the applicable config for the
+factor kind that is next in the user's method. Resolution walks the
+scope chain from narrowest to broadest, returning the first hit.
 
-The chain helper `AuthnScope::lookup_chain` produces the ordered
+The chain helper `AuthnScope::resolution_chain` produces the ordered
 sequence of scopes to query. For a user with `tenant_id = T` and
 `user_id = U`, the chain is
-`[User { T, U }, Tenant(T), Global]`. The factor store walks this list
-and returns the first configured method.
+`[User { T, U }, Tenant(T), System]`.
+
+Application code does not walk the chain — the store does, in one
+query, and returns a [`ResolvedFactor`] carrying both the config and
+the scope it was resolved from:
 
 ```rust,ignore
-async fn load_factor_with_fallback(
-    user_scope: &AuthnScope,
-    tenant_id: &TenantId,
-    kind: &FactorKind,
-) -> Result<Option<FactorConfig>, FactorStoreError> {
-    for scope in user_scope.lookup_chain() {
-        if let Some(config) = factor_store.load_factor(&scope, kind).await? {
-            return Ok(Some(config));
-        }
-    }
-    Ok(None)
+pub struct ResolvedFactor {
+    pub config: FactorConfig,
+    pub resolved_from: AuthnScope,
 }
+
+// In service code, one call:
+let resolved = factors
+    .resolve_factor(&user_scope, kind)
+    .await?
+    .ok_or(AuthnError::NoFlow)?;
 ```
 
+Backends implement `resolve_factor` as a single ordered `SELECT`
+(the SQLite example does this via a `UNION ALL` with a `rank` column
+and `LIMIT 1`). Latency-wise this is one round trip regardless of
+where the config actually lives.
+
+The `resolved_from` field lets callers know which tier served the
+request — used by the failure-counter CAS logic to know whether to
+CAS against an existing user-scope row or to create a new one from a
+tenant/system template.
+
+For admin and display code that wants "what did this tenant
+*explicitly* configure?", the store also exposes `load_factor`
+which returns the config at exactly the requested scope with no
+fallback. Never on the auth hot path — use `resolve_factor` there.
+
 The same chain is used for each factor in the method. A method that
-chains password and TOTP looks up the password config first (which
+chains password and TOTP resolves the password config first (which
 might be a user-scoped override) and then the TOTP config (which might
 be a tenant default). Each factor's configuration is resolved
 independently, which is the right shape for the common case where the
 user has chosen their own TOTP device but the tenant has standardised
 the password policy.
 
-The storage convention matches the tier model. The factor store schema
-typically has `tenant_id` and `user_id` columns that are nullable,
-with the following semantics:
+## Storage encoding
 
-| `tenant_id` | `user_id` | Scope |
-|---|---|---|
-| `NULL` | `NULL` | `Global` |
-| set | `NULL` | `Tenant(tenant_id)` |
-| set | set | `User { tenant_id, user_id }` |
+The factor store schema has `tenant_id` (NOT NULL) and `user_id`
+(nullable) columns:
 
-`ScopeColumns` is the in-code representation of this pair; it lives
-next to `AuthnScope` and is what the SQL adapters use when building
-queries.
+| `tenant_id`     | `user_id` | Scope                            |
+|-----------------|-----------|----------------------------------|
+| `TenantId::SYSTEM` | `NULL`   | `System`                         |
+| `<tenant>`      | `NULL`    | `Tenant(tenant)`                 |
+| `<tenant>`      | `<user>`  | `User { tenant, user }`          |
+
+`tenant_id` is **never NULL** for configuration scope; platform-owned
+rows live under the reserved `TenantId::SYSTEM` tenant. This keeps
+FK integrity uniform (`tenant_id REFERENCES tenants(id)`) and lets
+SQL callers use a single `tenant_id = ?` clause without the
+`IS NULL` special-cases that a two-optional encoding would need.
+
+`ScopeColumns` in
+[`axess-core/src/authn/types.rs`](https://github.com/GnomesOfZurich/axess/blob/main/axess-core/src/authn/types.rs)
+is the in-code representation of the pair; it exposes `tenant_id:
+TenantId` (always populated) and `user_id: Option<UserId>` (populated
+only for User scope).
+
+Note this is **distinct** from audit-event storage, where a NULL
+`tenant_id` means "tenant not yet known" (pre-authenticated event,
+failed login for an unknown user), never "System scope."
 
 ## What gets scoped
 
@@ -93,39 +145,44 @@ chain-walking resolution.
 
 *Factor configurations* are the per-factor stored data: the password
 hash for a user, the TOTP secret for a user, the FIDO2 credential
-public keys for a user, the LDAP bind parameters for a tenant. Most
-factor configurations are user-scoped because they belong to a
-specific user (a password hash is intrinsically per-user). A few are
-tenant-scoped because they belong to a tenant configuration (LDAP bind
-parameters, OIDC discovery URLs). A very few are global (the system
-default Argon2id parameters, the system default TOTP drift window).
+public keys for a user, the LDAP bind parameters for a tenant, the
+system default Argon2id parameters, the system default TOTP drift
+window. Most user-specific factor configurations are user-scoped
+because they belong to a specific user (a password hash is
+intrinsically per-user). Policy-shaped configurations
+(Argon2id parameters, drift windows) are typically tenant-scoped or
+system-scoped.
 
 *Methods* are the ordered sequences of factor steps. A tenant typically
 configures a single default method (password-plus-TOTP, say), and a
 small minority of tenants override it (a regulated tenant requires
 FIDO2 instead of TOTP). Individual users very rarely have a custom
 method; when they do, it is because policy demands a stronger factor
-for a flagged user.
+for a flagged user. Methods live at User or Tenant scope only; the
+SQLite example rejects System scope on `save_method` and friends,
+because runtime authentication methods must be materialised per
+tenant.
 
 *Lockout policies* are the rate and threshold for locking out a user
-after repeated failed attempts. Defaults are global. Tenants with
+after repeated failed attempts. System defaults exist. Tenants with
 stricter risk postures override at tenant scope. Per-user lockout
 policies exist but are rare; they usually mean "this user is on a
 watch list and gets locked out faster than the rest".
 
 The pattern across all three is identical. Configure a sensible
-global default. Let tenants override when they have a real reason.
-Reach for the user-scoped override only when policy demands
-per-individual differentiation. The more configuration you do at the
-narrowest scope, the more state you have to reason about during
-incidents.
+system default. Let tenants adopt it or override when they have a
+real reason. Reach for the user-scoped override only when policy
+demands per-individual differentiation. The more configuration you do
+at the narrowest scope, the more state you have to reason about
+during incidents.
 
 ## Migration patterns
 
 The scope hierarchy is the right tool for rolling out factor changes
 in a controlled way. The pattern is to introduce the change at the
-narrowest scope, verify it on a small population, and broaden the
-scope as confidence accumulates.
+narrowest scope, verify it on a small population, and broaden as
+confidence accumulates — but broadening happens through explicit
+per-tenant adoption, never through silent system-wide broadcast.
 
 A worked example. A SaaS deployment wants to require FIDO2 for all
 users, replacing the existing password-plus-TOTP method. The cautious
@@ -144,19 +201,21 @@ transition next, and the pilot widens to a population that includes
 real customer traffic. The user-scoped overrides from phase one are
 removed (they no longer differ from the tenant default).
 
-Phase three is Global rollout. With confidence from both pilot phases,
-the team configures the new method at global scope. The
-tenant-scoped override for the early-adopter tenant is removed at the
-same time, since it no longer differs from the global default. The
-roll-out is complete; the method store has one row (the global
-default) instead of many.
+Phase three is Per-tenant rollout. With confidence from both pilot
+phases, the team iterates the remaining tenants, either by updating
+each tenant's method configuration to the new FIDO2-plus-password
+sequence, or (if the tenant admin is empowered) by prompting the
+admin to adopt the new method template. Each tenant transitions
+independently, with an audit event per change. There is no
+system-wide broadcast: if a tenant deliberately does not adopt the
+new method (e.g. their user base has no FIDO2 hardware), they retain
+the old method and the roll-out simply skips them.
 
 The pattern works in reverse for emergency revocation. If the new
-method has a bug that surfaces after global rollout, the team can
-override at tenant scope or user scope for the affected population
-without redeploying the application or reverting the global config.
-The narrower scope wins; the affected users walk the old method while
-the bug is fixed.
+method has a bug that surfaces during rollout, the team can override
+at tenant scope or user scope for the affected population without
+redeploying the application. The narrower scope wins; the affected
+users walk the old method while the bug is fixed.
 
 ## How Cedar policy interacts
 
@@ -195,14 +254,13 @@ to use user scope only when policy genuinely requires per-individual
 differentiation, and to document the reason in a separate field next
 to the row.
 
-The second is using the hierarchy as a feature flag. The temptation
-is to roll out a new factor by user-scoping it to internal users, then
-forget about the user-scoped rows after the global rollout. The
-hierarchy is a good migration tool but a bad permanent home for
-temporary state. After a rollout completes, remove the narrower-scope
-overrides that no longer differ from the broader-scope default. The
-audit trail still records the historical use; the live configuration
-is clean.
+The second is treating System as a runtime broadcast tier. A factor
+configured at System scope is a *template* — the correct pattern is
+to adopt (materialise a tenant-scoped row) rather than to depend on
+resolution to reach it silently. Depending on system-tier fallback
+turns platform-wide edits into surprise tenant-level changes.
+Materialise on adoption; treat runtime fallback to System as a
+convenience, not a management model.
 
 The third is conflating method scope with tenant identity. The
 hierarchy says nothing about which tenants exist; it says only how to

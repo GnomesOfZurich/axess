@@ -151,8 +151,8 @@ where
     /// Strategy:
     /// 1. **Probe user-scope** before entering the CAS loop.
     ///    The `updated_config` we received was computed against
-    ///    whatever scope `load_factor_with_fallback` returned: that
-    ///    may have been tenant or global. Using it as the CAS
+    ///    whatever scope `resolve_factor` returned: that may have
+    ///    been tenant or system. Using it as the CAS
     ///    `prior_config` against a user-scope row would always lose
     ///    the first round (different bytes), then fall through to
     ///    the reload-and-save path which can silently overwrite a

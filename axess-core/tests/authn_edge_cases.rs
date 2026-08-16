@@ -175,14 +175,14 @@ fn zeroized_string_debug_hides_content() {
 /// AuthnScope::key() produces distinct keys for each variant.
 #[test]
 fn authn_scope_keys_are_distinct() {
-    let global = AuthnScope::Global;
+    let system = AuthnScope::System;
     let tenant = AuthnScope::Tenant(tid("t1"));
     let user = AuthnScope::User {
         tenant_id: tid("t1"),
         user_id: uid("u1"),
     };
 
-    assert_ne!(global.key(), tenant.key());
+    assert_ne!(system.key(), tenant.key());
     assert_ne!(tenant.key(), user.key());
-    assert_ne!(global.key(), user.key());
+    assert_ne!(system.key(), user.key());
 }

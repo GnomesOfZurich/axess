@@ -27,9 +27,9 @@ pub enum MockStoreError {
     /// A tenant lookup was made but no default tenant has been configured.
     #[error("no default tenant configured")]
     NoDefaultTenant,
-    /// Caller tried to persist an auth method at [`AuthnScope::Global`], which is rejected.
-    #[error("auth methods cannot be stored at global scope")]
-    InvalidGlobalMethod,
+    /// Caller tried to persist an auth method at [`AuthnScope::System`], which is rejected.
+    #[error("auth methods cannot be stored at system scope")]
+    InvalidSystemMethod,
 }
 
 // ── MockIdentityStore ─────────────────────────────────────────────────────────
@@ -407,6 +407,23 @@ impl MockFactorStore {
 impl FactorStore for MockFactorStore {
     type Error = MockStoreError;
 
+    async fn resolve_factor(
+        &self,
+        scope: &AuthnScope,
+        kind: FactorKind,
+    ) -> Result<Option<crate::authn::store::ResolvedFactor>, Self::Error> {
+        for candidate in scope.resolution_chain() {
+            let key = Self::config_key(&candidate, &kind);
+            if let Some(cfg) = self.configs.get(&key).map(|r| r.clone()) {
+                return Ok(Some(crate::authn::store::ResolvedFactor {
+                    config: cfg,
+                    resolved_from: candidate,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     async fn load_factor(
         &self,
         scope: &AuthnScope,
@@ -493,10 +510,10 @@ impl FactorStore for MockFactorStore {
     }
 
     async fn save_method(&self, scope: &AuthnScope, method: AuthMethod) -> Result<(), Self::Error> {
-        if matches!(scope, AuthnScope::Global) {
+        if matches!(scope, AuthnScope::System) {
             // Consistent with the example backend: auth methods are a
             // tenant-or-user-scoped concept.
-            return Err(MockStoreError::InvalidGlobalMethod);
+            return Err(MockStoreError::InvalidSystemMethod);
         }
         let key = scope.key();
         let mut entry = self.scoped_methods.entry(key).or_default();
@@ -509,8 +526,8 @@ impl FactorStore for MockFactorStore {
     }
 
     async fn remove_method(&self, scope: &AuthnScope, name: &str) -> Result<(), Self::Error> {
-        if matches!(scope, AuthnScope::Global) {
-            return Err(MockStoreError::InvalidGlobalMethod);
+        if matches!(scope, AuthnScope::System) {
+            return Err(MockStoreError::InvalidSystemMethod);
         }
         if let Some(mut entry) = self.scoped_methods.get_mut(&scope.key()) {
             entry.retain(|(m, _)| m.name.as_ref() != name);
@@ -524,8 +541,8 @@ impl FactorStore for MockFactorStore {
         name: &str,
         enabled: bool,
     ) -> Result<bool, Self::Error> {
-        if matches!(scope, AuthnScope::Global) {
-            return Err(MockStoreError::InvalidGlobalMethod);
+        if matches!(scope, AuthnScope::System) {
+            return Err(MockStoreError::InvalidSystemMethod);
         }
         if let Some(mut entry) = self.scoped_methods.get_mut(&scope.key()) {
             for (m, en) in entry.iter_mut() {

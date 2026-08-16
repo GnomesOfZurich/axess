@@ -58,13 +58,15 @@ pub use factor::{
 };
 pub use ids::{DeviceId, IdError, TenantId, UserId};
 pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
+#[cfg(feature = "oauth")]
+pub use service::DEFAULT_SID_MAP_CAPACITY;
 pub use service::{
     AuthnService, FactorOutcome, LoginOutcome, NoSessionRegistryError, PrepareOutcome,
     SessionValidator, SignupOutcome, require_valid_session,
 };
 pub use store::{
     AuditQuery, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore, IdentityAdmin,
-    IdentityAuthnLog, IdentityLookup, IdentityStore, NoopAuthnLog,
+    IdentityAuthnLog, IdentityLookup, IdentityStore, NoopAuthnLog, ResolvedFactor,
 };
 pub use types::{
     AuthnScope, EntityState, IpPolicy, LockoutPolicy, ScopeColumns, StatusDetail, Tenant, User,

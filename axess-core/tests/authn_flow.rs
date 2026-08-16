@@ -617,15 +617,15 @@ async fn email_otp_expired_code_rejected() {
     );
 }
 
-// ── Scope fallback: global config resolves ──────────────────────────────────
+// ── Scope fallback: system config resolves ──────────────────────────────────
 
 #[tokio::test]
-async fn scope_fallback_to_global() {
+async fn scope_fallback_to_system() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(AuthnScope::Global, password_config("Gnomes2+"))
+        .with_factor(AuthnScope::System, password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::new(identity, factors);

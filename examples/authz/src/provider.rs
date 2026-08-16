@@ -199,7 +199,7 @@ impl AuthzEntityProvider for DocEntityProvider {
         self.make_uid("Document", id)
     }
 
-    fn validate_against_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
+    fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
         // Example provider: trusts the loaded schema. Real providers cross-check
         // entity shapes against the schema here.
         tracing::trace!(

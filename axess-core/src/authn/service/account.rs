@@ -13,12 +13,11 @@
 //! multiple impl blocks on the same type, so the public method surface
 //! is byte-identical to before the split.
 //!
-//! This `mod.rs` itself only carries the **internal helpers** that
-//! support the multi-factor login path
-//! ([`AuthnService::complete_factor_step`]) and the scope-fallback
-//! lookup ([`AuthnService::load_factor_with_fallback`]) that
-//! `service::login` and `service::fido2_service` consume. They live
-//! under `account/` for historical reasons and are `pub(crate)`-scoped.
+//! This `mod.rs` itself only carries the **internal helper**
+//! [`AuthnService::complete_factor_step`] that supports the
+//! multi-factor login path. Scope resolution moved into the store
+//! trait ([`FactorStore::resolve_factor`]); the service layer calls
+//! it directly instead of wrapping it.
 
 mod admin;
 mod impersonation;
@@ -30,9 +29,7 @@ use crate::authn::service::outcomes::FactorOutcome;
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
-    factor::{FactorConfig, FactorKind},
     store::{FactorStore, IdentityStore},
-    types::AuthnScope,
 };
 use crate::session::extractor::AuthSession;
 
@@ -41,37 +38,6 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Load a factor config, trying User → Tenant → Global scope in order.
-    pub(crate) async fn load_factor_with_fallback(
-        &self,
-        user_scope: &AuthnScope,
-        tenant_id: &crate::authn::ids::TenantId,
-        kind: FactorKind,
-    ) -> Result<FactorConfig, AuthnError<I::Error>> {
-        if let Some(cfg) = self
-            .factors
-            .load_factor(user_scope, kind.clone())
-            .await
-            .map_err(AuthnError::Store)?
-        {
-            return Ok(cfg);
-        }
-        let tenant_scope = AuthnScope::Tenant(*tenant_id);
-        if let Some(cfg) = self
-            .factors
-            .load_factor(&tenant_scope, kind.clone())
-            .await
-            .map_err(AuthnError::Store)?
-        {
-            return Ok(cfg);
-        }
-        self.factors
-            .load_factor(&AuthnScope::Global, kind)
-            .await
-            .map_err(AuthnError::Store)?
-            .ok_or(AuthnError::NoFlow)
-    }
-
     /// Shared post-factor-success logic: check if all factors are complete,
     /// and if so, reset the failed-attempt counter, register in the session
     /// registry, and emit an Authenticated audit event.

@@ -16,7 +16,7 @@ use std::fmt::Write;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-pub use totp_rs::{Algorithm as TotpAlgorithm, TOTP};
+pub use totp_rs::{Algorithm as TotpAlgorithm, Builder as TotpBuilder, Totp};
 
 // ── TotpConfig ───────────────────────────────────────────────────────────────
 
@@ -176,8 +176,19 @@ pub fn verify_totp(
     }
 
     // totp-rs stores the secret internally; pass a copy from the Zeroizing wrapper.
-    // The TOTP struct is short-lived (dropped at end of this function).
-    let totp = TOTP::new(algorithm, length, 0, time_step, decoded.to_vec()).ok()?;
+    // The `Totp` struct is short-lived (dropped at end of this function).
+    // `skew` is set to 0 because verify handles the drift window explicitly
+    // via `check_candidate` at each step; letting the library apply skew on
+    // top would double-count.
+    let digits_u8: u8 = length.try_into().ok()?;
+    let totp = TotpBuilder::new()
+        .with_algorithm(algorithm)
+        .with_digits(digits_u8)
+        .with_skew(0)
+        .with_step_duration(time_step)
+        .with_secret(decoded.to_vec())
+        .build()
+        .ok()?;
 
     // Negative timestamps (pre-1970) cannot map to a TOTP step under
     // RFC 6238; reject rather than wrap silently into the future.
@@ -186,8 +197,10 @@ pub fn verify_totp(
 
     let check_candidate = |step: u64| -> Option<u64> {
         let timestamp_secs = step.saturating_mul(time_step);
-        let expected = totp.generate(timestamp_secs);
-        if expected.as_bytes().ct_eq(sanitized_code.as_bytes()).into() {
+        // `Token: Display` produces the zero-padded numeric string;
+        // compare with `ConstantTimeEq` to keep the compare timing-safe.
+        let expected = totp.generate(timestamp_secs).to_string();
+        if bool::from(expected.as_bytes().ct_eq(sanitized_code.as_bytes())) {
             Some(step)
         } else {
             None
@@ -460,9 +473,16 @@ mod tests {
         use chrono::DateTime;
         let raw: [u8; 16] = [0xab; 16];
         let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &raw);
-        let totp = TOTP::new(TotpAlgorithm::SHA1, 6, 0, 30, raw.to_vec()).unwrap();
+        let totp = TotpBuilder::new()
+            .with_algorithm(TotpAlgorithm::SHA1)
+            .with_digits(6)
+            .with_skew(0)
+            .with_step_duration(30)
+            .with_secret(raw.to_vec())
+            .build()
+            .unwrap();
         let t: u64 = 1_700_000_000;
-        let code = totp.generate(t);
+        let code = totp.generate(t).to_string();
         let now = DateTime::from_timestamp(t as i64, 0).unwrap();
         let result = verify_totp(
             &b32,
@@ -485,7 +505,7 @@ mod tests {
 
     /// `verify_totp` MUST reject a `length` that exceeds [`MAX_TOTP_DIGITS`].
     /// The bound is 8 because the underlying `totp-rs` crate enforces
-    /// RFC 6238 §1.2's 6..=8 digit range in `TOTP::new`.
+    /// RFC 6238 §1.2's 6..=8 digit range in `TotpBuilder::build`.
     #[test]
     fn verify_totp_rejects_length_above_max() {
         use chrono::DateTime;

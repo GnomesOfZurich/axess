@@ -1,7 +1,19 @@
 //! MySQL/MariaDB-backed [`DeviceStore`] using sqlx.
 //!
+//! # Cross-dialect parity contract
+//!
+//! See [`crate::device::storage::sqlite`] for the cross-dialect
+//! contract: this file MUST stay column-for-column in sync with its
+//! [`sqlite`](crate::device::storage::sqlite) and
+//! [`postgres`](crate::device::storage::postgres) siblings. MySQL's
+//! `CREATE INDEX` is not idempotent, so indexes are declared inline in
+//! `CREATE TABLE` here where the other two dialects use standalone
+//! `CREATE INDEX IF NOT EXISTS` statements — that dialect delta is
+//! expected, not a divergence.
+//!
 //! # Schema
 //!
+
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS devices (
 //!     tenant_id        VARCHAR(64)    NOT NULL,

@@ -38,10 +38,8 @@ use axum::{
     http::header::{HeaderName, HeaderValue},
     response::Response,
 };
-// use http::header::{HeaderName, HeaderValue};
 use std::{
     future::Future,
-    io::Error as IoError,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -66,6 +64,11 @@ pub trait RequestIdGenerator {
     const ID_LENGTH: usize;
 
     /// Produce a fresh request ID as a [`HeaderValue`].
+    ///
+    /// Implementations MUST return a value whose bytes are valid ASCII
+    /// (so `HeaderValue::to_str` never fails on it) — the layer mirrors
+    /// the generated value into a `String` extension for downstream
+    /// tracing without further validation.
     fn generate(&self) -> HeaderValue;
 }
 
@@ -80,8 +83,11 @@ impl RequestIdGenerator for UuidGenerator {
     const ID_LENGTH: usize = 36;
 
     fn generate(&self) -> HeaderValue {
+        // UUIDv4 string is ASCII by construction — `HeaderValue::from_str`
+        // cannot fail. `unwrap` here would be equally safe; `expect` names
+        // the invariant so a future mutation to `generate` gets flagged.
         HeaderValue::from_str(&Uuid::new_v4().to_string())
-            .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id"))
+            .expect("UUIDv4 string is always valid ASCII")
     }
 }
 
@@ -114,49 +120,38 @@ where
         }
     }
 
-    /// Helper function to ensure that a request ID is set in the request headers.
-    fn ensure_request_id(&self, req: &mut Request<Body>) -> Result<HeaderValue, IoError> {
+    /// Ensure a request ID is set in the request headers and mirrored in
+    /// the `RequestId` extension. Returns the header value that downstream
+    /// layers should echo back on the response.
+    fn ensure_request_id(&self, req: &mut Request<Body>) -> HeaderValue {
         #[cfg(feature = "accept-client-id")]
         if let Some(existing_id) = req.headers().get(&G::HEADER_NAME) {
             let existing_id = existing_id.clone();
-            // Collapse nested if into a single condition using let-chains to satisfy clippy
             if let Ok(id_str) = existing_id.to_str()
                 && id_str.len() == G::ID_LENGTH
             {
-                // Ensure extension contains same ID (avoid cloning if already present)
                 match req.extensions().get::<RequestId>() {
-                    Some(ext) if ext.0 == id_str => return Ok(existing_id),
+                    Some(ext) if ext.0 == id_str => return existing_id,
                     _ => {
                         req.extensions_mut().insert(RequestId(id_str.to_string()));
-                        return Ok(existing_id);
+                        return existing_id;
                     }
                 }
             }
             // fallthrough: invalid client id -> generate our own below
         }
 
-        // Generate header value
         let header_val = self.generator.generate();
-
-        // Ensure header is present
         req.headers_mut()
             .insert(&G::HEADER_NAME, header_val.clone());
-
-        // Safely extract string for extensions; if to_str() fails, replace header with a UTF-8 UUID
-        let request_id_str = match header_val.to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                // fallback to safe ASCII UUID and update header
-                let fallback = HeaderValue::from_str(&Uuid::new_v4().to_string())
-                    .unwrap_or_else(|_| HeaderValue::from_static("unknown"));
-                req.headers_mut().insert(&G::HEADER_NAME, fallback.clone());
-                // .to_str() ok for from_static / valid uuid
-                fallback.to_str().unwrap_or("unknown").to_string()
-            }
-        };
-
+        // Generators are required to emit ASCII (see `RequestIdGenerator`
+        // and `UuidGenerator::generate`), so `to_str` cannot fail.
+        let request_id_str = header_val
+            .to_str()
+            .expect("RequestIdGenerator must produce ASCII header values")
+            .to_string();
         req.extensions_mut().insert(RequestId(request_id_str));
-        Ok(header_val)
+        header_val
     }
 }
 
@@ -176,16 +171,7 @@ where
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
-        let request_id = match self.ensure_request_id(&mut req) {
-            Ok(id) => id,
-            Err(_) => {
-                // If we can't generate a request ID, we'll skip it and continue
-                // This is more robust than failing the entire request
-                tracing::warn!("Failed to generate request ID, continuing without it");
-                HeaderValue::from_static("unknown")
-            }
-        };
-
+        let request_id = self.ensure_request_id(&mut req);
         let fut = self.inner.call(req);
         Box::pin(async move {
             let mut res = fut.await?;
@@ -612,7 +598,7 @@ mod tests {
         req.extensions_mut()
             .insert(RequestId("STALE-VAL".to_string()));
 
-        let returned = service.ensure_request_id(&mut req).unwrap();
+        let returned = service.ensure_request_id(&mut req);
         assert_eq!(
             returned.to_str().unwrap(),
             "client-A",
@@ -638,7 +624,7 @@ mod tests {
             .insert(X_REQUEST_ID, HeaderValue::from_static("client-B"));
         req.extensions_mut()
             .insert(RequestId("client-B".to_string()));
-        let returned = service.ensure_request_id(&mut req).unwrap();
+        let returned = service.ensure_request_id(&mut req);
         assert_eq!(returned.to_str().unwrap(), "client-B");
         assert_eq!(
             req.extensions().get::<RequestId>().unwrap().0,
@@ -662,7 +648,7 @@ mod tests {
         // Length 4; does NOT match MockGenerator::ID_LENGTH (8).
         req.headers_mut()
             .insert(X_REQUEST_ID, HeaderValue::from_static("abcd"));
-        let returned = service.ensure_request_id(&mut req).unwrap();
+        let returned = service.ensure_request_id(&mut req);
         let id = returned.to_str().unwrap();
         assert_ne!(
             id, "abcd",

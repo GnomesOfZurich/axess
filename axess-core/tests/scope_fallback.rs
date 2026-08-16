@@ -1,5 +1,5 @@
 #![cfg(feature = "testing")]
-//! Multi-tenant factor-scope resolution: user → tenant → global lookup
+//! Multi-tenant factor-scope resolution: user → tenant → system lookup
 //! chain through `AuthnService::verify_factor`.
 
 mod common;
@@ -33,7 +33,7 @@ async fn user_scope_takes_priority() {
             AuthnScope::Tenant(tid("t1")),
             password_config("tenant-password"),
         )
-        .with_factor(AuthnScope::Global, password_config("global-password"))
+        .with_factor(AuthnScope::System, password_config("system-password"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::new(identity, factors);
@@ -84,14 +84,14 @@ async fn tenant_scope_fallback() {
     assert!(matches!(r, FactorOutcome::Authenticated));
 }
 
-/// Full chain: user miss → tenant miss → global hit.
+/// Full chain: user miss → tenant miss → system hit.
 #[tokio::test]
-async fn user_tenant_global_fallback_chain() {
+async fn user_tenant_system_fallback_chain() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new()
-        .with_factor(AuthnScope::Global, password_config("global-password"))
+        .with_factor(AuthnScope::System, password_config("system-password"))
         .with_method(&uid("u1"), password_method());
 
     let service = AuthnService::new(identity, factors);
@@ -103,7 +103,7 @@ async fn user_tenant_global_fallback_chain() {
         .unwrap();
     let r = service
         .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("global-password")),
+            &FactorCredential::Password(ZeroizedString::new("system-password")),
             &session,
         )
         .await
