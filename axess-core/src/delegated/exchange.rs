@@ -269,14 +269,14 @@ impl TokenExchangeClient {
             .unwrap_or_default();
 
         Ok(TokenExchangeResponse {
-            access_token: ZeroizedString::from(parsed.access_token),
+            access_token: parsed.access_token,
             issued_token_type: parsed
                 .issued_token_type
                 .unwrap_or_else(|| token_types::ACCESS_TOKEN.to_string()),
             token_type: parsed.token_type.unwrap_or_else(|| "Bearer".to_string()),
             expires_in: parsed.expires_in,
             scopes,
-            refresh_token: parsed.refresh_token.map(ZeroizedString::from),
+            refresh_token: parsed.refresh_token,
         })
     }
 }
@@ -284,7 +284,12 @@ impl TokenExchangeClient {
 /// RFC 8693 §2.2.1 token-exchange response body.
 #[derive(Debug, Deserialize)]
 struct TokenExchangeResponseBody {
-    access_token: String,
+    /// Wire field. Typed [`ZeroizedString`] so the plaintext the
+    /// provider sent is redacted in `Debug` and zeroed on drop: this
+    /// struct is where the token first lands, and zeroing only the
+    /// copy would leave the original in the heap for the process's
+    /// lifetime.
+    access_token: ZeroizedString,
     #[serde(default)]
     issued_token_type: Option<String>,
     #[serde(default)]
@@ -294,7 +299,7 @@ struct TokenExchangeResponseBody {
     #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
-    refresh_token: Option<String>,
+    refresh_token: Option<ZeroizedString>,
 }
 
 #[cfg(test)]

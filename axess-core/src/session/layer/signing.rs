@@ -42,7 +42,7 @@ const HKDF_INFO_FINGERPRINT: &[u8] = b"axess.v1.session.fingerprint.hmac";
 /// path (oracle, side-channel) cannot be replayed against the others.
 /// All three keys (and the master) are zeroed on drop.
 ///
-/// Kept as an internal implementation detail of the signing module —
+/// Kept as an internal implementation detail of the signing module:
 /// external callers reach the HMAC operations via [`SigningKeyRing`]
 /// methods (`sign_cookie`, `decode_cookie`, `compute_binding_fingerprints`,
 /// `derive_subkey`) so no consumer needs to touch a specific sub-key.
@@ -95,7 +95,7 @@ impl Drop for SigningKeys {
 /// Only one previous slot is maintained. Chained rotation faster than
 /// one session-TTL window forces re-auth for cookies signed under the
 /// pre-first-rotation key (they no longer verify under current OR
-/// previous). This is the correct security behavior — see
+/// previous). This is the correct security behavior: see
 /// `OPERATIONS.md#signing-key-rotation`.
 #[derive(Clone)]
 pub(crate) struct SigningKeyRing {
@@ -126,7 +126,7 @@ impl SigningKeyRing {
         self.previous = None;
     }
 
-    /// `true` when a previous master is configured — a signing-key
+    /// `true` when a previous master is configured, a signing-key
     /// rotation window is currently active.
     pub(crate) fn has_previous(&self) -> bool {
         self.previous.is_some()
@@ -648,7 +648,7 @@ mod rotation_tests {
     }
 
     /// `SigningKeyRing::has_previous` reflects the runtime rotation
-    /// state — used by `SessionLayer::has_previous_signing_key` for
+    /// state: used by `SessionLayer::has_previous_signing_key` for
     /// operator-facing introspection.
     #[test]
     fn ring_has_previous_reflects_state() {
@@ -665,7 +665,7 @@ mod rotation_tests {
     /// `clear_previous` retires the rotation slot: cookies signed under
     /// the retired master must fail verification afterwards, and the
     /// ring reports `has_previous() == false`. Companion to
-    /// [`ring_verifies_previous_cookie_and_flags_fallback`] — proves the
+    /// [`ring_verifies_previous_cookie_and_flags_fallback`]: proves the
     /// operator can end the rotation window explicitly.
     #[test]
     fn ring_clear_previous_ends_rotation_window() {

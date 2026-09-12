@@ -50,7 +50,7 @@ struct Entry<V> {
 ///
 /// Every TTL decision and every `expires_at_micros` calculation goes
 /// through `clock.now()`. Tests using
-/// [`MockClock`](axess_clock::testing::MockClock) can advance time in
+/// `MockClock` can advance time in
 /// arbitrary jumps and observe deterministic eviction. There are no
 /// background tasks and no calls into `Instant::now()` /
 /// `chrono::Utc::now()`.

@@ -1,6 +1,6 @@
 //! Server-side DPoP proof verification (RFC 9449).
 //!
-//! [`generate_dpop_proof`](super::fapi_flow::generate_dpop_proof) handles the
+//! `generate_dpop_proof` handles the
 //! signing side; this module is the verifier the *resource server* uses to
 //! validate a `DPoP` header on an inbound request.
 //!
@@ -91,7 +91,7 @@ impl MemoryJtiCache {
 
     /// Swap the clock used for eviction. Defaults to
     /// [`SystemClock`](axess_clock::SystemClock). Pass a
-    /// [`MockClock`](axess_clock::testing::MockClock) under DST so
+    /// `MockClock` under DST so
     /// the TTL-eviction path is deterministic.
     pub fn with_clock(mut self, clock: Arc<dyn axess_clock::Clock>) -> Self {
         self.clock = clock;

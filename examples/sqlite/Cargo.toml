@@ -1,8 +1,8 @@
 [package]
 name = "axess-example-sqlite"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.93.1"
+rust-version.workspace = true
 publish = false
 resolver = "3"
 description = "An example Axum web application using SQLite for session storage and authentication."
@@ -12,7 +12,7 @@ repository = "https://github.com/GnomesOfZurich/axess"
 categories = ["web-programming"]
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.4.0", features = ["sqlite"] }
+axess = { path = "../../axess", version = "=0.5.0", features = ["sqlite"] }
 axum = { version = "0.8.9", features = ["macros", "form"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -24,10 +24,10 @@ thiserror = { version = "2.0.20" }
 tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
 # `tower::ServiceExt::oneshot` lets the smoke test drive the router
-# without binding a real socket — faster, parallel-safe, no port
+# without binding a real socket: faster, parallel-safe, no port
 # allocation games.
 tower = { version = "0.5.3", features = ["util"] }

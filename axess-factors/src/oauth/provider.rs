@@ -92,7 +92,7 @@ pub struct OAuthProviderConfig {
     pub(crate) fapi: Option<FapiConfig>,
     /// Source of wall-clock time for `exp`/`iat`/`nbf` checks. Defaults
     /// to [`SystemClock`](axess_clock::SystemClock); swap in a
-    /// [`MockClock`](axess_clock::testing::MockClock) for DST.
+    /// `MockClock` for DST.
     pub(crate) clock: Arc<dyn axess_clock::Clock>,
     /// Allowlist of `post_logout_redirect_uri` values accepted by
     /// [`build_end_session_url`](OAuthProvider::build_end_session_url). When non-empty, any redirect not in the

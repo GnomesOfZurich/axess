@@ -6,6 +6,133 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.5.0] - 2026-09-12
+
+Three breaking changes, all single struct fields; see
+`docs/production/migrating.md` for the fix at each one.
+
+### Changed (breaking)
+
+- **`SocialProviderConfig::client_secret` is now `ZeroizedString`** (was
+  `String`), and so is the matching private field on `SocialProvider`. The
+  type derives `Debug` and its docs invite loading it from a config file, so
+  an adopter logging their configuration printed the OAuth client secret
+  verbatim. `TotpConfig`, `HotpConfig` and `outbound_oauth_client` already
+  did this; `social` was the exception.
+
+- **`ClientCredentialsToken::access_token` is now `ZeroizedString`** (was
+  `String`). Public, `Debug`-deriving, and the return value of
+  `OAuthProvider::client_credentials`, so `debug!(?token)` printed a live
+  bearer token. It is the same defect in the other direction: a secret axess
+  hands *to* the adopter. `OAuthClaims` already wrapped its tokens.
+
+- **`KeyId`'s inner field is now private**, matching `KindTag`, which always
+  kept its own private behind the same `new`/`from_static`/`as_str`. The
+  `pub` exposed a `ShortString` that `axess-events` did not re-export, so
+  touching the field forced a direct `axess-strings` dependency at the
+  workspace's internal pin.
+
+### Security
+
+- **Bearer tokens are zeroized where they land, not only where they are
+  stored.** Six private token-endpoint response structs paired
+  `#[derive(Debug, Deserialize)]` with a bare-`String` `access_token` and
+  then copied it into a `ZeroizedString`, so zeroing the copy left the
+  original in the heap for the life of the process. The wire fields are now
+  `ZeroizedString` themselves, which deletes the conversion rather than
+  duplicating it. All six types are private; no public API change.
+
+- **An unknown tenant no longer discloses itself at login.** `begin_login`
+  answered a nonexistent tenant with `Err(AuthnError::NotActive(_))`, a 403
+  "account not active", while a wrong password answers
+  `Ok(LoginOutcome::InvalidCredentials)`, so tenant existence was readable
+  off the status code. It now returns `InvalidCredentials` and runs the same
+  dummy store queries against a throwaway tenant id, which closes the timing
+  channel that response-shape parity alone would have left open.
+
+- **`h2` 0.4.14 → 0.4.19**, clearing RUSTSEC-2026-0258 ("unbounded empty
+  DATA frames"), reached through `axum` → `hyper`. Lockfile-only.
+- **`chacha20` 0.10.0 → 0.10.2**, replacing a yanked release pulled in
+  through `rand` under `axess-rng`.
+
+### Changed
+
+- **`rust-version` corrected to 1.94.0.** Not an MSRV bump: the declared
+  1.93.1 had been false since `sqlx` 0.9.0 landed, so no adopter could have
+  built on it with the lockfile as pinned. The CI job meant to catch that
+  hardcoded `1.93.1` in both its own name and its toolchain and ran `cargo
+  build --workspace --all-features` without `--locked`, so it asserted a
+  constant instead of the declared value, and passed. It now reads
+  `rust-version` from `Cargo.toml` and runs `scripts/check-msrv.sh`, the same
+  script maintainers run locally, so the two cannot drift.
+
+- **That correction now actually takes effect.** The eight example crates and
+  the fuzz crate hardcoded `rust-version = "1.93.1"` instead of inheriting
+  it, and cargo resolves against the *minimum* across workspace members, so
+  correcting the root alone changed nothing. The examples now use
+  `rust-version.workspace = true`; the fuzz crate, nightly-only and outside
+  the workspace, drops the key. `scripts/check-msrv.sh` rejects any new
+  literal.
+
+- **TLS and crypto dependencies moved to their current patch releases**, all
+  semver-compatible, with declared floors raised alongside the lockfile:
+  `rustls` 0.23.44, `rustls-webpki` 0.103.15, `rustls-pki-types` 1.15.1,
+  `tokio-rustls` 0.26.5, `rustls-native-certs` 0.8.4, `webpki-roots` 1.0.9,
+  `aws-lc-rs` 1.18.1 (`aws-lc-sys` 0.45.0), `hyper` 1.11.1, `uuid` 1.26.1,
+  `moka` 0.12.16, `lru` 0.18.4, and the `rcgen` dev-dependency 0.14.10.
+
+- **The unused `argon2` dev-dependency is gone.** Nothing in the workspace
+  ever named it; hashing goes through `password-auth` 1.0.0, which carries
+  its own argon2, and every mention of Argon2 in axess's source is a doc
+  comment describing that. Verified rather than assumed: `cargo test
+  --workspace --all-features --no-run` builds every test target without it.
+
+- **`deny.toml`: `rcgen`'s new `pem` 4 duplicate documented, and a stale skip
+  root corrected.** `cedar-policy-core@4.11.2` no longer matched a 4.12.0
+  lockfile, so it accepted nothing and the `itertools` and `unicode-width`
+  duplicates it existed for had resurfaced as unread warnings. `cargo deny
+  check licenses sources bans` now passes with none.
+
+- **`tracing-subscriber` is no longer a mandatory dependency of
+  `axess-core`.** A library depends on `tracing`, the facade, and leaves the
+  subscriber to the binary: installing one is the application's decision, and
+  two libraries that both install one conflict. The only `src/` use was
+  `testing::mock_tracing`, so it is now optional and pulled by the `testing`
+  feature.
+
+### Fixed
+
+- **Every intra-doc link in the workspace resolves.** 29 diagnostics under
+  `cargo doc --workspace --all-features -D warnings`, now none. Three causes:
+  relative paths that resolve in the defining module but not where the doc
+  comment travels with a re-export, now `crate::`-absolute; links into
+  `axess-clock`/`axess-rng`'s `testing` feature, a dev-dependency no
+  documentation build can see, now plain code spans; and two links to items
+  that do not exist: `IdTokenClaims`, where the type is `OAuthClaims`, and
+  `TOTP`, which `totp-rs` 6.0 renamed to `Totp`.
+
+### Added
+
+- **`scripts/check-doc-links.sh`** runs `cargo doc --workspace --all-features`
+  under `-D warnings`, then verifies every workspace member rendered a page,
+  because `cargo doc` prints nothing and exits 0 when the docs are fresh. The
+  member list comes from `cargo metadata`, so a new crate cannot fall outside
+  it. Wired in as `test-all.sh` step 6 and in place of
+  `release-preflight.sh`'s former docs step, which covered two crates of
+  eighteen with warnings allowed.
+
+- **`axess-events` re-exports `ShortString`**, which the
+  `From<ShortString> for KindTag` impl needs to name. Additive.
+
+- **`scripts/check-doc-versions.sh`** verifies that every documented
+  `axess... = { version = "..." }` snippet in a tracked `.md` or `.rs` is
+  compatible with `[workspace.package] version`, by cargo's compatibility
+  rule rather than string equality. `release-preflight.sh` step 2. It found
+  seven stale snippets on introduction, including a facade `README.md` two
+  minor versions behind.
+
+---
+
 ## [0.4.0] - 2026-08-16
 
 Breaking security-first release: authorization, factor-scope model,
@@ -17,7 +144,7 @@ CSRF, provider registration, session-key rotation.
   mirrors `SessionCrypto::with_previous_key`; cookie AND fingerprint
   verify try current → previous, on fallback re-issue the cookie
   under the current key and update the stored fingerprint. One
-  previous slot — see `OPERATIONS.md#signing-key-rotation`.
+  previous slot: see `OPERATIONS.md#signing-key-rotation`.
   Companion `SessionLayer::remove_previous_signing_key()` retires
   the slot at the end of the overlap window.
 - **Cedar validator at startup.** `PolicyStore::from_text` runs
@@ -37,20 +164,20 @@ CSRF, provider registration, session-key rotation.
 ### Changed (breaking)
 
 - `AuthnScope::Global` → `AuthnScope::System`; storage encodes as
-  `(tenant_id = TenantId::SYSTEM, user_id = NULL)` — no NULL-tenant
+  `(tenant_id = TenantId::SYSTEM, user_id = NULL)`: no NULL-tenant
   for configuration scope anywhere.
 - `ScopeColumns.tenant_id`: `Option<TenantId>` → `TenantId`.
 - `AuthnScope::lookup_chain` → `resolution_chain`, returns
   `Vec<AuthnScope>`.
 - `FactorStore` gains `resolve_factor` (runtime, chain-walking,
   returns `ResolvedFactor`). `load_factor` keeps its name but its
-  contract is now "exact scope only" — the within-scope fallback
+  contract is now "exact scope only": the within-scope fallback
   the docs used to describe moved into `resolve_factor`. Every
   `FactorStore` impl must add `resolve_factor`; every runtime
   auth call site must switch from `load_factor` to `resolve_factor`
   or it silently loses the chain walk.
 - `AuthzEntityProvider::validate_against_schema` → `validate_schema`;
-  default `Ok(())` removed — adopters type it explicitly.
+  default `Ok(())` removed, adopters type it explicitly.
 - `AuthzError::PolicyValidation` new variant (wildcard-less matches
   break).
 - `MockStoreError` / `examples/sqlite::BackendError`:
@@ -74,7 +201,7 @@ CSRF, provider registration, session-key rotation.
   optional, pulled by `fido2` / `oauth` / `delegated-*` / `*-sts`).
   CSRF-origin canonicalization needs it on every build; adopters
   compiling with only `authz` / `memory` now pick it up too. No
-  functional break — the crate was already present transitively for
+  functional break: the crate was already present transitively for
   most feature combinations.
 
 ### Fixed
@@ -91,7 +218,7 @@ CSRF, provider registration, session-key rotation.
 - `examples/sqlite` `resolve_factor` is a single ordered
   `SELECT ... UNION ALL ... LIMIT 1` (was three sequential trips).
 - `refresh_session_with_status_check` no longer runs `find_token`
-  twice on the happy path — the status check and the rotation share
+  twice on the happy path: the status check and the rotation share
   the loaded record via a private `refresh_session_from_record`
   helper.
 - Cookie verify skips the `base64(HMAC) → decode` round-trip on
@@ -104,7 +231,7 @@ CSRF, provider registration, session-key rotation.
   (potential use-after-free in `LruCache::pop()` under panic).
 - HOTP `verify_hotp` no longer overflows the u64 counter when
   `counter + offset` approaches `u64::MAX` (panic in debug, wrap-to-0
-  in release — the wrap would then compare against the counter-0 code
+  in release: the wrap would then compare against the counter-0 code
   and could pass). Loop now uses `checked_add` and stops iterating on
   overflow.
 - HOTP verification success arm advances the stored counter via
@@ -115,7 +242,7 @@ CSRF, provider registration, session-key rotation.
 - `CsrfConfig::require_origin` fails fast when every supplied origin
   fails to canonicalize: adopters passing typos (`"not-a-url"`,
   missing scheme, opaque-origin schemes) previously ended up with the
-  Origin/Referer gate silently disabled — the empty allow-list is
+  Origin/Referer gate silently disabled: the empty allow-list is
   what the runtime treats as "no gate configured". Now panics with
   the rejected inputs listed, matching `SessionConfigBuilder::build`'s
   fail-fast discipline for the same misconfig class.
@@ -127,7 +254,7 @@ CSRF, provider registration, session-key rotation.
 - CSRF module docs now warn about the rotation-mid-request footgun:
   a handler that both reads `CsrfToken` from request extensions AND
   rotates the session ships a token bound to the pre-rotation id
-  while the response cookie carries the post-rotation token — the
+  while the response cookie carries the post-rotation token: the
   next state-changing request 403s. Recommendation: redirect (302)
   after rotation rather than render inline with the request-extension
   token.
@@ -139,11 +266,11 @@ CSRF, provider registration, session-key rotation.
 - Rename `AuthnScope::Global` → `System`; `lookup_chain` →
   `resolution_chain`.
 - `FactorStore` impls: add `resolve_factor`; keep `load_factor`
-  but audit every runtime auth call — the old within-scope
+  but audit every runtime auth call: the old within-scope
   fallback is now `resolve_factor`'s job.
 - `AuthzEntityProvider::validate_against_schema` → `validate_schema`
   with an explicit body.
-- `ScopeColumns.tenant_id` pattern matches: no more `Option` —
+- `ScopeColumns.tenant_id` pattern matches: no more `Option`:
   `TenantId::SYSTEM` for the system tier.
 - SQL schema: `factor_configs.tenant_id` and `auth_methods.tenant_id`
   become `NOT NULL` with FK to `tenants(id)`; seed the reserved
@@ -151,7 +278,7 @@ CSRF, provider registration, session-key rotation.
   `examples/sqlite/migrations/`.
 - Reads of `SessionConfig` fields → call the matching getter
   (`config.ttl` → `config.ttl()`, etc.). Struct-literal construction
-  is no longer possible — use `SessionConfig::builder()` (which
+  is no longer possible: use `SessionConfig::builder()` (which
   panics on the `__Host-` / non-zero-TTL / non-empty-cookie-name
   violations the fields used to admit silently).
 - `KeyExtractor::UserId` / `TenantId`: any adopter relying on the
@@ -181,14 +308,14 @@ CSRF, provider registration, session-key rotation.
   `finalize_session`, so a CSRF token minted during a request stays valid on
   the client's next state-changing request. Previously a fresh guest (no
   trusted `existing_id`) took the id-cycling branch and minted a *second*,
-  different id for the response cookie — even though the request, and the
+  different id for the response cookie: even though the request, and the
   `CsrfLayer` token HMAC-bound to it, already ran under the id `load_session`
   minted. The client was left holding a `csrf-token` bound to the old id and an
   `axess.sid` carrying the new one, so its next state-changing request
   (typically the login `POST`) failed validation with `csrf: token validation
   failed` → `403`. The id-cycle branch is now gated on `regenerate` alone; a
   fresh guest is saved under its already-fixation-safe load-minted id. Session
-  fixation protection is unchanged — privilege changes and binding-mismatch
+  fixation protection is unchanged: privilege changes and binding-mismatch
   resets still rotate the id via the `regenerate` path.
 
 ---
@@ -229,18 +356,18 @@ CSRF, provider registration, session-key rotation.
 
 ## [0.3.0] - 2026-08-01
 
-Breaking release: the MSRV rises and `jsonwebtoken`'s `Algorithm` type —
-re-exposed through this crate's public API — becomes `#[non_exhaustive]`.
+Breaking release: the MSRV rises and `jsonwebtoken`'s `Algorithm` type:
+re-exposed through this crate's public API: becomes `#[non_exhaustive]`.
 
 ### Added
 
-- `EventSubjectRef<'a>` and `EventPayload::subject_ref()` — a borrowed,
+- `EventSubjectRef<'a>` and `EventPayload::subject_ref()`, a borrowed,
   zero-allocation view of the entity an event is *about*
   (`User` / `Tenant` / `Device` / `Session` / `Other { kind, id }`),
   mirroring the owned envelope-level `EventSubject`. Fills the hot-path gap
   the owned type doesn't cover: per-tick routing, per-tenant fan-out,
   per-subject bucketing, and tracing-span tagging without allocating.
-  Additive — `subject_ref()` defaults to `None`, so existing `EventPayload`
+  Additive: `subject_ref()` defaults to `None`, so existing `EventPayload`
   implementations are unaffected.
 
 ### Changed
@@ -253,7 +380,7 @@ re-exposed through this crate's public API — becomes `#[non_exhaustive]`.
 - **BREAKING:** MSRV raised to **1.93.1**. The library itself builds on 1.88
   (raised from 1.87 by `jsonwebtoken` 11); the declared floor is set to the
   workspace-wide requirement so the full build+test suite runs on a single
-  toolchain — `serial_test` 4.0.1 (dev-only) requires 1.93.1.
+  toolchain: `serial_test` 4.0.1 (dev-only) requires 1.93.1.
 - Dependency bumps: `base64` 0.22 → **0.23** (SIMD engines; API unchanged for
   our usage), `cedar-policy` → **4.12.0** (unified across the workspace),
   `tokio` → **1.53.1**, `thiserror` → **2.0.19**, `zeroize` → **1.9.0**,
@@ -273,7 +400,7 @@ re-exposed through this crate's public API — becomes `#[non_exhaustive]`.
 
 ### Security
 
-Transitive-dependency security patch — no adopter-facing API changes,
+Transitive-dependency security patch: no adopter-facing API changes,
 same public surface as 0.2.1.
 
 - `crossbeam-epoch` 0.9.18 → 0.9.20 (fixes [RUSTSEC-2026-0204]: invalid pointer dereference in the `fmt::Pointer` impl for `Atomic` / `Shared`).

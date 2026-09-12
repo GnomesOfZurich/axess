@@ -1,17 +1,17 @@
 [package]
 name = "axess-example-local-idp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.93.1"
+rust-version.workspace = true
 publish = false
 resolver = "3"
-description = "Production-grade in-process IdP example for the Axess library — file-backed key store with atomic rotation."
+description = "Production-grade in-process IdP example for the Axess library: file-backed key store with atomic rotation."
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.4.0", features = ["local-idp"] }
+axess = { path = "../../axess", version = "=0.5.0", features = ["local-idp"] }
 axum = { version = "0.8.9", features = ["json"] }
 chrono = "0.4.45"
 jsonwebtoken = "11.0.0"

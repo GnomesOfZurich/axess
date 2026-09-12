@@ -100,7 +100,7 @@ impl OAuthProviderConfig {
 
     /// Swap the clock used for FAPI `nbf` / clock-skew checks. Defaults
     /// to [`SystemClock`](axess_clock::SystemClock). Pass a
-    /// [`MockClock`](axess_clock::testing::MockClock) under DST so the
+    /// `MockClock` under DST so the
     /// time-bound validation is deterministic.
     pub fn with_clock(mut self, clock: std::sync::Arc<dyn axess_clock::Clock>) -> Self {
         self.clock = clock;

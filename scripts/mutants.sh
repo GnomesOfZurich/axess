@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# axess — run `cargo mutants` inside an isolated git worktree.
+# axess: run `cargo mutants` inside an isolated git worktree.
 #
 # local-run isolation. Background:
 #
-# Cargo-mutants edits source files as it probes them — it injects a
+# Cargo-mutants edits source files as it probes them, it injects a
 # stub body marked `/* ~ changed by cargo-mutants ~ */`, runs the
 # test suite, then rolls the change back. If the primary working
 # tree is also the mutation target, any concurrent tooling (`cargo
@@ -58,7 +58,7 @@ fi
 
 # 1. Ensure the worktree exists. We pin it to a private branch
 #    (`mutants/scratch`) so the worktree never shares a branch with
-#    the primary checkout — running two `git worktree`s on the same
+#    the primary checkout: running two `git worktree`s on the same
 #    branch is rejected by git anyway.
 if ! git worktree list --porcelain | grep -q "worktree $WORKTREE_DIR"; then
   echo "Creating mutants worktree at $WORKTREE_DIR (branch: $WORKTREE_BRANCH)..."

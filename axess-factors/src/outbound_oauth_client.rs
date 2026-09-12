@@ -35,8 +35,8 @@
 //!
 //! # DST
 //!
-//! The injectable [`Clock`] makes expiry deterministic under
-//! [`MockClock`](axess_clock::testing::MockClock). The HTTP path uses
+//! The injectable [`Clock`](axess_clock::Clock) makes expiry deterministic under
+//! `MockClock`. The HTTP path uses
 //! `reqwest`; point it at a `wiremock` test endpoint for full
 //! deterministic replay.
 
@@ -175,7 +175,12 @@ impl std::fmt::Debug for ClientAuthMethod {
 /// return extra metadata.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    /// Wire field. Typed [`ZeroizedString`] so the plaintext the
+    /// provider sent is redacted in `Debug` and zeroed on drop: this
+    /// struct is where the token first lands, and zeroing only the
+    /// copy would leave the original in the heap for the process's
+    /// lifetime.
+    access_token: ZeroizedString,
     #[serde(default)]
     expires_in: Option<u64>,
 }
@@ -400,7 +405,7 @@ impl OutboundOAuthClient {
         // sole heap allocation gets zeroized when the cached entry
         // drops. Cloning + zeroizing the original would defeat the
         // purpose (leaves the clone unzeroed).
-        let access_token = ZeroizedString::from(parsed.access_token);
+        let access_token = parsed.access_token;
 
         Ok(CachedToken {
             access_token,

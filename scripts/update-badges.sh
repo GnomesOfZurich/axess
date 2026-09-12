@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# axess — regenerate badges derived from Cargo.toml facts.
+# axess: regenerate badges derived from Cargo.toml facts.
 #
 # Only the badges whose text is derived from a source-of-truth file are
 # regenerated here:
@@ -8,7 +8,7 @@
 #   - license.svg → workspace [workspace.package].license (root Cargo.toml,
 #                   formatted "X / Y" to match the Gnomes badge convention)
 #
-# Status ("alpha", "beta", etc.) is an editorial choice — change it by
+# Status ("alpha", "beta", etc.) is an editorial choice: change it by
 # regenerating status.svg via generate-badge.sh directly.
 #
 # Coverage is handled by ci.yml (auto-commit pattern) since it updates

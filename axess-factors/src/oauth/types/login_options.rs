@@ -11,7 +11,7 @@ pub enum ResponseMode {
     /// transmit the URL fragment in the HTTP request. Selecting this mode
     /// requires a client-side shim (HTML page served at `redirect_uri` that
     /// reads `window.location.hash` and re-POSTs the parameters back to the
-    /// server) before [`finish_oauth_login`](axess_core::authn::service::AuthnService::finish_oauth_login) can complete. For a
+    /// server) before `AuthnService::finish_oauth_login` can complete. For a
     /// pure server-side flow, prefer [`Query`](Self::Query) (default) or
     /// [`FormPost`](Self::FormPost); both deliver the `code` directly.
     Fragment,

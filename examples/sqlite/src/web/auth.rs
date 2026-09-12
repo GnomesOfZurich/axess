@@ -87,7 +87,7 @@ pub async fn post_login(
     // `AuthSession::regenerate` docs), so no explicit `session.regenerate()`
     // call is required here. Every application-defined privilege boundary
     // (MFA add, tenant switch, impersonation, etc.) still needs its own
-    // `regenerate()` — the library only auto-cycles at login-completion and
+    // `regenerate()`: the library only auto-cycles at login-completion and
     // OAuth-callback finish.
     match outcome {
         LoginOutcome::FactorRequired(FactorKind::Password) => {

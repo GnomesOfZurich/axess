@@ -25,7 +25,7 @@ use axess_strings::ShortString;
 ///
 /// Owned form: use in envelope fields and anywhere the subject
 /// out-lives the event borrow. For zero-allocation *introspection* on
-/// the hot path — routing, per-tenant filtering, tracing, fan-out —
+/// the hot path: routing, per-tenant filtering, tracing, fan-out:
 /// see the borrowed pair [`EventSubjectRef`] and [`EventSubject::as_ref`].
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -83,11 +83,11 @@ impl<'a> From<&'a EventSubject> for EventSubjectRef<'a> {
     }
 }
 
-/// Borrowed view of an [`EventSubject`] — the zero-allocation pair for
+/// Borrowed view of an [`EventSubject`]: the zero-allocation pair for
 /// hot-path subject introspection.
 ///
 /// Every non-trivial event-bus consumer needs to answer *"what is this
-/// event about?"* cheaply — for routing, per-tenant filtering,
+/// event about?"* cheaply: for routing, per-tenant filtering,
 /// distributed-log fan-out, tracing spans, per-subject bucketing.
 /// [`EventSubjectRef`] is the primitive those consumers reach for.
 ///
@@ -97,7 +97,7 @@ impl<'a> From<&'a EventSubject> for EventSubjectRef<'a> {
 /// borrows.
 ///
 /// The variants mirror [`EventSubject`] one-to-one so pattern-match
-/// consumers keep type discipline — a `User`-subject event is never
+/// consumers keep type discipline, a `User`-subject event is never
 /// mistaken for an `Other`-subject event just because both got squashed
 /// into a `{kind: &str, id: &str}` shape.
 ///
@@ -107,7 +107,7 @@ impl<'a> From<&'a EventSubject> for EventSubjectRef<'a> {
 /// or the `From<&EventSubject>` impl. When *building* a subject from a
 /// payload's own field (a `String` or `ShortString` you'd rather not
 /// clone into an owned `EventSubject`), construct the borrowed form
-/// directly — the payload's inherent
+/// directly: the payload's inherent
 /// [`EventPayload::subject_ref`](crate::EventPayload::subject_ref)
 /// method typically returns
 /// `EventSubjectRef::Other { kind: "Instrument", id: &v.instrument_id }`
@@ -115,8 +115,8 @@ impl<'a> From<&'a EventSubject> for EventSubjectRef<'a> {
 ///
 /// # Compatibility
 ///
-/// [`EventSubjectRef`] intentionally derives neither `serde` nor `rkyv`
-/// — it is a transient *view*, never a wire type. Only the owned
+/// [`EventSubjectRef`] intentionally derives neither `serde` nor `rkyv`:
+/// it is a transient *view*, never a wire type. Only the owned
 /// [`EventSubject`] is serialisable. If a consumer needs to persist a
 /// subject seen through this ref, call [`EventSubjectRef::to_owned`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn event_subject_ref_is_hashable_for_per_subject_bucketing() {
         // Consumers key hash-maps by subject for per-subject counters,
-        // rate limits, dedup — verify the Hash derive stands up.
+        // rate limits, dedup: verify the Hash derive stands up.
         let u = some_user();
         let t = some_tenant();
         let subjects = [
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn event_subject_ref_is_copy() {
         // Consumers pattern-match then log/route in the same scope;
-        // `Copy` keeps the ergonomics off — no manual clones on the
+        // `Copy` keeps the ergonomics off: no manual clones on the
         // borrowed view.
         let u = some_user();
         let subj = EventSubject::User(u);

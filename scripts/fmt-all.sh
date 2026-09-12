@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# axess — format every Rust crate in the workspace (library + examples).
+# axess: format every Rust crate in the workspace (library + examples).
 #
 # `cargo fmt --all` from the repo root already covers everything because
 # `examples/*` is in `[workspace] members`. This script is a thin

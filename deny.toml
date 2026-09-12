@@ -1,4 +1,4 @@
-# cargo-deny configuration — CRA supply chain policy
+# cargo-deny configuration: CRA supply chain policy
 # https://embarkstudios.github.io/cargo-deny/
 #
 # Run: cargo deny check licenses sources bans
@@ -63,10 +63,10 @@ allow-wildcard-paths = true
 # git-pinned crate rather than 15+ individual `skip` lines.
 skip-tree = [
     # `webauthn-rs v0.6.0-dev` (git-pinned dev release) sits on the
-    # RustCrypto 0.10 cohort — aead 0.5, aes 0.8, aes-gcm 0.10, cipher 0.4,
+    # RustCrypto 0.10 cohort, aead 0.5, aes 0.8, aes-gcm 0.10, cipher 0.4,
     # block-buffer 0.10, crypto-common 0.1, ctr 0.9, digest 0.10, ghash 0.5,
     # hkdf 0.12, hmac 0.12, inout 0.1, polyval 0.6, sha1 0.10, sha2 0.10,
-    # universal-hash 0.5, cpufeatures 0.2 — while axess uses the 0.11
+    # universal-hash 0.5, cpufeatures 0.2: while axess uses the 0.11
     # cohort (aes-gcm 0.11 via the workspace pin). The whole tree
     # underneath webauthn-rs is a mirrored old-cohort. Also carries older
     # asn1-rs / der-parser / oid-registry / const-oid via x509-parser 0.16.
@@ -88,10 +88,16 @@ skip-tree = [
     # ecosystem. Not adopter-controllable.
     { crate = "sqlx@0.9.0", reason = "database-driver ecosystem carries its own hashbrown/thiserror/socket2/windows-sys majors" },
 
+    # `rcgen 0.14.10` is a dev-dependency: test certificates for the mTLS
+    # and x509 paths, and moved to `pem 4`, while `jsonwebtoken 11` is
+    # still on `pem 3`. The two only ever coexist in a dev/test build;
+    # rcgen never reaches an adopter's tree.
+    { crate = "rcgen@0.14.10", reason = "dev-only test-certificate crate; on pem 4 while jsonwebtoken 11 is on pem 3" },
+
     # `cedar-policy-core` transitively pulls `lalrpop` for grammar
     # generation; lalrpop 0.22 carries older unicode-width / hashbrown
     # majors that don't reach runtime.
-    { crate = "cedar-policy-core@4.11.2", reason = "lalrpop build-time transitives carry older unicode-width/hashbrown" },
+    { crate = "cedar-policy-core@4.12.0", reason = "lalrpop build-time transitives carry older unicode-width/hashbrown/itertools" },
 ]
 
 [sources]

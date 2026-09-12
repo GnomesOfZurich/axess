@@ -70,6 +70,11 @@ pub mod status;
 pub mod subject;
 pub mod trace;
 
+// Re-exported because `KeyId`'s field is public: naming or destructuring it
+// would otherwise require a direct `axess-strings` dependency held at this
+// workspace's exact internal pin.
+pub use axess_strings::ShortString;
+
 pub use encryption::{AeadAlgorithm, EncryptedBlob, KeyId};
 pub use id::{DeviceId, EventId, SessionId, TenantId, UserId};
 pub use kind::{EventPayload, KindTag};

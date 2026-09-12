@@ -144,7 +144,7 @@ pub trait EventPayload: Clone + fmt::Debug + Send + Sync + 'static {
     /// per-tenant fan-out, per-subject bucketing, tracing-span tagging.
     /// See [`EventSubjectRef`] for the borrowed-vs-owned rationale.
     ///
-    /// Override example — a payload carrying an instrument id:
+    /// Override example, a payload carrying an instrument id:
     ///
     /// ```ignore
     /// use axess_events::{EventPayload, EventSubjectRef, KindTag};

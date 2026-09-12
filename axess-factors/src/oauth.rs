@@ -18,9 +18,9 @@
 //!
 //! # Deterministic simulation testing
 //!
-//! Use [`MockOAuthProvider`] in tests to simulate OIDC discovery and token
-//! exchange without HTTP. Configure it with [`MockOAuthProvider::with_user`]
-//! or [`MockOAuthProvider::with_failure`].
+//! Use [`MockOAuthProvider`](crate::oauth::MockOAuthProvider) in tests to simulate OIDC discovery and token
+//! exchange without HTTP. Configure it with [`MockOAuthProvider::with_user`](crate::oauth::MockOAuthProvider::with_user)
+//! or [`MockOAuthProvider::with_failure`](crate::oauth::MockOAuthProvider::with_failure).
 
 pub mod mock;
 pub mod provider;

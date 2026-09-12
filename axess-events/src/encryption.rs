@@ -22,7 +22,7 @@ use axess_strings::ShortString;
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub struct KeyId(pub ShortString);
+pub struct KeyId(ShortString);
 
 impl KeyId {
     /// Construct from any string slice.

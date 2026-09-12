@@ -64,7 +64,7 @@ mod fingerprint_serde {
             return Err("FingerprintHash must be 64 hex characters");
         }
         let mut out = [0u8; 32];
-        for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let hi = nibble(chunk[0])?;
             let lo = nibble(chunk[1])?;
             out[i] = (hi << 4) | lo;

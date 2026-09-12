@@ -2,7 +2,7 @@
 //!
 //! Storage encoding: `factor_configs.tenant_id` and `auth_methods.tenant_id`
 //! are NOT NULL and reference `tenants(id)`. System-scope rows live under
-//! [`TenantId::SYSTEM`] — there is no NULL-tenant encoding for
+//! [`TenantId::SYSTEM`]: there is no NULL-tenant encoding for
 //! configuration scope. See `docs/authentication/scope.md`.
 
 use axess::authn::{

@@ -82,6 +82,8 @@ use std::sync::Arc;
 use axess_rng::{SecureRng, SystemRng};
 use serde::Deserialize;
 
+use crate::secret::ZeroizedString;
+
 /// Errors from the social-login flow.
 #[derive(Debug, thiserror::Error)]
 pub enum SocialError {
@@ -105,7 +107,7 @@ pub enum SocialError {
 /// User identity extracted from a social provider's userinfo response.
 ///
 /// Distinct type from
-/// [`IdTokenClaims`](crate::oauth::types::IdTokenClaims) so the security
+/// [`OAuthClaims`](crate::oauth::types::OAuthClaims) so the security
 /// difference is visible at every call site: claims here come from a
 /// TLS-trusted JSON GET, not from a signed assertion. Treating one as
 /// the other is a type error.
@@ -168,7 +170,12 @@ pub struct SocialProviderConfig {
     /// OAuth 2.0 `client_id` for this adopter.
     pub client_id: String,
     /// OAuth 2.0 `client_secret` for this adopter.
-    pub client_secret: String,
+    ///
+    /// Held as [`ZeroizedString`] so it is redacted in `Debug` output and
+    /// zeroed on drop. This type derives `Debug` and is meant to be loaded
+    /// from a config file, so a plain `String` here would print the secret
+    /// verbatim the first time an adopter logged their own configuration.
+    pub client_secret: ZeroizedString,
     /// Adopter's callback URL: the IdP redirects back to this after
     /// authorization. Must match what the adopter registered with the IdP.
     pub redirect_uri: String,
@@ -193,7 +200,7 @@ where
     token_endpoint: String,
     userinfo_endpoint: String,
     client_id: String,
-    client_secret: String,
+    client_secret: ZeroizedString,
     redirect_uri: String,
     scopes: Vec<String>,
     use_pkce: bool,
@@ -248,7 +255,7 @@ where
     }
 
     /// Swap the RNG used to mint the PKCE verifier and CSRF state.
-    /// Tests inject a [`MockRng`](axess_rng::testing::MockRng) here
+    /// Tests inject a `MockRng` here
     /// so both are deterministic under DST; production keeps the
     /// default [`SystemRng`].
     pub fn with_rng(mut self, rng: Arc<dyn SecureRng>) -> Self {
@@ -431,226 +438,4 @@ fn urlencode(s: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axess_rng::testing::MockRng;
-    use wiremock::matchers::{body_string_contains, header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn github_style_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> {
-        let id = raw
-            .get("id")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| SocialError::ClaimMapping("missing numeric `id`".into()))?;
-        Ok(SocialClaims {
-            subject: id.to_string(),
-            email: raw.get("email").and_then(|v| v.as_str()).map(String::from),
-            display_name: raw.get("name").and_then(|v| v.as_str()).map(String::from),
-            raw: raw.clone(),
-        })
-    }
-
-    fn make_provider(
-        mock: &MockServer,
-    ) -> SocialProvider<
-        impl Fn(&serde_json::Value) -> Result<SocialClaims, SocialError> + Send + Sync,
-    > {
-        SocialProvider::new(
-            SocialProviderConfig {
-                name: "github".into(),
-                authorization_endpoint: format!("{}/login/oauth/authorize", mock.uri()),
-                token_endpoint: format!("{}/login/oauth/access_token", mock.uri()),
-                userinfo_endpoint: format!("{}/user", mock.uri()),
-                client_id: "demo-client-id".into(),
-                client_secret: "demo-client-secret".into(),
-                redirect_uri: "https://app.example.com/auth/callback/github".into(),
-                scopes: vec!["read:user".into(), "user:email".into()],
-            },
-            github_style_mapper,
-        )
-        // Pin the PKCE verifier so the assertion on the generated URL
-        // is reproducible. `MockRng::new(seed)` is the standard DST
-        // pattern used elsewhere in the workspace.
-        .with_rng(std::sync::Arc::new(MockRng::new(42)))
-    }
-
-    #[test]
-    fn build_auth_url_includes_pkce_and_state_by_default() {
-        let provider = SocialProvider::new(
-            SocialProviderConfig {
-                name: "github".into(),
-                authorization_endpoint: "https://github.com/login/oauth/authorize".into(),
-                token_endpoint: "https://github.com/login/oauth/access_token".into(),
-                userinfo_endpoint: "https://api.github.com/user".into(),
-                client_id: "demo-client".into(),
-                client_secret: "demo-secret".into(),
-                redirect_uri: "https://app.example.com/auth/callback".into(),
-                scopes: vec!["read:user".into()],
-            },
-            github_style_mapper,
-        )
-        .with_rng(std::sync::Arc::new(MockRng::new(7)));
-
-        let result = provider.build_auth_url("csrf-state-xyz");
-
-        assert!(
-            result
-                .url
-                .starts_with("https://github.com/login/oauth/authorize?")
-        );
-        assert!(result.url.contains("response_type=code"));
-        assert!(result.url.contains("client_id=demo-client"));
-        assert!(result.url.contains("state=csrf-state-xyz"));
-        assert!(result.url.contains("code_challenge="));
-        assert!(result.url.contains("code_challenge_method=S256"));
-        assert!(
-            !result.pkce_verifier.is_empty(),
-            "PKCE verifier should be present by default"
-        );
-    }
-
-    #[test]
-    fn without_pkce_omits_code_challenge() {
-        let provider = SocialProvider::new(
-            SocialProviderConfig {
-                name: "discord".into(),
-                authorization_endpoint: "https://discord.com/api/oauth2/authorize".into(),
-                token_endpoint: "https://discord.com/api/oauth2/token".into(),
-                userinfo_endpoint: "https://discord.com/api/users/@me".into(),
-                client_id: "demo-client".into(),
-                client_secret: "demo-secret".into(),
-                redirect_uri: "https://app.example.com/auth/callback".into(),
-                scopes: vec!["identify".into()],
-            },
-            github_style_mapper,
-        )
-        .without_pkce();
-
-        let result = provider.build_auth_url("csrf-1");
-
-        assert!(!result.url.contains("code_challenge"));
-        assert!(result.pkce_verifier.is_empty());
-    }
-
-    #[tokio::test]
-    async fn happy_path_exchanges_code_then_fetches_userinfo() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/login/oauth/access_token"))
-            .and(header("Accept", "application/json"))
-            .and(body_string_contains("grant_type=authorization_code"))
-            .and(body_string_contains("code=the-code"))
-            .and(body_string_contains("client_id=demo-client-id"))
-            .and(body_string_contains("code_verifier=pkce-verifier-stub"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "tok-abc",
-                "token_type": "bearer",
-            })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/user"))
-            .and(header("Authorization", "Bearer tok-abc"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "id": 12345,
-                "login": "octocat",
-                "name": "The Octocat",
-                "email": "octocat@example.com",
-            })))
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        let provider = make_provider(&mock);
-        let access_token = provider
-            .exchange_code("the-code", "pkce-verifier-stub")
-            .await
-            .expect("exchange_code");
-        assert_eq!(access_token, "tok-abc");
-
-        let claims = provider
-            .fetch_userinfo(&access_token)
-            .await
-            .expect("userinfo");
-        assert_eq!(claims.subject, "12345");
-        assert_eq!(claims.email.as_deref(), Some("octocat@example.com"));
-        assert_eq!(claims.display_name.as_deref(), Some("The Octocat"));
-        assert_eq!(
-            claims.raw.get("login").and_then(|v| v.as_str()),
-            Some("octocat")
-        );
-    }
-
-    #[tokio::test]
-    async fn token_endpoint_without_access_token_is_invalid_response() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/login/oauth/access_token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "error": "invalid_grant",
-                "error_description": "authorization code expired",
-            })))
-            .mount(&mock)
-            .await;
-
-        let provider = make_provider(&mock);
-        let err = provider
-            .exchange_code("stale-code", "pkce-verifier-stub")
-            .await
-            .expect_err("missing access_token must error");
-        assert!(
-            matches!(err, SocialError::InvalidResponse(_)),
-            "expected InvalidResponse, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn userinfo_4xx_is_http_error() {
-        let mock = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/user"))
-            .respond_with(ResponseTemplate::new(401).set_body_string("Bad credentials"))
-            .mount(&mock)
-            .await;
-
-        let provider = make_provider(&mock);
-        let err = provider
-            .fetch_userinfo("revoked-token")
-            .await
-            .expect_err("401 must error");
-        assert!(
-            matches!(err, SocialError::Http(_)),
-            "expected Http, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn claim_mapper_rejection_is_claim_mapping_error() {
-        let mock = MockServer::start().await;
-
-        // Userinfo lacks the `id` field the mapper requires.
-        Mock::given(method("GET"))
-            .and(path("/user"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "login": "octocat",
-                "email": "octocat@example.com",
-            })))
-            .mount(&mock)
-            .await;
-
-        let provider = make_provider(&mock);
-        let err = provider
-            .fetch_userinfo("tok-anything")
-            .await
-            .expect_err("missing id must reject");
-        assert!(
-            matches!(err, SocialError::ClaimMapping(_)),
-            "expected ClaimMapping, got {err:?}"
-        );
-    }
-}
+mod tests;

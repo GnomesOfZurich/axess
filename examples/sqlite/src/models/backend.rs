@@ -1,13 +1,13 @@
-//! `OurBackend`; implements both [`IdentityStore`] and [`FactorStore`] against SQLite.
+//! `OurBackend`; implements both [`IdentityStore`](axess::authn::IdentityStore) and [`FactorStore`](axess::authn::FactorStore) against SQLite.
 //!
 //! This is the only application-specific type needed for authentication.
 //! All identity and factor data live in the same SQLite pool. Each trait
 //! group is split into its own sub-module to keep the surface readable:
 //!
-//! - [`identity`] ; `IdentityLookup`, `IdentityAuthnLog`, `IdentityAdmin`
-//! - [`factors`]  ; `FactorStore`
-//! - [`audit`]    ; `AuditQuery`
-//! - [`refresh`]  ; `RefreshTokenStore`
+//! - `identity` ; `IdentityLookup`, `IdentityAuthnLog`, `IdentityAdmin`
+//! - `factors`  ; `FactorStore`
+//! - `audit`    ; `AuditQuery`
+//! - `refresh`  ; `RefreshTokenStore`
 //! - [`seed`]     ; first-boot data: a default tenant + alice/bob test users
 
 use axess::authn::{EntityState, StatusDetail, Tenant, TenantId, User, UserId};
@@ -28,7 +28,7 @@ pub use seed::seed;
 
 /// SQLite-backed identity and factor store.
 ///
-/// Implements both [`IdentityStore`] and [`FactorStore`]. Pass `backend.clone()` for
+/// Implements both [`IdentityStore`](axess::authn::IdentityStore) and [`FactorStore`](axess::authn::FactorStore). Pass `backend.clone()` for
 /// both type parameters when constructing `AuthnService`.
 #[derive(Clone)]
 pub struct OurBackend {
@@ -50,7 +50,7 @@ impl OurBackend {
     }
 
     /// Swap the clock. Tests pin time by passing a `MockClock`; production
-    /// keeps the default `SystemClock` from [`new`].
+    /// keeps the default `SystemClock` from [`Self::new`].
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
@@ -88,7 +88,7 @@ pub enum BackendError {
     /// A row read from storage carries a malformed `tenant_id` /
     /// `user_id` / other schema-invariant field that cannot be decoded
     /// back to a typed identifier. Distinct from [`Self::Db`] (SQL
-    /// error) and [`Self::Json`] (JSON parse) — this is a semantic
+    /// error) and [`Self::Json`] (JSON parse): this is a semantic
     /// integrity failure on data axess assumes valid.
     #[error("backend integrity: {0}")]
     Backend(String),

@@ -13,7 +13,7 @@ If project guidance changes, update this file first and only keep tool-specific 
 
 axess is a modular, policy-driven authentication and authorization library for the Axum web framework in Rust. Multi-factor authentication with an explicit session state machine, Cedar Policy authorization (RBAC + ABAC + ReBAC), and deterministic simulation testing (DST) from the ground up.
 
-Rust edition `2024`, MSRV `1.87`, latest stable toolchain.
+Rust edition `2024`, MSRV `1.94.0` (`rust-version` in `[workspace.package]` is the single source), toolchain pinned in `rust-toolchain.toml`.
 
 ## Core Boundaries
 
@@ -300,6 +300,8 @@ Inline `#[cfg(test)] mod tests { … }` blocks inside production files are fine 
 - For integration-test binaries under `tests/`, prefer topic-named sibling files (one binary per topic) over deeply-nested inner mods, capping each file at the same ~200-LoC threshold per logical area.
 
 Rationale: production-file size grows linearly with the feature coverage of its tests, drowning the actual logic. A 1000-LoC file with 700 LoC of inline tests is harder to navigate than 300 LoC of prod plus a separate test sibling.
+
+Enforced, not remembered: `./scripts/check-inline-tests.sh` fails on any block over the limit, and `./scripts/release-preflight.sh` runs it among its cheap early gates, ahead of clippy and the test run. Note it measures a **block**, not a file: `session/layer/signing.rs` is ~690 lines across three mods of 98/118/191 and is compliant. Files that already are test siblings (`tests.rs`, anything under `tests/`) are exempt: they are where tests were moved to, not production files drowning in them.
 
 ## Key Design Decisions
 

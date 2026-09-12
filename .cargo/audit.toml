@@ -1,7 +1,7 @@
 # Acknowledged security advisories for transitive dependencies.
 #
 # Each entry documents why the advisory is accepted and what would resolve it.
-# Review periodically — remove entries when upstream fixes land.
+# Review periodically: remove entries when upstream fixes land.
 
 [advisories]
 ignore = [
@@ -18,7 +18,7 @@ ignore = [
     # Pulled transitively by: sqlx-postgres, sqlx-mysql, openidconnect, fred, crypto-glue.
     # Risk to axess: none. Axess does not use rand::rng() with a custom logger.
     # The unsoundness requires a specific interaction between rand::rng() and
-    # a custom global logger that calls rand — not a pattern axess uses.
+    # a custom global logger that calls rand: not a pattern axess uses.
     # Resolution: wait for upstream deps to bump to rand 0.9+.
     "RUSTSEC-2026-0097",
 ]

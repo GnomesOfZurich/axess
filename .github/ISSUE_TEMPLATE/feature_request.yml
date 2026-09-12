@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         Check [`ROADMAP.md`](https://github.com/GnomesOfZurich/axess/blob/main/ROADMAP.md)
-        first — your idea may already be tracked (or explicitly
+        first: your idea may already be tracked (or explicitly
         out-of-scope under "Not planned").
   - type: textarea
     id: problem
@@ -20,7 +20,7 @@ body:
     attributes:
       label: Proposed shape
       description: |
-        Rough trait / type / API surface. A sketch is fine — we'll refine
+        Rough trait / type / API surface. A sketch is fine: we'll refine
         in review. Cite related crates or RFCs if your shape mirrors them.
       render: rust
   - type: textarea

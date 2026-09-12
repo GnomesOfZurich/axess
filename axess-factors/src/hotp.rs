@@ -145,7 +145,7 @@ pub fn verify_hotp(
     // The ct_eq comparison runs every iteration; only the first match is recorded.
     // `checked_add` guards against `counter + window` overflowing near
     // `u64::MAX`: debug builds would panic, release builds would silently
-    // wrap to 0 and compare against the counter-0 code — a real
+    // wrap to 0 and compare against the counter-0 code, a real
     // authentication bypass under adversarial inputs. On overflow we
     // stop iterating; matched stays whatever it was on prior iterations.
     let mut matched: Option<u64> = None;

@@ -1,6 +1,6 @@
 name: Mutants
 
-# AX-028 — mutation-testing sweep. Runs on every PR (touch-only via
+# AX-028: mutation-testing sweep. Runs on every PR (touch-only via
 # `--in-diff`) and on a weekly schedule for a fuller pass over the
 # whole workspace. Per-file kill rate is summarised on the workflow
 # job summary so a regression on a previously-clean file shows up at
@@ -10,7 +10,7 @@ on:
   pull_request:
     branches: [main, develop]
   schedule:
-    # Sunday 03:00 UTC — full sweep so mainline kill rates have a
+    # Sunday 03:00 UTC: full sweep so mainline kill rates have a
     # weekly reference point even when no PR has been opened.
     - cron: '0 3 * * 0'
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
     name: cargo-mutants
     runs-on: ubuntu-latest
 
-    # No `services:` block — mutants invokes `cargo test --lib` per the
+    # No `services:` block: mutants invokes `cargo test --lib` per the
     # workspace `mutants.toml`, which excludes infra-dependent
     # integration tests. Bringing up Valkey / Postgres here would just
     # slow the sweep down. If a future mutants run depends on
@@ -92,7 +92,7 @@ jobs:
             --json
           status=$?
           echo "exit_status=$status" >> "$GITHUB_OUTPUT"
-          # Don't fail the step yet — we want the summary to render
+          # Don't fail the step yet: we want the summary to render
           # before exiting. Final fail/pass decision is in the next
           # step.
           exit 0
@@ -102,7 +102,7 @@ jobs:
         run: |
           set -eu
           if [ ! -f mutants.out/outcomes.json ]; then
-            echo "::warning::cargo-mutants produced no outcomes.json — sweep may have aborted before producing output."
+            echo "::warning::cargo-mutants produced no outcomes.json: sweep may have aborted before producing output."
             exit 0
           fi
           python3 - <<'PY'
@@ -130,7 +130,7 @@ jobs:
           rows = []
           for src, b in sorted(per_file.items()):
               # Kill rate excludes unviable mutants from the denominator
-              # (an unviable mutant is one that doesn't compile — it's
+              # (an unviable mutant is one that doesn't compile, it's
               # not a "missed" coverage gap, it's an artifact of the
               # mutation operator). Keeps the rate honest.
               denom = b["total"] - b["unviable"]

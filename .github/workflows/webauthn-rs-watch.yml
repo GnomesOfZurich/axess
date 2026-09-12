@@ -54,14 +54,14 @@ jobs:
         run: |
           set -eu
           # Sentinel title so subsequent runs don't open duplicates.
-          title="webauthn-rs $STABLE_VER stable available — unblock AX-001 / AX-002 / AX-012 / AX-207"
+          title="webauthn-rs $STABLE_VER stable available: unblock AX-001 / AX-002 / AX-012 / AX-207"
           existing=$(gh issue list \
             --state open \
             --search "$title in:title" \
             --json number \
             --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
-            echo "Tracking issue #$existing already open — no-op."
+            echo "Tracking issue #$existing already open: no-op."
             exit 0
           fi
           body=$(cat <<EOF
@@ -69,14 +69,14 @@ jobs:
 
           This unblocks the FIDO2 cascade tracked in [ROADMAP.md](../blob/main/ROADMAP.md):
 
-          - **AX-001** — Per-ceremony UV/attestation policy
-          - **AX-002** — FIDO2 standalone example
-          - **AX-012** — Pin \`webauthn-rs\` to stable release
-          - **AX-207** — Cross-Device Authentication (CDA)
+          - **AX-001**: Per-ceremony UV/attestation policy
+          - **AX-002**: FIDO2 standalone example
+          - **AX-012**: Pin \`webauthn-rs\` to stable release
+          - **AX-207**: Cross-Device Authentication (CDA)
 
           Suggested order: AX-012 first (single-file bump), then AX-001 + AX-002 together, then AX-207.
 
-          Closes nothing yet — this is a notification.
+          Closes nothing yet: this is a notification.
           EOF
           )
           gh issue create --title "$title" --body "$body" --label "deps" --label "fido2"

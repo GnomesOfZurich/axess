@@ -70,7 +70,7 @@ sequence of scopes to query. For a user with `tenant_id = T` and
 `user_id = U`, the chain is
 `[User { T, U }, Tenant(T), System]`.
 
-Application code does not walk the chain — the store does, in one
+Application code does not walk the chain: the store does, in one
 query, and returns a [`ResolvedFactor`] carrying both the config and
 the scope it was resolved from:
 
@@ -93,14 +93,14 @@ and `LIMIT 1`). Latency-wise this is one round trip regardless of
 where the config actually lives.
 
 The `resolved_from` field lets callers know which tier served the
-request — used by the failure-counter CAS logic to know whether to
+request: used by the failure-counter CAS logic to know whether to
 CAS against an existing user-scope row or to create a new one from a
 tenant/system template.
 
 For admin and display code that wants "what did this tenant
 *explicitly* configure?", the store also exposes `load_factor`
 which returns the config at exactly the requested scope with no
-fallback. Never on the auth hot path — use `resolve_factor` there.
+fallback. Never on the auth hot path: use `resolve_factor` there.
 
 The same chain is used for each factor in the method. A method that
 chains password and TOTP resolves the password config first (which
@@ -181,7 +181,7 @@ during incidents.
 The scope hierarchy is the right tool for rolling out factor changes
 in a controlled way. The pattern is to introduce the change at the
 narrowest scope, verify it on a small population, and broaden as
-confidence accumulates — but broadening happens through explicit
+confidence accumulates: but broadening happens through explicit
 per-tenant adoption, never through silent system-wide broadcast.
 
 A worked example. A SaaS deployment wants to require FIDO2 for all
@@ -255,7 +255,7 @@ differentiation, and to document the reason in a separate field next
 to the row.
 
 The second is treating System as a runtime broadcast tier. A factor
-configured at System scope is a *template* — the correct pattern is
+configured at System scope is a *template*: the correct pattern is
 to adopt (materialise a tenant-scoped row) rather than to depend on
 resolution to reach it silently. Depending on system-tier fallback
 turns platform-wide edits into surprise tenant-level changes.

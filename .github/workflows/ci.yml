@@ -57,7 +57,7 @@ jobs:
   # markers in the source tree; if the developer subsequently `git add`s
   # without inspecting the diff, the mutation lands as a stub body that
   # silently breaks the affected function. This guard runs on every push
-  # and PR — catches the marker before review, regardless of whether
+  # and PR: catches the marker before review, regardless of whether
   # the developer's local pre-commit setup is configured to reject it.
   ban_cargo_mutants_markers:
     name: Ban cargo-mutants markers
@@ -70,7 +70,7 @@ jobs:
           # First-party Rust source only. The marker can legitimately
           # appear in docs/comments (`docs/`, `ROADMAP.md`, `CHANGELOG.md`,
           # `axess-core/src/.../*.rs` `///` lines describing how the
-          # mutator interacts with a given function) — those are
+          # mutator interacts with a given function): those are
           # documentation about cargo-mutants, not mutations. We grep
           # for the literal injection marker (`~ changed by cargo-mutants ~`)
           # inside .rs files; the marker only appears in the form
@@ -87,7 +87,7 @@ jobs:
           echo "OK: no cargo-mutants mutation markers in source."
 
   # lockfile-drift check. Cargo.lock is tracked (axess workspace
-  # policy — see `.gitignore` comment). Without this gate, a `cargo build`
+  # policy: see `.gitignore` comment). Without this gate, a `cargo build`
   # inside the test job silently refreshes the lockfile when a Cargo.toml
   # change isn't accompanied by a corresponding lockfile bump, and the
   # uncommitted Cargo.lock update lands on `main` invisibly. `--locked`
@@ -110,7 +110,7 @@ jobs:
           cargo metadata --locked --format-version 1 > /dev/null
           # 2. Re-check that no step somehow mutated Cargo.lock anyway
           #    (would mean we're rebuilding against a different lockfile
-          #    than the committed one — defence in depth).
+          #    than the committed one: defence in depth).
           git diff --exit-code Cargo.lock
 
   # Detect orphan source files: any `.rs` under `src/` (other than the
@@ -155,7 +155,7 @@ jobs:
               # Also accept `#[path = "..NAME.rs"]` indirection.
               if ! grep -qE "(^|[[:space:]])mod[[:space:]]+${base}[[:space:];{]" "$parent" \
                  && ! grep -qE "#\[path[[:space:]]*=[[:space:]]*\"[^\"]*${base}\.rs\"\]" "$parent"; then
-                echo "::error file=$f::Orphan source — not reachable via 'mod ${base};' in $parent"
+                echo "::error file=$f::Orphan source: not reachable via 'mod ${base};' in $parent"
                 errors=$((errors+1))
               fi
             done < <(find "$src" -name '*.rs' -type f ! -name lib.rs ! -name main.rs ! -name mod.rs)
@@ -191,10 +191,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Was `-p axess -p axess-core`: two crates of eighteen, which is how 29
+      # unresolved intra-doc links accumulated elsewhere in the workspace. The
+      # script covers every member and proves it rendered each one, since
+      # `cargo doc` prints nothing and exits 0 when the docs are fresh.
       - name: Build rustdoc with warnings as errors
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features -p axess -p axess-core
+        run: ./scripts/check-doc-links.sh
 
   # Tests
   test:
@@ -262,7 +264,7 @@ jobs:
   # CockroachDB wire-protocol compatibility. Cockroach speaks the Postgres
   # wire protocol, so the existing `postgres` backend (sqlx::PgPool) should
   # work unmodified. This job runs the postgres integration suite against
-  # a Cockroach single-node instance to catch divergence early —
+  # a Cockroach single-node instance to catch divergence early:
   # transaction-retry semantics, `ON CONFLICT DO UPDATE` quirks, and
   # `DATEADD`-equivalent edge cases that Cockroach handles slightly
   # differently from real Postgres.
@@ -279,7 +281,7 @@ jobs:
         ports:
           - 26257:26257
           - 8080:8080
-        # `start-single-node --insecure` is the standard CI shape — no
+        # `start-single-node --insecure` is the standard CI shape: no
         # TLS, in-memory store ok for the duration of the job. The
         # health-cmd polls Cockroach's HTTP admin endpoint which is
         # available only after the node has fully started.
@@ -297,26 +299,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Cockroach defaults to user `root` with no password on `--insecure`
       # mode. We point the existing postgres integration suite at port
-      # 26257 — same `POSTGRES_URL` env var consumed by the tests, just
+      # 26257: same `POSTGRES_URL` env var consumed by the tests, just
       # against a different backend speaking the same wire protocol.
       - name: Run postgres integration tests against CockroachDB
         run: cargo test -p axess-core --features postgres,testing -- --ignored
         env:
           POSTGRES_URL: postgres://root@localhost:26257/defaultdb?sslmode=disable
 
-  # MSRV check — verify the declared minimum supported Rust version still
+  # MSRV check: verify the declared minimum supported Rust version still
   # builds and tests. Bump in lockstep with `rust-version` in each Cargo.toml.
   msrv:
-    name: MSRV (1.93.1)
+    # The version is read from Cargo.toml rather than written here as well.
+    # It was hardcoded twice (job name and toolchain) and went stale: the tree
+    # declared 1.93.1 while sqlx 0.9.0 required 1.94.0, so the promise was
+    # already false and nothing said so.
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - id: msrv
+        name: Read rust-version from Cargo.toml
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/p' Cargo.toml \
+            | grep -m1 '^rust-version' | sed 's/.*"\(.*\)".*/\1/')
+          test -n "$version" || { echo "could not read rust-version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
-      - name: Build with MSRV
-        run: cargo build --workspace --all-features
-      - name: Test with MSRV
-        run: cargo test --workspace --all-features --lib
+      # Same script maintainers run locally, so the two cannot drift.
+      - name: Build and test on the declared MSRV
+        run: ./scripts/check-msrv.sh
 
   # Build check for different platforms
   build:
@@ -363,7 +377,7 @@ jobs:
           # SQLite-only: catches a re-export from a sibling crate (e.g.
           # `axess-identity`) that fails to gate properly when the
           # caller enables a storage feature without also enabling
-          # `testing`. Previously regressed once — see the
+          # `testing`. Previously regressed once: see the
           # `pub use axess_identity::testing` fix in `axess-core/src/authn/ids.rs`.
           - profile: sqlite-only
             flags: --no-default-features --features sqlite
@@ -384,7 +398,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `cargo check --lib` rather than `cargo build` — faster (skips
+      # `cargo check --lib` rather than `cargo build`: faster (skips
       # link), and matches what catches the missing-cfg-gate class of
       # bugs locally. `--lib` keeps the check scoped to library targets
       # only so the absence of a feature can't be masked by an
@@ -412,7 +426,7 @@ jobs:
           cargo build --package axess-example-authz
 
   # coverage-guided fuzzing of decode hot-paths. Smoke run only
-  # on PR/push — 30 s per target catches the easy crashes without
+  # on PR/push: 30 s per target catches the easy crashes without
   # blocking CI on a deeper soak. Schedule a longer run in a separate
   # workflow if/when needed.
   fuzz:
@@ -445,7 +459,7 @@ jobs:
           name: fuzz-crashes
           path: fuzz/artifacts/
 
-  # Benchmarks — compile check + run to catch regressions.
+  # Benchmarks: compile check + run to catch regressions.
   # Results are uploaded as artifacts for comparison across runs.
   bench:
     name: Benchmarks
@@ -513,7 +527,7 @@ jobs:
     # (where a break would land on main), workflow_dispatch (the release
     # workflow reuses this job via `uses:`, and its caller event
     # propagates here), and version-tag pushes. Ordinary branch pushes
-    # skip — they'll be revalidated at PR time and by
+    # skip: they'll be revalidated at PR time and by
     # `scripts/release-preflight.sh` before tagging. Cuts the multi-
     # minute install-and-baseline-build off every non-release push.
     if: |
@@ -603,7 +617,7 @@ jobs:
         with:
           components: llvm-tools-preview
       # Instrumented builds use a different profile than the clippy/test
-      # cache, so scope this cache separately — sharing the default key
+      # cache, so scope this cache separately: sharing the default key
       # thrashed both caches.
       - uses: Swatinem/rust-cache@v2
         with:
@@ -612,8 +626,8 @@ jobs:
       # Run the instrumented test suite ONCE, then render summary + HTML
       # from the same profile data. The old version invoked
       # `cargo llvm-cov` twice (`--summary-only`, then `--html`), each
-      # rebuilding and re-running the full workspace under instrumentation
-      # — an easy ~50% wall-clock cut here.
+      # rebuilding and re-running the full workspace under instrumentation,
+      # an easy ~50% wall-clock cut here.
       - name: Run instrumented tests
         run: cargo llvm-cov --workspace --all-features --no-report
         env:
@@ -657,9 +671,9 @@ jobs:
   # both from [workspace.package] in Cargo.toml and fails if the
   # committed SVGs are out of date. Coverage uses the auto-commit
   # pattern above; this job is deliberately separate because
-  # version/license changes are rare, deliberate edits — drift is a
+  # version/license changes are rare, deliberate edits: drift is a
   # signal to the contributor, not something CI should silently fix.
-  # Pure bash + sed + awk — no Rust toolchain needed.
+  # Pure bash + sed + awk: no Rust toolchain needed.
   badges:
     name: Badges in sync
     runs-on: ubuntu-latest

@@ -8,7 +8,7 @@
 //! [`postgres`](crate::device::storage::postgres) siblings. MySQL's
 //! `CREATE INDEX` is not idempotent, so indexes are declared inline in
 //! `CREATE TABLE` here where the other two dialects use standalone
-//! `CREATE INDEX IF NOT EXISTS` statements — that dialect delta is
+//! `CREATE INDEX IF NOT EXISTS` statements: that dialect delta is
 //! expected, not a divergence.
 //!
 //! # Schema

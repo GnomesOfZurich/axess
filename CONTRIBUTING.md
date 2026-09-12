@@ -75,15 +75,27 @@ Breaking changes happen freely across the 0.x line; adopters get one coordinated
 
 ### MSRV bumps are breaking changes
 
-The workspace pins `rust-version = "1.87"` in `[workspace.package]`. A bump to a higher MSRV requires a minor-version bump on every published crate (0.x → 0.x+1 for 0.x; 1.x → 1.x+1 once stable). The reasoning: adopters pin Rust toolchains in CI; jumping the floor without warning silently breaks their builds.
+The workspace pins `rust-version` in `[workspace.package]`; `./scripts/check-msrv.sh` reports the current value and proves the tree still builds on it. A bump to a higher MSRV requires a minor-version bump on every published crate (0.x → 0.x+1 for 0.x; 1.x → 1.x+1 once stable). The reasoning: adopters pin Rust toolchains in CI; jumping the floor without warning silently breaks their builds.
 
 Procedure for an MSRV bump:
 
 1. Justify in the PR description (which compiler feature, why it earns the bump).
-2. Update `rust-version` in `[workspace.package]` AND the `MSRV` job's
-   toolchain pin in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+2. Update `rust-version` in `[workspace.package]`. That is the only place
+   it is written: `./scripts/check-msrv.sh` and the `MSRV` job in
+   [`.github/workflows/ci.yml`](.github/workflows/ci.yml) both read it from
+   there, and `./scripts/check-doc-versions.sh` fails if the docs disagree.
 3. Add an entry under `### Changed (breaking)` in CHANGELOG.md naming the new floor.
 4. Bump the workspace `version` (in `[workspace.package]`) accordingly.
+
+### `cargo semver-checks` does not catch everything
+
+`./scripts/release-preflight.sh` runs it, and a pass means none of its covered
+classes regressed --- not that the release is non-breaking. It has no lint for
+a **public struct field changing type**, so
+`pub client_secret: String` becoming `ZeroizedString` is a breaking change that
+the tool reports clean against a real published baseline. Breaking changes are
+documented by hand under `### Changed (breaking)` in CHANGELOG.md; the tool is
+a backstop for what it does cover, not the record.
 
 ### No `#[non_exhaustive]` on first-party enums
 

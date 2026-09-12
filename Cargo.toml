@@ -35,9 +35,9 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
-rust-version = "1.93.1"
+rust-version = "1.94.0"
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
@@ -51,17 +51,17 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # Every member crate that takes a direct dep on one of these uses
 # `workspace = true` so the version stays consistent across the
 # workspace (axess-core's session fingerprint HMAC matches axess-factors'
-# HOTP HMAC, etc.). Transitive duplicate-majors pulled in by upstreams
-# — `openidconnect`/`totp-rs` on `sha2 v0.10` + `hmac v0.12`,
-# `webauthn-rs v0.6.0-dev` on `x509-parser v0.16` — are out of our
+# HOTP HMAC, etc.). Transitive duplicate-majors pulled in by upstreams,
+# such as `openidconnect`/`totp-rs` on `sha2 v0.10` + `hmac v0.12`,
+# `webauthn-rs v0.6.0-dev` on `x509-parser v0.16`, are out of our
 # control and accepted until the respective upstreams bump; see
 # `docs/architecture.md` (crypto-backend posture) for the full
 # rationale. `x509-parser` is pre-pinned for the mTLS resolver
-# work — no current direct consumer.
+# work: no current direct consumer.
 [workspace.dependencies]
 # Internal axess crates. Members write `axess-foo = { workspace = true }`
 # (optionally `features = [...]` or `optional = true`); path + version
-# stay declared once here. The literal "0.4.0" appears alongside
+# stay declared once here. The literal "0.5.0" appears alongside
 # `[workspace.package].version` above (Cargo schema does not let
 # `[workspace.dependencies]` entries reference `[workspace.package]`); a
 # release bump touches both lines in this file only.
@@ -72,15 +72,15 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "=0.4.0" }
-axess-clock    = { path = "axess-clock",    version = "=0.4.0" }
-axess-core     = { path = "axess-core",     version = "=0.4.0", default-features = false }
-axess-events   = { path = "axess-events",   version = "=0.4.0" }
-axess-factors  = { path = "axess-factors",  version = "=0.4.0" }
-axess-identity = { path = "axess-identity", version = "=0.4.0", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "=0.4.0" }
-axess-rng      = { path = "axess-rng",      version = "=0.4.0" }
-axess-strings  = { path = "axess-strings",  version = "=0.4.0", default-features = false }
+axess-cache    = { path = "axess-cache",    version = "=0.5.0" }
+axess-clock    = { path = "axess-clock",    version = "=0.5.0" }
+axess-core     = { path = "axess-core",     version = "=0.5.0", default-features = false }
+axess-events   = { path = "axess-events",   version = "=0.5.0" }
+axess-factors  = { path = "axess-factors",  version = "=0.5.0" }
+axess-identity = { path = "axess-identity", version = "=0.5.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.5.0" }
+axess-rng      = { path = "axess-rng",      version = "=0.5.0" }
+axess-strings  = { path = "axess-strings",  version = "=0.5.0", default-features = false }
 
 # RustCrypto family + x509-parser; see preamble above.
 aes-gcm = "0.11.0"
@@ -115,5 +115,5 @@ tokio-test = "0.4.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt"] }
 url = "2.5.8"
-uuid = { version = "1.24.1", default-features = false }
+uuid = { version = "1.26.1", default-features = false }
 zeroize = { version = "1.9.0", features = ["zeroize_derive"] }

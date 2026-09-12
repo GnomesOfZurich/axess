@@ -152,14 +152,14 @@ impl<S: SessionStore> SessionLayer<S> {
     /// then fail both current and previous verification and their
     /// holders are forced to re-authenticate. This is the correct
     /// security behavior for an emergency-rotate-again scenario
-    /// (compromised previous key must not remain valid) — see
+    /// (compromised previous key must not remain valid): see
     /// `OPERATIONS.md#signing-key-rotation`.
     pub fn with_previous_signing_key(mut self, previous_master: [u8; 32]) -> Self {
         // Same "mutate before cloning" contract as `config_mut`. When
         // the Arc has been shared, `Arc::make_mut` deep-copies the
         // ring (key material included) into a fresh Arc and mutates
         // that; the previously-cloned service keeps the un-rotated
-        // ring — usually not what the caller intended, and it also
+        // ring: usually not what the caller intended, and it also
         // means the master key bytes exist in two places briefly.
         // The debug_assert catches this in dev; release builds allow
         // it (matches SessionConfig setter behavior).
@@ -175,7 +175,7 @@ impl<S: SessionStore> SessionLayer<S> {
         self
     }
 
-    /// `true` when a previous signing key is configured — i.e. the
+    /// `true` when a previous signing key is configured, i.e. the
     /// layer is currently in a signing-key rotation window. Adopters
     /// building admin / status endpoints can use this to surface
     /// "rotation in progress" state without inspecting the master
@@ -194,7 +194,7 @@ impl<S: SessionStore> SessionLayer<S> {
     /// `OPERATIONS.md#signing-key-rotation` for the procedure.
     ///
     /// Same "mutate before cloning" contract as
-    /// [`with_previous_signing_key`](Self::with_previous_signing_key) —
+    /// [`with_previous_signing_key`](Self::with_previous_signing_key):
     /// invoke on the freshly-built layer, before it is handed to
     /// `tower::Layer` / `Router::layer`; a debug build asserts on the
     /// footgun. Calling this when no previous key is set is a no-op.

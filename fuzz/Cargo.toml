@@ -1,9 +1,8 @@
 [package]
 name = "axess-fuzz"
-version = "0.4.0"
+version = "0.5.0"
 publish = false
 edition = "2024"
-rust-version = "1.93.1"
 
 # opt out of the workspace so the fuzz crate's nightly-only
 # dependencies (libfuzzer-sys) don't infect the main `cargo build`.
@@ -22,7 +21,7 @@ axess-core = { path = "../axess-core", features = ["memory", "oauth", "sqlite", 
 
 # Each fuzz target is a separate `[[bin]]` so cargo-fuzz can build them
 # individually. `path = "fuzz_targets/<name>.rs"` matches the layout
-# `cargo fuzz init` would produce — kept manual so the layout is visible
+# `cargo fuzz init` would produce: kept manual so the layout is visible
 # in source control.
 
 [[bin]]

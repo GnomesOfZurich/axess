@@ -136,18 +136,43 @@ async fn suspended_user_cannot_login() {
     assert!(matches!(outcome, Ok(LoginOutcome::Locked { .. })));
 }
 
-/// Nonexistent tenant returns NotActive.
+/// An unknown tenant must be indistinguishable from a known tenant whose
+/// credentials are wrong.
+///
+/// This asserts the property rather than the variant. The previous version
+/// pinned `Err(AuthnError::NotActive(_))`, which was the leak: that variant
+/// maps to 403 "account not active" while a bad password yields
+/// `Ok(LoginOutcome::InvalidCredentials)`, so an attacker could separate
+/// "no such tenant" from "wrong password" on the status code alone.
+///
+/// Comparing the two paths is what makes this a real check: asserting one
+/// variant in isolation would still pass if the other path changed to match
+/// it for the wrong reason.
 #[tokio::test]
-async fn nonexistent_tenant_returns_error() {
-    let identity = MockIdentityStore::new(); // No tenants!
-    let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+async fn unknown_tenant_is_indistinguishable_from_bad_credentials() {
     let session = test_session();
 
-    let result = service
+    // No tenants at all.
+    let unknown_tenant = AuthnService::new(MockIdentityStore::new(), MockFactorStore::new())
         .begin_login("alice", "nonexistent", &session, None)
         .await;
-    assert!(matches!(result, Err(AuthnError::NotActive(_))));
+
+    // A tenant that exists, but no matching user.
+    let known_tenant = AuthnService::new(
+        MockIdentityStore::new().with_tenant(test_tenant()),
+        MockFactorStore::new(),
+    )
+    .begin_login("alice", "default", &session, None)
+    .await;
+
+    assert!(
+        matches!(unknown_tenant, Ok(LoginOutcome::InvalidCredentials)),
+        "an unknown tenant must not surface a distinct error, got {unknown_tenant:?}"
+    );
+    assert!(
+        matches!(known_tenant, Ok(LoginOutcome::InvalidCredentials)),
+        "control: a known tenant with no such user is InvalidCredentials, got {known_tenant:?}"
+    );
 }
 
 /// SessionId display/parse round-trip.

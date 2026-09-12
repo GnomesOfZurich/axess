@@ -112,7 +112,7 @@ where
     /// `new_id_fn` is the application's choice of identifier scheme.
     /// Pass `|| DeviceId::try_new(Uuid::new_v4().to_string()).unwrap()`
     /// for the canonical UUID-v4 shape, or a deterministic generator
-    /// driven by [`MockRng`](axess_rng::testing::MockRng) for tests.
+    /// driven by `MockRng` for tests.
     /// Only called on the create path.
     pub fn ensure_device(
         &self,

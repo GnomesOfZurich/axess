@@ -11,7 +11,18 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientCredentialsToken {
     /// The access token issued by the authorization server.
-    pub access_token: String,
+    ///
+    /// Wrapped in [`ZeroizedString`](crate::secret::ZeroizedString) so the
+    /// bearer string is redacted in `Debug` output and zeroed from the heap
+    /// when dropped. The type derives `Debug`, and this is the field a
+    /// `tracing` call recording the whole response would print.
+    ///
+    /// Unlike [`OAuthClaims::access_token`](crate::oauth::types::OAuthClaims),
+    /// this field is *not* `#[serde(skip_serializing)]`: a client-credentials
+    /// response is a token and nothing else, so an adopter caching one must
+    /// be able to serialize it. `ZeroizedString` is transparent to serde in
+    /// both directions.
+    pub access_token: crate::secret::ZeroizedString,
     /// Token type (typically `"Bearer"`).
     pub token_type: String,
     /// Token lifetime in seconds.

@@ -70,7 +70,7 @@ jwt-svid = ["jwt", "axess-core/jwt-svid"]
 ldap = ["axess-core/ldap"]
 mtls = ["axess-core/mtls"]
 oauth = ["axess-core/oauth"]
-# Plain-OAuth-2.0 user login. OFF BY DEFAULT — see
+# Plain-OAuth-2.0 user login. OFF BY DEFAULT: see
 # `axess::social` module docs for the security model and when to reach
 # for this vs OIDC.
 social = ["axess-core/social"]

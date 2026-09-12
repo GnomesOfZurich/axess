@@ -175,7 +175,7 @@ pub trait AuthzEntityProvider: Send + Sync {
     /// exist in the compiled Cedar schema.
     ///
     /// Called by [`AuthzStore::validate`][super::session::AuthzStore::validate]
-    /// if you invoke it at startup. **No default implementation** — every
+    /// if you invoke it at startup. **No default implementation**: every
     /// adopter must type the body explicitly. If your application has no
     /// tenant model (single-tenant or system-only) and no schema invariants
     /// to enforce, write `Ok(())` as a deliberate acknowledgement. A silent

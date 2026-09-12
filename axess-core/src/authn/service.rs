@@ -253,7 +253,7 @@ where
     /// Attach a FIDO2/WebAuthn provider.
     ///
     /// **Single-instance by design.** Calling `with_fido2` twice replaces
-    /// the previously attached provider silently — one deployment, one
+    /// the previously attached provider silently: one deployment, one
     /// relying-party configuration is the assumption. Multi-tenant apps
     /// that need per-tenant relying-party ids (e.g. distinct RP-IDs per
     /// customer domain) must wrap dispatch in the application layer;
@@ -278,7 +278,7 @@ where
     /// this provider instead of checking a local password hash.
     ///
     /// **Single-instance by design.** Calling `with_ldap` twice replaces
-    /// the previously attached provider silently — one deployment, one
+    /// the previously attached provider silently: one deployment, one
     /// directory is the assumption. Multi-tenant apps that need
     /// per-subsidiary directories must wrap dispatch in the application
     /// layer; axess-core does not maintain a per-tenant LDAP registry.
@@ -327,7 +327,7 @@ where
     ///    etc.); the application maps a tenant → provider-name in its own
     ///    tenant record and calls [`begin_oauth_login`](Self::begin_oauth_login)
     ///    with the resolved name. Provider names are stable identifiers,
-    ///    NOT dynamic per-tenant strings — do not derive them from
+    ///    NOT dynamic per-tenant strings: do not derive them from
     ///    `tenant_id` at registration time (would require re-registration
     ///    on every tenant create/delete, would collide with reserved
     ///    identifier characters, and would defeat the introspection story
@@ -336,7 +336,7 @@ where
     /// If you need genuinely dynamic per-tenant IdP configuration
     /// (each tenant admin uploads their own client_secret through a UI,
     /// changing at runtime), that requires provider hot-swap which
-    /// axess-core does not yet support — see the roadmap.
+    /// axess-core does not yet support: see the roadmap.
     #[cfg(feature = "oauth")]
     pub fn with_oauth_provider(
         mut self,

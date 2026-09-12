@@ -19,9 +19,10 @@
 //!
 //! All providers here use plain OAuth 2.0; claims come from a
 //! TLS-trusted userinfo endpoint, not from a signed assertion. See
-//! [`axess::social`](axess::social) module docs for the security
+//! [`axess::social`] module docs for the security
 //! delta vs OIDC.
 
+use axess::authn::ZeroizedString;
 use axess::social::{SocialClaims, SocialError, SocialProvider, SocialProviderConfig};
 
 /// Function pointer type for static claim-mapper helpers. Using a
@@ -51,7 +52,7 @@ pub fn github(
             token_endpoint: "https://github.com/login/oauth/access_token".into(),
             userinfo_endpoint: "https://api.github.com/user".into(),
             client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            client_secret: ZeroizedString::new(client_secret),
             redirect_uri: redirect_uri.into(),
             scopes: vec!["read:user".into(), "user:email".into()],
         },
@@ -92,7 +93,7 @@ pub fn discord(
             token_endpoint: "https://discord.com/api/oauth2/token".into(),
             userinfo_endpoint: "https://discord.com/api/users/@me".into(),
             client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            client_secret: ZeroizedString::new(client_secret),
             redirect_uri: redirect_uri.into(),
             scopes: vec!["identify".into(), "email".into()],
         },
@@ -153,7 +154,7 @@ pub fn twitter_x(
             token_endpoint: "https://api.twitter.com/2/oauth2/token".into(),
             userinfo_endpoint: "https://api.twitter.com/2/users/me".into(),
             client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            client_secret: ZeroizedString::new(client_secret),
             redirect_uri: redirect_uri.into(),
             scopes: vec!["tweet.read".into(), "users.read".into()],
         },
@@ -196,7 +197,7 @@ pub fn spotify(
             token_endpoint: "https://accounts.spotify.com/api/token".into(),
             userinfo_endpoint: "https://api.spotify.com/v1/me".into(),
             client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            client_secret: ZeroizedString::new(client_secret),
             redirect_uri: redirect_uri.into(),
             scopes: vec!["user-read-email".into(), "user-read-private".into()],
         },
@@ -243,7 +244,7 @@ pub fn reddit(
             token_endpoint: "https://www.reddit.com/api/v1/access_token".into(),
             userinfo_endpoint: "https://oauth.reddit.com/api/v1/me".into(),
             client_id: client_id.into(),
-            client_secret: client_secret.into(),
+            client_secret: ZeroizedString::new(client_secret),
             redirect_uri: redirect_uri.into(),
             scopes: vec!["identity".into()],
         },

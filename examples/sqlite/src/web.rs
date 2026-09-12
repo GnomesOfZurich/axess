@@ -5,7 +5,7 @@ pub mod protected;
 use axess::csrf::CsrfToken;
 
 /// Minimal HTML escaper for form-value interpolation. Only handles the
-/// characters that break out of attribute or text context — `&`, `<`, `>`,
+/// characters that break out of attribute or text context: `&`, `<`, `>`,
 /// `"`, `'`. Sufficient for the fixture's static templates; not a general
 /// HTML sanitizer.
 pub(crate) fn html_escape(input: &str) -> String {

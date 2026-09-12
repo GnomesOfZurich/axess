@@ -9,7 +9,7 @@
 # Build:   mdbook build       (writes docs/book/)
 # Serve:   mdbook serve       (http://localhost:3000, live-reload)
 #
-# The build output (docs/book/) is gitignored — GH Pages produces it.
+# The build output (docs/book/) is gitignored: GH Pages produces it.
 
 [book]
 title = "Axess"
@@ -25,7 +25,7 @@ git-repository-url = "https://github.com/GnomesOfZurich/axess"
 edit-url-template = "https://github.com/GnomesOfZurich/axess/edit/main/docs/{path}"
 site-url = "/axess/"
 no-section-label = true
-# Mermaid JS assets — written into docs/ by `mdbook-mermaid install docs`
+# Mermaid JS assets: written into docs/ by `mdbook-mermaid install docs`
 # (CI runs that step). Listed here so mdBook embeds the <script> tags.
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
@@ -43,7 +43,7 @@ heading-split-level = 3
 enable = true
 level = 1
 
-# mdbook-mermaid preprocessor — renders ```mermaid code blocks as
+# mdbook-mermaid preprocessor: renders ```mermaid code blocks as
 # SVG diagrams. Required for the state-machine diagram in
 # session-state-machine.md and the crate dependency graph in
 # architecture.md. The preprocessor is installed in CI by the docs

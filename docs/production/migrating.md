@@ -15,17 +15,110 @@ change (the same code does something subtly different). The
 sections below group by symptom; finding your case is faster than
 reading the full changelog.
 
+## 0.4.0 to 0.5.0
+
+`v0.5.0` has three adopter-facing changes, each to a single struct
+field. Two are type changes from `String` to `ZeroizedString`, for the
+same reason: the field held a secret in a `Debug`-deriving public type,
+so printing the value printed the secret.
+`SocialProviderConfig::client_secret` reaches adopters of the `social`
+feature; `ClientCredentialsToken::access_token` reaches adopters of
+`oauth` who call `OAuthProvider::client_credentials`. The third is a
+visibility change: `axess_events::KeyId` stops exposing its inner
+`ShortString`.
+
+### Compile errors you will see
+
+Building a `SocialProviderConfig` from a `String` no longer compiles:
+`expected 'ZeroizedString', found 'String'` (E0308), at the struct
+literal. Wrap the secret:
+
+```rust
+use axess::authn::ZeroizedString;
+use axess::social::SocialProviderConfig;
+
+SocialProviderConfig {
+    client_secret: ZeroizedString::new(secret),   // was: secret.into()
+    // ...
+}
+```
+
+`ZeroizedString::new` takes `impl Into<String>`, so a `&str`, an owned
+`String`, or a generic `impl Into<String>` parameter all wrap directly;
+`From<String>` and `From<&str>` mean `.into()` works too, where the
+target type is unambiguous. A helper that accepts `impl Into<String>`
+and passes it through to this field keeps its own signature, because the
+wrap happens at the field; the helper's callers need no change.
+
+The rationale is that `SocialProviderConfig` derives `Debug` and its
+documentation invites loading it from a TOML/YAML/JSON config file, so
+an adopter logging their own configuration printed the OAuth client
+secret verbatim. `ZeroizedString` prints as `ZeroizedString(***)` and
+zeroes its bytes on drop, which is what `TotpConfig::secret`,
+`HotpConfig::secret` and the outbound OAuth client already did; `social`
+was the only place in the crate that did not.
+
+### `ClientCredentialsToken::access_token`
+
+This one is a value axess returns, not one you construct, so most code
+needs no change: `&token.access_token` still derefs to `&str` and passes
+to anything taking `&str`, including an `Authorization` header value.
+Two shapes do need an edit. Code that binds the field as an owned string
+(`let bearer: String = token.access_token`) becomes
+`token.access_token.to_string()`. Code that builds the struct itself,
+which in practice means a test double standing in for a token endpoint,
+wraps the value: `access_token: ZeroizedString::new("test-token")`.
+
+Serialization is deliberately unchanged. Unlike `OAuthClaims`, which
+marks its token `#[serde(skip_serializing)]`, a client-credentials
+response *is* a token, so an adopter caching one must still be able to
+serialize it; `ZeroizedString` is transparent to serde in both
+directions. What changed is `Debug`: the field now prints as
+`ZeroizedString(***)`, which is the disclosure this release closes.
+
+### `KeyId`'s inner field
+
+`axess_events::KeyId` no longer exposes its `ShortString`. A struct
+literal or a destructuring pattern stops compiling:
+
+```rust
+let id = KeyId(ShortString::new("kms-2026-01"));   // was
+let id = KeyId::new("kms-2026-01");                // now
+let id = KeyId::from_static("kms-2026-01");        // const, no allocation
+
+let raw = id.0;            // was
+let raw = id.as_str();     // now
+```
+
+All three constructors and the accessor existed before this release; only
+the field's visibility changed, matching `KindTag`, which had always kept
+its own field private. If you do need to name `ShortString` (the
+`From<ShortString> for KindTag` impl is the reason you might), `axess-events`
+now re-exports it, so `use axess_events::ShortString` replaces a direct
+`axess-strings` dependency.
+
+### What is not a break
+
+Config files are unaffected. `ZeroizedString` is a newtype over `String`
+deriving `Serialize`/`Deserialize`, which serde treats transparently, so
+a bare string in a config file still deserializes into the field.
+
+Most *read* sites keep compiling. `ZeroizedString` derefs to `str`, so
+`&config.client_secret`, `config.client_secret.len()` and anything
+taking `&str` work unchanged. Only a site that needs an owned `String`
+has to say so, with `config.client_secret.to_string()`.
+
 ## 0.2.2 to 0.3.0
 
 `v0.3.0` upgrades the `jsonwebtoken` dependency from 10 to 11 and
 raises the workspace MSRV. Two adopter-facing changes. (There is no
 `0.2.1 to 0.2.2` entry: 0.2.2 was a transitive-dependency security
-patch with no public-API change — see *What does not migrate*.)
+patch with no public-API change: see *What does not migrate*.)
 
 ### Compile errors you will see
 
 An exhaustive `match` on a `jsonwebtoken::Algorithm` obtained from
-axess no longer compiles — `non-exhaustive patterns: '_' not
+axess no longer compiles: `non-exhaustive patterns: '_' not
 covered`. `jsonwebtoken` 11 marks `Algorithm` `#[non_exhaustive]`,
 and axess re-exposes that type through its public surface:
 `ALLOWED_ALGORITHMS`, `JwtVerifier::with_algorithms`, and the
@@ -43,13 +136,13 @@ match alg {
 The rationale is upstream's: `#[non_exhaustive]` lets `jsonwebtoken`
 add algorithms in a future minor without that being a breaking
 change for them, which moves the "handle the unknown" obligation
-onto callers. For a verifier the safe default is to fail closed —
+onto callers. For a verifier the safe default is to fail closed:
 treat the `_` arm as "unsupported algorithm, reject".
 
 ### Toolchain
 
 The workspace MSRV is now **1.93.1** (up from 1.87). The library
-itself builds on 1.88 — `jsonwebtoken` 11 raised that — but the
+itself builds on 1.88 (`jsonwebtoken` 11 raised that) but the
 declared floor is set to the workspace-wide requirement so the full
 build-and-test suite runs on one toolchain. Bump your toolchain to
 1.93.1 or later.
@@ -57,7 +150,7 @@ build-and-test suite runs on one toolchain. Bump your toolchain to
 ### What is not a break
 
 The new `EventSubjectRef` and `EventPayload::subject_ref()` are
-purely additive — `subject_ref()` defaults to `None`, so existing
+purely additive: `subject_ref()` defaults to `None`, so existing
 `EventPayload` implementations need no change. The inter-crate
 version pins moving to exact `=0.3.0` are internal to the axess
 workspace; adopters depend on the `axess` facade with their own

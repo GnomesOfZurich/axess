@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for taking the time to file a bug.
 
-        **Security issues** — do not file here. See
+        **Security issues**: do not file here. See
         [`SECURITY.md`](https://github.com/GnomesOfZurich/axess/blob/main/SECURITY.md).
   - type: input
     id: version

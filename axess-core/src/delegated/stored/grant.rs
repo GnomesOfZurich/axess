@@ -176,9 +176,14 @@ async fn post_token_endpoint(
 /// don't trip parsing.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    /// Wire field. Typed [`ZeroizedString`] so the plaintext the
+    /// provider sent is redacted in `Debug` and zeroed on drop: this
+    /// struct is where the token first lands, and zeroing only the
+    /// copy would leave the original in the heap for the process's
+    /// lifetime.
+    access_token: ZeroizedString,
     #[serde(default)]
-    refresh_token: Option<String>,
+    refresh_token: Option<ZeroizedString>,
     #[serde(default)]
     expires_in: Option<u64>,
     #[serde(default)]
@@ -229,8 +234,8 @@ async fn parse_token_response(
 
     Ok(StoredDelegation {
         provider: provider.name.clone(),
-        access_token: ZeroizedString::from(parsed.access_token),
-        refresh_token: parsed.refresh_token.map(ZeroizedString::from),
+        access_token: parsed.access_token,
+        refresh_token: parsed.refresh_token,
         expires_at,
         scopes,
         token_type: parsed.token_type.unwrap_or_else(|| "Bearer".to_string()),

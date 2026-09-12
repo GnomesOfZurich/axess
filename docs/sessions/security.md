@@ -256,7 +256,7 @@ calls. The defences against the remaining surface:
   token minted under one session fails validation once the session
   regenerates (on login, MFA add, tenant switch). The middleware
   accepts the token from the `X-CSRF-Token` header (AJAX) or the
-  `_csrf` form field (HTML forms — `application/x-www-form-urlencoded`
+  `_csrf` form field (HTML forms: `application/x-www-form-urlencoded`
   only; JS-driven multipart uploads should use the header). Adopters
   who need cross-origin/deferred use cases can layer `tower-http`'s
   middleware instead.

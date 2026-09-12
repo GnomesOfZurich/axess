@@ -1,10 +1,10 @@
 //! Workload-identity federation.
 //!
-//! One generic [`WorkloadResolver`](workload::WorkloadResolver) that
+//! One generic [`WorkloadResolver`](crate::federation::workload::WorkloadResolver) that
 //! verifies any JWT-bearer workload token (GitHub Actions OIDC,
 //! Kubernetes service-account projected tokens, GitLab CI OIDC,
 //! Okta / Azure AD / Auth0, axess `LocalIdP`, etc.) against a
-//! configured [`JwtVerifier`](super::jwt::verifier::JwtVerifier) and
+//! configured [`JwtVerifier`](crate::jwt::verifier::JwtVerifier) and
 //! dispatches the verified claims through a caller-supplied
 //! claim-mapping closure to produce a
 //! [`Principal::Workload`](axess_identity::Principal::Workload) with a
@@ -22,7 +22,7 @@
 //!
 //! The typed [`TenantId`](axess_identity::TenantId) is adopter-supplied
 //! at resolver construction; the same registry-agnostic pattern as
-//! [`MtlsResolver`](super::mtls::MtlsResolver). Adopter middleware
+//! [`MtlsResolver`](crate::mtls::MtlsResolver). Adopter middleware
 //! peeks at the JWT (or whatever issuer-specific claim drives tenant
 //! selection) to look up the tenant id before constructing the resolver.
 //!
@@ -32,11 +32,11 @@
 //! Kubernetes service-account tokens live in the
 //! `axess-example-workload-identity` crate. Adopters copy the recipe
 //! that matches their IdP and wire it against
-//! [`WorkloadResolver`](workload::WorkloadResolver) here.
+//! [`WorkloadResolver`](crate::federation::workload::WorkloadResolver) here.
 //!
 //! # SPIFFE-spec adapter
 //!
-//! [`JwtSvidResolver`](super::jwt::svid::JwtSvidResolver) is the one
+//! [`JwtSvidResolver`](crate::jwt::svid::JwtSvidResolver) is the one
 //! exception to the generic pattern. It implements the SPIFFE JWT-SVID
 //! *spec* (mandatory `spiffe://` URI in `sub`, trust-domain extracted
 //! from the URI), not just a claim shape, so it earns its own module

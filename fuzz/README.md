@@ -62,7 +62,7 @@ deeper soak runs belong in a scheduled workflow.
 `fuzz/Cargo.lock` is intentionally gitignored. The crate opts out of the
 main workspace (`[workspace]` is present but empty) and its `axess-core`
 dep is a path-only reference with no version pin, so `cargo +nightly
-fuzz` regenerates the lockfile on demand — locally and in CI. Committing
+fuzz` regenerates the lockfile on demand: locally and in CI. Committing
 it just accumulated stale entries (the last committed value pointed at
 `axess-core = 0.0.16` long after the workspace had passed 0.3.0), and
 because CI ignored the committed value functionally, the drift was

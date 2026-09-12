@@ -643,14 +643,14 @@ pub struct ResolvedFactor {
 /// admin code silently walks a fallback chain, or auth code returns a
 /// system default when the caller wanted "no config at this exact scope."
 ///
-/// - [`resolve_factor`](Self::resolve_factor) — RUNTIME auth. Walks
+/// - [`resolve_factor`](Self::resolve_factor): RUNTIME auth. Walks
 ///   the User → Tenant → System resolution chain (see
 ///   [`AuthnScope::resolution_chain`]) and returns the first hit as
 ///   [`ResolvedFactor`], carrying the config AND the scope it lives at.
 ///   Backends should implement this as a single storage query that
 ///   walks the chain in one round trip.
 ///
-/// - [`load_factor`](Self::load_factor) — ADMIN / display. Fetches
+/// - [`load_factor`](Self::load_factor): ADMIN / display. Fetches
 ///   the config at EXACTLY the requested scope with no fallback. Use for
 ///   configuration UIs, provisioning tooling, migration scripts, and
 ///   anything answering "what did this tenant / user explicitly configure?"
@@ -664,7 +664,7 @@ pub struct ResolvedFactor {
 /// [`AuthnScope::System`] holds platform-owned defaults. Tenants adopt
 /// system defaults explicitly (at provisioning or later reconfiguration);
 /// nothing silent about it. Storage-wise, System rows live under the
-/// reserved [`TenantId::system`] tenant — there is no NULL-tenant
+/// reserved [`TenantId::system`] tenant: there is no NULL-tenant
 /// encoding for configuration scope. See `docs/authentication/scope.md`.
 pub trait FactorStore: Send + Sync + 'static {
     /// Error type returned by storage operations.
@@ -696,7 +696,7 @@ pub trait FactorStore: Send + Sync + 'static {
     /// Use for configuration UIs answering "what did this tenant
     /// explicitly configure?", for provisioning tooling that needs to
     /// know whether a User-scope override exists before writing, and
-    /// for admin export / migration. Never on the runtime auth path —
+    /// for admin export / migration. Never on the runtime auth path:
     /// use [`resolve_factor`](Self::resolve_factor) there.
     fn load_factor(
         &self,

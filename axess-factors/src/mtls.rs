@@ -1,7 +1,7 @@
 //! SPIFFE X509-SVID resolver over rustls peer-cert chain.
 //!
-//! Implements [`PrincipalResolver`] over the leaf client certificate
-//! presented during the mTLS handshake. Returns [`Principal::Workload`]
+//! Implements [`PrincipalResolver`](axess_identity::PrincipalResolver) over the leaf client certificate
+//! presented during the mTLS handshake. Returns [`Principal::Workload`](axess_identity::Principal::Workload)
 //! when the certificate's `Subject Alternative Name` contains a SPIFFE
 //! URI (`spiffe://<trust_domain>/...`) and the trust domain matches the
 //! pinned expectation.
@@ -20,7 +20,7 @@
 //!    via adopter-side middleware. The chain is request-scoped; axess
 //!    does not own its lifetime.
 //! 4. Per request, build an [`MtlsResolver`] (peer cert + expected
-//!    trust domain + caller-resolved [`TenantId`]) and call
+//!    trust domain + caller-resolved [`TenantId`](axess_identity::TenantId)) and call
 //!    `resolve().await`.
 //!
 //! axess provides the request-extension type and the SPIFFE-ID parse;
@@ -38,7 +38,7 @@
 //! # TenantId source
 //!
 //! Unlike the JWT-SVID flow (where a custom `tid` claim carries the
-//! typed [`TenantId`] UUID), an X509-SVID has no JWT claims. The
+//! typed [`TenantId`](axess_identity::TenantId) UUID), an X509-SVID has no JWT claims. The
 //! adopter middleware does the `tenant_slug → TenantId` lookup against
 //! its own registry before constructing the resolver, typically via a
 //! cached `HashMap<String, TenantId>` populated at startup. The

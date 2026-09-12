@@ -10,8 +10,8 @@
 # Do NOT invoke `cargo mutants` directly against the primary working
 # tree. Cargo-mutants edits source files in-place during each probe
 # (injecting a `~ changed by cargo-mutants ~` stub body), and any
-# concurrent tooling — `cargo test`, `rust-analyzer`, another agent's
-# `clippy` — observes whichever transient mutation is in flight.
+# concurrent tooling: `cargo test`, `rust-analyzer`, another agent's
+# `clippy`: observes whichever transient mutation is in flight.
 # Past symptoms: tests failing differently each run, mutation markers
 # landing in commits because a crash left rollback halfway done, and
 # `clippy -D warnings` tripping on stub bodies.
@@ -26,7 +26,7 @@
 # # Scope
 #
 # - We mutate library code (`*/src/**`). Tests, examples, benches,
-#   fuzz harnesses, and build scripts are excluded — mutating them
+#   fuzz harnesses, and build scripts are excluded: mutating them
 #   would just generate mutants the existing tests can't kill.
 # - We exclude infrastructure derive-impl files where mutation is
 #   either uninteresting (Display/From/serde glue) or known to
@@ -65,7 +65,7 @@ examine_globs = [
     "axess-strings/src/**/*.rs",
 ]
 
-# Hard excludes — never mutate these even if they match `examine_globs`.
+# Hard excludes: never mutate these even if they match `examine_globs`.
 exclude_globs = [
     # Test-only modules and integration tests are themselves the
     # oracles; mutating them would just produce noise.
@@ -87,7 +87,7 @@ exclude_globs = [
 
 # Extra arguments passed to `cargo` (BOTH `cargo test --no-run` and
 # the test phase). `--all-features` ensures every feature gate's
-# code path is exercised — without it, mutants on files behind
+# code path is exercised: without it, mutants on files behind
 # `cfg(feature = "sqlite")` etc. would be tested against a build
 # that hasn't compiled the gating tests, producing false survivors.
 # `#[ignore]`'d integration tests (Postgres, Valkey) don't run by

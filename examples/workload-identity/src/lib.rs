@@ -1,5 +1,5 @@
 //! Adopter recipes for axess's generic
-//! [`WorkloadResolver`](axess::workload_identity::WorkloadResolver).
+//! [`WorkloadResolver`](axess::federation::workload::WorkloadResolver).
 //!
 //! axess deliberately ships *no* per-issuer adapters: each IdP's JWT
 //! claim shape is small enough (~20 lines for the struct, ~30 for the

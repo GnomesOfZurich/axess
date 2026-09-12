@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Generate a shields.io-style SVG badge as a static file.
-# No network calls — useful for repos that want self-contained badges.
+# No network calls: useful for repos that want self-contained badges.
 #
 # Usage: ./scripts/generate-badge.sh <label> <message> <color> <output-path>
 # Example: ./scripts/generate-badge.sh coverage "82%" brightgreen .github/badges/coverage.svg

@@ -29,7 +29,7 @@ const DEFAULT_MAX_CUSTOM_BYTES: usize = 64 * 1024;
 /// Session configuration controlling cookie attributes and session lifetime.
 ///
 /// Construct via [`SessionConfig::builder()`] (or
-/// [`SessionConfig::default()`] for production-safe defaults) — fields
+/// [`SessionConfig::default()`] for production-safe defaults): fields
 /// are crate-private so struct-literal construction cannot bypass the
 /// validation `SessionConfigBuilder::build` performs (`__Host-` prefix
 /// requires `secure=true`, non-zero TTL, non-empty cookie name).

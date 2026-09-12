@@ -99,7 +99,7 @@ where
 
         // Pre-compute the binding fingerprint pair from the request
         // before moving it. `compute_binding_fingerprints` returns
-        // (current, previous) — `previous` is only `Some` when a
+        // (current, previous): `previous` is only `Some` when a
         // rotation window is active. The pair is threaded into
         // `load_session` so verification can fall back to the previous
         // key and re-store the fingerprint under the current key.
@@ -178,7 +178,7 @@ where
                 // `rotation_fallback_used` is folded into `modified`
                 // so the finalize path persists the (possibly-updated)
                 // fingerprint AND flips `session_changed = true`, which
-                // in turn triggers the Set-Cookie emission below —
+                // in turn triggers the Set-Cookie emission below:
                 // re-issuing the cookie under the current signing key.
                 modified: load.binding_invalidated || device_changed || load.rotation_fallback_used,
                 regenerate: load.binding_invalidated,

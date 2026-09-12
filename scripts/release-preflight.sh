@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# axess — fail-fast release preflight for maintainers.
+# axess: fail-fast release preflight for maintainers.
 #
 # Runs the same local gates documented in docs/production/release.md, but as a
 # numbered executable checklist so release validation is reproducible and less
@@ -39,26 +39,44 @@ if [ "$ALLOW_DIRTY" = true ]; then
   PACKAGE_ARGS+=(--allow-dirty)
 fi
 
-TOTAL=10
+TOTAL=13
 if [ "$WITH_FUZZ" = true ]; then
-  TOTAL=11
+  TOTAL=14
 fi
 
+# Steps number themselves. Hand-written ordinals silently desync the moment a
+# step is inserted, renumbered or reordered: adding step 2 once shifted the
+# non-leaf package step onto 11, which the fuzz step already used, so
+# `--with-fuzz` printed "[11/12]" twice with no other symptom.
+STEP_NO=0
+
 step() {
-  local number="$1"
-  local label="$2"
-  shift 2
+  local label="$1"
+  shift
+  STEP_NO=$((STEP_NO + 1))
   echo ""
-  echo "[$number/$TOTAL] $label"
+  echo "[$STEP_NO/$TOTAL] $label"
   "$@"
 }
 
-step 1 "Format check" cargo fmt --manifest-path "$AXESS_DIR/Cargo.toml" --all -- --check
+step "Format check" cargo fmt --manifest-path "$AXESS_DIR/Cargo.toml" --all -- --check
 
-# Mirrors the `Ban #[non_exhaustive]` CI job — see the docstring on that job
+# Sub-second, so it runs before the expensive gates: a stale snippet should
+# stop the release immediately, not after a 40-minute test run. Docs carry
+# copy-pasteable `axess = { version = "..." }` blocks that nothing else keeps
+# in step with the workspace version, and a reader landing on a crate README
+# from crates.io or the GitHub tree view will pin whatever it says.
+step "Documented versions" "$AXESS_DIR/scripts/check-doc-versions.sh"
+
+# Also sub-second. Guards the AGENTS.md rule that an inline `#[cfg(test)]`
+# block over ~200 lines moves to a sibling file: 24 blocks had drifted past
+# it before the rule was enforced rather than remembered.
+step "Inline test block sizes" "$AXESS_DIR/scripts/check-inline-tests.sh"
+
+# Mirrors the `Ban #[non_exhaustive]` CI job: see the docstring on that job
 # in .github/workflows/ci.yml for the policy rationale (trade one breakage
 # class for another; project prefers loud call-site breaks on variant add).
-step 2 "Ban #[non_exhaustive]" bash -c '
+step "Ban #[non_exhaustive]" bash -c '
   set -eu
   cd "$0"
   if grep -RIn --include="*.rs" \
@@ -72,20 +90,42 @@ step 2 "Ban #[non_exhaustive]" bash -c '
   echo "OK: no #[non_exhaustive] occurrences."
 ' "$AXESS_DIR"
 
-step 3 "Clippy" cargo clippy --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features --all-targets -- -D warnings
-step 4 "Workspace tests" cargo test --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features
-step 5 "Public docs build" cargo doc --manifest-path "$AXESS_DIR/Cargo.toml" --no-deps --all-features -p axess -p axess-core
+step "Clippy" cargo clippy --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features --all-targets -- -D warnings
+step "Workspace tests" cargo test --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features
+# Was `cargo doc -p axess -p axess-core` with warnings allowed, which is how 29
+# unresolved intra-doc links reached 0.5.0: it documented two crates of
+# eighteen and treated the warnings as advice. The script covers the whole
+# workspace under -D warnings and proves it documented every member.
+step "Public docs build (rustdoc links)" "$AXESS_DIR/scripts/check-doc-links.sh"
+
+# Expensive (a second full build on the MSRV toolchain), so it sits after the
+# cheap gates and the main test run. It belongs in the release gate rather than
+# in test-all.sh: `rust-version` is a promise to adopters, and the moment to
+# check a promise is before publishing it.
+step "MSRV build + lib tests" "$AXESS_DIR/scripts/check-msrv.sh"
 
 # `cargo deny` covers bans / licenses / sources policy; `cargo audit` covers
 # the RUSTSEC advisory database (CVSS 4.0 handling that cargo-deny 0.18.x
 # doesn't do yet, per the note on the CI Security Audit job). Both gate the
 # release: a deny hit or an unpatched advisory blocks the tag.
-step 6 "Supply-chain policy (cargo deny)" cargo deny --manifest-path "$AXESS_DIR/Cargo.toml" check licenses sources bans
-step 7 "Security advisories (cargo audit)" cargo audit --file "$AXESS_DIR/Cargo.lock" --deny warnings
+step "Supply-chain policy (cargo deny)" cargo deny --manifest-path "$AXESS_DIR/Cargo.toml" check licenses sources bans
+step "Security advisories (cargo audit)" cargo audit --file "$AXESS_DIR/Cargo.lock" --deny warnings
 
-step 8 "Semver checks" cargo semver-checks check-release --manifest-path "$AXESS_DIR/Cargo.toml" --workspace
+# A pass here is a floor, not a ceiling. cargo-semver-checks has no lint for a
+# public struct field changing type (255 lints as of 0.50.0; the nearest are
+# `struct_pub_field_missing` and the struct-to-enum conversions), so a change
+# like `pub client_secret: String` -> `ZeroizedString` is breaking and still
+# reports "no semver update required" against a real baseline. Read a green
+# step as "none of the covered classes regressed", and keep documenting
+# breaking changes in CHANGELOG.md by hand.
+#
+# The tool also reads rustdoc JSON and supports only a narrow range of format
+# versions: an "unsupported rustdoc format vNN" failure here means
+# cargo-semver-checks is older than the pinned toolchain, not that the code
+# broke. Fix with `cargo install cargo-semver-checks --locked`.
+step "Semver checks" cargo semver-checks check-release --manifest-path "$AXESS_DIR/Cargo.toml" --workspace
 
-step 9 "Leaf crate publish dry-runs" bash -c '
+step "Leaf crate publish dry-runs" bash -c '
   set -euo pipefail
   cd "$0"
   shift
@@ -95,7 +135,7 @@ step 9 "Leaf crate publish dry-runs" bash -c '
   done
 ' "$AXESS_DIR" bash ${PACKAGE_ARGS[@]+"${PACKAGE_ARGS[@]}"}
 
-step 10 "Non-leaf package preflight" bash -c '
+step "Non-leaf package preflight" bash -c '
   set -euo pipefail
   cd "$0"
   shift
@@ -109,7 +149,7 @@ step 10 "Non-leaf package preflight" bash -c '
 # takes several minutes even with warm caches. Off by default so the common
 # preflight stays fast; the CI `Fuzz Smoke` job runs on every PR regardless.
 if [ "$WITH_FUZZ" = true ]; then
-  step 11 "Fuzz smoke (nightly)" bash -c '
+  step "Fuzz smoke (nightly)" bash -c '
     set -euo pipefail
     if ! command -v cargo-fuzz >/dev/null 2>&1; then
       echo "ERROR: cargo-fuzz not installed. Run: cargo install cargo-fuzz --locked" >&2
@@ -125,6 +165,13 @@ if [ "$WITH_FUZZ" = true ]; then
       cargo +nightly fuzz run "$target" -- -max_total_time=30
     done
   ' "$AXESS_DIR"
+fi
+
+# TOTAL is still declared by hand (the fuzz step is conditional), so make a
+# mismatch loud rather than letting the denominator quietly lie.
+if [ "$STEP_NO" -ne "$TOTAL" ]; then
+  echo "ERROR: ran $STEP_NO steps but TOTAL claims $TOTAL. Update TOTAL." >&2
+  exit 1
 fi
 
 echo ""

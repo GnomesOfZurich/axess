@@ -160,7 +160,7 @@ on the published version. The shape:
 mkdir /tmp/axess-smoke
 cd /tmp/axess-smoke
 cargo new --name axess-smoke .
-echo 'axess = "0.2"' >> Cargo.toml
+echo 'axess = "0.5"' >> Cargo.toml
 cargo build
 ```
 
@@ -200,6 +200,22 @@ mailing list, or other channels mirror as appropriate).
 Update the docs.rs links anywhere they hardcode a version. The
 canonical version is now the released one, not the development
 branch.
+
+The copy-pasteable dependency snippets in the READMEs, the book and
+the `testing` doc-comments are checked rather than remembered:
+`./scripts/check-doc-versions.sh` compares every
+`axess... = { version = "..." }` in a tracked `.md` or `.rs` file
+against `[workspace.package] version`, and
+`./scripts/release-preflight.sh` runs it among its cheap early gates. The comparison is
+cargo's compatibility rule, not string equality, so `"0.4"` and
+`"0.4.0"` both satisfy a 0.4.0 workspace; for 0.x the minor is the
+breaking unit. `CHANGELOG.md` is exempt because its entries are
+supposed to name the versions they shipped in, and non-semver
+placeholders such as the `0.NEW.0` in `docs/production/release.md`
+are ignored.
+
+Bump the workspace version first, then run the check: it will list
+every snippet the bump left behind.
 
 ## Rollback
 

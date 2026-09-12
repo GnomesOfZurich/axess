@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# axess — run clippy across the workspace (library crates + example crates).
+# axess: run clippy across the workspace (library crates + example crates).
 #
 # `cargo clippy --workspace --all-features --all-targets` from the repo
 # root already covers everything because `examples/*` is in

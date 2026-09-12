@@ -250,7 +250,7 @@ impl AzureFicClient {
             ));
         }
         Ok(AzureFicResponse {
-            access_token: ZeroizedString::from(parsed.access_token),
+            access_token: parsed.access_token,
             token_type: parsed.token_type.unwrap_or_else(|| "Bearer".to_string()),
             expires_in: parsed.expires_in,
         })
@@ -259,7 +259,12 @@ impl AzureFicClient {
 
 #[derive(Debug, Deserialize)]
 struct AzureSuccessBody {
-    access_token: String,
+    /// Wire field. Typed [`ZeroizedString`] so the plaintext the
+    /// provider sent is redacted in `Debug` and zeroed on drop: this
+    /// struct is where the token first lands, and zeroing only the
+    /// copy would leave the original in the heap for the process's
+    /// lifetime.
+    access_token: ZeroizedString,
     #[serde(default)]
     token_type: Option<String>,
     #[serde(default)]

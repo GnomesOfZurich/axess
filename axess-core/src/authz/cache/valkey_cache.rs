@@ -66,14 +66,14 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// until TTL expiry.
 ///
 /// This means every application-side mutation that changes the
-/// **authorization-relevant state of a principal** — role assignment,
+/// **authorization-relevant state of a principal**: role assignment,
 /// role removal, group membership change, account suspension, tenant
-/// switch — MUST be paired with a call to
+/// switch: MUST be paired with a call to
 /// [`invalidate_principal`](Self::invalidate_principal) (or
 /// [`invalidate_tenant`](Self::invalidate_tenant) for tenant-scoped
 /// changes) on the mutating pod. Forgetting this leaves the affected
 /// user acting under their old rights for up to [`ttl`](Self::with_ttl)
-/// seconds — a real vulnerability for revocation.
+/// seconds, a real vulnerability for revocation.
 ///
 /// TTL is a safety net, not a substitute. Short TTLs (60s default)
 /// bound the worst-case exposure; explicit invalidation on mutation is
@@ -308,7 +308,7 @@ where
             // cache read costs O(entities × attributes) on the critical
             // path with no correctness gain against our own writer. It
             // does NOT defend against Valkey being written to by anything
-            // other than axess — that's a distinct trust boundary
+            // other than axess: that's a distinct trust boundary
             // (network segmentation, Valkey ACLs) and MUST NOT be relied
             // on cache-side. Note also the mutation-invalidation contract
             // documented on the struct: semantic staleness (a revoked
