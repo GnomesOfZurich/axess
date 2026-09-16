@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.5.1] - 2026-09-16
+
+A dependency patch release. No API change, nothing to migrate.
+
+### Security
+
+- **`rustls` 0.23.44 to 0.23.45**, closing RUSTSEC-2026-0285: TLS 1.3
+  handshake messages sent at the wrong encryption level were accepted, where
+  RFC 8446 requires the connection be terminated. Reached directly and through
+  the `reqwest`, `openidconnect` and `ldap3` TLS features. The declared minimum
+  moves with it, so an existing lockfile must update rather than may.
+
+---
+
 ## [0.5.0] - 2026-09-12
 
 Three breaking changes, all single struct fields; see

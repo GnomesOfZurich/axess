@@ -47,7 +47,7 @@ turn on `memory`, the in-memory session store used for development and
 tests.
 
 ```toml
-axess = { version = "0.5.0", features = ["memory"] }
+axess = { version = "0.5.1", features = ["memory"] }
 ```
 
 The complete feature reference lives in the

@@ -44,7 +44,7 @@ The selection is a Cargo feature, configured per crate:
 
 ```toml
 [dependencies]
-axess = { version = "0.5.0", features = ["crypto-aws-lc"] }
+axess = { version = "0.5.1", features = ["crypto-aws-lc"] }
 ```
 
 The default is `crypto-rust` (which is the same as not specifying

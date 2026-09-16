@@ -23,8 +23,8 @@
 
 # The exceptions that genuinely need CRLF on disk, because their interpreter is
 # a Windows one and they are Windows artefacts by definition.
-*.{cmd,[cC][mM][dD]} text eol=crlf
-*.{bat,[bB][aA][tT]} text eol=crlf
+*.[cC][mM][dD] text eol=crlf
+*.[bB][aA][tT] text eol=crlf
 *.ps1 text eol=crlf
 
 # Redundant under the rule above, and kept because it is the one that bit.
