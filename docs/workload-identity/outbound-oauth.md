@@ -1,14 +1,14 @@
 # Outbound: OAuth
 
-This chapter covers the case where the application authenticates
+This chapter covers the case where your application authenticates
 itself as a workload against a downstream OAuth-protected service.
 The application is the OAuth client; the downstream is the resource
-server. The credential is an access token the application acquires
+server. The credential is an access token you acquire
 through one of the OAuth client flows (client credentials, token
 exchange, or refresh of a stored token).
 
 The chapter pairs with *Inbound: federation* and *Cloud STS
-exchange*: those cover the inbound case where the application
+exchange*: those cover the inbound case where you
 accepts workload tokens; this covers the outbound case where the
 application presents them.
 
@@ -18,7 +18,7 @@ The feature flag is `outbound-oauth` (off by default).
 
 Three patterns lead to outbound OAuth.
 
-The first is a service-to-service call between two services your
+**A service-to-service call** between two services your
 deployment owns, where the receiving service authenticates
 inbound OAuth (typically through the generic `WorkloadResolver`
 from *Inbound: federation*). The application's outbound
@@ -26,12 +26,12 @@ configuration mints a fresh token through the client-credentials
 grant, sends it on the request, and the receiving service
 validates it.
 
-The second is a call to a SaaS service that requires OAuth (Slack,
+**A call to a SaaS service** that requires OAuth (Slack,
 Stripe, Twilio, an enterprise CRM). The application is registered
 as an OAuth client at the SaaS, holds a client id and secret, and
 mints tokens to call the SaaS's API.
 
-The third is a call to a downstream service on a user's behalf,
+**A call on a user's behalf** to a downstream service,
 where the credential is a token exchanged from the user's session
 or from a stored refresh token. This is the OBO case, covered in
 *Delegated and OBO access*; the outbound-oauth machinery in this
@@ -40,98 +40,114 @@ under the hood.
 
 ## Configuration
 
-`OutboundOAuthClient` is the type that mints tokens. The
-configuration:
+`OutboundOAuthClient` fetches tokens through the client-credentials
+grant. The configuration:
 
 ```rust,ignore
-use axess::workload::outbound::{OutboundOAuthClient, OutboundOAuthConfig};
+use axess_core::ZeroizedString;
+use axess_core::workload::outbound::oauth_client::{
+    ClientAuthMethod, OutboundOAuthClient,
+};
 
-let client = OutboundOAuthClient::new(OutboundOAuthConfig {
-    token_endpoint: "https://idp.example.com/oauth/token".parse().unwrap(),
-    client_id: "billing-api-prod".into(),
-    client_credential: ClientCredential::Secret("...".into()),
-    scopes: vec!["https://api.downstream.example/.default".into()],
-    audience: Some("https://api.downstream.example".into()),
-});
+let client = OutboundOAuthClient::new(
+    "https://idp.example.com/oauth/token".parse()?,
+    ClientAuthMethod::ClientSecretBasic {
+        client_id: "billing-api-prod".into(),
+        client_secret: ZeroizedString::new(secret),
+    },
+)
+.with_scopes(["https://api.downstream.example/.default"]);
 ```
 
-`token_endpoint` is the OAuth server's token endpoint. The
-endpoint typically comes from the OAuth server's discovery
-document; the configuration is the resolved URL.
+The first argument is the OAuth server's token endpoint. It typically
+comes from the server's discovery document; the configuration is the
+resolved URL.
 
-`client_credential` carries how the application authenticates to
-the token endpoint. The variants are:
+The client authenticates to that endpoint with a `ClientAuthMethod`:
 
 ```rust,ignore
-pub enum ClientCredential {
-    Secret(ZeroizedString),
-    JwtAssertion { signing_key: SigningKey, kid: String },
-    Mtls,                         // client cert from outbound TLS
-    SignedJwt { /* ... */ },
+pub enum ClientAuthMethod {
+    ClientSecretBasic { client_id: String, client_secret: ZeroizedString },
+    ClientSecretPost  { client_id: String, client_secret: ZeroizedString },
+    PrivateKeyJwt {
+        client_id: String,
+        signing_key: EncodingKey,
+        algorithm: Algorithm,
+        key_id: Option<String>,
+        audience: String,
+        assertion_ttl: Duration,
+    },
 }
 ```
 
-The `Secret` variant is the classic OAuth client secret. The
-`JwtAssertion` variant is RFC 7523 (private_key_jwt
-authentication), which is what FAPI-grade integrations use; the
-application signs a short-lived assertion JWT with its private
-key, and the token endpoint validates it against the registered
-public key. The `Mtls` variant uses the outbound TLS connection's
-client certificate as the authentication. The `SignedJwt` variant
-covers cases where the JWT structure differs from RFC 7523.
+`ClientSecretBasic` puts `client_id` and `client_secret` in an
+`Authorization: Basic` header, which is what most off-the-shelf IdPs
+expect (Okta, Auth0, Entra). `ClientSecretPost` sends the same pair as
+form fields, which some older IdPs require instead; check their
+documentation rather than guessing. Both secrets are zeroized on drop.
 
-`scopes` is the list of scopes requested. The narrowest possible
-list is the recommendation; over-broad scopes leak privilege if
-the resulting token is compromised.
+`PrivateKeyJwt` is RFC 7523, and it is the one to reach for in a
+FAPI-grade integration: axess signs a short-lived assertion with its
+private key and the IdP validates it against the published JWKS, so
+there is no shared secret to rotate. Its `audience` is the assertion
+JWT's own `aud` claim: per RFC 7523 §3 a value the IdP recognises as
+naming itself, usually the token endpoint URL, though some IdPs want
+their `issuer` URL instead. It does not name the downstream API. The
+`signing_key` is validated when the client is constructed, so a
+malformed key fails at startup rather than on the first call.
 
-`audience` is the optional audience parameter, used by some token
-endpoints (Azure AD, Auth0, others that follow the same pattern)
-to bind the resulting token to a specific resource.
+mTLS is not a variant here. Outbound client-certificate
+authentication is a property of the connection rather than of the token
+request; see *Outbound mTLS*.
 
-## Minting tokens
+The rest of the builder is small: `with_scopes` sets the requested
+scopes, `with_refresh_threshold` moves the cache's refresh point
+(default 30 seconds before expiry), and `with_clock`, `with_rng` and
+`with_http_client` substitute the ambient dependencies, the first two
+for deterministic tests, the third for proxy, timeout or outbound-mTLS
+configuration.
 
-The simple shape calls `mint_token` directly:
+The narrowest possible scope list is the recommendation; over-broad
+scopes leak privilege if the resulting token is compromised.
+
+There is no audience parameter. Token endpoints that bind a token to a
+specific resource through a non-standard `audience` form field (Auth0,
+some Azure AD configurations) are not covered by the builder; where the
+IdP accepts a resource-shaped scope instead (`.default` for Entra, for
+example), express it through `with_scopes`.
+
+## Getting a token
+
+`get_access_token` returns the current token as a `String`, fetching
+one if the cache has nothing fresh:
 
 ```rust,ignore
 async fn call_downstream(
     client: &OutboundOAuthClient,
+    http: &reqwest::Client,
 ) -> Result<(), Error> {
-    let token = client.mint_token().await?;
+    let token = client.get_access_token().await?;
 
-    let response = http_client
+    let response = http
         .get("https://api.downstream.example/data")
-        .header("Authorization", format!("Bearer {}", token.access_token))
+        .bearer_auth(&token)
         .send()
         .await?;
     Ok(())
 }
 ```
 
-Each `mint_token` call hits the token endpoint, exchanges the
-client credentials, and returns the access token. The cost is one
-round-trip per call.
+`OutboundOAuthClient` always caches, and there is no wrapper to reach
+for: it holds the token itself. The first call
+fetches and stores the response under a write lock, later calls inside
+the validity window read it under a read lock, and the window ends
+`refresh_threshold` before `expires_in` so a token does not expire
+mid-flight. Call it per request rather than holding the returned
+`String`, and the refresh is handled for you.
 
-The optimised shape caches the token for the duration of its
-validity:
-
-```rust,ignore
-async fn call_downstream_cached(
-    client: &CachedOutboundOAuthClient,
-) -> Result<(), Error> {
-    let token = client.get_cached().await?;
-    // token is fresh or freshly-minted; cache handles the expiry.
-    // ... use it
-}
-```
-
-`CachedOutboundOAuthClient` is the cache wrapper. The cache uses
-the same `ClockTtlCache` machinery the rest of axess uses; the
-TTL is the token's `expires_in` value, minus a small buffer so a
-token that expires mid-call is refreshed proactively.
-
-The right shape depends on the call rate. Below a few calls per
-minute, the simple shape works. Above that, the cache is worth
-the complexity.
+`force_refresh` bypasses the cache and replaces its contents, which is
+what to call when the downstream rejects an apparently-fresh token,
+since the IdP may have revoked it early.
 
 ## Token exchange (RFC 8693)
 
@@ -142,55 +158,65 @@ credential to a token-exchange-capable IdP and receives a token
 bound to the downstream audience.
 
 ```rust,ignore
-use axess::workload::outbound::{TokenExchanger, ExchangeRequest};
+use axess_core::ZeroizedString;
+use axess_core::delegated::exchange::{TokenExchangeClient, TokenExchangeRequest};
 
-let exchanger = TokenExchanger::new(/* ... */);
+let client = TokenExchangeClient::new(
+    token_endpoint,
+    "billing-api-prod",
+    Some(ZeroizedString::new(client_secret)),
+);
 
-let token = exchanger.exchange(ExchangeRequest {
-    subject_token: inbound_token,
-    subject_token_type: "urn:ietf:params:oauth:token-type:jwt".into(),
-    audience: "https://api.downstream.example".into(),
-    scopes: vec!["read:data".into()],
-}).await?;
+let token = client
+    .exchange(
+        &TokenExchangeRequest::new(
+            inbound_token,
+            "urn:ietf:params:oauth:token-type:jwt",
+        )
+        .with_audience("https://api.downstream.example")
+        .with_scopes(["read:data"]),
+    )
+    .await?;
 ```
+
+The client secret is optional. Pass `None` where the authorization
+server authenticates axess through mTLS at the transport layer
+instead, and configure the certificate on a `reqwest::Client` handed
+to `with_http_client`.
 
 The exchange runs through the IdP's token endpoint with the
 RFC 8693 parameters; the IdP validates the subject token,
-applies whatever exchange policy it has, and returns a token for
-the requested audience. The pattern is what most enterprise IdPs
-support today (Azure AD, Okta, Auth0); the OBO chapter covers it
-in detail from the application's side.
+applies whatever exchange policy it has, and returns a
+`TokenExchangeResponse`. Its `access_token` is a `ZeroizedString`
+rather than a `String`, so the in-memory copy zeroes on drop; deref it
+where the HTTP client wants a `&str`. The pattern is what most
+enterprise IdPs support today (Azure AD, Okta, Auth0); the OBO chapter
+covers it in detail from your side.
 
-## DPoP and sender-constrained tokens
+## Sender-constrained tokens
 
-The FAPI 2.0 chapter (*FAPI 2.0*) covers DPoP as a way to bind
-access tokens to a key the client controls. The
-outbound-oauth machinery supports DPoP through an opt-in
-configuration:
+The FAPI 2.0 chapter (*FAPI 2.0*) covers DPoP and mTLS as ways to bind
+an access token to a key the client controls. That machinery is
+inbound: `SenderConstraint` is a field of `FapiConfig`, which applies
+to an `OAuthProviderConfig` axess authenticates users against.
 
-```rust,ignore
-let config = OutboundOAuthConfig {
-    // ... standard configuration ...
-    sender_constraint: Some(SenderConstraint::DPoP {
-        key_provider: Box::new(my_dpop_key_provider()),
-    }),
-};
-```
+The outbound client does not generate DPoP proofs. Sender-constraining
+an outbound call means one of two things instead. Either authenticate
+to the token endpoint with `ClientAuthMethod::PrivateKeyJwt`, which
+proves possession of a private key on every token request and removes
+the shared secret a thief could replay; or present a client
+certificate on the connection, which is *Outbound mTLS*, and ask the
+IdP to bind the issued token to that certificate under RFC 8705.
 
-When `sender_constraint` is set, the client generates a DPoP
-proof on each call, signed with the configured key, and attaches
-it to the request along with the access token. The downstream
-validates the proof, matches the key thumbprint against the
-token's binding, and serves the request.
-
-The cost is one extra HTTP header per call plus a signature. The
-benefit is that a stolen access token is unusable without the
-DPoP key, which the client never transmits.
+Whether the second is available is the IdP's decision, not axess's:
+the binding is recorded in the token's `cnf` claim by the issuer. Axess
+presents the certificate; it does not verify that the issuer acted on
+it.
 
 ## Threat model
 
 The outbound OAuth flows have a smaller threat surface than the
-inbound flows because the application controls both ends of the
+inbound flows because you control both ends of the
 trust relationship.
 
 Against client credential theft: the credential lives in the
@@ -209,24 +235,33 @@ exposure; the encrypted credential store decorator covers that.
 
 Against scope creep: the scopes parameter restricts what the
 token can do. The discipline is to request the narrowest scopes
-the application needs, so a compromised token has limited blast
+you need, so a compromised token has limited blast
 radius.
 
 ## Troubleshooting
 
 If the token endpoint returns `invalid_client`, the client
 credentials are not what the IdP expects. The most common cause
-is using `Secret` against an endpoint that requires
-`JwtAssertion`, or vice versa.
+is using `ClientSecretBasic` against an endpoint that wants the
+credentials as form fields (`ClientSecretPost`), or a shared secret
+where the IdP expects `PrivateKeyJwt`.
 
 If the token endpoint returns `invalid_scope`, the requested
 scopes are not authorised for this client. Check the client's
 registration at the IdP to see which scopes are permitted.
 
-If the downstream returns 401 on the apparently-fresh token, the
-audience does not match the downstream's expected audience. Some
-IdPs default the audience to the client id rather than to a
-resource URL; set the `audience` parameter explicitly.
+If the downstream returns 401 on an apparently-fresh token, the
+audience does not match what the downstream expects. Some IdPs
+default a client-credentials token's audience to the client id
+rather than to a resource URL. The builder exposes nothing to
+override it, so the fix is at the IdP, either by registering the downstream as
+a resource and requesting its scope (`.../.default` and similar) or
+by configuring the default audience on the client registration.
+
+If a call fails on a token that worked moments earlier, the IdP
+revoked it before its stated expiry. The cache has no way to learn
+this, so call `force_refresh` on a 401 and retry once before
+surfacing the error.
 
 ## Further reading
 

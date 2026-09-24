@@ -29,7 +29,7 @@ where
         tenant_id: &TenantId,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let ldap = match &self.ldap {
+        let ldap = match &self.inner.ldap {
             Some(l) => l,
             None => {
                 tracing::error!("LdapBind factor configured but no LdapProvider attached");
@@ -50,6 +50,7 @@ where
 
         // Look up the user's identifier for the bind DN template and group filter.
         let user = self
+            .inner
             .identity
             .get_user(user_id)
             .await
@@ -89,16 +90,16 @@ where
             _ => return Ok(FactorOutcome::InvalidCredential),
         };
 
-        self.metrics.factor_attempt();
+        self.inner.metrics.factor_attempt();
 
         // Attempt the LDAP bind. Pass the clean identifier for group search.
         match ldap.verify_bind(&user.identifier, &bind_dn, password).await {
             Ok(_result) => {
-                self.metrics.factor_success();
+                self.inner.metrics.factor_success();
 
                 // Reset failed attempts on successful bind.
                 session
-                    .advance_factor(&FactorKind::LdapBind, self.clock.now())
+                    .advance_factor(&FactorKind::LdapBind, self.inner.clock.now())
                     .await;
 
                 self.emit_audit(
@@ -106,7 +107,7 @@ where
                         .attributed_to(user_id, tenant_id)
                         .with_factor(FactorKind::LdapBind),
                 )
-                .await;
+                .await?;
 
                 self.complete_factor_step(user_id, tenant_id, session).await
             }
@@ -123,7 +124,7 @@ where
                 // generic message to callers to avoid leaking LDAP server
                 // hostnames, connection details, or schema information.
                 tracing::error!(error = %e, bind_dn = %bind_dn, "LDAP bind failed (non-credential error)");
-                self.metrics.factor_failure();
+                self.inner.metrics.factor_failure();
                 Err(AuthnError::ExternalService(
                     "external authentication unavailable".to_string(),
                 ))

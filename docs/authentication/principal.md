@@ -77,8 +77,10 @@ projected Kubernetes service-account token, a GitHub Actions OIDC
 token). The resolver does the verification work (signature, audience,
 expiry, sometimes a token-exchange against a control plane) and on
 success returns a `WorkloadPrincipal` with the validated identity. The
-work is async because verifying tokens typically involves a JWKS
-fetch or an STS round-trip. The chapter *Workload identity overview*
+work is async because verifying tokens typically involves fetching the
+issuer's signing keys (its JWKS, the JSON Web Key Set published at a
+well-known URL) or a round-trip to a Security Token Service (STS),
+which exchanges one credential for another. The chapter *Workload identity overview*
 covers the resolver landscape end-to-end.
 
 The two resolvers are independent. An application that has no
@@ -110,7 +112,9 @@ the caller kind (and the branches obscure the intent).
 The same applies to the audit trail. A regulatory audit log that
 records "principal X performed action Y against resource Z at time
 T" works uniformly across human and workload callers when the
-principal type is unified. The downstream SIEM rules ("alert on any
+principal type is unified. The downstream rules in a SIEM, the
+security information and event management system that collects these
+logs ("alert on any
 principal making more than N requests per minute to the
 high-sensitivity endpoint") fire on both human attacks and runaway
 workloads, without separate detection logic.
@@ -214,7 +218,7 @@ rather than as a kind of value, makes the policy author's life harder
 in the short term and easier in the long term: a policy that does not
 explicitly admit `None` denies it by default.
 
-## What this enables
+## What the unified type saves you
 
 The unified principal type is what makes the rest of the workload
 identity story (Part VII) and the Cedar authorisation story (Part IV)
@@ -230,7 +234,7 @@ policy author resolves the discrimination where it actually matters.
 `WorkloadPrincipal` values: SPIFFE JWT-SVID, SPIFFE mTLS, Kubernetes
 ServiceAccount tokens, GitHub Actions OIDC, generic OAuth-RS, and
 cloud STS exchange. *Cedar policy fundamentals* covers the
-`AuthzSession::require` and `AuthzSession::decide` calls that take a
+`AuthzSession::require` and `AuthzSession::is_permitted` calls that take a
 `Principal` and return an `AuthzDecision`. *Audit events* covers the
 log emitted for each authentication and authorisation decision,
 including the principal serialisation.

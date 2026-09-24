@@ -6,11 +6,12 @@
 //! re-export site preserves the existing
 //! `axess_core::authn::event::AuthEventBuilder` import path.
 
-use super::{AuditContext, AuthEvent, AuthEventStatus, AuthEventType};
+use super::{AuditContext, AuthEvent, AuthEventStatus, AuthEventType, AuthFailureReason};
 use crate::authn::factor::FactorKind;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::session::id::SessionId;
 use chrono::{DateTime, Utc};
+use std::net::IpAddr;
 
 /// Builder for constructing [`AuthEvent`] records ergonomically.
 ///
@@ -22,7 +23,7 @@ use chrono::{DateTime, Utc};
 ///
 /// let event = AuthEventBuilder::success(AuthEventType::Authenticated)
 ///     .attributed_to(&user("alice"), &tenant("acme"))
-///     .with_ip("203.0.113.7")
+///     .with_ip("203.0.113.7".parse().unwrap())
 ///     .with_user_agent("Mozilla/5.0")
 ///     .with_request_id("req-7f3a")
 ///     .build();
@@ -37,11 +38,11 @@ pub struct AuthEventBuilder {
     event_status: AuthEventStatus,
     session_id: Option<SessionId>,
     factor_kind: Option<FactorKind>,
-    ip_address: Option<String>,
+    ip_address: Option<IpAddr>,
     user_agent: Option<String>,
     request_id: Option<String>,
     geo_country: Option<String>,
-    error: Option<String>,
+    error: Option<AuthFailureReason>,
     actor_id: Option<UserId>,
     device_id: Option<DeviceId>,
     factors_completed: Vec<FactorKind>,
@@ -135,6 +136,23 @@ impl AuthEventBuilder {
         Self::new(None, None, event_type, AuthEventStatus::Success)
     }
 
+    /// Start a `Locked`-status builder for `event_type`.
+    ///
+    /// A lockout is not an ordinary failure. It is the outcome a SOC
+    /// dashboard counts separately from a wrong password, because a run of
+    /// them is the signature of a brute-force attempt rather than a user
+    /// who mistyped, and because an account that is locked is in a state
+    /// an operator may have to clear.
+    ///
+    /// The four call sites that record one used
+    /// `failure(..).with_error("locked")`, which put the outcome in a free
+    /// text field and left [`AuthEventStatus::Locked`] unreachable: the
+    /// variant existed for exactly this and nothing ever set it. Querying
+    /// it meant matching a string, and a string nothing enforced.
+    pub fn locked(event_type: AuthEventType) -> Self {
+        Self::new(None, None, event_type, AuthEventStatus::Locked)
+    }
+
     /// Attach both user and tenant attribution in one call.
     ///
     /// Takes refs and clones internally so call sites avoid the
@@ -185,8 +203,15 @@ impl AuthEventBuilder {
     }
 
     /// Attach the client IP address.
-    pub fn with_ip(mut self, ip: impl Into<String>) -> Self {
-        self.ip_address = Some(ip.into());
+    ///
+    /// Takes an [`IpAddr`] rather than a string: this field is offered as
+    /// SOC 2 and PCI-DSS evidence, and an evidence field that accepts
+    /// arbitrary text accepts a forged one. Resolve the address with
+    /// [`ip_from_headers_trusted`](crate::authz::ip_from_headers_trusted)
+    /// against the peer your server accepted, and pass `None` by simply
+    /// not calling this where you have nothing trustworthy.
+    pub fn with_ip(mut self, ip: IpAddr) -> Self {
+        self.ip_address = Some(ip);
         self
     }
 
@@ -209,8 +234,16 @@ impl AuthEventBuilder {
     }
 
     /// Attach an error description for failed events.
-    pub fn with_error(mut self, err: impl Into<String>) -> Self {
-        self.error = Some(err.into());
+    /// Takes an [`AuthFailureReason`] rather than a string, because this
+    /// is the field a SOC dashboard groups by.
+    ///
+    /// Deliberately not `impl Into<_>`: that would keep string literals
+    /// compiling, and a typo would then land in
+    /// [`Other`](AuthFailureReason::Other) silently, which is the defect
+    /// this type removes. Free text is still available, by naming
+    /// `AuthFailureReason::Other` where you mean it.
+    pub fn with_error(mut self, reason: AuthFailureReason) -> Self {
+        self.error = Some(reason);
         self
     }
 
@@ -251,7 +284,7 @@ impl AuthEventBuilder {
     /// async variant) once per request, then pass the result here.
     pub fn with_audit_context(mut self, ctx: &AuditContext) -> Self {
         if let Some(ip) = &ctx.ip_address {
-            self.ip_address = Some(ip.to_string());
+            self.ip_address = Some(*ip);
         }
         if let Some(ua) = &ctx.user_agent {
             self.user_agent = Some(ua.clone());

@@ -4,7 +4,7 @@ use super::outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome};
 use super::verification::{VerifyOutcome, generate_otp_code, verify_credential};
 use crate::authn::{
     error::AuthnError,
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::{FactorConfig, FactorCredential, FactorKind},
     store::{FactorStore, IdentityStore},
     types::{AuthnScope, EntityState},
@@ -31,7 +31,7 @@ where
     ) -> Result<LoginOutcome, AuthnError<I::Error>> {
         use crate::validation::MAX_IDENTIFIER_BYTES;
 
-        self.metrics.auth_attempt();
+        self.inner.metrics.auth_attempt();
 
         // 0. Reject oversized identifiers before hitting the database.
         if identifier.is_empty()
@@ -39,7 +39,7 @@ where
             || tenant_identifier.is_empty()
             || tenant_identifier.len() > MAX_IDENTIFIER_BYTES
         {
-            self.metrics.auth_failure();
+            self.inner.metrics.auth_failure();
             return Ok(LoginOutcome::InvalidCredentials);
         }
 
@@ -56,6 +56,7 @@ where
         // same dummy store queries run against a throwaway tenant id to
         // keep the timing of an unknown tenant in line with a known one.
         let tenant = match self
+            .inner
             .identity
             .find_tenant(tenant_identifier)
             .await
@@ -69,14 +70,31 @@ where
                 let _ = self
                     .find_user_with_timing_equalization(identifier, &dummy_tenant)
                     .await;
-                self.metrics.auth_failure();
+                self.inner.metrics.auth_failure();
+                // Unattributed: there is no tenant and so no user to name.
+                // Emitting anyway is what keeps the audit failure mode from
+                // becoming an enumeration oracle, because an audit-store
+                // outage must fail this path exactly as it fails a known
+                // user's wrong password. It also closes a SOC blind spot: a
+                // credential-stuffing run against identifiers that do not
+                // exist used to leave no audit row at all.
+                self.emit_audit(
+                    AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                        .with_error(AuthFailureReason::UnknownTenant),
+                )
+                .await?;
                 return Ok(LoginOutcome::InvalidCredentials);
             }
         };
 
         if let Err(e) = tenant.validate() {
             tracing::error!(error = %e, "IdentityStore returned invalid Tenant");
-            self.metrics.auth_failure();
+            self.inner.metrics.auth_failure();
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                    .with_error(AuthFailureReason::InvalidTenantRow),
+            )
+            .await?;
             return Ok(LoginOutcome::InvalidCredentials);
         }
 
@@ -90,13 +108,14 @@ where
                 status = ?tenant.status,
                 "login rejected: tenant status does not allow login"
             );
-            self.metrics.auth_failure();
+            self.inner.metrics.auth_failure();
             return Err(AuthnError::NotActive(tenant.status.clone()));
         }
 
         // 1b. Enforce tenant IP policy if a client IP was provided.
         if let Some(ip) = client_ip {
             let policy = self
+                .inner
                 .identity
                 .ip_policy_for_tenant(&tenant.id)
                 .await
@@ -107,7 +126,7 @@ where
                     client_ip = %ip,
                     "login rejected by tenant IP policy"
                 );
-                self.metrics.auth_failure();
+                self.inner.metrics.auth_failure();
                 return Ok(LoginOutcome::InvalidCredentials);
             }
         }
@@ -124,40 +143,49 @@ where
         {
             Some(u) => u,
             None => {
-                self.metrics.auth_failure();
+                self.inner.metrics.auth_failure();
+                // Tenant-attributed but userless: the tenant is real and
+                // the identifier is not. See the unknown-tenant branch
+                // above for why this emits rather than returning quietly.
+                self.emit_audit(
+                    AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                        .maybe_attributed_to(None, Some(&tenant.id))
+                        .with_error(AuthFailureReason::UnknownIdentifier),
+                )
+                .await?;
                 return Ok(LoginOutcome::InvalidCredentials);
             }
         };
 
         // 3. Check account status.
         let status = self
+            .inner
             .identity
             .account_status(&user.id)
             .await
             .map_err(AuthnError::Store)?;
 
         if !status.allows_login() {
-            self.metrics.auth_failure();
+            self.inner.metrics.auth_failure();
             // Emit a `Failure(LoginAttempt)` audit row before returning so
             // a fresh session probing a known-locked account leaves a SOC
             // trail. `begin_login` does not go through
             // `enforce_account_status`, so the audit emit must happen
-            // here explicitly. The error tag distinguishes locked from
-            // other non-active states so dashboards can separate
-            // brute-force probes from administrative-state mismatches.
-            let error_tag = if status.is_locked() {
-                "locked"
+            // here explicitly. A lockout carries `Locked` rather than
+            // `Failure`, so a dashboard separates brute-force probes from
+            // administrative-state mismatches on the status column instead
+            // of on a free-text tag. The other non-active states keep the
+            // tag, having no status of their own.
+            let builder = if status.is_locked() {
+                AuthEventBuilder::locked(AuthEventType::LoginAttempt)
             } else {
-                "not_active"
-            };
-            self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
-                    .attributed_to(&user.id, &tenant.id)
-                    .with_error(error_tag),
-            )
-            .await;
+                    .with_error(AuthFailureReason::NotActive)
+            };
+            self.emit_audit(builder.attributed_to(&user.id, &tenant.id))
+                .await?;
             if status.is_locked() {
-                self.metrics.account_locked();
+                self.inner.metrics.account_locked();
                 // Surface the lockout expiry so UIs can render
                 // "locked until X" on the begin path. Mirrors
                 // `prepare_factor`: read `until` off
@@ -175,16 +203,39 @@ where
 
         // 4. Load available authentication methods.
         let methods = self
+            .inner
             .factors
             .available_methods(&user.id, &tenant.id)
             .await
             .map_err(AuthnError::Store)?;
 
-        let method = methods.into_iter().next().ok_or(AuthnError::NoFlow)?;
+        // Both of the next two rejections have to emit, for the same
+        // reason every other branch here does. A known account with no
+        // usable method would otherwise be the one outcome that leaves no
+        // audit row, and during an audit-store outage the one that still
+        // succeeds while every other path fails, which is an enumeration
+        // signal, narrow but of exactly the shape this flow was rewritten
+        // to remove.
+        let Some(method) = methods.into_iter().next() else {
+            self.inner.metrics.auth_failure();
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                    .attributed_to(&user.id, &tenant.id)
+                    .with_error(AuthFailureReason::NoFactorsConfigured),
+            )
+            .await?;
+            return Err(AuthnError::NoFlow);
+        };
 
         let resolved_factors = method.factors();
         if resolved_factors.is_empty() {
-            self.metrics.auth_failure();
+            self.inner.metrics.auth_failure();
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                    .attributed_to(&user.id, &tenant.id)
+                    .with_error(AuthFailureReason::NoFactorsConfigured),
+            )
+            .await?;
             return Ok(LoginOutcome::InvalidCredentials);
         }
 
@@ -201,7 +252,7 @@ where
                 .attributed_to(&user.id, &tenant.id)
                 .with_factor(first_kind.clone()),
         )
-        .await;
+        .await?;
 
         Ok(LoginOutcome::FactorRequired(first_kind))
     }
@@ -269,6 +320,7 @@ where
                 // Load the EmailOtp config to get the destination and parameters.
                 let user_scope = AuthnScope::User { tenant_id, user_id };
                 let config = self
+                    .inner
                     .factors
                     .resolve_factor(&user_scope, FactorKind::EmailOtp)
                     .await
@@ -286,7 +338,7 @@ where
                 // Cooldown: reject if a pending code hasn't expired yet.
                 // This prevents email bombing; the application can only trigger
                 // one send per TTL window.
-                let now = self.clock.now();
+                let now = self.inner.clock.now();
                 if cfg.pending_until.is_some_and(|until| now < until) {
                     return Ok(PrepareOutcome::AlreadySent {
                         destination: cfg.email.clone(),
@@ -307,7 +359,7 @@ where
                 // Generate a random numeric code using the injectable RNG.
                 // Wrap in ZeroizedString so it's cleared from memory after use.
                 let code = crate::authn::factor::ZeroizedString::new(generate_otp_code(
-                    &self.rng,
+                    &self.inner.rng,
                     code_length,
                 ));
 
@@ -321,7 +373,8 @@ where
                 cfg.pending_until = Some(expires);
 
                 // Save to user scope (per-user pending state).
-                self.factors
+                self.inner
+                    .factors
                     .save_factor(&user_scope, FactorConfig::EmailOtp(cfg))
                     .await
                     .map_err(AuthnError::Store)?;
@@ -335,7 +388,7 @@ where
             FactorKind::Fido2 => {
                 #[cfg(feature = "fido2")]
                 {
-                    let webauthn = match &self.fido2 {
+                    let webauthn = match &self.inner.fido2 {
                         Some(w) => w,
                         None => return Ok(PrepareOutcome::Ready),
                     };
@@ -343,6 +396,7 @@ where
                     // Load stored credentials.
                     let user_scope = AuthnScope::User { tenant_id, user_id };
                     let config = self
+                        .inner
                         .factors
                         .resolve_factor(&user_scope, FactorKind::Fido2)
                         .await
@@ -430,6 +484,7 @@ where
         // Runtime resolution: User → Tenant → System, single-query in the store.
         let user_scope = AuthnScope::User { tenant_id, user_id };
         let config = self
+            .inner
             .factors
             .resolve_factor(&user_scope, current_kind.clone())
             .await
@@ -460,8 +515,8 @@ where
                 .await;
         }
 
-        self.metrics.factor_attempt();
-        let outcome = verify_credential(credential, &config, &current_kind, self.clock.now());
+        self.inner.metrics.factor_attempt();
+        let outcome = verify_credential(credential, &config, &current_kind, self.inner.clock.now());
 
         if let VerifyOutcome::FailWithUpdate(updated_config) = &outcome {
             self.persist_fail_with_update(&user_scope, current_kind.clone(), updated_config)
@@ -477,7 +532,7 @@ where
                 .await;
         }
 
-        self.metrics.factor_success();
+        self.inner.metrics.factor_success();
 
         if let VerifyOutcome::PassWithUpdate(updated_config) = outcome {
             let swapped = self
@@ -486,13 +541,13 @@ where
             if !swapped {
                 // Concurrent verification spent the same step/counter
                 // first; treat as a replay and reject.
-                self.metrics.factor_failure();
+                self.inner.metrics.factor_failure();
                 return Ok(FactorOutcome::InvalidCredential);
             }
         }
 
         session
-            .advance_factor(&current_kind, self.clock.now())
+            .advance_factor(&current_kind, self.inner.clock.now())
             .await;
         self.complete_factor_step(&user_id, &tenant_id, session)
             .await
@@ -509,7 +564,7 @@ where
             None => return false,
         };
         let sid = session.session_id().await;
-        if let Some(reg) = &self.registry {
+        if let Some(reg) = &self.inner.registry {
             reg.is_valid(&user_id, &sid).await
         } else {
             true
@@ -520,9 +575,9 @@ where
     #[tracing::instrument(skip(self, session))]
     pub async fn logout(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
         if let Some(user_id) = session.user_id().await {
-            self.metrics.session_invalidated();
+            self.inner.metrics.session_invalidated();
             let sid = session.session_id().await;
-            if let Some(reg) = &self.registry {
+            if let Some(reg) = &self.inner.registry {
                 reg.invalidate_user(&user_id).await;
             }
             // When the session is authenticated (user_id exists) but the
@@ -542,7 +597,7 @@ where
                     .maybe_attributed_to(Some(&user_id), tenant_id.as_ref())
                     .with_session(sid),
             )
-            .await;
+            .await?;
         }
         session.clear().await;
         // Cycle the session ID to prevent session fixation after logout.
@@ -585,6 +640,7 @@ where
         tenant_id: &crate::authn::ids::TenantId,
     ) -> Result<Option<crate::authn::types::User>, AuthnError<I::Error>> {
         let user_opt = self
+            .inner
             .identity
             .find_user(identifier, tenant_id)
             .await
@@ -612,8 +668,12 @@ where
         // response time independent of identifier existence.
         let dummy_id = crate::authn::ids::UserId::try_new(uuid::Uuid::new_v4().to_string())
             .expect("fresh v4 UUID is a valid UserId");
-        let _ = self.identity.account_status(&dummy_id).await;
-        let _ = self.factors.available_methods(&dummy_id, tenant_id).await;
+        let _ = self.inner.identity.account_status(&dummy_id).await;
+        let _ = self
+            .inner
+            .factors
+            .available_methods(&dummy_id, tenant_id)
+            .await;
         Ok(None)
     }
 }

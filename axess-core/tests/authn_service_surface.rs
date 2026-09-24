@@ -36,7 +36,9 @@ async fn validator_with_live_registry_passes_registered_session() {
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_registry(registry.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build();
 
     let session = test_session();
     session
@@ -63,7 +65,9 @@ async fn validator_with_live_registry_rejects_unregistered_session() {
         .with_tenant(test_tenant())
         .with_user(user);
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_registry(registry);
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_registry(registry)
+        .build();
 
     let session = test_session();
     session
@@ -91,7 +95,9 @@ async fn has_session_registry_false_without_registry() {
 async fn has_session_registry_true_with_registry() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_registry(registry);
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_registry(registry)
+        .build();
     assert!(svc.has_session_registry());
 }
 
@@ -110,7 +116,9 @@ async fn invalidate_user_sessions_with_registry_invalidates() {
     use axess_core::session::store::SessionRegistry;
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_registry(registry.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build();
 
     let session = test_session();
     session
@@ -152,7 +160,9 @@ async fn invalidate_session_with_registry_removes_target_only() {
     use axess_core::session::store::SessionRegistry;
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_registry(registry.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build();
 
     let s1 = test_session();
     s1.set_authenticated(uid("u1"), tid("default"), Utc::now())
@@ -187,7 +197,9 @@ async fn active_sessions_with_registry_returns_registry_contents() {
     use axess_core::session::store::SessionRegistry;
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_registry(registry.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build();
 
     let session = test_session();
     session
@@ -222,9 +234,10 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity, factors)
+    let svc = AuthnService::builder(identity, factors)
         .with_registry(registry.clone())
-        .with_max_sessions_per_user(2);
+        .with_max_sessions_per_user(2)
+        .build();
 
     // Pre-populate the registry with 2 sessions for the user, so the cap is
     // exactly met before the new login.
@@ -299,7 +312,9 @@ async fn ldap_factor_completes_login_with_valid_bind_dn_override() {
     // registers exactly `bind_dn` as the valid bind target, so the override
     // path's bind succeeds without going through the build_bind_dn template.
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec![]);
-    let svc = AuthnService::new(identity, factors).with_ldap(ldap);
+    let svc = AuthnService::builder(identity, factors)
+        .with_ldap(ldap)
+        .build();
 
     let session = test_session();
     svc.begin_login("alice", "default", &session, None)
@@ -338,7 +353,9 @@ async fn ldap_bind_dn_without_equals_rejected_even_if_provider_would_accept() {
             AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
         );
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec![]);
-    let svc = AuthnService::new(identity, factors).with_ldap(ldap);
+    let svc = AuthnService::builder(identity, factors)
+        .with_ldap(ldap)
+        .build();
 
     let session = test_session();
     svc.begin_login("alice", "default", &session, None)
@@ -381,7 +398,9 @@ async fn ldap_bind_dn_over_length_cap_rejected_even_if_provider_would_accept() {
             AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
         );
     let ldap = MockLdapProvider::new(bind_dn.as_str()).with_user("alice", "ldap-secret", vec![]);
-    let svc = AuthnService::new(identity, factors).with_ldap(ldap);
+    let svc = AuthnService::builder(identity, factors)
+        .with_ldap(ldap)
+        .build();
 
     let session = test_session();
     svc.begin_login("alice", "default", &session, None)
@@ -424,7 +443,9 @@ async fn ldap_password_at_max_bytes_is_not_rejected_by_length_guard() {
             AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
         );
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", password.as_str(), vec![]);
-    let svc = AuthnService::new(identity, factors).with_ldap(ldap);
+    let svc = AuthnService::builder(identity, factors)
+        .with_ldap(ldap)
+        .build();
 
     let session = test_session();
     svc.begin_login("alice", "default", &session, None)
@@ -556,9 +577,10 @@ async fn email_otp_cooldown_boundary_at_until_refreshes_not_alreadysent() {
         .with_method(&uid("u1"), email_method);
 
     let clock = MockClock::now();
-    let service = AuthnService::new(identity, factors)
+    let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
-        .with_rng(MockRng::new(42));
+        .with_rng(MockRng::new(42))
+        .build();
     let session = test_session();
     service
         .begin_login("alice", "default", &session, None)
@@ -593,7 +615,9 @@ async fn oauth_providers_accessor_returns_live_registry() {
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let mock = MockOAuthProvider::new("mock-oauth");
-    let svc = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let registry = svc.oauth_providers();
     assert_eq!(

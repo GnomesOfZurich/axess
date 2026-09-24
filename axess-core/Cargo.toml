@@ -34,14 +34,14 @@ axess-rng = { workspace = true }
 aes-gcm = { workspace = true, optional = true }
 axum = { workspace = true, default-features = false, features = ["original-uri", "form", "json", "query", "tokio"] }
 base64 = { workspace = true }
-cedar-policy = { version = "4.12.0", optional = true }
+cedar-policy = { version = "4.13.0", optional = true }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { version = "6.2.1", features = ["serde"] }
 fred = { version = "10.1.0", features = ["transactions", "i-std", "i-cluster", "blocking-encoding", "replicas"], optional = true }
 hmac = { workspace = true }
-# Pinned ahead of the default-features ring/aws-lc-rs split: picking
-# `aws_lc_rs` keeps a single TLS provider across the workspace.
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"], optional = true }
+# No backend here either: see axess-factors' note. The adopter picks with
+# `jwt-aws-lc` or `jwt-rust-crypto`, which this crate passes through.
+jsonwebtoken = { version = "11.1.0", default-features = false, optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
 moka = { version = "0.12.16", features = ["future"], optional = true }
 # `timing-resistant-secret-traits` makes secret-bearing types refuse
@@ -175,6 +175,10 @@ fido2 = ["dep:webauthn-rs", "axess-factors/fido2"]
 # Auth0, etc. via a custom claim parser. SPIFFE adopters get the
 # same primitives transitively via `jwt-svid`.
 jwt = ["axess-factors/jwt"]
+# The crypto backend `jsonwebtoken` verifies with, passed through: enable
+# exactly one beside `jwt`. See axess-factors' features for the trade.
+jwt-aws-lc = ["jwt", "axess-factors/jwt-aws-lc", "jsonwebtoken?/aws_lc_rs"]
+jwt-rust-crypto = ["jwt", "axess-factors/jwt-rust-crypto", "jsonwebtoken?/rust_crypto"]
 jwt-svid = ["jwt", "axess-factors/jwt-svid"]
 ldap = ["dep:ldap3", "axess-factors/ldap"]
 mtls = ["dep:x509-parser", "dep:rustls-pki-types", "axess-factors/mtls"]

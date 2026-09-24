@@ -184,3 +184,43 @@ fn peer_cert_chain_leaf_is_none_for_empty_chain() {
 fn issuer_mtls_wire_string_is_stable() {
     assert_eq!(Issuer::Mtls.as_str(), "mtls");
 }
+
+#[tokio::test]
+async fn from_chain_takes_the_leaf_and_resolves() {
+    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/ekekrantz");
+    // A realistic chain: leaf first, then an intermediate the resolver
+    // must ignore. Picking the wrong element would resolve the wrong
+    // SPIFFE ID, so assert on the identity rather than on success.
+    let intermediate = cert_with_san_uri("spiffe://gnomes.local/ca/intermediate");
+    let chain = PeerCertChain::new(vec![cert, intermediate]);
+
+    let resolver = MtlsResolver::from_chain(
+        &chain,
+        TrustDomain::new("gnomes.local").unwrap(),
+        sample_tenant(),
+    )
+    .expect("non-empty chain");
+
+    match resolver.resolve().await.expect("must resolve") {
+        Principal::Workload(w) => assert_eq!(
+            w.workload_id.as_str(),
+            "spiffe://gnomes.local/compute-worker/ekekrantz"
+        ),
+        Principal::Human(_) => panic!("expected Workload, got Human"),
+    }
+}
+
+#[test]
+fn from_chain_rejects_an_empty_chain() {
+    // `MtlsResolver` deliberately has no `Debug` (it holds a peer
+    // certificate), so match rather than `expect_err`.
+    match MtlsResolver::from_chain(
+        &PeerCertChain::new(Vec::new()),
+        TrustDomain::new("gnomes.local").unwrap(),
+        sample_tenant(),
+    ) {
+        Err(MtlsError::EmptyChain) => {}
+        Err(other) => panic!("expected EmptyChain, got {other}"),
+        Ok(_) => panic!("empty chain has no leaf"),
+    }
+}

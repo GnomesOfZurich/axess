@@ -2,7 +2,8 @@
 //! `IdentityAdmin`.
 
 use axess::authn::{
-    AuthEvent, EntityState, LockoutPolicy, StatusDetail, Tenant, TenantId, User, UserId,
+    AuditOutcome, AuthEvent, EntityState, LockoutPolicy, StatusDetail, Tenant, TenantId, User,
+    UserId,
 };
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -98,7 +99,7 @@ impl axess::authn::IdentityLookup for OurBackend {
 }
 
 impl axess::authn::IdentityAuthnLog for OurBackend {
-    async fn record_event(&self, event: AuthEvent) -> Result<(), Self::Error> {
+    async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
         let event_id = Uuid::new_v4().to_string();
         // Unresolved attribution (pre-auth failures, malformed OAuth claims)
         // persists as NULL so audit queries can distinguish "we don't know"
@@ -113,11 +114,11 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
             .expect("event_time micros in range")
             .to_rfc3339();
         let factor_kind = event.factor_kind.as_ref().map(|k| k.as_str().to_string());
-        let ip_address = event.ip_address.as_deref().map(|s| s.to_string());
+        let ip_address = event.ip_address.map(|ip| ip.to_string());
         let user_agent = event.user_agent.as_deref().map(|s| s.to_string());
         let request_id = event.request_id.as_deref().map(|s| s.to_string());
         let geo_country = event.geo_country.as_deref().map(|s| s.to_string());
-        let error = event.error.as_deref().map(|s| s.to_string());
+        let error = event.error.as_ref().map(|r| r.as_str().to_string());
 
         sqlx::query(
             "INSERT INTO auth_events
@@ -147,7 +148,11 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
             user_id = user_id.as_deref().unwrap_or("<unattributed>"),
             "auth event recorded"
         );
-        Ok(())
+        // This example writes every event. A sink that needs to protect
+        // its storage under a flood of unauthenticated login attempts
+        // returns `AuditOutcome::Shed` instead, on a criterion that does
+        // not depend on the identifier.
+        Ok(AuditOutcome::Recorded)
     }
 
     async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
@@ -237,43 +242,21 @@ impl axess::authn::IdentityAdmin for OurBackend {
             .await?;
         Ok(())
     }
+}
 
-    async fn record_password_hash(&self, user_id: &UserId, hash: &str) -> Result<(), Self::Error> {
-        // Idempotent on (user_id, hash): a re-recorded hash leaves the
-        // earlier created_at untouched, which is fine for reuse-check
-        // semantics (most-recent-N is a high-water mark, not a strict
-        // ordering of unique insertions).
-        sqlx::query(
-            "INSERT INTO password_history (user_id, hash, created_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(user_id, hash) DO NOTHING",
-        )
-        .bind(user_id.to_string())
-        .bind(hash)
-        .bind(self.clock().now().to_rfc3339())
-        .execute(self.pool())
-        .await?;
-        Ok(())
+fn status_to_db(status: &EntityState) -> &'static str {
+    match status {
+        EntityState::Active => "active",
+        EntityState::Candidate => "candidate",
+        EntityState::Pending(_) => "pending",
+        EntityState::Suspended(_) => "suspended",
+        EntityState::Terminated(_) => "terminated",
+        EntityState::Archived(_) => "archived",
+        EntityState::Guest => "guest",
     }
+}
 
-    async fn password_history(
-        &self,
-        user_id: &UserId,
-        count: usize,
-    ) -> Result<Vec<String>, Self::Error> {
-        let rows = sqlx::query(
-            "SELECT hash FROM password_history
-              WHERE user_id = ?1
-              ORDER BY created_at DESC
-              LIMIT ?2",
-        )
-        .bind(user_id.to_string())
-        .bind(count as i64)
-        .fetch_all(self.pool())
-        .await?;
-        Ok(rows.into_iter().map(|r| r.get("hash")).collect())
-    }
-
+impl axess::authn::IdentityPasswordReset for OurBackend {
     async fn store_reset_token(
         &self,
         user_id: &UserId,
@@ -351,14 +334,45 @@ impl axess::authn::IdentityAdmin for OurBackend {
     }
 }
 
-fn status_to_db(status: &EntityState) -> &'static str {
-    match status {
-        EntityState::Active => "active",
-        EntityState::Candidate => "candidate",
-        EntityState::Pending(_) => "pending",
-        EntityState::Suspended(_) => "suspended",
-        EntityState::Terminated(_) => "terminated",
-        EntityState::Archived(_) => "archived",
-        EntityState::Guest => "guest",
+/// Password-reuse prevention, carved out of `IdentityAdmin` in 0.6.0.
+///
+/// A backend with no reuse policy simply does not implement this trait;
+/// the password-change flow is then unavailable to it at compile time,
+/// rather than panicking on the first change a user makes.
+impl axess::authn::IdentityPasswordHistory for OurBackend {
+    async fn record_password_hash(&self, user_id: &UserId, hash: &str) -> Result<(), Self::Error> {
+        // Idempotent on (user_id, hash): a re-recorded hash leaves the
+        // earlier created_at untouched, which is fine for reuse-check
+        // semantics (most-recent-N is a high-water mark, not a strict
+        // ordering of unique insertions).
+        sqlx::query(
+            "INSERT INTO password_history (user_id, hash, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_id, hash) DO NOTHING",
+        )
+        .bind(user_id.to_string())
+        .bind(hash)
+        .bind(self.clock().now().to_rfc3339())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn password_history(
+        &self,
+        user_id: &UserId,
+        count: usize,
+    ) -> Result<Vec<String>, Self::Error> {
+        let rows = sqlx::query(
+            "SELECT hash FROM password_history
+              WHERE user_id = ?1
+              ORDER BY created_at DESC
+              LIMIT ?2",
+        )
+        .bind(user_id.to_string())
+        .bind(count as i64)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("hash")).collect())
     }
 }

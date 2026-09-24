@@ -72,12 +72,14 @@ two collects the password, possibly with the identifier carried over a
 hidden form field or a short-lived intermediate token. The variant
 records who is being identified but says nothing about credentials.
 
-`Authenticating` is where most of the action happens. The session knows
-who it is trying to authenticate, which method is in progress (because
-a tenant might have multiple methods, and the choice is locked in
-before any factor runs), what factors are still required, what factors
-have already been verified this attempt, how many credential attempts
-have been made, and when the last attempt landed. The last two fields
+`Authenticating` is where most of the action happens. The session
+knows six things: who it is trying to authenticate, which method is in
+progress, what factors are still required, what factors have already
+been verified this attempt, how many credential attempts have been
+made, and when the last attempt landed.
+
+The method is recorded because a tenant might have several, and the
+choice is locked in before any factor runs. The last two fields
 exist because lockout decisions depend on them. A method that allows
 three attempts before locking the user out for fifteen minutes needs
 exactly this information, and putting it in the variant rather than in
@@ -193,7 +195,7 @@ Pure state machines compose cleanly with async orchestrators that hold
 the locks and dispatch side effects, and the two halves get reviewed
 and tested independently.
 
-## When `Authenticated` is and is not the right shape
+## Where `Authenticated` stops being the right shape
 
 The natural temptation when integrating axess for the first time is to
 treat `Authenticated` as the "done" state and `Guest` as the "not done"
@@ -267,7 +269,7 @@ state-machine variants do not change. The schema-migration story
 covered in *Schema migration* handles upgrade paths without breaking
 existing sessions.
 
-## What this enables
+## The foundation the rest of the book stands on
 
 The state machine is the foundation that lets the rest of the book be
 shorter. Factor composition (*Factors and methods*) works because
@@ -286,11 +288,11 @@ authentication question, and the rest of the library asks it.
 
 ## Further reading
 
-The chapters that build directly on this one are *Factors and methods*
-(which factors fit into the variants, and how methods compose), *Scope
-hierarchy* (how `begin_login` picks the right method given Global,
-Tenant, and User overrides), and *Refresh tokens and session continuity*
-(how the session continues across long-lived sessions, key rotation,
-and detection of token theft). *Session lifecycle and crypto envelope*
+Three chapters build directly on this one. *Factors and methods*
+covers which factors fit into the variants and how methods compose.
+*Scope hierarchy* covers how `begin_login` picks the right method
+given Global, Tenant and User overrides. *Refresh tokens and session
+continuity* covers how a session survives across long-lived sessions,
+key rotation and token theft. *Session lifecycle and crypto envelope*
 in Part V covers the cookie, the encryption envelope, and the
 orchestration's dirty-flag handling.

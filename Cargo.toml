@@ -35,7 +35,7 @@ resolver = "3"
 # Per-crate fields (`name`, `description`, `keywords`, `categories`, `exclude`)
 # stay local because they genuinely differ.
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.94.0"
 authors = ["Gnomes"]
@@ -61,7 +61,7 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 [workspace.dependencies]
 # Internal axess crates. Members write `axess-foo = { workspace = true }`
 # (optionally `features = [...]` or `optional = true`); path + version
-# stay declared once here. The literal "0.5.1" appears alongside
+# stay declared once here. The literal "0.6.0" appears alongside
 # `[workspace.package].version` above (Cargo schema does not let
 # `[workspace.dependencies]` entries reference `[workspace.package]`); a
 # release bump touches both lines in this file only.
@@ -72,23 +72,23 @@ homepage = "https://github.com/GnomesOfZurich/axess"
 # override unless the workspace entry has it too. Members that want the
 # defaults restate them via `features = [...]`. The other entries leave
 # defaults enabled so the common case stays terse.
-axess-cache    = { path = "axess-cache",    version = "=0.5.1" }
-axess-clock    = { path = "axess-clock",    version = "=0.5.1" }
-axess-core     = { path = "axess-core",     version = "=0.5.1", default-features = false }
-axess-events   = { path = "axess-events",   version = "=0.5.1" }
-axess-factors  = { path = "axess-factors",  version = "=0.5.1" }
-axess-identity = { path = "axess-identity", version = "=0.5.1", default-features = false }
-axess-macros   = { path = "axess-macros",   version = "=0.5.1" }
-axess-rng      = { path = "axess-rng",      version = "=0.5.1" }
-axess-strings  = { path = "axess-strings",  version = "=0.5.1", default-features = false }
+axess-cache    = { path = "axess-cache",    version = "=0.6.0" }
+axess-clock    = { path = "axess-clock",    version = "=0.6.0" }
+axess-core     = { path = "axess-core",     version = "=0.6.0", default-features = false }
+axess-events   = { path = "axess-events",   version = "=0.6.0" }
+axess-factors  = { path = "axess-factors",  version = "=0.6.0" }
+axess-identity = { path = "axess-identity", version = "=0.6.0", default-features = false }
+axess-macros   = { path = "axess-macros",   version = "=0.6.0" }
+axess-rng      = { path = "axess-rng",      version = "=0.6.0" }
+axess-strings  = { path = "axess-strings",  version = "=0.6.0", default-features = false }
 
 # RustCrypto family + x509-parser; see preamble above.
-aes-gcm = "0.11.0"
+aes-gcm = "0.11.1"
 hmac = "0.13.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 x509-parser = "0.18.1"
-quick-xml = { version = "0.41.0", features = ["serialize"] }
+quick-xml = { version = "0.42.0", features = ["serialize"] }
 
 # Workspace-pinned non-RustCrypto deps. Each member crate that takes a
 # direct dep on one of these should write `dep = { workspace = true }`
@@ -101,13 +101,17 @@ axum = { version = "0.8.9", default-features = false }
 base32 = "0.5.1"
 base64 = "0.23.1"
 chrono = "0.4.45"
+# Benchmark-only in this workspace (axess-strings compares ShortString
+# against it). Pinned to the version nomos uses so the comparison is
+# against the code the org actually links, not a nearby release.
+compact_str = "0.10.0"
 criterion = "0.8.2"
 hex = "0.4.3"
 once_cell = "1.21.4"
 proptest = "1.11.0"
-rand = "0.10.2"
+rand = "0.10.3"
 rkyv = { version = "0.8.17", default-features = false, features = ["alloc", "bytecheck", "uuid-1"] }
-serde_json = { version = "1.0.150", default-features = false }
+serde_json = { version = "1.0.151", default-features = false }
 subtle = "2.6.1"
 thiserror = { version = "2.0.20", default-features = false }
 tokio = { version = "1.53.1", default-features = false }

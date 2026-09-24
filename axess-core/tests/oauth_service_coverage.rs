@@ -38,7 +38,9 @@ async fn finish_oauth_login_rejects_oversized_code() {
 
     let mock = MockOAuthProvider::new("size-idp").with_user("u", "u@e.com", vec![], vec![]);
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
     let session = test_session();
 
     let oversized_code = "a".repeat(MAX_OAUTH_PARAM_BYTES + 1);
@@ -63,7 +65,9 @@ async fn finish_oauth_login_accepts_at_boundary() {
 
     let mock = MockOAuthProvider::new("size-idp2").with_user("u", "u@e.com", vec![], vec![]);
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
     let session = test_session();
 
     let exactly_max = "a".repeat(MAX_OAUTH_PARAM_BYTES);
@@ -88,7 +92,9 @@ async fn finish_oauth_login_rejects_oversized_state() {
 
     let mock = MockOAuthProvider::new("size-idp3").with_user("u", "u@e.com", vec![], vec![]);
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
     let session = test_session();
 
     let oversized_state = "s".repeat(MAX_OAUTH_PARAM_BYTES + 1);
@@ -114,9 +120,10 @@ async fn oauth_ceremony_not_expired_at_exact_boundary() {
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
-        .with_oauth_provider(provider);
+        .with_oauth_provider(provider)
+        .build();
 
     let session = test_session();
     authn

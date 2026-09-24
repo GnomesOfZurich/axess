@@ -1,9 +1,11 @@
 # Scope hierarchy
 
 Methods and factor configurations live at three tiers: System, Tenant,
-and User. The mechanism is simple, the consequences are not. Done well,
-the three-tier hierarchy makes multi-tenant SaaS deployment feel like
-one configuration with two override surfaces. Done badly, it becomes
+and User. The mechanism takes a paragraph to describe and a long time
+to get right.
+
+Used well, the three tiers make a multi-tenant deployment feel like one
+configuration with two override surfaces. Used carelessly, they become
 a maze where nobody can answer "what method is this user actually
 using?" without running a query. This chapter walks through the
 mechanism and the patterns that keep it operationally clear.
@@ -192,7 +194,7 @@ Phase one is User-scoped pilot. The operations team configures the
 new method (`Required(Password)` then `Required(Fido2)`) at user scope
 for a small set of internal users. These users go through the new
 flow first, surface any UX problems, and validate that the FIDO2
-ceremony works end-to-end against the application's relying-party
+ceremony works end-to-end against your relying-party
 configuration.
 
 Phase two is Tenant-scoped pilot. The team configures the new method
@@ -214,7 +216,7 @@ the old method and the roll-out simply skips them.
 The pattern works in reverse for emergency revocation. If the new
 method has a bug that surfaces during rollout, the team can override
 at tenant scope or user scope for the affected population without
-redeploying the application. The narrower scope wins; the affected
+redeploying. The narrower scope wins; the affected
 users walk the old method while the bug is fixed.
 
 ## How Cedar policy interacts
@@ -229,7 +231,7 @@ than to choose one. A policy might require that
 `factors_completed.contains("Fido2")` for an action against a sensitive
 resource. The method itself remains the resolved one from the scope
 hierarchy. If the method does not include FIDO2, the user reaches the
-sensitive route and gets a deny; the application then offers step-up
+sensitive route and gets a deny; you then offer step-up
 to add FIDO2 (covered in *Factors and methods* §"Step-up
 authentication"), the user completes it, and the policy now passes.
 
@@ -244,7 +246,7 @@ prompted for step-up.
 
 The hierarchy invites a few mistakes that are worth naming explicitly.
 
-The first is overusing user-scoped configuration. Every user-scoped
+**Overusing user-scoped configuration.** Every user-scoped
 row in the factor store is a piece of state that an operator has to
 maintain. If a tenant decides to change its method, the tenant-scoped
 row updates; the user-scoped overrides do not. After a few months of
@@ -254,7 +256,7 @@ to use user scope only when policy genuinely requires per-individual
 differentiation, and to document the reason in a separate field next
 to the row.
 
-The second is treating System as a runtime broadcast tier. A factor
+**Treating System as a runtime broadcast tier.** A factor
 configured at System scope is a *template*: the correct pattern is
 to adopt (materialise a tenant-scoped row) rather than to depend on
 resolution to reach it silently. Depending on system-tier fallback
@@ -262,18 +264,18 @@ turns platform-wide edits into surprise tenant-level changes.
 Materialise on adoption; treat runtime fallback to System as a
 convenience, not a management model.
 
-The third is conflating method scope with tenant identity. The
+**Conflating method scope with tenant identity.** The
 hierarchy says nothing about which tenants exist; it says only how to
 resolve a configuration for a given (tenant, user) pair. Tenant
 provisioning, tenant suspension, and tenant deletion are covered in
 *Multi-tenancy*.
 
-## What this enables
+## How the hierarchy scales
 
 The hierarchy is the reason an axess deployment scales from "one
 company with one method" to "a SaaS with hundreds of tenants, each
 with its own posture, and a few high-risk users on stricter policies"
-without restructuring the application. The same code path
+without restructuring anything. The same code path
 (`begin_login`, `verify_factor`, `Authenticated`) handles the
 single-tenant case and the hundred-tenant case. The only difference is
 which scope holds the configuration.

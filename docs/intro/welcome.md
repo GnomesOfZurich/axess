@@ -53,11 +53,12 @@ described in detail in the next chapter.
 It helps to know the boundaries. Axess is not a SaaS, has no hosted
 control plane, and does not own your user database. It is a library
 your application depends on, and your application keeps owning its data.
-It is not an Identity Provider in its primary use. In OAuth/OIDC
-terms axess is the Relying Party (the application that delegates
-identity to an external IdP and runs a session on the resulting
-tokens), not the OpenID Provider (the IdP itself, with login UI,
-consent screens, and user database). For the OP role, point axess at
+It is not an Identity Provider (IdP) in its primary use. In OAuth and
+OIDC terms axess is the Relying Party (RP): the application that
+delegates identity to an external IdP and runs a session on the
+resulting tokens. It is not the OpenID Provider (OP): the IdP itself,
+with login UI, consent screens, and user database. Later chapters use
+RP and OP as shorthand for those two roles. For the OP role, point axess at
 Keycloak, Ory Hydra, Okta, Azure AD, or whatever SSO your
 organisation already runs. The `local-idp` feature does mint workload
 JWTs in-process, but that is on-host service-to-service issuance, not
@@ -86,7 +87,7 @@ and the rules that keep leaf crates from depending on the orchestrator.
 | `axess-cache` | TTL+LRU cache with single-flight. Used by the Cedar entity cache and the OIDC JWKS cache. |
 | `axess-clock` | `Clock` trait, `SystemClock`, `MockClock`. The DST time foundation. |
 | `axess-rng` | `SecureRng` trait, `SystemRng`, `MockRng`. The DST entropy foundation. |
-| `axess-strings` | Shared string newtypes (`Arc<str>` interning). |
+| `axess-strings` | `ShortString`, an immutable identifier: inline to 22 bytes, `&'static str` in place, or shared behind an `Arc`. |
 | `axess-macros` | `require_authn!`, `require_partial_authn!`, `require_authz!` procedural macros. |
 
 ## When to reach for axess

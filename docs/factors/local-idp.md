@@ -38,8 +38,10 @@ Azure AD, etc.) when you need any of those. `LocalIdp` exists for
 JWTs for service-to-service flows it controls.
 
 The feature flag is `local-idp` (off by default), enabled with
-`features = ["local-idp"]` on the `axess` facade. It pulls in
-`oauth`, `oidc`, and `jwt` as transitive features.
+`features = ["local-idp", "jwt-rust-crypto"]` on the `axess` facade. It
+pulls in `oauth`, `oidc` and `jwt` as transitive features, and `jwt` needs a
+crypto backend named beside it: `jwt-rust-crypto` (pure Rust) or `jwt-aws-lc`
+(FIPS-capable, needs a C toolchain).
 
 ---
 

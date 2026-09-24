@@ -3,7 +3,7 @@
 Federated login through an Identity Provider you do not control is
 the most common reason adopters reach for OAuth. The user has a
 Google account, an Okta account, a corporate Azure AD account, and
-the application accepts a login from any of them rather than asking
+you accept a login from any of them rather than asking
 the user to invent and remember another password. The mechanism is
 OAuth 2.0 for the authorisation flow and OpenID Connect for the
 identity assertion layered on top. This chapter walks through what
@@ -11,9 +11,11 @@ axess wires up automatically, what the integration code has to do, and
 the failure modes that have specific defences.
 
 The feature flag is `oauth` (off by default), enabled with
-`features = ["oauth"]` on the `axess` facade. The feature transitively
-enables `oidc` (the discovery and JWKS-cache machinery) and `jwt` (the
-ID token validator).
+`features = ["oauth", "jwt-rust-crypto"]` on the `axess` facade. `oauth`
+transitively enables `oidc` (the discovery and JWKS-cache machinery) and `jwt`
+(the ID token validator), and `jwt` needs a crypto backend named beside it:
+`jwt-rust-crypto` (pure Rust) or `jwt-aws-lc` (FIPS-capable, needs a C
+toolchain).
 
 Axess supports generic OIDC-based external login and SSO, including standard providers such as Google and Microsoft Entra ID when configured with the appropriate issuer metadata and client credentials. SAML / Shibboleth federation is not currently supported out of the box.
 
@@ -86,14 +88,16 @@ and debounced (the cache refuses to refresh more often than once
 every few seconds, defeating a denial-of-service that triggers
 constant JWKS fetches).
 
-The configuration record carries the client id and secret (both
-provisioned at the IdP), the redirect URI (where the IdP sends the
-user after authentication), the ceremony timeout (how long the
-intermediate state on the session may live before the flow has to
-restart), and the list of scopes to request (`openid` and `profile`
-at minimum; `email` if the application needs the user's email
-address; `offline_access` if the application needs a refresh token
-to continue acting as the user after the initial session expires).
+The configuration record carries four things:
+
+- The client id and secret, both provisioned at the IdP.
+- The redirect URI, where the IdP sends the user after authentication.
+- The ceremony timeout: how long the intermediate state on the session
+  may live before the flow has to restart.
+- The scopes to request. `openid` and `profile` at minimum; `email` if
+  you need the user's email address; `offline_access` if
+  it needs a refresh token to keep acting as the user after the
+  initial session expires.
 
 ## Begin the login
 
@@ -193,19 +197,26 @@ integration lives. Axess performs the full set of checks RFC 6749
 and OpenID Connect Core 1.0 require; the integration code does not
 have to write them. The checks are:
 
-The first is signature verification against the IdP's JWKS. The
+**Signature verification** against the IdP's JWKS. The
 cache holds the current signing keys; if the ID token's `kid` header
 does not match a cached key, the cache refreshes (subject to the
 single-flight and debounce protections). A signature that fails
-against the refreshed keys produces `OAuthError::SignatureInvalid`.
+against the refreshed keys produces `OAuthError::IdTokenValidation`,
+carrying the underlying reason as a string; a `kid` the refreshed JWKS
+still does not contain produces `OAuthError::UnknownKid` instead, which
+is the one to alert on because it usually means the IdP rotated keys in
+a way the cache cannot follow.
 
-The second is the issuer check. The ID token's `iss` claim must
+**The issuer check.** The ID token's `iss` claim must
 exactly match the discovery document's `issuer` field. A mismatch
 indicates either a misconfigured IdP, a discovery-document substitution
 attack, or an attempt to replay an ID token from a different issuer;
-all three produce `OAuthError::IssuerMismatch`.
+all three produce `OAuthError::IdTokenValidation`. There is no
+per-check variant: the enum carries one validation error whose string
+names which claim failed, so match on the variant and log the string
+rather than branching on the reason.
 
-The third is the audience check. The ID token's `aud` claim must
+**The audience check.** The ID token's `aud` claim must
 contain the client's registered client id. If `aud` is a single
 value, the check is straightforward. If `aud` is an array (which
 happens when the IdP issues tokens valid for multiple clients), the
@@ -236,7 +247,7 @@ which matches what RFC 7519 implementations typically use.
 ## Back-channel logout
 
 When the IdP supports OIDC back-channel logout, the IdP sends a POST
-to a registered logout endpoint at the application with a
+to a registered logout endpoint at your application with a
 `logout_token`. The application validates the token and, on success,
 revokes the user's session.
 
@@ -256,9 +267,9 @@ delay.
 
 ## RP-Initiated Logout
 
-The opposite direction is RP-Initiated Logout: the application
+The opposite direction is RP-Initiated Logout: you
 initiates a logout that propagates to the IdP, so the user is logged
-out of the IdP session as well as the application session. Axess
+out of the IdP session as well as your own. Axess
 constructs the end-session URL through
 `OAuthProvider::build_end_session_url`, which takes the ID token
 hint (the user's last issued ID token, signed by the IdP), an
@@ -277,7 +288,7 @@ time.
 
 A common shape is to offer login with several IdPs side by side
 (Google, GitHub, Microsoft). Each provider is its own
-`OAuthProvider` instance constructed at startup; the application
+`OAuthProvider` instance constructed at startup; your code
 registers them under a `provider_name` key. The login URL carries
 the provider name (`GET /auth/login/google`); the callback URL also
 carries the name (`GET /auth/callback/google`). Axess dispatches to
@@ -313,7 +324,7 @@ against another): the audience check plus the `azp` check on
 multi-element audiences catch this.
 
 Against authorization code interception: PKCE binds the code to the
-verifier the application generated. An attacker who intercepts the
+verifier you generated. An attacker who intercepts the
 code cannot exchange it without the verifier.
 
 Against open-redirect phishing on logout: the
@@ -325,7 +336,7 @@ defends against (real-time phishing of the IdP login page itself)
 and the ones that depend on the IdP's own security posture (a
 compromised IdP issues compromised tokens, and no client-side check
 catches that). The defence for the latter is operational: monitor
-which IdPs the application accepts, audit periodically, and rotate
+which IdPs you accept, audit periodically, and rotate
 the registered client secret if the IdP suffers a breach.
 
 ## Troubleshooting
@@ -359,10 +370,15 @@ userinfo endpoint requires. The fix is to add the required scopes
 
 ## Further reading
 
-*FAPI 2.0* covers the financial-grade extensions (PAR, DPoP, JARM)
-that layer on top of the OAuth provider for regulated deployments.
+*FAPI 2.0* covers the financial-grade extensions that layer on top of
+the OAuth provider for regulated deployments: PAR (pushed
+authorization requests, which send the authorize parameters
+server-to-server instead of through the browser), DPoP (demonstrating
+proof of possession, which binds a token to a key the client holds),
+and JARM (JWT-secured authorization response mode, which signs the
+IdP's response back to the client).
 *Workload identity overview* covers the inbound resolver side of
-the same machinery, where the application is the OAuth server
+the same machinery, where your service is the OAuth server
 accepting tokens issued by federated workload-identity systems.
 *Local IdP* covers the in-process IdP, both production `LocalIdp`
 for workload-identity issuance and the `LocalIdpFixture` that mints

@@ -12,9 +12,9 @@
 
 Axess is a session-based multi-factor authentication and Cedar Policy authorization library, built around a trait-based design that supports deterministic simulation testing (DST) from the ground up. It exists because the existing landscape (primarily [axum-login](https://github.com/maxcountryman/axum-login)) did not expose enough of its internals to extend with arbitrary factor chains or compose with Cedar / ReBAC without significant custom work.
 
-> **Status:** `v0.5.1` on crates.io. The 0.x line is pre-1.0; the public
-> API may evolve between minor versions based on adopter feedback before
-> stabilising.
+> **Status:** pre-1.0 (the Version badge above carries the current release).
+> The public API may evolve between minor versions based on adopter feedback
+> before stabilising.
 
 ---
 
@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.5.1", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.6.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -108,7 +108,7 @@ In Axess, `PolicyStore` is loaded once at startup and is `Send + Sync`. Entity s
 | `axess-clock` | `Clock` / `MockClock` for DST |
 | `axess-rng` | `SecureRng` / `MockRng` for DST |
 | `axess-events` | rkyv-serialisable audit-event payloads |
-| `axess-strings` | `Arc<str>` interning |
+| `axess-strings` | `ShortString`, an immutable identifier: inline, `&'static str`, or shared |
 
 ## Naming conventions
 
@@ -170,7 +170,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.5.1", features = ["sqlite", "authz"] }
+axess = { version = "0.6.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:
@@ -212,6 +212,9 @@ Names are kebab-case throughout. The `axess` facade's default features are `["au
 | Feature | What it enables | Default |
 |---|---|---|
 | `mtls` | Inbound mTLS / X.509-SVID workload identity resolver | no |
+| `jwt` | JWT verification primitives: `JwtVerifier`, `WorkloadResolver` | no |
+| `jwt-aws-lc` | `jwt`, verifying with aws-lc-rs: FIPS-capable, needs a C toolchain | no |
+| `jwt-rust-crypto` | `jwt`, verifying with RustCrypto: pure Rust, builds anywhere | no |
 | `jwt-svid` | Inbound SPIFFE JWT-SVID workload identity resolver (spec-bound: mandatory `spiffe://` URI in `sub`) | no |
 | `workload-id` | Umbrella over the SPIFFE / mTLS / outbound surfaces below | no |
 | `outbound-mtls` | axess presenting an mTLS identity to downstream services | no |
@@ -221,7 +224,7 @@ Names are kebab-case throughout. The `axess` facade's default features are `["au
 | `azure-fic` | Azure Federated Identity Credentials exchange | no |
 | `cloud-sts` | Umbrella: `aws-sts` + `gcp-wif` + `azure-fic` | no |
 
-For JWT-bearer workload identity from any non-SPIFFE issuer (GitHub Actions OIDC, Kubernetes service-account projected tokens, GitLab CI OIDC, Okta, Azure AD, Auth0, axess `LocalIdP`, …), use the generic `WorkloadResolver` under `jwt-svid`'s feature set. It takes an adopter-supplied claim parser plus mapping closure; there are deliberately no per-company features. See [`examples/workload-identity/`](examples/workload-identity/) for ready-made claim parsers (GitHub Actions, Kubernetes SA) you can copy or depend on.
+For JWT-bearer workload identity from any non-SPIFFE issuer (GitHub Actions OIDC, Kubernetes service-account projected tokens, GitLab CI OIDC, Okta, Azure AD, Auth0, axess `LocalIdP`, …), use the generic `WorkloadResolver`, which is gated on `jwt` (not `jwt-svid`). It takes an adopter-supplied claim parser plus mapping closure; there are deliberately no per-company features. See [`examples/workload-identity/`](examples/workload-identity/) for ready-made claim parsers (GitHub Actions, Kubernetes SA) you can copy or depend on.
 
 #### Adjacent flows + audit
 
@@ -255,7 +258,9 @@ These are opt-in alternatives to the in-process `EntityCache` for the Cedar enti
 |---|---|---|
 | `full` | Discoverability umbrella: turns on the common combinations | no |
 
-`axess-factors` has its own default feature flags: `password` (Argon2id), `totp` (RFC 6238), `hotp` (RFC 4226), `email_otp`. The rest of its surface (`fido2`, `ldap`, `mtls`, `jwt`, `oidc`, `oauth`, `fapi`, `bearer`, `outbound-oauth`, federation adapters) is opt-in and wired through the matching feature flags on the `axess` facade.
+`axess-factors` has its own default feature flags: `password` (Argon2id), `totp` (RFC 6238), `hotp` (RFC 4226), `email_otp`. The rest of its surface (`fido2`, `ldap`, `mtls`, `jwt`, `oidc`, `oauth`, `fapi`, `bearer`, `outbound-oauth`, federation adapters) is opt-in. Most are wired through the matching flags on the `axess` facade; **`bearer` is not**: there is no `axess/bearer` feature, so an adopter who wants `validate_bearer_token` or `BearerTokenLayer` depends on `axess-factors` directly.
+
+**The JWT crypto backend is chosen, not inherited.** `jsonwebtoken` takes its provider from a cargo feature, so anything enabling `jwt` must also enable exactly one of `jwt-aws-lc` (aws-lc-rs: FIPS-capable, needs a C toolchain and NASM on Windows) or `jwt-rust-crypto` (pure Rust, builds anywhere). Enabling neither is a compile error that says so. Enabling both is not: axess installs whichever backend is compiled in, preferring aws-lc-rs, because feature unification across crates is not something an adopter can always avoid and `jsonwebtoken` would otherwise panic on the first verification. Signing goes through `jsonwebtoken::encode` directly, so code that signs calls `axess_factors::jwt::ensure_crypto_provider` itself.
 
 ---
 

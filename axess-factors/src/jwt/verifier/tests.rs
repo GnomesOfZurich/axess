@@ -38,6 +38,11 @@ fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
 }
 
 fn sign(claims: &serde_json::Value, kid: &str, der: &[u8]) -> String {
+    // Signing needs the same crypto provider verification does, and under
+    // `--all-features` `jsonwebtoken` has no default. Verification installs
+    // one itself; a signer asks, and a test that signs before anything has
+    // verified would otherwise panic on the order tests happened to run in.
+    crate::jwt::ensure_crypto_provider();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
     let key = EncodingKey::from_rsa_der(der);
@@ -439,6 +444,7 @@ async fn ps256_opt_in_via_with_algorithms() {
     let mut header = Header::new(Algorithm::PS256);
     header.kid = Some(kid.clone());
     let signing_key = EncodingKey::from_rsa_der(&private_der);
+    crate::jwt::ensure_crypto_provider();
     let token = encode(&header, &claims, &signing_key).expect("PS256 JWT encode");
 
     // Default allowlist rejects PS256; proves the conservative

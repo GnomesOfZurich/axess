@@ -27,6 +27,17 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     #[error("store error: {0}")]
     Store(#[source] E),
 
+    /// The service was built with
+    /// [`AuditContextPolicy::Required`](crate::authn::service::AuditContextPolicy::Required)
+    /// and an event was about to be written with no client metadata.
+    ///
+    /// A configuration fault on the request path, not a client error: the
+    /// route did not call
+    /// [`AuthnService::with_audit_context`](crate::authn::AuthnService::with_audit_context).
+    /// Map it to 500, and fix the wiring rather than relaxing the policy.
+    #[error("audit context policy is Required but this event carries no client metadata")]
+    MissingAuditContext,
+
     /// No active authentication flow found in the session.
     ///
     /// Returned by `verify_factor` when the session is not in `Authenticating` state.
@@ -178,6 +189,10 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
         let (status, message) = match &self {
             AuthnError::Store(_) => {
                 tracing::error!(error = %self, "authentication store error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
+            AuthnError::MissingAuditContext => {
+                tracing::error!(error = %self, "audit context missing under Required policy");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             }
             AuthnError::NoFlow => (StatusCode::CONFLICT, "no active authentication flow"),

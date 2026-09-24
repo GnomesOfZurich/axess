@@ -132,7 +132,9 @@ fn build_mock_service() -> (Service, String) {
 
     let identity = MockIdentityStore::new();
     let factors = MockFactorStore::new();
-    let authn = AuthnService::new(identity, factors).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, factors)
+        .with_oauth_provider(mock)
+        .build();
 
     // Note: MockOAuthProvider doesn't have a PAR endpoint, so FAPI enforcement
     // can't be applied. In mock mode we demonstrate the API surface without
@@ -182,7 +184,9 @@ async fn build_live_service() -> Result<(Service, String), Box<dyn std::error::E
 
     let identity = MockIdentityStore::new();
     let factors = MockFactorStore::new();
-    let authn = AuthnService::new(identity, factors).with_oauth_provider(provider);
+    let authn = AuthnService::builder(identity, factors)
+        .with_oauth_provider(provider)
+        .build();
 
     Ok((authn, provider_name))
 }

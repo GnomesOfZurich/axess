@@ -43,7 +43,14 @@ pub fn rsa_keypair(kid: &str) -> (Vec<u8>, JwkSet) {
 }
 
 /// Sign `claims` as an RS256 JWT under `kid`.
+///
+/// The example takes `jwt-rust-crypto`, but a workspace build with
+/// `--all-features` compiles both backends in, and `jsonwebtoken` cannot
+/// derive a provider from two: `encode` panics rather than returning an error.
+/// Verification goes through axess and is covered there; signing reaches
+/// `jsonwebtoken` directly, so it asks for the provider itself.
 pub fn sign(claims: &serde_json::Value, kid: &str, der: &[u8]) -> String {
+    axess_factors::jwt::ensure_crypto_provider();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
     let key = EncodingKey::from_rsa_der(der);

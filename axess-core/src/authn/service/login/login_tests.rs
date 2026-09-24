@@ -84,7 +84,14 @@ fn build_tenant(tenant_id: TenantId, identifier: &str) -> Tenant {
 fn build_service_with_identity(
     identity: MockIdentityStore,
 ) -> AuthnService<MockIdentityStore, MockFactorStore> {
-    AuthnService::new(identity, MockFactorStore::new())
+    build_service_builder(identity).build()
+}
+
+/// The builder form, for tests that configure before building.
+fn build_service_builder(
+    identity: MockIdentityStore,
+) -> crate::authn::service::AuthnServiceBuilder<MockIdentityStore, MockFactorStore> {
+    AuthnService::builder(identity, MockFactorStore::new())
 }
 
 // ── check_session (line 491) ─────────────────────────────────────
@@ -111,8 +118,9 @@ async fn check_session_authenticated_no_registry_returns_true() {
 /// `reg.is_valid` propagation.
 #[tokio::test]
 async fn check_session_registry_rejection_returns_false() {
-    let service = build_service_with_identity(MockIdentityStore::new())
-        .with_registry(MemorySessionRegistry::new());
+    let service = build_service_builder(MockIdentityStore::new())
+        .with_registry(MemorySessionRegistry::new())
+        .build();
     let session = authenticated_session().await;
     assert!(
         !service.check_session(&session).await,
@@ -130,7 +138,9 @@ async fn check_session_registry_acceptance_returns_true() {
         .await
         .unwrap();
 
-    let service = build_service_with_identity(MockIdentityStore::new()).with_registry(registry);
+    let service = build_service_builder(MockIdentityStore::new())
+        .with_registry(registry)
+        .build();
     assert!(service.check_session(&session).await);
 }
 
@@ -160,7 +170,9 @@ async fn logout_invalidates_user_in_registry() {
     registry.register(&fixture_user_id(), &sid).await.unwrap();
     assert!(registry.is_valid(&fixture_user_id(), &sid).await.unwrap());
 
-    let service = build_service_with_identity(identity).with_registry(registry.clone());
+    let service = build_service_builder(identity)
+        .with_registry(registry.clone())
+        .build();
     service.logout(&session).await.expect("logout must succeed");
 
     assert!(

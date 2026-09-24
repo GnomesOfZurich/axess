@@ -22,7 +22,9 @@ use crate::authn::{
     ids::{TenantId, UserId},
     service::{AuthnService, FactorOutcome},
     store::FactorStore,
-    types::{AuthnScope, EntityState, LockoutPolicy, StatusDetail, Tenant, User},
+    types::{
+        AuthnScope, CounterUnavailable, EntityState, LockoutPolicy, StatusDetail, Tenant, User,
+    },
 };
 use crate::session::extractor::AuthSession;
 use crate::testing::{
@@ -161,13 +163,16 @@ async fn authenticating_session(remaining: Vec<FactorKind>) -> AuthSession {
     session
 }
 
-fn locked_failure_events(events: &[AuthEvent]) -> Vec<&AuthEvent> {
+/// Rows a locked account produces: `Locked` on the status, not `Failure`
+/// with the word in `error`. The status is the field a SOC query can filter
+/// on and the store enforces; the tag was a string nothing checked, and it
+/// left [`AuthEventStatus::Locked`] unreachable.
+fn locked_events(events: &[AuthEvent]) -> Vec<&AuthEvent> {
     events
         .iter()
         .filter(|e| {
             matches!(e.event_type, AuthEventType::FactorVerified)
-                && matches!(e.event_status, AuthEventStatus::Failure)
-                && e.error.as_deref() == Some("locked")
+                && matches!(e.event_status, AuthEventStatus::Locked)
         })
         .collect()
 }
@@ -188,7 +193,7 @@ async fn enforce_account_status_returns_ok_for_active() {
     assert!(matches!(result, AccountStatusEnforcement::Ok));
     // No audit row for an Active account.
     assert!(
-        locked_failure_events(&inspector.events()).is_empty(),
+        locked_events(&inspector.events()).is_empty(),
         "Active account must not trigger a `locked` audit row"
     );
 }
@@ -217,14 +222,22 @@ async fn enforce_account_status_locked_with_until_passes_through_until_and_emits
         other => panic!("expected Locked, got {other:?}"),
     }
 
-    // Exactly one Failure row with `error = "locked"` and the
-    // next factor kind on it.
+    // Exactly one `Locked` row, with the next factor kind on it.
     let all_events = inspector.events();
-    let locked_events = locked_failure_events(&all_events);
+    let locked_events = locked_events(&all_events);
     assert_eq!(
         locked_events.len(),
         1,
-        "locked-account attempt must emit exactly one Failure audit row"
+        "locked-account attempt must emit exactly one Locked audit row"
+    );
+    // And it must not be recorded as an ordinary failure: the two are
+    // separate outcomes on a dashboard, which is the point of the status.
+    assert!(
+        !all_events.iter().any(|e| matches!(
+            (&e.event_type, &e.event_status),
+            (AuthEventType::FactorVerified, AuthEventStatus::Failure)
+        )),
+        "a lockout must not also appear as a Failure row"
     );
     let event = locked_events[0];
     assert_eq!(event.factor_kind.as_ref(), Some(&FactorKind::Totp));
@@ -253,7 +266,7 @@ async fn enforce_account_status_locked_indefinite_returns_until_none() {
         }
         other => panic!("expected Locked, got {other:?}"),
     }
-    assert_eq!(locked_failure_events(&inspector.events()).len(), 1);
+    assert_eq!(locked_events(&inspector.events()).len(), 1);
 }
 
 #[tokio::test]
@@ -278,7 +291,7 @@ async fn enforce_account_status_pending_returns_not_active_without_audit() {
     // signal is specific to brute-force-after-lockout, not "any
     // non-active attempt."
     assert!(
-        locked_failure_events(&inspector.events()).is_empty(),
+        locked_events(&inspector.events()).is_empty(),
         "Pending account must not trigger the `locked` audit"
     );
 }
@@ -304,7 +317,7 @@ async fn enforce_account_status_no_next_kind_still_emits_audit_without_factor_fi
         .unwrap();
 
     let all_events = inspector.events();
-    let events = locked_failure_events(&all_events);
+    let events = locked_events(&all_events);
     assert_eq!(events.len(), 1);
     assert!(
         events[0].factor_kind.is_none(),
@@ -597,11 +610,10 @@ async fn record_factor_failure_at_threshold_returns_locked() {
 }
 
 #[tokio::test]
-async fn record_factor_failure_counter_store_error_mutes_to_invalid_credential() {
-    // If `record_failed_attempt` errors, the helper must NOT
-    // propagate `Err(AuthnError::Store)`; that would leak a
-    // distinct timing/error signature. It must return
-    // `Ok(InvalidCredential)` and log a warning.
+async fn counter_store_outage_fails_closed_by_default() {
+    // `CounterUnavailable::Lock` is the default. A dead counter store must
+    // not hand an attacker an unbounded brute-force window: the attempt
+    // counts as locked even though the counter never moved.
     let user = user_with_status(EntityState::Active);
     let (service, inspector) = build_service_with_user(user);
     let session = authenticating_session(vec![FactorKind::Password]).await;
@@ -612,23 +624,61 @@ async fn record_factor_failure_counter_store_error_mutes_to_invalid_credential()
         .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
         .await
         .expect("store errors must not propagate as Err");
+    let until = match outcome {
+        FactorOutcome::Locked { until } => until,
+        other => panic!("outage must fail closed to Locked, got {other:?}"),
+    };
+    // The window comes from the policy, exactly as on the ordinary
+    // threshold path, so a caller cannot tell the two apart.
+    let until = until.expect("policy duration is Some, so until must be Some");
     assert!(
-        matches!(outcome, FactorOutcome::InvalidCredential),
-        "counter-store outage must surface as InvalidCredential, not Locked or Err"
+        until > chrono::Utc::now(),
+        "Locked.until must be in the future; until={until}"
     );
 
-    // Counter did not advance (the store rejected the increment),
-    // but the audit row should still be there (audit
-    // BEFORE counter increment).
+    // The counter did not advance, and the audit row is still written,
+    // because audit comes before the increment.
     assert_eq!(inspector.failed_attempts_for("u1"), 0);
-    let has_failure_audit = inspector.events().iter().any(|e| {
-        matches!(e.event_type, AuthEventType::FactorVerified)
-            && matches!(e.event_status, AuthEventStatus::Failure)
-    });
     assert!(
-        has_failure_audit,
-        "audit row must be emitted BEFORE the counter increment, so a counter-store outage doesn't suppress the SOC signal"
+        inspector.events().iter().any(|e| {
+            matches!(e.event_type, AuthEventType::FactorVerified)
+                && matches!(e.event_status, AuthEventStatus::Failure)
+        }),
+        "audit row must be emitted BEFORE the counter increment, so a \
+         counter-store outage doesn't suppress the SOC signal"
     );
+}
+
+#[tokio::test]
+async fn counter_store_outage_fails_open_when_configured() {
+    // `CounterUnavailable::Allow` keeps logins working while the counter is
+    // dead, at the cost of disabling lockout. It must still not propagate
+    // `Err(AuthnError::Store)`: that would leak a distinct timing and error
+    // signature, letting an attacker separate good usernames from bad.
+    let user = user_with_status(EntityState::Active);
+    let identity = MockIdentityStore::new()
+        .with_tenant(fixture_tenant())
+        .with_user(user)
+        .with_lockout_policy(LockoutPolicy {
+            max_attempts: 3,
+            on_counter_unavailable: CounterUnavailable::Allow,
+            ..LockoutPolicy::default()
+        });
+    let inspector = identity.clone();
+    let service = AuthnService::new(identity, MockFactorStore::new());
+    let session = authenticating_session(vec![FactorKind::Password]).await;
+
+    inspector.arm_record_failed_attempt_failure();
+
+    let outcome = service
+        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
+        .await
+        .expect("store errors must not propagate as Err");
+    assert!(
+        matches!(outcome, FactorOutcome::InvalidCredential),
+        "Allow must surface the outage as InvalidCredential, not Locked or Err"
+    );
+    assert_eq!(inspector.failed_attempts_for("u1"), 0);
 }
 
 // ── persist_pass_with_update ────────────────────────────────────────────

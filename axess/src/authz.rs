@@ -46,13 +46,18 @@ pub use axess_core::authz::{
     AuthzSession,
     AuthzStore,
     BuildRequestContext,
+    // Helpers. `ip_from_headers_trusted` is the one to reach for wherever a
+    // proxy is involved; the untrusted form believes whatever the client
+    // sent and is correct only with no proxy in front.
+    CidrParseError,
     NoContext,
     PolicyEvaluator,
     PolicyStore,
     RequestEntityProvider,
     StandardRequestContext,
-    // Helpers
-    ip_from_headers,
+    TrustedProxies,
+    ip_from_headers_trusted,
+    ip_from_headers_untrusted,
     make_action_uid,
     make_entity_uid,
 };

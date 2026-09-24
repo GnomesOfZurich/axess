@@ -13,32 +13,60 @@ into the data itself rather than into the store.
 
 ## The version field
 
-`SessionData::schema_version` is a `u32` field set at construction
-and serialised with the rest of the data. At read time the
-deserialiser inspects the version, dispatches to the appropriate
-migration function for that version, and produces a current-shape
-`SessionData`.
+`SessionData::version` is a `u8` set at construction and serialised
+with the rest of the data. The current value is the
+`SESSION_DATA_VERSION` constant. At read time the deserialiser fills
+in whatever a newer field's `#[serde(default)]` supplies, and
+`migrate` then walks the row forward one version step at a time.
 
 ```rust,ignore
+pub const SESSION_DATA_VERSION: u8 = 2;
+
 pub struct SessionData {
-    pub schema_version: u32,
+    #[serde(default = "default_version")]
+    pub version: u8,
     pub auth_state: AuthState,
-    pub principal_hint: Option<PrincipalHint>,
-    pub custom: HashMap<String, serde_json::Value>,
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<DeviceId>,
+    pub custom: serde_json::Value,
 }
 
 impl SessionData {
-    const CURRENT_VERSION: u32 = 2;
-
-    fn migrate(self) -> Self {
-        match self.schema_version {
-            0 => migrate_from_v0(self),
-            1 => migrate_from_v1(self),
-            _ => self,  // current, no migration needed
+    /// Returns whether anything changed, so the caller knows to re-save.
+    pub fn migrate(&mut self) -> bool {
+        if self.version >= SESSION_DATA_VERSION {
+            return false;
         }
+        // v1 -> v2: added `device_id`. The field's serde default already
+        // supplied `None`, so the only work is bumping the version so a
+        // re-save records the current schema.
+        // ... one arm per step, each bumping `self.version` itself.
+        true
     }
 }
 ```
+
+Three properties of that shape are worth stating.
+
+It migrates in place, `&mut self`, and returns whether anything
+changed. That boolean is the signal to persist: a row already at the
+current version is not rewritten, so a deploy does not rewrite every
+session in the store on first read.
+
+Each version step bumps `self.version` itself, and there is no
+unconditional assignment to `SESSION_DATA_VERSION` at the end. The
+trailing assignment is tempting and wrong: it makes every step look
+correct from the outside, because the version ends up right whether or
+not the step ran. Bumping per step keeps each one observable, which is
+what lets a mutation test tell "this branch runs" from "this branch is
+dead".
+
+Most steps do nothing but bump. A field added with
+`#[serde(default)]` is already correct in memory by the time `migrate`
+sees it; the migration exists to record that the row has been read
+under the new schema. Real transformation work only appears when a
+field changes meaning rather than merely appearing.
 
 The migration functions are pure transformations. They take the
 old shape (which serde has parsed against an older `SessionData`
@@ -66,11 +94,11 @@ options are to default the field (set it to `None`, or to a known
 placeholder), to discard the session (the migration returns an
 error, the layer treats the session as invalid and starts a fresh
 one), or to defer the population (the field is set later in the
-request lifecycle from the application's stores).
+request lifecycle from your own stores).
 
 The first option is the standard pattern. New fields get
 sensible defaults, the session continues to work with the new
-shape, and the application populates the real value on the next
+shape, and you populate the real value on the next
 dirty write.
 
 ## When the session is invalidated
@@ -98,9 +126,9 @@ rather than a long-tail bug that surfaces sporadically.
 ## Adding a custom field
 
 Adopters who add their own fields to `SessionData::custom` follow
-the same pattern at the application layer. The `custom` map is
+the same pattern in their own code. The `custom` value is
 JSON-shaped; each application-owned key is independently
-versioned by the application.
+versioned by you.
 
 The common pattern is to wrap the custom value in a small struct
 with its own version field:
@@ -124,9 +152,9 @@ fn read_app_data(session: &SessionData) -> MyAppSessionData {
 }
 ```
 
-The application's `schema_version` is independent of axess's. The
-two evolve on different cadences and the application's version
-field captures the application's own changes.
+The application's own version field is independent of axess's. The
+two evolve on different cadences, and your own version field
+captures your changes.
 
 ## When to reach for a different mechanism
 
@@ -139,7 +167,7 @@ one-off copy script) or for changes to the encryption envelope
 It is also the wrong tool for application-level data migrations
 that touch the database. A migration that says "every user gains
 a new field on their user record" runs against the user store
-(via `sqlx::migrate!` or the application's migration tool), not
+(via `sqlx::migrate!` or whatever migration tool you use), not
 against the session store. The session machinery does not interact
 with the user table.
 
@@ -153,4 +181,4 @@ migrations that have to consider too many cases at once.
 the migration runs as part of. *Backends* covers the storage
 backends and their own (database-level) migration mechanisms.
 *Migration guide* in Part VIII covers the cross-axess-version
-migrations that bump the `SessionData::schema_version` constant.
+migrations that bump the `SESSION_DATA_VERSION` constant.

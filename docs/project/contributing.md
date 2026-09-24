@@ -16,14 +16,14 @@ place.
 
 Three things to do before you open a PR.
 
-The first is to read or skim *Architecture at a glance*. The
+**Read or skim *Architecture at a glance*.** The
 verifier-versus-orchestrator boundary, the three state slices, the
 DST discipline, and the naming conventions are the four
 architectural decisions that the review process holds new code
 against. A PR that violates one of them is harder to land; a PR
 written with them in mind sails through.
 
-The second is to find or create an AX-NNN tracking entry. The
+**Find or create an AX-NNN tracking entry.** The
 ROADMAP is the source of truth for "what is being worked on" and
 "what is committed." A PR that lands a feature should reference
 an AX-NNN. A PR that lands a bug fix can do without (though one
@@ -31,7 +31,7 @@ is often associated even with fixes). The number lives in the
 PR description and in the commit messages; the format is
 `AX-NNN` (no `#`, no space).
 
-The third is to discuss substantial changes before writing them.
+**Discuss substantial changes before writing them.**
 The review cycle is faster when the maintainers have agreed to
 the shape ahead of time. A drive-by PR that rewrites a module
 is usually rejected even when the rewrite is well-thought-out;
@@ -59,11 +59,24 @@ The pattern in the test code is to parameterise:
 ```rust,ignore
 #[tokio::test]
 async fn login_succeeds_with_correct_password() {
-    let suite = TestSuite::default();  // sets up the mocks
-    let outcome = suite.service
+    // The mocks are builders, assembled per test, so each test states
+    // the world it needs rather than inheriting a shared fixture.
+    let identity = MockIdentityStore::new()
+        .with_tenant(fixture_tenant())
+        .with_user(fixture_user());
+    // `MockClock::at` pins the instant; `MockClock::now` takes the
+    // wall clock once and then holds it. Either way the clock does not
+    // move unless the test calls `advance_secs`.
+    let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_clock(Arc::new(MockClock::at(
+            DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )))
+        .build();
+
+    let outcome = service
         .verify_factor(
-            &suite.session(),
-            FactorCredential::Password("Gnomes2+".into()),
+            &FactorCredential::Password("Gnomes2+".into()),
+            &session,
         )
         .await
         .unwrap();
@@ -71,10 +84,14 @@ async fn login_succeeds_with_correct_password() {
 }
 ```
 
-`TestSuite::default()` wires `MockClock`, `MockRng`,
-`MockBackend`, `MockRegistry`, the in-memory session store, and
-the in-memory device store. The test runs entirely in process,
-deterministically, against a known initial state.
+There is no all-in-one harness. The pieces are `MockIdentityStore` and
+`MockFactorStore` for the two halves of what used to be one backend,
+`MemorySessionStore` and `MemorySessionRegistry` for sessions,
+`MockClock` and `MockRng` for the injected clock and randomness, and
+`MockOAuthProvider`, `MockFido2Provider`, `MockLdapProvider`,
+`MockPolicyEvaluator` and `MockEntityProvider` where a test reaches
+those seams. Wiring them per test is more typing and leaves each test
+saying what it depends on, which is worth more in a suite this size.
 
 For tests that need a real database (integration tests that
 verify SQL adapters), the pattern is to feature-gate them and
@@ -100,8 +117,8 @@ while still exercising the integration tests in CI.
 The PR description is what reviewers read first. The goal is to
 explain what the PR does, why, and what to look for. The shape:
 
-A one-sentence summary at the top. "Add the `BearerToken`
-factor for inbound API authentication." Not "Misc fixes." The
+A one-sentence summary at the top. "Add the bearer-token factor for
+inbound API authentication." Not "Misc fixes." The
 summary is what shows up in the PR list and in the commit
 history.
 
@@ -197,7 +214,7 @@ The exceptions are extremely narrow: the `axess-cache` crate's
 documented as DST-breaking), and the production `SystemClock`
 and `SystemRng` implementations delegate to the OS (these are
 the only places where the OS calls happen). New code introduces
-neither another exception nor a workaround that hides the same
+no further exception and no workaround that hides the same
 problem.
 
 The discipline is what lets the test suite be reproducible. A

@@ -208,7 +208,7 @@ impl AuditArchiver for FilesystemAuditArchiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authn::event::{AuthEventStatus, AuthEventType};
+    use crate::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
     use chrono::{TimeZone, Utc};
 
     fn make_event(year: i32, month: u32, day: u32) -> AuthEvent {
@@ -219,8 +219,12 @@ mod tests {
             AuthEventType::LoginAttempt,
             AuthEventStatus::Failure,
         )
-        .with_ip("203.0.113.1")
-        .with_error("test event")
+        .with_ip(
+            "203.0.113.1"
+                .parse()
+                .expect("literal is a valid IPv4 address"),
+        )
+        .with_error(AuthFailureReason::Other("test event".into()))
         .build_at(Utc.with_ymd_and_hms(year, month, day, 12, 0, 0).unwrap())
     }
 

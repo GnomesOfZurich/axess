@@ -81,7 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let identity = MockIdentityStore::new();
     let factors = MockFactorStore::new();
-    let authn = Arc::new(AuthnService::new(identity, factors).with_oauth_provider(provider));
+    let authn = Arc::new(
+        AuthnService::builder(identity, factors)
+            .with_oauth_provider(provider)
+            .build(),
+    );
 
     let session_store = MemorySessionStore::new();
     // Generate a fresh random key; sessions reset on restart (OK for dev).

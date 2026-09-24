@@ -18,7 +18,7 @@
 use crate::authn::service::AuthnService;
 use crate::authn::{
     error::AuthnError,
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
@@ -61,7 +61,7 @@ where
         target_user: &crate::authn::types::User,
         session: &AuthSession,
     ) -> Result<(), AuthnError<I::Error>> {
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
 
         // Wipe any custom JSON the admin's session was carrying. Without
         // this, attacker-pre-seeded keys (OAuth PKCE_VERIFIER, CSRF_STATE,
@@ -83,7 +83,7 @@ where
         let sid = session.session_id().await;
         // Same as complete_signup; refuse to leave an admin in
         // an Authenticated-but-untracked impersonation session.
-        if let Some(reg) = &self.registry
+        if let Some(reg) = &self.inner.registry
             && !reg.register(&target_user.id, &sid).await
         {
             tracing::error!(
@@ -104,7 +104,7 @@ where
                 .with_actor(*admin_user_id),
             now,
         )
-        .await;
+        .await?;
 
         tracing::warn!(
             admin = %admin_user_id,
@@ -143,9 +143,9 @@ where
                 AuthEventBuilder::failure(AuthEventType::Impersonation)
                     .attributed_to(&target_user.id, &target_user.tenant_id)
                     .with_actor(admin_user.id)
-                    .with_error("cross-tenant impersonation refused"),
+                    .with_error(AuthFailureReason::CrossTenantImpersonation),
             )
-            .await;
+            .await?;
             return Err(AuthnError::CrossTenant);
         }
         self.begin_impersonation(&admin_user.id, target_user, session)

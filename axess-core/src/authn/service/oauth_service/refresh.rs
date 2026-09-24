@@ -8,7 +8,7 @@
 
 use crate::authn::service::AuthnService;
 use crate::authn::{
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
     ids::UserId,
     store::{FactorStore, IdentityStore},
@@ -56,14 +56,20 @@ where
         // distinguishable in the audit stream.
 
         if refresh_token.is_empty() {
-            self.record_oauth_refresh_failure("token_refresh_no_token", provider_name)
-                .await;
+            self.record_oauth_refresh_failure(
+                AuthFailureReason::TokenRefreshNoToken,
+                provider_name,
+            )
+            .await?;
             return Err(OAuthError::NoRefreshToken);
         }
 
-        let Some(provider) = self.oauth_providers.get(provider_name) else {
-            self.record_oauth_refresh_failure("token_refresh_unknown_provider", provider_name)
-                .await;
+        let Some(provider) = self.inner.oauth_providers.get(provider_name) else {
+            self.record_oauth_refresh_failure(
+                AuthFailureReason::TokenRefreshUnknownProvider,
+                provider_name,
+            )
+            .await?;
             return Err(OAuthError::UnknownProvider(provider_name.to_string()));
         };
         let provider = provider.clone();
@@ -71,8 +77,11 @@ where
         let claims = match provider.refresh_token(refresh_token).await {
             Ok(c) => c,
             Err(e) => {
-                self.record_oauth_refresh_failure("token_refresh_provider_rejected", provider_name)
-                    .await;
+                self.record_oauth_refresh_failure(
+                    AuthFailureReason::TokenRefreshProviderRejected,
+                    provider_name,
+                )
+                .await?;
                 return Err(e);
             }
         };
@@ -84,9 +93,10 @@ where
                 .with_factor(FactorKind::Federated(
                     crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
                 ))
-                .with_error("token_refresh"),
+                .with_error(AuthFailureReason::TokenRefresh),
         )
-        .await;
+        .await
+        .map_err(|e| OAuthError::AuditStore(e.to_string()))?;
 
         Ok(claims)
     }
@@ -96,7 +106,12 @@ where
     /// Mirrors [`record_oauth_failure`](super::login::AuthnService::record_oauth_failure)
     /// but session-free: the refresh path is called with just a provider
     /// name and a token, with no `AuthSession` to source attribution from.
-    async fn record_oauth_refresh_failure(&self, reason: &str, provider_name: &str) {
+    async fn record_oauth_refresh_failure(
+        &self,
+        reason: AuthFailureReason,
+        provider_name: &str,
+    ) -> Result<(), axess_factors::oauth::OAuthError> {
+        use axess_factors::oauth::OAuthError;
         // No session in this path → no attribution. `failure(type)`
         // already builds an unattributed shape; `maybe_attributed_to`
         // is unnecessary.
@@ -107,6 +122,7 @@ where
                 ))
                 .with_error(reason),
         )
-        .await;
+        .await
+        .map_err(|e| OAuthError::AuditStore(e.to_string()))
     }
 }

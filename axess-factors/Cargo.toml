@@ -32,8 +32,13 @@ chrono = { workspace = true, features = ["serde"], optional = true }
 dashmap = { version = "6.2.1", features = ["serde"], optional = true }
 hex = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
-# `aws_lc_rs` keeps one TLS provider across the workspace.
-jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"], optional = true }
+# No backend chosen here: `jsonwebtoken` 11 takes its crypto from a cargo
+# feature, and pinning one makes that choice for every adopter. An adopter
+# that had already chosen the other ends up with both enabled, and
+# `jsonwebtoken` then cannot determine a provider at all, and panics on the
+# first verification. So the choice is theirs, through `jwt-aws-lc` or
+# `jwt-rust-crypto` below, and `jwt` without either does not compile.
+jsonwebtoken = { version = "11.1.0", default-features = false, optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
 # `timing-resistant-secret-traits` makes secret types refuse `PartialEq` / `Hash`.
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"], optional = true }
@@ -97,8 +102,27 @@ ldap = ["dep:ldap3", "dep:subtle", "dep:tokio", "dep:thiserror"]
 mtls = ["dep:axess-identity", "dep:rustls-pki-types", "dep:x509-parser", "dep:thiserror"]
 
 # JWT / OIDC primitives (consumed by federation adapters, bearer, oauth)
+#
+# Pick exactly one backend beside `jwt`:
+#
+#   jwt-aws-lc       aws-lc-rs. FIPS-capable, and what this workspace's TLS
+#                    uses; needs a C toolchain, and NASM on Windows.
+#   jwt-rust-crypto  the RustCrypto family. Pure Rust, builds anywhere.
+#
+# Neither is a compile error naming this list, which beats `jsonwebtoken`'s own
+# runtime panic on the first verification. Both is deliberately allowed:
+# `--all-features` is a normal CI shape and feature unification can enable the
+# second one behind an adopter's back, so `jwt::ensure_crypto_provider` settles
+# it at run time instead of the build failing on a packaging fact.
 jwt = ["dep:jsonwebtoken", "dep:axess-clock", "dep:base64", "dep:axess-identity", "dep:tokio", "dep:thiserror"]
-oidc = ["dep:jsonwebtoken", "dep:openidconnect", "dep:tokio", "dep:thiserror", "dep:base64"]
+jwt-aws-lc = ["jwt", "jsonwebtoken?/aws_lc_rs"]
+jwt-rust-crypto = ["jwt", "jsonwebtoken?/rust_crypto"]
+# `jwt` for the backend guard, not only for the primitives: `oidc` verifies
+# an IdP's signed ID token through `jsonwebtoken`, and without `jwt` the
+# backend features and the `compile_error!` that demands one are both out of
+# scope. It resolved to `jsonwebtoken []`, no crypto at all, and panicked
+# on the first verification, which is the bug the backend features exist for.
+oidc = ["jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio", "dep:thiserror", "dep:base64"]
 
 # OAuth ceremony surface
 fapi = ["oauth", "dep:p256"]

@@ -37,105 +37,85 @@ guarantees.
 
 The analytics stream uses `RichAuthnEvent`, a denormalised wrapper
 that adds optional enrichment fields (device trust level, geo
-lookup, parsed user-agent, ASN, configurable tags). The fields
-are populated by an `EventEnrichment` closure the application
-provides; the closure runs once per event, populates whatever
-data the deployment wants, and returns the enriched event. The
-stream feeds the analytics store, which is typically a columnar
+lookup, parsed user-agent, ASN, configurable tags). The deployment
+populates whatever of them it wants when it builds the
+`RichAuthnEvent` around the `AuthEvent`; axess defines the shape so
+downstream consumers can be shared between adopters, and does not
+populate the fields for you. The stream feeds the analytics store, which is typically a columnar
 database (ClickHouse, DuckDB) or a streaming platform (Apache
 Iggy with rkyv).
 
 ```text
-              AuthEvent (regulatory wire)
-                       │
-                       ▼
-                ┌──────────────┐
-                │  AuditPipe   │
-                └───┬──────────┘
-                    │ fan-out
-        ┌───────────┼────────────┐
-        ▼           ▼            ▼
-   IdentityAuthnLog   AuthnAnalyticsSink    AuditArchiver
-    (lockout depends)    (enriched stream)    (cold tier)
-        │                  │                     │
-        ▼                  ▼                     ▼
-   primary store      analytics store        archive store
+       the authentication operation
+                    │
+                    ▼  awaited, once
+           IdentityAuthnLog::record_event        <- you implement this
+                    │
+       ┌────────────┴────────────┐               <- and everything below
+       ▼                         ▼
+  AuthnAnalyticsSink        AuditArchiver
+  (RichAuthnEvent)          (cold tier)
+       │                         │
+       ▼                         ▼
+  analytics store           archive store
 ```
 
-The fan-out runs once per event. The performance cost is small
-because each sink is fire-and-forget; a slow sink does not slow
-the authentication hot path, but it can lose events under
-pressure, which is the next concern.
+Axess does not fan out. It calls `record_event` and
+awaits it; whether that write also feeds an analytics stream or an
+archive is decided by the implementation you supply.
 
-## Reliability and fire-and-forget
+## Reliability, and who owns it
 
-The pipeline's emit path is synchronous (the event is constructed
-on the authentication hot path and handed to the pipeline before
-the operation returns), but the dispatch to each sink is
-asynchronous. The trade-off is what every audit-pipeline design
-has to make.
+Axess does not buffer, queue, retry or fan out audit events. It builds
+the `AuthEvent` on the authentication path and awaits one call:
+`IdentityAuthnLog::record_event`. That is the whole of the pipeline
+axess ships, and everything after it is the implementation you provide.
 
-A fully-synchronous pipeline blocks the authentication operation
-until every sink acknowledges the event. The latency cost is the
-sum of every sink's latency; one slow sink slows every login. The
-pattern is a non-starter for production.
+Two consequences follow, and they are the reason to read this section
+before choosing a sink.
 
-A fully-asynchronous pipeline with no durability lets the events
-fan out to sinks in the background. The latency cost is zero
-(the operation returns before the sinks see the event). The
-trade-off is that an event lost between emit and the sink is
-genuinely lost; there is no retry, no acknowledgement, no
-delivery guarantee.
+**The write is on the hot path.** Whatever `record_event` does, the
+login waits for it. A sink that talks to the network over a slow link
+makes logins slow. If you want the latency off the request, buffer
+inside your own implementation: return as soon as the event is durable
+somewhere you trust, and dispatch onward in the background. That is a
+choice axess deliberately leaves to you, because the right answer
+depends on whether losing an event is worse than slowing a login, and
+only the deployment knows that.
 
-Axess takes a middle position. The synchronous emit produces an
-event handed to the pipeline; the pipeline buffers the event in
-memory or in a durable queue (the choice is configuration); a
-background task dispatches from the buffer to each sink with
-retry. The buffer absorbs sink latency without blocking the
-authentication operation; the buffer's durability determines
-whether events survive an application crash.
+**A failed write fails the login.** Since 0.6.0, `record_event`
+returning an error surfaces as `AuthnError::Store` (and on OAuth paths
+as `OAuthError::AuditStore`), and the authentication does not complete.
+An authentication that leaves no evidence has not, for evidence
+purposes, happened. Earlier versions logged the error and continued,
+which meant an audit outage silently produced authentications nobody
+could later account for.
 
-The configuration shape:
+This trades availability for evidence, and the trade has a sharp edge:
+**logins fail while your audit store does**. Put the sink behind
+something durable: write locally, ship onward in the background
+rather than a remote service on the request path, and page on
+`AuthnMetrics::audit_store_outage`.
 
-```rust,ignore
-pub struct AuditPipeConfig {
-    pub regulatory_sink: Arc<dyn IdentityAuthnLog>,
-    pub analytics_sink: Option<Arc<dyn AuthnAnalyticsSink>>,
-    pub buffer: BufferStrategy,    // InMemory | FsBacked { path }
-    pub max_buffer_size: usize,
-    pub on_buffer_full: BufferFullPolicy,  // DropOldest | Block | ShutdownAuthn
-    pub enrichment: Option<Arc<dyn EventEnrichment>>,
-}
-```
+**To drop an event without failing the login, return
+`AuditOutcome::Shed`.** That is the valve for the hazard this creates:
+every failed login writes a row, including for identifiers that do not
+exist, so an unauthenticated caller can drive writes at your storage
+without bound, and exhausting it would otherwise fail every login for
+every user. A shed event continues the flow and fires
+`AuthnMetrics::audit_event_shed`.
 
-`buffer` controls where the in-flight events live. `InMemory` is
-the simple choice: a bounded VecDeque that holds events between
-emit and dispatch. Events in the buffer are lost on application
-crash; for most deployments, the regulatory sink's own durability
-(the database transaction that records the event) is what
-matters, and the in-memory buffer is just for absorbing latency
-spikes.
+**Shed on a criterion independent of the identifier**: a global rate,
+a queue depth, a disk watermark. Shedding based on anything derived
+from *which* identifier was tried makes the drop observable per
+identifier, and rebuilds the user-enumeration oracle that emitting
+unattributed events exists to close.
 
-`FsBacked { path }` writes the buffer to disk so events survive
-a crash. The cost is one local-disk write per event; the benefit
-is that the audit trail does not lose events to short network
-outages or process restarts. Deployments in regulated
-environments use the file-backed buffer; everyone else uses the
-in-memory one.
-
-`max_buffer_size` is the cap. Above it, the `on_buffer_full`
-policy fires.
-
-`on_buffer_full` is the choice for what happens when the buffer
-fills. `DropOldest` is the high-throughput default: the oldest
-buffered events are evicted so the newest fit. `Block` is the
-strict choice: the authentication operation that produced the
-event blocks until the buffer has room; the latency cost can be
-substantial but no events are lost. `ShutdownAuthn` is the
-fail-shut choice: the authentication subsystem stops accepting
-new logins until the buffer drains. Regulated deployments
-typically choose `Block` or `ShutdownAuthn`; permissive
-deployments choose `DropOldest`.
+`axess-events` has two wrappers worth knowing when you build one.
+`LogAndSwallow` takes a sink and turns its errors into log lines, which
+is the fail-soft shape written once. `NoopEventSink` discards
+everything, which is what tests and the analytics stream want when it
+is switched off.
 
 ## The IdentityAuthnLog sink
 
@@ -157,9 +137,16 @@ The analytics sink is the optional stream for the SIEM and
 analytics consumers. The trait:
 
 ```rust,ignore
-#[async_trait]
-pub trait AuthnAnalyticsSink: Send + Sync {
-    async fn dispatch(&self, event: RichAuthnEvent) -> Result<(), SinkError>;
+pub trait AuthnAnalyticsSink: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn record_rich(
+        &self,
+        event: RichAuthnEvent,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// A stable name for this sink, used in log lines and metrics.
+    fn name(&self) -> &'static str;
 }
 ```
 
@@ -174,17 +161,21 @@ A typical Apache Iggy implementation:
 
 ```rust,ignore
 struct IggyAnalyticsSink {
-    client: IggyClient,
+    client: IggyClient,   // from the `iggy` crate
     topic: String,
 }
 
-#[async_trait]
 impl AuthnAnalyticsSink for IggyAnalyticsSink {
-    async fn dispatch(&self, event: RichAuthnEvent) -> Result<(), SinkError> {
-        let bytes = rkyv::to_bytes::<_, 256>(&event).map_err(SinkError::serialize)?;
-        self.client.send(self.topic.clone(), bytes.to_vec()).await
-            .map_err(SinkError::transport)?;
+    type Error = MySinkError;
+
+    async fn record_rich(&self, event: RichAuthnEvent) -> Result<(), Self::Error> {
+        let bytes = rkyv::to_bytes::<_, 256>(&event)?;
+        self.client.send(self.topic.clone(), bytes.to_vec()).await?;
         Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "iggy"
     }
 }
 ```
@@ -232,9 +223,10 @@ banking regulations ask for seven years; HIPAA asks for six
 years. Configure to match.
 
 The deleted tier is what comes after the archive expires. The
-events are removed entirely; the deletion is auditable (a
-`DeletionEvent` itself, recording the date range and the count)
-but the underlying data is gone. Some deployments never reach
+events are removed entirely and the underlying data is gone.
+Record the deletion itself somewhere durable, with the date range
+and the count: axess has no event for it, and an expiry nobody
+wrote down is indistinguishable from a gap. Some deployments never reach
 this tier (an indefinite archive is a defensible choice for
 small-volume deployments); others rotate through it on the
 regulatory schedule.
@@ -245,16 +237,29 @@ The transition from hot to archived runs through the
 `AuditArchiver` trait:
 
 ```rust,ignore
-#[async_trait]
-pub trait AuditArchiver: Send + Sync {
-    async fn archive_batch(&self, events: Vec<AuthEvent>) -> Result<(), ArchiveError>;
-    async fn purge_batch(&self, range: ArchiveDateRange) -> Result<usize, ArchiveError>;
+pub trait AuditArchiver: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn archive_batch(
+        &self,
+        events: &[AuthEvent],
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// A stable name for this archiver, used in log lines and metrics.
+    fn name(&self) -> &'static str;
 }
 ```
 
-The trait has two methods. `archive_batch` writes a batch of
-events to the cold store. `purge_batch` removes a date range from
-the archive (for the deleted-tier transition).
+The trait has one write verb and a name. `archive_batch` takes the
+events by slice, so an implementation that streams them does not force
+an allocation, and returns your own `Self::Error`.
+
+There is no purge verb. Deleting from the cold store is the cold
+store's business (an S3 lifecycle rule, a partition drop, a retention
+setting on the object bucket), and it is usually configured where the
+storage lives rather than driven from the application. An archiver that
+wants to purge on a schedule does it inside its own implementation.
+Axess never calls it.
 
 The pipeline runs an `AuditRetentionLoop<S, A>` (S is the source
 `IdentityAuthnLog`, A is the archiver) that drives the
@@ -262,31 +267,40 @@ transitions on a configurable schedule:
 
 ```rust,ignore
 let retention_policy = AuditRetentionPolicy {
-    archive_after: Duration::from_secs(30 * 86400),   // 30 days
+    archive_after: Duration::from_secs(30 * 86400),   // 30 days; default is 90
     purge_hot_after_archive: Duration::from_secs(7 * 86400),
     delete_archive_after: None,                       // never purge archive
 };
 
 let loop_handle = AuditRetentionLoop::new(
-    identity_authn_log.clone(),
-    Arc::new(my_archiver),
+    retention_source,
+    my_archiver,
     retention_policy,
-).run();
+)
+.with_tick_interval(Duration::from_secs(3600))  // the default
+.with_batch_size(10_000)                        // the default
+.spawn();                                       // JoinHandle<()>
 ```
 
-The loop runs once per configured interval (typically daily).
-Each run does three things: it reads the events from the hot
-tier that have aged past `archive_after`, it batches them into
-the archiver, and it purges the hot tier of events whose
-archive copy was made more than `purge_hot_after_archive` ago.
+The loop ticks once per `tick_interval`, hourly by default, archiving
+up to `batch_size` events per tick. Each tick reads the hot-tier events
+that have aged past `archive_after`, hands them to the archiver, and
+purges the hot rows whose archive copy was made more than
+`purge_hot_after_archive` ago. `spawn` returns a `JoinHandle`; the loop
+runs until that handle is dropped. `tick` is public too, for a
+deployment that would rather drive it from its own scheduler and read
+the `RetentionTickReport` each pass returns.
 
 The `delete_archive_after` field is the optional final
 transition. `None` means the archive grows indefinitely; a
 configured duration means the archive itself is purged at that
 age.
 
-The defaults (30 days hot, 7 days hot retention after archive,
-no archive deletion) are conservative for finance. PCI-DSS asks
+The defaults (90 days hot, then the verification window before the hot
+row goes, and no archive deletion) are conservative for finance.
+`delete_archive_after: None` is the right default for most adopters,
+because regulators penalise premature deletion far more harshly than
+they reward storage savings. PCI-DSS asks
 for one year of audit retention, which the defaults satisfy by
 keeping events in the archive indefinitely. Other regulatory
 regimes have different requirements; tune to match.
@@ -320,24 +334,26 @@ the deployment's.
 
 ## Backpressure and tenant isolation
 
-In a multi-tenant deployment, one tenant's audit load can
-overwhelm the pipeline if the buffer is shared. The pattern that
-works is per-tenant pipelines: each tenant has its own
-`AuditPipe` with its own buffer and its own retention
-configuration. The configuration matches what the tenant has
-agreed to (high-throughput tenants get larger buffers; regulated
-tenants get file-backed buffers). One tenant's spike does not
-affect another's.
+Since the buffer is yours, so is the backpressure. Worth deciding
+before a busy tenant decides it for you.
 
-The cost is operational complexity: one configuration per
-tenant. The benefit is isolation; the SLA you offer a tenant is
-genuinely a per-tenant SLA, not a deployment-wide average.
+`AuthEvent` carries `tenant_id`, so a sink can route per tenant: its
+own buffer, its own retention, its own destination. That is what makes
+a per-tenant audit SLA real rather than a deployment-wide average, and
+it keeps one tenant's spike off another's stream. The cost is a
+configuration per tenant and the operational surface that comes with
+it.
 
-For most deployments, a single shared pipeline with conservative
-defaults is fine. The per-tenant shape is for deployments with
-strict per-tenant guarantees.
+A single shared sink with conservative behaviour is fine for most
+deployments, and is the sensible starting point. Reach for per-tenant
+routing when a contract names a number.
 
-## What this enables
+What axess will not do is stop authenticating because the audit is
+behind. It has no policy to drop, block or shut down on a full buffer,
+because it has no buffer. If you need a fail-shut posture, see
+*Reliability* above.
+
+## From events to a defensible trail
 
 The pipeline is what turns axess's audit events into a defensible
 production audit trail. The dual stream serves the two

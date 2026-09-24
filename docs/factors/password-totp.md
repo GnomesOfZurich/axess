@@ -19,45 +19,70 @@ Argon2id hash. The choice of Argon2id rather than bcrypt or PBKDF2 is
 the standard one for new systems built today; the parameter tuning is
 the operational lever you reach for first.
 
-The configuration struct is `PasswordConfig`. It carries the Argon2id
-parameters (memory cost, time cost, parallelism), the minimum and
-maximum password length, and the optional pepper. Defaults are
-calibrated for a server class that can spare about fifty milliseconds
-of CPU per verification, which is what current guidance considers an
-appropriate cost ceiling for an interactive login.
+The configuration struct is `PasswordConfig`, and it is smaller than
+you might expect:
 
 ```rust,ignore
 pub struct PasswordConfig {
-    pub argon: Argon2idParams,    // memory, time, parallelism
-    pub min_length: usize,        // default 8
-    pub max_length: usize,        // default 128
-    pub pepper: Option<Vec<u8>>,  // optional, see below
+    /// Argon2id PHC hash string, zeroized on drop.
+    pub hash: ZeroizedString,
+    /// Strength rules applied when setting a new password.
+    pub rules: PasswordRules,
 }
 ```
 
-The pepper is an optional secret stored outside the database (in the
-secrets manager that holds the session signing key). When set, the
-hash is HMAC-SHA256(pepper, password) before Argon2id processes it.
-The defence-in-depth benefit is the same one refresh-token peppers
-provide: a database breach alone does not enable an offline
-brute-force attack against the password hashes, because the pepper
-is not in the database.
+There are no Argon2 parameters to set, and no pepper. Hashing is the
+`password_auth` crate's `generate_password_hash` / `verify_password`
+pair, which picks recommended Argon2id parameters, generates a fresh
+random salt per hash, and encodes the parameter set into the stored
+hash itself, in PHC string format (the Password Hashing Competition's
+`$argon2id$v=19$m=...` encoding). Verification reads the parameters back out of the stored hash,
+so raising the cost later is a matter of upgrading the crate and
+rehashing on next login. Old hashes keep verifying against the
+parameters they were made with.
 
-The maximum password length matters for DoS protection. Argon2id is
-deliberately expensive; an attacker who can submit a megabyte of
-password text per request can wedge the server with a handful of
-concurrent attempts. The cap is one hundred and twenty-eight
-characters by default, which is generous for legitimate users (no
-password manager generates more than that) and bounded enough that
-the worst case per request stays under a hundred milliseconds.
+That also means the cost is not yours to tune from axess, and the
+answer to "can I use a pepper" is that you would have to apply it
+yourself before calling `generate_password_hash`, storing the result in
+`hash`. Nothing in the type stops you; nothing in the type helps you
+either.
 
-The minimum is eight characters, which is below the modern
-recommendation but matches what most users encounter elsewhere. A
-deployment serious about password quality lifts this to twelve or
-fourteen, alongside a length-and-character-class meter on the signup
-form. Axess does not enforce password complexity rules beyond the
-length range; complexity meters live in the registration UI, where
-they can produce real feedback.
+What *is* configurable is the strength rules:
+
+```rust,ignore
+pub struct PasswordRules {
+    pub min_length: usize,        // default 12
+    pub require_uppercase: bool,  // default true
+    pub require_lowercase: bool,  // default true
+    pub require_digit: bool,      // default true
+    pub require_special: bool,    // default false
+    pub history_count: usize,     // default 0, no reuse check
+}
+```
+
+So axess does enforce complexity, and the defaults are stricter than
+the habitual eight-character minimum: twelve characters with upper,
+lower and a digit. `require_special` is off by default because the
+character-class requirement that most reliably produces `Password1!` is
+the one that demands punctuation.
+
+`history_count` is the reuse check, and it is off by default because it
+costs something to turn on: a non-zero value makes the flow call
+`IdentityPasswordHistory::password_history` and `record_password_hash`, both of
+which `unimplemented!()` until your backend provides them. Set it to
+`12` for the SOC2-shaped "cannot reuse the last twelve" rule, and
+implement those two methods at the same time.
+
+Rules are resolved per tenant, through
+`IdentityLookup::password_rules_for_tenant`, which defaults to
+`PasswordRules::default()`. A deployment with one policy can ignore
+it; a deployment that sells a stricter tier can override it per tenant
+without touching the login path.
+
+There is no maximum length in the rules. You should want one, because
+Argon2id is deliberately expensive and an unbounded password field is a
+cheap way to burn server CPU. Impose it at the
+edge, where the request is parsed, before the value reaches the hasher.
 
 ## TOTP (RFC 6238)
 
@@ -70,27 +95,43 @@ The configuration struct is `TotpConfig`:
 
 ```rust,ignore
 pub struct TotpConfig {
-    pub secret: ZeroizedString,   // base32-encoded 20-byte secret
-    pub digits: u32,              // default 6
-    pub period: Duration,         // default 30 s
-    pub algorithm: HmacAlgorithm, // default Sha1 (RFC 6238)
-    pub drift_window: u32,        // default 1
+    pub secret: ZeroizedString,      // raw bytes; base32 for provisioning URIs
+    pub digits: u8,                  // default 6
+    pub period_secs: u32,            // default 30
+    pub algorithm: OtpAlgorithm,     // Sha1 | Sha256 | Sha512, default Sha1
+    pub past_window: u32,            // default 1
+    pub future_window: u32,          // default 1
+    pub last_step: Option<u64>,      // last validated counter; blocks replay
 }
 ```
 
-`secret` is zeroized in memory on drop. The string is base32-encoded
-because that is what TOTP apps expect when scanning a QR code or
-pasting a manual key; the bytes underneath are twenty cryptographically
-random bytes from `SecureRng`. Adopters serialise the secret to and
-from their factor store however the store's encryption envelope
-prefers.
+Two fields there are not decoration. The drift window is *two* numbers,
+not one: `past_window` for a client behind the server and
+`future_window` for one ahead of it. Both default to 1, because a
+phone's clock runs ahead as often as behind. NTP-synced devices drift
+forward across time-zone changes, and a handset's OS clock is commonly
+a few hundred milliseconds early, so a one-sided window rejects valid
+codes from those users.
+
+`last_step` is the replay defence. It records the counter of the last
+code accepted, so a code that already worked cannot be used again
+inside its remaining validity. That makes `TotpConfig` mutable state,
+not just configuration: your factor store must persist the updated
+value after a successful verification, or the same intercepted code
+stays usable for the rest of its window.
+
+`secret` is zeroized in memory on drop. It holds the raw bytes, twenty
+cryptographically random ones from `SecureRng`; base32 is the encoding
+applied when the secret goes into a provisioning URI for a QR code or a
+manual key, not how it is stored. Adopters serialise it to and from
+their factor store however the store's encryption envelope prefers.
 
 `digits` is six in line with every TOTP authenticator in production
 use. RFC 6238 admits up to eight, but no widely deployed TOTP app
 generates eight-digit codes, so the field exists for symmetry rather
 than for variability.
 
-`period` is the time window each code is valid for. Thirty seconds is
+`period_secs` is the time window each code is valid for. Thirty is
 the RFC default and what every authenticator app expects. Increasing
 the period (to sixty seconds, say) reduces the chance that a user
 typing slowly enters a code that has just expired, at the cost of
@@ -98,20 +139,19 @@ doubling the window an intercepted code remains valid. The
 recommendation is to keep this at thirty unless you have a specific
 reason to change it.
 
-`algorithm` is the HMAC primitive used to derive the code. SHA-1 is
-the RFC 6238 default and remains universally compatible. SHA-256 is
-the harder-to-collide choice; some authenticator apps do not yet
-support it. Stay on SHA-1 unless you have control over the
-authenticator app the users will use.
+`algorithm` is an `OtpAlgorithm`: `Sha1`, `Sha256` or `Sha512`. SHA-1
+is the RFC 6238 default and the only one guaranteed to interoperate.
+Most modern authenticator apps handle SHA-256; few handle SHA-512.
+Stay on SHA-1 unless you control which app the users will use.
 
-`drift_window` is the count of adjacent time windows the verifier
-accepts. A drift window of one means the verifier accepts codes from
-the current window plus one window on either side, covering a
-ninety-second total acceptance range against a thirty-second period.
-The drift accommodates a few seconds of clock skew between server and
-authenticator. Lifting it to two or three reduces user friction at
-the cost of slightly increasing the brute-force attack surface; the
-default of one is the right trade for most deployments.
+`past_window` and `future_window` count the adjacent time steps the
+verifier accepts on each side. One and one, against a thirty-second
+period, gives a ninety-second total acceptance range. Lifting either
+reduces friction for users with a drifting clock at the cost of
+widening the window an intercepted code stays usable, and widening
+`past_window` in particular gives a brute-force attempt more valid
+targets per guess. The defaults are the right trade for most
+deployments.
 
 ## Composing password and TOTP
 
@@ -227,12 +267,12 @@ covers the events emitted at email-OTP issuance and verification.
 A password-plus-TOTP login is robust against three common attacks
 and weak against one.
 
-It is robust against a password leak (an attacker with the password
-alone cannot complete login without the TOTP code), against a TOTP
-secret leak (an attacker with the TOTP secret alone cannot complete
-login without the password), and against credential stuffing (an
-attacker reusing leaked credentials from another service is
-unlikely to also have the user's TOTP secret).
+It is robust against either credential leaking on its own. The
+password alone does not complete a login without the TOTP code, and
+the TOTP secret alone does not complete one without the password. That
+also covers credential stuffing: an attacker replaying credentials
+leaked from another service is unlikely to hold the user's TOTP secret
+as well.
 
 It is weak against a real-time phishing attack: a fake login page
 that prompts the user for their password, forwards it to the real

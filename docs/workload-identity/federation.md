@@ -166,7 +166,7 @@ Write your own recipe. For any new IdP:
 The two shipped recipes are the templates; read their source,
 adapt as needed.
 
-## When federation does and does not fit
+## Where federation fits
 
 Federation is the right answer when the deployment cannot or does
 not want to issue its own workload identities. A Kubernetes-based

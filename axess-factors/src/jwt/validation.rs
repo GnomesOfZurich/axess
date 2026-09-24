@@ -176,6 +176,11 @@ pub fn verify_jwt(
     allowed_algorithms: &[Algorithm],
     clock: &dyn Clock,
 ) -> Result<serde_json::Value, JwtError> {
+    // 0. A provider, before anything asks jsonwebtoken to verify: with both
+    // backends compiled in it has no default and panics. See
+    // `crate::jwt::ensure_crypto_provider`.
+    crate::jwt::ensure_crypto_provider();
+
     // 1. Decode header (no signature check).
     let header = decode_header(token).map_err(|e| JwtError::InvalidHeader(format!("{e}")))?;
 

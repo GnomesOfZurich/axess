@@ -229,8 +229,9 @@ fn oauth_providers_accessor_returns_configured_registry() {
     use crate::testing::mock_authn::MockFactorStore;
     use axess_factors::oauth::MockOAuthProvider;
 
-    let service = AuthnService::new(MockIdentityStore::new(), MockFactorStore::new())
-        .with_oauth_provider(MockOAuthProvider::new("ax-028-idp"));
+    let service = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
+        .with_oauth_provider(MockOAuthProvider::new("ax-028-idp"))
+        .build();
 
     let registry = service.oauth_providers();
     assert_eq!(

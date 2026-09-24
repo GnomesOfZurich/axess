@@ -6,7 +6,8 @@
 //! wrapper level changes a downstream assertion.
 use super::*;
 use crate::authn::event::{AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType};
-use crate::authn::store::{IdentityAdmin, IdentityAuthnLog, IdentityLookup};
+use crate::authn::store::IdentityPasswordHistory;
+use crate::authn::store::{IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordReset};
 use crate::authn::types::StatusDetail;
 use chrono::Utc;
 

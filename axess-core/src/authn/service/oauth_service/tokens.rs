@@ -37,7 +37,7 @@ where
         post_logout_redirect_uri: Option<&str>,
         state: Option<&str>,
     ) -> Option<url::Url> {
-        let provider = self.oauth_providers.get(provider_name)?;
+        let provider = self.inner.oauth_providers.get(provider_name)?;
         provider.build_end_session_url(id_token_hint, post_logout_redirect_uri, state)
     }
 
@@ -61,6 +61,7 @@ where
         use axess_factors::oauth::OAuthError;
 
         let provider = self
+            .inner
             .oauth_providers
             .get(provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?;
@@ -90,12 +91,13 @@ where
         use axess_factors::oauth::OAuthError;
 
         let provider = self
+            .inner
             .oauth_providers
             .get(provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?;
 
         let mut key_seed = [0u8; 32];
-        self.rng.fill_bytes(&mut key_seed);
+        self.inner.rng.fill_bytes(&mut key_seed);
 
         provider.generate_dpop_proof(http_method, http_url, access_token, key_seed)
     }

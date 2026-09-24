@@ -52,6 +52,7 @@ async fn lockout_policy_delegates_to_inner_not_trait_default() {
         max_attempts: 13,
         duration: Some(std::time::Duration::from_secs(99)),
         attempt_window: std::time::Duration::from_secs(7),
+        ..LockoutPolicy::default()
     };
     let inner = MockIdentityStore::new().with_lockout_policy(custom);
     let wrapped = NoopAuthnLog(inner);
@@ -73,6 +74,7 @@ async fn lockout_policy_for_tenant_delegates_to_inner_not_trait_default() {
         max_attempts: 17,
         duration: None,
         attempt_window: std::time::Duration::from_secs(11),
+        ..LockoutPolicy::default()
     };
     let inner = MockIdentityStore::new().with_lockout_policy(custom);
     let wrapped = NoopAuthnLog(inner);

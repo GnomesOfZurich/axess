@@ -212,6 +212,25 @@ impl MtlsResolver {
             tenant_id,
         }
     }
+
+    /// Construct a resolver from the peer-cert chain the TLS
+    /// terminator recorded, taking its leaf. Returns
+    /// [`MtlsError::EmptyChain`] when the chain holds no certificate:
+    /// the terminator did not request a client certificate, or the
+    /// wiring middleware inserted an empty [`PeerCertChain`].
+    ///
+    /// Prefer this over [`new`](Self::new) when what is in the request
+    /// extensions is the chain rather than a leaf. The tenant is still
+    /// the caller's to resolve, from [`peek_spiffe`] on
+    /// [`PeerCertChain::leaf`].
+    pub fn from_chain(
+        chain: &PeerCertChain,
+        expected_trust_domain: TrustDomain,
+        tenant_id: TenantId,
+    ) -> Result<Self, MtlsError> {
+        let leaf = chain.leaf().ok_or(MtlsError::EmptyChain)?;
+        Ok(Self::new(leaf.clone(), expected_trust_domain, tenant_id))
+    }
 }
 
 impl PrincipalResolver for MtlsResolver {

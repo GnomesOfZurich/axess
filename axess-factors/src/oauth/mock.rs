@@ -21,8 +21,9 @@ use std::sync::Arc;
 /// let mock = MockOAuthProvider::new("test-idp")
 ///     .with_user("user-123", "alice@example.com", vec!["engineers"], vec!["admin"]);
 ///
-/// let authn = AuthnService::new(identity, factors)
-///     .with_oauth_provider(mock);
+/// let authn = AuthnService::builder(identity, factors)
+///     .with_oauth_provider(mock)
+///     .build();
 /// ```
 pub struct MockOAuthProvider {
     name: Arc<str>,

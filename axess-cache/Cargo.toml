@@ -33,7 +33,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dependencies]
 axess-clock = { workspace = true }
-lru = "0.18.4"
+lru = "0.18.5"
 parking_lot = "0.12.5"
 # Only `sync`: `tokio::sync::OnceCell` powers `get_or_try_insert_with`'s
 # single-flight semantics. Runtime-agnostic primitive (no executor needed).
@@ -45,6 +45,11 @@ tokio = { workspace = true, default-features = false, features = ["sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# `testing` explicitly: the tests use `axess_clock::testing::MockClock`, and
+# the runtime dependency above does not enable that feature. In a
+# full-workspace build another member switches it on, so these tests compiled
+# by accident; `cargo test -p axess-cache` on its own did not.
+axess-clock = { workspace = true, features = ["testing"] }
 # `chrono` is only used in tests/doctests to construct fixed wall-clock times
 # for `MockClock::at(...)`; runtime never imports chrono directly, all time
 # decisions go through the injected `Clock`.

@@ -32,7 +32,7 @@
 //! [`SystemClock`](axess_clock::SystemClock)) as the score. This is load-bearing
 //! for [`SessionRegistry::active_sessions`](crate::session::store::SessionRegistry::active_sessions):
 //! the trait promises "ordered oldest first" so that the
-//! [`max_sessions_per_user`](crate::authn::service::AuthnService::with_max_sessions_per_user)
+//! [`max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
 //! eviction loop in `complete_factor_step` can FIFO-evict (rather than
 //! arbitrary-evict, which an attacker could exploit by spawning a burst
 //! of short-lived sessions to push the legitimate user out). Previously

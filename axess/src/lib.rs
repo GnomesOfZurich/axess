@@ -46,16 +46,18 @@ pub mod session {
 /// Authentication namespace. Prefer `axess::authn::*` in new code.
 pub mod authn {
     pub use axess_core::{
-        AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType, AuthMethod,
-        AuthnBackend, AuthnError, AuthnScope, AuthnService, DeviceId, EmailOtpConfig, EntityState,
-        EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome, FactorStep,
-        FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin,
-        IdentityAuthnLog, IdentityLookup, IdentityStore, IpPolicy, LdapBindFactorConfig,
-        LockoutPolicy, LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm,
-        PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor,
-        SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId,
-        TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
-        require_valid_session,
+        AuditContext, AuditContextPolicy, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder,
+        AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError,
+        AuthnScope, AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId,
+        EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind,
+        FactorOutcome, FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config,
+        HotpConfig, IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+        IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
+        LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
+        PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor, SessionValidator,
+        SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
+        ZeroizedString, create_tenant, default_catalog, extract_audit_context,
+        extract_audit_context_untrusted, require_valid_session,
     };
     pub use axess_factors::{
         HOTP_LENGTH, HotpAlgorithm, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams,

@@ -56,8 +56,9 @@
 //! Wire it in:
 //!
 //! ```rust,ignore
-//! let authn = AuthnService::new(identity, factors)
-//!     .with_metrics(CountingMetrics::new());
+//! let authn = AuthnService::builder(identity, factors)
+//!     .with_metrics(CountingMetrics::new())
+//!     .build();
 //! ```
 
 /// Trait for reporting authentication and session metrics.
@@ -92,11 +93,39 @@ pub trait AuthnMetrics: Send + Sync + 'static {
     ///
     /// Distinct from [`factor_failure`](Self::factor_failure): the user did
     /// supply credentials, but the persistent counter that drives lockout
-    /// could not be incremented. The request still returns
-    /// `InvalidCredential` (so attackers can't probe store outages), but
-    /// operators should alert on this; it means lockout policy is
-    /// silently disabled while the outage persists.
+    /// could not be incremented. What the request returns then is
+    /// [`LockoutPolicy::on_counter_unavailable`](crate::authn::types::LockoutPolicy),
+    /// which defaults to treating the attempt as locked. Alert on this
+    /// either way: under `Lock` it explains the support calls, and under
+    /// `Allow` it is the only signal that lockout is off.
     fn factor_counter_store_outage(&self) {}
+
+    /// The audit store rejected an event, so the flow was failed rather
+    /// than allowed to proceed unrecorded. Every login is failing while
+    /// this fires: it is a page, not a dashboard line.
+    fn audit_store_outage(&self) {}
+
+    /// An event was refused because
+    /// [`AuditContextPolicy::Required`](crate::authn::service::AuditContextPolicy::Required)
+    /// is set and the request path attached no
+    /// [`AuditContext`](crate::authn::event::AuditContext).
+    ///
+    /// A wiring fault, not an outage: nothing is down and nothing
+    /// rejected the write. Distinct from
+    /// [`audit_store_outage`](Self::audit_store_outage) so an on-call
+    /// page is not raised for a route that forgot
+    /// `AuthnService::with_audit_context`. Any non-zero value means some
+    /// route is failing every request.
+    fn audit_context_missing(&self) {}
+
+    /// An audit sink deliberately dropped an event under load.
+    ///
+    /// Distinct from [`audit_store_outage`](Self::audit_store_outage):
+    /// nothing is failing, the sink is shedding to protect its storage.
+    /// A steady rate means the trail has bounded gaps and the sink's
+    /// capacity wants looking at; a spike usually means someone is
+    /// driving unauthenticated login attempts at you.
+    fn audit_event_shed(&self) {}
 
     /// An account was locked due to too many failed attempts.
     fn account_locked(&self) {}

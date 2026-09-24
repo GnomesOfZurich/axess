@@ -223,8 +223,9 @@ as the session signing key, covered in *Operations runbook*.
 The `RefreshTokenStore` trait documents that production backends
 must implement three methods atomically. The atomicity is what makes
 the family-based theft detection sound; a non-atomic implementation
-opens a TOCTOU window where an attacker could race the legitimate
-user past the detection.
+opens a time-of-check-to-time-of-use window, where an attacker could
+race the legitimate user past the detection between the moment the
+token is checked and the moment it is spent.
 
 `rotate_token` must atomically mark the current token revoked and
 issue a new token in the same family. Two requests racing each other
@@ -245,7 +246,7 @@ The first-party SQL adapters use transactions to satisfy these
 contracts. Custom adapters need to do the same; the contract is
 documented on the trait so reviewers can check it explicitly.
 
-## What this enables
+## Choosing a point on the continuum
 
 Refresh tokens and session cookies are the two ends of a continuum
 between "convenience" and "security". A session cookie alone is the

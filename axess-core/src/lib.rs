@@ -95,16 +95,19 @@ pub mod authn;
 pub mod device;
 
 pub use authn::{
-    AuditContext, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType,
-    AuthMethod, AuthnBackend, AuthnError, AuthnScope, AuthnService, DeviceId, EmailOtpConfig,
+    AuditContext, AuditContextPolicy, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder,
+    AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError,
+    AuthnScope, AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig,
     EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome,
     FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
-    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityStore, IpPolicy, LdapBindFactorConfig,
-    LockoutPolicy, LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm,
-    PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor,
-    SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig,
-    User, UserId, ZeroizedString, create_tenant, default_catalog, extract_audit_context,
-    extract_audit_context_async, require_valid_session,
+    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+    IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
+    LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
+    PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor, SessionValidator,
+    SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
+    ZeroizedString, create_tenant, default_catalog, extract_audit_context,
+    extract_audit_context_async, extract_audit_context_async_untrusted,
+    extract_audit_context_untrusted, require_valid_session,
 };
 
 // ── Federation; external-IdP adapters ───────────────────────────────────────
@@ -127,7 +130,7 @@ pub mod authz;
 pub use authz::{
     AuthzDecision, AuthzDenied, AuthzEntityProvider, AuthzError, AuthzSession, AuthzStore,
     BuildRequestContext, NoContext, PolicyEvaluator, PolicyStore, StandardRequestContext,
-    ip_from_headers, make_action_uid, make_entity_uid,
+    ip_from_headers_untrusted, make_action_uid, make_entity_uid,
 };
 
 // ── Storage backends (re-exports from session::storage) ────────────────────────

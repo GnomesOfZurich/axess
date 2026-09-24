@@ -1,7 +1,7 @@
 # mTLS-based authentication
 
 Mutual TLS authenticates the client to the server at the transport
-layer, before the application sees the request. The client presents
+layer, before your handler sees the request. The client presents
 an X.509 certificate during the TLS handshake, the server validates
 the certificate against a trust anchor, and the resulting connection
 carries a known identity. For service-to-service traffic between
@@ -13,7 +13,9 @@ This chapter covers using mTLS as a factor for human or human-adjacent
 flows (a kiosk machine, an internal admin host). The other use of
 mTLS in axess, where the certificate identifies a workload rather
 than a human, is covered in *Workload identity overview* and
-specifically in *Inbound: mTLS-SVID*. The mechanism is the same; the
+specifically in *Inbound: mTLS-SVID*, an SVID being a SPIFFE
+Verifiable Identity Document, the credential format that carries a
+workload's identity. The mechanism is the same; the
 interpretation of the certificate differs.
 
 The feature flag is `mtls` (off by default), enabled with
@@ -65,9 +67,9 @@ async fn mtls_middleware<B>(
 
 The trusted-terminator check is the critical line. If the
 deployment accepts the certificate header from anywhere, an
-attacker who can reach the application directly (bypassing the
+attacker who can reach your service directly (bypassing the
 terminator) can spoof any identity by setting the header
-themselves. The defence is to either configure the application to
+themselves. The defence is to either configure your listener to
 listen only on a socket the terminator owns, or to gate the
 extraction on a token the terminator injects alongside the
 certificate.
@@ -97,14 +99,14 @@ where the client does not need to provision a certificate.
 ## From certificate to user
 
 After the middleware inserts the `PeerCertChain` into the
-extensions, the application's login handler reads it back and maps
+extensions, your login handler reads it back and maps
 the certificate to a user identity. The mapping depends on the
 deployment's conventions.
 
 The simplest mapping is from the certificate's Subject Common Name
 (CN) to a username. The CA issues certificates with CNs that match
 the deployment's usernames, the login handler reads the CN, and
-the application looks up the user under that CN.
+you look up the user under that CN.
 
 ```rust,ignore
 use axess::factors::mtls::PeerCertChain;
@@ -185,7 +187,7 @@ attacker action and both can be revoked).
 
 It is weak against three specific attacks.
 
-The first is private-key theft from a compromised device. An
+**Private-key theft from a compromised device.** An
 attacker with full filesystem access to a client can copy the
 private key, install it on their own machine, and use the
 certificate. The defence is to store the private key on hardware
@@ -193,18 +195,21 @@ the operating system protects (a TPM, a hardware security module,
 a smartcard) rather than in a file. Hardware-backed keys cannot
 be exported and survive even a full filesystem compromise.
 
-The second is CA compromise. An attacker who can issue
-certificates from a CA the application trusts can authenticate as
+**CA compromise.** An attacker who can issue
+certificates from a CA you trust can authenticate as
 anyone. The defence is operational: keep the issuing CA offline,
 use short-lived certificates so revocation is automatic, and
 monitor the CA's audit log. For service-to-service mTLS, a SPIFFE
 control plane handles this with rotating, short-lived certificates
 backed by an attested root.
 
-The third is missing revocation. When a certificate is revoked
-(employee leaves, machine is lost), the application needs to know.
-The TLS terminator checks revocation through OCSP or CRL or a
-short-lived-certificate strategy; an unchecked revocation lets
+**Missing revocation.** When a certificate is revoked
+(employee leaves, machine is lost), you need to know.
+The TLS terminator checks revocation through OCSP (the Online
+Certificate Status Protocol, which asks the issuer about one
+certificate), a CRL (a certificate revocation list, which the issuer
+publishes in bulk), or a short-lived-certificate strategy that lets
+revocation happen by expiry; an unchecked revocation lets
 the old certificate continue to work. The defence is to wire
 revocation checking at the terminator and to monitor the
 revocation lifecycle.

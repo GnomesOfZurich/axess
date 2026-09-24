@@ -275,7 +275,7 @@ impl AuthnAnalyticsSink for NoopAuthnAnalyticsSink {
 ///     iggy_sink,
 ///     |event| async move {
 ///         let ua = parse_ua(event.user_agent.as_deref()).await;
-///         let geo = geoip_lookup(event.ip_address.as_deref()).await;
+///         let geo = geoip_lookup(event.ip_address).await;
 ///         RichAuthnEvent::from_event(event)
 ///             .with_user_agent_summary(ua)
 ///             .with_geo_country(geo.country)
@@ -390,7 +390,10 @@ where
         &self,
         event: AuthEvent,
     ) -> impl std::future::Future<
-        Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
+        Output = Result<
+            crate::authn::store::AuditOutcome,
+            <L as crate::authn::store::IdentityLookup>::Error,
+        >,
     > + Send {
         // Clone for the analytics path; the regulatory path takes
         // ownership for `inner.record_event`.

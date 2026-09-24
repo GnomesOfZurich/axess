@@ -6,7 +6,7 @@ the data they need to reason about (which roles the principal is in,
 which group owns the resource, what the principal's MFA status is).
 The policy set is loaded once at startup. The principal and action
 come from the request. The entity graph and the request context
-come from the application, per request, through two interfaces this
+come from you, per request, through two interfaces this
 chapter covers: the `AuthzEntityProvider` trait and the
 `StandardRequestContext` extension surface.
 
@@ -19,33 +19,55 @@ below avoid both failure modes.
 
 ## The entity provider contract
 
-`AuthzEntityProvider` is the trait the application implements. The
+`AuthzEntityProvider` is the trait you implement. The
 job is to take a request's principal and resource UIDs, and return
 a Cedar entity graph rich enough that the evaluator can answer the
 policy questions:
 
 ```rust,ignore
-#[async_trait]
 pub trait AuthzEntityProvider: Send + Sync {
-    async fn entities(
+    /// How your application names a resource: a `String` id, a typed
+    /// key, whatever the domain uses.
+    type ResourceId: Send + Sync;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn entities_for(
         &self,
-        principal: &Principal,
-        resources: &[ResourceUid],
-    ) -> Result<EntitySet, AuthzProviderError>;
+        principal: &EntityUid,
+        resource_id: &Self::ResourceId,
+        action: &EntityUid,
+    ) -> impl Future<Output = Result<Entities, Self::Error>> + Send;
+
+    /// Turn one of your resource ids into the Cedar UID policies match on.
+    fn resource_uid(&self, id: &Self::ResourceId) -> Result<EntityUid, AuthzError>;
 }
 ```
 
-The provider receives the principal (so it can load the
-principal's groups, roles, and any attributes the policies need)
-and the list of resource UIDs the request is touching (so it can
-load the resources, their parents, and their attributes). It
-returns an `EntitySet`, which is Cedar's typed entity graph: each
-entity has a UID, a set of attributes, and a list of parent
-entities.
+The provider receives a Cedar `EntityUid` for the principal, one
+resource id, and the action `EntityUid`. It returns Cedar's own
+`Entities`, the typed entity graph the evaluator reads: each entity
+carries a UID, a map of attributes, and a set of parent UIDs.
+
+Three things about that signature shape an implementation.
+
+The resource is singular, not a slice. One call answers one
+authorization question, so the provider loads exactly what this
+decision needs and nothing more.
+
+The principal arrives as an `EntityUid`, not as a `Principal`. Its
+`id()` is the string you look up, and its type is whatever your schema
+calls a principal. That keeps the provider a translation from your
+storage into Cedar's vocabulary, with no branch on human versus
+workload unless your schema has one.
+
+`action` is passed so a provider can load less when the action does not
+need it. Many providers ignore it; `_action` in the signature is a
+perfectly good implementation.
 
 The contract is "return enough to answer the policies, no more."
-An entity set that omits an entity a policy references produces an
-`EntityNotFound` error at evaluation time. An entity set that
+An entity set that omits an entity a policy references denies at
+evaluation time, quietly, because a decision has no error to
+return. An entity set that
 includes hundreds of entities the policy never touches wastes the
 database time. The right shape is the minimum set the policies
 need for this request.
@@ -59,7 +81,7 @@ The principal's parents. Every role the principal is in, every
 group they belong to. A policy that says
 `principal in Role::"finance-viewer"` needs the principal's
 `parents` list to include `Role::"finance-viewer"` if the principal
-is in that role. The provider populates this from the application's
+is in that role. The provider populates this from your
 role-and-group store.
 
 The principal's attributes. The user's tenant id, MFA status,
@@ -98,59 +120,88 @@ struct AppEntityProvider {
     db: PgPool,
 }
 
-#[async_trait]
 impl AuthzEntityProvider for AppEntityProvider {
-    async fn entities(
-        &self,
-        principal: &Principal,
-        resources: &[ResourceUid],
-    ) -> Result<EntitySet, AuthzProviderError> {
-        let mut set = EntitySet::new();
+    type ResourceId = String;
+    type Error = ProviderError;
 
-        // Principal: load roles and groups, attach as parents.
-        let user_id = principal.user_id().ok_or(AuthzProviderError::NotHuman)?;
-        let memberships = sqlx::query_as::<_, (String,)>(
-            "SELECT role_uid FROM user_roles WHERE user_id = $1"
+    async fn entities_for(
+        &self,
+        principal: &EntityUid,
+        resource_id: &String,
+        _action: &EntityUid,
+    ) -> Result<Entities, Self::Error> {
+        let mut entities = Vec::new();
+
+        // Principal: load roles, build them as entities, attach as parents.
+        let user_id = principal.id().as_ref();
+        let roles = sqlx::query_as::<_, (String,)>(
+            "SELECT role_name FROM user_roles WHERE user_id = $1",
         )
-        .bind(user_id.to_string())
+        .bind(user_id)
         .fetch_all(&self.db)
         .await?;
 
-        let principal_uid = ResourceUid::new("User", &user_id.to_string());
-        set.insert(Entity {
-            uid: principal_uid.clone(),
-            attrs: principal_attrs(principal),
-            parents: memberships
-                .into_iter()
-                .map(|(uid,)| ResourceUid::parse(&uid).unwrap())
-                .collect(),
-        });
+        let mut role_uids = HashSet::new();
+        for (role_name,) in roles {
+            let role_uid = self.make_uid("Role", &role_name)?;
+            entities.push(Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())?);
+            role_uids.insert(role_uid);
+        }
+        entities.push(Entity::new(principal.clone(), HashMap::new(), role_uids)?);
 
-        // Resources: load each resource's row + tenant parent.
-        for resource in resources {
-            if resource.entity_type() == "Document" {
-                let row: DocumentRow = sqlx::query_as("SELECT * FROM documents WHERE id = $1")
-                    .bind(resource.id())
-                    .fetch_one(&self.db)
-                    .await?;
-                set.insert(Entity {
-                    uid: resource.clone(),
-                    attrs: document_attrs(&row),
-                    parents: vec![ResourceUid::new("TenantData", &row.tenant_id)],
-                });
-            }
+        // Resource: its row, and the attributes policies match on.
+        let doc = sqlx::query_as::<_, (String, String)>(
+            "SELECT owner_id, tenant_id FROM documents WHERE id = $1",
+        )
+        .bind(resource_id)
+        .fetch_optional(&self.db)
+        .await?
+        .ok_or_else(|| ProviderError::NotFound(resource_id.clone()))?;
+
+        let owner_uid = self.make_uid("User", &doc.0)?;
+        let mut attrs = HashMap::new();
+        attrs.insert(
+            "owner".to_string(),
+            RestrictedExpression::new_entity_uid(owner_uid.clone()),
+        );
+        let tenant_uid = self.make_uid("Tenant", &doc.1)?;
+        entities.push(Entity::new(
+            self.resource_uid(resource_id)?,
+            attrs,
+            HashSet::from([tenant_uid]),
+        )?);
+
+        // Anything a policy can reach must be in the set. An `owner`
+        // attribute pointing at a User entity that is absent evaluates
+        // to a deny, not an error, so build the owner too.
+        if doc.0 != user_id {
+            entities.push(Entity::new(owner_uid, HashMap::new(), HashSet::new())?);
         }
 
-        Ok(set)
+        Entities::from_entities(entities, None).map_err(ProviderError::build)
+    }
+
+    fn resource_uid(&self, id: &String) -> Result<EntityUid, AuthzError> {
+        self.make_uid("Document", id)
     }
 }
 ```
+
+The last step is the one that bites. Cedar evaluates against the
+entities you hand it and nothing else, so an entity a policy
+dereferences but the provider did not build is simply absent, and the
+policy that needed it does not match. The failure looks like a
+too-strict policy rather than a missing row. Build every entity any
+policy in your set can reach from the principal or the resource.
+
+`examples/authz/` is a complete working version of this provider,
+against an in-memory store rather than Postgres.
 
 The shape is uniform: one principal entity (with parents from the
 role-and-group store), one or more resource entities (each with
 parents from the tenant model and attributes from the resource's
 row). The provider uses Postgres in this example; the choice is
-the application's. The key shape is that the loads are batched per
+yours. The key shape is that the loads are batched per
 request (one query for memberships, one or two for the resources),
 not per policy or per entity.
 
@@ -175,17 +226,29 @@ principal UID plus the resource UIDs; the cache value is the
 entity set; the cache TTL is a function of how stale the
 application is willing to tolerate.
 
-Axess provides an `AuthzSessionCache` decorator that wraps an
-`AuthzSession`. The decorator caches the entity graph for a
-configurable TTL (default sixty seconds for low-sensitivity
-deployments, one second or less for high-sensitivity deployments,
-or even off for the highest-sensitivity ones). The cache is keyed
-by `(tenant_id, principal_uid, resource_uids)`.
+Axess provides `EntityCache`, an LRU-plus-TTL decorator around a
+`RequestEntityProvider`, so repeat checks skip the inner provider's
+entity-build work:
+
+```rust,ignore
+let cached = EntityCache::new(provider)
+    .with_capacity(10_000)
+    .with_ttl(Duration::from_secs(60));
+```
+
+It is keyed by `(principal, tenant, resource, action)`, and every TTL
+decision goes through an injected `Clock`, so a deterministic test can
+drive expiry without sleeping.
+
+Invalidation is yours. Call `EntityCache::invalidate` from whatever
+mutates a principal's roles or a resource's authorization-relevant
+attributes; axess cannot know when your data changed, so it does not
+try.
 
 The TTL is the lever. Sixty seconds is fine for a deployment where
 a role change can take a minute to propagate (most internal admin
 panels). Anything tighter requires the cache to be invalidated on
-role changes, which means the application's role-mutation code
+role changes, which means your role-mutation code
 calls into the cache to flush the affected entries. The
 `CacheInvalidator` trait on `EntityCache` is the surface for this;
 applications that need stricter consistency wire the invalidations
@@ -201,7 +264,7 @@ eviction rate, invalidation rate).
 The context is the third input to a policy evaluation. It carries
 the per-request attributes that are not on the principal or the
 resource: the MFA status, the IP address, the time of the request,
-the custom keys the application wants to expose to policies.
+the custom keys you want to expose to policies.
 
 `StandardRequestContext` is the built-in implementation:
 
@@ -259,65 +322,63 @@ Required fields are checked at policy load time; optional fields
 are checked at evaluation time. A policy that uses a required
 field the request omits produces a startup error (good, caught
 early). A policy that uses an optional field the request omits
-produces a deny at runtime with `ContextMissing` (acceptable, deny
-is the conservative answer).
+denies at runtime, which is the conservative answer but a silent
+one: the reason is on the `axess::authz::decision` target, not in
+a returned error.
 
 ## When to extend the context
 
 The custom keys exist to bridge application state that does not
 fit on the principal or the resource. Common cases:
 
-The first is a tenant feature flag. A policy that gates a beta
+**A tenant feature flag.** A policy that gates a beta
 feature on "this tenant has opted in" reads `context.custom.beta`,
-which the application sets from the tenant's feature-flag state.
+which you set from the tenant's feature-flag state.
 
-The second is the request's geographical context. A policy that
+**The request's geographical context.** A policy that
 restricts certain actions to certain regions reads
-`context.custom.region`, which the application populates from the
+`context.custom.region`, which you populate from the
 load balancer's geo-IP information or from an explicit header.
 
-The third is a stepped-up factor that is not in `factors_completed`
-because it was completed for a different reason. A policy that
-wants to know "did the user complete a fresh password challenge in
-the last five minutes" reads
-`context.custom.password_challenge_at`, which the application
-populates from a sidecar store of recent challenges.
+**A stepped-up factor not in `factors_completed`,** because it was
+completed for a different reason. A policy that wants to know "did the
+user complete a fresh password challenge in the last five minutes"
+reads `context.custom.password_challenge_at`, which you populate from
+a sidecar store of recent challenges.
 
-The pattern across all three: the application owns the data, the
+The pattern across all three: you own the data, the
 context is the carrier, the policy sees a typed attribute it can
 match on.
 
 ## Failure modes and visibility
 
-The two failure modes worth knowing are `EntityNotFound` and
-`ContextMissing`, both of which surface as `Deny` from the
-evaluator. The right response is the same in both cases: log the
-failure with enough detail to diagnose, surface a generic deny to
-the user, and keep the audit trail.
+Two mistakes account for most surprising denies, and neither announces
+itself as an error: `is_authorized` returns `Allow` or `Deny` and
+nothing else, so both simply deny.
 
-`EntityNotFound` typically means the entity provider should have
-loaded an entity but did not. The fix is in the provider: load the
-missing entity, or update the policy to not reference it.
+**A policy referencing an entity the provider did not load.** The fix
+is in the provider: load it, or stop referencing it.
 
-`ContextMissing` typically means a policy was written against a
-context key the application does not provide. The fix is in the
-schema: declare the key as optional and update the policy to handle
-its absence, or update the application to provide it.
+**A policy written against a context key you do not supply.** The fix
+is in the schema: declare the key optional and handle its absence, or
+supply it. Building the context can also fail
+outright, which is `AuthzError::Context`, raised before evaluation
+rather than during it.
 
-Axess emits an `AuthzEvent` for every evaluation, regardless of
-outcome. The chapter *Audit events* covers the event surface; the
-relevant variants here are `AuthzEvent::EntityNotFound` and
-`AuthzEvent::ContextMissing`, both of which name the missing key
-and the policy that referenced it. A spike in either suggests a
-mismatch between the policy set and the rest of the deployment;
-operational dashboards should alert on it.
+Visibility comes from `tracing`, not from an audit row. Every decision
+emits on the target `axess::authz::decision` with `principal`,
+`action`, `resource`, `decision`, `reasons` and `latency_us`; a
+validation failure emits `decision = "deny"` with a `reason` naming
+what went wrong. Route that target and alert on the deny rate:
+a spike is usually a policy set that has drifted from the data model
+rather than users doing anything new.
 
-## What this enables
+## Fitting Cedar to an arbitrary data model
 
 The provider-and-context contract is what makes Cedar usable
 against an arbitrary application data model. The schema names the
 shape; the policies match on the shape; the provider populates the
-shape from whatever the application's storage actually looks like.
+shape from whatever your storage actually looks like.
 The three layers are independent, which means a database migration
 that changes how roles are stored does not break the policies (the
 provider updates; the rest stays), and a policy change does not
@@ -332,6 +393,7 @@ that show the three styles composed in real policies.
 evaluator surface this chapter feeds. *RBAC, ReBAC, and ABAC
 patterns* covers the policy authoring style with concrete examples
 for each pattern. *Identity store implementation* covers how the
-provider's principal-loading queries fit into the application's
+provider's principal-loading queries fit into your
 identity-store implementation. *Audit events* covers the
-`AuthzEvent` variants the evaluator emits.
+decision events the evaluator emits on
+`axess::authz::decision`.

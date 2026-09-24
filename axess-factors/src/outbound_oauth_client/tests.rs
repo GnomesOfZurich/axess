@@ -307,7 +307,6 @@ async fn private_key_jwt_sends_signed_client_assertion() {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rsa::RsaPrivateKey;
     use rsa::pkcs1::EncodeRsaPrivateKey;
-    use rsa::pkcs8::EncodePublicKey;
 
     let mut rng = rsa::rand_core::OsRng;
     let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
@@ -390,11 +389,17 @@ async fn private_key_jwt_sends_signed_client_assertion() {
     // Sanity: the assertion is verifiable against the actual public
     // key. Confirms axess didn't accidentally sign with a different
     // key or send a malformed signature.
-    let pem = public_key
-        .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
-        .expect("public key pem");
-    let decoding_key =
-        jsonwebtoken::DecodingKey::from_rsa_pem(pem.as_bytes()).expect("decoding key");
+    // Raw components rather than PEM: `DecodingKey::from_rsa_pem` sits
+    // behind `jsonwebtoken`'s `use_pem` feature, which this workspace
+    // does not enable because no production path parses a PEM through
+    // `jsonwebtoken` (`LocalIdpSigningKey` uses the `rsa` / `p256`
+    // crates directly). Taking it here would put `pem` + `simple_asn1`
+    // in every adopter's build for one assertion.
+    use rsa::traits::PublicKeyParts;
+    let decoding_key = jsonwebtoken::DecodingKey::from_rsa_raw_components(
+        &public_key.n().to_bytes_be(),
+        &public_key.e().to_bytes_be(),
+    );
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
     validation.set_audience(&[format!("{}/oauth2/token", server.uri())]);
     let _ = jsonwebtoken::decode::<serde_json::Value>(assertion, &decoding_key, &validation)

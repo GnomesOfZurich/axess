@@ -84,7 +84,18 @@ let app = Router::new()
 
 #### Trusted proxy and IP extraction
 
-- [ ] If you rely on `X-Real-IP` or `X-Forwarded-For` for audit trails or rate limiting, ensure your reverse proxy **strips these headers from untrusted client requests** before forwarding. Axess trusts the first entry in `X-Forwarded-For`.
+- [ ] Use `ip_from_headers_trusted` with a `TrustedProxies` set naming your proxies, not `ip_from_headers_untrusted`. The untrusted form believes any `X-Forwarded-For` the client sends and exists only for deployments that terminate their own TLS with no proxy in front.
+- [ ] Still configure your reverse proxy to strip client-supplied `X-Forwarded-For` and `X-Real-IP`. The trusted-proxy walk is defence in depth, not a substitute.
+
+#### Rate limiting is required in front of login routes
+
+- [ ] Apply the rate-limit layer to every route that reaches `begin_login`. Axess does **not** enforce it inside the service, and since 0.6.0 every failed login, including for identifiers that do not exist, writes an audit row, while a failed audit write fails the login. Without a limit, an unauthenticated caller can drive unbounded writes at your audit store, and exhausting it turns every login into a failure for every user. Your sink can also shed under load by returning `AuditOutcome::Shed`, but shed on a global rate or watermark, never on anything derived from which identifier was tried, or the drop becomes a user-enumeration signal.
+- [ ] Alert on `AuthnMetrics::audit_store_outage`. It fires on exactly that path.
+- [ ] Put the audit sink behind something durable: write locally, ship asynchronously, rather than a remote service on the request path.
+
+#### Identity store lookup latency
+
+- [ ] If your `IdentityStore` caches `find_user` or `account_status`, cache negative results on the same terms as positive ones. Axess equalises login response time between known and unknown identifiers using a fresh random id, which can never hit a cache; caching only real users inverts the timing signal and restores a user-enumeration oracle.
 
 #### Session store selection
 
@@ -124,7 +135,7 @@ let app = Router::new()
 
 ### Trusted proxy configuration (detailed)
 
-Axess extracts client IP addresses from the `X-Real-IP` and `X-Forwarded-For` headers for audit logging and rate limiting. These headers are **only trustworthy if your reverse proxy strips or overwrites them** before forwarding.
+Axess can extract client IP addresses from the `X-Real-IP` and `X-Forwarded-For` headers for audit logging and rate limiting. These headers are **only trustworthy if your reverse proxy strips or overwrites them** before forwarding, and if you use the trusted-proxy form described below.
 
 **If you don't run behind a trusted reverse proxy**, these headers are user-controlled and any IP-based security decision (rate limiting, geo-blocking, audit trails) can be spoofed.
 
@@ -140,7 +151,30 @@ proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 ```
 
-Axess reads `X-Real-IP` first; if absent, it takes the first entry from `X-Forwarded-For`. It does **not** walk the forwarded chain or maintain a trusted-proxy allowlist; that is the reverse proxy's responsibility.
+#### What axess does with these headers
+
+Since 0.6.0 axess **does** walk the forwarded chain and **does** maintain a trusted-proxy allowlist. `ip_from_headers_trusted(headers, peer, &trusted)`:
+
+1. Returns the TCP peer immediately if the peer is not itself a trusted proxy: an unproxied client's headers are never read.
+2. Otherwise joins **every** `X-Forwarded-For` field line in order (RFC 9110 §5.3 makes repeated lines one comma-joined list) and walks it **right to left**, skipping hops that are themselves trusted, returning the first address that is not.
+3. Stops at a malformed entry and returns the peer, rather than trusting past it.
+4. Reads `X-Real-IP` only when no `X-Forwarded-For` is present, and only when there is exactly one such line: more than one means something appended rather than overwrote, so the first is whatever the client sent.
+
+Rightmost-untrusted is the only correct reading: `X-Forwarded-For` is append-only, so the **leftmost** entry is whatever the client chose to put there. Axess took the leftmost entry before 0.6.0, which was spoofable through a correctly configured proxy.
+
+Build the allowlist with exact addresses or CIDR ranges:
+
+```rust
+use axess::authz::TrustedProxies;
+
+let trusted = TrustedProxies::from_cidrs(["10.0.0.0/8", "2001:db8::/32"])?;
+// or, for a same-pod sidecar:
+let trusted = TrustedProxies::loopback_only();
+```
+
+A spec with bits set below the prefix is rejected rather than widened: `10.0.0.5/8` is an error, because it reads like one host and would mean sixteen million. Write `10.0.0.0/8` or `10.0.0.5/32`.
+
+**`ip_from_headers_untrusted` still exists** and still believes the client. The name carries the warning; prefer the trusted form wherever a proxy is involved.
 
 ## Feature inventory
 

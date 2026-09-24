@@ -34,7 +34,7 @@
 //!
 //! let ctx = StandardRequestContext::new(
 //!     session.is_mfa_complete(),
-//!     ip_from_headers(request.headers()),
+//!     ip_from_headers_untrusted(request.headers()),
 //! );
 //! let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
 //! authz.require("PostJournalEntry", &ledger_id).await?;

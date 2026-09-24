@@ -4,6 +4,14 @@
 /// exchange, ID-token validation, and refresh.
 #[derive(Debug, thiserror::Error)]
 pub enum OAuthError {
+    /// The audit store rejected the event recording this OAuth outcome.
+    ///
+    /// The flow is failed rather than allowed to proceed unrecorded: an
+    /// authentication that leaves no evidence has not, for evidence
+    /// purposes, happened. Carries the store's own message.
+    #[error("audit store rejected the event: {0}")]
+    AuditStore(String),
+
     /// Provider configuration is missing required fields or fails validation.
     #[error("OAuth configuration error: {0}")]
     Config(String),
@@ -165,6 +173,13 @@ impl OAuthError {
             // cannot abuse a retry loop here because the AS is the
             // authoritative gate.
             Self::Discovery(_) | Self::UserInfo(_) => true,
+
+            // An audit-store rejection is an outage on our side, and the
+            // same request replayed once the store recovers records
+            // correctly. Retrying is the right response; the cap in the
+            // caller's loop is what stops it spinning while the store
+            // stays down.
+            Self::AuditStore(_) => true,
 
             // Permanent / semantic rejections; retrying the same input
             // produces the same outcome.

@@ -3,7 +3,7 @@
 use super::{AuthnService, outcomes::FactorOutcome};
 use crate::authn::{
     error::AuthnError,
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::{FactorConfig, FactorCredential, FactorKind},
     ids::{TenantId, UserId},
     store::{FactorStore, IdentityStore},
@@ -32,12 +32,13 @@ where
         credentials: &[crate::authn::factor::Fido2Credential],
         auth_result: &webauthn_rs::prelude::AuthenticationResult,
     ) -> Result<(), AuthnError<I::Error>> {
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         let mut updated = credentials.to_vec();
         for cred in &mut updated {
             cred.record_authentication(auth_result, now);
         }
-        self.factors
+        self.inner
+            .factors
             .save_factor(
                 user_scope,
                 FactorConfig::Fido2(crate::authn::factor::Fido2Config {
@@ -53,7 +54,7 @@ where
         session
             .set_custom(
                 fido2_keys::CEREMONY_STARTED,
-                serde_json::Value::String(self.clock.now().to_rfc3339()),
+                serde_json::Value::String(self.inner.clock.now().to_rfc3339()),
             )
             .await;
     }
@@ -94,9 +95,9 @@ where
             tracing::warn!("FIDO2 ceremony timestamp unparseable; treating as expired");
             return true;
         };
-        let elapsed = self.clock.now() - started_at.with_timezone(&chrono::Utc);
+        let elapsed = self.inner.clock.now() - started_at.with_timezone(&chrono::Utc);
         match elapsed.to_std() {
-            Ok(d) => d > self.fido2_options.ceremony_timeout,
+            Ok(d) => d > self.inner.fido2_options.ceremony_timeout,
             Err(_) => {
                 // Negative duration (clock skew); treat as expired and log.
                 tracing::warn!(
@@ -117,7 +118,7 @@ where
         tenant_id: &TenantId,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let webauthn = match &self.fido2 {
+        let webauthn = match &self.inner.fido2 {
             Some(w) => w,
             None => return Ok(FactorOutcome::InvalidCredential),
         };
@@ -197,7 +198,7 @@ where
             webauthn.on_credential_used(auth_result.cred_id(), &device_id);
         }
 
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         session.advance_factor(&FactorKind::Fido2, now).await;
 
         self.complete_factor_step(user_id, tenant_id, session).await
@@ -210,38 +211,39 @@ where
         user: &crate::authn::types::User,
         session: &AuthSession,
     ) -> Result<(serde_json::Value, Option<uuid::Uuid>), AuthnError<I::Error>> {
-        let webauthn = match &self.fido2 {
+        let webauthn = match &self.inner.fido2 {
             Some(w) => w,
             None => return Err(AuthnError::NoFlow),
         };
 
         let status = self
+            .inner
             .identity
             .account_status(&user.id)
             .await
             .map_err(AuthnError::Store)?;
         if !status.allows_login() {
-            // Emit `Failure(FactorEnabled)` so a registration attempt
-            // from a suspended user leaves SOC visibility. Distinguish
-            // Locked from other non-active states so dashboards can
-            // separate brute-force probes from administrative-state
-            // mismatches; preserve `until` for the Locked path. Audit
-            // type is `FactorEnabled` rather than `FactorVerified`
-            // because this is an account-management action, not a login.
-            let error_tag = if status.is_locked() {
-                "locked"
+            // Emit an audit row so a registration attempt from a suspended
+            // user leaves SOC visibility. A lockout carries `Locked`, the
+            // other non-active states `Failure` with a tag, so a dashboard
+            // separates brute-force probes from administrative-state
+            // mismatches on the status column. Audit type is
+            // `FactorEnabled` rather than `FactorVerified` because this is
+            // an account-management action, not a login.
+            let builder = if status.is_locked() {
+                AuthEventBuilder::locked(AuthEventType::FactorEnabled)
             } else {
-                "not_active"
+                AuthEventBuilder::failure(AuthEventType::FactorEnabled)
+                    .with_error(AuthFailureReason::NotActive)
             };
             self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::FactorEnabled)
+                builder
                     .attributed_to(&user.id, &user.tenant_id)
-                    .with_factor(FactorKind::Fido2)
-                    .with_error(error_tag),
+                    .with_factor(FactorKind::Fido2),
             )
-            .await;
+            .await?;
             if let crate::authn::types::EntityState::Suspended(detail) = &status {
-                self.metrics.account_locked();
+                self.inner.metrics.account_locked();
                 return Err(AuthnError::Locked {
                     until: detail.until,
                 });
@@ -254,6 +256,7 @@ where
             user_id: user.id,
         };
         let existing = match self
+            .inner
             .factors
             .load_factor(&user_scope, FactorKind::Fido2)
             .await
@@ -266,7 +269,7 @@ where
             Some(id) => (id, None),
             None => {
                 let mut bytes = [0u8; 16];
-                self.rng.fill_bytes(&mut bytes);
+                self.inner.rng.fill_bytes(&mut bytes);
                 let id = uuid::Uuid::from_bytes(bytes);
                 (id, Some(id))
             }
@@ -303,7 +306,7 @@ where
         credential_name: &str,
         session: &AuthSession,
     ) -> Result<(), AuthnError<I::Error>> {
-        let webauthn = match &self.fido2 {
+        let webauthn = match &self.inner.fido2 {
             Some(w) => w,
             None => return Err(AuthnError::NoFlow),
         };
@@ -340,6 +343,7 @@ where
             user_id: user.id,
         };
         let mut credentials = match self
+            .inner
             .factors
             .load_factor(&user_scope, FactorKind::Fido2)
             .await
@@ -350,10 +354,11 @@ where
         credentials.push(crate::authn::factor::Fido2Credential::new(
             passkey,
             credential_name,
-            self.clock.now(),
+            self.inner.clock.now(),
         ));
 
-        self.factors
+        self.inner
+            .factors
             .save_factor(
                 &user_scope,
                 FactorConfig::Fido2(crate::authn::factor::Fido2Config { credentials }),
@@ -381,7 +386,7 @@ where
                 .attributed_to(&user.id, &user.tenant_id)
                 .with_factor(FactorKind::Fido2),
         )
-        .await;
+        .await?;
 
         Ok(())
     }
@@ -392,7 +397,7 @@ where
         &self,
         session: &AuthSession,
     ) -> Result<serde_json::Value, AuthnError<I::Error>> {
-        let webauthn = match &self.fido2 {
+        let webauthn = match &self.inner.fido2 {
             Some(w) => w,
             None => return Err(AuthnError::NoFlow),
         };
@@ -419,12 +424,13 @@ where
         credentials: &[crate::authn::factor::Fido2Credential],
         session: &AuthSession,
     ) -> Result<(), AuthnError<I::Error>> {
-        let webauthn = match &self.fido2 {
+        let webauthn = match &self.inner.fido2 {
             Some(w) => w,
             None => return Err(AuthnError::NoFlow),
         };
 
         let status = self
+            .inner
             .identity
             .account_status(&user.id)
             .await
@@ -432,27 +438,27 @@ where
         if !status.allows_login() {
             self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
                 .await;
-            // Emit `Failure(FactorVerified)` audit row and distinguish
-            // Locked from other non-active states, preserving `until`
-            // for the Locked path by walking the `EntityState::Suspended`
-            // deep-nested form. The discoverable path runs OUTSIDE the
-            // factor pipeline so it can't piggy-back on
-            // `enforce_account_status`'s audit emit; mirror it here.
-            let error_tag = if status.is_locked() {
-                "locked"
+            // Emit an audit row, with `Locked` for a lockout and `Failure`
+            // plus a tag for the other non-active states, preserving
+            // `until` for the Locked path by walking the
+            // `EntityState::Suspended` deep-nested form. The discoverable
+            // path runs OUTSIDE the factor pipeline so it can't piggy-back
+            // on `enforce_account_status`'s audit emit; mirror it here.
+            let builder = if status.is_locked() {
+                AuthEventBuilder::locked(AuthEventType::FactorVerified)
             } else {
-                "not_active"
+                AuthEventBuilder::failure(AuthEventType::FactorVerified)
+                    .with_error(AuthFailureReason::NotActive)
             };
             self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::FactorVerified)
+                builder
                     .attributed_to(&user.id, &user.tenant_id)
                     .with_factor(FactorKind::Fido2)
-                    .with_session(session.session_id().await)
-                    .with_error(error_tag),
+                    .with_session(session.session_id().await),
             )
-            .await;
+            .await?;
             if let crate::authn::types::EntityState::Suspended(detail) = &status {
-                self.metrics.account_locked();
+                self.inner.metrics.account_locked();
                 return Err(AuthnError::Locked {
                     until: detail.until,
                 });
@@ -554,12 +560,13 @@ where
         // session is already authenticated, we'd hold an Authenticated
         // session that the registry never saw. Reset first → register-
         // through-complete-step → handle errors before set_authenticated.
-        self.identity
+        self.inner
+            .identity
             .reset_failed_attempts(&user.id)
             .await
             .map_err(AuthnError::Store)?;
 
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         session
             .set_authenticated(user.id, user.tenant_id, now)
             .await;
@@ -595,6 +602,7 @@ where
             user_id: user.id,
         };
         match self
+            .inner
             .factors
             .load_factor(&user_scope, FactorKind::Fido2)
             .await
@@ -618,6 +626,7 @@ where
             user_id: user.id,
         };
         let mut credentials = match self
+            .inner
             .factors
             .load_factor(&user_scope, FactorKind::Fido2)
             .await
@@ -636,7 +645,8 @@ where
             return Ok(false);
         }
 
-        self.factors
+        self.inner
+            .factors
             .save_factor(
                 &user_scope,
                 FactorConfig::Fido2(crate::authn::factor::Fido2Config { credentials }),
@@ -649,7 +659,7 @@ where
                 .attributed_to(&user.id, &user.tenant_id)
                 .with_factor(FactorKind::Fido2),
         )
-        .await;
+        .await?;
 
         Ok(true)
     }

@@ -30,7 +30,9 @@ async fn oauth_csrf_mismatch_rejected() {
     let provider: OAuthProviderConfig = oauth_setup_provider(&server).await;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(provider);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(provider)
+        .build();
 
     let session = test_session();
     authn
@@ -57,9 +59,10 @@ async fn oauth_expired_ceremony_rejected() {
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
-        .with_oauth_provider(provider);
+        .with_oauth_provider(provider)
+        .build();
 
     let session = test_session();
     authn
@@ -103,9 +106,10 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
-        .with_oauth_provider(provider);
+        .with_oauth_provider(provider)
+        .build();
 
     let session = test_session();
     authn
@@ -165,7 +169,9 @@ async fn mock_oauth_provider_returns_configured_user() {
     );
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let claims = authn
         .refresh_oauth_token("mock-idp", "any-refresh-token")
@@ -191,7 +197,9 @@ async fn mock_oauth_provider_simulates_failure() {
     let mock = MockOAuthProvider::new("failing-idp").with_failure("IdP is down for maintenance");
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let result = authn.refresh_oauth_token("failing-idp", "some-token").await;
     assert!(result.is_err());

@@ -109,6 +109,11 @@ fn build_id_token(
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
 
+    // Signing goes straight to `jsonwebtoken::encode`, which axess does not
+    // wrap, so it needs the provider installed the same as verification does.
+    // With both backends compiled in, which `--all-features` does, deriving
+    // one is impossible and `encode` panics instead of returning an error.
+    axess_factors::jwt::ensure_crypto_provider();
     let key = EncodingKey::from_rsa_der(private_der);
     jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode")
 }
@@ -182,7 +187,9 @@ async fn full_oauth_flow_with_signed_id_token() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(provider);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(provider)
+        .build();
 
     let session = test_session();
 
@@ -291,7 +298,9 @@ async fn oauth_token_endpoint_error_propagates() {
     .unwrap();
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(provider);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(provider)
+        .build();
 
     let session = test_session();
     authn
@@ -416,6 +425,7 @@ async fn unknown_kid_yields_typed_variant() {
     });
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid_unknown.clone());
+    axess_factors::jwt::ensure_crypto_provider();
     let key = EncodingKey::from_rsa_der(&private_unknown);
     let token = jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode");
 

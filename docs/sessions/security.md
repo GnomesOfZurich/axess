@@ -84,10 +84,9 @@ signature for valid id" by measuring response latency.
 The signing key rotation is the operational lever for replacing the
 signing key without invalidating active sessions. The pattern is
 covered in *Operations runbook*. The short version is:
-`SessionLayer::with_previous_key` accepts the old key, sessions
-signed with the old key continue to validate, sessions signed
-with the new key (which is now what the layer uses for new
-signings) are the new default. After enough time for all old
+`SessionLayer::with_previous_signing_key` accepts the old key, sessions
+signed with it continue to validate, and the key passed to
+`SessionLayer::new` signs everything new. After enough time for all old
 cookies to expire, the previous key is removed.
 
 ## The fingerprint binding
@@ -99,118 +98,180 @@ the accept-language), HMACs them together with a deployment-level
 pepper, and stores the result alongside the session.
 
 ```rust,ignore
-let fingerprint = hmac_sha256(
-    fingerprint_pepper,
-    format!("{}|{}|{}",
-        user_agent,
-        client_ip,
-        accept_language,
-    ),
-);
+pub trait SessionBinding: Send + Sync + 'static {
+    /// The raw binding material. `None` means the signal is absent for
+    /// this request, and binding is skipped rather than failed.
+    fn extract(&self, req: &Request<Body>) -> Option<Vec<u8>>;
+}
+
+// The one that ships:
+let layer = SessionLayer::new(store, signing_key)
+    .with_binding(UserAgentBinding);
 ```
 
-The choice of features is deliberate. They are coarse enough that
-the legitimate user's browser produces the same fingerprint across
-ordinary requests (the user agent does not change between requests,
-the IP is within the same prefix, the accept-language is stable),
-and specific enough that an attacker replaying the cookie from a
-different machine produces a different fingerprint.
+`UserAgentBinding` returns the `User-Agent` header. The layer
+HMAC-SHA256s whatever `extract` returns, keyed with the **session
+signing key**, and stores the digest on the session. There is no
+separate pepper to configure: the signing key is the secret, which is
+what stops an attacker who can read session rows out of the store from
+recomputing a valid fingerprint.
 
-The tolerance is the operational lever. Strict matching produces
-too many false positives (a user switching from wifi to cellular
-sees their IP change, a browser auto-update changes the user
-agent string). Coarse matching produces too few signals to detect
-replay. The default tolerance:
+That key choice has one consequence worth knowing. Because the
+fingerprint is keyed, rotating the signing key changes every
+fingerprint, so the layer computes the current-key and previous-key
+values together and accepts either during a rotation window.
 
-- IP: same /24 for IPv4, same /64 for IPv6.
-- User agent: same major version of the same browser.
-- Accept-language: same primary language.
+Implement the trait yourself for anything richer: the user agent
+combined with an IP prefix, a TLS channel-binding value, a client hint
+your front end sets. The contract is small on purpose: return the raw
+material, and let the layer do the keying and the constant-time
+compare.
 
-A request that matches within the tolerance passes. A request
-that diverges beyond it produces an event the policy decides what
-to do with.
+## What a mismatch does
 
-The policy has three options:
+There is no policy to configure, and no tolerance to tune. The
+fingerprint either matches or it does not, and a mismatch resets the
+session to `Guest`. The user is logged out; their other sessions are
+untouched, because the fingerprint lives on the session, not on the
+user.
 
-- `FingerprintPolicy::Warn` logs the mismatch and lets the
-  request proceed. This is the right setting during initial
-  rollout when the tolerance is being calibrated; the logs show
-  how often legitimate users trigger mismatches, and the tolerance
-  can be adjusted.
+That is a deliberately blunt instrument, and it is why the binding
+signal should be one that does not change under a legitimate user.
+`User-Agent` qualifies: it survives a network change, a wifi-to-cellular
+switch, and a page reload, and it changes on a browser update, which
+logs the user out once, at an unsurprising moment. An IP-derived
+binding does not qualify on a mobile network, which is why nothing
+ships with one.
 
-- `FingerprintPolicy::Reauth` returns 401 and clears the session.
-  The user has to log in again. This is the right setting for
-  high-sensitivity actions; the user accepts the friction of
-  re-authentication in exchange for the assurance that a captured
-  cookie does not get away with the session.
+If you want a softer response, the place to put it is your own
+`SessionBinding` implementation: return `None` when the signal is
+absent or when you would rather not judge, and binding is skipped for
+that request.
 
-- `FingerprintPolicy::Revoke` deletes the session entirely. The
-  user is logged out, and their other sessions remain. This is
-  the right setting when fingerprint mismatch is a strong signal
-  of compromise; the deployment treats it as the user being
-  hijacked and ends the session immediately.
+## When the check runs
 
-The default is `Warn`. Lift to `Reauth` once the warn rate is
-below your tolerance.
+The fingerprint is recomputed and compared **once per HTTP request**, at
+`SessionLayer` entry. It is set at the earliest transition out of
+`Guest`: `set_identifying` when the username is submitted,
+`begin_authenticating` when a multi-factor flow starts,
+`set_authenticated` when authentication completes. So even a pre-MFA
+session cannot be replayed from another device. Once set it is never
+overwritten.
 
-The pepper is a deployment-level secret stored alongside the
-session signing key. It defeats fingerprint synthesis: an attacker
-who knows the features (the user's IP, their user agent) cannot
-construct the fingerprint without the pepper, so they cannot
-adjust their replay to match.
+Once per request is the whole of it, and the gap is persistent
+connections. A WebSocket or an SSE stream is checked at the upgrade and
+never again, so a connection that outlives the binding's validity is
+not re-examined. Where that matters, re-check on the messages
+themselves rather than relying on the layer.
 
-## Trusted-proxy configuration
+## Reading the client IP
 
-The fingerprint depends on the request's IP being accurate. In
-many deployments the application sits behind one or more proxies
-(a load balancer, a CDN, a WAF), and the request's source IP is
-the proxy's IP, not the user's. The user's IP is in a forwarded
-header like `X-Forwarded-For`.
+Nothing in the session layer reads a forwarded header, because nothing
+in the default binding uses the IP. Your own code does, though: a
+Cedar policy conditioned on `ip_address`, a `KeyExtractor::ForwardedIp`
+rate limiter, an audit row. That is where the spoofing risk lives.
 
-Reading the forwarded header is necessary but dangerous. A
-deployment that trusts the header without checking the source can
-be spoofed: a request directly to the application with a forged
-`X-Forwarded-For` header will be treated as if it came through
-the proxy.
+`ip_from_headers_untrusted` reads `X-Real-IP`, then the first entry of
+`X-Forwarded-For`. **Any client can set both headers.** Calling it on
+an internet-facing service means an attacker chooses the IP your
+policies see, and the name says so at every call site.
 
-The defence is the trusted-proxy configuration. The application
-configures which source IPs are trusted to set the header; the
-session layer reads the header only when the immediate request
-came from one of those IPs.
+The same applies to your audit trail, and there it matters more.
+`extract_audit_context` takes the client IP as an argument for the same
+reason. Hand it an address you resolved yourself, or `None`: a null
+`ip_address` is honest and a forged one is not. The header-reading form
+is `extract_audit_context_untrusted`, and the name is the warning.
+
+This matters more than it used to. A failed audit write now fails the
+login, so those rows are guaranteed to exist, which makes a forged
+address in them worse rather than better: evidence written by the
+subject of the evidence.
+
+The defence is to require that the request's actual peer be a proxy you
+trust before believing anything it forwarded:
 
 ```rust,ignore
-let layer = SessionLayer::new(store, signing_key)
-    .with_trusted_proxies(vec![
-        "10.0.0.0/8".parse().unwrap(),    // internal load balancer
-        "172.16.0.0/12".parse().unwrap(), // VPN range
-    ])
-    .with_forwarded_header(ForwardedHeader::XForwardedFor);
+use axess_core::authz::{TrustedProxies, ip_from_headers_trusted};
+
+// Addresses, CIDR ranges, or both. `TrustedProxies::loopback_only()`
+// covers a same-pod sidecar like Envoy or NGINX.
+let trusted = TrustedProxies::from_cidrs(["10.0.0.0/8"])?
+    .with_cidrs(["2001:db8::/32"])?;
+
+let client_ip = ip_from_headers_trusted(&headers, peer_addr, &trusted);
 ```
 
-The configuration accepts a list of CIDR ranges that the
-deployment trusts. Requests from inside any range have their
-`X-Forwarded-For` read; requests from outside any range use the
-immediate connection's IP.
+An empty `TrustedProxies` trusts nothing and always returns the peer,
+which is the right default for a service with no proxy in front of it.
 
-The forwarded-header choice is the application's. The standard is
-`X-Forwarded-For` (a comma-separated list of IPs, the first being
-the original client), but some deployments use `Forwarded` (RFC
-7239) or a proxy-specific header. Axess supports all three;
-configure the one the deployment uses.
+The extraction walks `X-Forwarded-For` **from the right**, and the
+reason is worth understanding, because the obvious alternative is
+broken. The header is append-only: each hop adds the address it saw.
+So a client can send its own value and a correctly configured proxy
+will faithfully append the real one after it:
 
-For multi-hop proxy chains, the rule is the same. The request
-came through `lb → cdn → application`; the application's immediate
-peer is the CDN, the CDN's `X-Forwarded-For` lists `lb` and the
-original client. If both the CDN and the LB are in trusted ranges,
-the application takes the leftmost IP from the header (the
-original client). If only the immediate peer is trusted, the
-application takes the rightmost IP from the header (the next hop
-back).
+```text
+client sends:  X-Forwarded-For: 192.0.2.5
+proxy appends:                  192.0.2.5, 203.0.113.9
+                                ^^^^^^^^^  ^^^^^^^^^^^
+                                attacker   real client
+```
 
-The configuration is deployment-specific. Get it wrong in either
-direction (trust too much, get spoofed; trust too little, see only
-proxy IPs) and the fingerprint binding becomes either fragile or
-useless.
+Reading the leftmost entry hands back whatever the attacker chose,
+through a proxy that did its job. So the walk starts at the right,
+skips hops that are themselves trusted proxies, and returns the first
+address that is not. Everything to the left of that is client-supplied
+and discarded.
+
+Two edge cases follow from the same reasoning. A malformed entry stops
+the walk and yields the peer, because once one hop's contribution
+cannot be read, which hop wrote what is no longer knowable. And if
+every entry is a trusted proxy, the request originated inside your
+perimeter, so the peer is the answer.
+
+`X-Real-IP` is consulted only when `X-Forwarded-For` is absent. It is a
+single value with no chain to audit, so a proxy that forwards a
+client-supplied one is indistinguishable from a proxy that set it, and
+it is honoured only when exactly one such header line is present. More
+than one means something appended rather than overwrote, which makes the
+first of them whatever the client sent.
+
+Every `X-Forwarded-For` line is joined before the walk, in order, for the
+same reason. RFC 9110 §5.3 makes repeated field lines equivalent to one
+comma-joined list, but reading only the first would let a client that
+sends its own header, to a proxy that adds a separate line rather than
+appending, put the entire walk on ground it controls.
+
+A CIDR with bits set below its prefix is rejected rather than widened.
+`10.0.0.5/8` reads like one host and means sixteen million, and this is
+the list that decides whose headers are believed; write `10.0.0.0/8` or
+`10.0.0.5/32`.
+
+### Getting the address onto the event
+
+Resolving the address is half of it. Axess attaches nothing by itself
+it cannot, since it has neither your peer socket nor your proxy set, so
+an event carries client metadata only if the route hands it over:
+
+```rust,ignore
+let client_ip = ip_from_headers_trusted(&headers, peer_addr, &trusted);
+let ctx = extract_audit_context(&headers, Some(client_ip), Some(&session));
+
+// A copy of the service that stamps `ctx` onto everything it emits.
+// Cheap: the collaborators are shared, only the context differs.
+let service = state.authn.with_audit_context(ctx);
+service.begin_login(&identifier, tenant, &session, None).await?;
+```
+
+Derive that copy per request and let it die with the request. Holding one
+in application state pins a single client's address onto every later
+event, which is worse than a blank one: the rows look complete.
+
+If a blank address should be an error rather than a silence, build with
+`AuditContextPolicy::Required`. It refuses to write an event on a route
+that attached no context at all: note that it checks the *wiring*, not
+the contents, so a context you deliberately built with `None` still
+passes. It is fail-closed, so wire every route before turning it on.
 
 ## Defending against XSS
 
@@ -275,7 +336,7 @@ calls. The defences against the remaining surface:
 
 Three failure modes recur during initial deployment.
 
-The first is a cookie that the browser refuses to send. The
+**A cookie the browser refuses to send.** The
 symptom is sessions that disappear between requests; the cause is
 almost always either `Secure=true` on an `http://` connection
 (the browser refuses to send), `SameSite=Strict` on a cross-site
@@ -283,14 +344,14 @@ navigation that should have been recognised, or a `Path` that
 does not match the request URL. Inspect the cookie's attributes
 in the browser's dev tools.
 
-The second is a fingerprint that diverges for the legitimate user.
+**A fingerprint that diverges for the legitimate user.**
 The symptom is a `Warn` log every few sessions or a `Reauth` that
 fires on every wifi-to-cellular switch. The cause is usually the
 tolerance being too strict; widen the IP prefix or relax the
 user-agent match. The right tolerance is the smallest one that
 does not produce noise on legitimate traffic.
 
-The third is the trusted-proxy configuration getting the wrong IP.
+**A trusted-proxy configuration yielding the wrong IP.**
 The symptom is a fingerprint that matches when it should not (an
 attacker successfully replaying a cookie), or that diverges when
 it should match (a legitimate user being asked to re-authenticate).

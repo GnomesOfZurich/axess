@@ -20,7 +20,7 @@ The pattern is uniform across clouds. The application has a
 validated workload identity (a JWT-SVID, a federated OIDC token, a
 GitHub Actions OIDC token). The application wants to call a cloud
 API on the workload's behalf. Instead of giving the workload a
-long-lived cloud key, the application exchanges the workload's
+long-lived cloud key, you exchange the workload's
 identity at the cloud's STS endpoint for a short-lived credential
 bound to a specific cloud role.
 
@@ -33,7 +33,7 @@ bound to a specific cloud role.
 ```
 
 The exchange happens at the application layer, server-side. The
-workload's identity token never leaves the application; the
+workload's identity token never leaves your process; the
 short-lived cloud credential is what makes the actual cloud API
 call. The benefit is that no long-lived cloud key ever sits on
 the workload's filesystem, and revocation of the workload's
@@ -46,14 +46,21 @@ The AWS adapter calls `AssumeRoleWithWebIdentity`, the STS API for
 identity federation. The configuration:
 
 ```rust,ignore
-use axess::workload::cloud_sts::{AwsStsExchanger, AwsStsConfig};
+use axess_core::workload::outbound::cloud_sts::aws::{
+    AssumeRoleWithWebIdentityRequest, AwsStsClient,
+};
 
-let exchanger = AwsStsExchanger::new(AwsStsConfig {
+// Defaults to the global endpoint; `with_endpoint` pins a regional one
+// (or LocalStack), `with_http_client` supplies timeouts or outbound mTLS.
+let client = AwsStsClient::new();
+
+let request = AssumeRoleWithWebIdentityRequest {
     role_arn: "arn:aws:iam::123456789012:role/billing-api-prod".into(),
-    region: "eu-west-1".into(),
-    session_duration: Duration::from_secs(900),  // 15 minutes
-    role_session_name_strategy: SessionNameStrategy::WorkloadId,
-});
+    role_session_name: "billing-api".into(),
+    web_identity_token: token,          // the workload's own JWT
+    duration_seconds: Some(900),        // 15 minutes
+    ..Default::default()
+};
 ```
 
 The `role_arn` is the AWS role the credential will assume. The
@@ -76,11 +83,11 @@ deployments with specific compliance requirements.
 
 ```rust,ignore
 async fn call_aws(
-    exchanger: &AwsStsExchanger,
+    client: &AwsStsClient,
     principal: &Principal,
 ) -> Result<(), Error> {
-    let creds = exchanger
-        .exchange(principal_to_token(principal))
+    let creds = client
+        .assume_role_with_web_identity(&request_for(principal))
         .await?;
 
     let s3_client = aws_sdk_s3::Client::from_conf(
@@ -100,20 +107,24 @@ endpoint, which exchanges a token from an external identity
 provider for a Google Cloud access token. The configuration:
 
 ```rust,ignore
-use axess::workload::cloud_sts::{GcpWifExchanger, GcpWifConfig};
+use axess_core::workload::outbound::cloud_sts::gcp::{
+    GcpStsClient, WorkloadIdentityPoolProvider,
+};
 
-let exchanger = GcpWifExchanger::new(GcpWifConfig {
-    workload_identity_pool: "projects/123/locations/global/workloadIdentityPools/axess".into(),
-    workload_identity_provider: "external-oidc".into(),
-    target_principal: "billing-api@project.iam.gserviceaccount.com".into(),
-    scopes: vec!["https://www.googleapis.com/auth/cloud-platform".into()],
-});
+let provider = WorkloadIdentityPoolProvider::new(
+    "123",                  // project number
+    "global",               // location
+    "axess",                // pool id
+    "external-oidc",        // provider id
+);
+let client = GcpStsClient::new();
+let federated = client.exchange_token(&provider, token).await?;
 ```
 
 The `workload_identity_pool` and `workload_identity_provider` name
 the GCP-side configuration that maps external identities to GCP
 identities. The pool and provider are configured on the GCP side
-through the `gcloud` CLI or Terraform; the application's adapter
+through the `gcloud` CLI or Terraform; your adapter
 references them by name.
 
 The `target_principal` is the GCP service account the exchange
@@ -122,7 +133,7 @@ GCP resources the resulting credential can access.
 
 The `scopes` list bounds what the credential can be used for. The
 narrowest possible scope is the recommendation; `cloud-platform`
-is the broadest and should be used only when the application
+is the broadest and should be used only when you
 genuinely needs unrestricted access.
 
 ## Azure Federated Identity Credentials
@@ -132,13 +143,18 @@ access token through the FIC (Federated Identity Credential)
 mechanism. The configuration:
 
 ```rust,ignore
-use axess::workload::cloud_sts::{AzureFicExchanger, AzureFicConfig};
+use axess_core::workload::outbound::cloud_sts::azure::{
+    AzureFicClient, AzureFicRequest,
+};
 
-let exchanger = AzureFicExchanger::new(AzureFicConfig {
-    tenant_id: "00000000-0000-0000-0000-000000000000".into(),
-    client_id: "11111111-1111-1111-1111-111111111111".into(),
-    scope: "https://storage.azure.com/.default".into(),
-});
+let client = AzureFicClient::new(
+    "00000000-0000-0000-0000-000000000000",   // Azure AD tenant
+    "11111111-1111-1111-1111-111111111111",   // managed identity / app id
+);
+
+let request = AzureFicRequest::new(token)
+    .scopes(["https://storage.azure.com/.default"]);
+let response = client.acquire_token(&request).await?;
 ```
 
 The `tenant_id` is the Azure AD tenant. The `client_id` is the
@@ -148,7 +164,7 @@ identity determines which external tokens may exchange for it.
 
 The `scope` is the Azure AD resource the resulting token is bound
 to. Azure tokens are audience-scoped; a token for storage cannot
-be used against Key Vault. List the scopes the application needs;
+be used against Key Vault. List the scopes you need;
 use the `.default` suffix to inherit the managed identity's
 configured permissions.
 
@@ -178,7 +194,7 @@ shape with a per-workload cache (a `ClockTtlCache` from
 
 The expiry handling needs care. A credential that expires
 mid-call produces an authentication error from the cloud SDK,
-which the application catches and translates into a re-exchange.
+which you catch and translate into a re-exchange.
 The cache wraps the expiry check; calls that get a near-expired
 credential refresh proactively.
 
@@ -190,9 +206,9 @@ two are independent; they share the workload identity as input
 but produce cloud-specific credentials as output.
 
 The pattern composes cleanly. The application has a workload
-principal; it has one `AwsStsExchanger` and one `GcpWifExchanger`
-in scope; calls to AWS go through the AWS exchanger, calls to
-GCP go through the GCP exchanger. No cross-cloud coupling.
+principal; it has an `AwsStsClient`, a `GcpStsClient` and an
+`AzureFicClient` as it needs them; calls to each cloud go through that
+cloud's client. No cross-cloud coupling.
 
 ## Threat model
 
@@ -203,19 +219,19 @@ actions.
 
 The remaining attack surfaces:
 
-The first is the workload identity itself. A compromised workload
+**The workload identity itself.** A compromised workload
 identity can be exchanged for fresh cloud credentials at any
 time. The defence is to keep the workload identity short-lived
 (SPIRE rotates SVIDs every few hours, GitHub OIDC tokens are
 single-use), so a compromised identity has a bounded lifetime.
 
-The second is the STS endpoint. A compromised STS issues
+**The STS endpoint.** A compromised STS issues
 compromised credentials. The defence is operational: the cloud
-provider secures their STS; the application validates the
+provider secures their STS; you validate the
 returned credentials by their structure (signature, format) but
 cannot independently verify that the STS itself is honest.
 
-The third is the role's trust policy. A misconfigured trust
+**The role's trust policy.** A misconfigured trust
 policy allows any workload to assume the role, defeating the
 identity-based restriction. The defence is to review trust
 policies carefully at deployment time; the principle of least
@@ -223,11 +239,13 @@ privilege applies.
 
 ## Audit
 
-Each exchange produces an audit event (a
-`DelegatedTokenExchanged` event in the axess audit pipeline) and
-a cloud-side audit event (CloudTrail for AWS, Cloud Audit Logs
-for GCP, Activity Log for Azure). The two together give a
-complete picture: what identity was exchanged, when, for what
+Each exchange produces a cloud-side audit event: CloudTrail for AWS,
+Cloud Audit Logs for GCP, Activity Log for Azure. **Axess emits
+nothing of its own here.** These clients are primitives you call
+directly, with no audit sink on the call path, and the event
+vocabulary has no name reserved for a token exchange. If you want the
+axess-side half of the picture, record it yourself where you perform
+the exchange, so you have: what identity was exchanged, when, for what
 role, and what cloud actions the resulting credential performed.
 
 The retention configuration is in *Audit pipeline*. The

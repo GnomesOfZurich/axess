@@ -61,6 +61,7 @@ where
 
         // 1. Validate tenant exists and is active.
         let tenant = self
+            .inner
             .identity
             .find_tenant(tenant_identifier)
             .await
@@ -74,6 +75,7 @@ where
 
         // 2. Check if user already exists.
         let existing = self
+            .inner
             .identity
             .find_user(&user.identifier, &tenant.id)
             .await
@@ -95,7 +97,7 @@ where
                 existing_user.status,
                 crate::authn::types::EntityState::Candidate
             ) {
-                let now = self.clock.now();
+                let now = self.inner.clock.now();
                 let workflow = WorkflowState::new(WorkflowKind::Signup, 1, now);
                 session
                     .set_pending_workflow(existing_user.id, existing_user.tenant_id, workflow)
@@ -114,13 +116,14 @@ where
         let user_id = user.id;
         let tenant_id = tenant.id;
 
-        self.identity
+        self.inner
+            .identity
             .create_user(user)
             .await
             .map_err(AuthnError::Store)?;
 
         // 4. Transition session to PendingWorkflow(Signup).
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         let workflow = WorkflowState::new(WorkflowKind::Signup, 1, now);
         session
             .set_pending_workflow(user_id, tenant_id, workflow)
@@ -132,7 +135,7 @@ where
                 .attributed_to(&user_id, &tenant_id),
             now,
         )
-        .await;
+        .await?;
 
         Ok(SignupOutcome::Started)
     }
@@ -158,13 +161,14 @@ where
         };
 
         // Activate the user.
-        self.identity
+        self.inner
+            .identity
             .activate_user(&user_id)
             .await
             .map_err(AuthnError::Store)?;
 
         // Transition to Authenticated.
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         session.set_authenticated(user_id, tenant_id, now).await;
 
         // Register in session registry if configured.
@@ -173,7 +177,7 @@ where
         // Authenticated cookie that no `invalidate_user` call could ever
         // evict, because the registry never learnt about it.
         let sid = session.session_id().await;
-        if let Some(reg) = &self.registry
+        if let Some(reg) = &self.inner.registry
             && !reg.register(&user_id, &sid).await
         {
             tracing::error!(
@@ -192,7 +196,7 @@ where
                 .with_session(sid),
             now,
         )
-        .await;
+        .await?;
 
         Ok(())
     }

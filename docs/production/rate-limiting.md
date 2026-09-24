@@ -41,7 +41,7 @@ the aggregate volume is the giveaway. The rate limiter keyed by
 session id catches the pattern.
 
 Workload misbehaviour. A workload that for some reason has
-entered a tight loop calling the application's API. The
+entered a tight loop calling your API. The
 authentication side validates the workload token on each request;
 the rate limiter catches the runaway pattern before it overwhelms
 the service.
@@ -76,11 +76,18 @@ burst of more than `max_requests` requests within a short
 interval consumes all the tokens; subsequent requests are
 rejected until enough tokens have regenerated.
 
-The state of the buckets lives in memory by default
-(`BucketStore::InMemory`). For multi-instance deployments where
-the same caller can reach any instance, the rate limit needs to
-be aggregated across instances; `BucketStore::Valkey { client }`
-shifts the state to a shared Valkey instance.
+The buckets live in this process, in a `DashMap`, and there is no
+option to put them anywhere else. That is a deliberate scope
+line rather than a missing backend: with N instances behind a load
+balancer, each one enforces the configured limit independently, so the
+effective limit is N times what you configured, and a caller that
+spreads its requests gets N times the budget.
+
+Distributed rate limiting belongs at the gateway, against a shared
+store (Valkey, Redis, or whatever your ingress already offers). Use
+this layer for the per-process defence: the burst that would exhaust a
+connection pool, the per-username budget that keeps a lockout attack
+from succeeding. Set the volumetric limit upstream.
 
 ## Key extraction
 
@@ -89,34 +96,43 @@ The key is what the rate limiter counts against. The
 
 ```rust,ignore
 pub enum KeyExtractor {
-    PeerIp,                              // request source IP (read through trusted-proxy)
-    SessionId,                           // present session id
-    UserId,                              // authenticated user
-    TenantId,                            // authenticated tenant
-    WorkloadId,                          // authenticated workload
-    Custom(Arc<dyn KeyExtractorFn>),     // application-supplied
-    Composite(Vec<KeyExtractor>),        // multi-key (one bucket per combination)
+    ForwardedIp,       // X-Real-IP, then X-Forwarded-For; trusted proxy only
+    PeerIp,            // SocketAddr from ConnectInfo. The default.
+    UserId,            // RateLimitUserId request extension
+    TenantId,          // RateLimitTenantId request extension
+    LoginIdentifier,   // RateLimitLoginIdentifier request extension
+    Header(String),    // an arbitrary header, e.g. an API key
 }
 ```
 
+The three extension-backed variants read a value you put
+into the request extensions, which is what makes them composable with
+any authentication scheme: axess does not need to know how you
+established the user, only that you named it. Set the extension in a
+layer that runs before the rate limiter.
+
+There is no custom-closure variant and no composite. One limiter keys
+on one thing; layering two concerns means stacking two
+`RateLimitLayer`s, which is also what makes each one's configured
+budget legible on its own.
+
 The choice of key determines which attack the limiter catches.
-`PeerIp` catches single-source attacks; `SessionId` catches
-session-replay attacks; `UserId` catches per-user runaway loops;
-`TenantId` catches per-tenant runaway (which can be a noisy
-neighbour rather than an attack).
+`PeerIp` catches single-source volumetric attacks. `ForwardedIp` does
+the same behind a reverse proxy, and only behind one, because a client that
+can reach your service directly can forge `X-Forwarded-For` and mint
+itself a fresh bucket per request. `UserId` catches a per-user runaway
+loop, `TenantId` a per-tenant one, which is as often a noisy neighbour
+as an attack.
 
-The `Composite` choice creates one bucket per combination of
-the named keys. A rate limit keyed by `(PeerIp, UserId)` lets a
-single legitimate user from one IP do their normal work while
-catching a single attacker IP that is rotating through many
-users (the composite key is unique per `(ip, user)` pair, so the
-attacker exhausts each pair's bucket once per user, but the
-total request rate stays bounded).
-
-The `Custom` choice is the escape hatch for keys axess does not
-know about: the OAuth client id, a custom request header, the
-authenticated session's tenant slug. The application provides
-the extraction function; the layer uses it to derive the key.
+`LoginIdentifier` is the one to read twice. Per-IP limiting alone does
+not defend a login route: an attacker spreading attempts across many
+IPs stays under every per-IP budget while hammering one username, and
+with a lockout policy in place that is a denial of service against that
+account rather than a break-in attempt. Keying on the submitted
+identifier, normalised to lowercase so `Alice` and `alice` share a
+bucket, bounds the attempts per account regardless of where they came
+from. Put a `LoginIdentifier` limiter on every login-class route, and
+layer a `PeerIp` one beside it for the volumetric case.
 
 ## Per-endpoint rate limits
 
@@ -192,7 +208,7 @@ refreshes every hour should have a rate limit of a few refreshes
 per hour per session id; an attacker who steals a session cannot
 extract value through rapid refresh.
 
-For data endpoints: matched to the application's expected use
+For data endpoints: matched to your expected use
 pattern. An API for human-driven dashboards sees a few requests
 per minute per session; an API for programmatic clients sees
 hundreds per second per workload. The pattern is
@@ -243,10 +259,10 @@ A rate of 429s spread across many IPs, matching legitimate user
 patterns (residential ASNs from served countries, mixed mobile
 and home connections), suggests misconfiguration.
 
-The audit events the rate limiter produces (a `RateLimitRejected`
-event per drop) carry the source IP, the endpoint, and the
-timestamp; SIEM queries against these distinguish the patterns
-quickly.
+The rate limiter emits no audit event. It rejects the request and
+returns, and nothing reaches the audit trail, so distinguishing these
+patterns means logging the rejection yourself with the source IP and
+the endpoint at the point you install the middleware.
 
 ## Per-tenant rate limits
 
@@ -277,7 +293,7 @@ ratio of rejected to evaluated is the reject rate; below 0.1%
 typically means the limit is set well, above 1% suggests either
 attack or misconfiguration.
 
-The `AuthnMetrics` implementation is the application's; it
+The `AuthnMetrics` implementation is yours; it
 typically routes to Prometheus, OpenTelemetry, or whatever
 metrics system the deployment uses. The
 [`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite)
@@ -303,7 +319,7 @@ deployment that has lockout but no rate limiting is vulnerable
 to high-volume attacks that distribute across many users. Both
 together cover both attack shapes.
 
-## What this enables
+## Where the limiter sits in the stack
 
 The rate limiter is the operational layer that sits between
 "the request was sent" and "the authentication logic runs." A
@@ -315,8 +331,8 @@ that complements the credential-pattern defence of lockout.
 ## Further reading
 
 *Multi-tenancy* covers the lockout policy that pairs with the
-rate limit. *Audit events* catalogues the `RateLimitRejected`
-event the layer emits. *Cookies, fingerprinting, hijack
+rate limit. *Audit events* covers the trail the rate limiter does not
+write to. *Cookies, fingerprinting, hijack
 detection* covers the trusted-proxy configuration that
 determines how `PeerIp` reads the source IP. *Operations
 runbook* covers the metrics dashboards and the SIEM rules that

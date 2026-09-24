@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-local-idp"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -11,10 +11,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.5.1", features = ["local-idp"] }
+axess = { path = "../../axess", version = "=0.6.0", features = ["local-idp", "jwt-rust-crypto"] }
 axum = { version = "0.8.9", features = ["json"] }
 chrono = "0.4.45"
-jsonwebtoken = "11.0.0"
+jsonwebtoken = "11.1.0"
 rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

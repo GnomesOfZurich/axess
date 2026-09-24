@@ -102,7 +102,9 @@ async fn suspend_invalidates_registry_sessions() {
         .with_factor(user_scope(), password_config("pass"))
         .with_method(&uid("u1"), password_method());
     let registry = MemorySessionRegistry::new();
-    let service = AuthnService::new(identity, factors).with_registry(registry.clone());
+    let service = AuthnService::builder(identity, factors)
+        .with_registry(registry.clone())
+        .build();
     let session = test_session();
 
     service

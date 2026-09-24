@@ -44,7 +44,9 @@ async fn service_begin_registration_with_mock_returns_error() {
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_fido2(MockFido2Provider::new());
+    let service = AuthnService::builder(identity, factors)
+        .with_fido2(MockFido2Provider::new())
+        .build();
 
     let session = test_session();
     let result = service
@@ -102,7 +104,9 @@ async fn real_provider_begin_registration_stores_ceremony_state() {
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_fido2(provider);
+    let service = AuthnService::builder(identity, factors)
+        .with_fido2(provider)
+        .build();
 
     let session = test_session();
     let result = service
@@ -158,7 +162,9 @@ async fn real_provider_begin_discoverable_authentication() {
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_fido2(provider);
+    let service = AuthnService::builder(identity, factors)
+        .with_fido2(provider)
+        .build();
 
     let session = test_session();
     let result = service.begin_discoverable_login(&session).await;
@@ -192,7 +198,9 @@ async fn finish_registration_without_begin_returns_error() {
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_fido2(provider);
+    let service = AuthnService::builder(identity, factors)
+        .with_fido2(provider)
+        .build();
 
     let session = test_session();
 

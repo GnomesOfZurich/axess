@@ -428,6 +428,12 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         header.alg = state.signing_key.algorithm();
         let claims_json = build_claims_json(&self.issuer, claims);
         let key = state.signing_key.encoding_key();
+        // This is the one place axess signs rather than verifies, and
+        // `jsonwebtoken` needs a crypto provider for both. With one backend
+        // compiled in it derives its own; with two (`--all-features`, or an
+        // adopter and a dependency that chose differently) it cannot, and
+        // would panic here.
+        axess_factors::jwt::ensure_crypto_provider();
         let token = encode(&header, &claims_json, &key)
             .map_err(|e| IssuanceError::Encoding(e.to_string()))?;
 

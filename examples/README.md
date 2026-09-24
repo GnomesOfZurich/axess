@@ -66,7 +66,9 @@ client.init().await?;
 
 let session_store = ValkeySessionStore::new(client.clone(), encryption_key);
 let registry = ValkeySessionRegistry::new(client);
-let authn = AuthnService::new(identity, factors).with_registry(registry);
+let authn = AuthnService::builder(identity, factors)
+    .with_registry(registry)
+    .build();
 ```
 
 Everything else (handlers, macros, auth flow) stays the same.

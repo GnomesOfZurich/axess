@@ -10,15 +10,13 @@ homepage.workspace = true
 documentation = "https://docs.rs/axess-strings"
 readme = "README.md"
 description = """
-Short, hot-path string primitive for the axess workspace. ShortString is
-optimized for the workload of short identifiers that are hashed, compared,
-and cloned at high volume: event taxonomy tags, factor names, routing
-discriminators. The current internal representation is a placeholder
-(heap Box<str> + &'static str) suitable for getting the API contract in
-place; it will be swapped to an Umbra-style 16-byte representation in a
-follow-up commit. The public API is stable across the swap.
+Immutable short-string primitive for identifiers that are cloned, hashed
+and compared at high volume: event subject ids, taxonomy tags, key ids.
+A 24-byte value holding up to 22 bytes inline, referencing `&'static str`
+in place, and sharing anything longer through an `Arc<str>` so a clone is
+a refcount bump rather than an allocation. Contains no unsafe code.
 """
-keywords = ["string", "intern", "umbra", "short-string", "compact"]
+keywords = ["string", "identifier", "immutable", "short-string", "compact"]
 categories = ["data-structures", "no-std"]
 exclude = ["tests/", "benches/"]
 
@@ -44,5 +42,19 @@ serde = { version = "1.0.229", optional = true, default-features = false, featur
 rkyv = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+# `std` explicitly: the workspace pin is `default-features = false`, and in a
+# full-workspace build another member happens to switch `std` on, so this
+# crate's own tests compiled by accident. On its own (`cargo test -p
+# axess-strings`, and so `cargo miri test -p axess-strings`) nothing did, and
+# `serde_json` failed its own `compile_error!`.
+serde_json = { workspace = true, features = ["std"] }
+criterion = { workspace = true }
+# Benchmark-only. `benches/short_string.rs` guards the claim that decided
+# this crate's existence: above the inline cap, `CompactString::clone`
+# reallocates and copies where `ShortString::clone` bumps a refcount.
+compact_str = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "short_string"
+harness = false

@@ -46,6 +46,7 @@ where
         }
 
         let provider = self
+            .inner
             .oauth_providers
             .get(provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?

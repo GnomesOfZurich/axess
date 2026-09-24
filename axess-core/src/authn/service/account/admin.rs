@@ -114,7 +114,8 @@ where
             )
             .await?;
 
-        self.identity
+        self.inner
+            .identity
             .suspend_user(user_id, detail)
             .await
             .map_err(AuthnError::Store)?;
@@ -122,7 +123,7 @@ where
         // Invalidate all active sessions so suspended users are forced out
         // immediately, rather than staying logged in until their next request
         // happens to check account status.
-        if let Some(reg) = &self.registry {
+        if let Some(reg) = &self.inner.registry {
             reg.invalidate_user(user_id).await;
         }
 
@@ -132,7 +133,7 @@ where
             builder = builder.with_actor(actor_id);
         }
 
-        self.emit_audit(builder).await;
+        self.emit_audit(builder).await?;
 
         Ok(())
     }
@@ -204,7 +205,8 @@ where
             )
             .await?;
 
-        self.identity
+        self.inner
+            .identity
             .activate_user(user_id)
             .await
             .map_err(AuthnError::Store)?;
@@ -215,7 +217,7 @@ where
             builder = builder.with_actor(actor_id);
         }
 
-        self.emit_audit(builder).await;
+        self.emit_audit(builder).await?;
 
         Ok(())
     }
@@ -247,6 +249,7 @@ where
         action_label: &'static str,
     ) -> Result<crate::authn::types::User, AuthnError<I::Error>> {
         let user = self
+            .inner
             .identity
             .get_user(user_id)
             .await

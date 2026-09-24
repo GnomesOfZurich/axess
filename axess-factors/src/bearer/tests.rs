@@ -71,6 +71,10 @@ fn rsa_keypair() -> (Vec<u8>, JwkSet, String) {
 
 fn sign_jwt(private_der: &[u8], kid: &str, claims: &serde_json::Value) -> String {
     use jsonwebtoken::{EncodingKey, Header, encode};
+    // Signing needs a provider as much as verifying does, and under
+    // `--all-features` jsonwebtoken has no default. Verification installs one
+    // itself; a signer asks.
+    crate::jwt::ensure_crypto_provider();
     let key = EncodingKey::from_rsa_der(private_der);
     let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some(kid.to_string());

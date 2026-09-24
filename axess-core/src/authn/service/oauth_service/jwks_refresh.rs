@@ -50,8 +50,11 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// let authn = Arc::new(AuthnService::new(identity, factors)
-    ///     .with_oauth_provider("google", google_provider));
+    /// let authn = Arc::new(
+    ///     AuthnService::builder(identity, factors)
+    ///         .with_oauth_provider("google", google_provider)
+    ///         .build(),
+    /// );
     ///
     /// // Refresh JWKS every hour. Keep the handle and abort on shutdown
     /// // (or this task lives forever).
@@ -60,7 +63,7 @@ where
     /// jwks_task.abort();
     /// ```
     pub fn spawn_jwks_refresh(&self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
-        let providers: Vec<_> = self.oauth_providers.values().cloned().collect();
+        let providers: Vec<_> = self.inner.oauth_providers.values().cloned().collect();
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);

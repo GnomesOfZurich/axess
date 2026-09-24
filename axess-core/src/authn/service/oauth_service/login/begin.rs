@@ -29,6 +29,7 @@ where
         use axess_factors::oauth::{OAuthError, keys as oauth_keys};
 
         let provider = self
+            .inner
             .oauth_providers
             .get(provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?;
@@ -45,7 +46,7 @@ where
                 session.get_custom(oauth_keys::PAR_INFLIGHT).await
             && let Some(expires_at_str) = map.get("expires_at").and_then(|v| v.as_str())
             && let Ok(expires_at) = chrono::DateTime::parse_from_rfc3339(expires_at_str)
-            && self.clock.now() < expires_at.with_timezone(&chrono::Utc)
+            && self.inner.clock.now() < expires_at.with_timezone(&chrono::Utc)
         {
             tracing::warn!(
                 provider = %provider_name,
@@ -166,7 +167,10 @@ where
             .set_custom(oauth_keys::PROVIDER, str_val(provider_name.to_string()))
             .await;
         session
-            .set_custom(oauth_keys::STARTED, str_val(self.clock.now().to_rfc3339()))
+            .set_custom(
+                oauth_keys::STARTED,
+                str_val(self.inner.clock.now().to_rfc3339()),
+            )
             .await;
         if let Some(issuer) = provider_issuer {
             session
@@ -196,7 +200,7 @@ where
     ) {
         use axess_factors::oauth::types::keys as oauth_keys;
         let lifetime = ceremony_timeout.min(std::time::Duration::from_secs(600));
-        let expires_at = self.clock.now()
+        let expires_at = self.inner.clock.now()
             + chrono::Duration::from_std(lifetime).unwrap_or(chrono::Duration::seconds(90));
         let mut entry = serde_json::Map::new();
         entry.insert(

@@ -3,8 +3,12 @@
 use crate::web::app::AppState;
 use crate::web::csrf_hidden_input;
 use axess::AuthSession;
-use axess::authn::{FactorCredential, FactorKind, FactorOutcome, LoginOutcome};
+use axess::authn::{
+    FactorCredential, FactorKind, FactorOutcome, LoginOutcome, extract_audit_context,
+};
+use axess::authz::{TrustedProxies, ip_from_headers_trusted};
 use axess::csrf::CsrfToken;
+use axum::extract::ConnectInfo;
 use axum::{
     Extension, Form,
     extract::State,
@@ -55,8 +59,22 @@ pub async fn post_login(
     State(state): State<AppState>,
     session: AuthSession,
     Extension(csrf): Extension<CsrfToken>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
+    // Resolve the client address against the trusted-proxy set, then hand
+    // the service a copy of itself that stamps it onto every event the
+    // login emits. Without this the audit rows carry a null IP, which is
+    // honest but is not evidence.
+    //
+    // `loopback_only` suits this example, which is reached directly or
+    // through a same-host proxy. A deployment behind a load balancer names
+    // its egress ranges with `TrustedProxies::from_cidrs`.
+    let client_ip = ip_from_headers_trusted(&headers, peer.ip(), &TrustedProxies::loopback_only());
+    let audit_ctx = extract_audit_context(&headers, Some(client_ip), Some(&session));
+    let service = state.service.with_audit_context(audit_ctx);
+
     let tenant = form
         .tenant
         .as_deref()
@@ -67,8 +85,7 @@ pub async fn post_login(
     // Since this form submits username + password together, we skip prepare_factor
     // (it returns Ready for passwords) and call verify_factor immediately.
     // For EmailOtp or FIDO2 flows, call prepare_factor first to generate the challenge.
-    let outcome = match state
-        .service
+    let outcome = match service
         .begin_login(&form.identifier, tenant, &session, None)
         .await
     {

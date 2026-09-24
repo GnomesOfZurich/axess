@@ -32,7 +32,6 @@
 //! Test fixtures live in [`testing`](crate::testing), which derives ids deterministically
 //! from string labels over a fixed workspace test namespace.
 
-#![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

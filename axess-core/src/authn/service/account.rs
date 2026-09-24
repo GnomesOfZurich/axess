@@ -71,9 +71,9 @@ where
             // no way to evict this session; it would be authenticated but
             // un-trackable. Register first so the session is always reachable
             // by the eviction path even if subsequent steps fail.
-            if let Some(reg) = &self.registry {
+            if let Some(reg) = &self.inner.registry {
                 // Enforce concurrent session limit: evict oldest sessions.
-                if let Some(max) = self.max_sessions_per_user {
+                if let Some(max) = self.inner.max_sessions_per_user {
                     let active = reg.active_sessions(user_id).await;
                     if active.len() >= max {
                         let to_evict = active.len() - max + 1;
@@ -84,7 +84,7 @@ where
                                 evicted_session = %old_sid,
                                 "concurrent session limit reached; evicting oldest session"
                             );
-                            self.metrics.session_invalidated();
+                            self.inner.metrics.session_invalidated();
                         }
                     }
                 }
@@ -108,7 +108,7 @@ where
                 // initial status check (in `verify_factor`) and the register
                 // above; without this re-check, the just-registered session
                 // would survive the suspension as if the suspend never happened.
-                match self.identity.account_status(user_id).await {
+                match self.inner.identity.account_status(user_id).await {
                     Ok(status) if !status.allows_login() => {
                         tracing::warn!(
                             user_id = %user_id,
@@ -120,7 +120,7 @@ where
                         // Wipe the in-memory session state so the response cookie
                         // does not ship a Set-Cookie for an authenticated session.
                         session.clear().await;
-                        self.metrics.account_locked();
+                        self.inner.metrics.account_locked();
                         let until =
                             if let crate::authn::types::EntityState::Suspended(detail) = &status {
                                 detail.until
@@ -153,7 +153,7 @@ where
             // the next successful login will reset it. The alternative (fail
             // the request) would leave behind an authenticated registered
             // session with no way to reach it through the response.
-            if let Err(e) = self.identity.reset_failed_attempts(user_id).await {
+            if let Err(e) = self.inner.identity.reset_failed_attempts(user_id).await {
                 tracing::warn!(
                     user_id = %user_id,
                     error = %e,
@@ -168,18 +168,19 @@ where
             for kind in &factors_completed {
                 event_builder = event_builder.with_factors_completed(kind.clone());
             }
-            self.emit_audit(event_builder).await;
+            self.emit_audit(event_builder).await?;
 
             // Record last login time for compliance/audit.
             if let Err(e) = self
+                .inner
                 .identity
-                .record_last_login(user_id, self.clock.now())
+                .record_last_login(user_id, self.inner.clock.now())
                 .await
             {
                 tracing::error!(error = %e, "failed to record last login");
             }
 
-            self.metrics.auth_success();
+            self.inner.metrics.auth_success();
             return Ok(FactorOutcome::Authenticated);
         }
 

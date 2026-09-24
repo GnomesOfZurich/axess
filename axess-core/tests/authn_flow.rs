@@ -87,7 +87,9 @@ async fn password_totp_login_flow() {
         .with_method(&uid("u1"), password_totp_method());
 
     let clock = MockClock::now();
-    let service = AuthnService::new(identity, factors).with_clock(clock.clone());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build();
     let session = test_session();
 
     let outcome = service
@@ -286,7 +288,9 @@ async fn totp_replay_rejected() {
         .with_method(&uid("u1"), password_totp_method());
 
     let clock = MockClock::now();
-    let service = AuthnService::new(identity, factors).with_clock(clock.clone());
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build();
 
     // First login succeeds.
     let s1 = test_session();
@@ -448,7 +452,9 @@ async fn forced_logout_via_registry() {
         .with_method(&uid("u1"), password_method());
 
     let registry = MemorySessionRegistry::new();
-    let service = AuthnService::new(identity, factors).with_registry(registry.clone());
+    let service = AuthnService::builder(identity, factors)
+        .with_registry(registry.clone())
+        .build();
     let session = test_session();
 
     service
@@ -497,9 +503,10 @@ async fn email_otp_prepare_and_verify() {
 
     let clock = MockClock::now();
     let rng = MockRng::new(42);
-    let service = AuthnService::new(identity, factors)
+    let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
-        .with_rng(rng);
+        .with_rng(rng)
+        .build();
     let session = test_session();
 
     service
@@ -543,9 +550,10 @@ async fn email_otp_cooldown_returns_already_sent() {
         .with_method(&uid("u1"), email_method);
 
     let clock = MockClock::now();
-    let service = AuthnService::new(identity, factors)
+    let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
-        .with_rng(MockRng::new(42));
+        .with_rng(MockRng::new(42))
+        .build();
     let session = test_session();
 
     service
@@ -591,9 +599,10 @@ async fn email_otp_expired_code_rejected() {
         .with_method(&uid("u1"), email_method);
 
     let clock = MockClock::now();
-    let service = AuthnService::new(identity, factors)
+    let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
-        .with_rng(MockRng::new(42));
+        .with_rng(MockRng::new(42))
+        .build();
     let session = test_session();
 
     service

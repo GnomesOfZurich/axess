@@ -31,7 +31,7 @@ proves possession.
 
 Registration is the more involved of the two because it is where the
 relying-party configuration matters. The server starts the ceremony
-by calling `Fido2Provider::begin_registration`, which returns a
+by calling `Fido2Provider::start_registration`, which returns a
 `CreationChallengeResponse`. The handler serialises that to JSON and
 returns it to the browser, which calls
 `navigator.credentials.create()` with the JSON deserialised. The
@@ -44,7 +44,7 @@ to the factor store under the user's scope, indexed by the credential
 id.
 
 Authentication mirrors registration. The server calls
-`Fido2Provider::begin_authentication`, which returns a
+`Fido2Provider::start_authentication`, which returns a
 `RequestChallengeResponse` listing the credential ids the user has
 registered. The browser calls `navigator.credentials.get()` with the
 serialised challenge. The browser produces a
@@ -205,16 +205,16 @@ stuffing is defeated because the credential is unique to the
 relying party. Server-side breach is defeated because what is
 stored is a public key, not a secret.
 
-The remaining attack surface is:
+Three things remain in the attack surface.
 
-The first is a compromised endpoint. An attacker with full control
+**A compromised endpoint.** An attacker with full control
 of the user's device can ask the authenticator to perform any
 authentication the device permits. The defence here is
 user-verification: the authenticator must prove the user is
 present (biometric or PIN). For a deployment where this matters,
 `user_verification: Required` is non-negotiable.
 
-The second is account recovery. A user who loses their passkey
+**Account recovery.** A user who loses their passkey
 needs to recover access; the recovery path becomes the weakest
 link in the chain. The recommendation is to enrol at least two
 passkeys (a primary on the phone, a backup on a hardware key, say),
@@ -223,7 +223,7 @@ identity verification rather than a password-reset email. The
 recovery flow gets attacked because the primary login is robust;
 make sure the recovery is at least as strong.
 
-The third is sync-fabric credentials. A passkey synced through
+**Sync-fabric credentials.** A passkey synced through
 Apple iCloud Keychain, Google Password Manager, or 1Password is
 available on every device the user has signed into that sync
 fabric. This is what makes passkeys usable; it also means a

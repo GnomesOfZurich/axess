@@ -3,6 +3,7 @@
 //! Use the builder methods to pre-load users, tenants, and factor configs before
 //! running tests. The mocks are fully thread-safe (`Arc<DashMap<…>>`).
 
+use crate::authn::store::AuditOutcome;
 use crate::authn::{
     event::AuthEvent,
     factor::{FactorConfig, FactorKind},
@@ -61,6 +62,15 @@ pub struct MockIdentityStore {
     /// counter-store outage to assert the caller does not propagate it as
     /// `Err(Store)` (which would leak timing + bypass lockout).
     fail_record_failed_attempt: Arc<std::sync::atomic::AtomicBool>,
+    /// Audit-outage test hook: when `true`, [`record_event`](IdentityAuthnLog::record_event)
+    /// returns [`MockStoreError::NotFound`] without storing. Models an
+    /// audit-store outage, which the service must surface as
+    /// `Err(Store)` rather than proceeding unrecorded, and must surface
+    /// identically for a known and an unknown identifier.
+    fail_record_event: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, `record_event` reports `AuditOutcome::Shed` and stores
+    /// nothing: a sink protecting its storage, not a broken one.
+    shed_record_event: Arc<std::sync::atomic::AtomicBool>,
     /// Password history per user: `user_id -> Vec<hash>`.
     password_history: Arc<DashMap<String, Vec<String>>>,
     /// Active password reset tokens: `user_id -> (token_hash, expires_at)`.
@@ -89,6 +99,8 @@ impl MockIdentityStore {
             default_tenant: None,
             lockout_policy: LockoutPolicy::default(),
             fail_record_failed_attempt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_record_event: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shed_record_event: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             password_history: Default::default(),
             reset_tokens: Default::default(),
             password_rules: Default::default(),
@@ -116,6 +128,37 @@ impl MockIdentityStore {
     /// Disarm the counter-outage failure mode.
     pub fn disarm_record_failed_attempt_failure(&self) {
         self.fail_record_failed_attempt
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arm the audit-outage failure mode: subsequent `record_event` calls
+    /// return `Err(MockStoreError::NotFound)` without storing the event.
+    pub fn arm_record_event_failure(&self) {
+        self.fail_record_event
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Disarm the audit-outage failure mode.
+    pub fn disarm_record_event_failure(&self) {
+        self.fail_record_event
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Arm load-shedding: subsequent `record_event` calls store nothing
+    /// and report [`AuditOutcome::Shed`].
+    ///
+    /// Distinct from
+    /// [`arm_record_event_failure`](Self::arm_record_event_failure), and
+    /// the distinction is the point: a shed event must not fail the flow,
+    /// an outage must.
+    pub fn arm_record_event_shedding(&self) {
+        self.shed_record_event
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Disarm load-shedding.
+    pub fn disarm_record_event_shedding(&self) {
+        self.shed_record_event
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -227,9 +270,21 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
 }
 
 impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
-    async fn record_event(&self, event: AuthEvent) -> Result<(), Self::Error> {
+    async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
+        if self
+            .fail_record_event
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(MockStoreError::NotFound);
+        }
+        if self
+            .shed_record_event
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(AuditOutcome::Shed);
+        }
         self.events.lock().unwrap().push(event);
-        Ok(())
+        Ok(AuditOutcome::Recorded)
     }
 
     async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
@@ -294,55 +349,6 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
             .ok_or(MockStoreError::NotFound)?;
         entry.status = EntityState::Suspended(detail);
         Ok(())
-    }
-
-    async fn record_password_hash(&self, user_id: &UserId, hash: &str) -> Result<(), Self::Error> {
-        self.password_history
-            .entry(user_id.to_string())
-            .or_default()
-            .push(hash.to_string());
-        Ok(())
-    }
-
-    async fn password_history(
-        &self,
-        user_id: &UserId,
-        count: usize,
-    ) -> Result<Vec<String>, Self::Error> {
-        Ok(self
-            .password_history
-            .get(user_id.to_string().as_str())
-            .map(|hashes| hashes.iter().rev().take(count).cloned().collect())
-            .unwrap_or_default())
-    }
-
-    async fn store_reset_token(
-        &self,
-        user_id: &UserId,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Self::Error> {
-        self.reset_tokens
-            .insert(user_id.to_string(), (token_hash.to_string(), expires_at));
-        Ok(())
-    }
-
-    async fn verify_reset_token(
-        &self,
-        user_id: &UserId,
-        token_hash: &str,
-    ) -> Result<bool, Self::Error> {
-        let key = user_id.to_string();
-        let Some(entry) = self.reset_tokens.get(key.as_str()) else {
-            return Ok(false);
-        };
-        let (stored_hash, expires_at) = entry.value().clone();
-        drop(entry);
-        if expires_at <= chrono::Utc::now() || stored_hash != token_hash {
-            return Ok(false);
-        }
-        self.reset_tokens.remove(key.as_str());
-        Ok(true)
     }
 }
 
@@ -606,4 +612,57 @@ pub fn make_password_service(
         );
 
     AuthnService::new(identity, factors)
+}
+
+impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
+    async fn store_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Self::Error> {
+        self.reset_tokens
+            .insert(user_id.to_string(), (token_hash.to_string(), expires_at));
+        Ok(())
+    }
+
+    async fn verify_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+    ) -> Result<bool, Self::Error> {
+        let key = user_id.to_string();
+        let Some(entry) = self.reset_tokens.get(key.as_str()) else {
+            return Ok(false);
+        };
+        let (stored_hash, expires_at) = entry.value().clone();
+        drop(entry);
+        if expires_at <= chrono::Utc::now() || stored_hash != token_hash {
+            return Ok(false);
+        }
+        self.reset_tokens.remove(key.as_str());
+        Ok(true)
+    }
+}
+
+impl crate::authn::store::IdentityPasswordHistory for MockIdentityStore {
+    async fn record_password_hash(&self, user_id: &UserId, hash: &str) -> Result<(), Self::Error> {
+        self.password_history
+            .entry(user_id.to_string())
+            .or_default()
+            .push(hash.to_string());
+        Ok(())
+    }
+
+    async fn password_history(
+        &self,
+        user_id: &UserId,
+        count: usize,
+    ) -> Result<Vec<String>, Self::Error> {
+        Ok(self
+            .password_history
+            .get(user_id.to_string().as_str())
+            .map(|hashes| hashes.iter().rev().take(count).cloned().collect())
+            .unwrap_or_default())
+    }
 }

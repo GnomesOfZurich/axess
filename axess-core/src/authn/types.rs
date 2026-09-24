@@ -341,6 +341,40 @@ pub struct ScopeColumns {
     pub user_id: Option<UserId>,
 }
 
+/// What to do when the failed-attempt counter store is unavailable.
+///
+/// [`IdentityAuthnLog::record_failed_attempt`](super::store::IdentityAuthnLog::record_failed_attempt)
+/// can fail independently of the reads that got the login this far: the
+/// read-replica split this library encourages puts reads on a replica and
+/// this write on the primary, so a primary outage leaves logins working and
+/// the counter dead. While that lasts, the count never rises and
+/// `max_attempts` is never reached.
+///
+/// Neither choice below changes the response an attacker sees for a
+/// *nonexistent* user: those are rejected at `begin_login` with timing
+/// equalization and never reach the counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CounterUnavailable {
+    /// Treat the attempt as locked. Brute force stays bounded during the
+    /// outage; a user who mistypes their password is told they are locked
+    /// and can retry once `duration` elapses. The default, because an
+    /// authentication library should fail closed.
+    ///
+    /// Note the interaction with `duration: None`: an indefinite lockout
+    /// plus a persistently broken counter store needs an administrator to
+    /// clear each affected account. Deployments running indefinite lockouts
+    /// should either monitor [`AuthnMetrics::factor_counter_store_outage`](crate::metrics::AuthnMetrics::factor_counter_store_outage)
+    /// or choose [`Allow`](Self::Allow) knowingly.
+    #[default]
+    Lock,
+    /// Treat the attempt as an ordinary failure. Logins keep working and
+    /// lockout is disabled for the duration of the outage, which is an
+    /// unbounded brute-force window precisely when monitoring is degraded.
+    /// Choose this only with a compensating control, such as a
+    /// `KeyExtractor::LoginIdentifier` rate limiter in front of the route.
+    Allow,
+}
+
 /// Lockout policy configuration.
 ///
 /// Applied when verifying credentials to prevent brute-force attacks.
@@ -357,6 +391,9 @@ pub struct LockoutPolicy {
     /// `max_attempts - 1` times today and once tomorrow gets locked, even
     /// though the failures are unrelated. Default: 1 hour.
     pub attempt_window: Duration,
+    /// What to do when the counter store itself is unavailable.
+    /// Default: [`CounterUnavailable::Lock`].
+    pub on_counter_unavailable: CounterUnavailable,
 }
 
 impl Default for LockoutPolicy {
@@ -365,6 +402,7 @@ impl Default for LockoutPolicy {
             max_attempts: 5,
             duration: Some(Duration::from_secs(15 * 60)),
             attempt_window: Duration::from_secs(60 * 60),
+            on_counter_unavailable: CounterUnavailable::Lock,
         }
     }
 }

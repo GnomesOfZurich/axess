@@ -43,9 +43,10 @@ let session_layer = SessionLayer::new(store, signing_key)
     .with_ttl(Duration::from_secs(86400));
 
 let authn = Arc::new(
-    AuthnService::new(identity_store, factor_store)
+    AuthnService::builder(identity_store, factor_store)
         .with_metrics(my_metrics)
-        .with_registry(session_registry),
+        .with_registry(session_registry)
+        .build(),
 );
 ```
 

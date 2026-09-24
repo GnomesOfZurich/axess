@@ -5,7 +5,7 @@ a check scattered across handlers, expressed in code, written by
 whoever happened to be in the file at the time, with no shared
 schema and no way to review the policy as a whole. The pattern works
 for small applications and fails for everything else, because the
-authorisation logic is the part of the application that needs the
+authorisation logic is the part of your system that needs the
 most review and is also the part most likely to drift.
 
 [Cedar](https://cedarpolicy.com/) is a policy language designed for
@@ -15,7 +15,7 @@ ABAC in one set of rules. Axess loads a Cedar policy set at startup,
 validates it against a schema, and exposes per-request evaluation
 through a small typed interface. This chapter covers the lifecycle:
 loading, validation, the per-request evaluator, the contract with
-the application's data layer, and the error modes.
+your data layer, and the error modes.
 
 The feature flag is `authz` (on by default in the `axess` facade).
 
@@ -30,17 +30,17 @@ constructs a `PolicyStore` from one or more policy files, validates
 the parsed policies against a schema, and produces an `AuthzStore`
 that holds the result. A load failure (a malformed policy, a type
 mismatch against the schema, an action that references an
-undefined entity) is a startup failure: the application refuses to
+undefined entity) is a startup failure: the process refuses to
 start. The defence is structural: there is no path to production
-with a broken policy file because the application refuses to come
+with a broken policy file, because the process refuses to come
 up.
 
 The evaluate phase happens once per authorisation check. The
 application constructs an `AuthzSession` from the `AuthzStore`, a
 `Principal` (typically extracted from the session or from a
 workload-identity resolver), an `AuthzEntityProvider` that supplies
-the application's entity graph for this request, and a context
-(MFA status, IP address, the application's custom attributes). The
+your entity graph for this request, and a context
+(MFA status, IP address, your custom attributes). The
 session offers two verbs: `require` (allow or deny, returning an
 error on deny) and `decide` (a typed `AuthzDecision`). The
 evaluation is cheap, predictable, and deterministic.
@@ -86,10 +86,10 @@ gets caught because the schema declares `age` as a number and the
 literal is a string).
 
 The schema is its own discipline. Writing a schema that accurately
-describes the application's entities is the hardest part of a
+describes your entities is the hardest part of a
 Cedar integration. The schema names the principal types (`User`,
 `Workload`, `Role`, `Group`), the action types (`read`, `write`,
-`administer`), the resource types (the application's domain
+`administer`), the resource types (your domain
 objects), and the parent relationships (a `User` is in `Group`s,
 which are in `Role`s, which permit `Action`s). The Cedar
 documentation covers schema authoring in detail; the chapter here
@@ -101,174 +101,66 @@ The `AuthzSession` is constructed per request and lives only as
 long as the request:
 
 ```rust,ignore
-let session: AuthzSession = authz_store.session()
-    .with_principal(principal)
-    .with_entity_provider(&app.entity_provider)
-    .with_context(StandardRequestContext::from_request(&request))
-    .build();
+// One `AuthzStore` for the process, built from the policy set, the
+// schema and your entity provider. It is held in an `Arc`.
+let session = authz_store.for_user_id_with_context(
+    &user_id.to_string(),
+    StandardRequestContext::new(mfa_verified, client_ip),
+)?;
 
-match session.decide(
-    Action::View,
-    ResourceUid::new("Document", "doc-123"),
-).await {
-    Ok(AuthzDecision::Allow) => proceed(),
-    Ok(AuthzDecision::Deny) => render_forbidden(),
-    Err(e) => render_error(e),
+if session.is_permitted("View", &doc_id).await {
+    proceed()
+} else {
+    render_forbidden()
 }
 ```
 
-The `with_principal` call binds the caller. The principal carries
-the user id, the tenant id, the factors completed, and the
-authentication time. Cedar policies can match on any of these.
+`for_user_id` binds the caller. It turns the user id into the Cedar
+`User` UID your schema declares, and the session carries that UID for
+every check it makes. Use `for_user_id_with_context` when policies need
+request attributes; `for_user_id` alone gives an empty Cedar context.
 
-The `with_entity_provider` call binds the application's data
-layer. The entity provider is the application-specific code that
-loads the relevant entities (the user record, their group
-memberships, the resource being accessed, its parents) for the
-evaluation. The provider returns a Cedar entity graph; the session
-holds it for the duration of the evaluation. The next chapter,
-*Entity providers and request context*, covers the provider
-contract in detail.
+The entity provider is bound to the *store*, not the session, because
+it is process-wide application code rather than per-request state. It
+is what loads the relevant entities (the user record, their group
+memberships, the resource being accessed, its parents) for each
+evaluation. The next chapter, *Entity providers and request context*,
+covers the contract in detail.
 
-The `with_context` call binds the contextual attributes. The
-`StandardRequestContext` covers the common cases: MFA status, IP
-address, the time of the request. Applications can extend it with
-custom keys (a custom-headers map, a tenant-feature-flag set, a
-geographical location).
+`StandardRequestContext::new(mfa_verified, ip_address)` covers the
+common context keys. Applications needing more implement
+`BuildRequestContext` themselves and pass their own type; the session
+is generic over it.
 
-The `decide` verb evaluates the policies and returns
-`AuthzDecision::Allow` or `AuthzDecision::Deny`. The verb is async
-because the entity provider may need to fetch entity data from a
-database. The `require` verb is a thin wrapper that returns an
-error on `Deny`, suitable for handlers that want to short-circuit
-on a denied request.
+The resource is your provider's `ResourceId`, not a Cedar UID. You pass
+the id your application already has, and the provider's `resource_uid`
+turns it into the UID the policies match on. The action is a plain
+`&str` naming the action in your schema.
 
-## What policies look like
+The session caches entities per `(action, resource)` for its lifetime,
+so a handler that checks the same pair twice pays for the provider
+once.
 
-A Cedar policy is a `permit` or `forbid` statement against a
-principal, action, and resource, with optional `when` conditions.
-The simplest possible policy:
+There are three verbs, and no method returns an error for a denial.
 
-```cedar,ignore
-permit (
-    principal,
-    action == Action::"read",
-    resource
-);
-```
+`require(action, resource)` returns `Result<(), AuthzDenied>`, so a
+handler can `?` it and let a deny become a 403. `AuthzDenied` is a
+unit type: it says access was refused, and deliberately says nothing
+about why, because the reason is exactly what an attacker probing
+policies would like to learn. Log the detail on your side of the call.
 
-This is the "everyone can read everything" policy. It permits any
-principal to perform the read action against any resource. It is
-useful for nothing in production but illustrates the shape.
+`is_permitted(action, resource)` returns a plain `bool`, for code that
+needs a non-binary outcome: a UI that hides a button rather than
+showing it and denying on click, an admin panel listing what this user
+could do.
 
-A real RBAC policy:
+`batch_check(&[(action, resource)])` evaluates several pairs and
+returns `Vec<(String, AuthzDecision)>`, sharing the session's entity
+cache across them. Use it to answer "which of these may I do?" in one
+pass instead of a loop of `is_permitted`.
 
-```cedar,ignore
-permit (
-    principal in Role::"finance-viewer",
-    action == Action::"read",
-    resource in TenantData::"acme"
-) when {
-    principal.tenant_id == "acme"
-};
-```
-
-This permits any principal in the `finance-viewer` role to read any
-resource in the `acme` tenant's data, but only when the principal
-is also in the `acme` tenant. The `in` operator is set membership
-against the entity graph: the policy is asking the entity provider
-"is this principal in this role?", which the provider answers from
-the application's data.
-
-A ReBAC policy:
-
-```cedar,ignore
-permit (
-    principal,
-    action == Action::"edit",
-    resource
-) when {
-    resource.owner == principal
-};
-```
-
-This permits a principal to edit a resource only when the resource's
-`owner` attribute equals the principal. Ownership is the ReBAC
-relationship; the schema declares `Document` has an `owner`
-attribute of type `User`, and the entity provider populates it from
-the document's row.
-
-An ABAC policy:
-
-```cedar,ignore
-permit (
-    principal,
-    action == Action::"write",
-    resource in TenantData::"acme"
-) when {
-    principal.tenant_id == "acme"
-    && context.mfa == true
-    && context.ip like "10.*"
-};
-```
-
-This permits writes to the `acme` tenant's data when the principal
-is in the tenant, has completed MFA, and is connecting from an
-internal IP range. Context attributes come from the
-`StandardRequestContext` (or custom extensions); the schema
-declares them so the validator can type-check the policy.
-
-The three styles compose freely in one rule. A real production
-policy is typically a mix: roles establish broad permissions,
-relationships restrict to ownership, attributes restrict to
-high-assurance contexts. Cedar's deny-by-default behaviour means
-the rules accumulate as positive grants; no rule denies, and the
-absence of a permitting rule is itself a deny.
-
-## Errors
-
-The `AuthzError` enum has variants for the cases that go wrong:
-
-```rust,ignore
-pub enum AuthzError {
-    PolicySetInvalid(String),       // load-time, should never reach prod
-    SchemaValidationFailed(String), // load-time
-    EntityNotFound { uid: String }, // evaluator could not load an entity
-    ContextMissing(String),         // policy needed a context key not provided
-    EvaluationFailed(String),       // Cedar internal error (rare)
-    Cancelled,                      // request cancelled during evaluation
-}
-```
-
-The load-time variants should never reach production because the
-`PolicyStore::validate_against` call catches them at startup.
-
-The runtime variants are recoverable but specific. `EntityNotFound`
-means the entity provider returned no entity for a UID a policy
-referenced; the deployment may have a stale Cedar reference or a
-race between policy and data. `ContextMissing` means a policy
-referenced a context key the request did not provide; the schema
-should have caught this at load time but did not (a context key
-the schema declared as optional, used in a policy as if required).
-`EvaluationFailed` is the catch-all for Cedar's own errors, which
-are rare in well-formed policy sets.
-
-Every variant produces a deny. There is no path where an
-evaluation error produces an allow. The defence is structural and
-is one of the reasons Cedar was chosen.
-
-## When to use require versus decide
-
-The two verbs differ in their failure handling. `require` returns
-an error on `Deny` (so the handler short-circuits with an error
-without needing an explicit match); `decide` returns the typed
-decision (so the handler can branch).
-
-The recommendation is to use `require` in handlers (the most
-common case: deny gives a 403, allow proceeds), and `decide` in
-code that needs to express a non-binary outcome (a UI that hides
-buttons rather than displaying them and denying on click, an
-admin panel that shows what the current user could do).
+All three are async because the provider is: loading entities usually
+means a database round trip.
 
 ```rust,ignore
 // require version: handler short-circuits on deny
@@ -276,20 +168,15 @@ async fn delete_document(
     session: AuthzSession,
     Path(doc_id): Path<String>,
 ) -> Result<Json<()>, AppError> {
-    session
-        .require(Action::Delete, ResourceUid::new("Document", &doc_id))
-        .await?;
+    session.require("Delete", &doc_id).await?;
     // ... proceed with delete
 }
 
-// decide version: branch on the decision
+// is_permitted version: branch on the boolean
 async fn dashboard(
     session: AuthzSession,
 ) -> impl IntoResponse {
-    let can_create_doc = matches!(
-        session.decide(Action::Create, ResourceUid::new("Document", "*")).await,
-        Ok(AuthzDecision::Allow)
-    );
+    let can_create_doc = session.is_permitted("Create", &template_id).await;
     render_dashboard(can_create_doc)
 }
 ```
@@ -329,7 +216,7 @@ much more stable) and not decisions.
 
 The next chapter, *Entity providers and request context*, covers
 the entity-graph caching mechanism and the contract between Cedar
-and the application's data layer.
+and your data layer.
 
 ## Further reading
 

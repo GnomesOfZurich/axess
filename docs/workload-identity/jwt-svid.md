@@ -38,98 +38,74 @@ but the keys advertised in the JWKS specify it.
 
 ## Configuration
 
-`JwtSvidResolverConfig` carries the validation parameters:
+The resolver takes a verifier, the trust domain it accepts, and the
+token, and nothing else:
 
 ```rust,ignore
-pub struct JwtSvidResolverConfig {
-    pub trust_domain: TrustDomain,
-    pub jwks_url: Url,
-    pub expected_audiences: Vec<String>,
-    pub clock_skew: Duration,
-    pub max_token_age: Duration,
-}
+use std::sync::{Arc, RwLock};
 
-let resolver = JwtSvidResolver::new(JwtSvidResolverConfig {
-    trust_domain: "prod.example.com".parse().unwrap(),
-    jwks_url: "https://spire.prod.example.com/keys".parse().unwrap(),
-    expected_audiences: vec!["https://api.example.com".into()],
-    clock_skew: Duration::from_secs(30),
-    max_token_age: Duration::from_secs(3600),
-});
+use axess_factors::jwt::{svid::JwtSvidResolver, verifier::JwtVerifier};
+
+let verifier = Arc::new(
+    JwtVerifier::new(Arc::new(RwLock::new(jwks)))
+        .with_issuer("https://spire.prod.example.com")
+        .with_audience("https://api.example.com")
+        .with_clock_skew(Duration::from_secs(30)),
+);
+let resolver = JwtSvidResolver::new(
+    verifier,
+    "prod.example.com".parse()?,
+    token,
+);
+let principal = resolver.resolve().await?;
 ```
+
+Everything about *how* a token is validated (issuer, audience,
+clock skew, which algorithms, whether a `jti` may be replayed)
+belongs to the [`JwtVerifier`](../../axess-factors/src/jwt/verifier.rs)
+you hand it, and is configured there. The resolver adds the SPIFFE
+rules on top: the trust domain, and the shape of the identity.
+
+Where the key set comes from is likewise yours: a `JwkSet` read from
+a file the deployment mirrors, or `JwksCache` (feature `oidc`) if you
+want axess to fetch it. The resolver never fetches.
 
 `trust_domain` is the trust domain the resolver accepts SVIDs
 from. A token whose `sub` SPIFFE ID names a different trust domain
 is rejected. The defence is the trust-domain isolation that SPIFFE
 is built around.
 
-`jwks_url` is where the resolver fetches signing keys. The fetch
-runs through the `axess-cache` machinery: a single-flight cache
-that dedupes concurrent fetches, with debouncing to prevent
-denial-of-service through key-rotation thrash. The cache TTL
-defaults to one hour, which matches the typical SPIRE rotation
-schedule.
+`expected_audiences` and the clock (`with_audience` and
+`with_clock_skew` on the verifier) are configured there rather than
+here; see above. A token
+whose `aud` does not match is rejected by the verifier before the resolver
+sees it.
 
-`expected_audiences` is the allowlist of audience values the
-resolver accepts. A token whose `aud` does not contain at least one
-of the expected values is rejected. Most deployments configure a
-single audience (the application's URL); deployments that serve
-multiple identities behind one resolver list each.
-
-`clock_skew` is the tolerance applied to the `exp` and `iat`
-checks. Thirty seconds is generous; production deployments that
-synchronise clocks tightly through NTP can lower it.
-
-`max_token_age` is the upper bound on how far in the past the
-token's `iat` claim can be. The check defeats replay of stale
-tokens: even if a token has not expired, a token issued more than
-the configured age ago is rejected. The default is one hour, which
-is generous; deployments with stricter posture set it lower.
+**There is no `max_token_age`.** An `iat` upper bound is not implemented: a
+token is accepted until its `exp`, and bounding issuance age is the issuer's
+to do through a short lifetime. If you need it, check `VerifiedClaims::iat`
+yourself after `verify`.
 
 ## Wiring the resolver
 
-The resolver is wired as a Tower middleware that runs before the
-handler. The middleware reads a bearer token from the
-`Authorization` header (or wherever the deployment puts it),
-calls into the resolver, and on success inserts the resulting
-`Principal` into the request extensions.
+**There is no `JwtSvidLayer`.** axess ships no Tower middleware for SVIDs;
+the resolver is a plain call you make where you like, which is what lets a
+daemon with no Axum router use it at all:
 
 ```rust,ignore
-use axess::workload::{JwtSvidResolver, JwtSvidLayer};
+use axess_identity::PrincipalResolver;
 
-let resolver = JwtSvidResolver::new(/* ... */);
-let layer = JwtSvidLayer::new(resolver);
-
-let app = Router::new()
-    .route("/api/data", get(handler))
-    .layer(layer);
+// `bearer_from` and its error are yours; axess has no opinion on how a
+// request without a credential is refused.
+let token = bearer_from(&headers).ok_or(MyError::NoCredential)?;
+let resolver = JwtSvidResolver::new(verifier.clone(), trust_domain.clone(), token);
+let principal = resolver.resolve().await?;   // Principal::Workload
 ```
 
-The handler reads the principal through an extractor:
-
-```rust,ignore
-use axess::Principal;
-use axum::Extension;
-
-async fn handler(Extension(principal): Extension<Principal>) -> &'static str {
-    match principal {
-        Principal::Workload(w) => {
-            tracing::info!(workload = %w.workload_id, "request from workload");
-            "ok"
-        }
-        Principal::Human(_) => {
-            // The route is workload-only; reject the human request.
-            // (Or route differently. Choice is the application's.)
-            unreachable!("the layer only accepts workload tokens")
-        }
-    }
-}
-```
-
-The middleware can be composed with other authentication paths.
-An application that accepts both human sessions and workload
-tokens wires the session layer and the JWT-SVID layer side by
-side; the first one to produce a principal wins.
+In an Axum application, call it in a middleware of your own and insert the
+`Principal` into the request extensions; the `bearer` feature's
+`BearerTokenLayer` is the shipped example of that shape, for plain bearers
+rather than SVIDs.
 
 ## Validation details
 
@@ -139,8 +115,18 @@ without ever fetching JWKS keys; an expired token is rejected
 without engaging the signature check.
 
 The first check is parsing. The token must be a well-formed JWT
-with header, payload, and signature segments. Malformed input
-produces `JwtSvidError::Malformed` without further work.
+with header, payload, and signature segments. Malformed input is
+rejected without further work.
+
+One thing to know before reading the rest: `resolve` reports every one
+of these failures as `IdentityError`, because that is what
+`PrincipalResolver` returns. A failed SPIFFE-ID decomposition or a
+trust-domain mismatch surfaces as `IdentityError::InvalidSpiffeId`
+with a message naming the problem; everything else collapses to
+`IdentityError::NotAuthenticated`, with the underlying JWT error
+logged at `debug` for operators. `JwtSvidError` does not exist. The
+collapse is deliberate: a caller presenting a bad token learns only
+that it was refused.
 
 The second check is the header. The `alg` field must be one of
 the configured allowed algorithms (RS256 or ES256 by default;
@@ -152,8 +138,8 @@ The third check is the claims. The `sub` claim must be a valid
 SPIFFE URI under the configured trust domain. The `aud` claim
 must contain at least one of the configured expected audiences.
 The `exp` and `iat` claims must be present and within the clock
-skew and max age bounds. Missing or malformed claims produce
-specific error variants so the operational signal is clear.
+skew and max age bounds. Which claim failed appears in the debug log,
+not in the returned error.
 
 The fourth check is the signature. The resolver looks up the key
 matching the token's `kid` in the cached JWKS, verifies the
@@ -166,12 +152,14 @@ SPIRE typically issues tokens with `nbf` slightly in the future to
 allow for clock skew on the receiver side. The check uses the
 same clock-skew tolerance.
 
-The sixth check is the duplicate-jti check, when configured.
-SPIFFE recommends a JTI on each token to allow receivers to
-detect replay; an axess deployment that wants this protection
-configures a JTI store (typically a small Valkey cache with the
-configured `max_token_age` TTL), and the resolver checks for
-duplicates before admitting the token.
+The sixth check is the duplicate-`jti` check, when configured.
+SPIFFE recommends a `jti` on each token so a receiver can detect
+replay; a deployment that wants it implements `JtiReplayStore` and
+hands it to the verifier with `with_replay_store`: a `HashSet`
+behind a mutex for one process, a small Valkey cache for a fleet.
+axess ships the trait and `NoReplay`, not a backend. With a store
+configured, a token carrying no `jti` is rejected rather than
+admitted unchecked, and entries expire with the token's own `exp`.
 
 ## What the principal looks like
 
@@ -222,9 +210,10 @@ Against token theft: the audience check defeats most of it. A
 token stolen from one service cannot be used against another
 service whose audience does not match.
 
-Against token replay: the `iat` + `max_token_age` bound shrinks
-the replay window. With the optional JTI cache, replay is detected
-explicitly.
+Against token replay: the token's own lifetime is the window, so a
+short `exp` at the issuer is the control, since no issuance-age
+bound is implemented here. With a `JtiReplayStore` configured,
+replay is detected explicitly rather than merely bounded.
 
 Against trust-domain confusion: the trust-domain match defeats
 cross-domain attacks. A token from a different trust domain is
@@ -238,22 +227,32 @@ on a schedule.
 
 ## Troubleshooting
 
-If the resolver returns `KeyNotFound` consistently, the JWKS URL
-is wrong or the key advertised in the token is not yet published
-at the URL. The latter is common during SPIRE rotation; the
-caching layer's debounce can hide the rotation briefly. Force a
-cache refresh (or wait for the TTL) and retry.
+**Every rejection looks the same to the caller.** `resolve` returns
+`IdentityError::NotAuthenticated` whichever check failed: a bad
+signature, an unknown key, a wrong audience, an expired token, a
+replayed `jti`, a missing or malformed `sub`. That is deliberate,
+and it mirrors the user-enumeration discipline the Authn surface
+follows: a caller learns that it was refused, not what to change
+to get past. Do not branch on the variant, and do not expect one
+that names the cause, because there isn't one.
 
-If the resolver returns `AudienceMismatch` for tokens that should
-work, the issuing service is minting tokens with a different
-audience than the application expects. Either the issuer's
-configuration is wrong, or the application's `expected_audiences`
-list is missing the relevant value. Inspect the token (the
-payload is unencoded base64, so it is readable) to see what `aud`
-it carries.
+The cause goes to the log instead, at `debug` on the
+`axess_factors::jwt` target. Turn that on and the rejected
+verification prints the underlying `JwtError`:
 
-If the resolver returns `TrustDomainMismatch`, a workload from a
-different domain is calling your service. If this is intentional,
+```
+RUST_LOG=axess_factors::jwt=debug
+```
+
+A key the JWKS does not advertise is the common one during SPIRE
+rotation, where the cache debounce can hide a fresh key briefly;
+force a refresh or wait out the TTL. An audience rejection means
+the issuer mints a different `aud` than `expected_audiences`
+lists. The token payload is base64 and readable, so decode it and
+compare rather than guessing.
+
+If the log shows the SPIFFE ID parsing or the trust domain, a
+workload from a different domain is calling your service. If this is intentional,
 configure federation (the next chapter, *Inbound: federation*,
 covers the mechanism). If it is not intentional, the workload is
 misconfigured.
@@ -276,8 +275,8 @@ adopter-direct options exist on crates.io today:
 - [`spire-api`](https://crates.io/crates/spire-api); lower-level
   generated gRPC client when finer control is needed.
 
-axess does not currently wrap either crate; the
-`SpireWorkloadApiResolver` ROADMAP item lands when an adopter
+axess does not currently wrap either crate; the SPIRE Workload API
+client on the ROADMAP (feature `spire`) lands when an adopter
 needs an axess-shaped surface (e.g. integration with axess-clock
 for rotation timing, axess-rng for ceremony nonces, or the
 `Principal::Workload` shape on the fetch result for symmetry with

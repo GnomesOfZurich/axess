@@ -50,7 +50,7 @@ The transitions move strictly forward through the ladder.
 `Unknown` becomes `Seen` on first successful login. `Seen` becomes
 `Trusted` on explicit user action or after an
 application-configurable trust period. Any state becomes `Revoked`
-on revocation. There is no path back from `Revoked`; a device
+on revocation. `Revoked` is terminal; a device
 that was revoked and is later re-encountered registers as a new
 `Unknown` device.
 
@@ -165,37 +165,69 @@ ways to clear the bar is the disjunction in one rule.
 
 ## Identifying a device
 
-Each request needs to be associated with a device. The mapping
-runs through the `DeviceResolver` trait:
+Each request needs to be associated with a device. The mapping runs
+through the `DeviceResolver` trait:
 
 ```rust,ignore
-#[async_trait]
-pub trait DeviceResolver: Send + Sync {
-    async fn resolve(
-        &self,
-        request: &Request,
-        user_id: &UserId,
-        tenant_id: &TenantId,
-    ) -> Result<DeviceMatch, DeviceResolverError>;
-}
+pub trait DeviceResolver: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
 
-pub enum DeviceMatch {
-    Existing(DeviceId),
-    NewDevice(DeviceId),  // freshly minted, written to store
+    fn resolve(
+        &self,
+        parts: &Parts,
+    ) -> impl Future<Output = Result<Option<DeviceId>, Self::Error>> + Send;
 }
 ```
 
-The default implementation computes the fingerprint from the
-request features (user agent, IP, accept-language) and matches it
-against existing devices for the user. A match returns the
-existing device id; a miss writes a new device row with
-`trust_level = Unknown` and returns the new id.
+Three things in that signature decide how device tracking behaves.
 
-The default works for most deployments. Applications with
-stronger device-identity signals (a long-lived hardware key, a
-mobile app's persistent installation id, a device certificate)
-can provide their own `DeviceResolver` that consults the stronger
-signal first and falls back to the fingerprint match.
+It takes `axum::http::request::Parts`, not the whole request, because
+`axum::body::Body` is `!Sync` and a `Send` future may not hold it across
+an `await`. The session layer splits the request before calling and
+reassembles it afterwards, so a resolver sees headers, extensions and
+the URI but never the body.
+
+It returns `Option<DeviceId>` rather than a match enum. There is no
+"existing versus new" distinction at this seam: whether a device row was
+found or minted is the resolver's business, and the layer only wants the
+id to attach. `Ok(None)` is the ordinary "no device" answer, not a
+failure: a request with no `User-Agent`, or one arriving before the
+tenant is known, resolves to nothing at all.
+
+The error type is the implementor's associated `Error`, typically the
+`DeviceStore::Error` underneath. Resolution is best-effort: the session
+layer logs an `Err(_)` and continues without a device rather than
+failing the request. A device store outage degrades device tracking; it
+does not take authentication down with it.
+
+Two implementations ship. `NoopDeviceResolver` always answers
+`Ok(None)`, and is the default plug when the `device` feature is on but
+nothing has been configured. `LifecycleDeviceResolver` is the turn-key
+one: it wires a `DeviceFingerprintExtractor` to a
+`DeviceLifecycleService`, computing the fingerprint from request
+features and either matching an existing device or minting one with
+`trust_level = Unknown`.
+
+`LifecycleDeviceResolver` has four hooks, because those are the four
+things that differ between deployments:
+
+- `tenant_fn`, defaulting to a `TenantId` in the request extensions.
+- `client_ip_fn`, defaulting to `None`, because reading it means
+  either `ConnectInfo` or a trusted `X-Forwarded-For`.
+- `user_fn`, defaulting to `None`, because the resolver runs before
+  authentication.
+- `new_id_fn`, defaulting to a v4 UUID, overridden in DST tests for
+  determinism.
+
+If `tenant_fn` yields `None` the resolver short-circuits to `Ok(None)`:
+there is no meaningful device without a tenant scope, for the
+cross-tenant-correlation reason this chapter covers below. A
+fingerprint the extractor cannot compute short-circuits the same way.
+
+Applications with a stronger device signal (a long-lived hardware key,
+a mobile app's installation id, a device certificate) implement
+`DeviceResolver` themselves, consult the stronger signal first, and fall
+back to the fingerprint match.
 
 ## Caching
 
@@ -210,10 +242,17 @@ cache value is the `Device` record. The TTL is short (a few
 seconds) so revocations propagate quickly; the LRU bound
 constrains memory under fan-out scenarios.
 
-The cache is invalidated explicitly on revocation. The
-`DeviceStore::revoke` call clears the relevant cache entry and
-writes the revocation. Subsequent reads see the revoked state
-without waiting for the TTL.
+Revoking a device is `DeviceStore::set_trust_level(tenant_id, id,
+DeviceTrustLevel::Revoked, now)`. There is no `revoke` verb, and there
+is no cache invalidation hook: the TTL is the only thing that expires a
+cached `Device`, so a revocation is visible to other readers within a
+few seconds rather than immediately. Keep the TTL short for that
+reason, and call `set_trust_level` on the same instance you read
+through if you need the change to be visible to yourself at once.
+
+`delete` is the harder form, removing the record outright. Prefer
+`Revoked` where the audit trail matters: a deleted device leaves no
+evidence that it was ever trusted.
 
 The pattern is the same one *Entity providers and request
 context* covers for the Cedar entity cache. Cache the data, not
@@ -235,20 +274,34 @@ features. The fingerprint hash is the HMAC against the
 per-tenant pepper; an attacker who reads the store sees the
 hash, not the IP or user agent.
 
-The second is the retention sweep. The `DeviceStore::retention_sweep`
-verb removes device records older than a configured threshold,
-along with the refresh tokens that bound to them. The sweep is
-the GDPR-shaped lever: data the deployment no longer needs is
-removed within a bounded period, and the retention is
-documentable.
+The second is the sweep. `DeviceStore::sweep(tenant_id, now)` ages
+devices down through their trust levels and eventually removes them,
+returning a `SweepCounts` of what it did:
 
-The retention period is per-tenant. The
-`Tenant::device_retention_days` field carries it; the default is
-ninety days. Tenants with stricter requirements set it lower
-(say, thirty days for an EU tenant subject to strict GDPR
-interpretation); tenants with looser ones set it higher (say,
-three hundred and sixty-five days for a US tenant where session
-continuity matters more).
+```rust,ignore
+pub struct SweepCounts {
+    pub trusted_to_seen: u64,
+    pub seen_to_revoked: u64,
+    pub revoked_purged: u64,
+}
+```
+
+Those three numbers are the three transitions, and they are the shape
+of the retention story: a trusted device that has not been seen in a
+while drops to `Seen`, a `Seen` device that keeps not being seen is
+revoked, and a revoked device is purged after a grace period. Only the
+last one deletes anything, so a device does not vanish the moment it
+goes quiet.
+
+The thresholds are a `SweepConfig`, not a tenant column: `trusted_idle`
+(ninety days by default), `seen_idle` (thirty) and `revoked_grace`. A
+deployment that needs different retention per tenant holds its own
+config per tenant and passes the right one. Axess does not store that
+mapping, and `Tenant` carries no retention field to hold it.
+
+The sweep takes `now` rather than reading a clock, so a test can drive
+it to any instant and a scheduled job can run it deterministically.
+Nothing calls it for you: wire it to whatever runs your periodic work.
 
 The chapter *Multi-tenancy* covers the per-tenant configuration
 mechanism. *Security posture* covers the GDPR and SOC2
@@ -338,7 +391,7 @@ one).
 decorator gives you bounded-size LRU + clock-driven TTL eviction
 for free, with revocation propagating through `set_trust_level`.
 
-## What this enables
+## The connective tissue
 
 Device identity is the connective tissue between the user, the
 sessions they hold, the refresh tokens those sessions issue, and

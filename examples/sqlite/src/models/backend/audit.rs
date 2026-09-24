@@ -5,11 +5,12 @@
 //! different backend, keep that invariant.
 
 use axess::authn::{
-    AuditQuery, AuthEvent, AuthEventStatus, AuthEventType, EventQueryFilter, FactorKind, TenantId,
-    UserId,
+    AuditQuery, AuthEvent, AuthEventStatus, AuthEventType, AuthFailureReason, EventQueryFilter,
+    FactorKind, TenantId, UserId,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{AssertSqlSafe, Row};
+use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::warn;
 
@@ -139,6 +140,26 @@ impl AuditQuery for OurBackend {
             // the kinds the example UI exercises. Anything unrecognised
             // becomes `None` rather than dropping the event.
             let factor_kind = factor_kind.as_deref().and_then(parse_factor_kind);
+
+            // `ip_address` is a TEXT column, and rows written before 0.6.0
+            // hold whatever string the writer supplied -- including a value
+            // a client forged, since the field accepted arbitrary text then.
+            // An unparseable one becomes `None` rather than dropping the
+            // event: the address is optional metadata, not identity, and a
+            // null address is honest where an invented one is not.
+            let ip_address = ip_address.and_then(|s| match s.parse::<IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(e) => {
+                    warn!(value = %s, error = %e, "audit row: unparseable ip_address, storing none");
+                    None
+                }
+            });
+
+            // Infallible by design: a tag this version has no variant for
+            // becomes `AuthFailureReason::Other` rather than an error, so an
+            // audit row written by a newer or older axess still reads back
+            // with its reason intact.
+            let error = error.map(AuthFailureReason::from);
 
             out.push(AuthEvent {
                 user_id: user_id.and_then(|u| UserId::try_new(u).ok()),

@@ -38,7 +38,7 @@ use crate::authn::{
     factor::{FactorConfig, FactorKind},
     ids::{TenantId, UserId},
     store::{FactorStore, IdentityStore},
-    types::{AuthnScope, EntityState},
+    types::{AuthnScope, CounterUnavailable, EntityState},
 };
 use crate::session::extractor::AuthSession;
 
@@ -97,6 +97,7 @@ where
         session: &AuthSession,
     ) -> Result<AccountStatusEnforcement, AuthnError<I::Error>> {
         let status = self
+            .inner
             .identity
             .account_status(user_id)
             .await
@@ -109,7 +110,7 @@ where
                 None
             };
             self.record_locked_attempt_audit(user_id, tenant_id, next_kind, session)
-                .await;
+                .await?;
             return Ok(AccountStatusEnforcement::Locked { until });
         }
         if !status.allows_login() {
@@ -126,15 +127,14 @@ where
         tenant_id: &TenantId,
         next_kind: Option<FactorKind>,
         session: &AuthSession,
-    ) {
-        let mut builder = AuthEventBuilder::failure(AuthEventType::FactorVerified)
+    ) -> Result<(), AuthnError<I::Error>> {
+        let mut builder = AuthEventBuilder::locked(AuthEventType::FactorVerified)
             .attributed_to(user_id, tenant_id)
-            .with_session(session.session_id().await)
-            .with_error("locked");
+            .with_session(session.session_id().await);
         if let Some(k) = next_kind {
             builder = builder.with_factor(k);
         }
-        self.emit_audit(builder).await;
+        self.emit_audit(builder).await
     }
 
     /// Atomically apply a `FailWithUpdate` factor-config increment
@@ -182,6 +182,7 @@ where
         const MAX_FAIL_UPDATE_RETRIES: usize = 8;
 
         let initial_user_scope = self
+            .inner
             .factors
             .load_factor(user_scope, current_kind.clone())
             .await
@@ -202,7 +203,8 @@ where
             // No user-scope row yet; plain insert is correct, no
             // concurrent writer can race because there is nothing to
             // race with.
-            self.factors
+            self.inner
+                .factors
                 .save_factor(user_scope, updated_config.clone())
                 .await
                 .map_err(AuthnError::Store)?;
@@ -221,6 +223,7 @@ where
             // security signal; only the post-success CAS in
             // `persist_pass_with_update` treats `Ok(false)` as replay.
             let swapped = self
+                .inner
                 .factors
                 .compare_and_save_factor(user_scope, &prior_config, next_config.clone())
                 .await
@@ -232,6 +235,7 @@ where
             // CAS lost the race; reload and recompute the increment
             // from whatever the concurrent writer left behind.
             let reloaded = self
+                .inner
                 .factors
                 .load_factor(user_scope, current_kind.clone())
                 .await
@@ -240,6 +244,7 @@ where
                 // No user-scope row exists at all; fall back to a plain
                 // save so the failure is at least recorded somewhere.
                 if let Err(e) = self
+                    .inner
                     .factors
                     .save_factor(user_scope, updated_config.clone())
                     .await
@@ -305,21 +310,22 @@ where
         current_kind: &FactorKind,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        self.metrics.factor_failure();
+        self.inner.metrics.factor_failure();
 
         // This is the one intentional bypass of `emit_audit` /
         // `emit_audit_at`. The audit-ordering fix needs a `tracing::error!` with
         // `user_id = %user_id` context that the generic emit helpers
         // don't provide; every other audit emit in the crate goes
-        // through them. Direct `self.identity.record_event(...)` is
+        // through them. Direct `self.inner.identity.record_event(...)` is
         // load-bearing here, not stylistic.
         if let Err(e) = self
+            .inner
             .identity
             .record_event(
                 AuthEventBuilder::failure(AuthEventType::FactorVerified)
                     .attributed_to(user_id, tenant_id)
                     .with_factor(current_kind.clone())
-                    .build_at(self.clock.now()),
+                    .build_at(self.inner.clock.now()),
             )
             .await
         {
@@ -331,36 +337,56 @@ where
             );
         }
 
-        let count = match self.identity.record_failed_attempt(user_id).await {
+        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+
+        let count = match self.inner.identity.record_failed_attempt(user_id).await {
             Ok(n) => n,
             Err(e) => {
-                // Counter-store outage is operationally distinct from the
-                // user typing a wrong password: the request still maps to
-                // InvalidCredential (so an attacker probing for outages
-                // gets the same response shape as a normal mismatch), but
-                // lockout policy is silently disabled while the outage
-                // lasts. Tag the metric separately so operators can alert
-                // on it without false-firing on every wrong password.
-                self.metrics.factor_counter_store_outage();
+                // A counter-store outage is operationally distinct from the
+                // user typing a wrong password, and the counter can fail
+                // while the reads that got us here keep working: the
+                // read-replica split puts reads on a replica and this write
+                // on the primary. Tag the metric separately so operators can
+                // alert on it without false-firing on every wrong password.
+                self.inner.metrics.factor_counter_store_outage();
+                let verdict = match policy.on_counter_unavailable {
+                    // Fail closed. The attempt counts as locked, so brute
+                    // force stays bounded while the counter is dead. This
+                    // leaks nothing about user existence: an unknown
+                    // identifier never reaches here, having been rejected at
+                    // `begin_login` with timing equalization.
+                    CounterUnavailable::Lock => {
+                        self.inner.metrics.account_locked();
+                        let until = policy.duration.and_then(|d| {
+                            chrono::Duration::from_std(d)
+                                .ok()
+                                .map(|d| self.inner.clock.now() + d)
+                        });
+                        FactorOutcome::Locked { until }
+                    }
+                    // Fail open. Logins keep working and lockout is disabled
+                    // until the counter comes back.
+                    CounterUnavailable::Allow => FactorOutcome::InvalidCredential,
+                };
                 tracing::warn!(
                     user_id = %user_id,
                     error = %e,
                     outage = "factor_counter_store",
-                    "record_failed_attempt errored; returning InvalidCredential \
-                     without lockout-counter update; monitor counter-store health"
+                    on_counter_unavailable = ?policy.on_counter_unavailable,
+                    "record_failed_attempt errored; lockout counter not updated; \
+                     monitor counter-store health"
                 );
-                session.record_attempt_at(self.clock.now()).await;
-                return Ok(FactorOutcome::InvalidCredential);
+                session.record_attempt_at(self.inner.clock.now()).await;
+                return Ok(verdict);
             }
         };
 
         // Update session state for UI feedback only; never used for
         // lockout decisions (those are store-authoritative).
-        session.record_attempt_at(self.clock.now()).await;
+        session.record_attempt_at(self.inner.clock.now()).await;
 
-        let policy = self.identity.lockout_policy_for_tenant(tenant_id);
         if count >= policy.max_attempts {
-            self.metrics.account_locked();
+            self.inner.metrics.account_locked();
             // Surface the lockout window to the caller as `now +
             // policy.duration`, computed at the verdict that creates
             // the lockout (mirrors what production stores write into
@@ -370,7 +396,7 @@ where
             let until = policy.duration.and_then(|d| {
                 chrono::Duration::from_std(d)
                     .ok()
-                    .map(|d| self.clock.now() + d)
+                    .map(|d| self.inner.clock.now() + d)
             });
             return Ok(FactorOutcome::Locked { until });
         }
@@ -402,6 +428,7 @@ where
         updated_config: FactorConfig,
     ) -> Result<bool, AuthnError<I::Error>> {
         let existing_user_scope = self
+            .inner
             .factors
             .load_factor(user_scope, current_kind)
             .await
@@ -414,12 +441,14 @@ where
             // failure-counter CAS in `apply_failure_update`, where
             // `Ok(false)` means "retry."
             Some(prior) => self
+                .inner
                 .factors
                 .compare_and_save_factor(user_scope, &prior, updated_config)
                 .await
                 .map_err(AuthnError::Store),
             None => {
-                self.factors
+                self.inner
+                    .factors
                     .save_factor(user_scope, updated_config)
                     .await
                     .map_err(AuthnError::Store)?;

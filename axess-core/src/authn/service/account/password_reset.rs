@@ -19,13 +19,17 @@ use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
     factor::{FactorConfig, FactorKind},
-    store::{FactorStore, IdentityStore},
+    store::{FactorStore, IdentityPasswordHistory, IdentityPasswordReset, IdentityStore},
     types::AuthnScope,
 };
 
 impl<I, F> AuthnService<I, F>
 where
-    I: IdentityStore,
+    // `IdentityPasswordReset` is required here and nowhere else: a store
+    // that cannot persist a reset token cannot reach this flow, so the
+    // omission is a compile error rather than a panic on an
+    // unauthenticated route. See the trait for why it has no defaults.
+    I: IdentityStore + IdentityPasswordReset + IdentityPasswordHistory,
     F: FactorStore<Error = I::Error>,
 {
     /// Begin a password-reset flow for a user.
@@ -52,6 +56,7 @@ where
         // Look up the user. If not found, return Ok(None) to avoid
         // leaking whether the identifier exists (timing equalized below).
         let tenant = self
+            .inner
             .identity
             .find_tenant(tenant_identifier)
             .await
@@ -63,6 +68,7 @@ where
         };
 
         let user = self
+            .inner
             .identity
             .find_user(identifier, &tenant.id)
             .await
@@ -78,7 +84,7 @@ where
         // SHA-256 work as the found path, narrowing the timing side
         // channel that would otherwise leak account existence.
         let mut token_bytes = [0u8; 32];
-        self.rng.fill_bytes(&mut token_bytes);
+        self.inner.rng.fill_bytes(&mut token_bytes);
         use base64::Engine as _;
         let plaintext = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
         let hash = {
@@ -103,8 +109,10 @@ where
             }
         };
 
-        let expires_at = self.clock.now() + chrono::Duration::from_std(ttl).unwrap_or_default();
-        self.identity
+        let expires_at =
+            self.inner.clock.now() + chrono::Duration::from_std(ttl).unwrap_or_default();
+        self.inner
+            .identity
             .store_reset_token(&user.id, &hash, expires_at)
             .await
             .map_err(AuthnError::Store)?;
@@ -113,7 +121,7 @@ where
             AuthEventBuilder::success(AuthEventType::PasswordResetRequested)
                 .attributed_to(&user.id, &user.tenant_id),
         )
-        .await;
+        .await?;
 
         Ok(Some(plaintext))
     }
@@ -140,6 +148,7 @@ where
         // compared to history hashing and we get a fast-path tenant
         // refusal here.
         let user = self
+            .inner
             .identity
             .get_user(user_id)
             .await
@@ -184,6 +193,7 @@ where
 
         // Update the password factor.
         let user = self
+            .inner
             .identity
             .get_user(user_id)
             .await
@@ -195,20 +205,31 @@ where
             user_id: user.id,
         };
 
-        // Record old hash in password history (if backend supports it).
+        // Record the old hash in password history.
+        //
+        // Not "if the backend supports it": there is no support check here
+        // or at the second call site below. `IdentityAdmin::record_password_hash`
+        // has a default body that panics, so a backend which has not
+        // overridden it unwinds on the first password change any user
+        // makes. The guard below tests whether an *old password exists*,
+        // which is a different question. See
+        // `docs/_review/2026-09-24-audit-context-and-availability.md`.
         if let Some(FactorConfig::Password(ref old_config)) = self
+            .inner
             .factors
             .load_factor(&user_scope, FactorKind::Password)
             .await
             .map_err(AuthnError::Store)?
         {
-            self.identity
+            self.inner
+                .identity
                 .record_password_hash(user_id, &old_config.hash)
                 .await
                 .map_err(AuthnError::Store)?;
         }
 
         let rules = self
+            .inner
             .identity
             .password_rules_for_tenant(&user.tenant_id)
             .await
@@ -245,7 +266,8 @@ where
         // Production backends should override `record_password_hash` and
         // `save_factor` to share a single SQL transaction; until then,
         // this ordering minimises blast radius.
-        self.identity
+        self.inner
+            .identity
             .record_password_hash(user_id, &new_password_hash)
             .await
             .map_err(AuthnError::Store)?;
@@ -254,13 +276,15 @@ where
             hash: crate::authn::factor::ZeroizedString::new(new_password_hash),
             rules,
         });
-        self.factors
+        self.inner
+            .factors
             .save_factor(&user_scope, new_config)
             .await
             .map_err(AuthnError::Store)?;
 
         // Reset failed attempts.
-        self.identity
+        self.inner
+            .identity
             .reset_failed_attempts(user_id)
             .await
             .map_err(AuthnError::Store)?;
@@ -271,7 +295,7 @@ where
         // effort: failures are logged but do not block the reset (the
         // password change has already succeeded and is more important than
         // session-registry hygiene).
-        if let Some(reg) = &self.registry {
+        if let Some(reg) = &self.inner.registry {
             reg.invalidate_user(user_id).await;
             tracing::info!(
                 user_id = %user_id,
@@ -283,7 +307,7 @@ where
             AuthEventBuilder::success(AuthEventType::PasswordReset)
                 .attributed_to(&user.id, &user.tenant_id),
         )
-        .await;
+        .await?;
 
         Ok(true)
     }
@@ -313,7 +337,8 @@ where
             let digest = sha2::Sha256::digest(token.as_bytes());
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
         };
-        self.identity
+        self.inner
+            .identity
             .verify_reset_token(user_id, &hash)
             .await
             .map_err(AuthnError::Store)
@@ -358,6 +383,7 @@ where
             return Ok(false);
         }
         let history = self
+            .inner
             .identity
             .password_history(user_id, rules.history_count)
             .await

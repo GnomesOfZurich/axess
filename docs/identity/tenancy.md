@@ -8,7 +8,7 @@ atomic provisioning pattern that ensures every tenant starts in a
 sound state, the three-lever lockout, and the operational
 patterns for tenant suspension and deletion.
 
-The mechanism is on by default. There is no feature flag to
+The mechanism is on by default, and no feature flag exists to
 toggle tenancy; the `TenantId` field is present on every relevant
 record. A single-tenant deployment uses one well-known
 `TenantId` (`"default"` is the convention) and effectively gets
@@ -17,21 +17,40 @@ second tenant is added.
 
 ## The tenant record
 
-The `Tenant` struct lives in `axess-identity` and carries the
-configuration that applies to every user under the tenant:
+The `Tenant` struct lives in `axess-core` and is deliberately thin:
 
 ```rust,ignore
 pub struct Tenant {
-    pub tenant_id: TenantId,
-    pub status: TenantStatus,                    // Active | Suspended | Deleted
-    pub display_name: String,
-    pub fingerprint_pepper: ZeroizedString,      // per-tenant device pepper
-    pub lockout_policy: LockoutPolicy,           // tenant-scoped lockout
-    pub device_retention_days: u32,              // GDPR-shaped retention
+    pub id: TenantId,
+    pub identifier: Arc<str>,      // slug or domain used for lookup
+    pub display_name: Arc<str>,
+    pub status: EntityState,       // same lifecycle enum a user's status uses
+    pub created_by: UserId,
     pub created_at: DateTime<Utc>,
-    pub suspended_at: Option<DateTime<Utc>>,
+    pub updated_by: UserId,
+    pub updated_at: DateTime<Utc>,
 }
 ```
+
+Note what is *not* on it. There is no per-tenant lockout policy field,
+no fingerprint pepper, no retention setting. Per-tenant policy is
+resolved through `IdentityLookup`, not stored on the struct:
+`lockout_policy_for_tenant`, `password_rules_for_tenant` and
+`ip_policy_for_tenant` are trait methods with defaults, and a
+deployment that sells a stricter tier overrides them against its own
+table. That keeps `Tenant` a row an adopter can map onto whatever they
+already have, rather than a schema axess imposes.
+
+`status` is `EntityState` (`Guest`, `Candidate`, `Pending`, `Active`,
+`Suspended`, and the closed state), shared with users rather than a
+tenant-specific enum, which is what makes "is this principal usable"
+one question at both levels.
+
+`created_by` and `updated_by` are `UserId`s, so every tenant row names
+the actor behind it. For an operator-onboarded tenant that is
+`UserId::system()`; for a self-service signup it is typically the first
+admin.
+
 
 The `TenantId` is a typed UUID (the convention in axess-identity).
 The `status` carries the tenant's lifecycle state, covered below.
@@ -81,30 +100,54 @@ cross-tenant access is structurally impossible.
 
 ## Atomic provisioning
 
-A tenant comes into existence through `AuthnService::create_tenant`,
-which is the verb behind any "sign up a new organisation" or
-"administrator provisions a new tenant" flow. The call is atomic
-by design.
+A tenant comes into existence through `create_tenant`, the verb behind
+any "sign up a new organisation" or "administrator provisions a new
+tenant" flow. It is a free function rather than an `AuthnService`
+method, for the reason given below: it needs both stores.
 
 ```rust,ignore
-let tenant = service.create_tenant(TenantBootstrap {
-    display_name: "Acme Inc.".into(),
-    initial_admin: AdminUser {
-        identifier: "admin@acme.example".into(),
-        initial_password: Some(initial_password.into()),
+use axess_core::authn::provisioning::{TenantBootstrap, create_tenant};
+
+let tenant = Tenant::new(
+    tenant_id,
+    "acme",                      // lookup identifier
+    "Acme Inc.",                 // display name
+    UserId::system(),            // created_by
+    clock.now(),
+)?;
+
+let (tenant, method) = create_tenant(
+    &identity_store,
+    &factor_store,
+    TenantBootstrap {
+        tenant,
+        // Which factors this tenant may use. `default_catalog()` is the
+        // shipped set; filter or extend it per tenant.
+        factors: default_catalog(),
+        // `None` takes a method derived from the factors.
+        method: Some(AuthMethod {
+            name: "password-then-totp".into(),
+            steps: vec![
+                FactorStep::Required(FactorKind::Password),
+                FactorStep::Required(FactorKind::Totp),
+            ],
+        }),
     },
-    initial_method: Method {
-        name: "password-then-totp".into(),
-        steps: vec![
-            FactorStep::Required(FactorKind::Password),
-            FactorStep::Required(FactorKind::Totp),
-        ],
-    },
-    fingerprint_pepper: SecureRng::random_bytes(32),
-    lockout_policy: LockoutPolicy::default(),
-    device_retention_days: 90,
-}).await?;
+)
+.await?;
 ```
+
+`create_tenant` is a free function over an `IdentityStore` and a
+`FactorStore`, not a method on `AuthnService`, because provisioning
+touches both and belongs to neither. It returns the tenant and the
+`AuthMethod` it installed.
+
+The bootstrap creates no administrator. Creating the first
+user is a separate `create_user` call, which means a caller who wants
+"tenant plus admin, or neither" wraps both in their own transaction.
+Bootstrapping with an empty `factors` list is refused outright
+(`ProvisioningError::NoFactorsSpecified`), because a tenant whose users
+cannot present any factor cannot be logged into.
 
 The atomicity matters because a partially-provisioned tenant is a
 landmine. A tenant that exists in the tenant table but has no
@@ -163,106 +206,137 @@ stay below the per-tenant threshold, and either spread across
 many source IPs or stay below the per-IP threshold. The cost of
 the attack grows as a product of the three.
 
-The lockout configuration is in `LockoutPolicy`:
+The lockout configuration is in `LockoutPolicy`, and it is one scale,
+not three:
 
 ```rust,ignore
 pub struct LockoutPolicy {
-    pub per_user: LockoutScale,
-    pub per_tenant: LockoutScale,
-    pub per_ip: LockoutScale,
-}
-
-pub struct LockoutScale {
-    pub failures_before_lockout: u32,
-    pub window: Duration,
-    pub backoff: BackoffPolicy,  // fixed | exponential
-    pub max_lockout: Duration,
+    pub max_attempts: u32,             // default 5
+    pub duration: Option<Duration>,    // default 15 min; None = indefinite
+    pub attempt_window: Duration,      // default 1 hour
+    pub on_counter_unavailable: CounterUnavailable,   // default Lock
 }
 ```
 
-The policy is per-tenant by default (loaded from the tenant
-record's `lockout_policy` field). The global default applies if
-the tenant did not override.
+`max_attempts` is compared against the count
+`IdentityAuthnLog::record_failed_attempt` returns. `duration` is how
+long the lock lasts, and `None` means it does not expire on its own:
+an administrator has to clear it. `attempt_window` is how far back
+failures count, so five failures spread over two hours do not lock an
+account whose window is one hour.
+
+The scoping is per user only. Per-tenant and per-IP lockout
+scales do not exist on this type, and adding one would be the wrong place for it: a
+per-IP threshold that locks *accounts* is a denial-of-service tool in
+an attacker's hands. Rate-limit by IP instead, at the middleware layer,
+where the response is a 429 rather than a locked account
+(*Rate limiting* covers `KeyExtractor::LoginIdentifier`, which is the
+per-account half of that defence).
+
+`on_counter_unavailable` decides what happens when the counter store
+itself is down. That case is not hypothetical: `record_failed_attempt`
+is a write, and the read-replica split this library encourages puts
+reads on a replica and writes on the primary, so a primary outage
+leaves logins working and the counter dead. While that lasts the count
+never rises and `max_attempts` is never reached.
+
+`CounterUnavailable::Lock` is the default and treats the attempt as
+locked, so brute force stays bounded while the counter is dead. A user
+who mistypes is told they are locked and retries after `duration`.
+`CounterUnavailable::Allow` keeps those users logging in and disables
+lockout until the counter returns, which is an unbounded brute-force
+window at exactly the moment monitoring is degraded. Choose it only
+with a compensating control, such as a `KeyExtractor::LoginIdentifier`
+rate limiter in front of the route.
+
+One interaction to watch: `Lock` together with `duration: None` means a
+persistently broken counter store needs an administrator to clear each
+affected account. Deployments running indefinite lockouts should alert
+on `AuthnMetrics::factor_counter_store_outage`, which fires on exactly
+this path, or pick `Allow` knowingly.
+
+Neither setting changes what an attacker sees for an identifier that
+does not exist. Those are refused at `begin_login` with timing
+equalization and never reach the counter.
+
+The policy is resolved per tenant through
+`IdentityLookup::lockout_policy_for_tenant`, which defaults to
+`lockout_policy()`, which defaults to `LockoutPolicy::default()`.
+Override either where your tenants differ.
 
 ## Tenant suspension
 
-A suspended tenant is still in the database but cannot
-authenticate. The state is reached through `AuthnService::suspend_tenant`,
-which is the operational verb behind "this tenant has not paid"
-or "this tenant has been flagged for compliance review."
+`Tenant` carries `status: EntityState`, the same type a user's status
+uses, so a suspended tenant is representable. **Axess ships no
+operation to suspend one.** `IdentityStore` has `suspend_user` and
+`activate_user` and no tenant equivalent, the session registry
+invalidates by user and by session and not by tenant, and there is no
+tenant lifecycle event in the audit vocabulary.
 
-The transition does five things atomically: it sets the tenant's
-status to `Suspended`, it sets the `suspended_at` timestamp, it
-invalidates every active session under the tenant (deletes the
-session rows, the user's next request comes through as `Guest`),
-it revokes every refresh token under the tenant (sets `revoked
-= true` on each), and it emits a `TenantSuspended` audit event.
+What exists today is per-user: `suspend_user_in_tenant` sets the
+status, invalidates that user's sessions through the registry, and
+emits `AccountSuspended` attributed to the actor who did it.
 
-A suspended tenant's users hit `TenantSuspended` on every login
-attempt instead of proceeding to factor verification. The error
-is distinct from `UserNotFound` because the application typically
-wants to render a specific page for it (a "your organisation is
-suspended, contact support" message), not the generic invalid-credentials
-flow.
+If you need "this tenant has not paid" or "this tenant is under
+compliance review" now, it is yours to build: set the tenant's status
+through your own `IdentityStore` implementation, and invalidate the
+sessions of its users yourself. Doing it inside axess would mean new
+required methods on both `IdentityStore` and the session registry,
+which every adopter would have to implement, so it is a deliberate
+decision rather than an oversight to leave it out.
 
-Unsuspending is the inverse: `unsuspend_tenant` flips the status
-back to `Active`, clears `suspended_at`, and emits a
-`TenantReactivated` event. Sessions are not restored; users have
-to log in again, which is the right behaviour because their
-device records may have aged or rotated during the suspension.
+Whatever drives the status, a tenant that is not `Active` refuses its
+users before factor verification. That is a state the application may
+want to render specifically ("your organisation is suspended, contact
+support") rather than as the generic invalid-credentials page, so check
+the tenant's status rather than inferring it from the login outcome.
 
 ## Tenant deletion
 
-A deleted tenant is the irreversible end of the lifecycle. The
-state is reached through `AuthnService::delete_tenant`, typically
-in response to a customer exit or a GDPR erasure request.
+The same gap as suspension, one step further along. `EntityState` has a
+closed state, so a deleted tenant is representable, and **axess ships
+no operation to delete one and no cascade to run.** `IdentityAdmin` has
+`delete_user`, which is the GDPR erasure primitive for a single user;
+there is no tenant equivalent.
 
-The deletion runs as a cascade. All sessions, refresh tokens,
-devices, factor configurations, audit events, and the tenant
-record itself are removed. The deletion is two-phase: the first
-phase marks the tenant as `Deleted` and stops accepting new
-operations on it; the second phase runs the cascade asynchronously
-(typically as a background task) and removes the underlying
-rows.
+What a customer exit or a tenant-wide erasure request needs, you build:
+enumerate the tenant's users, call `delete_user` for each, and remove
+the tenant row. Two details from that verb carry over. Its contract
+says what must be gone afterwards (the user row, the factor configs,
+the refresh tokens, the sessions, the password history), and it leaves
+audit events in place, to be retained under an independent lawful basis
+with identifying columns pseudonymised. A tenant-level erasure inherits
+both.
 
-The two-phase pattern matters for two reasons. First, the
-cascade is potentially expensive on large tenants; running it
-synchronously blocks the operator's request. Second, the
-two-phase approach gives a recovery window: if the deletion was
-accidental, the first phase is reversible by flipping the status
-back to `Suspended` before the cascade runs. After the cascade,
-recovery requires a backup restore.
-
-The audit events emitted during the cascade are preserved (in a
-separate `axess.audit.tenant_deletion` log) so the deletion is
-defensible against later inquiry. The events name the
-operator who initiated, the timestamp, and the counts (how many
-users, how many sessions, how many tokens).
+If you build it, two things are worth doing that a naive cascade will
+not. Mark the tenant `Suspended` first and run the removal afterwards:
+the cascade is expensive on a large tenant, and the gap between the two
+is the only window in which an accidental deletion is recoverable
+without a backup restore. And write your own audit row for the
+operation, naming the operator, the instant and the counts, because
+axess has no tenant lifecycle event to emit and the deletion is exactly
+the thing you will later be asked to defend.
 
 ## Per-tenant configuration storage
 
-The per-tenant fields (fingerprint pepper, lockout policy,
-device retention, methods) live in dedicated tables keyed by
-tenant id. The application's tenant store is one of the adopter-
-implemented surfaces; axess provides traits, the implementation
-is yours. The pattern is uniform across the surfaces:
+There is no `TenantStore` trait. Tenant reads and writes live on the
+identity tiers alongside everything else: `IdentityLookup::find_tenant`
+and `default_tenant` read, `IdentityAdmin::create_tenant` writes, and
+the three `*_for_tenant` policy methods resolve per-tenant
+configuration from wherever you keep it.
 
-```rust,ignore
-#[async_trait]
-pub trait TenantStore: Send + Sync {
-    async fn get(&self, id: &TenantId) -> Result<Tenant, TenantStoreError>;
-    async fn create(&self, bootstrap: TenantBootstrap) -> Result<Tenant, ...>;
-    async fn suspend(&self, id: &TenantId, at: DateTime<Utc>) -> Result<(), ...>;
-    async fn unsuspend(&self, id: &TenantId) -> Result<(), ...>;
-    async fn delete(&self, id: &TenantId, mode: DeleteMode) -> Result<(), ...>;
-    async fn update_lockout_policy(&self, id: &TenantId, policy: LockoutPolicy) -> Result<(), ...>;
-    async fn rotate_fingerprint_pepper(&self, id: &TenantId, new: ZeroizedString) -> Result<(), ...>;
-}
-```
+That is a deliberate consolidation rather than a gap. A separate tenant
+trait would be a second surface every adopter has to implement, against
+the same database, with its own error type and its own transaction
+boundary. Provisioning a tenant already has to touch users and
+factors, so it could not stay inside that boundary anyway.
 
-The trait surface is the tenant lifecycle in code. An adopter
-implements it against their own tenant table; axess calls into
-it on each lifecycle event.
+The practical consequence is that per-tenant policy has no prescribed
+schema. A deployment with one policy for everyone implements nothing
+and takes the defaults. A deployment that varies policy per tenant adds
+a column or a table of its own and returns it from
+`lockout_policy_for_tenant` and friends. Axess never reads that storage
+directly, which is why it cannot dictate its shape.
 
 ## Reserved principals
 
@@ -272,16 +346,23 @@ operations (retention sweeps, scheduled rotations, audit pipeline
 ingestion). The principal carries no `TenantId`; its actions are
 attributed to the system itself, not to any tenant or user.
 
-The reservation prevents an application from creating a user
-named "system" and inadvertently granting that user the
-permissions axess reserves for its background work. The
-`UserId::is_reserved` check fires at user-creation time;
-attempting to provision a reserved principal returns an error.
+The reservation prevents an application from creating a user named
+"system" and inadvertently granting that user the permissions axess
+reserves for its background work. `UserId::is_system` and
+`TenantId::is_system` are the predicates, and
+`ensure_user_id_not_reserved(user_id, tenant_id)` is the guard,
+returning `IdError::Reserved` for either.
+
+Nothing calls that guard for you on the `IdentityAdmin::create_user`
+path, because the row is built in your code before the call. Put it at
+the top of your `create_user` implementation, which is what its
+documentation asks for. Tenant provisioning does check: `create_tenant`
+refuses a bootstrap whose tenant id is the reserved one.
 
 The set of reserved principals is small and stable. The chapter
 *Audit events* lists them.
 
-## What this enables
+## What a SaaS gets from this
 
 Multi-tenancy in axess is what lets a SaaS application provision
 new organisations without restructuring the data model, suspend

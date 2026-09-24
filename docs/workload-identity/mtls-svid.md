@@ -55,14 +55,15 @@ wherever the terminator put it, wrap it in `PeerCertChain`, and
 insert it into the request extensions before the resolver runs.
 
 ```rust,ignore
-use axess::workload::PeerCertChain;
+use axess::federation::mtls::PeerCertChain;
 
 async fn mtls_middleware<B>(
     mut req: Request<B>,
     next: Next<B>,
 ) -> Response {
+    // `chain` is a `Vec<CertificateDer<'static>>`, leaf first.
     if let Some(chain) = extract_cert_from_terminator(&req) {
-        req.extensions_mut().insert(PeerCertChain::from(chain));
+        req.extensions_mut().insert(PeerCertChain::new(chain));
     }
     next.run(req).await
 }
@@ -78,58 +79,81 @@ alongside the certificate.
 
 ## The resolver
 
-`MtlsResolver` is the resolver that reads the chain from the
-extensions, extracts the SPIFFE URI, validates against the
-configured trust domain, and produces a `Principal::Workload`.
+`MtlsResolver` reads the SPIFFE URI out of the leaf certificate,
+checks it against the configured trust domain, and produces a
+`Principal::Workload`.
 
 ```rust,ignore
-use axess::workload::{MtlsResolver, MtlsResolverConfig};
+use axess::federation::mtls::{MtlsResolver, PeerCertChain, peek_spiffe};
+use axess_identity::PrincipalResolver;
 
-let resolver = MtlsResolver::new(MtlsResolverConfig {
-    trust_domain: "prod.example.com".parse().unwrap(),
-    tenant_resolver: Box::new(MyTenantResolver::new(/* ... */)),
-});
+// Which tenant this is, from the SPIFFE ID, before the resolver is
+// built: `peek_spiffe` is a plain function over the leaf certificate
+// and does no validation beyond parsing the SAN URI.
+let leaf = chain.leaf().ok_or(MtlsError::EmptyChain)?;
+let components = peek_spiffe(leaf)?;
+let tenant_id = my_directory.tenant_for(&components.tenant_slug)?;
+
+let resolver = MtlsResolver::from_chain(
+    &chain,
+    "prod.example.com".parse()?,
+    tenant_id,
+)?;
+let principal = resolver.resolve().await?;   // Principal::Workload
 ```
 
-The configuration is small because most of the validation work has
-already happened. The terminator validated the certificate chain;
-the resolver only needs to read the SAN URI, parse it as a SPIFFE
-ID, and check that the trust domain matches the configured one.
+`from_chain` takes the leaf and returns `MtlsError::EmptyChain` if
+there is none. Where you already hold a leaf, from a terminator that
+hands you one certificate rather than a chain, `MtlsResolver::new` takes it
+directly and is infallible.
 
-`tenant_resolver` is the adopter-supplied piece that maps the
-SPIFFE path to a `TenantId`. The path typically follows a
-convention like `/svc/<service>/<tenant_slug>`, and the resolver
-looks up the tenant id from the slug. The convention is the
-deployment's; axess just provides the trait surface.
+Either way the resolver holds the leaf, the trust domain it accepts,
+and the tenant. There is no configuration struct and no tenant-resolver
+trait: mapping a SPIFFE path to a `TenantId` is the adopter's, done
+before construction with `peek_spiffe`, because the convention is the
+deployment's.
+
+The work is small because most of the validation already happened: the
+terminator validated the chain, and the resolver parses the SAN URI and
+checks the trust domain.
 
 ## The validation flow
 
-The resolver's `resolve` method runs five steps.
+Two error types are in play, and which one you see depends on where
+you are standing.
 
-The first step is reading the peer certificate chain from request
-extensions. Absence here is a configuration error (the extraction
-middleware did not run), and the resolver returns
-`MtlsError::NoPeerCert`.
+`peek_spiffe` is the parsing step, and it reports `MtlsError`. It
+parses the leaf's DER, where a failure is `MtlsError::CertParse`, then
+reads the Subject Alternative Name extension. A certificate with no
+SAN yields `MtlsError::NoSan`; one whose SAN carries no `spiffe://`
+URI yields `MtlsError::NoSpiffeUri`. The URI is then parsed as a
+SPIFFE ID and decomposed into
+`spiffe://<trust_domain>/<service>/<tenant_slug>`; a URI that is
+malformed, or whose path does not match that shape, yields
+`MtlsError::Identity`, which carries the underlying `IdentityError`.
+`MtlsError::EmptyChain` comes from `MtlsResolver::from_chain` rather
+than from parsing, and means the chain held no leaf at all.
 
-The second step is parsing the leaf certificate. The chain may
-contain intermediate certificates; the leaf is the first one. The
-resolver extracts the SAN extension and looks for a URI value
-matching the SPIFFE format. Absence of a SPIFFE URI in the SAN
-produces `MtlsError::NoSpiffeId`.
+`resolve` is the `PrincipalResolver` step, and it reports
+`IdentityError`, because that is what the trait returns for every
+resolver. It re-runs `peek_spiffe` on the leaf, cheaply and
+deliberately, so the cryptographic claim flows through one path rather
+than through whatever the middleware peeked at earlier, then compares
+the presented trust domain against the configured one. A mismatch is
+`IdentityError::InvalidSpiffeId`, naming both domains, and is logged at
+`warn`. Every other parse failure collapses to
+`IdentityError::NotAuthenticated`, with the specific `MtlsError` logged
+at `debug`.
 
-The third step is parsing the SPIFFE URI. The URI must be
-well-formed (a `spiffe://` scheme, a trust domain, a path). A
-malformed URI produces `MtlsError::MalformedSpiffeId`.
+That collapse is deliberate: a caller presenting a bad certificate
+learns only that it was rejected, while the operator reading the logs
+learns which of `CertParse`, `NoSan` or `NoSpiffeUri` it was. When you
+want the distinction in your own code, call `peek_spiffe` yourself,
+which the tenant lookup means you are doing anyway.
 
-The fourth step is the trust-domain match. The parsed trust
-domain must equal the configured one. A mismatch produces
-`MtlsError::TrustDomainMismatch`.
-
-The fifth step is the tenant resolution. The path is fed to the
-configured `TenantResolver`, which returns a `TenantId`. The
-resolver assembles the `WorkloadPrincipal` with the SPIFFE id, the
-trust domain, the issuer (`Issuer::Mtls`), and the tenant id, and
-returns it.
+The resolver does not resolve tenants. The tenant is
+decided before it is built, and `resolve` copies the `TenantId` it was
+given into the principal.
 
 ## What the principal looks like
 
@@ -147,11 +171,13 @@ Principal::Workload(WorkloadPrincipal {
 })
 ```
 
-The `attributes` map carries any X.509 fields the deployment
-chooses to surface (the certificate's serial number for audit, the
-certificate's expiry for short-lived-cert tracking, custom
-extensions). The choice is the deployment's; the resolver exposes
-the chain so the adopter can read what they need.
+`attributes` is always empty here. `MtlsResolver` puts nothing in it,
+and the certificate is not carried on the principal, so X.509 detail
+you want downstream (the serial number for audit, the expiry for
+short-lived-cert tracking, a custom extension) has to be read from
+the leaf in your own middleware and carried in your own request
+extension. The field exists on `WorkloadPrincipal` for resolvers that
+do populate it from claims.
 
 ## Combining with other resolvers
 
@@ -201,25 +227,32 @@ attestation; the choice is the deployment's.
 
 ## Troubleshooting
 
-If the resolver returns `NoPeerCert` for connections that should
-work, the extraction middleware is not running, or the terminator
-is not forwarding the certificate. Inspect the request extensions
+If the chain is empty (`EmptyChain`, or `PeerCertChain::leaf`
+returning `None`) for connections that should work, the terminator
+is not requesting a client certificate, or your middleware is not
+recording the one it received. Inspect what the terminator reports
 before the resolver runs.
 
-If the resolver returns `NoSpiffeId`, the certificate does not
-carry a SPIFFE URI in the SAN. Inspect the certificate
-(`openssl x509 -in cert.pem -text`) to see what SAN entries are
-present. The issuer's configuration may need to be updated to
-include the SPIFFE URI.
+If `resolve` returns `IdentityError::NotAuthenticated`, the debug log
+carries the real reason. `NoSan` or `NoSpiffeUri` means the certificate
+does not carry a SPIFFE URI in its Subject Alternative Name. Inspect
+it with `openssl x509 -in cert.pem -text` to see what SAN entries are
+present, and update the issuer's configuration to include the SPIFFE
+URI. `CertParse` means the bytes are not a certificate at all, which
+usually means the middleware picked up the wrong header or forwarded a
+PEM where DER was expected.
 
-If the resolver returns `TrustDomainMismatch`, a workload from a
-different trust domain has connected. If this is intentional,
-configure federation (covered in *Inbound: federation*).
+If `resolve` returns `IdentityError::InvalidSpiffeId`, read the
+message. "trust domain mismatch" means a workload from another trust
+domain connected; if that is intentional, see *Inbound: federation*.
+Anything else means the SPIFFE path does not have the
+`/<service>/<tenant_slug>` shape axess decomposes, and the issuer's
+path convention needs to change, because axess does not make the shape
+configurable.
 
-If the resolver succeeds but the tenant resolution fails, the
-path convention is not matching the workload's actual SPIFFE
-path. Inspect the path and update the tenant resolver to handle
-the actual format.
+If `peek_spiffe` succeeds but your own tenant lookup then fails, the
+`tenant_slug` in the path is not one your directory knows. That is
+your mapping to fix, not axess's; the resolver never sees it.
 
 ## Further reading
 

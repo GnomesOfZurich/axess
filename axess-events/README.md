@@ -14,7 +14,7 @@ The wire format is [rkyv](https://crates.io/crates/rkyv) for zero-copy deseriali
 
 ## Usage
 
-axess-events is consumed transparently by `axess-core` and by adopter analytics pipelines; see [`docs/audit-pipeline.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/audit-pipeline.md) for the integration shape.
+axess-events is consumed transparently by `axess-core` and by adopter analytics pipelines; see [`docs/production/audit-pipeline.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/production/audit-pipeline.md) for the integration shape.
 
 ## Licence
 

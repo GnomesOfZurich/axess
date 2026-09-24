@@ -45,7 +45,7 @@ where
         self.enforce_oauth_expected_tenant(user, claims, session)
             .await?;
 
-        let now = self.clock.now();
+        let now = self.inner.clock.now();
         session
             .set_authenticated(user.id, user.tenant_id, now)
             .await;
@@ -64,7 +64,7 @@ where
         // the request now would leave behind a tracked authenticated
         // session with no way to deliver the response cookie.
         // Log + continue.
-        if let Err(e) = self.identity.reset_failed_attempts(&user.id).await {
+        if let Err(e) = self.inner.identity.reset_failed_attempts(&user.id).await {
             tracing::warn!(
                 user_id = %user.id,
                 error = %e,
@@ -89,7 +89,7 @@ where
                 .with_session(sid),
             now,
         )
-        .await;
+        .await?;
 
         Ok(())
     }
@@ -185,7 +185,7 @@ where
         session: &AuthSession,
         sid: &crate::session::id::SessionId,
     ) -> Result<(), AuthnError<I::Error>> {
-        let Some(reg) = &self.registry else {
+        let Some(reg) = &self.inner.registry else {
             return Ok(());
         };
 
@@ -206,7 +206,7 @@ where
         // as an Authenticated OAuth session. Without this check, an
         // invalidate that ran when no session was registered yet
         // would be effectively undone by a subsequent register.
-        match self.identity.account_status(&user.id).await {
+        match self.inner.identity.account_status(&user.id).await {
             Ok(status) if !status.allows_login() => {
                 tracing::warn!(
                     user_id = %user.id,
@@ -218,7 +218,7 @@ where
                 );
                 reg.invalidate_session(&user.id, sid).await;
                 session.clear().await;
-                self.metrics.account_locked();
+                self.inner.metrics.account_locked();
                 Err(match status {
                     crate::authn::types::EntityState::Suspended(detail) => AuthnError::Locked {
                         until: detail.until,
@@ -253,9 +253,9 @@ where
     /// 1. **TTL prune**: drop entries older than `SID_MAP_TTL` (24h).
     ///    Steady-state cleanup so an OIDC session the IdP never
     ///    explicitly logged out eventually ages out.
-    /// 2. **Capacity evict**: if at/over `self.sid_map_capacity`
+    /// 2. **Capacity evict**: if at/over `self.inner.sid_map_capacity`
     ///    (default `DEFAULT_SID_MAP_CAPACITY = 10 000`; override via
-    ///    [`AuthnService::with_sid_map_capacity`]) after TTL prune,
+    ///    [`AuthnServiceBuilder::with_sid_map_capacity`]) after TTL prune,
     ///    evict a *batch* of oldest entries via a single bounded
     ///    scan. Sort + `take(BATCH)` is O(N log K) for K=128, keeping
     ///    the per-batch cost bounded under burst load.
@@ -282,12 +282,12 @@ where
         // session id (typically <64 chars).
         const MAX_OIDC_SID_BYTES: usize = 256;
         // Capacity cap is per-service configurable via
-        // `AuthnService::with_sid_map_capacity` (default
+        // `AuthnServiceBuilder::with_sid_map_capacity` (default
         // `DEFAULT_SID_MAP_CAPACITY = 10_000`). High-throughput OAuth
         // deployments raise it so legitimate concurrent OIDC sessions
         // do not trip the batch-eviction path and lose back-channel
         // logout precision on the evicted mappings.
-        let max_sid_map_entries = self.sid_map_capacity;
+        let max_sid_map_entries = self.inner.sid_map_capacity;
         const SID_MAP_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
         const EVICT_BATCH: usize = 128;
 
@@ -308,6 +308,7 @@ where
         };
 
         let issuer = self
+            .inner
             .oauth_providers
             .get(claims.provider.as_ref())
             .and_then(|p| p.issuer().map(|s| s.to_string()))
@@ -317,14 +318,15 @@ where
         // Phase 1: TTL prune.
         let cutoff = now - SID_MAP_TTL;
         let stale_keys: Vec<SidKey> = self
+            .inner
             .sid_map
             .iter()
             .filter(|e| e.value().2 < cutoff)
             .map(|e| e.key().clone())
             .collect();
         for evict_key in stale_keys {
-            if let Some((_, (evict_user, evict_sid, _))) = self.sid_map.remove(&evict_key) {
-                if let Some(reg) = &self.registry {
+            if let Some((_, (evict_user, evict_sid, _))) = self.inner.sid_map.remove(&evict_key) {
+                if let Some(reg) = &self.inner.registry {
                     reg.invalidate_session(&evict_user, &evict_sid).await;
                 }
                 tracing::debug!(
@@ -336,16 +338,18 @@ where
         }
 
         // Phase 2: capacity-based batch eviction.
-        if self.sid_map.len() >= max_sid_map_entries {
+        if self.inner.sid_map.len() >= max_sid_map_entries {
             let mut oldest: Vec<(chrono::DateTime<chrono::Utc>, SidKey)> = self
+                .inner
                 .sid_map
                 .iter()
                 .map(|e| (e.value().2, e.key().clone()))
                 .collect();
             oldest.sort_by_key(|(ts, _)| *ts);
             for (_, evict_key) in oldest.into_iter().take(EVICT_BATCH) {
-                if let Some((_, (evict_user, evict_sid, _))) = self.sid_map.remove(&evict_key) {
-                    if let Some(reg) = &self.registry {
+                if let Some((_, (evict_user, evict_sid, _))) = self.inner.sid_map.remove(&evict_key)
+                {
+                    if let Some(reg) = &self.inner.registry {
                         reg.invalidate_session(&evict_user, &evict_sid).await;
                     }
                     tracing::warn!(
@@ -359,7 +363,7 @@ where
         }
 
         // Atomic swap with displaced-mapping invalidation.
-        let displaced = self.sid_map.insert(key, (user.id, *sid, now));
+        let displaced = self.inner.sid_map.insert(key, (user.id, *sid, now));
         if let Some((old_user_id, old_session_id, _)) = displaced {
             tracing::warn!(
                 iss = %issuer,
@@ -367,7 +371,7 @@ where
                 old_user = %old_user_id,
                 "SidMap atomic swap displaced existing mapping; invalidating old session"
             );
-            if let Some(reg) = &self.registry {
+            if let Some(reg) = &self.inner.registry {
                 reg.invalidate_session(&old_user_id, &old_session_id).await;
             }
         }

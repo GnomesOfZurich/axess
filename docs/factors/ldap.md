@@ -12,23 +12,23 @@ The feature flag is `ldap` (off by default), enabled with
 
 ## When LDAP fits
 
-LDAP fits when three conditions hold. The first is that the
-authoritative user identities live in an LDAP directory the
-application can reach. The second is that the directory administrators
-have agreed to allow simple binds from the application's deployment
-network. The third is that the directory speaks LDAP, not some other
-protocol that wraps LDAP semantics (SAML, OIDC) which would route
-through the OAuth factor instead.
+LDAP fits when three conditions hold:
 
-When those conditions hold, LDAP gives the application
-authentication-as-a-service from the directory without the
-application ever storing a user password. New employees added to the
-directory can log into the application immediately; departed
+- The authoritative user identities live in an LDAP directory you can
+  reach.
+- The directory administrators have agreed to allow simple binds from
+  your deployment network.
+- The directory speaks LDAP, rather than a protocol that wraps LDAP
+  semantics. SAML and OIDC route through the OAuth factor instead.
+
+When those conditions hold, LDAP gives you authentication as a service
+from the directory, and you never store a user password. New employees
+added to the directory can log in immediately; departed
 employees removed from the directory lose access immediately. The
 directory is the source of truth.
 
 When those conditions do not hold (a SaaS deployment where users
-come from many organisations, a directory the application cannot
+come from many organisations, a directory you cannot
 reach over a stable network, an authoritative store that is not LDAP),
 the right answer is OAuth or OIDC against an IdP that the
 organisation does support.
@@ -76,7 +76,7 @@ observed latency.
 `group_search` is optional. When set, after a successful bind axess
 performs an additional search to enumerate the user's group
 memberships. The result is returned alongside the bind outcome and
-can be used by the application to populate the user's authorisation
+can be used to populate the user's authorisation
 attributes.
 
 ```rust,ignore
@@ -98,7 +98,7 @@ groups are already attributes of the user.
 ## The verification flow
 
 The verification flow is straightforward. The user submits a username
-and password to the application. The application calls
+and password to your handler, which calls
 `AuthnService::verify_factor` with the LDAP bind credential; axess
 expands the bind DN template with the username, opens a TLS
 connection to the directory, performs a simple bind with the
@@ -119,7 +119,7 @@ no idle-connection management) against per-attempt latency (a TLS
 handshake on each login). For most deployments the latency is
 acceptable; busy directories with thousands of binds per second
 benefit from a connection pool at the network layer (HAProxy,
-nginx) rather than inside the application.
+nginx) rather than in your process.
 
 ## Mixing LDAP with other factors
 
@@ -132,7 +132,7 @@ and then axess prompts for the user's TOTP code. The TOTP secret is
 stored in axess's own factor store (not in LDAP), under the user's
 scope. The combination gives directory-managed passwords with an
 application-managed second factor; the directory does not need to
-know about TOTP and the application does not need to know about
+know about TOTP, and you do not need to know about
 the password.
 
 A variation is LDAP followed by `AnyOf(vec![Totp, Fido2])`,
@@ -183,7 +183,7 @@ usually grants this by default. Run the same search through a
 known-good LDAP client to verify.
 
 If TLS fails with a certificate-validation error, the directory's
-certificate is probably signed by a private CA that the application's
+certificate is probably signed by a private CA that your
 trust store does not include. Add the CA to the rustls trust store
 via the standard `SSL_CERT_FILE` or `SSL_CERT_DIR` environment
 variables.
@@ -192,7 +192,7 @@ variables.
 
 *Factors and methods* covers the composition machinery this chapter
 exercises. *Identity store implementation* covers how user records
-referenced by LDAP get provisioned in the application's identity
+referenced by LDAP get provisioned in your identity
 store (typically just-in-time on first successful LDAP login).
 *Multi-tenancy* covers the case where different tenants federate to
 different directories.

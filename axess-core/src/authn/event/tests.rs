@@ -18,7 +18,7 @@ fn audit_context_from_headers_with_all_fields() {
     headers.insert("user-agent", "Mozilla/5.0 TestBrowser".parse().unwrap());
     headers.insert("x-request-id", "req-abc-123".parse().unwrap());
 
-    let ctx = extract_audit_context(&headers, None);
+    let ctx = extract_audit_context_untrusted(&headers, None);
 
     assert_eq!(
         ctx.ip_address,
@@ -39,7 +39,7 @@ fn audit_context_from_headers_with_all_fields() {
 #[test]
 fn audit_context_missing_headers_produce_none() {
     let headers = HeaderMap::new();
-    let ctx = extract_audit_context(&headers, None);
+    let ctx = extract_audit_context_untrusted(&headers, None);
 
     assert!(ctx.ip_address.is_none());
     assert!(ctx.user_agent.is_none());
@@ -56,7 +56,7 @@ fn ip_from_x_forwarded_for_takes_first() {
         "198.51.100.1, 203.0.113.50".parse().unwrap(),
     );
 
-    let ip = ip_from_headers(&headers);
+    let ip = ip_from_headers_untrusted(&headers);
     assert_eq!(ip, Some("198.51.100.1".parse::<IpAddr>().unwrap()));
 }
 
@@ -66,7 +66,7 @@ fn ip_from_x_real_ip_preferred_over_forwarded() {
     headers.insert("x-real-ip", "10.0.0.1".parse().unwrap());
     headers.insert("x-forwarded-for", "192.168.1.1".parse().unwrap());
 
-    let ip = ip_from_headers(&headers);
+    let ip = ip_from_headers_untrusted(&headers);
     assert_eq!(ip, Some("10.0.0.1".parse::<IpAddr>().unwrap()));
 }
 
@@ -89,7 +89,7 @@ fn event_carries_ip_and_user_agent_from_audit_context() {
     .with_audit_context(&ctx)
     .build();
 
-    assert_eq!(event.ip_address.as_deref(), Some("203.0.113.42"));
+    assert_eq!(event.ip_address, Some("203.0.113.42".parse().unwrap()));
     assert_eq!(event.user_agent.as_deref(), Some("TestAgent/1.0"));
     assert_eq!(event.request_id.as_deref(), Some("req-xyz"));
     assert_eq!(event.geo_country.as_deref(), Some("CH"));
@@ -299,7 +299,7 @@ async fn extract_audit_context_async_carries_session_id() {
     let session = crate::testing::test_session();
     let expected_sid = session.session_id().await.to_string();
 
-    let ctx = extract_audit_context_async(&headers, Some(&session)).await;
+    let ctx = extract_audit_context_async_untrusted(&headers, Some(&session)).await;
     assert_eq!(
         ctx.session_id.as_deref(),
         Some(expected_sid.as_str()),
@@ -310,4 +310,126 @@ async fn extract_audit_context_async_carries_session_id() {
         Some("10.1.2.3")
     );
     assert_eq!(ctx.user_agent.as_deref(), Some("AuditUA/1"));
+}
+
+#[test]
+fn audit_context_takes_the_ip_it_is_given_and_ignores_the_header() {
+    // The whole point of the argument: a client-supplied `X-Real-IP`
+    // must not reach the audit row when the caller has resolved the
+    // address itself.
+    let mut headers = HeaderMap::new();
+    headers.insert("x-real-ip", "192.0.2.5".parse().unwrap());
+    headers.insert("user-agent", "Mozilla/5.0 TestBrowser".parse().unwrap());
+
+    let resolved: IpAddr = "203.0.113.42".parse().unwrap();
+    let ctx = extract_audit_context(&headers, Some(resolved), None);
+
+    assert_eq!(
+        ctx.ip_address,
+        Some(resolved),
+        "the resolved address wins over the header"
+    );
+    assert_eq!(ctx.user_agent.as_deref(), Some("Mozilla/5.0 TestBrowser"));
+}
+
+#[test]
+fn audit_context_records_no_ip_rather_than_a_forged_one() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-real-ip", "192.0.2.5".parse().unwrap());
+
+    let ctx = extract_audit_context(&headers, None, None);
+
+    assert!(
+        ctx.ip_address.is_none(),
+        "passing None must leave the field empty, not fall back to the header"
+    );
+}
+
+#[test]
+fn failure_reason_round_trips_through_its_wire_string() {
+    // Every variant must survive as_str -> from_str, or a reason written
+    // by one version reads back as something else in the next.
+    let all = [
+        AuthFailureReason::NotActive,
+        AuthFailureReason::UnknownTenant,
+        AuthFailureReason::InvalidTenantRow,
+        AuthFailureReason::UnknownIdentifier,
+        AuthFailureReason::CrossTenantImpersonation,
+        AuthFailureReason::TokenRefresh,
+        AuthFailureReason::TokenRefreshNoToken,
+        AuthFailureReason::TokenRefreshUnknownProvider,
+        AuthFailureReason::TokenRefreshProviderRejected,
+        AuthFailureReason::CeremonyExpired,
+        AuthFailureReason::CsrfMismatch,
+        AuthFailureReason::MissingIssuer,
+        AuthFailureReason::PkceVerifierInvalid,
+        AuthFailureReason::TokenExchange,
+        AuthFailureReason::ProviderMismatch,
+        AuthFailureReason::Other("anything else".to_owned()),
+    ];
+    for reason in all {
+        let wire = reason.as_str().to_owned();
+        assert_eq!(
+            AuthFailureReason::from(wire.as_str()),
+            reason,
+            "`{wire}` did not round-trip"
+        );
+    }
+}
+
+#[test]
+fn failure_reason_tags_are_distinct() {
+    // Two variants sharing a tag would silently merge on read-back.
+    let tags = [
+        AuthFailureReason::NotActive,
+        AuthFailureReason::UnknownTenant,
+        AuthFailureReason::InvalidTenantRow,
+        AuthFailureReason::UnknownIdentifier,
+        AuthFailureReason::CrossTenantImpersonation,
+        AuthFailureReason::TokenRefresh,
+        AuthFailureReason::TokenRefreshNoToken,
+        AuthFailureReason::TokenRefreshUnknownProvider,
+        AuthFailureReason::TokenRefreshProviderRejected,
+        AuthFailureReason::CeremonyExpired,
+        AuthFailureReason::CsrfMismatch,
+        AuthFailureReason::MissingIssuer,
+        AuthFailureReason::PkceVerifierInvalid,
+        AuthFailureReason::TokenExchange,
+        AuthFailureReason::ProviderMismatch,
+    ]
+    .map(|r| r.as_str().to_owned());
+    let unique: std::collections::BTreeSet<_> = tags.iter().collect();
+    assert_eq!(
+        unique.len(),
+        tags.len(),
+        "duplicate wire tag among variants"
+    );
+}
+
+#[test]
+fn unknown_reason_becomes_other_rather_than_failing() {
+    // An audit row must never be lost because this version does not know
+    // the tag: a newer axess, or an adopter's own reason, still reads.
+    let parsed = AuthFailureReason::from("some_reason_from_a_newer_version");
+    assert_eq!(
+        parsed,
+        AuthFailureReason::Other("some_reason_from_a_newer_version".to_owned())
+    );
+    assert_eq!(parsed.as_str(), "some_reason_from_a_newer_version");
+    assert!("anything".parse::<AuthFailureReason>().is_ok());
+}
+
+#[test]
+fn failure_reason_serialises_as_a_plain_string() {
+    // The JSON an adopter already stores must not change shape just
+    // because the Rust type became an enum.
+    let json = serde_json::to_string(&AuthFailureReason::UnknownTenant).unwrap();
+    assert_eq!(json, r#""unknown_tenant""#);
+
+    let back: AuthFailureReason = serde_json::from_str(r#""unknown_tenant""#).unwrap();
+    assert_eq!(back, AuthFailureReason::UnknownTenant);
+
+    // And a free-form one is still a bare string, not a tagged enum.
+    let other = serde_json::to_string(&AuthFailureReason::Other("boom".into())).unwrap();
+    assert_eq!(other, r#""boom""#);
 }

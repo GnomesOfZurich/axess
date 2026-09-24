@@ -39,24 +39,54 @@ pub struct AuditContext {
     pub session_id: Option<String>,
 }
 
-/// Extract an [`AuditContext`] from Axum request headers and an optional session.
+/// Extract an [`AuditContext`], **taking the client IP from the request
+/// headers and trusting it**.
 ///
-/// # Example
+/// `X-Real-IP` and `X-Forwarded-For` are ordinary request headers, so on
+/// any service a client can reach directly the resulting
+/// `AuthEvent::ip_address` is whatever that client chose. Since a failed
+/// audit write now fails the login, those rows are guaranteed to exist,
+/// which makes a forged address in them worse rather than better: it is
+/// evidence written by the subject of the evidence.
 ///
-/// ```rust,ignore
-/// use axess_core::authn::event::extract_audit_context;
-///
-/// let ctx = extract_audit_context(request.headers(), Some(&session));
-/// let event = AuthEventBuilder::new(user_id, tenant_id, event_type, status)
-///     .with_audit_context(&ctx)
-///     .build();
-/// ```
-pub fn extract_audit_context(
+/// Use it only where something upstream guarantees the headers. Otherwise
+/// use [`extract_audit_context`], which takes the address you resolved.
+pub fn extract_audit_context_untrusted(
     headers: &axum::http::HeaderMap,
     _session: Option<&crate::session::extractor::AuthSession>,
 ) -> AuditContext {
+    extract_audit_context(headers, ip_from_headers_untrusted(headers), _session)
+}
+
+/// Extract an [`AuditContext`] using a client IP **you** resolved.
+///
+/// [`extract_audit_context_untrusted`] takes
+/// the IP from `X-Real-IP` or `X-Forwarded-For`, and any client can set both,
+/// so the `ip_address` on every resulting audit row is chosen by the subject
+/// of the audit. An attacker's failed logins can be recorded against whatever
+/// address they like, which is evidence forgery in the one place a deployment
+/// most needs evidence to hold.
+///
+/// Resolve the address first, against the peer your server actually accepted
+/// the connection from:
+///
+/// ```rust,ignore
+/// use axess_core::authz::{TrustedProxies, ip_from_headers_trusted};
+/// use axess_core::authn::event::extract_audit_context;
+///
+/// let client_ip = ip_from_headers_trusted(request.headers(), peer_addr, &trusted);
+/// let ctx = extract_audit_context(request.headers(), Some(client_ip), Some(&session));
+/// ```
+///
+/// Pass `None` when you have no trustworthy address; a null `ip_address` is
+/// honest, and a forged one is not.
+pub fn extract_audit_context(
+    headers: &axum::http::HeaderMap,
+    client_ip: Option<IpAddr>,
+    _session: Option<&crate::session::extractor::AuthSession>,
+) -> AuditContext {
     AuditContext {
-        ip_address: ip_from_headers(headers),
+        ip_address: client_ip,
         user_agent: headers
             .get("user-agent")
             .and_then(|v| v.to_str().ok())
@@ -75,25 +105,42 @@ pub fn extract_audit_context(
 ///
 /// Prefer this over [`extract_audit_context`] when you have access to an
 /// [`AuthSession`](crate::session::extractor::AuthSession).
-pub async fn extract_audit_context_async(
+pub async fn extract_audit_context_async_untrusted(
     headers: &axum::http::HeaderMap,
     session: Option<&crate::session::extractor::AuthSession>,
 ) -> AuditContext {
-    let mut ctx = extract_audit_context(headers, session);
+    extract_audit_context_async(headers, ip_from_headers_untrusted(headers), session).await
+}
+
+/// [`extract_audit_context`] plus the session id. See that function for why
+/// the IP is an argument rather than something read from a header.
+pub async fn extract_audit_context_async(
+    headers: &axum::http::HeaderMap,
+    client_ip: Option<IpAddr>,
+    session: Option<&crate::session::extractor::AuthSession>,
+) -> AuditContext {
+    let mut ctx = extract_audit_context(headers, client_ip, session);
     if let Some(s) = session {
         ctx.session_id = Some(s.session_id().await.to_string());
     }
     ctx
 }
 
-/// Extract a best-effort client IP address from request headers.
+/// Extract a client IP address from request headers, **trusting the client**.
 ///
-/// Checks `X-Real-IP` then `X-Forwarded-For` (first entry). Returns `None`
+/// Checks `X-Real-IP` then the first `X-Forwarded-For` entry. Returns `None`
 /// if neither header is present or parseable.
+///
+/// The name carries the warning because the behaviour warrants one: both
+/// headers are ordinary request headers, so on any deployment a client can
+/// reach directly, the value is whatever that client chose. Use it only when
+/// something upstream guarantees the headers, and use
+/// [`ip_from_headers_trusted`](crate::authz::ip_from_headers_trusted) when it
+/// does not.
 ///
 /// This is a standalone copy for the `authn` module so it does not depend on
 /// the feature-gated `authz` module.
-pub fn ip_from_headers(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
+pub fn ip_from_headers_untrusted(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
     let raw = headers
         .get("X-Real-IP")
         .or_else(|| headers.get("X-Forwarded-For"))
@@ -105,7 +152,17 @@ pub fn ip_from_headers(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
 
 // ── AuthEventType ─────────────────────────────────────────────────────────────
 
-/// Enumerates all possible authentication-related events tracked by Axess.
+/// Every authentication-related event name axess defines.
+///
+/// The enum is shared vocabulary, not a list of what axess emits. Axess
+/// emits from its service layer, which is the part holding an
+/// [`IdentityAuthnLog`](super::store::IdentityAuthnLog) to write through.
+/// Seven names are for glue the adopter implements and axess is not on the
+/// call path for: `MethodEnabled`, `MethodDisabled`, `SessionExpired`,
+/// `SessionInvalidated`, `DeviceTrustGranted`, `DevicePurged` and
+/// `DeviceFingerprintMismatch`. They are declared here so every deployment
+/// spells them the same way and a shared SIEM rule matches across adopters;
+/// each is marked below. See `docs/production/audit-events.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[cfg_attr(
     feature = "rkyv",
@@ -126,17 +183,22 @@ pub enum AuthEventType {
     FactorEnabled,
     /// Disabling an authentication factor.
     FactorDisabled,
-    /// Enabling an authentication method.
+    /// Enabling an authentication method. **Adopter-emitted:** axess has
+    /// no method enable/disable operation.
     MethodEnabled,
-    /// Disabling an authentication method.
+    /// Disabling an authentication method. **Adopter-emitted**, as
+    /// [`MethodEnabled`](Self::MethodEnabled).
     MethodDisabled,
     /// A password reset was requested (token issued).
     PasswordResetRequested,
     /// A password reset was completed (new password set).
     PasswordReset,
-    /// Session expired due to inactivity or policy.
+    /// Session expired due to inactivity or policy. **Adopter-emitted:**
+    /// expiry is decided by the session store, and `refresh_session` takes
+    /// no audit sink.
     SessionExpired,
     /// Session was explicitly invalidated (e.g., admin logout).
+    /// **Adopter-emitted**, as [`SessionExpired`](Self::SessionExpired).
     SessionInvalidated,
     /// A new user account was created (signup started).
     SignupStarted,
@@ -154,6 +216,7 @@ pub enum AuthEventType {
     DeviceFirstSeen,
     /// A `Device` transitioned from `Seen` → `Trusted` via a
     /// trust ceremony, user opt-in, or admin-driven assignment.
+    /// **Adopter-emitted:** the ceremony is yours.
     DeviceTrustGranted,
     /// A `Device` transitioned to `Revoked`. `error` carries
     /// the reason (`"user_action"`, `"refresh_family_revoked"`,
@@ -161,13 +224,16 @@ pub enum AuthEventType {
     DeviceRevoked,
     /// A `Device` row was hard-deleted (retention sweep or
     /// Art 17 erasure). `device_id` is a tombstone; the row is gone.
+    /// **Adopter-emitted:** the retention sweep is yours.
     DevicePurged,
     /// A new `DeviceBinding` (`Cookie` / `WebAuthn`) was
     /// attached to a `Device`. `error` carries the binding kind.
     DeviceBindingAdded,
     /// A request carried a valid `device_id` cookie but the
     /// recomputed `FingerprintHash` did not match. Always
-    /// `Suspicious`: canonical cookie-replay signal.
+    /// `Suspicious`: canonical cookie-replay signal. **Adopter-emitted:**
+    /// it comes from your [`DeviceResolver`](crate::device::DeviceResolver),
+    /// which is also why `AuthEventStatus::Suspicious` is never set by axess.
     DeviceFingerprintMismatch,
 }
 
@@ -258,9 +324,14 @@ pub enum AuthEventStatus {
     Failure,
     /// Blocked due to lockout.
     Locked,
-    /// Failed due to expiry.
+    /// Failed due to expiry. **Adopter-set:** the paths where it applies,
+    /// such as `refresh_session`, are free functions with no audit sink in
+    /// their signature, so axess never writes this.
     Expired,
-    /// Flagged as suspicious (e.g., anomaly detected).
+    /// Flagged as suspicious (e.g., anomaly detected). **Adopter-set:** its
+    /// canonical producer is
+    /// [`DeviceFingerprintMismatch`](AuthEventType::DeviceFingerprintMismatch),
+    /// which comes from an adopter-implemented resolver.
     Suspicious,
 }
 
@@ -295,6 +366,164 @@ impl FromStr for AuthEventStatus {
 impl fmt::Display for AuthEventStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+/// Why a failed [`AuthEvent`] failed.
+///
+/// This is the field a SOC dashboard groups by, so it is an enum rather
+/// than free text. It used to be a `String`, which is the same defect
+/// [`AuthEventBuilder::locked`](super::event::AuthEventBuilder::locked)
+/// was introduced to fix for the *outcome*: querying meant matching a
+/// string, and a string nothing enforced. One call site wrote
+/// `"cross-tenant impersonation refused"`, with spaces, so it did not
+/// even sort alongside the snake_case tags it sat beside.
+///
+/// [`Other`](Self::Other) carries anything axess has no tag for,
+/// including an adopter's own detail. Parsing never fails: an
+/// unrecognised string becomes `Other`, so rows written by an older
+/// version, or by an adopter, read back without loss.
+///
+/// The wire form is the string from [`as_str`](Self::as_str), in both
+/// serde and database columns, so this is a Rust-level type change only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+pub enum AuthFailureReason {
+    /// The account or factor exists but is not in an active state.
+    NotActive,
+    /// The identity is valid and active but has no usable authentication
+    /// method configured, so there is nothing to challenge.
+    NoFactorsConfigured,
+    /// No tenant matched the identifier supplied at login.
+    UnknownTenant,
+    /// The tenant row was present but could not be interpreted.
+    InvalidTenantRow,
+    /// No identity matched the identifier supplied at login.
+    UnknownIdentifier,
+    /// An administrator tried to impersonate across a tenant boundary.
+    CrossTenantImpersonation,
+    /// An OAuth refresh-token exchange failed.
+    TokenRefresh,
+    /// A refresh was attempted with no refresh token stored.
+    TokenRefreshNoToken,
+    /// A refresh named a provider that is not registered.
+    TokenRefreshUnknownProvider,
+    /// The identity provider rejected the refresh token.
+    TokenRefreshProviderRejected,
+    /// The OAuth ceremony outlived its timeout before the callback.
+    CeremonyExpired,
+    /// The `state` returned by the identity provider did not match.
+    CsrfMismatch,
+    /// The stored ceremony carried no issuer to compare against.
+    MissingIssuer,
+    /// The stored PKCE verifier was absent or unusable.
+    PkceVerifierInvalid,
+    /// The authorization-code exchange was rejected.
+    TokenExchange,
+    /// The callback's provider did not match the one the flow began with.
+    ProviderMismatch,
+    /// Anything axess has no tag for, including adopter-supplied detail.
+    ///
+    /// Prefer a variant where one fits: `Other` is not queryable as a
+    /// class, which is the problem this type exists to solve.
+    Other(String),
+}
+
+impl AuthFailureReason {
+    /// Stable string representation for database storage.
+    ///
+    /// Not `&'static str`, unlike
+    /// [`AuthEventStatus::as_str`](AuthEventStatus::as_str), because
+    /// [`Other`](Self::Other) borrows its own payload.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::NotActive => "not_active",
+            Self::NoFactorsConfigured => "no_factors_configured",
+            Self::UnknownTenant => "unknown_tenant",
+            Self::InvalidTenantRow => "invalid_tenant_row",
+            Self::UnknownIdentifier => "unknown_identifier",
+            Self::CrossTenantImpersonation => "cross_tenant_impersonation",
+            Self::TokenRefresh => "token_refresh",
+            Self::TokenRefreshNoToken => "token_refresh_no_token",
+            Self::TokenRefreshUnknownProvider => "token_refresh_unknown_provider",
+            Self::TokenRefreshProviderRejected => "token_refresh_provider_rejected",
+            Self::CeremonyExpired => "ceremony_expired",
+            Self::CsrfMismatch => "csrf_mismatch",
+            Self::MissingIssuer => "missing_issuer",
+            Self::PkceVerifierInvalid => "pkce_verifier_invalid",
+            Self::TokenExchange => "token_exchange",
+            Self::ProviderMismatch => "provider_mismatch",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+impl From<&str> for AuthFailureReason {
+    fn from(s: &str) -> Self {
+        match s {
+            "not_active" => Self::NotActive,
+            "no_factors_configured" => Self::NoFactorsConfigured,
+            "unknown_tenant" => Self::UnknownTenant,
+            "invalid_tenant_row" => Self::InvalidTenantRow,
+            "unknown_identifier" => Self::UnknownIdentifier,
+            "cross_tenant_impersonation" => Self::CrossTenantImpersonation,
+            "token_refresh" => Self::TokenRefresh,
+            "token_refresh_no_token" => Self::TokenRefreshNoToken,
+            "token_refresh_unknown_provider" => Self::TokenRefreshUnknownProvider,
+            "token_refresh_provider_rejected" => Self::TokenRefreshProviderRejected,
+            "ceremony_expired" => Self::CeremonyExpired,
+            "csrf_mismatch" => Self::CsrfMismatch,
+            "missing_issuer" => Self::MissingIssuer,
+            "pkce_verifier_invalid" => Self::PkceVerifierInvalid,
+            "token_exchange" => Self::TokenExchange,
+            "provider_mismatch" => Self::ProviderMismatch,
+            other => Self::Other(other.to_owned()),
+        }
+    }
+}
+
+impl From<String> for AuthFailureReason {
+    fn from(s: String) -> Self {
+        // Route through the borrowed form so the tag table lives once,
+        // then avoid re-allocating when nothing matched.
+        match Self::from(s.as_str()) {
+            Self::Other(_) => Self::Other(s),
+            known => known,
+        }
+    }
+}
+
+impl FromStr for AuthFailureReason {
+    /// Parsing cannot fail: an unrecognised tag becomes
+    /// [`Other`](Self::Other) rather than an error, so an audit row is
+    /// never dropped for carrying a reason this version does not know.
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from(s))
+    }
+}
+
+impl fmt::Display for AuthFailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+// Serialized as the plain tag string rather than as a Rust enum, so the
+// JSON an adopter already stores is unchanged by this type existing.
+impl Serialize for AuthFailureReason {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthFailureReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from(String::deserialize(deserializer)?))
     }
 }
 
@@ -340,15 +569,23 @@ pub struct AuthEvent {
     /// Optional kind of factor involved.
     pub factor_kind: Option<FactorKind>,
     /// Optional client IP address.
-    pub ip_address: Option<String>,
+    ///
+    /// Typed rather than free text so a forged or malformed value cannot
+    /// be stored at all. Resolve it with
+    /// [`ip_from_headers_trusted`](crate::authz::ip_from_headers_trusted)
+    /// against the peer your server accepted; `None` is the honest value
+    /// where no trustworthy address is available.
+    pub ip_address: Option<std::net::IpAddr>,
     /// Optional user agent string.
     pub user_agent: Option<String>,
     /// Optional request ID for log correlation (from `X-Request-Id`).
     pub request_id: Option<String>,
     /// Optional ISO 3166-1 alpha-2 country code derived from client IP.
     pub geo_country: Option<String>,
-    /// Optional error detail for failed events.
-    pub error: Option<String>,
+    /// Why the event failed, for failed events.
+    ///
+    /// Typed so a dashboard can group by it; see [`AuthFailureReason`].
+    pub error: Option<AuthFailureReason>,
     /// Optional administrator who initiated the action on the subject's
     /// behalf, distinct from `user_id` (the subject of the event).
     ///

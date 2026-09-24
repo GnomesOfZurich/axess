@@ -22,6 +22,7 @@
 //! - Not suitable for production; use `SqliteSessionStore`, `PostgresSessionStore`,
 //!   or `ValkeySessionStore` for persistent deployments.
 
+use crate::authn::store::AuditOutcome;
 use crate::authn::{
     factor::{FactorConfig, FactorKind, PasswordConfig, PasswordRules, ZeroizedString},
     ids::{TenantId, UserId},
@@ -184,7 +185,10 @@ impl crate::authn::store::IdentityLookup for InMemoryBackend {
 }
 
 impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
-    async fn record_event(&self, event: crate::authn::event::AuthEvent) -> Result<(), Self::Error> {
+    async fn record_event(
+        &self,
+        event: crate::authn::event::AuthEvent,
+    ) -> Result<AuditOutcome, Self::Error> {
         self.identity.record_event(event).await
     }
 
@@ -217,7 +221,9 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
     ) -> Result<(), Self::Error> {
         self.identity.suspend_user(user_id, detail).await
     }
+}
 
+impl crate::authn::store::IdentityPasswordHistory for InMemoryBackend {
     async fn record_password_hash(&self, user_id: &UserId, hash: &str) -> Result<(), Self::Error> {
         self.identity.record_password_hash(user_id, hash).await
     }
@@ -228,25 +234,6 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
         count: usize,
     ) -> Result<Vec<String>, Self::Error> {
         self.identity.password_history(user_id, count).await
-    }
-
-    async fn store_reset_token(
-        &self,
-        user_id: &UserId,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), Self::Error> {
-        self.identity
-            .store_reset_token(user_id, token_hash, expires_at)
-            .await
-    }
-
-    async fn verify_reset_token(
-        &self,
-        user_id: &UserId,
-        token_hash: &str,
-    ) -> Result<bool, Self::Error> {
-        self.identity.verify_reset_token(user_id, token_hash).await
     }
 }
 
@@ -318,3 +305,24 @@ impl FactorStore for InMemoryBackend {
 
 #[cfg(test)]
 mod in_memory_backend_tests;
+
+impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
+    async fn store_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Self::Error> {
+        self.identity
+            .store_reset_token(user_id, token_hash, expires_at)
+            .await
+    }
+
+    async fn verify_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+    ) -> Result<bool, Self::Error> {
+        self.identity.verify_reset_token(user_id, token_hash).await
+    }
+}

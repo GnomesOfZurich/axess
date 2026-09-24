@@ -35,7 +35,7 @@ record; *Multi-tenancy* and *Cookies, fingerprinting, hijack
 detection* cover the mechanism.
 
 The session cookie has `Secure=true` set. TLS terminates at the
-edge; the application sees only HTTPS traffic; the cookie is
+edge; your service sees only HTTPS traffic; the cookie is
 only sent on HTTPS.
 
 The trusted-proxy list is configured. The application reads the
@@ -115,18 +115,18 @@ plus a safety margin), the previous key can be removed.
 
 The rotation sequence:
 
-1. Deploy the application with `new_signing_key = old_key` and
+1. Deploy with `new_signing_key = old_key` and
    `previous_key = old_key`. Nothing has changed; this is the
    baseline.
 2. Generate a fresh 32-byte signing key. Store it in the secrets
    manager alongside the existing one.
-3. Deploy the application with `new_signing_key = fresh_key` and
+3. Deploy with `new_signing_key = fresh_key` and
    `previous_key = old_key`. New cookies sign with the fresh
    key; existing cookies continue to validate against the old.
 4. Wait one session TTL. By the end of this window, every
    existing session has either expired or been refreshed (which
    re-signs the cookie with the fresh key).
-5. Deploy the application with `previous_key = None` (or absent).
+5. Deploy with `previous_key = None` (or absent).
    The old key is now unused.
 6. Remove the old key from the secrets manager.
 
@@ -254,7 +254,7 @@ audit-pipeline drain.
 ## Health checks and metrics
 
 A production deployment exposes `/healthz` and `/metrics`
-endpoints. The health check confirms the application's
+endpoints. The health check confirms your
 backends are reachable; the metrics expose the operational
 counters.
 
@@ -331,7 +331,7 @@ signals.
 
 Health check failing on session store: the session backend is
 unreachable. Investigate the database. Until the backend is
-back, the application cannot serve authenticated traffic; the
+back, you cannot serve authenticated traffic; the
 load balancer treats the 503 as a signal to route around the
 instance.
 
@@ -346,12 +346,20 @@ rate; widen the IP-prefix tolerance or the user-agent matching.
 *Cookies, fingerprinting, hijack detection* covers the tolerance
 configuration.
 
-Audit pipeline buffer filling: the analytics sink is slow or
-down. Inspect the sink's metrics; if it is the SIEM under
-maintenance, the buffer fills until the policy fires
-(`DropOldest`, `Block`, or `ShutdownAuthn`). Plan for the
-maintenance window through the deployment's standard
-notification process.
+Logins slowing with no change in traffic: look at the audit sink.
+`IdentityAuthnLog::record_event` is awaited on the login path, so
+whatever it does, the login waits for it. A SIEM under maintenance
+behind a synchronous sink shows up as login latency, not as an audit
+alert. If that is a risk you carry, buffer inside your own sink
+implementation; *Audit pipeline* covers exactly how far axess goes
+here, and where you take over.
+
+Logins failing in a burst with the store reachable: check
+`AuthnMetrics::audit_store_outage` before `auth_failure`. A failed audit
+write fails the login since 0.6.0, so an audit problem presents as an
+authentication problem. `audit_event_shed` rising instead means the sink
+is deliberately dropping events to protect itself: nothing is failing,
+but the trail has gaps and something is driving volume at you.
 
 ## Canonical OPERATIONS.md
 

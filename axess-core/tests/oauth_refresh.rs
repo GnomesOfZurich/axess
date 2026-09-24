@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::event::AuthFailureReason;
 use axess_core::{
     authn::service::AuthnService,
     testing::mock_authn::{MockFactorStore, MockIdentityStore},
@@ -23,8 +24,9 @@ async fn oauth_refresh_roundtrip() {
     );
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn =
-        AuthnService::new(identity.clone(), MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let claims = authn
         .refresh_oauth_token("refresh-idp", "stored-refresh-token")
@@ -51,8 +53,9 @@ async fn oauth_refresh_empty_token_rejected() {
     let mock = MockOAuthProvider::new("test-idp2").with_user("user-1", "a@b.com", vec![], vec![]);
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn =
-        AuthnService::new(identity.clone(), MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let result = authn.refresh_oauth_token("test-idp2", "").await;
     assert!(matches!(
@@ -65,7 +68,7 @@ async fn oauth_refresh_empty_token_rejected() {
         events
             .iter()
             .any(|e| matches!(e.event_status, AuthEventStatus::Failure)
-                && e.error.as_deref() == Some("token_refresh_no_token")),
+                && e.error == Some(AuthFailureReason::TokenRefreshNoToken)),
         "expected a Failure event tagged token_refresh_no_token, got {events:?}"
     );
 }
@@ -90,7 +93,7 @@ async fn oauth_refresh_unknown_provider_rejected() {
         events
             .iter()
             .any(|e| matches!(e.event_status, AuthEventStatus::Failure)
-                && e.error.as_deref() == Some("token_refresh_unknown_provider")),
+                && e.error == Some(AuthFailureReason::TokenRefreshUnknownProvider)),
         "expected a Failure event tagged token_refresh_unknown_provider, got {events:?}"
     );
 }
@@ -102,7 +105,9 @@ async fn oauth_userinfo_empty_token_rejected() {
 
     let mock = MockOAuthProvider::new("ui-idp").with_user("u1", "x@y.com", vec![], vec![]);
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let result = authn.fetch_userinfo("ui-idp", "").await;
     assert!(matches!(

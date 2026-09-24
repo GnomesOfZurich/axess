@@ -18,10 +18,27 @@ db-path = "~/.cargo/advisory-db"
 ignore = [
     # rsa: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
     # Severity: 5.9 (medium). No fixed version available.
-    # Pulled transitively by: sqlx-mysql, openidconnect, crypto-glue (webauthn-rs).
-    # Risk to axess: low. We do not use RSA for session encryption or key
-    # exchange. The crate is used by upstream deps for JWT signature verification
-    # and by our dev-dependency for test key generation.
+    #
+    # Reachability, stated precisely because an earlier version of this note
+    # called it transitive-only and that was wrong:
+    #   - Transitively, via sqlx-mysql, openidconnect and crypto-glue
+    #     (webauthn-rs).
+    #   - Directly, as an optional runtime dependency of axess-core enabled by
+    #     `local-idp`, for RSA-2048 keygen and PKCS#1 parsing in
+    #     `LocalIdpSigningKey`.
+    #   - Directly, under `jwt-rust-crypto`, because jsonwebtoken's
+    #     `rust_crypto` backend performs RS256 signing and verification
+    #     through this crate.
+    #
+    # Risk: the advisory is a timing sidechannel on RSA private-key
+    # operations. RSA is not used for session encryption or key exchange, and
+    # keygen is unaffected. The exposed operation is RS256 *signing*, which
+    # only happens when `local-idp` is enabled (off by default) and the
+    # deployment mints its own tokens. A deployment that signs with
+    # `local-idp` over an attacker-reachable interface should prefer ES256, or
+    # the `jwt-aws-lc` backend, which does not route through this crate.
+    # Verification-only deployments are not exposed.
+    #
     # Resolution: wait for rsa crate maintainers to release a fix.
     "RUSTSEC-2023-0071",
 

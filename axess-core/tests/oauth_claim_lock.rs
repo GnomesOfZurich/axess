@@ -130,7 +130,9 @@ async fn no_claim_lock_stashed_returns_no_flow() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let session = test_session();
     // No claim lock stashed; session is clean.
@@ -156,7 +158,9 @@ async fn wrong_claim_lock_returns_no_flow() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let session = test_session();
     session
@@ -188,9 +192,10 @@ async fn register_failure_returns_no_flow() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .with_registry(FailingRegistry);
+        .with_registry(FailingRegistry)
+        .build();
 
     let session = test_session();
     let claims = test_claims("idp3", "sub3");
@@ -222,9 +227,10 @@ async fn active_user_with_working_registry_returns_ok() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .with_registry(MemorySessionRegistry::new());
+        .with_registry(MemorySessionRegistry::new())
+        .build();
 
     let session = test_session();
     let claims = test_claims("idp4", "sub4");
@@ -268,9 +274,10 @@ async fn suspended_user_post_register_returns_locked() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(suspended_user.clone());
-    let authn = AuthnService::new(identity, MockFactorStore::new())
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .with_registry(MemorySessionRegistry::new());
+        .with_registry(MemorySessionRegistry::new())
+        .build();
 
     let session = test_session();
     let claims = test_claims("idp5", "sub5");
@@ -306,7 +313,9 @@ async fn verify_provider_issuer_mismatch_returns_csrf_mismatch() {
     let mock =
         MockOAuthProvider::new("idp-issuer-check").with_user("sub", "u@e.com", vec![], vec![]);
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new()).with_oauth_provider(mock);
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build();
 
     let session = test_session();
     // Stash a full ceremony manually; MockOAuthProvider doesn't implement

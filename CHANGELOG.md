@@ -6,6 +6,258 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [unreleased]
+
+Nothing yet.
+
+## [0.6.0] - 2026-09-24
+
+Breaking: if you use the JWT features you must now pick a crypto backend, and
+several security fixes change behaviour. Rationale for the larger decisions
+lives in the commit log and in `platform/.claude/decisions/`.
+
+### Changed
+
+- **`jwt` requires a crypto backend.** `axess-factors` enabled `jsonwebtoken`'s
+  `aws_lc_rs` for everyone; an adopter who had already picked `rust_crypto` got
+  both, and `jsonwebtoken` panics on first verification when it cannot choose.
+  Enable exactly one beside `jwt`: `jwt-aws-lc` (FIPS-capable, needs a C
+  toolchain and NASM on Windows) or `jwt-rust-crypto` (pure Rust). Neither is a
+  build error naming both; both is allowed, and
+  `axess_factors::jwt::ensure_crypto_provider` picks one.
+  **Migrating:** if you enable `jwt`, `oauth`, `oidc`, `fapi`, `bearer`,
+  `jwt-svid`, `local-idp` or `workload-id`, add one of the two. Call
+  `ensure_crypto_provider` yourself if you sign tokens.
+
+- **`oidc` now enables `jwt`.** It verified ID tokens with no backend enabled,
+  so it built with no crypto and panicked on first use.
+
+- **A lockout records `AuthEventStatus::Locked`.** It was `Failure` with
+  `error = "locked"`, leaving the outcome in a free-text field.
+  **Breaking for audit-row readers:** match on the status column. Rows written
+  before this keep the old encoding. Other non-active states are unchanged.
+
+- **`extract_audit_context` takes the client IP as an argument**, and
+  `ip_from_headers` is now `ip_from_headers_untrusted` in both `authn` and
+  `authz`. Behaviour of the renamed function is unchanged; the names now carry
+  the warning at the call site. The header-reading context form remains as
+  `extract_audit_context_untrusted`. **Migrating:** add the argument, resolved
+  with `ip_from_headers_trusted` against the peer your server accepted, or
+  `None`. The compiler finds every call site.
+
+- **`record_password_hash` and `password_history` moved** from `IdentityAdmin`
+  to a new `IdentityPasswordHistory` trait with no default bodies. Both had
+  defaults that panicked, and `record_password_hash` is called on **every**
+  password change with no guard, so any backend that had not overridden it
+  unwound the first time a user changed their password, on a method that
+  looked optional because a defaulted trait method does. Same defect and same
+  fix as the password-reset pair below.
+  **Migrating:** move the two `impl`s into an `impl IdentityPasswordHistory`
+  block. A deployment with no password-reuse policy implements nothing, and
+  the password-change flow is then unavailable to it at compile time.
+
+- **`store_reset_token` and `verify_reset_token` moved** from `IdentityAdmin`
+  to a new `IdentityPasswordReset` trait with no default bodies.
+  **Migrating:** move the two `impl`s into an `impl IdentityPasswordReset`
+  block. If you do not use password reset, implement nothing.
+
+- **`IdentityAuthnLog::record_event` returns `AuditOutcome`, not `()`.**
+  A failed audit write fails the login, and every failed login writes a
+  row, so an unauthenticated caller can drive unbounded writes at the
+  store. `AuditOutcome::Shed` lets a sink drop one deliberately: the flow
+  continues and `AuthnMetrics::audit_event_shed` fires, where `Err` still
+  fails the login.
+  **Shed on a criterion independent of the identifier**: a global rate, a
+  queue depth, a disk watermark. Shedding on anything derived from *which*
+  identifier was tried makes the drop observable per-identifier and
+  reintroduces the enumeration oracle.
+  **Migrating:** return `Ok(AuditOutcome::Recorded)` where you returned
+  `Ok(())`. `NoopAuthnLog` now reports `Shed`, which is what it always did.
+
+- **`AuthnService` is a cheap handle, and construction moved to a builder.**
+  It was a flat struct of thirteen collaborators, which made it neither
+  cheaply shareable nor able to carry anything per request. It is now
+  `{inner: Arc<..>, audit: Option<..>}`, so cloning is a refcount bump.
+  **Migrating:** `AuthnService::new(a, b).with_clock(c)` becomes
+  `AuthnService::builder(a, b).with_clock(c).build()`. `new(a, b)` with no
+  customisation is unchanged. `from_backend` gains `builder_from_backend`.
+  Customisation moved because the collaborators sit behind an `Arc` once
+  built, where every copy of the handle observes them.
+
+- **`AuthnService::with_audit_context`: client metadata now reaches audit
+  events.** The pieces all existed and nothing joined them, so every audit
+  row axess wrote carried `ip_address: None`.
+
+  ```rust
+  let ip = ip_from_headers_trusted(&headers, peer.ip(), &trusted);
+  let ctx = extract_audit_context(&headers, Some(ip), Some(&session));
+  state.authn.with_audit_context(ctx).begin_login(..).await?;
+  ```
+
+  Build with `AuditContextPolicy::Required` to refuse events from a route
+  that attached no context. It defaults to `Optional`, the previous
+  behaviour, and **`Required` is fail-closed**.
+
+- **`ip_from_headers_trusted`, `TrustedProxies` and `CidrParseError` are
+  exported from the `axess` facade.** Only `ip_from_headers_untrusted` was,
+  so an adopter on the facade could reach the spoofable helper and not the
+  safe one. `AuditContext`, `extract_audit_context` and
+  `AuthnServiceBuilder` are exported for the same reason.
+
+- **`AuthEvent::error` is an `AuthFailureReason`, not a `String`.**
+  `AuthEventBuilder::with_error` takes the enum. Fifteen tags are variants;
+  anything else is `AuthFailureReason::Other`, and parsing never fails, so a
+  tag from another version reads back intact. The wire form is unchanged:
+  serde and database columns still see the plain tag string.
+  **Migrating:** name the variant. One stored value changes:
+  `"cross-tenant impersonation refused"` is now `cross_tenant_impersonation`,
+  so a dashboard matching the old prose needs updating.
+
+- **`AuthEvent::ip_address` is an `IpAddr`, not a `String`.**
+  `AuthEventBuilder::with_ip` takes one too, in place of
+  `impl Into<String>`. The field is offered as SOC 2 and PCI-DSS evidence,
+  and an evidence field that accepts arbitrary text accepts a forged one;
+  `AuditContext::ip_address` was already typed, and the builder threw the
+  type away with `ip.to_string()`.
+  **Migrating:** parse or pass through an `IpAddr`. Sinks writing to a text
+  column call `.to_string()` at the point of the write.
+
+- **`ShortString::prefix` is removed.** Documented as powering an equality fast
+  path that never existed; nothing but its own tests called it.
+
+### Added
+
+- **`MtlsResolver::from_chain`**: takes the `PeerCertChain` your TLS
+  middleware recorded and returns `MtlsError::EmptyChain` when it holds no leaf.
+
+- **`TrustedProxies::from_cidrs` and `with_cidrs`**: parse `"10.0.0.0/8"` and
+  `"2001:db8::/32"` and compose with exact addresses. Exact addresses alone
+  were impractical for a load balancer with a changing egress pool, and an
+  operator who cannot express the range skips the check entirely. Mixed
+  families never match.
+
+- **`ShortString` gains the rest of its shape:** `INLINE_CAPACITY`,
+  `is_inline()`, `is_allocated()`, `Borrow<str>`, `new(impl AsRef<str>)`,
+  `From<ShortString> for String`, and reverse `PartialEq` so `"case-42" == id`
+  compiles. All additive. `is_inline()` and `is_allocated()` differ: a
+  `from_static` value is allocation-free without carrying its bytes, so it
+  answers `false` to both. Assert on `is_allocated()`.
+
+### Security
+
+- **A panicking default made "forgot password" a user-enumeration oracle.**
+  `IdentityAdmin::store_reset_token` defaulted to `unimplemented!()`, and
+  `begin_password_reset` returns `Ok(None)` for an unknown identifier while
+  reaching the store only for a known one, so an unauthenticated request got
+  200 for an unregistered address and a panic for a registered one, in the
+  function that equalizes its own timing to avoid exactly that. Fixed by the
+  `IdentityPasswordReset` move above: the omission is now a compile error.
+
+- **A failed audit write now fails the login.** `record_event` returning an
+  error was logged and discarded. It now surfaces as `AuthnError::Store`, and
+  on OAuth paths as `OAuthError::AuditStore`. **This trades availability for
+  evidence:** logins fail while the audit store does, so put the sink behind
+  something durable rather than a remote service on the request path.
+  `AuthnMetrics::audit_store_outage` should page.
+
+- **Rejected logins emit even with no user to attribute them to.** Prerequisite
+  for the above: had only known identifiers written audit rows, an attacker
+  degrading the audit store would see `Err` for real accounts and an ordinary
+  rejection otherwise, reading off which identifiers are registered. Unknown
+  tenants and identifiers now write rows tagged `unknown_tenant` and
+  `unknown_identifier`. It also ends a blind spot: credential stuffing against
+  unregistered addresses previously left no trace.
+
+- **`ip_from_headers_trusted` was spoofable through a correctly configured
+  proxy.** It took the leftmost `X-Forwarded-For` entry, but the header is
+  append-only: a client sends its own value and the proxy appends the real
+  address after it. It now walks from the right, skipping trusted hops, and
+  returns the first address that is not one. A malformed entry yields the peer,
+  and `X-Real-IP` is read only when `X-Forwarded-For` is absent.
+  **This changes the value returned** wherever a client can prepend.
+
+- **The audit trail's client IP was attacker-controlled.**
+  `extract_audit_context` filled `AuthEvent::ip_address` from request headers,
+  so on any directly reachable service an attacker's failed logins were
+  recorded against an address of their choosing: evidence forgery by the
+  subject of the evidence, in a catalogue offered as SOC 2 and PCI-DSS
+  evidence. Fixed by the signature change above.
+
+- **Lockout now fails closed when its counter store is down.**
+  `record_failed_attempt` is a write, and the read-replica split this library
+  encourages left logins working and the counter dead during a primary outage:
+  brute force was unbounded exactly when monitoring was degraded.
+  `LockoutPolicy::on_counter_unavailable` defaults to `CounterUnavailable::Lock`.
+  **This changes behaviour**: a user who mistypes during such an outage is
+  told they are locked. `CounterUnavailable::Allow` restores the old behaviour.
+  `Lock` with `duration: None` needs an administrator per account. Alert on
+  `AuthnMetrics::factor_counter_store_outage`.
+
+- **`record_failed_attempt` now states its atomicity requirement.** Its return
+  value is compared against `max_attempts`, so a read-modify-write
+  implementation loses updates and lets parallel attempts exceed the policy.
+
+- **There is no unsafe code in axess.** All ten crates declare
+  `#![forbid(unsafe_code)]`. `axess-strings` was the exception: a 16-byte
+  union with a hand-rolled refcount and an `unsafe impl Sync`, 20 blocks in
+  all, while the architecture chapter claimed otherwise. Replaced with a safe
+  24-byte enum, inline to 22 bytes and `Arc<str>` beyond, at no measurable cost
+  on the ids that actually run. The Miri gate went with the code it checked.
+
+- **The RUSTSEC-2023-0071 exception described the wrong dependency graph.**
+  `rsa` is also a direct optional runtime dependency under `local-idp`, and
+  under `jwt-rust-crypto` it performs RS256 signing. The advisory is a timing
+  sidechannel on RSA private-key operations, so the exposed case is a
+  deployment minting its own tokens over an attacker-reachable interface;
+  those should prefer ES256 or `jwt-aws-lc`. The exception stands, accurately
+  justified.
+
+### Fixed
+
+- **Twenty-three chapters described a library that does not exist.** Worth
+  re-reading if you built from them. The load-bearing corrections: the
+  getting-started example ignored `begin_login`'s result and offered a
+  password prompt to a locked account; `FingerprintPolicy`,
+  `with_absolute_ttl` and `require_step_up` do not exist; rate-limit buckets
+  are in-process with a closed extractor enum, not pluggable; `IdentityStore`
+  was documented with the wrong error type and audit verbs; and
+  `SessionStore::cycle` takes four arguments, not two.
+
+- **The security-posture chapter states the FIPS position accurately.** There
+  is no FIPS-validated build of axess. **If you were counting on that, re-read
+  the chapter.**
+
+- **The audit-events and audit-pipeline chapters match the implementation.**
+  Axess writes one flat `AuthEvent` with `event_status` carrying the outcome
+  and `event_time` in epoch microseconds; it awaits one `record_event` call and
+  does not buffer, queue, retry or fan out. The chapters described a different
+  model with per-outcome event types and a buffering config.
+  **Re-check SIEM queries built from the old chapters**: event names, status
+  handling and column names all differ. Two properties worth knowing before
+  choosing a sink: the write is on the login hot path, and it now fails the
+  login (see Security).
+
+### Dependencies
+
+`lru` 0.18.4 → 0.18.5. Declared minimums raised so consumers pick them up:
+`cedar-policy` 4.13.0, `jsonwebtoken` 11.1.0, `quick-xml` 0.42.0, `rand`
+0.10.3, `aes-gcm` 0.11.1, `serde_json` 1.0.151.
+
+`axess-strings` and `axess-cache` could not build standalone: the workspace
+pins `serde_json` with `default-features = false`, and `axess-cache` depended
+on `axess-clock` without `testing`. Both compiled only because another member
+enabled those features. This is what blocked Miri from running at all.
+
+`rand` 0.8.6 remains behind the RustCrypto backend, so RUSTSEC-2026-0097 stays
+on the `deny.toml` ignore list until `rsa` and its dependants move off it.
+
+### Minimum Supported Rust Version
+
+`1.94.0`, Rust 2024 edition. Unchanged in this release: the floor was
+corrected to 1.94.0 in 0.5.0, and nothing here moves it. Restated because
+the only other MSRV note in this file sits under 0.2.0 and says `1.87`,
+which is what *that* release shipped with, not what this one needs.
+
 ## [0.5.1] - 2026-09-16
 
 A dependency patch release. No API change, nothing to migrate.
@@ -14,9 +266,10 @@ A dependency patch release. No API change, nothing to migrate.
 
 - **`rustls` 0.23.44 to 0.23.45**, closing RUSTSEC-2026-0285: TLS 1.3
   handshake messages sent at the wrong encryption level were accepted, where
-  RFC 8446 requires the connection be terminated. Reached directly and through
-  the `reqwest`, `openidconnect` and `ldap3` TLS features. The declared minimum
-  moves with it, so an existing lockfile must update rather than may.
+  RFC 8446 requires the connection to be terminated. Reached directly and through
+  the `reqwest`, `openidconnect` and `ldap3` TLS features. The floor in
+  `Cargo.toml` moved too, so a consumer keeping its own lockfile cannot stay on
+  the vulnerable version.
 
 ---
 

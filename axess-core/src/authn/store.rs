@@ -133,6 +133,26 @@ pub trait IdentityLookup: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Look up a user by their login identifier within a tenant.
+    ///
+    /// # Latency must not depend on whether the identifier exists
+    ///
+    /// `begin_login` equalises response time between known and unknown
+    /// identifiers by running the same store calls against a dummy id on
+    /// the unknown path. That defence assumes this lookup costs roughly
+    /// the same either way, and the dummy is a **fresh random UUID**, so
+    /// it can never hit a cache.
+    ///
+    /// An implementation that caches positive lookups and not negative
+    /// ones therefore does not merely weaken the equalisation, it
+    /// **inverts** it: a known identifier answers from cache while an
+    /// unknown one goes to the database, and probing a known identifier
+    /// warms its entry and widens the gap. That is a user-enumeration
+    /// oracle, restored by a change that looks purely like an
+    /// optimisation.
+    ///
+    /// If you cache, cache misses on the same terms as hits. The same
+    /// applies to [`account_status`](Self::account_status), which the
+    /// equalisation also calls.
     fn find_user(
         &self,
         identifier: &str,
@@ -236,6 +256,24 @@ pub trait IdentityLookup: Send + Sync + 'static {
 
 // ── IdentityAuthnLog ─────────────────────────────────────────────────────────
 
+/// What an audit sink did with an event.
+///
+/// Distinguishes "I deliberately dropped this" from "I am broken", which
+/// `Result<(), E>` alone cannot express: an `Err` fails the login, and an
+/// `Ok(())` claims a write that may not have happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuditOutcome {
+    /// The event was durably recorded.
+    #[default]
+    Recorded,
+    /// The event was deliberately dropped under load.
+    ///
+    /// The flow continues and `AuthnMetrics::audit_event_shed` fires. A
+    /// gap in the trail is the cost; it is bounded and observable, where
+    /// an exhausted store is neither.
+    Shed,
+}
+
 /// Per-authn-attempt writes the login pipeline emits: audit events,
 /// failed-attempt lockout counter, last-login timestamp.
 ///
@@ -249,12 +287,47 @@ pub trait IdentityLookup: Send + Sync + 'static {
 /// module) to satisfy the bound with no-op behaviour.
 pub trait IdentityAuthnLog: IdentityLookup {
     /// Record an authentication event (audit log).
+    ///
+    /// Returning `Err` **fails the authentication**: an authentication that
+    /// leaves no evidence has not, for evidence purposes, happened. Reserve
+    /// it for a sink that is genuinely broken.
+    ///
+    /// Returning [`AuditOutcome::Shed`] says the event was deliberately
+    /// dropped under load, and the flow continues. That is the valve for
+    /// the one hazard this design creates: every failed login writes a row,
+    /// including for identifiers that do not exist, so an unauthenticated
+    /// caller can drive writes at your storage, and with no way to shed,
+    /// exhausting it turns every login into a failure for every user.
+    ///
+    /// **Shed on a criterion independent of the identifier**: a global
+    /// rate, a queue depth, a disk watermark. Shedding based on anything
+    /// derived from *which* identifier was tried makes the drop observable
+    /// per-identifier and reintroduces the user-enumeration oracle that
+    /// emitting unattributed events exists to close.
+    ///
+    /// Note what shedding costs under attack: the flood that triggers it
+    /// is the thing you least want unrecorded. If you shed selectively,
+    /// prefer dropping by
+    /// [`event_status`](crate::authn::event::AuthEvent::event_status) or
+    /// [`event_type`](crate::authn::event::AuthEvent::event_type)
+    /// successes before failures, say, because both are independent of
+    /// the identifier and keep the security-relevant signal. Dropping
+    /// uniformly is safe too, and simpler.
     fn record_event(
         &self,
         event: AuthEvent,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<AuditOutcome, Self::Error>> + Send;
 
     /// Increment the failed attempt counter for a user. Returns the new count.
+    ///
+    /// The returned value is compared directly against
+    /// [`LockoutPolicy::max_attempts`](crate::authn::types::LockoutPolicy),
+    /// so the increment and the read **MUST** be atomic with respect to other
+    /// writes: a single `UPDATE ... SET n = n + 1 RETURNING n`, or an
+    /// equivalent the backend guarantees. A read-modify-write that loads the
+    /// count, adds one and stores it back loses updates under concurrent
+    /// failures, and an attacker running parallel attempts gets more of them
+    /// than the policy allows.
     fn record_failed_attempt(
         &self,
         user_id: &UserId,
@@ -330,105 +403,6 @@ pub trait IdentityAdmin: IdentityAuthnLog {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Store a password hash in the user's password history.
-    ///
-    /// Called automatically after a successful password change. The history
-    /// is the storage primitive behind password-reuse prevention required
-    /// by SOC2, PCI-DSS, and NIST SP 800-63B §5.1.1.2. The default impl
-    /// panics so a missing override surfaces loudly the first time an
-    /// operator changes a password; production backends serving regulated
-    /// users MUST override.
-    fn record_password_hash(
-        &self,
-        user_id: &UserId,
-        hash: &str,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            unimplemented!(
-                "IdentityAdmin::record_password_hash({user_id}, hash[{}]) is required \
-                 for password-reuse prevention (SOC2, PCI-DSS, NIST SP 800-63B \
-                 §5.1.1.2). Override this method on your backend to persist the hash \
-                 to a per-user history table. See the trait method docs for the full \
-                 contract.",
-                hash.len(),
-            )
-        }
-    }
-
-    /// Return the last `count` password hashes for a user, most recent first.
-    ///
-    /// Used by [`password_history`](Self::password_history)'s consumer to
-    /// reject a new password whose hash collides with a previously-used
-    /// one; the read side of the password-reuse prevention loop required
-    /// by SOC2, PCI-DSS, and NIST SP 800-63B §5.1.1.2. The default impl
-    /// panics so a missing override surfaces loudly the first time the
-    /// rule fires; production backends MUST override.
-    fn password_history(
-        &self,
-        user_id: &UserId,
-        count: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<String>, Self::Error>> + Send {
-        async move {
-            unimplemented!(
-                "IdentityAdmin::password_history({user_id}, {count}) is required for \
-                 password-reuse prevention (SOC2, PCI-DSS, NIST SP 800-63B \
-                 §5.1.1.2). Override this method on your backend to return the most \
-                 recent `count` hashes from the per-user history table. See the \
-                 trait method docs for the full contract.",
-            )
-        }
-    }
-
-    /// Store a password-reset token hash for a user.
-    ///
-    /// `token_hash` is the SHA-256 hash (URL-safe base64) of the plaintext
-    /// token. `expires_at` is the absolute expiry time. This method backs
-    /// the out-of-band password-recovery feature; the default impl panics
-    /// so an integration that wires the recovery flow without persistence
-    /// surfaces loudly. Production backends offering recovery MUST override.
-    fn store_reset_token(
-        &self,
-        user_id: &UserId,
-        token_hash: &str,
-        expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        async move {
-            unimplemented!(
-                "IdentityAdmin::store_reset_token({user_id}, hash[{}], expires_at={expires_at}) \
-                 is required for the out-of-band password-recovery feature. Override \
-                 this method on your backend to persist (user_id, token_hash, \
-                 expires_at) atomically (single-row upsert). See the trait method \
-                 docs for the full contract.",
-                token_hash.len(),
-            )
-        }
-    }
-
-    /// Verify and consume a password-reset token.
-    ///
-    /// Returns `true` if the token hash matches a stored, non-expired token
-    /// for the user. The token MUST be deleted/consumed on success
-    /// (single-use). This method backs the out-of-band password-recovery
-    /// feature; the default impl panics so a recovery flow wired without a
-    /// verifier surfaces loudly. Production backends offering recovery
-    /// MUST override.
-    fn verify_reset_token(
-        &self,
-        user_id: &UserId,
-        token_hash: &str,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async move {
-            unimplemented!(
-                "IdentityAdmin::verify_reset_token({user_id}, hash[{}]) is required \
-                 for the out-of-band password-recovery feature. Override this method \
-                 on your backend to look up the stored hash, compare in constant \
-                 time, check the expiry, and delete the row on a successful match \
-                 (single-use). See the trait method docs for the full contract.",
-                token_hash.len(),
-            )
-        }
-    }
-
     /// Transition a user to [`EntityState::Suspended`] with the given reason.
     ///
     /// Existing authenticated sessions are not automatically
@@ -484,6 +458,104 @@ pub trait IdentityAdmin: IdentityAuthnLog {
 /// keeps compiling unchanged.
 pub trait IdentityStore: IdentityAdmin {}
 impl<T: IdentityAdmin> IdentityStore for T {}
+
+// ── IdentityPasswordReset ────────────────────────────────────────────────────
+
+/// Persistence for the out-of-band password-recovery flow.
+///
+/// Deliberately separate from [`IdentityAdmin`], and deliberately
+/// without default bodies, because neither possible default is safe.
+///
+/// A default that panics turns
+/// [`AuthnService::begin_password_reset`](crate::authn::service::AuthnService::begin_password_reset)
+/// into a user-enumeration oracle. That function answers `Ok(None)` for
+/// an identifier it cannot find and reaches the store only for one it
+/// can, so an unattended backend would answer an unauthenticated
+/// "forgot password" request with 200 for an address that is not
+/// registered and a panic for one that is. The function equalizes its
+/// timing precisely to avoid leaking that, and a panicking default gives
+/// it away on the status code.
+///
+/// A default that silently succeeds is worse: recovery appears to work,
+/// no token is ever stored, and every subsequent verification fails for
+/// a reason nothing explains.
+///
+/// So the requirement is moved into the type system. A store that does
+/// not implement this trait cannot call the reset flow, and the failure
+/// is a compile error naming the two methods rather than a runtime
+/// panic on an unauthenticated route.
+pub trait IdentityPasswordReset: IdentityLookup {
+    /// Persist `(user_id, token_hash, expires_at)`, replacing any token
+    /// already outstanding for that user. Implementations MUST write
+    /// atomically (a single-row upsert), so two concurrent requests
+    /// cannot leave two live tokens for one account.
+    ///
+    /// Store the **hash**, never the token: a database reader must not be
+    /// able to complete a reset.
+    fn store_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Look up the stored hash for `user_id`, compare it against
+    /// `token_hash` in **constant time**, check the expiry, and delete the
+    /// row on a successful match so the token is single-use.
+    ///
+    /// Return `Ok(false)` for absent, expired and mismatched alike; the
+    /// caller does not distinguish them and neither should the response.
+    fn verify_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+}
+
+/// Storage for password-reuse prevention: the write and read sides of a
+/// per-user password history.
+///
+/// Carved out of [`IdentityAdmin`], where both methods had default bodies
+/// that panicked. The write side is called on **every** password change,
+/// unguarded, so a backend that had not overridden it unwound the first
+/// time any user changed their password, and the method looked optional,
+/// because a defaulted trait method does.
+///
+/// With no defaults here, a store that cannot keep history simply does not
+/// implement this trait, and the password-change flow is unavailable to it
+/// at compile time rather than at the worst moment. This is the same
+/// treatment [`IdentityPasswordReset`] received, for the same reason.
+///
+/// Required by SOC2, PCI-DSS, and NIST SP 800-63B §5.1.1.2 for regulated
+/// deployments; a deployment with no reuse policy can skip it entirely.
+pub trait IdentityPasswordHistory: IdentityLookup {
+    /// Store a password hash in the user's password history.
+    ///
+    /// Called after a successful password change, with the hash being
+    /// *replaced* and then with the new one, so the history reflects what
+    /// was actually in force.
+    ///
+    /// Store the hash, never the password. Implementations should bound
+    /// the history they retain; nothing here evicts for you.
+    fn record_password_hash(
+        &self,
+        user_id: &UserId,
+        hash: &str,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Return the last `count` password hashes for a user, most recent
+    /// first.
+    ///
+    /// The read side of the reuse check: the caller compares a candidate
+    /// against each entry. Returning fewer than `count` is fine and means
+    /// the user has no longer history; returning them out of order is not,
+    /// because a bounded check would then test the wrong ones.
+    fn password_history(
+        &self,
+        user_id: &UserId,
+        count: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<String>, Self::Error>> + Send;
+}
 
 // ── NoopAuthnLog adopter helper ──────────────────────────────────────────────
 
@@ -584,14 +656,17 @@ impl<L: IdentityLookup> IdentityLookup for NoopAuthnLog<L> {
 }
 
 impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
-    async fn record_event(&self, event: AuthEvent) -> Result<(), Self::Error> {
+    async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
         tracing::trace!(
             target: "axess::authn::noop_log",
             event_type = ?event.event_type,
             user_id = ?event.user_id,
             "NoopAuthnLog: event discarded (no SOC trail wired up)",
         );
-        Ok(())
+        // Honest rather than convenient: this sink drops every event, so
+        // it reports every event as shed. `Recorded` would claim a write
+        // that never happens.
+        Ok(AuditOutcome::Shed)
     }
 
     async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
@@ -897,3 +972,44 @@ mod noop_authn_log_tests;
 
 #[cfg(test)]
 mod store_tests;
+
+#[cfg(test)]
+mod password_history_capability_tests {
+    //! The property that matters is a compile-time one: a store without
+    //! password history cannot reach the password-change flow, because the
+    //! flow is bounded on [`IdentityPasswordHistory`] and the trait has no
+    //! default bodies to inherit.
+    //!
+    //! That cannot be asserted at runtime: a test that failed to compile
+    //! would fail the build rather than the test. What is checked here is
+    //! the thing that would silently undo it: a default body reappearing,
+    //! which would make the bound satisfiable by any `IdentityAdmin` again
+    //! and restore the panic this carve-out removed.
+
+    /// Fails to compile if either method gains a default body, because a
+    /// defaulted method would let this empty impl pass.
+    #[test]
+    fn trait_has_no_default_bodies() {
+        let src = include_str!("store.rs");
+        let start = src
+            .find("pub trait IdentityPasswordHistory")
+            .expect("trait must exist");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("trait must be closed");
+        let decl = &body[..end];
+
+        assert!(
+            !decl.contains('{') || decl.matches('{').count() == 1,
+            "IdentityPasswordHistory gained a method body; the point of the \
+             carve-out is that a store which cannot keep history fails to \
+             compile rather than panicking mid password change"
+        );
+        assert!(
+            !decl.contains("unimplemented!") && !decl.contains("todo!"),
+            "a panicking default reappeared in IdentityPasswordHistory"
+        );
+        for m in ["fn record_password_hash", "fn password_history"] {
+            assert!(decl.contains(m), "{m} must live on this trait");
+        }
+    }
+}

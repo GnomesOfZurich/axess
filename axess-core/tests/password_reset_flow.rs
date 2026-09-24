@@ -13,11 +13,11 @@
 
 mod common;
 
+use axess_core::authn::store::IdentityPasswordHistory;
 use axess_core::{
     authn::{
         error::AuthnError,
         service::AuthnService,
-        store::IdentityAdmin,
         types::{EntityState, StatusDetail, User},
     },
     testing::mock_authn::{MockFactorStore, MockIdentityStore},

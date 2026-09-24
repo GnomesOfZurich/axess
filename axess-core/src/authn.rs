@@ -4,9 +4,10 @@
 //!
 //! - `types`: [`User`], [`Tenant`], [`EntityState`], [`LockoutPolicy`], [`AuthnScope`]
 //! - `factor`: [`FactorKind`], [`FactorConfig`], [`FactorCredential`], [`ZeroizedString`]
-//! - `event`: [`AuthEvent`], [`AuthEventBuilder`], [`AuthEventType`], [`AuthEventStatus`]
+//! - `event`: [`AuthEvent`], [`AuthEventBuilder`], [`AuthEventType`], [`AuthEventStatus`],
+//!   [`AuthFailureReason`]
 //! - `store`: [`IdentityStore`], [`FactorStore`], [`AuthnBackend`], [`AuthMethod`]
-//! - `service`: [`AuthnService`], [`LoginOutcome`], [`SignupOutcome`], [`FactorOutcome`]
+//! - `service`: [`AuthnService`], [`AuthnServiceBuilder`], [`AuditContextPolicy`], [`LoginOutcome`], [`SignupOutcome`], [`FactorOutcome`]
 //! - `error`: [`AuthnError`]
 //!
 //! # Naming conventions
@@ -48,8 +49,9 @@ pub use audit::archive::{
 pub use audit::archive::{FilesystemArchiveError, FilesystemAuditArchiver};
 pub use error::AuthnError;
 pub use event::{
-    AuditContext, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType,
-    extract_audit_context, extract_audit_context_async, ip_from_headers,
+    AuditContext, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason,
+    extract_audit_context, extract_audit_context_async, extract_audit_context_async_untrusted,
+    extract_audit_context_untrusted, ip_from_headers_untrusted,
 };
 pub use factor::{
     EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FactorStep, FactorTemplate,
@@ -61,13 +63,15 @@ pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
 #[cfg(feature = "oauth")]
 pub use service::DEFAULT_SID_MAP_CAPACITY;
 pub use service::{
-    AuthnService, FactorOutcome, LoginOutcome, NoSessionRegistryError, PrepareOutcome,
-    SessionValidator, SignupOutcome, require_valid_session,
+    AuditContextPolicy, AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome,
+    NoSessionRegistryError, PrepareOutcome, SessionValidator, SignupOutcome, require_valid_session,
 };
 pub use store::{
-    AuditQuery, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore, IdentityAdmin,
-    IdentityAuthnLog, IdentityLookup, IdentityStore, NoopAuthnLog, ResolvedFactor,
+    AuditOutcome, AuditQuery, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore,
+    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+    IdentityPasswordReset, IdentityStore, NoopAuthnLog, ResolvedFactor,
 };
 pub use types::{
-    AuthnScope, EntityState, IpPolicy, LockoutPolicy, ScopeColumns, StatusDetail, Tenant, User,
+    AuthnScope, CounterUnavailable, EntityState, IpPolicy, LockoutPolicy, ScopeColumns,
+    StatusDetail, Tenant, User,
 };

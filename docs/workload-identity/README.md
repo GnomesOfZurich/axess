@@ -59,16 +59,21 @@ ToCedarEntity bridge
 Cedar evaluation
 ```
 
-Two resolvers ship today plus a generic third for everything else:
-`JwtSvidResolver` (SPIFFE JWT-SVID, spec-bound; mandatory
-`spiffe://` URI in `sub`); `MtlsResolver` (SPIFFE X.509-SVID over
-mTLS); and `WorkloadResolver`, the generic JWT-bearer resolver that
-covers every non-SPIFFE workload-identity flow (Kubernetes projected
-service-account tokens, GitHub Actions OIDC, GitLab CI OIDC, Okta,
-Azure AD, Auth0, axess's own `LocalIdP`, custom internal JWT
-formats). The adopter supplies a small claim parser + mapping
-closure per issuer they care about; see `examples/workload-identity/`
-for ready-made recipes (GitHub Actions, Kubernetes SA). The human
+Two SPIFFE resolvers ship, plus a generic third for everything else:
+
+- `JwtSvidResolver`, for SPIFFE JWT-SVIDs. Spec-bound, with a
+  mandatory `spiffe://` URI in `sub`.
+- `MtlsResolver`, for SPIFFE X.509-SVIDs over mTLS.
+- `WorkloadResolver`, the generic JWT-bearer resolver. It covers every
+  non-SPIFFE workload-identity flow: Kubernetes projected
+  service-account tokens, GitHub Actions and GitLab CI OIDC, Okta,
+  Azure AD, Auth0, axess's own `LocalIdP`, custom internal JWT
+  formats.
+
+For the generic one the adopter supplies a small claim parser and
+mapping closure per issuer they care about; `examples/workload-identity/`
+has ready-made recipes for GitHub Actions and Kubernetes service
+accounts. The human
 side has its own `SessionResolver` covered in Part II. A
 `MockResolver` is available for DST tests. Each resolver implements
 the same trait and produces the same `Principal` shape.
@@ -78,11 +83,11 @@ the same trait and produces the same `Principal` shape.
 A traditional auth library treats human and workload identity as
 two independent stacks. The session layer handles users; a separate
 JWT-validation middleware handles services. Neither composes with
-the other, and policies that need to apply to both ("only callers
-in the finance tenant may read this resource") end up duplicated:
-one rule for users in code that knows about sessions, another rule
-for workloads in code that knows about tokens, and the two drift
-apart over time as the application evolves.
+the other. A policy that has to apply to both, say "only callers in
+the finance tenant may read this resource", ends up written twice:
+once for users, in code that knows about sessions, and once for
+workloads, in code that knows about tokens. The two drift apart as
+the application evolves.
 
 Unifying on `Principal` removes the duplication. The Cedar policy
 quoted above works for a human and a workload because the policy
@@ -136,11 +141,14 @@ issuance, key rotation, and trust-domain federation. Axess does not
 replace SPIRE; SPIRE issues, axess validates. The two are designed
 to compose.
 
-A future `SpireWorkloadApiResolver` (tracked in the ROADMAP as
-) will talk to a local SPIRE agent socket directly, fetching
-fresh SVIDs on demand rather than relying on adopters to mount them
-into the filesystem. For now, adopters mount short-lived SVIDs into
-pod filesystems and configure axess against them.
+A SPIRE Workload API client is on the ROADMAP under feature `spire`:
+it would talk to a local SPIRE agent socket directly, fetching fresh
+SVIDs on demand and maintaining their rotation, rather than relying on
+adopters to mount them into the filesystem. It lands when an adopter
+needs an axess-shaped wrapper around it. Until then, adopters mount
+short-lived SVIDs into pod filesystems and configure axess against
+them, or drive the upstream `spire-workload` / `spire-api` crates
+directly; *Inbound: JWT-SVID* has the fetch-side recipe.
 
 ## Federation
 
@@ -156,12 +164,12 @@ against the local trust-domain bundle (the JWKS for JWT-SVIDs, the
 CA bundle for X.509-SVIDs). The SVID carries the local trust
 domain; the resolver knows where to fetch the keys.
 
-Federated is the cross-domain case. The resolver validates the
-SVID against a remote trust-domain bundle, then runs the resulting
-identity through a `TrustDomainFederation` policy that maps the
-foreign identity (which trust domains are accepted, which path
-prefixes within each are admitted, how the identity is rewritten
-into the local namespace if at all). The federation policy is
+Federated is the cross-domain case, and axess ships no policy type
+for it. A resolver is constructed against one expected trust domain
+and refuses anything else, so accepting a second domain means
+deciding, in your own code, which domains you admit, which path
+prefixes within each, and how a foreign identity maps into your
+namespace. That decision is
 deployment configuration; axess validates, the deployment decides
 the rules.
 
@@ -216,7 +224,7 @@ pays the compile cost for the credential kinds it actually uses.
 |---|---|---|
 | `jwt-svid` | `JwtSvidResolver` | Inbound SPIFFE JWT-SVID (spec-bound) |
 | `mtls` | `MtlsResolver` | Inbound SPIFFE X.509-SVID via mTLS |
-| `jwt` (auto-pulled by `jwt-svid` etc.) | `WorkloadResolver` | Generic JWT-bearer workload identity for *every* non-SPIFFE issuer (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via adopter-supplied claim parser + mapping closure. No per-company features; see `examples/workload-identity/` |
+| `jwt` (auto-pulled by `jwt-svid` etc.; name `jwt-aws-lc` or `jwt-rust-crypto` beside it) | `WorkloadResolver` | Generic JWT-bearer workload identity for *every* non-SPIFFE issuer (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via adopter-supplied claim parser + mapping closure. No per-company features; see `examples/workload-identity/` |
 | `outbound-mtls` | (client side) | Outbound mTLS with workload SVID |
 | `outbound-oauth` | (client side) | Outbound OAuth client |
 | `aws-sts`, `gcp-wif`, `azure-fic` | (cloud STS) | Exchange workload identity for cloud credentials |

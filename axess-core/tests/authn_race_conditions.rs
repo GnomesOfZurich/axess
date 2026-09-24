@@ -5,11 +5,12 @@
 
 mod common;
 
+use axess_core::authn::event::AuthFailureReason;
 use axess_core::authn::{
     factor::{FactorConfig, FactorCredential, FactorKind, HotpConfig, ZeroizedString},
-    service::{AuthnService, FactorOutcome},
+    service::{AuthnService, FactorOutcome, LoginOutcome},
     store::{AuthMethod, IdentityAdmin},
-    types::StatusDetail,
+    types::{CounterUnavailable, LockoutPolicy, StatusDetail},
 };
 use axess_core::session::store::MemorySessionRegistry;
 use axess_core::testing::{
@@ -35,7 +36,9 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
     let registry = MemorySessionRegistry::new();
-    let svc = AuthnService::new(identity.clone(), factors).with_registry(registry.clone());
+    let svc = AuthnService::builder(identity.clone(), factors)
+        .with_registry(registry.clone())
+        .build();
 
     let session = test_session();
     svc.begin_login("alice", "default", &session, None)
@@ -155,17 +158,18 @@ async fn hotp_burns_counter_after_max_attempts() {
     }
 }
 
-/// A wrong password while the counter store is down must return
-/// `InvalidCredential` (just like with a healthy counter), not
-/// `Err(AuthnError::Store)`. Two attack scenarios this defends against:
+/// A wrong password while the counter store is down must never come back as
+/// `Err(AuthnError::Store)`. An attacker who can induce store errors, or who
+/// simply waits for an outage, would otherwise tell good usernames from bad
+/// by the distinct `Err` shape against the normal credential rejection.
 ///
-/// 1. **User enumeration:** an attacker who can induce store errors (or
-///    waits for an outage) can tell good usernames from bad by the distinct
-///    `Err` shape vs. the normal `InvalidCredential`.
-/// 2. **Lockout bypass:** without this fix, the attacker gets unlimited
-///    attempts during the outage because no counter increments.
+/// What it *does* come back as is the deployment's choice, because the
+/// counter being dead means lockout cannot be enforced from the count.
+/// Both arms are pinned below.
 #[tokio::test]
-async fn wrong_password_during_counter_outage_returns_invalid_credential() {
+async fn wrong_password_during_counter_outage_never_returns_err() {
+    // Default policy: CounterUnavailable::Lock. The attempt is treated as
+    // locked, so the outage cannot be used for unlimited attempts.
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
@@ -180,10 +184,56 @@ async fn wrong_password_during_counter_outage_returns_invalid_credential() {
         .await
         .unwrap();
 
-    // Arm the counter-store outage.
     identity.arm_record_failed_attempt_failure();
 
-    // Wrong password: must come back as InvalidCredential, not Err(Store).
+    let result = service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new("wrong")),
+            &session,
+        )
+        .await;
+    assert!(
+        matches!(result, Ok(FactorOutcome::Locked { .. })),
+        "default policy must fail closed under counter outage, got {result:?}"
+    );
+
+    // Repeating yields the same outcome: no Err timing difference to exploit.
+    let result2 = service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new("wrong-again")),
+            &session,
+        )
+        .await;
+    assert!(
+        matches!(result2, Ok(FactorOutcome::Locked { .. })),
+        "repeat attempts under outage must stay Locked, got {result2:?}"
+    );
+}
+
+#[tokio::test]
+async fn wrong_password_during_counter_outage_allows_when_configured() {
+    // CounterUnavailable::Allow keeps logins working and disables lockout
+    // for the duration. Still never `Err`, for the enumeration reason above.
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"))
+        .with_lockout_policy(LockoutPolicy {
+            on_counter_unavailable: CounterUnavailable::Allow,
+            ..LockoutPolicy::default()
+        });
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_method(&uid("u1"), password_method());
+    let service = AuthnService::new(identity.clone(), factors);
+
+    let session = test_session();
+    service
+        .begin_login("alice", "default", &session, None)
+        .await
+        .unwrap();
+
+    identity.arm_record_failed_attempt_failure();
+
     let result = service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("wrong")),
@@ -192,19 +242,74 @@ async fn wrong_password_during_counter_outage_returns_invalid_credential() {
         .await;
     assert!(
         matches!(result, Ok(FactorOutcome::InvalidCredential)),
-        "wrong-credential under counter outage must be InvalidCredential, got {result:?}"
+        "Allow must surface the outage as InvalidCredential, got {result:?}"
     );
+}
 
-    // Repeating the attack with the outage in place yields the same outcome:
-    // no Err timing difference for the attacker to exploit.
-    let result2 = service
-        .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("wrong-again")),
-            &session,
-        )
+/// An audit-store outage must fail the login rather than let it proceed
+/// unrecorded, and it must fail **identically** for a known and an unknown
+/// identifier.
+///
+/// The second half is the part that is easy to get wrong. Before the
+/// unknown-identifier path emitted an audit event, an outage produced
+/// `Err(Store)` for a real user and `Ok(InvalidCredentials)` for a
+/// nonexistent one, which is a user-enumeration oracle an attacker can open
+/// at will by degrading the audit store. Both paths emit now, so both fail.
+#[tokio::test]
+async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_method(&uid("u1"), password_method());
+    let service = AuthnService::new(identity.clone(), factors);
+
+    identity.arm_record_event_failure();
+
+    let known = service
+        .begin_login("alice", "default", &test_session(), None)
         .await;
+    let unknown = service
+        .begin_login("nobody", "default", &test_session(), None)
+        .await;
+
     assert!(
-        matches!(result2, Ok(FactorOutcome::InvalidCredential)),
-        "subsequent wrong attempts under outage must also be InvalidCredential, got {result2:?}"
+        known.is_err(),
+        "a login that cannot be recorded must not proceed, got {known:?}"
+    );
+    assert!(
+        unknown.is_err(),
+        "the unknown-identifier path must fail the same way, or an audit \
+         outage becomes a user-enumeration oracle, got {unknown:?}"
+    );
+    assert_eq!(
+        format!("{known:?}"),
+        format!("{unknown:?}"),
+        "known and unknown identifiers must be indistinguishable under an audit outage"
+    );
+}
+
+/// With the audit store healthy, a login attempt against an identifier that
+/// does not exist still lands in the trail. A credential-stuffing run over a
+/// list of addresses, none of which are registered, used to leave nothing
+/// behind but a metric counter.
+#[tokio::test]
+async fn unknown_identifier_attempts_reach_the_audit_trail() {
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let service = AuthnService::new(identity.clone(), MockFactorStore::new());
+
+    let outcome = service
+        .begin_login("nobody", "default", &test_session(), None)
+        .await
+        .expect("healthy audit store: the attempt is recorded and rejected");
+    assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
+
+    let events = identity.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.error == Some(AuthFailureReason::UnknownIdentifier)),
+        "an attempt against an unknown identifier must leave an audit row, got {events:?}"
     );
 }

@@ -69,7 +69,15 @@ pub mod provider;
 pub mod session;
 pub mod store;
 
-pub use context::{BuildRequestContext, NoContext, StandardRequestContext, ip_from_headers};
+// `ip_from_headers_trusted` and `TrustedProxies` sit beside
+// `ip_from_headers_untrusted` here deliberately. That one trusts
+// whatever the client sent, and its own docs tell the reader to prefer
+// the trusted variant; leaving that variant reachable only through
+// `authz::context::` made the safe call the harder one to find.
+pub use context::{
+    BuildRequestContext, CidrParseError, NoContext, StandardRequestContext, TrustedProxies,
+    ip_from_headers_trusted, ip_from_headers_untrusted,
+};
 pub use error::{AuthzDenied, AuthzError};
 pub use provider::{
     AuthzEntityProvider, RequestEntityProvider, make_action_uid, make_entity_uid,

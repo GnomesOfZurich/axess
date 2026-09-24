@@ -7,11 +7,12 @@
 
 use crate::authn::service::AuthnService;
 use crate::authn::{
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
+use axess_factors::oauth::OAuthError;
 
 impl<I, F> AuthnService<I, F>
 where
@@ -49,6 +50,7 @@ where
             return true;
         };
         let configured = self
+            .inner
             .oauth_providers
             .get(provider_name)
             .map(|p| p.ceremony_timeout())
@@ -62,7 +64,7 @@ where
                 "provider ceremony_timeout exceeds RFC 6749 §4.1.2 RECOMMENDED 600s; capped"
             );
         }
-        let elapsed = self.clock.now() - started_at.with_timezone(&chrono::Utc);
+        let elapsed = self.inner.clock.now() - started_at.with_timezone(&chrono::Utc);
         elapsed.to_std().unwrap_or_default() > timeout
     }
 
@@ -81,22 +83,27 @@ where
     /// contract for free.
     pub(super) async fn record_oauth_failure_and_clear(
         &self,
-        reason: &str,
+        reason: AuthFailureReason,
         provider_name: &str,
         session: &AuthSession,
-    ) {
-        self.record_oauth_failure(reason, provider_name, session)
+    ) -> Result<(), OAuthError> {
+        // Clear the ceremony state even when the audit write fails: the
+        // state is unusable either way, and leaving it behind would let a
+        // replay of the same callback find a live ceremony.
+        let recorded = self
+            .record_oauth_failure(reason, provider_name, session)
             .await;
         self.clear_oauth_state(session).await;
+        recorded
     }
 
     /// Record an OAuth failure audit event.
     pub(super) async fn record_oauth_failure(
         &self,
-        reason: &str,
+        reason: AuthFailureReason,
         provider_name: &str,
         session: &AuthSession,
-    ) {
+    ) -> Result<(), OAuthError> {
         // Use whatever attribution the session carries; a pre-auth failure
         // legitimately has `None` for both ids, and the event_type +
         // error field carry the diagnostic information.
@@ -111,7 +118,8 @@ where
                 ))
                 .with_error(reason),
         )
-        .await;
+        .await
+        .map_err(|e| OAuthError::AuditStore(e.to_string()))
     }
 
     /// Clear all OAuth ceremony state from the session.

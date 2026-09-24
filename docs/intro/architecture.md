@@ -31,7 +31,7 @@ flowchart TD
   cache["axess-cache<br/><i>TTL cache</i>"]
   clock["axess-clock<br/><i>Clock trait</i>"]
   rng["axess-rng<br/><i>SecureRng trait</i>"]
-  strings["axess-strings<br/><i>Arc&lt;str&gt;</i>"]
+  strings["axess-strings<br/><i>ShortString</i>"]
 
   facade --> core
   facade --> factors
@@ -68,11 +68,16 @@ lives here.
 
 `axess-factors` holds the per-credential verifiers. The list is long
 because the credential surface authentication actually has is long:
-Argon2id, TOTP, HOTP, email OTP, FIDO2, LDAP bind, mTLS, OAuth and OIDC
-(with discovery, JWKS cache, and logout-token claim validation), JWT
-validation, federation adapters for Kubernetes service accounts and
-GitHub Actions and generic OAuth resource servers, a bearer-token
-extractor, an outbound OAuth client, and the PKCE helpers. The crate is
+
+- Argon2id, TOTP, HOTP and email OTP.
+- FIDO2, LDAP bind and mTLS.
+- OAuth and OIDC, with discovery, a JWKS cache and logout-token claim
+  validation; plus JWT validation and the PKCE helpers.
+- Federation adapters for Kubernetes service accounts, GitHub Actions
+  and generic OAuth resource servers.
+- A bearer-token extractor and an outbound OAuth client.
+
+The crate is
 composable on its own and is the obvious extension point when you need
 a custom factor: implement the verifier trait, register it with the
 service, the rest stays the same.
@@ -91,7 +96,7 @@ and `axess-core`. Per-credential algorithms and their data shapes live
 on the verifier side. The sum types and the composition machinery that
 combine them live on the orchestrator side.
 
-This is concrete. The `Fido2Config` struct, the `Fido2Verifier` trait,
+This is concrete. The `Fido2Config` struct, the `Fido2Provider` trait,
 and the WebAuthn ceremony itself live in `axess-factors`. The
 `FactorKind::Fido2` variant, the `FactorConfig::Fido2(Fido2Config)`
 wrapping, and the `FactorStep::factor(FactorKind::Fido2)` composition
@@ -209,7 +214,7 @@ path goes through an injected trait. This is the discipline that lets
 the test suite be reproducible and that lets subtle timing or ordering
 bugs become failing tests rather than rare incidents.
 
-Two traits carry the foundation. The first is `Clock`:
+Two traits carry the foundation. `Clock` is the first:
 
 ```rust,ignore
 pub trait Clock: Send + Sync {
@@ -220,7 +225,7 @@ pub struct SystemClock;          // delegates to chrono::Utc::now()
 pub struct MockClock { /* ... */ } // advances under test control
 ```
 
-The second is `SecureRng`:
+`SecureRng` is the second:
 
 ```rust,ignore
 pub trait SecureRng: Send + Sync {
@@ -253,7 +258,7 @@ control.
 
 | Trait | Production implementation | Test mock |
 |---|---|---|
-| `AuthnBackend` | real database | `MockBackend` |
+| `IdentityStore` / `FactorStore` | real database | `MockIdentityStore` / `MockFactorStore` |
 | `SessionRegistry` | Valkey or memory | `MemorySessionRegistry` |
 | `OAuthProvider` | HTTP plus JWKS cache | `MockOAuthProvider` |
 | `Fido2Provider` | WebAuthn ceremony | `MockFido2Provider` |
@@ -406,17 +411,16 @@ Three invariants run through every part of the workspace. They are not
 advice; they are enforced by lints, by review, and in some cases by
 the type system.
 
-The first is `#![forbid(unsafe_code)]`, declared at the root of every
-crate. There is no unsafe code in axess. There never will be unsafe
-code in axess. If a future change needs it, the change goes elsewhere.
+**`#![forbid(unsafe_code)]`**, declared at the root of all ten
+published crates. There is no unsafe code in axess.
 
-The second is constant-time comparison for any byte-level secret
+**Constant-time comparison** for any byte-level secret
 check. HMAC cookie verification, TOTP code verification, OAuth CSRF
 state, refresh-token device binding, session fingerprint: all of these
 compare bytes through `subtle::ConstantTimeEq`. The alternative, `==`
 on bytes, leaks timing information and is rejected at review.
 
-The third is secret zeroization on drop. Password hashes are wrapped
+**Zeroization on drop.** Password hashes are wrapped
 in `ZeroizedString`. TOTP and HOTP shared secrets use `Zeroizing`. The
 session signing key zeroes its bytes in its `Drop` impl. The
 discipline is not perfect (an attacker with sufficient memory access

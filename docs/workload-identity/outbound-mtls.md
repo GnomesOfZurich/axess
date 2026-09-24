@@ -1,6 +1,6 @@
 # Outbound: mTLS
 
-This chapter covers the case where the application presents an
+This chapter covers the case where your application presents an
 X.509 client certificate during the outbound TLS handshake to a
 downstream service that requires mTLS. The credential is the
 application's workload identity in X.509 form, typically an
@@ -34,14 +34,13 @@ key, and provides them to the outbound TLS handshake. The
 configuration:
 
 ```rust,ignore
-use axess::workload::outbound::{OutboundMtlsClient, OutboundMtlsConfig};
+use axess_core::workload::outbound::mtls_client::OutboundMtlsClient;
 
-let client = OutboundMtlsClient::new(OutboundMtlsConfig {
-    client_cert_path: "/var/lib/axess/svid/cert.pem".into(),
-    client_key_path: "/var/lib/axess/svid/key.pem".into(),
-    ca_bundle_path: Some("/var/lib/axess/svid/ca.pem".into()),
-    reload_interval: Some(Duration::from_secs(300)),
-});
+// The client takes the material, not paths to it: reading and reloading
+// the files is yours, which is what lets an SVID come from a SPIFFE
+// Workload API socket rather than from disk.
+let client = OutboundMtlsClient::new_from_pem(&cert_chain_pem, &private_key_pem)?
+    .with_server_roots_pem(&ca_bundle_pem)?;
 ```
 
 `client_cert_path` and `client_key_path` are filesystem paths to
@@ -63,7 +62,7 @@ schedules; deployments with faster rotation lower this.
 
 ## The TLS handshake
 
-The client integrates with the application's HTTP client (typically
+The client integrates with your HTTP client (typically
 `reqwest`, but the pattern generalises) through a custom
 `Connector`:
 
@@ -91,7 +90,7 @@ directly; other HTTP clients have similar integration points.
 The handshake validates the downstream's server certificate against
 the configured trust anchor (or the system store), then presents
 the client certificate. If the downstream requires the client
-certificate and the application's certificate is missing or
+certificate and yours is missing or
 invalid, the handshake fails. If the downstream does not require
 the certificate, the handshake succeeds and the certificate is
 ignored.
@@ -122,7 +121,7 @@ keeps the previous certificate in memory. The client continues
 to function until the previous certificate expires, by which
 point either the malformed state is fixed or the handshake
 fails. The graceful-degradation pattern is the right shape: a
-botched rotation should not bring down the application
+botched rotation should not bring your service down
 immediately.
 
 ## When the downstream is also axess
@@ -161,8 +160,8 @@ configuration on a schedule.
 ## Troubleshooting
 
 If the handshake fails with a certificate-validation error, the
-downstream does not trust the application's CA. The downstream's
-trust bundle needs to include the application's CA; this is the
+downstream does not trust your CA. Its trust bundle needs to include
+your CA; this is the
 downstream's configuration, not the client's.
 
 If the handshake succeeds but the downstream returns 401 on every
@@ -170,11 +169,11 @@ request, the downstream is performing authorisation against the
 certificate's identity rather than just authentication. Check
 the downstream's authorisation policy: it may require a specific
 SPIFFE path, a specific issuer, or a specific X.509 extension
-that the application's certificate does not have.
+that your certificate does not have.
 
-If the reload fails silently and the application uses an
+If the reload fails silently and you keep using an
 expired certificate, check the reload-interval configuration and
-the application's log output. The reload errors are logged at
+your log output. The reload errors are logged at
 warn level; a missed reload typically surfaces as a
 "failed to read certificate" message.
 

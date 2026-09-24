@@ -195,7 +195,7 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     /// Return all active session IDs for a user, ordered oldest first.
     ///
     /// Used by the concurrent-session-limit enforcement on
-    /// [`AuthnService::with_max_sessions_per_user`](crate::authn::AuthnService::with_max_sessions_per_user)
+    /// [`AuthnServiceBuilder::with_max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
     /// to FIFO-evict the oldest session when a new login would cross the
     /// cap. **This method is required**: a silent empty result here
     /// disables the limit without any warning, which is a security
@@ -547,7 +547,7 @@ impl HealthCheck for MemorySessionStore {
 /// [`Self::active_sessions`] returns sessions oldest-first, satisfying
 /// the [`SessionRegistry::active_sessions`] "ordered oldest first"
 /// contract (load-bearing for the
-/// [`max_sessions_per_user`](crate::authn::service::AuthnService::with_max_sessions_per_user)
+/// [`max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
 /// FIFO eviction in `complete_factor_step`). The cost is O(N) lookup
 /// for `is_valid` and `invalidate_session`, but N is bounded by the
 /// concurrent-session limit (typically ≤10) and the Memory registry

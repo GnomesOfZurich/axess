@@ -198,6 +198,18 @@ jobs:
       - name: Build rustdoc with warnings as errors
         run: ./scripts/check-doc-links.sh
 
+      # Markdown links, which the rustdoc gate above cannot see. Resolved
+      # offline: a github.com link into this repo is a repo path wearing a
+      # URL, so no network flakiness can disable this one.
+      - name: Markdown links resolve
+        run: ./scripts/check-markdown-links.sh
+
+      - name: Prose style
+        run: ./scripts/check-prose-style.sh
+
+      - name: Documented identifiers exist
+        run: ./scripts/check-doc-identifiers.sh
+
   # Tests
   test:
     name: Test Suite

@@ -116,11 +116,10 @@ pub struct Method {
 ```
 
 The two-step `Required(Password)` then `AnyOf(vec![Totp, Fido2])`
-method handles a common shape: the user must enter their password,
-then must complete one of two second factors, and the choice of second
-factor is theirs (perhaps because they have not registered a passkey
-yet, or perhaps because their phone is at home and they only have
-their hardware key with them). The state machine's
+method handles a common shape: the user enters their password, then
+completes one of two second factors, and which one is their choice.
+They may not have registered a passkey yet, or their phone may be at
+home and only the hardware key with them. The state machine's
 `Authenticating::remaining` field carries the residue of steps yet to
 complete: after the password step, `remaining` looks like
 `[AnyOf(vec![Totp, Fido2])]` and the application's login page renders
@@ -225,8 +224,11 @@ is in progress).
 
 `begin_login` does three things that are worth naming explicitly.
 First, it looks up the user in the configured identity store, in the
-tenant that the caller named, and returns `UserNotFound` if no user
-matches. Second, it loads the method that applies to that user under
+tenant that the caller named. An identifier that matches nothing returns
+`LoginOutcome::InvalidCredentials`, the same outcome a wrong password
+gives, and the lookup runs the same store queries against a dummy id so
+the latency does not differ either. There is no "no such user" to branch
+on, deliberately. Second, it loads the method that applies to that user under
 the scope hierarchy (covered in *Scope hierarchy*); the result is the
 specific sequence of steps the user will walk. Third, it transitions
 the session into `Authenticating` with the loaded method's
@@ -284,9 +286,17 @@ Step-up is the pattern where an already-`Authenticated` session is
 asked to re-prove identity (or to prove with a stronger factor) before
 performing a sensitive action. Axess models this by transitioning the
 state from `Authenticated` back to `Authenticating` with a non-empty
-`remaining` list. The orchestrator method that drives this is
-`AuthnService::require_step_up`, which takes the session and the
-factor or factors the caller demands.
+`remaining` list. There is no `require_step_up` orchestrator method.
+What axess ships is the decision, not the transition: `decide_step_up`
+is a free function over a `Device` and a `StepUpPolicy`, returning
+`Some(factors)` when the device's trust level calls for them and `None`
+when it does not. `StepUpPolicy` is a factor list per `DeviceTrustLevel`:
+`unknown` and `seen` demand factors by default, `trusted` and
+`revoked` demand none. `begin_login` surfaces the answer as
+`LoginOutcome::StepUpRequired { device_id, allowed_factors }`.
+
+Driving the session back into `Authenticating` with that list is the
+caller's step.
 
 The state-machine view is uniform. The session is `Authenticating`
 again; the factor list contains the stepped-up factors; the session
@@ -302,7 +312,7 @@ engine can express "this action requires `Fido2` in
 handler can demand it directly. The state machine does not impose a
 policy; it provides the shape that lets the policy be enforced.
 
-## What this enables
+## How far two steps get you
 
 A method composed of a `Required(Password)` followed by an
 `AnyOf(vec![Totp, Fido2, EmailOtp])` covers an enormous share of real

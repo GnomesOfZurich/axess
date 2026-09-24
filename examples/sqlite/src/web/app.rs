@@ -133,7 +133,9 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
 
     let state_backend = backend.clone();
     let service = Arc::new(
-        AuthnService::new(backend.clone(), backend).with_metrics(AppMetricsHandle(metrics.clone())),
+        AuthnService::builder(backend.clone(), backend)
+            .with_metrics(AppMetricsHandle(metrics.clone()))
+            .build(),
     );
     let state = AppState {
         service,

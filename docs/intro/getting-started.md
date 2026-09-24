@@ -35,7 +35,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.5"             # facade -- depend on this, never on the internal crates
+axess = "0.6"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -47,7 +47,7 @@ turn on `memory`, the in-memory session store used for development and
 tests.
 
 ```toml
-axess = { version = "0.5.1", features = ["memory"] }
+axess = { version = "0.6.0", features = ["memory"] }
 ```
 
 The complete feature reference lives in the
@@ -73,7 +73,7 @@ right after.
 
 ```rust,no_run
 use axess::{
-    AuthnService, InMemoryBackend, InMemorySessionStore,
+    AuthnService, InMemoryBackend, MemorySessionStore,
     SessionLayer, AuthSession,
 };
 use axum::{Router, routing::get, response::IntoResponse, http::StatusCode};
@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_user_password("alice", "default", "Gnomes2+");
 
     // 2. Session store + 3. signing key.
-    let session_store = InMemorySessionStore::new();
+    let session_store = MemorySessionStore::new();
     let signing_key: [u8; 32] = [0; 32]; // PLACEHOLDER, see "Signing keys" below.
 
     // 4. AuthnService -- type-erased over clock and RNG; production wires
@@ -137,7 +137,7 @@ Production replaces this with a real backend that implements
 `IdentityStore` and `FactorStore` against your database. The trait
 surface is identical.
 
-`InMemorySessionStore::new()` is the trivial session backend. Session
+`MemorySessionStore::new()` is the trivial session backend. Session
 data lives in a `HashMap` behind an `RwLock`, and disappears on
 process exit. The first replacement is
 `axess::backends::sqlite::SessionStore` (with the `sqlite` feature),
@@ -171,7 +171,7 @@ password. Axess transitions the session from `Guest` to
 identifies the session, and `AuthSession` reads `Authenticated`.
 
 ```rust,ignore
-use axess::{AuthnService, AuthSession, LoginOutcome};
+use axess::{AuthnService, AuthSession, FactorCredential, FactorOutcome, LoginOutcome};
 use axum::{extract::State, response::IntoResponse, http::StatusCode, Json};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -188,42 +188,77 @@ async fn login(
     Json(form): Json<LoginForm>,
 ) -> impl IntoResponse {
     // 1. Begin the login. Transitions Guest -> Authenticating.
-    match service.begin_login(&session, &form.username, "default").await {
-        Ok(_) => {}
+    //    `client_ip` is `None` here; pass the real one in production so
+    //    the IP policy and the audit trail have something to work with.
+    match service
+        .begin_login(&form.username, "default", &session, None)
+        .await
+    {
+        // The identifier resolved and the first factor is known. For a
+        // password-only method that is `FactorKind::Password`.
+        Ok(LoginOutcome::FactorRequired(_)) => {}
+        Ok(LoginOutcome::InvalidCredentials) => {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Ok(LoginOutcome::Locked { until }) => {
+            return (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response();
+        }
+        Ok(LoginOutcome::StepUpRequired { .. }) => {
+            return (StatusCode::UNAUTHORIZED, "step-up required").into_response();
+        }
         Err(e) => return (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
     }
 
-    // 2. Verify the password factor.
-    use axess::FactorCredential;
+    // 2. Verify the password factor. Note the argument order:
+    //    credential first, session second.
     match service
         .verify_factor(
+            &FactorCredential::Password(form.password.clone()),
             &session,
-            FactorCredential::Password(form.password.clone()),
         )
         .await
     {
-        Ok(LoginOutcome::Authenticated { .. }) => {
+        Ok(FactorOutcome::Authenticated) => {
             (StatusCode::OK, "logged in").into_response()
         }
-        Ok(LoginOutcome::AwaitingFactor { remaining }) => {
+        Ok(FactorOutcome::FactorRequired(next)) => {
             // Unreachable for a password-only method, but the branch matters
             // when chaining factors (password + TOTP, etc).
-            (StatusCode::OK, format!("need more factors: {remaining:?}")).into_response()
+            (StatusCode::OK, format!("next factor: {next:?}")).into_response()
+        }
+        Ok(FactorOutcome::InvalidCredential) => {
+            (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
+        }
+        Ok(FactorOutcome::Locked { until }) => {
+            (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response()
         }
         Err(e) => (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
     }
 }
 ```
 
-The call to `begin_login` is what transitions the session from
-`Guest` to `Authenticating`. The transition records the user id, the
-tenant, and the list of factors still required (just `Password` for a
-single-factor method). Then `verify_factor` consumes one factor and
-returns a `LoginOutcome`. The successful terminal case is
-`LoginOutcome::Authenticated`, meaning every required factor has
-passed. The intermediate case is `LoginOutcome::AwaitingFactor`,
-meaning the factor verified but more are required; the state stays
-`Authenticating` and `remaining` lists what is still needed.
+Two different outcome types appear there, and the difference is the
+point.
+
+`begin_login` returns a `LoginOutcome`: the answer to "can this
+identifier start a login at all, and what does it need first?"
+`FactorRequired(FactorKind)` says the flow is open and names the first
+factor. `InvalidCredentials` and `Locked` say it is not. Handle those
+two here rather than falling through, or the code goes on to offer a
+password prompt for an account that is locked or does not exist.
+
+`verify_factor` returns a `FactorOutcome`: the answer to "did this one
+credential check out, and are we done?" `Authenticated` is the terminal
+success: every required factor has passed and the session is now
+`Authenticated`. `FactorRequired(FactorKind)` means this factor
+verified but another is needed; the state stays `Authenticating` and
+the variant names what comes next. `InvalidCredential` is a wrong
+password, and `Locked` is the lockout policy firing on this attempt.
+
+Both calls take the session, but in different positions:
+`begin_login(identifier, tenant, session, client_ip)` and
+`verify_factor(credential, session)`. The credential comes first
+because it is the subject of the verb.
 
 The branching is the whole point of the explicit state machine. There
 is no version of "logged in" that means "we believe one factor, you
@@ -264,7 +299,7 @@ the wiring steps from *The minimum viable wiring*.
 The browser sends the request with a `Cookie:` header carrying the
 session id. `SessionLayer` (5) extracts the cookie, verifies its HMAC
 signature against the signing key, looks up the session in the
-`InMemorySessionStore` (2), and rebuilds the `AuthState`. Axum
+`MemorySessionStore` (2), and rebuilds the `AuthState`. Axum
 invokes the handler with the hydrated `AuthSession` extractor. The
 handler reads or mutates the session through `AuthnService` (4), and
 mutations flag the session dirty. On response, `SessionLayer`
@@ -291,9 +326,11 @@ underneath, every existing session becomes invalid on the next
 request.
 
 Rotating the signing key is supported via
-`SessionLayer::with_previous_key`, which keeps the old key available
-for a transitional period so that sessions signed with the previous
-key continue to validate while new sessions sign with the new one.
+`SessionLayer::with_previous_signing_key`, which keeps the old key
+available for a transitional period so sessions signed with the
+previous key continue to validate while new sessions sign with the new
+one. (`SessionCrypto` has a similarly named `with_previous_key` for the
+at-rest envelope; they rotate different keys.)
 The *Operations runbook* walks through the rotation sequence in
 detail.
 
@@ -317,14 +354,18 @@ interpreted, and the `SameSite=Strict` trade-off.
 This chapter is deliberately the minimum. The real
 [`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite)
 extends the same shape with everything you will actually want in
-production: a real SQLite backend (`OurBackend` implements
-`IdentityStore` and `FactorStore` over a `sqlx::SqlitePool`), a
-SQLite-backed session store with AES-256-GCM encryption at rest, a
-password + TOTP two-factor login for a second user, self-service
-signup and TOTP enrollment, a password-reset flow with email-OTP,
-rate limiting on the auth routes, a health check on the session
-store, atomic auth-attempt counters exposed at `/metrics`, and a
-background interval task that purges expired sessions. Read the
+production:
+
+- A real SQLite backend: `OurBackend` implements `IdentityStore` and
+  `FactorStore` over a `sqlx::SqlitePool`.
+- A SQLite-backed session store with AES-256-GCM encryption at rest.
+- Password plus TOTP two-factor login for a second user, self-service
+  signup and TOTP enrollment, and a password-reset flow over email OTP.
+- Rate limiting on the auth routes, a health check on the session
+  store, and atomic auth-attempt counters exposed at `/metrics`.
+- A background interval task that purges expired sessions.
+
+Read the
 example, run it, compare its `app.rs` to the snippet in this chapter.
 The shape is the same; there are simply more pieces wired in.
 
@@ -351,14 +392,15 @@ If your handler cannot see `AuthSession`, the extractor needs the
 layer to populate request extensions. Add `use axess::AuthSession;`
 and check that `SessionLayer` is in `.layer(...)` on the router.
 
-If `begin_login` returns `UserNotFound`, the tenant probably does
-not match. The example seeds `alice` in tenant `default`; passing a
-different tenant returns `UserNotFound` deliberately, not
-"user exists in a different tenant". Axess never leaks tenant
-membership across tenant boundaries.
+If `begin_login` returns `InvalidCredentials` for a user you are sure
+exists, check the tenant. The example seeds `alice` in tenant `default`,
+and naming a different tenant gives the same `InvalidCredentials` as a
+wrong password: axess does not tell a caller that a user exists
+elsewhere, or that they exist at all. That makes this particular typo
+quiet to debug, which is the cost of not leaking tenant membership.
 
 If sessions disappear on process restart, that is correct for
-`InMemorySessionStore`. Use `SqliteSessionStore`,
+`MemorySessionStore`. Use `SqliteSessionStore`,
 `PostgresSessionStore`, or `ValkeySessionStore` (with their
 respective features) for persistence. See *Backends*.
 

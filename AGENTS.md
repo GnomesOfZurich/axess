@@ -196,7 +196,7 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 
 ## Security Principles
 
-- **No `unsafe` code in production paths.** `#![forbid(unsafe_code)]` enforced on 10 of 11 crates. The exception is `axess-strings`, which uses `#![deny(unsafe_code)]` + a scoped `#![allow(unsafe_code)]` in `repr.rs` for the Umbra-style raw heap representation (allocation, `NonNull` dereference, `unsafe impl Sync`). Every `unsafe` block in `repr.rs` cites the invariant it relies on. No other module in any crate may use `unsafe`.
+- **No `unsafe` code.** `#![forbid(unsafe_code)]` is declared at the root of all ten published crates, with no exceptions (the `examples/*` members do not declare it). `axess-strings` was the last holdout: its `repr.rs` held an Umbra-style union behind `#![deny(unsafe_code)]` plus a scoped allow, and was replaced with a safe enum in 0.6.0. A crate that needs `unsafe` needs a decision first, not an allow.
 - **Constant-time comparisons** (`subtle::ConstantTimeEq`): HMAC cookie verification, TOTP/HOTP codes, OAuth CSRF state, session fingerprint, refresh token device binding.
 - **Secret zeroization**: password hashes (`ZeroizedString`), TOTP/HOTP secrets (`Zeroizing`), signing key (`Drop` zeroing).
 - **Timing equalization**: `begin_login` runs dummy queries on unknown-user path to prevent user enumeration.
@@ -244,8 +244,10 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `fido2` | WebAuthn passkey verifier |
 | `ldap` | LDAP bind verifier |
 | `mtls` | mTLS verifier |
-| `oidc` | OIDC discovery + JWKS cache + logout-token claim validation |
-| `jwt` | JWT validation (incl. `JwtVerifier`) |
+| `oidc` | OIDC discovery + JWKS cache + logout-token claim validation (pulls `jwt`) |
+| `jwt` | JWT validation (incl. `JwtVerifier`). Needs a backend beside it |
+| `jwt-aws-lc` | `jwt` verifying with aws-lc-rs: FIPS-capable, needs a C toolchain |
+| `jwt-rust-crypto` | `jwt` verifying with RustCrypto: pure Rust, builds anywhere |
 | `jwt-svid` | SPIFFE JWT-SVID resolver (pulls `jwt`; spec-bound; mandatory `spiffe://` URI in `sub`) |
 | `oauth` | Inbound OAuth ceremony (pulls `oidc` + `jwt`) |
 | `fapi` | FAPI 2.0 add-ons (pulls `oauth`) |
@@ -290,6 +292,31 @@ cargo clippy --workspace --all-features --all-targets -- -D warnings
 Integration tests require a running Valkey instance at `redis://localhost:6379`. Postgres / MySQL backends also have integration suites; CI spins up service containers for all three plus CockroachDB.
 
 `./scripts/test-all.sh` runs every step regardless of prior failure (independent-verdict shape mirroring CI), prints per-step elapsed, and lists failed steps in the summary.
+
+### Documentation gates
+
+Five of them, each covering something the others cannot see. All are
+sub-second except the rustdoc build, and all run in `test-all.sh`,
+`release-preflight.sh` and CI.
+
+| script | reads | catches |
+|---|---|---|
+| `check-doc-links.sh` | rustdoc, `-D warnings` | broken intra-doc links in Rust source |
+| `check-doc-identifiers.sh` | the book's prose and its fenced blocks | a chapter naming a type, method, variant or feature the workspace does not have: 108 of the book's 112 Rust blocks are ```rust,ignore, so nothing compiles them |
+| `check-markdown-links.sh` | every tracked `.md` | a Markdown link, relative **or** an absolute `github.com/.../blob/...` URL into this repo, pointing at a file that does not exist |
+| `check-doc-versions.sh` | version and MSRV snippets in prose | a documented `axess = { version = "..." }` that has drifted from the workspace |
+| `check-prose-style.sh` | every tracked `.rs`, `.md`, `.toml`, `.sh`, `.yml` | an em dash. The house style elaborates with a colon and joins clauses with a semicolon. En dashes are fine in numeric ranges |
+
+`check-markdown-links.sh` resolves github.com links into this repository
+offline, by treating the URL as a repo path. That is deliberate: a link
+checker that fetches URLs fails on a flaky network, which is how link
+checkers get switched off. Links to other hosts are not checked.
+
+**What none of them catch is prose that merely stopped being true.** A
+chapter can describe behaviour the library no longer has, in sentences
+whose every identifier resolves, and every gate stays green. That failure
+mode is only caught by reading, and it is the common one after a
+behavioural change.
 
 ### Test-module layout
 

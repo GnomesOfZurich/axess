@@ -15,6 +15,298 @@ change (the same code does something subtly different). The
 sections below group by symptom; finding your case is faster than
 reading the full changelog.
 
+## 0.5.0 to 0.6.0
+
+`v0.6.0` is the largest break so far. One change is a cargo feature,
+five are compile errors in adopter code, and four change behaviour
+without any compiler help. The behaviour changes are the ones to read
+closely: each was a security defect, and each is fixed by doing
+something the old version did not do.
+
+### The build fails before anything else
+
+If you enable `jwt`, `oauth`, `oidc`, `fapi`, `bearer`, `jwt-svid`,
+`local-idp` or `workload-id`, the build now stops with:
+
+```text
+axess-factors: the `jwt` feature needs a crypto backend. Enable
+`jwt-aws-lc` (...) or `jwt-rust-crypto` (...)
+```
+
+Add exactly one. `jwt-aws-lc` is FIPS-capable and needs a C toolchain
+(and NASM on Windows); `jwt-rust-crypto` is pure Rust and builds
+anywhere. Enabling both is allowed, because cargo may switch the second
+on when another crate in your build asks for it.
+
+Until 0.5.1 `axess-factors` pinned aws-lc-rs itself, which chose for
+adopters who had already chosen the other; with both switched on,
+`jsonwebtoken` cannot pick and panics on first verification. If you sign
+tokens yourself, call `axess_factors::jwt::ensure_crypto_provider`
+before `jsonwebtoken::encode`.
+
+### Compile errors you will see
+
+**`IdentityAuthnLog::record_event` returns `AuditOutcome`.** Replace
+`Ok(())` with `Ok(AuditOutcome::Recorded)`:
+
+```rust
+async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
+    // ... unchanged write ...
+    Ok(AuditOutcome::Recorded)
+}
+```
+
+Return `AuditOutcome::Shed` to drop an event deliberately under load. The
+flow continues and `AuthnMetrics::audit_event_shed` fires, where an `Err`
+fails the login. This is the valve for a hazard the fail-closed audit
+creates: every failed login writes a row, including for identifiers that
+do not exist, so an unauthenticated caller can drive writes at your
+storage without bound.
+
+**Shed on a criterion independent of the identifier**: a global rate, a
+queue depth, a disk watermark. Shedding on anything derived from *which*
+identifier was tried makes the drop observable per-identifier and
+reintroduces the user-enumeration oracle that emitting unattributed events
+exists to close.
+
+`MockIdentityStore::arm_record_event_shedding` exercises the path in your
+own tests, beside the existing `arm_record_event_failure`.
+
+**`AuthnService` construction moved to a builder.** The service is now a
+cheap handle over one `Arc`, so it can carry per-request state; the
+collaborators are shared the moment it is built, and customising an
+already-shared service is therefore not possible.
+
+```rust
+let service = AuthnService::builder(identity, factors)   // was: ::new(..)
+    .with_clock(clock)
+    .with_registry(registry)
+    .build();                                            // <- new
+```
+
+`AuthnService::new(identity, factors)` with no customisation is unchanged.
+`from_backend(b)` is unchanged; chain from `builder_from_backend(b)`.
+
+**Client metadata now reaches audit events, if you wire it.** Before this
+release nothing in axess attached an `AuditContext` to the events it
+emitted, so every row carried a null IP:
+
+```rust
+let ip = ip_from_headers_trusted(&headers, peer.ip(), &trusted);
+let ctx = extract_audit_context(&headers, Some(ip), Some(&session));
+let service = state.service.with_audit_context(ctx);
+service.begin_login(&identifier, tenant, &session, None).await?;
+```
+
+`with_audit_context` returns a copy of the handle; the collaborators are
+shared, so this costs a refcount bump per request. The `sqlite` example
+does this in `post_login`.
+
+If your audit trail is compliance evidence, build with
+`.with_audit_context_policy(AuditContextPolicy::Required)` so a route that
+forgets the wiring fails loudly instead of recording blanks.
+**That is a fail-closed path**: it turns a missing context into a failed
+login, so wire every route before turning it on.
+
+**Two password-history methods are no longer on `IdentityAdmin`.**
+`record_password_hash` and `password_history` moved to a new
+`IdentityPasswordHistory` trait with no default bodies:
+
+```rust
+impl IdentityPasswordHistory for YourBackend {
+    async fn record_password_hash(/* ... */) { /* unchanged body */ }
+    async fn password_history(/* ... */) { /* unchanged body */ }
+}
+```
+
+Both had defaults that panicked, and `record_password_hash` is called on
+every password change with no guard, so a backend that had not overridden
+it unwound the first time any user changed their password. The method
+looked optional, because a defaulted trait method does.
+
+If you have no password-reuse policy, implement nothing. The password
+change and reset flows are bounded on this trait, so they become
+unavailable at compile time rather than panicking at runtime.
+
+Note that `IdentityAdmin::delete_user` still has a panicking default. It is
+not called by any axess flow: you reach it only by calling it yourself
+but override it before you rely on it for GDPR erasure.
+
+**Two password-reset methods are no longer on `IdentityAdmin`.**
+`store_reset_token` and `verify_reset_token` moved to a new
+`IdentityPasswordReset` trait with no default bodies. Move the two
+`impl`s into their own block:
+
+```rust
+impl IdentityPasswordReset for YourBackend {
+    async fn store_reset_token(/* ... */) { /* unchanged body */ }
+    async fn verify_reset_token(/* ... */) { /* unchanged body */ }
+}
+```
+
+They defaulted to `unimplemented!()`, so a backend that never
+implemented them compiled and then panicked on an open route. If you do
+not use password reset, implement nothing: the reset flow is bounded on
+the new trait, so it is no longer reachable.
+
+**`extract_audit_context` takes the client IP.** Resolve it against the
+peer your server accepted rather than letting the function read
+headers:
+
+```rust
+let ip = ip_from_headers_trusted(&headers, peer, &trusted);
+let ctx = extract_audit_context(&headers, Some(ip));   // was: (&headers)
+```
+
+Passing `None` is honest where you cannot establish the address. The old
+behaviour is still available as `extract_audit_context_untrusted`, whose
+name now carries the warning.
+
+**`ip_from_headers` is `ip_from_headers_untrusted`**, in both the
+`authn` and `authz` modules. The behaviour is unchanged and remains
+correct behind a proxy you control. Rename, or switch to
+`ip_from_headers_trusted`, which is the one to prefer.
+
+**`OAuthError` has a new variant.** `AuditStore(String)` is returned
+when the audit store rejects the event recording an OAuth outcome. The
+enum is not `#[non_exhaustive]`, so an exhaustive `match` over it now
+fails with `E0004`. It classifies as transient under
+`OAuthError::is_transient`.
+
+**`AuthEvent::error` is an `AuthFailureReason`.** It was
+`Option<String>`, and `AuthEventBuilder::with_error` took
+`impl Into<String>`. This is the field a SOC dashboard groups by, so it is
+the same defect `AuthEventBuilder::locked` was introduced to fix for the
+outcome: querying meant matching a string, and a string nothing enforced.
+
+```rust
+use axess::authn::AuthFailureReason;
+
+AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+    .with_error(AuthFailureReason::UnknownTenant)   // was: .with_error("unknown_tenant")
+```
+
+The setter deliberately does *not* take `impl Into<_>`: that would keep
+string literals compiling, and a typo would land in `Other` silently,
+which is the thing being removed. Where no tag fits, name
+`AuthFailureReason::Other` explicitly.
+
+Reading the field, compare against the variant rather than a string:
+
+```rust
+assert_eq!(event.error, Some(AuthFailureReason::CsrfMismatch));
+```
+
+**The wire form does not change.** Serde still emits the plain tag string,
+and a text column still stores it, so stored rows and JSON are unaffected.
+Converting a stored string back is infallible: an unrecognised tag
+becomes `Other` rather than an error, so rows from another version are
+never dropped:
+
+```rust
+let error = error.map(AuthFailureReason::from);
+```
+
+**One stored value does change.** The impersonation refusal was written as
+`"cross-tenant impersonation refused"` and is now the tag
+`cross_tenant_impersonation`. A dashboard matching the old prose needs
+updating; rows written before the upgrade keep the old text and will read
+back as `Other`.
+
+**`AuthEvent::ip_address` is an `IpAddr`.** It was `Option<String>`, and
+`AuthEventBuilder::with_ip` took `impl Into<String>`, so the field that
+this release spent its security budget making trustworthy would still
+accept `"not-an-ip"`, or an address the caller invented. `AuditContext`
+was already typed; the builder discarded the type with `ip.to_string()`.
+
+```rust
+let ip = ip_from_headers_trusted(&headers, peer, &trusted);
+let event = AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+    .with_ip(ip)                         // was: .with_ip(ip.to_string())
+    .build();
+```
+
+Reading the field, the borrow you used to take becomes a plain copy, and a
+sink writing to a text column stringifies at the point of the write:
+
+```rust
+let ip_address = event.ip_address.map(|ip| ip.to_string());
+```
+
+**Reading rows written before 0.6.0 needs a decision.** That column holds
+whatever string the old writer supplied, including values a client forged,
+and some will not parse. Prefer warning and storing `None` over dropping
+the row: the address is optional metadata rather than identity, and a null
+address is honest where an invented one is not. The `sqlite` example does
+this, beside the same handling for `factor_kind`.
+
+Note that `cargo-semver-checks` does **not** flag a public struct field
+changing type: there is no lint for it, so this break is invisible to
+the tool and is documented here and in the changelog instead.
+
+**`ShortString::prefix` is gone.** It was documented as powering an
+equality fast path that `PartialEq` never used. Delete the call; there
+is nothing to replace it with.
+
+### Behaviour changes with no compile error
+
+**A login now fails if its audit record cannot be written.**
+`IdentityAuthnLog::record_event` returning an error used to be logged
+and discarded, and the login proceeded unrecorded. It now surfaces as
+`AuthnError::Store`, and on OAuth paths as `OAuthError::AuditStore`.
+
+This trades availability for evidence: **logins fail while your audit
+store does.** Put the sink behind something durable: write locally and
+ship asynchronously, rather than a remote service on the request path.
+`AuthnMetrics::audit_store_outage` fires here and should page.
+
+Related, and the reason the above is safe: rejected logins now emit an
+audit row even when there is no user to attribute them to, tagged
+`unknown_tenant` or `unknown_identifier`. Without that, an attacker who
+could degrade your audit store would see `Err` for registered
+identifiers and an ordinary rejection for everything else.
+
+**Lockout fails closed when its counter store is unavailable.**
+`record_failed_attempt` is a write, so a primary-database outage in a
+read-replica deployment used to leave logins working and the lockout
+counter dead: brute force unbounded exactly when monitoring was
+degraded. `LockoutPolicy::on_counter_unavailable` now defaults to
+`CounterUnavailable::Lock`.
+
+During such an outage a user who mistypes is told they are locked and
+retries after `duration`. Set `CounterUnavailable::Allow` for the old
+behaviour. Note that `Lock` with `duration: None` means a persistently
+broken counter store needs an administrator per account. Alert on
+`AuthnMetrics::factor_counter_store_outage` either way.
+
+**`ip_from_headers_trusted` returns a different address.** It took the
+leftmost `X-Forwarded-For` entry, but that header is append-only: a
+client sends its own value and the proxy appends the real address after
+it, so the leftmost entry was whatever the attacker chose. It now walks
+from the right, skipping hops that are themselves trusted proxies, and
+returns the first address that is not. A malformed entry stops the walk
+and yields the peer; `X-Real-IP` is read only when `X-Forwarded-For` is
+absent. **The value changes on any deployment where a client can
+prepend**, which is the point.
+
+If exact proxy addresses were impractical for you, `TrustedProxies`
+now accepts CIDR ranges through `from_cidrs` and `with_cidrs`.
+
+### Audit rows you already store
+
+**A lockout is recorded as `AuthEventStatus::Locked`.** It was
+`Failure` with `error = "locked"`, so the outcome lived in a free-text
+field while the `Locked` variant was unreachable. A dashboard matching
+`status = 'failure' AND error = 'locked'` will stop matching: filter on
+the status column instead. **Rows written before the upgrade keep the
+old encoding**, so a query spanning the boundary needs both. Other
+non-active states are unchanged, still `Failure` with
+`error = "not_active"`.
+
+If you built SIEM queries or dashboards from the audit chapters before
+0.6.0, re-check them regardless: those chapters described a model axess
+does not implement, and were rewritten in this release.
+
 ## 0.4.0 to 0.5.0
 
 `v0.5.0` has three adopter-facing changes, each to a single struct
@@ -212,10 +504,10 @@ different implementations (for instance, a read-replica
 identity store and a write-only factor store). When the two
 stores are the same type (the common case), pass it twice.
 
-`SessionLayer::with_secret` becomes
-`SessionLayer::with_signing_key`. The previous name was
-ambiguous; the new name names what the bytes are used for
-(HMAC signing the cookie).
+The signing key is a constructor argument, not a builder call:
+`SessionLayer::new(store, signing_key)`, taking `[u8; 32]`. Rotation
+is the one related builder, `with_previous_signing_key`, which keeps
+the outgoing key valid for verification while the new one signs.
 
 `AuthState::Logged` becomes `AuthState::Authenticated`. The
 state was renamed for clarity; nothing else changed about the
@@ -229,12 +521,11 @@ different hasher (PBKDF2, legacy bcrypt) implement a custom
 factor and register it. *Factors and methods* covers the
 extension pattern.
 
-The `AuditPipeConfig` shape changed. The `sinks: Vec<Box<dyn Sink>>`
-field was replaced with explicit `regulatory_sink: Arc<...>`
-and `analytics_sink: Option<Arc<...>>` fields, reflecting the
-dual-stream architecture from *Audit pipeline*. The change
-makes the wire-stable vs. enriched stream distinction explicit
-in the config.
+There is no audit-pipeline config type to migrate. Axess awaits one
+call, `IdentityAuthnLog::record_event`, and the implementation behind
+it is yours; a deployment that had wired sinks into a config struct
+wires them inside that implementation instead. *Audit pipeline* covers
+the seam.
 
 The `RateLimitConfig` no longer accepts a `key_fn` field
 directly; use `KeyExtractor::Custom(Arc<dyn KeyExtractorFn>)`
@@ -251,11 +542,13 @@ change is what enables multi-factor methods longer than two
 factors. Code that pattern-matched on `Some(kind)` needs to
 adapt to `remaining.first()` or to iterate over the list.
 
-The lockout policy now defaults to per-IP in addition to
-per-user and per-tenant. The previous default only locked the
-user; the new default also throttles the source IP. Deployments
-that explicitly want only per-user lockout configure
-`LockoutPolicy::per_user_only()`.
+`LockoutPolicy` is per-user and has no other scale. It is three
+fields (`max_attempts`, `duration`, `attempt_window`) with no
+per-tenant or per-IP variant to configure or to turn off. Throttling a
+source IP is the rate limiter's job, where the answer is a 429 rather
+than a locked account; see *Rate limiting*, and note
+`KeyExtractor::LoginIdentifier` for the per-account half of that
+defence.
 
 The session cookie's `SameSite` attribute now defaults to `Lax`
 rather than `Strict`. The change is to match modern browser
@@ -263,12 +556,11 @@ defaults and to admit cross-site link-to-app navigations as
 legitimate. Deployments that need `Strict` configure it
 explicitly.
 
-The fingerprint binding now defaults to `FingerprintPolicy::Warn`
-rather than `FingerprintPolicy::Reauth`. The new default is
-quieter during initial rollout. Production deployments that
-want stricter posture lift to `Reauth` or `Revoke` after
-calibrating the warn rate (*Cookies, fingerprinting, hijack
-detection* covers the calibration).
+Session binding is off unless you ask for it. Nothing is bound until
+the layer is built `.with_binding(UserAgentBinding)`, and a mismatch
+then resets the session to `Guest`. There is no policy to set and no
+quieter setting to start from (*Cookies, fingerprinting, hijack
+detection* covers the limits of what the binding catches).
 
 ### Schema migrations
 

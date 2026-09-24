@@ -39,9 +39,16 @@ if [ "$ALLOW_DIRTY" = true ]; then
   PACKAGE_ARGS+=(--allow-dirty)
 fi
 
-TOTAL=13
-if [ "$WITH_FUZZ" = true ]; then
-  TOTAL=14
+# Derived, not declared. This number has desynced twice from the steps that
+# actually run -- most recently when "Non-leaf package preflight" landed and
+# left the denominator at 13, which failed the guard at the bottom and so
+# failed the whole release gate on bookkeeping rather than on a real check.
+# Counting the invocations keeps it honest; the guard below stays as a
+# backstop for the case this grep cannot see.
+TOTAL=$(grep -cE '^[[:space:]]*step "' "$SCRIPT_DIR/release-preflight.sh")
+if [ "$WITH_FUZZ" != true ]; then
+  # The fuzz smoke step is the one conditional invocation.
+  TOTAL=$((TOTAL - 1))
 fi
 
 # Steps number themselves. Hand-written ordinals silently desync the moment a
@@ -68,10 +75,27 @@ step "Format check" cargo fmt --manifest-path "$AXESS_DIR/Cargo.toml" --all -- -
 # from crates.io or the GitHub tree view will pin whatever it says.
 step "Documented versions" "$AXESS_DIR/scripts/check-doc-versions.sh"
 
+# Also sub-second, and the only gate that reads the book. 108 of its 112
+# Rust blocks are ```rust,ignore, so a chapter can name a type that does
+# not exist and every other check stays green; one sweep found 59 such
+# names, including an import in the getting-started tutorial.
+step "Documented identifiers" "$AXESS_DIR/scripts/check-doc-identifiers.sh"
+
 # Also sub-second. Guards the AGENTS.md rule that an inline `#[cfg(test)]`
 # block over ~200 lines moves to a sibling file: 24 blocks had drifted past
 # it before the rule was enforced rather than remembered.
 step "Inline test block sizes" "$AXESS_DIR/scripts/check-inline-tests.sh"
+
+# Sub-second too, and the only gate that reads Markdown. `check-doc-links.sh`
+# runs rustdoc and sees Rust intra-doc links; nothing saw the READMEs, which
+# is how a crates.io front page came to link at a chapter that had moved.
+step "Markdown links resolve" "$AXESS_DIR/scripts/check-markdown-links.sh"
+
+# Also sub-second. The 0.6.0 language pass removed every em dash and nothing
+# preserved the result: a later documentation sweep reintroduced 101 of them
+# across nineteen files with every gate green.
+step "Prose style" "$AXESS_DIR/scripts/check-prose-style.sh"
+
 
 # Mirrors the `Ban #[non_exhaustive]` CI job: see the docstring on that job
 # in .github/workflows/ci.yml for the policy rationale (trade one breakage

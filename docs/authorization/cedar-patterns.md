@@ -339,7 +339,7 @@ forbid (
 
 The rule denies the account-deletion action unless FIDO2 is in the
 user's completed factors. The user reaches the action with a
-password-and-TOTP session, gets denied, and the application offers
+password-and-TOTP session, gets denied, and you offer
 step-up: the user completes the FIDO2 ceremony, the session's
 `factors_completed` now includes `Fido2`, the next request to the
 delete-account action passes the policy.
@@ -356,7 +356,7 @@ session."
 
 The two patterns most likely to mislead are worth naming.
 
-The first is duplicating ReBAC as RBAC. The temptation is to
+**Duplicating ReBAC as RBAC.** The temptation is to
 materialise the ownership relationship as a per-resource role
 ("owner of document 123"), then write an RBAC policy that grants
 edit to the role. The shape works but produces an explosion of
@@ -366,13 +366,13 @@ expressing. The right shape is to express ownership as an
 attribute (`resource.owner == principal`) and write the ReBAC
 policy directly.
 
-The second is encoding state machines in policies. A workflow that
+**Encoding state machines in policies.** A workflow that
 allows transitions only from certain states is a state machine,
 not a policy. Writing it as a Cedar rule (`permit ... when {
 resource.state == "draft" && action == "submit" }`) admits the
 rule but makes the policy set the source of truth for what the
 state machine allows. The right shape is to put the state machine
-in code (or in a typed state machine in the application), and to
+in code (or in a typed state machine of your own), and to
 use Cedar only for "who can invoke this transition" rather than
 "which transition is valid right now."
 
@@ -385,33 +385,32 @@ pair, every required and optional context key. Getting the schema
 right is most of the work; getting the policies right is what
 follows naturally from a good schema.
 
-Three rules help:
+Three rules help.
 
-The first is to name entities by their domain meaning, not by the
-table they live in. `User` is the right name; `usersRow` is the
-wrong name. The policies that read like English are the ones that
-let reviewers do their job.
+**Name entities by their domain meaning, not by the table they live
+in.** `User` is the right name; `usersRow` is the wrong one. Policies
+that read like English are the ones that let reviewers do their job.
 
-The second is to declare attributes as required only when every
-production deployment guarantees the attribute is present. An
-attribute declared as required forces the entity provider to
-return it on every load, which often forces the application to
-add an `INSERT` default. Optional attributes are the right default;
-require only when the policy logically depends on it.
+**Declare an attribute required only when every production deployment
+guarantees it is present.** A required attribute forces the entity
+provider to return it on every load, which often forces you to add an
+`INSERT` default. Optional is the right default; require only when the
+policy logically depends on it.
 
-The third is to update the schema whenever a policy expression
-needs an attribute that is not yet declared. The validator catches
-the inconsistency at load time; the alternative is a runtime deny
-that is hard to debug. The schema is not optional; treat it as
-part of the policy set.
+**Update the schema whenever a policy expression needs an attribute
+that is not yet declared.** The validator catches the inconsistency at
+load time; the alternative is a runtime deny that is hard to debug.
+Treat the schema as part of the policy set.
 
 ## Further reading
 
 *Cedar policy fundamentals* covers the policy lifecycle and the
 evaluator surface. *Entity providers and request context* covers
 the data-loading contract the policies in this chapter depend on.
-*Audit events* covers the `AuthzEvent` variants the evaluator
-emits, including the policy id that produced each decision. The
+*Audit events* covers why a Cedar decision is a `tracing` event on
+`axess::authz::decision` rather than an audit row, and what it
+carries: the principal, action, resource, the decision, the policy
+ids that produced it, and how long evaluation took. The
 [Cedar documentation](https://docs.cedarpolicy.com/) covers the
 language in full detail and is the authoritative reference for
 syntax and semantics.

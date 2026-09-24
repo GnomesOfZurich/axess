@@ -288,6 +288,20 @@ if [ "$SKIP_RUSTDOC" = false ]; then
     "$SCRIPT_DIR/check-doc-links.sh"
 fi
 
+# Markdown, which the rustdoc gate above does not read. A README link is the
+# first thing an adopter follows and the last thing anyone re-checks.
+bg_step "Markdown links resolve" false \
+  "$SCRIPT_DIR/check-markdown-links.sh"
+
+bg_step "Prose style" false \
+  "$SCRIPT_DIR/check-prose-style.sh"
+
+# Cheap, and covers what the rustdoc check cannot see: the book's prose and
+# its ```rust,ignore blocks, which no compiler reads.
+bg_step "Documented identifiers exist" false \
+  "$SCRIPT_DIR/check-doc-identifiers.sh"
+
+
 # ── Speed-up note ─────────────────────────────────────────────────────────────
 #
 # `cargo-nextest` (https://nexte.st) typically runs the workspace test

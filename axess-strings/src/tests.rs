@@ -80,14 +80,6 @@ fn ordering_is_lexicographic() {
 }
 
 #[test]
-fn prefix_pads_short_strings() {
-    assert_eq!(ShortString::new("ab").prefix(), *b"ab\0\0");
-    assert_eq!(ShortString::new("abcd").prefix(), *b"abcd");
-    assert_eq!(ShortString::new("abcdef").prefix(), *b"abcd");
-    assert_eq!(ShortString::new("").prefix(), [0u8; 4]);
-}
-
-#[test]
 fn display_formats_as_string() {
     let s = ShortString::new("hello");
     assert_eq!(format!("{s}"), "hello");
@@ -243,4 +235,119 @@ fn partial_eq_string_distinguishes_unequal() {
 fn from_str_carries_input() {
     let s: ShortString = "kind.v9".into();
     assert_eq!(s.as_str(), "kind.v9");
+}
+
+#[test]
+fn borrow_str_allows_map_lookup_without_allocating_a_key() {
+    // A `HashMap<ShortString, _>` queried from a literal needs
+    // `Borrow<str>`; without it every lookup would have to build a key.
+    use std::collections::HashMap;
+    let mut m: HashMap<ShortString, u32> = HashMap::new();
+    m.insert(ShortString::new("EURIBOR_3M"), 3);
+    assert_eq!(m.get("EURIBOR_3M"), Some(&3));
+    assert_eq!(m.get("missing"), None);
+}
+
+#[test]
+fn new_accepts_anything_that_looks_like_a_str() {
+    // `impl AsRef<str>` so `String`, `&String` and `&str` all work at the
+    // call site, matching what a `CompactString`-shaped API offers.
+    let owned = String::from("inst-aapl");
+    assert_eq!(ShortString::new(&owned).as_str(), "inst-aapl");
+    assert_eq!(ShortString::new(owned.clone()).as_str(), "inst-aapl");
+    assert_eq!(ShortString::new("inst-aapl").as_str(), "inst-aapl");
+}
+
+#[test]
+fn inline_capacity_is_the_inlining_boundary() {
+    let at_cap = "a".repeat(ShortString::INLINE_CAPACITY);
+    let over_cap = "a".repeat(ShortString::INLINE_CAPACITY + 1);
+
+    assert!(
+        ShortString::new(&at_cap).is_inline(),
+        "exactly at the cap must inline"
+    );
+    assert!(!ShortString::new(&at_cap).is_allocated());
+    assert!(
+        !ShortString::new(&over_cap).is_inline(),
+        "one past the cap must not inline"
+    );
+    assert!(ShortString::new(&over_cap).is_allocated());
+}
+
+#[test]
+fn from_static_is_never_inline_but_never_allocates() {
+    // The two predicates disagree here, which is the whole reason both
+    // exist: `Static` is allocation-free without carrying its bytes.
+    const SHORT: ShortString = ShortString::from_static("ab");
+    const LONG: ShortString =
+        ShortString::from_static("spiffe://gnomes.local/feed-worker/ekekrantz");
+
+    for s in [SHORT, LONG] {
+        assert!(
+            !s.is_inline(),
+            "from_static points at 'static memory, it does not copy"
+        );
+        assert!(!s.is_allocated(), "from_static must never allocate");
+    }
+}
+
+#[test]
+fn clone_of_an_allocated_value_shares_rather_than_copies() {
+    // The property this crate exists for. A clone of an over-cap value
+    // must reach the same buffer, not a fresh copy of it: that is what
+    // makes the clone a refcount bump. `CompactString` fails this by
+    // design, and a change here that quietly reverted to copying would
+    // remove the only reason not to depend on it.
+    let original = ShortString::new("spiffe://gnomes.local/feed-worker/ekekrantz");
+    assert!(
+        original.is_allocated(),
+        "precondition: the case must be over the cap"
+    );
+
+    let copy = original.clone();
+    assert_eq!(original, copy);
+    assert!(
+        std::ptr::eq(original.as_str().as_ptr(), copy.as_str().as_ptr()),
+        "clone must share the original buffer, not allocate a second one"
+    );
+}
+
+#[test]
+// `cmp_owned` is right in general and wrong here: building the `String`
+// is the point, since it is the only way to reach
+// `PartialEq<ShortString> for String` rather than the `&str` impl.
+#[allow(clippy::cmp_owned)]
+fn reverse_equality_holds_from_the_std_side() {
+    let s = ShortString::new("case-42");
+
+    assert!(*"case-42" == s);
+    assert!("case-42" == s);
+    assert!(String::from("case-42") == s);
+
+    assert!(*"other" != s);
+    assert!("other" != s);
+    assert!(String::from("other") != s);
+}
+
+#[test]
+fn into_string_carries_content_for_every_repr() {
+    // One case per form, since each reaches `as_str` differently.
+    let inline = ShortString::new("case-42");
+    let stat = ShortString::from_static("spiffe://gnomes.local/feed-worker/ekekrantz");
+    let shared = ShortString::new("spiffe://gnomes.local/feed-worker/ekekrantz");
+
+    assert!(inline.is_inline());
+    assert!(!stat.is_allocated() && !stat.is_inline());
+    assert!(shared.is_allocated());
+
+    assert_eq!(String::from(inline), "case-42");
+    assert_eq!(
+        String::from(stat),
+        "spiffe://gnomes.local/feed-worker/ekekrantz"
+    );
+    assert_eq!(
+        String::from(shared),
+        "spiffe://gnomes.local/feed-worker/ekekrantz"
+    );
 }

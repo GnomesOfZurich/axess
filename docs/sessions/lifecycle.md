@@ -64,21 +64,32 @@ identifies. Each row in the store carries:
 
 ```rust,ignore
 pub struct SessionData {
-    pub auth_state: AuthState,                  // see Part II
-    pub principal_hint: Option<PrincipalHint>,  // cache of recent extractor outputs
-    pub custom: HashMap<String, serde_json::Value>,  // application data
-    pub schema_version: u32,                    // see Schema migration
+    pub version: u8,                   // see Schema migration
+    pub auth_state: AuthState,         // see Part II
+    pub fingerprint: Option<String>,   // HMAC of the binding material
+    pub device_id: Option<DeviceId>,   // set by the DeviceResolver, if any
+    pub custom: serde_json::Value,     // application data
 }
 ```
 
+`custom` is a single `serde_json::Value`, not a map: axess treats it as
+one opaque blob and never looks inside. Applications that want several
+independent keys nest an object there and own its shape, including its
+own versioning.
+
 The `auth_state` carries the state-machine variant (`Guest`,
-`Authenticating`, `Authenticated`, `PendingWorkflow`,
-`Identifying`). The `principal_hint` is an optional cache of the
-principal extracted during this session's authentication, kept on
-the session so the `PrincipalResolver` does not have to recompute
-it on every request. The `custom` map carries application-defined
-data with a sixty-four kilobyte cap. The `schema_version` is the
-field that lets the data shape evolve.
+`Identifying`, `Authenticating`, `Authenticated`,
+`PendingWorkflow`). The `fingerprint` is the HMAC of whatever the
+configured `SessionBinding` extracted, set at the first transition out
+of `Guest` and compared on every later request. The `device_id` is
+whatever the `DeviceResolver` returned, if one is configured. The
+`custom` value carries application-defined data, capped by
+`SessionLayer::with_max_custom_bytes`. The `version` is the field that
+lets the data shape evolve.
+
+There is no cached principal on the session. The resolver runs per
+request against the `auth_state`, which is what keeps a revoked session
+from serving a stale identity.
 
 The serialisation format is MessagePack: faster than JSON, more
 compact, and stable across versions of `serde`. Backends that
@@ -255,9 +266,13 @@ read-write-read cycle does not rotate.
 
 `regenerate` exists for the cases the library can't infer on its
 own: any handler that crosses a **privilege boundary** should call
-it before responding. The canonical list (drawn from OWASP ASVS
-V3, the OWASP Session Management Cheat Sheet, and NIST SP 800-63B
-on AAL transitions):
+it before responding.
+
+The canonical list is drawn from OWASP ASVS V3, the OWASP Session
+Management Cheat Sheet, and NIST SP 800-63B on transitions between
+authenticator assurance levels. An AAL is that standard's measure of
+how strongly a session's authentication is evidenced: AAL1 is a single
+factor, AAL2 adds a second, AAL3 requires a hardware authenticator.
 
 | Boundary | Rotate session id? | Also revoke sibling sessions? |
 |---|---|---|
@@ -276,9 +291,9 @@ on AAL transitions):
 Rotating does two things at once: it defeats fixation (any
 pre-existing id, including one an attacker planted before the
 boundary, becomes useless), and it caps the blast radius of a
-captured pre-elevation cookie (a cookie stolen at AAL1 cannot ride
-the new AAL2 binding). Sibling-session revocation
-(`SessionRegistry::revoke_user_sessions`) is a strictly stronger
+captured pre-elevation cookie: one stolen while the session was at
+AAL1 cannot ride the new AAL2 binding. Sibling-session revocation
+(`SessionRegistry::invalidate_user`) is a strictly stronger
 statement that matters most on credential changes, where any other
 device holding a stale password-derived session must be cut off.
 
@@ -310,12 +325,17 @@ write. A session that goes idle for the TTL expires; a session
 that gets a single dirty write per TTL window never expires
 (through ordinary use).
 
-Some deployments want a hard cap: a session expires absolutely at
-a fixed time after creation, regardless of activity. The
-`SessionLayer::with_absolute_ttl` option enables this; the
-absolute expiry is stored at session creation and is not refreshed.
-The two TTLs (sliding and absolute) compose: the session expires
-at the earlier of the two.
+Some deployments want a hard cap: a session expires absolutely at a
+fixed time after creation, regardless of activity. Axess has no
+absolute TTL. `with_ttl` sets the sliding one and there is no second
+knob beside it, so a session kept warm by ordinary use does not expire
+on its own.
+
+Where a hard cap matters, put the creation instant in `custom` and
+check it in a layer of your own above the session layer, or end the
+session from the registry on the schedule you want. Both are a few
+lines, and both keep the decision where the deployment's compliance
+requirement actually lives.
 
 ## Session cleanup
 
@@ -340,7 +360,7 @@ thousands; for millions, the delete needs to be incremental (a
 limit clause, looping through batches) to avoid long-running
 transactions that lock the table.
 
-## What this enables
+## Invisible to application code
 
 The lifecycle as designed makes session handling invisible to
 application code. The handler reads `AuthSession`, mutates it (or
@@ -354,7 +374,7 @@ tolerance too tight), not bugs in the lifecycle itself.
 The chapter *Backends* covers the storage backends in detail; the
 chapter *Cookies, fingerprinting, hijack detection* covers the
 fingerprint binding in detail; the chapter *Schema migration*
-covers the `SessionData::schema_version` field and what happens
+covers the `SessionData::version` field and what happens
 when the data shape changes between deployments.
 
 ## Further reading
@@ -364,5 +384,5 @@ first-party session stores and their feature-flag and dialect
 notes. *Cookies, fingerprinting, hijack detection* covers the
 configuration knobs for the fingerprint and the trusted-proxy
 configuration that determines how IP is read. *Schema migration*
-covers the `SessionData::schema_version` field. *Operations
+covers the `SessionData::version` field. *Operations
 runbook* covers signing-key and envelope-key rotation.

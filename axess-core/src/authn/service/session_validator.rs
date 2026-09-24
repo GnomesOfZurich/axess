@@ -14,7 +14,7 @@ use std::sync::Arc;
 /// admin paths that need one.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "no session registry configured on AuthnService; call AuthnService::with_registry at construction"
+    "no session registry configured on AuthnService; call AuthnServiceBuilder::with_registry at construction"
 )]
 pub struct NoSessionRegistryError;
 

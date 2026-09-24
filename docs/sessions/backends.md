@@ -2,7 +2,7 @@
 
 Axess ships four first-party session storage backends. The choice
 between them is the operational decision the deployment makes when
-it picks a database, not a technical decision the application code
+it picks a database, not a technical decision your code
 needs to revisit. This chapter covers the capability matrix, the
 configuration shape per backend, and the operational notes that
 have caught real deployments by surprise.
@@ -18,20 +18,68 @@ surface plus a handful of session-specific verbs the typical
 application needs.
 
 ```rust,ignore
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    async fn load(&self, id: &SessionId) -> Result<Option<SessionRow>, StoreError>;
-    async fn save(&self, row: &SessionRow) -> Result<(), StoreError>;
-    async fn delete(&self, id: &SessionId) -> Result<(), StoreError>;
-    async fn cycle(&self, old: &SessionId, new: &SessionId) -> Result<(), StoreError>;
-    async fn cleanup_expired(&self) -> Result<usize, StoreError>;
-    async fn find_sessions_for_user(
+pub trait SessionStore: Send + Sync + Clone + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn load(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<Output = Result<Option<SessionData>, Self::Error>> + Send;
+
+    fn save(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn delete(
+        &self,
+        id: &SessionId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Atomically delete the old row and store the data under the new id.
+    fn cycle(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn prune_expired(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+
+    /// Defaults to `Ok(vec![])`; override where the backend can index it.
+    fn find_sessions_for_user(
         &self,
         user_id: &UserId,
-        tenant_id: &TenantId,
-    ) -> Result<Vec<SessionId>, StoreError>;
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<(SessionId, SessionData)>, Self::Error>> + Send;
 }
 ```
+
+Four things about that surface shape an implementation.
+
+`Clone` is a supertrait. The layer holds the store by value and clones
+it per request, so the type must be cheap to clone: a connection pool
+or an `Arc<DashMap<..>>` behind the struct, never the data itself.
+
+The error is your associated `Self::Error`, not a type axess defines.
+
+There is no row type. `load` and `save` deal in `SessionData`
+directly, and the TTL is a `save` argument rather than a field, because
+expiry is the store's to enforce however its backend does it: a column
+plus `prune_expired` for SQL, a native key TTL for Valkey.
+
+`cycle` is the session-fixation defence, and its contract is stricter
+than it looks. It is a write as well as a move: the data and TTL come
+with it, so the rotation is one statement rather than a delete followed
+by a save. The new id is supplied by the caller rather than minted by
+the store, so that handler-side code can register the post-rotation id
+with the `SessionRegistry` before the layer persists the rotation.
+Implementations must do the delete and the insert atomically, in one
+transaction, so a crash mid-cycle can never leave the user holding both
+rows or neither.
 
 The verbs map to operations the lifecycle in the previous chapter
 exercises. `load` retrieves a session by id. `save` writes a
@@ -76,7 +124,7 @@ are cluster-safe out of the box.
 
 The native TTL column says whether the database has a native
 mechanism for removing expired rows. SQLite, Postgres, and MySQL
-do not; the application runs a periodic cleanup task. Valkey
+do not, so you run a periodic cleanup task. Valkey
 expires keys automatically as they age past their TTL, which means
 the cleanup task is unnecessary.
 
@@ -122,7 +170,7 @@ The operational notes:
   that has more than one request at a time.
 
 - The schema migration story is `sqlx::migrate!`: the migrations
-  directory under the application is the source of truth, and the
+  directory under your process is the source of truth, and the
   pool runs them at startup. Axess does not include its own
   migrations; `init_schema` is enough.
 
@@ -153,7 +201,7 @@ let store = SessionStore::new(pool.clone(), SessionCrypto::new(envelope_key));
 store.init_schema().await?;
 ```
 
-The pool sizing depends on the application's request rate; twenty
+The pool sizing depends on your request rate; twenty
 is a reasonable starting point for a single application instance,
 multiplied by the number of instances and tuned against the
 database's `max_connections` setting.
@@ -176,7 +224,7 @@ The operational notes:
 
 - Postgres extensions: pgcrypto can be used as an alternative to
   the AES-GCM envelope, but the axess envelope is faster (the
-  encryption happens in the application before the network write,
+  encryption happens in your process before the network write,
   not on the database side) and uses the same key as other axess
   encryption. Stick with the envelope unless a specific deployment
   reason argues for pgcrypto.
@@ -186,7 +234,7 @@ The operational notes:
 The MySQL backend is right for deployments where MySQL is the
 already-deployed database. The capability surface is the same as
 Postgres, with a handful of dialect differences that affect the
-implementation but not the application.
+implementation but not your code.
 
 Configuration:
 
@@ -208,7 +256,7 @@ The operational notes:
   CONFLICT DO UPDATE` becomes `ON DUPLICATE KEY UPDATE`, the
   placeholder syntax shifts from `$1` to `?`, datetime precision
   defaults to seconds rather than microseconds. Axess handles all
-  three internally; the application code is identical.
+  three internally; your code is identical.
 
 - MariaDB 10.x and later versions are compatible with the same
   schema and the same SQL. The CI runs against both MySQL 8.x and
@@ -238,9 +286,16 @@ Configuration:
 
 ```rust,ignore
 use axess::backends::valkey::SessionStore;
+use fred::prelude::*;
 
-let client = redis::Client::open("redis://valkey:6379")?;
-let store = SessionStore::new(client, SessionCrypto::new(envelope_key));
+// The client is `fred`'s, not the `redis` crate's.
+let client = Client::new(Config::from_url("redis://valkey:6379")?, None, None, None);
+client.init().await?;
+
+// The key is the AES-256-GCM envelope key: encryption at rest is on,
+// not opt-in. `with_prefix` overrides the default `axess` namespace,
+// which is how one Valkey serves several deployments.
+let store = SessionStore::new(client, envelope_key).with_prefix("axess");
 ```
 
 The Valkey backend does not need a schema initialisation; the keys
@@ -248,10 +303,11 @@ are written directly with TTLs.
 
 The operational notes:
 
-- Cluster mode: the Valkey client supports cluster mode through
-  the `cluster` feature of the underlying redis crate. The keys
-  axess writes are prefixed (`axess:session:`, `axess:registry:`,
-  ...) so cluster sharding by key works without conflict.
+- Cluster mode: `fred` is built here with `i-cluster` already on, so
+  there is no feature for you to add. The keys axess writes are
+  prefixed and typed (`axess:sess:<id>`, `axess:reg:<user>`,
+  `axess:revoked-session:<id>`, `axess:revoked-user:<id>`), so
+  sharding by key works without conflict.
 
 - Persistence: Valkey can be configured for in-memory only, for
   RDB snapshots, or for AOF (append-only file) durability. The
@@ -284,7 +340,7 @@ The decision tree is short.
 If the deployment already has a database, use the matching backend.
 Postgres for Postgres, MySQL for MySQL, Valkey for Redis or Valkey.
 
-If the deployment is starting fresh and the application is
+If the deployment is starting fresh and your service is
 single-instance, SQLite is the simplest choice and works fine for
 small-to-medium scale.
 

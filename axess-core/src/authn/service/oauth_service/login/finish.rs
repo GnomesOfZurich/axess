@@ -7,7 +7,7 @@
 use super::helpers::{compute_claim_lock, is_valid_pkce_verifier, normalize_issuer};
 use crate::authn::service::AuthnService;
 use crate::authn::{
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
     ids::UserId,
     store::{FactorStore, IdentityStore},
@@ -72,20 +72,32 @@ where
                 verifier_len = stored_verifier.len(),
                 "stashed PKCE code_verifier failed RFC 7636 §4.1 validation"
             );
-            self.record_oauth_failure_and_clear("pkce_verifier_invalid", &provider_name, session)
-                .await;
+            self.record_oauth_failure_and_clear(
+                AuthFailureReason::PkceVerifierInvalid,
+                &provider_name,
+                session,
+            )
+            .await?;
             return Err(OAuthError::InvalidParameter);
         }
 
         if self.is_oauth_expired(session, &provider_name).await {
-            self.record_oauth_failure_and_clear("ceremony_expired", &provider_name, session)
-                .await;
+            self.record_oauth_failure_and_clear(
+                AuthFailureReason::CeremonyExpired,
+                &provider_name,
+                session,
+            )
+            .await?;
             return Err(OAuthError::Expired);
         }
 
         if !bool::from(state.as_bytes().ct_eq(stored_csrf.as_bytes())) {
-            self.record_oauth_failure_and_clear("csrf_mismatch", &provider_name, session)
-                .await;
+            self.record_oauth_failure_and_clear(
+                AuthFailureReason::CsrfMismatch,
+                &provider_name,
+                session,
+            )
+            .await?;
             return Err(OAuthError::CsrfMismatch);
         }
 
@@ -98,6 +110,7 @@ where
         // could replay a valid state from Provider A at Provider B's callback
         // (confused-deputy attack).
         let provider = self
+            .inner
             .oauth_providers
             .get(&provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.clone()))?
@@ -122,8 +135,12 @@ where
                     error = %e,
                     "OAuth token exchange failed"
                 );
-                self.record_oauth_failure_and_clear("token_exchange", &provider_name, session)
-                    .await;
+                self.record_oauth_failure_and_clear(
+                    AuthFailureReason::TokenExchange,
+                    &provider_name,
+                    session,
+                )
+                .await?;
                 return Err(OAuthError::TokenExchange(
                     "token exchange failed".to_string(),
                 ));
@@ -161,7 +178,8 @@ where
                     crate::authn::factor::FederatedProvider::Custom(provider_name.clone()),
                 )),
         )
-        .await;
+        .await
+        .map_err(|e| axess_factors::oauth::OAuthError::AuditStore(e.to_string()))?;
 
         Ok(claims)
     }
@@ -202,18 +220,22 @@ where
                 let current_issuer = provider.issuer().map(normalize_issuer).unwrap_or_default();
                 if stored_issuer != current_issuer {
                     self.record_oauth_failure_and_clear(
-                        "provider_mismatch",
+                        AuthFailureReason::ProviderMismatch,
                         provider_name,
                         session,
                     )
-                    .await;
+                    .await?;
                     return Err(OAuthError::CsrfMismatch);
                 }
                 Ok(())
             }
             None => {
-                self.record_oauth_failure_and_clear("missing_issuer", provider_name, session)
-                    .await;
+                self.record_oauth_failure_and_clear(
+                    AuthFailureReason::MissingIssuer,
+                    provider_name,
+                    session,
+                )
+                .await?;
                 Err(OAuthError::NoFlow)
             }
         }

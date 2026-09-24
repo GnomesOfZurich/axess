@@ -49,9 +49,9 @@ The four headline mechanisms address four specific gaps in baseline
 OAuth.
 
 Pushed Authorization Requests (PAR, RFC 9126) move the authorization
-parameters off the redirect URL. Instead of the application
+parameters off the redirect URL. Instead of your code
 constructing a query-string-laden authorize URL and redirecting the
-user to it, the application makes a direct POST to the IdP's PAR
+user to it, you make a direct POST to the IdP's PAR
 endpoint containing the parameters, receives an opaque `request_uri`
 in return, and constructs a much shorter authorize URL containing
 only the client id and the request URI. The defence is twofold: the
@@ -144,7 +144,7 @@ rejections.
 
 ## The PAR flow
 
-With FAPI enabled, the application starts a federated login through
+With FAPI enabled, you start a federated login through
 the PAR-enhanced auth URL rather than the query-parameter auth URL:
 
 ```rust,ignore
@@ -168,9 +168,9 @@ client secret basic, mTLS, or signed JWT assertion); axess passes
 through the credential that `OAuthProviderConfig` was constructed
 with.
 
-The callback flow on the application side is unchanged. The IdP
-redirects the user back to the application's callback URL with a
-code; the application calls `finish_oauth_login` with the code and
+The callback flow on your side is unchanged. The IdP
+redirects the user back to your callback URL with a
+code; you call `finish_oauth_login` with the code and
 state; axess performs the token exchange and ID token validation.
 
 ## DPoP key management
@@ -190,7 +190,7 @@ let proof: DpopProof = provider.generate_dpop_proof(
     "GET",                                         // HTTP method
     "https://resource.example.com/data",           // target URL
     Some(&access_token),                           // bind to this access token
-    &dpop_key,                                     // the application's key
+    &dpop_key,                                     // your key
 )?;
 
 let response = http_client
@@ -224,9 +224,16 @@ ended, or when token theft is detected. Axess exposes revocation
 through `OAuthProvider::revoke_token`:
 
 ```rust,ignore
-provider.revoke_token(&access_token, Some(TokenTypeHint::AccessToken)).await?;
-provider.revoke_token(&refresh_token, Some(TokenTypeHint::RefreshToken)).await?;
+provider.revoke_token(&access_token, Some("access_token")).await?;
+provider.revoke_token(&refresh_token, Some("refresh_token")).await?;
 ```
+
+The hint is the RFC 7009 string, passed through verbatim rather than
+through an enum, because an IdP may accept hints the RFC does not list.
+Passing `None` is legal and makes the IdP search both token types.
+Providers with no revocation endpoint return `OAuthError::Config`
+rather than silently succeeding, so a deployment cannot believe it is
+revoking when it is not.
 
 The revocation endpoint, when present in the discovery document, is
 called with the token to revoke and an optional type hint. The IdP
@@ -238,7 +245,7 @@ token typically has a short lifetime (matching the FAPI ID token
 bound) and expires on its own; the refresh token has a longer life
 and an unrevoked one allows continued access through new access
 tokens. A logout that revokes only the access token leaves the
-refresh token active, which is rarely what the application wants.
+refresh token active, which is rarely what you want.
 
 ## Testing FAPI flows
 
@@ -299,7 +306,7 @@ else.
 
 ## Troubleshooting
 
-If the PAR exchange fails with `invalid_client`, the application's
+If the PAR exchange fails with `invalid_client`, your
 PAR endpoint authentication does not match what the IdP expects.
 Some IdPs require mTLS authentication on PAR even when the rest of
 the flow uses client secrets; check the IdP's PAR documentation.
