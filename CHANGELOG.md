@@ -8,7 +8,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`check-doc-identifiers.sh` read stale sources from `target/`.** Its filter
+  tested for the substring `/target`, which never matches a top-level
+  `target/` because a relative path has no leading slash, so every crate ever
+  unpacked by `cargo package` was part of the set a documented name could
+  resolve against. `ShortString::prefix`, removed in this release, went on
+  resolving locally against `target/package/axess-strings-0.4.0/` while CI,
+  which checks out clean, rejected it. Both the Rust and Markdown inputs now
+  come from `git ls-files`, so the gate reads what a clean checkout has and
+  nothing else. A `REMOVED` list covers the third case the script had no
+  answer for: a name this workspace deleted, which a migration section still
+  has to write.
 
 ## [0.6.0] - 2026-09-24
 

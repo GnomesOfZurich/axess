@@ -36,6 +36,20 @@ import pathlib, re, sys, collections
 ROOT = pathlib.Path(".")
 
 # Not ours to define. Each entry is a claim about provenance, not a mute.
+# Names this workspace deliberately removed, which the migration guide must
+# still write in order to tell an adopter to delete their call. Distinct from
+# ALLOW, which is for names that were never ours.
+#
+# Keep this list short-lived: an entry belongs here for the release that
+# removed the name and the one that documents the migration, then goes when
+# that migration section is retired. A permanent entry means the gate has
+# stopped checking something it should.
+REMOVED = {
+    # Removed in 0.6.0. `docs/production/migrating.md` names it under
+    # "0.5.0 to 0.6.0" to say the call has no replacement.
+    "ShortString::prefix",
+}
+
 ALLOW = {
     # std / core
     "RwLock", "HashMap", "AtomicU64", "DashMap",
@@ -78,14 +92,39 @@ ALLOW = {
     "AxessSession", "SqliteStore",
 }
 
-# `.mutants-worktree` is a stale copy of the tree that `mutants.sh` leaves
-# behind. Reading it would let a name deleted from the real source keep
-# resolving, which is the one thing this gate exists to notice.
-RS = [
-    p
-    for p in ROOT.glob("**/*.rs")
-    if "/target" not in str(p) and "mutants-worktree" not in str(p)
-]
+# Only tracked files. Two local-only trees would otherwise be read, and both
+# hold stale copies of the source: `.mutants-worktree`, which `mutants.sh`
+# leaves behind, and `target/package/`, where `cargo package` unpacks every
+# release ever built here. Reading either lets a name deleted from the real
+# source keep resolving, which is the one thing this gate exists to notice.
+#
+# This was not hypothetical. The filter used to be a substring test for
+# "/target", which never matched the top-level `target/` because a relative
+# path has no leading slash. `ShortString::prefix` was removed in 0.6.0 and
+# went on resolving locally against `target/package/axess-strings-0.4.0/`
+# for a whole session; CI, which checks out clean, caught it. A filesystem
+# walk cannot tell a stale copy from the real thing, so ask git instead.
+import subprocess
+
+
+def tracked(pattern):
+    """Paths git knows about, which is what a clean checkout will contain."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z", pattern],
+            capture_output=True, text=True, check=True, cwd=ROOT,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise SystemExit(
+            "ERROR: this gate lists its inputs with `git ls-files`, and that "
+            "failed. Run it inside a git checkout of the repository; a "
+            "filesystem walk was the previous approach and it read stale "
+            f"copies under target/ that a clean checkout does not have. ({exc})"
+        )
+    return [ROOT / p for p in out.split("\0") if p]
+
+
+RS = tracked("*.rs")
 src = "\n".join(p.read_text(errors="ignore") for p in RS)
 defined = set(re.findall(r"\b([A-Z][A-Za-z0-9_]*)\b", src))
 
@@ -106,9 +145,7 @@ lower_defined |= set(re.findall(r"\b(?:const|static)\s+([A-Za-z_][A-Za-z0-9_]*)"
 # with no obvious cause; `crypto-aws-lc` in the security-posture chapter was
 # exactly that.
 FEATURES = set()
-for manifest in ROOT.glob("**/Cargo.toml"):
-    if "/target" in str(manifest):
-        continue
+for manifest in tracked("*Cargo.toml"):
     body = re.search(
         r"^\[features\]$(.*?)(?=^\[|\Z)", manifest.read_text(errors="ignore"), re.M | re.S
     )
@@ -269,7 +306,11 @@ for f in RS:
     for fn, seqs in declared_signatures(f.read_text(errors="ignore")).items():
         REAL_SIGS[fn] += seqs
 
-docs = [p for p in ROOT.glob("docs/**/*.md") if "docs/book/" not in str(p)]
+# From git for the same reason as the Rust sources above: `docs/book/` is
+# generated output that is present locally and absent in a clean checkout,
+# and a gate whose input depends on what happens to be on disk reports
+# something different in CI than it does here.
+docs = [p for p in tracked("docs/*.md") if "docs/book/" not in str(p)]
 # A name inside backticks, allowing a trailing path, call or generic:
 # `Foo`, `Foo::bar()`, `Foo<T>`. Without the tail, `TestSuite::default()`
 # slips past, which is how a fabricated test harness survived a sweep.
@@ -408,6 +449,8 @@ for d in docs:
             ty, member = m.group(1), m.group(2)
             if ty not in ENUMERABLE or member in EXTERNAL_MEMBERS or ty in ALLOW:
                 continue
+            if f"{ty}::{member}" in REMOVED:
+                continue
             checked += 1
             if member not in OWNS[ty]:
                 missing[f"{ty}::{member}"].append(f"{d}:{i}")
@@ -444,7 +487,9 @@ if missing:
             print(f"      {site}", file=sys.stderr)
     print(
         "\nEither the name is wrong (fix the chapter) or it is not ours to "
-        "define (add it to ALLOW in this script, with the reason).",
+        "define (add it to ALLOW in this script, with the reason), or it "
+        "is ours and deliberately removed and a migration section has to "
+        "name it (add it to REMOVED).",
         file=sys.stderr,
     )
     sys.exit(1)
