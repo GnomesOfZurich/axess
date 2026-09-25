@@ -14,6 +14,7 @@
 mod common;
 
 use axess_core::authn::store::IdentityPasswordHistory;
+use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::{
     authn::{
         error::AuthnError,
@@ -41,11 +42,11 @@ fn fixture_user(user_id: &str, identifier: &str, tenant: &str) -> User {
     }
 }
 
-fn make_service_with_user(user: User) -> AuthnService<MockIdentityStore, MockFactorStore> {
+fn make_service_with_user(user: User) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user);
-    AuthnService::new(identity, MockFactorStore::new())
+    AuthnService::new(identity, MockFactorStore::new()).with_audit_context(AuditContext::default())
 }
 
 // ── begin_password_reset ───────────────────────────────────────────────
@@ -92,7 +93,8 @@ async fn begin_password_reset_inactive_tenant_returns_none() {
     let identity = MockIdentityStore::new()
         .with_tenant(suspended)
         .with_user(fixture_user("u1", "alice", "t1"));
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
         .await
@@ -110,7 +112,8 @@ async fn begin_password_reset_inactive_tenant_returns_none() {
 #[tokio::test]
 async fn begin_password_reset_unknown_user_returns_none() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("nobody", "default", std::time::Duration::from_secs(300))
         .await
@@ -132,7 +135,8 @@ async fn begin_password_reset_expires_at_is_in_the_future() {
         .with_tenant(test_tenant())
         .with_user(fixture_user("u1", "alice", "t1"));
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
         .await
@@ -232,7 +236,8 @@ async fn begin_password_reset_invalid_user_returns_none() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(bad_user);
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let token = svc
         .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
         .await
@@ -270,7 +275,8 @@ async fn complete_password_reset_rejects_password_reuse() {
             },
         );
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     // Begin a reset to issue a real token.
     let token = svc

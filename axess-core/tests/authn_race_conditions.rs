@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
 use axess_core::authn::{
     factor::{FactorConfig, FactorCredential, FactorKind, HotpConfig, ZeroizedString},
@@ -38,12 +39,11 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity.clone(), factors)
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
-    svc.begin_login("alice", "default", &session, None)
-        .await
-        .unwrap();
+    svc.begin_login("alice", "default", &session).await.unwrap();
 
     // Pre-flight the "concurrent suspend": flip the account to Suspended just
     // before the final `verify_factor` call. Models the worst case where the
@@ -101,13 +101,13 @@ async fn hotp_burns_counter_after_max_attempts() {
                 user_scope(),
             ),
         );
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
 
     // Three wrong attempts.
     for _ in 0..3 {
         let session = test_session();
         service
-            .begin_login("carol", "default", &session, None)
+            .begin_login("carol", "default", &session)
             .await
             .unwrap();
         service
@@ -135,7 +135,7 @@ async fn hotp_burns_counter_after_max_attempts() {
     let code_0 = generate_hotp_code(secret, 0);
     let session = test_session();
     service
-        .begin_login("carol", "default", &session, None)
+        .begin_login("carol", "default", &session)
         .await
         .unwrap();
     let r = service
@@ -176,11 +176,12 @@ async fn wrong_password_during_counter_outage_never_returns_err() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     let session = test_session();
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
 
@@ -224,11 +225,12 @@ async fn wrong_password_during_counter_outage_allows_when_configured() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     let session = test_session();
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
 
@@ -263,15 +265,16 @@ async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     identity.arm_record_event_failure();
 
     let known = service
-        .begin_login("alice", "default", &test_session(), None)
+        .begin_login("alice", "default", &test_session())
         .await;
     let unknown = service
-        .begin_login("nobody", "default", &test_session(), None)
+        .begin_login("nobody", "default", &test_session())
         .await;
 
     assert!(
@@ -297,10 +300,11 @@ async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
 #[tokio::test]
 async fn unknown_identifier_attempts_reach_the_audit_trail() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let service = AuthnService::new(identity.clone(), MockFactorStore::new());
+    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     let outcome = service
-        .begin_login("nobody", "default", &test_session(), None)
+        .begin_login("nobody", "default", &test_session())
         .await
         .expect("healthy audit store: the attempt is recorded and rejected");
     assert!(matches!(outcome, LoginOutcome::InvalidCredentials));

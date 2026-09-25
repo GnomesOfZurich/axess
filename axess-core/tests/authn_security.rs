@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{FactorCredential, ZeroizedString},
     service::AuthnService,
@@ -30,10 +31,7 @@ async fn session_id_changes_after_authentication() {
 
     let id_before = session.session_id().await;
 
-    service
-        .begin_login("alice", "t1", &session, None)
-        .await
-        .unwrap();
+    service.begin_login("alice", "t1", &session).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("pass")),
@@ -59,10 +57,7 @@ async fn partial_auth_is_not_authenticated() {
     let service = make_password_service("u1", "alice", "pass");
     let session = test_session();
 
-    let outcome = service
-        .begin_login("alice", "t1", &session, None)
-        .await
-        .unwrap();
+    let outcome = service.begin_login("alice", "t1", &session).await.unwrap();
     assert!(matches!(
         outcome,
         axess_core::authn::service::LoginOutcome::FactorRequired(_)
@@ -85,10 +80,7 @@ async fn check_session_rejects_unauthenticated() {
     assert!(!service.check_session(&session).await);
 
     // Partially logged in (mid-MFA).
-    service
-        .begin_login("alice", "t1", &session, None)
-        .await
-        .unwrap();
+    service.begin_login("alice", "t1", &session).await.unwrap();
     assert!(!service.check_session(&session).await);
 }
 
@@ -104,11 +96,12 @@ async fn suspend_invalidates_registry_sessions() {
     let registry = MemorySessionRegistry::new();
     let service = AuthnService::builder(identity, factors)
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     service

@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.6.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.7.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -170,7 +170,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.6.0", features = ["sqlite", "authz"] }
+axess = { version = "0.7.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:

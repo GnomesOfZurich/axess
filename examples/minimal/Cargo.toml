@@ -1,0 +1,21 @@
+# The example the getting-started chapter walks through.
+#
+# It exists so that chapter's code is compiled rather than asserted. The
+# book pulls the body in with mdBook's `{{#include}}` and an ANCHOR, so
+# the page cannot drift from something that builds: change the API and
+# this crate stops compiling, which fails CI before the chapter is wrong.
+[package]
+name = "axess-example-minimal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# `memory` for the in-process session store, `testing` for
+# `InMemoryBackend`. Both are what let this run with no database.
+axess = { path = "../../axess", version = "=0.7.0", features = ["memory", "testing"] }
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net"] }
+serde = { version = "1.0.229", features = ["derive"] }

@@ -1,16 +1,13 @@
 # Architecture at a glance
 
-This chapter describes the shape of the axess workspace: which crate
-owns what, how the pieces compose, what stays put under which kind of
-change, and where adopters plug in. The goal is to make the rest of the
-book pre-cached. Once you have the four architectural decisions below
-in mind (the verifier-versus-orchestrator line, the three state slices,
-the DST foundation, and the naming conventions), every later chapter
-slots into place without further explanation.
+Which crate owns what, how the pieces compose, and where you plug in.
+Four decisions carry the rest of the book: the
+verifier-versus-orchestrator line, the three state slices, the DST
+foundation, and the naming conventions. With those in mind, later
+chapters need no further scaffolding.
 
-If you are evaluating axess, read this chapter end-to-end. If you are
-already mid-integration, you can skim and come back when something
-feels surprising.
+Evaluating? Read it end to end. Mid-integration? Skim, and come back
+when something surprises you.
 
 ## Workspace shape
 
@@ -181,7 +178,7 @@ flowchart LR
 
 *Authentication state* is `AuthState`, the session state machine
 covered in Part II. It transitions through factor verification, lives
-inside `SessionData` behind a cookie, and is what `AuthnService::verify_factor`
+inside `SessionData` behind a cookie, and is what `RequestAuthnService::verify_factor`
 mutates. It answers the question *"is this caller authenticated, and to
 what tier?"* It changes on factor verification, which is rare in
 absolute terms.

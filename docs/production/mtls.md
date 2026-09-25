@@ -1,4 +1,4 @@
-# mTLS-based authentication
+# Behind an mTLS terminator
 
 Mutual TLS authenticates the client to the server at the transport
 layer, before your handler sees the request. The client presents
@@ -9,14 +9,18 @@ parties that own both sides of the connection, mTLS is the strongest
 practical authentication: there is no credential to phish, no token
 to leak, no replay window after the handshake.
 
-This chapter covers using mTLS as a factor for human or human-adjacent
-flows (a kiosk machine, an internal admin host). The other use of
-mTLS in axess, where the certificate identifies a workload rather
-than a human, is covered in *Workload identity overview* and
-specifically in *Inbound: mTLS-SVID*, an SVID being a SPIFFE
-Verifiable Identity Document, the credential format that carries a
-workload's identity. The mechanism is the same; the
-interpretation of the certificate differs.
+A certificate identifies a machine. What you do with that depends on
+whether a machine is the whole answer.
+
+Where the caller is a service, it is: *Inbound: mTLS-SVID* covers
+`MtlsResolver`, which reads a SPIFFE URI out of the validated leaf and
+produces a `Principal::Workload`, and the certificate is the subject.
+
+Where the caller is a person at a kiosk or an internal admin host, the
+certificate says which machine and nothing about who is using it. This
+chapter is that case: where the certificate reaches your process from,
+how to gate on it, and what it leaves for the factor flow behind the
+gate to establish.
 
 The feature flag is `mtls` (off by default), enabled with
 `features = ["mtls"]` on the `axess` facade.
@@ -52,14 +56,16 @@ certificate chain in a `PeerCertChain`, and inserts it into the
 Axum request extensions:
 
 ```rust,ignore
-use axess::factors::mtls::PeerCertChain;
+use axess::federation::mtls::PeerCertChain;
 
 async fn mtls_middleware<B>(
     mut req: Request<B>,
     next: Next<B>,
 ) -> Response {
+    // `new` takes the chain leaf first, as the client presented it.
+    // Cloning a `PeerCertChain` is cheap; it holds an `Arc<[..]>`.
     if let Some(chain) = extract_cert_from_terminator(&req) {
-        req.extensions_mut().insert(PeerCertChain::from(chain));
+        req.extensions_mut().insert(PeerCertChain::new(chain));
     }
     next.run(req).await
 }
@@ -96,85 +102,47 @@ For consumer-facing deployments where clients might use any
 certificate, mTLS is the wrong factor. Use OAuth or another flow
 where the client does not need to provision a certificate.
 
-## From certificate to user
+## The gate
 
-After the middleware inserts the `PeerCertChain` into the
-extensions, your login handler reads it back and maps
-the certificate to a user identity. The mapping depends on the
-deployment's conventions.
+The certificate identifies the machine and the factor flow identifies
+the person. Run them as two separate things: a gate in front, an
+ordinary method behind.
 
-The simplest mapping is from the certificate's Subject Common Name
-(CN) to a username. The CA issues certificates with CNs that match
-the deployment's usernames, the login handler reads the CN, and
-you look up the user under that CN.
+The gate is your middleware, not an axess type. It reads the
+`PeerCertChain` the extraction layer inserted, decides whether this
+certificate may reach the login routes at all, and rejects the request
+before any handler sees it:
 
 ```rust,ignore
-use axess::factors::mtls::PeerCertChain;
-use axum::Extension;
+use axess::federation::mtls::PeerCertChain;
 
-async fn mtls_login(
-    session: AuthSession,
-    State(service): State<Arc<AuthnService<...>>>,
-    Extension(chain): Extension<PeerCertChain>,
-) -> impl IntoResponse {
-    let leaf = chain.leaf().expect("validated chain has at least one cert");
-    let cn = extract_common_name(leaf).expect("validated cert has a CN");
-
-    match service.begin_login(&session, &cn, "default-tenant").await {
-        Ok(_) => {}
-        Err(e) => return (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
+async fn require_org_certificate(req: Request, next: Next) -> Response {
+    let Some(chain) = req.extensions().get::<PeerCertChain>() else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let Some(leaf) = chain.leaf() else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    // Your policy: which CA, which CN or SAN, which expiry window.
+    if !issued_by_org_ca(leaf) {
+        return StatusCode::FORBIDDEN.into_response();
     }
-
-    use axess::FactorCredential;
-    match service
-        .verify_factor(&session, FactorCredential::Mtls { chain })
-        .await
-    {
-        Ok(_) => Redirect::to("/dashboard").into_response(),
-        Err(e) => (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
-    }
+    next.run(req).await
 }
 ```
 
-A more structured mapping uses a SPIFFE URI in the certificate's
-Subject Alternative Name (SAN). The CA issues certificates with
-SAN URIs of the form `spiffe://<trust_domain>/<path>`, and the
-application's login handler parses the URI to extract the trust
-domain, the path, and any embedded identifiers. This shape is what
-the workload identity chapter covers, and it remains the right
-shape even for human-adjacent flows because it is more structured
-than a CN.
+Behind that gate, the user authenticates with whatever method the tenant
+configures: password plus TOTP, a passkey, an OAuth provider. Only a
+provisioned machine reaches the login page, and only the right person
+finishes, which is the pairing a high-assurance admin interface wants.
 
-The verification on the axess side is straightforward. The
-`FactorCredential::Mtls { chain }` variant carries the cert chain
-through `verify_factor`. The verifier checks that the chain is
-present (a sanity check, since the middleware put it there), that
-the leaf certificate has not expired, and that the certificate
-matches the user's stored mTLS configuration (which CA it should
-be signed by, which CN or SAN it should have). Verification
-success advances the state machine; failure returns
-`InvalidCredential`.
-
-## Composing mTLS with other factors
-
-mTLS as a sole factor is appropriate for service-to-service traffic
-where the certificate's possession is itself the authentication
-event. For human flows, mTLS pairs with another factor in a method.
-
-A common shape for a high-assurance admin interface is mTLS
-followed by FIDO2. The user's machine presents a certificate
-issued by the organisation's CA (so only employees whose machines
-have been provisioned can even reach the login page); the user
-then authenticates with a passkey (so a stolen machine is not
-enough, the user themselves must be present). The combination is
-strong against both remote attackers (they have no certificate)
-and local attackers (they have no passkey).
-
-A variation uses mTLS as a tenant-scoping factor and OAuth as the
-user-identification factor. The certificate identifies which
-tenant the request is for (a partner integration's certificate
-maps to the partner's tenant); the OAuth flow identifies which
-user within that tenant. The method composes the two.
+Two consequences follow from the split. The certificate is not part of
+the authentication, so no audit row mentions it: record the gate's
+decision yourself if you need evidence that a particular machine was
+used. And the session is not bound to the certificate, so one issued
+behind the gate lasts until it expires whatever becomes of the
+certificate. Pair short session lifetimes with short-lived certificates
+where that matters.
 
 ## Threat model
 

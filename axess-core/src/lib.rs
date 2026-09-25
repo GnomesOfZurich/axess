@@ -95,19 +95,17 @@ pub mod authn;
 pub mod device;
 
 pub use authn::{
-    AuditContext, AuditContextPolicy, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder,
-    AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError,
-    AuthnScope, AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig,
-    EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome,
-    FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
-    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
-    IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
-    LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
-    PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor, SessionValidator,
+    AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus,
+    AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError, AuthnScope,
+    AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig, EntityState,
+    EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome, FactorStep,
+    FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin,
+    IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory, IdentityPasswordReset,
+    IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy, LoginOutcome,
+    NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig, PasswordRules,
+    PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor, SessionValidator,
     SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
-    ZeroizedString, create_tenant, default_catalog, extract_audit_context,
-    extract_audit_context_async, extract_audit_context_async_untrusted,
-    extract_audit_context_untrusted, require_valid_session,
+    ZeroizedString, create_tenant, default_catalog, require_valid_session,
 };
 
 // ── Federation; external-IdP adapters ───────────────────────────────────────
@@ -125,13 +123,21 @@ pub mod federation;
 #[cfg_attr(docsrs, doc(cfg(feature = "authz")))]
 pub mod authz;
 
+/// The client's address, resolved once. Ungated: the rate limiter and the
+/// audit trail need this and neither should have to compile Cedar for it.
+pub mod client_ip;
+
 #[cfg(feature = "authz")]
 #[cfg_attr(docsrs, doc(cfg(feature = "authz")))]
 pub use authz::{
     AuthzDecision, AuthzDenied, AuthzEntityProvider, AuthzError, AuthzSession, AuthzStore,
     BuildRequestContext, NoContext, PolicyEvaluator, PolicyStore, StandardRequestContext,
-    ip_from_headers_untrusted, make_action_uid, make_entity_uid,
+    make_action_uid, make_entity_uid,
 };
+
+// Ungated, unlike the Cedar context above: a rate limiter needs the client
+// address and should not compile a policy engine to get it.
+pub use client_ip::{CidrParseError, ClientIp, TrustedProxies};
 
 // ── Storage backends (re-exports from session::storage) ────────────────────────
 //

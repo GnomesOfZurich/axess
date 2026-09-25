@@ -5,9 +5,7 @@ hot path to the storage layers that compliance, incident response,
 and operations consume. The pipeline has two streams (regulatory
 and analytics), three retention tiers (hot, archived, deleted),
 and a small number of trait surfaces that adopters implement
-against their own storage. This chapter covers the architecture,
-the configuration, and the operational patterns that make the
-pipeline trustworthy under load.
+against their own storage.
 
 The chapter pairs with *Audit events*, which catalogues what
 flows through the pipeline; this chapter covers how the flow
@@ -111,13 +109,22 @@ from *which* identifier was tried makes the drop observable per
 identifier, and rebuilds the user-enumeration oracle that emitting
 unattributed events exists to close.
 
-`axess-events` has two wrappers worth knowing when you build one.
-`LogAndSwallow` takes a sink and turns its errors into log lines, which
-is the fail-soft shape written once. `NoopEventSink` discards
-everything, which is what tests and the analytics stream want when it
-is switched off.
+`axess-events` has two wrappers worth knowing, and both are for the
+**analytics** stream: they implement `EventSink`, not `IdentityAuthnLog`.
+`LogAndSwallow` turns a sink's errors into log lines, which is the
+fail-soft shape written once, and `NoopEventSink` discards everything,
+which is what tests want when the stream is switched off.
 
-## The IdentityAuthnLog sink
+Neither can be wrapped around the regulatory sink, and that is
+deliberate. Swallowing an `IdentityAuthnLog` error is exactly the
+fail-open this release removed; the way to drop a regulatory event is
+`AuditOutcome::Shed`, which is explicit and counted.
+
+## The two sinks
+
+One is the record; the other is the stream you can drop.
+
+### The IdentityAuthnLog sink
 
 The regulatory sink is the `IdentityAuthnLog` implementation the
 application already provides for the lockout policy (covered in
@@ -131,7 +138,7 @@ The pattern means the regulatory store is what the application
 already needs for lockout. The pipeline does not add a second
 database; it just uses what is already there.
 
-## The AuthnAnalyticsSink
+### The AuthnAnalyticsSink
 
 The analytics sink is the optional stream for the SIEM and
 analytics consumers. The trait:
@@ -193,7 +200,11 @@ the sink accumulates events in memory until a threshold (batch
 size or time interval), then issues a bulk insert. The pattern
 matches ClickHouse's preferred ingestion shape.
 
-## The three-tier retention
+## Retention and archival
+
+How long rows live, and what moves them off the hot store.
+
+### The three-tier retention
 
 The regulatory stream's events grow without bound by default. A
 deployment with millions of users produces hundreds of millions
@@ -231,7 +242,7 @@ this tier (an indefinite archive is a defensible choice for
 small-volume deployments); others rotate through it on the
 regulatory schedule.
 
-## AuditArchiver
+### AuditArchiver
 
 The transition from hot to archived runs through the
 `AuditArchiver` trait:
@@ -305,7 +316,7 @@ for one year of audit retention, which the defaults satisfy by
 keeping events in the archive indefinitely. Other regulatory
 regimes have different requirements; tune to match.
 
-## Filesystem archive
+### Filesystem archive
 
 The `audit-archive-fs` feature ships
 `FilesystemAuditArchiver`, a reference implementation that

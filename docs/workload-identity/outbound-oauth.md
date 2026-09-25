@@ -1,7 +1,7 @@
 # Outbound: OAuth
 
-This chapter covers the case where your application authenticates
-itself as a workload against a downstream OAuth-protected service.
+Your application authenticates itself as a workload against a
+downstream OAuth-protected service.
 The application is the OAuth client; the downstream is the resource
 server. The credential is an access token you acquire
 through one of the OAuth client flows (client credentials, token

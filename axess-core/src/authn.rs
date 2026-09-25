@@ -7,7 +7,7 @@
 //! - `event`: [`AuthEvent`], [`AuthEventBuilder`], [`AuthEventType`], [`AuthEventStatus`],
 //!   [`AuthFailureReason`]
 //! - `store`: [`IdentityStore`], [`FactorStore`], [`AuthnBackend`], [`AuthMethod`]
-//! - `service`: [`AuthnService`], [`AuthnServiceBuilder`], [`AuditContextPolicy`], [`LoginOutcome`], [`SignupOutcome`], [`FactorOutcome`]
+//! - `service`: [`AuthnService`], [`RequestAuthnService`], [`AuthnServiceBuilder`], [`LoginOutcome`], [`SignupOutcome`], [`FactorOutcome`]
 //! - `error`: [`AuthnError`]
 //!
 //! # Naming conventions
@@ -50,8 +50,6 @@ pub use audit::archive::{FilesystemArchiveError, FilesystemAuditArchiver};
 pub use error::AuthnError;
 pub use event::{
     AuditContext, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason,
-    extract_audit_context, extract_audit_context_async, extract_audit_context_async_untrusted,
-    extract_audit_context_untrusted, ip_from_headers_untrusted,
 };
 pub use factor::{
     EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FactorStep, FactorTemplate,
@@ -63,8 +61,8 @@ pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
 #[cfg(feature = "oauth")]
 pub use service::DEFAULT_SID_MAP_CAPACITY;
 pub use service::{
-    AuditContextPolicy, AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome,
-    NoSessionRegistryError, PrepareOutcome, SessionValidator, SignupOutcome, require_valid_session,
+    AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome, NoSessionRegistryError,
+    PrepareOutcome, RequestAuthnService, SessionValidator, SignupOutcome, require_valid_session,
 };
 pub use store::{
     AuditOutcome, AuditQuery, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore,

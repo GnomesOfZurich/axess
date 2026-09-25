@@ -3,12 +3,8 @@
 use crate::web::app::AppState;
 use crate::web::csrf_hidden_input;
 use axess::AuthSession;
-use axess::authn::{
-    FactorCredential, FactorKind, FactorOutcome, LoginOutcome, extract_audit_context,
-};
-use axess::authz::{TrustedProxies, ip_from_headers_trusted};
+use axess::authn::{AuditContext, FactorCredential, FactorKind, FactorOutcome, LoginOutcome};
 use axess::csrf::CsrfToken;
-use axum::extract::ConnectInfo;
 use axum::{
     Extension, Form,
     extract::State,
@@ -59,21 +55,16 @@ pub async fn post_login(
     State(state): State<AppState>,
     session: AuthSession,
     Extension(csrf): Extension<CsrfToken>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
+    audit: AuditContext,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
-    // Resolve the client address against the trusted-proxy set, then hand
-    // the service a copy of itself that stamps it onto every event the
-    // login emits. Without this the audit rows carry a null IP, which is
-    // honest but is not evidence.
-    //
-    // `loopback_only` suits this example, which is reached directly or
-    // through a same-host proxy. A deployment behind a load balancer names
-    // its egress ranges with `TrustedProxies::from_cidrs`.
-    let client_ip = ip_from_headers_trusted(&headers, peer.ip(), &TrustedProxies::loopback_only());
-    let audit_ctx = extract_audit_context(&headers, Some(client_ip), Some(&session));
-    let service = state.service.with_audit_context(audit_ctx);
+    // Derive the request-scoped handle. Both calls below go through it
+    // because there is no other way to reach them: `begin_login` and
+    // `verify_factor` live on `RequestAuthnService`, not on the shared service.
+    // Until 0.7.0 they were on both, and routing only the first through it
+    // left the failed-password rows, the ones a brute-force query counts,
+    // with no address on them.
+    let service = state.service.with_audit_context(audit);
 
     let tenant = form
         .tenant
@@ -86,7 +77,7 @@ pub async fn post_login(
     // (it returns Ready for passwords) and call verify_factor immediately.
     // For EmailOtp or FIDO2 flows, call prepare_factor first to generate the challenge.
     let outcome = match service
-        .begin_login(&form.identifier, tenant, &session, None)
+        .begin_login(&form.identifier, tenant, &session)
         .await
     {
         Ok(o) => o,
@@ -109,7 +100,7 @@ pub async fn post_login(
     match outcome {
         LoginOutcome::FactorRequired(FactorKind::Password) => {
             let cred = FactorCredential::Password(form.password.into());
-            match state.service.verify_factor(&cred, &session).await {
+            match service.verify_factor(&cred, &session).await {
                 Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
                 Ok(FactorOutcome::FactorRequired(FactorKind::Totp)) => {
                     Redirect::to("/totp").into_response()
@@ -163,10 +154,16 @@ pub async fn post_totp(
     State(state): State<AppState>,
     session: AuthSession,
     Extension(csrf): Extension<CsrfToken>,
+    audit: AuditContext,
     Form(form): Form<TotpForm>,
 ) -> impl IntoResponse {
+    // Second-factor failures are the half of a credential-stuffing run that
+    // survives a leaked password, so these rows need an address as much as
+    // the first-factor ones do.
+    let service = state.service.with_audit_context(audit);
+
     let cred = FactorCredential::OtpCode(form.code.into());
-    match state.service.verify_factor(&cred, &session).await {
+    match service.verify_factor(&cred, &session).await {
         Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
         Ok(FactorOutcome::InvalidCredential) => {
             Html(totp_with_error("Wrong code; please try again.", &csrf)).into_response()
@@ -188,8 +185,13 @@ pub async fn post_totp(
 
 // ── POST /logout ──────────────────────────────────────────────────────────────
 
-pub async fn logout(State(state): State<AppState>, session: AuthSession) -> impl IntoResponse {
-    if let Err(err) = state.service.logout(&session).await {
+pub async fn logout(
+    State(state): State<AppState>,
+    session: AuthSession,
+    audit: AuditContext,
+) -> impl IntoResponse {
+    let service = state.service.with_audit_context(audit);
+    if let Err(err) = service.logout(&session).await {
         tracing::warn!(error = %err, "logout error");
     }
     Redirect::to("/login")
@@ -216,6 +218,7 @@ pub async fn post_signup(
     State(state): State<AppState>,
     session: AuthSession,
     Extension(csrf): Extension<CsrfToken>,
+    audit: AuditContext,
     Form(form): Form<SignupForm>,
 ) -> impl IntoResponse {
     use axess::authn::{
@@ -249,7 +252,11 @@ pub async fn post_signup(
         }
     };
 
-    match state.service.begin_signup(user, tenant, &session).await {
+    // Account creation is an audited event in its own right; registration
+    // abuse is spotted by grouping those rows by address.
+    let service = state.service.with_audit_context(audit);
+
+    match service.begin_signup(user, tenant, &session).await {
         Ok(SignupOutcome::Started) => {
             // The user is now created (Candidate state). Store their password
             // factor and auth method so they can log in after activation.
@@ -293,7 +300,7 @@ pub async fn post_signup(
             }
 
             // Auto-complete signup (skip email verification for this example).
-            match state.service.complete_signup(&session).await {
+            match service.complete_signup(&session).await {
                 Ok(()) => Redirect::to("/dashboard").into_response(),
                 Err(e) => {
                     tracing::warn!(error = %e, "complete_signup error");
@@ -520,6 +527,7 @@ pub struct ForgotPasswordForm {
 
 pub async fn post_forgot_password(
     State(state): State<AppState>,
+    audit: AuditContext,
     Form(form): Form<ForgotPasswordForm>,
 ) -> impl IntoResponse {
     let tenant = form
@@ -533,6 +541,7 @@ pub async fn post_forgot_password(
     let ttl = std::time::Duration::from_secs(15 * 60); // 15 minutes
     match state
         .service
+        .with_audit_context(audit)
         .begin_password_reset(&form.identifier, tenant, ttl)
         .await
     {
@@ -581,6 +590,7 @@ pub struct ResetPasswordForm {
 
 pub async fn post_reset_password(
     State(state): State<AppState>,
+    audit: AuditContext,
     Form(form): Form<ResetPasswordForm>,
 ) -> impl IntoResponse {
     let user_id = match axess::authn::UserId::try_new(form.user_id.as_str()) {
@@ -598,6 +608,7 @@ pub async fn post_reset_password(
 
     match state
         .service
+        .with_audit_context(audit)
         .complete_password_reset(&user_id, &form.token, &form.new_password)
         .await
     {

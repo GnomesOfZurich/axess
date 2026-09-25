@@ -6,7 +6,7 @@
 //! calls `complete_signup` to activate the user and transition the
 //! session to `Authenticated`.
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::RequestAuthnService;
 use crate::authn::service::outcomes::SignupOutcome;
 use crate::authn::{
     error::AuthnError,
@@ -18,7 +18,7 @@ use crate::session::{
     extractor::AuthSession,
 };
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,

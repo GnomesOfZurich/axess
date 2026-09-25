@@ -31,7 +31,25 @@ impl Service<Request<Body>> for OkService {
     }
 }
 
+/// A request that the client-IP layer has already resolved to `ip`.
+///
+/// This used to set `X-Forwarded-For` and let the extractor believe it,
+/// which is precisely the bypass `KeyExtractor::ClientIp` exists to close:
+/// the header is no longer read, so a header-based fixture would put every
+/// request in the same bucket. The resolved value goes in the extensions,
+/// where the layer puts it.
 fn make_request_with_ip(ip: &str) -> Request<Body> {
+    let mut req = Request::new(Body::empty());
+    req.extensions_mut()
+        .insert(crate::client_ip::ClientIp::for_test(Some(
+            ip.parse().unwrap(),
+        )));
+    req
+}
+
+/// A request carrying a forged forwarded header and no resolved address,
+/// which is what an attacker can actually produce.
+fn make_request_with_forged_header(ip: &str) -> Request<Body> {
     let mut req = Request::new(Body::empty());
     req.headers_mut()
         .insert("x-forwarded-for", HeaderValue::from_str(ip).unwrap());
@@ -42,7 +60,7 @@ fn make_service(max: u32, window: Duration) -> RateLimitService<OkService> {
     let config = RateLimitConfig::builder()
         .max_requests(max)
         .window(window)
-        .key(KeyExtractor::ForwardedIp)
+        .key(KeyExtractor::ClientIp)
         .build();
     let layer = RateLimitLayer::new(config);
     layer.layer(OkService)
@@ -131,7 +149,7 @@ async fn retry_after_header_present_when_configured() {
     let config = RateLimitConfig::builder()
         .max_requests(1)
         .window(Duration::from_secs(120))
-        .key(KeyExtractor::ForwardedIp)
+        .key(KeyExtractor::ClientIp)
         .retry_after(true)
         .build();
     let svc = RateLimitLayer::new(config).layer(OkService);
@@ -159,7 +177,7 @@ async fn retry_after_header_absent_when_disabled() {
     let config = RateLimitConfig::builder()
         .max_requests(1)
         .window(Duration::from_secs(60))
-        .key(KeyExtractor::ForwardedIp)
+        .key(KeyExtractor::ClientIp)
         .retry_after(false)
         .build();
     let svc = RateLimitLayer::new(config).layer(OkService);
@@ -521,4 +539,26 @@ fn warn_threshold_helpers_have_strict_bounds() {
     assert!(!should_warn_very_long_window(Duration::from_secs(3600)));
     assert!(should_warn_very_long_window(Duration::from_secs(3601)));
     assert!(!should_warn_very_long_window(Duration::from_secs(60)));
+}
+
+/// The bypass this variant exists to close: rotating a forwarded header
+/// must not buy a fresh bucket. Before 0.7.0 each of these landed in its
+/// own bucket and the limiter was ornamental behind a proxy that appends.
+#[tokio::test]
+async fn forged_forwarded_headers_share_one_bucket() {
+    let svc = make_service(1, Duration::from_secs(60));
+
+    let res = ServiceExt::oneshot(svc.clone(), make_request_with_forged_header("10.0.0.1"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = ServiceExt::oneshot(svc.clone(), make_request_with_forged_header("10.0.0.2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a different forged header must not reset the bucket"
+    );
 }

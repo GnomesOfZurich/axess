@@ -1,11 +1,8 @@
 # Operations runbook
 
-This chapter is the operator-facing runbook. It covers the
-pre-launch checklist, the routine rotations the deployment needs
-to schedule, the multi-instance considerations that catch
-deployments off-guard, the graceful-shutdown sequence, the
-health-check and metrics surfaces, and the emergency procedures
-for the categories of incident that recur.
+For whoever carries the pager. Read the pre-launch checklist before
+launch; the rest is reference for when something is wrong at three in
+the morning.
 
 The chapter has two halves. The first half is operational
 guidance specific to axess. The second half is the canonical
@@ -48,7 +45,7 @@ and any other authentication-adjacent endpoints. The defaults
 from *Rate limiting* are starting points; calibrate to the
 deployment's legitimate-traffic envelope.
 
-The lockout policy is configured (or the global default is
+The lockout policy is configured (or the system default is
 accepted). The three levers (per-user, per-tenant, per-IP) all
 have explicit thresholds suited to the deployment's risk
 posture. *Multi-tenancy* §"Three-lever lockout" covers the

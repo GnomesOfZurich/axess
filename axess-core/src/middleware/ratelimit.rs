@@ -8,7 +8,7 @@
 //! | Extractor | Source | Use case |
 //! |-----------|--------|----------|
 //! | `KeyExtractor::PeerIp` | `SocketAddr` from `ConnectInfo` | **Default.** Safe for direct connections. |
-//! | `KeyExtractor::ForwardedIp` | `X-Real-IP` (first) then `X-Forwarded-For` | Behind a **trusted** reverse proxy only. |
+//! | `KeyExtractor::ClientIp` | the `ClientIp` resolved by `client_ip::layer` | Behind a reverse proxy. Needs the layer installed. |
 //! | `KeyExtractor::UserId` | `RateLimitUserId` request extension | Per-user limits (set after authentication). |
 //! | `KeyExtractor::TenantId` | `RateLimitTenantId` request extension | Per-tenant limits. |
 //! | `KeyExtractor::LoginIdentifier` | `RateLimitLoginIdentifier` request extension | **Required for login routes** to mitigate per-username lockout DoS. |
@@ -80,17 +80,20 @@ use tower::{Layer, Service};
 /// What to use as the rate-limit bucket key.
 #[derive(Clone, Debug)]
 pub enum KeyExtractor {
-    /// Rate limit by client IP from a trusted reverse proxy header.
+    /// Rate limit by the address [`client_ip::layer`](crate::client_ip::layer)
+    /// resolved for this request.
     ///
-    /// Reads `X-Real-IP` then `X-Forwarded-For` (first entry). Use this only
-    /// when deployed behind a reverse proxy (NGINX, Envoy, ALB, Cloudflare)
-    /// that sets these headers from the real peer address and strips
-    /// client-supplied values.
+    /// The layer walks the forwarded chain against the peer the server
+    /// accepted and the proxies you named, so a caller cannot pick its own
+    /// bucket by writing a header. Requires the layer to be installed
+    /// outside this one; without it every request resolves to `None` and
+    /// shares one bucket, which limits harder rather than less.
     ///
-    /// Without a trusted proxy, clients can spoof these headers to bypass
-    /// rate limiting entirely. For direct-to-client deployments, use
-    /// [`PeerIp`](KeyExtractor::PeerIp) instead.
-    ForwardedIp,
+    /// Replaces `ForwardedIp`, which read `X-Real-IP` and then the first
+    /// `X-Forwarded-For` entry and believed both. Both are caller-writable:
+    /// rotating either bought a fresh bucket per request, which is the
+    /// whole of what a rate limiter exists to prevent.
+    ClientIp,
     /// Rate limit by TCP peer address via axum's `ConnectInfo`.
     ///
     /// Requires `Router::into_make_service_with_connect_info::<SocketAddr>()`
@@ -213,16 +216,6 @@ impl RateLimitConfigBuilder {
             tracing::warn!(
                 window_secs = self.window.as_secs(),
                 "RateLimitConfig: window exceeds 1 hour; long windows increase memory usage per bucket"
-            );
-        }
-        if matches!(self.key_extractor, KeyExtractor::ForwardedIp) {
-            tracing::warn!(
-                "RateLimitConfig: using ForwardedIp key extractor. \
-                 This reads X-Forwarded-For / X-Real-IP headers which are \
-                 client-spoofable unless set by a trusted reverse proxy. \
-                 Ensure your proxy strips client-supplied forwarded headers \
-                 before adding its own. For direct-to-client deployments, \
-                 use KeyExtractor::PeerIp instead."
             );
         }
         RateLimitConfig {
@@ -382,6 +375,21 @@ impl RateLimitLoginIdentifier {
 /// rate-limited collectively under this key.
 const ANONYMOUS_BUCKET: &str = "__anonymous__";
 
+/// Bucket for requests whose origin could not be established: no peer
+/// address, or no `ClientIp` because the layer is not installed. Everything
+/// unattributable shares it, which limits harder rather than less.
+///
+/// The failure mode is worth stating plainly, because it is total. On a
+/// route where nothing resolves an address, every caller shares this one
+/// bucket, so a single client can exhaust the limit for everybody. That is
+/// the correct trade against the alternative, which is keying on something
+/// the caller chooses and so enforcing nothing at all, but it is a denial
+/// of service reachable from a misconfiguration rather than from a bug.
+/// Install the layer, and alert on a non-zero count of audit rows carrying
+/// `ip_source = 'unknown'`, which is the same misconfiguration seen from
+/// the other side.
+const UNKNOWN_BUCKET: &str = "unknown";
+
 /// Hard cap on bucket-key length (bytes). Header- and identity-derived
 /// keys are truncated to this size before being used as a `DashMap` key, so
 /// an attacker who sets megabyte-sized `X-Forwarded-For` / `X-User-Id` /
@@ -413,7 +421,7 @@ fn truncate_key(mut key: String) -> String {
 
 fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
     let raw = match extractor {
-        KeyExtractor::ForwardedIp => extract_forwarded_ip(req),
+        KeyExtractor::ClientIp => extract_resolved_client_ip(req),
         KeyExtractor::PeerIp => extract_peer_ip(req),
         KeyExtractor::UserId => req
             .extensions()
@@ -435,19 +443,30 @@ fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
     truncate_key(raw)
 }
 
-/// Extract client IP from proxy headers (`X-Real-IP`, `X-Forwarded-For`).
+/// Read the address `client_ip::layer` resolved for this request.
 ///
-/// Only use behind a trusted reverse proxy that sets these headers from the
-/// real peer address and strips client-supplied values.
-fn extract_forwarded_ip(req: &Request<Body>) -> String {
-    let headers = req.headers();
-    headers
-        .get("x-real-ip")
-        .or_else(|| headers.get("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(|s| s.trim().to_owned())
-        .unwrap_or_else(|| extract_peer_ip(req))
+/// No header is consulted here. A missing `ClientIp` means the layer is
+/// not installed, and the answer is the shared bucket rather than a guess:
+/// a guess would be the caller's own claim, which is what this replaced.
+fn extract_resolved_client_ip(req: &Request<Body>) -> String {
+    match req.extensions().get::<crate::client_ip::ClientIp>() {
+        Some(ip) => match ip.get() {
+            Some(addr) => addr.to_string(),
+            None => UNKNOWN_BUCKET.to_owned(),
+        },
+        None => {
+            use std::sync::Once;
+            static WARN: Once = Once::new();
+            WARN.call_once(|| {
+                tracing::warn!(
+                    "ClientIp rate limiting: no ClientIp in request extensions; \
+                     all requests share one bucket. Wrap the router in \
+                     axess_core::client_ip::layer."
+                );
+            });
+            UNKNOWN_BUCKET.to_owned()
+        }
+    }
 }
 
 /// Extract client IP from the TCP peer address stored in request extensions.
@@ -474,10 +493,11 @@ fn extract_peer_ip(req: &Request<Body>) -> String {
                 "PeerIp rate limiting: no SocketAddr in request extensions; \
                      all requests will share a single bucket. Use \
                      Router::into_make_service_with_connect_info::<SocketAddr>() \
-                     or switch to KeyExtractor::ForwardedIp behind a trusted proxy."
+                     or, behind a proxy, client_ip::layer with \
+                     KeyExtractor::ClientIp."
             );
         });
-        "unknown".to_owned()
+        UNKNOWN_BUCKET.to_owned()
     })
 }
 

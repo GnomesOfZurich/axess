@@ -3,10 +3,9 @@
 The four factors `axess-factors` ships by default (`password`, `totp`,
 `hotp`, `email_otp`) are the ones most adopters reach for first. They
 require no external IdP, no specialised hardware, no extra
-infrastructure. This chapter walks through password (Argon2id) and
-TOTP (RFC 6238), the two most common combination in practice, with
-references to HOTP and email OTP at the end. The pattern these
-factors illustrate generalises to every other factor in the library.
+infrastructure. Password (Argon2id) and TOTP (RFC 6238) are the common
+pairing, and the pattern they illustrate generalises to every other
+factor in the library.
 
 The feature flags `password`, `totp`, `hotp`, `email_otp` are all on
 by default in `axess-factors`. No `Cargo.toml` change is needed to
@@ -68,10 +67,11 @@ the one that demands punctuation.
 
 `history_count` is the reuse check, and it is off by default because it
 costs something to turn on: a non-zero value makes the flow call
-`IdentityPasswordHistory::password_history` and `record_password_hash`, both of
-which `unimplemented!()` until your backend provides them. Set it to
-`12` for the SOC2-shaped "cannot reuse the last twelve" rule, and
-implement those two methods at the same time.
+`IdentityPasswordHistory::password_history` and `record_password_hash`.
+That trait has no default bodies, so the password flow is bounded on it
+and a store that does not implement it will not compile against the
+flow. Set `history_count` to `12` for the SOC2-shaped "cannot reuse the
+last twelve" rule, and implement the trait at the same time.
 
 Rules are resolved per tenant, through
 `IdentityLookup::password_rules_for_tenant`, which defaults to

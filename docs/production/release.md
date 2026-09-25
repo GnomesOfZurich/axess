@@ -56,11 +56,20 @@ Commit the regenerated SVG alongside the version bump.
 
 [`CHANGELOG.md`](../../CHANGELOG.md) follows [Keep a
 Changelog](https://keepachangelog.com/en/1.1.0/). Move every entry from
-`[unreleased]` under a new `## [0.NEW.0] - YYYY-MM-DD` heading and group
+`[Unreleased]` under a new `## [0.NEW.0] - YYYY-MM-DD` heading and group
 by `### Added` / `### Changed (breaking)` / `### Fixed` / `### Security`
 as the entries fit.
 
-Recreate an empty `[unreleased]` section at the top for the next cycle.
+Recreate an empty `## [Unreleased]` heading at the top for the next
+cycle, before the cut section. Without it the next change has nowhere to
+land but a released section, which is how a finished release note grows
+entries that were never in that release.
+
+An entry is a bold lead plus the consequence, one to three lines, and a
+breaking one says **Migrating:** with the step. The reasoning, the
+measurements and the account of how a defect surfaced go in the commit
+message, which is written anyway. A release section that is the longest
+in the file is a defect, not a reflection of how much work it took.
 
 ## 4. Local pre-flight
 

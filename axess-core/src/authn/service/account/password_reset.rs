@@ -3,18 +3,18 @@
 //!
 //! Two-step ceremony with single-use, hashed-on-disk token:
 //!
-//! - [`AuthnService::begin_password_reset`] generates a 32-byte URL-safe
+//! - [`RequestAuthnService::begin_password_reset`] generates a 32-byte URL-safe
 //!   token, stores `SHA-256(token)`, returns the plaintext for the
 //!   application to deliver out-of-band (email link, SMS, etc.).
-//! - [`AuthnService::complete_password_reset`] verifies the token,
+//! - [`RequestAuthnService::complete_password_reset`] verifies the token,
 //!   enforces the tenant's history-reuse rule against the new plaintext,
 //!   Argon2id-hashes it, updates the password factor, records audit
 //!   events, and invalidates other live sessions for the user.
-//! - [`AuthnService::complete_password_reset_in_tenant`] adds a
+//! - [`RequestAuthnService::complete_password_reset_in_tenant`] adds a
 //!   cross-tenant rail before `complete_password_reset` does the
 //!   expensive Argon2id-flavoured rest of the flow.
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
@@ -23,7 +23,7 @@ use crate::authn::{
     types::AuthnScope,
 };
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     // `IdentityPasswordReset` is required here and nowhere else: a store
     // that cannot persist a reset token cannot reach this flow, so the
@@ -207,13 +207,14 @@ where
 
         // Record the old hash in password history.
         //
-        // Not "if the backend supports it": there is no support check here
-        // or at the second call site below. `IdentityAdmin::record_password_hash`
-        // has a default body that panics, so a backend which has not
-        // overridden it unwinds on the first password change any user
-        // makes. The guard below tests whether an *old password exists*,
-        // which is a different question. See
-        // `docs/_review/2026-09-24-audit-context-and-availability.md`.
+        // Unconditional, and the guard below is about whether an *old
+        // password exists*, not about whether the backend keeps history.
+        // That distinction used to matter a great deal: the method carried
+        // a default body that panicked, so a backend which had not
+        // overridden it unwound here on the first password change any user
+        // made. It now lives on `IdentityPasswordHistory`, which has no
+        // defaults, and this flow is bounded on that trait, so a store
+        // without history cannot reach this line at all.
         if let Some(FactorConfig::Password(ref old_config)) = self
             .inner
             .factors
@@ -311,7 +312,16 @@ where
 
         Ok(true)
     }
+}
 
+impl<I, F> AuthnService<I, F>
+where
+    // Same bounds as the request-scoped block above, for the same reason:
+    // these are its helpers, and a store that cannot persist a reset token
+    // has no business reaching them.
+    I: IdentityStore + IdentityPasswordReset + IdentityPasswordHistory,
+    F: FactorStore<Error = I::Error>,
+{
     /// Hash the supplied plaintext token via SHA-256 and verify it
     /// against the store's per-user reset-token record.
     ///

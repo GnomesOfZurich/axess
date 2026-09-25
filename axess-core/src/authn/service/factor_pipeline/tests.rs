@@ -16,6 +16,7 @@
 //! the pipeline even though it now lives on the session.
 
 use super::AccountStatusEnforcement;
+use crate::authn::AuditContext;
 use crate::authn::{
     event::{AuthEvent, AuthEventStatus, AuthEventType},
     factor::{EmailOtpConfig, FactorConfig, FactorKind, HotpConfig, ZeroizedString},
@@ -113,7 +114,7 @@ fn hotp_config_with_attempts(counter: u64, attempt_count: u8) -> FactorConfig {
 fn build_service_with_user(
     user: User,
 ) -> (
-    AuthnService<MockIdentityStore, MockFactorStore>,
+    super::RequestAuthnService<MockIdentityStore, MockFactorStore>,
     MockIdentityStore,
 ) {
     let identity = MockIdentityStore::new()
@@ -127,7 +128,8 @@ fn build_service_with_user(
     // service runs; `MockIdentityStore` is `Clone` and shares the
     // underlying `DashMap`s via `Arc`.
     let inspector = identity.clone();
-    let service = AuthnService::new(identity, MockFactorStore::new());
+    let service = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     (service, inspector)
 }
 
@@ -138,7 +140,7 @@ fn build_service_with_factors(
     user: User,
     factors: MockFactorStore,
 ) -> (
-    AuthnService<MockIdentityStore, MockFactorStore>,
+    super::RequestAuthnService<MockIdentityStore, MockFactorStore>,
     MockIdentityStore,
     MockFactorStore,
 ) {
@@ -151,7 +153,7 @@ fn build_service_with_factors(
         });
     let inspector = identity.clone();
     let factor_inspector = factors.clone();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     (service, inspector, factor_inspector)
 }
 
@@ -665,7 +667,8 @@ async fn counter_store_outage_fails_open_when_configured() {
             ..LockoutPolicy::default()
         });
     let inspector = identity.clone();
-    let service = AuthnService::new(identity, MockFactorStore::new());
+    let service = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = authenticating_session(vec![FactorKind::Password]).await;
 
     inspector.arm_record_failed_attempt_failure();

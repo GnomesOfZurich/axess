@@ -128,7 +128,11 @@ do not, so you run a periodic cleanup task. Valkey
 expires keys automatically as they age past their TTL, which means
 the cleanup task is unnecessary.
 
-## SQLite
+## The backends
+
+What each one is good at, and what it costs you.
+
+### SQLite
 
 The SQLite backend is right for development, for tests, for
 single-instance production deployments, and for embedded-style
@@ -180,7 +184,7 @@ The operational notes:
   is configured, so a backup carries the same security posture as
   the live data.
 
-## Postgres
+### Postgres
 
 Postgres is the right backend for most production deployments. It
 is cluster-safe, has good concurrency, supports JSONB if a
@@ -229,7 +233,7 @@ The operational notes:
   encryption. Stick with the envelope unless a specific deployment
   reason argues for pgcrypto.
 
-## MySQL
+### MySQL
 
 The MySQL backend is right for deployments where MySQL is the
 already-deployed database. The capability surface is the same as
@@ -273,7 +277,7 @@ The operational notes:
   automatically, but be aware of the setting if connection-state
   matters to your application.
 
-## Valkey
+### Valkey
 
 The Valkey backend is right for deployments where a Redis-style
 key-value store is already present in the architecture, or for
@@ -371,8 +375,11 @@ matters for adopters who want backend-agnostic access (test
 doubles, ops endpoints that work against any deployment, code that
 needs to switch backends at runtime).
 
+`Store` is one of the few things the facade does not re-export, so this
+needs a direct `axess-core` dependency alongside `axess`:
+
 ```rust,ignore
-use axess::store::Store;
+use axess_core::store::Store;
 use std::sync::Arc;
 
 async fn dump_session(

@@ -15,10 +15,6 @@ happened. A sink that wants to drop an event under load says so with
 `AuditOutcome::Shed`, which continues the flow; see *Audit pipeline*
 for why that valve exists and the rule for using it safely.
 
-This chapter covers the vocabulary, the fields every event carries, who
-emits each name, the SOC thresholds worth alerting on, and SIEM queries
-that work against the real column names.
-
 The chapter pairs with *Audit pipeline*, which covers how the
 events get from the application into the regulatory store and the
 analytics path.
@@ -113,16 +109,17 @@ the adopter's, because axess is not on the call path.
 status separates them. `Authenticated` is the end-to-end success,
 emitted once every required factor has passed.
 
-A refusal is emitted even when there is nothing to attribute it to.
-An attempt against a tenant that does not exist writes an unattributed
-row with `error = "unknown_tenant"`; one against a real tenant and an
+A refusal is emitted even when there is nothing to attribute it to. An
+attempt against a tenant that does not exist writes an unattributed row
+with `error = "unknown_tenant"`; one against a real tenant with an
 unknown identifier writes a tenant-attributed row with
-`error = "unknown_identifier"`. Two things follow. A credential-stuffing
-run over addresses that are not registered is visible in the trail
-rather than only in a metric, which is usually the first sign of one.
-And because every rejection path writes, an audit-store outage fails
-them all identically, so it cannot be used to tell registered
-identifiers from unregistered ones.
+`error = "unknown_identifier"`. Two things follow:
+
+- A credential-stuffing run over unregistered addresses is visible in
+  the trail, not only in a metric. That is usually the first sign of one.
+- Because every rejection path writes, an audit-store outage fails them
+  all identically, so it cannot be used to tell registered identifiers
+  from unregistered ones.
 
 ### Factors and methods
 
@@ -214,19 +211,22 @@ Every event is the same struct. There are no per-variant field sets:
 | `session_id` | `Option<SessionId>` | session-related events |
 | `factor_kind` | `Option<FactorKind>` | which factor, where one is involved |
 | `device_id` | `Option<DeviceId>` | omitted from the wire form entirely when absent |
-| `ip_address` | `Option<IpAddr>` | typed, so a forged or malformed value cannot be stored. `None` unless the request path called `AuthnService::with_audit_context` |
-| `user_agent` | `Option<String>` | same: `None` unless a context was attached |
-| `request_id` | `Option<String>` | from `X-Request-Id`, for log correlation |
+| `ip_address` | `Option<IpAddr>` | typed, so a forged or malformed value cannot be stored. `None` where nothing trustworthy resolved |
+| `ip_source` | `Source` | how the address was arrived at: `unknown`, `peer`, `forwarded` or `supplied` |
+| `user_agent` | `Option<String>` | from the request the context was extracted from |
+| `request_id` | `Option<String>` | the typed value the request-id layer left behind, under the `request-id` feature; `None` without it |
+| `trace_id` | `Option<String>` | the W3C trace id, under the `trace-id` feature |
 | `geo_country` | `Option<String>` | ISO 3166-1 alpha-2, derived from the IP |
 | `error` | `Option<AuthFailureReason>` | *why* it failed, as a tag a dashboard can group by. Not the place to look for the outcome; that is `event_status` |
 
-The three client-metadata fields are `None` on every event unless the
-route attached an [`AuditContext`]. Axess cannot resolve a trustworthy
-client address by itself: that needs the TCP peer and your trusted-proxy
-set, so it records nothing rather than something forgeable. Wire it with
-`AuthnService::with_audit_context`, and build with
-`AuditContextPolicy::Required` if a blank IP should be an error rather
-than a silence.
+Every event carries an [`AuditContext`], because the methods that write
+one live on `RequestAuthnService` and the only way to hold a `RequestAuthnService` is
+to have supplied a context. What the context contains is a separate
+question: axess cannot resolve a trustworthy client address by itself,
+since that needs the TCP peer and your trusted-proxy set. Install
+`axess::client_ip::layer` and the address is there; leave it out and
+`ip_address` is `None` with `ip_source = 'unknown'` saying so, which is
+the query below.
 
 [`AuditContext`]: https://docs.rs/axess-core/latest/axess_core/authn/event/struct.AuditContext.html
 
@@ -286,6 +286,37 @@ lower-snake-case (`login_attempt`), not the Rust variant names. And
 `event_time` is **epoch microseconds as a signed integer**, not a
 timestamp type, so it needs converting before any date function
 touches it.
+
+These queries assume the request path wired an `AuditContext` and that
+`client_ip::layer` is installed. Without either, `ip_address` is NULL and
+the IP-keyed queries below return one useless bucket.
+
+Ask the data rather than waiting to notice:
+
+```sql
+-- Rows whose address nothing resolved. Should be zero.
+SELECT event_type, COUNT(*)
+FROM auth_events
+WHERE ip_source = 'unknown' AND event_time > <recent>
+GROUP BY event_type;
+```
+
+A non-zero count names the routes to fix, and `ip_source` distinguishes
+the two causes that look identical in `ip_address`: `unknown` means
+nothing resolved an address, `peer` on a deployment that runs a proxy
+means the trusted set does not name it. Run it once after wiring and
+again after any route is added.
+
+Until 0.7.0 there was also an `AuditContextPolicy::Required`, which
+failed the login instead. It checked whether a route attached a context
+at all, never how much that context contained, so a context carrying no
+address satisfied it: it never meant "no authentication without
+evidence", only "no route that forgot the wiring". That is a
+compile-time property, and 0.7.0 checks it at compile time by putting
+the authenticating methods on a type you cannot construct without a
+context. The query above is what remains, and it answers the case the
+policy never could: a route that attached a context while the layer was
+missing.
 
 ```sql
 -- Brute-force: top failing source IPs per minute.

@@ -44,10 +44,20 @@ ROOT = pathlib.Path(".")
 # removed the name and the one that documents the migration, then goes when
 # that migration section is retired. A permanent entry means the gate has
 # stopped checking something it should.
+#
+# Holds bare type names and `Type::member` alike; both branches below
+# consult it. Until 0.7.0 only the `Type::member` branch did, so a removed
+# *type* had no way through the gate at all and the only recourse was
+# ALLOW, which would have been a false claim about provenance.
 REMOVED = {
     # Removed in 0.6.0. `docs/production/migrating.md` names it under
     # "0.5.0 to 0.6.0" to say the call has no replacement.
     "ShortString::prefix",
+    # Removed in 0.7.0: the runtime policy that checked whether a route had
+    # wired an audit context. `docs/production/migrating.md` names it to say
+    # the check is the compiler's now, and `docs/production/audit-events.md`
+    # names it to say why the SQL detector outlives it.
+    "AuditContextPolicy",
 }
 
 ALLOW = {
@@ -431,7 +441,7 @@ for d in docs:
         if in_rust_block:
             names += code_names(line)
         for name in names:
-            if name in ALLOW or name in local:
+            if name in ALLOW or name in local or name in REMOVED:
                 continue
             checked += 1
             if name not in defined:

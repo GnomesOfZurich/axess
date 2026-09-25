@@ -14,7 +14,7 @@
 //! is byte-identical to before the split.
 //!
 //! This `mod.rs` itself only carries the **internal helper**
-//! [`AuthnService::complete_factor_step`] that supports the
+//! [`RequestAuthnService::complete_factor_step`] that supports the
 //! multi-factor login path. Scope resolution moved into the store
 //! trait ([`FactorStore::resolve_factor`]); the service layer calls
 //! it directly instead of wrapping it.
@@ -24,7 +24,7 @@ mod impersonation;
 mod password_reset;
 mod signup;
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::RequestAuthnService;
 use crate::authn::service::outcomes::FactorOutcome;
 use crate::authn::{
     error::AuthnError,
@@ -33,7 +33,7 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,

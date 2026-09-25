@@ -54,6 +54,29 @@ matches="$(git ls-files '*.md' '*.rs' \
   | xargs grep -noE '(axess(-[a-z]+)?)[[:space:]]*=[[:space:]]*(\{[^}]*version[[:space:]]*=[[:space:]]*)?"[0-9][^"]*"' \
   2>/dev/null || true)"
 
+# A third shape, and the one that actually shipped wrong: prose naming the
+# release. `docs/intro/welcome.md` said "published on crates.io at `v0.3.0`"
+# three releases after 0.3.0, because the pattern above only matches a
+# dependency snippet. A chapter that states the current version is wrong from
+# the next release onward, so the rule is not "keep it updated" but "do not
+# state it": link to crates.io instead. Historical statements are fine, which
+# is why this looks only for a claim about the present.
+prose="$(git ls-files '*.md' '*.rs' \
+  | grep -v '^CHANGELOG.md$' \
+  | grep -v '^docs/production/migrating.md$' \
+  | xargs grep -noEi '(published|released|available|current(ly)?)[^.]{0,40}(crates\.io)?[^.]{0,20}(at|is|version)[[:space:]]+.?v?[0-9]+\.[0-9]+\.[0-9]+' \
+  2>/dev/null || true)"
+
+if [ -n "$prose" ]; then
+  echo "ERROR: prose states a current version, which drifts at the next release:" >&2
+  printf '%s\n' "$prose" | sed 's/^/  /' >&2
+  echo "" >&2
+  echo "       Link to https://crates.io/crates/axess instead of naming a" >&2
+  echo "       version. Historical statements (a migration section, a" >&2
+  echo "       changelog entry) are exempt and belong in those files." >&2
+  exit 1
+fi
+
 checked=0
 stale=0
 stale_report=""

@@ -116,7 +116,7 @@ axess-core has accumulated significant surface. When proposing a new crate carve
 1. **No reverse dep from axess-core onto the carved module.** If the module's types appear in `AuthnService` method signatures or in any axess-core trait surface, the carve isn't yet feasible; invert the dependency first.
 2. **Module has its own external dep blast.** Carving `delegated/` into `axess-delegated` won because it pulls `aes-gcm` only when adopters opt in. A carve that pulls no extra deps is just churn.
 3. **Module is consumable in isolation.** A consumer who wants only the carved module should not transitively recompile axess-core's protocol surface.
-4. **Re-export via the facade preserves the import path.** Adopters write `axess::middleware::ratelimit::*`, not `axess_middleware::ratelimit::*`. The facade decides the shape.
+4. **Re-export via the facade preserves the import path.** Adopters write `axess::RateLimitLayer`, not `axess_core::middleware::ratelimit::RateLimitLayer`. The facade decides the shape, and it flattens: the middleware lives under `axess_core::middleware`, and the facade lifts the types an adopter needs to the root and the layers to their own modules (`axess::csrf`, `axess::request_id`, `axess::trace_id`).
 
 ## Security
 

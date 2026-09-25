@@ -8,6 +8,7 @@ use axess::authn::{
     AuditQuery, AuthEvent, AuthEventStatus, AuthEventType, AuthFailureReason, EventQueryFilter,
     FactorKind, TenantId, UserId,
 };
+use axess::client_ip::Source;
 use chrono::{DateTime, Utc};
 use sqlx::{AssertSqlSafe, Row};
 use std::net::IpAddr;
@@ -29,8 +30,8 @@ impl AuditQuery for OurBackend {
         // from typed inputs keeps the query parameterised.
         let mut sql = String::from(
             "SELECT id, user_id, tenant_id, session_id, event_type, event_status, \
-             event_time, factor_kind, ip_address, user_agent, request_id, \
-             geo_country, error \
+             event_time, factor_kind, ip_address, ip_source, user_agent, request_id, \
+             trace_id, geo_country, error \
              FROM auth_events \
              WHERE (tenant_id = ?1",
         );
@@ -107,8 +108,10 @@ impl AuditQuery for OurBackend {
             let event_time: String = row.get("event_time");
             let factor_kind: Option<String> = row.get("factor_kind");
             let ip_address: Option<String> = row.get("ip_address");
+            let ip_source: String = row.get("ip_source");
             let user_agent: Option<String> = row.get("user_agent");
             let request_id: Option<String> = row.get("request_id");
+            let trace_id: Option<String> = row.get("trace_id");
             let geo_country: Option<String> = row.get("geo_country");
             let error: Option<String> = row.get("error");
 
@@ -161,6 +164,22 @@ impl AuditQuery for OurBackend {
             // with its reason intact.
             let error = error.map(AuthFailureReason::from);
 
+            // An unrecognised value means a writer from another version, or
+            // a hand-edited row. Reading it as `Unknown` keeps the rest of
+            // the event, and claiming a provenance the row does not have
+            // would be worse than admitting none.
+            let ip_source = match ip_source.as_str() {
+                "peer" => Source::Peer,
+                "forwarded" => Source::Forwarded,
+                "supplied" => Source::Supplied,
+                other => {
+                    if other != "unknown" {
+                        warn!(value = %other, "audit row: unrecognised ip_source");
+                    }
+                    Source::Unknown
+                }
+            };
+
             out.push(AuthEvent {
                 user_id: user_id.and_then(|u| UserId::try_new(u).ok()),
                 tenant_id: tenant_id.and_then(|t| TenantId::try_new(t).ok()),
@@ -170,8 +189,10 @@ impl AuditQuery for OurBackend {
                 event_time,
                 factor_kind,
                 ip_address,
+                ip_source,
                 user_agent,
                 request_id,
+                trace_id,
                 geo_country,
                 error,
                 actor_id: None,

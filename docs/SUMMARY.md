@@ -21,7 +21,6 @@
 - [OAuth 2.0 and OIDC](factors/oauth.md)
 - [FAPI 2.0](factors/fapi.md)
 - [LDAP bind](factors/ldap.md)
-- [mTLS-based authentication](factors/mtls.md)
 
 # Part IV: Authorization
 
@@ -61,6 +60,7 @@
 - [Audit pipeline](production/audit-pipeline.md)
 - [Rate limiting](production/rate-limiting.md)
 - [Security posture](production/security-posture.md)
+- [Behind an mTLS terminator](production/mtls.md)
 - [Operations runbook](production/operations.md)
 - [Migration guide](production/migrating.md)
 

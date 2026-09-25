@@ -1,6 +1,6 @@
 //! LDAP bind verification on [`AuthnService`].
 
-use super::{AuthnService, outcomes::FactorOutcome};
+use super::{RequestAuthnService, outcomes::FactorOutcome};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
@@ -10,7 +10,7 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,

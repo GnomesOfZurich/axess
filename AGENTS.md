@@ -121,6 +121,12 @@ testing/     DST mocks + fixtures (always-on)
 | `Auth*` | Shared across authn and authz | `AuthSession`, `AuthState`, `AuthEvent`, `AuthMethod`, `AuthPrincipal` |
 | `Authz*` | Authorization-layer-specific | `AuthzStore`, `AuthzSession`, `AuthzDecision`, `AuthzError` |
 
+A type that is another type narrowed to a scope prefixes that scope
+instead, keeping the base name intact so the pair scans together:
+`RequestAuthnService` is `AuthnService` for the life of one request. The
+scope goes first because it is what a reader has to get right, and the
+base name stays last so the two sort next to each other in any listing.
+
 ### Type suffixes
 
 | Suffix | Meaning | Examples |

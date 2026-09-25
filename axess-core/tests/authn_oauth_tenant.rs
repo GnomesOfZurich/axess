@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::{error::AuthnError, service::AuthnService};
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
@@ -88,7 +89,8 @@ async fn complete_oauth_login_refuses_cross_tenant_when_expected_tenant_set() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     // Simulate begin_oauth_login_in_tenant having stashed the binding.
@@ -119,7 +121,8 @@ async fn complete_oauth_login_accepts_when_tenant_matches() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     session
@@ -144,7 +147,8 @@ async fn complete_oauth_login_unbound_session_unaffected() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     stash_claim_lock(&session, "test", "external-sub-123").await;
     svc.complete_oauth_login(&user, &fake_claims(), &session)
@@ -161,7 +165,8 @@ async fn validator_with_identity_check_invalidates_tenant_mismatch() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     stash_claim_lock(&session, "test", "external-sub").await;
@@ -193,7 +198,8 @@ async fn validator_with_identity_check_passes_unmodified_session() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     stash_claim_lock(&session, "test", "external-sub").await;
     svc.complete_oauth_login(&user, &empty_claims("external-sub"), &session)

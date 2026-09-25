@@ -69,6 +69,8 @@ fn make_event(
         event_time: chrono::Utc::now().timestamp_micros(),
         factor_kind: None,
         ip_address: None,
+        ip_source: Default::default(),
+        trace_id: None,
         user_agent: None,
         request_id: None,
         geo_country: None,

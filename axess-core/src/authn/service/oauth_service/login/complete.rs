@@ -6,7 +6,7 @@
 //! the OIDC `sid` → local-session mapping for back-channel logout.
 
 use super::helpers::compute_claim_lock;
-use crate::authn::service::AuthnService;
+use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
@@ -21,79 +21,6 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Complete an OAuth login by linking claims to a local user and
-    /// establishing an authenticated session.
-    ///
-    /// OAuth uses a three-step flow (unlike the two-step core and FIDO2 flows):
-    /// 1. `begin_oauth_login`: redirect the user to the IdP
-    /// 2. `finish_oauth_login`: handle the callback, get `OAuthClaims`
-    /// 3. `complete_oauth_login`: the application resolves the local `User`
-    ///    from the claims (find or create), then calls this to establish the
-    ///    session. This step is separate because user resolution is
-    ///    application-specific logic that the library cannot perform.
-    #[tracing::instrument(skip(self, user, claims, session))]
-    pub async fn complete_oauth_login(
-        &self,
-        user: &crate::authn::types::User,
-        claims: &axess_factors::oauth::OAuthClaims,
-        session: &AuthSession,
-    ) -> Result<(), AuthnError<I::Error>> {
-        // Pre-flip checks: claim-lock binding + tenant rail.
-        // Both refuse before mutating session state so a
-        // bypass attempt never produces a partially-completed login.
-        self.verify_oauth_claim_lock(user, claims, session).await?;
-        self.enforce_oauth_expected_tenant(user, claims, session)
-            .await?;
-
-        let now = self.inner.clock.now();
-        session
-            .set_authenticated(user.id, user.tenant_id, now)
-            .await;
-        let sid = session.session_id().await;
-
-        // Post-flip session-binding work: register-or-clear MUST come
-        // first because the session is already Authenticated;
-        // subsequent fail-soft operations may log on outage but
-        // cannot bubble Err here without leaking an un-trackable
-        // Authenticated session to the caller.
-        self.register_oauth_session_or_clear(user, claims, session, &sid)
-            .await?;
-
-        // reset_failed_attempts must NOT propagate as Err(Store).
-        // The session is already authenticated and registered; failing
-        // the request now would leave behind a tracked authenticated
-        // session with no way to deliver the response cookie.
-        // Log + continue.
-        if let Err(e) = self.inner.identity.reset_failed_attempts(&user.id).await {
-            tracing::warn!(
-                user_id = %user.id,
-                error = %e,
-                "failed to reset failed-attempt counter post-OAuth; \
-                 proceeding (counter will reset on next successful login)"
-            );
-        }
-
-        // Maintain the (issuer, oidc_sid) → local
-        // session mapping that powers OIDC back-channel logout by
-        // `sid`. Self-contained; see helper for the TTL-prune /
-        // capacity-evict / atomic-swap-with-displaced-invalidation
-        // sequence.
-        self.maintain_oidc_sid_map(user, claims, &sid, now).await;
-
-        self.emit_audit_at(
-            AuthEventBuilder::success(AuthEventType::Authenticated)
-                .attributed_to(&user.id, &user.tenant_id)
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(claims.provider.to_string()),
-                ))
-                .with_session(sid),
-            now,
-        )
-        .await?;
-
-        Ok(())
-    }
-
     /// Verify the single-use claim-binding lock minted by
     /// `finish_oauth_login`.
     ///
@@ -375,5 +302,84 @@ where
                 reg.invalidate_session(&old_user_id, &old_session_id).await;
             }
         }
+    }
+}
+
+impl<I, F> RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
+    /// Complete an OAuth login by linking claims to a local user and
+    /// establishing an authenticated session.
+    ///
+    /// OAuth uses a three-step flow (unlike the two-step core and FIDO2 flows):
+    /// 1. `begin_oauth_login`: redirect the user to the IdP
+    /// 2. `finish_oauth_login`: handle the callback, get `OAuthClaims`
+    /// 3. `complete_oauth_login`: the application resolves the local `User`
+    ///    from the claims (find or create), then calls this to establish the
+    ///    session. This step is separate because user resolution is
+    ///    application-specific logic that the library cannot perform.
+    #[tracing::instrument(skip(self, user, claims, session))]
+    pub async fn complete_oauth_login(
+        &self,
+        user: &crate::authn::types::User,
+        claims: &axess_factors::oauth::OAuthClaims,
+        session: &AuthSession,
+    ) -> Result<(), AuthnError<I::Error>> {
+        // Pre-flip checks: claim-lock binding + tenant rail.
+        // Both refuse before mutating session state so a
+        // bypass attempt never produces a partially-completed login.
+        self.verify_oauth_claim_lock(user, claims, session).await?;
+        self.enforce_oauth_expected_tenant(user, claims, session)
+            .await?;
+
+        let now = self.inner.clock.now();
+        session
+            .set_authenticated(user.id, user.tenant_id, now)
+            .await;
+        let sid = session.session_id().await;
+
+        // Post-flip session-binding work: register-or-clear MUST come
+        // first because the session is already Authenticated;
+        // subsequent fail-soft operations may log on outage but
+        // cannot bubble Err here without leaking an un-trackable
+        // Authenticated session to the caller.
+        self.register_oauth_session_or_clear(user, claims, session, &sid)
+            .await?;
+
+        // reset_failed_attempts must NOT propagate as Err(Store).
+        // The session is already authenticated and registered; failing
+        // the request now would leave behind a tracked authenticated
+        // session with no way to deliver the response cookie.
+        // Log + continue.
+        if let Err(e) = self.inner.identity.reset_failed_attempts(&user.id).await {
+            tracing::warn!(
+                user_id = %user.id,
+                error = %e,
+                "failed to reset failed-attempt counter post-OAuth; \
+                 proceeding (counter will reset on next successful login)"
+            );
+        }
+
+        // Maintain the (issuer, oidc_sid) → local
+        // session mapping that powers OIDC back-channel logout by
+        // `sid`. Self-contained; see helper for the TTL-prune /
+        // capacity-evict / atomic-swap-with-displaced-invalidation
+        // sequence.
+        self.maintain_oidc_sid_map(user, claims, &sid, now).await;
+
+        self.emit_audit_at(
+            AuthEventBuilder::success(AuthEventType::Authenticated)
+                .attributed_to(&user.id, &user.tenant_id)
+                .with_factor(FactorKind::Federated(
+                    crate::authn::factor::FederatedProvider::Custom(claims.provider.to_string()),
+                ))
+                .with_session(sid),
+            now,
+        )
+        .await?;
+
+        Ok(())
     }
 }

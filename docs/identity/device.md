@@ -12,7 +12,11 @@ because most adopters benefit from it without specifically asking.
 
 The feature flag is `device` (on by default).
 
-## The three-stage ladder
+## The model
+
+What a device is to axess, and what makes its identifier unguessable.
+
+### The three-stage ladder
 
 A device occupies one of four states. The first three form an
 assurance ladder; the fourth is terminal.
@@ -54,7 +58,7 @@ on revocation. `Revoked` is terminal; a device
 that was revoked and is later re-encountered registers as a new
 `Unknown` device.
 
-## The device record
+### The device record
 
 The `Device` struct carries the per-device state:
 
@@ -91,7 +95,7 @@ from `Seen` to `Trusted` the application typically asks the user
 to name it ("My laptop", "iPhone 15 Pro"); the name appears in the
 user's device-management UI. It is not used for authentication.
 
-## The per-tenant pepper
+### The per-tenant pepper
 
 The fingerprint pepper is the secret the HMAC uses. Two design
 choices matter.
@@ -112,7 +116,11 @@ but new logins re-register devices from scratch.
 The chapter *Operations runbook* covers the rotation sequence and
 the staged rollout.
 
-## How devices interact with refresh tokens
+## How devices are used
+
+Refresh tokens, step-up decisions, and recognising a returning device.
+
+### How devices interact with refresh tokens
 
 The cascade between devices and refresh tokens is bidirectional
 and is what makes "revoke this device" actually mean "revoke every
@@ -136,7 +144,7 @@ attack-driven revocation ("a token was stolen"). The two cases
 converge on the same revocation primitive; both directions of
 cascade fire from the same code path.
 
-## Step-up policies
+### Step-up policies
 
 The trust level becomes interesting at the Cedar policy layer. A
 policy that wants to require a `Trusted` device for sensitive
@@ -163,7 +171,7 @@ that requires both FIDO2 and a Trusted device is the two
 constraints together; a policy that allows any of three different
 ways to clear the bar is the disjunction in one rule.
 
-## Identifying a device
+### Identifying a device
 
 Each request needs to be associated with a device. The mapping runs
 through the `DeviceResolver` trait:
@@ -229,7 +237,11 @@ a mobile app's installation id, a device certificate) implement
 `DeviceResolver` themselves, consult the stronger signal first, and fall
 back to the fingerprint match.
 
-## Caching
+## Performance and privacy
+
+Keeping the lookup cheap without keeping the fingerprint.
+
+### Caching
 
 The device record is read on most requests (every authenticated
 request that involves a Cedar evaluation reads the device). A
@@ -259,7 +271,7 @@ context* covers for the Cedar entity cache. Cache the data, not
 the decision; invalidate eagerly on mutation; let TTLs catch the
 cases the invalidation missed.
 
-## PII tokenisation and GDPR
+### PII tokenisation and GDPR
 
 The device record carries personally-identifiable information.
 The fingerprint features include the IP address (which is PII

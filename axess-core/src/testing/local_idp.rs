@@ -19,7 +19,7 @@
 //! # Example: integrate with `JwtVerifier`
 //!
 //! ```rust,ignore
-//! use axess::authn::jwt::svid::JwtSvidResolver;
+//! use axess::jwt::svid::JwtSvidResolver;
 //! use axess::testing::local_idp::{LocalIdpFixture, MintClaims};
 //! use chrono::{Duration, Utc};
 //!

@@ -69,15 +69,12 @@ pub mod provider;
 pub mod session;
 pub mod store;
 
-// `ip_from_headers_trusted` and `TrustedProxies` sit beside
-// `ip_from_headers_untrusted` here deliberately. That one trusts
-// whatever the client sent, and its own docs tell the reader to prefer
-// the trusted variant; leaving that variant reachable only through
-// `authz::context::` made the safe call the harder one to find.
-pub use context::{
-    BuildRequestContext, CidrParseError, NoContext, StandardRequestContext, TrustedProxies,
-    ip_from_headers_trusted, ip_from_headers_untrusted,
-};
+// The trusted-proxy primitives moved to `crate::client_ip` in 0.7.0. They
+// were here because the Cedar request context wanted an address, which put
+// the only correct walk behind the `authz` feature: the rate limiter could
+// not reach it without compiling Cedar, so it read the headers itself and
+// was spoofable for three releases.
+pub use context::{BuildRequestContext, NoContext, StandardRequestContext};
 pub use error::{AuthzDenied, AuthzError};
 pub use provider::{
     AuthzEntityProvider, RequestEntityProvider, make_action_uid, make_entity_uid,

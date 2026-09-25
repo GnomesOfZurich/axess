@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::authn::{error::AuthnError, service::AuthnService, types::StatusDetail};
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
@@ -17,12 +18,12 @@ fn make_service_with_user_in(
     user_id: &str,
     identifier: &str,
     tenant: &str,
-) -> AuthnService<MockIdentityStore, MockFactorStore> {
+) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
     let user = test_user_in_tenant(user_id, identifier, tenant);
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user);
-    AuthnService::new(identity, MockFactorStore::new())
+    AuthnService::new(identity, MockFactorStore::new()).with_audit_context(AuditContext::default())
 }
 
 #[tokio::test]
@@ -70,7 +71,8 @@ async fn begin_impersonation_in_tenant_rejects_cross_tenant() {
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     let res = svc
         .begin_impersonation_in_tenant(&admin, &target, &session)
@@ -88,7 +90,8 @@ async fn begin_impersonation_in_tenant_accepts_same_tenant() {
         .with_tenant(test_tenant())
         .with_user(admin.clone())
         .with_user(target.clone());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     svc.begin_impersonation_in_tenant(&admin, &target, &session)
         .await

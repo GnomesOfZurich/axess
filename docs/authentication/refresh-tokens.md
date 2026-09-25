@@ -3,16 +3,12 @@
 A session cookie keeps a user logged in until it expires or is cleared.
 A refresh token is the mechanism that extends that lifetime past the
 cookie's short window, without exposing a long-lived bearer credential
-to the client. The shape of the mechanism matters more than most
-adopters initially realise, because the choice between "long cookie"
-and "short cookie plus refresh token" is the choice between "stolen
-cookie is valid for a day" and "stolen cookie is valid for an hour
-and then detectable as theft when the legitimate user next refreshes".
+to the client. The choice between a long cookie and a short cookie plus
+a refresh token is the choice between a stolen cookie that is valid for
+a day and one that is valid for an hour and then shows up as theft the
+next time the legitimate user refreshes.
 
-This chapter covers the refresh token shape in axess: hash-only
-storage, token families for reuse detection, device binding and
-cascade revocation, and the configuration surface adopters tune. The
-relevant code lives in
+The code is in
 [`axess-core/src/session/refresh.rs`](https://github.com/GnomesOfZurich/axess/blob/main/axess-core/src/session/refresh.rs).
 
 ## Why refresh tokens at all
@@ -83,17 +79,12 @@ issued by rotation extends the same family. When the system detects
 that a token from a family has been used after rotation (which is
 what theft looks like), it revokes the entire family.
 
-`device_id` is the link to the device identity ladder. When a refresh
-token is bound to a device, revoking the token can cascade to revoke
-the device, and revoking the device cascades to revoke every token
-bound to it. The cascade is bidirectional and is the mechanism that
-makes "log out everywhere on this device" work in practice. *Device
-identity* covers the device ladder in detail.
+`device_id` is the link to the device identity ladder, and it is what
+makes revocation travel in both directions between the two stores. The
+section on the cascade below has the detail; *Device identity* covers
+the ladder itself.
 
 ## How families catch theft
-
-The interesting part of the design is the family. The mechanism is
-worth walking through with a concrete sequence.
 
 Alice logs in. The server issues refresh token A, in family F. A is
 delivered to her browser; the hash of A is stored in the database
@@ -128,12 +119,10 @@ synchronously and take application-specific action (logging Alice
 out of related sessions, alerting her by email, escalating to
 fraud review).
 
-The pattern catches a class of attacks that long-lived sessions
-cannot detect at all. Even a sophisticated attacker who avoids
-generating alerts cannot avoid the family revoke, because the
-legitimate user's next refresh inevitably triggers it. The trade-off
-is one re-login per detected compromise; given the alternative is
-silent access, the trade-off is worth it.
+What a long-lived session cannot do is notice. An attacker who avoids
+every other alert still cannot avoid this one, because it is the
+legitimate user's next refresh that fires it, and the cost is a single
+re-login per detection.
 
 ## Device-binding cascade
 
@@ -185,8 +174,7 @@ pub struct RefreshTokenConfig {
 ```
 
 The defaults are conservative for most applications: a thirty-day TTL,
-ten concurrent tokens per user, rotation enabled, and no pepper. Each
-field is worth a few words of guidance.
+ten concurrent tokens per user, rotation enabled, and no pepper.
 
 `ttl` is how long a refresh token is valid before it expires without
 being used. Thirty days is enough that most users do not feel the

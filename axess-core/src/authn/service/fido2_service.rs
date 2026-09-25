@@ -1,6 +1,6 @@
 //! FIDO2/WebAuthn ceremony methods on [`AuthnService`].
 
-use super::{AuthnService, outcomes::FactorOutcome};
+use super::{AuthnService, RequestAuthnService, outcomes::FactorOutcome};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
@@ -108,6 +108,60 @@ where
         }
     }
 
+    /// Begin a passwordless/discoverable FIDO2 authentication.
+    #[tracing::instrument(skip(self, session))]
+    pub async fn begin_discoverable_login(
+        &self,
+        session: &AuthSession,
+    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
+        let webauthn = match &self.inner.fido2 {
+            Some(w) => w,
+            None => return Err(AuthnError::NoFlow),
+        };
+
+        let (challenge, auth_state) =
+            webauthn.start_discoverable_authentication().map_err(|e| {
+                tracing::warn!("FIDO2 start_discoverable_authentication failed: {e:?}");
+                AuthnError::NoFlow
+            })?;
+
+        let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
+        session.set_custom(fido2_keys::DISC_STATE, state_json).await;
+        self.stamp_ceremony_start(session).await;
+
+        serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
+    }
+
+    // ── Credential management ────────────────────────────────────────────────
+
+    /// List all FIDO2 credentials registered for a user.
+    #[tracing::instrument(skip(self, user))]
+    pub async fn list_fido2_credentials(
+        &self,
+        user: &crate::authn::types::User,
+    ) -> Result<Vec<crate::authn::factor::Fido2Credential>, AuthnError<I::Error>> {
+        let user_scope = AuthnScope::User {
+            tenant_id: user.tenant_id,
+            user_id: user.id,
+        };
+        match self
+            .inner
+            .factors
+            .load_factor(&user_scope, FactorKind::Fido2)
+            .await
+        {
+            Ok(Some(FactorConfig::Fido2(cfg))) => Ok(cfg.credentials),
+            Ok(_) => Ok(vec![]),
+            Err(e) => Err(AuthnError::Store(e)),
+        }
+    }
+}
+
+impl<I, F> RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
     /// Verify a FIDO2/WebAuthn authentication assertion.
     pub(super) async fn verify_fido2_factor(
         &self,
@@ -391,30 +445,6 @@ where
         Ok(())
     }
 
-    /// Begin a passwordless/discoverable FIDO2 authentication.
-    #[tracing::instrument(skip(self, session))]
-    pub async fn begin_discoverable_login(
-        &self,
-        session: &AuthSession,
-    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
-        let webauthn = match &self.inner.fido2 {
-            Some(w) => w,
-            None => return Err(AuthnError::NoFlow),
-        };
-
-        let (challenge, auth_state) =
-            webauthn.start_discoverable_authentication().map_err(|e| {
-                tracing::warn!("FIDO2 start_discoverable_authentication failed: {e:?}");
-                AuthnError::NoFlow
-            })?;
-
-        let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
-        session.set_custom(fido2_keys::DISC_STATE, state_json).await;
-        self.stamp_ceremony_start(session).await;
-
-        serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
-    }
-
     /// Complete a passwordless/discoverable FIDO2 authentication.
     #[tracing::instrument(skip(self, assertion, user, credentials, session))]
     pub async fn finish_discoverable_login(
@@ -586,30 +616,6 @@ where
                 session.clear().await;
                 Err(e)
             }
-        }
-    }
-
-    // ── Credential management ────────────────────────────────────────────────
-
-    /// List all FIDO2 credentials registered for a user.
-    #[tracing::instrument(skip(self, user))]
-    pub async fn list_fido2_credentials(
-        &self,
-        user: &crate::authn::types::User,
-    ) -> Result<Vec<crate::authn::factor::Fido2Credential>, AuthnError<I::Error>> {
-        let user_scope = AuthnScope::User {
-            tenant_id: user.tenant_id,
-            user_id: user.id,
-        };
-        match self
-            .inner
-            .factors
-            .load_factor(&user_scope, FactorKind::Fido2)
-            .await
-        {
-            Ok(Some(FactorConfig::Fido2(cfg))) => Ok(cfg.credentials),
-            Ok(_) => Ok(vec![]),
-            Err(e) => Err(AuthnError::Store(e)),
         }
     }
 

@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::{
     error::AuthnError,
     factor::{FactorCredential, FactorKind, ZeroizedString},
@@ -45,11 +46,11 @@ async fn empty_factor_chain() {
             ),
         );
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
@@ -60,7 +61,7 @@ async fn empty_factor_chain() {
 async fn verify_factor_without_begin_returns_no_flow() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let result = service
@@ -77,7 +78,7 @@ async fn verify_factor_without_begin_returns_no_flow() {
 async fn prepare_factor_without_begin_returns_no_flow() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let result = service.prepare_factor(&session).await;
@@ -127,12 +128,10 @@ async fn suspended_user_cannot_login() {
             ),
         );
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
-    let outcome = service
-        .begin_login("alice", "default", &session, None)
-        .await;
+    let outcome = service.begin_login("alice", "default", &session).await;
     assert!(matches!(outcome, Ok(LoginOutcome::Locked { .. })));
 }
 
@@ -154,7 +153,8 @@ async fn unknown_tenant_is_indistinguishable_from_bad_credentials() {
 
     // No tenants at all.
     let unknown_tenant = AuthnService::new(MockIdentityStore::new(), MockFactorStore::new())
-        .begin_login("alice", "nonexistent", &session, None)
+        .with_audit_context(AuditContext::default())
+        .begin_login("alice", "nonexistent", &session)
         .await;
 
     // A tenant that exists, but no matching user.
@@ -162,7 +162,8 @@ async fn unknown_tenant_is_indistinguishable_from_bad_credentials() {
         MockIdentityStore::new().with_tenant(test_tenant()),
         MockFactorStore::new(),
     )
-    .begin_login("alice", "default", &session, None)
+    .with_audit_context(AuditContext::default())
+    .begin_login("alice", "default", &session)
     .await;
 
     assert!(

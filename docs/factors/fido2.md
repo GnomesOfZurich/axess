@@ -11,11 +11,6 @@ the credential was registered, and a credential registered against
 not behavioural: the browser refuses to use the credential at the
 wrong origin, regardless of what the user clicks.
 
-This chapter walks through the integration: the two-ceremony model,
-relying-party configuration, storage, the resident-key choice, and
-the rollout patterns for shipping passkeys alongside an existing
-password-and-TOTP flow.
-
 The feature flag is `fido2` (off by default), enabled with
 `features = ["fido2"]` on the `axess` facade.
 
@@ -236,27 +231,17 @@ highest-sensitivity actions through Cedar policy.
 
 ## Troubleshooting
 
-A few failures recur during initial integration.
+Three failures recur during a first integration.
 
-If the browser rejects the registration with "The relying party ID
-is not a registrable suffix of the page origin", the `rp_id` does
-not match the page origin. Setting `rp_id` to `example.com` while
-the registration page is on `accounts.example.com` works; setting
-it to `attacker.com` does not. Check the host part of the actual
-URL the browser is on.
+| Symptom | Usually | What to do |
+|---|---|---|
+| "The relying party ID is not a registrable suffix of the page origin" | `rp_id` does not match the page origin. `example.com` works from a page on `accounts.example.com`; `attacker.com` does not | Check the host part of the URL the browser is actually on |
+| Authentication works on one device, fails on another | The credential is a passkey on the first device and was never synced. Some authenticators register non-syncable credentials by default | Check `resident_key: Required` and the authenticator's own documentation |
+| The signature counter check fails for legitimate users | The authenticator does not implement the counter. Some legacy hardware keys do not | Log the mismatch and let the authentication proceed |
 
-If authentication succeeds on one device and fails on another, the
-likely cause is that the credential is a passkey on one device but
-not synced to the other. Some authenticators register
-non-syncable credentials by default; check the
-`resident_key: Required` setting and the device's documentation.
-
-If the signature counter check fails for legitimate users, the
-authenticator may not implement the counter (some legacy hardware
-keys do not). The fix is to log the counter mismatch and let the
-authentication proceed, sacrificing clone detection for usability
-on those specific authenticators. The decision is policy, and the
-application surfaces it explicitly.
+That last one trades clone detection for usability on those
+authenticators, so it is a policy decision rather than a fix, and the
+application makes it explicitly.
 
 ## Further reading
 

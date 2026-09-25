@@ -30,7 +30,7 @@
 //! - `GET /auth/callback/:provider`; handles IdP callback
 //! - `GET /profile`; shows authenticated user info (requires login)
 
-use axess::authn::AuthnService;
+use axess::authn::{AuditContext, AuthnService};
 use axess::federation::oauth::OAuthProviderConfig;
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{AuthSession, MemorySessionStore, SecureRng, SessionLayer};
@@ -106,9 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state)
         .layer(session_layer);
 
+    // Resolve the client address once, outside everything that reads one.
+    // Without it the audit rows carry no address and say so
+    // (`ip_source = 'unknown'`). `loopback_only` suits a dev server bound
+    // to 127.0.0.1; name the proxy's ranges in a real deployment.
+    let app = axess::client_ip::layer(app, axess::client_ip::TrustedProxies::loopback_only());
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     info!("Listening on http://127.0.0.1:3000");
-    axum::serve(listener, app.into_make_service()).await?;
+    // `with_connect_info` is what puts the peer address where the
+    // client-IP layer can read it.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -174,9 +186,11 @@ async fn callback(
     Path(_provider): Path<String>,
     Query(params): Query<CallbackParams>,
     session: AuthSession,
+    audit: AuditContext,
 ) -> impl IntoResponse {
     match state
         .authn
+        .with_audit_context(audit)
         .finish_oauth_login(&params.code, &params.state, &session)
         .await
     {

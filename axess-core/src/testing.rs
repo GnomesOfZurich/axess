@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.6.0", features = ["testing"] }
+//! axess = { version = "0.7.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied

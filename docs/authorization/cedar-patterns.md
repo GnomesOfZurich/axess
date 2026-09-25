@@ -9,7 +9,11 @@ fighting each other. The examples are concrete enough that you
 should be able to paste them into a `.cedar` file and have them
 type-check against a corresponding schema.
 
-## RBAC: roles as groups
+## The three styles
+
+Roles, relationships and attributes, and how they combine.
+
+### RBAC: roles as groups
 
 Role-based access control assigns users to roles and assigns
 permissions to roles. The model has been the workhorse of
@@ -71,7 +75,7 @@ second is when permissions need to depend on the request context
 (MFA must be present for sensitive actions), which is the ABAC
 case below.
 
-## ReBAC: relationships as paths
+### ReBAC: relationships as paths
 
 Relationship-based access control assigns permissions based on the
 relationship between the principal and the resource, not on a
@@ -161,7 +165,7 @@ intermediate entity (a "can_view" set on the document that the
 application's data layer computes ahead of time) and let the
 policy match on the simpler shape.
 
-## ABAC: attributes as conditions
+### ABAC: attributes as conditions
 
 Attribute-based access control adds context to the decision. The
 attributes might be on the principal (MFA status, last
@@ -227,7 +231,7 @@ in doubt, write the policy and read it back: if the rule says
 relationship Z to this resource can perform Y," it is ReBAC; if it
 says "users can perform Y when condition W," it is ABAC.
 
-## Composing the three styles
+### Composing the three styles
 
 A real production policy set mixes the three. A user who has the
 `editor` role (RBAC) can edit any document, but a user who owns a
@@ -287,7 +291,11 @@ express the absolute constraints through `forbid` rules. The
 about high-risk principal states; they are the small set of cases
 where a positive grant is not enough.
 
-## Tenant isolation as a structural rule
+## Patterns worth copying
+
+Two that are easier to get right in policy than in Rust.
+
+### Tenant isolation as a structural rule
 
 Multi-tenant applications need a structural rule that no policy
 should ever leak data across tenants. The right shape is a single
@@ -317,7 +325,7 @@ type system and the rule denies. The policy authoring style is to
 treat tenant id as a required attribute on every multi-tenant
 entity, and to let this `forbid` catch any drift.
 
-## Step-up as a policy concern
+### Step-up as a policy concern
 
 Step-up authentication is the pattern where a user is asked to
 re-prove identity (or to prove with a stronger factor) before

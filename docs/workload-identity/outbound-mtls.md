@@ -1,8 +1,7 @@
 # Outbound: mTLS
 
-This chapter covers the case where your application presents an
-X.509 client certificate during the outbound TLS handshake to a
-downstream service that requires mTLS. The credential is the
+Your application presents an X.509 client certificate during the
+outbound TLS handshake, to a downstream service that requires mTLS. The credential is the
 application's workload identity in X.509 form, typically an
 X.509-SVID issued by SPIRE or an equivalent. The downstream
 validates the certificate against its trust anchor and accepts

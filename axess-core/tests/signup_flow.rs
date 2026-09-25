@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::{
     authn::{
         error::AuthnError,
@@ -40,10 +41,10 @@ fn candidate_user(id: &str, identifier: &str) -> User {
     }
 }
 
-fn make_service() -> AuthnService<MockIdentityStore, MockFactorStore> {
+fn make_service() -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    AuthnService::new(identity, factors)
+    AuthnService::new(identity, factors).with_audit_context(AuditContext::default())
 }
 
 // ── Signup flow tests ────────────────────────────────────────────────────────
@@ -86,7 +87,7 @@ async fn begin_signup_active_user_returns_already_exists() {
         .with_tenant(test_tenant())
         .with_user(active_user);
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u2", "alice@example.com");
@@ -109,7 +110,7 @@ async fn begin_signup_orphan_candidate_resumes() {
         .with_tenant(test_tenant())
         .with_user(candidate_user("u1", "alice@example.com"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     // Retry begin_signup with a *different* candidate user_id but same
@@ -138,7 +139,7 @@ async fn begin_signup_bad_tenant_returns_tenant_not_active() {
     // No tenants registered.
     let identity = MockIdentityStore::new();
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u1", "alice@example.com");
@@ -186,7 +187,8 @@ async fn complete_signup_without_pending_workflow_returns_no_flow() {
 async fn signup_records_audit_events() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u1", "alice@example.com");
@@ -224,7 +226,8 @@ async fn suspend_user_changes_status() {
             }
         });
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     let detail = StatusDetail {
         reason: "policy violation".into(),
@@ -263,7 +266,8 @@ async fn activate_user_changes_status() {
             }
         });
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     service.activate_user(&uid("u1")).await.unwrap();
 
@@ -295,7 +299,8 @@ async fn suspend_then_reactivate() {
             }
         });
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     // Suspend.
     let detail = StatusDetail {

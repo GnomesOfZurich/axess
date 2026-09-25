@@ -17,7 +17,11 @@ of the request lifecycle. A request context that omits an attribute
 a policy expects produces denies that are hard to debug. The shapes
 below avoid both failure modes.
 
-## The entity provider contract
+## The contract
+
+What you must supply, and how much of it.
+
+### The entity provider contract
 
 `AuthzEntityProvider` is the trait you implement. The
 job is to take a request's principal and resource UIDs, and return
@@ -72,7 +76,7 @@ includes hundreds of entities the policy never touches wastes the
 database time. The right shape is the minimum set the policies
 need for this request.
 
-## What "enough" means
+### What "enough" means
 
 The policies that the evaluator runs against the entity set
 typically need a few categories of data.
@@ -110,81 +114,20 @@ attached to the resource).
 The application's data model is the source of truth for all of
 this; the provider's job is to shape the data into Cedar's vocabulary.
 
-## A worked provider
+## Building one
 
-A typical provider for a document-management application looks
-like this:
+A concrete implementation, and where to put a cache.
+
+### A worked provider
+
+This is the provider from `examples/authz`, included from the file CI
+compiles, so what you read here cannot drift from something that builds.
+It reads its rows from an in-memory map so the example needs no database;
+a provider backed by Postgres issues the equivalent queries and the shape
+of what follows is identical.
 
 ```rust,ignore
-struct AppEntityProvider {
-    db: PgPool,
-}
-
-impl AuthzEntityProvider for AppEntityProvider {
-    type ResourceId = String;
-    type Error = ProviderError;
-
-    async fn entities_for(
-        &self,
-        principal: &EntityUid,
-        resource_id: &String,
-        _action: &EntityUid,
-    ) -> Result<Entities, Self::Error> {
-        let mut entities = Vec::new();
-
-        // Principal: load roles, build them as entities, attach as parents.
-        let user_id = principal.id().as_ref();
-        let roles = sqlx::query_as::<_, (String,)>(
-            "SELECT role_name FROM user_roles WHERE user_id = $1",
-        )
-        .bind(user_id)
-        .fetch_all(&self.db)
-        .await?;
-
-        let mut role_uids = HashSet::new();
-        for (role_name,) in roles {
-            let role_uid = self.make_uid("Role", &role_name)?;
-            entities.push(Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())?);
-            role_uids.insert(role_uid);
-        }
-        entities.push(Entity::new(principal.clone(), HashMap::new(), role_uids)?);
-
-        // Resource: its row, and the attributes policies match on.
-        let doc = sqlx::query_as::<_, (String, String)>(
-            "SELECT owner_id, tenant_id FROM documents WHERE id = $1",
-        )
-        .bind(resource_id)
-        .fetch_optional(&self.db)
-        .await?
-        .ok_or_else(|| ProviderError::NotFound(resource_id.clone()))?;
-
-        let owner_uid = self.make_uid("User", &doc.0)?;
-        let mut attrs = HashMap::new();
-        attrs.insert(
-            "owner".to_string(),
-            RestrictedExpression::new_entity_uid(owner_uid.clone()),
-        );
-        let tenant_uid = self.make_uid("Tenant", &doc.1)?;
-        entities.push(Entity::new(
-            self.resource_uid(resource_id)?,
-            attrs,
-            HashSet::from([tenant_uid]),
-        )?);
-
-        // Anything a policy can reach must be in the set. An `owner`
-        // attribute pointing at a User entity that is absent evaluates
-        // to a deny, not an error, so build the owner too.
-        if doc.0 != user_id {
-            entities.push(Entity::new(owner_uid, HashMap::new(), HashSet::new())?);
-        }
-
-        Entities::from_entities(entities, None).map_err(ProviderError::build)
-    }
-
-    fn resource_uid(&self, id: &String) -> Result<EntityUid, AuthzError> {
-        self.make_uid("Document", id)
-    }
-}
+{{#include ../../examples/authz/src/provider.rs:provider}}
 ```
 
 The last step is the one that bites. Cedar evaluates against the
@@ -194,18 +137,14 @@ policy that needed it does not match. The failure looks like a
 too-strict policy rather than a missing row. Build every entity any
 policy in your set can reach from the principal or the resource.
 
-`examples/authz/` is a complete working version of this provider,
-against an in-memory store rather than Postgres.
-
 The shape is uniform: one principal entity (with parents from the
 role-and-group store), one or more resource entities (each with
 parents from the tenant model and attributes from the resource's
-row). The provider uses Postgres in this example; the choice is
-yours. The key shape is that the loads are batched per
-request (one query for memberships, one or two for the resources),
-not per policy or per entity.
+row). Where those rows live is your choice. What matters is that the
+loads are batched per request, one query for memberships and one or two
+for the resources, rather than per policy or per entity.
 
-## Caching entities, not decisions
+### Caching entities, not decisions
 
 The single most important performance choice in a Cedar integration
 is what to cache. Axess takes the conservative line: entity graphs
@@ -259,7 +198,11 @@ generic `axess-cache` machinery the entity cache uses. *Operations
 runbook* covers the operational signals for the cache (hit rate,
 eviction rate, invalidation rate).
 
-## The standard request context
+## Request context
+
+What the evaluator sees beyond the entities.
+
+### The standard request context
 
 The context is the third input to a policy evaluation. It carries
 the per-request attributes that are not on the principal or the
@@ -326,7 +269,7 @@ denies at runtime, which is the conservative answer but a silent
 one: the reason is on the `axess::authz::decision` target, not in
 a returned error.
 
-## When to extend the context
+### When to extend the context
 
 The custom keys exist to bridge application state that does not
 fit on the principal or the resource. Common cases:

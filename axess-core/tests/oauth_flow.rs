@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
@@ -32,7 +33,8 @@ async fn oauth_csrf_mismatch_rejected() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     authn
@@ -62,7 +64,8 @@ async fn oauth_expired_ceremony_rejected() {
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     authn
@@ -109,7 +112,8 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     authn
@@ -142,7 +146,8 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
 #[tokio::test]
 async fn oauth_unknown_provider_rejected() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new());
+    let authn = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = authn
@@ -171,7 +176,8 @@ async fn mock_oauth_provider_returns_configured_user() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let claims = authn
         .refresh_oauth_token("mock-idp", "any-refresh-token")
@@ -199,7 +205,8 @@ async fn mock_oauth_provider_simulates_failure() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let result = authn.refresh_oauth_token("failing-idp", "some-token").await;
     assert!(result.is_err());

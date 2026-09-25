@@ -1,6 +1,6 @@
 //! Shared building blocks for the factor verify/prepare pipelines.
 //!
-//! [`AuthnService::verify_factor`] and [`AuthnService::prepare_factor`] both:
+//! [`RequestAuthnService::verify_factor`] and [`RequestAuthnService::prepare_factor`] both:
 //! - extract the `Authenticating` triple from the session (or fail with
 //!   [`AuthnError::NoFlow`]),
 //! - re-check account status against the store on every step (lockout
@@ -25,13 +25,13 @@
 //! Before this split, `verify_factor` was 345 lines in one
 //! method; afterwards it is a ~50-line pipeline. `prepare_factor`'s
 //! account-status block was a copy-paste of `verify_factor`'s; both
-//! now share [`AuthnService::enforce_account_status`].
+//! now share [`RequestAuthnService::enforce_account_status`].
 //!
 //! [`AuthnError::NoFlow`]: crate::authn::error::AuthnError::NoFlow
 
-use super::AuthnService;
 use super::outcomes::FactorOutcome;
 use super::verification::{apply_email_otp_failure, apply_hotp_failure};
+use super::{AuthnService, RequestAuthnService};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
@@ -42,7 +42,7 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 
-/// Outcome of [`AuthnService::enforce_account_status`].
+/// Outcome of [`RequestAuthnService::enforce_account_status`].
 ///
 /// Caller maps each variant to its own response shape:
 /// - `verify_factor` → `Locked { until }` becomes [`FactorOutcome::Locked { until }`],
@@ -71,7 +71,7 @@ pub(super) enum AccountStatusEnforcement {
     NotActive(EntityState),
 }
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
@@ -137,6 +137,136 @@ where
         self.emit_audit(builder).await
     }
 
+    /// Record a factor-verification failure: audit emit, counter
+    /// increment, lockout-policy verdict.
+    ///
+    /// Returns the [`FactorOutcome`] to bubble up: `Locked { until: None }`
+    /// once the lockout threshold is reached, otherwise `InvalidCredential`.
+    ///
+    /// Audit-emit comes BEFORE the counter increment so audit-store
+    /// errors fail loudly instead of letting counter and log diverge
+    /// (otherwise a user could get locked with no explanatory audit
+    /// row, leaving the SOC team correlating inconsistent state).
+    ///
+    /// Store errors on `record_failed_attempt` are NOT
+    /// propagated as `Err(AuthnError::Store)`. Doing so would leak a
+    /// distinct timing/error signature to the attacker (a Store-error
+    /// response is measurably different from a normal
+    /// `InvalidCredential`), letting them tell good usernames apart
+    /// from bad ones AND letting them brute-force without ever
+    /// incrementing the lockout counter. Instead we log + return
+    /// `InvalidCredential`. Persistent counter outages should be
+    /// monitored externally (metrics hook + log levels) and a
+    /// circuit-breaker added at the application layer if needed.
+    pub(super) async fn record_factor_failure(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        current_kind: &FactorKind,
+        session: &AuthSession,
+    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
+        self.inner.metrics.factor_failure();
+
+        // This is the one intentional bypass of `emit_audit` /
+        // `emit_audit_at`. The audit-ordering fix needs a `tracing::error!` with
+        // `user_id = %user_id` context that the generic emit helpers
+        // don't provide; every other audit emit in the crate goes
+        // through them. Direct `self.inner.identity.record_event(...)` is
+        // load-bearing here, not stylistic.
+        if let Err(e) = self
+            .inner
+            .identity
+            .record_event(
+                AuthEventBuilder::failure(AuthEventType::FactorVerified)
+                    .attributed_to(user_id, tenant_id)
+                    .with_factor(current_kind.clone())
+                    .build_at(self.inner.clock.now()),
+            )
+            .await
+        {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "failed to record FactorVerified Failure audit event; \
+                 SOC dashboards will be missing this attempt; proceeding with counter update"
+            );
+        }
+
+        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+
+        let count = match self.inner.identity.record_failed_attempt(user_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                // A counter-store outage is operationally distinct from the
+                // user typing a wrong password, and the counter can fail
+                // while the reads that got us here keep working: the
+                // read-replica split puts reads on a replica and this write
+                // on the primary. Tag the metric separately so operators can
+                // alert on it without false-firing on every wrong password.
+                self.inner.metrics.factor_counter_store_outage();
+                let verdict = match policy.on_counter_unavailable {
+                    // Fail closed. The attempt counts as locked, so brute
+                    // force stays bounded while the counter is dead. This
+                    // leaks nothing about user existence: an unknown
+                    // identifier never reaches here, having been rejected at
+                    // `begin_login` with timing equalization.
+                    CounterUnavailable::Lock => {
+                        self.inner.metrics.account_locked();
+                        let until = policy.duration.and_then(|d| {
+                            chrono::Duration::from_std(d)
+                                .ok()
+                                .map(|d| self.inner.clock.now() + d)
+                        });
+                        FactorOutcome::Locked { until }
+                    }
+                    // Fail open. Logins keep working and lockout is disabled
+                    // until the counter comes back.
+                    CounterUnavailable::Allow => FactorOutcome::InvalidCredential,
+                };
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    outage = "factor_counter_store",
+                    on_counter_unavailable = ?policy.on_counter_unavailable,
+                    "record_failed_attempt errored; lockout counter not updated; \
+                     monitor counter-store health"
+                );
+                session.record_attempt_at(self.inner.clock.now()).await;
+                return Ok(verdict);
+            }
+        };
+
+        // Update session state for UI feedback only; never used for
+        // lockout decisions (those are store-authoritative).
+        session.record_attempt_at(self.inner.clock.now()).await;
+
+        if count >= policy.max_attempts {
+            self.inner.metrics.account_locked();
+            // Surface the lockout window to the caller as `now +
+            // policy.duration`, computed at the verdict that creates
+            // the lockout (mirrors what production stores write into
+            // the suspension row at the same moment). UIs avoid a
+            // follow-up `enforce_account_status` round-trip to learn
+            // the expiry.
+            let until = policy.duration.and_then(|d| {
+                chrono::Duration::from_std(d)
+                    .ok()
+                    .map(|d| self.inner.clock.now() + d)
+            });
+            return Ok(FactorOutcome::Locked { until });
+        }
+        Ok(FactorOutcome::InvalidCredential)
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
+impl<I, F> AuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
     /// Atomically apply a `FailWithUpdate` factor-config increment
     /// against the user-scope row.
     ///
@@ -282,127 +412,6 @@ where
         Ok(())
     }
 
-    /// Record a factor-verification failure: audit emit, counter
-    /// increment, lockout-policy verdict.
-    ///
-    /// Returns the [`FactorOutcome`] to bubble up: `Locked { until: None }`
-    /// once the lockout threshold is reached, otherwise `InvalidCredential`.
-    ///
-    /// Audit-emit comes BEFORE the counter increment so audit-store
-    /// errors fail loudly instead of letting counter and log diverge
-    /// (otherwise a user could get locked with no explanatory audit
-    /// row, leaving the SOC team correlating inconsistent state).
-    ///
-    /// Store errors on `record_failed_attempt` are NOT
-    /// propagated as `Err(AuthnError::Store)`. Doing so would leak a
-    /// distinct timing/error signature to the attacker (a Store-error
-    /// response is measurably different from a normal
-    /// `InvalidCredential`), letting them tell good usernames apart
-    /// from bad ones AND letting them brute-force without ever
-    /// incrementing the lockout counter. Instead we log + return
-    /// `InvalidCredential`. Persistent counter outages should be
-    /// monitored externally (metrics hook + log levels) and a
-    /// circuit-breaker added at the application layer if needed.
-    pub(super) async fn record_factor_failure(
-        &self,
-        user_id: &UserId,
-        tenant_id: &TenantId,
-        current_kind: &FactorKind,
-        session: &AuthSession,
-    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        self.inner.metrics.factor_failure();
-
-        // This is the one intentional bypass of `emit_audit` /
-        // `emit_audit_at`. The audit-ordering fix needs a `tracing::error!` with
-        // `user_id = %user_id` context that the generic emit helpers
-        // don't provide; every other audit emit in the crate goes
-        // through them. Direct `self.inner.identity.record_event(...)` is
-        // load-bearing here, not stylistic.
-        if let Err(e) = self
-            .inner
-            .identity
-            .record_event(
-                AuthEventBuilder::failure(AuthEventType::FactorVerified)
-                    .attributed_to(user_id, tenant_id)
-                    .with_factor(current_kind.clone())
-                    .build_at(self.inner.clock.now()),
-            )
-            .await
-        {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "failed to record FactorVerified Failure audit event; \
-                 SOC dashboards will be missing this attempt; proceeding with counter update"
-            );
-        }
-
-        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
-
-        let count = match self.inner.identity.record_failed_attempt(user_id).await {
-            Ok(n) => n,
-            Err(e) => {
-                // A counter-store outage is operationally distinct from the
-                // user typing a wrong password, and the counter can fail
-                // while the reads that got us here keep working: the
-                // read-replica split puts reads on a replica and this write
-                // on the primary. Tag the metric separately so operators can
-                // alert on it without false-firing on every wrong password.
-                self.inner.metrics.factor_counter_store_outage();
-                let verdict = match policy.on_counter_unavailable {
-                    // Fail closed. The attempt counts as locked, so brute
-                    // force stays bounded while the counter is dead. This
-                    // leaks nothing about user existence: an unknown
-                    // identifier never reaches here, having been rejected at
-                    // `begin_login` with timing equalization.
-                    CounterUnavailable::Lock => {
-                        self.inner.metrics.account_locked();
-                        let until = policy.duration.and_then(|d| {
-                            chrono::Duration::from_std(d)
-                                .ok()
-                                .map(|d| self.inner.clock.now() + d)
-                        });
-                        FactorOutcome::Locked { until }
-                    }
-                    // Fail open. Logins keep working and lockout is disabled
-                    // until the counter comes back.
-                    CounterUnavailable::Allow => FactorOutcome::InvalidCredential,
-                };
-                tracing::warn!(
-                    user_id = %user_id,
-                    error = %e,
-                    outage = "factor_counter_store",
-                    on_counter_unavailable = ?policy.on_counter_unavailable,
-                    "record_failed_attempt errored; lockout counter not updated; \
-                     monitor counter-store health"
-                );
-                session.record_attempt_at(self.inner.clock.now()).await;
-                return Ok(verdict);
-            }
-        };
-
-        // Update session state for UI feedback only; never used for
-        // lockout decisions (those are store-authoritative).
-        session.record_attempt_at(self.inner.clock.now()).await;
-
-        if count >= policy.max_attempts {
-            self.inner.metrics.account_locked();
-            // Surface the lockout window to the caller as `now +
-            // policy.duration`, computed at the verdict that creates
-            // the lockout (mirrors what production stores write into
-            // the suspension row at the same moment). UIs avoid a
-            // follow-up `enforce_account_status` round-trip to learn
-            // the expiry.
-            let until = policy.duration.and_then(|d| {
-                chrono::Duration::from_std(d)
-                    .ok()
-                    .map(|d| self.inner.clock.now() + d)
-            });
-            return Ok(FactorOutcome::Locked { until });
-        }
-        Ok(FactorOutcome::InvalidCredential)
-    }
-
     /// Persist a `PassWithUpdate` factor-config change to the user
     /// scope, using compare-and-swap when a user-scope row already
     /// exists so a concurrent verification cannot race past the
@@ -457,6 +466,3 @@ where
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

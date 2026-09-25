@@ -10,6 +10,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
@@ -189,7 +190,8 @@ async fn full_oauth_flow_with_signed_id_token() {
         .with_user(test_user("u1", "alice"));
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
 
@@ -300,7 +302,8 @@ async fn oauth_token_endpoint_error_propagates() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     authn

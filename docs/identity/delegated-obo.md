@@ -51,7 +51,11 @@ act on the user's behalf only while the user has an active
 session, and where the user's session credential can be exchanged
 for a downstream credential at low cost.
 
-## Stored OBO
+## The two mechanisms
+
+One keeps a refresh token on your side; the other keeps nothing.
+
+### Stored OBO
 
 The stored OBO shape uses the `delegated-stored` feature. The
 machinery has three moving parts: an OAuth flow that grants
@@ -144,7 +148,7 @@ session is what owns refresh-before-expiry. `StoredDelegationSession::revoke`
 is the matching teardown: it calls the provider's revocation endpoint
 where one is configured and removes the stored row.
 
-## Token exchange
+### Token exchange
 
 The token exchange shape uses the `delegated-exchange` feature.
 The machinery is much smaller because there is no persistent
@@ -204,7 +208,7 @@ caches the exchanged token for the duration of its validity (the
 optimisation, which is worth the complexity only at high call
 rates).
 
-## Which to use
+### Which to use
 
 The decision tree is short.
 
@@ -229,7 +233,11 @@ data from Gmail"), stored OBO for the background asynchronous
 calls (the nightly sync that pulls all new mail since the last
 run). The two flows handle the two needs.
 
-## Audit and consent
+## Operating it
+
+Recording consent, and taking it back.
+
+### Audit and consent
 
 Both shapes need an audit trail. The user granted consent at a
 specific moment; that moment is what defends against later
@@ -253,7 +261,7 @@ than for ordinary authentication events because the events
 defend against future disputes that may surface months or years
 later. The retention configuration is in *Audit pipeline*.
 
-## Revocation
+### Revocation
 
 Both shapes need a revocation path. The user (or an
 administrator) decides you should no longer act on

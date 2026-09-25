@@ -24,7 +24,7 @@ fn bench_ratelimit_throughput(c: &mut Criterion) {
             RateLimitConfig::builder()
                 .max_requests(1_000_000) // High limit so we measure overhead, not rejection
                 .window(Duration::from_secs(60))
-                .key(KeyExtractor::ForwardedIp)
+                .key(KeyExtractor::ClientIp)
                 .build(),
         ));
 
@@ -52,7 +52,7 @@ fn bench_ratelimit_multi_ip(c: &mut Criterion) {
             RateLimitConfig::builder()
                 .max_requests(1_000_000)
                 .window(Duration::from_secs(60))
-                .key(KeyExtractor::ForwardedIp)
+                .key(KeyExtractor::ClientIp)
                 .build(),
         ));
 
@@ -81,7 +81,7 @@ fn bench_ratelimit_reject(c: &mut Criterion) {
             RateLimitConfig::builder()
                 .max_requests(1) // Exhaust immediately
                 .window(Duration::from_secs(3600))
-                .key(KeyExtractor::ForwardedIp)
+                .key(KeyExtractor::ClientIp)
                 .build(),
         ));
 

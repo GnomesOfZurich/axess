@@ -31,10 +31,12 @@
 //!
 //! ```rust,ignore
 //! use axess_core::authz::context::StandardRequestContext;
+//! use axess_core::client_ip::ClientIp;   // handler argument,
+//!                                         // filled by `client_ip::layer`
 //!
 //! let ctx = StandardRequestContext::new(
 //!     session.is_mfa_complete(),
-//!     ip_from_headers_untrusted(request.headers()),
+//!     client_ip.get(),
 //! );
 //! let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
 //! authz.require("PostJournalEntry", &ledger_id).await?;

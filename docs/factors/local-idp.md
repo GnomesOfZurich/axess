@@ -39,8 +39,9 @@ JWTs for service-to-service flows it controls.
 
 The feature flag is `local-idp` (off by default), enabled with
 `features = ["local-idp", "jwt-rust-crypto"]` on the `axess` facade. It
-pulls in `oauth`, `oidc` and `jwt` as transitive features, and `jwt` needs a
-crypto backend named beside it: `jwt-rust-crypto` (pure Rust) or `jwt-aws-lc`
+pulls in `jwt` transitively and nothing else: minting and the JWKS need no
+OAuth machinery, so enabling this does not bring `oauth` or `oidc` with it.
+`jwt` needs a crypto backend named beside it: `jwt-rust-crypto` (pure Rust) or `jwt-aws-lc`
 (FIPS-capable, needs a C toolchain).
 
 ---
@@ -87,7 +88,7 @@ pub struct LoadedKeys {
 ```
 
 `load_all` returns current + historical keys from a single
-consistent read. The JWKS published at `/.well-known/jwks.json`
+consistent read. The JWKS published at `/jwks.json`
 includes all of them so tokens already in flight under a rotated-out
 historical key continue to verify until the operator removes that
 key from the store.
@@ -208,7 +209,7 @@ crate is the reference implementation:
 
 Integration tests that exercise:
 
-- The inbound JWT-SVID resolver (`axess::authn::jwt::svid::JwtSvidResolver`).
+- The inbound JWT-SVID resolver (`axess::jwt::svid::JwtSvidResolver`).
 - The OAuth Resource Server resolver path.
 - Any of the [cloud STS adapters](../workload-identity/cloud-sts.md).
 - The `JwtVerifier` shape generally.
@@ -280,10 +281,12 @@ let token = idp.mint(
 );
 
 // SPIFFE JWT-SVID shape (subject = SPIFFE ID, audience required).
+// Subject is spiffe://<trust_domain>/<service>/<tenant>, the same
+// segment order `WorkloadId::build` renders. All five are required.
 let svid = idp.mint_jwt_svid(
     "test.gnomes",                  // trust domain
-    "worker",                       // workload path
-    "acme",                         // namespace (optional positional)
+    "worker",                       // service
+    "acme",                         // tenant
     "sts.amazonaws.com",            // audience
     Duration::minutes(5),
 );
@@ -295,7 +298,7 @@ need custom fields.
 ### Sharing the JWKS with `JwtVerifier`
 
 ```rust,ignore
-use axess::authn::jwt::verifier::JwtVerifier;
+use axess::jwt::verifier::JwtVerifier;
 
 let verifier = JwtVerifier::new(idp.jwks_handle())
     .with_algorithms(idp.verifier_algorithms());

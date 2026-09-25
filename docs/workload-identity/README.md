@@ -23,7 +23,11 @@ deployments read *Inbound: federation* and *Cloud STS exchange*;
 applications that call downstream services on a workload's behalf
 read *Outbound: OAuth* and *Outbound: mTLS*.
 
-## The resolver model
+## The model
+
+One resolver trait, and why humans and workloads share a type.
+
+### The resolver model
 
 Every inbound request that carries a workload credential runs
 through a `PrincipalResolver`. The resolver inspects the credential
@@ -78,7 +82,7 @@ side has its own `SessionResolver` covered in Part II. A
 `MockResolver` is available for DST tests. Each resolver implements
 the same trait and produces the same `Principal` shape.
 
-## Why one type covers both
+### Why one type covers both
 
 A traditional auth library treats human and workload identity as
 two independent stacks. The session layer handles users; a separate
@@ -116,7 +120,11 @@ permit (
 The discrimination is local, readable, and lives in the policy file
 rather than scattered across handlers.
 
-## SPIFFE and SVIDs
+## The credential kinds
+
+SPIFFE's vocabulary first, because everything after it assumes the terms.
+
+### SPIFFE and SVIDs
 
 [SPIFFE](https://spiffe.io/) is the industry-standard model for
 workload identity, and the chapters that follow assume the
@@ -150,7 +158,7 @@ short-lived SVIDs into pod filesystems and configure axess against
 them, or drive the upstream `spire-workload` / `spire-api` crates
 directly; *Inbound: JWT-SVID* has the fetch-side recipe.
 
-## Federation
+### Federation
 
 A trust domain is a unit of issuance. A workload in trust domain A
 is identified by an A-issued SVID, validated against A's signing
@@ -179,12 +187,13 @@ OIDC token, an Azure AD workload token). All of these go through
 the single generic `WorkloadResolver`: the adopter supplies a
 claim parser + mapping closure that synthesises a SPIFFE-shape
 `WorkloadId` from whichever claims the issuer's JWT carries. The
-synthesis is what lets the rest of the system (Cedar policies,
-audit events, the principal type) work uniformly: the external
-workload looks like any other workload by the time the policy
-evaluator sees it.
+synthesis is what lets the rest of the system work uniformly: by the
+time the policy evaluator sees it, the external workload looks like any
+other workload, and the audit rows you write about it carry the same
+shape of identity. Axess writes none of those rows itself on these
+paths; *Inbound: federation* says what that leaves you.
 
-## Cloud STS exchange
+### Cloud STS exchange
 
 A workload that needs to call AWS, GCP, or Azure APIs can exchange
 its workload identity for short-lived cloud credentials. The
@@ -199,7 +208,7 @@ credential lifecycle. The benefit is that no long-lived cloud keys
 ever live on the workload's filesystem; the credentials are minted
 on demand from the workload identity, used briefly, and discarded.
 
-## Outbound
+### Outbound
 
 Axess is not only an inbound authenticator. When a service
 authenticates *to* a downstream service, it uses the same identity
@@ -211,9 +220,9 @@ an OAuth flow.
 
 The pattern matters because it lets one identity (the workload's
 SVID, or its federated equivalent) carry through an entire chain of
-service calls. The audit trail records the same identity at every
-hop; revocation at the issuing authority propagates to every call
-that was about to use the identity.
+service calls, so an audit trail written at each hop names the same
+identity throughout, and revocation at the issuing authority propagates
+to every call that was about to use it.
 
 ## Feature flags
 
@@ -224,7 +233,7 @@ pays the compile cost for the credential kinds it actually uses.
 |---|---|---|
 | `jwt-svid` | `JwtSvidResolver` | Inbound SPIFFE JWT-SVID (spec-bound) |
 | `mtls` | `MtlsResolver` | Inbound SPIFFE X.509-SVID via mTLS |
-| `jwt` (auto-pulled by `jwt-svid` etc.; name `jwt-aws-lc` or `jwt-rust-crypto` beside it) | `WorkloadResolver` | Generic JWT-bearer workload identity for *every* non-SPIFFE issuer (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via adopter-supplied claim parser + mapping closure. No per-company features; see `examples/workload-identity/` |
+| `jwt` (pulled by `jwt-svid` etc.; name `jwt-aws-lc` or `jwt-rust-crypto` beside it; the module is `axess::jwt` since 0.7.0, not `axess::federation::jwt`) | `WorkloadResolver` | Generic JWT-bearer workload identity for *every* non-SPIFFE issuer (GitHub Actions, k8s SA, GitLab CI, Okta, Azure AD, Auth0, `LocalIdP`, …) via adopter-supplied claim parser + mapping closure. No per-company features; see `examples/workload-identity/` |
 | `outbound-mtls` | (client side) | Outbound mTLS with workload SVID |
 | `outbound-oauth` | (client side) | Outbound OAuth client |
 | `aws-sts`, `gcp-wif`, `azure-fic` | (cloud STS) | Exchange workload identity for cloud credentials |

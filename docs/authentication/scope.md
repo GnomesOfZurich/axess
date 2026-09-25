@@ -7,10 +7,13 @@ to get right.
 Used well, the three tiers make a multi-tenant deployment feel like one
 configuration with two override surfaces. Used carelessly, they become
 a maze where nobody can answer "what method is this user actually
-using?" without running a query. This chapter walks through the
-mechanism and the patterns that keep it operationally clear.
+using?" without running a query.
 
-## The three tiers
+## The model
+
+Three tiers, and why a lower one must opt in rather than inherit.
+
+### The three tiers
 
 `AuthnScope` lives in
 [`axess-core/src/authn/types.rs`](https://github.com/GnomesOfZurich/axess/blob/main/axess-core/src/authn/types.rs).
@@ -37,10 +40,9 @@ configured at user scope applies to that one user.
 
 The ordering is the ordering of authority. Narrower beats broader.
 
-## Adoption, not silent inheritance
+### Adoption, not silent inheritance
 
-The mental model is important: **System is a template tier, not a
-runtime broadcast tier.** A factor configured at System scope does not
+**System is a template tier, not a runtime broadcast tier.** A factor configured at System scope does not
 automatically become a login option for every tenant; a tenant adopts
 the template explicitly at provisioning time or through an
 administrative reconfiguration. The `FactorTemplate` catalog in
@@ -60,7 +62,11 @@ chain to find the applicable config data (see next section). The
 System row is legitimate as the config *source* for a factor the user
 has already activated (through their method); it is never the *grant*.
 
-## How resolution works
+## How it resolves
+
+Narrowest scope wins, resolved in one query by the store rather than the caller.
+
+### How resolution works
 
 At `begin_login` time and again at each `verify_factor` step, the
 service asks the factor store for the applicable config for the
@@ -112,7 +118,7 @@ independently, which is the right shape for the common case where the
 user has chosen their own TOTP device but the tenant has standardised
 the password policy.
 
-## Storage encoding
+### Storage encoding
 
 The factor store schema has `tenant_id` (NOT NULL) and `user_id`
 (nullable) columns:
@@ -139,7 +145,7 @@ Note this is **distinct** from audit-event storage, where a NULL
 `tenant_id` means "tenant not yet known" (pre-authenticated event,
 failed login for an unknown user), never "System scope."
 
-## What gets scoped
+### What gets scoped
 
 The hierarchy applies to three kinds of object: factor configurations,
 methods, and lockout policies. Each plays the same game, with the same
@@ -178,7 +184,11 @@ demands per-individual differentiation. The more configuration you do
 at the narrowest scope, the more state you have to reason about
 during incidents.
 
-## Migration patterns
+## Using it
+
+Moving an existing deployment onto it, and the shapes to avoid.
+
+### Migration patterns
 
 The scope hierarchy is the right tool for rolling out factor changes
 in a controlled way. The pattern is to introduce the change at the
@@ -219,7 +229,7 @@ at tenant scope or user scope for the affected population without
 redeploying. The narrower scope wins; the affected
 users walk the old method while the bug is fixed.
 
-## How Cedar policy interacts
+### How Cedar policy interacts
 
 The scope hierarchy answers "what method does this user authenticate
 with?" Cedar answers "what is this user allowed to do once
@@ -242,7 +252,7 @@ actions. A user can have a stronger method than the policy minimum and
 satisfy the policy without effort; a user with a weaker method gets
 prompted for step-up.
 
-## Anti-patterns
+### Anti-patterns
 
 The hierarchy invites a few mistakes that are worth naming explicitly.
 

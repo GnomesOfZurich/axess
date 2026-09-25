@@ -113,8 +113,15 @@ CREATE TABLE IF NOT EXISTS auth_events (
     event_time   TEXT NOT NULL DEFAULT (datetime('now')),
     factor_kind  TEXT,
     ip_address   TEXT,
+    -- How `ip_address` was arrived at: unknown, peer, forwarded, supplied.
+    -- An address alone is not evidence; a row saying `supplied` where the
+    -- rest say `forwarded` is the one to ask about.
+    ip_source    TEXT NOT NULL DEFAULT 'unknown',
     user_agent   TEXT,
     request_id   TEXT,
+    -- W3C trace id. The request id joins this row to one service's logs;
+    -- this joins it to the trace that crosses them.
+    trace_id     TEXT,
     geo_country  TEXT,
     error        TEXT
 );

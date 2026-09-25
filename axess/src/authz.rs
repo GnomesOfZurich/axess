@@ -46,21 +46,21 @@ pub use axess_core::authz::{
     AuthzSession,
     AuthzStore,
     BuildRequestContext,
-    // Helpers. `ip_from_headers_trusted` is the one to reach for wherever a
-    // proxy is involved; the untrusted form believes whatever the client
-    // sent and is correct only with no proxy in front.
-    CidrParseError,
     NoContext,
     PolicyEvaluator,
     PolicyStore,
     RequestEntityProvider,
     StandardRequestContext,
-    TrustedProxies,
-    ip_from_headers_trusted,
-    ip_from_headers_untrusted,
     make_action_uid,
     make_entity_uid,
 };
+
+// The trusted-proxy primitives left this module in 0.7.0. They sat behind
+// the `authz` feature, which meant the only correct way to work out a
+// caller's address required compiling Cedar, and the rate limiter read the
+// headers itself rather than pay that. They are `axess::client_ip` now,
+// ungated, with the layer that runs the walk once per request.
+pub use crate::client_ip;
 
 use cedar_policy::{Context, Entities, EntityUid};
 

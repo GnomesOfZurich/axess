@@ -46,6 +46,16 @@ jobs:
       - name: Build book
         run: mdbook build docs
 
+      # Compiles every fenced block the book does not mark `ignore`. Without
+      # this the marking means nothing: the getting-started example sat at
+      # `rust,no_run` for releases while calling an async method without
+      # `.await` and importing `AuthnService` from the wrong module, because
+      # nothing ever tried to build it.
+      - name: Build the crates the book's examples import
+        run: cargo build -p axess --all-features -p axess-example-minimal
+      - name: Test book code
+        run: mdbook test docs -L target/debug/deps
+
       - name: Configure Pages
         uses: actions/configure-pages@v5
         with:

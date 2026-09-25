@@ -49,7 +49,7 @@ Axess is a library for authentication and authorization. Its security depends on
 
 Recommended configuration for authentication endpoints:
 
-```rust
+```rust,ignore
 use axess::{RateLimitLayer, RateLimitConfig, KeyExtractor};
 use std::time::Duration;
 
@@ -58,7 +58,7 @@ let auth_rate_limit = RateLimitLayer::new(
     RateLimitConfig::builder()
         .max_requests(5)
         .window(Duration::from_secs(60))
-        .key(KeyExtractor::ForwardedIp)
+        .key(KeyExtractor::ClientIp)
         .build(),
 );
 
@@ -67,7 +67,7 @@ let otp_rate_limit = RateLimitLayer::new(
     RateLimitConfig::builder()
         .max_requests(3)
         .window(Duration::from_secs(60))
-        .key(KeyExtractor::ForwardedIp)
+        .key(KeyExtractor::ClientIp)
         .build(),
 );
 
@@ -84,7 +84,7 @@ let app = Router::new()
 
 #### Trusted proxy and IP extraction
 
-- [ ] Use `ip_from_headers_trusted` with a `TrustedProxies` set naming your proxies, not `ip_from_headers_untrusted`. The untrusted form believes any `X-Forwarded-For` the client sends and exists only for deployments that terminate their own TLS with no proxy in front.
+- [ ] Wrap the router in `axess::client_ip::layer` with a `TrustedProxies` set naming your proxies, and read `ClientIp` wherever an address is needed. Nothing reads a forwarded header directly any more: there is no function that takes one and believes it.
 - [ ] Still configure your reverse proxy to strip client-supplied `X-Forwarded-For` and `X-Real-IP`. The trusted-proxy walk is defence in depth, not a substitute.
 
 #### Rate limiting is required in front of login routes
@@ -153,7 +153,7 @@ proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 
 #### What axess does with these headers
 
-Since 0.6.0 axess **does** walk the forwarded chain and **does** maintain a trusted-proxy allowlist. `ip_from_headers_trusted(headers, peer, &trusted)`:
+Since 0.6.0 axess **does** walk the forwarded chain and **does** maintain a trusted-proxy allowlist. `trusted.client_ip(headers, peer)`:
 
 1. Returns the TCP peer immediately if the peer is not itself a trusted proxy: an unproxied client's headers are never read.
 2. Otherwise joins **every** `X-Forwarded-For` field line in order (RFC 9110 §5.3 makes repeated lines one comma-joined list) and walks it **right to left**, skipping hops that are themselves trusted, returning the first address that is not.
@@ -164,8 +164,8 @@ Rightmost-untrusted is the only correct reading: `X-Forwarded-For` is append-onl
 
 Build the allowlist with exact addresses or CIDR ranges:
 
-```rust
-use axess::authz::TrustedProxies;
+```rust,ignore
+use axess::client_ip::TrustedProxies;
 
 let trusted = TrustedProxies::from_cidrs(["10.0.0.0/8", "2001:db8::/32"])?;
 // or, for a same-pod sidecar:
@@ -174,7 +174,15 @@ let trusted = TrustedProxies::loopback_only();
 
 A spec with bits set below the prefix is rejected rather than widened: `10.0.0.5/8` is an error, because it reads like one host and would mean sixteen million. Write `10.0.0.0/8` or `10.0.0.5/32`.
 
-**`ip_from_headers_untrusted` still exists** and still believes the client. The name carries the warning; prefer the trusted form wherever a proxy is involved.
+Since 0.7.0 you do not usually call the walk yourself. `client_ip::layer` runs it once per request, outside every route, and hands each handler a `ClientIp`:
+
+```rust,ignore
+let app = axess::client_ip::layer(app, trusted);
+```
+
+`ClientIp` has a private field and the layer is the only thing that fills it, so no amount of header reading produces one. Everything that wants an address takes it from there: the audit context, the Cedar request context, the rate limiter's `KeyExtractor::ClientIp`, the device gate, and lockout.
+
+There is no longer a function that reads a forwarded header and believes it. The untrusted forms were removed in 0.7.0: a name carrying its own warning was tried twice and lost both times, once to a consumer that moved seven call sites onto one because its documentation recommended it.
 
 ## Feature inventory
 
@@ -269,7 +277,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | Feature | Notes |
 |---|---|
 | CSRF | Signed double-submit cookie; required for state-changing form posts. |
-| Rate limiting | Token-bucket via `RateLimitLayer`. `KeyExtractor::{PeerIp, ForwardedIp}` for direct vs trusted-proxy deployments. |
+| Rate limiting | Token-bucket via `RateLimitLayer`. `KeyExtractor::{PeerIp, ClientIp}` for direct vs proxied deployments; `ClientIp` reads what `client_ip::layer` resolved and no header. |
 | Request ID | `X-Request-Id` extraction + generation. |
 | Trace ID | W3C Trace Context (`traceparent`) propagation. |
 | WebSocket | Revocation-aware wrapper that closes connections on session invalidation. |

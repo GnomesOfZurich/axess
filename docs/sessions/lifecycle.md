@@ -16,7 +16,11 @@ fingerprint binding that catches cookie replay, and the dirty-flag
 and write-back machinery that makes the lifecycle invisible to
 application code.
 
-## The cookie
+## What a session is made of
+
+Four pieces: one in the browser, three on your side.
+
+### The cookie
 
 The session cookie is small. By default it carries an opaque
 session id (the `SessionId` newtype, sixteen bytes of cryptographic
@@ -49,7 +53,7 @@ cookie has the session id and the signature, both of which the
 server already has; nothing on the cookie carries the user's
 identity, the factors completed, or any other session state.
 
-## The session store
+### The session store
 
 The session store is the persistence layer for the data the cookie
 identifies. Each row in the store carries:
@@ -98,7 +102,7 @@ require text (some configurations of MySQL, for instance) encode
 the bytes as base64 first. The format is the same across all
 backends; switching backends does not require re-serialisation.
 
-## The AES-256-GCM envelope
+### The AES-256-GCM envelope
 
 The serialised session bytes are encrypted before storage. The
 envelope is AES-256-GCM, a standard authenticated-encryption scheme
@@ -137,7 +141,7 @@ key can be removed.
 The chapter *Operations runbook* covers the rotation sequence and
 the staged rollout for both the signing key and the envelope key.
 
-## The fingerprint binding
+### The fingerprint binding
 
 A session id alone is not enough to defend against cookie theft. An
 attacker who captures a session cookie can replay it from a
@@ -174,7 +178,11 @@ coarse: the IP must remain within the same /24 (for IPv4) or /64
 The chapter *Cookies, fingerprinting, hijack detection* covers the
 configuration knobs and the trade-offs in detail.
 
-## The Tower layer
+## How it runs
+
+What the layer does per request, and what decides a write.
+
+### The Tower layer
 
 The `SessionLayer` is the Tower middleware that threads the
 session through every request. The layer's `call` method is the
@@ -239,7 +247,7 @@ The store sees writes proportional to the rate of state changes,
 not the rate of requests, which is the difference between a
 manageable database load and a saturated one.
 
-## The dirty flag
+### The dirty flag
 
 The dirty flag is the optimisation that makes the session store
 viable at the read rates a real application produces. The flag is
@@ -303,7 +311,11 @@ role grants), and would misfire on factor-config tuning that is
 not a privilege change. The boundary decision is necessarily
 app-level. Call `regenerate` at the handler that knows.
 
-## When the session expires
+## Ending a session
+
+Expiry from the inside, and sweeping what is left.
+
+### When the session expires
 
 The session has two expiry mechanisms. The first is the cookie's
 own `Max-Age` attribute, which the browser enforces: after the
@@ -337,7 +349,7 @@ session from the registry on the schedule you want. Both are a few
 lines, and both keep the decision where the deployment's compliance
 requirement actually lives.
 
-## Session cleanup
+### Session cleanup
 
 Expired sessions need to be removed from the store. The cleanup
 is the application's responsibility (axess does not run a

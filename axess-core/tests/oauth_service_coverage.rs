@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
@@ -40,7 +41,8 @@ async fn finish_oauth_login_rejects_oversized_code() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let oversized_code = "a".repeat(MAX_OAUTH_PARAM_BYTES + 1);
@@ -67,7 +69,8 @@ async fn finish_oauth_login_accepts_at_boundary() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let exactly_max = "a".repeat(MAX_OAUTH_PARAM_BYTES);
@@ -94,7 +97,8 @@ async fn finish_oauth_login_rejects_oversized_state() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let oversized_state = "s".repeat(MAX_OAUTH_PARAM_BYTES + 1);
@@ -123,7 +127,8 @@ async fn oauth_ceremony_not_expired_at_exact_boundary() {
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     authn
@@ -160,7 +165,8 @@ async fn oauth_ceremony_not_expired_at_exact_boundary() {
 #[tokio::test]
 async fn revoke_oauth_token_unknown_provider_errors() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new());
+    let authn = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     let result = authn
         .revoke_oauth_token("nonexistent", "some-token", Some("access_token"))

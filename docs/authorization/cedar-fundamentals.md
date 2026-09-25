@@ -13,9 +13,7 @@ this exact problem. It is declarative, deny-by-default, statically
 checkable against a schema, and built to express RBAC, ReBAC, and
 ABAC in one set of rules. Axess loads a Cedar policy set at startup,
 validates it against a schema, and exposes per-request evaluation
-through a small typed interface. This chapter covers the lifecycle:
-loading, validation, the per-request evaluator, the contract with
-your data layer, and the error modes.
+through a small typed interface.
 
 The feature flag is `authz` (on by default in the `axess` facade).
 

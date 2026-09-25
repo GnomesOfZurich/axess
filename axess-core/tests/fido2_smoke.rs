@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::{
     authn::service::AuthnService,
     testing::{
@@ -46,7 +47,8 @@ async fn service_begin_registration_with_mock_returns_error() {
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
         .with_fido2(MockFido2Provider::new())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = service
@@ -64,7 +66,7 @@ async fn service_begin_registration_without_provider_returns_no_flow() {
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = service
@@ -81,7 +83,7 @@ async fn service_discoverable_login_without_provider_returns_no_flow() {
         .with_default_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = service.begin_discoverable_login(&session).await;
@@ -106,7 +108,8 @@ async fn real_provider_begin_registration_stores_ceremony_state() {
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
         .with_fido2(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = service
@@ -164,7 +167,8 @@ async fn real_provider_begin_discoverable_authentication() {
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
         .with_fido2(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     let result = service.begin_discoverable_login(&session).await;
@@ -200,7 +204,8 @@ async fn finish_registration_without_begin_returns_error() {
     let factors = MockFactorStore::new();
     let service = AuthnService::builder(identity, factors)
         .with_fido2(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
 

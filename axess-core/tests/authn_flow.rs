@@ -18,6 +18,7 @@
 mod common;
 
 use axess_clock::Clock;
+use axess_core::authn::AuditContext;
 use axess_core::{
     authn::{
         event::AuthEventType,
@@ -51,11 +52,11 @@ async fn password_only_login_flow() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     assert!(matches!(
@@ -89,11 +90,12 @@ async fn password_totp_login_flow() {
     let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
-        .begin_login("bob", "default", &session, None)
+        .begin_login("bob", "default", &session)
         .await
         .unwrap();
     assert!(matches!(
@@ -128,11 +130,11 @@ async fn wrong_password_returns_invalid_credential() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     let cred = FactorCredential::Password(ZeroizedString::new("wrong"));
@@ -144,11 +146,11 @@ async fn wrong_password_returns_invalid_credential() {
 async fn user_not_found_returns_invalid_credentials() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
-        .begin_login("nobody", "default", &session, None)
+        .begin_login("nobody", "default", &session)
         .await
         .unwrap();
     assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
@@ -170,12 +172,13 @@ async fn lockout_after_max_attempts() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     for i in 0..3 {
         let session = test_session();
         service
-            .begin_login("alice", "default", &session, None)
+            .begin_login("alice", "default", &session)
             .await
             .unwrap();
         let cred = FactorCredential::Password(ZeroizedString::new("wrong"));
@@ -213,14 +216,12 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
 
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     // Cycle 1: password OK, 2 wrong TOTP.
     let s1 = test_session();
-    service
-        .begin_login("bob", "default", &s1, None)
-        .await
-        .unwrap();
+    service.begin_login("bob", "default", &s1).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
@@ -239,10 +240,7 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
 
     // Cycle 2: password OK: counter must NOT reset.
     let s2 = test_session();
-    service
-        .begin_login("bob", "default", &s2, None)
-        .await
-        .unwrap();
+    service.begin_login("bob", "default", &s2).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
@@ -290,14 +288,12 @@ async fn totp_replay_rejected() {
     let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     // First login succeeds.
     let s1 = test_session();
-    service
-        .begin_login("bob", "default", &s1, None)
-        .await
-        .unwrap();
+    service.begin_login("bob", "default", &s1).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
@@ -314,10 +310,7 @@ async fn totp_replay_rejected() {
 
     // Second login with SAME code (same time step) should fail.
     let s2 = test_session();
-    service
-        .begin_login("bob", "default", &s2, None)
-        .await
-        .unwrap();
+    service.begin_login("bob", "default", &s2).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
@@ -361,15 +354,12 @@ async fn hotp_counter_advances_and_old_rejected() {
         )
         .with_method(&uid("u1"), hotp_method);
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let code_0 = generate_hotp_code(secret, 0);
 
     // Login with counter=0 code.
     let s1 = test_session();
-    service
-        .begin_login("carol", "default", &s1, None)
-        .await
-        .unwrap();
+    service.begin_login("carol", "default", &s1).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
@@ -385,10 +375,7 @@ async fn hotp_counter_advances_and_old_rejected() {
 
     // Second login: counter=0 code should be rejected (counter advanced to 1).
     let s2 = test_session();
-    service
-        .begin_login("carol", "default", &s2, None)
-        .await
-        .unwrap();
+    service.begin_login("carol", "default", &s2).await.unwrap();
     service
         .verify_factor(
             &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
@@ -417,11 +404,11 @@ async fn session_regenerate_flag_set_on_authentication() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     service
@@ -454,11 +441,12 @@ async fn forced_logout_via_registry() {
     let registry = MemorySessionRegistry::new();
     let service = AuthnService::builder(identity, factors)
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     service
@@ -506,11 +494,12 @@ async fn email_otp_prepare_and_verify() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(rng)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
 
@@ -553,11 +542,12 @@ async fn email_otp_cooldown_returns_already_sent() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
 
@@ -602,11 +592,12 @@ async fn email_otp_expired_code_rejected() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     let code = match service.prepare_factor(&session).await.unwrap() {
@@ -637,11 +628,11 @@ async fn scope_fallback_to_system() {
         .with_factor(AuthnScope::System, password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     let r = service
@@ -679,11 +670,12 @@ async fn audit_events_recorded_on_login() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity.clone(), factors);
+    let service =
+        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     service

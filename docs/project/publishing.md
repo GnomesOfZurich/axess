@@ -1,9 +1,7 @@
 # Publishing runbook
 
-This chapter is the maintainer-only reference. It covers the
-publish-to-crates.io procedure: the pre-flight checklist, the
-dependency topological order, the dry-run, the actual publish,
-and the rollback procedure if something goes wrong.
+Maintainers only. Publishing to crates.io is irreversible and versions
+cannot be reused, so the order below is not advisory.
 
 The audience is the maintainer cutting a release. An adopter
 does not need this chapter; the chapter is here so the
@@ -160,7 +158,7 @@ on the published version. The shape:
 mkdir /tmp/axess-smoke
 cd /tmp/axess-smoke
 cargo new --name axess-smoke .
-echo 'axess = "0.6"' >> Cargo.toml
+echo 'axess = "0.7"' >> Cargo.toml
 cargo build
 ```
 
@@ -182,7 +180,7 @@ A successful smoke test means the publish is real.
 
 After the smoke test passes:
 
-Tag the release in git (`git tag v0.2.0 && git push --tags`).
+Tag the release in git (`git tag v0.NEW.0 && git push origin v0.NEW.0`).
 The tag is the canonical reference point.
 
 Update the status banner near the top of

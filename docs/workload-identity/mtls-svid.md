@@ -12,7 +12,11 @@ direct VPC peering).
 
 The feature flag is `mtls` (off by default).
 
-## The credential shape
+## The credential
+
+An ordinary X.509 certificate, with the identity in one SAN entry.
+
+### The credential shape
 
 An X.509-SVID is an ordinary X.509 leaf certificate with one
 specific requirement: the Subject Alternative Name extension
@@ -25,7 +29,7 @@ The certificate chain is signed by the trust domain's CA. The
 chain validates the certificate's authenticity; the SAN URI
 identifies the workload within the trust domain.
 
-## Where the certificate comes from
+### Where the certificate comes from
 
 Axess does not handle the TLS handshake. The handshake happens
 where TLS terminates (rustls in the application process, a sidecar
@@ -77,7 +81,11 @@ terminator owns and reject direct connections at the network
 layer, or gate the header on a token the terminator injects
 alongside the certificate.
 
-## The resolver
+## Wiring it up
+
+Reading the tenant out of the leaf comes first, and that read validates nothing.
+
+### The resolver
 
 `MtlsResolver` reads the SPIFFE URI out of the leaf certificate,
 checks it against the configured trust domain, and produces a
@@ -117,7 +125,7 @@ The work is small because most of the validation already happened: the
 terminator validated the chain, and the resolver parses the SAN URI and
 checks the trust domain.
 
-## The validation flow
+### The validation flow
 
 Two error types are in play, and which one you see depends on where
 you are standing.
@@ -155,7 +163,7 @@ The resolver does not resolve tenants. The tenant is
 decided before it is built, and `resolve` copies the `TenantId` it was
 given into the principal.
 
-## What the principal looks like
+### What the principal looks like
 
 A successful validation produces:
 

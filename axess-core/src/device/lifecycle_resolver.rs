@@ -20,7 +20,7 @@
 //! | Hook | Default | When to override |
 //! |------|---------|------------------|
 //! | `tenant_fn` | `parts.extensions.get::<TenantId>()` | when tenant lives elsewhere (subdomain, JWT claim, …) |
-//! | `client_ip_fn` | always `None` | use ``parts.extensions.get::<axum::extract::ConnectInfo<SocketAddr>>().map(\|c\| c.0.ip())`` if your app calls `into_make_service_with_connect_info`, or read `X-Forwarded-For` if behind a trusted proxy |
+//! | `client_ip_fn` | the address [`client_ip::layer`](crate::client_ip::layer) resolved, or `None` without it | override only where the address comes from somewhere axess cannot see, such as a platform's own header |
 //! | `user_fn` | always `None` | when an upstream auth layer has already injected a `UserId` extension |
 //! | `new_id_fn` | `uuid::Uuid::new_v4().to_string()` | when you have a deterministic id scheme (e.g. DST tests with `MockRng`) |
 //!
@@ -206,11 +206,17 @@ fn default_tenant_fn() -> TenantFn {
 }
 
 fn default_client_ip_fn() -> ClientIpFn {
-    // Default ignores request shape; observe `parts` via a cheap no-op
-    // method so the closure param isn't underscore-prefixed.
+    // Whatever `client_ip::layer` resolved, and nothing if it is not
+    // installed. It used to be unconditionally `None`, with the module
+    // table suggesting the adopter read `X-Forwarded-For` here, which is
+    // the header a caller writes.
     Arc::new(|parts: &Parts| {
-        parts.uri.host();
-        None
+        parts
+            .extensions
+            .get::<crate::client_ip::ClientIp>()
+            .copied()
+            .unwrap_or_default()
+            .get()
     })
 }
 

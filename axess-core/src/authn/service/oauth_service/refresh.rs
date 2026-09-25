@@ -6,7 +6,7 @@
 //! tokens against axess sessions; this path delegates to the upstream
 //! IdP's `/token` endpoint with the IdP's refresh token.
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
@@ -14,7 +14,7 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
@@ -103,7 +103,7 @@ where
 
     /// Record an OAuth refresh-token failure audit event.
     ///
-    /// Mirrors [`record_oauth_failure`](super::login::AuthnService::record_oauth_failure)
+    /// Mirrors [`record_oauth_failure`](super::login::RequestAuthnService::record_oauth_failure)
     /// but session-free: the refresh path is called with just a provider
     /// name and a token, with no `AuthSession` to source attribution from.
     async fn record_oauth_refresh_failure(

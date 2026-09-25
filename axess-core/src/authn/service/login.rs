@@ -10,7 +10,7 @@ use crate::authn::{
     types::{AuthnScope, EntityState},
 };
 use crate::session::extractor::AuthSession;
-impl<I, F> super::AuthnService<I, F>
+impl<I, F> super::RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
@@ -21,13 +21,12 @@ where
     /// Updates the session to `Authenticating`.
     ///
     /// Returns a [`LoginOutcome`] describing what the UI should do next.
-    #[tracing::instrument(skip(self, session, client_ip), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(skip(self, session), fields(tenant = %tenant_identifier))]
     pub async fn begin_login(
         &self,
         identifier: &str,
         tenant_identifier: &str,
         session: &AuthSession,
-        client_ip: Option<std::net::IpAddr>,
     ) -> Result<LoginOutcome, AuthnError<I::Error>> {
         use crate::validation::MAX_IDENTIFIER_BYTES;
 
@@ -112,15 +111,22 @@ where
             return Err(AuthnError::NotActive(tenant.status.clone()));
         }
 
-        // 1b. Enforce tenant IP policy if a client IP was provided.
-        if let Some(ip) = client_ip {
-            let policy = self
-                .inner
-                .identity
-                .ip_policy_for_tenant(&tenant.id)
-                .await
-                .map_err(AuthnError::Store)?;
-            if !policy.is_allowed(ip) {
+        // 1b. Enforce the tenant IP policy against the address this handle
+        // was derived with. Until 0.7.0 the address was a parameter and the
+        // check ran only `if let Some(ip)`, so a caller passing `None`
+        // skipped the policy entirely: an allowlist a caller could switch
+        // off by omitting an argument, and 51 of the 52 call sites in this
+        // repository omitted it. The address now comes from the client-IP
+        // layer by way of the audit context, which the caller does not
+        // choose.
+        let policy = self
+            .inner
+            .identity
+            .ip_policy_for_tenant(&tenant.id)
+            .await
+            .map_err(AuthnError::Store)?;
+        match self.audit.ip_address {
+            Some(ip) if !policy.is_allowed(ip) => {
                 tracing::warn!(
                     tenant = %tenant.id,
                     client_ip = %ip,
@@ -129,6 +135,28 @@ where
                 self.inner.metrics.auth_failure();
                 return Ok(LoginOutcome::InvalidCredentials);
             }
+            // A policy that restricts, and no address to test against it:
+            // the only safe reading is that it is not satisfied. An empty
+            // policy permits everything, so an unknown address is no less
+            // compliant with it than a known one, and those deployments are
+            // unaffected.
+            //
+            // `ip_source` separates the two ways to get here. `Unknown`
+            // means `client_ip::layer` is not installed, which is a
+            // deployment fault and the likely cause. Any other source means
+            // the transport genuinely has no address to offer.
+            None if policy.restricts() => {
+                tracing::error!(
+                    tenant = %tenant.id,
+                    ip_source = self.audit.ip_source.as_str(),
+                    "tenant has an IP policy and this request has no resolved \
+                     client address, so the policy cannot be satisfied; install \
+                     axess::client_ip::layer on the router"
+                );
+                self.inner.metrics.auth_failure();
+                return Ok(LoginOutcome::InvalidCredentials);
+            }
+            _ => {}
         }
 
         // 2. Find user with timing equalization; when the identifier is
@@ -553,24 +581,6 @@ where
             .await
     }
 
-    /// Check whether the current session is valid (consults the registry if installed).
-    #[tracing::instrument(skip(self, session))]
-    pub async fn check_session(&self, session: &AuthSession) -> bool {
-        if !session.is_authenticated().await {
-            return false;
-        }
-        let user_id = match session.user_id().await {
-            Some(id) => id,
-            None => return false,
-        };
-        let sid = session.session_id().await;
-        if let Some(reg) = &self.inner.registry {
-            reg.is_valid(&user_id, &sid).await
-        } else {
-            true
-        }
-    }
-
     /// Log out the current user: clear the session and invalidate in the registry.
     #[tracing::instrument(skip(self, session))]
     pub async fn logout(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
@@ -603,6 +613,37 @@ where
         // Cycle the session ID to prevent session fixation after logout.
         session.regenerate().await;
         Ok(())
+    }
+}
+
+// Re-export fido2_keys for use in prepare_factor when fido2 feature is enabled.
+#[cfg(feature = "fido2")]
+pub(crate) use super::fido2_service::fido2_keys;
+
+#[cfg(test)]
+mod login_tests;
+
+impl<I, F> super::AuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
+    /// Check whether the current session is valid (consults the registry if installed).
+    #[tracing::instrument(skip(self, session))]
+    pub async fn check_session(&self, session: &AuthSession) -> bool {
+        if !session.is_authenticated().await {
+            return false;
+        }
+        let user_id = match session.user_id().await {
+            Some(id) => id,
+            None => return false,
+        };
+        let sid = session.session_id().await;
+        if let Some(reg) = &self.inner.registry {
+            reg.is_valid(&user_id, &sid).await
+        } else {
+            true
+        }
     }
 
     /// Look up a user by identifier with timing-equalization on miss.
@@ -677,10 +718,3 @@ where
         Ok(None)
     }
 }
-
-// Re-export fido2_keys for use in prepare_factor when fido2 feature is enabled.
-#[cfg(feature = "fido2")]
-pub(crate) use super::fido2_service::fido2_keys;
-
-#[cfg(test)]
-mod login_tests;

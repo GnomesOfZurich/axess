@@ -6,9 +6,9 @@ Google account, an Okta account, a corporate Azure AD account, and
 you accept a login from any of them rather than asking
 the user to invent and remember another password. The mechanism is
 OAuth 2.0 for the authorisation flow and OpenID Connect for the
-identity assertion layered on top. This chapter walks through what
-axess wires up automatically, what the integration code has to do, and
-the failure modes that have specific defences.
+identity assertion layered on top. The division of labour is the thing
+to hold on to: what axess wires up, and what your integration code still
+owns.
 
 The feature flag is `oauth` (off by default), enabled with
 `features = ["oauth", "jwt-rust-crypto"]` on the `axess` facade. `oauth`
@@ -47,19 +47,27 @@ sequenceDiagram
     App->>User: 302 to /dashboard
 ```
 
-The flow has six pieces axess does for you and three pieces the
-integration code is responsible for. The six axess-owned pieces are:
-generating the PKCE verifier and challenge, generating and binding
-the CSRF state, generating and binding the OIDC nonce, the discovery
-of the IdP's endpoints and signing keys, the token exchange itself,
-and the ID token validation including signature, audience, nonce, and
-the `azp` check when the audience is multi-valued. The three pieces
-the integration owns are: the redirect to the IdP authorize URL, the
-callback handler that picks up the code, and the application-specific
-mapping from the validated claims to the user record in the local
-identity store.
+Axess owns six pieces of the flow:
 
-## The provider
+- the PKCE verifier and challenge
+- the CSRF state, generated and bound
+- the OIDC nonce, generated and bound
+- discovery of the IdP's endpoints and signing keys
+- the token exchange
+- ID token validation: signature, audience, nonce, and `azp` when the
+  audience is multi-valued
+
+Your integration owns three:
+
+- the redirect to the IdP authorize URL
+- the callback handler that picks up the code
+- mapping validated claims onto a user record in your identity store
+
+## Configuring a provider
+
+You do not implement the trait; `discover` builds a provider from the IdP's own document.
+
+### The provider
 
 `OAuthProvider` is the trait that represents an IdP. The trait is
 asynchronous because every method may need to fetch JWKS, perform
@@ -99,7 +107,28 @@ The configuration record carries four things:
   it needs a refresh token to keep acting as the user after the
   initial session expires.
 
-## Begin the login
+### Multiple providers
+
+A common shape is to offer login with several IdPs side by side
+(Google, GitHub, Microsoft). Each provider is its own
+`OAuthProvider` instance constructed at startup; your code
+registers them under a `provider_name` key. The login URL carries
+the provider name (`GET /auth/login/google`); the callback URL also
+carries the name (`GET /auth/callback/google`). Axess dispatches to
+the right provider per request.
+
+A per-tenant variation is also common: each tenant's users federate
+against the tenant's own IdP (an Okta workspace, an Azure AD
+directory). The provider name in this case is the tenant slug; the
+provider is constructed at tenant provisioning time (or lazily, on
+first use) and cached. The scope hierarchy chapter covers the
+pattern for storing per-tenant configurations.
+
+## The login flow
+
+The three steps a user passes through, in order.
+
+### Begin the login
 
 The handler that starts the federated login transitions the session
 into a state that holds the PKCE verifier, the CSRF state, and the
@@ -125,20 +154,20 @@ async fn begin_oauth_login(
 }
 ```
 
-`begin_oauth_login` does three things internally. First, it generates
-the PKCE verifier through `SecureRng` and derives the S256 challenge
-that travels in the authorize URL. Second, it generates the CSRF
-state and the OIDC nonce, also through `SecureRng`, and stores all
-three values (verifier, state, nonce) in the session's intermediate
-state. Third, it composes the authorize URL with the client id, the
-redirect URI, the requested scopes, the PKCE challenge, the state,
-and the nonce, and returns it.
+`begin_oauth_login` does three things:
+
+1. Generates the PKCE verifier through `SecureRng` and derives the S256
+   challenge that travels in the authorize URL.
+2. Generates the CSRF state and the OIDC nonce, also through `SecureRng`,
+   and stores all three in the session's intermediate state.
+3. Composes the authorize URL from the client id, redirect URI, scopes,
+   challenge, state and nonce, and returns it.
 
 The redirect URI passed at this step must exactly match the one
 registered with the IdP at provisioning time. A mismatch is the
 single most common reason a federated login fails out of the box.
 
-## Handle the callback
+### Handle the callback
 
 The IdP, on successful user authentication and consent, redirects the
 user to the registered redirect URI with a `code` and a `state` query
@@ -169,28 +198,27 @@ struct CallbackQuery {
 }
 ```
 
-`finish_oauth_login` does seven things internally. First, it reads
-the PKCE verifier, the CSRF state, and the nonce from the session's
-intermediate state. Second, it cross-checks the supplied state
-against the stored state, returning `OAuthError::CsrfMismatch` if
-they disagree. Third, it constructs the POST to the IdP's token
-endpoint, including the code, the PKCE verifier, the client id, and
-the client secret. Fourth, it parses the response and extracts the
-ID token, access token, and (optional) refresh token. Fifth, it
-validates the ID token: signature against the cached JWKS, issuer
-match, audience match, nonce match, expiry, `azp` check when the
-audience is multi-valued. Sixth, it optionally fetches the userinfo
-endpoint with the access token to supplement the ID token claims.
-Seventh, it transitions the session to `Authenticated` (or to
-`PendingWorkflow` if the federated flow is part of a multi-step
-ceremony like signup).
+`finish_oauth_login` does seven things:
+
+1. Reads the PKCE verifier, CSRF state and nonce from the session's
+   intermediate state.
+2. Cross-checks the supplied state against the stored one, returning
+   `OAuthError::CsrfMismatch` if they disagree.
+3. POSTs to the IdP's token endpoint with the code, verifier, client id
+   and client secret.
+4. Extracts the ID token, access token and optional refresh token.
+5. Validates the ID token: signature against the cached JWKS, issuer,
+   audience, nonce, expiry, and `azp` when the audience is multi-valued.
+6. Optionally fetches userinfo to supplement the ID token claims.
+7. Transitions the session to `Authenticated`, or to `PendingWorkflow`
+   if the federated flow is one step of a longer ceremony such as signup.
 
 If any of the seven steps fails, the function returns an
 `OAuthError` variant naming what failed. The session does not
 transition; the intermediate state is cleared (to prevent replay);
 the callback handler can render an error.
 
-## ID token validation
+### ID token validation
 
 The ID token validation is where most of the security of an OIDC
 integration lives. Axess performs the full set of checks RFC 6749
@@ -244,7 +272,11 @@ issued within the last few minutes; tokens older than that indicate
 replay. The bound is configurable but defaults to five minutes,
 which matches what RFC 7519 implementations typically use.
 
-## Back-channel logout
+## Logging out
+
+Two mechanisms, driven from opposite ends.
+
+### Back-channel logout
 
 When the IdP supports OIDC back-channel logout, the IdP sends a POST
 to a registered logout endpoint at your application with a
@@ -265,7 +297,7 @@ caps protect against denial-of-service through oversize tokens; the
 bounds defeat replay of a captured logout token after a meaningful
 delay.
 
-## RP-Initiated Logout
+### RP-Initiated Logout
 
 The opposite direction is RP-Initiated Logout: you
 initiates a logout that propagates to the IdP, so the user is logged
@@ -283,23 +315,6 @@ the user to an arbitrary external site after logout, which is the
 shape of a phishing setup. The allowlist is a small explicit list of
 allowed URIs; anything else is rejected at `build_end_session_url`
 time.
-
-## Multiple providers
-
-A common shape is to offer login with several IdPs side by side
-(Google, GitHub, Microsoft). Each provider is its own
-`OAuthProvider` instance constructed at startup; your code
-registers them under a `provider_name` key. The login URL carries
-the provider name (`GET /auth/login/google`); the callback URL also
-carries the name (`GET /auth/callback/google`). Axess dispatches to
-the right provider per request.
-
-A per-tenant variation is also common: each tenant's users federate
-against the tenant's own IdP (an Okta workspace, an Azure AD
-directory). The provider name in this case is the tenant slug; the
-provider is constructed at tenant provisioning time (or lazily, on
-first use) and cached. The scope hierarchy chapter covers the
-pattern for storing per-tenant configurations.
 
 ## Threat model
 

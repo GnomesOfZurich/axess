@@ -4,13 +4,16 @@ Most of axess works against traits, and the identity store is the
 most consequential of them. The library does not prescribe a user
 schema, a tenant schema, or a factor schema; it prescribes a set
 of trait methods you implement against whatever
-schema it already has. This chapter walks through the three-tier
-trait split, the verbs each tier carries, the patterns for
-implementing them against a SQL backend, and the
+schema it already has. The three-tier split is by privilege, so an
+adopter implements only the tier it needs, down to the
 read-replica-and-fixtures variant that the `NoopAuthnLog` adapter
 enables.
 
-## The three tiers
+## The traits
+
+Split by privilege, so an adopter implements only the tier it needs.
+
+### The three tiers
 
 The identity store is split into three trait tiers, in order of
 increasing privilege. An adopter that needs only read access
@@ -89,9 +92,9 @@ pub trait IdentityAdmin: IdentityAuthnLog {
         user_id: &UserId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // Plus the password-history and suspension verbs, which default to
-    // `unimplemented!()` with a message naming the feature that needs
-    // them. See below.
+    // Plus the suspension verbs. `delete_user` is the one method here
+    // that still defaults to `unimplemented!()`; nothing in axess calls
+    // it, so the panic fires only if you call it yourself. See below.
 }
 
 // The umbrella for production: all three tiers.
@@ -137,28 +140,32 @@ state is derived from that count and the policy, not stored as its own
 row. `create_user` takes a fully-formed `User`, so identifier
 generation and defaulting happen in your code, before the call.
 
-Two `IdentityAdmin` methods have default bodies that `unimplemented!()`
-rather than returning an error: password-reuse prevention needs
-`record_password_hash` and `password_history`, and a backend that never
-raises `history_count` above zero should not have to write stubs for
-them. The panic is uniform when it does fire, on an authenticated
-change-password call, so it costs availability and nothing else.
+Four methods that once had `unimplemented!()` defaults on `IdentityAdmin`
+no longer do. They live on two capability traits with no default bodies,
+and the flows that need them are bounded on those traits, so a store that
+has not implemented them cannot reach the flow and the omission is a
+compile error rather than a panic.
 
-The reset-token methods are not among them, and the reason is worth
-knowing because it is the shape of a mistake rather than a preference.
-`begin_password_reset` answers `Ok(None)` for an identifier it cannot
-find and reaches the store only for one it can. A panicking default
-therefore answered an unauthenticated "forgot password" request with a
-200 for an address that is not registered and a 500 for one that is:
-a user-enumeration oracle, in the function that equalizes its own
-timing specifically to avoid leaking that. A silently-succeeding
-default would be worse, since recovery would appear to work while no
-token was ever stored.
+`IdentityPasswordReset` holds `store_reset_token` and
+`verify_reset_token`. The reason is the shape of a mistake rather than a
+preference. `begin_password_reset` answers `Ok(None)` for an identifier
+it cannot find and reaches the store only for one it can, so a panicking
+default answered an unauthenticated "forgot password" request with a 200
+for an address that is not registered and a 500 for one that is: a
+user-enumeration oracle, in the function that equalizes its own timing
+specifically to avoid leaking that. A silently-succeeding default would
+have been worse, since recovery would appear to work while no token was
+ever stored.
 
-So those two live on `IdentityPasswordReset`, with no defaults, and the
-reset flow is bounded on it. A store that has not implemented them
-cannot call the flow, and the omission is a compile error naming both
-methods.
+`IdentityPasswordHistory` holds `record_password_hash` and
+`password_history`, for a plainer reason. `record_password_hash` is
+called on **every** password change with no guard, so a backend that had
+not overridden it panicked the first time any user changed their
+password, on a method that looked optional because a defaulted trait
+method does.
+
+A deployment with no password-reuse policy implements neither trait and
+loses nothing.
 
 The hierarchy reads from narrowest to widest. An
 `IdentityAuthnLog` is an `IdentityLookup` plus the audit writes.
@@ -166,7 +173,7 @@ An `IdentityAdmin` is an `IdentityAuthnLog` plus the
 administrative writes. The umbrella `IdentityStore` is the
 all-three-tiers shape that production backends implement.
 
-## Why three tiers
+### Why three tiers
 
 The split is the answer to two adopter situations the library has
 seen often enough to model explicitly.
@@ -195,7 +202,7 @@ implements `IdentityAdmin`. The split prevents the login path
 code from accidentally calling `delete_user` or `suspend_user`
 because it never has the trait method in scope.
 
-## What the verbs actually do
+### What the verbs actually do
 
 The verbs split cleanly across the tiers.
 
@@ -211,10 +218,31 @@ users in a tenant for admin tooling.
 `IdentityAuthnLog` is the writes the login flow makes as it runs.
 `record_event` takes one flat `AuthEvent`, carrying the event type, the
 status, the timestamp in epoch microseconds, and whatever attribution
-was resolvable: user, tenant, session, factor kind, IP, user agent,
-request id, error string. It is called throughout the flow, not only
-after a factor check, and its argument is the same type the audit query
-surface returns. `record_failed_attempt` increments the user's failure
+was resolvable: user, tenant, session, factor kind, the client address
+as an `IpAddr`, user agent, request id, and the failure reason as an
+`AuthFailureReason` rather than free text. It is called throughout the
+flow, not only after a factor check, and its argument is the same type
+the audit query surface returns.
+
+Three of those fields deserve a nullable column and usually get a
+surprised implementer: the address, user agent and request id are `None`
+on every event unless the request path called
+`AuthnService::with_audit_context`. Axess cannot resolve a trustworthy
+client address on its own, since that needs your TCP peer and your
+trusted-proxy set, so it records nothing rather than something
+forgeable. *Cookies, fingerprinting, hijack detection* covers the
+wiring.
+
+**What you return decides whether the login succeeds.** `Err` fails the
+authentication: an authentication that leaves no evidence has not, for
+evidence purposes, happened. Reserve it for a sink that is genuinely
+broken, and expect logins to fail while yours is. `Ok(Shed)` says you
+dropped the event deliberately under load, and the flow continues.
+
+Shed on something identifier-independent, a global rate or a queue depth
+or a disk watermark. A shed decision derived from *which* identifier was
+tried is observable per identifier, and rebuilds the user-enumeration
+oracle that writing unattributable rejections exists to close. `record_failed_attempt` increments the user's failure
 counter and returns the new count, which is the number the
 `LockoutPolicy` compares against its threshold;
 `reset_failed_attempts` zeroes it on a successful login or an
@@ -225,12 +253,15 @@ state is derived from the counter and the policy.
 `create_user` are the provisioning verbs, and `create_user` takes an
 already-built `User`, so identifier generation and defaulting happen in
 your code, not behind the trait. `activate_user` moves a user out of
-the pending state. The rest of the tier covers password history,
-out-of-band reset tokens, and suspension; several of those have
-defaults that `unimplemented!()` until the feature that needs them is
-turned on.
+the pending state. The rest of the tier is suspension and deletion.
+Password history and reset tokens used to live here; they are capability
+traits of their own now, for the reasons above.
 
-## Implementing against SQL
+## Implementing them
+
+Against SQL, and the two places the contract is easy to get wrong.
+
+### Implementing against SQL
 
 The typical implementation against a SQL database is verbose but
 mechanical. The pattern is to implement each verb as one query
@@ -311,7 +342,7 @@ not an error: the login flow treats "no such user" and "wrong password"
 identically, on purpose, so that a failed login does not reveal which
 identifiers exist.
 
-## Implementing the audit writes
+### Implementing the audit writes
 
 `IdentityAuthnLog` is the layer that requires care. Its verbs fire on
 every login attempt, so a slow implementation is the bottleneck of the
@@ -322,68 +353,7 @@ one flat `AuthEvent` row. `record_failed_attempt` and
 `reset_failed_attempts` maintain a single counter on the user.
 
 ```rust,ignore
-impl IdentityAuthnLog for OurBackend {
-    async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
-        // Unresolved attribution, a pre-auth failure or a malformed
-        // OAuth claim, persists as NULL so audit queries can tell "we do not
-        // know who" from a real principal. Both columns allow NULL.
-        let user_id: Option<String> = event.user_id.as_ref().map(|u| u.to_string());
-        let tenant_id: Option<String> = event.tenant_id.as_ref().map(|t| t.to_string());
-        let event_time = DateTime::<Utc>::from_timestamp_micros(event.event_time)
-            .expect("event_time micros in range")
-            .to_rfc3339();
-
-        sqlx::query(
-            "INSERT INTO auth_events
-             (id, user_id, tenant_id, session_id, event_type, event_status,
-              event_time, factor_kind, ip_address, user_agent, request_id,
-              geo_country, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(&user_id)
-        .bind(&tenant_id)
-        .bind(event.session_id.map(|sid| sid.to_string()))
-        .bind(event.event_type.to_string())
-        .bind(event.event_status.to_string())
-        .bind(&event_time)
-        .bind(event.factor_kind.as_ref().map(|k| k.as_str()))
-        .bind(event.ip_address.as_deref())
-        .bind(event.user_agent.as_deref())
-        .bind(event.request_id.as_deref())
-        .bind(event.geo_country.as_deref())
-        .bind(event.error.as_deref())
-        .execute(self.pool())
-        .await?;
-        // `Shed` instead, to drop an event under load without failing
-        // the login. Key that decision on something identifier-independent.
-        Ok(AuditOutcome::Recorded)
-    }
-
-    /// Returns the count *after* the increment: that is the number the
-    /// lockout policy compares against its threshold.
-    async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
-        sqlx::query("UPDATE users SET failed_attempts = failed_attempts + 1 WHERE id = ?1")
-            .bind(user_id.to_string())
-            .execute(self.pool())
-            .await?;
-
-        let row = sqlx::query("SELECT failed_attempts FROM users WHERE id = ?1")
-            .bind(user_id.to_string())
-            .fetch_one(self.pool())
-            .await?;
-        let count: i64 = row.get("failed_attempts");
-        Ok(count as u32)
-    }
-
-    async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        sqlx::query("UPDATE users SET failed_attempts = 0 WHERE id = ?1")
-            .bind(user_id.to_string())
-            .execute(self.pool())
-            .await?;
-        Ok(())
-    }
-}
+{{#include ../../examples/sqlite/src/models/backend/identity.rs:authn_log}}
 ```
 
 Two properties of that shape matter operationally.
@@ -414,7 +384,7 @@ is in *Audit pipeline*: typically a hot/cold split where recent
 attempts (the ones the lockout policy consults) stay in the
 attempts table and older attempts archive to a cold store.
 
-## The NoopAuthnLog adapter
+### The NoopAuthnLog adapter
 
 `NoopAuthnLog<L>` wraps an `IdentityLookup` and provides no-op
 implementations of the `IdentityAuthnLog` write verbs. The
@@ -442,7 +412,11 @@ The chapter warns about this in the docstring of `NoopAuthnLog`;
 the warning is worth repeating: do not use `NoopAuthnLog` in
 production without an alternative lockout source.
 
-## What about workload identities
+## Fitting an existing system
+
+Where axess bends to a schema you already run.
+
+### What about workload identities
 
 Workloads have their own identity surface, not the same one
 humans use. The `IdentityStore` traits do not cover workloads;
@@ -461,7 +435,7 @@ has two variants, the read paths for the two variants go through
 two different stores. The application implements both stores and
 the resolver code routes appropriately.
 
-## Schema migration
+### Schema migration
 
 The identity store is the part of your system most likely to
 need migrations over time: a new factor adds a column to the
@@ -480,7 +454,7 @@ The pattern in `examples/sqlite/` is the reference. The
 runs them at startup; the implementation queries against the
 latest schema.
 
-## Fitting into a schema you already have
+### Fitting into a schema you already have
 
 The trait split is what lets axess fit into existing applications
 without forcing a schema rewrite. The library knows nothing about

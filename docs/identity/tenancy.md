@@ -3,10 +3,7 @@
 A tenant in axess is the unit of isolation. Users, factor
 configurations, sessions, devices, policies, and audit events all
 carry a `TenantId`, and the library refuses to leak data across
-tenants by construction. This chapter covers the model, the
-atomic provisioning pattern that ensures every tenant starts in a
-sound state, the three-lever lockout, and the operational
-patterns for tenant suspension and deletion.
+tenants by construction.
 
 The mechanism is on by default, and no feature flag exists to
 toggle tenancy; the `TenantId` field is present on every relevant
@@ -15,7 +12,11 @@ record. A single-tenant deployment uses one well-known
 the multi-tenant machinery for free, ready to expand when a
 second tenant is added.
 
-## The tenant record
+## The model
+
+What a tenant is, and the boundary the type system enforces.
+
+### The tenant record
 
 The `Tenant` struct lives in `axess-core` and is deliberately thin:
 
@@ -60,7 +61,7 @@ override of the global lockout configuration, covered in the
 *Three-lever lockout* section below. The `device_retention_days`
 is the per-tenant GDPR-shaped retention period for device records.
 
-## Cross-tenant refusal as a structural rule
+### Cross-tenant refusal as a structural rule
 
 Every operation in axess that touches a user, a session, a device,
 a factor, or an event carries a tenant scope. The library checks
@@ -151,7 +152,7 @@ cannot present any factor cannot be logged into.
 
 The atomicity matters because a partially-provisioned tenant is a
 landmine. A tenant that exists in the tenant table but has no
-configured method admits any user with the global default method,
+configured method admits any user with the system default method,
 which may not be what the new tenant wants. A tenant with a
 method but no factor configurations for the admin user produces
 an immediate lockout. A tenant with an admin user but no factor
@@ -264,7 +265,11 @@ The policy is resolved per tenant through
 `lockout_policy()`, which defaults to `LockoutPolicy::default()`.
 Override either where your tenants differ.
 
-## Tenant suspension
+## Tenant lifecycle
+
+Suspending and deleting, and what each does to live sessions.
+
+### Tenant suspension
 
 `Tenant` carries `status: EntityState`, the same type a user's status
 uses, so a suspended tenant is representable. **Axess ships no
@@ -291,7 +296,7 @@ want to render specifically ("your organisation is suspended, contact
 support") rather than as the generic invalid-credentials page, so check
 the tenant's status rather than inferring it from the login outcome.
 
-## Tenant deletion
+### Tenant deletion
 
 The same gap as suspension, one step further along. `EntityState` has a
 closed state, so a deleted tenant is representable, and **axess ships
@@ -308,16 +313,21 @@ audit events in place, to be retained under an independent lawful basis
 with identifying columns pseudonymised. A tenant-level erasure inherits
 both.
 
-If you build it, two things are worth doing that a naive cascade will
-not. Mark the tenant `Suspended` first and run the removal afterwards:
-the cascade is expensive on a large tenant, and the gap between the two
-is the only window in which an accidental deletion is recoverable
-without a backup restore. And write your own audit row for the
-operation, naming the operator, the instant and the counts, because
-axess has no tenant lifecycle event to emit and the deletion is exactly
-the thing you will later be asked to defend.
+If you build it, two things a naive cascade will not do:
 
-## Per-tenant configuration storage
+- **Mark the tenant `Suspended` first**, then remove. The cascade is
+  expensive on a large tenant, and the gap between the two is the only
+  window in which an accidental deletion is recoverable without a
+  backup restore.
+- **Write your own audit row**, naming the operator, the instant and the
+  counts. Axess has no tenant lifecycle event to emit, and the deletion
+  is exactly the thing you will later be asked to defend.
+
+## Configuration and conventions
+
+There is no tenant trait, and the consolidation is deliberate.
+
+### Per-tenant configuration storage
 
 There is no `TenantStore` trait. Tenant reads and writes live on the
 identity tiers alongside everything else: `IdentityLookup::find_tenant`
@@ -338,7 +348,7 @@ a column or a table of its own and returns it from
 `lockout_policy_for_tenant` and friends. Axess never reads that storage
 directly, which is why it cannot dictate its shape.
 
-## Reserved principals
+### Reserved principals
 
 A handful of principals are reserved across all tenants. The
 `system()` principal is the one axess uses for its own internal
@@ -375,7 +385,7 @@ N>1.
 
 ## Further reading
 
-*Scope hierarchy* covers the three-tier (Global, Tenant, User)
+*Scope hierarchy* covers the three-tier (`System`, `Tenant`, `User`)
 resolution mechanism that determines which configuration applies
 to which user. *Device identity* covers the per-tenant
 fingerprint pepper and the GDPR-shaped retention sweep.

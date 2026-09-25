@@ -5,6 +5,7 @@
 mod common;
 
 use axess_clock::Clock;
+use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
 use axess_core::{
     authn::service::AuthnService,
@@ -184,7 +185,8 @@ async fn begin_oauth_login_refuses_with_par_inflight_in_future() {
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("fapi-stub"))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     // Stash a PAR marker that expires 60 s from MockClock's "now".
@@ -219,7 +221,8 @@ async fn begin_oauth_login_succeeds_with_par_inflight_at_exact_now() {
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("fapi-stub-eq"))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let exactly_now = clock.now();
@@ -253,7 +256,8 @@ async fn par_inflight_expires_at_is_in_the_future() {
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_oauth_provider(FapiStubProvider::new("fapi-stub-fut"))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let now = clock.now();
@@ -299,7 +303,8 @@ async fn csrf_mismatch_records_failure_audit_event() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     authn
         .begin_oauth_login("test", &OAuthLoginOptions::default(), &session)
@@ -330,7 +335,8 @@ async fn build_end_session_url_delegates_to_provider() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(FapiStubProvider::new("logout-stub"))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let url = authn.build_end_session_url(
         "logout-stub",
@@ -365,7 +371,8 @@ async fn begin_oauth_login_clears_stale_expected_tenant() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(provider)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     session

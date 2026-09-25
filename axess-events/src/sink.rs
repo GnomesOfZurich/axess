@@ -76,14 +76,26 @@ where
     }
 }
 
-/// Wraps any [`EventSink`] and converts errors into a `warn!` log,
-/// returning `Ok(())` regardless. Intended for best-effort emission
-/// paths where the producer's primary work has already committed and
-/// the audit/observability emit must not block or roll back.
+/// Wraps any [`EventSink`] and turns its errors into a `warn!`,
+/// returning `Ok(())` regardless. For observability streams whose
+/// producer has already committed its real work and must not block or
+/// roll back on a telemetry write.
 ///
-/// Mirrors the existing best-effort pattern in axess's device
-/// subsystem; operationally, the state mutation is the security
-/// signal; audit is for forensics.
+/// # What this is not for
+///
+/// The regulatory audit trail does not run through [`EventSink`]. It
+/// runs through `IdentityAuthnLog` in `axess-core`, which has no
+/// `EventSink` impl, so this type cannot wrap it and the compiler will
+/// say so. That is deliberate rather than an oversight: swallowing an
+/// `IdentityAuthnLog` error is exactly the fail-open that axess 0.6.0
+/// removed, where a login succeeded while the row recording it was
+/// lost, and the catalogue offered as SOC 2 or PCI-DSS evidence grew
+/// holes that nothing reported.
+///
+/// A store that must shed a regulatory event under load says so by
+/// returning `AuditOutcome::Shed`, which lets the login proceed and
+/// counts the drop on `AuthnMetrics::audit_event_shed`. Dropping one
+/// is allowed; dropping one silently is not.
 #[derive(Debug)]
 pub struct LogAndSwallow<S>(pub S);
 

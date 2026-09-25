@@ -49,8 +49,16 @@ use uuid::Uuid;
 
 const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
-#[derive(Clone)]
-struct RequestId(String);
+/// The request id this layer settled on, in the request extensions.
+///
+/// The layer also writes it to
+/// [`RequestIdGenerator::HEADER_NAME`],
+/// so a reader that knows the header name can find it there. Anything that
+/// does not, such as the audit context, reads this instead: the header is
+/// whatever the generator chose to call it, and `x-request-id` is only the
+/// default.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
 
 /// Pluggable strategy for producing request IDs and selecting the header
 /// name they are written under.

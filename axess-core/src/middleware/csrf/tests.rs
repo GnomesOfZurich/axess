@@ -884,7 +884,7 @@ async fn csrf_service_remints_stale_cookie_on_safe_verb() {
 /// inner service calls `regenerate()` on the session handle (as a
 /// factor-chain-completion path would) receives a fresh `Set-Cookie`
 /// bound to the post-rotation id. This is the case that makes the
-/// login flow survive `AuthnService::verify_factor` cycling the id
+/// login flow survive `RequestAuthnService::verify_factor` cycling the id
 /// without leaving the client tokenless.
 #[tokio::test]
 async fn csrf_service_remints_when_handler_rotates_session() {

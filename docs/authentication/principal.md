@@ -8,10 +8,8 @@ an API are both principals, with different variants but the same trait
 surface, the same authorisation contract, and the same place in the
 audit trail.
 
-This chapter covers the type, where each variant comes from, how the
-unified shape lets a Cedar policy treat humans and workloads with one
-set of rules, and why the alternative (two parallel authentication
-stacks) was rejected.
+The alternative, two parallel authentication stacks, was rejected, and
+the reasoning is below.
 
 ## The type
 

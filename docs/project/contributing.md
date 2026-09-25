@@ -1,10 +1,8 @@
 # Contributing
 
-This chapter is the contributor reference. It covers what we
-expect of pull requests, the testing requirements (including the
-non-negotiable DST discipline), the AX-NNN tracking convention,
-and the naming and visibility conventions that show up at code
-review.
+What a pull request needs before it will be merged. The DST
+requirement is the one that surprises people, so read that section even
+if you skip the rest.
 
 The chapter has two halves. The first half is contributor-facing
 guidance specific to working on axess. The second half is the

@@ -467,7 +467,7 @@ impl<T: IdentityAdmin> IdentityStore for T {}
 /// without default bodies, because neither possible default is safe.
 ///
 /// A default that panics turns
-/// [`AuthnService::begin_password_reset`](crate::authn::service::AuthnService::begin_password_reset)
+/// [`RequestAuthnService::begin_password_reset`](crate::authn::service::RequestAuthnService::begin_password_reset)
 /// into a user-enumeration oracle. That function answers `Ok(None)` for
 /// an identifier it cannot find and reaches the store only for one it
 /// can, so an unattended backend would answer an unauthenticated

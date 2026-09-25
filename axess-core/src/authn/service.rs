@@ -3,11 +3,11 @@
 //!
 //! Hold an `Arc<AuthnService<…>>` in Axum state. The login flow is:
 //!
-//! 1. [`AuthnService::begin_login`]: identifies the user, starts the MFA chain.
-//! 2. [`AuthnService::prepare_factor`]: for challenge-based factors (EmailOtp),
+//! 1. [`RequestAuthnService::begin_login`]: identifies the user, starts the MFA chain.
+//! 2. [`RequestAuthnService::prepare_factor`]: for challenge-based factors (EmailOtp),
 //!    generates and stores the challenge, returns data for the app to deliver.
 //!    For simple factors (Password, TOTP, HOTP), returns `Ready` immediately.
-//! 3. [`AuthnService::verify_factor`]: verifies the credential the user submits.
+//! 3. [`RequestAuthnService::verify_factor`]: verifies the credential the user submits.
 //!
 //! # Enforcing session validity on protected routes
 //!
@@ -84,22 +84,22 @@ use std::sync::Arc;
 /// [`AuthnServiceBuilder::with_clock`] without changing the type; adopters
 /// can store the service in `Arc<AppState>` and inject a `MockClock`
 /// for tests against the same `<I, F>` shape.
-/// A cheap handle over one `Arc` of shared collaborators, plus the
-/// per-request audit context.
+/// A cheap handle over one `Arc` of shared collaborators.
 ///
-/// Cloning is a refcount bump, which is what makes
-/// [`with_audit_context`](Self::with_audit_context) affordable once per
-/// request. Construction goes through [`AuthnService::builder`], because
-/// the collaborators must be settled before they are shared.
+/// This is the application-lifetime half: keep one in application state.
+/// It cannot write an audit event, because it does not know who the client
+/// is. The methods that can are on [`RequestAuthnService`], which
+/// [`with_audit_context`](Self::with_audit_context) derives per request.
+///
+/// Cloning is a refcount bump. Construction goes through
+/// [`AuthnService::builder`], because the collaborators must be settled
+/// before they are shared.
 pub struct AuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore,
 {
     pub(crate) inner: Arc<AuthnServiceBuilder<I, F>>,
-    /// Client metadata stamped onto every event this handle emits.
-    /// `None` straight from the builder.
-    pub(crate) audit: Option<Arc<crate::authn::event::AuditContext>>,
 }
 
 // Cloneable whatever `I` and `F` are, because both sit behind the `Arc`.
@@ -113,49 +113,64 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
-            audit: self.audit.clone(),
         }
     }
 }
 
-/// What axess does when about to write an audit event carrying no client
-/// metadata.
+/// An [`AuthnService`] bound to one request's client metadata.
 ///
-/// The seam this governs was unwired for a whole release: the context
-/// type, the extractor and the builder method all existed, nothing joined
-/// them, and every audit row carried a null IP while the documentation
-/// offered the catalogue as SOC 2 and PCI-DSS evidence. Nothing failed,
-/// which is why nobody noticed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AuditContextPolicy {
-    /// Write the event with whatever metadata is present, including none.
-    /// Correct where there is genuinely no trustworthy address: a null IP
-    /// is honest where an invented one is not.
-    #[default]
-    Optional,
-    /// Refuse to write an event on a route that attached no context,
-    /// turning a silent omission into a loud one.
-    ///
-    /// The test is whether a context was **attached**, not how much it
-    /// contains. A context carrying no address still satisfies this:
-    /// `extract_audit_context(.., None, ..)` is the documented choice
-    /// where nothing is trustworthy, and refusing it would punish the
-    /// deployments that were honest about having no address.
-    ///
-    /// **This is a fail-closed path.** An adopter who sets it and forgets
-    /// [`AuthnService::with_audit_context`] on one route fails that
-    /// route's logins rather than under-recording them. Wire every route
-    /// before turning it on, and watch
-    /// [`AuthnMetrics::audit_context_missing`](crate::metrics::AuthnMetrics::audit_context_missing).
-    ///
-    /// **It does not guarantee the event was recorded**, despite the
-    /// name. A sink that returns
-    /// [`AuditOutcome::Shed`](crate::authn::store::AuditOutcome::Shed)
-    /// still drops it, and the login still succeeds. `Required` fixes the
-    /// wiring; durability is the sink's contract, and
-    /// [`AuthnMetrics::audit_event_shed`](crate::metrics::AuthnMetrics::audit_event_shed)
-    /// is where a gap shows up.
-    Required,
+/// Every method that can write an audit event lives here and nowhere else,
+/// so a row with no client address is not a thing a caller can produce by
+/// forgetting a step: there is no `begin_login` to forget it on. Derive one
+/// per request with
+/// [`AuthnService::with_audit_context`](AuthnService::with_audit_context)
+/// and let it die with the request.
+///
+/// It derefs to the service, so the application-scoped methods
+/// ([`check_session`](AuthnService::check_session), the capability
+/// predicates, the revocation calls) are reachable through it and a handler
+/// needs only the one handle.
+///
+/// **Do not store one.** It pins that client's address for as long as it
+/// lives, so a copy kept in application state would stamp a stale address
+/// onto every later event: a quieter kind of wrong than a missing one,
+/// because the rows look complete.
+pub struct RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore,
+{
+    service: AuthnService<I, F>,
+    /// Client metadata stamped onto every event this handle emits. Not
+    /// optional: holding one is what the type means.
+    pub(crate) audit: Arc<crate::authn::event::AuditContext>,
+}
+
+// Same reason as `AuthnService`'s hand-written impl: a derive would demand
+// `I: Clone, F: Clone` and so refuse the stores adopters actually have.
+impl<I, F> Clone for RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore,
+{
+    fn clone(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            audit: Arc::clone(&self.audit),
+        }
+    }
+}
+
+impl<I, F> std::ops::Deref for RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore,
+{
+    type Target = AuthnService<I, F>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
 }
 
 /// Configures an [`AuthnService`], and is what the built handle shares.
@@ -170,7 +185,6 @@ where
     I: IdentityStore,
     F: FactorStore,
 {
-    pub(crate) audit_policy: AuditContextPolicy,
     pub(crate) identity: Arc<I>,
     pub(crate) factors: Arc<F>,
     pub(crate) registry: Option<Arc<dyn SessionRegistryHandle>>,
@@ -216,7 +230,6 @@ where
     /// Start configuring a service. Finish with [`build`](Self::build).
     pub fn new(identity: I, factors: F) -> Self {
         Self {
-            audit_policy: AuditContextPolicy::Optional,
             identity: Arc::new(identity),
             factors: Arc::new(factors),
             registry: None,
@@ -277,151 +290,39 @@ where
         AuthnServiceBuilder::new(identity, factors)
     }
 
-    /// Return a copy of this handle that stamps every event it emits with
-    /// `ctx`.
+    /// Derive the request-scoped handle that can authenticate, stamping
+    /// every event it emits with `ctx`.
     ///
-    /// Call it once per request, from wherever the client address was
-    /// resolved:
+    /// Call it once per request, and let the result die with the request:
     ///
     /// ```ignore
-    /// let ip = ip_from_headers_trusted(&headers, peer, &trusted);
-    /// let ctx = extract_audit_context(&headers, Some(ip), Some(&session));
-    /// let svc = state.authn.with_audit_context(ctx);
-    /// svc.begin_login(&identifier, &tenant, &session).await?;
+    /// async fn post_login(
+    ///     State(state): State<AppState>,
+    ///     audit: AuditContext,          // the extractor; reads what the layer resolved
+    ///     Form(form): Form<LoginForm>,
+    /// ) -> Response {
+    ///     let svc = state.authn.with_audit_context(audit);
+    ///     svc.begin_login(&form.identifier, &tenant, &session).await?;
+    ///     svc.verify_factor(&credential, &session).await?;
+    /// }
     /// ```
     ///
+    /// Both calls go through `svc` because there is no other way to make
+    /// them: `begin_login` and `verify_factor` are on
+    /// [`RequestAuthnService`], not on this type. Before 0.7.0 they were on both
+    /// and reaching back to `state.authn` for the second call wrote that
+    /// row with no address, which in a login handler is the failed-password
+    /// row: the one a brute-force query counts.
+    ///
     /// The collaborators are shared, so this costs a refcount bump and one
-    /// small allocation; only the context differs between copies.
-    ///
-    /// **Call it per request, and let the copy die with the request.**
-    /// The returned handle pins that one client's address for as long as
-    /// it lives, so storing it in application state would stamp a stale
-    /// address onto every later event: a quieter kind of wrong than a
-    /// missing one, because the rows look complete. Keep the shared
-    /// service in state and derive a copy per request.
-    pub fn with_audit_context(&self, ctx: crate::authn::event::AuditContext) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-            audit: Some(Arc::new(ctx)),
-        }
-    }
-
-    /// The audit-context policy this service was built with.
-    pub fn audit_context_policy(&self) -> AuditContextPolicy {
-        self.inner.audit_policy
-    }
-
-    /// Stamp the builder with `self.inner.clock.now()` and dispatch the
-    /// resulting [`AuthEvent`](crate::authn::event::AuthEvent) to the
-    /// identity store, logging at `tracing::error!` if the store
-    /// rejects the write.
-    ///
-    /// This is the canonical audit-emit entry point for the crate.
-    /// The vast majority of audit emits share the shape
-    /// `builder.build_at(self.inner.clock.now())` followed by an identity
-    /// `record_event` that must not block the request flow on store
-    /// failure. Threading the clock through the builder finisher at
-    /// every call site obscures intent (the timestamp is always *now*)
-    /// and risks drift if the clock dependency ever changes shape
-    /// (matching how the RNG threading was retrofitted). `emit_audit`
-    /// centralises the `clock + record + log` pattern so call sites
-    /// read as `self.emit_audit(builder.with_factor(kind)).await`:
-    /// the audit content is what the reader cares about.
-    ///
-    /// Audit-store outages surface as `tracing::error!` (with
-    /// `event_type` and `event_status` context) **and** as
-    /// [`AuthnError::Store`](crate::authn::error::AuthnError::Store): the
-    /// flow stops. An authentication that is not recorded has not, for
-    /// evidence purposes, happened, and a deployment that offers this
-    /// catalogue as SOC 2 or PCI-DSS evidence cannot have it silently
-    /// develop holes. The trade is availability: logins fail while the
-    /// audit store does, so the sink belongs behind something durable
-    /// (a local write shipped asynchronously) rather than a remote
-    /// service on the request path.
-    ///
-    /// Every path that can reject a login emits before it returns, which
-    /// is what keeps this from becoming a user-enumeration oracle: an
-    /// unknown identifier and a wrong password both attempt an audit
-    /// write, so an outage fails both identically.
-    ///
-    /// The underlying `record_event_or_log` is private;
-    /// callers go through [`emit_audit`](Self::emit_audit) for the
-    /// "now" case and [`emit_audit_at`](Self::emit_audit_at) for the
-    /// captured-timestamp case. The single intentional bypass is the
-    /// audit-failure-with-context emit in `factor_pipeline.rs`,
-    /// which calls `self.inner.identity.record_event(...)` directly so its
-    /// `tracing::error!` can include `user_id = %user_id`: context
-    /// `record_event_or_log` doesn't have. That bypass is documented
-    /// at the call site.
-    pub(crate) async fn emit_audit(
+    /// small allocation; only the context differs between handles.
+    pub fn with_audit_context(
         &self,
-        builder: crate::authn::event::AuthEventBuilder,
-    ) -> Result<(), crate::authn::error::AuthnError<I::Error>> {
-        self.emit_audit_at(builder, self.inner.clock.now()).await
-    }
-
-    /// Stamp the builder with the given `event_time` and dispatch
-    /// to the identity store, failing the flow on a store error exactly
-    /// as [`emit_audit`](Self::emit_audit) does.
-    ///
-    /// Use this when several events in the same flow must share a
-    /// single timestamp (e.g. a successful signup and the resulting
-    /// `Authenticated` row should be the same instant): capture the
-    /// time once upstream and pass it to each emit. Calls that just
-    /// want "now" should use [`emit_audit`](Self::emit_audit).
-    pub(crate) async fn emit_audit_at(
-        &self,
-        builder: crate::authn::event::AuthEventBuilder,
-        event_time: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), crate::authn::error::AuthnError<I::Error>> {
-        // The single point every emit site funnels through, and so the
-        // one place the per-request context has to be applied. Before
-        // 0.6.0 nothing applied it anywhere and every row carried a null
-        // client IP.
-        let builder = match &self.audit {
-            Some(ctx) => builder.with_audit_context(ctx),
-            None => builder,
-        };
-        let event = builder.build_at(event_time);
-
-        // `Required` is about the *wiring*, not about how much the context
-        // turned out to contain. A route that attached a context carrying
-        // no address is the honest case: `extract_audit_context(.., None,
-        // ..)` is what the docs tell you to do where nothing is
-        // trustworthy, and failing it would punish exactly the deployments
-        // that got this right. What must not pass silently is a route that
-        // never attached one at all.
-        if self.inner.audit_policy == AuditContextPolicy::Required && self.audit.is_none() {
-            tracing::error!(
-                event_type = ?event.event_type,
-                "audit context policy is Required and this route attached no context; \
-                 call AuthnService::with_audit_context on the request path"
-            );
-            self.inner.metrics.audit_context_missing();
-            return Err(crate::authn::error::AuthnError::MissingAuditContext);
-        }
-
-        let event_type = format!("{:?}", event.event_type);
-        let event_status = format!("{:?}", event.event_status);
-        match self.inner.identity.record_event(event).await {
-            Ok(crate::authn::store::AuditOutcome::Recorded) => Ok(()),
-            Ok(crate::authn::store::AuditOutcome::Shed) => {
-                // A deliberate drop, not a failure: the sink is protecting
-                // its storage. Proceed, and let the metric carry it.
-                self.inner.metrics.audit_event_shed();
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    event_type = %event_type,
-                    event_status = %event_status,
-                    "identity store rejected audit event; failing the flow rather \
-                     than proceeding unrecorded"
-                );
-                self.inner.metrics.audit_store_outage();
-                Err(crate::authn::error::AuthnError::Store(e))
-            }
+        ctx: crate::authn::event::AuditContext,
+    ) -> RequestAuthnService<I, F> {
+        RequestAuthnService {
+            service: self.clone(),
+            audit: Arc::new(ctx),
         }
     }
 
@@ -560,6 +461,109 @@ where
             identity: Some(Arc::new(session_validator::IdentityWrapper(
                 self.inner.identity.clone(),
             ))),
+        }
+    }
+}
+
+impl<I, F> RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
+    /// Stamp the builder with `self.inner.clock.now()` and dispatch the
+    /// resulting [`AuthEvent`](crate::authn::event::AuthEvent) to the
+    /// identity store, logging at `tracing::error!` if the store
+    /// rejects the write.
+    ///
+    /// This is the canonical audit-emit entry point for the crate.
+    /// The vast majority of audit emits share the shape
+    /// `builder.build_at(self.inner.clock.now())` followed by an identity
+    /// `record_event` that must not block the request flow on store
+    /// failure. Threading the clock through the builder finisher at
+    /// every call site obscures intent (the timestamp is always *now*)
+    /// and risks drift if the clock dependency ever changes shape
+    /// (matching how the RNG threading was retrofitted). `emit_audit`
+    /// centralises the `clock + record + log` pattern so call sites
+    /// read as `self.emit_audit(builder.with_factor(kind)).await`:
+    /// the audit content is what the reader cares about.
+    ///
+    /// Audit-store outages surface as `tracing::error!` (with
+    /// `event_type` and `event_status` context) **and** as
+    /// [`AuthnError::Store`](crate::authn::error::AuthnError::Store): the
+    /// flow stops. An authentication that is not recorded has not, for
+    /// evidence purposes, happened, and a deployment that offers this
+    /// catalogue as SOC 2 or PCI-DSS evidence cannot have it silently
+    /// develop holes. The trade is availability: logins fail while the
+    /// audit store does, so the sink belongs behind something durable
+    /// (a local write shipped asynchronously) rather than a remote
+    /// service on the request path.
+    ///
+    /// Every path that can reject a login emits before it returns, which
+    /// is what keeps this from becoming a user-enumeration oracle: an
+    /// unknown identifier and a wrong password both attempt an audit
+    /// write, so an outage fails both identically.
+    ///
+    /// The underlying `record_event_or_log` is private;
+    /// callers go through [`emit_audit`](Self::emit_audit) for the
+    /// "now" case and [`emit_audit_at`](Self::emit_audit_at) for the
+    /// captured-timestamp case. The single intentional bypass is the
+    /// audit-failure-with-context emit in `factor_pipeline.rs`,
+    /// which calls `self.inner.identity.record_event(...)` directly so its
+    /// `tracing::error!` can include `user_id = %user_id`: context
+    /// `record_event_or_log` doesn't have. That bypass is documented
+    /// at the call site.
+    pub(crate) async fn emit_audit(
+        &self,
+        builder: crate::authn::event::AuthEventBuilder,
+    ) -> Result<(), crate::authn::error::AuthnError<I::Error>> {
+        self.emit_audit_at(builder, self.inner.clock.now()).await
+    }
+
+    /// Stamp the builder with the given `event_time` and dispatch
+    /// to the identity store, failing the flow on a store error exactly
+    /// as [`emit_audit`](Self::emit_audit) does.
+    ///
+    /// Use this when several events in the same flow must share a
+    /// single timestamp (e.g. a successful signup and the resulting
+    /// `Authenticated` row should be the same instant): capture the
+    /// time once upstream and pass it to each emit. Calls that just
+    /// want "now" should use [`emit_audit`](Self::emit_audit).
+    pub(crate) async fn emit_audit_at(
+        &self,
+        builder: crate::authn::event::AuthEventBuilder,
+        event_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), crate::authn::error::AuthnError<I::Error>> {
+        // The single point every emit site funnels through, and so the one
+        // place the per-request context is applied. It is not optional
+        // here: reaching this method at all means a caller held a
+        // `RequestAuthnService`, and the only way to hold one is to have supplied
+        // a context. Before 0.6.0 nothing applied it anywhere and every row
+        // carried a null client IP; 0.6.0 applied it when present and
+        // offered a runtime policy for when it was not; 0.7.0 removed the
+        // state the policy was checking for.
+        let event = builder.with_audit_context(&self.audit).build_at(event_time);
+
+        let event_type = format!("{:?}", event.event_type);
+        let event_status = format!("{:?}", event.event_status);
+        match self.inner.identity.record_event(event).await {
+            Ok(crate::authn::store::AuditOutcome::Recorded) => Ok(()),
+            Ok(crate::authn::store::AuditOutcome::Shed) => {
+                // A deliberate drop, not a failure: the sink is protecting
+                // its storage. Proceed, and let the metric carry it.
+                self.inner.metrics.audit_event_shed();
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    event_type = %event_type,
+                    event_status = %event_status,
+                    "identity store rejected audit event; failing the flow rather \
+                     than proceeding unrecorded"
+                );
+                self.inner.metrics.audit_store_outage();
+                Err(crate::authn::error::AuthnError::Store(e))
+            }
         }
     }
 }
@@ -718,19 +722,10 @@ where
         self
     }
 
-    /// What to do when an event would be written with no client
-    /// metadata. See [`AuditContextPolicy`]; defaults to
-    /// [`Optional`](AuditContextPolicy::Optional).
-    pub fn with_audit_context_policy(mut self, policy: AuditContextPolicy) -> Self {
-        self.audit_policy = policy;
-        self
-    }
-
     /// Share the collaborators and return the handle.
     pub fn build(self) -> AuthnService<I, F> {
         AuthnService {
             inner: Arc::new(self),
-            audit: None,
         }
     }
 }
@@ -742,8 +737,13 @@ mod audit_context_wiring_tests {
     //! joined them, so every audit row carried a null client IP while the
     //! documentation offered the catalogue as compliance evidence. Nothing
     //! failed, which is why nothing caught it.
+    //!
+    //! The case that needed a test most is the one that no longer compiles.
+    //! `AuthnService` has no `emit_audit`, so "a route that forgot to wire a
+    //! context" is not a state a test can construct, and the policy that
+    //! used to catch it at runtime is gone with it.
 
-    use super::{AuditContextPolicy, AuthnService};
+    use super::AuthnService;
     use crate::authn::event::{AuditContext, AuthEventBuilder, AuthEventType};
     use crate::testing::{MockFactorStore, MockIdentityStore};
 
@@ -778,76 +778,18 @@ mod audit_context_wiring_tests {
         assert_eq!(event.user_agent.as_deref(), Some("probe/1.0"));
     }
 
-    /// A handle without a context records nothing about the client, which
-    /// is the pre-0.6.0 behaviour, now the explicit default rather than
-    /// the only possibility.
+    /// A context with no address is a context, and must write its row.
+    ///
+    /// Requiring the type is not requiring an address. Where nothing is
+    /// trustworthy the extractor honestly yields `None`, and a first cut of
+    /// the policy this replaced tested whether the *event* carried client
+    /// metadata, which would have failed every login on exactly the
+    /// deployments that got this right.
     #[tokio::test]
-    async fn without_a_context_the_event_still_records() {
+    async fn an_honestly_empty_context_still_records() {
         let identity = MockIdentityStore::new();
         let service = AuthnService::new(identity.clone(), MockFactorStore::new());
-        assert_eq!(service.audit_context_policy(), AuditContextPolicy::Optional);
 
-        service
-            .emit_audit(AuthEventBuilder::success(AuthEventType::Authenticated))
-            .await
-            .expect("Optional must not refuse a bare event");
-
-        assert!(
-            identity
-                .events()
-                .last()
-                .expect("recorded")
-                .ip_address
-                .is_none()
-        );
-    }
-
-    /// `Required` is what turns the silent omission loud.
-    #[tokio::test]
-    async fn required_policy_refuses_an_event_with_no_client_metadata() {
-        let identity = MockIdentityStore::new();
-        let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
-            .with_audit_context_policy(AuditContextPolicy::Required)
-            .build();
-
-        let err = service
-            .emit_audit(AuthEventBuilder::success(AuthEventType::Authenticated))
-            .await
-            .expect_err("Required must refuse an event with no context");
-        assert!(matches!(
-            err,
-            crate::authn::error::AuthnError::MissingAuditContext
-        ));
-        assert!(
-            identity.events().is_empty(),
-            "a refused event must not also be written"
-        );
-
-        service
-            .with_audit_context(ctx_with_ip("203.0.113.7"))
-            .emit_audit(AuthEventBuilder::success(AuthEventType::Authenticated))
-            .await
-            .expect("Required is satisfied once a context is attached");
-        assert_eq!(identity.events().len(), 1);
-    }
-
-    /// `Required` must accept a context that is legitimately empty.
-    ///
-    /// `extract_audit_context(.., None, ..)` is what the documentation
-    /// tells an adopter to do where no address is trustworthy, and a
-    /// first cut of this check tested whether the *event* carried any
-    /// client metadata, which would have failed every login on exactly
-    /// the deployments that were honest about having none. The policy is
-    /// about whether the route wired a context, not about how much that
-    /// context happened to contain.
-    #[tokio::test]
-    async fn required_accepts_a_context_that_is_honestly_empty() {
-        let identity = MockIdentityStore::new();
-        let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
-            .with_audit_context_policy(AuditContextPolicy::Required)
-            .build();
-
-        // Attached, and empty: no trustworthy address was available.
         let empty = AuditContext::default();
         assert!(empty.ip_address.is_none());
 
@@ -855,16 +797,23 @@ mod audit_context_wiring_tests {
             .with_audit_context(empty)
             .emit_audit(AuthEventBuilder::success(AuthEventType::Authenticated))
             .await
-            .expect("an attached but empty context satisfies Required");
+            .expect("an empty context is still a context");
 
-        assert_eq!(identity.events().len(), 1);
-        assert!(identity.events()[0].ip_address.is_none());
+        let events = identity.events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].ip_address.is_none());
+        assert_eq!(
+            events[0].ip_source,
+            crate::client_ip::Source::Unknown,
+            "the row says it does not know, rather than claiming a source"
+        );
     }
 
     /// The handle is a view over shared collaborators, not a second
-    /// service: a context-carrying copy writes to the same store.
+    /// service: two request handles write to the same store, each with its
+    /// own client.
     #[tokio::test]
-    async fn copies_share_the_same_collaborators() {
+    async fn request_handles_share_the_same_collaborators() {
         let identity = MockIdentityStore::new();
         let service = AuthnService::new(identity.clone(), MockFactorStore::new());
 
@@ -880,11 +829,23 @@ mod audit_context_wiring_tests {
             .expect("emit");
 
         let events = identity.events();
-        assert_eq!(events.len(), 2, "both copies wrote to the one store");
+        assert_eq!(events.len(), 2, "both handles wrote to the one store");
         assert_ne!(
             events[0].ip_address, events[1].ip_address,
-            "each copy carried its own context"
+            "each handle carried its own context"
         );
+    }
+
+    /// The request handle reaches the service's own methods, so a handler
+    /// needs one handle and not two. Losing this would push handlers back
+    /// to holding `state.authn` alongside the derived handle, which is the
+    /// shape that wrote the address onto one call and not the other.
+    #[tokio::test]
+    async fn the_request_handle_derefs_to_the_service() {
+        let service = AuthnService::new(MockIdentityStore::new(), MockFactorStore::new());
+        let request = service.with_audit_context(AuditContext::default());
+
+        assert!(!request.has_session_registry());
     }
 }
 
@@ -897,7 +858,7 @@ mod audit_shed_tests {
     //! with no way to shed, exhausting it fails every login for everyone.
 
     use super::AuthnService;
-    use crate::authn::event::{AuthEventBuilder, AuthEventType};
+    use crate::authn::event::{AuditContext, AuthEventBuilder, AuthEventType};
     use crate::authn::store::AuditOutcome;
     use crate::testing::{MockFactorStore, MockIdentityStore};
 
@@ -906,7 +867,8 @@ mod audit_shed_tests {
     #[tokio::test]
     async fn shedding_continues_the_flow_where_an_outage_fails_it() {
         let identity = MockIdentityStore::new();
-        let service = AuthnService::new(identity.clone(), MockFactorStore::new());
+        let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+            .with_audit_context(AuditContext::default());
 
         identity.arm_record_event_shedding();
         service

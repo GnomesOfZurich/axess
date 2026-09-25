@@ -6,14 +6,17 @@ the threat model of regulated financial APIs. The headline
 differences from baseline OAuth are mandatory Pushed Authorization
 Requests (PAR), mandatory sender-constrained tokens through DPoP or
 mTLS, optional JWT Authorization Response Mode (JARM), and stricter
-ID token lifetime bounds. This chapter walks through what FAPI adds,
-how axess exposes it, and when to reach for it.
+ID token lifetime bounds.
 
 The feature flag is `fapi` (off by default), which implies `oauth`.
 The base OAuth chapter (*OAuth 2.0 and OIDC*) covers everything that
 remains true under FAPI; this chapter covers only what changes.
 
-## Axess is the Relying Party, not the OP
+## Whether FAPI applies to you
+
+What the profile is, what it demands, and who needs it.
+
+### Axess is the Relying Party, not the OP
 
 A FAPI deployment has two parties. The **OpenID Provider** (OP, also
 called the IdP) owns user identity, runs the login UI, and issues
@@ -43,45 +46,47 @@ that is on-host workload-identity issuance (service-to-service flows
 where a sidecar mints JWTs for its own workloads), not a
 user-facing OP. *Local IdP* covers that surface.
 
-## What FAPI changes
+### What FAPI changes
 
-The four headline mechanisms address four specific gaps in baseline
-OAuth.
+Four mechanisms, each closing a specific gap in baseline OAuth.
 
-Pushed Authorization Requests (PAR, RFC 9126) move the authorization
-parameters off the redirect URL. Instead of your code
-constructing a query-string-laden authorize URL and redirecting the
-user to it, you make a direct POST to the IdP's PAR
-endpoint containing the parameters, receives an opaque `request_uri`
-in return, and constructs a much shorter authorize URL containing
-only the client id and the request URI. The defence is twofold: the
-authorization parameters never appear in browser history or referer
-headers, and the parameters cannot be tampered with in transit
-because the user only carries a reference to them.
+#### PAR: parameters off the redirect URL
 
-DPoP (Demonstration of Proof of Possession, RFC 9449) binds the
-access token to a key pair the client controls. Each request the
-client makes to a protected resource carries a JWT signed with the
-client's DPoP key, and the token validator at the resource server
-checks that the access token was issued for a thumbprint of that
-key. The defence is against bearer-token theft: an attacker who
-captures the access token (from logs, a misconfigured proxy, a
-debugging surface) cannot use it without also having the DPoP
-private key, which never leaves the client.
+Pushed Authorization Requests ([RFC 9126]) POST the authorization
+parameters straight to the IdP, which returns an opaque `request_uri`.
+The authorize URL then carries only the client id and that reference.
 
-JARM (JWT Authorization Response Mode) is the optional FAPI 2.0
-recommendation that the IdP return the authorization response as a
-signed JWT instead of as query parameters. The defence is integrity:
-the response cannot be tampered with after the IdP issues it. JARM
-is optional in FAPI 2.0; some implementations use it, others do not.
+Two gaps close at once: the parameters never reach browser history or a
+referer header, and the user cannot tamper with what they are only
+holding a reference to.
 
-Stricter ID token bounds: FAPI 2.0 requires the ID token's `nbf`
-(not-before) claim to be enforced and the lifetime to be no longer
-than a short window (axess defaults to five minutes, and refuses
-ID tokens with `nbf` in the future or `exp` more than five minutes
-out). The defence is against replay through stale tokens.
+#### DPoP: tokens bound to a key
 
-## When to reach for FAPI
+DPoP ([RFC 9449]) binds the access token to a key pair the client holds.
+Every request carries a JWT signed with that key, and the resource server
+checks the access token was issued for its thumbprint.
+
+That defeats bearer-token theft. An attacker who lifts the token from
+logs, a misconfigured proxy or a debugging surface cannot use it without
+the private key, which never leaves the client.
+
+#### JARM: signed authorization responses
+
+The IdP returns the authorization response as a signed JWT rather than
+query parameters, so it cannot be tampered with after issuance. Optional
+in FAPI 2.0; some implementations use it, some do not.
+
+#### Short ID token windows
+
+FAPI 2.0 requires `nbf` to be enforced and the lifetime kept short.
+Axess defaults to five minutes and refuses an ID token whose `nbf` is in
+the future or whose `exp` is more than five minutes out. That closes
+replay through stale tokens.
+
+[RFC 9126]: https://www.rfc-editor.org/rfc/rfc9126
+[RFC 9449]: https://www.rfc-editor.org/rfc/rfc9449
+
+### When to reach for FAPI
 
 The honest answer is: when a regulator requires it. FAPI 2.0 was
 designed for the open-banking ecosystem and similar regulated
@@ -98,13 +103,17 @@ asking you for compliance evidence, or you do not. If you do, the
 mechanisms below are non-negotiable, and axess implements them. If
 you do not, the baseline OAuth chapter covers what you need.
 
-## Configuration
+## The mechanisms
+
+The four things FAPI adds over ordinary OAuth.
+
+### Configuration
 
 FAPI is enabled per-provider by attaching a `FapiConfig` to an
 `OAuthProviderConfig`:
 
 ```rust,ignore
-use axess::factors::oauth::{FapiConfig, SenderConstraint, OAuthProviderConfig};
+use axess::federation::oauth::{FapiConfig, SenderConstraint, OAuthProviderConfig};
 
 let fapi_config = FapiConfig {
     sender_constraint: SenderConstraint::DPoP,
@@ -142,7 +151,7 @@ short enough that a captured token expires before most replay attacks
 can succeed and long enough that clock skew does not cause spurious
 rejections.
 
-## The PAR flow
+### The PAR flow
 
 With FAPI enabled, you start a federated login through
 the PAR-enhanced auth URL rather than the query-parameter auth URL:
@@ -173,7 +182,7 @@ redirects the user back to your callback URL with a
 code; you call `finish_oauth_login` with the code and
 state; axess performs the token exchange and ID token validation.
 
-## DPoP key management
+### DPoP key management
 
 DPoP binds each access token to a public key the client controls.
 The application generates a key pair at session start (or at
@@ -215,7 +224,7 @@ radius and operational complexity. Most deployments choose
 per-session keys for high-sensitivity flows and per-instance keys
 for routine flows.
 
-## Token revocation
+### Token revocation
 
 FAPI 2.0 expects that compromised tokens can be revoked through the
 IdP's revocation endpoint (RFC 7009). The application calls

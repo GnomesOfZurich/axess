@@ -93,7 +93,8 @@ where
     /// Same as [`begin_oauth_login`](Self::begin_oauth_login) but stashes
     /// `expected_tenant` in the session under the internal
     /// `oauth_keys::EXPECTED_TENANT` slot.
-    /// On callback, [`complete_oauth_login`](Self::complete_oauth_login)
+    /// On callback,
+    /// [`complete_oauth_login`](crate::authn::service::RequestAuthnService::complete_oauth_login)
     /// reads it and refuses to authenticate the session if the resolved
     /// `User.tenant_id` does not match.
     ///

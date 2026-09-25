@@ -1,19 +1,207 @@
 # Migration guide
 
-This chapter is the cross-version migration reference. Each axess
-release that ships a breaking change documents the change here,
-with the symptom (what the compiler or the runtime will tell you),
-the rationale (why the change happened), and the fix (what to
-update in adopter code). The pattern is ordered by version, with
-the most recent breaks first.
+Find your version below; the newest is first. Each break is listed by
+**what you will see** rather than by what we changed, because a compile
+error, a failed deserialization and a behaviour that quietly differs
+send you looking in different places. Each one names the symptom and the
+fix.
 
-The chapter is sorted by what you will see, not by what we
-changed. A breaking change manifests as either a compile error
-(the type system rejected something it accepted before), a runtime
-error (a deserialization fails, a config rejects), or a behaviour
-change (the same code does something subtly different). The
-sections below group by symptom; finding your case is faster than
-reading the full changelog.
+The behaviour changes are the ones to read closely. Nothing tells you
+about those.
+
+## 0.6.0 to 0.7.0
+
+Working out who a request came from was correct only through a path that
+cost a policy engine to reach, so the rate limiter did it wrong instead,
+the audit context offered a constructor that read a forgeable header, and
+the JWT module was filed where it needed an unrelated feature to reach.
+Every error below comes from closing that off.
+
+### `no TrustedProxies in authz`
+
+`TrustedProxies`, `CidrParseError`, `ip_from_headers_trusted` and
+`ip_from_headers_untrusted` moved from `axess::authz` to
+`axess::client_ip`, which is not feature-gated.
+
+```rust,ignore
+// Before
+use axess::authz::{TrustedProxies, ip_from_headers_trusted};
+
+// After
+use axess::client_ip::TrustedProxies;   // the walk is TrustedProxies::client_ip
+```
+
+They were behind the `authz` feature, which pulls `cedar-policy`. An
+adopter who wanted a correct client address and no policy engine could
+not have one.
+
+### `no variant ForwardedIp for KeyExtractor`
+
+Resolve the address once, in a layer, and key on the result:
+
+```rust,ignore
+// Before: the limiter read X-Real-IP, then the leftmost X-Forwarded-For.
+let config = RateLimitConfig::builder()
+    .key(KeyExtractor::ForwardedIp)
+    .build();
+
+// After: the layer resolves, the limiter reads the answer.
+let app = axess::client_ip::layer(app, trusted);
+
+let config = RateLimitConfig::builder()
+    .key(KeyExtractor::ClientIp)
+    .build();
+```
+
+**Read this one even if it compiles after a rename.** Both headers the
+old extractor read are caller-writable, and nothing upstream is obliged
+to overwrite them: a proxy that appends to `X-Forwarded-For` leaves the
+caller's entry in front of the real one, and no proxy sets `X-Real-IP`
+unless configured to. A caller rotating either got a fresh bucket per
+request. If your deployment relied on `ForwardedIp` behind a proxy,
+assume the limit was not enforced against a caller who cared to avoid
+it, and check what your proxy actually does to both headers.
+
+Put the layer outside everything that reads an address, and serve the
+router with `into_make_service_with_connect_info::<SocketAddr>()`.
+Without the peer there is nothing to check a header against, and every
+request resolves to no address and shares one bucket.
+
+`ClientIp` is what every consumer now reads, and none of them takes an
+address from the caller any more. Its fields are private; only the layer
+and the explicit `ClientIp::resolved` fill one, so a handler cannot build
+one out of a header by accident.
+
+### `no method begin_login on AuthnService`
+
+The methods that write an audit event moved to `RequestAuthnService`, which
+`with_audit_context` returns. There is no other way to make one.
+
+```rust,ignore
+// Before: the stamp was optional, and reaching back to the shared
+// service for the second call wrote that row with no address.
+state.authn.begin_login(&identifier, tenant, &session, client_ip).await?;
+
+// After
+let svc = state.authn.with_audit_context(audit);
+svc.begin_login(&identifier, tenant, &session).await?;
+svc.verify_factor(&credential, &session).await?;
+```
+
+Keep the `AuthnService` in application state and derive a `RequestAuthnService`
+per request. It derefs to the service, so `check_session`, the revocation
+methods and the capability predicates are reachable through the one
+handle; only the authenticating methods require the context.
+
+**`begin_login` lost its `client_ip` argument**, and with it a hole. The
+tenant IP policy was enforced only `if let Some(ip) = client_ip`, so a
+caller passing `None` skipped it: an allowlist that a caller could switch
+off by omitting an argument. 51 of the 52 call sites in this repository
+omitted it. The address now comes from the handle, and a tenant policy
+that restricts anything refuses a request whose address did not resolve,
+because a policy that cannot be evaluated has not been satisfied. If you
+have tenants with an `IpPolicy`, install `client_ip::layer` before
+upgrading or their logins will fail closed.
+
+### `request_id` goes `None` if you never ran the layer
+
+Nothing fails to compile here. In 0.6.0 `AuditContext::request_id` was
+filled straight from the `X-Request-Id` header, ungated, while the
+middleware that mints request ids sat behind the `request-id` feature.
+The two were unconnected, so a deployment that had never enabled the
+feature still recorded whatever a caller put in that header.
+
+If you run `RequestIdLayer` under `request-id`, nothing changes: the
+value was the layer's id before and is the layer's id now, read from a
+typed extension instead of a header the layer had just written.
+
+If you do not, `request_id` is `None` from here on instead of a
+caller-supplied string. That is a column going quiet, not a control
+weakening: an unvalidated header value was never evidence of anything.
+Turn the feature on and install the layer if you want the column back.
+
+```toml
+axess = { version = "0.7", features = ["request-id"] }
+```
+
+`accept-client-id` honours an id minted upstream rather than generating
+one, validating the inbound value before it reaches the context.
+`middleware::request_id::RequestId` is public, so a deployment whose
+generator uses a custom `HEADER_NAME` can read the typed value directly.
+
+`trace_id` is new and behaves the same way under `trace-id`, with no
+prior value to lose.
+
+### `no variant MissingAuditContext` / `no AuditContextPolicy`
+
+Both are gone, along with `with_audit_context_policy` and the
+`audit_context_missing` metric. Delete the builder call; there is nothing
+to replace it with, because the thing it checked at runtime is now
+checked by the compiler.
+
+`Required` only ever tested whether a route attached a context, never how
+much that context held, so it never meant "no authentication without
+evidence". A route that forgot the wiring is now a type error. A route
+that wired a context while the client-IP layer was missing is the case
+the policy could not see either way, and the `ip_source = 'unknown'`
+query in *Audit events* is what finds it.
+
+### `no function extract_audit_context`
+
+All four builders are gone: `extract_audit_context`, `..._async`,
+`..._untrusted`, `..._async_untrusted`. The context is an extractor.
+
+```rust,ignore
+// Before
+let ip = ip_from_headers_trusted(&headers, peer, &trusted);
+let ctx = extract_audit_context(&headers, Some(ip), Some(&session));
+let service = state.authn.with_audit_context(ctx);
+
+// After: the handler asks for it.
+async fn login_route(session: AuthSession, audit: AuditContext) {
+    let service = state.authn.with_audit_context(audit);
+}
+```
+
+It reads the address `client_ip::layer` resolved, plus the user-agent,
+request id and session id from the request. Install the layer or every
+context carries no address, which is honest and is not evidence.
+
+Two of the four read `X-Real-IP` directly and believed it. If your code
+called either `_untrusted` form, the addresses in your audit rows were
+chosen by the subject of the audit for as long as it did, and they are
+not evidence of where anything came from.
+
+### `no function ip_from_headers_trusted`
+
+The walk belongs to the set that decides it:
+
+```rust,ignore
+// Before
+let ip = ip_from_headers_trusted(&headers, peer, &trusted);
+
+// After
+let ip = trusted.client_ip(&headers, Some(peer));
+```
+
+`Option<IpAddr>` now, because a unix-domain socket has no peer for an
+address set to match. The old `client_ip_layer` is `client_ip::layer`, and
+`ip_from_headers_untrusted` is gone with no replacement: walking from the
+right is correct wherever reading the leftmost entry was, and correct in
+the cases where it was not.
+
+### `could not find jwt in federation`
+
+```rust,ignore
+// Before
+use axess::federation::jwt::svid::JwtSvidResolver;
+
+// After
+use axess::jwt::svid::JwtSvidResolver;
+```
+
+The module is gated on `jwt` now rather than `oauth`. If you enabled
+`oauth` only to reach it, you can drop that feature.
 
 ## 0.5.0 to 0.6.0
 
@@ -49,7 +237,7 @@ before `jsonwebtoken::encode`.
 **`IdentityAuthnLog::record_event` returns `AuditOutcome`.** Replace
 `Ok(())` with `Ok(AuditOutcome::Recorded)`:
 
-```rust
+```rust,ignore
 async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
     // ... unchanged write ...
     Ok(AuditOutcome::Recorded)
@@ -77,7 +265,7 @@ cheap handle over one `Arc`, so it can carry per-request state; the
 collaborators are shared the moment it is built, and customising an
 already-shared service is therefore not possible.
 
-```rust
+```rust,ignore
 let service = AuthnService::builder(identity, factors)   // was: ::new(..)
     .with_clock(clock)
     .with_registry(registry)
@@ -91,16 +279,20 @@ let service = AuthnService::builder(identity, factors)   // was: ::new(..)
 release nothing in axess attached an `AuditContext` to the events it
 emitted, so every row carried a null IP:
 
-```rust
+```rust,ignore
 let ip = ip_from_headers_trusted(&headers, peer.ip(), &trusted);
 let ctx = extract_audit_context(&headers, Some(ip), Some(&session));
 let service = state.service.with_audit_context(ctx);
 service.begin_login(&identifier, tenant, &session, None).await?;
+service.verify_factor(&credential, &session).await?;
 ```
 
 `with_audit_context` returns a copy of the handle; the collaborators are
-shared, so this costs a refcount bump per request. The `sqlite` example
-does this in `post_login`.
+shared, so this costs a refcount bump per request. Route *every* call in
+the request through that copy, not just the first: the stamp is on the
+handle, so falling back to `state.service` for `verify_factor` writes the
+failed-password row with no address on it. The `sqlite` example derives
+one in each of its four audited handlers.
 
 If your audit trail is compliance evidence, build with
 `.with_audit_context_policy(AuditContextPolicy::Required)` so a route that
@@ -108,11 +300,14 @@ forgets the wiring fails loudly instead of recording blanks.
 **That is a fail-closed path**: it turns a missing context into a failed
 login, so wire every route before turning it on.
 
+> Removed in 0.7.0. The wiring it checked at runtime is checked by the
+> compiler now; see *0.6.0 to 0.7.0* above.
+
 **Two password-history methods are no longer on `IdentityAdmin`.**
 `record_password_hash` and `password_history` moved to a new
 `IdentityPasswordHistory` trait with no default bodies:
 
-```rust
+```rust,ignore
 impl IdentityPasswordHistory for YourBackend {
     async fn record_password_hash(/* ... */) { /* unchanged body */ }
     async fn password_history(/* ... */) { /* unchanged body */ }
@@ -137,7 +332,7 @@ but override it before you rely on it for GDPR erasure.
 `IdentityPasswordReset` trait with no default bodies. Move the two
 `impl`s into their own block:
 
-```rust
+```rust,ignore
 impl IdentityPasswordReset for YourBackend {
     async fn store_reset_token(/* ... */) { /* unchanged body */ }
     async fn verify_reset_token(/* ... */) { /* unchanged body */ }
@@ -153,7 +348,7 @@ the new trait, so it is no longer reachable.
 peer your server accepted rather than letting the function read
 headers:
 
-```rust
+```rust,ignore
 let ip = ip_from_headers_trusted(&headers, peer, &trusted);
 let ctx = extract_audit_context(&headers, Some(ip));   // was: (&headers)
 ```
@@ -179,7 +374,7 @@ fails with `E0004`. It classifies as transient under
 the same defect `AuthEventBuilder::locked` was introduced to fix for the
 outcome: querying meant matching a string, and a string nothing enforced.
 
-```rust
+```rust,ignore
 use axess::authn::AuthFailureReason;
 
 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
@@ -193,7 +388,7 @@ which is the thing being removed. Where no tag fits, name
 
 Reading the field, compare against the variant rather than a string:
 
-```rust
+```rust,ignore
 assert_eq!(event.error, Some(AuthFailureReason::CsrfMismatch));
 ```
 
@@ -203,7 +398,7 @@ Converting a stored string back is infallible: an unrecognised tag
 becomes `Other` rather than an error, so rows from another version are
 never dropped:
 
-```rust
+```rust,ignore
 let error = error.map(AuthFailureReason::from);
 ```
 
@@ -219,7 +414,7 @@ this release spent its security budget making trustworthy would still
 accept `"not-an-ip"`, or an address the caller invented. `AuditContext`
 was already typed; the builder discarded the type with `ip.to_string()`.
 
-```rust
+```rust,ignore
 let ip = ip_from_headers_trusted(&headers, peer, &trusted);
 let event = AuthEventBuilder::failure(AuthEventType::LoginAttempt)
     .with_ip(ip)                         // was: .with_ip(ip.to_string())
@@ -229,7 +424,7 @@ let event = AuthEventBuilder::failure(AuthEventType::LoginAttempt)
 Reading the field, the borrow you used to take becomes a plain copy, and a
 sink writing to a text column stringifies at the point of the write:
 
-```rust
+```rust,ignore
 let ip_address = event.ip_address.map(|ip| ip.to_string());
 ```
 
@@ -325,7 +520,7 @@ Building a `SocialProviderConfig` from a `String` no longer compiles:
 `expected 'ZeroizedString', found 'String'` (E0308), at the struct
 literal. Wrap the secret:
 
-```rust
+```rust,ignore
 use axess::authn::ZeroizedString;
 use axess::social::SocialProviderConfig;
 
@@ -373,7 +568,7 @@ directions. What changed is `Debug`: the field now prints as
 `axess_events::KeyId` no longer exposes its `ShortString`. A struct
 literal or a destructuring pattern stops compiling:
 
-```rust
+```rust,ignore
 let id = KeyId(ShortString::new("kms-2026-01"));   // was
 let id = KeyId::new("kms-2026-01");                // now
 let id = KeyId::from_static("kms-2026-01");        // const, no allocation
@@ -417,7 +612,7 @@ and axess re-exposes that type through its public surface:
 local-IdP `algorithm` / `verifier_algorithms` helpers. Add a
 wildcard arm to any such match:
 
-```rust
+```rust,ignore
 match alg {
     Algorithm::RS256 => ...,
     Algorithm::ES256 => ...,

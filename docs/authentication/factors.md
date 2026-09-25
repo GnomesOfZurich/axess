@@ -5,8 +5,7 @@ WebAuthn assertion, an LDAP bind, an OAuth token exchange. A method is
 a sequence of factors that together count as a successful login.
 Composing factors into methods, and scoping methods to apply per-user
 or per-tenant rather than globally, is the day-to-day surface adopters
-work with. This chapter explains the vocabulary, the types that carry
-it, and the pattern for adding a factor that axess does not ship.
+work with.
 
 ## Vocabulary
 
@@ -35,11 +34,11 @@ method is in progress, and the audit trail names the method when
 recording success or failure.
 
 A *scope* is the tier at which a method is configured. There are three
-tiers (Global, Tenant, and User), covered in detail in *Scope
-hierarchy*. The short version: a global default applies everywhere; a
+tiers (`System`, `Tenant`, `User`), covered in detail in *Scope
+hierarchy*. The short version: a system default applies everywhere; a
 tenant can override it; a user can override the tenant. Resolution is
 the simple inversion of authority: user override beats tenant override
-beats global default.
+beats system default.
 
 ## The factor list
 
@@ -98,7 +97,11 @@ the OAuth-RS resolver and a custom string identifier; the workload
 identity chapter (*Workload identity overview*) describes the same
 pattern from the inbound-resolver side.
 
-## How factors compose
+## Composing and verifying
+
+How a method becomes a chain, and what one step does.
+
+### How factors compose
 
 The composition primitives are `FactorStep` and `Method`. A `FactorStep`
 is one node in a method. A `Method` is a vector of steps plus a name.
@@ -139,10 +142,11 @@ with at most one decision point per step, and admitting arbitrary
 expressions would invite policies that pass formal review but defeat
 operational understanding.
 
-## The verify_factor path
+### The verify_factor path
 
 Application code drives factor verification through
-`AuthnService::verify_factor`. The signature is
+`RequestAuthnService::verify_factor`, on the request-scoped handle that
+`AuthnService::with_audit_context` returns. The signature is
 
 ```rust,ignore
 pub async fn verify_factor(
@@ -213,26 +217,26 @@ for instance) or `None` when the lockout requires administrative
 intervention. The application surfaces this to the user with the right
 copy; the audit log records the lockout regardless.
 
-## Begin and complete
+### Begin and complete
 
 `verify_factor` is the verb that drives a method forward, but a login
-also has a start and an end. The start is `AuthnService::begin_login`,
+also has a start and an end. The start is `RequestAuthnService::begin_login`,
 which transitions a `Guest` session into `Authenticating`. The end is
 the orchestrator's promotion of `Authenticating` to `Authenticated`
 when the last factor completes (or to `PendingWorkflow` when a workflow
 is in progress).
 
-`begin_login` does three things that are worth naming explicitly.
-First, it looks up the user in the configured identity store, in the
-tenant that the caller named. An identifier that matches nothing returns
-`LoginOutcome::InvalidCredentials`, the same outcome a wrong password
-gives, and the lookup runs the same store queries against a dummy id so
-the latency does not differ either. There is no "no such user" to branch
-on, deliberately. Second, it loads the method that applies to that user under
-the scope hierarchy (covered in *Scope hierarchy*); the result is the
-specific sequence of steps the user will walk. Third, it transitions
-the session into `Authenticating` with the loaded method's
-`remaining` set to the method's full step list.
+`begin_login` does three things:
+
+1. **Looks up the user** in the named tenant. An identifier matching
+   nothing returns `LoginOutcome::InvalidCredentials`, the same outcome a
+   wrong password gives, and runs the same store queries against a dummy
+   id so the latency matches too. There is deliberately no "no such
+   user" to branch on.
+2. **Loads the method** that applies under the scope hierarchy (see
+   *Scope hierarchy*): the sequence of steps this user will walk.
+3. **Transitions the session** to `Authenticating`, with `remaining` set
+   to that method's full step list.
 
 `complete_signup` is the corresponding verb for the `PendingWorkflow`
 case. After a signup ceremony completes (email verified, KYC checks
@@ -242,7 +246,11 @@ factor list on the resulting `Authenticated` variant is the list that
 was used during the signup, which is what the audit trail wants and
 what subsequent policy evaluation reads.
 
-## Adding a custom factor
+## Extending it
+
+Your own factor, and asking for another when risk rises.
+
+### Adding a custom factor
 
 The pattern for adding a factor that axess does not ship is the same
 pattern that produced the factors that axess does ship. There are
@@ -265,7 +273,7 @@ axess, and that omission is intentional.
 
 The third part is the `FactorConfig` variant and the storage adapter
 that loads it. The factor config goes into the configured factor
-store; the load path resolves the scope (Global, Tenant, User) and
+store; the load path resolves the scope (`System`, `Tenant`, `User`) and
 returns the right config for the user being authenticated. Adopters
 implement the factor store, so the storage decision is theirs.
 
@@ -280,7 +288,7 @@ than a thousand lines of Rust including tests. The reason the work
 stays small is that the orchestration and the state machine do not
 change; the verifier is doing one job, behind a fixed contract.
 
-## Step-up authentication
+### Step-up authentication
 
 Step-up is the pattern where an already-`Authenticated` session is
 asked to re-prove identity (or to prove with a stronger factor) before

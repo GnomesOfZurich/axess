@@ -18,6 +18,13 @@ authors = ["Gnomes of Zurich"]
 language = "en"
 src = "."
 
+# mdBook defaults doctests to Rust 2015, where `async fn` is a syntax
+# error. Every example in this book is 2024, like the workspace, so
+# without this `mdbook test` rejects the getting-started example on
+# edition grounds before it reaches anything real.
+[rust]
+edition = "2024"
+
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "navy"

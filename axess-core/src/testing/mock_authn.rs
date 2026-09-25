@@ -78,6 +78,10 @@ pub struct MockIdentityStore {
     /// Per-tenant password rules: `tenant_id -> PasswordRules`. Falls back
     /// to `PasswordRules::default()` for tenants without an override.
     password_rules: Arc<DashMap<String, crate::authn::factor::PasswordRules>>,
+    /// tenant id -> IP policy, for
+    /// [`IdentityLookup::ip_policy_for_tenant`](crate::authn::IdentityLookup::ip_policy_for_tenant).
+    /// Absent means the trait default, which permits every address.
+    ip_policies: Arc<DashMap<String, crate::authn::types::IpPolicy>>,
 }
 
 impl Default for MockIdentityStore {
@@ -104,6 +108,7 @@ impl MockIdentityStore {
             password_history: Default::default(),
             reset_tokens: Default::default(),
             password_rules: Default::default(),
+            ip_policies: Default::default(),
         }
     }
 
@@ -115,6 +120,22 @@ impl MockIdentityStore {
         rules: crate::authn::factor::PasswordRules,
     ) -> Self {
         self.password_rules.insert(tenant_id.to_string(), rules);
+        self
+    }
+
+    /// Install a per-tenant [`IpPolicy`](crate::authn::types::IpPolicy)
+    /// looked up by [`IdentityLookup::ip_policy_for_tenant`](crate::authn::IdentityLookup::ip_policy_for_tenant).
+    ///
+    /// Without one the trait default applies, which permits every address:
+    /// a login test that does not install a policy is not testing the gate,
+    /// which is how the gate went untested while it could be skipped
+    /// altogether by passing no address.
+    pub fn with_ip_policy(
+        self,
+        tenant_id: &TenantId,
+        policy: crate::authn::types::IpPolicy,
+    ) -> Self {
+        self.ip_policies.insert(tenant_id.to_string(), policy);
         self
     }
 
@@ -255,6 +276,17 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
 
     fn lockout_policy(&self) -> LockoutPolicy {
         self.lockout_policy.clone()
+    }
+
+    async fn ip_policy_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<crate::authn::types::IpPolicy, Self::Error> {
+        Ok(self
+            .ip_policies
+            .get(tenant_id.to_string().as_str())
+            .map(|p| p.clone())
+            .unwrap_or_default())
     }
 
     async fn password_rules_for_tenant(
@@ -564,8 +596,15 @@ impl FactorStore for MockFactorStore {
 
 // ── Pre-wired AuthnService fixture ──────────────────────────────────────────
 
-/// Assemble a ready-to-login [`AuthnService`](crate::authn::service::AuthnService)
+/// Assemble a ready-to-login [`RequestAuthnService`](crate::authn::service::RequestAuthnService)
 /// holding a single password-authenticated user under tenant `"t1"`.
+///
+/// The handle carries an empty [`AuditContext`](crate::authn::event::AuditContext),
+/// which is the honest fixture for a test whose subject is not the client:
+/// the rows it writes record no address and say so. Tests about the address
+/// itself derive their own handle with
+/// [`with_audit_context`](crate::authn::service::AuthnService::with_audit_context),
+/// which this one derefs to.
 ///
 /// Use this in tests whose subject is the surface around login (lockout,
 /// session id rotation, custom-data limits) rather than the factor-chain
@@ -577,13 +616,14 @@ impl FactorStore for MockFactorStore {
 /// ```ignore
 /// use axess_core::testing::mock_authn::make_password_service;
 /// let svc = make_password_service("u1", "alice@example.com", "hunter2");
-/// // ... drive svc.begin_login("alice@example.com", "t1", &session, None) ...
+/// // ... drive svc.begin_login("alice@example.com", "t1", &session) ...
 /// ```
 pub fn make_password_service(
     user_label: &str,
     identifier: &str,
     password: &str,
-) -> crate::authn::service::AuthnService<MockIdentityStore, MockFactorStore> {
+) -> crate::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    use crate::authn::event::AuditContext;
     use crate::authn::factor::{PasswordConfig, PasswordRules, ZeroizedString};
     use crate::authn::service::AuthnService;
     use crate::testing::{tenant_record, user_record};
@@ -611,7 +651,7 @@ pub fn make_password_service(
             AuthMethod::sequential("password", vec![FactorKind::Password], scope),
         );
 
-    AuthnService::new(identity, factors)
+    AuthnService::new(identity, factors).with_audit_context(AuditContext::default())
 }
 
 impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {

@@ -98,6 +98,7 @@ impl axess::authn::IdentityLookup for OurBackend {
     }
 }
 
+// ANCHOR: authn_log
 impl axess::authn::IdentityAuthnLog for OurBackend {
     async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
         let event_id = Uuid::new_v4().to_string();
@@ -115,16 +116,19 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
             .to_rfc3339();
         let factor_kind = event.factor_kind.as_ref().map(|k| k.as_str().to_string());
         let ip_address = event.ip_address.map(|ip| ip.to_string());
+        let ip_source = event.ip_source.as_str();
         let user_agent = event.user_agent.as_deref().map(|s| s.to_string());
         let request_id = event.request_id.as_deref().map(|s| s.to_string());
+        let trace_id = event.trace_id.as_deref().map(|s| s.to_string());
         let geo_country = event.geo_country.as_deref().map(|s| s.to_string());
         let error = event.error.as_ref().map(|r| r.as_str().to_string());
 
         sqlx::query(
             "INSERT INTO auth_events
              (id, user_id, tenant_id, session_id, event_type, event_status, event_time,
-              factor_kind, ip_address, user_agent, request_id, geo_country, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              factor_kind, ip_address, ip_source, user_agent, request_id, trace_id,
+              geo_country, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(&event_id)
         .bind(&user_id)
@@ -135,8 +139,10 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         .bind(&event_time)
         .bind(&factor_kind)
         .bind(&ip_address)
+        .bind(ip_source)
         .bind(&user_agent)
         .bind(&request_id)
+        .bind(&trace_id)
         .bind(&geo_country)
         .bind(&error)
         .execute(self.pool())
@@ -178,6 +184,7 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         Ok(())
     }
 }
+// ANCHOR_END: authn_log
 
 impl axess::authn::IdentityAdmin for OurBackend {
     async fn create_user(&self, user: User) -> Result<(), Self::Error> {

@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
 use axess_core::{
     authn::service::AuthnService,
@@ -26,7 +27,8 @@ async fn oauth_refresh_roundtrip() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let claims = authn
         .refresh_oauth_token("refresh-idp", "stored-refresh-token")
@@ -55,7 +57,8 @@ async fn oauth_refresh_empty_token_rejected() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let result = authn.refresh_oauth_token("test-idp2", "").await;
     assert!(matches!(
@@ -80,7 +83,8 @@ async fn oauth_refresh_unknown_provider_rejected() {
     use axess_core::authn::event::AuthEventStatus;
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity.clone(), MockFactorStore::new());
+    let authn = AuthnService::new(identity.clone(), MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     let result = authn.refresh_oauth_token("nonexistent", "some-token").await;
     assert!(matches!(
@@ -107,7 +111,8 @@ async fn oauth_userinfo_empty_token_rejected() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let authn = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let result = authn.fetch_userinfo("ui-idp", "").await;
     assert!(matches!(
@@ -120,7 +125,8 @@ async fn oauth_userinfo_empty_token_rejected() {
 #[tokio::test]
 async fn oauth_userinfo_unknown_provider_rejected() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let authn = AuthnService::new(identity, MockFactorStore::new());
+    let authn = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
 
     let result = authn.fetch_userinfo("nope", "some-token").await;
     assert!(matches!(

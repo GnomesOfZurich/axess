@@ -97,9 +97,8 @@ groups are already attributes of the user.
 
 ## The verification flow
 
-The verification flow is straightforward. The user submits a username
-and password to your handler, which calls
-`AuthnService::verify_factor` with the LDAP bind credential; axess
+The user submits a username and password to your handler, which calls
+`RequestAuthnService::verify_factor` with the LDAP bind credential; axess
 expands the bind DN template with the username, opens a TLS
 connection to the directory, performs a simple bind with the
 constructed DN and the user's password, optionally searches for
@@ -163,30 +162,12 @@ verifier without touching it again.
 
 ## Troubleshooting
 
-If binds fail consistently with "invalid credentials" for known-good
-passwords, the bind DN template is most likely wrong. Active
-Directory typically expects `userPrincipalName` (the user's email
-address) or `sAMAccountName` (a short login name) in the bind, not
-a constructed DN. The template might need to be `{user}@example.com`
-rather than `uid={user},ou=people,dc=example,dc=com`.
-
-If the connection succeeds but the bind times out, the directory is
-under load or the connection is being inspected by a middlebox that
-buffers slowly. The connection timeout fires; the user sees a
-generic failure. Inspect the network path.
-
-If the group search returns nothing, the filter template might be
-wrong or the bound user might not have permission to read group
-membership. OpenLDAP often requires explicit ACLs for the bound
-user to enumerate groups they are members of; Active Directory
-usually grants this by default. Run the same search through a
-known-good LDAP client to verify.
-
-If TLS fails with a certificate-validation error, the directory's
-certificate is probably signed by a private CA that your
-trust store does not include. Add the CA to the rustls trust store
-via the standard `SSL_CERT_FILE` or `SSL_CERT_DIR` environment
-variables.
+| Symptom | Usually | What to do |
+|---|---|---|
+| "Invalid credentials" for passwords you know are good | The bind DN template. Active Directory usually expects `userPrincipalName` (an email address) or `sAMAccountName` (a short login name), not a constructed DN | Try `{user}@example.com` in place of `uid={user},ou=people,dc=example,dc=com` |
+| The connection opens, then the bind times out | The directory is loaded, or a middlebox is inspecting the connection and buffering slowly. The timeout fires and the user sees a generic failure | Inspect the network path |
+| The group search comes back empty | A wrong `filter_template`, or a bound user without permission to read group membership. OpenLDAP often wants an explicit ACL for a user to enumerate their own groups; Active Directory usually grants it | Run the same search through a known-good LDAP client |
+| TLS fails on certificate validation | The directory's certificate is signed by a private CA your trust store does not carry | Add the CA through `SSL_CERT_FILE` or `SSL_CERT_DIR` |
 
 ## Further reading
 

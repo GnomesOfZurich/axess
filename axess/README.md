@@ -9,7 +9,7 @@
 
 Public API facade for the [Axess](https://github.com/GnomesOfZurich/axess) authentication and authorization library for [Axum](https://github.com/tokio-rs/axum).
 
-This is the crate most applications should depend on. It re-exports the curated public surface from `axess-core`, `axess-factors`, `axess-identity`, and `axess-macros` through a single import path and decides the canonical module layout (`axess::backends::{sqlite, postgres, mysql, valkey, memory}`, `axess::session::*`, `axess::middleware::*`, etc.).
+This is the crate most applications should depend on. It re-exports the curated public surface from `axess-core`, `axess-factors`, `axess-identity`, and `axess-macros` through a single import path and decides the canonical module layout (`axess::backends::{sqlite, postgres, mysql, valkey, memory}`, `axess::session::*`, `axess::csrf`, `axess::federation::*`, etc.).
 
 ## What you get
 
@@ -26,7 +26,7 @@ This is the crate most applications should depend on. It re-exports the curated 
 
 ```toml
 [dependencies]
-axess = { version = "0.6.0", features = ["sqlite", "authz"] }
+axess = { version = "0.7.0", features = ["sqlite", "authz"] }
 ```
 
 ```rust,no_run

@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{FactorCredential, ZeroizedString},
     service::{AuthnService, FactorOutcome},
@@ -36,11 +37,11 @@ async fn user_scope_takes_priority() {
         .with_factor(AuthnScope::System, password_config("system-password"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
 
@@ -67,11 +68,11 @@ async fn tenant_scope_fallback() {
         )
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     let r = service
@@ -94,11 +95,11 @@ async fn user_tenant_system_fallback_chain() {
         .with_factor(AuthnScope::System, password_config("system-password"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     let r = service

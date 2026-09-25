@@ -46,7 +46,11 @@ authentication side validates the workload token on each request;
 the rate limiter catches the runaway pattern before it overwhelms
 the service.
 
-## The layer
+## Configuring the limiter
+
+What to install, what it counts requests against, and how to size it.
+
+### The layer
 
 `RateLimitLayer` is a Tower layer with a small configuration:
 
@@ -89,14 +93,14 @@ this layer for the per-process defence: the burst that would exhaust a
 connection pool, the per-username budget that keeps a lockout attack
 from succeeding. Set the volumetric limit upstream.
 
-## Key extraction
+### Key extraction
 
 The key is what the rate limiter counts against. The
 `KeyExtractor` enum carries the choices:
 
 ```rust,ignore
 pub enum KeyExtractor {
-    ForwardedIp,       // X-Real-IP, then X-Forwarded-For; trusted proxy only
+    ClientIp,          // what client_ip::layer resolved. Behind a proxy.
     PeerIp,            // SocketAddr from ConnectInfo. The default.
     UserId,            // RateLimitUserId request extension
     TenantId,          // RateLimitTenantId request extension
@@ -117,12 +121,25 @@ on one thing; layering two concerns means stacking two
 budget legible on its own.
 
 The choice of key determines which attack the limiter catches.
-`PeerIp` catches single-source volumetric attacks. `ForwardedIp` does
-the same behind a reverse proxy, and only behind one, because a client that
-can reach your service directly can forge `X-Forwarded-For` and mint
-itself a fresh bucket per request. `UserId` catches a per-user runaway
-loop, `TenantId` a per-tenant one, which is as often a noisy neighbour
-as an attack.
+`PeerIp` catches single-source volumetric attacks and is right where
+nothing sits in front of you. `ClientIp` is the one to use behind a
+proxy: it reads the address `client_ip::layer` resolved and consults no
+header, so a caller cannot pick its own bucket.
+
+Configuring that layer means naming the proxies you trust, and usually
+you can: managed front ends publish their ranges, and a sidecar is
+loopback. Where the list is the weak link rather than the check, because
+a rotating range has to be kept synced and a stale one quietly resolves
+every request to the proxy, `TrustedProxies::private_transport()` asserts
+the other true thing instead: nothing reaches this process except through
+your own infrastructure. That assertion does not go stale. It is the
+weaker of the two, and a direct caller reaching a process configured that
+way has its headers believed in full, so check that the listener is not
+reachable rather than assuming it. It replaced `ForwardedIp`
+in 0.7.0, which read `X-Real-IP` and then the leftmost `X-Forwarded-For`
+entry and believed both, which made rotating either a way to mint a fresh
+bucket per request. `UserId` catches a per-user runaway loop, `TenantId` a
+per-tenant one, which is as often a noisy neighbour as an attack.
 
 `LoginIdentifier` is the one to read twice. Per-IP limiting alone does
 not defend a login route: an attacker spreading attempts across many
@@ -134,7 +151,7 @@ bucket, bounds the attempts per account regardless of where they came
 from. Put a `LoginIdentifier` limiter on every login-class route, and
 layer a `PeerIp` one beside it for the volumetric case.
 
-## Per-endpoint rate limits
+### Per-endpoint rate limits
 
 Different endpoints have different sensitivities. A login
 endpoint can tolerate a few requests per second per IP because
@@ -183,7 +200,23 @@ Read the IP from the forwarded header only when the immediate
 peer is a trusted proxy; otherwise the rate limiter can be
 spoofed.
 
-## Tuning the windows
+### Per-tenant rate limits
+
+For multi-tenant deployments, the rate limit configuration can
+be per-tenant. A tenant with a higher SLA gets a higher rate
+limit; a tenant with a lower SLA gets a tighter one. The
+mechanism is the same `RateLimitLayer`, with a `Custom` key
+extractor that composes the standard key (typically `PeerIp`)
+with the tenant id, and with separate `RateLimitConfig`s per
+tenant tier.
+
+The pattern is operationally complex (one configuration per
+tenant tier), so most deployments use a single shared limit and
+calibrate to the deployment-wide envelope. The per-tenant shape
+is for deployments where the SLA differences are explicit and
+the operational overhead is justified.
+
+### Tuning the windows
 
 Tuning the rate limit is more art than science, but a few
 guidelines hold up.
@@ -219,7 +252,11 @@ The default to start with is to measure first. The metrics from
 real reject rate; the calibration is then to set the limit just
 above the legitimate-traffic envelope.
 
-## What happens at the limit
+## Behaviour at the limit
+
+What a rejected caller sees, and how to read a spike.
+
+### What happens at the limit
 
 A request that hits the rate limit gets:
 
@@ -241,7 +278,7 @@ The application's metrics record the rejection. The
 applications wire it to their Prometheus or OpenTelemetry
 counter.
 
-## Distinguishing attack from misconfiguration
+### Distinguishing attack from misconfiguration
 
 A high rate of 429s is operationally interesting. The cause is
 either an attack (real attacker getting throttled) or a
@@ -264,23 +301,30 @@ returns, and nothing reaches the audit trail, so distinguishing these
 patterns means logging the rejection yourself with the source IP and
 the endpoint at the point you install the middleware.
 
-## Per-tenant rate limits
+### Composing with the lockout policy
 
-For multi-tenant deployments, the rate limit configuration can
-be per-tenant. A tenant with a higher SLA gets a higher rate
-limit; a tenant with a lower SLA gets a tighter one. The
-mechanism is the same `RateLimitLayer`, with a `Custom` key
-extractor that composes the standard key (typically `PeerIp`)
-with the tenant id, and with separate `RateLimitConfig`s per
-tenant tier.
+The rate limiter and the lockout policy are different defences
+that compose. The rate limiter catches volume; the lockout policy
+catches credential pattern. Both fire on attacks, in different
+shapes.
 
-The pattern is operationally complex (one configuration per
-tenant tier), so most deployments use a single shared limit and
-calibrate to the deployment-wide envelope. The per-tenant shape
-is for deployments where the SLA differences are explicit and
-the operational overhead is justified.
+The pattern that emerges: the rate limiter is the first line of
+defence against credential stuffing. It drops the attack to a
+trickle before any individual user's lockout policy can fire.
+The lockout policy then catches the few attempts that get
+through, marking the targeted user accounts as locked.
 
-## Metrics
+A deployment that has rate limiting but no lockout policy is
+vulnerable to slow attacks that stay below the rate limit. A
+deployment that has lockout but no rate limiting is vulnerable
+to high-volume attacks that distribute across many users. Both
+together cover both attack shapes.
+
+## Operating it
+
+What to watch, and where the limiter sits relative to everything else.
+
+### Metrics
 
 The layer emits two metrics through the `AuthnMetrics` trait:
 
@@ -300,26 +344,7 @@ metrics system the deployment uses. The
 reference application shows a simple `AtomicU64`-based
 implementation suitable for adapting to a real metrics system.
 
-## Composing with the lockout policy
-
-The rate limiter and the lockout policy are different defences
-that compose. The rate limiter catches volume; the lockout policy
-catches credential pattern. Both fire on attacks, in different
-shapes.
-
-The pattern that emerges: the rate limiter is the first line of
-defence against credential stuffing. It drops the attack to a
-trickle before any individual user's lockout policy can fire.
-The lockout policy then catches the few attempts that get
-through, marking the targeted user accounts as locked.
-
-A deployment that has rate limiting but no lockout policy is
-vulnerable to slow attacks that stay below the rate limit. A
-deployment that has lockout but no rate limiting is vulnerable
-to high-volume attacks that distribute across many users. Both
-together cover both attack shapes.
-
-## Where the limiter sits in the stack
+### Where the limiter sits in the stack
 
 The rate limiter is the operational layer that sits between
 "the request was sent" and "the authentication logic runs." A

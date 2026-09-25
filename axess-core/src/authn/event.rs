@@ -19,17 +19,46 @@ use std::{fmt, net::IpAddr, str::FromStr};
 
 /// Enriched context for audit events (compliance: MiFID II record-keeping, GDPR).
 ///
-/// Extracted from HTTP request headers via [`extract_audit_context`]. Passed to
+/// Extracted from HTTP request headers via [`AuditContext`]. Passed to
 /// [`AuthEventBuilder::with_audit_context`] to stamp every event with client
 /// metadata without threading individual header values through every call site.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuditContext {
-    /// Client IP address (from `X-Real-IP` or `X-Forwarded-For`).
+    /// Client IP address, as resolved by
+    /// [`client_ip::layer`](crate::client_ip::layer).
     pub ip_address: Option<IpAddr>,
+    /// How [`ip_address`](Self::ip_address) was arrived at.
+    ///
+    /// An address is not evidence on its own. This says whether it is the
+    /// peer the server accepted, an entry walked out of a forwarded chain
+    /// against a trusted peer, or a value the application supplied through
+    /// [`ClientIp::resolved`](crate::client_ip::ClientIp::resolved), which
+    /// axess cannot check. A row that says `supplied` where the rest say
+    /// `forwarded` is worth a question.
+    pub ip_source: crate::client_ip::Source,
     /// `User-Agent` header value.
     pub user_agent: Option<String>,
-    /// Request ID for log correlation (from `X-Request-Id`).
+    /// Request ID for log correlation.
+    ///
+    /// Filled from
+    /// [`RequestId`](crate::middleware::request_id::RequestId) under the
+    /// `request-id` feature, and `None` without it. The `X-Request-Id`
+    /// header is not read directly: it is an ordinary request header that
+    /// any caller can set, to any length, and this value goes into an
+    /// audit row. To honour an id from an upstream proxy, enable
+    /// `accept-client-id`, which validates the inbound value in the layer
+    /// before it reaches here.
     pub request_id: Option<String>,
+    /// W3C trace id, for correlating this event with a distributed trace.
+    ///
+    /// The request id ties an event to one service's logs; this ties it to
+    /// the trace that crosses them, which is the thread an incident
+    /// responder actually pulls. Filled from
+    /// [`TraceContext`](crate::middleware::trace_id::TraceContext) under
+    /// the `trace-id` feature, and `None` without it: the id lives inside
+    /// a `traceparent` header that has to be parsed, and guessing at it
+    /// would put a malformed value in a column meant for joining.
+    pub trace_id: Option<String>,
     /// ISO 3166-1 alpha-2 country code derived from IP (if available).
     ///
     /// Requires an external geo-IP lookup; left as `None` when no resolver
@@ -39,115 +68,91 @@ pub struct AuditContext {
     pub session_id: Option<String>,
 }
 
-/// Extract an [`AuditContext`], **taking the client IP from the request
-/// headers and trusting it**.
-///
-/// `X-Real-IP` and `X-Forwarded-For` are ordinary request headers, so on
-/// any service a client can reach directly the resulting
-/// `AuthEvent::ip_address` is whatever that client chose. Since a failed
-/// audit write now fails the login, those rows are guaranteed to exist,
-/// which makes a forged address in them worse rather than better: it is
-/// evidence written by the subject of the evidence.
-///
-/// Use it only where something upstream guarantees the headers. Otherwise
-/// use [`extract_audit_context`], which takes the address you resolved.
-pub fn extract_audit_context_untrusted(
-    headers: &axum::http::HeaderMap,
-    _session: Option<&crate::session::extractor::AuthSession>,
-) -> AuditContext {
-    extract_audit_context(headers, ip_from_headers_untrusted(headers), _session)
-}
+impl<S> axum::extract::FromRequestParts<S> for AuditContext
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
 
-/// Extract an [`AuditContext`] using a client IP **you** resolved.
-///
-/// [`extract_audit_context_untrusted`] takes
-/// the IP from `X-Real-IP` or `X-Forwarded-For`, and any client can set both,
-/// so the `ip_address` on every resulting audit row is chosen by the subject
-/// of the audit. An attacker's failed logins can be recorded against whatever
-/// address they like, which is evidence forgery in the one place a deployment
-/// most needs evidence to hold.
-///
-/// Resolve the address first, against the peer your server actually accepted
-/// the connection from:
-///
-/// ```rust,ignore
-/// use axess_core::authz::{TrustedProxies, ip_from_headers_trusted};
-/// use axess_core::authn::event::extract_audit_context;
-///
-/// let client_ip = ip_from_headers_trusted(request.headers(), peer_addr, &trusted);
-/// let ctx = extract_audit_context(request.headers(), Some(client_ip), Some(&session));
-/// ```
-///
-/// Pass `None` when you have no trustworthy address; a null `ip_address` is
-/// honest, and a forged one is not.
-pub fn extract_audit_context(
-    headers: &axum::http::HeaderMap,
-    client_ip: Option<IpAddr>,
-    _session: Option<&crate::session::extractor::AuthSession>,
-) -> AuditContext {
-    AuditContext {
-        ip_address: client_ip,
-        user_agent: headers
-            .get("user-agent")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string()),
-        request_id: headers
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string()),
-        geo_country: None,
-        session_id: None, // filled asynchronously below if session is provided
+    /// Build the context from the request, rather than from parts the
+    /// caller assembles.
+    ///
+    /// The address is whatever
+    /// [`client_ip::layer`](crate::client_ip::layer) resolved,
+    /// read from the extensions. No header is consulted for it, and there
+    /// is no argument through which a different one could be supplied:
+    /// four free functions used to build this value, two of them took the
+    /// address straight out of `X-Real-IP`, and a consumer migrated seven
+    /// call sites onto one of those because its own documentation
+    /// recommended it.
+    ///
+    /// Everything is optional and nothing here fails. A route mounted
+    /// outside the layer yields no address, a request with no session
+    /// yields no session id, and a null column is an honest record of
+    /// what the request actually carried.
+    ///
+    /// `geo_country` stays `None`: it needs a lookup axess does not
+    /// perform. Fill it in afterwards if you run one.
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let header = |name: &str| {
+            parts
+                .headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+
+        let client_ip = parts
+            .extensions
+            .get::<crate::client_ip::ClientIp>()
+            .copied()
+            .unwrap_or_default();
+        let user_agent = header("user-agent");
+
+        // The typed value the request-id layer left behind, and nothing
+        // else. `X-Request-Id` is an ordinary request header: any caller
+        // can set it, to any length, and it would land in an audit row
+        // unbounded and unchecked. Accepting an upstream id is what the
+        // `accept-client-id` feature is for, where the layer validates it
+        // and then puts it here.
+        #[cfg(feature = "request-id")]
+        let request_id = parts
+            .extensions
+            .get::<crate::middleware::request_id::RequestId>()
+            .map(|id| id.0.clone());
+        #[cfg(not(feature = "request-id"))]
+        let request_id = None;
+
+        #[cfg(feature = "trace-id")]
+        let trace_id = parts
+            .extensions
+            .get::<crate::middleware::trace_id::TraceContext>()
+            .map(|ctx| ctx.trace_id.clone());
+        #[cfg(not(feature = "trace-id"))]
+        let trace_id = None;
+
+        // A request without a session is ordinary on a login route, which
+        // is the one place this context matters most, so its absence is a
+        // `None` rather than a rejection.
+        let session_id =
+            match crate::session::extractor::AuthSession::from_request_parts(parts, state).await {
+                Ok(session) => Some(session.session_id().await.to_string()),
+                Err(_) => None,
+            };
+
+        Ok(Self {
+            ip_address: client_ip.get(),
+            ip_source: client_ip.source(),
+            user_agent,
+            request_id,
+            trace_id,
+            geo_country: None,
+            session_id,
+        })
     }
-}
-
-/// Extract an [`AuditContext`] from headers and an optional session, including
-/// the session ID (requires `.await`).
-///
-/// Prefer this over [`extract_audit_context`] when you have access to an
-/// [`AuthSession`](crate::session::extractor::AuthSession).
-pub async fn extract_audit_context_async_untrusted(
-    headers: &axum::http::HeaderMap,
-    session: Option<&crate::session::extractor::AuthSession>,
-) -> AuditContext {
-    extract_audit_context_async(headers, ip_from_headers_untrusted(headers), session).await
-}
-
-/// [`extract_audit_context`] plus the session id. See that function for why
-/// the IP is an argument rather than something read from a header.
-pub async fn extract_audit_context_async(
-    headers: &axum::http::HeaderMap,
-    client_ip: Option<IpAddr>,
-    session: Option<&crate::session::extractor::AuthSession>,
-) -> AuditContext {
-    let mut ctx = extract_audit_context(headers, client_ip, session);
-    if let Some(s) = session {
-        ctx.session_id = Some(s.session_id().await.to_string());
-    }
-    ctx
-}
-
-/// Extract a client IP address from request headers, **trusting the client**.
-///
-/// Checks `X-Real-IP` then the first `X-Forwarded-For` entry. Returns `None`
-/// if neither header is present or parseable.
-///
-/// The name carries the warning because the behaviour warrants one: both
-/// headers are ordinary request headers, so on any deployment a client can
-/// reach directly, the value is whatever that client chose. Use it only when
-/// something upstream guarantees the headers, and use
-/// [`ip_from_headers_trusted`](crate::authz::ip_from_headers_trusted) when it
-/// does not.
-///
-/// This is a standalone copy for the `authn` module so it does not depend on
-/// the feature-gated `authz` module.
-pub fn ip_from_headers_untrusted(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
-    let raw = headers
-        .get("X-Real-IP")
-        .or_else(|| headers.get("X-Forwarded-For"))
-        .and_then(|v| v.to_str().ok())?;
-
-    // X-Forwarded-For may be a comma-separated list; take the first entry.
-    raw.split(',').next().and_then(|s| s.trim().parse().ok())
 }
 
 // ── AuthEventType ─────────────────────────────────────────────────────────────
@@ -572,10 +577,15 @@ pub struct AuthEvent {
     ///
     /// Typed rather than free text so a forged or malformed value cannot
     /// be stored at all. Resolve it with
-    /// [`ip_from_headers_trusted`](crate::authz::ip_from_headers_trusted)
+    /// [`TrustedProxies::client_ip`](crate::client_ip::TrustedProxies::client_ip)
     /// against the peer your server accepted; `None` is the honest value
     /// where no trustworthy address is available.
     pub ip_address: Option<std::net::IpAddr>,
+    /// How [`ip_address`](Self::ip_address) was arrived at. See
+    /// [`AuditContext::ip_source`].
+    pub ip_source: crate::client_ip::Source,
+    /// W3C trace id. See [`AuditContext::trace_id`].
+    pub trace_id: Option<String>,
     /// Optional user agent string.
     pub user_agent: Option<String>,
     /// Optional request ID for log correlation (from `X-Request-Id`).

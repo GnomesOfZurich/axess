@@ -2,10 +2,10 @@
 //!
 //! Two variants:
 //!
-//! - `AuthnService::begin_impersonation`: bare. Does not check that
+//! - `RequestAuthnService::begin_impersonation`: bare. Does not check that
 //!   admin and target share a tenant; the caller is responsible (e.g.
 //!   via a Cedar policy that scopes the action).
-//! - `AuthnService::begin_impersonation_in_tenant`: refuses with
+//! - `RequestAuthnService::begin_impersonation_in_tenant`: refuses with
 //!   [`AuthnError::CrossTenant`] when `admin.tenant_id != target.tenant_id`,
 //!   closing the cross-tenant pivot vector that the unscoped form leaves
 //!   to the application's policy layer.
@@ -15,7 +15,7 @@
 //! `SELECT * FROM auth_events WHERE actor_id = ? AND event_type = 'impersonation'`
 //! reconstruct the admin's full session-take history.
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
@@ -23,7 +23,7 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,

@@ -81,6 +81,19 @@ step "Documented versions" "$AXESS_DIR/scripts/check-doc-versions.sh"
 # names, including an import in the getting-started tutorial.
 step "Documented identifiers" "$AXESS_DIR/scripts/check-doc-identifiers.sh"
 
+# The same failure one level down, in the doc comments rather than the book.
+# `cargo doc` catches a broken intra-doc link and nothing catches a plain
+# backticked `Type::method`; the first run found a Setup example calling a
+# constructor that never existed, inside a ```text fence so nothing compiled
+# it, and a password-change note pointing at the wrong revocation method.
+step "Documented methods" "$AXESS_DIR/scripts/check-rustdoc-identifiers.sh"
+
+# Neither identifier gate looks at the path. A name can be real and the
+# module it is imported through fictional, which is how the crates.io front
+# page came to describe `axess::middleware::*` and the mTLS chapter to import
+# from `axess::factors`, in blocks nothing compiles.
+step "Documented imports" "$AXESS_DIR/scripts/check-facade-paths.sh"
+
 # Also sub-second. Guards the AGENTS.md rule that an inline `#[cfg(test)]`
 # block over ~200 lines moves to a sibling file: 24 blocks had drifted past
 # it before the rule was enforced rather than remembered.

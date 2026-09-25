@@ -1,17 +1,8 @@
 # Security posture
 
-This chapter is the production-readiness chapter. It covers the
-crypto choices axess makes by default, the production integration
-requirements an adopter has to meet before launch, the
-compliance touch-points (GDPR, SOC 2, PCI-DSS, HIPAA) the
-deployment will face, and the disclosure protocol for handling
-the inevitable vulnerability report.
-
-The chapter has two halves. The first half is axess-specific and
-covers the crypto backends, the FIPS-routing notes, and the PII
-classification. The second half is the canonical [`SECURITY.md`](https://github.com/GnomesOfZurich/axess/blob/main/SECURITY.md)
-from the repo root, included verbatim so the production
-checklist lives in one place rather than two.
+What axess chooses for you, what it leaves to you, and what an auditor
+will ask about. Read it before launch, not after the questionnaire
+arrives.
 
 ## Crypto backends
 
@@ -32,11 +23,11 @@ cargo feature and will not pick one for you. Anything enabling
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.6.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.7.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.6.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.7.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,
@@ -87,26 +78,16 @@ classification matters for GDPR (the data subject's rights), for
 SOC 2 (the control objectives), and for the retention sweep
 (*Device identity*'s `device_retention_days`). The classification:
 
-Primary PII includes the user's identifier (email, username, or
-similar), their hashed password, their TOTP secret, their FIDO2
-credentials, their IP address as seen during authentication, and
-their device fingerprint. This data lives in the identity store
-and the device store; the retention is the application's choice
-within whatever regulatory bounds apply.
+| Class | What | Where | Retention |
+|---|---|---|---|
+| Primary | Identifier (email, username), password hash, TOTP secret, FIDO2 credentials, the IP seen at authentication, device fingerprint | Identity store, device store | Yours to choose, within whatever regulatory bounds apply |
+| Secondary | The audit-event log, which reaches the primary through `user_id`, `tenant_id`, `device_id` and `client_ip` | Audit store | *Audit pipeline*. The usual GDPR pattern keeps it longer than primary PII but scrubs or hashes the IPs once the hot window closes |
+| Pseudonymous | Session id, refresh-token hash, device id (a UUID that names no user) | Session store, device store | Longer than primary PII, with no GDPR implication |
 
-Secondary PII includes the audit-event log (which references the
-primary PII through `user_id`, `tenant_id`, `device_id`, and
-`client_ip`). The audit retention covered in *Audit pipeline*
-applies here; for GDPR the typical pattern is to retain audit
-data longer than the primary PII but to scrub or hash the IP
-addresses after the operational hot window.
-
-Pseudonymous data includes the session id, the refresh token
-hash, and the device id itself (a UUID that does not name the
-user directly). These can be retained longer than the primary
-PII without GDPR implications; they only become PII when joined
-to the primary data, and the join requires access to the
-identity store.
+Pseudonymous is a claim about the data on its own. Each of those values
+becomes PII the moment it is joined to the primary set, and the join needs
+access to the identity store, so that store's access control is what keeps
+the classification true.
 
 The GDPR right-to-erasure verb is `IdentityAdmin::delete_user`, and
 what it does is your implementation's decision rather than a cascade
@@ -132,43 +113,23 @@ The deployment will face one or more of these regulatory frames.
 Axess does not provide compliance on its own; it provides the
 controls each framework requires. The touch-points:
 
-GDPR (EU data protection): the right-to-erasure verb (above),
-the audit trail's retention configuration, the IP-address scrubbing in
-the cold-tier archive, and `DeviceStore::sweep` with the thresholds in
-your `SweepConfig`. The deployment owns the data subject
-notices, the privacy policy, and the legal basis for processing;
-axess provides the technical mechanisms.
+| Frame | What axess gives you | What stays yours |
+|---|---|---|
+| GDPR (EU data protection) | The erasure verb above, audit retention configuration, IP scrubbing in the cold-tier archive, `DeviceStore::sweep` against your `SweepConfig` thresholds | Data subject notices, the privacy policy, the legal basis for processing |
+| SOC 2 (operational controls) | The audit catalogue, the lockout policy against credential stuffing, session and refresh-token security, the operational metrics | Policy and procedure documentation |
+| PCI-DSS (card data) | Strong authentication for administrative access, audit retention of at least one year, session data encrypted at rest | The cardholder data environment. Axess covers the authentication boundary into it, not the environment |
+| HIPAA (US healthcare) | Strong authentication for access to protected health information, audit retention of at least six years, session data encrypted at rest and in transit | The HIPAA-covered systems, on the same boundary split |
 
-SOC 2 (operational controls): the audit catalogue (every
-authentication decision produces an `AuthEvent`; authorisation
-decisions go to a `tracing` target instead, so wire that into your
-evidence pipeline separately), the lockout policy (defends against
-credential stuffing), the
-session and refresh-token security (covered in earlier chapters),
-the operational metrics (covered in *Operations runbook*). The
-deployment owns the policy and procedure documentation; axess
-provides the operational evidence.
+One gap in that first column is easy to miss under SOC 2: every
+*authentication* decision produces an `AuthEvent`, but *authorisation*
+decisions go to a `tracing` target instead. They are not in the catalogue,
+so an evidence pipeline that reads only `AuthEvent` rows will not have
+them. Wire the target separately.
 
-PCI-DSS (payment card data, if applicable): the strong
-authentication for administrative access, the audit retention
-of at least one year, the cryptographic protection of session
-data at rest. The deployment owns the cardholder data
-environment; axess covers the authentication boundary into it.
-
-HIPAA (US healthcare data, if applicable): the strong
-authentication for protected health information access, the
-audit retention of at least six years, the encryption of
-session data at rest and in transit. The deployment owns the
-HIPAA-covered systems; axess covers the authentication
-boundary.
-
-The chapters that cover the relevant mechanisms are the place to
-look up specific controls: *Session lifecycle and crypto envelope*
-for the at-rest encryption, *Audit pipeline* for the retention,
-*Refresh tokens and session continuity* for the refresh-token
-hygiene, *Multi-tenancy* for the lockout policy. The compliance
-documentation maps the framework's requirements to the relevant
-chapters.
+For the mechanism behind a specific control: *Session lifecycle and crypto
+envelope* for encryption at rest, *Audit pipeline* for retention, *Refresh
+tokens and session continuity* for refresh-token hygiene, *Multi-tenancy*
+for the lockout policy.
 
 ## Failing closed
 

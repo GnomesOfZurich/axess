@@ -16,7 +16,7 @@
 //! only; activate doesn't touch live sessions), and the audit-event
 //! emission.
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType},
@@ -24,7 +24,7 @@ use crate::authn::{
     types::StatusDetail,
 };
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
@@ -221,7 +221,13 @@ where
 
         Ok(())
     }
+}
 
+impl<I, F> AuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
     /// Resolve `user_id` to a [`User`](crate::authn::types::User) and
     /// enforce the expected-tenant rail.
     ///

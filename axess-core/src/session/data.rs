@@ -142,7 +142,7 @@ impl SessionData {
 ///
 /// - **Guest**: anonymous visitor, no authentication started.
 /// - **Identifying**: optional state for username-first flows. The built-in
-///   `AuthnService::begin_login()` skips this and goes directly to
+///   `RequestAuthnService::begin_login()` skips this and goes directly to
 ///   `Authenticating`. Available via `session.set_identifying()` for apps
 ///   that need a two-step identify-then-authenticate UX.
 /// - **Authenticating**: progressing through a multi-factor method; `remaining`

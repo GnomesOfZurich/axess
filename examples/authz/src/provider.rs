@@ -102,6 +102,28 @@ pub enum ProviderError {
     Build(String),
 }
 
+// `?` rather than a `map_err` closure at each of the nine fallible calls
+// below. The conversions are uninteresting and repeating them inline buries
+// the part worth reading, which is which entities get built and why.
+impl From<AuthzError> for ProviderError {
+    fn from(e: AuthzError) -> Self {
+        Self::Build(e.to_string())
+    }
+}
+
+impl From<cedar_policy::EntityAttrEvaluationError> for ProviderError {
+    fn from(e: cedar_policy::EntityAttrEvaluationError) -> Self {
+        Self::Build(format!("{e:?}"))
+    }
+}
+
+impl From<cedar_policy::entities_errors::EntitiesError> for ProviderError {
+    fn from(e: cedar_policy::entities_errors::EntitiesError) -> Self {
+        Self::Build(format!("{e:?}"))
+    }
+}
+
+// ANCHOR: provider
 impl AuthzEntityProvider for DocEntityProvider {
     /// Resources are identified by document ID string.
     type ResourceId = String;
@@ -125,6 +147,10 @@ impl AuthzEntityProvider for DocEntityProvider {
         let user_id = principal.id().as_ref();
 
         // 2. Build Role entities and collect parent UIDs for the user.
+        //    The lookups here read an in-memory map so this example
+        //    compiles with no database. A real provider issues the
+        //    equivalent queries (`SELECT role_name FROM user_roles WHERE
+        //    user_id = $1`) and the shape of what follows is unchanged.
         let role_names = self
             .data
             .user_roles
@@ -134,18 +160,14 @@ impl AuthzEntityProvider for DocEntityProvider {
 
         let mut role_uids = HashSet::new();
         for role_name in &role_names {
-            let role_uid = self
-                .make_uid("Role", role_name)
-                .map_err(|e| ProviderError::Build(e.to_string()))?;
-            let role_entity = Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())
-                .map_err(|e| ProviderError::Build(format!("{e:?}")))?;
+            let role_uid = self.make_uid("Role", role_name)?;
+            let role_entity = Entity::new(role_uid.clone(), HashMap::new(), HashSet::new())?;
             entities.push(role_entity);
             role_uids.insert(role_uid);
         }
 
         // 3. Build the User entity with Role parents.
-        let user_entity = Entity::new(principal.clone(), HashMap::new(), role_uids)
-            .map_err(|e| ProviderError::Build(format!("{e:?}")))?;
+        let user_entity = Entity::new(principal.clone(), HashMap::new(), role_uids)?;
         entities.push(user_entity);
 
         // 4. Build the Document entity with `owner` attribute.
@@ -155,13 +177,9 @@ impl AuthzEntityProvider for DocEntityProvider {
             .get(resource_id.as_str())
             .ok_or_else(|| ProviderError::NotFound(resource_id.to_string()))?;
 
-        let doc_uid = self
-            .make_uid("Document", &doc.id)
-            .map_err(|e| ProviderError::Build(e.to_string()))?;
+        let doc_uid = self.make_uid("Document", &doc.id)?;
 
-        let owner_uid = self
-            .make_uid("User", &doc.owner_id)
-            .map_err(|e| ProviderError::Build(e.to_string()))?;
+        let owner_uid = self.make_uid("User", &doc.owner_id)?;
 
         let mut doc_attrs = HashMap::new();
         doc_attrs.insert(
@@ -169,12 +187,14 @@ impl AuthzEntityProvider for DocEntityProvider {
             RestrictedExpression::new_entity_uid(owner_uid.clone()),
         );
 
-        let doc_entity = Entity::new(doc_uid, doc_attrs, HashSet::new())
-            .map_err(|e| ProviderError::Build(format!("{e:?}")))?;
+        let doc_entity = Entity::new(doc_uid, doc_attrs, HashSet::new())?;
         entities.push(doc_entity);
 
         // 5. The owner user entity must also be in the entity set if they
         //    are different from the requesting principal.
+        //
+        //    An entity a policy dereferences but the provider did not
+        //    build is absent, and Cedar reads absent as deny, not error.
         if doc.owner_id != user_id {
             let owner_roles = self
                 .data
@@ -186,12 +206,11 @@ impl AuthzEntityProvider for DocEntityProvider {
                 .iter()
                 .filter_map(|r| self.make_uid("Role", r).ok())
                 .collect();
-            let owner_entity = Entity::new(owner_uid, HashMap::new(), owner_role_uids)
-                .map_err(|e| ProviderError::Build(format!("{e:?}")))?;
+            let owner_entity = Entity::new(owner_uid, HashMap::new(), owner_role_uids)?;
             entities.push(owner_entity);
         }
 
-        Entities::from_entities(entities, None).map_err(|e| ProviderError::Build(format!("{e:?}")))
+        Ok(Entities::from_entities(entities, None)?)
     }
 
     /// Build the Cedar entity UID for a document.
@@ -210,3 +229,4 @@ impl AuthzEntityProvider for DocEntityProvider {
         Ok(())
     }
 }
+// ANCHOR_END: provider

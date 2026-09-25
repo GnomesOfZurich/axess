@@ -6,21 +6,123 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
-## [unreleased]
+## [Unreleased]
+
+---
+
+## [0.7.0] - 2026-09-25
+
+Working out where a request came from is now one answer, resolved once by
+a layer, carrying its own provenance. Reaching it used to cost a policy
+engine, so five consumers each did it their own way and two of them
+believed a header the caller writes.
+
+### Changed (breaking)
+
+- **Client-address resolution moved to `axess::client_ip`, ungated.**
+  It was in `axess::authz`, behind the feature that pulls `cedar-policy`.
+  **Migrating:** import `TrustedProxies` and `CidrParseError` from
+  `axess::client_ip`; the walk is `TrustedProxies::client_ip`; wrap the
+  router in `client_ip::layer` and serve with
+  `into_make_service_with_connect_info::<SocketAddr>()`.
+  `ip_from_headers_trusted` and `ip_from_headers_untrusted` are gone;
+  walking from the right is correct wherever reading the leftmost entry
+  was, and correct where it was not.
+
+- **The authenticating methods are on `RequestAuthnService`.**
+  `AuthnService::with_audit_context` returns it; `begin_login`,
+  `verify_factor`, `logout`, the signup, reset, impersonation,
+  admin-status, FIDO2 and OAuth-completion calls live there. It derefs to
+  `AuthnService`, so the rest of the surface is reachable through it.
+  **Migrating:** keep the `AuthnService` in application state and derive
+  one per request.
+
+- **`begin_login` no longer takes `client_ip`.** The address comes from
+  the handle. **Migrating:** drop the argument.
+
+- **`AuditContext` is an extractor.** `extract_audit_context` and its
+  `_async`, `_untrusted` and `_async_untrusted` variants are gone; two of
+  them read `X-Real-IP` and believed it. **Migrating:** take
+  `audit: AuditContext` in the handler.
+
+- **`AuditContextPolicy`, `AuthnError::MissingAuditContext` and
+  `AuthnMetrics::audit_context_missing` are removed.** The wiring they
+  checked at runtime is a compile error now. **Migrating:** delete the
+  `with_audit_context_policy` call; there is no replacement.
+
+- **`KeyExtractor::ForwardedIp` is `KeyExtractor::ClientIp`**, reading
+  what the layer resolved rather than two caller-writable headers.
+  **Migrating:** install the layer, or every request shares one bucket.
+
+- **`TrustedProxies::client_ip` returns `ClientIp`, not `Option<IpAddr>`**,
+  and `trusts` is now `trusts_peer` and `trusts_hop`: peer trust and chain
+  trust are different questions. **Migrating:** call `.get()` for the
+  address; `private_transport()` is the policy for a transport with no
+  checkable peer, such as a unix socket.
+
+- **`X-Real-IP` is no longer read unless you say your proxy overwrites
+  it.** A trusted peer that sets neither forwarded header left this one in
+  the caller's hands, which is the forgery the module exists to prevent;
+  Caddy never sets it at all. **Migrating:** if your proxy does overwrite
+  it (nginx's `proxy_set_header X-Real-IP $remote_addr`), call
+  `TrustedProxies::proxy_overwrites_real_ip()`. Otherwise the peer is the
+  answer, as it should have been.
+
+- **`request_id` comes from the request-id layer, not the `X-Request-Id`
+  header.** 0.6.0 read the header directly and ungated, so a deployment
+  that had never enabled `request-id` still recorded whatever a caller put
+  there. **Migrating:** nothing, if you run `RequestIdLayer` under the
+  `request-id` feature; the id is the same one. Without that feature
+  `request_id` is now `None` rather than a caller-supplied string.
+  `middleware::request_id::RequestId` is public so a custom `HEADER_NAME`
+  deployment can read the typed value, and `accept-client-id` validates an
+  upstream id before it reaches the context.
+
+- **`axess::federation::jwt` is `axess::jwt`**, gated on `jwt` rather than
+  `oauth`. `features = ["jwt-svid"]` previously left no path to the
+  resolver it compiled.
+
+### Added
+
+- **`ClientIp::source()` returns `Source::{Unknown, Peer, Forwarded,
+  Supplied}`**, and `AuditContext` and `AuthEvent` carry it as `ip_source`.
+  `unknown` means the layer is not installed; `peer` where a proxy runs
+  means the trusted set does not name it. Add the column and query it.
+
+- **`ClientIp::resolved`** for a front end axess cannot check: Cloudflare's
+  `CF-Connecting-IP`, Fly's `Fly-Client-IP`, a service mesh. Insert it in
+  your own middleware; it stamps `Source::Supplied`.
+
+- **`AuditContext` and `AuthEvent` carry `trace_id`**, from `TraceContext`
+  under the `trace-id` feature.
+
+- **`IpPolicy::restricts`** and **`MockIdentityStore::with_ip_policy`**.
 
 ### Fixed
 
-- **`check-doc-identifiers.sh` read stale sources from `target/`.** Its filter
-  tested for the substring `/target`, which never matches a top-level
-  `target/` because a relative path has no leading slash, so every crate ever
-  unpacked by `cargo package` was part of the set a documented name could
-  resolve against. `ShortString::prefix`, removed in this release, went on
-  resolving locally against `target/package/axess-strings-0.4.0/` while CI,
-  which checks out clean, rejected it. Both the Rust and Markdown inputs now
-  come from `git ls-files`, so the gate reads what a clean checkout has and
-  nothing else. A `REMOVED` list covers the third case the script had no
-  answer for: a name this workspace deleted, which a migration section still
-  has to write.
+- **A tenant IP allowlist could be switched off by the caller.**
+  `begin_login` enforced the tenant's `IpPolicy` only when passed an
+  address, and 51 of the 52 call sites here passed `None`. A restricting
+  policy now refuses a request whose address did not resolve; an empty
+  policy is unaffected. **Migrating: if any tenant has an `IpPolicy`,
+  install `client_ip::layer` before upgrading, or their logins fail
+  closed.**
+
+- **The device gate's `client_ip_fn` returned `None` unconditionally.** It
+  reads the resolved address now.
+
+- **The `sqlite` example wrote audit rows with no client IP on four of its
+  six audited calls**, including the failed-password row.
+
+- **The mTLS chapter documented a factor that was never built**, down to a
+  `FactorCredential::Mtls` variant. Rewritten to the terminator-and-gate
+  shape axess supports, and moved to Part VIII.
+
+### Dependencies
+
+- `thiserror` 2.0.20 -> 2.0.21, `tokio-test` (dev) 0.4.5 -> 0.4.6.
+
+---
 
 ## [0.6.0] - 2026-09-24
 
@@ -100,7 +202,7 @@ lives in the commit log and in `platform/.claude/decisions/`.
   events.** The pieces all existed and nothing joined them, so every audit
   row axess wrote carried `ip_address: None`.
 
-  ```rust
+  ```rust,ignore
   let ip = ip_from_headers_trusted(&headers, peer.ip(), &trusted);
   let ctx = extract_audit_context(&headers, Some(ip), Some(&session));
   state.authn.with_audit_context(ctx).begin_login(..).await?;
@@ -269,6 +371,8 @@ on the `deny.toml` ignore list until `rsa` and its dependants move off it.
 corrected to 1.94.0 in 0.5.0, and nothing here moves it. Restated because
 the only other MSRV note in this file sits under 0.2.0 and says `1.87`,
 which is what *that* release shipped with, not what this one needs.
+
+---
 
 ## [0.5.1] - 2026-09-16
 
@@ -674,6 +778,8 @@ re-exposed through this crate's public API: becomes `#[non_exhaustive]`.
   `StackSlot`). Lockfile-only; no public-API change.
 
 [RUSTSEC-2026-0221]: https://rustsec.org/advisories/RUSTSEC-2026-0221
+
+---
 
 ## [0.2.2] - 2026-07-19
 

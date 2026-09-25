@@ -46,18 +46,18 @@ pub mod session {
 /// Authentication namespace. Prefer `axess::authn::*` in new code.
 pub mod authn {
     pub use axess_core::{
-        AuditContext, AuditContextPolicy, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder,
-        AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError,
-        AuthnScope, AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId,
-        EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind,
-        FactorOutcome, FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config,
-        HotpConfig, IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+        AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus,
+        AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError, AuthnScope,
+        AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig,
+        EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome,
+        FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
+        IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
         IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
         LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
-        PasswordRules, PrepareOutcome, ProvisioningError, ResolvedFactor, SessionValidator,
-        SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
-        ZeroizedString, create_tenant, default_catalog, extract_audit_context,
-        extract_audit_context_untrusted, require_valid_session,
+        PasswordRules, PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor,
+        SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId,
+        TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
+        require_valid_session,
     };
     pub use axess_factors::{
         HOTP_LENGTH, HotpAlgorithm, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams,
@@ -265,6 +265,29 @@ pub use axess_core::{
 // Rate limiting
 pub use axess_core::{KeyExtractor, RateLimitConfig, RateLimitConfigBuilder, RateLimitLayer};
 
+/// The client's address, resolved once per request.
+///
+/// Ungated, and deliberately not under `authz`: the rate limiter, the audit
+/// trail and the device gate all need an address, and none of them should
+/// compile a policy engine to get one.
+pub mod client_ip {
+    pub use axess_core::client_ip::{CidrParseError, ClientIp, Source, TrustedProxies, layer};
+}
+
+/// JWT verification primitives and, under `jwt-svid`, SPIFFE JWT-SVID
+/// resolution.
+///
+/// At the root rather than under `federation` since 0.7.0, and gated on
+/// `jwt` rather than `oauth`. It was reachable only with `oauth` enabled,
+/// so `features = ["jwt-svid"]` compiled the resolver and left no path to
+/// it: a workload deployment with no OAuth in sight had to enable OAuth.
+#[cfg(feature = "jwt")]
+pub mod jwt {
+    #[cfg(feature = "jwt-svid")]
+    pub use axess_factors::jwt::svid;
+    pub use axess_factors::jwt::{claims, validation, verifier};
+}
+
 /// External identity providers and federation adapters. Mirrors
 /// [`axess_core::federation`].
 pub mod federation {
@@ -293,15 +316,6 @@ pub mod federation {
 
         #[cfg(feature = "fapi")]
         pub use axess_core::{DpopProof, FapiConfig, ParResponse, SenderConstraint};
-    }
-
-    /// JWT verification primitives and (under `jwt-svid`) SPIFFE JWT-SVID
-    /// resolution.
-    #[cfg(feature = "oauth")]
-    pub mod jwt {
-        #[cfg(feature = "jwt-svid")]
-        pub use axess_factors::jwt::svid;
-        pub use axess_factors::jwt::{claims, validation, verifier};
     }
 
     /// mTLS workload-identity resolution via SPIFFE X509-SVID.

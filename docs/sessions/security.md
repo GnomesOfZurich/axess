@@ -168,12 +168,14 @@ themselves rather than relying on the layer.
 
 Nothing in the session layer reads a forwarded header, because nothing
 in the default binding uses the IP. Your own code does, though: a
-Cedar policy conditioned on `ip_address`, a `KeyExtractor::ForwardedIp`
-rate limiter, an audit row. That is where the spoofing risk lives.
+Cedar policy conditioned on `ip_address`, a rate-limit key, an audit row.
+That is where the spoofing risk lives, and since 0.7.0 the answer is to
+resolve once with `client_ip::layer` and read `ClientIp` everywhere
+instead of asking each consumer to work it out.
 
-`ip_from_headers_untrusted` reads `X-Real-IP`, then the first entry of
-`X-Forwarded-For`. **Any client can set both headers.** Calling it on
-an internet-facing service means an attacker chooses the IP your
+Reading `X-Real-IP`, or the first entry of `X-Forwarded-For`, means
+taking a value **any client can set**. Doing that on an
+internet-facing service means an attacker chooses the IP your
 policies see, and the name says so at every call site.
 
 The same applies to your audit trail, and there it matters more.
@@ -191,14 +193,24 @@ The defence is to require that the request's actual peer be a proxy you
 trust before believing anything it forwarded:
 
 ```rust,ignore
-use axess_core::authz::{TrustedProxies, ip_from_headers_trusted};
+use axess::client_ip::{self, TrustedProxies};
 
 // Addresses, CIDR ranges, or both. `TrustedProxies::loopback_only()`
 // covers a same-pod sidecar like Envoy or NGINX.
 let trusted = TrustedProxies::from_cidrs(["10.0.0.0/8"])?
     .with_cidrs(["2001:db8::/32"])?;
 
-let client_ip = ip_from_headers_trusted(&headers, peer_addr, &trusted);
+// Resolve once, outside every route, where the peer is still known.
+let app = client_ip::layer(app, trusted);
+```
+
+Handlers then take a `ClientIp`, and the audit context takes itself:
+
+```rust,ignore
+async fn login_route(session: AuthSession, audit: AuditContext, ip: ClientIp) {
+    let service = state.authn.with_audit_context(audit);
+    // `ip.get()` where a policy or a key needs the address.
+}
 ```
 
 An empty `TrustedProxies` trusts nothing and always returns the peer,
@@ -236,6 +248,18 @@ it is honoured only when exactly one such header line is present. More
 than one means something appended rather than overwrote, which makes the
 first of them whatever the client sent.
 
+Which kind your proxy is, is worth checking rather than assuming, because
+the header is not one a proxy sets by default. nginx sets it only where
+the configuration says `proxy_set_header X-Real-IP $remote_addr`; without
+that line a client's value passes through. Caddy never sets it at all, so
+behind Caddy the value is always the client's. That costs nothing there,
+because Caddy does set `X-Forwarded-For` on every proxied request and this
+walk prefers it, leaving the `X-Real-IP` branch unreachable. It costs
+something behind a proxy that sets neither, or that sets `X-Real-IP` alone:
+name that proxy in the trusted set and its forwarded value is believed. If
+you cannot say which your proxy does, strip the header at the edge and let
+the walk use the chain.
+
 Every `X-Forwarded-For` line is joined before the walk, in order, for the
 same reason. RFC 9110 §5.3 makes repeated field lines equivalent to one
 comma-joined list, but reading only the first would let a client that
@@ -249,29 +273,47 @@ the list that decides whose headers are believed; write `10.0.0.0/8` or
 
 ### Getting the address onto the event
 
-Resolving the address is half of it. Axess attaches nothing by itself
-it cannot, since it has neither your peer socket nor your proxy set, so
-an event carries client metadata only if the route hands it over:
+Resolving the address is half of it. The event still has to carry it,
+and since 0.7.0 that is an extractor rather than something the route
+assembles:
 
 ```rust,ignore
-let client_ip = ip_from_headers_trusted(&headers, peer_addr, &trusted);
-let ctx = extract_audit_context(&headers, Some(client_ip), Some(&session));
-
-// A copy of the service that stamps `ctx` onto everything it emits.
-// Cheap: the collaborators are shared, only the context differs.
-let service = state.authn.with_audit_context(ctx);
-service.begin_login(&identifier, tenant, &session, None).await?;
+async fn login_route(session: AuthSession, audit: AuditContext, /* ... */) {
+    // The request-scoped handle. Cheap: the collaborators are shared,
+    // only the context differs.
+    let service = state.authn.with_audit_context(audit);
+    service.begin_login(&identifier, tenant, &session).await?;
+    service.verify_factor(&credential, &session).await?;
+}
 ```
 
-Derive that copy per request and let it die with the request. Holding one
-in application state pins a single client's address onto every later
-event, which is worse than a blank one: the rows look complete.
+`AuditContext` reads the address the layer resolved, plus the user-agent,
+request id and session id from the request it is already looking at.
+There is no argument through which a header-derived address could reach
+it.
 
-If a blank address should be an error rather than a silence, build with
-`AuditContextPolicy::Required`. It refuses to write an event on a route
-that attached no context at all: note that it checks the *wiring*, not
-the contents, so a context you deliberately built with `None` still
-passes. It is fail-closed, so wire every route before turning it on.
+Both calls go through `service` because there is no other way to make
+them. `begin_login` and `verify_factor` are on `RequestAuthnService`, the type
+`with_audit_context` returns, and not on the `AuthnService` in
+application state. Until 0.7.0 they were on both, and a handler that
+derived the handle and then reached back to `state.authn` for
+`verify_factor` left the failed-password rows blank, which are the rows a
+brute-force query counts.
+
+`RequestAuthnService` derefs to the service, so the application-scoped calls
+(`check_session`, the revocation methods, the capability predicates) are
+reachable through the one handle.
+
+Derive it per request and let it die with the request. Holding one in
+application state pins a single client's address onto every later event,
+which is worse than a blank one: the rows look complete.
+
+A blank address is still possible, and still honest, where the client-IP
+layer is not installed or the transport has no address to offer. It is
+not silent: the row records `ip_source = 'unknown'`, and *Audit events*
+has the query that finds them. Where the tenant has an IP policy it is
+not merely recorded but refused, because a policy that cannot be
+evaluated has not been satisfied.
 
 ## Defending against XSS
 

@@ -13,7 +13,7 @@ The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_k
 **Procedure:**
 1. Generate a new 32-byte signing master in your secrets manager.
 2. Deploy with both masters wired: new as current, old as previous.
-   ```rust
+   ```rust,ignore
    let layer = SessionLayer::new(store, new_master)
        .with_previous_signing_key(old_master);
    ```
@@ -31,7 +31,7 @@ The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_k
 
 `SessionCrypto` supports transparent key rotation via `with_previous_key()`:
 
-```rust
+```rust,ignore
 let crypto = SessionCrypto::new(new_key)
     .with_previous_key(old_key);
 ```
@@ -60,7 +60,7 @@ let crypto = SessionCrypto::new(new_key)
 
 Implement a `/healthz` endpoint using the `CompositeHealthCheck` trait:
 
-```rust
+```rust,ignore
 use axess::{CompositeHealthCheck, HealthCheck, HealthStatus};
 
 async fn healthz(State(health): State<CompositeHealthCheck>) -> impl IntoResponse {
@@ -92,7 +92,7 @@ There is no built-in migration tool. Sessions are short-lived (default 24h TTL),
 SQLite, PostgreSQL, and MySQL stores accumulate expired sessions. Use
 the built-in helper:
 
-```rust
+```rust,ignore
 let store = SqliteSessionStore::new(pool, crypto);
 store.init_schema().await?;
 let _cleanup = store.spawn_cleanup_task(Duration::from_secs(3600));
@@ -108,7 +108,7 @@ Axess spawns long-lived background tasks for everything that needs to run on a w
 
 The standard pattern is Axum's `with_graceful_shutdown` plus explicit abort/await of every `JoinHandle` axess returns:
 
-```rust
+```rust,ignore
 use axum::serve;
 use std::sync::Arc;
 use tokio::signal;
@@ -239,7 +239,7 @@ Implement the [`AuthnMetrics`](https://docs.rs/axess) trait against your metrics
 
 ### Force-logout all users
 
-```rust
+```rust,ignore
 // Via session registry (if configured):
 registry.invalidate_user(&user_id).await;
 

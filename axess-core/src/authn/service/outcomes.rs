@@ -27,7 +27,7 @@ pub enum LoginOutcome {
     /// returned a non-empty factor set.
     ///
     /// axess does not emit this variant from
-    /// [`AuthnService::begin_login`](super::AuthnService::begin_login)
+    /// [`RequestAuthnService::begin_login`](super::RequestAuthnService::begin_login)
     /// directly; `Device` resolution is a middleware concern
     /// ([`SessionLayer::with_device_resolver`](crate::session::SessionLayer::with_device_resolver))
     /// and the application substitutes the outcome per the wiring
@@ -54,7 +54,7 @@ pub enum LoginOutcome {
 
 /// Result of preparing a factor challenge.
 ///
-/// Returned by [`AuthnService::prepare_factor`](super::AuthnService::prepare_factor). Challenge-based factors
+/// Returned by [`RequestAuthnService::prepare_factor`](super::RequestAuthnService::prepare_factor). Challenge-based factors
 /// (EmailOtp, Fido2) return data the application must act on, e.g. sending
 /// an email or forwarding a WebAuthn challenge to the browser. Simple factors
 /// (Password, TOTP, HOTP) are always [`Ready`](PrepareOutcome::Ready).

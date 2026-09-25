@@ -179,6 +179,16 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         .layer(csrf_layer)
         .layer(session_layer);
 
+    // Outermost, so it runs before anything that reads an address and
+    // while `ConnectInfo` is still the nearest thing to the socket. It
+    // resolves once and every handler below reads a `ClientIp`.
+    //
+    // `loopback_only` suits this example, reached directly or through a
+    // same-host proxy. A deployment behind a load balancer names its
+    // egress ranges with `TrustedProxies::from_cidrs` instead; get that
+    // set wrong and the walk believes a header it should not.
+    let router = axess::client_ip::layer(router, axess::client_ip::TrustedProxies::loopback_only());
+
     (router, session_store)
 }
 

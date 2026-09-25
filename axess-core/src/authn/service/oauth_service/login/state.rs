@@ -5,7 +5,7 @@
 //! stale state, finish records failures and checks expiry). They live here so
 //! the per-step modules can stay focused on their own happy path.
 
-use crate::authn::service::AuthnService;
+use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
@@ -13,6 +13,66 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 use axess_factors::oauth::OAuthError;
+
+impl<I, F> RequestAuthnService<I, F>
+where
+    I: IdentityStore,
+    F: FactorStore<Error = I::Error>,
+{
+    /// Record an OAuth failure audit row AND clear the in-flight
+    /// ceremony state.
+    ///
+    /// Every failure branch in `finish_oauth_login` must do both:
+    /// the audit row gives the SOC the signal that the ceremony was
+    /// cut short, and `clear_oauth_state` releases the session-side
+    /// PKCE verifier / CSRF state / nonce / etc. so a subsequent
+    /// `begin_oauth_login` doesn't trip the "in-flight ceremony
+    /// already running" rail. Earlier these were two manual calls
+    /// at five sites; one of them subtly omitted the clear in an
+    /// earlier revision before being fixed. Roll them into one
+    /// helper so the next site that fails partway through gets the
+    /// contract for free.
+    pub(super) async fn record_oauth_failure_and_clear(
+        &self,
+        reason: AuthFailureReason,
+        provider_name: &str,
+        session: &AuthSession,
+    ) -> Result<(), OAuthError> {
+        // Clear the ceremony state even when the audit write fails: the
+        // state is unusable either way, and leaving it behind would let a
+        // replay of the same callback find a live ceremony.
+        let recorded = self
+            .record_oauth_failure(reason, provider_name, session)
+            .await;
+        self.clear_oauth_state(session).await;
+        recorded
+    }
+
+    /// Record an OAuth failure audit event.
+    pub(super) async fn record_oauth_failure(
+        &self,
+        reason: AuthFailureReason,
+        provider_name: &str,
+        session: &AuthSession,
+    ) -> Result<(), OAuthError> {
+        // Use whatever attribution the session carries; a pre-auth failure
+        // legitimately has `None` for both ids, and the event_type +
+        // error field carry the diagnostic information.
+        let user_id = session.user_id().await;
+        let tenant_id = session.tenant_id().await;
+
+        self.emit_audit(
+            AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                .maybe_attributed_to(user_id.as_ref(), tenant_id.as_ref())
+                .with_factor(FactorKind::Federated(
+                    crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
+                ))
+                .with_error(reason),
+        )
+        .await
+        .map_err(|e| OAuthError::AuditStore(e.to_string()))
+    }
+}
 
 impl<I, F> AuthnService<I, F>
 where
@@ -66,60 +126,6 @@ where
         }
         let elapsed = self.inner.clock.now() - started_at.with_timezone(&chrono::Utc);
         elapsed.to_std().unwrap_or_default() > timeout
-    }
-
-    /// Record an OAuth failure audit row AND clear the in-flight
-    /// ceremony state.
-    ///
-    /// Every failure branch in `finish_oauth_login` must do both:
-    /// the audit row gives the SOC the signal that the ceremony was
-    /// cut short, and `clear_oauth_state` releases the session-side
-    /// PKCE verifier / CSRF state / nonce / etc. so a subsequent
-    /// `begin_oauth_login` doesn't trip the "in-flight ceremony
-    /// already running" rail. Earlier these were two manual calls
-    /// at five sites; one of them subtly omitted the clear in an
-    /// earlier revision before being fixed. Roll them into one
-    /// helper so the next site that fails partway through gets the
-    /// contract for free.
-    pub(super) async fn record_oauth_failure_and_clear(
-        &self,
-        reason: AuthFailureReason,
-        provider_name: &str,
-        session: &AuthSession,
-    ) -> Result<(), OAuthError> {
-        // Clear the ceremony state even when the audit write fails: the
-        // state is unusable either way, and leaving it behind would let a
-        // replay of the same callback find a live ceremony.
-        let recorded = self
-            .record_oauth_failure(reason, provider_name, session)
-            .await;
-        self.clear_oauth_state(session).await;
-        recorded
-    }
-
-    /// Record an OAuth failure audit event.
-    pub(super) async fn record_oauth_failure(
-        &self,
-        reason: AuthFailureReason,
-        provider_name: &str,
-        session: &AuthSession,
-    ) -> Result<(), OAuthError> {
-        // Use whatever attribution the session carries; a pre-auth failure
-        // legitimately has `None` for both ids, and the event_type +
-        // error field carry the diagnostic information.
-        let user_id = session.user_id().await;
-        let tenant_id = session.tenant_id().await;
-
-        self.emit_audit(
-            AuthEventBuilder::failure(AuthEventType::LoginAttempt)
-                .maybe_attributed_to(user_id.as_ref(), tenant_id.as_ref())
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
-                ))
-                .with_error(reason),
-        )
-        .await
-        .map_err(|e| OAuthError::AuditStore(e.to_string()))
     }
 
     /// Clear all OAuth ceremony state from the session.

@@ -37,7 +37,7 @@
 //! - `GET  /profile`; shows authenticated user info + DPoP proof demo
 //! - `POST /auth/logout`; RP-Initiated Logout (revoke tokens, redirect to IdP)
 
-use axess::authn::AuthnService;
+use axess::authn::{AuditContext, AuthnService};
 use axess::federation::oauth::{
     FapiConfig, OAuthLoginOptions, OAuthProviderConfig, ResponseMode, SenderConstraint,
 };
@@ -103,12 +103,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state)
         .layer(session_layer);
 
+    // Resolve the client address once, outside everything that reads one.
+    // A FAPI deployment sits behind a TLS terminator, so name that
+    // terminator's ranges with `TrustedProxies::from_cidrs` rather than
+    // trusting loopback as this local example does.
+    let app = axess::client_ip::layer(app, axess::client_ip::TrustedProxies::loopback_only());
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     info!("Listening on http://127.0.0.1:3000");
     if !is_live {
         info!("Running in MOCK mode; set FAPI_ISSUER to connect to a real IdP");
     }
-    axum::serve(listener, app.into_make_service()).await?;
+    // `with_connect_info` is what puts the peer address where the
+    // client-IP layer can read it.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -255,8 +267,9 @@ async fn callback_get(
     axum::extract::State(state): axum::extract::State<AppState>,
     Query(params): Query<CallbackParams>,
     session: AuthSession,
+    audit: AuditContext,
 ) -> impl IntoResponse {
-    handle_callback(&state, &params, &session).await
+    handle_callback(&state, &params, &session, audit).await
 }
 
 /// POST callback; form_post response mode (FAPI preferred).
@@ -267,19 +280,22 @@ async fn callback_get(
 async fn callback_post(
     axum::extract::State(state): axum::extract::State<AppState>,
     session: AuthSession,
+    audit: AuditContext,
     Form(params): Form<CallbackParams>,
 ) -> impl IntoResponse {
     info!("Received callback via form_post (code not in URL)");
-    handle_callback(&state, &params, &session).await
+    handle_callback(&state, &params, &session, audit).await
 }
 
 async fn handle_callback(
     state: &AppState,
     params: &CallbackParams,
     session: &AuthSession,
+    audit: AuditContext,
 ) -> axum::response::Response {
     match state
         .authn
+        .with_audit_context(audit)
         .finish_oauth_login(&params.code, &params.state, session)
         .await
     {

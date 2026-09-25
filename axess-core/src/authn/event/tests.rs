@@ -8,17 +8,35 @@
 #![cfg(test)]
 
 use super::*;
+use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use std::net::IpAddr;
 
-#[test]
-fn audit_context_from_headers_with_all_fields() {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-real-ip", "203.0.113.42".parse().unwrap());
-    headers.insert("user-agent", "Mozilla/5.0 TestBrowser".parse().unwrap());
-    headers.insert("x-request-id", "req-abc-123".parse().unwrap());
+/// Request parts carrying `headers`, and the address the client-IP layer
+/// resolved if there was one.
+fn parts(headers: HeaderMap, resolved: Option<&str>) -> axum::http::request::Parts {
+    let mut req = axum::http::Request::builder().body(()).unwrap();
+    *req.headers_mut() = headers;
+    if let Some(ip) = resolved {
+        req.extensions_mut()
+            .insert(crate::client_ip::ClientIp::for_test(Some(
+                ip.parse().unwrap(),
+            )));
+    }
+    req.into_parts().0
+}
 
-    let ctx = extract_audit_context_untrusted(&headers, None);
+#[tokio::test]
+async fn audit_context_from_headers_with_all_fields() {
+    let mut headers = HeaderMap::new();
+    headers.insert("user-agent", "Mozilla/5.0 TestBrowser".parse().unwrap());
+
+    let mut p = parts(headers, Some("203.0.113.42"));
+    p.extensions
+        .insert(crate::middleware::request_id::RequestId(
+            "req-abc-123".to_owned(),
+        ));
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
 
     assert_eq!(
         ctx.ip_address,
@@ -32,14 +50,14 @@ fn audit_context_from_headers_with_all_fields() {
     );
     assert!(
         ctx.session_id.is_none(),
-        "sync extractor cannot read session ID"
+        "no session on the request means no session id"
     );
 }
 
-#[test]
-fn audit_context_missing_headers_produce_none() {
-    let headers = HeaderMap::new();
-    let ctx = extract_audit_context_untrusted(&headers, None);
+#[tokio::test]
+async fn audit_context_missing_headers_produce_none() {
+    let mut p = parts(HeaderMap::new(), None);
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
 
     assert!(ctx.ip_address.is_none());
     assert!(ctx.user_agent.is_none());
@@ -49,30 +67,10 @@ fn audit_context_missing_headers_produce_none() {
 }
 
 #[test]
-fn ip_from_x_forwarded_for_takes_first() {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-forwarded-for",
-        "198.51.100.1, 203.0.113.50".parse().unwrap(),
-    );
-
-    let ip = ip_from_headers_untrusted(&headers);
-    assert_eq!(ip, Some("198.51.100.1".parse::<IpAddr>().unwrap()));
-}
-
-#[test]
-fn ip_from_x_real_ip_preferred_over_forwarded() {
-    let mut headers = HeaderMap::new();
-    headers.insert("x-real-ip", "10.0.0.1".parse().unwrap());
-    headers.insert("x-forwarded-for", "192.168.1.1".parse().unwrap());
-
-    let ip = ip_from_headers_untrusted(&headers);
-    assert_eq!(ip, Some("10.0.0.1".parse::<IpAddr>().unwrap()));
-}
-
-#[test]
 fn event_carries_ip_and_user_agent_from_audit_context() {
     let ctx = AuditContext {
+        ip_source: crate::client_ip::Source::Forwarded,
+        trace_id: None,
         ip_address: Some("203.0.113.42".parse().unwrap()),
         user_agent: Some("TestAgent/1.0".to_string()),
         request_id: Some("req-xyz".to_string()),
@@ -287,23 +285,26 @@ fn auth_event_status_display_matches_as_str() {
     }
 }
 
-/// `extract_audit_context_async` must propagate the
-/// session ID from a real `AuthSession`. A `Default::default()`
-/// mutation would silently lose the session correlation.
+/// The extractor must propagate the session id from the session on the
+/// request. A `Default::default()` mutation would silently lose the
+/// correlation between an event and the session that produced it.
 #[tokio::test]
-async fn extract_audit_context_async_carries_session_id() {
+async fn audit_context_carries_session_id() {
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert("x-real-ip", "10.1.2.3".parse().unwrap());
     headers.insert("user-agent", "AuditUA/1".parse().unwrap());
 
     let session = crate::testing::test_session();
     let expected_sid = session.session_id().await.to_string();
 
-    let ctx = extract_audit_context_async_untrusted(&headers, Some(&session)).await;
+    let mut p = parts(headers, Some("10.1.2.3"));
+    // `AuthSession` extracts the `SessionHandle` the session layer put in
+    // the extensions, so that is what a request has to carry.
+    p.extensions.insert(session.0.clone());
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
     assert_eq!(
         ctx.session_id.as_deref(),
         Some(expected_sid.as_str()),
-        "async extractor must populate session_id from the session"
+        "the extractor must populate session_id from the session"
     );
     assert_eq!(
         ctx.ip_address.map(|ip| ip.to_string()).as_deref(),
@@ -312,17 +313,18 @@ async fn extract_audit_context_async_carries_session_id() {
     assert_eq!(ctx.user_agent.as_deref(), Some("AuditUA/1"));
 }
 
-#[test]
-fn audit_context_takes_the_ip_it_is_given_and_ignores_the_header() {
-    // The whole point of the argument: a client-supplied `X-Real-IP`
-    // must not reach the audit row when the caller has resolved the
-    // address itself.
+#[tokio::test]
+async fn audit_context_takes_the_resolved_ip_and_ignores_the_header() {
+    // A client-supplied `X-Real-IP` must not reach the audit row. There
+    // is no longer an argument through which it could: the extractor
+    // reads the resolved value and never the header.
     let mut headers = HeaderMap::new();
     headers.insert("x-real-ip", "192.0.2.5".parse().unwrap());
     headers.insert("user-agent", "Mozilla/5.0 TestBrowser".parse().unwrap());
 
     let resolved: IpAddr = "203.0.113.42".parse().unwrap();
-    let ctx = extract_audit_context(&headers, Some(resolved), None);
+    let mut p = parts(headers, Some("203.0.113.42"));
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
 
     assert_eq!(
         ctx.ip_address,
@@ -332,16 +334,18 @@ fn audit_context_takes_the_ip_it_is_given_and_ignores_the_header() {
     assert_eq!(ctx.user_agent.as_deref(), Some("Mozilla/5.0 TestBrowser"));
 }
 
-#[test]
-fn audit_context_records_no_ip_rather_than_a_forged_one() {
+#[tokio::test]
+async fn audit_context_records_no_ip_rather_than_a_forged_one() {
     let mut headers = HeaderMap::new();
     headers.insert("x-real-ip", "192.0.2.5".parse().unwrap());
 
-    let ctx = extract_audit_context(&headers, None, None);
+    // No client-IP layer, so nothing resolved an address.
+    let mut p = parts(headers, None);
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
 
     assert!(
         ctx.ip_address.is_none(),
-        "passing None must leave the field empty, not fall back to the header"
+        "an unresolved address must stay empty, not fall back to the header"
     );
 }
 
@@ -432,4 +436,61 @@ fn failure_reason_serialises_as_a_plain_string() {
     // And a free-form one is still a bare string, not a tagged enum.
     let other = serde_json::to_string(&AuthFailureReason::Other("boom".into())).unwrap();
     assert_eq!(other, r#""boom""#);
+}
+
+/// The trace id is what joins an audit row to the trace that crosses
+/// services, so it has to survive the context reaching the event.
+#[tokio::test]
+async fn trace_id_reaches_the_event_through_the_context() {
+    let ctx = AuditContext {
+        trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".to_owned()),
+        ..Default::default()
+    };
+    let event = AuthEventBuilder::new(
+        None,
+        None,
+        AuthEventType::LoginAttempt,
+        AuthEventStatus::Failure,
+    )
+    .with_audit_context(&ctx)
+    .build_at(chrono::Utc::now());
+    assert_eq!(
+        event.trace_id.as_deref(),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736")
+    );
+}
+
+/// Without the `trace-id` feature there is nothing typed to read, and a
+/// `traceparent` header is not a trace id until it is parsed. `None` is
+/// the honest answer rather than a malformed value in a join column.
+#[tokio::test]
+async fn no_trace_context_means_no_trace_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "traceparent",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+            .parse()
+            .unwrap(),
+    );
+    let mut p = parts(headers, None);
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
+    assert!(ctx.trace_id.is_none());
+}
+
+/// `X-Request-Id` is an ordinary request header, so a caller can set it to
+/// anything of any length, and this value lands in an audit row. Only the
+/// value the layer validated and put in the extensions is read; honouring
+/// an upstream id is what `accept-client-id` is for.
+#[tokio::test]
+async fn a_client_supplied_request_id_header_is_not_believed() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", "forged-by-the-caller".parse().unwrap());
+
+    let mut p = parts(headers, None);
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
+
+    assert!(
+        ctx.request_id.is_none(),
+        "a header the caller writes must not reach the audit row"
+    );
 }

@@ -210,6 +210,19 @@ jobs:
       - name: Documented identifiers exist
         run: ./scripts/check-doc-identifiers.sh
 
+      # `cargo doc` rejects a broken intra-doc link. It says nothing about a
+      # plain backticked `Type::method`, nor about a ```text fence, which is
+      # what a setup example becomes once it stops compiling. Both are how a
+      # reader learns which call to make.
+      - name: Documented methods exist
+        run: ./scripts/check-rustdoc-identifiers.sh
+
+      # The identifier checks confirm a name exists. This confirms the path
+      # the docs tell an adopter to write: `axess::factors::mtls` named a
+      # real type through a module that has never existed.
+      - name: Documented imports resolve
+        run: ./scripts/check-facade-paths.sh
+
   # Tests
   test:
     name: Test Suite

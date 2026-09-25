@@ -1,23 +1,16 @@
 # Getting started
 
-This chapter is the on-ramp. It assumes you can read Rust and have seen
-Axum, but it does not assume you know axess. The goal by the end is a
-small running Axum application that logs a user in with a password,
-holds the session in a signed cookie, and rejects requests to a
-protected route until the login is complete.
+By the end you have a running Axum application that logs a user in with
+a password, holds the session in a signed cookie, and refuses a
+protected route until the login completes. No database: the in-memory
+backend is a one-trait swap away from SQLite, covered at the end and in
+[`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite).
 
-We will skip the database for as long as possible. Replacing the
-in-memory backend with a real SQLite backend is a one-trait swap,
-covered at the end and walked through in detail in *Identity store
-implementation* and the working
-[`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite)
-reference application.
-
-If you already have an Axum application and want the punch list: add
-the dependencies in *Dependencies*, drop in the `SessionLayer` and
-`AuthnService` from *The minimum viable wiring*, and wire the login
-handler from *Adding password login*. The rest of the chapter is
-rationale and a tour of the production-shaped example.
+**Already have an Axum application?** Add the dependencies in
+*Dependencies*, drop in the `SessionLayer` and `AuthnService` from *The
+minimum viable wiring*, and wire the handler from *Adding password
+login*. The rest is rationale and a tour of the production-shaped
+example.
 
 ## Prerequisites
 
@@ -35,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.6"             # facade -- depend on this, never on the internal crates
+axess = "0.7"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -43,11 +36,12 @@ tower = "0.5"             # transitively from axum, but listed for clarity
 
 The defaults of the `axess` facade enable `authz` and `device`.
 Everything else is opt-in via features. For this chapter we will also
-turn on `memory`, the in-memory session store used for development and
-tests.
+turn on `memory` for the in-memory session store and `testing` for
+`InMemoryBackend`. Both are development conveniences; a deployment with a
+real database needs neither.
 
 ```toml
-axess = { version = "0.6.0", features = ["memory"] }
+axess = { version = "0.7.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the
@@ -59,67 +53,26 @@ state their required feature at the top.
 
 ## The minimum viable wiring
 
-A minimum axess setup has four moving pieces, used in the same order
-they are wired. The backend looks up users and verifies their factors.
-The session store persists session data across requests. A signing key
-HMAC-signs the session cookie so it cannot be tampered with. The
-`AuthnService` is what handlers reach for to drive the state machine.
-On top of those four pieces sits one Tower layer, `SessionLayer`,
-which reads the cookie at the start of every request, hydrates the
-session, and writes it back on response.
+Four moving pieces, in the order you wire them:
+
+1. **The backend** looks up users and verifies their factors.
+2. **The session store** persists session data across requests.
+3. **A signing key** HMAC-signs the cookie so it cannot be tampered with.
+4. **`AuthnService`** is what handlers reach for to drive the state machine.
+
+Two Tower layers sit on top. `SessionLayer` reads the cookie at the start
+of every request, hydrates the session, and writes it back on response.
+`client_ip::layer` works out the client's address once, from the TCP peer
+and the proxies you say you trust, so that nothing downstream has to read
+a header and guess. Serve the router with
+`into_make_service_with_connect_info::<SocketAddr>()` or there is no peer
+for it to work from.
 
 Here is the whole thing in one file. We will walk through each line
 right after.
 
-```rust,no_run
-use axess::{
-    AuthnService, InMemoryBackend, MemorySessionStore,
-    SessionLayer, AuthSession,
-};
-use axum::{Router, routing::get, response::IntoResponse, http::StatusCode};
-use std::{sync::Arc, time::Duration};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Backend -- one type implements both IdentityStore and FactorStore.
-    let backend = InMemoryBackend::new()
-        .with_user_password("alice", "default", "Gnomes2+");
-
-    // 2. Session store + 3. signing key.
-    let session_store = MemorySessionStore::new();
-    let signing_key: [u8; 32] = [0; 32]; // PLACEHOLDER, see "Signing keys" below.
-
-    // 4. AuthnService -- type-erased over clock and RNG; production wires
-    //    SystemClock + SystemRng.
-    let service = Arc::new(AuthnService::new(backend.clone(), backend));
-
-    // 5. SessionLayer threads the session through each request.
-    let session_layer = SessionLayer::new(session_store, signing_key)
-        .with_ttl(Duration::from_secs(86_400))
-        .with_secure(false); // dev only -- see "Cookie security" below.
-
-    let app = Router::new()
-        .route("/", get(public_page))
-        .route("/dashboard", get(protected_page))
-        .with_state(service)
-        .layer(session_layer);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-async fn public_page() -> &'static str {
-    "everyone can see this"
-}
-
-async fn protected_page(session: AuthSession) -> impl IntoResponse {
-    if session.is_authenticated() {
-        (StatusCode::OK, "welcome").into_response()
-    } else {
-        (StatusCode::UNAUTHORIZED, "log in first").into_response()
-    }
-}
+```rust,ignore
+{{#include ../../examples/minimal/src/main.rs:wiring}}
 ```
 
 This compiles and runs. Visiting `http://127.0.0.1:3000/` returns
@@ -171,70 +124,13 @@ password. Axess transitions the session from `Guest` to
 identifies the session, and `AuthSession` reads `Authenticated`.
 
 ```rust,ignore
-use axess::{AuthnService, AuthSession, FactorCredential, FactorOutcome, LoginOutcome};
-use axum::{extract::State, response::IntoResponse, http::StatusCode, Json};
+use axess::authn::{AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome};
+use axess::{AuthSession, InMemoryBackend};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 use std::sync::Arc;
 
-#[derive(Deserialize)]
-struct LoginForm {
-    username: String,
-    password: String,
-}
-
-async fn login(
-    session: AuthSession,
-    State(service): State<Arc<AuthnService<InMemoryBackend, InMemoryBackend>>>,
-    Json(form): Json<LoginForm>,
-) -> impl IntoResponse {
-    // 1. Begin the login. Transitions Guest -> Authenticating.
-    //    `client_ip` is `None` here; pass the real one in production so
-    //    the IP policy and the audit trail have something to work with.
-    match service
-        .begin_login(&form.username, "default", &session, None)
-        .await
-    {
-        // The identifier resolved and the first factor is known. For a
-        // password-only method that is `FactorKind::Password`.
-        Ok(LoginOutcome::FactorRequired(_)) => {}
-        Ok(LoginOutcome::InvalidCredentials) => {
-            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
-        }
-        Ok(LoginOutcome::Locked { until }) => {
-            return (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response();
-        }
-        Ok(LoginOutcome::StepUpRequired { .. }) => {
-            return (StatusCode::UNAUTHORIZED, "step-up required").into_response();
-        }
-        Err(e) => return (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
-    }
-
-    // 2. Verify the password factor. Note the argument order:
-    //    credential first, session second.
-    match service
-        .verify_factor(
-            &FactorCredential::Password(form.password.clone()),
-            &session,
-        )
-        .await
-    {
-        Ok(FactorOutcome::Authenticated) => {
-            (StatusCode::OK, "logged in").into_response()
-        }
-        Ok(FactorOutcome::FactorRequired(next)) => {
-            // Unreachable for a password-only method, but the branch matters
-            // when chaining factors (password + TOTP, etc).
-            (StatusCode::OK, format!("next factor: {next:?}")).into_response()
-        }
-        Ok(FactorOutcome::InvalidCredential) => {
-            (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
-        }
-        Ok(FactorOutcome::Locked { until }) => {
-            (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response()
-        }
-        Err(e) => (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
-    }
-}
+{{#include ../../examples/minimal/src/main.rs:login}}
 ```
 
 Two different outcome types appear there, and the difference is the
@@ -256,9 +152,10 @@ the variant names what comes next. `InvalidCredential` is a wrong
 password, and `Locked` is the lockout policy firing on this attempt.
 
 Both calls take the session, but in different positions:
-`begin_login(identifier, tenant, session, client_ip)` and
+`begin_login(identifier, tenant, session)` and
 `verify_factor(credential, session)`. The credential comes first
-because it is the subject of the verb.
+because it is the subject of the verb. Neither takes a client address:
+that rides on the handle, resolved once by `client_ip::layer`.
 
 The branching is the whole point of the explicit state machine. There
 is no version of "logged in" that means "we believe one factor, you

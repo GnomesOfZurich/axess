@@ -17,12 +17,18 @@
 //! # Setup
 //!
 //! ```text
-//! use axess::{AuthnService, BackChannelLogoutHandler};
+//! use axess::BackChannelLogoutHandler;
 //! use axum::Router;
 //!
-//! let authn: Arc<AuthnService<_, _, _, _>> = /* … */;
-//! let handler = authn.backchannel_logout_handler()
-//!     .expect("requires both OAuth providers and a session registry");
+//! // `new` returns None when no provider advertises both an issuer and a
+//! // client id, since there is then nothing a logout token could match.
+//! let handler = BackChannelLogoutHandler::new(
+//!     &providers,          // &[Arc<dyn OAuthProvider>]
+//!     registry,            // Arc<dyn SessionRevoker>
+//!     sid_map,
+//!     clock,               // Arc<dyn Clock>
+//! )
+//! .expect("at least one provider with an issuer and a client id");
 //!
 //! let app = Router::new()
 //!     .route("/auth/backchannel-logout", axum::routing::post(
@@ -68,7 +74,8 @@ use std::sync::Arc;
 /// accepts `POST` requests with `Content-Type: application/x-www-form-urlencoded`
 /// containing a `logout_token` field.
 ///
-/// Construct via `AuthnService::backchannel_logout_handler`.
+/// Construct with [`BackChannelLogoutHandler::new`], which returns `None`
+/// unless at least one provider advertises both an issuer and a client id.
 #[derive(Clone)]
 pub struct BackChannelLogoutHandler {
     /// Registered providers, keyed by issuer URL for O(1) lookup.
@@ -103,7 +110,7 @@ const JTI_EVICT_BATCH: usize = 128;
 
 /// Shared map of OIDC session IDs to local session identifiers.
 ///
-/// Populated by `AuthnService::complete_oauth_login` when the IdP's ID token
+/// Populated by `RequestAuthnService::complete_oauth_login` when the IdP's ID token
 /// contains a `sid` claim. Used by the back-channel logout handler to invalidate
 /// individual sessions by OIDC session ID.
 ///

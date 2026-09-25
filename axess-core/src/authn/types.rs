@@ -424,6 +424,18 @@ pub struct IpPolicy {
 }
 
 impl IpPolicy {
+    /// Whether this policy restricts anything at all.
+    ///
+    /// An empty policy permits every address, so a request whose address is
+    /// unknown is no less compliant with it than one whose address is
+    /// known. A non-empty one cannot be evaluated without an address, which
+    /// is why [`AuthnService::with_audit_context`](crate::authn::AuthnService::with_audit_context)
+    /// is the only way to reach a login: the answer has to come from
+    /// somewhere the caller cannot choose.
+    pub fn restricts(&self) -> bool {
+        !self.allow.is_empty() || !self.deny.is_empty()
+    }
+
     /// Check whether the given IP address is permitted by this policy.
     ///
     /// Returns `true` if the IP is allowed, `false` if denied.

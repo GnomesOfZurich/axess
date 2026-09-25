@@ -105,19 +105,6 @@ pub trait AuthnMetrics: Send + Sync + 'static {
     /// this fires: it is a page, not a dashboard line.
     fn audit_store_outage(&self) {}
 
-    /// An event was refused because
-    /// [`AuditContextPolicy::Required`](crate::authn::service::AuditContextPolicy::Required)
-    /// is set and the request path attached no
-    /// [`AuditContext`](crate::authn::event::AuditContext).
-    ///
-    /// A wiring fault, not an outage: nothing is down and nothing
-    /// rejected the write. Distinct from
-    /// [`audit_store_outage`](Self::audit_store_outage) so an on-call
-    /// page is not raised for a route that forgot
-    /// `AuthnService::with_audit_context`. Any non-zero value means some
-    /// route is failing every request.
-    fn audit_context_missing(&self) {}
-
     /// An audit sink deliberately dropped an event under load.
     ///
     /// Distinct from [`audit_store_outage`](Self::audit_store_outage):

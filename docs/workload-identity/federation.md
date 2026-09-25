@@ -11,9 +11,11 @@ a generic resolver that bridges any JWT-bearer issuer into the
 unified workload-principal shape.
 
 This chapter covers `WorkloadResolver`, the single resolver that
-handles every non-SPIFFE federation. It is gated on the `jwt`
-feature (transitively enabled by `jwt-svid` and the rest of the
-workload-identity bundle).
+handles every non-SPIFFE federation. It is gated on the `jwt` feature,
+which `jwt-svid` and the rest of the workload-identity bundle pull in.
+Before 0.7.0 the facade put this module under `federation` and gated it
+on `oauth`, so `features = ["jwt-svid"]` compiled the resolver and left
+no path to it.
 
 ## What federation means here
 
@@ -163,6 +165,14 @@ Write your own recipe. For any new IdP:
    for audit-log attribution (the constructor validates the label
    format: `[a-z0-9_]{1,32}`).
 
+`WorkloadId::build` renders `spiffe://<trust_domain>/<service>/<tenant_slug>`,
+and each of those two segments is one path component: `[A-Za-z0-9._~-]`,
+non-empty, with the whole URI capped at 2048 characters. A claim that is
+already a path does not pass through. GitLab's `project_path` is
+`group/subgroup/project`, and handing it over whole fails on the first
+slash, so decide what the segments mean for your issuer and build them
+rather than forwarding a claim verbatim.
+
 The two shipped recipes are the templates; read their source,
 adapt as needed.
 
@@ -210,31 +220,24 @@ compromised OIDC IdP issues tokens for arbitrary identities. The
 defences are operational: secure each issuer, monitor for unusual
 issuance patterns, rotate keys on a schedule.
 
-The audit pipeline (covered in *Audit pipeline*) emits an event on
-every successful workload authentication, recording the issuer
-label (`Issuer::OAuth` / `Issuer::Custom(...)`) and the
-synthesised identity. The events feed the SIEM rules that catch
-issuer-level anomalies.
+Nothing is audited for you here. `WorkloadResolver::resolve` verifies
+the token and hands back a `Principal`; it writes no `AuthEvent`, and
+`AuthEventType` has no variant for workload authentication, so a SIEM
+rule watching the catalogue for these will wait forever. Axess emits from
+its service layer, which holds an `IdentityAuthnLog` to write through,
+and the workload resolvers sit outside it.
+
+Record it at your call site if you want it: the issuer label and the
+synthesised `WorkloadId` are both on the principal the resolver returns,
+which is the attribution an issuer-level anomaly rule needs.
 
 ## Troubleshooting
 
-If `resolve()` returns `NotAuthenticated`, the JWT failed
-verification; wrong issuer, wrong audience, expired, bad
-signature, or a custom-claim deserialisation failure. Enable
-`tracing::debug!` on `axess_factors::federation::workload` to see
-which step rejected the token.
-
-If `resolve()` returns `InvalidSpiffeId`, the resolver verified
-the token but the trust domain extracted from the synthesised
-`WorkloadId` did not match the resolver's pinned trust domain.
-Typically a mapper bug: the closure synthesised the id under the
-wrong trust domain. Check the recipe's `trust_domain` capture.
-
-If `resolve()` returns `InvalidComponent(...)`, the claim mapper
-rejected the verified claims. The error message names which
-claim was missing or malformed. Decode the JWT payload
-(`base64 -d` of the middle segment) to compare claims against the
-mapper's expectations.
+| `resolve()` returns | Usually | What to do |
+|---|---|---|
+| `NotAuthenticated` | The JWT failed verification: wrong issuer, wrong audience, expired, bad signature, or a custom-claim that would not deserialise | Turn on `tracing::debug!` for `axess_factors::federation::workload` to see which step rejected it |
+| `InvalidSpiffeId` | The token verified, but the trust domain in the synthesised `WorkloadId` is not the one the resolver pinned. Usually the mapper closure built the id under the wrong trust domain | Check which `trust_domain` the recipe captured |
+| `InvalidComponent(...)` | The claim mapper rejected the verified claims, or a path segment carried a character outside `[A-Za-z0-9._~-]`. The message names which | Decode the payload (`base64 -d` of the JWT's middle segment) and compare it against what the mapper expects |
 
 ## Further reading
 

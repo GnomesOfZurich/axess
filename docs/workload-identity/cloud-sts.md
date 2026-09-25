@@ -40,7 +40,11 @@ the workload's filesystem, and revocation of the workload's
 identity (at the issuer) propagates to the cloud access without
 any cloud-side action.
 
-## AWS STS
+## The three clouds
+
+The same exchange, spelled three ways.
+
+### AWS STS
 
 The AWS adapter calls `AssumeRoleWithWebIdentity`, the STS API for
 identity federation. The configuration:
@@ -100,7 +104,7 @@ async fn call_aws(
 }
 ```
 
-## GCP Workload Identity Federation
+### GCP Workload Identity Federation
 
 The GCP adapter calls Google Cloud's federated-credentials
 endpoint, which exchanges a token from an external identity
@@ -136,7 +140,7 @@ narrowest possible scope is the recommendation; `cloud-platform`
 is the broadest and should be used only when you
 genuinely needs unrestricted access.
 
-## Azure Federated Identity Credentials
+### Azure Federated Identity Credentials
 
 The Azure adapter exchanges an external identity for an Azure AD
 access token through the FIC (Federated Identity Credential)

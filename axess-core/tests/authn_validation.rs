@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{FactorCredential, FactorKind, ZeroizedString},
     ids::{TenantId, UserId},
@@ -29,7 +30,7 @@ async fn oversized_identifier_returns_invalid_credentials() {
     // 300-byte identifier should be rejected (limit is 256).
     let huge_identifier = "a".repeat(300);
     let outcome = service
-        .begin_login(&huge_identifier, "default", &session, None)
+        .begin_login(&huge_identifier, "default", &session)
         .await
         .unwrap();
     assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
@@ -40,7 +41,7 @@ async fn empty_identifier_returns_invalid_credentials() {
     let service = make_password_service("u1", "alice", "secret");
     let session = test_session();
 
-    let outcome = service.begin_login("", "t1", &session, None).await.unwrap();
+    let outcome = service.begin_login("", "t1", &session).await.unwrap();
     assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
 }
 
@@ -49,10 +50,7 @@ async fn oversized_password_rejected_before_argon2() {
     let service = make_password_service("u1", "alice", "secret");
     let session = test_session();
 
-    service
-        .begin_login("alice", "t1", &session, None)
-        .await
-        .unwrap();
+    service.begin_login("alice", "t1", &session).await.unwrap();
 
     // 2000-byte password should be rejected before reaching Argon2.
     let huge_password = "a".repeat(2000);
@@ -86,11 +84,11 @@ async fn oversized_otp_code_rejected() {
                 user_scope(),
             ),
         );
-    let service = AuthnService::new(identity, factors);
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
     service

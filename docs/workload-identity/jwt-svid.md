@@ -36,7 +36,11 @@ JWKS endpoint. The signing algorithm is RS256 or ES256 in
 production deployments; SPIFFE does not standardise the algorithm,
 but the keys advertised in the JWKS specify it.
 
-## Configuration
+## Wiring it up
+
+The resolver takes a verifier, a trust domain and a token, and nothing else.
+
+### Configuration
 
 The resolver takes a verifier, the trust domain it accepts, and the
 token, and nothing else:
@@ -86,7 +90,7 @@ token is accepted until its `exp`, and bounding issuance age is the issuer's
 to do through a short lifetime. If you need it, check `VerifiedClaims::iat`
 yourself after `verify`.
 
-## Wiring the resolver
+### Wiring the resolver
 
 **There is no `JwtSvidLayer`.** axess ships no Tower middleware for SVIDs;
 the resolver is a plain call you make where you like, which is what lets a
@@ -107,7 +111,11 @@ In an Axum application, call it in a middleware of your own and insert the
 `BearerTokenLayer` is the shipped example of that shape, for plain bearers
 rather than SVIDs.
 
-## Validation details
+## What it checks, and what you get
+
+Every rejection returns the same error, deliberately.
+
+### Validation details
 
 The validation runs through six checks in order. The order matters
 because cheaper checks come first: a malformed token fails parsing
@@ -161,7 +169,7 @@ axess ships the trait and `NoReplay`, not a backend. With a store
 configured, a token carrying no `jti` is rejected rather than
 admitted unchecked, and entries expire with the token's own `exp`.
 
-## What the principal looks like
+### What the principal looks like
 
 A successful validation produces a `Principal::Workload`:
 
@@ -240,7 +248,7 @@ The cause goes to the log instead, at `debug` on the
 `axess_factors::jwt` target. Turn that on and the rejected
 verification prints the underlying `JwtError`:
 
-```
+```text
 RUST_LOG=axess_factors::jwt=debug
 ```
 

@@ -7,6 +7,7 @@
 
 mod common;
 
+use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, ZeroizedString},
     service::{AuthnService, FactorOutcome, LoginOutcome, PrepareOutcome},
@@ -38,7 +39,8 @@ async fn validator_with_live_registry_passes_registered_session() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
@@ -67,7 +69,8 @@ async fn validator_with_live_registry_rejects_unregistered_session() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
@@ -87,7 +90,8 @@ async fn validator_with_live_registry_rejects_unregistered_session() {
 #[tokio::test]
 async fn has_session_registry_false_without_registry() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     assert!(!svc.has_session_registry());
 }
 
@@ -97,7 +101,8 @@ async fn has_session_registry_true_with_registry() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     assert!(svc.has_session_registry());
 }
 
@@ -106,7 +111,8 @@ async fn has_session_registry_true_with_registry() {
 #[tokio::test]
 async fn invalidate_user_sessions_no_registry_returns_err() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let result = svc.invalidate_user_sessions(&uid("u1")).await;
     assert!(result.is_err());
 }
@@ -118,7 +124,8 @@ async fn invalidate_user_sessions_with_registry_invalidates() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
@@ -145,7 +152,8 @@ async fn invalidate_user_sessions_with_registry_invalidates() {
 #[tokio::test]
 async fn invalidate_session_no_registry_returns_err() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     session
         .set_authenticated(uid("u1"), tid("default"), Utc::now())
@@ -162,7 +170,8 @@ async fn invalidate_session_with_registry_removes_target_only() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let s1 = test_session();
     s1.set_authenticated(uid("u1"), tid("default"), Utc::now())
@@ -187,7 +196,8 @@ async fn invalidate_session_with_registry_removes_target_only() {
 #[tokio::test]
 async fn active_sessions_no_registry_returns_err() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
     let result = svc.active_sessions(&uid("u1")).await;
     assert!(result.is_err());
 }
@@ -199,7 +209,8 @@ async fn active_sessions_with_registry_returns_registry_contents() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     session
@@ -237,7 +248,8 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
     let svc = AuthnService::builder(identity, factors)
         .with_registry(registry.clone())
         .with_max_sessions_per_user(2)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     // Pre-populate the registry with 2 sessions for the user, so the cap is
     // exactly met before the new login.
@@ -255,9 +267,7 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
     // Now do a real password login: `complete_factor_step` must evict
     // exactly one old session before registering the new one.
     let session = test_session();
-    svc.begin_login("alice", "default", &session, None)
-        .await
-        .unwrap();
+    svc.begin_login("alice", "default", &session).await.unwrap();
     let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
     let outcome = svc.verify_factor(&cred, &session).await.unwrap();
     assert!(
@@ -314,12 +324,11 @@ async fn ldap_factor_completes_login_with_valid_bind_dn_override() {
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec![]);
     let svc = AuthnService::builder(identity, factors)
         .with_ldap(ldap)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
-    svc.begin_login("alice", "default", &session, None)
-        .await
-        .unwrap();
+    svc.begin_login("alice", "default", &session).await.unwrap();
     let cred = FactorCredential::Password(ZeroizedString::new("ldap-secret"));
     let outcome = svc.verify_factor(&cred, &session).await.unwrap();
     assert!(
@@ -355,12 +364,11 @@ async fn ldap_bind_dn_without_equals_rejected_even_if_provider_would_accept() {
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec![]);
     let svc = AuthnService::builder(identity, factors)
         .with_ldap(ldap)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
-    svc.begin_login("alice", "default", &session, None)
-        .await
-        .unwrap();
+    svc.begin_login("alice", "default", &session).await.unwrap();
     let cred = FactorCredential::Password(ZeroizedString::new("ldap-secret"));
     let outcome = svc.verify_factor(&cred, &session).await.unwrap();
     assert!(
@@ -400,12 +408,11 @@ async fn ldap_bind_dn_over_length_cap_rejected_even_if_provider_would_accept() {
     let ldap = MockLdapProvider::new(bind_dn.as_str()).with_user("alice", "ldap-secret", vec![]);
     let svc = AuthnService::builder(identity, factors)
         .with_ldap(ldap)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
-    svc.begin_login("alice", "default", &session, None)
-        .await
-        .unwrap();
+    svc.begin_login("alice", "default", &session).await.unwrap();
     let cred = FactorCredential::Password(ZeroizedString::new("ldap-secret"));
     let outcome = svc.verify_factor(&cred, &session).await.unwrap();
     assert!(
@@ -445,12 +452,11 @@ async fn ldap_password_at_max_bytes_is_not_rejected_by_length_guard() {
     let ldap = MockLdapProvider::new(bind_dn).with_user("alice", password.as_str(), vec![]);
     let svc = AuthnService::builder(identity, factors)
         .with_ldap(ldap)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
-    svc.begin_login("alice", "default", &session, None)
-        .await
-        .unwrap();
+    svc.begin_login("alice", "default", &session).await.unwrap();
     let cred = FactorCredential::Password(ZeroizedString::new(password));
     let outcome = svc.verify_factor(&cred, &session).await.unwrap();
     assert!(
@@ -480,11 +486,11 @@ async fn begin_login_identifier_at_max_bytes_is_not_rejected() {
             &uid("u1"),
             AuthMethod::sequential("password", vec![FactorKind::Password], user_scope()),
         );
-    let svc = AuthnService::new(identity, factors);
+    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
 
     let session = test_session();
     let outcome = svc
-        .begin_login(&long_identifier, "default", &session, None)
+        .begin_login(&long_identifier, "default", &session)
         .await
         .unwrap();
     assert!(
@@ -513,11 +519,11 @@ async fn begin_login_tenant_identifier_at_max_bytes_is_not_rejected() {
             &uid("u1"),
             AuthMethod::sequential("password", vec![FactorKind::Password], user_scope()),
         );
-    let svc = AuthnService::new(identity, factors);
+    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
 
     let session = test_session();
     let outcome = svc
-        .begin_login("alice", &long_tenant_identifier, &session, None)
+        .begin_login("alice", &long_tenant_identifier, &session)
         .await
         .unwrap();
     assert!(
@@ -526,31 +532,122 @@ async fn begin_login_tenant_identifier_at_max_bytes_is_not_rejected() {
     );
 }
 
-/// `begin_login` with a `client_ip` must allow login when the tenant's IP
-/// policy permits the IP.
-#[tokio::test]
-async fn begin_login_with_allowed_ip_proceeds() {
-    let identity = MockIdentityStore::new()
-        .with_tenant(test_tenant())
-        .with_user(test_user("u1", "alice"));
-    let factors = MockFactorStore::new()
-        .with_factor(user_scope(), password_config("Gnomes2+"))
-        .with_method(&uid("u1"), password_method());
-    let svc = AuthnService::new(identity, factors);
+/// The tenant IP policy gate, which until 0.7.0 was skippable.
+///
+/// The address used to be a `begin_login` parameter, and the check ran
+/// only `if let Some(ip)`, so a caller passing `None` bypassed the policy
+/// entirely. 51 of the 52 call sites in this repository passed `None`, and
+/// the one test that existed installed no policy, so it passed whether or
+/// not the gate ran. The address now arrives on the handle, and the four
+/// cases below are the whole truth table.
+mod tenant_ip_policy {
+    use super::*;
+    use axess_core::authn::types::IpPolicy;
 
-    let session = test_session();
-    // Default IP policy on the mock store allows all IPs.
-    let client_ip = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-        192, 168, 1, 1,
-    )));
-    let outcome = svc
-        .begin_login("alice", "default", &session, client_ip)
-        .await
-        .unwrap();
-    assert!(
-        matches!(outcome, LoginOutcome::FactorRequired(FactorKind::Password)),
-        "allowed client IP must clear the IP policy gate; got {outcome:?}"
-    );
+    fn service_with_policy(policy: IpPolicy) -> AuthnService<MockIdentityStore, MockFactorStore> {
+        let identity = MockIdentityStore::new()
+            .with_tenant(test_tenant())
+            .with_user(test_user("u1", "alice"))
+            .with_ip_policy(&test_tenant().id, policy);
+        let factors = MockFactorStore::new()
+            .with_factor(user_scope(), password_config("Gnomes2+"))
+            .with_method(&uid("u1"), password_method());
+        AuthnService::new(identity, factors)
+    }
+
+    fn allowlist(cidr: &str) -> IpPolicy {
+        IpPolicy {
+            allow: vec![cidr.into()],
+            deny: vec![],
+        }
+    }
+
+    fn context_from(ip: &str) -> AuditContext {
+        AuditContext {
+            ip_address: Some(ip.parse().expect("test literal")),
+            ip_source: axess_core::client_ip::Source::Forwarded,
+            ..Default::default()
+        }
+    }
+
+    /// An address inside the allowlist clears the gate.
+    #[tokio::test]
+    async fn an_allowed_address_proceeds() {
+        let outcome = service_with_policy(allowlist("192.168.1.0/24"))
+            .with_audit_context(context_from("192.168.1.1"))
+            .begin_login("alice", "default", &test_session())
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            LoginOutcome::FactorRequired(FactorKind::Password)
+        ));
+    }
+
+    /// An address outside it does not, and says nothing about why: a
+    /// distinct outcome here would tell an unauthenticated caller that the
+    /// tenant has an IP policy at all.
+    #[tokio::test]
+    async fn an_address_outside_the_allowlist_is_refused() {
+        let outcome = service_with_policy(allowlist("192.168.1.0/24"))
+            .with_audit_context(context_from("203.0.113.9"))
+            .begin_login("alice", "default", &test_session())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, LoginOutcome::InvalidCredentials),
+            "an address outside the allowlist must not authenticate; got {outcome:?}"
+        );
+    }
+
+    /// The case the old shape got wrong. A policy that restricts and no
+    /// address to test against it cannot be satisfied, so the login fails
+    /// closed. Before 0.7.0 this combination sailed through the gate.
+    #[tokio::test]
+    async fn a_restricting_policy_with_no_address_fails_closed() {
+        let outcome = service_with_policy(allowlist("192.168.1.0/24"))
+            .with_audit_context(AuditContext::default())
+            .begin_login("alice", "default", &test_session())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, LoginOutcome::InvalidCredentials),
+            "a policy that cannot be evaluated must not be treated as \
+             satisfied; got {outcome:?}"
+        );
+    }
+
+    /// Failing closed must not mean failing everyone. A tenant with no
+    /// policy permits every address, so an unknown address is no less
+    /// compliant with it than a known one, and those deployments (the
+    /// default, and the overwhelming majority) are untouched.
+    #[tokio::test]
+    async fn an_empty_policy_with_no_address_proceeds() {
+        let outcome = service_with_policy(IpPolicy::default())
+            .with_audit_context(AuditContext::default())
+            .begin_login("alice", "default", &test_session())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, LoginOutcome::FactorRequired(FactorKind::Password)),
+            "an unrestricted tenant must be unaffected; got {outcome:?}"
+        );
+    }
+
+    /// A denylist restricts too, so the same fail-closed reading applies.
+    #[tokio::test]
+    async fn a_denylist_with_no_address_fails_closed() {
+        let policy = IpPolicy {
+            allow: vec![],
+            deny: vec!["203.0.113.0/24".into()],
+        };
+        let outcome = service_with_policy(policy)
+            .with_audit_context(AuditContext::default())
+            .begin_login("alice", "default", &test_session())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, LoginOutcome::InvalidCredentials));
+    }
 }
 
 // ── EmailOTP cooldown boundary ─────────────────────────────────────────────
@@ -580,10 +677,11 @@ async fn email_otp_cooldown_boundary_at_until_refreshes_not_alreadysent() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
     service
-        .begin_login("alice", "default", &session, None)
+        .begin_login("alice", "default", &session)
         .await
         .unwrap();
 
@@ -617,7 +715,8 @@ async fn oauth_providers_accessor_returns_live_registry() {
     let mock = MockOAuthProvider::new("mock-oauth");
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_oauth_provider(mock)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let registry = svc.oauth_providers();
     assert_eq!(

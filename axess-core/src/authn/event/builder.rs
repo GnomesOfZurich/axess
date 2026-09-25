@@ -39,6 +39,8 @@ pub struct AuthEventBuilder {
     session_id: Option<SessionId>,
     factor_kind: Option<FactorKind>,
     ip_address: Option<IpAddr>,
+    ip_source: crate::client_ip::Source,
+    trace_id: Option<String>,
     user_agent: Option<String>,
     request_id: Option<String>,
     geo_country: Option<String>,
@@ -70,6 +72,8 @@ impl AuthEventBuilder {
             session_id: None,
             factor_kind: None,
             ip_address: None,
+            ip_source: crate::client_ip::Source::default(),
+            trace_id: None,
             user_agent: None,
             request_id: None,
             geo_country: None,
@@ -207,11 +211,14 @@ impl AuthEventBuilder {
     /// Takes an [`IpAddr`] rather than a string: this field is offered as
     /// SOC 2 and PCI-DSS evidence, and an evidence field that accepts
     /// arbitrary text accepts a forged one. Resolve the address with
-    /// [`ip_from_headers_trusted`](crate::authz::ip_from_headers_trusted)
+    /// [`TrustedProxies::client_ip`](crate::client_ip::TrustedProxies::client_ip)
     /// against the peer your server accepted, and pass `None` by simply
     /// not calling this where you have nothing trustworthy.
     pub fn with_ip(mut self, ip: IpAddr) -> Self {
         self.ip_address = Some(ip);
+        // Whatever the caller resolved, by means the library cannot see.
+        // `with_audit_context` records the provenance it was given instead.
+        self.ip_source = crate::client_ip::Source::Supplied;
         self
     }
 
@@ -280,14 +287,18 @@ impl AuthEventBuilder {
     /// Stamp the builder with all fields from an [`AuditContext`].
     ///
     /// This is the preferred way to enrich events: call
-    /// [`extract_audit_context`](super::extract_audit_context) (or the
+    /// [`AuditContext`](super::AuditContext) (or the
     /// async variant) once per request, then pass the result here.
     pub fn with_audit_context(mut self, ctx: &AuditContext) -> Self {
         if let Some(ip) = &ctx.ip_address {
             self.ip_address = Some(*ip);
+            self.ip_source = ctx.ip_source;
         }
         if let Some(ua) = &ctx.user_agent {
             self.user_agent = Some(ua.clone());
+        }
+        if let Some(tid) = &ctx.trace_id {
+            self.trace_id = Some(tid.clone());
         }
         if let Some(rid) = &ctx.request_id {
             self.request_id = Some(rid.clone());
@@ -328,6 +339,8 @@ impl AuthEventBuilder {
             event_time: event_time.timestamp_micros(),
             factor_kind: self.factor_kind,
             ip_address: self.ip_address,
+            ip_source: self.ip_source,
+            trace_id: self.trace_id,
             user_agent: self.user_agent,
             request_id: self.request_id,
             geo_country: self.geo_country,

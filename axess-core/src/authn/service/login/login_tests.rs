@@ -14,6 +14,7 @@ use super::super::AuthnService;
 use super::*;
 use crate::authn::ids::{TenantId, UserId};
 use crate::authn::types::{EntityState, LockoutPolicy, Tenant, User};
+use crate::authn::{AuditContext, RequestAuthnService};
 use crate::session::data::SessionData;
 use crate::session::extractor::AuthSession;
 use crate::session::layer::{SessionHandle, SessionInner};
@@ -83,8 +84,10 @@ fn build_tenant(tenant_id: TenantId, identifier: &str) -> Tenant {
 
 fn build_service_with_identity(
     identity: MockIdentityStore,
-) -> AuthnService<MockIdentityStore, MockFactorStore> {
-    build_service_builder(identity).build()
+) -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
+    build_service_builder(identity)
+        .build()
+        .with_audit_context(AuditContext::default())
 }
 
 /// The builder form, for tests that configure before building.
@@ -120,7 +123,8 @@ async fn check_session_authenticated_no_registry_returns_true() {
 async fn check_session_registry_rejection_returns_false() {
     let service = build_service_builder(MockIdentityStore::new())
         .with_registry(MemorySessionRegistry::new())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = authenticated_session().await;
     assert!(
         !service.check_session(&session).await,
@@ -140,7 +144,8 @@ async fn check_session_registry_acceptance_returns_true() {
 
     let service = build_service_builder(MockIdentityStore::new())
         .with_registry(registry)
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     assert!(service.check_session(&session).await);
 }
 
@@ -172,7 +177,8 @@ async fn logout_invalidates_user_in_registry() {
 
     let service = build_service_builder(identity)
         .with_registry(registry.clone())
-        .build();
+        .build()
+        .with_audit_context(AuditContext::default());
     service.logout(&session).await.expect("logout must succeed");
 
     assert!(
@@ -201,7 +207,7 @@ async fn begin_login_rejects_oversized_identifier() {
     let huge_identifier = "x".repeat(MAX_IDENTIFIER_BYTES + 1);
 
     let outcome = service
-        .begin_login(&huge_identifier, "t-login", &session, None)
+        .begin_login(&huge_identifier, "t-login", &session)
         .await
         .expect("oversized identifier must reject cleanly");
     assert!(
@@ -219,7 +225,7 @@ async fn begin_login_rejects_empty_identifier() {
     let service = build_service_with_identity(MockIdentityStore::new());
     let session = make_session();
     let outcome = service
-        .begin_login("", "t-login", &session, None)
+        .begin_login("", "t-login", &session)
         .await
         .expect("empty identifier must reject cleanly");
     assert!(
@@ -237,7 +243,7 @@ async fn begin_login_rejects_oversized_tenant_identifier() {
     let session = make_session();
     let huge_tenant = "y".repeat(MAX_IDENTIFIER_BYTES + 1);
     let outcome = service
-        .begin_login("alice", &huge_tenant, &session, None)
+        .begin_login("alice", &huge_tenant, &session)
         .await
         .expect("oversized tenant must reject cleanly");
     assert!(
@@ -253,7 +259,7 @@ async fn begin_login_rejects_empty_tenant_identifier() {
     let service = build_service_with_identity(MockIdentityStore::new());
     let session = make_session();
     let outcome = service
-        .begin_login("alice", "", &session, None)
+        .begin_login("alice", "", &session)
         .await
         .expect("empty tenant must reject cleanly");
     assert!(
@@ -286,7 +292,7 @@ async fn begin_login_finds_existing_user_via_timing_equalized_path() {
     let session = make_session();
 
     let result = service
-        .begin_login(user_identifier, tenant_identifier, &session, None)
+        .begin_login(user_identifier, tenant_identifier, &session)
         .await;
 
     // With the mutation: result is Ok(InvalidCredentials).

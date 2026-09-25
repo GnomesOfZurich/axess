@@ -10,10 +10,8 @@ and then trusts. It is an enum, transitions on the enum are methods on
 the enum, and a partial login is a distinct variant rather than a
 "finished" session with one field missing.
 
-This chapter walks through the variants, the transition method, the
-outcome enum that dispatches transitions, the `PendingWorkflow` escape
-hatch for signup and password reset, and the orchestration-versus-pure
-split that keeps the state machine independently testable.
+The orchestration-versus-pure split is what keeps the machine
+independently testable, and it is the part worth reading twice.
 
 ## The five variants
 
@@ -150,7 +148,7 @@ pub enum AdvanceOutcome {
 The visibility on the method is `pub(crate)`, which is the choice that
 keeps the orchestration honest. The pure state mutation is reachable
 only from within `axess-core`. Application code never calls it
-directly. Instead, application code calls `AuthnService::verify_factor`,
+directly. Instead, application code calls `RequestAuthnService::verify_factor`,
 which is the orchestrator method that locks the session, performs the
 factor's cryptographic verification through `axess-factors`, calls
 `advance_factor` on the typed state, and dispatches on the returned
@@ -234,7 +232,7 @@ fits better.
 
 ## Logging out and identifier rotation
 
-`AuthnService::logout` (and `AuthSession::clear`, which calls into it)
+`RequestAuthnService::logout` (and `AuthSession::clear`, which calls into it)
 transitions any state to `Guest`. The transition is more than a state
 change. The session identifier is rotated, the cookie is cleared on
 the response, the session row is deleted from the session store, and

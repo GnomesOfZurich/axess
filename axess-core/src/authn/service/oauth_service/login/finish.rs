@@ -5,7 +5,7 @@
 //! lock that `complete_oauth_login` will verify.
 
 use super::helpers::{compute_claim_lock, is_valid_pkce_verifier, normalize_issuer};
-use crate::authn::service::AuthnService;
+use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
@@ -15,7 +15,7 @@ use crate::authn::{
 use crate::session::extractor::AuthSession;
 use subtle::ConstantTimeEq;
 
-impl<I, F> AuthnService<I, F>
+impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
