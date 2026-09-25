@@ -19,11 +19,19 @@ language = "en"
 src = "."
 
 # mdBook defaults doctests to Rust 2015, where `async fn` is a syntax
-# error. Every example in this book is 2024, like the workspace, so
-# without this `mdbook test` rejects the getting-started example on
-# edition grounds before it reaches anything real.
+# error, so a non-`ignore` block would be rejected on edition grounds
+# before it reached anything real.
+#
+# 2021 rather than 2024, which is the workspace's edition, because the
+# CI docs job pins mdBook v0.4.40 and that version rejects `2024` as an
+# unknown variant: `mdbook build` fails on the config before it reads a
+# single chapter. Nothing is lost by it today, since every fenced Rust
+# block in the book is `rust,ignore` and `mdbook test` therefore compiles
+# none of them; the key is here so that the first block that is not
+# `ignore` does not land on 2015. Raise it to 2024 when the pin in
+# `.github/workflows/docs.yml` moves to an mdBook that understands it.
 [rust]
-edition = "2024"
+edition = "2021"
 
 [output.html]
 default-theme = "rust"

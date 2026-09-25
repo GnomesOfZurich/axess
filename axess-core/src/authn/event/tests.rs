@@ -32,6 +32,11 @@ async fn audit_context_from_headers_with_all_fields() {
     headers.insert("user-agent", "Mozilla/5.0 TestBrowser".parse().unwrap());
 
     let mut p = parts(headers, Some("203.0.113.42"));
+    // The typed value only exists under the feature that defines it, and so
+    // does the read that finds it. Asserting both sides here is what keeps
+    // this file compiling on a feature set that omits `request-id`, which
+    // is most of them.
+    #[cfg(feature = "request-id")]
     p.extensions
         .insert(crate::middleware::request_id::RequestId(
             "req-abc-123".to_owned(),
@@ -43,7 +48,14 @@ async fn audit_context_from_headers_with_all_fields() {
         Some("203.0.113.42".parse::<IpAddr>().unwrap())
     );
     assert_eq!(ctx.user_agent.as_deref(), Some("Mozilla/5.0 TestBrowser"));
+    #[cfg(feature = "request-id")]
     assert_eq!(ctx.request_id.as_deref(), Some("req-abc-123"));
+    #[cfg(not(feature = "request-id"))]
+    assert!(
+        ctx.request_id.is_none(),
+        "without `request-id` there is no layer to leave a value and no read \
+         to find one"
+    );
     assert!(
         ctx.geo_country.is_none(),
         "geo_country requires external lookup"

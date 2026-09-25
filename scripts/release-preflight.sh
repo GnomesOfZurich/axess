@@ -127,6 +127,34 @@ step "Ban #[non_exhaustive]" bash -c '
   echo "OK: no #[non_exhaustive] occurrences."
 ' "$AXESS_DIR"
 
+# Every other compile step here is `--all-features`, which cannot see a
+# feature-gated item named from ungated code. 0.7.0 shipped exactly that
+# in a test and CI found it after the tag was cut.
+step "Feature matrix (mirrors ci.yml)" "$AXESS_DIR/scripts/check-feature-matrix.sh"
+
+# The book is built only by the docs workflow, so a book.toml the pinned
+# mdBook rejects fails nowhere local. Building it here catches content and
+# config errors; it cannot catch a version skew, which is what this step
+# warns about, because a newer local mdBook accepts config the pinned one
+# refuses. That is how `edition = "2024"` reached CI.
+step "Book builds" bash -c '
+  set -eu
+  cd "$0"
+  if ! command -v mdbook >/dev/null 2>&1; then
+    echo "SKIP: mdbook not installed (cargo install mdbook)."
+    exit 0
+  fi
+  pinned=$(grep -oE "mdBook/releases/download/v[0-9.]+" .github/workflows/docs.yml | head -1 | sed "s@.*/v@@")
+  local_v=$(mdbook --version | sed "s/^mdbook v\{0,1\}//")
+  if [ "$pinned" != "$local_v" ]; then
+    echo "WARNING: local mdbook $local_v, docs.yml pins $pinned."
+    echo "         A newer local mdbook accepts book.toml keys the pinned one"
+    echo "         rejects, so a green build here does not prove a green CI."
+  fi
+  mdbook build docs >/dev/null
+  echo "OK: mdbook build docs (local mdbook $local_v)."
+' "$AXESS_DIR"
+
 step "Clippy" cargo clippy --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features --all-targets -- -D warnings
 step "Workspace tests" cargo test --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features
 # Was `cargo doc -p axess -p axess-core` with warnings allowed, which is how 29
