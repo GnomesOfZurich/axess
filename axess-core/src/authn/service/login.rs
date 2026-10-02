@@ -5,7 +5,7 @@ use super::verification::{VerifyOutcome, generate_otp_code, verify_credential};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
-    factor::{FactorConfig, FactorCredential, FactorKind},
+    factor::{FactorConfig, FactorCredential, FactorKind, FactorStep},
     store::{FactorStore, IdentityStore},
     types::{AuthnScope, EntityState},
 };
@@ -255,8 +255,15 @@ where
             return Err(AuthnError::NoFlow);
         };
 
-        let resolved_factors = method.factors();
-        if resolved_factors.is_empty() {
+        // The method's own steps, choices included: a step offering
+        // `AnyOf([Totp, RecoveryCode])` stays a choice for the whole flow.
+        let steps: Vec<FactorStep> = method
+            .steps
+            .iter()
+            .filter(|step| step.primary().is_some())
+            .cloned()
+            .collect();
+        if steps.is_empty() {
             self.inner.metrics.auth_failure();
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
@@ -267,11 +274,11 @@ where
             return Ok(LoginOutcome::InvalidCredentials);
         }
 
-        let first_kind = resolved_factors[0].clone();
+        let first_kind = steps[0].primary().cloned().ok_or(AuthnError::NoFlow)?;
 
         // 5. Begin the authentication flow in the session.
         session
-            .begin_authenticating(user.id, tenant.id, method.name.clone(), resolved_factors)
+            .begin_authenticating(user.id, tenant.id, method.name.clone(), steps)
             .await;
 
         // Record login attempt event.
@@ -317,7 +324,12 @@ where
         // The audit row on `Locked` is emitted by
         // `enforce_account_status` itself.
         match self
-            .enforce_account_status(&user_id, &tenant_id, remaining.first().cloned(), session)
+            .enforce_account_status(
+                &user_id,
+                &tenant_id,
+                remaining.first().and_then(FactorStep::primary).cloned(),
+                session,
+            )
             .await?
         {
             AccountStatusEnforcement::Ok => {}
@@ -337,12 +349,18 @@ where
             }
         }
 
-        let current_kind = remaining.first().ok_or(AuthnError::NoFlow)?.clone();
+        let current_kind = remaining
+            .first()
+            .and_then(FactorStep::primary)
+            .ok_or(AuthnError::NoFlow)?
+            .clone();
 
         match current_kind {
-            FactorKind::Password | FactorKind::Totp | FactorKind::Hotp | FactorKind::LdapBind => {
-                Ok(PrepareOutcome::Ready)
-            }
+            FactorKind::Password
+            | FactorKind::Totp
+            | FactorKind::Hotp
+            | FactorKind::LdapBind
+            | FactorKind::RecoveryCode => Ok(PrepareOutcome::Ready),
 
             FactorKind::EmailOtp => {
                 // Load the EmailOtp config to get the destination and parameters.
@@ -495,7 +513,12 @@ where
             .ok_or(AuthnError::NoFlow)?;
 
         match self
-            .enforce_account_status(&user_id, &tenant_id, remaining.first().cloned(), session)
+            .enforce_account_status(
+                &user_id,
+                &tenant_id,
+                remaining.first().and_then(FactorStep::primary).cloned(),
+                session,
+            )
             .await?
         {
             AccountStatusEnforcement::Ok => {}
@@ -507,7 +530,15 @@ where
             }
         }
 
-        let current_kind = remaining.first().ok_or(AuthnError::NoFlow)?.clone();
+        // The step's factor the credential is for: the required one, or the
+        // choice its shape fits (a recovery code at an `AnyOf([Totp,
+        // RecoveryCode])` step). A credential no choice fits is wrong for
+        // this step, and fails like a wrong code.
+        let step = remaining.first().ok_or(AuthnError::NoFlow)?;
+        let current_kind = match step.kind_for(credential) {
+            Some(kind) => kind,
+            None => step.primary().cloned().ok_or(AuthnError::NoFlow)?,
+        };
 
         // Runtime resolution: User → Tenant → System, single-query in the store.
         let user_scope = AuthnScope::User { tenant_id, user_id };

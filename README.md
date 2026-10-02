@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.7.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.8.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-A complete application (login pages, factor enrollment, route guards, rate limiting, health probes) lives in [`examples/sqlite/`](examples/sqlite/). For OAuth/OIDC, plain-OAuth social login, FAPI, Cedar authorization, device identity, in-process IdP, and workload-identity recipes, see the sibling directories under [`examples/`](examples/). Axess supports generic OIDC-based external login and SSO, including standard providers such as Google and Microsoft Entra ID when configured with the appropriate issuer metadata and client credentials; SAML / Shibboleth federation is not currently supported out of the box.
+A complete application (login pages, factor enrollment, route guards, rate limiting, health probes) lives in [`examples/sqlite/`](examples/sqlite/), with device identity as a second binary beside it. For OAuth/OIDC and plain-OAuth social login, FAPI, Cedar authorization, and machine callers (workload-identity recipes, shared secrets, an in-process IdP), see [`examples/`](examples/README.md). Axess supports generic OIDC-based external login and SSO, including standard providers such as Google and Microsoft Entra ID when configured with the appropriate issuer metadata and client credentials; SAML / Shibboleth federation is not currently supported out of the box.
 
 ---
 
@@ -95,7 +95,7 @@ In Axess, `PolicyStore` is loaded once at startup and is `Send + Sync`. Entity s
 
 ## Workspace layout
 
-10 library crates plus 8 examples. See [`docs/intro/architecture.md`](docs/intro/architecture.md) for the dependency diagram and "what belongs where" rationale.
+10 library crates plus 6 example crates (see [`examples/README.md`](examples/README.md) for which to read first). See [`docs/intro/architecture.md`](docs/intro/architecture.md) for the dependency diagram and "what belongs where" rationale.
 
 | Crate | Role |
 |---|---|
@@ -170,7 +170,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.7.0", features = ["sqlite", "authz"] }
+axess = { version = "0.8.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:
@@ -249,6 +249,7 @@ These are opt-in alternatives to the in-process `EntityCache` for the Cedar enti
 |---|---|---|
 | `request-id` | UUID-based request ID injected into response headers | no |
 | `trace-id` | W3C Trace Context propagation via headers | no |
+| `service-secret` | Shared-secret check for internal machine callers that cannot hold a key: signed requests (preferred) or a presented secret. The weakest machine credential; prefer `jwt` or `mtls` | no |
 | `accept-client-id` | `X-Client-ID` header extraction | no |
 | `ws` | WebSocket session middleware | no |
 

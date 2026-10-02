@@ -197,7 +197,8 @@ the principal came through the JWT-SVID path with the specific
 JWKS URL. The tenant and service derivation depends on the
 deployment's SPIFFE path convention (the example above expects
 paths like `/svc/<service>/<tenant>`); the resolver's path-parsing
-logic is configurable, and `examples/local_idp/` demonstrates the
+logic is configurable, and the `local-idp` binary in
+`examples/workload-identity/` demonstrates the
 pattern.
 
 The `attributes` map carries the rest of the token's claims, so

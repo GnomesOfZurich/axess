@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.7.0", features = ["testing"] }
+//! axess = { version = "0.8.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -202,7 +202,7 @@ mod session_ext {
         ) -> impl std::future::Future<Output = ()> + Send;
 
         /// Force the session into [`AuthState::Authenticating`](crate::session::data::AuthState::Authenticating)
-        /// with the given factor sequence.
+        /// with the given factor sequence, each kind a required step.
         fn begin_authenticating(
             &self,
             user_id: UserId,
@@ -251,7 +251,11 @@ mod session_ext {
             method_name: Arc<str>,
             factors: Vec<FactorKind>,
         ) {
-            AuthSession::begin_authenticating(self, user_id, tenant_id, method_name, factors).await;
+            let steps = factors
+                .into_iter()
+                .map(crate::authn::factor::FactorStep::Required)
+                .collect();
+            AuthSession::begin_authenticating(self, user_id, tenant_id, method_name, steps).await;
         }
 
         async fn advance_factor(&self, kind: &FactorKind, authn_time: DateTime<Utc>) {

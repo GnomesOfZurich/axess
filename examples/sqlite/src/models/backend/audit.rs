@@ -222,6 +222,7 @@ fn parse_factor_kind(s: &str) -> Option<FactorKind> {
         "email-otp" => Some(FactorKind::EmailOtp),
         "fido2" => Some(FactorKind::Fido2),
         "ldap-bind" => Some(FactorKind::LdapBind),
+        "recovery_code" => Some(FactorKind::RecoveryCode),
         _ => None,
     }
 }

@@ -3,7 +3,7 @@
 //! [`AuthSession`] is the primary API surface for handlers. Changes are flushed
 //! to the session store by the [`SessionLayer`](super::layer::SessionLayer) middleware after the handler returns.
 
-use crate::authn::factor::FactorKind;
+use crate::authn::factor::{FactorKind, FactorStep};
 use crate::authn::ids::{TenantId, UserId};
 use crate::session::{
     data::{AdvanceOutcome, AuthState, SessionData, WorkflowState},
@@ -94,7 +94,7 @@ impl AuthSession {
     /// shape rather than the older "`auth_state().await` then match"
     /// pattern that incurred two lock acquisitions and an extra
     /// `AuthState::clone`.
-    pub async fn authenticating_state(&self) -> Option<(UserId, TenantId, Vec<FactorKind>)> {
+    pub async fn authenticating_state(&self) -> Option<(UserId, TenantId, Vec<FactorStep>)> {
         let guard = self.0.0.read().await;
         match &guard.data.auth_state {
             AuthState::Authenticating {
@@ -220,20 +220,20 @@ impl AuthSession {
 
     /// Begin a multi-factor authentication flow.
     ///
-    /// Sets the state to [`AuthState::Authenticating`] with the given factors in order.
+    /// Sets the state to [`AuthState::Authenticating`] with the method's steps in order.
     pub(crate) async fn begin_authenticating(
         &self,
         user_id: UserId,
         tenant_id: TenantId,
         method_name: Arc<str>,
-        factors: Vec<FactorKind>,
+        steps: Vec<FactorStep>,
     ) {
         let mut guard = self.0.0.write().await;
         // Pure state mutation lives on AuthState.
         guard
             .data
             .auth_state
-            .begin_authenticating(user_id, tenant_id, method_name, factors);
+            .begin_authenticating(user_id, tenant_id, method_name, steps);
         // Bind fingerprint early; during Authenticating state; so that
         // mid-MFA sessions are also protected against hijacking.
         if guard.data.fingerprint.is_none()

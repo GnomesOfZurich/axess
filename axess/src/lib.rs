@@ -60,9 +60,11 @@ pub mod authn {
         require_valid_session,
     };
     pub use axess_factors::{
-        HOTP_LENGTH, HotpAlgorithm, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams,
-        build_totp_uri, generate_password_hash, generate_totp_secret, verify_hotp, verify_password,
-        verify_totp,
+        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, RECOVERY_CODE_COUNT,
+        RecoveryCodesConfig, StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm,
+        TotpVerifyParams, build_totp_uri, generate_password_hash, generate_recovery_codes,
+        generate_totp_secret, normalize_recovery_code, verify_hotp, verify_password,
+        verify_recovery_code, verify_totp,
     };
 }
 
@@ -94,6 +96,13 @@ pub use authz::{
 #[cfg(feature = "request-id")]
 pub mod request_id {
     pub use axess_core::middleware::request_id::*;
+}
+
+/// Shared-secret authentication for internal machine callers. Re-exports
+/// [`axess_core::middleware::service_secret`].
+#[cfg(feature = "service-secret")]
+pub mod service_secret {
+    pub use axess_core::middleware::service_secret::*;
 }
 
 /// W3C Trace Context middleware. Re-exports [`axess_core::middleware::trace_id`].
@@ -386,9 +395,10 @@ pub mod delegated {
 
 // Factor verification functions from axess-factors
 pub use axess_factors::{
-    HOTP_LENGTH, HotpAlgorithm, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams,
-    build_totp_uri, generate_password_hash, generate_totp_secret, verify_hotp, verify_password,
-    verify_totp,
+    GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, RECOVERY_CODE_COUNT, RecoveryCodesConfig,
+    StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams, build_totp_uri,
+    generate_password_hash, generate_recovery_codes, generate_totp_secret, normalize_recovery_code,
+    verify_hotp, verify_password, verify_recovery_code, verify_totp,
 };
 
 // Macros re-exported from axess-macros where they live.

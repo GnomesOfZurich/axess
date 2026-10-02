@@ -1,18 +1,21 @@
 [package]
 name = "axess-example-sqlite"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
 resolver = "3"
-description = "An example Axum web application using SQLite for session storage and authentication."
+description = "The axess reference application on SQLite: signup, password and TOTP login with recovery codes, password reset, sessions, rate limiting; plus a device-identity demo (`--bin device`)."
+default-run = "axess-example-sqlite"
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 categories = ["web-programming"]
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.7.0", features = ["sqlite"] }
+# `sqlite` opts the storage backend in; `device` (used by `--bin device`) is
+# in axess's default features.
+axess = { path = "../../axess", version = "=0.8.0", features = ["sqlite"] }
 axum = { version = "0.8.9", features = ["macros", "form"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 chrono = { version = "0.4.45", features = ["serde"] }
@@ -31,3 +34,7 @@ uuid = { version = "1.26.1", features = ["v4"] }
 # without binding a real socket: faster, parallel-safe, no port
 # allocation games.
 tower = { version = "0.5.3", features = ["util"] }
+# The second-factor test plays the authenticator app (`totp-rs`, the
+# library axess verifies with) and posts forms (`serde_urlencoded`).
+serde_urlencoded = "0.7.1"
+totp-rs = "6.0.0"

@@ -14,6 +14,7 @@
 //! | `EmailOtp` | `FactorConfig::EmailOtp(EmailOtpConfig)` | No (code is transient) | `FactorCredential::OtpCode(Arc<str>)` | Server-generated code sent out-of-band |
 //! | `Fido2` | `FactorConfig::Fido2(Fido2Config)` | Yes (credential public key) | `FactorCredential::Fido2Assertion(Value)` | WebAuthn; requires `fido2` feature |
 //! | `LdapBind` | `FactorConfig::LdapBind(LdapBindFactorConfig)` | No (directory-side) | `FactorCredential::Password(ZeroizedString)` | Bind DN from config or provider template |
+//! | `RecoveryCode` | `FactorConfig::RecoveryCodes(RecoveryCodesConfig)` | Yes (hashed set, used-at per code) | `FactorCredential::RecoveryCode(Arc<str>)` | One-time fallback; a code is spent on success (CAS) |
 //! | `Federated(_)` | N/A (OAuth flow) | No (IdP-side) | N/A (token exchange) | OAuth2/OIDC; handled by `OAuthService` |
 
 mod template;
@@ -30,8 +31,8 @@ mod template;
 
 pub use axess_factors::Fido2Config;
 pub use axess_factors::{
-    EmailOtpConfig, HotpConfig, OtpAlgorithm, PasswordConfig, PasswordRules, TotpConfig,
-    ZeroizedString,
+    EmailOtpConfig, HotpConfig, OtpAlgorithm, PasswordConfig, PasswordRules, RecoveryCodesConfig,
+    StoredRecoveryCode, TotpConfig, ZeroizedString,
 };
 pub use template::{FactorTemplate, default_catalog};
 
@@ -64,6 +65,10 @@ pub enum FactorKind {
     Fido2,
     /// LDAP simple bind: password verified against an LDAP directory.
     LdapBind,
+    /// One-time recovery code: a fallback for a second factor, each code
+    /// spent on use. Typically offered beside it in one step,
+    /// `AnyOf([Totp, RecoveryCode])`.
+    RecoveryCode,
     /// OAuth 2.0 / OIDC federated login through an external identity provider.
     Federated(FederatedProvider),
 }
@@ -78,6 +83,7 @@ impl FactorKind {
             FactorKind::EmailOtp => "email_otp",
             FactorKind::Fido2 => "fido2",
             FactorKind::LdapBind => "ldap_bind",
+            FactorKind::RecoveryCode => "recovery_code",
             FactorKind::Federated(p) => p.as_str(),
         }
     }
@@ -126,6 +132,30 @@ impl FactorStep {
         match self {
             FactorStep::Required(k) => k == kind,
             FactorStep::AnyOf(choices) => choices.contains(kind),
+        }
+    }
+
+    /// The factor a UI prompts for first: the required one, or the first
+    /// choice. `None` only for an `AnyOf` with no choices.
+    pub fn primary(&self) -> Option<&FactorKind> {
+        match self {
+            FactorStep::Required(k) => Some(k),
+            FactorStep::AnyOf(choices) => choices.first(),
+        }
+    }
+
+    /// The factor `credential` would be verified as at this step: the
+    /// required one, or the first choice the credential's shape fits. A
+    /// [`FactorCredential::RecoveryCode`] fits only
+    /// [`FactorKind::RecoveryCode`]; an OTP code fits TOTP, HOTP and email
+    /// OTP (the first listed wins); a password fits a password or an LDAP
+    /// bind; an assertion fits FIDO2.
+    pub fn kind_for(&self, credential: &FactorCredential) -> Option<FactorKind> {
+        match self {
+            FactorStep::Required(k) => Some(k.clone()),
+            FactorStep::AnyOf(choices) => {
+                choices.iter().find(|kind| credential.fits(kind)).cloned()
+            }
         }
     }
 }
@@ -185,6 +215,8 @@ pub enum FactorConfig {
     /// LDAP bind factor. Per-user config is optional; if absent, the bind DN
     /// is constructed from the provider's template and the user's identifier.
     LdapBind(LdapBindFactorConfig),
+    /// Recovery codes: the user's set of hashed one-time codes.
+    RecoveryCodes(RecoveryCodesConfig),
 }
 
 impl FactorConfig {
@@ -197,6 +229,7 @@ impl FactorConfig {
             FactorConfig::EmailOtp(_) => FactorKind::EmailOtp,
             FactorConfig::Fido2(_) => FactorKind::Fido2,
             FactorConfig::LdapBind(_) => FactorKind::LdapBind,
+            FactorConfig::RecoveryCodes(_) => FactorKind::RecoveryCode,
         }
     }
 }
@@ -227,6 +260,10 @@ pub enum FactorCredential {
     Password(ZeroizedString),
     /// One-time code as entered by the user (TOTP, HOTP, or email OTP).
     OtpCode(Arc<str>),
+    /// A recovery code as entered by the user. Distinct from
+    /// [`OtpCode`](Self::OtpCode) so a step offering `AnyOf([Totp,
+    /// RecoveryCode])` knows which one the user chose.
+    RecoveryCode(Arc<str>),
     /// FIDO2/WebAuthn authentication assertion (JSON-serialized `PublicKeyCredential`).
     ///
     /// Use [`FactorCredential::fido2_assertion`] to construct, and
@@ -236,6 +273,21 @@ pub enum FactorCredential {
 }
 
 impl FactorCredential {
+    /// Whether this credential's shape can verify a factor of `kind`.
+    pub fn fits(&self, kind: &FactorKind) -> bool {
+        matches!(
+            (self, kind),
+            (
+                Self::Password(_),
+                FactorKind::Password | FactorKind::LdapBind
+            ) | (
+                Self::OtpCode(_),
+                FactorKind::Totp | FactorKind::Hotp | FactorKind::EmailOtp
+            ) | (Self::RecoveryCode(_), FactorKind::RecoveryCode)
+                | (Self::Fido2Assertion(_), FactorKind::Fido2)
+        )
+    }
+
     /// Construct a `Fido2Assertion` from a `PublicKeyCredential`.
     #[cfg(feature = "fido2")]
     pub fn fido2_assertion(

@@ -23,11 +23,11 @@ cargo feature and will not pick one for you. Anything enabling
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.7.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.8.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.7.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.8.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,

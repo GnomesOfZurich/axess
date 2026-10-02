@@ -51,6 +51,7 @@
   - [Cloud STS exchange](workload-identity/cloud-sts.md)
   - [Outbound: OAuth](workload-identity/outbound-oauth.md)
   - [Outbound: mTLS](workload-identity/outbound-mtls.md)
+  - [Shared secrets: the last resort](workload-identity/shared-secrets.md)
 - [Delegated and OBO access](identity/delegated-obo.md)
 - [Local IdP](factors/local-idp.md)
 

@@ -1,7 +1,7 @@
 //! Session payload: the typed data stored in the session store per session.
 
 use crate::authn::{
-    factor::FactorKind,
+    factor::{FactorKind, FactorStep},
     ids::{DeviceId, TenantId, UserId},
 };
 use chrono::{DateTime, Utc};
@@ -176,8 +176,12 @@ pub enum AuthState {
         tenant_id: TenantId,
         /// Human-readable method name, e.g. `"password+totp"`.
         method_name: Arc<str>,
-        /// Ordered list of factor kinds still to be verified.
-        remaining: Vec<FactorKind>,
+        /// The method's steps still to be completed, in order. A step may
+        /// offer a choice ([`FactorStep::AnyOf`]). Sessions written before
+        /// steps were kept here hold a plain list of kinds, read as
+        /// required steps.
+        #[serde(deserialize_with = "deserialize_remaining_steps")]
+        remaining: Vec<FactorStep>,
         /// Factor kinds that have already been verified in this flow,
         /// in the order they were completed. Carried into
         /// [`AuthState::Authenticated::factors_completed`] on transition
@@ -287,13 +291,13 @@ impl AuthState {
         user_id: UserId,
         tenant_id: TenantId,
         method_name: Arc<str>,
-        factors: Vec<FactorKind>,
+        steps: Vec<FactorStep>,
     ) {
         *self = AuthState::Authenticating {
             user_id,
             tenant_id,
             method_name,
-            remaining: factors,
+            remaining: steps,
             completed: Vec::new(),
             attempt_count: 0,
             last_attempt: None,
@@ -337,7 +341,7 @@ impl AuthState {
 
     /// Advance through a multi-factor flow.
     ///
-    /// Removes `kind` from `remaining` (if present) and pushes it to
+    /// Removes the first step `kind` satisfies from `remaining` (if any) and pushes `kind` to
     /// `completed`. When `remaining` becomes empty, transitions to
     /// `Authenticated` carrying the `completed` list as
     /// `factors_completed`. Returns the [`AdvanceOutcome`] describing
@@ -362,9 +366,11 @@ impl AuthState {
                 completed,
                 ..
             } => {
-                if let Some(pos) = remaining.iter().position(|k| k == kind) {
-                    let removed = remaining.remove(pos);
-                    completed.push(removed);
+                // The step this factor satisfies is done; the factor itself
+                // (not the step's other choices) is what was completed.
+                if let Some(pos) = remaining.iter().position(|step| step.accepts(kind)) {
+                    remaining.remove(pos);
+                    completed.push(kind.clone());
                 }
                 if remaining.is_empty() {
                     let uid = *user_id;
@@ -404,6 +410,29 @@ impl AuthState {
             *last_attempt = Some(now);
         }
     }
+}
+
+/// Read `Authenticating::remaining` as steps, accepting the earlier shape
+/// (a list of factor kinds) as required steps, so a session written by an
+/// earlier release mid-login still loads after an upgrade.
+fn deserialize_remaining_steps<'de, D>(deserializer: D) -> Result<Vec<FactorStep>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StepOrKind {
+        Step(FactorStep),
+        Kind(FactorKind),
+    }
+    let items = Vec::<StepOrKind>::deserialize(deserializer)?;
+    Ok(items
+        .into_iter()
+        .map(|item| match item {
+            StepOrKind::Step(step) => step,
+            StepOrKind::Kind(kind) => FactorStep::Required(kind),
+        })
+        .collect())
 }
 
 /// Result of [`AuthState::advance_factor`].

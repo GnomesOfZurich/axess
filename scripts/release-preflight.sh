@@ -155,6 +155,26 @@ step "Book builds" bash -c '
   echo "OK: mdbook build docs (local mdbook $local_v)."
 ' "$AXESS_DIR"
 
+# Mirrors the docs job's last two steps: build what the book's code imports,
+# then compile every block not marked `ignore` against it. The build is the
+# half that carries weight today: the getting-started chapter includes
+# `examples/minimal/src/main.rs` region by region, so that crate compiling
+# is that chapter's code compiling. The count says how many blocks
+# `mdbook test` itself compiled, so a pass over none of them cannot read
+# as coverage.
+step "Book code compiles" bash -c '
+  set -eu
+  cd "$0"
+  if ! command -v mdbook >/dev/null 2>&1; then
+    echo "SKIP: mdbook not installed (cargo install mdbook)."
+    exit 0
+  fi
+  cargo build --quiet -p axess --all-features -p axess-example-minimal
+  mdbook test docs -L "${CARGO_TARGET_DIR:-$0/target}/debug/deps" >/dev/null
+  testable=$(git ls-files "docs/*.md" | xargs grep -hE "^\`\`\`rust" | grep -vc ignore || true)
+  echo "OK: examples/minimal builds; mdbook test compiled $testable block(s) not marked ignore."
+' "$AXESS_DIR"
+
 step "Clippy" cargo clippy --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features --all-targets -- -D warnings
 step "Workspace tests" cargo test --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features
 # Was `cargo doc -p axess -p axess-core` with warnings allowed, which is how 29

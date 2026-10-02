@@ -21,7 +21,9 @@ the order that matches your deployment: SPIFFE-based deployments
 read *Inbound: JWT-SVID* and *Inbound: mTLS-SVID*; cloud-platform
 deployments read *Inbound: federation* and *Cloud STS exchange*;
 applications that call downstream services on a workload's behalf
-read *Outbound: OAuth* and *Outbound: mTLS*.
+read *Outbound: OAuth* and *Outbound: mTLS*. A caller that can do none
+of this, and can only be given a string, reads *Shared secrets: the
+last resort*, which also says why it is the last resort.
 
 ## The model
 

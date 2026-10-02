@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-workload-identity"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -8,7 +8,10 @@ resolver = "3"
 description = """
 Adopter recipes for axess workload-identity federation. Shows how to wire
 WorkloadResolver against GitHub Actions OIDC and Kubernetes service-account
-projected tokens. Copy whichever recipe matches your IdP into your own code.
+projected tokens, and, as the last resort for a caller with no identity of
+its own, signed requests over a shared secret. Copy whichever recipe matches
+your caller into your own code. `--bin local-idp` runs an in-process IdP
+with a file-backed, rotating key store, for flows without a real IdP.
 """
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
@@ -22,25 +25,35 @@ categories = ["authentication"]
 # `jwt-rust-crypto`, not bare `jwt`: the JWT primitives need a crypto backend,
 # and an example that builds anywhere should not require a C toolchain. An
 # adopter wanting FIPS-capable crypto takes `jwt-aws-lc` instead.
-axess = { path = "../../axess", version = "=0.7.0", features = ["jwt-rust-crypto"] }
-axess-factors = { path = "../../axess-factors", version = "=0.7.0", features = ["jwt-rust-crypto"] }
-axess-identity = { path = "../../axess-identity", version = "=0.7.0" }
+# `service-secret` backs the shared-secret recipe, for callers that can have
+# no identity of their own.
+# `local-idp` backs `--bin local-idp`, an in-process IdP that mints the
+# workload JWTs these recipes verify.
+axess = { path = "../../axess", version = "=0.8.0", features = ["jwt-rust-crypto", "service-secret", "local-idp"] }
+axess-factors = { path = "../../axess-factors", version = "=0.8.0", features = ["jwt-rust-crypto"] }
+axess-identity = { path = "../../axess-identity", version = "=0.8.0" }
+axum = { version = "0.8.9", features = ["json"] }
+chrono = "0.4.45"
+jsonwebtoken = "11.1.0"
+rsa = { version = "0.9.10", features = ["pem"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+thiserror = { version = "2.0.20" }
+tokio = { version = "1.53.1", features = ["full"] }
 tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 # `axess_identity::PrincipalResolver` is the trait the integration
 # tests call into; the workspace crate is already a runtime dep
 # above, so the dev-dep just adds nothing extra.
-axess-identity = { path = "../../axess-identity", version = "=0.7.0" }
+axess-identity = { path = "../../axess-identity", version = "=0.8.0" }
 # `MockClock` pins JwtVerifier's notion of "now" so the pinned JWT
 # timestamps validate deterministically under DST.
-axess-clock = { path = "../../axess-clock", version = "=0.7.0", features = ["testing"] }
+axess-clock = { path = "../../axess-clock", version = "=0.8.0", features = ["testing"] }
 base64 = "0.23.1"
-chrono = "0.4.45"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 # `pkcs5` matches the workspace pin. The `pkcs1` *module* (used to
 # DER-encode the test signing key) is unconditionally available.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
-tokio = { version = "1.53.1", features = ["macros", "rt"] }
+tower = { version = "0.5.3", features = ["util"] }

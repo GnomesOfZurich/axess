@@ -321,7 +321,7 @@ fn begin_authenticating_constructs_authenticating_with_factors_in_order() {
         user,
         tenant,
         Arc::from("password+totp"),
-        vec![FactorKind::Password, FactorKind::Totp],
+        required(vec![FactorKind::Password, FactorKind::Totp]),
     );
     match state {
         AuthState::Authenticating {
@@ -336,7 +336,10 @@ fn begin_authenticating_constructs_authenticating_with_factors_in_order() {
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(&*method_name, "password+totp");
-            assert_eq!(remaining, vec![FactorKind::Password, FactorKind::Totp]);
+            assert_eq!(
+                remaining,
+                required(vec![FactorKind::Password, FactorKind::Totp])
+            );
             assert!(completed.is_empty());
             assert_eq!(attempt_count, 0);
             assert!(last_attempt.is_none());
@@ -379,7 +382,7 @@ fn advance_factor_still_authenticating_when_factors_remain() {
         user_id: user,
         tenant_id: tenant,
         method_name: Arc::from("password+totp"),
-        remaining: vec![FactorKind::Password, FactorKind::Totp],
+        remaining: required(vec![FactorKind::Password, FactorKind::Totp]),
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
@@ -392,7 +395,7 @@ fn advance_factor_still_authenticating_when_factors_remain() {
             completed,
             ..
         } => {
-            assert_eq!(remaining, vec![FactorKind::Totp]);
+            assert_eq!(remaining, required(vec![FactorKind::Totp]));
             assert_eq!(completed, vec![FactorKind::Password]);
         }
         other => panic!("expected still Authenticating, got {other:?}"),
@@ -408,7 +411,7 @@ fn advance_factor_completes_when_last_factor_verified() {
         user_id: user,
         tenant_id: tenant,
         method_name: Arc::from("password"),
-        remaining: vec![FactorKind::Password],
+        remaining: required(vec![FactorKind::Password]),
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
@@ -444,7 +447,7 @@ fn advance_factor_carries_completed_factors_into_authenticated() {
         user_id: user,
         tenant_id: tenant,
         method_name: Arc::from("password+totp"),
-        remaining: vec![FactorKind::Password, FactorKind::Totp],
+        remaining: required(vec![FactorKind::Password, FactorKind::Totp]),
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
@@ -482,7 +485,7 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
         user_id: user,
         tenant_id: tenant,
         method_name: Arc::from("password"),
-        remaining: vec![FactorKind::Password],
+        remaining: required(vec![FactorKind::Password]),
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
@@ -495,7 +498,7 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
             completed,
             ..
         } => {
-            assert_eq!(remaining, vec![FactorKind::Password]);
+            assert_eq!(remaining, required(vec![FactorKind::Password]));
             assert!(completed.is_empty());
         }
         other => panic!("expected Authenticating, got {other:?}"),
@@ -525,7 +528,7 @@ fn record_attempt_at_increments_counter_and_captures_timestamp() {
         user_id: user,
         tenant_id: tenant,
         method_name: Arc::from("password"),
-        remaining: vec![FactorKind::Password],
+        remaining: required(vec![FactorKind::Password]),
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
@@ -574,4 +577,81 @@ fn set_pending_workflow_replaces_state() {
         }
         other => panic!("expected PendingWorkflow, got {other:?}"),
     }
+}
+
+/// The steps of a plain sequential method.
+fn required(kinds: Vec<FactorKind>) -> Vec<crate::authn::factor::FactorStep> {
+    kinds
+        .into_iter()
+        .map(crate::authn::factor::FactorStep::Required)
+        .collect()
+}
+
+/// A recovery code completes a step that offers it beside TOTP, and the
+/// factor recorded as completed is the one used, not the step's first choice.
+#[test]
+fn a_choice_step_is_completed_by_whichever_factor_it_offers() {
+    use crate::authn::factor::FactorStep;
+    let user = axess_identity::testing::user("u1");
+    let tenant = axess_identity::testing::tenant("t1");
+    let mut state = AuthState::Guest;
+    state.begin_authenticating(
+        user,
+        tenant,
+        Arc::from("password+totp"),
+        vec![
+            FactorStep::Required(FactorKind::Password),
+            FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
+        ],
+    );
+    let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    assert_eq!(
+        state.advance_factor(&FactorKind::Password, now),
+        AdvanceOutcome::StillAuthenticating
+    );
+    assert_eq!(
+        state.advance_factor(&FactorKind::RecoveryCode, now),
+        AdvanceOutcome::Completed
+    );
+    match state {
+        AuthState::Authenticated {
+            factors_completed, ..
+        } => assert_eq!(
+            factors_completed,
+            vec![FactorKind::Password, FactorKind::RecoveryCode]
+        ),
+        other => panic!("expected Authenticated, got {other:?}"),
+    }
+}
+
+/// A session written mid-login by a release that stored `remaining` as a
+/// list of kinds still loads, its kinds read as required steps.
+#[test]
+fn a_mid_login_session_from_an_earlier_release_still_loads() {
+    use crate::authn::factor::FactorStep;
+    let legacy = serde_json::json!({
+        "kind": "Authenticating",
+        "user_id": axess_identity::testing::user("u1"),
+        "tenant_id": axess_identity::testing::tenant("t1"),
+        "method_name": "password+totp",
+        "remaining": ["Totp"],
+        "completed": ["Password"],
+        "attempt_count": 0,
+        "last_attempt": null,
+    });
+    let state: AuthState = serde_json::from_value(legacy.clone()).unwrap();
+    match &state {
+        AuthState::Authenticating { remaining, .. } => {
+            assert_eq!(remaining, &vec![FactorStep::Required(FactorKind::Totp)]);
+        }
+        other => panic!("expected Authenticating, got {other:?}"),
+    }
+    // And through the session codec's own format.
+    let packed = rmp_serde::to_vec_named(&legacy).unwrap();
+    let from_msgpack: AuthState = rmp_serde::from_slice(&packed).unwrap();
+    assert_eq!(from_msgpack, state);
+    // The current shape round-trips.
+    let again: AuthState =
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&state).unwrap()).unwrap();
+    assert_eq!(again, state);
 }

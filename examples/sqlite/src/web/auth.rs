@@ -25,7 +25,11 @@ use serde::Deserialize;
 // the session layer in [`crate::web::app::build_router`].
 
 fn render_with_csrf(template: &'static str, csrf: &CsrfToken) -> Html<String> {
-    Html(template.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf)))
+    Html(
+        template
+            .replace("__RECOVERY_FORM__", RECOVERY_FORM)
+            .replace("__CSRF_INPUT__", &csrf_hidden_input(csrf)),
+    )
 }
 
 // ── Form types ────────────────────────────────────────────────────────────────
@@ -157,12 +161,39 @@ pub async fn post_totp(
     audit: AuditContext,
     Form(form): Form<TotpForm>,
 ) -> impl IntoResponse {
+    let cred = FactorCredential::OtpCode(form.code.into());
+    second_factor(state, session, csrf, audit, cred).await
+}
+
+// ── POST /recovery-code ───────────────────────────────────────────────────────
+
+/// A recovery code in place of the TOTP code. The method's second step is
+/// `AnyOf([Totp, RecoveryCode])`, so `verify_factor` takes either: it
+/// picks the choice the credential's shape fits, and spends the code it
+/// matched so it cannot be used again.
+pub async fn post_recovery_code(
+    State(state): State<AppState>,
+    session: AuthSession,
+    Extension(csrf): Extension<CsrfToken>,
+    audit: AuditContext,
+    Form(form): Form<TotpForm>,
+) -> impl IntoResponse {
+    let cred = FactorCredential::RecoveryCode(form.code.into());
+    second_factor(state, session, csrf, audit, cred).await
+}
+
+async fn second_factor(
+    state: AppState,
+    session: AuthSession,
+    csrf: CsrfToken,
+    audit: AuditContext,
+    cred: FactorCredential,
+) -> axum::response::Response {
     // Second-factor failures are the half of a credential-stuffing run that
     // survives a leaked password, so these rows need an address as much as
     // the first-factor ones do.
     let service = state.service.with_audit_context(audit);
 
-    let cred = FactorCredential::OtpCode(form.code.into());
     match service.verify_factor(&cred, &session).await {
         Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
         Ok(FactorOutcome::InvalidCredential) => {
@@ -418,7 +449,9 @@ pub async fn post_setup_totp(
     Extension(csrf): Extension<CsrfToken>,
     Form(form): Form<SetupTotpForm>,
 ) -> impl IntoResponse {
-    use axess::authn::{AuthnScope, FactorConfig, FactorStore, TotpConfig, ZeroizedString};
+    use axess::authn::{
+        AuthnScope, FactorConfig, FactorKind, FactorStep, FactorStore, TotpConfig, ZeroizedString,
+    };
 
     if !session.is_authenticated().await {
         return Redirect::to("/login").into_response();
@@ -476,13 +509,31 @@ pub async fn post_setup_totp(
         return error_page("Failed to save TOTP configuration.").into_response();
     }
 
-    // Upgrade the auth method to password+totp.
+    // Recovery codes for when the authenticator is lost. Only the hashes
+    // are stored; the plaintext is shown once, below, and never again.
+    let codes = axess::generate_recovery_codes(&axess::SystemRng, axess::RECOVERY_CODE_COUNT);
+    if let Err(e) = state
+        .backend
+        .save_factor(&scope, FactorConfig::RecoveryCodes(codes.config))
+        .await
+    {
+        tracing::warn!(error = %e, "failed to store recovery codes");
+        return error_page("Failed to save recovery codes.").into_response();
+    }
+
+    // Upgrade the auth method: password, then TOTP or a recovery code.
+    let steps = vec![
+        FactorStep::Required(FactorKind::Password),
+        FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
+    ];
+    let steps_json = serde_json::to_string(&steps).expect("factor steps always serialize");
     if let Err(e) = sqlx::query(
-        "UPDATE auth_methods SET name = 'password+totp', steps_json = '[{\"Required\":\"Password\"},{\"Required\":\"Totp\"}]'
+        "UPDATE auth_methods SET name = 'password+totp', steps_json = ?3
          WHERE user_id = ?1 AND tenant_id = ?2",
     )
     .bind(user_id.to_string())
     .bind(tenant_id.to_string())
+    .bind(steps_json)
     .execute(state.backend.pool())
     .await
     {
@@ -501,13 +552,24 @@ pub async fn post_setup_totp(
 
     tracing::info!(user = %user_id, "TOTP enrolled successfully");
 
-    Html(
+    let code_list: String = codes
+        .display
+        .iter()
+        .map(|code| format!("  <li><code>{}</code></li>\n", &**code))
+        .collect();
+    Html(format!(
         r#"<!doctype html><html><head><title>TOTP Enrolled</title></head><body>
 <h1>TOTP Enrolled Successfully!</h1>
 <p>Your next login will require both your password and a TOTP code.</p>
+<h2>Your recovery codes</h2>
+<p>If you lose your authenticator, sign in with one of these instead of a
+TOTP code. Each works once. Store them somewhere safe now: this is the
+only time they are shown.</p>
+<ul>
+{code_list}</ul>
 <p><a href="/dashboard">Back to dashboard</a></p>
-</body></html>"#,
-    )
+</body></html>"#
+    ))
     .into_response()
 }
 
@@ -648,7 +710,8 @@ fn login_with_error(msg: &str, csrf: &CsrfToken) -> String {
 }
 
 fn totp_with_error(msg: &str, csrf: &CsrfToken) -> String {
-    let form = TOTP_FORM.replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
+    let form =
+        format!("{TOTP_FORM}\n{RECOVERY_FORM}").replace("__CSRF_INPUT__", &csrf_hidden_input(csrf));
     format!(
         r#"<!doctype html><html><head><title>TOTP Verification</title></head><body>
 <h1>Enter TOTP Code</h1>
@@ -691,6 +754,20 @@ const TOTP_FORM: &str = r#"
   </label><br><br>
   <button type="submit">Verify</button>
 </form>"#;
+
+const RECOVERY_FORM: &str = r#"
+<details>
+  <summary>Lost your authenticator? Use a recovery code</summary>
+  <form method="POST" action="/recovery-code">
+    __CSRF_INPUT__
+    <label>Recovery code:<br>
+      <input type="text" name="code" autocomplete="off" required
+             placeholder="ABCDE-FGHJK" maxlength="16">
+    </label><br><br>
+    <button type="submit">Use recovery code</button>
+  </form>
+  <p>Each code works once.</p>
+</details>"#;
 
 const LOGIN_HTML: &str = r#"<!doctype html>
 <html><head><title>Login</title></head><body>
@@ -823,4 +900,5 @@ const TOTP_HTML: &str = r#"<!doctype html>
   </label><br><br>
   <button type="submit">Verify</button>
 </form>
+__RECOVERY_FORM__
 </body></html>"#;

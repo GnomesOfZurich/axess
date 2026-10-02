@@ -22,16 +22,12 @@ src = "."
 # error, so a non-`ignore` block would be rejected on edition grounds
 # before it reached anything real.
 #
-# 2021 rather than 2024, which is the workspace's edition, because the
-# CI docs job pins mdBook v0.4.40 and that version rejects `2024` as an
-# unknown variant: `mdbook build` fails on the config before it reads a
-# single chapter. Nothing is lost by it today, since every fenced Rust
-# block in the book is `rust,ignore` and `mdbook test` therefore compiles
-# none of them; the key is here so that the first block that is not
-# `ignore` does not land on 2015. Raise it to 2024 when the pin in
-# `.github/workflows/docs.yml` moves to an mdBook that understands it.
+# 2024, the workspace's edition. mdBook before 0.5 rejected `2024` as an
+# unknown variant, which is why this once said 2021; the CI docs job now
+# pins an mdBook that understands it, and the preflight warns when the
+# local mdBook differs from that pin.
 [rust]
-edition = "2021"
+edition = "2024"
 
 [output.html]
 default-theme = "rust"

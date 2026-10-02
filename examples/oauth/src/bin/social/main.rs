@@ -1,4 +1,4 @@
-//! # axess-example-social
+//! # axess-example-oauth, `--bin social`
 //!
 //! Login with GitHub via [`axess::social::SocialProvider`].
 //!
@@ -19,7 +19,7 @@
 //! ```sh
 //! GITHUB_CLIENT_ID=your-id \
 //! GITHUB_CLIENT_SECRET=your-secret \
-//! cargo run -p axess-example-social
+//! cargo run -p axess-example-oauth --bin social
 //! ```
 //!
 //! Open <http://localhost:3000/> and click "Login with GitHub".
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn home() -> Html<&'static str> {
     Html(
         r#"<!doctype html>
-<html><head><title>axess-example-social</title>
+<html><head><title>axess-example-oauth: social login</title>
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:3em auto;padding:0 1em}</style>
 </head><body>
 <h1>axess social-login example</h1>
@@ -209,7 +209,7 @@ fn missing_creds() -> ! {
          at https://github.com/settings/developers with callback URL \
          http://localhost:3000/auth/callback/github, then re-run with \
          GITHUB_CLIENT_ID=your-id GITHUB_CLIENT_SECRET=your-secret \
-         cargo run -p axess-example-social. See examples/social/README.md \
+         cargo run -p axess-example-oauth --bin social. See examples/oauth/README.md \
          for non-GitHub providers."
     );
     std::process::exit(2);

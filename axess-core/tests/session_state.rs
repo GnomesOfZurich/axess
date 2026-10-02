@@ -5,7 +5,7 @@
 
 mod common;
 
-use axess_core::authn::factor::FactorKind;
+use axess_core::authn::factor::{FactorKind, FactorStep};
 use axess_core::session::data::{AuthState, SessionData, WorkflowKind, WorkflowState};
 use axess_core::testing::{AuthSessionTestExt, test_session};
 use chrono::Utc;
@@ -236,8 +236,8 @@ async fn advance_factor_removes_first_match_only() {
     let state = session.auth_state().await;
     if let AuthState::Authenticating { remaining, .. } = state {
         assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0], FactorKind::Totp);
-        assert_eq!(remaining[1], FactorKind::Password);
+        assert_eq!(remaining[0], FactorStep::Required(FactorKind::Totp));
+        assert_eq!(remaining[1], FactorStep::Required(FactorKind::Password));
     } else {
         panic!("expected Authenticating state");
     }

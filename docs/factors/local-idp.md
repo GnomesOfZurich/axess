@@ -114,7 +114,7 @@ let idp = LocalIdp::from_key_store("https://idp.example.com", store)
 
 Memory storage is not for production: restarts lose the keys, and
 every restart produces fresh JWKS that breaks tokens already in
-flight. The `examples/local_idp/` directory implements a file-backed
+flight. The `local-idp` binary of `examples/workload-identity/` implements a file-backed
 [`LocalIdpKeyStore`] with atomic rotation that the production path
 should pattern after; the same shape adapts to Vault, AWS KMS, GCP
 KMS, or any other key management backend.
@@ -191,8 +191,9 @@ handlers.
 
 ### Production-pattern example
 
-The [`examples/local_idp/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/local_idp)
-crate is the reference implementation:
+The `local-idp` binary in [`examples/workload-identity/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/workload-identity)
+(`cargo run -p axess-example-workload-identity --bin local-idp`) is the
+reference implementation:
 
 - File-backed `LocalIdpKeyStore` (`FileLocalIdpKeyStore`) with the
   directory layout pattern `historical/{kid}.pem` + atomic

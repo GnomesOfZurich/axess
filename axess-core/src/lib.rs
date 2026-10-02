@@ -58,6 +58,7 @@
 //! | `ldap` | LDAP bind authentication (Active Directory, OpenLDAP). |
 //! | `request-id` | `X-Request-Id` middleware. |
 //! | `trace-id` | W3C Trace Context (`traceparent`) middleware. |
+//! | `service-secret` | Shared-secret check for machine callers that cannot hold a key: [`middleware::service_secret`]. The weakest machine credential; prefer `jwt` or `mtls`. |
 //! | `default-error-response` | Built-in `IntoResponse` mapping for [`AuthnError`] (on by default). Disable to ship your own HTTP mapping; see [`authn::error`] for the recommended status-code table. |
 //! | `full` | All of the above. |
 //!

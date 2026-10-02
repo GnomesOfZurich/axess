@@ -9,6 +9,64 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.7.0 to 0.8.0
+
+A method step that offers a choice, `FactorStep::AnyOf`, used to be
+flattened to its first choice at login, so "TOTP or something else" only
+ever asked for TOTP. The login state now keeps the steps as they were
+declared, and recovery codes arrive as the first factor that needs the
+choice. Both breaks below follow from that.
+
+### `mismatched types: expected Vec<FactorStep>, found Vec<FactorKind>`
+
+`AuthState::Authenticating::remaining` and
+`AuthSession::authenticating_state` now carry the method's steps rather
+than a flat list of kinds. Where you read a kind from them, read
+`step.primary()`, which is what the old list held:
+
+```rust,ignore
+// 0.7
+let next: Option<FactorKind> = remaining.first().cloned();
+// 0.8
+let next: Option<FactorKind> = remaining.first().map(FactorStep::primary);
+```
+
+`FactorRequired` and `prepare_factor` still name that first choice, so a
+login page that prompts for TOTP keeps doing so; it may now also offer
+the alternatives the step lists. `AuthSessionTestExt::begin_authenticating`
+still takes kinds.
+
+Sessions saved mid-login by 0.7 still load: their kinds are read as
+required steps. Nothing needs to be drained before upgrading.
+
+### `non-exhaustive patterns: FactorKind::RecoveryCode not covered`
+
+`FactorKind`, `FactorConfig` and `FactorCredential` each gain a variant
+(`RecoveryCode`, `RecoveryCodes`, `RecoveryCode`). Add the arm. A factor
+store that maps kinds to strings maps the new one to `"recovery_code"`,
+which is what `FactorKind::RecoveryCode.as_str()` returns.
+
+### Adopting recovery codes
+
+If you kept recovery codes in your own table, they can move onto the
+factor model: store the hashes as `FactorConfig::RecoveryCodes`, offer
+them beside the factor they back up with
+`FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode])`,
+and submit `FactorCredential::RecoveryCode` to `verify_factor`. Each code
+is spent through the factor store's compare-and-swap, so two logins
+racing on the same code cannot both pass. Existing hashes carry over
+only if they are PHC strings `verify_password` accepts, taken over the
+code as `normalize_recovery_code` renders it (ASCII letters and digits,
+upper-cased, separators dropped); otherwise issue a fresh set.
+
+### What is not a break
+
+The `service-secret` feature is new and off by default. Turn it on to
+replace a hand-written shared-secret check on an internal route with
+`ServiceSecretLayer`, preferably in its signed mode; see
+[Shared secrets: the last resort](../workload-identity/shared-secrets.md)
+for why it ranks below `jwt` and `mtls`.
+
 ## 0.6.0 to 0.7.0
 
 Working out who a request came from was correct only through a path that
@@ -121,7 +179,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.7", features = ["request-id"] }
+axess = { version = "0.8", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

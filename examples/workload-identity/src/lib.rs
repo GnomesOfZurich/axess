@@ -8,7 +8,7 @@
 //! additions without reuse benefit. Adopters copy the recipe that
 //! matches their IdP and wire it against the generic resolver.
 //!
-//! Two recipes ship here:
+//! Three recipes ship here:
 //!
 //! - [`github_actions`]; GitHub Actions OIDC tokens
 //!   (`https://token.actions.githubusercontent.com`), mapping the
@@ -19,6 +19,10 @@
 //!   (`kubernetes.io.{namespace,serviceaccount.name}` claim
 //!   namespace), mapping namespace + service-account-name to the same
 //!   shape.
+//! - [`shared_secret`]; the last resort, for a caller with no identity
+//!   an IdP can vouch for: requests signed with a shared secret through
+//!   the `service-secret` feature. Weaker than the two above; its module
+//!   docs say how much.
 //!
 //! Each recipe is `pub` so the example crate can be a dependency for
 //! integration tests in adopter projects, but the intended use is
@@ -28,3 +32,4 @@
 
 pub mod github_actions;
 pub mod kubernetes;
+pub mod shared_secret;

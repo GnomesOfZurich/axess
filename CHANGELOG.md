@@ -10,6 +10,77 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.8.0] - 2026-10-02
+
+A step that offers a choice now is one. `AnyOf` was part of the method
+model, and the login flow flattened every `AnyOf` to its first choice, so
+"TOTP or something else" only ever asked for TOTP. Recovery codes, the
+fallback for a lost authenticator, are the first factor that needs the
+choice, and arrive with it. Internal service callers get a shared-secret
+check to replace hand-written ones. See
+[the migration guide](docs/production/migrating.md#070-to-080).
+
+### Added
+
+- **Recovery codes, `FactorKind::RecoveryCode`.** `axess-factors` gains
+  the `recovery_code` feature (on by default; zero-infra, built on
+  `password`; the functions and types are re-exported from `axess`):
+  `generate_recovery_codes` mints a set through the injectable
+  `SecureRng` (10 codes of 10 characters from a 32-symbol alphabet without
+  `0`/`O`/`1`/`I`, 50 bits each, shown as `ABCDE-FGHJK`) and returns the
+  plaintext for one-time display beside a `RecoveryCodesConfig` of Argon2id
+  hashes; `verify_recovery_code` accepts any spacing, dash or case, checks
+  every unspent hash whether or not one matched, and returns the set with
+  the matched code spent. In `axess-core` that is
+  `FactorConfig::RecoveryCodes` and `FactorCredential::RecoveryCode`, and
+  verification returns the spent set as a pass-with-update, so the factor
+  store's compare-and-swap makes each code single-use even when two logins
+  race on it. Offer it beside the factor it backs up:
+  `FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode])`.
+- **`FactorStep::primary` and `FactorStep::kind_for`**, and
+  **`FactorCredential::fits`**: what a step prompts for first, and which
+  of its choices a presented credential is for.
+- **Shared-secret service callers, `service-secret` feature**, for
+  machine callers that cannot hold a key; it is the weakest machine
+  credential axess offers, below `jwt` and `mtls`.
+  `ServiceSecretLayer::signed` (preferred) verifies an HMAC-SHA256
+  signature over timestamp, method, path and body sent by
+  `ServiceSigner`, so the secret never travels, and refuses stale and
+  replayed requests; `ServiceSecretLayer::bearer` and `::header` accept
+  the secret itself. Secrets are named for rotation, at least 32 bytes,
+  kept only as derived values and compared in constant time; the handler
+  extracts `ServiceCaller`. An unconfigured route answers `404`. See
+  [Shared secrets: the last resort](docs/workload-identity/shared-secrets.md).
+
+### Changed
+
+- **Nine example crates become six.** `device` is now
+  `cargo run -p axess-example-sqlite --bin device`, `social` is
+  `cargo run -p axess-example-oauth --bin social`, and `local_idp` is
+  `cargo run -p axess-example-workload-identity --bin local-idp`.
+  [`examples/README.md`](examples/README.md) says which to read first.
+
+### Changed (breaking)
+
+- **`AuthState::Authenticating::remaining` is `Vec<FactorStep>`**, the
+  method's steps with their choices, not `Vec<FactorKind>`.
+  `AuthSession::authenticating_state` returns the steps likewise.
+  `verify_factor` verifies a credential as the choice its shape fits (a
+  `RecoveryCode` credential fits only `RecoveryCode`; an OTP code fits
+  TOTP, HOTP and email OTP, first listed wins); `FactorRequired` and
+  `prepare_factor` report the step's first choice, so a UI that prompts
+  for TOTP keeps doing so and may offer the alternative. A session saved
+  mid-login by 0.7 still loads: its kinds are read as required steps.
+  **Migrating:** read `remaining` as steps (`step.primary()` for the
+  former value); `AuthSessionTestExt::begin_authenticating` still takes
+  kinds.
+- **`FactorKind`, `FactorConfig` and `FactorCredential` each gain a
+  variant** (`RecoveryCode`, `RecoveryCodes`, `RecoveryCode`).
+  **Migrating:** add the arm to exhaustive matches; a store mapping kinds
+  to strings maps `"recovery_code"`.
+
+---
+
 ## [0.7.0] - 2026-09-25
 
 Working out where a request came from is now one answer, resolved once by

@@ -1,51 +1,45 @@
 # Axess Examples
 
-Each example is a standalone crate demonstrating a specific aspect of the Axess library. Most are runnable Axum applications; `workload-identity/` is a library-only recipes crate (no `main`). Run any runnable example with:
+Six crates, each a runnable starting point you can copy from. Pick by what
+you are building:
 
-```sh
-cargo run -p <example-name>
-```
+| Crate | Run with | What it shows |
+|---|---|---|
+| [`minimal/`](minimal/) | `cargo run -p axess-example-minimal` | **The smallest working login.** Password login with in-memory stores, in one file. It is the code the *Getting started* chapter walks through. |
+| [`sqlite/`](sqlite/) | `cargo run -p axess-example-sqlite` | **The reference application.** Signup, password and TOTP login, recovery codes when the authenticator is lost, password reset, lockout, CSRF, rate limiting, sessions, health and metrics, all on SQLite, with tests that drive it as a browser does. |
+| | `cargo run -p axess-example-sqlite --bin device` | **Device identity.** Fingerprinting with a per-tenant pepper, the Unknown → Seen → Trusted ladder, a cached device store, and the retention sweep, on the same SQLite pool. |
+| [`authz/`](authz/) | `cargo run -p axess-example-authz` | **Authorization.** Cedar policies for roles (RBAC), ownership (ReBAC) and attributes such as "MFA was used" (ABAC). In memory, no database. |
+| [`oauth/`](oauth/) | `cargo run -p axess-example-oauth` | **Sign in with an OpenID Connect provider** (Google, Keycloak, Auth0, …): discovery, PKCE, ID-token validation. |
+| | `cargo run -p axess-example-oauth --bin social` | **Sign in with a provider that lacks OIDC** (GitHub, Discord, Twitter/X, …), and why that is weaker. |
+| [`fapi/`](fapi/) | `cargo run -p axess-example-fapi` | **Financial-grade API security (FAPI 2.0).** PAR, DPoP sender-constrained tokens, form_post, RP-initiated logout, revocation. Ships a Keycloak realm; falls back to a mock provider. |
+| [`workload-identity/`](workload-identity/) | `cargo test -p axess-example-workload-identity` | **Machine callers.** Recipes for GitHub Actions and Kubernetes service accounts, and, as the last resort for a caller with no identity of its own, signed requests over a shared secret. Each recipe is tested. |
+| | `cargo run -p axess-example-workload-identity --bin local-idp` | **An in-process identity provider** minting workload JWTs from a file-backed, rotating key store, for flows without a real IdP. |
 
-## Examples
+## Which one should I look at?
 
-| Directory | Package | What it demonstrates |
-|-----------|---------|---------------------|
-| [`sqlite/`](sqlite/) | `axess-example-sqlite` | **Authentication.** Signup, password + TOTP login (with conditional enrollment via `FactorStore::load_factor`), forgot/reset password, session management, lockout, logout. SQLite for identity and session storage. |
-| [`authz/`](authz/) | `axess-example-authz` | **Authorization.** Cedar Policy evaluation with RBAC, ReBAC (ownership), and ABAC (MFA requirement). In-memory data, no database needed. |
-| [`oauth/`](oauth/) | `axess-example-oauth` | **OAuth/OIDC.** Federated login via Google (or any OIDC provider). Full redirect flow with PKCE, CSRF protection, and ID token validation. |
-| [`social/`](social/) | `axess-example-social` | **Plain OAuth 2.0 social login.** Generic `SocialProvider` wired to GitHub user login: claims sourced from a TLS-trusted userinfo endpoint instead of a signed assertion. Use only for IdPs that lack OIDC (GitHub, Twitter/X, Discord, Reddit, Spotify, Strava, …); prefer the `oauth/` example when OIDC is available. |
-| [`fapi/`](fapi/) | `axess-example-fapi` | **FAPI 2.0.** Financial-grade API security: PAR, DPoP sender-constrained tokens, form_post response mode, RP-Initiated Logout, token revocation. Ships with a pre-configured Keycloak realm under [`fapi/keycloak/`](fapi/keycloak/); one `podman compose up` plus env vars gets a working end-to-end FAPI flow. Falls back to an in-process mock provider if no `FAPI_ISSUER` is set. |
-| [`device/`](device/) | `axess-example-device` | **Device identity.** `SqliteSessionStore` + `SqliteDeviceStore` sharing one pool, fingerprint extractor with per-tenant pepper, `CachedDeviceStore` decorator, `DeviceLifecycleService`, `LifecycleDeviceResolver`, and the background three-stage retention sweep. |
-| [`local_idp/`](local_idp/) | `axess-example-local-idp` | **In-process IdP.** Production `LocalIdp` minting workload JWTs against a file-backed RSA key store with atomic key rotation, RFC 8414 discovery document, JWKS endpoint. Useful when running workload-identity flows without standing up a real Okta / Azure AD / SPIRE. |
-| [`workload-identity/`](workload-identity/) | `axess-example-workload-identity` | **Workload-identity recipes.** Copy-paste claim structs + mapper closures for GitHub Actions OIDC and Kubernetes service-account projected tokens, plugged into the generic `WorkloadResolver`. Read as documentation for writing your own recipe (GitLab CI, CircleCI, Buildkite, internal JWTs, …). |
-
-## Which example should I look at?
-
-- **"I want to add login to my Axum app"** → start with `sqlite/`
-- **"I want to add access control / permissions"** → start with `authz/`
-- **"I want to add Google or any OIDC SSO login"** → start with `oauth/`
-- **"I want Login with GitHub (or another non-OIDC provider)"** → start with `social/`
-- **"I need financial-grade security (PSD2, Open Banking)"** → start with `fapi/`
-- **"I want to track devices (cookie binding, fingerprinting, retention)"** → start with `device/`
-- **"I need a local IdP fixture for integration tests"** → start with `local_idp/`
-- **"I want CI / Kubernetes workloads to authenticate to my service"** → start with `workload-identity/`
+- **"I want to see the least code that logs someone in"** → `minimal/`
+- **"I want to add login to my Axum app"** → `sqlite/`
+- **"I want two-factor login, with a way back in when the phone is lost"** → `sqlite/`
+- **"I want to track devices (fingerprinting, trust, retention)"** → `sqlite/`, `--bin device`
+- **"I want to add access control / permissions"** → `authz/`
+- **"I want Google or any OIDC single sign-on"** → `oauth/`
+- **"I want Login with GitHub (or another non-OIDC provider)"** → `oauth/`, `--bin social`
+- **"I need financial-grade security (PSD2, Open Banking)"** → `fapi/`
+- **"I want CI or Kubernetes workloads to call my service"** → `workload-identity/`
+- **"An internal job or relay can only be given a secret"** → `workload-identity/src/shared_secret.rs`, after reading why it is the last resort
+- **"I need an IdP for integration tests"** → `workload-identity/`, `--bin local-idp`
 - **"I want to combine them"** → read them independently, then combine
 
 ## Running
 
-Most examples listen on `http://127.0.0.1:3000` by default and run with just `cargo run`, no external services required. Exceptions:
+Everything that serves listens on `http://127.0.0.1:3000` (so run one at a
+time) and needs no outside services, except:
 
-- `oauth/` and `social/` need OAuth client credentials from the chosen IdP (Google / GitHub); see each crate's README for the env vars.
-- `fapi/` optionally talks to a Keycloak container (see [`fapi/README.md`](fapi/README.md)) and falls back to an in-process mock provider otherwise.
-- `workload-identity/` is a recipes crate (claim structs + mappers), not a server; it ships unit tests rather than a `cargo run` entry point.
-
-```sh
-# Authentication example:
-cargo run -p axess-example-sqlite
-
-# Authorization example:
-cargo run -p axess-example-authz
-```
+- `oauth/` needs OAuth client credentials from the provider (Google for the
+  default binary, GitHub for `--bin social`); its README lists the variables.
+- `fapi/` optionally talks to a Keycloak container (see
+  [`fapi/README.md`](fapi/README.md)) and falls back to an in-process mock
+  provider otherwise.
 
 ## Using Valkey instead of SQLite for sessions
 

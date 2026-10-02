@@ -33,12 +33,13 @@ axess/              Facade crate. Re-exports the public API from
 
 axess-core/         Orchestrator. Session state machine, AuthnService,
                     AuthzStore (Cedar), middleware (csrf / ratelimit /
-                    request_id / trace_id), session storage
+                    request_id / trace_id / service_secret), session storage
                     backends, principal abstraction, workload identity,
                     LocalIdp, OBO delegated access, store unification.
 
 axess-factors/      Verifiers. Every per-credential algorithm:
-                    password (Argon2id), TOTP, HOTP, email OTP, FIDO2,
+                    password (Argon2id), TOTP, HOTP, email OTP,
+                    recovery codes, FIDO2,
                     LDAP bind, mTLS, OAuth/OIDC (incl. discovery + JWKS
                     cache + logout-token claim validation), JWT
                     validation (incl. JWT-SVID), generic workload-identity
@@ -72,13 +73,21 @@ axess-macros/       require_authn!, require_partial_authn!,
                     require_authz! procedural macros.
 
 examples/
-  sqlite/    reference app: SQLite sessions + full auth flow
-  oauth/     OAuth 2.0 / OIDC login
-  authz/     Cedar Policy authorization
-  fapi/      FAPI 2.0 (PAR, DPoP, JARM, RP-initiated logout)
-  device/    device identity (Unknown → Seen → Trusted ladder)
-  local_idp/ in-process IdP minting workload-identity JWTs
+  minimal/            smallest working login, in memory
+  sqlite/             reference app: SQLite sessions + full auth flow
+                      (password, TOTP, recovery codes); --bin device for
+                      device identity (Unknown → Seen → Trusted ladder)
+  oauth/              OIDC login; --bin social for plain OAuth 2.0
+  authz/              Cedar Policy authorization
+  fapi/               FAPI 2.0 (PAR, DPoP, JARM, RP-initiated logout)
+  workload-identity/  machine-caller recipes (GitHub Actions, Kubernetes,
+                      shared secrets); --bin local-idp, an in-process IdP
 ```
+
+A new example is a section of the crate its reader already uses, or a
+binary in it, before it is a crate of its own: a crate earns its place
+only when it needs setup the others do not (an outside IdP, a Keycloak
+realm).
 
 axess-core's `src/` layout (top-level modules):
 
@@ -172,7 +181,7 @@ Vocabulary for the load → finalize → cookie pipeline and the typed `AuthStat
 
 ### Multi-Factor Authentication
 
-Factors (password, TOTP, HOTP, email OTP, FIDO2, OAuth/OIDC, LDAP, mTLS, bearer JWT) compose into methods via `FactorStep`. A method is a sequence of steps; each step is either a single factor or `AnyOf(factors)` (user's choice). Methods can vary per tenant or user via the three-tier scope hierarchy (Global, Tenant, User).
+Factors (password, TOTP, HOTP, email OTP, recovery codes, FIDO2, OAuth/OIDC, LDAP, mTLS, bearer JWT) compose into methods via `FactorStep`. A method is a sequence of steps; each step is either a single factor or `AnyOf(factors)` (user's choice). The session keeps the steps themselves (`Authenticating::remaining: Vec<FactorStep>`), so a choice survives the whole flow: `verify_factor` verifies a credential as the choice its shape fits, and outcomes name the step's first choice. Recovery codes are the canonical choice: `AnyOf([Totp, RecoveryCode])`. Methods can vary per tenant or user via the three-tier scope hierarchy (Global, Tenant, User).
 
 ### Cedar Policy Authorization
 
@@ -223,6 +232,7 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `admin` | Administrative user/tenant management APIs |
 | `accept_client_id` | `X-Client-ID` header extraction |
 | `request_id` | `X-Request-Id` middleware |
+| `service-secret` | Shared-secret check for machine callers that cannot hold a key (`ServiceSecretLayer::signed` preferred, `bearer`/`header` weakest); weaker than `jwt`/`mtls` |
 | `trace_id` | W3C Trace Context (`traceparent`) middleware |
 | `sqlite` / `postgres` / `valkey` | Encrypted session stores (AES-256-GCM) |
 | `fido2` | WebAuthn passkeys (pulls `axess-factors/fido2`) |
@@ -239,7 +249,7 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `delegated-stored` / `delegated-exchange` / `delegated-stored-encrypted` / `delegated` | OBO access |
 | `ws` | WebSocket helpers |
 
-### axess-factors (default = `password`, `totp`, `hotp`, `email_otp`)
+### axess-factors (default = `password`, `totp`, `hotp`, `email_otp`, `recovery_code`)
 
 | Feature | What it enables |
 |---------|----------------|
@@ -247,6 +257,7 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `totp` | RFC 6238 (default) |
 | `hotp` | RFC 4226 (default) |
 | `email_otp` | Email OTP (default) |
+| `recovery_code` | One-time recovery codes, Argon2id-hashed (default; pulls `password`) |
 | `fido2` | WebAuthn passkey verifier |
 | `ldap` | LDAP bind verifier |
 | `mtls` | mTLS verifier |

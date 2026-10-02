@@ -86,12 +86,15 @@ rsa = { version = "0.9.10", features = ["pkcs5"] }
 wiremock = "0.6.5"
 
 [features]
-default = ["password", "totp", "hotp", "email_otp"]
+default = ["password", "totp", "hotp", "email_otp", "recovery_code"]
 
 # Symmetric credential factors
 email_otp = ["dep:chrono"]
 hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:hex", "dep:subtle"]
 password = ["dep:password-auth"]
+# One-time fallback codes for a second factor: Argon2id-hashed (via
+# `password`), generated through the injectable `SecureRng`.
+recovery_code = ["password", "dep:axess-rng", "dep:chrono"]
 # `totp` lists `base32`/`hex` explicitly even though they overlap with `hotp`;
 # without that, totp-only builds fail to compile until `hotp` is also enabled.
 totp = ["dep:totp-rs", "dep:axess-rng", "dep:subtle", "dep:base32", "dep:hex"]

@@ -12,7 +12,7 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run -p axess-example-device
+//! cargo run -p axess-example-sqlite --bin device
 //! ```
 //!
 //! Then `curl -v http://localhost:3000/whoami` from a few different
@@ -23,19 +23,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axess::authn::{FactorKind, LoginOutcome, TenantId};
+use axess::authn::{FactorKind, LoginOutcome, TenantId, UserId};
 use axess::device::{
     CachedDeviceStore, DefaultFingerprintExtractor, DeviceLifecycleService, DeviceResolver,
     DeviceStore, DeviceTrustLevel, LifecycleDeviceResolver, NoopDeviceEventSink, StepUpPolicy,
     TenantPepperResolver, decide_step_up,
 };
 use axess::session::SessionCrypto;
-use axess::testing as id_fixtures;
 use axess::{
-    SessionLayer,
+    SessionLayer, SystemClock,
     backends::sqlite::{DeviceStore as SqliteDeviceStore, SessionStore as SqliteSessionStore},
 };
-use axess_clock::SystemClock;
 use axum::{
     Json, Router,
     extract::{Extension, Request},
@@ -45,6 +43,11 @@ use axum::{
 };
 use serde_json::json;
 use sqlx::sqlite::SqlitePoolOptions;
+
+/// The one tenant and user this demo runs as. Fixed ids rather than
+/// generated ones so restarts and log lines line up.
+const DEMO_TENANT: TenantId = TenantId::from_bytes([0xd0; 16]);
+const DEMO_USER: UserId = UserId::from_bytes([0xd1; 16]);
 
 /// Concrete resolver type. Spelt out once so `Extension<AppResolver>`
 /// works without a `dyn` (the trait uses RPITIT, not dyn-safe).
@@ -106,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DeviceLifecycleService::new(cached_devices.clone()).with_event_sink(NoopDeviceEventSink);
 
     // ── 5. resolver, scoped to the single demo tenant ────────────────────
-    let demo_tenant = id_fixtures::tenant("demo-tenant");
+    let demo_tenant = DEMO_TENANT;
     let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock)
         .with_tenant_fn(move |_parts| Some(demo_tenant));
     let resolver: AppResolver = Arc::new(resolver);
@@ -123,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // simulation the adopter swaps both call sites for a `MockClock`.
     let sweep_clock = SystemClock;
     tokio::spawn(async move {
-        use axess_clock::Clock;
+        use axess::Clock;
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
@@ -166,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn index() -> Html<&'static str> {
     Html(
         r#"<!doctype html>
-<html><head><title>axess-example-device</title>
+<html><head><title>axess device identity</title>
 <style>
 body{font-family:system-ui,sans-serif;max-width:780px;margin:2em auto;padding:0 1em;color:#222}
 code{background:#f4f4f4;padding:.1em .35em;border-radius:3px}
@@ -174,7 +177,7 @@ li{margin:.3em 0}
 section{margin-bottom:1.6em}
 .method{display:inline-block;min-width:3.5em;font-weight:600;color:#0a5}
 </style></head><body>
-<h1>axess-example-device</h1>
+<h1>axess device identity</h1>
 <p>End-to-end device-identity wiring demo. Each request is fingerprinted
 (<code>DefaultFingerprintExtractor</code>), resolved to a stored device, and
 optionally promoted on authentication. Devices accumulate across requests
@@ -262,7 +265,7 @@ async fn list_devices(
     Extension(devices): Extension<SqliteDeviceStore>,
     Extension(tenant): Extension<TenantId>,
 ) -> impl IntoResponse {
-    let demo_user = id_fixtures::user("demo-user");
+    let demo_user = DEMO_USER;
     match devices.find_active_for_user(&tenant, &demo_user, 100).await {
         Ok(list) => {
             let summary: Vec<_> = list

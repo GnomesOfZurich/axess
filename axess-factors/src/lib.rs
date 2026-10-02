@@ -102,18 +102,23 @@ pub mod password;
 /// gate) because it's a pure-spec character-class check with no
 /// protocol deps.
 pub mod pkce;
-/// [`ZeroizedString`](secret::ZeroizedString): secret-string primitive
-/// shared across factor configs and other credential-bearing types.
-/// Always on (no feature gate) because the orchestrator's OAuth token
-/// storage and delegated-credential storage hold it without the
-/// `password`/`totp`/`hotp` features.
-pub mod secret;
 /// Plain-OAuth-2.0 user login ("social login") for IdPs that don't
 /// support OIDC (GitHub user login, Twitter/X, Discord, Reddit,
 /// Spotify, …). Off by default. **Weaker security model** than the
 /// OIDC path under [`oauth`]: claims come from a TLS-trusted userinfo
 /// endpoint, not from a signed assertion. See module docs for the
 /// full delta and when to reach for this.
+/// Recovery codes: one-time fallback credentials for a second factor,
+/// [`RecoveryCodesConfig`](recovery_code::RecoveryCodesConfig) +
+/// generation and verification (`recovery_code` feature).
+#[cfg(feature = "recovery_code")]
+pub mod recovery_code;
+/// [`ZeroizedString`](secret::ZeroizedString): secret-string primitive
+/// shared across factor configs and other credential-bearing types.
+/// Always on (no feature gate) because the orchestrator's OAuth token
+/// storage and delegated-credential storage hold it without the
+/// `password`/`totp`/`hotp` features.
+pub mod secret;
 #[cfg(feature = "social")]
 pub mod social;
 #[cfg(feature = "totp")]
@@ -133,6 +138,12 @@ pub use totp::{
 
 #[cfg(feature = "email_otp")]
 pub use email_otp::EmailOtpConfig;
+#[cfg(feature = "recovery_code")]
+pub use recovery_code::{
+    GeneratedRecoveryCodes, RECOVERY_CODE_ALPHABET, RECOVERY_CODE_COUNT, RECOVERY_CODE_LENGTH,
+    RecoveryCodesConfig, StoredRecoveryCode, generate_recovery_codes, normalize_recovery_code,
+    verify_recovery_code,
+};
 
 pub use fido2::Fido2Config;
 #[cfg(feature = "fido2")]

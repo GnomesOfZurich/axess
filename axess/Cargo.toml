@@ -55,6 +55,7 @@ testing = ["axess-core/testing", "axess-identity/testing", "memory"]
 # HTTP middleware
 accept-client-id = ["axess-core/accept-client-id"]
 request-id = ["axess-core/request-id"]
+service-secret = ["axess-core/service-secret"]
 trace-id = ["axess-core/trace-id"]
 ws = ["axess-core/ws"]
 

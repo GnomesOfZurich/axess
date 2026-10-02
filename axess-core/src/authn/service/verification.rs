@@ -58,8 +58,9 @@ pub(crate) enum VerifyOutcome {
     Pass,
     /// Verification succeeded: caller must persist this updated config.
     ///
-    /// Used for TOTP (update `last_step` for replay prevention) and
-    /// HOTP (advance `counter` to prevent reuse).
+    /// Used for TOTP (update `last_step` for replay prevention), HOTP
+    /// (advance `counter` to prevent reuse) and recovery codes (spend the
+    /// matched code).
     PassWithUpdate(FactorConfig),
 }
 
@@ -231,6 +232,26 @@ pub(crate) fn verify_credential(
             updated.pending_until = None;
             updated.attempt_count = 0;
             VerifyOutcome::PassWithUpdate(FactorConfig::EmailOtp(updated))
+        }
+
+        (
+            FactorCredential::RecoveryCode(code),
+            FactorConfig::RecoveryCodes(cfg),
+            FactorKind::RecoveryCode,
+        ) => {
+            if code.as_ref().len() > MAX_OTP_CODE_BYTES {
+                return VerifyOutcome::Fail;
+            }
+            // A match returns the set with that code spent; persisting it by
+            // compare-and-swap is what makes the code single-use: a second
+            // login racing on the same code loses the swap and is rejected
+            // as a replay.
+            match axess_factors::verify_recovery_code(cfg, code.as_ref(), now) {
+                Some(updated) => {
+                    VerifyOutcome::PassWithUpdate(FactorConfig::RecoveryCodes(updated))
+                }
+                None => VerifyOutcome::Fail,
+            }
         }
 
         (FactorCredential::Fido2Assertion(_), FactorConfig::Fido2(_), FactorKind::Fido2) => {

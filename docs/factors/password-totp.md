@@ -234,15 +234,59 @@ the secret in a short-lived enrolment record (in the session
 success, discard on failure.
 
 The second is recovery codes. A user who loses access to their TOTP
-device cannot log in with a method that requires TOTP. The
-deployment must offer a recovery path: either a recovery code printed
-at enrolment time (a long random string the user stores in a password
-manager), an email-OTP fallback factor, or an administrative reset
-flow with identity verification. Axess does not opinionate which path
-to take; the choice depends on the deployment's risk profile. The
-common pattern is to generate a recovery code at enrolment, treat it
-as a one-shot factor stored under the user's scope, and offer it as
-an alternative second factor.
+device cannot log in with a method that requires TOTP alone, so mint a
+set of recovery codes at the end of enrolment and offer them beside
+TOTP in the method's second step. The next section covers how.
+
+## Recovery codes
+
+A recovery code is a one-time credential that stands in for the second
+factor. `axess::generate_recovery_codes` (from `axess-factors`) mints a set through the
+injectable `SecureRng`: ten codes of ten characters, drawn from a
+32-symbol alphabet that leaves out `0`, `O`, `1` and `I`, which is 50 bits
+per code. It returns the codes in display form (`ABCDE-FGHJK`) for the user
+to see exactly once, and a `RecoveryCodesConfig` holding only their
+Argon2id hashes. Persist the config as the user's
+`FactorConfig::RecoveryCodes`; never store or log the display form.
+
+Offer the codes beside the factor they back up, in one step:
+
+```rust,ignore
+AuthMethod {
+    name: "password+totp".into(),
+    steps: vec![
+        FactorStep::Required(FactorKind::Password),
+        FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
+    ],
+    scope,
+}
+```
+
+After the password, `verify_factor` reports `FactorRequired(Totp)`: the
+step's first choice, so the TOTP prompt is unchanged and the UI can add
+"use a recovery code instead". The user's choice is the credential the
+UI submits. `FactorCredential::OtpCode` is verified as TOTP;
+`FactorCredential::RecoveryCode` is verified as a recovery code, typed
+with or without the dash, in any case. A step that does not offer
+`RecoveryCode` refuses a recovery code like a wrong TOTP code.
+
+A matched code is spent. Verification returns the set with that code
+marked used, and the pipeline saves it with the factor store's
+compare-and-swap, the same path that stops a TOTP code being replayed:
+two logins racing on one code cannot both complete. A wrong code counts
+toward the account lockout like any failed factor, and the audit trail
+records the login's completed factors as `[Password, RecoveryCode]`, so
+"this login skipped TOTP" is visible.
+
+Regenerating replaces the set. Treat it as a factor mutation: require a
+fresh authentication first, because a hijacked session should not be able
+to mint codes only the attacker has seen, and tell the user it happened.
+`RecoveryCodesConfig::remaining` gives the count of unspent codes for a
+settings page; prompt the user to regenerate when it runs low.
+
+The `sqlite` example issues codes at TOTP enrollment, offers them on its
+TOTP page, and has a test that drives the whole flow through the router:
+enroll, sign in with a code, see the same code refused.
 
 ## HOTP and email OTP, briefly
 

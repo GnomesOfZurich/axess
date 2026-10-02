@@ -67,7 +67,7 @@ Or depend on `axess-macros` directly if you only need the macros:
 
 ```toml
 [dependencies]
-axess-macros = "0.7"
+axess-macros = "0.8"
 ```
 
 ## License

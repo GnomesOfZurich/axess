@@ -160,7 +160,15 @@ fn build_service_with_factors(
 async fn authenticating_session(remaining: Vec<FactorKind>) -> AuthSession {
     let session = test_session();
     session
-        .begin_authenticating(uid("u1"), tid("t1"), Arc::from("test-method"), remaining)
+        .begin_authenticating(
+            uid("u1"),
+            tid("t1"),
+            Arc::from("test-method"),
+            remaining
+                .into_iter()
+                .map(crate::authn::factor::FactorStep::Required)
+                .collect(),
+        )
         .await;
     session
 }
@@ -771,7 +779,13 @@ async fn authenticating_state_destructures_authenticating_session() {
         .expect("Authenticating session must produce a triple");
     assert_eq!(user_id, uid("u1"));
     assert_eq!(tenant_id, tid("t1"));
-    assert_eq!(remaining, vec![FactorKind::Password, FactorKind::Totp]);
+    assert_eq!(
+        remaining,
+        vec![
+            crate::authn::factor::FactorStep::Required(FactorKind::Password),
+            crate::authn::factor::FactorStep::Required(FactorKind::Totp),
+        ]
+    );
 }
 
 #[tokio::test]

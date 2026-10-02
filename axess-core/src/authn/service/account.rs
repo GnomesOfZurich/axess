@@ -186,9 +186,10 @@ where
 
         // More factors remain; return the next kind.
         let next_kind = match &new_state {
-            crate::session::data::AuthState::Authenticating { remaining, .. } => {
-                remaining.first().cloned()
-            }
+            crate::session::data::AuthState::Authenticating { remaining, .. } => remaining
+                .first()
+                .and_then(crate::authn::factor::FactorStep::primary)
+                .cloned(),
             _ => None,
         };
 

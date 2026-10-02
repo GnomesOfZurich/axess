@@ -1,4 +1,4 @@
-//! # axess-example-local-idp
+//! # axess-example-workload-identity, `--bin local-idp`
 //!
 //! Production-pattern example for `axess::local_idp::LocalIdp`. Boots
 //! an in-process IdP that signs workload-identity JWTs against an
@@ -22,7 +22,7 @@
 //! ## Running
 //!
 //! ```sh
-//! cargo run -p axess-example-local-idp
+//! cargo run -p axess-example-workload-identity --bin local-idp
 //! ```
 //!
 //! On first launch the example mints an RSA-2048 key, writes it to
@@ -380,7 +380,7 @@ async fn rotate_handler(
 async fn root_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
-        "axess-example-local-idp; try GET /.well-known/openid-configuration, GET /jwks.json, POST /issue, POST /admin/rotate\n",
+        "axess-example-workload-identity local-idp; try GET /.well-known/openid-configuration, GET /jwks.json, POST /issue, POST /admin/rotate\n",
     )
 }
 
@@ -425,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind = BIND,
         issuer = ISSUER,
         discovery_url = %idp.discovery_url(),
-        "axess-example-local-idp listening"
+        "local IdP listening"
     );
     axum::serve(listener, app).await?;
     Ok(())

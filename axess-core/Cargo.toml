@@ -163,6 +163,7 @@ testing-oauth = ["testing", "oauth", "dep:wiremock", "dep:rsa"]
 # HTTP middleware
 accept-client-id = []
 request-id = []
+service-secret = []
 trace-id = []
 ws = ["axum/ws"]
 

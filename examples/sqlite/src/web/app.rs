@@ -149,6 +149,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         .route("/login", get(auth::login_page).post(auth::post_login))
         .route("/signup", get(auth::signup_page).post(auth::post_signup))
         .route("/totp", get(auth::totp_page).post(auth::post_totp))
+        .route("/recovery-code", post(auth::post_recovery_code))
         .route(
             "/forgot-password",
             get(auth::forgot_password_page).post(auth::post_forgot_password),

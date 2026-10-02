@@ -696,3 +696,138 @@ async fn audit_events_recorded_on_login() {
     assert!(types.contains(&&AuthEventType::LoginAttempt));
     assert!(types.contains(&&AuthEventType::Authenticated));
 }
+
+// ── Recovery codes: a choice beside TOTP ────────────────────────────────────
+
+/// Password, then TOTP or a recovery code: the step a recovery code exists for.
+fn password_then_totp_or_recovery() -> AuthMethod {
+    use axess_core::authn::factor::FactorStep;
+    AuthMethod {
+        name: "password+totp".into(),
+        steps: vec![
+            FactorStep::Required(FactorKind::Password),
+            FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
+        ],
+        scope: user_scope(),
+    }
+}
+
+/// A user with a password, a TOTP secret and three recovery codes; returns
+/// the service and the codes in display form.
+fn recovery_world(
+    method: AuthMethod,
+) -> (
+    axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore>,
+    MockClock,
+    Vec<String>,
+    &'static str,
+) {
+    let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    let set = axess_factors::generate_recovery_codes(&MockRng::new(7), 3);
+    let shown: Vec<String> = set.display.iter().map(|c| c.to_string()).collect();
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "bob"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), totp_config(secret))
+        .with_factor(user_scope(), FactorConfig::RecoveryCodes(set.config))
+        .with_method(&uid("u1"), method);
+    let clock = MockClock::now();
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    (service, clock, shown, secret)
+}
+
+async fn past_the_password(
+    service: &axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore>,
+) -> axess_core::session::extractor::AuthSession {
+    let session = test_session();
+    service
+        .begin_login("bob", "default", &session)
+        .await
+        .unwrap();
+    let r = service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &session,
+        )
+        .await
+        .unwrap();
+    // The UI is asked for the step's first choice, and may offer the rest.
+    assert!(
+        matches!(r, FactorOutcome::FactorRequired(FactorKind::Totp)),
+        "got {r:?}"
+    );
+    session
+}
+
+#[tokio::test]
+async fn a_recovery_code_completes_the_login_once() {
+    let (service, _clock, codes, _) = recovery_world(password_then_totp_or_recovery());
+
+    let s1 = past_the_password(&service).await;
+    let typed = codes[1].to_lowercase().replace('-', " ");
+    let r = service
+        .verify_factor(&FactorCredential::RecoveryCode(typed.as_str().into()), &s1)
+        .await
+        .unwrap();
+    assert!(matches!(r, FactorOutcome::Authenticated), "got {r:?}");
+    assert!(s1.is_authenticated().await);
+
+    // The same code is spent: a second login cannot use it.
+    let s2 = past_the_password(&service).await;
+    let r = service
+        .verify_factor(
+            &FactorCredential::RecoveryCode(codes[1].as_str().into()),
+            &s2,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(r, FactorOutcome::InvalidCredential),
+        "a spent code must not verify again, got {r:?}"
+    );
+
+    // Another code from the set still works.
+    let r = service
+        .verify_factor(
+            &FactorCredential::RecoveryCode(codes[2].as_str().into()),
+            &s2,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(r, FactorOutcome::Authenticated), "got {r:?}");
+}
+
+#[tokio::test]
+async fn totp_still_completes_a_step_that_also_offers_recovery_codes() {
+    let (service, clock, _codes, secret) = recovery_world(password_then_totp_or_recovery());
+    let session = past_the_password(&service).await;
+    let code = generate_totp_code(secret, clock.now().into());
+    let r = service
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+    assert!(matches!(r, FactorOutcome::Authenticated), "got {r:?}");
+}
+
+#[tokio::test]
+async fn a_recovery_code_is_refused_where_the_method_does_not_offer_one() {
+    let (service, _clock, codes, _) = recovery_world(password_totp_method());
+    let session = past_the_password(&service).await;
+    let r = service
+        .verify_factor(
+            &FactorCredential::RecoveryCode(codes[0].as_str().into()),
+            &session,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(r, FactorOutcome::InvalidCredential),
+        "TOTP-only step must not accept a recovery code, got {r:?}"
+    );
+    assert!(!session.is_authenticated().await);
+}
