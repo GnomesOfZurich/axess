@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "axess"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess-core",
  "axess-factors",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "axess-cache"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess-clock",
  "chrono",
@@ -354,14 +354,14 @@ dependencies = [
 
 [[package]]
 name = "axess-clock"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "axess-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aes-gcm 0.11.1",
  "axess-cache",
@@ -421,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "axess-events"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess-identity",
  "axess-strings",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-authz"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess",
  "axum",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-fapi"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess",
  "axum",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-minimal"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess",
  "axum",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-oauth"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess",
  "axum",
@@ -488,7 +488,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-sqlite"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess",
  "axum",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-workload-identity"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess",
  "axess-clock",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "axess-factors"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess-clock",
  "axess-identity",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "axess-identity"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess-rng",
  "rkyv",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "axess-macros"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axess-core",
  "cedar-policy",
@@ -596,14 +596,14 @@ dependencies = [
 
 [[package]]
 name = "axess-rng"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "rand 0.10.3",
 ]
 
 [[package]]
 name = "axess-strings"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "compact_str",
  "criterion",
@@ -3793,9 +3793,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
 dependencies = [
  "bytes",
  "getrandom 0.4.2",
@@ -4249,9 +4249,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

@@ -10,6 +10,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.8.1] - 2026-10-15
+
+### Security
+
+- **A policy that errors during evaluation now denies the request**, even
+  where another `permit` would allow. Cedar skips an erroring policy, so a
+  failing `forbid` let the request through. Logged at error level.
+- **`Cargo.lock` takes `quinn-proto` 0.11.19 and `rustls` 0.23.46**
+  (RUSTSEC-2026-0338 to 0342, 0346 to 0349). Adopters resolve their own
+  versions: run `cargo update -p quinn-proto -p rustls`.
+
+---
+
 ## [0.8.0] - 2026-10-02
 
 A step that offers a choice now is one. `AnyOf` was part of the method

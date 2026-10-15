@@ -41,7 +41,7 @@ turn on `memory` for the in-memory session store and `testing` for
 real database needs neither.
 
 ```toml
-axess = { version = "0.8.0", features = ["memory", "testing"] }
+axess = { version = "0.8.1", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the

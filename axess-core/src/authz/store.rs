@@ -11,7 +11,6 @@ use cedar_policy::{
     Validator,
 };
 use std::str::FromStr;
-use tracing::warn;
 
 use super::error::AuthzError;
 
@@ -60,7 +59,9 @@ pub fn validate_policies(policies: &PolicySet, schema: &Schema) -> Result<(), Au
 pub enum AuthzDecision {
     /// At least one Cedar `permit` policy matched and no `forbid` policy applied.
     Allow,
-    /// No `permit` policy matched, or a `forbid` policy applied. Fail-closed default.
+    /// No `permit` policy matched, a `forbid` policy applied, or the request
+    /// could not be evaluated: it failed schema validation, or any policy
+    /// errored. Fail-closed default.
     Deny,
 }
 
@@ -153,7 +154,7 @@ impl PolicyEvaluator for PolicyStore {
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("Cedar request validation failed: {e:?}");
+                tracing::error!("Cedar request validation failed: {e:?}");
                 tracing::info!(
                     target: "axess::authz::decision",
                     principal = %principal_str,
@@ -176,14 +177,30 @@ impl PolicyEvaluator for PolicyStore {
         let reasons: Vec<String> = diagnostics.reason().map(|p| p.to_string()).collect();
         let errors: Vec<String> = diagnostics.errors().map(|e| e.to_string()).collect();
 
+        let latency_us = started.elapsed().as_micros() as u64;
+
+        // Fail closed on any evaluation error. Cedar skips a policy whose
+        // evaluation errors, so a `forbid` that fails (an attribute of the
+        // wrong type, an overflow) stops forbidding and the `permit` beside it
+        // allows. Whatever the decision, a request any policy could not
+        // evaluate is denied, and said so at error level.
         if !errors.is_empty() {
-            tracing::warn!(
+            tracing::error!(
                 errors = ?errors,
-                "Cedar policy evaluation errors"
+                "Cedar policy evaluation errors: denied"
             );
+            tracing::info!(
+                target: "axess::authz::decision",
+                principal = %principal_str,
+                action = %action_str,
+                resource = %resource_str,
+                decision = "deny",
+                reason = "policy_evaluation_error",
+                latency_us = latency_us,
+            );
+            return AuthzDecision::Deny;
         }
 
-        let latency_us = started.elapsed().as_micros() as u64;
         match response.decision() {
             Decision::Allow => {
                 tracing::trace!(reasons = ?reasons, "Cedar: allowed");
@@ -264,6 +281,111 @@ mod authz_store_tests {
 
     fn build_store() -> PolicyStore {
         PolicyStore::from_text(POLICY_TEXT, SCHEMA_JSON).unwrap()
+    }
+
+    /// A schema whose `User` carries a number, so a policy can do arithmetic
+    /// on it that passes strict validation and fails at evaluation.
+    const COUNTING_SCHEMA_JSON: &str = r#"{
+        "TestApp": {
+            "entityTypes": {
+                "User": {
+                    "memberOfTypes": [],
+                    "shape": {
+                        "type": "Record",
+                        "attributes": { "n": { "type": "Long" } }
+                    }
+                },
+                "Resource": { "memberOfTypes": [] }
+            },
+            "actions": {
+                "View": {
+                    "appliesTo": {
+                        "principalTypes": ["User"],
+                        "resourceTypes": ["Resource"]
+                    }
+                }
+            }
+        }
+    }"#;
+
+    fn alice_with(n: i64, store: &PolicyStore) -> Entities {
+        let json = format!(
+            r#"[{{"uid": {{"type": "TestApp::User", "id": "alice"}}, "attrs": {{"n": {n}}}, "parents": []}}]"#
+        );
+        Entities::from_json_str(&json, Some(store.schema())).unwrap()
+    }
+
+    fn view_doc1(store: &PolicyStore, entities: &Entities) -> AuthzDecision {
+        store.is_authorized(
+            entities,
+            r#"TestApp::User::"alice""#.parse().unwrap(),
+            r#"TestApp::Action::"View""#.parse().unwrap(),
+            r#"TestApp::Resource::"doc1""#.parse().unwrap(),
+            Context::empty(),
+        )
+    }
+
+    /// A `forbid` that errors does not stop forbidding.
+    ///
+    /// Cedar skips a policy whose evaluation errors, so a `forbid` that fails
+    /// (here on an overflow; in practice on an attribute an entity lacks)
+    /// would stop applying and let the `permit` beside it allow. The decision
+    /// must fail closed: any evaluation error is a deny.
+    #[test]
+    fn an_erroring_forbid_fails_closed() {
+        let policies = r#"
+            permit(principal, action == TestApp::Action::"View", resource);
+            forbid(principal, action, resource)
+                when { principal.n + 9223372036854775807 > 0 };
+        "#;
+        let store = PolicyStore::from_text(policies, COUNTING_SCHEMA_JSON).unwrap();
+        // The forbid evaluates without error and applies: denied.
+        assert_eq!(
+            view_doc1(&store, &alice_with(0, &store)),
+            AuthzDecision::Deny
+        );
+        // The forbid overflows: Cedar would skip it and allow.
+        assert_eq!(
+            view_doc1(&store, &alice_with(1, &store)),
+            AuthzDecision::Deny
+        );
+    }
+
+    /// An erroring `permit` was already a deny; it stays one.
+    #[test]
+    fn an_erroring_permit_denies() {
+        let policies = r#"
+            permit(principal, action == TestApp::Action::"View", resource)
+                when { principal.n + 9223372036854775807 > 0 };
+        "#;
+        let store = PolicyStore::from_text(policies, COUNTING_SCHEMA_JSON).unwrap();
+        assert_eq!(
+            view_doc1(&store, &alice_with(1, &store)),
+            AuthzDecision::Deny
+        );
+        assert_eq!(
+            view_doc1(&store, &alice_with(-1, &store)),
+            AuthzDecision::Allow
+        );
+    }
+
+    /// Cedar would let the working `permit` allow; any evaluation error denies.
+    #[test]
+    fn a_working_permit_beside_an_erroring_one_denies() {
+        let policies = r#"
+            permit(principal, action == TestApp::Action::"View", resource);
+            permit(principal, action == TestApp::Action::"View", resource)
+                when { principal.n + 9223372036854775807 > 0 };
+        "#;
+        let store = PolicyStore::from_text(policies, COUNTING_SCHEMA_JSON).unwrap();
+        assert_eq!(
+            view_doc1(&store, &alice_with(1, &store)),
+            AuthzDecision::Deny
+        );
+        assert_eq!(
+            view_doc1(&store, &alice_with(-1, &store)),
+            AuthzDecision::Allow
+        );
     }
 
     #[test]
