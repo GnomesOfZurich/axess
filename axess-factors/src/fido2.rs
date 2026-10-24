@@ -77,8 +77,11 @@ impl Fido2Credential {
         result: &webauthn_rs::prelude::AuthenticationResult,
         now: DateTime<Utc>,
     ) {
-        self.passkey.update_credential(result);
-        self.last_used_at = Some(now);
+        // `update_credential` answers `None` for a result that belongs to
+        // another credential; only the matching one counts as used.
+        if self.passkey.update_credential(result).is_some() {
+            self.last_used_at = Some(now);
+        }
     }
 }
 
@@ -503,3 +506,6 @@ mod verifier_tests {
         assert_eq!(captured[0].1, device_id);
     }
 }
+
+#[cfg(all(test, feature = "fido2"))]
+mod credential_tests;

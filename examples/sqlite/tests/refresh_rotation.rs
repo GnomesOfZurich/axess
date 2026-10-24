@@ -42,6 +42,7 @@ fn token(suffix: &str) -> RefreshToken {
         device_info: None,
         family_id: None,
         device_id: None,
+        authn_time: None,
     }
 }
 

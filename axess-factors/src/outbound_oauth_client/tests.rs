@@ -434,3 +434,30 @@ async fn scopes_are_sent_in_form_body() {
     .with_scopes(["read", "write"]);
     let _ = client.get_access_token().await.expect("scope sent");
 }
+
+#[tokio::test]
+async fn out_of_range_expires_in_is_refused() {
+    for body in [
+        r#"{"access_token":"t","expires_in":10000000000000000}"#,
+        r#"{"access_token":"t","expires_in":18446744073709551615}"#,
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+        let client = OutboundOAuthClient::new(
+            token_url(&server),
+            ClientAuthMethod::ClientSecretBasic {
+                client_id: "axess".into(),
+                client_secret: "shh".into(),
+            },
+        );
+        let err = client.get_access_token().await.expect_err("refused");
+        assert!(
+            matches!(err, OAuthClientError::MalformedResponse(_)),
+            "got {err:?}"
+        );
+    }
+}

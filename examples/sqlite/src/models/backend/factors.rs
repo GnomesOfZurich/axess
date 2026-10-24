@@ -230,6 +230,37 @@ impl FactorStore for OurBackend {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn insert_factor_if_absent(
+        &self,
+        scope: &AuthnScope,
+        config: FactorConfig,
+    ) -> Result<bool, Self::Error> {
+        let kind_str = config.kind().as_str().to_string();
+        let config_json = serde_json::to_string(&config)?;
+        let id = Uuid::new_v4().to_string();
+
+        let cols = scope.as_columns();
+        let tenant_str = cols.tenant_id.to_string();
+        let user_str = cols.user_id.map(|u| u.to_string());
+
+        // One statement, atomic: the UNIQUE(user_id, tenant_id, kind)
+        // constraint decides the winner of two concurrent first writes.
+        let res = sqlx::query(
+            "INSERT INTO factor_configs (id, user_id, tenant_id, kind, config_json, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'))
+             ON CONFLICT(user_id, tenant_id, kind) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(&user_str)
+        .bind(&tenant_str)
+        .bind(&kind_str)
+        .bind(&config_json)
+        .execute(self.pool())
+        .await?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn available_methods(
         &self,
         user_id: &UserId,

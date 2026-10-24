@@ -88,7 +88,7 @@ fn default_endpoint() -> Url {
 /// .with_duration_seconds(900)
 /// .with_policy(r#"{"Version":"2012-10-17","Statement":[…]}"#);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AssumeRoleWithWebIdentityRequest {
     /// The IAM role's full ARN to assume.
     pub role_arn: String,
@@ -115,6 +115,22 @@ pub struct AssumeRoleWithWebIdentityRequest {
     /// an IAM-configured identity provider (the common case for K8s
     /// / GitHub Actions / axess), leave as `None`.
     pub provider_id: Option<String>,
+}
+
+impl std::fmt::Debug for AssumeRoleWithWebIdentityRequest {
+    /// Redacts `web_identity_token`: it is a bearer credential and
+    /// `Debug` output ends up in logs and panic messages.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssumeRoleWithWebIdentityRequest")
+            .field("role_arn", &self.role_arn)
+            .field("role_session_name", &self.role_session_name)
+            .field("web_identity_token", &"[redacted]")
+            .field("duration_seconds", &self.duration_seconds)
+            .field("policy", &self.policy)
+            .field("policy_arns", &self.policy_arns)
+            .field("provider_id", &self.provider_id)
+            .finish()
+    }
 }
 
 impl AssumeRoleWithWebIdentityRequest {

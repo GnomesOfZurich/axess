@@ -547,3 +547,98 @@ async fn sweep_seen_revoked_guard_requires_both_conditions() {
          solely on the elapsed predicate"
     );
 }
+
+/// Re-saving a device under a new fingerprint must drop the old
+/// fingerprint's index entry, or a lookup by the old fingerprint keeps
+/// returning a device that no longer carries it.
+#[tokio::test]
+async fn resave_with_new_fingerprint_drops_old_index_entry() {
+    let store = MemoryDeviceStore::new();
+    let now = Utc::now();
+    store.save(&d("dev-1", 0xaa, now)).await.unwrap();
+    store.save(&d("dev-1", 0xbb, now)).await.unwrap();
+
+    let old = FingerprintHash::from_bytes([0xaa; 32]);
+    assert!(
+        store
+            .find_by_fingerprint(&t(), &old)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let new = FingerprintHash::from_bytes([0xbb; 32]);
+    assert!(
+        store
+            .find_by_fingerprint(&t(), &new)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// Deleting a device must not remove an index entry that now points at a
+/// different device with the same fingerprint.
+#[tokio::test]
+async fn delete_keeps_index_entry_owned_by_another_device() {
+    let store = MemoryDeviceStore::new();
+    let now = Utc::now();
+    store.save(&d("dev-1", 0xaa, now)).await.unwrap();
+    store.save(&d("dev-2", 0xaa, now)).await.unwrap();
+    store.delete(&t(), &d("dev-1", 0xaa, now).id).await.unwrap();
+
+    let fp = FingerprintHash::from_bytes([0xaa; 32]);
+    let found = store.find_by_fingerprint(&t(), &fp).await.unwrap();
+    assert_eq!(found.map(|x| x.id), Some(d("dev-2", 0xaa, now).id));
+}
+
+/// A purge in the sweep must not remove an index entry that points at
+/// another device sharing the fingerprint.
+#[tokio::test]
+async fn sweep_purge_keeps_index_entry_owned_by_another_device() {
+    let cfg = SweepConfig::builder()
+        .revoked_grace(chrono::Duration::seconds(1))
+        .build();
+    let store = MemoryDeviceStore::new().with_sweep_config(cfg);
+    let t0 = Utc::now();
+    let mut old = d("dev-old", 0xcc, t0 - chrono::Duration::days(1));
+    old.trust_level = DeviceTrustLevel::Revoked;
+    old.revoked_at = Some(t0 - chrono::Duration::days(1));
+    store.save(&old).await.unwrap();
+    store.save(&d("dev-live", 0xcc, t0)).await.unwrap();
+
+    let counts = store.sweep(&t(), t0).await.unwrap();
+    assert_eq!(counts.revoked_purged, 1);
+    let fp = FingerprintHash::from_bytes([0xcc; 32]);
+    let found = store.find_by_fingerprint(&t(), &fp).await.unwrap();
+    assert_eq!(found.map(|x| x.id), Some(d("dev-live", 0xcc, t0).id));
+}
+
+/// Revoked devices must not use up the limit: with two newer revoked
+/// devices and one older active one, a limit of 1 still returns the
+/// active device.
+#[tokio::test]
+async fn find_active_for_user_applies_limit_after_dropping_revoked() {
+    let store = MemoryDeviceStore::new();
+    let now = Utc::now();
+    store
+        .save(&d("active", 0x01, now - chrono::Duration::days(3)))
+        .await
+        .unwrap();
+    for (name, fp, age) in [("rev-1", 0x02, 1), ("rev-2", 0x03, 2)] {
+        let mut dev = d(name, fp, now - chrono::Duration::days(age));
+        dev.trust_level = DeviceTrustLevel::Revoked;
+        store.save(&dev).await.unwrap();
+    }
+    let got = store.find_active_for_user(&t(), &u(), 1).await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].id, d("active", 0x01, now).id);
+    assert!(
+        store
+            .find_active_for_user(&t(), &u(), 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let all = store.find_active_for_user(&t(), &u(), 10).await.unwrap();
+    assert_eq!(all.len(), 1);
+}

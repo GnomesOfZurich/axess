@@ -321,3 +321,11 @@ fn default_endpoint_is_global_sts() {
     let client = AwsStsClient::default();
     assert_eq!(client.endpoint().as_str(), "https://sts.amazonaws.com/");
 }
+
+#[test]
+fn request_debug_redacts_web_identity_token() {
+    let req = AssumeRoleWithWebIdentityRequest::new("arn:aws:iam::1:role/r", "sess", "SECRET-JWT");
+    let shown = format!("{req:?}");
+    assert!(!shown.contains("SECRET-JWT"), "{shown}");
+    assert!(shown.contains("arn:aws:iam::1:role/r"));
+}

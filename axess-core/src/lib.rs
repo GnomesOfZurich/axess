@@ -203,7 +203,9 @@ pub use device::{
 
 #[cfg(feature = "device")]
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
-pub use authn::service::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up};
+pub use authn::service::{
+    StepUpPolicy, StepUpPolicyBuilder, decide_step_up, decide_step_up_for_user,
+};
 
 #[cfg(all(
     feature = "device",

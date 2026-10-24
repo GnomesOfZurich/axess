@@ -60,16 +60,7 @@ impl JwksCache {
         http_client: &openidconnect::reqwest::Client,
     ) -> Result<Self, OidcError> {
         let jwks_uri = jwks_uri.into();
-        let bytes = http_client
-            .get(&jwks_uri)
-            .send()
-            .await
-            .map_err(|e| OidcError::JwksFetch(format!("{e}")))?
-            .bytes()
-            .await
-            .map_err(|e| OidcError::JwksFetch(format!("read body: {e}")))?;
-        let jwks: JwkSet =
-            serde_json::from_slice(&bytes).map_err(|e| OidcError::JwksParse(format!("{e}")))?;
+        let jwks = fetch_key_set(http_client, &jwks_uri).await?;
 
         Ok(Self {
             jwks_uri,
@@ -137,17 +128,7 @@ impl JwksCache {
             return Ok(());
         }
 
-        let bytes = self
-            .http_client
-            .get(&self.jwks_uri)
-            .send()
-            .await
-            .map_err(|e| OidcError::JwksFetch(format!("{e}")))?
-            .bytes()
-            .await
-            .map_err(|e| OidcError::JwksFetch(format!("read body: {e}")))?;
-        let new_jwks: JwkSet =
-            serde_json::from_slice(&bytes).map_err(|e| OidcError::JwksParse(format!("{e}")))?;
+        let new_jwks = fetch_key_set(&self.http_client, &self.jwks_uri).await?;
 
         let mut guard = self.jwks.write().unwrap_or_else(|poisoned| {
             tracing::warn!("JWKS RwLock was poisoned; recovering with fresh data");
@@ -162,6 +143,32 @@ impl JwksCache {
         drop(refresh_guard);
         Ok(())
     }
+}
+
+/// GET `jwks_uri` and parse the body as a key set.
+///
+/// Refuses a non-HTTPS `jwks_uri` (loopback excepted) and any non-2xx
+/// response, so an error page that happens to parse as a key set can never
+/// replace trusted keys.
+async fn fetch_key_set(
+    http_client: &openidconnect::reqwest::Client,
+    jwks_uri: &str,
+) -> Result<JwkSet, OidcError> {
+    crate::oidc::discovery::require_https_or_loopback(jwks_uri)?;
+    let response = http_client
+        .get(jwks_uri)
+        .send()
+        .await
+        .map_err(|e| OidcError::JwksFetch(format!("{e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(OidcError::JwksFetch(format!("HTTP {status}")));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| OidcError::JwksFetch(format!("read body: {e}")))?;
+    serde_json::from_slice(&bytes).map_err(|e| OidcError::JwksParse(format!("{e}")))
 }
 
 #[cfg(test)]
@@ -244,5 +251,57 @@ mod tests {
             matches!(err, OidcError::JwksParse(_)),
             "expected JwksParse, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_non_success_status_even_with_valid_key_set_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(sample_jwks_json()))
+            .mount(&server)
+            .await;
+        let client = openidconnect::reqwest::Client::new();
+        let err = JwksCache::fetch(format!("{}/jwks.json", server.uri()), &client)
+            .await
+            .expect_err("a 503 must not seed the cache");
+        assert!(matches!(err, OidcError::JwksFetch(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_cached_keys_when_endpoint_errors_with_key_set_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({ "keys": [] })),
+            )
+            .mount(&server)
+            .await;
+        let client = openidconnect::reqwest::Client::new();
+        let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
+        let cache = JwksCache::from_parts(format!("{}/jwks.json", server.uri()), &client, seed);
+
+        let err = cache.refresh().await.expect_err("a 500 must be an error");
+        assert!(matches!(err, OidcError::JwksFetch(_)), "got {err:?}");
+        assert_eq!(
+            cache.handle().read().unwrap().keys.len(),
+            1,
+            "cached keys must survive a failed refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_and_refresh_refuse_plain_http_to_a_remote_host() {
+        let client = openidconnect::reqwest::Client::new();
+        let err = JwksCache::fetch("http://keys.example.com/jwks.json", &client)
+            .await
+            .expect_err("plain http to a remote host must be refused");
+        assert!(matches!(err, OidcError::NonHttpsIssuer(_)), "got {err:?}");
+
+        let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
+        let cache = JwksCache::from_parts("http://keys.example.com/jwks.json", &client, seed);
+        let err = cache.refresh().await.expect_err("refresh must refuse too");
+        assert!(matches!(err, OidcError::NonHttpsIssuer(_)), "got {err:?}");
     }
 }

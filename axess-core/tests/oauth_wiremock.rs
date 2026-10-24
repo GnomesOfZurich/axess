@@ -94,8 +94,29 @@ fn build_id_token(
     kid: &str,
     private_der: &[u8],
 ) -> String {
+    build_id_token_with(
+        issuer,
+        client_id,
+        subject,
+        nonce,
+        kid,
+        private_der,
+        json!({}),
+    )
+}
+
+/// As [`build_id_token`], with `extra` claims merged over the defaults.
+fn build_id_token_with(
+    issuer: &str,
+    client_id: &str,
+    subject: &str,
+    nonce: &str,
+    kid: &str,
+    private_der: &[u8],
+    extra: serde_json::Value,
+) -> String {
     let now = chrono::Utc::now().timestamp();
-    let claims = json!({
+    let mut claims = json!({
         "iss": issuer,
         "sub": subject,
         "aud": client_id,
@@ -106,6 +127,10 @@ fn build_id_token(
         "email_verified": true,
         "name": "Alice Test",
     });
+    claims
+        .as_object_mut()
+        .expect("object")
+        .extend(extra.as_object().expect("extra object").clone());
 
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(kid.to_string());
@@ -258,6 +283,216 @@ async fn full_oauth_flow_with_signed_id_token() {
             panic!("finish_oauth_login failed: {e:?}");
         }
     }
+}
+
+/// The tenant declared at begin must still be on the session when
+/// `complete_oauth_login` runs after a real `finish_oauth_login`, so a
+/// resolver that returns a user from another tenant is refused.
+#[tokio::test]
+async fn cross_tenant_user_refused_after_real_finish() {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    let client_id = "test-client-id";
+    let (private_der, jwk, kid) = generate_rsa_keypair();
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery_document(&issuer)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+        .mount(&server)
+        .await;
+    let provider = OAuthProviderConfig::discover(
+        "test",
+        &issuer,
+        client_id,
+        "test-secret",
+        "http://localhost:3000/callback",
+    )
+    .await
+    .expect("discovery should succeed");
+
+    let other_tenant_user = common::test_user_in_tenant("u1", "alice", "t2");
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(other_tenant_user.clone());
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(provider)
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+
+    authn
+        .begin_oauth_login_in_tenant(
+            "test",
+            &OAuthLoginOptions::default(),
+            &common::tid("t1"),
+            &session,
+        )
+        .await
+        .expect("begin should succeed");
+    let nonce = session
+        .get_custom("axess.oauth.nonce")
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .expect("nonce");
+    let csrf = session
+        .get_custom("axess.oauth.csrf_state")
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .expect("csrf");
+    let id_token = build_id_token(
+        &issuer,
+        client_id,
+        "alice-subject",
+        &nonce,
+        &kid,
+        &private_der,
+    );
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "mock-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "id_token": id_token,
+        })))
+        .mount(&server)
+        .await;
+
+    let claims = authn
+        .finish_oauth_login("code", &csrf, &session)
+        .await
+        .expect("finish should succeed");
+    let res = authn
+        .complete_oauth_login(&other_tenant_user, &claims, &session)
+        .await;
+    assert!(
+        matches!(res, Err(axess_core::authn::error::AuthnError::CrossTenant)),
+        "expected CrossTenant, got {res:?}"
+    );
+    assert!(!session.is_authenticated().await);
+}
+
+/// Log in through a discovered provider, with `extra` claims in the ID
+/// token, and return the claims `finish_oauth_login` produced.
+async fn login_with_extra_claims(
+    fapi: bool,
+    extra: serde_json::Value,
+) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    let client_id = "test-client-id";
+    let (private_der, jwk, kid) = generate_rsa_keypair();
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery_document(&issuer)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/par"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .set_body_json(json!({ "request_uri": "urn:par:1", "expires_in": 60 })),
+        )
+        .mount(&server)
+        .await;
+    let mut provider = OAuthProviderConfig::discover(
+        "test",
+        &issuer,
+        client_id,
+        "test-secret",
+        "http://localhost:3000/callback",
+    )
+    .await
+    .expect("discovery should succeed");
+    if fapi {
+        provider = provider
+            .with_par_endpoint(format!("{issuer}/par"))
+            .with_fapi(axess_factors::oauth::FapiConfig::default())
+            .expect("fapi");
+    }
+    let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
+        .with_oauth_provider(provider)
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    authn
+        .begin_oauth_login("test", &OAuthLoginOptions::default(), &session)
+        .await
+        .expect("begin");
+    let nonce = session
+        .get_custom("axess.oauth.nonce")
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .expect("nonce");
+    let csrf = session
+        .get_custom("axess.oauth.csrf_state")
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .expect("csrf");
+    let id_token = build_id_token_with(
+        &issuer,
+        client_id,
+        "alice-subject",
+        &nonce,
+        &kid,
+        &private_der,
+        extra,
+    );
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "mock-access-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "id_token": id_token,
+        })))
+        .mount(&server)
+        .await;
+    authn.finish_oauth_login("code", &csrf, &session).await
+}
+
+/// `groups`, `roles` and `sid` in the ID token reach `OAuthClaims`, so
+/// back-channel logout by `sid` has a session to match.
+#[tokio::test]
+async fn id_token_groups_roles_and_sid_reach_oauth_claims() {
+    let claims = login_with_extra_claims(
+        false,
+        json!({ "groups": ["g1", "g2"], "roles": ["admin"], "sid": "idp-session-9" }),
+    )
+    .await
+    .expect("login");
+    assert_eq!(claims.groups, vec!["g1", "g2"]);
+    assert_eq!(claims.roles, vec!["admin"]);
+    assert_eq!(claims.oidc_sid.as_deref(), Some("idp-session-9"));
+}
+
+/// FAPI requires `nbf`; a token that carries a valid one must pass, and one
+/// without it must still be refused.
+#[tokio::test]
+async fn fapi_login_reads_nbf_from_the_id_token() {
+    let now = chrono::Utc::now().timestamp();
+    login_with_extra_claims(true, json!({ "nbf": now - 5, "exp": now + 120 }))
+        .await
+        .expect("FAPI login with nbf must succeed");
+    let err = login_with_extra_claims(true, json!({ "exp": now + 120 }))
+        .await
+        .expect_err("FAPI login without nbf must fail");
+    // The provider reports every token-validation failure to the caller as
+    // a generic exchange failure.
+    assert!(
+        matches!(err, axess_factors::oauth::OAuthError::TokenExchange(_)),
+        "got {err:?}"
+    );
 }
 
 /// Token endpoint returning error should propagate as TokenExchange error.

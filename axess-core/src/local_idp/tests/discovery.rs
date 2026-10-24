@@ -387,3 +387,73 @@ async fn with_metadata_field_refuses_the_reserved_fields() {
             .all(|(k, _)| k != "jwks_uri" && k != "issuer")
     );
 }
+
+#[tokio::test]
+async fn signing_algorithms_cannot_be_overridden_by_an_extra_field() {
+    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(key),
+    )
+    .await
+    .expect("load")
+    .with_metadata_field(
+        "id_token_signing_alg_values_supported",
+        serde_json::json!(["none"]),
+    );
+    let meta = idp.metadata().await;
+    assert!(meta.extra.is_empty());
+    assert_eq!(
+        meta.to_json()["id_token_signing_alg_values_supported"],
+        serde_json::json!(["RS256"])
+    );
+}
+
+#[tokio::test]
+async fn duplicate_extra_fields_keep_the_first_value() {
+    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(key),
+    )
+    .await
+    .expect("load")
+    .with_metadata_field("scopes_supported", serde_json::json!(["openid"]))
+    .with_metadata_field("scopes_supported", serde_json::json!(["admin"]));
+    let meta = idp.metadata().await;
+    assert_eq!(meta.extra.len(), 1);
+    assert_eq!(
+        meta.to_json()["scopes_supported"],
+        serde_json::json!(["openid"])
+    );
+}
+
+/// `extra` is a public field, so the serialiser enforces the reserved names
+/// itself instead of trusting the builder.
+#[tokio::test]
+async fn filling_extra_directly_cannot_override_derived_fields() {
+    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(key),
+    )
+    .await
+    .expect("load");
+    let mut meta = idp.metadata().await;
+    meta.extra = vec![
+        ("issuer".into(), serde_json::json!("https://evil.example")),
+        (
+            "id_token_signing_alg_values_supported".into(),
+            serde_json::json!(["none"]),
+        ),
+        ("x".into(), serde_json::json!(1)),
+        ("x".into(), serde_json::json!(2)),
+    ];
+    let json = meta.to_json();
+    assert_eq!(json["issuer"], "https://idp.local");
+    assert_eq!(
+        json["id_token_signing_alg_values_supported"],
+        serde_json::json!(["RS256"])
+    );
+    assert_eq!(json["x"], 1);
+}

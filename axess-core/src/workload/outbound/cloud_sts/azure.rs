@@ -63,10 +63,18 @@ const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
 
 /// Compose the standard tenant-scoped token endpoint URL.
 fn token_endpoint_for_tenant(tenant: &str) -> Url {
-    // Tenant values are well-formed Azure tenant ids or domain names;
-    // a join failure is a programmer error.
+    // The tenant is one path segment: percent-encode it so a value
+    // carrying `/`, `?`, `#` or `@` cannot redirect the request to a
+    // different path or host. A segment that is exactly `.` or `..`
+    // would be collapsed by URL parsing, so the percent sign itself is
+    // escaped there; the endpoint names a tenant that does not exist
+    // and the token request is refused by the IdP.
+    let segment = match tenant {
+        "." | ".." | "" => format!("%25{}", super::encode_path_segment(tenant)),
+        other => super::encode_path_segment(other),
+    };
     Url::parse(&format!(
-        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+        "https://login.microsoftonline.com/{segment}/oauth2/v2.0/token"
     ))
     .expect("Azure AD token endpoint URL is well-formed")
 }
@@ -74,7 +82,7 @@ fn token_endpoint_for_tenant(tenant: &str) -> Url {
 // ── Request ──────────────────────────────────────────────────────────────────
 
 /// Inputs to an Azure FIC token request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AzureFicRequest {
     /// The federated token: passed as `client_assertion` in the
     /// `client_credentials` form body.
@@ -83,6 +91,17 @@ pub struct AzureFicRequest {
     /// resource-scoped value, typically `{resource}/.default`
     /// (e.g. `https://graph.microsoft.com/.default`).
     pub scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for AzureFicRequest {
+    /// Redacts `federated_token`: it is a bearer credential and
+    /// `Debug` output ends up in logs and panic messages.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AzureFicRequest")
+            .field("federated_token", &"[redacted]")
+            .field("scopes", &self.scopes)
+            .finish()
+    }
 }
 
 impl AzureFicRequest {

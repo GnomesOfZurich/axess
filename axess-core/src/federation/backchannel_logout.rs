@@ -45,6 +45,8 @@
 //! - `iat` must be recent (within 5 minutes)
 //! - `events` must contain the back-channel logout event URI
 //! - At least one of `sub` or `sid` must be present
+//! - `jti` must be present, and is single-use within the `iat` window
+//! - A `sub` only logs out a user who signed in through the same issuer
 //!
 //! **Signature verification:** `OAuthProviderConfig` fetches and caches the
 //! IdP's JWKS keys at discovery time, and `verify_logout_jwt` validates the
@@ -163,7 +165,7 @@ pub struct LogoutTokenClaims {
     pub sid: Option<String>,
     /// Issuer that sent the logout token.
     pub iss: String,
-    /// Token `jti` claim (when present). Used by the handler to detect
+    /// Token `jti` claim (always present on a validated token). Used by the handler to detect
     /// replay of the same logout token within the IAT window.
     pub jti: Option<String>,
 }
@@ -221,16 +223,14 @@ impl BackChannelLogoutHandler {
     ) -> Result<StatusCode, StatusCode> {
         let claims = handler.validate_logout_token(&params.logout_token).await?;
 
-        // Replay protection: if the IdP supplied a `jti`, refuse to act on
-        // the same `(issuer, jti)` twice within the IAT window. Without this
-        // an attacker who captures a valid logout token can re-fire it for
-        // up to MAX_IAT_AGE_SECS, repeatedly poking the registry under the
-        // victim's identity. Tokens without `jti` get the IAT window as
-        // their only mitigation (RFC 7519 makes `jti` optional but the
-        // OIDC back-channel logout spec recommends it).
-        if let Some(ref jti) = claims.jti
-            && !handler.record_jti(&claims.iss, jti, handler.clock.now())
-        {
+        // Replay protection: `validate_logout_token` guarantees a `jti`, so
+        // refuse to act on the same `(issuer, jti)` twice within the IAT
+        // window. Without this an attacker who captures a valid logout
+        // token can re-fire it for up to MAX_IAT_AGE_SECS.
+        let Some(ref jti) = claims.jti else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        if !handler.record_jti(&claims.iss, jti, handler.clock.now()) {
             tracing::warn!(
                 iss = %claims.iss,
                 jti = %jti,
@@ -252,32 +252,10 @@ impl BackChannelLogoutHandler {
             "back-channel logout: invalidating session(s)"
         );
 
-        // If `sub` is present, invalidate all sessions for that user.
-        // The IdP-provided `sub` is a raw string, so we parse it into a
-        // typed UserId. If parsing fails (e.g., the IdP issues a sub that
-        // does not satisfy our UserId validation rules), reject the
-        // request; better to fail visibly than to silently no-op a
-        // logout.
-        if let Some(ref sub) = claims.sub {
-            match crate::authn::ids::UserId::try_new(sub.as_str()) {
-                Ok(uid) => handler.registry.invalidate_user(&uid).await,
-                Err(e) => {
-                    tracing::warn!(
-                        iss = %claims.iss,
-                        sub = %sub,
-                        error = %e,
-                        "back-channel logout: provider sub is not a valid UserId; rejecting"
-                    );
-                    return Err(StatusCode::BAD_REQUEST);
-                }
-            }
-        }
-
         // If `sid` is present, invalidate the specific session mapped to this
-        // OIDC session ID. This handles the case where only `sid` (no `sub`) is
-        // sent, or when the IdP wants to invalidate a single session without
-        // affecting others. Look up by `(issuer, sid)`; `sid` alone is not
-        // unique across providers.
+        // OIDC session ID. Look up by `(issuer, sid)`; `sid` alone is not
+        // unique across providers. This runs first so a `sub` that this
+        // application cannot use never prevents the `sid` logout.
         if let Some(ref sid) = claims.sid {
             let key: SidKey = (claims.iss.clone(), sid.clone());
             if let Some((_, (user_id, session_id, _inserted_at))) = handler.sid_map.remove(&key) {
@@ -297,6 +275,38 @@ impl BackChannelLogoutHandler {
                     sid = %sid,
                     "back-channel logout: sid not found in sid map and no sub to fall back to"
                 );
+            }
+        }
+
+        // If `sub` is present, invalidate all sessions of that user, but
+        // only a user who signed in through THIS issuer: the sid map records
+        // `(issuer, sid) -> user` for every OIDC login, so a user with no
+        // entry under `claims.iss` was not authenticated by it, and an IdP
+        // must not be able to log out users it never authenticated. A `sub`
+        // that is not a local user id (for example a numeric subject) names
+        // nobody here and is skipped, not an error: the IdP's request has
+        // been handled and `sid` handling above has already run.
+        if let Some(ref sub) = claims.sub {
+            match crate::authn::ids::UserId::try_new(sub.as_str()) {
+                Ok(uid) if handler.issuer_authenticated(&claims.iss, &uid) => {
+                    handler.registry.invalidate_user(&uid).await;
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        iss = %claims.iss,
+                        sub = %sub,
+                        "back-channel logout: no session of this user was established \
+                         through this issuer; ignoring sub"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        iss = %claims.iss,
+                        sub = %sub,
+                        error = %e,
+                        "back-channel logout: sub is not a local user id; ignoring sub"
+                    );
+                }
             }
         }
 
@@ -414,10 +424,17 @@ impl BackChannelLogoutHandler {
             return Err(StatusCode::BAD_REQUEST);
         }
 
+        // OIDC Back-Channel Logout 1.0 §2.4 makes `jti` REQUIRED. Without it
+        // the token cannot be replay-protected, so refuse it.
         let jti = payload
             .get("jti")
             .and_then(|v| v.as_str())
+            .filter(|j| !j.is_empty())
             .map(|s| s.to_string());
+        if jti.is_none() {
+            tracing::warn!("back-channel logout: missing jti claim");
+            return Err(StatusCode::BAD_REQUEST);
+        }
 
         Ok(LogoutTokenClaims {
             sub,
@@ -427,11 +444,18 @@ impl BackChannelLogoutHandler {
         })
     }
 
+    /// Whether `user` holds a session mapping recorded under `issuer`.
+    fn issuer_authenticated(&self, issuer: &str, user: &crate::authn::ids::UserId) -> bool {
+        self.sid_map
+            .iter()
+            .any(|e| e.key().0 == issuer && e.value().0 == *user)
+    }
+
     /// Record this `(issuer, jti)` as seen. Returns `true` if this is the
     /// first time we have seen the pair (caller may proceed). Returns
     /// `false` if the pair was already in the cache (caller should reject
-    /// as a replay). Tokens without a `jti` claim are not replay-protected;
-    /// the IAT window is the only mitigation in that case.
+    /// as a replay). Tokens without a `jti` never reach this point:
+    /// `validate_logout_token` refuses them.
     ///
     /// Eviction:
     /// - Entries older than [`MAX_IAT_AGE_SECS`] are pruned on each call.

@@ -27,7 +27,7 @@ use axess::authn::{FactorKind, LoginOutcome, TenantId, UserId};
 use axess::device::{
     CachedDeviceStore, DefaultFingerprintExtractor, DeviceLifecycleService, DeviceResolver,
     DeviceStore, DeviceTrustLevel, LifecycleDeviceResolver, NoopDeviceEventSink, StepUpPolicy,
-    TenantPepperResolver, decide_step_up,
+    TenantPepperResolver, decide_step_up_for_user,
 };
 use axess::session::SessionCrypto;
 use axess::{
@@ -295,7 +295,7 @@ async fn list_devices(
 /// [`StepUpPolicy`], and surface the decision in a shape that mirrors
 /// what an application would substitute for a
 /// [`LoginOutcome::FactorRequired`] coming back from
-/// `AuthnService::begin_login`. When `decide_step_up` returns
+/// `AuthnService::begin_login`. When `decide_step_up_for_user` returns
 /// `Some(factors)`, the application emits
 /// `LoginOutcome::StepUpRequired { device_id, allowed_factors: factors }`
 /// instead of the standard `FactorRequired`.
@@ -344,7 +344,7 @@ async fn step_up_check(
         }
     };
     let policy = StepUpPolicy::default();
-    match decide_step_up(&device, &policy) {
+    match decide_step_up_for_user(&device, &DEMO_USER, &policy) {
         Some(allowed_factors) => {
             // This is the substitution the application's login handler
             // would make on top of `begin_login`'s result. Constructed

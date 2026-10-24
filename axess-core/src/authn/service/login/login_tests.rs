@@ -270,13 +270,10 @@ async fn begin_login_rejects_empty_tenant_identifier() {
 
 /// Kills line 575 `-> Ok(None)`: when the user EXISTS, the
 /// helper must surface `Some(user)`. The mutation always returns
-/// `None`, which collapses `begin_login` to
-/// `Ok(LoginOutcome::InvalidCredentials)` via the user-not-found
-/// arm (line 109). With the original body and a configured user
-/// (but no factor methods registered), `begin_login` continues
-/// past the lookup and fails at the no-methods gate (line 166)
-/// with `Err(AuthnError::NoFlow)`: observably distinct from the
-/// `InvalidCredentials` produced by the mutation.
+/// `None`, which collapses `begin_login` to the user-not-found arm.
+/// With the original body and a configured user (but no factor
+/// methods registered), `begin_login` continues past the lookup and
+/// stops at the no-methods gate, which writes a different audit row.
 #[tokio::test]
 async fn begin_login_finds_existing_user_via_timing_equalized_path() {
     let user_id = fixture_user_id();
@@ -288,6 +285,7 @@ async fn begin_login_finds_existing_user_via_timing_equalized_path() {
         .with_user(build_user(&user_id, &tenant_id, user_identifier))
         .with_lockout_policy(LockoutPolicy::default());
 
+    let observer = identity.clone();
     let service = build_service_with_identity(identity);
     let session = make_session();
 
@@ -295,17 +293,18 @@ async fn begin_login_finds_existing_user_via_timing_equalized_path() {
         .begin_login(user_identifier, tenant_identifier, &session)
         .await;
 
-    // With the mutation: result is Ok(InvalidCredentials).
-    // With the original: result is Err(NoFlow) (no methods
-    // registered for this user).
+    // A user with no methods answers like an unknown one on the wire
+    // (`InvalidCredentials`), so the two are told apart by the audit row:
+    // the real user reaches the no-methods gate, the mutation does not.
     assert!(
-        !matches!(result, Ok(LoginOutcome::InvalidCredentials)),
-        "real user must NOT collapse to InvalidCredentials; \
-             `find_user → Ok(None)` mutation would invert this. got: {result:?}"
+        matches!(result, Ok(LoginOutcome::InvalidCredentials)),
+        "no methods must not be distinguishable by outcome. got: {result:?}"
     );
-    assert!(
-        matches!(result, Err(AuthnError::NoFlow)),
-        "with no methods registered, begin_login must reach the \
-             NoFlow gate past the user-lookup. got: {result:?}"
+    let events = observer.events();
+    let last = events.last().expect("an audit row for the refusal");
+    assert_eq!(
+        last.error,
+        Some(crate::authn::event::AuthFailureReason::NoFactorsConfigured),
+        "the real user must reach the no-methods gate past the user-lookup"
     );
 }

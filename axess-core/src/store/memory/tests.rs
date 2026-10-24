@@ -224,3 +224,41 @@ async fn default_clock_is_system_clock() {
     let drift = (now_via_std - now_via_clock).num_seconds().abs();
     assert!(drift < 5, "SystemClock drift {drift}s exceeds tolerance");
 }
+
+/// Pruning while other threads insert must report what it removed, not the
+/// difference of two length readings (which underflows when the map grew).
+#[test]
+fn prune_count_survives_concurrent_inserts() {
+    let (s, clock) = store_with_clock();
+    for i in 0..200 {
+        s.inner.insert(
+            format!("seed-{i}"),
+            super::Entry {
+                value: 1,
+                expires_at: anchor() + chrono::Duration::seconds(1),
+            },
+        );
+    }
+    clock.advance(chrono::Duration::seconds(10));
+    let writer = {
+        let s = s.clone();
+        std::thread::spawn(move || {
+            for i in 0..20_000 {
+                s.inner.insert(
+                    format!("live-{i}"),
+                    super::Entry {
+                        value: 2,
+                        expires_at: anchor() + chrono::Duration::days(1),
+                    },
+                );
+            }
+        })
+    };
+    let mut removed = 0;
+    while !writer.is_finished() {
+        removed += s.prune_expired_sync();
+    }
+    writer.join().unwrap();
+    removed += s.prune_expired_sync();
+    assert_eq!(removed, 200, "exactly the expired seeds are reported");
+}

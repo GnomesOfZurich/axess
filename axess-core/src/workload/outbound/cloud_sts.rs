@@ -44,3 +44,21 @@ pub mod aws;
 pub mod azure;
 #[cfg(feature = "gcp-wif")]
 pub mod gcp;
+
+/// Percent-encode `raw` for use as a single URL path segment: only
+/// unreserved characters and `@` pass through, so `/`, `?`, `#`, `%`
+/// and `:` in an adopter-supplied tenant or account name stay inside
+/// the segment.
+#[cfg(any(feature = "azure-fic", feature = "gcp-wif"))]
+fn encode_path_segment(raw: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len());
+    for b in raw.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'@') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}

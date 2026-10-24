@@ -44,6 +44,15 @@ pub fn spawn_jwks_refresh(
     provider: Arc<dyn OAuthProvider>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
+    // `tokio::time::interval` panics on a zero period, which inside the
+    // spawned task would kill the refresh loop silently. Fall back to the
+    // JWKS debounce window instead.
+    let interval = if interval.is_zero() {
+        tracing::warn!("spawn_jwks_refresh: zero interval; using the 60 s default");
+        crate::oidc::MIN_JWKS_REFRESH_INTERVAL
+    } else {
+        interval
+    };
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         // Skip the immediate first tick; discovery just ran, JWKS is fresh.

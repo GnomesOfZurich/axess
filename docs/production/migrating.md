@@ -9,11 +9,100 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.9.0 to 0.10.0
+
+The compile errors come first; the behaviour changes after them are the
+ones nothing will point you at.
+
+### `not all trait items implemented, missing: insert_factor_if_absent`
+
+`FactorStore` needs one more method. It must be atomic: insert the row if no
+row of that kind exists at that scope, and say whether it did.
+
+```rust,ignore
+async fn insert_factor_if_absent(
+    &self,
+    scope: &AuthnScope,
+    config: FactorConfig,
+) -> Result<bool, Self::Error> {
+    let res = sqlx::query(
+        "INSERT INTO factor_configs (...) VALUES (...)
+         ON CONFLICT(user_id, tenant_id, kind) DO NOTHING",
+    )
+    // ...binds...
+    .execute(&self.pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+```
+
+The library uses the `false` answer as a replay signal for one-time codes:
+two parallel first uses of an inherited factor race on this insert, and the
+loser is refused. A store that answers `true` twice reopens that replay.
+
+### `missing field authn_time in initializer of RefreshToken`
+
+`RefreshToken` carries `authn_time: Option<DateTime<Utc>>`, the time of the
+original sign-in, which rotation copies forward. Add a nullable column, write
+it on store and read it back; `None` for rows that predate the column, which
+the library reads as `issued_at`. The sqlite example's migration
+`20261024000000_refresh_token_authn_time.sql` shows the shape. A store that
+does not persist it degrades towards a later `authn_time`, which weakens
+"recent login" and step-up checks.
+
+### Logins that are now refused or answered differently
+
+- **`logout` ends only the current session.** Call
+  `invalidate_user_sessions` where you meant "everywhere".
+- **`begin_login` answers `InvalidCredentials`** for a user with no methods
+  and for a suspended or terminated tenant, where it returned `NoFlow` or
+  `NotActive`. A suspended user still receives `Locked` or `NotActive`.
+- **A timed suspension ends on its own** once its `until` has passed, at
+  login, impersonation, password reset, passkey registration and OAuth
+  completion. Impersonation and password reset refuse an inactive account;
+  the refused reset does not spend its token.
+- **Tenant-scoped OAuth login refuses a user resolved into another tenant**
+  with `CrossTenant`. It was meant to; it did not.
+- **A plain-HTTP `jwks_uri`** outside loopback is refused on fetch and refresh,
+  and an error response no longer replaces cached keys.
+- **An ID or logout token whose `azp` names another client is refused**, even
+  when `aud` lists only yours.
+- **Back-channel logout** requires `jti`; a `sub` logs out only users who
+  signed in through the sending issuer with a `sid`.
+
+### Devices, passkeys and rate limits
+
+- **A device owned by another user is never reused.** Where your code
+  resolves the device before the user is known, call
+  `decide_step_up_for_user(&device, &user_id, &policy)`; `decide_step_up`
+  remains and ignores ownership. The default device resolver supplies no
+  user, so supply one, or the rule cannot apply.
+- **`KeyExtractor::Header` keys only within an authenticated identity.**
+  Install the rate-limit layer after authentication and set
+  `RateLimitUserId`, or key on `UserId`; without an identity the peer
+  address is used.
+- **`PiiToken::parse`** accepts only `pii:` plus a hyphenated lowercase UUID.
+  Re-emit tokens stored in another spelling.
+
+### Identity types
+
+- **`Issuer::custom`** refuses `cli`, `jwt_svid`, `mtls` and `oauth`.
+- **`Issuer::Custom` serializes** as `{"kind":"custom","label":"..."}`; it
+  failed at runtime before, so no stored data changes.
+- **`WorkloadId` and `TrustDomain`** are validated when deserialized, and
+  SPIFFE paths reject `.` and `..`. A stored value that was never valid now
+  fails to load.
+
+### What is not a break
+
+Sessions, stored factors and refresh tokens from 0.9.0 load unchanged once
+the `authn_time` column exists. Nothing needs draining before upgrading.
+
 ## 0.8.1 to 0.9.0
 
-A security release. Three signatures changed and the MSRV moved to
-1.95.0; the rest are behaviour changes, listed after the compile errors
-because nothing will point you at them.
+Three signatures changed and the MSRV moved to 1.95.0; the rest are
+behaviour changes, listed after the compile errors because nothing will
+point you at them.
 
 ### `mismatched types: expected RotationOutcome, found ()`
 
@@ -257,7 +346,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.9", features = ["request-id"] }
+axess = { version = "0.10", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

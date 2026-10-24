@@ -19,8 +19,8 @@ impl RefreshTokenStore for OurBackend {
         sqlx::query(
             "INSERT INTO refresh_tokens
                  (id, user_id, tenant_id, token_hash, family_id, device_id,
-                  device_info, issued_at, expires_at, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  device_info, issued_at, expires_at, revoked, authn_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(token.id.to_string())
         .bind(token.user_id.to_string())
@@ -32,6 +32,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(token.issued_at.to_rfc3339())
         .bind(token.expires_at.to_rfc3339())
         .bind(i64::from(token.revoked))
+        .bind(token.authn_time.map(|t| t.to_rfc3339()))
         .execute(self.pool())
         .await?;
         Ok(())
@@ -40,7 +41,7 @@ impl RefreshTokenStore for OurBackend {
     async fn find_token(&self, token_hash: &str) -> Result<Option<RefreshToken>, Self::Error> {
         let row = sqlx::query(
             "SELECT id, user_id, tenant_id, token_hash, family_id, device_id,
-                    device_info, issued_at, expires_at, revoked
+                    device_info, issued_at, expires_at, revoked, authn_time
                FROM refresh_tokens
               WHERE token_hash = ?1",
         )
@@ -91,7 +92,7 @@ impl RefreshTokenStore for OurBackend {
     async fn active_tokens(&self, user_id: &UserId) -> Result<Vec<RefreshToken>, Self::Error> {
         let rows = sqlx::query(
             "SELECT id, user_id, tenant_id, token_hash, family_id, device_id,
-                    device_info, issued_at, expires_at, revoked
+                    device_info, issued_at, expires_at, revoked, authn_time
                FROM refresh_tokens
               WHERE user_id = ?1 AND revoked = 0
               ORDER BY issued_at ASC",
@@ -131,8 +132,8 @@ impl RefreshTokenStore for OurBackend {
         sqlx::query(
             "INSERT INTO refresh_tokens
                  (id, user_id, tenant_id, token_hash, family_id, device_id,
-                  device_info, issued_at, expires_at, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  device_info, issued_at, expires_at, revoked, authn_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(new_token.id.to_string())
         .bind(new_token.user_id.to_string())
@@ -144,6 +145,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(new_token.issued_at.to_rfc3339())
         .bind(new_token.expires_at.to_rfc3339())
         .bind(i64::from(new_token.revoked))
+        .bind(new_token.authn_time.map(|t| t.to_rfc3339()))
         .execute(&mut *tx)
         .await?;
 
@@ -175,8 +177,8 @@ impl RefreshTokenStore for OurBackend {
         sqlx::query(
             "INSERT INTO refresh_tokens
                  (id, user_id, tenant_id, token_hash, family_id, device_id,
-                  device_info, issued_at, expires_at, revoked)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  device_info, issued_at, expires_at, revoked, authn_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(new_token.id.to_string())
         .bind(new_token.user_id.to_string())
@@ -188,6 +190,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(new_token.issued_at.to_rfc3339())
         .bind(new_token.expires_at.to_rfc3339())
         .bind(i64::from(new_token.revoked))
+        .bind(new_token.authn_time.map(|t| t.to_rfc3339()))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -209,6 +212,7 @@ fn refresh_token_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) -> R
     let issued_at: String = row.get("issued_at");
     let expires_at: String = row.get("expires_at");
     let revoked: i64 = row.get("revoked");
+    let authn_time: Option<String> = row.get("authn_time");
 
     RefreshToken {
         id: RefreshTokenId::try_new(&id).expect("refresh_tokens.id must be a valid RefreshTokenId"),
@@ -225,5 +229,6 @@ fn refresh_token_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) -> R
         device_id: device_id
             .as_deref()
             .map(|s| DeviceId::try_new(s).expect("refresh_tokens.device_id invalid")),
+        authn_time: authn_time.as_deref().map(|t| parse_db_datetime(clock, t)),
     }
 }

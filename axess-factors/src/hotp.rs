@@ -58,8 +58,8 @@ pub struct HotpConfig {
     #[serde(default)]
     pub attempt_count: u8,
     /// Maximum failed attempts before the counter is burned. RFC 4226
-    /// §7.4 RECOMMENDS T ≤ 10. Default: 5. Set to 0 to disable
-    /// (not recommended).
+    /// §7.4 RECOMMENDS T ≤ 10. Default: 5. A value of 0 is
+    /// treated as the default, never as "no limit".
     #[serde(default = "default_max_hotp_attempts")]
     pub max_attempts: u8,
 }

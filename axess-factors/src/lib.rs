@@ -170,7 +170,9 @@ pub use bearer::{
 };
 
 #[cfg(feature = "outbound-oauth")]
-pub use outbound_oauth_client::{ClientAuthMethod, OAuthClientError, OutboundOAuthClient};
+pub use outbound_oauth_client::{
+    ClientAuthMethod, OAuthClientError, OutboundOAuthClient, basic_credentials, expiry_after,
+};
 
 #[cfg(any(feature = "totp", feature = "hotp"))]
 pub use otp_algorithm::OtpAlgorithm;

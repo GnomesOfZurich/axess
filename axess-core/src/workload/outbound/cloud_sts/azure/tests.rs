@@ -194,3 +194,39 @@ async fn malformed_success_body_surfaces_as_malformed_response() {
         .expect_err("non-JSON success body must reject");
     assert!(matches!(err, AzureFicError::MalformedResponse(_)));
 }
+
+#[test]
+fn request_debug_redacts_federated_token() {
+    let req = AzureFicRequest::new("SECRET-JWT").with_scope("s");
+    let shown = format!("{req:?}");
+    assert!(!shown.contains("SECRET-JWT"), "{shown}");
+}
+
+#[test]
+fn tenant_is_confined_to_one_path_segment() {
+    let client = AzureFicClient::new("evil/../x?y#z@host", "app-id");
+    assert_eq!(
+        client.token_endpoint().host_str(),
+        Some("login.microsoftonline.com")
+    );
+    assert_eq!(client.token_endpoint().query(), None);
+    assert_eq!(client.token_endpoint().fragment(), None);
+    assert!(
+        client
+            .token_endpoint()
+            .path()
+            .starts_with("/evil%2F..%2Fx%3Fy%23z@host/oauth2/v2.0/token"),
+        "{}",
+        client.token_endpoint()
+    );
+    for dots in [".", ".."] {
+        let client = AzureFicClient::new(dots, "app-id");
+        let segments: Vec<_> = client.token_endpoint().path_segments().unwrap().collect();
+        assert_eq!(segments.len(), 4, "{}", client.token_endpoint());
+        assert!(
+            segments[0].starts_with("%25"),
+            "{}",
+            client.token_endpoint()
+        );
+    }
+}

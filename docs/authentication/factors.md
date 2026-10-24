@@ -300,7 +300,10 @@ is a free function over a `Device` and a `StepUpPolicy`, returning
 `Some(factors)` when the device's trust level calls for them and `None`
 when it does not. `StepUpPolicy` is a factor list per `DeviceTrustLevel`:
 `unknown` and `seen` demand factors by default, `trusted` and
-`revoked` demand none. `begin_login` surfaces the answer as
+`revoked` demand none. When the device was found before the user was
+known, use `decide_step_up_for_user`, which treats a device owned by a
+different user as `Unknown`, so trust earned by one person never
+carries over to another. `begin_login` surfaces the answer as
 `LoginOutcome::StepUpRequired { device_id, allowed_factors }`.
 
 Driving the session back into `Authenticating` with that list is the

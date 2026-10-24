@@ -270,12 +270,7 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
-        let status = self
-            .inner
-            .identity
-            .account_status(&user.id)
-            .await
-            .map_err(AuthnError::Store)?;
+        let status = self.current_account_status(&user.id).await?;
         if !status.allows_login() {
             // Emit an audit row so a registration attempt from a suspended
             // user leaves SOC visibility. A lockout carries `Locked`, the
@@ -309,6 +304,8 @@ where
             tenant_id: user.tenant_id,
             user_id: user.id,
         };
+        // A failed read must not look like "no passkeys yet": the exclude
+        // list would be empty and the user could register a duplicate.
         let existing = match self
             .inner
             .factors
@@ -316,7 +313,8 @@ where
             .await
         {
             Ok(Some(FactorConfig::Fido2(cfg))) => cfg.credentials,
-            _ => vec![],
+            Ok(_) => vec![],
+            Err(e) => return Err(AuthnError::Store(e)),
         };
 
         let (user_unique_id, new_id) = match user.webauthn_id {
@@ -396,6 +394,8 @@ where
             tenant_id: user.tenant_id,
             user_id: user.id,
         };
+        // A failed read must abort: saving the list as just the new
+        // passkey would overwrite every passkey the user already has.
         let mut credentials = match self
             .inner
             .factors
@@ -403,7 +403,8 @@ where
             .await
         {
             Ok(Some(FactorConfig::Fido2(cfg))) => cfg.credentials,
-            _ => vec![],
+            Ok(_) => vec![],
+            Err(e) => return Err(AuthnError::Store(e)),
         };
         credentials.push(crate::authn::factor::Fido2Credential::new(
             passkey,
@@ -459,12 +460,7 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
-        let status = self
-            .inner
-            .identity
-            .account_status(&user.id)
-            .await
-            .map_err(AuthnError::Store)?;
+        let status = self.current_account_status(&user.id).await?;
         if !status.allows_login() {
             self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
                 .await;

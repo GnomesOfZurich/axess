@@ -304,6 +304,22 @@ mod authz_tests {
     }
 
     #[tokio::test]
+    async fn require_authz_path_param_escape_does_not_decode_into_another_resource() {
+        let app = build_app("alice");
+        // `doc-\u{31}` would parse as `doc-1` if the id were spliced into
+        // UID text; as an opaque id it is a different, unpermitted resource.
+        let (status, _) = call_protected(app, "/docs/doc-%5Cu%7B31%7D").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn require_authz_quote_in_path_param_is_denied_not_an_error() {
+        let app = build_app("alice");
+        let (status, _) = call_protected(app, "/docs/x%22%20or%20%22").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn require_authz_returns_401_for_unauthenticated() {
         let app = build_app("alice");
         // Skip the /login step → no session cookie → should 401.

@@ -378,3 +378,59 @@ async fn session_surfaces_refresh_rejected_on_invalid_grant() {
         "expected RefreshRejected, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn complete_grant_form_encodes_basic_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Basic YXhlc3MtY2xpZW50LWlkOmElM0FiJTI1YyUyQmQ=",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "tok",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = DelegatedProvider::new(
+        "test-provider",
+        Url::parse(&format!("{}/oauth2/authorize", server.uri())).unwrap(),
+        Url::parse(&format!("{}/oauth2/token", server.uri())).unwrap(),
+        "axess-client-id",
+        "a:b%c+d",
+        Url::parse("https://gnomes.local/callback").unwrap(),
+    );
+    let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+    complete_grant(&provider, &ctx, "c", &ctx.state, &reqwest::Client::new())
+        .await
+        .expect("secret with reserved characters reaches the IdP intact");
+}
+
+#[tokio::test]
+async fn complete_grant_refuses_out_of_range_expires_in() {
+    for body in [
+        r#"{"access_token":"t","expires_in":10000000000000000}"#,
+        r#"{"access_token":"t","expires_in":18446744073709551615}"#,
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+            .mount(&server)
+            .await;
+        let provider = build_provider(&server.uri());
+        let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+        let err = complete_grant(&provider, &ctx, "c", &ctx.state, &reqwest::Client::new())
+            .await
+            .expect_err("out-of-range lifetime is refused, not a panic or an expired token");
+        assert!(
+            matches!(
+                err,
+                crate::delegated::error::DelegatedError::MalformedResponse(_)
+            ),
+            "got {err:?}"
+        );
+    }
+}

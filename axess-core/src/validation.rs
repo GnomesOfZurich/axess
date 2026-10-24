@@ -32,7 +32,9 @@ pub fn is_valid_password(
     require_digit: bool,
     require_special: bool,
 ) -> bool {
-    if password.len() < min_length {
+    // Characters, not UTF-8 bytes: a 5-character password of 2-byte
+    // letters must not satisfy a minimum of 8.
+    if password.chars().count() < min_length {
         return false;
     }
     if require_upper && !password.chars().any(|c| c.is_ascii_uppercase()) {

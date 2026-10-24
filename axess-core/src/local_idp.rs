@@ -255,8 +255,7 @@ impl LocalIdpKeyStore for MemoryLocalIdpKeyStore {
 
 // ── LocalIdp ─────────────────────────────────────────────────────────────────
 
-/// Discovery fields the document derives itself; `with_metadata_field` refuses them.
-const RESERVED_METADATA_FIELDS: [&str; 2] = ["issuer", "jwks_uri"];
+use discovery::RESERVED_METADATA_FIELDS;
 
 /// Production-grade in-process IdP.
 ///
@@ -356,9 +355,10 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
 
     /// Append an adopter-extension field to the discovery document.
     /// `name` is the JSON key; `value` is any `serde_json::Value`.
-    /// Multiple calls accumulate; later calls do not overwrite earlier
-    /// keys (the JSON output preserves both; adopters should not
-    /// repeat keys). Use for fields RFC 8414 / OIDC Core define but
+    /// Multiple calls accumulate. A name the document derives itself
+    /// (`issuer`, `jwks_uri`, `id_token_signing_alg_values_supported`) or a
+    /// name already added is refused: the call is ignored with a warning and
+    /// the first value stays. Use for fields RFC 8414 / OIDC Core define but
     /// that `LocalIdp` does not auto-populate (e.g. `scopes_supported`,
     /// `claims_supported`, `subject_types_supported`, FAPI-specific
     /// fields).
@@ -373,6 +373,10 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         // repoint relying parties and is not accepted.
         if RESERVED_METADATA_FIELDS.contains(&name.as_str()) {
             tracing::warn!(field = %name, "with_metadata_field ignored a reserved discovery field");
+            return self;
+        }
+        if self.extra_metadata.iter().any(|(n, _)| *n == name) {
+            tracing::warn!(field = %name, "with_metadata_field ignored a duplicate field");
             return self;
         }
         self.extra_metadata.push((name, value));

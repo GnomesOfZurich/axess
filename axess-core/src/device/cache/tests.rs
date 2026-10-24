@@ -156,7 +156,7 @@ async fn record_sighting_does_not_invalidate() {
 }
 
 #[tokio::test]
-async fn find_by_fingerprint_primes_by_id_cache() {
+async fn find_by_fingerprint_does_not_prime_by_id_cache() {
     let inner = MemoryDeviceStore::new();
     let (t, u, d) = ids();
     let device = build_device(&t, &u, &d);
@@ -164,8 +164,6 @@ async fn find_by_fingerprint_primes_by_id_cache() {
     inner.save(&device).await.unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
-    // Cold fingerprint lookup; pass-through to inner, then primes
-    // the by-id cache.
     drop(
         cached
             .find_by_fingerprint(&t, &fp)
@@ -174,13 +172,10 @@ async fn find_by_fingerprint_primes_by_id_cache() {
             .expect("device found by fingerprint"),
     );
 
-    // Subsequent load hits cache (no second storage round-trip).
+    // The row read by fingerprint may be stale by the time it would be
+    // stored, so the next load goes to storage.
     drop(cached.load(&t, &d).await.unwrap());
-    let stats = cached.stats();
-    assert_eq!(
-        stats.hits, 1,
-        "find_by_fingerprint must prime the by-id cache so load is warm"
-    );
+    assert_eq!(cached.stats().hits, 0, "find_by_fingerprint must not prime");
 }
 
 /// Pin: refresh-family cascade revocation propagates through the

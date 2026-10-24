@@ -75,9 +75,9 @@
 /// this extractor automatically; it doesn't conflict with handler-side
 /// `Path<T>` extractors because they share the same parsed path data.
 ///
-/// Unknown placeholders (no matching path param) are left literal,
-/// causing `EntityUid::from_str` to fail and the macro to return 500;
-/// fail-loud rather than evaluating Cedar against a malformed UID.
+/// Unknown placeholders (no matching path param) make the macro return 500;
+/// fail-loud rather than evaluating Cedar against a malformed UID. Substituted
+/// values are opaque ids: quotes, backslashes and `\u{..}` escapes stay data.
 #[macro_export]
 macro_rules! require_authz {
     // PD-073: `$namespace` is `:expr` rather than `:literal` so consuming
@@ -93,7 +93,6 @@ macro_rules! require_authz {
              auth_session: $crate::AuthSession,
              req: $crate::axum::extract::Request,
              next: $crate::axum::middleware::Next| async move {
-                use ::std::str::FromStr;
                 use ::std::sync::Arc;
                 use $crate::axum::response::IntoResponse;
 
@@ -140,56 +139,23 @@ macro_rules! require_authz {
                     }
                 };
 
-                // 3. Substitute path params in resource template.
-                let resource_str = $crate::__macro_support::interpolate_path_params(
-                    $resource, &path_params.0
-                );
-
-                // 4. Build EntityUids. The format strings are namespaced.
-                let principal_uid = format!(
-                    "{}::User::\"{}\"", $namespace, user_id
-                );
-                let action_uid = format!(
-                    "{}::Action::\"{}\"", $namespace, $action
-                );
-                // Resource template is "TypeName:id"; we wrap the id half in quotes.
-                let (resource_type, resource_id) = match resource_str.split_once(':') {
-                    ::std::option::Option::Some(parts) => parts,
-                    ::std::option::Option::None => {
-                        $crate::tracing::error!(
-                            macro_name = "require_authz!",
-                            resource_template = $resource,
-                            resolved = %resource_str,
-                            "resource must be 'TypeName:id' shape"
-                        );
-                        return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                let resource_uid = format!(
-                    "{}::{}::\"{}\"", $namespace, resource_type, resource_id
-                );
-
-                let principal = match $crate::__cedar::EntityUid::from_str(&principal_uid) {
-                    ::std::result::Result::Ok(u) => u,
-                    ::std::result::Result::Err(e) => {
-                        $crate::tracing::error!(uid = %principal_uid, ?e, "invalid principal UID");
-                        return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                let action_uid_parsed = match $crate::__cedar::EntityUid::from_str(&action_uid) {
-                    ::std::result::Result::Ok(u) => u,
-                    ::std::result::Result::Err(e) => {
-                        $crate::tracing::error!(uid = %action_uid, ?e, "invalid action UID");
-                        return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-                let resource = match $crate::__cedar::EntityUid::from_str(&resource_uid) {
-                    ::std::result::Result::Ok(u) => u,
-                    ::std::result::Result::Err(e) => {
-                        $crate::tracing::error!(uid = %resource_uid, ?e, "invalid resource UID");
-                        return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
+                // 3. Build EntityUids. Ids are opaque strings, never re-parsed
+                //    from formatted text, so request data cannot inject syntax.
+                let (principal, action_uid_parsed, resource) =
+                    match $crate::__macro_support::build_uids(
+                        $namespace, $action, $resource, &path_params.0, &user_id,
+                    ) {
+                        ::std::result::Result::Ok(uids) => uids,
+                        ::std::result::Result::Err(e) => {
+                            $crate::tracing::error!(
+                                macro_name = "require_authz!",
+                                resource_template = $resource,
+                                ?e,
+                                "invalid Cedar UID"
+                            );
+                            return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                        }
+                    };
 
                 // 5. Build entities via the provider (cache-aware via decorator chain).
                 //    The provider receives `&auth_session` so it can read

@@ -62,16 +62,27 @@ pub fn aud_contains(payload: &serde_json::Value, client_id: &str) -> bool {
 /// log our users out at will (or, in adjacent flows, escalate). Returns
 /// `true` when:
 ///
-/// * `aud` is a single string (no `azp` requirement), OR
-/// * `aud` is an array AND `azp == client_id`.
+/// * `azp` is absent and `aud` is a single value, OR
+/// * `azp == client_id`.
 ///
-/// Returns `false` (reject) when `aud` is an array and `azp` is missing
-/// or mismatched.
+/// Returns `false` (reject) when `azp` is present and is not the client,
+/// whatever `aud` holds, or when `aud` is an array with several values and
+/// `azp` is missing.
 pub fn azp_satisfied(payload: &serde_json::Value, client_id: &str) -> bool {
+    // A present `azp` must be the expected client whatever `aud` holds: a
+    // token authorised for another party is not ours even when it names
+    // only us in `aud`. A non-string `azp` is malformed and refused.
+    if let Some(azp) = payload.get("azp")
+        && azp.as_str() != Some(client_id)
+    {
+        return false;
+    }
     match payload.get("aud") {
-        Some(serde_json::Value::Array(arr)) if arr.len() > 1 => {
-            payload.get("azp").and_then(|v| v.as_str()) == Some(client_id)
-        }
+        // Multi-valued `aud` requires `azp` to be present (and, by the
+        // check above, equal to client_id).
+        Some(serde_json::Value::Array(arr)) if arr.len() > 1 => payload.get("azp").is_some(),
+        // Single-valued `aud`: `azp` may be absent, already pinned by the
+        // `aud` check.
         _ => true,
     }
 }
@@ -230,5 +241,22 @@ mod tests {
             !azp_satisfied(&mismatched, "this-client"),
             "multi-element aud with non-matching azp must reject (OIDC Core §2)"
         );
+    }
+
+    /// A present `azp` that is not the expected client is refused even when
+    /// `aud` holds a single value naming us.
+    #[test]
+    fn azp_satisfied_rejects_foreign_azp_with_single_aud() {
+        for aud in [
+            serde_json::json!("this-client"),
+            serde_json::json!(["this-client"]),
+        ] {
+            let payload = serde_json::json!({ "aud": aud, "azp": "other-rp" });
+            assert!(!azp_satisfied(&payload, "this-client"));
+        }
+        let non_string = serde_json::json!({ "aud": "this-client", "azp": 7 });
+        assert!(!azp_satisfied(&non_string, "this-client"));
+        let matching = serde_json::json!({ "aud": "this-client", "azp": "this-client" });
+        assert!(azp_satisfied(&matching, "this-client"));
     }
 }

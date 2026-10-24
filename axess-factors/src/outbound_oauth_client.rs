@@ -226,6 +226,31 @@ pub struct OutboundOAuthClient {
     http_client: reqwest::Client,
 }
 
+/// Base64 payload of an HTTP Basic `client_secret_basic` credential.
+///
+/// RFC 6749 §2.3.1: the client id and secret are form-urlencoded before
+/// they are joined with `:` and base64-encoded, so a secret carrying
+/// `:`, `+` or `%` reaches a strict IdP intact. Use as
+/// `format!("Basic {}", basic_credentials(id, secret))`.
+#[must_use]
+pub fn basic_credentials(client_id: &str, client_secret: &str) -> String {
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+    B64_STANDARD.encode(format!("{}:{}", enc(client_id), enc(client_secret)))
+}
+
+/// `now + secs`, or `None` when the lifetime does not fit a timestamp.
+///
+/// An IdP-supplied `expires_in` is untrusted: a huge value must be
+/// refused rather than panic or wrap into the past.
+#[must_use]
+pub fn expiry_after(
+    now: chrono::DateTime<chrono::Utc>,
+    secs: u64,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let secs = i64::try_from(secs).ok()?;
+    now.checked_add_signed(chrono::Duration::try_seconds(secs)?)
+}
+
 impl OutboundOAuthClient {
     /// Construct a new outbound OAuth client.
     ///
@@ -345,14 +370,7 @@ impl OutboundOAuthClient {
                 client_id,
                 client_secret,
             } => {
-                // RFC 6749 §2.3.1: id and secret are form-urlencoded before
-                // they are joined and base64-encoded, so a secret carrying
-                // `:`, `+` or `%` reaches a strict IdP intact.
-                let enc = |s: &str| {
-                    url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>()
-                };
-                let creds = format!("{}:{}", enc(client_id), enc(client_secret));
-                let encoded = B64_STANDARD.encode(creds);
+                let encoded = basic_credentials(client_id, client_secret);
                 request = request.header(AUTHORIZATION, format!("Basic {encoded}"));
             }
             ClientAuthMethod::ClientSecretPost {
@@ -405,7 +423,11 @@ impl OutboundOAuthClient {
         // token as a 1-hour bearer (industry convention). Refresh
         // before that anyway via `refresh_threshold`.
         let lifetime_secs = parsed.expires_in.unwrap_or(3600).max(1);
-        let expires_at = self.clock.now() + chrono::Duration::seconds(lifetime_secs as i64);
+        let expires_at = expiry_after(self.clock.now(), lifetime_secs).ok_or_else(|| {
+            OAuthClientError::MalformedResponse(format!(
+                "expires_in {lifetime_secs} is out of range"
+            ))
+        })?;
 
         // Move the String into the ZeroizedString wrapper so the
         // sole heap allocation gets zeroized when the cached entry

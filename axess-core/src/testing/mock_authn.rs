@@ -403,6 +403,11 @@ pub struct MockFactorStore {
     /// exercise the retry/reload path inside
     /// `persist_fail_with_update`.
     cas_failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of upcoming `load_factor` calls that report no row even
+    /// when one exists: a read that happened before a concurrent first
+    /// write landed. Unit-test only.
+    #[cfg(test)]
+    blind_loads_remaining: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockFactorStore {
@@ -413,6 +418,14 @@ impl MockFactorStore {
 
     fn config_key(scope: &AuthnScope, kind: &FactorKind) -> String {
         format!("{}::{}", scope.key(), kind.as_str())
+    }
+
+    /// The next `n` `load_factor` calls report no row, as a read that
+    /// raced ahead of a concurrent first write would.
+    #[cfg(test)]
+    pub(crate) fn arm_blind_loads(&self, n: usize) {
+        self.blind_loads_remaining
+            .store(n, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Register a factor configuration for a given scope.
@@ -467,6 +480,15 @@ impl FactorStore for MockFactorStore {
         scope: &AuthnScope,
         kind: FactorKind,
     ) -> Result<Option<FactorConfig>, Self::Error> {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            let left = self.blind_loads_remaining.load(Ordering::SeqCst);
+            if left > 0 {
+                self.blind_loads_remaining.store(left - 1, Ordering::SeqCst);
+                return Ok(None);
+            }
+        }
         let key = Self::config_key(scope, &kind);
         Ok(self.configs.get(&key).map(|r| r.clone()))
     }
@@ -515,6 +537,21 @@ impl FactorStore for MockFactorStore {
             }
         });
         Ok(swapped)
+    }
+
+    async fn insert_factor_if_absent(
+        &self,
+        scope: &AuthnScope,
+        config: FactorConfig,
+    ) -> Result<bool, Self::Error> {
+        let key = Self::config_key(scope, &config.kind());
+        match self.configs.entry(key) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(config);
+                Ok(true)
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+        }
     }
 
     async fn available_methods(

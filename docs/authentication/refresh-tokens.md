@@ -49,10 +49,19 @@ pub struct RefreshToken {
     pub device_info: Option<String>,
     pub family_id: Option<TokenFamilyId>,
     pub device_id: Option<DeviceId>,
+    pub authn_time: Option<DateTime<Utc>>,
 }
 ```
 
-Three fields are worth dwelling on.
+Four fields are worth dwelling on.
+
+`authn_time` is when the user last proved who they are. Rotation mints
+a new token on every refresh, so `issued_at` keeps moving forward while
+the person has not signed in again. The session a refresh produces
+carries `authn_time` (or `issued_at` when it is `None`, as it is for a
+token issued at login), so a 29-day-old refresh chain does not pass a
+"recent login" or step-up freshness check. Rotation copies the value from
+parent to child; a store must persist it.
 
 `token_hash` is the SHA-256 hash of the token string, not the string
 itself. The plaintext token is generated when the token is issued

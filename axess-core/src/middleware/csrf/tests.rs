@@ -1043,3 +1043,77 @@ async fn csrf_token_for_fresh_guest_survives_session_finalize() {
              response cookie a different session id than the token was bound to"
     );
 }
+
+/// A form rendered right after the session id changed must embed a token the
+/// next POST can use. The cookie the browser still holds is bound to the old
+/// id; handing it to the handler would make the first submit 403. The handler
+/// is shown a fresh token bound to the current id instead, and that same token
+/// is what the response sets as the cookie.
+#[tokio::test]
+async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
+    use axum::http::{Method, Request};
+    use std::convert::Infallible;
+    use tower::{Layer, ServiceExt, service_fn};
+
+    let echo_token = service_fn(|req: Request<Body>| async move {
+        let token = req
+            .extensions()
+            .get::<CsrfToken>()
+            .map(|t| t.0.clone())
+            .unwrap_or_default();
+        Ok::<_, Infallible>(
+            Response::builder()
+                .status(200)
+                .body(Body::from(token))
+                .unwrap(),
+        )
+    });
+
+    let key = [31u8; 32];
+    let config = CsrfConfig::new(key);
+    let service = CsrfLayer::new(config.clone()).layer(echo_token);
+
+    let handle = session_handle(5);
+    let stale_token = mint_token(b"the-session-before-it-changed", &key);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/form")
+        .header("cookie", format!("{}={}", config.cookie_name, stale_token))
+        .extension(handle.clone())
+        .body(Body::empty())
+        .unwrap();
+    let resp = service.oneshot(req).await.unwrap();
+    let set_cookie = resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("a stale cookie is replaced")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cookie_value = set_cookie
+        .split('=')
+        .nth(1)
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let embedded = String::from_utf8(body.to_vec()).unwrap();
+
+    let sid = handle.0.read().await.id;
+    assert_ne!(
+        embedded, stale_token,
+        "the stale cookie must not reach the form"
+    );
+    assert!(
+        validate_token(&embedded, sid.as_bytes(), &key),
+        "the token embedded in the form must verify against the current session id"
+    );
+    assert_eq!(
+        embedded, cookie_value,
+        "form token and replacement cookie must agree"
+    );
+}

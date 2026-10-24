@@ -212,9 +212,7 @@ impl AuthzEntityProvider for MockEntityProvider {
     // impl is compatible with that in Rust 2024 (RPIT in trait desugaring).
 
     fn resource_uid(&self, id: &String) -> Result<EntityUid, AuthzError> {
-        use std::str::FromStr;
-        EntityUid::from_str(&format!(r#"{}::Resource::"{id}""#, self.namespace))
-            .map_err(|e| AuthzError::InvalidEntityUid(format!("Resource/{id}: {e:?}")))
+        crate::authz::make_entity_uid(&self.namespace, "Resource", id)
     }
 
     fn validate_schema(&self, schema: &cedar_policy::Schema) -> Result<(), AuthzError> {

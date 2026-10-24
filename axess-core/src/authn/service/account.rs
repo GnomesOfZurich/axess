@@ -38,6 +38,44 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
+    /// The user's account status as of the injected clock's now.
+    ///
+    /// Reads the store's status and applies
+    /// [`EntityState::effective_at`](crate::authn::types::EntityState::effective_at),
+    /// so a suspension whose `until` has passed no longer blocks, and no
+    /// store has to run a job to lift it. Every login-time status decision
+    /// goes through here rather than calling the store directly.
+    pub(crate) async fn current_account_status(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+    ) -> Result<crate::authn::types::EntityState, AuthnError<I::Error>> {
+        let status = self
+            .inner
+            .identity
+            .account_status(user_id)
+            .await
+            .map_err(AuthnError::Store)?;
+        Ok(status.effective_at(self.inner.clock.now()))
+    }
+
+    /// Undo an authentication whose audit row could not be written.
+    ///
+    /// The flow fails when the audit store is down, but by then the session
+    /// is already authenticated and registered. Returning the error alone
+    /// would leave a live session behind a failed login, so end it: drop the
+    /// registry entry and wipe the session state.
+    pub(crate) async fn end_session_after_audit_failure(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        session: &AuthSession,
+    ) {
+        let sid = session.session_id().await;
+        if let Some(reg) = &self.inner.registry {
+            reg.invalidate_session(user_id, &sid).await;
+        }
+        session.clear().await;
+    }
+
     /// Shared post-factor-success logic: check if all factors are complete,
     /// and if so, reset the failed-attempt counter, register in the session
     /// registry, and emit an Authenticated audit event.
@@ -108,7 +146,7 @@ where
                 // initial status check (in `verify_factor`) and the register
                 // above; without this re-check, the just-registered session
                 // would survive the suspension as if the suspend never happened.
-                match self.inner.identity.account_status(user_id).await {
+                match self.current_account_status(user_id).await {
                     Ok(status) if !status.allows_login() => {
                         tracing::warn!(
                             user_id = %user_id,
@@ -141,7 +179,7 @@ where
                         );
                         reg.invalidate_session(user_id, &sid).await;
                         session.clear().await;
-                        return Err(AuthnError::Store(e));
+                        return Err(e);
                     }
                 }
             }
@@ -168,7 +206,10 @@ where
             for kind in &factors_completed {
                 event_builder = event_builder.with_factors_completed(kind.clone());
             }
-            self.emit_audit(event_builder).await?;
+            if let Err(e) = self.emit_audit(event_builder).await {
+                self.end_session_after_audit_failure(user_id, session).await;
+                return Err(e);
+            }
 
             // Record last login time for compliance/audit.
             if let Err(e) = self

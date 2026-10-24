@@ -189,14 +189,21 @@ where
             return Err(AuthnError::NoFlow);
         }
 
-        // Record audit event.
-        self.emit_audit_at(
-            AuthEventBuilder::success(AuthEventType::SignupCompleted)
-                .attributed_to(&user_id, &tenant_id)
-                .with_session(sid),
-            now,
-        )
-        .await?;
+        // Record audit event. A signup that cannot be recorded does not
+        // leave an authenticated session behind.
+        if let Err(e) = self
+            .emit_audit_at(
+                AuthEventBuilder::success(AuthEventType::SignupCompleted)
+                    .attributed_to(&user_id, &tenant_id)
+                    .with_session(sid),
+                now,
+            )
+            .await
+        {
+            self.end_session_after_audit_failure(&user_id, session)
+                .await;
+            return Err(e);
+        }
 
         Ok(())
     }

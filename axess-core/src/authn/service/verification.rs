@@ -5,6 +5,23 @@ use crate::authn::factor::{
 };
 use axess_rng::SecureRng;
 
+/// Attempt limit applied when a config carries `max_attempts = 0`.
+///
+/// Zero used to switch the limit off. A zero reaches a config through a
+/// missing field in stored JSON, a partial migration or a careless admin
+/// form, and "no limit" is the worst thing any of those should silently
+/// mean, so zero now means the default.
+pub(crate) const DEFAULT_MAX_OTP_ATTEMPTS: u8 = 5;
+
+/// The attempt limit in force for a configured `max_attempts`.
+pub(crate) fn effective_max_attempts(configured: u8) -> u8 {
+    if configured == 0 {
+        DEFAULT_MAX_OTP_ATTEMPTS
+    } else {
+        configured
+    }
+}
+
 /// Compute the next HOTP config state after a failed verification.
 ///
 /// Mirror of [`apply_email_otp_failure`] for HOTP. If the prior
@@ -15,7 +32,7 @@ pub(crate) fn apply_hotp_failure(
     prior: &crate::authn::factor::HotpConfig,
 ) -> crate::authn::factor::HotpConfig {
     let mut next = prior.clone();
-    if prior.max_attempts > 0 && prior.attempt_count >= prior.max_attempts {
+    if prior.attempt_count >= effective_max_attempts(prior.max_attempts) {
         next.counter = prior
             .counter
             .saturating_add(prior.lookahead_window as u64 + 1);
@@ -37,7 +54,7 @@ pub(crate) fn apply_hotp_failure(
 /// burn/increment policy.
 pub(crate) fn apply_email_otp_failure(prior: &EmailOtpConfig) -> EmailOtpConfig {
     let mut next = prior.clone();
-    if prior.max_attempts > 0 && prior.attempt_count >= prior.max_attempts {
+    if prior.attempt_count >= effective_max_attempts(prior.max_attempts) {
         next.pending_hash = None;
         next.pending_until = None;
         next.attempt_count = 0;
@@ -139,7 +156,7 @@ pub(crate) fn verify_credential(
             // (advance the counter past it) and fail. The user must
             // re-sync their token (typically by pressing it once and
             // re-enrolling, or by an admin counter reset).
-            if cfg.max_attempts > 0 && cfg.attempt_count >= cfg.max_attempts {
+            if cfg.attempt_count >= effective_max_attempts(cfg.max_attempts) {
                 let mut burned = cfg.clone();
                 burned.counter = cfg.counter.saturating_add(cfg.lookahead_window as u64 + 1);
                 burned.attempt_count = 0;
@@ -203,13 +220,16 @@ pub(crate) fn verify_credential(
             };
 
             // Check expiry using the injected clock time.
-            if cfg.pending_until.is_some_and(|until| now > until) {
-                return VerifyOutcome::Fail;
+            // A code with no expiry is never valid: refuse rather than
+            // accept a code that would live forever.
+            match cfg.pending_until {
+                Some(until) if now <= until => {}
+                _ => return VerifyOutcome::Fail,
             }
 
             // Enforce per-code attempt limit; burn the code after max_attempts
             // failed verifications to prevent brute-force within the TTL window.
-            if cfg.max_attempts > 0 && cfg.attempt_count >= cfg.max_attempts {
+            if cfg.attempt_count >= effective_max_attempts(cfg.max_attempts) {
                 tracing::warn!("email OTP attempt limit exceeded, burning code");
                 let mut burned = cfg.clone();
                 burned.pending_hash = None;
@@ -282,7 +302,22 @@ pub(crate) fn verify_credential(
 ///
 /// Returns a zero-padded decimal string (e.g. `"042817"` for length 6).
 pub(crate) fn generate_otp_code(rng: &impl SecureRng, length: usize) -> String {
-    let modulus = 10u64.pow(length as u32);
+    // A u64 holds at most 19 decimal digits, so longer codes are built from
+    // chunks of up to 18; each chunk is drawn uniformly on its own.
+    const CHUNK: usize = 18;
+    let mut code = String::with_capacity(length);
+    let mut remaining = length;
+    while remaining > 0 {
+        let width = remaining.min(CHUNK);
+        code.push_str(&random_digits(rng, width));
+        remaining -= width;
+    }
+    code
+}
+
+/// `width` (1..=18) uniformly random decimal digits, zero padded.
+fn random_digits(rng: &impl SecureRng, width: usize) -> String {
+    let modulus = 10u64.pow(width as u32);
     // Rejection sampling to eliminate modulo bias: discard values from the
     // partial final bucket that would skew the distribution.
     let max_fair = u64::MAX - (u64::MAX % modulus);
@@ -291,7 +326,7 @@ pub(crate) fn generate_otp_code(rng: &impl SecureRng, length: usize) -> String {
         rng.fill_bytes(&mut bytes);
         let value = u64::from_le_bytes(bytes);
         if value < max_fair {
-            return format!("{:0>width$}", value % modulus, width = length);
+            return format!("{:0>width$}", value % modulus, width = width);
         }
         // Extremely rare (~5.4e-14 probability per iteration for 6-digit codes).
     }

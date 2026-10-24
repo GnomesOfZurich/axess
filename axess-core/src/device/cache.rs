@@ -19,16 +19,19 @@
 //! - **Not cached**:
 //!   - [`find_by_fingerprint`](DeviceStore::find_by_fingerprint):
 //!     cold path during first sighting before a `device_id` cookie
-//!     exists. Calling it primes the by-id cache on success so the
-//!     next `load` for the same device hits warm.
+//!     exists. It does not prime the by-id cache: a row read here can
+//!     be overtaken by a revocation before it is stored, and a stale
+//!     `Trusted` row must never be put back.
 //!   - [`find_for_user`](DeviceStore::find_for_user): list with
 //!     varying cardinality; harder to invalidate correctly when one
 //!     of the user's devices changes. Pass-through.
 //!   - [`save`](DeviceStore::save) /
 //!     [`set_trust_level`](DeviceStore::set_trust_level) /
-//!     [`delete`](DeviceStore::delete): invalidate the key, then
-//!     pass through. Trust transitions and revocations MUST be
-//!     immediately visible.
+//!     [`delete`](DeviceStore::delete): write to storage, then
+//!     invalidate the key. Invalidating after the write (and not
+//!     before) means a load that read the old row while the write was
+//!     in flight cannot leave it cached. Trust transitions and
+//!     revocations MUST be immediately visible.
 //!   - [`record_sighting`](DeviceStore::record_sighting): the only
 //!     mutation we deliberately do **not** invalidate on. It moves
 //!     `last_seen_at` forward by milliseconds; the cache showing a
@@ -37,9 +40,9 @@
 //!     `record_sighting` runs on every request the device appears in.
 //!     Read [`CachedDeviceStore::record_sighting`] for the full
 //!     reasoning.
-//!   - [`sweep`](DeviceStore::sweep): operates on storage; the cache
-//!     catches up via TTL or explicit invalidation by callers that
-//!     also call `set_trust_level` / `delete` on the swept rows.
+//!   - [`sweep`](DeviceStore::sweep): operates on storage; every
+//!     cached row of the swept tenant is dropped afterwards, because
+//!     the sweep demotes, revokes and purges rows the cache cannot see.
 //!
 //! # DST guarantees
 //!
@@ -98,6 +101,9 @@ where
 {
     inner: S,
     cache: Arc<ClockTtlCache<CacheKey, Device>>,
+    capacity: NonZeroUsize,
+    ttl: Duration,
+    clock: Arc<dyn Clock>,
 }
 
 impl<S> Clone for CachedDeviceStore<S>
@@ -108,6 +114,9 @@ where
         Self {
             inner: self.inner.clone(),
             cache: self.cache.clone(),
+            capacity: self.capacity,
+            ttl: self.ttl,
+            clock: self.clock.clone(),
         }
     }
 }
@@ -130,49 +139,46 @@ where
     /// Construct with explicit cache parameters.
     pub fn with_options(inner: S, capacity: usize, ttl: Duration, clock: Arc<dyn Clock>) -> Self {
         let capacity = NonZeroUsize::new(capacity.max(1)).expect("capacity >= 1");
-        let cache = Arc::new(ClockTtlCache::new(capacity, ttl, clock));
-        Self { inner, cache }
+        let cache = Arc::new(ClockTtlCache::new(capacity, ttl, clock.clone()));
+        Self {
+            inner,
+            cache,
+            capacity,
+            ttl,
+            clock,
+        }
     }
 
-    /// Builder: override the cache capacity (default 10,000).
-    pub fn with_capacity(mut self, capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity >= 1");
-        // Rebuild the cache with the new capacity. Anything currently
-        // cached is dropped; acceptable on the construction path
-        // (callers should set capacity before serving traffic).
-        let ttl = Duration::from_secs(DEFAULT_TTL_SECS);
+    /// Rebuild the cache from the current settings. Anything cached is
+    /// dropped; the builders below run before the store serves traffic.
+    fn rebuilt(mut self) -> Self {
         self.cache = Arc::new(ClockTtlCache::new(
-            cap,
-            ttl,
-            Arc::new(SystemClock) as Arc<dyn Clock>,
+            self.capacity,
+            self.ttl,
+            self.clock.clone(),
         ));
         self
     }
 
-    /// Builder: override the cache TTL (default 60 s).
-    pub fn with_ttl(self, ttl: Duration) -> Self {
-        let cap = self.cache.capacity();
-        let cache = Arc::new(ClockTtlCache::new(
-            cap,
-            ttl,
-            Arc::new(SystemClock) as Arc<dyn Clock>,
-        ));
-        Self {
-            inner: self.inner,
-            cache,
-        }
+    /// Builder: override the cache capacity (default 10,000). Keeps the
+    /// TTL and clock set so far.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = NonZeroUsize::new(capacity.max(1)).expect("capacity >= 1");
+        self.rebuilt()
+    }
+
+    /// Builder: override the cache TTL (default 60 s). Keeps the
+    /// capacity and clock set so far.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self.rebuilt()
     }
 
     /// Builder: inject a [`Clock`] for deterministic-simulation testing.
-    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
-        let cap = self.cache.capacity();
-        // Preserve TTL when only swapping the clock.
-        let ttl = Duration::from_secs(DEFAULT_TTL_SECS);
-        let cache = Arc::new(ClockTtlCache::new(cap, ttl, clock));
-        Self {
-            inner: self.inner,
-            cache,
-        }
+    /// Keeps the capacity and TTL set so far.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self.rebuilt()
     }
 
     /// Snapshot of the underlying cache counters
@@ -212,20 +218,25 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            // Cache hit; return immediately, never touch storage.
-            if let Some(d) = cache.get(&key) {
-                return Ok(Some(d));
+            // Single-flight through the cache: a concurrent write that
+            // invalidates the key removes this in-flight load, so a row
+            // read before a revocation is never promoted into the cache
+            // after it. `None` results are not cached: a deleted device
+            // should immediately reflect any subsequent re-creation.
+            let loaded = cache
+                .get_or_try_insert_with(key, || async {
+                    match inner.load(&tenant, &device).await {
+                        Ok(Some(d)) => Ok(d),
+                        Ok(None) => Err(None),
+                        Err(e) => Err(Some(e)),
+                    }
+                })
+                .await;
+            match loaded {
+                Ok(d) => Ok(Some(d)),
+                Err(None) => Ok(None),
+                Err(Some(e)) => Err(e),
             }
-            // Cache miss; fall through to inner, populate on Some.
-            // (None results are not cached: a deleted device should
-            // immediately reflect any subsequent re-creation, and the
-            // miss rate of "asking for a non-existent device" is
-            // expected to be vanishingly low in practice.)
-            let result = inner.load(&tenant, &device).await?;
-            if let Some(ref d) = result {
-                cache.insert(key, d.clone());
-            }
-            Ok(result)
         }
     }
 
@@ -234,19 +245,10 @@ where
         tenant_id: &TenantId,
         hash: &FingerprintHash,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
-        let cache = self.cache.clone();
-        let inner = self.inner.clone();
-        let tenant = *tenant_id;
-        let hash = *hash;
-        async move {
-            let result = inner.find_by_fingerprint(&tenant, &hash).await?;
-            // Prime the by-id cache so the next per-request `load`
-            // for the same device is warm.
-            if let Some(ref d) = result {
-                cache.insert((tenant, d.id), d.clone());
-            }
-            Ok(result)
-        }
+        // Pass-through, deliberately not priming the by-id cache: the
+        // row read here may be overtaken by a revocation before it
+        // could be stored, and a stale row must never be re-cached.
+        self.inner.find_by_fingerprint(tenant_id, hash)
     }
 
     fn find_for_user(
@@ -278,18 +280,13 @@ where
         let inner = self.inner.clone();
         let device = device.clone();
         async move {
-            // Invalidate first so a concurrent `load` after this
-            // returns either the new value (via inner) or nothing;
-            // never the stale cached row. ClockTtlCache's
-            // invalidate-wins-during-load semantics close the rest
-            // of the race.
+            // Write first, then invalidate: a load that read the old
+            // row while the write was in flight is dropped by the
+            // invalidation instead of staying cached. The invalidation
+            // runs on failure too, since the stored row is then unknown.
+            let result = inner.save(&device).await;
             cache.invalidate(&key);
-            inner.save(&device).await?;
-            // Re-prime with the just-saved value so the next load is
-            // warm. This is an optimisation, not correctness; the
-            // load-on-miss path would also populate.
-            cache.insert(key, device);
-            Ok(())
+            result
         }
     }
 
@@ -326,8 +323,9 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
+            let result = inner.set_trust_level(&tenant, &device, level, now).await;
             cache.invalidate(&key);
-            inner.set_trust_level(&tenant, &device, level, now).await
+            result
         }
     }
 
@@ -342,8 +340,9 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
+            let result = inner.delete(&tenant, &device).await;
             cache.invalidate(&key);
-            inner.delete(&tenant, &device).await
+            result
         }
     }
 
@@ -352,13 +351,22 @@ where
         tenant_id: &TenantId,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
-        // Sweep operates on storage. The cache catches up via TTL,
-        // and any caller that explicitly drives a `delete` /
-        // `set_trust_level` after observing a sweep result will
-        // correctly invalidate via those paths.
-        self.inner.sweep(tenant_id, now)
+        // The sweep demotes, revokes and purges rows the cache cannot
+        // see, so drop the tenant's cached rows once it has run, also
+        // when it failed part-way.
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let tenant = *tenant_id;
+        async move {
+            let result = inner.sweep(&tenant, now).await;
+            cache.invalidate_by(|k| k.0 == tenant);
+            result
+        }
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod races;

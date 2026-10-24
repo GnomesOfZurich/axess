@@ -102,14 +102,19 @@ impl PiiToken {
     /// the type. Does NOT validate that the token resolves; that's a
     /// store-side concern.
     pub fn is_well_formed(s: &str) -> bool {
+        // Only the canonical hyphenated lowercase spelling: `Uuid::parse_str`
+        // also takes braced, URN, hyphenless and uppercase forms, which are
+        // the same UUID under a different string and would name a second
+        // key for one mapping.
         s.strip_prefix("pii:")
-            .and_then(|rest| Uuid::parse_str(rest).ok())
-            .is_some()
+            .and_then(|rest| Uuid::parse_str(rest).ok().map(|u| (u, rest)))
+            .is_some_and(|(u, rest)| u.hyphenated().to_string() == rest)
     }
 
     /// Parse a wire string into a [`PiiToken`]. Returns `None` for any
     /// shape that wouldn't round-trip through [`Self::new`] (missing
-    /// `pii:` prefix, non-UUID body).
+    /// `pii:` prefix, non-UUID body, or a UUID spelled other than hyphenated
+    /// lowercase).
     pub fn parse(s: &str) -> Option<Self> {
         if Self::is_well_formed(s) {
             Some(Self(Arc::from(s)))

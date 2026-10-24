@@ -187,6 +187,22 @@ where
         token: &str,
         new_password: &str,
     ) -> Result<bool, AuthnError<I::Error>> {
+        // A suspended or terminated account cannot have its password
+        // replaced by a reset link: the reset would hand its credentials to
+        // whoever holds the link while the account is barred. Refused before
+        // the token is read, so the token is not spent and works once the
+        // account is active again. The answer is the same `Ok(false)` as a
+        // bad token.
+        let status = self.current_account_status(user_id).await?;
+        if !status.allows_login() {
+            tracing::warn!(
+                user_id = %user_id,
+                status = ?status,
+                "password reset refused: account is not active"
+            );
+            return Ok(false);
+        }
+
         if !self.verify_reset_token_hash(user_id, token).await? {
             return Ok(false);
         }
@@ -222,11 +238,25 @@ where
             .await
             .map_err(AuthnError::Store)?
         {
-            self.inner
+            // Every change records the hash it installs, so the replaced
+            // hash is normally already the newest entry. Record it only
+            // when it is not (the first change of an account that had no
+            // history), or each hash would count twice and a check over the
+            // last N passwords would cover about N/2.
+            let old_hash: &str = &old_config.hash;
+            let latest = self
+                .inner
                 .identity
-                .record_password_hash(user_id, &old_config.hash)
+                .password_history(user_id, 1)
                 .await
                 .map_err(AuthnError::Store)?;
+            if latest.first().map(String::as_str) != Some(old_hash) {
+                self.inner
+                    .identity
+                    .record_password_hash(user_id, old_hash)
+                    .await
+                    .map_err(AuthnError::Store)?;
+            }
         }
 
         let rules = self

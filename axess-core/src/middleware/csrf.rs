@@ -450,15 +450,30 @@ where
             // session id. A token can only be minted when a session id
             // is present to bind it to; without one we leave the client
             // tokenless rather than issue an unbound token.
-            let provisional_mint = match (&cookie_token, session_id.as_ref()) {
-                (Some(existing), _) if !existing.is_empty() => None,
-                (_, Some(sid_at_entry)) => {
+            //
+            // A presented cookie that does not verify against the session id
+            // at entry (left over from before the id changed) is not handed
+            // to the handler: embedding it would render a form whose first
+            // submit is refused. It is treated as absent here, so the handler
+            // sees a fresh token bound to the current id, and the same token
+            // goes out as the replacement cookie. Validation of a
+            // state-changing request is unchanged and has already run.
+            let usable_cookie = cookie_token.as_deref().filter(|c| {
+                !c.is_empty()
+                    && session_id
+                        .as_ref()
+                        .is_none_or(|sid| validate_token(c, sid.as_bytes(), &config.signing_key))
+            });
+            let provisional_mint = match (usable_cookie, session_id.as_ref()) {
+                (Some(_), _) => None,
+                (None, Some(sid_at_entry)) => {
                     Some(mint_token(sid_at_entry.as_bytes(), &config.signing_key))
                 }
-                (_, None) => None,
+                (None, None) => None,
             };
             let extension_token = provisional_mint
                 .clone()
+                .or_else(|| usable_cookie.map(str::to_owned))
                 .or_else(|| cookie_token.clone())
                 .unwrap_or_default();
             req.extensions_mut().insert(CsrfToken(extension_token));

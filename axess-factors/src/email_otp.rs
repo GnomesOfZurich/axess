@@ -32,7 +32,8 @@ pub struct EmailOtpConfig {
     #[serde(default)]
     pub attempt_count: u8,
     /// Maximum failed verification attempts before the pending code is burned.
-    /// Default: 5. Set to 0 to disable (not recommended).
+    /// Default: 5. A value of 0 is treated as
+    /// the default, never as "no limit".
     #[serde(default = "default_max_email_otp_attempts")]
     pub max_attempts: u8,
 }

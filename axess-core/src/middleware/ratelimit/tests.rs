@@ -235,34 +235,74 @@ async fn evict_expired_removes_stale_buckets() {
     assert!(store.buckets.contains_key("fresh"));
 }
 
-#[tokio::test]
-async fn header_key_extractor() {
+fn header_request(user: Option<&str>, key: &str) -> Request<Body> {
+    let mut req = Request::new(Body::empty());
+    req.headers_mut()
+        .insert("x-api-key", HeaderValue::from_str(key).unwrap());
+    req.extensions_mut()
+        .insert(std::net::SocketAddr::from(([203, 0, 113, 9], 4000)));
+    if let Some(u) = user {
+        req.extensions_mut()
+            .insert(RateLimitUserId(u.parse().unwrap()));
+    }
+    req
+}
+
+const USER_A: &str = "00000000-0000-4000-8000-00000000000a";
+const USER_B: &str = "00000000-0000-4000-8000-00000000000b";
+
+fn header_service() -> RateLimitService<OkService> {
     let config = RateLimitConfig::builder()
         .max_requests(1)
         .window(Duration::from_secs(60))
         .key(KeyExtractor::Header("x-api-key".into()))
         .build();
-    let svc = RateLimitLayer::new(config).layer(OkService);
+    RateLimitLayer::new(config).layer(OkService)
+}
 
-    let mut req = Request::new(Body::empty());
-    req.headers_mut()
-        .insert("x-api-key", HeaderValue::from_static("key-a"));
-    let res = ServiceExt::oneshot(svc.clone(), req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+#[tokio::test]
+async fn header_key_subdivides_an_authenticated_identity() {
+    let svc = header_service();
+    let status = |req| {
+        let svc = svc.clone();
+        async move { ServiceExt::oneshot(svc, req).await.unwrap().status() }
+    };
+    assert_eq!(
+        status(header_request(Some(USER_A), "key-a")).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status(header_request(Some(USER_A), "key-a")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        status(header_request(Some(USER_A), "key-b")).await,
+        StatusCode::OK
+    );
+    // Another user's identical header value is another bucket.
+    assert_eq!(
+        status(header_request(Some(USER_B), "key-a")).await,
+        StatusCode::OK
+    );
+}
 
-    // Same key, should be limited.
-    let mut req = Request::new(Body::empty());
-    req.headers_mut()
-        .insert("x-api-key", HeaderValue::from_static("key-a"));
-    let res = ServiceExt::oneshot(svc.clone(), req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    // Different key, should pass.
-    let mut req = Request::new(Body::empty());
-    req.headers_mut()
-        .insert("x-api-key", HeaderValue::from_static("key-b"));
-    let res = ServiceExt::oneshot(svc.clone(), req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+#[tokio::test]
+async fn rotating_header_values_without_identity_share_the_peer_bucket() {
+    let svc = header_service();
+    let first = ServiceExt::oneshot(svc.clone(), header_request(None, "v1"))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    for v in ["v2", "v3", "v4"] {
+        let res = ServiceExt::oneshot(svc.clone(), header_request(None, v))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a new header value must not buy a new bucket"
+        );
+    }
 }
 
 #[tokio::test]
@@ -569,11 +609,7 @@ async fn forged_forwarded_headers_share_one_bucket() {
 #[test]
 fn header_key_and_ip_fallback_do_not_collide() {
     let extractor = KeyExtractor::Header("x-api-key".to_string());
-    let with_header = Request::builder()
-        .uri("/")
-        .header("x-api-key", "10.0.0.5")
-        .body(Body::empty())
-        .unwrap();
+    let with_header = header_request(Some(USER_A), "10.0.0.5");
     let from_ip = make_request_with_ip("10.0.0.5");
     let a = extract_key(&with_header, &extractor);
     let b = extract_key(&from_ip, &extractor);

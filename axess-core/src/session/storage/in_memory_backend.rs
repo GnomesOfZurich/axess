@@ -277,6 +277,14 @@ impl FactorStore for InMemoryBackend {
             .await
     }
 
+    async fn insert_factor_if_absent(
+        &self,
+        scope: &AuthnScope,
+        config: FactorConfig,
+    ) -> Result<bool, Self::Error> {
+        self.factors.insert_factor_if_absent(scope, config).await
+    }
+
     async fn available_methods(
         &self,
         user_id: &UserId,

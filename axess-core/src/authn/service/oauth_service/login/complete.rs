@@ -133,7 +133,15 @@ where
         // as an Authenticated OAuth session. Without this check, an
         // invalidate that ran when no session was registered yet
         // would be effectively undone by a subsequent register.
-        match self.inner.identity.account_status(&user.id).await {
+        // `effective_at(now)` ends a timed suspension whose `until` has passed,
+        // the same reading every login-time status decision uses.
+        let status = self
+            .inner
+            .identity
+            .account_status(&user.id)
+            .await
+            .map(|status| status.effective_at(self.inner.clock.now()));
+        match status {
             Ok(status) if !status.allows_login() => {
                 tracing::warn!(
                     user_id = %user.id,
@@ -331,8 +339,12 @@ where
         // Both refuse before mutating session state so a
         // bypass attempt never produces a partially-completed login.
         self.verify_oauth_claim_lock(user, claims, session).await?;
-        self.enforce_oauth_expected_tenant(user, claims, session)
-            .await?;
+        let tenant_check = self
+            .enforce_oauth_expected_tenant(user, claims, session)
+            .await;
+        // The binding is single-use: gone whether the check passed or not.
+        super::state::remove_expected_tenant(session).await;
+        tenant_check?;
 
         let now = self.inner.clock.now();
         session

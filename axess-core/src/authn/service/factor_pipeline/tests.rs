@@ -32,7 +32,7 @@ use crate::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 use std::sync::Arc;
 
 // ── Fixture helpers (local; these compose differently than the
@@ -210,7 +210,8 @@ async fn enforce_account_status_returns_ok_for_active() {
 
 #[tokio::test]
 async fn enforce_account_status_locked_with_until_passes_through_until_and_emits_audit() {
-    let until = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+    // In the future: a suspension whose `until` has passed is over.
+    let until = Utc::now() + chrono::Duration::days(1);
     let detail = StatusDetail {
         reason: "policy".into(),
         since: Utc::now(),
@@ -704,7 +705,12 @@ async fn persist_pass_with_update_inserts_when_no_user_scope_row() {
 
     let updated = hotp_config(8); // post-verification counter advance
     let saved = service
-        .persist_pass_with_update(&fixture_scope(), FactorKind::Hotp, updated)
+        .persist_pass_with_update(
+            &fixture_scope(),
+            &hotp_config(7),
+            &AuthnScope::Tenant(tid("t1")),
+            updated,
+        )
         .await
         .unwrap();
 
@@ -729,7 +735,12 @@ async fn persist_pass_with_update_cas_succeeds_when_prior_matches() {
     let (service, _, factors_inspector) = build_service_with_factors(user, factors);
 
     let saved = service
-        .persist_pass_with_update(&fixture_scope(), FactorKind::Hotp, hotp_config(6))
+        .persist_pass_with_update(
+            &fixture_scope(),
+            &hotp_config(5),
+            &fixture_scope(),
+            hotp_config(6),
+        )
         .await
         .unwrap();
     assert!(saved);
@@ -759,7 +770,12 @@ async fn persist_pass_with_update_cas_loss_returns_false_as_replay_signal() {
     factors_inspector.arm_cas_failures(1);
 
     let saved = service
-        .persist_pass_with_update(&fixture_scope(), FactorKind::Hotp, hotp_config(6))
+        .persist_pass_with_update(
+            &fixture_scope(),
+            &hotp_config(5),
+            &fixture_scope(),
+            hotp_config(6),
+        )
         .await
         .unwrap();
     assert!(
@@ -809,4 +825,103 @@ async fn authenticating_state_returns_none_for_authenticated_session() {
         session.authenticating_state().await.is_none(),
         "Authenticated sessions are no longer mid-flow; must yield None"
     );
+}
+
+// ── concurrent first use and replay ─────────────────────────────────────
+
+fn hotp_counter(c: &FactorConfig) -> u64 {
+    let FactorConfig::Hotp(h) = c else {
+        panic!("expected Hotp")
+    };
+    h.counter
+}
+
+#[tokio::test]
+async fn parallel_pass_against_user_row_accepts_only_one() {
+    // Two requests verified the same code against the same stored
+    // config (counter 5). The first saves counter 6; the second still
+    // expects the value it verified against and must lose.
+    let user = user_with_status(EntityState::Active);
+    let factors = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
+    let (service, _, _) = build_service_with_factors(user, factors);
+    let verified = hotp_config(5);
+
+    let first = service
+        .persist_pass_with_update(
+            &fixture_scope(),
+            &verified,
+            &fixture_scope(),
+            hotp_config(6),
+        )
+        .await
+        .unwrap();
+    let second = service
+        .persist_pass_with_update(
+            &fixture_scope(),
+            &verified,
+            &fixture_scope(),
+            hotp_config(6),
+        )
+        .await
+        .unwrap();
+    assert!(first);
+    assert!(!second, "the replayed code must be rejected");
+}
+
+#[tokio::test]
+async fn parallel_pass_against_inherited_config_accepts_only_one() {
+    // No user row: both requests verified against the tenant template.
+    let user = user_with_status(EntityState::Active);
+    let (service, _, factors) = build_service_with_factors(user, MockFactorStore::new());
+    let tenant = AuthnScope::Tenant(tid("t1"));
+    let verified = hotp_config(5);
+
+    let first = service
+        .persist_pass_with_update(&fixture_scope(), &verified, &tenant, hotp_config(6))
+        .await
+        .unwrap();
+    let second = service
+        .persist_pass_with_update(&fixture_scope(), &verified, &tenant, hotp_config(6))
+        .await
+        .unwrap();
+    assert!(first);
+    assert!(!second, "the second first-use write must lose");
+    let stored = factors
+        .load_factor(&fixture_scope(), FactorKind::Hotp)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hotp_counter(&stored), 6);
+}
+
+#[tokio::test]
+async fn parallel_first_failures_are_all_counted() {
+    // A concurrent request already recorded the first failure (count
+    // 1), but this request's read ran before that write landed, so it
+    // sees no row and computed count 1 from the inherited template.
+    // Its failure must still be added: count 2, not 1.
+    let user = user_with_status(EntityState::Active);
+    let factors =
+        MockFactorStore::new().with_factor(fixture_scope(), hotp_config_with_attempts(0, 1));
+    let (service, _, inspector) = build_service_with_factors(user, factors);
+    inspector.arm_blind_loads(1);
+
+    service
+        .persist_fail_with_update(
+            &fixture_scope(),
+            FactorKind::Hotp,
+            &hotp_config_with_attempts(0, 1),
+        )
+        .await
+        .unwrap();
+
+    let stored = inspector
+        .load_factor(&fixture_scope(), FactorKind::Hotp)
+        .await
+        .unwrap()
+        .unwrap();
+    let FactorConfig::Hotp(h) = stored else {
+        panic!("expected Hotp")
+    };
+    assert_eq!(h.attempt_count, 2, "the second failure must not be lost");
 }

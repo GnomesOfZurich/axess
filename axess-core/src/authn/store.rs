@@ -817,6 +817,24 @@ pub trait FactorStore: Send + Sync + 'static {
         updated: FactorConfig,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 
+    /// Atomically store `config` at exactly `scope` only if no row of the
+    /// same kind exists there yet. Returns `Ok(true)` when the row was
+    /// inserted and `Ok(false)` when a row already existed (left
+    /// untouched).
+    ///
+    /// Used for the first write of per-user mutable state (TOTP replay
+    /// step, HOTP counter, failure counters) when the factor was
+    /// inherited from the tenant or system scope. Of two concurrent
+    /// first writes, exactly one must see `Ok(true)`; the other is a
+    /// replay. Implementations MUST make this atomic (for SQL, an
+    /// `INSERT ... ON CONFLICT DO NOTHING` checked via rows affected);
+    /// a load-then-save would re-open the replay window.
+    fn insert_factor_if_absent(
+        &self,
+        scope: &AuthnScope,
+        config: FactorConfig,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+
     /// Return the ordered list of **enabled** authentication methods
     /// available for a user.
     ///

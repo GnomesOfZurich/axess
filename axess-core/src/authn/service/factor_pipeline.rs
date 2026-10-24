@@ -96,12 +96,7 @@ where
         next_kind: Option<FactorKind>,
         session: &AuthSession,
     ) -> Result<AccountStatusEnforcement, AuthnError<I::Error>> {
-        let status = self
-            .inner
-            .identity
-            .account_status(user_id)
-            .await
-            .map_err(AuthnError::Store)?;
+        let status = self.current_account_status(user_id).await?;
 
         if status.is_locked() {
             let until = if let EntityState::Suspended(detail) = &status {
@@ -330,16 +325,42 @@ where
             };
             (existing, recomputed)
         } else {
-            // No user-scope row yet; plain insert is correct, no
-            // concurrent writer can race because there is nothing to
-            // race with.
-            self.inner
+            // No user-scope row yet. Insert only if still absent: of N
+            // parallel first failures exactly one inserts. A loser
+            // reloads the winner's row and takes the CAS loop below, so
+            // every failure is counted.
+            let inserted = self
+                .inner
                 .factors
-                .save_factor(user_scope, updated_config.clone())
+                .insert_factor_if_absent(user_scope, updated_config.clone())
                 .await
                 .map_err(AuthnError::Store)?;
-            applied = true;
-            (updated_config.clone(), updated_config.clone())
+            if inserted {
+                applied = true;
+                (updated_config.clone(), updated_config.clone())
+            } else {
+                let reloaded = self
+                    .inner
+                    .factors
+                    .load_factor(user_scope, current_kind.clone())
+                    .await
+                    .map_err(AuthnError::Store)?;
+                match reloaded {
+                    Some(existing) => {
+                        let next = match &existing {
+                            FactorConfig::EmailOtp(otp) => {
+                                FactorConfig::EmailOtp(apply_email_otp_failure(otp))
+                            }
+                            FactorConfig::Hotp(otp) => FactorConfig::Hotp(apply_hotp_failure(otp)),
+                            _ => updated_config.clone(),
+                        };
+                        (existing, next)
+                    }
+                    // Row vanished between insert and reload (admin
+                    // delete): the loop's missing-row fallback records it.
+                    None => (updated_config.clone(), updated_config.clone()),
+                }
+            }
         };
 
         for _ in 0..MAX_FAIL_UPDATE_RETRIES {
@@ -433,36 +454,34 @@ where
     pub(super) async fn persist_pass_with_update(
         &self,
         user_scope: &AuthnScope,
-        current_kind: FactorKind,
+        verified: &FactorConfig,
+        resolved_from: &AuthnScope,
         updated_config: FactorConfig,
     ) -> Result<bool, AuthnError<I::Error>> {
-        let existing_user_scope = self
-            .inner
-            .factors
-            .load_factor(user_scope, current_kind)
-            .await
-            .map_err(AuthnError::Store)?;
-        match existing_user_scope {
-            // CAS-loss here is a **security signal**: a concurrent
-            // verification spent the same TOTP step / HOTP counter
-            // first. `Ok(false)` propagates up as replay-detected and
-            // the caller rejects the credential. Distinct from the
-            // failure-counter CAS in `apply_failure_update`, where
-            // `Ok(false)` means "retry."
-            Some(prior) => self
-                .inner
+        // CAS-loss here is a **security signal**: a concurrent
+        // verification spent the same TOTP step / HOTP counter first.
+        // `Ok(false)` propagates up as replay-detected and the caller
+        // rejects the credential. Distinct from the failure-counter CAS
+        // in `persist_fail_with_update`, where `Ok(false)` means "retry."
+        //
+        // The expected value is the config the code was verified
+        // against, never a fresh reload: a reload would hand a second
+        // concurrent request the state the first one just saved.
+        if resolved_from == user_scope {
+            self.inner
                 .factors
-                .compare_and_save_factor(user_scope, &prior, updated_config)
+                .compare_and_save_factor(user_scope, verified, updated_config)
                 .await
-                .map_err(AuthnError::Store),
-            None => {
-                self.inner
-                    .factors
-                    .save_factor(user_scope, updated_config)
-                    .await
-                    .map_err(AuthnError::Store)?;
-                Ok(true)
-            }
+                .map_err(AuthnError::Store)
+        } else {
+            // Verified against an inherited template: there was no
+            // user-scope row. Exactly one concurrent first write may
+            // create it; the loser is a replay.
+            self.inner
+                .factors
+                .insert_factor_if_absent(user_scope, updated_config)
+                .await
+                .map_err(AuthnError::Store)
         }
     }
 }

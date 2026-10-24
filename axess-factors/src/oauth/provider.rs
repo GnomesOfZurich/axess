@@ -153,6 +153,17 @@ impl OAuthProviderConfig {
             .claims(&id_token_verifier, &Nonce::new(nonce.to_string()))
             .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
 
+        // The signature, `iss`, `aud`, `exp` and nonce checks above have run
+        // over exactly these bytes. `IdTokenClaims<EmptyAdditionalClaims>`
+        // discards every claim outside the standard set (`nbf`, `groups`,
+        // `roles`, `sid`, ...), so read those from the verified payload.
+        let verified_payload = raw_id_token
+            .as_deref()
+            .and_then(|jwt| crate::oidc::logout_token::decode_jwt_payload(jwt).ok())
+            .ok_or_else(|| {
+                OAuthError::IdTokenValidation("ID token payload is not readable".to_string())
+            })?;
+
         // at_hash / c_hash enforcement.
         //
         // OIDC Core §3.1.3.6 / §3.2.2.10 specifies `at_hash` (= leftmost
@@ -209,12 +220,9 @@ impl OAuthProviderConfig {
                 )));
             }
 
-            // Read nbf from the structural claims object; openidconnect
-            // does not expose `nbf` on `IdTokenClaims` directly, so go
-            // through the to_value round-trip.
-            let claims_json = serde_json::to_value(claims)
-                .map_err(|e| OAuthError::IdTokenValidation(format!("claims serialise: {e}")))?;
-            let nbf = claims_json.get("nbf").and_then(|v| v.as_i64());
+            // `IdTokenClaims` is built with `EmptyAdditionalClaims`, which
+            // drops `nbf`; read it from the verified payload instead.
+            let nbf = verified_payload.get("nbf").and_then(|v| v.as_i64());
             match nbf {
                 None => {
                     return Err(OAuthError::IdTokenValidation(
@@ -249,8 +257,18 @@ impl OAuthProviderConfig {
                 .map(|n| n.as_str().to_string())
         };
 
-        let additional_claims =
+        let mut additional_claims =
             serde_json::to_value(claims).unwrap_or(serde_json::Value::Object(Default::default()));
+        // Overlay the claims the typed view drops, keeping the typed
+        // values wherever both carry a key.
+        if let (Some(target), Some(extra)) = (
+            additional_claims.as_object_mut(),
+            verified_payload.as_object(),
+        ) {
+            for (k, v) in extra {
+                target.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
 
         let groups = extract_string_array(&additional_claims, "groups");
         let roles = extract_string_array(&additional_claims, "roles");

@@ -3,10 +3,9 @@
 //! In a real application this would query a database. Here the data is
 //! hardcoded to keep the example focused on Cedar authorization concepts.
 
-use axess::authorization::{AuthzEntityProvider, AuthzError};
+use axess::authorization::{AuthzEntityProvider, AuthzError, make_entity_uid};
 use cedar_policy::{Entities, Entity, EntityUid, RestrictedExpression, Schema};
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::Arc;
 
 // ── Domain types ─────────────────────────────────────────────────────────────
@@ -87,8 +86,7 @@ impl DocEntityProvider {
     }
 
     fn make_uid(&self, type_name: &str, id: &str) -> Result<EntityUid, AuthzError> {
-        EntityUid::from_str(&format!(r#"{}::{}::"{id}""#, self.namespace, type_name))
-            .map_err(|e| AuthzError::InvalidEntityUid(format!("{e:?}")))
+        make_entity_uid(&self.namespace, type_name, id)
     }
 }
 

@@ -19,7 +19,7 @@
 //! let outcome = service.begin_login(identifier, tenant, &session, ip).await?;
 //! let outcome = match outcome {
 //!     LoginOutcome::FactorRequired(_) if let Some(device) = resolved_device => {
-//!         match decide_step_up(&device, &policy) {
+//!         match decide_step_up_for_user(&device, &user_id, &policy) {
 //!             Some(allowed_factors) => LoginOutcome::StepUpRequired {
 //!                 device_id: device.id.clone(),
 //!                 allowed_factors,
@@ -39,6 +39,7 @@
 //! [`Device`]: crate::device::types::Device
 
 use crate::authn::factor::FactorKind;
+use crate::authn::ids::UserId;
 use crate::device::types::{Device, DeviceTrustLevel};
 
 /// Application-level step-up policy.
@@ -178,8 +179,36 @@ impl StepUpPolicyBuilder {
 ///
 /// Wraps [`StepUpPolicy::for_level`] with the empty-vec → `None`
 /// translation so callers don't have to write the conditional twice.
+///
+/// This ignores who owns the device. When the device was found by
+/// fingerprint before the user was known, use
+/// [`decide_step_up_for_user`], which does not let one user inherit
+/// another's `Trusted` device.
 pub fn decide_step_up(device: &Device, policy: &StepUpPolicy) -> Option<Vec<FactorKind>> {
     let factors = policy.for_level(device.trust_level);
+    if factors.is_empty() {
+        None
+    } else {
+        Some(factors.to_vec())
+    }
+}
+
+/// Like [`decide_step_up`], for the user who is logging in. A device
+/// owned by a different user counts as [`DeviceTrustLevel::Unknown`]:
+/// its trust was earned by someone else and does not carry over. An
+/// unowned device, or one the user owns, is judged by its own level.
+pub fn decide_step_up_for_user(
+    device: &Device,
+    user: &UserId,
+    policy: &StepUpPolicy,
+) -> Option<Vec<FactorKind>> {
+    let owned_by_someone_else = device.user_id.as_ref().is_some_and(|owner| owner != user);
+    let level = if owned_by_someone_else {
+        DeviceTrustLevel::Unknown
+    } else {
+        device.trust_level
+    };
+    let factors = policy.for_level(level);
     if factors.is_empty() {
         None
     } else {
@@ -274,5 +303,23 @@ mod tests {
         assert_eq!(p.unknown, default_step_up_factors());
         assert_eq!(p.seen, default_step_up_factors());
         assert!(p.trusted.is_empty());
+    }
+
+    /// A device owned by someone else is Unknown to the user logging in,
+    /// whatever trust it earned for its owner.
+    #[test]
+    fn foreign_trusted_device_is_treated_as_unknown() {
+        let p = StepUpPolicy::default();
+        let device = build_device(DeviceTrustLevel::Trusted);
+        let owner = crate::authn::ids::testing::user("u");
+        let other = crate::authn::ids::testing::user("someone-else");
+        assert!(decide_step_up_for_user(&device, &owner, &p).is_none());
+        assert_eq!(
+            decide_step_up_for_user(&device, &other, &p),
+            Some(p.for_level(DeviceTrustLevel::Unknown).to_vec())
+        );
+        let mut unowned = build_device(DeviceTrustLevel::Trusted);
+        unowned.user_id = None;
+        assert!(decide_step_up_for_user(&unowned, &other, &p).is_none());
     }
 }

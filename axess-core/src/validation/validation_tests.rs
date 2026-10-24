@@ -279,3 +279,11 @@ fn is_printable_distinguishes_printable_and_control_chars() {
         "an embedded BOM must reject (kills `!= → ==` on BOM)"
     );
 }
+
+/// The minimum counts characters, not UTF-8 bytes: five two-byte letters
+/// are ten bytes but still only five characters.
+#[test]
+fn min_length_counts_characters_not_bytes() {
+    assert!(!is_valid_password("äöüéè", 8, false, false, false, false));
+    assert!(is_valid_password("äöüéèàçñ", 8, false, false, false, false));
+}

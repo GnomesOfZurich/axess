@@ -12,7 +12,7 @@
 //! | `KeyExtractor::UserId` | `RateLimitUserId` request extension | Per-user limits (set after authentication). |
 //! | `KeyExtractor::TenantId` | `RateLimitTenantId` request extension | Per-tenant limits. |
 //! | `KeyExtractor::LoginIdentifier` | `RateLimitLoginIdentifier` request extension | **Required for login routes** to mitigate per-username lockout DoS. |
-//! | `KeyExtractor::Header(name)` | Arbitrary header | Custom keys (e.g. API key). |
+//! | `KeyExtractor::Header(name)` | Header value within the `RateLimitUserId` identity | Sub-buckets per authenticated user; peer address when unauthenticated. |
 //!
 //! # Login routes: required pairing
 //!
@@ -129,7 +129,21 @@ pub enum KeyExtractor {
     /// present, so a misconfigured route fails closed (one shared bucket)
     /// rather than evading the limit.
     LoginIdentifier,
-    /// Rate limit by an arbitrary header value.
+    /// Rate limit by a header value, **within an authenticated identity**.
+    ///
+    /// A header is whatever the caller writes. Keyed on its raw value, a
+    /// client sending a new value per request would get a fresh bucket each
+    /// time and no limit at all. So the header only subdivides a bucket the
+    /// caller cannot choose: when the request carries a [`RateLimitUserId`]
+    /// extension (set after authentication) and the header, the key is the
+    /// user id plus the header value. Otherwise the key is the TCP peer
+    /// address, exactly as for [`KeyExtractor::PeerIp`], so an unauthenticated
+    /// caller cannot select its own bucket by choosing a header.
+    ///
+    /// An authenticated user can still vary the header to spread their own
+    /// traffic over several buckets. Pair this with a [`KeyExtractor::UserId`]
+    /// layer when that matters. Install the layer after authentication so the
+    /// extension is present.
     Header(String),
 }
 
@@ -438,11 +452,20 @@ fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
             .get::<RateLimitLoginIdentifier>()
             .map(|i| i.as_str().to_owned())
             .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
-        // Prefixed, so a header VALUE spelled like an address (`X-Api-Key:
-        // 10.0.0.5`) cannot drain the bucket of the client at that address.
-        KeyExtractor::Header(name) => header_str(req, name)
-            .map(|v| format!("h:{v}"))
-            .unwrap_or_else(|| format!("ip:{}", extract_peer_ip(req))),
+        // A header value is the caller's own claim, so it only subdivides a
+        // bucket the caller cannot choose: an authenticated identity. Without
+        // one, every value would be a fresh bucket for the asking. The
+        // identity and the `h:` prefix keep one user's header values out of
+        // another user's buckets and out of the address buckets.
+        KeyExtractor::Header(name) => {
+            match (
+                req.extensions().get::<RateLimitUserId>(),
+                header_str(req, name),
+            ) {
+                (Some(user), Some(v)) => format!("h:{}:{v}", user.0),
+                _ => format!("ip:{}", extract_peer_ip(req)),
+            }
+        }
     };
     truncate_key(raw)
 }

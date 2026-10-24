@@ -143,6 +143,16 @@ where
     /// keys mid-clear, leaving the session with partial ceremony state
     /// that downstream calls would treat as "active flow".
     pub(super) async fn clear_oauth_state(&self, session: &AuthSession) {
+        self.clear_oauth_state_except_tenant(session).await;
+        remove_expected_tenant(session).await;
+    }
+
+    /// Clear the ceremony state but keep the expected-tenant binding.
+    ///
+    /// `finish_oauth_login` uses this: the binding must survive until
+    /// `complete_oauth_login` has compared it with the resolved user's
+    /// tenant, and `complete` removes it afterwards.
+    pub(super) async fn clear_oauth_state_except_tenant(&self, session: &AuthSession) {
         use axess_factors::oauth::types::keys as oauth_keys;
         const KEYS: &[&str] = &[
             oauth_keys::PKCE_VERIFIER,
@@ -151,7 +161,6 @@ where
             oauth_keys::PROVIDER,
             oauth_keys::PROVIDER_ISSUER,
             oauth_keys::STARTED,
-            oauth_keys::EXPECTED_TENANT,
             // Cleared after the OIDC callback completes.
             oauth_keys::PAR_INFLIGHT,
         ];
@@ -163,4 +172,14 @@ where
             })
             .await;
     }
+}
+
+/// Remove the begin-side expected-tenant binding.
+pub(super) async fn remove_expected_tenant(session: &AuthSession) {
+    use axess_factors::oauth::types::keys as oauth_keys;
+    session
+        .mutate_custom(|obj| {
+            obj.remove(oauth_keys::EXPECTED_TENANT);
+        })
+        .await;
 }

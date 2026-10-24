@@ -214,3 +214,79 @@ fn authn_scope_key_per_variant_format() {
         "User key must interpolate both ids, got {user_key:?}"
     );
 }
+
+fn policy(allow: &[&str], deny: &[&str]) -> IpPolicy {
+    IpPolicy {
+        allow: allow.iter().map(|s| (*s).into()).collect(),
+        deny: deny.iter().map(|s| (*s).into()).collect(),
+    }
+}
+
+#[test]
+fn ipv4_mapped_ipv6_is_judged_as_its_ipv4_address() {
+    let deny = policy(&[], &["10.0.0.0/8"]);
+    assert!(!deny.is_allowed("::ffff:10.1.2.3".parse().unwrap()));
+    assert!(deny.is_allowed("::ffff:172.16.0.1".parse().unwrap()));
+
+    let allow = policy(&["10.0.0.0/8"], &[]);
+    assert!(allow.is_allowed("::ffff:10.1.2.3".parse().unwrap()));
+    assert!(!allow.is_allowed("::ffff:11.1.2.3".parse().unwrap()));
+}
+
+#[test]
+fn mapped_notation_in_an_entry_names_the_ipv4_network() {
+    let deny = policy(&[], &["::ffff:10.0.0.0/104"]);
+    assert!(!deny.is_allowed("10.9.9.9".parse().unwrap()));
+    assert!(deny.is_allowed("11.9.9.9".parse().unwrap()));
+}
+
+#[test]
+fn a_malformed_deny_entry_denies_everyone() {
+    for bad in ["10.0.0.0/33", "not-an-ip", "10.0.0.0/x", "10.0.0.256", ""] {
+        let deny = policy(&[], &["192.0.2.0/24", bad]);
+        assert!(
+            !deny.is_allowed("203.0.113.1".parse().unwrap()),
+            "deny entry {bad:?} is unreadable and must fail closed"
+        );
+    }
+}
+
+#[test]
+fn a_malformed_allow_entry_matches_nothing() {
+    let allow = policy(&["10.0.0.0/33", "bogus"], &[]);
+    assert!(!allow.is_allowed("10.0.0.1".parse().unwrap()));
+}
+
+#[test]
+fn suspension_ends_when_until_passes() {
+    use chrono::TimeZone;
+    let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+    let detail = |until| {
+        EntityState::Suspended(StatusDetail {
+            reason: "lockout".into(),
+            since: now - chrono::Duration::hours(1),
+            until,
+        })
+    };
+    assert!(
+        detail(Some(now - chrono::Duration::seconds(1)))
+            .effective_at(now)
+            .allows_login()
+    );
+    assert!(detail(Some(now)).effective_at(now).allows_login());
+    assert!(
+        !detail(Some(now + chrono::Duration::seconds(1)))
+            .effective_at(now)
+            .allows_login()
+    );
+    assert!(!detail(None).effective_at(now).allows_login());
+    assert!(
+        !EntityState::Terminated(StatusDetail {
+            reason: "x".into(),
+            since: now,
+            until: Some(now - chrono::Duration::days(1)),
+        })
+        .effective_at(now)
+        .allows_login()
+    );
+}

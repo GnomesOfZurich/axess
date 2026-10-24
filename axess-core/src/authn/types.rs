@@ -209,6 +209,24 @@ impl EntityState {
         matches!(self, EntityState::Suspended(_))
     }
 
+    /// The state as it stands at `now`: a suspension whose `until` has
+    /// passed is over, so it reads as [`Active`](Self::Active). Every other
+    /// state, and a suspension with no `until` or a future one, is returned
+    /// unchanged.
+    ///
+    /// Stores record the suspension and its end time; nothing else ends it,
+    /// so the services read a user's status through this method with their
+    /// injected clock.
+    #[must_use]
+    pub fn effective_at(self, now: DateTime<Utc>) -> Self {
+        match self {
+            EntityState::Suspended(StatusDetail {
+                until: Some(until), ..
+            }) if until <= now => EntityState::Active,
+            other => other,
+        }
+    }
+
     /// Return `true` if the account allows login.
     ///
     /// Only `Active` accounts can authenticate. `Candidate` accounts must be
@@ -439,33 +457,69 @@ impl IpPolicy {
     /// Check whether the given IP address is permitted by this policy.
     ///
     /// Returns `true` if the IP is allowed, `false` if denied.
+    ///
+    /// An IPv4-mapped IPv6 address (`::ffff:10.0.0.1`) is judged as the IPv4
+    /// address it carries, so a dual-stack listener cannot be used to step
+    /// around an IPv4 entry. A deny entry that does not parse (a typo, a
+    /// prefix out of range) fails closed: it denies every address, because
+    /// skipping it would leave the denylist silently weaker than written. An
+    /// allow entry that does not parse matches nothing.
     pub fn is_allowed(&self, ip: std::net::IpAddr) -> bool {
+        let ip = canonical_ip(ip);
         if !self.allow.is_empty() {
             // Allowlist mode: IP must match at least one entry.
-            return self.allow.iter().any(|entry| ip_matches(ip, entry));
+            return self.allow.iter().any(|entry| {
+                parse_entry(entry).is_some_and(|(net, len)| cidr_contains(net, len, ip))
+            });
         }
         if !self.deny.is_empty() {
-            // Denylist mode: IP must not match any entry.
-            return !self.deny.iter().any(|entry| ip_matches(ip, entry));
+            // Denylist mode: IP must not match any entry, and every entry
+            // must be readable.
+            return self.deny.iter().all(|entry| {
+                parse_entry(entry).is_some_and(|(net, len)| !cidr_contains(net, len, ip))
+            });
         }
         // No restrictions.
         true
     }
 }
 
-/// Check if an IP matches a CIDR range or exact address string.
-fn ip_matches(ip: std::net::IpAddr, entry: &str) -> bool {
-    // Try CIDR match first (e.g. "10.0.0.0/8").
-    if let Some((network_str, prefix_str)) = entry.split_once('/')
-        && let (Ok(network), Ok(prefix_len)) = (
-            network_str.parse::<std::net::IpAddr>(),
-            prefix_str.parse::<u32>(),
-        )
-    {
-        return cidr_contains(network, prefix_len, ip);
+/// Fold an IPv4-mapped IPv6 address to the IPv4 address it carries.
+fn canonical_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+        v4 => v4,
     }
-    // Fall back to exact match.
-    entry.parse::<std::net::IpAddr>().is_ok_and(|e| e == ip)
+}
+
+/// Parse a policy entry (`"10.0.0.0/8"` or a bare address) into a canonical
+/// network and prefix length. `None` when the entry is malformed or its
+/// prefix is out of range for its family.
+fn parse_entry(entry: &str) -> Option<(std::net::IpAddr, u32)> {
+    let (addr_str, prefix) = match entry.split_once('/') {
+        Some((a, p)) => (a, Some(p.parse::<u32>().ok()?)),
+        None => (entry, None),
+    };
+    let addr = addr_str.parse::<std::net::IpAddr>().ok()?;
+    match (addr, prefix) {
+        (std::net::IpAddr::V4(_), p) => {
+            let len = p.unwrap_or(32);
+            (len <= 32).then_some((addr, len))
+        }
+        (std::net::IpAddr::V6(v6), p) => {
+            let len = p.unwrap_or(128);
+            if len > 128 {
+                return None;
+            }
+            // `::ffff:a.b.c.d/N` with N >= 96 is the IPv4 network a.b.c.d/(N-96).
+            match v6.to_ipv4_mapped() {
+                Some(v4) if len >= 96 => Some((std::net::IpAddr::V4(v4), len - 96)),
+                _ => Some((addr, len)),
+            }
+        }
+    }
 }
 
 /// Check if `ip` falls within the CIDR block `network/prefix_len`.

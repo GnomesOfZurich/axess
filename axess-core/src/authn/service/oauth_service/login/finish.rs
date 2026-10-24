@@ -147,7 +147,9 @@ where
             }
         };
 
-        self.clear_oauth_state(session).await;
+        // Keep the expected-tenant binding: `complete_oauth_login` checks
+        // it against the resolved user and removes it afterwards.
+        self.clear_oauth_state_except_tenant(session).await;
 
         // Stash a claim-binding lock in the session AFTER the
         // OAuth ceremony state is cleared so it survives into the

@@ -357,3 +357,20 @@ async fn memory_store_len_and_is_empty_track_inserts() {
     assert_eq!(store.len(), 1);
     assert!(!store.is_empty());
 }
+
+/// Braced, URN, hyphenless and uppercase spellings of a valid UUID are the
+/// same UUID but a different string, so they would key a second mapping.
+#[test]
+fn parse_refuses_non_canonical_uuid_spellings() {
+    let u = "6f9619ff-8b86-d011-b42d-00c04fc964ff";
+    assert!(PiiToken::parse(&format!("pii:{u}")).is_some());
+    for bad in [
+        format!("pii:{}", u.to_uppercase()),
+        format!("pii:{}", u.replace('-', "")),
+        format!("pii:{{{u}}}"),
+        format!("pii:urn:uuid:{u}"),
+    ] {
+        assert!(PiiToken::parse(&bad).is_none(), "{bad} must be refused");
+        assert!(!PiiToken::is_well_formed(&bad));
+    }
+}

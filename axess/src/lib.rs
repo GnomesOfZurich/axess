@@ -227,6 +227,7 @@ pub mod device {
         NoopDeviceResolver, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, StepUpPolicy,
         StepUpPolicyBuilder, SweepConfig, SweepConfigBuilder, SweepCounts, TenantPepperResolver,
         cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up,
+        decide_step_up_for_user,
     };
 }
 

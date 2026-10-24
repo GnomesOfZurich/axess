@@ -17,9 +17,6 @@ use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64_STANDARD;
-
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
 
@@ -159,8 +156,7 @@ async fn post_token_endpoint(
     provider: &DelegatedProvider,
     form: &[(&str, String)],
 ) -> Result<reqwest::Response, DelegatedError> {
-    let creds = format!("{}:{}", provider.client_id, &*provider.client_secret);
-    let encoded = B64_STANDARD.encode(creds);
+    let encoded = axess_factors::basic_credentials(&provider.client_id, &provider.client_secret);
 
     http.post(provider.token_endpoint.clone())
         .header(AUTHORIZATION, format!("Basic {encoded}"))
@@ -222,10 +218,12 @@ async fn parse_token_response(
         ));
     }
 
-    let expires_at = parsed
-        .expires_in
-        .filter(|s| *s > 0)
-        .map(|s| Utc::now() + chrono::Duration::seconds(s as i64));
+    let expires_at = match parsed.expires_in.filter(|s| *s > 0) {
+        None => None,
+        Some(s) => Some(axess_factors::expiry_after(Utc::now(), s).ok_or_else(|| {
+            DelegatedError::MalformedResponse(format!("expires_in {s} is out of range"))
+        })?),
+    };
 
     let scopes: Vec<String> = parsed
         .scope

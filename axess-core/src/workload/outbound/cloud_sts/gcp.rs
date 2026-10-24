@@ -332,7 +332,7 @@ impl GcpServiceAccountImpersonator {
     ) -> Result<GcpServiceAccountToken, GcpError> {
         let path = format!(
             "v1/projects/-/serviceAccounts/{}:generateAccessToken",
-            service_account_email
+            super::encode_path_segment(service_account_email)
         );
         let url = self
             .endpoint_base

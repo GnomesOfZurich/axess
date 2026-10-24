@@ -12,9 +12,6 @@ use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as B64_STANDARD;
-
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
 
@@ -233,8 +230,7 @@ impl TokenExchangeClient {
 
         let mut req = self.http.post(self.token_endpoint.clone());
         if let Some(secret) = &self.client_secret {
-            let creds = format!("{}:{}", self.client_id, &***secret);
-            let encoded = B64_STANDARD.encode(creds);
+            let encoded = axess_factors::basic_credentials(&self.client_id, secret);
             req = req.header(AUTHORIZATION, format!("Basic {encoded}"));
         }
 

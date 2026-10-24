@@ -101,14 +101,37 @@ where
         // tenant rejects all logins before we reveal anything
         // user-specific; this is the operator lever for "lock everyone
         // out of tenant X" (see `docs/identity/tenancy.md`).
-        if !tenant.status.allows_login() {
+        //
+        // The caller sees the same `InvalidCredentials` as for an unknown
+        // tenant, after the same dummy user lookup. A distinct answer here
+        // (it was `NotActive`, a 403) let anyone probing tenant slugs tell
+        // a suspended tenant from a missing one, and either from a live
+        // one. The audit row carries the real reason.
+        if !tenant
+            .status
+            .clone()
+            .effective_at(self.inner.clock.now())
+            .allows_login()
+        {
             tracing::warn!(
                 tenant = %tenant.id,
                 status = ?tenant.status,
                 "login rejected: tenant status does not allow login"
             );
+            let dummy_user_tenant =
+                crate::authn::ids::TenantId::try_new(uuid::Uuid::new_v4().to_string())
+                    .expect("fresh v4 UUID is a valid TenantId");
+            let _ = self
+                .find_user_with_timing_equalization(identifier, &dummy_user_tenant)
+                .await;
             self.inner.metrics.auth_failure();
-            return Err(AuthnError::NotActive(tenant.status.clone()));
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                    .maybe_attributed_to(None, Some(&tenant.id))
+                    .with_error(AuthFailureReason::NotActive),
+            )
+            .await?;
+            return Ok(LoginOutcome::InvalidCredentials);
         }
 
         // 1b. Enforce the tenant IP policy against the address this handle
@@ -186,12 +209,7 @@ where
         };
 
         // 3. Check account status.
-        let status = self
-            .inner
-            .identity
-            .account_status(&user.id)
-            .await
-            .map_err(AuthnError::Store)?;
+        let status = self.current_account_status(&user.id).await?;
 
         if !status.allows_login() {
             self.inner.metrics.auth_failure();
@@ -252,7 +270,9 @@ where
                     .with_error(AuthFailureReason::NoFactorsConfigured),
             )
             .await?;
-            return Err(AuthnError::NoFlow);
+            // Same answer as an unknown identifier. `NoFlow` here told a
+            // caller that the account exists and has nothing configured.
+            return Ok(LoginOutcome::InvalidCredentials);
         };
 
         // The method's own steps, choices included: a step offering
@@ -542,14 +562,15 @@ where
 
         // Runtime resolution: User → Tenant → System, single-query in the store.
         let user_scope = AuthnScope::User { tenant_id, user_id };
-        let config = self
+        let resolved = self
             .inner
             .factors
             .resolve_factor(&user_scope, current_kind.clone())
             .await
             .map_err(AuthnError::Store)?
-            .ok_or(AuthnError::NoFlow)?
-            .config;
+            .ok_or(AuthnError::NoFlow)?;
+        let resolved_from = resolved.resolved_from;
+        let config = resolved.config;
 
         // FIDO2 + LDAP have their own verification methods (different
         // ceremony shape, network call) and short-circuit with their
@@ -595,7 +616,7 @@ where
 
         if let VerifyOutcome::PassWithUpdate(updated_config) = outcome {
             let swapped = self
-                .persist_pass_with_update(&user_scope, current_kind.clone(), updated_config)
+                .persist_pass_with_update(&user_scope, &config, &resolved_from, updated_config)
                 .await?;
             if !swapped {
                 // Concurrent verification spent the same step/counter
@@ -612,14 +633,19 @@ where
             .await
     }
 
-    /// Log out the current user: clear the session and invalidate in the registry.
+    /// Log out the current session: clear it and invalidate it in the registry.
+    ///
+    /// Only this session ends. The user's other sessions (another browser, a
+    /// phone) stay signed in; use
+    /// [`invalidate_user_sessions`](crate::authn::service::AuthnService::invalidate_user_sessions)
+    /// to end all of them.
     #[tracing::instrument(skip(self, session))]
     pub async fn logout(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
         if let Some(user_id) = session.user_id().await {
             self.inner.metrics.session_invalidated();
             let sid = session.session_id().await;
             if let Some(reg) = &self.inner.registry {
-                reg.invalidate_user(&user_id).await;
+                reg.invalidate_session(&user_id, &sid).await;
             }
             // When the session is authenticated (user_id exists) but the
             // tenant is somehow missing, record the logout event with
@@ -653,6 +679,8 @@ pub(crate) use super::fido2_service::fido2_keys;
 
 #[cfg(test)]
 mod login_tests;
+#[cfg(test)]
+mod security_tests;
 
 impl<I, F> super::AuthnService<I, F>
 where

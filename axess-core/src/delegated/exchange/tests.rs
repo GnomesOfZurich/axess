@@ -185,3 +185,23 @@ async fn exchange_carries_resource_when_set() {
         .with_resource(Url::parse("https://api.gnomes/v1/market").unwrap());
     let _ = client.exchange(&req).await.expect("resource carried");
 }
+
+#[tokio::test]
+async fn exchange_form_encodes_basic_credentials() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .and(wiremock::matchers::header(
+            "authorization",
+            "Basic Z25vbWVzLWFwaTphJTNBYiUyNWMlMkJk",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "downstream",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("a:b%c+d".into()));
+    let req = TokenExchangeRequest::new("user-jwt", token_types::JWT);
+    client.exchange(&req).await.expect("exchange");
+}

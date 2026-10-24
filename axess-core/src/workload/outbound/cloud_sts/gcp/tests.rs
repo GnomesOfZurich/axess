@@ -261,3 +261,23 @@ fn default_endpoints_point_at_production_gcp() {
         "https://iamcredentials.googleapis.com/"
     );
 }
+
+#[tokio::test]
+async fn service_account_is_confined_to_one_path_segment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/-/serviceAccounts/a%2F..%2Fb%3Fx:generateAccessToken",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessToken": "tok",
+            "expireTime": "2030-01-01T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let imp = GcpServiceAccountImpersonator::new().with_endpoint_base(iam_base(&server));
+    imp.generate_access_token("fed", "a/../b?x", &["scope"], None)
+        .await
+        .expect("slash and query characters stay inside the account segment");
+}

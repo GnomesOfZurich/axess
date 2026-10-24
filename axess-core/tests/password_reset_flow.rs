@@ -331,3 +331,32 @@ async fn complete_password_reset_valid_token_returns_true() {
         .unwrap();
     assert!(result, "valid token must return Ok(true), got {result}");
 }
+
+/// Each change records the hash it installs, and the hash it replaces is
+/// already the newest entry, so three changes leave three entries, not five.
+#[tokio::test]
+async fn password_history_records_each_hash_once() {
+    let user = fixture_user("u1", "alice", "t1");
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(user.clone());
+    let inspector = identity.clone();
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+
+    for password in ["first-password-1", "second-password-2", "third-password-3"] {
+        let token = svc
+            .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
+            .await
+            .unwrap()
+            .expect("token");
+        assert!(
+            svc.complete_password_reset(&user.id, &token, password)
+                .await
+                .unwrap()
+        );
+    }
+
+    let history = inspector.password_history(&user.id, 10).await.unwrap();
+    assert_eq!(history.len(), 3, "one entry per password: {history:?}");
+}

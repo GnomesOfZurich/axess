@@ -24,6 +24,16 @@
 
 use serde_json::{Map, Value};
 
+/// Discovery fields the document derives itself. An adopter extra under any
+/// of these names is refused: `issuer` and `jwks_uri` would repoint relying
+/// parties, and `id_token_signing_alg_values_supported` could be set to
+/// `["none"]` to talk a verifier into accepting unsigned tokens.
+pub(crate) const RESERVED_METADATA_FIELDS: [&str; 3] = [
+    "issuer",
+    "jwks_uri",
+    "id_token_signing_alg_values_supported",
+];
+
 /// Issuer metadata document for [`crate::local_idp::LocalIdp`].
 ///
 /// Produced by [`crate::local_idp::LocalIdp::metadata`]; serialised
@@ -45,7 +55,10 @@ pub struct LocalIdpMetadata {
     /// every historical key still present in the JWKS.
     pub id_token_signing_alg_values_supported: Vec<String>,
     /// Adopter-supplied extension fields, in insertion order. Appear
-    /// in the JSON output after the auto-populated fields.
+    /// in the JSON output after the auto-populated fields. Serialisation
+    /// drops any entry whose name is derived by the document (`issuer`,
+    /// `jwks_uri`, `id_token_signing_alg_values_supported`) and any repeat of
+    /// an earlier name, so filling this field directly cannot override them.
     pub extra: Vec<(String, Value)>,
 }
 
@@ -66,6 +79,9 @@ impl LocalIdpMetadata {
             ),
         );
         for (k, v) in &self.extra {
+            if RESERVED_METADATA_FIELDS.contains(&k.as_str()) || obj.contains_key(k) {
+                continue;
+            }
             obj.insert(k.clone(), v.clone());
         }
         Value::Object(obj)

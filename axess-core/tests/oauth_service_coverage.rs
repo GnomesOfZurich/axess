@@ -242,3 +242,25 @@ async fn jwks_concurrent_refreshes_coalesce_to_single_fetch() {
         "32 concurrent refresh_jwks must coalesce into 1 outbound fetch (got {extra_fetches})"
     );
 }
+
+/// A zero refresh interval must not panic the background task (tokio's
+/// `interval` rejects a zero period, which would end the loop silently).
+#[tokio::test]
+async fn spawn_jwks_refresh_survives_a_zero_interval() {
+    use axess_factors::oauth::MockOAuthProvider;
+
+    let mock = || MockOAuthProvider::new("zero-idp").with_user("u", "u@e.com", vec![], vec![]);
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_oauth_provider(mock())
+        .build();
+    let service_task = authn.spawn_jwks_refresh(std::time::Duration::ZERO);
+    let free_task =
+        axess_core::spawn_jwks_refresh(std::sync::Arc::new(mock()), std::time::Duration::ZERO);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!service_task.is_finished(), "service refresh loop died");
+    assert!(!free_task.is_finished(), "free refresh loop died");
+    service_task.abort();
+    free_task.abort();
+}

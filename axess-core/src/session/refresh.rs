@@ -83,6 +83,29 @@ pub struct RefreshToken {
     /// [`DeviceTrustLevel::Revoked`]: crate::device::DeviceTrustLevel::Revoked
     /// [`cascade_revoke_devices`]: crate::device::cascade_revoke_devices
     pub device_id: Option<DeviceId>,
+    /// When the user last proved who they are, as opposed to when this
+    /// token was minted.
+    ///
+    /// Rotation mints a new token every time one is used, so `issued_at`
+    /// moves forward with each refresh while the person has not signed in
+    /// again. A session built from a refresh carries this instant as its
+    /// `authn_time`, which is what "recent login" and step-up freshness
+    /// checks read. Rotation copies it from parent to child unchanged.
+    ///
+    /// `None` for a token issued at login (its `issued_at` is the login) and
+    /// for rows written before this field existed; both read as `issued_at`.
+    /// A store that does not persist the field therefore degrades towards a
+    /// later `authn_time`, never an earlier one than the last rotation, so
+    /// persist it.
+    pub authn_time: Option<DateTime<Utc>>,
+}
+
+impl RefreshToken {
+    /// The time of the authentication this token descends from: the carried
+    /// [`authn_time`](Self::authn_time), else when the token was issued.
+    pub fn authenticated_at(&self) -> DateTime<Utc> {
+        self.authn_time.unwrap_or(self.issued_at)
+    }
 }
 
 /// Configuration for refresh token behavior.
@@ -455,7 +478,7 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
         Vec::new()
     };
 
-    let (plaintext, record) = build_refresh_token(req, config, rng, now);
+    let (plaintext, record) = build_refresh_token(req, config, rng, now, None);
 
     // Cap-eviction + insert in one trait call so production
     // backends can wrap them in a single transaction. The naive
@@ -595,7 +618,10 @@ async fn refresh_session_from_record<S: RefreshTokenStore>(
         auth_state: AuthState::Authenticated {
             user_id: record.user_id,
             tenant_id: record.tenant_id,
-            authn_time: now,
+            // The authentication the token descends from, not the refresh:
+            // a 29-day-old token must not yield a session that passes
+            // "recent login".
+            authn_time: record.authenticated_at(),
             // Refresh-token rotation re-establishes the same authn level
             // implicitly; no per-factor record carried across rotation.
             factors_completed: Vec::new(),
@@ -625,6 +651,7 @@ async fn refresh_session_from_record<S: RefreshTokenStore>(
             config,
             rng,
             now,
+            Some(record.authenticated_at()),
         );
 
         match store
@@ -722,7 +749,8 @@ async fn refresh_session_from_record<S: RefreshTokenStore>(
 ///         identity
 ///             .account_status(user_id)
 ///             .await
-///             .map(|status| status.allows_login())
+///             // `effective_at` ends a timed suspension whose `until` has passed.
+///             .map(|status| status.effective_at(now).allows_login())
 ///             .unwrap_or(false) // fail closed on store errors
 ///     },
 /// ).await;
@@ -835,6 +863,7 @@ fn build_refresh_token(
     config: &RefreshTokenConfig,
     rng: &impl SecureRng,
     now: DateTime<Utc>,
+    authn_time: Option<DateTime<Utc>>,
 ) -> (String, RefreshToken) {
     let plaintext = generate_token_value(rng);
     let token_hash = hash_token(&plaintext, config.hash_pepper.as_deref());
@@ -859,6 +888,7 @@ fn build_refresh_token(
         device_info: req.device_info,
         family_id: Some(effective_family),
         device_id: req.device_id,
+        authn_time,
     };
 
     (plaintext, record)
@@ -891,6 +921,8 @@ pub async fn revoke_refresh_token<S: RefreshTokenStore>(
 
 #[cfg(test)]
 mod atomic_rotation;
+#[cfg(test)]
+mod authn_time;
 #[cfg(test)]
 mod basics;
 #[cfg(all(test, feature = "device"))]

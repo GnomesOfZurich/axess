@@ -49,6 +49,20 @@ use crate::device::events::{DeviceEventSink, NoopDeviceEventSink};
 use crate::device::store::DeviceStore;
 use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
 
+/// How many of a user's own devices `ensure_device` scans for a matching
+/// fingerprint when the fingerprint lookup returned someone else's.
+const OWN_DEVICE_SCAN_LIMIT: usize = 100;
+
+/// `true` when `device` may serve a request made by `user`: the device is
+/// unowned, the request is not yet attributed to a user (a guest), or the
+/// owner is that user.
+fn is_usable_by(device: &Device, user: Option<&UserId>) -> bool {
+    match (device.user_id.as_ref(), user) {
+        (Some(owner), Some(user)) => owner == user,
+        _ => true,
+    }
+}
+
 /// Composes [`DeviceStore`] primitives into the lifecycle operations
 /// every axess consumer needs at request/authn boundaries.
 ///
@@ -101,6 +115,16 @@ where
     /// create a new row at [`DeviceTrustLevel::Unknown`] using
     /// `new_id_fn()` for the device_id and return it.
     ///
+    /// When `user` is `Some`, only a device that user owns (or one with
+    /// no owner) is reused. A device owned by someone else is skipped:
+    /// the caller's own device with that fingerprint is returned if it
+    /// has one, otherwise a new `Unknown` device is created. Two people
+    /// behind one office or VPN address with the same browser therefore
+    /// never share a device or its trust. When `user` is `None` the
+    /// owner cannot be compared, so the fingerprint's device is returned
+    /// as is; compare the owner with the authenticating user before
+    /// trusting it (see [`decide_step_up_for_user`](crate::authn::service::decide_step_up_for_user)).
+    ///
     /// `user` is `None` for guest sessions (pre-authn requests). The
     /// `user_id` field on the created Device row is set to whatever
     /// is passed in; updates that arrive later (e.g. when authn
@@ -125,16 +149,37 @@ where
         let tenant = *tenant;
         let user = user.cloned();
         async move {
-            // Fast path: device already known by this fingerprint.
+            // Fast path: device already known by this fingerprint. A
+            // device owned by a different user is not reused: a shared
+            // office, NAT or VPN gives two people the same fingerprint,
+            // and the second must not inherit the first one's trust.
             if let Some(existing) = self
                 .store
                 .find_by_fingerprint(&tenant, &fingerprint)
                 .await?
             {
-                self.store
-                    .record_sighting(&tenant, &existing.id, now)
-                    .await?;
-                return Ok(existing.id);
+                if is_usable_by(&existing, user.as_ref()) {
+                    self.store
+                        .record_sighting(&tenant, &existing.id, now)
+                        .await?;
+                    return Ok(existing.id);
+                }
+                // The lookup by fingerprint returns one row, which may be
+                // another user's. Look through the caller's own devices
+                // before minting a new one, so a repeat visit finds the
+                // same device again.
+                if let Some(user) = user.as_ref() {
+                    let own = self
+                        .store
+                        .find_for_user(&tenant, user, OWN_DEVICE_SCAN_LIMIT)
+                        .await?
+                        .into_iter()
+                        .find(|d| d.fingerprint_hash == fingerprint);
+                    if let Some(own) = own {
+                        self.store.record_sighting(&tenant, &own.id, now).await?;
+                        return Ok(own.id);
+                    }
+                }
             }
 
             // Create path: brand-new device at Unknown.
@@ -378,3 +423,6 @@ where
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ownership;

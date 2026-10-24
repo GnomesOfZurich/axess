@@ -17,16 +17,17 @@ const RFC_4226_SECRET_B32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
 // ── apply_hotp_failure ───────────────────────────────────────────
 
 #[test]
-fn apply_hotp_failure_zero_max_attempts_increments_without_burn() {
+fn apply_hotp_failure_zero_max_attempts_applies_default_limit() {
     let prior = HotpConfig {
         counter: 7,
-        attempt_count: 100,
+        attempt_count: 5,
         max_attempts: 0,
+        lookahead_window: 4,
         ..Default::default()
     };
     let next = apply_hotp_failure(&prior);
-    assert_eq!(next.counter, 7);
-    assert_eq!(next.attempt_count, 101);
+    assert_eq!(next.counter, 12, "zero must burn at the default limit");
+    assert_eq!(next.attempt_count, 0);
 }
 
 #[test]
@@ -59,18 +60,18 @@ fn apply_hotp_failure_burn_advances_counter_by_lookahead_plus_one() {
 // ── apply_email_otp_failure ──────────────────────────────────────
 
 #[test]
-fn apply_email_otp_failure_zero_max_attempts_increments_without_burn() {
+fn apply_email_otp_failure_zero_max_attempts_applies_default_limit() {
     let prior = EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new("hash")),
         pending_until: Some(Utc::now()),
-        attempt_count: 100,
+        attempt_count: 5,
         max_attempts: 0,
         ..Default::default()
     };
     let next = apply_email_otp_failure(&prior);
-    assert!(next.pending_hash.is_some());
-    assert_eq!(next.attempt_count, 101);
+    assert!(next.pending_hash.is_none(), "zero must burn at the default");
+    assert_eq!(next.attempt_count, 0);
 }
 
 // ── verify_credential: HOTP attempt-limit burn ───────────────────
@@ -97,31 +98,24 @@ fn hotp_attempt_limit_burns_lookahead_window() {
 }
 
 #[test]
-fn hotp_zero_max_attempts_does_not_burn() {
+fn hotp_zero_max_attempts_burns_at_default_limit() {
     let cfg = FactorConfig::Hotp(HotpConfig {
         secret: ZeroizedString::new(RFC_4226_SECRET_B32),
-        counter: 100,
-        attempt_count: 0,
+        counter: 0,
+        attempt_count: 5,
         max_attempts: 0,
-        lookahead_window: 4,
+        lookahead_window: 0,
         ..Default::default()
     });
-    let cred = FactorCredential::OtpCode(Arc::from("999999"));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now());
-    match outcome {
+    // "755224" is the correct code for counter 0; once the default limit
+    // is reached it must no longer be accepted.
+    let cred = FactorCredential::OtpCode(Arc::from("755224"));
+    match verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now()) {
         VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(updated)) => {
-            assert_eq!(updated.counter, 100);
-            assert_eq!(updated.attempt_count, 1);
+            assert_eq!(updated.counter, 1);
+            assert_eq!(updated.attempt_count, 0);
         }
-        other => panic!(
-            "expected FailWithUpdate without burn, got {:?}",
-            match other {
-                VerifyOutcome::Fail => "Fail",
-                VerifyOutcome::Pass => "Pass",
-                VerifyOutcome::PassWithUpdate(_) => "PassWithUpdate",
-                _ => "other",
-            }
-        ),
+        _ => panic!("expected the window to burn"),
     }
 }
 
@@ -152,25 +146,47 @@ fn hotp_success_advances_counter_by_one() {
 // ── verify_credential: Email OTP attempt-limit boundary ──────────
 
 #[test]
-fn email_otp_zero_max_attempts_does_not_burn() {
+fn email_otp_zero_max_attempts_burns_at_default_limit() {
     let hash = axess_factors::generate_password_hash("12345678");
     let future = Utc::now() + chrono::Duration::seconds(300);
     let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
         email: "test@example.com".into(),
         pending_hash: Some(ZeroizedString::new(&hash)),
         pending_until: Some(future),
-        attempt_count: 0,
+        attempt_count: 5,
         max_attempts: 0,
         ..Default::default()
     });
-    let cred = FactorCredential::OtpCode(Arc::from("00000000"));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now());
-    match outcome {
+    let cred = FactorCredential::OtpCode(Arc::from("12345678"));
+    match verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now()) {
         VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(updated)) => {
-            assert!(updated.pending_hash.is_some());
-            assert_eq!(updated.attempt_count, 1);
+            assert!(updated.pending_hash.is_none());
         }
-        _ => panic!("expected FailWithUpdate without burn"),
+        _ => panic!("expected the code to burn"),
+    }
+}
+
+#[test]
+fn email_otp_without_expiry_is_rejected() {
+    let code = "12345678";
+    let hash = axess_factors::generate_password_hash(code);
+    let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
+        email: "test@example.com".into(),
+        pending_hash: Some(ZeroizedString::new(&hash)),
+        pending_until: None,
+        ..Default::default()
+    });
+    let cred = FactorCredential::OtpCode(Arc::from(code));
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now());
+    assert!(matches!(outcome, VerifyOutcome::Fail));
+}
+
+#[test]
+fn generate_otp_code_handles_long_lengths() {
+    for len in [19usize, 20, 25, 40] {
+        let code = generate_otp_code(&crate::testing::mock_random::MockRng::new(7), len);
+        assert_eq!(code.len(), len);
+        assert!(code.bytes().all(|b| b.is_ascii_digit()));
     }
 }
 

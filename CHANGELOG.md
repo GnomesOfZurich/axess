@@ -10,75 +10,136 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
-## [0.9.0] - 2026-10-24
-
-A security release: the findings of the 2026-10-24 review, each with the
-test that failed before the fix. See
-[`docs/production/migrating.md`](docs/production/migrating.md) for the
-breaks and the behaviour changes.
+## [0.10.0] - 2026-10-25
 
 ### Changed (breaking)
 
-- **`RefreshTokenStore::rotate_token` returns `RotationOutcome`.**
-  **Migrating:** revoke the parent conditionally (`WHERE revoked = 0`),
-  return `ParentAlreadyRevoked` and store nothing when no row changed, and
-  `Rotated` otherwise.
-- **`ValidationConfig` gains `require_exp`** (default `true`).
-  **Migrating:** add the field to struct literals, or end them with
-  `..ValidationConfig::default()`.
-- **`ValkeyEntityCache::invalidate` returns `Result`.** **Migrating:**
-  handle or propagate the error; it was discarded before.
-- **MSRV is 1.95.0** (was 1.94.0), which `parking_lot` 0.13 requires.
-- **Dependencies**: `cedar-policy` 4.14.0, `lru` 0.19.0, `parking_lot`
-  0.13.0, `sha2` 0.11.1, `proptest` 1.12.0, `rkyv` 0.8.18, `zeroize` 1.9.1,
-  `uuid` 1.29.0, `tokio` 1.54.1, `serde_json` 1.0.154.
+- **`FactorStore` requires `insert_factor_if_absent`.** Insert the row if no
+  row of that kind exists at that scope and answer whether you did.
+- **`RefreshToken` has `authn_time: Option<DateTime<Utc>>`**, the original
+  sign-in time, copied on rotation. Add a nullable column; `None` reads as
+  `issued_at`.
+- **`logout` ends only the current session.** Use `invalidate_user_sessions`
+  to sign out everywhere.
+- **`KeyExtractor::Header` keys within an authenticated identity**, else on
+  the peer address. Set `RateLimitUserId` after authentication.
+- **`begin_login` answers `InvalidCredentials`** for a user with no methods
+  and for a suspended or terminated tenant.
+- **`PiiToken::parse` accepts only the hyphenated lowercase UUID form.**
+- **`Issuer::custom` refuses `cli`, `jwt_svid`, `mtls` and `oauth`.**
+- **`WorkloadId` and `TrustDomain` are validated on deserialize.**
+- **Back-channel logout requires `jti`**, and a `sub` logs out only users who
+  signed in through the sending issuer with a `sid`.
+- **A plain-HTTP `jwks_uri` is refused**, loopback excepted.
 
-### Security
+### Added
 
-- **A JWT without an integer `exp` is refused.** A missing `exp`, or a
-  float or string `exp`/`nbf`, was skipped and the token accepted forever.
-  `JwtVerifier::require_exp(false)` opts out of the first.
-- **A pinned issuer or audience is a required claim**, not one checked
-  only when present.
-- **The replay store holds a `jti` through the leeway window**, not only
-  until `exp`.
-- **An LDAP bind with an empty password is refused**; a permissive
-  directory answers it as an anonymous success.
-- **Discovery parses the issuer URL**: https, or http to a host that is
-  loopback, without userinfo. The document's `issuer` must equal the URL
-  fetched, and its `jwks_uri` must pass the same rule.
-- **Moka authz-cache invalidation works**; a revoked role authorized until
-  the TTL.
-- **Registered claims cannot be set as custom claims**, and the local IdP
-  refuses `issuer` and `jwks_uri` as custom discovery metadata.
-- **A failed session cycle deletes the old session** instead of leaving it
-  live.
-- **HOTP and TOTP refuse codes shorter than six digits** and a zero TOTP
-  step.
-- **Two refreshes racing on one token are a reuse**: the loser revokes the
-  family instead of minting a second live child.
-- **A fingerprint-bound session presented without a fingerprint is
-  invalidated.**
-- **CSRF guards every method except GET, HEAD, OPTIONS and TRACE.**
-- **Cedar entity ids are escaped on the authz store path.**
-- **Valkey invalidation escapes glob characters** in its patterns.
-- **Rate-limit keys from a header and from the peer address cannot
-  collide.**
-- **`traceparent` is validated**: lowercase hex, no version `ff`, no
-  all-zero ids.
-- **The WebSocket revocation watcher stops when its socket drops.**
-- **The bearer 401 body is JSON-encoded**, not formatted from the error.
-- **`client_secret_basic` form-encodes id and secret** (RFC 6749 §2.3.1).
-- **`mutate_custom` persists an equal-length change.**
-- **The entity-cache setters keep the settings they were not asked to
-  change.**
-- **`rustls` requires 0.23.46** (RUSTSEC-2026-0346 to 0349).
-- **`Cargo.lock` takes `rustls-webpki` 0.103.16, `webpki-roots` 1.0.11 and
-  `ctutils` 0.4.5** (RUSTSEC-2026-0381, 0382, 0385). Adopters resolve their
-  own: run `cargo update -p rustls-webpki -p webpki-roots -p ctutils`.
-- **RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is accepted, not fixed.** It
-  arrives through p256 0.13, which jsonwebtoken, openidconnect and webauthn-rs
-  pin; the defects it names are absent from 0.5.5. Reasoning in `deny.toml`.
+- `decide_step_up_for_user(device, user, policy)`; `decide_step_up` stays and
+  ignores ownership.
+- `basic_credentials` and `expiry_after` (axess-factors, `outbound-oauth`).
+- `EntityState::effective_at(now)`.
+- `Issuer::Custom` serializes as `{"kind":"custom","label":"..."}`.
+
+### Fixed
+
+- **One-time codes replayed in parallel.** Two concurrent requests with the
+  same TOTP, HOTP or email code both passed, including inherited factors;
+  parallel first failures counted as one. Exactly one passes and every
+  failure counts.
+- **Another user's trusted device reused.** A fingerprint match owned by
+  someone else returned their trusted device and skipped step-up. A device
+  is reused only for its owner.
+- **Tenant-scoped OAuth login ignored the tenant.** The expected tenant was
+  cleared before the check; a user in another tenant is refused with
+  `CrossTenant`.
+- **A refreshed session reported `authn_time = now`**, so an old refresh
+  chain passed recent-login and step-up checks.
+- **`require_authz!` spliced ids into Cedar text.** Quotes, backslashes or
+  `\u{..}` in an id could name another principal or resource.
+- **A revoked device stayed trusted in the cache** for the TTL; sweeps left
+  stale rows cached.
+- **Registering a passkey erased existing passkeys** when the store read
+  failed; every passkey got the last-used stamp on any login.
+- **JWKS error responses replaced the cached keys**; `azp` was unchecked
+  with a single-value `aud`; `nbf`, `groups`, `roles` and `sid` were dropped
+  from ID tokens, so FAPI login failed and `sid` logout found no session.
+- **A failed audit write left the session authenticated** after login,
+  signup or impersonation.
+- **Timed suspensions never ended**; impersonation and password reset
+  accepted inactive accounts; a refused reset spent its token.
+- **Local IdP `extra` fields overrode derived discovery fields.**
+- **`IpPolicy` let IPv4-mapped IPv6 past an IPv4 denylist**, and skipped an
+  unreadable deny entry.
+- **OBO exchange and stored grants sent the client secret unencoded**;
+  `expires_in` above `i64` panicked, `u64::MAX` wrapped to expired.
+- **STS request `Debug` printed the token**; Azure tenant and GCP account
+  names were not confined to one URL segment; SPIFFE paths accepted `..`.
+- **`find_active_for_user` applied its limit before dropping revoked
+  devices.** `max_attempts = 0` disabled the OTP limit. An email code with no
+  expiry never expired. Code generation overflowed at 20 digits. Each
+  password was recorded twice. `min_length` counted bytes.
+- **A zero JWKS refresh interval ended the refresh task.**
+  `MemoryStore::prune_expired` underflowed. The first form after a session id
+  change failed on submit.
+
+### Known
+
+- `DeviceStore` has no atomic update: `promote_on_authn` and
+  `bind_webauthn_credential` can overwrite a concurrent revocation.
+- The default device resolver supplies no user, so the ownership rule needs
+  an adopter-supplied resolver or `ensure_device` with the user.
+
+---
+
+## [0.9.0] - 2026-10-24
+
+### Changed (breaking)
+
+- **`RefreshTokenStore::rotate_token` returns `RotationOutcome`.** Revoke
+  the parent only while it is live; answer `ParentAlreadyRevoked` otherwise
+  and store nothing.
+- **`ValidationConfig` has `require_exp`** (default `true`).
+- **`ValkeyEntityCache::invalidate` returns `Result`.**
+- **MSRV is 1.95.0**, required by `parking_lot` 0.13.
+- **Dependencies**: cedar-policy 4.14.0, lru 0.19.0, parking_lot 0.13.0,
+  sha2 0.11.1, proptest 1.12.0, rkyv 0.8.18, zeroize 1.9.1, uuid 1.29.0,
+  tokio 1.54.1, serde_json 1.0.154.
+
+### Fixed
+
+- **A JWT without an integer `exp` was accepted forever.** `exp` is required
+  and `exp`/`nbf` must be integers; `require_exp(false)` opts out.
+- **A pinned `iss` or `aud` was enforced only when present.** It is required.
+- **The replay store forgot a `jti` at `exp`** while the token was still
+  accepted within the leeway.
+- **An LDAP bind with an empty password passed** as an anonymous success.
+- **Discovery accepted `http://localhost.attacker.com`** by prefix. The
+  issuer URL is parsed; the document's `issuer` must equal the URL fetched;
+  `jwks_uri` follows the same rule; an error status is a failed fetch.
+- **Moka authz-cache invalidation did nothing**; a revoked role authorized
+  until the TTL.
+- **Registered JWT claims could be set as custom claims**; the local IdP
+  accepted `issuer` and `jwks_uri` as custom metadata.
+- **A failed session cycle left the old session live.**
+- **HOTP and TOTP accepted codes under six digits** and a zero TOTP step.
+- **Two refreshes racing on one token each minted a live child.** The loser
+  is a reuse and revokes the family.
+- **A fingerprint-bound session presented without a fingerprint passed.**
+- **CSRF checked only POST, PUT, PATCH and DELETE.** Every method outside
+  GET, HEAD, OPTIONS and TRACE is checked.
+- **Cedar entity ids were unescaped on the authz store path.**
+- **Valkey invalidation patterns were not glob-escaped**, and a failed `DEL`
+  was discarded.
+- **A rate-limit header value could alias a peer address.**
+- **`traceparent` accepted uppercase hex, version `ff` and all-zero ids.**
+- **The WebSocket revocation watcher outlived its socket.**
+- **The bearer 401 body was formatted from the error** rather than encoded.
+- **`client_secret_basic` sent the id and secret unencoded.**
+- **`mutate_custom` missed an equal-length change.**
+- **The entity-cache setters reset each other's settings.**
+- **`rustls` requires 0.23.46** (RUSTSEC-2026-0346 to 0349). `Cargo.lock`
+  takes rustls-webpki 0.103.16, webpki-roots 1.0.11 and ctutils 0.4.5.
+  RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is accepted; see `deny.toml`.
 
 ---
 

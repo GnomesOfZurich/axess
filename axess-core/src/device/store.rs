@@ -64,10 +64,12 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send;
 
     /// Same as [`find_for_user`](Self::find_for_user) but excludes
-    /// `Revoked` rows. Default implementation filters in-memory after a
-    /// full `find_for_user` call; SQL backends SHOULD override with a
-    /// `WHERE trust_level != 'Revoked'` clause that the optimiser can
-    /// use against the trust-level index.
+    /// `Revoked` rows, and returns up to `limit` of the remaining ones.
+    /// The default implementation asks `find_for_user` for more rows
+    /// until `limit` active ones are found or the user has no more
+    /// devices, so revoked devices never use up the limit. SQL backends
+    /// SHOULD override with a `WHERE trust_level != 'Revoked'` clause
+    /// that the optimiser can use against the trust-level index.
     fn find_active_for_user(
         &self,
         tenant_id: &TenantId,
@@ -75,9 +77,20 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         async move {
-            let mut all = self.find_for_user(tenant_id, user_id, limit).await?;
-            all.retain(|d| d.trust_level != DeviceTrustLevel::Revoked);
-            Ok(all)
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let mut fetch = limit;
+            loop {
+                let mut rows = self.find_for_user(tenant_id, user_id, fetch).await?;
+                let exhausted = rows.len() < fetch;
+                rows.retain(|d| d.trust_level != DeviceTrustLevel::Revoked);
+                if rows.len() >= limit || exhausted {
+                    rows.truncate(limit);
+                    return Ok(rows);
+                }
+                fetch = fetch.saturating_mul(2);
+            }
         }
     }
 
@@ -405,7 +418,16 @@ impl DeviceStore for MemoryDeviceStore {
     async fn save(&self, device: &Device) -> Result<(), Self::Error> {
         let key = Self::key(&device.tenant_id, &device.id);
         let fp_key = (device.tenant_id, device.fingerprint_hash);
-        self.devices.insert(key, device.clone());
+        let previous = self.devices.insert(key, device.clone());
+        // A device re-saved under a new fingerprint must stop answering
+        // to the old one, unless the old entry already belongs to
+        // another device.
+        if let Some(old) = previous
+            && old.fingerprint_hash != device.fingerprint_hash
+        {
+            self.fingerprint_index
+                .remove_if(&(old.tenant_id, old.fingerprint_hash), |_, v| *v == old.id);
+        }
         self.fingerprint_index.insert(fp_key, device.id);
         self.write_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -451,7 +473,8 @@ impl DeviceStore for MemoryDeviceStore {
         let key = Self::key(tenant_id, id);
         if let Some((_, device)) = self.devices.remove(&key) {
             let fp_key = (device.tenant_id, device.fingerprint_hash);
-            self.fingerprint_index.remove(&fp_key);
+            self.fingerprint_index
+                .remove_if(&fp_key, |_, v| *v == device.id);
         }
         Ok(())
     }
@@ -526,7 +549,8 @@ impl DeviceStore for MemoryDeviceStore {
                 Action::Purge => {
                     if let Some((_, device)) = self.devices.remove(&key) {
                         let fp_key = (device.tenant_id, device.fingerprint_hash);
-                        self.fingerprint_index.remove(&fp_key);
+                        self.fingerprint_index
+                            .remove_if(&fp_key, |_, v| *v == device.id);
                     }
                 }
             }

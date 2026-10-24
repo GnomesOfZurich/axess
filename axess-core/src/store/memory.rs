@@ -152,10 +152,17 @@ where
     /// wraps this; both have identical semantics.
     pub fn prune_expired_sync(&self) -> u64 {
         let now = self.clock.now();
-        let before = self.inner.len();
-        self.inner.retain(|_, entry| entry.expires_at > now);
-        let after = self.inner.len();
-        (before - after) as u64
+        // Count what this call removes. Subtracting two `len()` readings
+        // underflows when other threads insert between them.
+        let mut removed = 0u64;
+        self.inner.retain(|_, entry| {
+            let keep = entry.expires_at > now;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        removed
     }
 
     /// Current entry count (including expired entries that have not

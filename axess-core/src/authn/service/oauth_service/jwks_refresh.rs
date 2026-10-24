@@ -64,6 +64,13 @@ where
     /// ```
     pub fn spawn_jwks_refresh(&self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
         let providers: Vec<_> = self.inner.oauth_providers.values().cloned().collect();
+        // A zero period would panic inside the task and end the loop silently.
+        let interval = if interval.is_zero() {
+            tracing::warn!("spawn_jwks_refresh: zero interval; using 60 s");
+            axess_factors::oidc::MIN_JWKS_REFRESH_INTERVAL
+        } else {
+            interval
+        };
 
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);

@@ -57,7 +57,7 @@ pub mod session_validator;
 pub use outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome};
 pub use session_validator::{NoSessionRegistryError, SessionValidator, require_valid_session};
 #[cfg(feature = "device")]
-pub use step_up::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up};
+pub use step_up::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up, decide_step_up_for_user};
 
 // ── Imports ──────────────────────────────────────────────────────────────────
 

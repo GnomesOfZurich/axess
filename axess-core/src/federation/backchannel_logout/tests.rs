@@ -14,7 +14,10 @@ use crate::testing::mock_random::MockRng;
 use axess_clock::SystemClock;
 use axess_factors::oauth::MockOAuthProvider;
 use axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT;
+use axum::extract::{Form, State};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+const ISS: &str = "https://test-idp.example.com";
 
 /// Helper: create a handler with a mock provider and memory registry.
 fn setup() -> (
@@ -431,8 +434,6 @@ fn jti_cache_max_is_sixteen_kib() {
 /// rejects when it must succeed).
 #[tokio::test]
 async fn handler_invalidates_session_and_rejects_jti_replay() {
-    use axum::extract::{Form, State};
-
     let registry = MemorySessionRegistry::new();
     let providers: Vec<Arc<dyn OAuthProvider>> =
         vec![Arc::new(MockOAuthProvider::new("test-idp").with_user(
@@ -441,19 +442,25 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
             vec![],
             vec![],
         ))];
+    let sid_map: SidMap = Arc::new(DashMap::new());
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
-        Arc::new(DashMap::new()),
+        sid_map.clone(),
         Arc::new(SystemClock),
     )
     .expect("handler should be created");
 
-    // Register a session that the logout must invalidate.
+    // Register a session that the logout must invalidate, signed in through
+    // the issuer that sends the token.
     let rng = MockRng::new(42);
     let session_id = SessionId::new(&rng);
     let user_id = axess_identity::testing::user("user-123");
     registry.register(&user_id, &session_id).await.unwrap();
+    sid_map.insert(
+        (ISS.to_string(), "some-sid".to_string()),
+        (user_id, session_id, chrono::Utc::now()),
+    );
     assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
     // Build a sub-only logout token (jti embedded in the mock).
@@ -496,4 +503,102 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
         StatusCode::BAD_REQUEST,
         "same (issuer, jti) within IAT window must be rejected as replay"
     );
+}
+
+// ── issuer scoping, non-UUID subs, jti ───────────────────────────────────────
+
+/// Unsigned logout token with the given extra claims (the mock provider
+/// skips signature verification).
+fn raw_token(extra: serde_json::Value) -> String {
+    let mut payload = serde_json::json!({
+        "iss": ISS,
+        "aud": "mock-client-id",
+        "iat": chrono::Utc::now().timestamp(),
+        "events": { BACKCHANNEL_LOGOUT_EVENT: {} },
+    });
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let header = serde_json::json!({"alg": "none", "typ": "JWT"});
+    format!(
+        "{}.{}.",
+        URL_SAFE_NO_PAD.encode(header.to_string().as_bytes()),
+        URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes()),
+    )
+}
+
+async fn post(handler: &BackChannelLogoutHandler, token: String) -> Result<StatusCode, StatusCode> {
+    BackChannelLogoutHandler::handle_backchannel_logout(
+        State(handler.clone()),
+        Form(LogoutParams {
+            logout_token: token,
+        }),
+    )
+    .await
+}
+
+fn handler_with(registry: &MemorySessionRegistry, sid_map: SidMap) -> BackChannelLogoutHandler {
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(MockOAuthProvider::new("test-idp"))];
+    BackChannelLogoutHandler::new(
+        &providers,
+        Arc::new(SessionRegistryAdapter(registry.clone())),
+        sid_map,
+        Arc::new(SystemClock),
+    )
+    .expect("handler")
+}
+
+/// A `sub` equal to a local user id does not log that user out when the
+/// user never signed in through the issuer that sent the token.
+#[tokio::test]
+async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map: SidMap = Arc::new(DashMap::new());
+    let handler = handler_with(&registry, sid_map.clone());
+    let rng = MockRng::new(7);
+    let session_id = SessionId::new(&rng);
+    let victim = axess_identity::testing::user("user-123");
+    registry.register(&victim, &session_id).await.unwrap();
+    // The victim signed in through a different issuer.
+    sid_map.insert(
+        ("https://other-idp.example.com".to_string(), "s".to_string()),
+        (victim, session_id, chrono::Utc::now()),
+    );
+
+    let token = raw_token(serde_json::json!({ "sub": victim.to_string(), "jti": "j1" }));
+    assert_eq!(post(&handler, token).await, Ok(StatusCode::OK));
+    assert!(registry.is_valid(&victim, &session_id).await.unwrap());
+}
+
+/// A numeric (non-UUID) `sub` must not stop the `sid` logout in the same
+/// token, and must not be answered with 400.
+#[tokio::test]
+async fn non_uuid_sub_does_not_block_sid_logout() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map: SidMap = Arc::new(DashMap::new());
+    let handler = handler_with(&registry, sid_map.clone());
+    let rng = MockRng::new(8);
+    let session_id = SessionId::new(&rng);
+    let user = axess_identity::testing::user("user-123");
+    registry.register(&user, &session_id).await.unwrap();
+    sid_map.insert(
+        (ISS.to_string(), "sid-1".to_string()),
+        (user, session_id, chrono::Utc::now()),
+    );
+
+    let token = raw_token(serde_json::json!({
+        "sub": "104857612345678901234", "sid": "sid-1", "jti": "j2"
+    }));
+    assert_eq!(post(&handler, token).await, Ok(StatusCode::OK));
+    assert!(!registry.is_valid(&user, &session_id).await.unwrap());
+}
+
+/// A logout token without `jti` cannot be replay-protected and is refused.
+#[tokio::test]
+async fn logout_token_without_jti_is_rejected() {
+    let registry = MemorySessionRegistry::new();
+    let handler = handler_with(&registry, Arc::new(DashMap::new()));
+    let token = raw_token(serde_json::json!({ "sid": "sid-1" }));
+    assert_eq!(post(&handler, token).await, Err(StatusCode::BAD_REQUEST));
 }

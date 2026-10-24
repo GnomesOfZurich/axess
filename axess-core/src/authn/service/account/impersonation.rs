@@ -63,6 +63,29 @@ where
     ) -> Result<(), AuthnError<I::Error>> {
         let now = self.inner.clock.now();
 
+        // A suspended, terminated or otherwise non-active target cannot be
+        // assumed: impersonation would hand the admin a session the account's
+        // own owner is barred from holding. Checked before the admin's
+        // session is touched.
+        let status = self.current_account_status(&target_user.id).await?;
+        if !status.allows_login() {
+            tracing::warn!(
+                admin = %admin_user_id,
+                target = %target_user.id,
+                status = ?status,
+                "impersonation refused: target account is not active"
+            );
+            self.emit_audit_at(
+                AuthEventBuilder::failure(AuthEventType::Impersonation)
+                    .attributed_to(&target_user.id, &target_user.tenant_id)
+                    .with_actor(*admin_user_id)
+                    .with_error(AuthFailureReason::NotActive),
+                now,
+            )
+            .await?;
+            return Err(AuthnError::NotActive(status));
+        }
+
         // Wipe any custom JSON the admin's session was carrying. Without
         // this, attacker-pre-seeded keys (OAuth PKCE_VERIFIER, CSRF_STATE,
         // app-specific flags) would persist into the impersonated identity
@@ -96,15 +119,22 @@ where
         }
 
         // Record the impersonation event with both principals: the target
-        // is the subject, the admin is the actor.
-        self.emit_audit_at(
-            AuthEventBuilder::success(AuthEventType::Impersonation)
-                .attributed_to(&target_user.id, &target_user.tenant_id)
-                .with_session(sid)
-                .with_actor(*admin_user_id),
-            now,
-        )
-        .await?;
+        // is the subject, the admin is the actor. An impersonation that
+        // cannot be recorded does not stand: the session is ended.
+        if let Err(e) = self
+            .emit_audit_at(
+                AuthEventBuilder::success(AuthEventType::Impersonation)
+                    .attributed_to(&target_user.id, &target_user.tenant_id)
+                    .with_session(sid)
+                    .with_actor(*admin_user_id),
+                now,
+            )
+            .await
+        {
+            self.end_session_after_audit_failure(&target_user.id, session)
+                .await;
+            return Err(e);
+        }
 
         tracing::warn!(
             admin = %admin_user_id,
