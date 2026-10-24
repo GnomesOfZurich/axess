@@ -5,7 +5,9 @@
 
 use axess::Clock;
 use axess::authn::{DeviceId, UserId};
-use axess::session::{RefreshToken, RefreshTokenId, RefreshTokenStore, TokenFamilyId};
+use axess::session::{
+    RefreshToken, RefreshTokenId, RefreshTokenStore, RotationOutcome, TokenFamilyId,
+};
 use sqlx::{AssertSqlSafe, Row};
 
 use super::{BackendError, OurBackend, parse_db_datetime};
@@ -153,15 +155,23 @@ impl RefreshTokenStore for OurBackend {
         &self,
         parent_id: &RefreshTokenId,
         new_token: &RefreshToken,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<RotationOutcome, Self::Error> {
         // Single transaction: parent revoke + child insert land together or
         // neither. Closes the window where a mid-rotation crash leaves the
         // user with a revoked parent and no replacement.
         let mut tx = self.pool().begin().await?;
-        sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?1")
-            .bind(parent_id.to_string())
-            .execute(&mut *tx)
-            .await?;
+        // Conditional: a parent already revoked means a parallel refresh won
+        // the race; nothing is inserted and the caller treats it as reuse.
+        let revoked_now =
+            sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?1 AND revoked = 0")
+                .bind(parent_id.to_string())
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        if revoked_now == 0 {
+            tx.rollback().await?;
+            return Ok(RotationOutcome::ParentAlreadyRevoked);
+        }
         sqlx::query(
             "INSERT INTO refresh_tokens
                  (id, user_id, tenant_id, token_hash, family_id, device_id,
@@ -181,7 +191,7 @@ impl RefreshTokenStore for OurBackend {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(RotationOutcome::Rotated)
     }
 }
 

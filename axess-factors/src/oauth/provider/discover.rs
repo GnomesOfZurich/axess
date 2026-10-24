@@ -19,12 +19,9 @@ use openidconnect::{ClientId, ClientSecret, IssuerUrl, RedirectUrl, core::CorePr
 /// Inlined into [`OAuthProviderConfig::discover`] would require live IdP
 /// or mock HTTP infra to exercise the rejection paths.
 pub(crate) fn is_issuer_url_acceptable(issuer_url: &str) -> bool {
-    if issuer_url.starts_with("https://") {
-        return true;
-    }
-    issuer_url.starts_with("http://localhost")
-        || issuer_url.starts_with("http://127.0.0.1")
-        || issuer_url.starts_with("http://[::1]")
+    // One rule for both discovery paths: the parsed host decides, see
+    // `oidc::discovery::require_https_or_loopback`.
+    crate::oidc::discovery::require_https_or_loopback(issuer_url).is_ok()
 }
 
 impl OAuthProviderConfig {
@@ -148,8 +145,12 @@ mod issuer_url_acceptability_tests {
         assert!(is_issuer_url_acceptable("http://localhost:8080/realms/dev"));
         assert!(is_issuer_url_acceptable("http://127.0.0.1:8080"));
         assert!(is_issuer_url_acceptable("http://[::1]:8443"));
-        // Non-loopback plain http rejected.
+        // Non-loopback plain http rejected, including hosts that merely START
+        // like loopback and URLs that hide the host behind userinfo.
         assert!(!is_issuer_url_acceptable("http://idp.example.com"));
+        assert!(!is_issuer_url_acceptable("http://localhost.attacker.com"));
+        assert!(!is_issuer_url_acceptable("http://127.0.0.1.nip.io"));
+        assert!(!is_issuer_url_acceptable("http://localhost@evil.com"));
         assert!(!is_issuer_url_acceptable("http://attacker.test/"));
         // Other schemes rejected.
         assert!(!is_issuer_url_acceptable("ftp://example.com"));

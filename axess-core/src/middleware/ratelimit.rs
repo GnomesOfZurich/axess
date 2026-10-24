@@ -438,7 +438,11 @@ fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
             .get::<RateLimitLoginIdentifier>()
             .map(|i| i.as_str().to_owned())
             .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
-        KeyExtractor::Header(name) => header_str(req, name).unwrap_or_else(|| extract_peer_ip(req)),
+        // Prefixed, so a header VALUE spelled like an address (`X-Api-Key:
+        // 10.0.0.5`) cannot drain the bucket of the client at that address.
+        KeyExtractor::Header(name) => header_str(req, name)
+            .map(|v| format!("h:{v}"))
+            .unwrap_or_else(|| format!("ip:{}", extract_peer_ip(req))),
     };
     truncate_key(raw)
 }

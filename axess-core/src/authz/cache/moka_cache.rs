@@ -88,6 +88,10 @@ where
             cache: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(60))
+                // Without this, `invalidate_entries_if` returns
+                // `InvalidationClosuresDisabled` and a revoked role keeps
+                // authorizing until the TTL expires.
+                .support_invalidation_closures()
                 .build(),
         }
     }
@@ -99,20 +103,28 @@ where
             cache: Cache::builder()
                 .max_capacity(capacity)
                 .time_to_live(ttl)
+                .support_invalidation_closures()
                 .build(),
         }
     }
 
     /// Fluent: set max capacity. Replaces the underlying cache (so call
     /// before any traffic; capacity changes mid-flight clear the cache).
+    /// The TTL already set is kept, so `.with_ttl(5s).with_capacity(100)`
+    /// means what it says.
     pub fn with_capacity(self, capacity: u64) -> Self {
-        let ttl = Duration::from_secs(60);
+        let ttl = self
+            .cache
+            .policy()
+            .time_to_live()
+            .unwrap_or(Duration::from_secs(60));
         Self::with_options(self.inner, capacity, ttl)
     }
 
-    /// Fluent: set TTL. Replaces the underlying cache.
+    /// Fluent: set TTL. Replaces the underlying cache; the capacity already
+    /// set is kept.
     pub fn with_ttl(self, ttl: Duration) -> Self {
-        let capacity = 10_000;
+        let capacity = self.cache.policy().max_capacity().unwrap_or(10_000);
         Self::with_options(self.inner, capacity, ttl)
     }
 
@@ -347,6 +359,38 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// `invalidate_principal` must evict; without invalidation closures
+    /// enabled on the builder, moka answers `InvalidationClosuresDisabled`
+    /// and a revoked role keeps authorizing until the TTL.
+    #[tokio::test]
+    async fn invalidate_principal_evicts_that_principals_entries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cached = MokaEntityCache::new(CountingProvider {
+            calls: calls.clone(),
+        });
+        let s = guest_session();
+        let p = principal();
+        let a = action();
+        let r = doc("doc-1");
+
+        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        cached
+            .invalidate_principal(&p)
+            .expect("invalidation closures are enabled on the builder");
+        // moka applies closure invalidation on its housekeeping pass.
+        cached.cache.run_pending_tasks().await;
+
+        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "after invalidate_principal the next call must re-invoke inner"
+        );
+    }
+
     #[tokio::test]
     async fn invalidate_evicts_cached_entry() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -410,5 +454,47 @@ mod tests {
             "after invalidate_all, every entry must re-invoke inner; \
              killing the `()` no-op mutation on invalidate_all"
         );
+    }
+}
+
+#[cfg(test)]
+mod setter_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    struct Never;
+    impl RequestEntityProvider for Never {
+        fn entities_for<'a>(
+            &'a self,
+            _session: &'a crate::session::AuthSession,
+            _principal: &'a EntityUid,
+            _resource: &'a EntityUid,
+            _action: &'a EntityUid,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<cedar_policy::Entities, AuthzError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(cedar_policy::Entities::empty()) })
+        }
+    }
+
+    /// `.with_ttl(5s).with_capacity(100)` keeps the TTL; the old setter reset
+    /// it to 60 s, so revoked roles stayed cached twelve times longer than set.
+    #[test]
+    fn fluent_setters_keep_each_others_settings() {
+        let _unused = AtomicUsize::new(0);
+        let cached = MokaEntityCache::new(Never)
+            .with_ttl(Duration::from_secs(5))
+            .with_capacity(100);
+        assert_eq!(
+            cached.cache.policy().time_to_live(),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(cached.cache.policy().max_capacity(), Some(100));
+        let _ = Arc::new(());
     }
 }

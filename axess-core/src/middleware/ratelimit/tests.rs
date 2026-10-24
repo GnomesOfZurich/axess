@@ -562,3 +562,24 @@ async fn forged_forwarded_headers_share_one_bucket() {
         "a different forged header must not reset the bucket"
     );
 }
+
+/// A header value spelled like an address lives in a different bucket from
+/// the client at that address, so `X-Api-Key: 10.0.0.5` cannot drain
+/// 10.0.0.5's bucket.
+#[test]
+fn header_key_and_ip_fallback_do_not_collide() {
+    let extractor = KeyExtractor::Header("x-api-key".to_string());
+    let with_header = Request::builder()
+        .uri("/")
+        .header("x-api-key", "10.0.0.5")
+        .body(Body::empty())
+        .unwrap();
+    let from_ip = make_request_with_ip("10.0.0.5");
+    let a = extract_key(&with_header, &extractor);
+    let b = extract_key(&from_ip, &extractor);
+    assert_ne!(
+        a, b,
+        "header key {a:?} and ip fallback {b:?} must be distinct buckets"
+    );
+    assert!(a.starts_with("h:") && b.starts_with("ip:"));
+}

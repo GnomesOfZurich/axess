@@ -105,8 +105,19 @@ impl TraceContext {
         if version.len() != 2 || trace_id.len() != 32 || parts[2].len() != 16 || flags.len() != 2 {
             return None;
         }
-        if !trace_id.chars().all(|c| c.is_ascii_hexdigit())
-            || !flags.chars().all(|c| c.is_ascii_hexdigit())
+        // W3C Trace Context §3.2: every field is lowercase hex, version `ff`
+        // is invalid, and an all-zero trace-id or parent-id is invalid.
+        let lower_hex = |s: &str| {
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        };
+        if !lower_hex(version) || !lower_hex(trace_id) || !lower_hex(parts[2]) || !lower_hex(flags)
+        {
+            return None;
+        }
+        if version == "ff"
+            || trace_id.bytes().all(|b| b == b'0')
+            || parts[2].bytes().all(|b| b == b'0')
         {
             return None;
         }

@@ -314,3 +314,31 @@ fn build_totp_uri_known_output() {
     assert!(uri.contains("digits=6"), "digits missing: {uri}");
     assert!(uri.contains("period=30"), "period missing: {uri}");
 }
+
+/// A code length below six is brute-forceable and a period of zero would
+/// divide by zero; both are refused before any code is compared.
+#[test]
+fn totp_rejects_short_length_and_zero_period() {
+    use chrono::DateTime;
+    let raw: [u8; 20] = [0xab; 20];
+    let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &raw);
+    let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let short = TotpVerifyParams {
+        length: Some(1),
+        period: Some(30),
+        ..TotpVerifyParams::default()
+    };
+    assert!(
+        verify_totp(&b32, "1", now, short).is_none(),
+        "a one-digit code must be refused"
+    );
+    let zero_period = TotpVerifyParams {
+        length: Some(6),
+        period: Some(0),
+        ..TotpVerifyParams::default()
+    };
+    assert!(
+        verify_totp(&b32, "123456", now, zero_period).is_none(),
+        "a zero period must be refused, not divide by zero"
+    );
+}

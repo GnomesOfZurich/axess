@@ -212,3 +212,19 @@ async fn entries_expire_under_injected_clock() {
         "TTL expired under MockClock; must re-fetch from inner"
     );
 }
+
+/// Each fluent setter carries the others' settings: `.with_ttl(5s)
+/// .with_capacity(100)` means both, not a capacity with the default TTL.
+#[test]
+fn fluent_setters_keep_each_others_settings() {
+    let cached = EntityCache::new(CountingProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    })
+    .with_ttl(std::time::Duration::from_secs(5))
+    .with_capacity(100);
+    assert_eq!(cached.ttl, std::time::Duration::from_secs(5));
+    assert_eq!(cached.capacity, 100);
+    let clocked = cached.with_clock(Arc::new(MockClock::at(chrono::Utc::now())));
+    assert_eq!(clocked.ttl, std::time::Duration::from_secs(5));
+    assert_eq!(clocked.capacity, 100);
+}

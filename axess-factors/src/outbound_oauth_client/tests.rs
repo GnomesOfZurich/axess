@@ -158,11 +158,15 @@ async fn force_refresh_bypasses_cache() {
 #[tokio::test]
 async fn client_secret_basic_sends_authorization_header() {
     let server = MockServer::start().await;
-    // Match on the exact Authorization header value.
-    // base64("axess-id:Gnomes2+") = "YXhlc3MtaWQ6R25vbWVzMis=".
+    // Match on the exact Authorization header value. RFC 6749 §2.3.1
+    // form-urlencodes id and secret before the Basic encoding, so the `+`
+    // travels as `%2B`: base64("axess-id:Gnomes2%2B").
     Mock::given(method("POST"))
         .and(path("/oauth2/token"))
-        .and(header("authorization", "Basic YXhlc3MtaWQ6R25vbWVzMis="))
+        .and(header(
+            "authorization",
+            "Basic YXhlc3MtaWQ6R25vbWVzMiUyQg==",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "tok",
             "expires_in": 3600,

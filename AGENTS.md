@@ -13,7 +13,7 @@ If project guidance changes, update this file first and only keep tool-specific 
 
 axess is a modular, policy-driven authentication and authorization library for the Axum web framework in Rust. Multi-factor authentication with an explicit session state machine, Cedar Policy authorization (RBAC + ABAC + ReBAC), and deterministic simulation testing (DST) from the ground up.
 
-Rust edition `2024`, MSRV `1.94.0` (`rust-version` in `[workspace.package]` is the single source), toolchain pinned in `rust-toolchain.toml`.
+Rust edition `2024`, MSRV `1.95.0` (`rust-version` in `[workspace.package]` is the single source), toolchain pinned in `rust-toolchain.toml`.
 
 ## Core Boundaries
 

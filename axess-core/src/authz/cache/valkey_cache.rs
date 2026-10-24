@@ -179,9 +179,9 @@ where
         tenant: Option<&str>,
         resource: &EntityUid,
         action: &EntityUid,
-    ) {
+    ) -> Result<(), fred::error::Error> {
         let key = self.cache_key(principal, tenant, resource, action);
-        let _: Result<(), _> = self.client.del(&key).await;
+        self.client.del(&key).await
     }
 
     /// Borrow the inner provider for read access.
@@ -241,7 +241,11 @@ where
         &self,
         principal: &EntityUid,
     ) -> Result<(), fred::error::Error> {
-        let pattern = format!("{}:authz-entities:{principal}|*", self.prefix);
+        let pattern = format!(
+            "{}:authz-entities:{}|*",
+            self.prefix,
+            glob_escape(&principal.to_string())
+        );
         self.scan_and_delete(&pattern).await
     }
 
@@ -255,9 +259,23 @@ where
     /// so the pattern is safe; if you adopt a custom EntityUid format
     /// that does, prefer a per-tenant key prefix instead.
     pub async fn invalidate_tenant(&self, tenant: &str) -> Result<(), fred::error::Error> {
-        let pattern = format!("{}:authz-entities:*|{tenant}|*", self.prefix);
+        let pattern = format!("{}:authz-entities:*|{}|*", self.prefix, glob_escape(tenant));
         self.scan_and_delete(&pattern).await
     }
+}
+
+/// Escape the characters SCAN MATCH reads as a glob (`*`, `?`, `[`, `]`,
+/// `\`), so a principal such as `App::User::"a[1]"` matches its own key and
+/// a tenant string of `*` cannot name every tenant's entries.
+fn glob_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl<P> super::invalidator::CacheInvalidator for ValkeyEntityCache<P>
@@ -395,6 +413,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The glob characters a principal or tenant may carry are escaped, so a
+    /// principal `a[1]` matches its own key and a tenant `*` matches only
+    /// the tenant spelled `*`.
+    #[test]
+    fn glob_escape_neutralises_pattern_characters() {
+        assert_eq!(
+            super::glob_escape(r#"App::User::"a[1]""#),
+            r#"App::User::"a\[1\]""#
+        );
+        assert_eq!(super::glob_escape("*"), r"\*");
+        assert_eq!(super::glob_escape("plain-tenant"), "plain-tenant");
+        assert_eq!(super::glob_escape(r"a\b?"), r"a\\b\?");
+    }
+
     use super::*;
     use cedar_policy::Entities;
     use std::str::FromStr;

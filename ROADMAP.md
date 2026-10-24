@@ -7,6 +7,62 @@
 
 ## Planned
 
+- **`EntityState::Suspended` conflates an administrative disablement with a
+  lockout, and nothing can tell them apart.** `AuthnError::Locked`'s own doc
+  says the state is reached by *"suspension or accumulated failed attempts"*,
+  and tells callers to show a generic message *"rather than distinguishing
+  failed-attempt vs admin-suspension reasons"*. That is right for a login
+  screen and wrong for anything that must decide **eligibility**: an account an
+  administrator disabled must never self-recover, and an account locked by
+  failed attempts is exactly the person a recovery flow exists for. The two
+  arrive as one variant, and the only field that could separate them is
+  `StatusDetail::reason`, which is free text, so distinguishing them means
+  parsing prose, which is keying a security decision on a spelling. `until` does
+  not help either: it is `None` both for an indefinite admin lock and (per the
+  same doc) for the failed-attempt lockout.
+
+  Found 2026-10-23 while reviewing platform's AA-116 second-factor-reset route,
+  and worth recording even though it changed nothing there: in platform a
+  lockout is **not** an `EntityState` at all (it is derived from
+  `failed_attempts`, and `users.status` carries no lockout value), so that
+  route's `Active`-only arm is correct and `Suspended` does mean
+  administratively disabled. The hazard is for the next adopter who reads
+  `AuthnError::Locked`'s doc, concludes `Suspended` includes lockout, and
+  widens an eligibility check, which would admit disabled accounts to
+  self-recovery. One reviewer reached exactly that conclusion from the doc.
+
+  Shape, for whoever takes it: either a machine-readable cause on
+  `StatusDetail` (an enum beside `reason`, so the error's two sources stay
+  joined for display and separable for a decision), or a distinct variant.
+  Either way the doc on `AuthnError::Locked` should say that its two sources
+  are an error-level union and not a statement about the state.
+
+- **A `SessionStore` query must not default to `Ok(empty)`.**
+  [`SessionStore::find_sessions_for_user`] carries a default
+  implementation returning `std::future::ready(Ok(Vec::new()))`, and the
+  SQLite backend (`session/storage/sqlite.rs`) does not override it. So on
+  that backend the query answers "this user has no sessions" (truthfully
+  shaped, and wrong) rather than failing or being absent. A caller
+  enumerating a user's sessions to revoke them sweeps nothing and reports
+  success, which is worse than a missing method because the absence
+  presents as coverage.
+  Found 2026-10-22 while designing a second-factor reset in an adopter
+  (GnomesOfZurich platform): the reset's effect would have "cleared every
+  session" by iterating that result. The adopter's fix is to use
+  [`SessionRegistry::invalidate_user`] instead, which is a *required*
+  method and is honoured on the read path by
+  `authn/service/session_validator.rs`, so nothing is blocked on axess;
+  but the trap stays for the next adopter who reaches for the obvious
+  name.
+  Three ways out, in preference order: implement it for SQLite (the
+  `sessions` table is `id, data, expires_at` with the user inside the JSON
+  blob, so this means either a `user_id` column or a scan, and the column
+  is the honest answer); or make it a required method so every backend
+  must answer; or remove it and let `SessionRegistry` own the question,
+  since that is where the working mechanism already lives. A default that
+  silently answers "none" for a *query* is the one option that should not
+  survive.
+
 - **Live Cedar policy reload without restart.** `PolicyStore` is
   currently immutable after construction; changing policy text or the
   compiled schema means a process restart. The trait

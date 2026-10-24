@@ -250,6 +250,84 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
     );
 }
 
+/// A store whose `cycle` fails and whose `delete` is counted: the regenerate
+/// path must fail closed in the STORE, not only in the response.
+#[derive(Clone)]
+struct FailingCycleStore {
+    inner: MemorySessionStore,
+    delete_calls: Arc<AtomicUsize>,
+}
+
+impl crate::session::store::SessionStore for FailingCycleStore {
+    type Error = std::io::Error;
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
+        Ok(self.inner.load(id).await.unwrap())
+    }
+    async fn save(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<(), Self::Error> {
+        self.inner.save(id, data, ttl).await.unwrap();
+        Ok(())
+    }
+    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.delete_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete(id).await.unwrap();
+        Ok(())
+    }
+    async fn cycle(
+        &self,
+        _old_id: &SessionId,
+        _new_id: &SessionId,
+        _data: &SessionData,
+        _ttl: Duration,
+    ) -> Result<(), Self::Error> {
+        Err(std::io::Error::other("store unavailable"))
+    }
+    async fn prune_expired(&self) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+}
+
+/// Logout (`regenerate`) while the store's cycle fails: the old id is deleted
+/// from the store and is NOT the id the response carries, so the old cookie
+/// no longer authenticates. Before this, the old id was re-issued with its
+/// Authenticated row still in the store.
+#[tokio::test]
+async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() {
+    let store = FailingCycleStore {
+        inner: MemorySessionStore::new(),
+        delete_calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let cfg = SessionConfig::default();
+    let id = SessionId::new(&MockRng::new(21));
+    let mut inner = fresh_inner(id);
+    inner.regenerate = true;
+    store
+        .inner
+        .save(&id, &SessionData::default(), cfg.ttl)
+        .await
+        .expect("seed");
+    let handle = handle_from(inner);
+
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+    assert_ne!(
+        outcome.final_id, id,
+        "the old id must never be re-issued after a failed cycle"
+    );
+    assert_eq!(
+        store.delete_calls.load(Ordering::SeqCst),
+        1,
+        "the old id must be deleted from the store"
+    );
+    assert!(
+        store.inner.load(&id).await.unwrap().is_none(),
+        "the old id's row must be gone so the old cookie is a guest"
+    );
+}
+
 /// `regenerate=true` alone (no `modified`, `existing_id=Some`) is
 /// the binding-mismatch / forced-rotation case: the layer must
 /// still treat session_changed=true and take the cycle path.
@@ -424,5 +502,43 @@ async fn load_session_keeps_session_when_fingerprint_matches() {
         outcome.data.fingerprint,
         Some(stored_fp),
         "session data must NOT be reset to default when fingerprints match"
+    );
+}
+
+/// A bound session presented WITHOUT binding material is a mismatch, not a
+/// skipped check: leaving the material out was the one way a stolen bound
+/// session still authenticated.
+#[tokio::test]
+async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprint() {
+    let store = MemorySessionStore::new();
+    let keys = SigningKeyRing::from_master([0xCC; 32]);
+    let cfg = SessionConfig::default();
+    let id = SessionId::new(&MockRng::new(31));
+    let data = SessionData {
+        fingerprint: Some("bound-to-a-device".to_string()),
+        ..SessionData::default()
+    };
+    store.save(&id, &data, cfg.ttl).await.expect("seed store");
+    let cookie_value = keys.sign_cookie(id);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::COOKIE,
+        axum::http::HeaderValue::from_str(&format!(
+            "{}={}",
+            cfg.cookie_name.as_ref(),
+            cookie_value
+        ))
+        .unwrap(),
+    );
+
+    let outcome = load_session(&store, &keys, &cfg, None, &headers, None, None).await;
+    assert!(
+        outcome.binding_invalidated,
+        "no binding material against a bound session must invalidate it"
+    );
+    assert_ne!(
+        outcome.existing_id,
+        Some(id),
+        "the bound id must not be kept"
     );
 }

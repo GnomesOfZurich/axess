@@ -303,6 +303,103 @@ fn expired_jwt_rejected() {
     );
 }
 
+// ── Claims that must be present, and readable ─────────────────────
+
+/// A correctly signed token with no `exp` never expires; the verifier
+/// refuses it by default rather than accepting it forever.
+#[test]
+fn missing_exp_rejected_by_default() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut claims = sample_claims();
+    claims.as_object_mut().unwrap().remove("exp");
+    let token = sign_jwt(&claims, &kid, &der);
+
+    let result = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS);
+    assert!(
+        matches!(result, Err(JwtError::VerificationFailed(ref m)) if m.contains("exp")),
+        "a token without exp must be rejected: {result:?}"
+    );
+
+    // Only a caller that turns the requirement off takes it.
+    let mut config = ValidationConfig::new();
+    config.require_exp = false;
+    assert!(verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock).is_ok());
+}
+
+/// An `exp` the verifier cannot read as an integer (a float, a string) is
+/// not "no exp" and not "a far future": it is refused.
+#[test]
+fn non_integer_exp_rejected() {
+    let (der, jwks, kid) = rsa_keypair();
+    for exp in [
+        serde_json::json!(1.0e9),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+    ] {
+        let mut claims = sample_claims();
+        claims["exp"] = exp.clone();
+        let token = sign_jwt(&claims, &kid, &der);
+        let result = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS);
+        assert!(
+            matches!(result, Err(JwtError::VerificationFailed(ref m)) if m.contains("exp")),
+            "exp {exp} must be rejected: {result:?}"
+        );
+    }
+}
+
+/// An `nbf` that is present but not an integer is refused the same way,
+/// rather than skipping the not-before check.
+#[test]
+fn non_integer_nbf_rejected() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut claims = sample_claims();
+    claims["nbf"] = serde_json::json!("0");
+    let token = sign_jwt(&claims, &kid, &der);
+    let result = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS);
+    assert!(
+        matches!(result, Err(JwtError::VerificationFailed(ref m)) if m.contains("nbf")),
+        "a non-integer nbf must be rejected: {result:?}"
+    );
+}
+
+/// A pinned issuer is enforced on a token that carries NO `iss`: a token
+/// minted by the same key for another service must not pass the pin by
+/// leaving the claim out.
+#[test]
+fn missing_iss_rejected_when_issuer_pinned() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut claims = sample_claims();
+    claims.as_object_mut().unwrap().remove("iss");
+    let token = sign_jwt(&claims, &kid, &der);
+
+    let mut config = ValidationConfig::new();
+    config.issuer = Some("https://idp.example.com".to_string());
+    let result = verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock);
+    assert!(
+        result.is_err(),
+        "a pinned issuer must require the claim: {result:?}"
+    );
+
+    // With the claim present and matching, the same config accepts it.
+    let token = sign_jwt(&sample_claims(), &kid, &der);
+    assert!(verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock).is_ok());
+}
+
+/// The same for a pinned audience.
+#[test]
+fn missing_aud_rejected_when_audience_pinned() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut claims = sample_claims();
+    claims.as_object_mut().unwrap().remove("aud");
+    let token = sign_jwt(&claims, &kid, &der);
+
+    let result = verify_jwt_signature(&token, &jwks, Some("my-client"), ALLOWED_ALGORITHMS);
+    assert!(
+        result.is_err(),
+        "a pinned audience must require the claim: {result:?}"
+    );
+}
+
 // ── Signature tampering ────────────────────────────────────────────
 
 /// Tampered signature is rejected. Flips a byte in the signature

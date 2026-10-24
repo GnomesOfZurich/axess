@@ -127,6 +127,13 @@ fn is_state_changing_only_unsafe_verbs() {
     assert!(is_state_changing(&axum::http::Method::PUT));
     assert!(is_state_changing(&axum::http::Method::PATCH));
     assert!(is_state_changing(&axum::http::Method::DELETE));
+    // Every method that is not safe changes state: the old allow-list
+    // skipped these.
+    for m in ["PURGE", "MKCOL", "LOCK", "PROPPATCH", "X-CUSTOM"] {
+        let method = axum::http::Method::from_bytes(m.as_bytes()).unwrap();
+        assert!(is_state_changing(&method), "{m} must be checked");
+    }
+    assert!(!is_state_changing(&axum::http::Method::TRACE));
 }
 
 #[test]

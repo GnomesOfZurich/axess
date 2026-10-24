@@ -66,6 +66,9 @@ impl DiscoveryDocument {
             .send()
             .await
             .map_err(|e| OidcError::DiscoveryFetch(format!("{e}")))?
+            // A 500 with a JSON body is not a discovery document.
+            .error_for_status()
+            .map_err(|e| OidcError::DiscoveryFetch(format!("{e}")))?
             .bytes()
             .await
             .map_err(|e| OidcError::DiscoveryFetch(format!("read body: {e}")))?;
@@ -83,6 +86,18 @@ impl DiscoveryDocument {
             .and_then(|v| v.as_str())
             .map(str::to_owned)
             .ok_or(OidcError::MissingField("jwks_uri"))?;
+
+        // The document is bound to the issuer it was fetched from (OIDC
+        // Discovery §4.3, RFC 8414 §3.3): a document naming another issuer is
+        // a mix-up, not a configuration. And the key set it points at travels
+        // over the same rail as the document, else an on-path attacker swaps
+        // the keys the document names.
+        if issuer.trim_end_matches('/') != issuer_url.trim_end_matches('/') {
+            return Err(OidcError::InvalidIssuer(format!(
+                "discovery document names issuer {issuer} but was fetched from {issuer_url}"
+            )));
+        }
+        require_https_or_loopback(&jwks_uri)?;
 
         let pick = |key: &str| -> Option<String> {
             raw.get(key).and_then(|v| v.as_str()).map(String::from)
@@ -157,133 +172,28 @@ impl Discovery {
 /// allowlist (`localhost`, `127.0.0.1`, `[::1]`). HTTPS-on-issuer is what
 /// transitively secures the JWKS URI: an attacker that can rewrite the
 /// discovery doc can swap `jwks_uri` to a key set they control.
-fn require_https_or_loopback(issuer_url: &str) -> Result<(), OidcError> {
-    if issuer_url.starts_with("https://") {
-        return Ok(());
+pub(crate) fn require_https_or_loopback(issuer_url: &str) -> Result<(), OidcError> {
+    // Parsed, not prefix-matched: `http://localhost.attacker.com`,
+    // `http://127.0.0.1.nip.io` and `http://localhost@evil.com` all start with
+    // a loopback spelling and none is loopback. The HOST decides, and a URL
+    // carrying userinfo is refused outright, since `user@host` is how a
+    // prefix test is defeated.
+    let refuse = || OidcError::NonHttpsIssuer(issuer_url.to_string());
+    let parsed = url::Url::parse(issuer_url).map_err(|_| refuse())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(refuse());
     }
-    let is_loopback = issuer_url.starts_with("http://localhost")
-        || issuer_url.starts_with("http://127.0.0.1")
-        || issuer_url.starts_with("http://[::1]");
-    if is_loopback {
-        return Ok(());
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" => match parsed.host() {
+            Some(url::Host::Domain("localhost")) => Ok(()),
+            Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
+            Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
+            _ => Err(refuse()),
+        },
+        _ => Err(refuse()),
     }
-    Err(OidcError::NonHttpsIssuer(issuer_url.to_string()))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn sample_jwks_json() -> serde_json::Value {
-        serde_json::json!({
-            "keys": [{
-                "kty": "RSA",
-                "use": "sig",
-                "alg": "RS256",
-                "kid": "k1",
-                "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
-                "e": "AQAB",
-            }],
-        })
-    }
-
-    fn discovery_json(issuer: &str, jwks_uri: &str) -> serde_json::Value {
-        serde_json::json!({
-            "issuer": issuer,
-            "authorization_endpoint": format!("{issuer}/authorize"),
-            "token_endpoint": format!("{issuer}/token"),
-            "jwks_uri": jwks_uri,
-            "end_session_endpoint": format!("{issuer}/logout"),
-            "scopes_supported": ["openid", "email", "profile"],
-        })
-    }
-
-    #[tokio::test]
-    async fn document_fetch_parses_well_known() {
-        let server = MockServer::start().await;
-        let jwks_uri = format!("{}/jwks", server.uri());
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(discovery_json(&server.uri(), &jwks_uri)),
-            )
-            .mount(&server)
-            .await;
-
-        let client = openidconnect::reqwest::Client::new();
-        let doc = DiscoveryDocument::fetch(&server.uri(), &client)
-            .await
-            .expect("fetch ok");
-
-        assert_eq!(doc.issuer, server.uri());
-        assert_eq!(doc.jwks_uri, jwks_uri);
-        assert!(doc.authorization_endpoint.is_some());
-        assert!(doc.end_session_endpoint.is_some());
-        assert!(doc.revocation_endpoint.is_none());
-        // Raw JSON preserves extension fields.
-        assert!(doc.raw.get("scopes_supported").is_some());
-    }
-
-    #[tokio::test]
-    async fn document_fetch_rejects_missing_jwks_uri() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": server.uri(),
-                // jwks_uri intentionally omitted
-            })))
-            .mount(&server)
-            .await;
-
-        let client = openidconnect::reqwest::Client::new();
-        let err = DiscoveryDocument::fetch(&server.uri(), &client)
-            .await
-            .expect_err("missing jwks_uri must reject");
-        assert!(
-            matches!(err, OidcError::MissingField("jwks_uri")),
-            "expected MissingField(jwks_uri), got {err:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn document_fetch_rejects_non_https_non_loopback() {
-        let client = openidconnect::reqwest::Client::new();
-        let err = DiscoveryDocument::fetch("http://idp.example.com", &client)
-            .await
-            .expect_err("plain http must reject");
-        assert!(
-            matches!(err, OidcError::NonHttpsIssuer(_)),
-            "expected NonHttpsIssuer, got {err:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn discovery_fetch_chains_jwks() {
-        let server = MockServer::start().await;
-        let jwks_uri = format!("{}/jwks", server.uri());
-        Mock::given(method("GET"))
-            .and(path("/.well-known/openid-configuration"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(discovery_json(&server.uri(), &jwks_uri)),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/jwks"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sample_jwks_json()))
-            .mount(&server)
-            .await;
-
-        let client = openidconnect::reqwest::Client::new();
-        let discovery = Discovery::fetch(&server.uri(), &client)
-            .await
-            .expect("discovery ok");
-
-        assert_eq!(discovery.document().issuer, server.uri());
-        let handle = discovery.jwks();
-        assert_eq!(handle.read().unwrap().keys.len(), 1);
-    }
-}
+mod tests;

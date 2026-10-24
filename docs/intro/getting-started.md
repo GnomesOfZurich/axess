@@ -14,7 +14,7 @@ example.
 
 ## Prerequisites
 
-You need Rust 1.94.0 or later on the stable channel (the workspace MSRV),
+You need Rust 1.95.0 or later on the stable channel (the workspace MSRV),
 Axum 0.8.x, and a Tokio runtime in your binary (`#[tokio::main]` is
 fine). Axess does not depend on system libraries, message brokers, or
 external IdPs by default. The defaults are deliberately zero-infra: the
@@ -28,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.8"             # facade -- depend on this, never on the internal crates
+axess = "0.9"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -41,7 +41,7 @@ turn on `memory` for the in-memory session store and `testing` for
 real database needs neither.
 
 ```toml
-axess = { version = "0.8.1", features = ["memory", "testing"] }
+axess = { version = "0.9.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the

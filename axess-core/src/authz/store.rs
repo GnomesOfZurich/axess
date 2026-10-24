@@ -248,13 +248,32 @@ pub(super) fn make_uid(
     type_name: &str,
     id: &str,
 ) -> Result<EntityUid, AuthzError> {
-    EntityUid::from_str(&format!(r#"{namespace}::{type_name}::"{id}""#))
-        .map_err(|e| AuthzError::InvalidEntityUid(format!("{type_name}/{id}: {e:?}")))
+    // Built from the type name and the id as DATA, never by formatting Cedar
+    // source and parsing it back: a parsed id decodes `\u{61}lice` to
+    // `alice` and chokes on `"` or `\`, so two ids could name one entity.
+    super::provider::make_entity_uid(namespace, type_name, id)
 }
 
 #[cfg(test)]
 mod authz_store_tests {
     use super::*;
+
+    /// An id is data: an escape sequence in it names a different entity from
+    /// the decoded spelling, and a quote or backslash is not an error.
+    #[test]
+    fn make_uid_keeps_the_id_as_data() {
+        let escaped = make_uid("TestApp", "User", r"\u{61}lice").expect("escaped id is an id");
+        let plain = make_uid("TestApp", "User", "alice").expect("plain id");
+        assert_ne!(
+            escaped, plain,
+            "an escape sequence must not decode into another principal"
+        );
+        assert_eq!(escaped.id().unescaped(), r"\u{61}lice");
+        assert!(
+            make_uid("TestApp", "User", "a\"b\\c").is_ok(),
+            "a quote or backslash in an id is data"
+        );
+    }
 
     const SCHEMA_JSON: &str = r#"{
         "TestApp": {

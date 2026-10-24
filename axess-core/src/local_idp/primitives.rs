@@ -514,8 +514,9 @@ pub trait IssuanceListener: Send + Sync {
 /// `Utc::now()`.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn enforce_max_ttl(claims: &MintClaims, max_ttl: Duration) {
-    let reference = claims.issued_at.unwrap_or_else(Utc::now);
-    let lifetime = claims.expires_at - reference;
+    // From now, not from a caller-supplied `issued_at` (see
+    // `enforce_max_ttl_fallible`).
+    let lifetime = claims.expires_at - Utc::now();
     assert!(
         lifetime <= max_ttl,
         "LocalIdpFixture::mint refusing token with lifetime {lifetime} \
@@ -537,8 +538,10 @@ pub(crate) fn enforce_max_ttl_fallible(
     max_ttl: Duration,
     now: DateTime<Utc>,
 ) -> Result<(), (Duration, Duration)> {
-    let reference = claims.issued_at.unwrap_or(now);
-    let lifetime = claims.expires_at - reference;
+    // Measured from NOW, not from a caller-supplied `issued_at`: a future-dated
+    // `iat` would otherwise shrink the apparent lifetime under the cap while
+    // the token stays valid for the whole span.
+    let lifetime = claims.expires_at - now;
     if lifetime <= max_ttl {
         Ok(())
     } else {
@@ -667,6 +670,10 @@ struct StandardClaimsView {
     jti: Option<String>,
 }
 
+/// The claims RFC 7519 §4.1 registers; set from `MintClaims`' typed fields
+/// only, never from its custom map.
+const REGISTERED_CLAIMS: [&str; 7] = ["iss", "sub", "aud", "exp", "nbf", "iat", "jti"];
+
 pub(crate) fn build_claims_json(issuer: &str, claims: &MintClaims) -> serde_json::Value {
     let aud_value = match claims.audience.as_slice() {
         [] => None,
@@ -691,10 +698,12 @@ pub(crate) fn build_claims_json(issuer: &str, claims: &MintClaims) -> serde_json
     let mut value = serde_json::to_value(view).expect("StandardClaimsView serialises");
     if let serde_json::Value::Object(ref mut map) = value {
         for (k, v) in &claims.custom {
-            // `iss` is fixture-controlled; refuse to let custom
-            // claims override it (would make the JWKS-routing
-            // semantics break).
-            if k == "iss" {
+            // The registered claims are the typed fields' to state. A custom
+            // `exp` would outlive the max-TTL check (which reads the typed
+            // `expires_at`), a custom `sub` or `aud` would swap the subject
+            // or audience under the signature, and a custom `iss` would
+            // break the JWKS routing; none is honoured.
+            if REGISTERED_CLAIMS.contains(&k.as_str()) {
                 continue;
             }
             map.insert(k.clone(), v.clone());
@@ -738,6 +747,48 @@ mod primitives_tests {
     use super::*;
     use jsonwebtoken::jwk::KeyAlgorithm;
     use rsa::rand_core::RngCore;
+
+    /// A custom claim never overrides a registered one: a custom `exp` would
+    /// outlive the max-TTL check, a custom `sub` or `aud` would swap the
+    /// subject or audience under the signature.
+    #[test]
+    fn custom_claims_cannot_override_registered_claims() {
+        let exp = Utc::now() + chrono::Duration::minutes(5);
+        let claims = MintClaims::new("worker-1", exp)
+            .with_custom_claim("exp", exp.timestamp() + 10 * 365 * 24 * 3600)
+            .with_custom_claim("sub", "mallory")
+            .with_custom_claim("aud", "other-service")
+            .with_custom_claim("iss", "https://evil.example")
+            .with_custom_claim("jti", "forged")
+            .with_custom_claim("dept", "treasury");
+        let v = build_claims_json("https://issuer.example", &claims);
+        assert_eq!(v["exp"], serde_json::json!(exp.timestamp()));
+        assert_eq!(v["sub"], serde_json::json!("worker-1"));
+        assert_eq!(v["iss"], serde_json::json!("https://issuer.example"));
+        assert!(
+            v.get("aud").is_none(),
+            "no audience was stated, none is minted"
+        );
+        assert!(v.get("jti").is_none(), "no jti was stated, none is minted");
+        assert_eq!(
+            v["dept"],
+            serde_json::json!("treasury"),
+            "a custom claim that is not registered is kept"
+        );
+    }
+
+    /// The lifetime cap is measured from now: a future-dated `iat` cannot
+    /// shrink the apparent lifetime of a token that stays valid for years.
+    #[test]
+    fn max_ttl_is_measured_from_now_not_from_a_stated_iat() {
+        let now = Utc::now();
+        let claims = MintClaims::new("worker-1", now + chrono::Duration::days(3650))
+            .with_issued_at(now + chrono::Duration::days(3649));
+        assert!(
+            enforce_max_ttl_fallible(&claims, chrono::Duration::hours(24), now).is_err(),
+            "a ten-year token must exceed a one-day cap whatever its iat says"
+        );
+    }
 
     /// Every JWS algorithm `LocalIdpFixture::verifier_algorithms` is
     /// allowed to surface must round-trip through this mapper. Kills

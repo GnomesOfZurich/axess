@@ -46,6 +46,31 @@ ignore = [
     # Transitive dep. Axess doesn't use rand::rng() with a custom logger.
     # Resolution: wait for upstream deps to bump to rand 0.9+.
     "RUSTSEC-2026-0097",
+
+    # crypto-bigint 0.5.5: timing variability in operations meant to be
+    # constant-time (RUSTSEC-2026-0387). Patched only in 0.7.6.
+    #
+    # Reachability: through p256 0.13 (local-idp keygen and PKCS#8 encoding,
+    # the FAPI client's key loading, ES256 signing and verification under
+    # `jwt-rust-crypto`) and through elliptic-curve 0.13 in crypto-glue
+    # (webauthn-rs). jsonwebtoken 11.1, openidconnect 4.0.1 and crypto-glue
+    # all pin p256 0.13 themselves, so no change in axess removes it.
+    #
+    # Risk, read against the 0.5.5 source on 2026-10-24: the advisory's named
+    # defects (`UintRef` equality exiting early, `BoxedMontyForm::invert`
+    # branching, and the 0.7 subtraction, zero-count, division and Montgomery
+    # code) are 0.7-series code that 0.5.5 does not contain. What p256 0.13
+    # uses from 0.5.5 is byte decoding, `ct_eq` (XOR-accumulated over every
+    # limb), `conditional_select` and `sbb` (wide-word arithmetic, no
+    # data-dependent branch); its field arithmetic is p256's own. The residue
+    # is the generic risk that a compiler introduces a branch into Rust
+    # written branch-free, which every pure-Rust curve shares. A deployment
+    # that signs ES256 over an attacker-reachable interface can take the
+    # `jwt-aws-lc` backend, which does not route through this crate.
+    #
+    # Resolution: remove when jsonwebtoken, openidconnect and webauthn-rs
+    # move to p256 0.14 (elliptic-curve 0.14, crypto-bigint 0.7).
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

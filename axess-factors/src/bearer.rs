@@ -314,7 +314,12 @@ where
                     let response = axum::response::Response::builder()
                         .status(axum::http::StatusCode::UNAUTHORIZED)
                         .header("WWW-Authenticate", "Bearer")
-                        .body(axum::body::Body::from(format!("{{\"error\":\"{e}\"}}")))
+                        // Serialised, not formatted: the error text carries the
+                        // token's unverified `iss`, which could otherwise inject
+                        // keys into the JSON body.
+                        .body(axum::body::Body::from(
+                            serde_json::json!({ "error": e.to_string() }).to_string(),
+                        ))
                         .unwrap();
                     Ok(response)
                 }

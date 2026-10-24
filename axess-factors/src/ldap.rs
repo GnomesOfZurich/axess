@@ -254,6 +254,13 @@ impl LdapProvider for LdapProviderConfig {
         password: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
         Box::pin(async move {
+            // A simple bind with an empty password is an UNAUTHENTICATED bind
+            // (RFC 4513 §5.1.2): directories that allow it answer rc=0 for any
+            // known DN, so an empty password would log any known user in. It
+            // is refused here, before a connection is opened.
+            if password.is_empty() {
+                return Err(LdapError::InvalidCredentials);
+            }
             let settings = ldap3::LdapConnSettings::new()
                 .set_conn_timeout(self.connection_timeout)
                 .set_starttls(self.starttls);
@@ -352,6 +359,11 @@ impl LdapProvider for MockLdapProvider {
         password: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<LdapBindResult, LdapError>> + Send + 'a>> {
         Box::pin(async move {
+            // The real provider refuses an empty password as an unauthenticated
+            // bind; the mock must not be more permissive than the thing it mocks.
+            if password.is_empty() {
+                return Err(LdapError::InvalidCredentials);
+            }
             let user = self.users.get(bind_dn).ok_or_else(|| {
                 tracing::debug!(
                     target: "axess::testing::mock_ldap",
@@ -470,6 +482,18 @@ mod tests {
 
         let dn = provider.build_bind_dn("bob");
         let err = provider.verify_bind("bob", &dn, "wrong").await.unwrap_err();
+        assert!(matches!(err, LdapError::InvalidCredentials));
+    }
+
+    /// An empty password is an unauthenticated bind (RFC 4513 §5.1.2), which a
+    /// permissive directory answers with rc=0 for any known DN; the provider
+    /// refuses it before connecting, and so does the mock.
+    #[tokio::test]
+    async fn empty_password_is_refused_as_an_unauthenticated_bind() {
+        let provider =
+            MockLdapProvider::new("{user}@corp.example.com").with_user("alice", "", vec![]);
+        let dn = provider.build_bind_dn("alice");
+        let err = provider.verify_bind("alice", &dn, "").await.unwrap_err();
         assert!(matches!(err, LdapError::InvalidCredentials));
     }
 

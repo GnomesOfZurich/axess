@@ -345,7 +345,13 @@ impl OutboundOAuthClient {
                 client_id,
                 client_secret,
             } => {
-                let creds = format!("{}:{}", client_id, &**client_secret);
+                // RFC 6749 §2.3.1: id and secret are form-urlencoded before
+                // they are joined and base64-encoded, so a secret carrying
+                // `:`, `+` or `%` reaches a strict IdP intact.
+                let enc = |s: &str| {
+                    url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>()
+                };
+                let creds = format!("{}:{}", enc(client_id), enc(client_secret));
                 let encoded = B64_STANDARD.encode(creds);
                 request = request.header(AUTHORIZATION, format!("Basic {encoded}"));
             }

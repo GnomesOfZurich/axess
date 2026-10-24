@@ -364,3 +364,26 @@ async fn repeated_rotation_appends_each_demoted_key_in_order() {
         "current first, then historical oldest→newest"
     );
 }
+
+/// `issuer` and `jwks_uri` are the document's own: an extra field under either
+/// name is refused rather than appended as a duplicate key that wins.
+#[tokio::test]
+async fn with_metadata_field_refuses_the_reserved_fields() {
+    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(key),
+    )
+    .await
+    .expect("load")
+    .with_metadata_field("jwks_uri", serde_json::json!("https://evil.example/jwks"))
+    .with_metadata_field("issuer", serde_json::json!("https://evil.example"))
+    .with_metadata_field("scopes_supported", serde_json::json!(["openid"]));
+    let meta = idp.metadata().await;
+    assert_eq!(meta.extra.len(), 1, "only the unreserved field is kept");
+    assert!(
+        meta.extra
+            .iter()
+            .all(|(k, _)| k != "jwks_uri" && k != "issuer")
+    );
+}

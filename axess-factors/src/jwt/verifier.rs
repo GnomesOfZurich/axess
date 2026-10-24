@@ -130,6 +130,10 @@ pub struct JwtVerifier<R = NoReplay> {
     expected_audience: Option<String>,
     clock_skew: Duration,
     require_nbf: bool,
+    /// Whether a token must carry `exp`. On by default: a token that never
+    /// expires is a credential with no end, and the replay store cannot
+    /// bound it.
+    require_exp: bool,
     replay: Option<R>,
     /// Injected clock; drives `exp` / `nbf` validation and replay-store
     /// TTL computation. Defaults to [`SystemClock`]. Set a
@@ -149,6 +153,7 @@ impl JwtVerifier<NoReplay> {
             expected_audience: None,
             clock_skew: Duration::from_secs(60),
             require_nbf: false,
+            require_exp: true,
             replay: None,
             clock: Arc::new(SystemClock),
         }
@@ -201,6 +206,14 @@ impl<R> JwtVerifier<R> {
         self
     }
 
+    /// Require the `exp` claim (the default). Only a caller with another
+    /// bound on a token's life turns this off; a token without `exp` is
+    /// otherwise valid forever and replayable without limit.
+    pub fn require_exp(mut self, required: bool) -> Self {
+        self.require_exp = required;
+        self
+    }
+
     /// Attach a replay store. Tokens verified by the resulting verifier
     /// must carry a `jti` claim; if the store reports it already used
     /// the verification fails. Replaces any previously configured store.
@@ -212,6 +225,7 @@ impl<R> JwtVerifier<R> {
             expected_audience: self.expected_audience,
             clock_skew: self.clock_skew,
             require_nbf: self.require_nbf,
+            require_exp: self.require_exp,
             replay: Some(store),
             clock: self.clock,
         }
@@ -243,6 +257,7 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
             audience: self.expected_audience.clone(),
             leeway_secs: self.clock_skew.as_secs(),
             require_nbf: self.require_nbf,
+            require_exp: self.require_exp,
         };
 
         let raw = {
@@ -283,7 +298,7 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
                     "replay store configured but token has no `jti` claim".into(),
                 )
             })?;
-            let ttl = compute_replay_ttl(exp, &*self.clock);
+            let ttl = compute_replay_ttl(exp, self.clock_skew, &*self.clock);
             store
                 .check_and_record(jti_value, ttl)
                 .await
@@ -306,21 +321,29 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
     }
 }
 
-/// Compute the TTL for a replay store entry: time until `exp` from now,
-/// floored at zero. A token without `exp` collapses to zero TTL; the
-/// replay store entry can be GC'd immediately because the token would
-/// have failed `exp` validation already.
+/// How long a token with no `exp` is held in the replay store. Reachable
+/// only when a caller turned `require_exp` off, since the verifier refuses
+/// such a token by default: a credential with no end cannot be bounded, so
+/// its `jti` is remembered for a day rather than forgotten at once.
+const REPLAY_TTL_WITHOUT_EXP: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Compute the TTL for a replay store entry: time until the token stops
+/// being accepted, which is `exp` PLUS the clock-skew leeway (the verifier
+/// accepts a token until `exp + skew`), floored at zero. A TTL of `exp -
+/// now` alone would forget a token's `jti` while the verifier still took
+/// the token, so a replay inside the leeway window would pass.
 ///
 /// `now` is sourced from the injected
 /// [`Clock`](axess_clock::Clock) rather than a direct
 /// `chrono::Utc::now()` call, so DST tests can drive the TTL
 /// calculation deterministically.
-fn compute_replay_ttl(exp: Option<i64>, clock: &dyn Clock) -> Duration {
+fn compute_replay_ttl(exp: Option<i64>, skew: Duration, clock: &dyn Clock) -> Duration {
     let Some(exp) = exp else {
-        return Duration::ZERO;
+        return REPLAY_TTL_WITHOUT_EXP;
     };
     let now = clock.now().timestamp();
-    let secs = (exp - now).max(0) as u64;
+    let skew = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
+    let secs = exp.saturating_add(skew).saturating_sub(now).max(0) as u64;
     Duration::from_secs(secs)
 }
 

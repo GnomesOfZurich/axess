@@ -507,37 +507,53 @@ async fn aud_array_round_trips_into_verified_claims() {
     );
 }
 
-/// `compute_replay_ttl` returns a non-zero `Duration` when
-/// `exp > now`, and the value is exactly `exp - now`. Pins three
-/// mutations:
+/// `compute_replay_ttl` holds a `jti` for as long as the verifier would
+/// still take the token: `exp + skew - now`, floored at zero. Pins the
+/// subtraction, the skew term, the floor, and the no-exp fallback:
 /// - `replace compute_replay_ttl -> Default::default()` (Duration::ZERO),
 /// - `(exp - now) → (exp + now)` (would yield ~2*now ≈ 4e9 seconds),
-/// - `(exp - now) → (exp / now)` (would yield ~1 second instead).
+/// - dropping the skew (a token presented in the leeway window would be
+///   forgotten while still accepted, so its replay would pass).
 #[test]
-fn compute_replay_ttl_pins_subtraction_and_non_default_return() {
+fn compute_replay_ttl_covers_the_leeway_window() {
     use axess_clock::testing::MockClock;
     use chrono::{TimeZone, Utc};
 
     let now: i64 = 1_700_000_000;
     let clock = MockClock::at(Utc.timestamp_opt(now, 0).single().unwrap());
+    let skew = Duration::from_secs(60);
 
-    // 900 seconds in the future → TTL = 900s. Discriminates `+`
-    // (would yield ~3.4e9), `/` (~1), and Default (0).
-    let ttl = compute_replay_ttl(Some(now + 900), &clock);
+    // 900 seconds in the future → TTL = 960s (exp + skew - now).
     assert_eq!(
-        ttl,
-        Duration::from_secs(900),
-        "TTL must equal `exp - now` exactly (kills `- → +/`/`-> Default`)"
+        compute_replay_ttl(Some(now + 900), skew, &clock),
+        Duration::from_secs(960),
+        "TTL must equal `exp + skew - now` exactly"
     );
 
-    // Past exp clamps to 0.
-    let zero_ttl = compute_replay_ttl(Some(now - 100), &clock);
+    // Expired 10 s ago but inside the 60 s leeway: the verifier still
+    // accepts it for 50 s, so the jti must be held for 50 s, not 0.
     assert_eq!(
-        zero_ttl,
+        compute_replay_ttl(Some(now - 10), skew, &clock),
+        Duration::from_secs(50),
+        "a token inside the leeway window is still replayable and must be remembered"
+    );
+
+    // Past the leeway window clamps to 0.
+    assert_eq!(
+        compute_replay_ttl(Some(now - 100), skew, &clock),
         Duration::ZERO,
-        "past exp must clamp TTL to zero (max(0) floor)"
+        "exp + skew in the past must clamp TTL to zero"
     );
 
-    // Missing exp → 0.
-    assert_eq!(compute_replay_ttl(None, &clock), Duration::ZERO);
+    // Without skew the old behaviour holds exactly.
+    assert_eq!(
+        compute_replay_ttl(Some(now + 900), Duration::ZERO, &clock),
+        Duration::from_secs(900)
+    );
+
+    // Missing exp is held for the fallback day, never forgotten at once.
+    assert_eq!(
+        compute_replay_ttl(None, skew, &clock),
+        Duration::from_secs(24 * 60 * 60)
+    );
 }

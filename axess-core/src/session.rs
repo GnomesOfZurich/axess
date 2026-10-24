@@ -44,6 +44,7 @@ pub use id::SessionId;
 pub use layer::SessionLayer;
 pub use refresh::{
     IssueRequest, RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
+    RotationOutcome,
 };
 #[cfg(any(test, feature = "memory"))]
 pub use store::{MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError};

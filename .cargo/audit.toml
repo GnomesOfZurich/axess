@@ -21,4 +21,13 @@ ignore = [
     # a custom global logger that calls rand: not a pattern axess uses.
     # Resolution: wait for upstream deps to bump to rand 0.9+.
     "RUSTSEC-2026-0097",
+
+    # crypto-bigint 0.5.5: timing variability in constant-time operations (RUSTSEC-2026-0387)
+    # Pulled transitively through p256 0.13 by jsonwebtoken, openidconnect and
+    # crypto-glue (webauthn-rs), and by axess-core/axess-factors' own p256 0.13.
+    # Risk to axess: low. The advisory's named defects are 0.7-series code absent
+    # from 0.5.5; the 0.5.5 operations p256 uses are written branch-free. Full
+    # reasoning in deny.toml. ES256 signers can use the `jwt-aws-lc` backend.
+    # Resolution: remove when those upstreams move to p256 0.14.
+    "RUSTSEC-2026-0387",
 ]

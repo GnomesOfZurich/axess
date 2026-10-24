@@ -255,6 +255,9 @@ impl LocalIdpKeyStore for MemoryLocalIdpKeyStore {
 
 // ── LocalIdp ─────────────────────────────────────────────────────────────────
 
+/// Discovery fields the document derives itself; `with_metadata_field` refuses them.
+const RESERVED_METADATA_FIELDS: [&str; 2] = ["issuer", "jwks_uri"];
+
 /// Production-grade in-process IdP.
 ///
 /// See module docs for the full architecture. `LocalIdp` is
@@ -364,7 +367,15 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         name: impl Into<String>,
         value: serde_json::Value,
     ) -> Self {
-        self.extra_metadata.push((name.into(), value));
+        let name = name.into();
+        // `issuer` and `jwks_uri` are the document's own, derived from the
+        // issuer and base URL; an extra field under either name would
+        // repoint relying parties and is not accepted.
+        if RESERVED_METADATA_FIELDS.contains(&name.as_str()) {
+            tracing::warn!(field = %name, "with_metadata_field ignored a reserved discovery field");
+            return self;
+        }
+        self.extra_metadata.push((name, value));
         self
     }
 

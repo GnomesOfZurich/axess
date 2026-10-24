@@ -9,6 +9,84 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.8.1 to 0.9.0
+
+A security release. Three signatures changed and the MSRV moved to
+1.95.0; the rest are behaviour changes, listed after the compile errors
+because nothing will point you at them.
+
+### `mismatched types: expected RotationOutcome, found ()`
+
+`RefreshTokenStore::rotate_token` reports whether it revoked the parent.
+Make the revoke conditional on the parent still being live, and store the
+child only when it was:
+
+```rust,ignore
+let revoked = sqlx::query(
+    "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?1 AND revoked = 0",
+)
+.bind(parent_id.to_string())
+.execute(&mut *tx)
+.await?
+.rows_affected();
+if revoked == 0 {
+    tx.rollback().await?;
+    return Ok(RotationOutcome::ParentAlreadyRevoked);
+}
+// insert the child, commit
+Ok(RotationOutcome::Rotated)
+```
+
+`ParentAlreadyRevoked` means a parallel refresh won. The session layer
+treats it as a reuse and revokes the family, so an implementation that
+always answers `Rotated` reopens the race this release closes.
+
+### `missing field require_exp in initializer of ValidationConfig`
+
+Add `require_exp: true`, or end the literal with
+`..ValidationConfig::default()`. Set it to `false` only for an issuer that
+genuinely mints tokens without `exp`.
+
+### `unused Result that must be used` on `ValkeyEntityCache::invalidate`
+
+It returns the Valkey error instead of discarding it. Propagate it, or log
+it where a failed invalidation is acceptable.
+
+### Tokens and logins that are now refused
+
+- **A JWT with no `exp`**, or with an `exp` or `nbf` that is not an
+  integer.
+- **A JWT missing `iss` or `aud`** when the verifier pins that claim.
+- **An LDAP login with an empty password.**
+- **An HOTP or TOTP code configured shorter than six digits.** Re-enroll
+  those factors at six or more.
+- **An OIDC discovery document** whose `issuer` differs from the URL it was
+  fetched from (a trailing slash is ignored), whose `jwks_uri` is plain
+  http to a non-loopback host, or that came with an error status.
+
+### Sessions, CSRF and request ids
+
+- **A session bound to a fingerprint and presented without one is
+  invalidated.** If a client legitimately loses the inputs your
+  fingerprint is built from, it signs in again.
+- **CSRF now guards every method except GET, HEAD, OPTIONS and TRACE**,
+  so a custom method that skipped the token now needs one.
+- **Rate-limit buckets restart once on upgrade**: header-derived keys are
+  now prefixed `h:` and peer-address keys `ip:`.
+- **An uppercase or otherwise invalid `traceparent` is ignored** and a new
+  trace starts, as W3C Trace Context requires.
+
+### Outbound OAuth
+
+`client_secret_basic` now form-encodes the client id and secret before the
+Basic encoding, as RFC 6749 §2.3.1 requires. A secret containing `:`, `+`,
+`%` or a space is sent differently; a compliant IdP decodes it back.
+
+### What is not a break
+
+Sessions, refresh tokens and stored factors from 0.8 load unchanged.
+Nothing needs draining before upgrading.
+
 ## 0.7.0 to 0.8.0
 
 A method step that offers a choice, `FactorStep::AnyOf`, used to be
@@ -179,7 +257,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.8", features = ["request-id"] }
+axess = { version = "0.9", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

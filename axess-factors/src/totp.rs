@@ -10,7 +10,7 @@
 
 use crate::otp_algorithm::OtpAlgorithm;
 use crate::secret::ZeroizedString;
-use crate::{MAX_TOTP_DIGITS, MIN_OTP_SECRET_BYTES};
+use crate::{MAX_TOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use subtle::ConstantTimeEq;
@@ -128,10 +128,15 @@ pub fn verify_totp(
     }
 
     let length = length.unwrap_or(TOTP_LENGTH);
-    if length > MAX_TOTP_DIGITS {
+    // RFC 6238 inherits RFC 4226's floor of six digits; a shorter code is
+    // brute-forceable, and a zero period would divide by zero below.
+    if !(MIN_OTP_DIGITS..=MAX_TOTP_DIGITS).contains(&length) {
         return None;
     }
     let time_step = period.unwrap_or(TOTP_PERIOD);
+    if time_step == 0 {
+        return None;
+    }
     // Clamp windows to a safe maximum. Accepting codes from more than 2
     // steps away (60s with 30s period) significantly increases replay risk.
     // Log when the configured window is silently clamped; operators

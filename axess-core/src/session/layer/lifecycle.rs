@@ -135,10 +135,14 @@ where
     // for persistence via the modified/rotation_fallback_used signal
     // read at the finalize + response-cookie stages.
     let mut binding_invalidated = false;
-    if let (Some(stored_hash), Some(current_hash)) =
-        (session_data.fingerprint.clone(), current_fingerprint)
-    {
-        if bool::from(stored_hash.as_bytes().ct_eq(current_hash.as_bytes())) {
+    // A session that was BOUND (it stores a fingerprint) and a request that
+    // presents no binding material is a mismatch, not a skip: leaving the
+    // material out was the one way a stolen bound session still passed.
+    if let Some(stored_hash) = session_data.fingerprint.clone() {
+        let current_hash = current_fingerprint.unwrap_or("");
+        if current_fingerprint.is_some()
+            && bool::from(stored_hash.as_bytes().ct_eq(current_hash.as_bytes()))
+        {
             // Fast path: current-key fingerprint matches. No action.
         } else if let Some(previous_hash) = previous_fingerprint
             && bool::from(stored_hash.as_bytes().ct_eq(previous_hash.as_bytes()))
@@ -255,13 +259,24 @@ where
             match store.cycle(&old_id, &new_id, &guard.data, config.ttl).await {
                 Ok(()) => new_id,
                 Err(e) => {
+                    // Fail closed in the STORE as well as in this response: the
+                    // row under `old_id` may still say Authenticated, so the old
+                    // id is deleted (best effort) and never re-issued; the cookie
+                    // carries the new id, which no row backs, so the next request
+                    // is a guest.
                     tracing::error!(
                         error = %e,
                         "session store cycle failed; clearing session (fail closed)"
                     );
+                    if let Err(e) = store.delete(&old_id).await {
+                        tracing::error!(
+                            error = %e,
+                            "session store delete after a failed cycle also failed; \
+                             the old session id may authenticate until its TTL"
+                        );
+                    }
                     guard.data = SessionData::default();
-                    guard.id = old_id;
-                    old_id
+                    new_id
                 }
             }
         } else {

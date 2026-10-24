@@ -90,6 +90,11 @@ where
 {
     inner: P,
     cache: ClockTtlCache<EntityCacheKey, Arc<Entities>>,
+    /// The settings the cache was built with, kept so a fluent setter
+    /// changing one carries the others instead of resetting them.
+    capacity: usize,
+    ttl: Duration,
+    clock: Arc<dyn Clock>,
 }
 
 impl<P> EntityCache<P>
@@ -117,31 +122,28 @@ where
         let cap = NonZeroUsize::new(capacity.max(1)).expect("capacity is at least 1");
         Self {
             inner,
-            cache: ClockTtlCache::new(cap, ttl, clock),
+            cache: ClockTtlCache::new(cap, ttl, clock.clone()),
+            capacity,
+            ttl,
+            clock,
         }
     }
 
     /// Fluent: set max capacity. Replaces the underlying cache (so call
     /// before any traffic; capacity changes mid-flight clear the cache).
     pub fn with_capacity(self, capacity: usize) -> Self {
-        let ttl = Duration::from_secs(DEFAULT_TTL_SECS);
-        Self::with_options(self.inner, capacity, ttl, Arc::new(SystemClock))
+        Self::with_options(self.inner, capacity, self.ttl, self.clock)
     }
 
     /// Fluent: set TTL. Replaces the underlying cache.
     pub fn with_ttl(self, ttl: Duration) -> Self {
-        Self::with_options(self.inner, DEFAULT_CAPACITY, ttl, Arc::new(SystemClock))
+        Self::with_options(self.inner, self.capacity, ttl, self.clock)
     }
 
     /// Fluent: inject a [`Clock`] for deterministic-simulation testing.
     /// Replaces the underlying cache.
     pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
-        Self::with_options(
-            self.inner,
-            DEFAULT_CAPACITY,
-            Duration::from_secs(DEFAULT_TTL_SECS),
-            clock,
-        )
+        Self::with_options(self.inner, self.capacity, self.ttl, clock)
     }
 
     /// Invalidate cached entries for `(principal, tenant, resource, action)`.

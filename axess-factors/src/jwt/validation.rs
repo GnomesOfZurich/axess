@@ -105,16 +105,23 @@ pub struct ValidationConfig {
     /// When `true`, a token missing `nbf` is rejected. (jsonwebtoken
     /// validates `nbf` when present but does not require it.)
     pub require_nbf: bool,
+    /// When `true` (the default), a token without an `exp` claim is
+    /// rejected. A token that never expires is a credential with no end,
+    /// and a replay store cannot bound it; only a caller that has another
+    /// bound on the token's life turns this off.
+    pub require_exp: bool,
 }
 
 impl ValidationConfig {
-    /// Default-tuned config: 60 s leeway, no iss/aud pinning, nbf optional.
+    /// Default-tuned config: 60 s leeway, no iss/aud pinning, nbf optional,
+    /// exp required.
     pub fn new() -> Self {
         Self {
             issuer: None,
             audience: None,
             leeway_secs: 60,
             require_nbf: false,
+            require_exp: true,
         }
     }
 }
@@ -245,6 +252,15 @@ pub fn verify_jwt(
     validation.validate_exp = false;
     validation.validate_nbf = false;
     validation.required_spec_claims.clear();
+    // jsonwebtoken checks a pinned `iss` or `aud` only when the claim is
+    // PRESENT; a token signed by the trusted key with the claim stripped
+    // would pass the pin. A pinned claim is therefore a required one.
+    if config.issuer.is_some() {
+        validation.required_spec_claims.insert("iss".to_string());
+    }
+    if config.audience.is_some() {
+        validation.required_spec_claims.insert("aud".to_string());
+    }
 
     // 5. decode() with signature verification (exp/nbf checks disabled
     //    per above; we do them manually below against the injected clock).
@@ -258,21 +274,40 @@ pub fn verify_jwt(
     let now = clock.now().timestamp();
     let leeway: i64 = i64::try_from(config.leeway_secs).unwrap_or(i64::MAX);
 
-    if let Some(exp) = token_data.claims.get("exp").and_then(|v| v.as_i64()) {
-        // Expired iff now is strictly past (exp + leeway). Equality is
-        // allowed for tokens issued at the boundary.
-        if now > exp.saturating_add(leeway) {
-            return Err(JwtError::VerificationFailed("token expired".to_string()));
+    // An `exp` that is present but not an integer (a float, a string) is
+    // not "no exp": it is a claim this verifier cannot read, and a token it
+    // cannot bound is refused. A missing `exp` is refused unless the caller
+    // turned `require_exp` off.
+    match token_data.claims.get("exp") {
+        Some(v) => {
+            let exp = v.as_i64().ok_or_else(|| {
+                JwtError::VerificationFailed("exp claim is not an integer".to_string())
+            })?;
+            // Expired iff now is strictly past (exp + leeway). Equality is
+            // allowed for tokens issued at the boundary.
+            if now > exp.saturating_add(leeway) {
+                return Err(JwtError::VerificationFailed("token expired".to_string()));
+            }
         }
-    }
-
-    match token_data.claims.get("nbf").and_then(|v| v.as_i64()) {
-        Some(nbf) if now < nbf.saturating_sub(leeway) => {
+        None if config.require_exp => {
             return Err(JwtError::VerificationFailed(
-                "token not yet valid".to_string(),
+                "missing required exp claim".to_string(),
             ));
         }
-        Some(_) => {}
+        None => {}
+    }
+
+    match token_data.claims.get("nbf") {
+        Some(v) => {
+            let nbf = v.as_i64().ok_or_else(|| {
+                JwtError::VerificationFailed("nbf claim is not an integer".to_string())
+            })?;
+            if now < nbf.saturating_sub(leeway) {
+                return Err(JwtError::VerificationFailed(
+                    "token not yet valid".to_string(),
+                ));
+            }
+        }
         None if config.require_nbf => {
             return Err(JwtError::VerificationFailed(
                 "missing required nbf claim".to_string(),

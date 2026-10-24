@@ -183,6 +183,17 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
 
 // ── Store trait ──────────────────────────────────────────────────────────────
 
+/// What [`RefreshTokenStore::rotate_token`] found when it revoked the parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationOutcome {
+    /// The parent was live, is now revoked, and the child is stored.
+    Rotated,
+    /// The parent was already revoked when the rotation ran: a parallel
+    /// refresh won, nothing was stored, and the caller treats this
+    /// presentation as a reuse.
+    ParentAlreadyRevoked,
+}
+
 /// Async storage backend for refresh tokens.
 ///
 /// All methods accept `&self`; implementations use interior mutability.
@@ -306,11 +317,22 @@ pub trait RefreshTokenStore: Send + Sync {
     /// A naive serial revoke + store can leave a user silently logged out
     /// across every device in the family if the second call fails
     /// mid-flight.
+    ///
+    /// # The revoke is conditional
+    ///
+    /// The parent is revoked only if it is NOT yet revoked (`UPDATE … SET
+    /// revoked = 1 WHERE id = ? AND revoked = 0`, or the backend's
+    /// compare-and-set). When that changes no row, another refresh of the
+    /// same token won the race: the implementation stores nothing and answers
+    /// [`RotationOutcome::ParentAlreadyRevoked`], which the caller treats as
+    /// a reuse of a rotated-out token. Without this, two parallel refreshes
+    /// with one token both succeeded and left two live children, and the
+    /// reuse detection never fired.
     fn rotate_token(
         &self,
         parent_id: &RefreshTokenId,
         new_token: &RefreshToken,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl std::future::Future<Output = Result<RotationOutcome, Self::Error>> + Send;
 
     /// Called when a rotated-out token is reused (a token compromise signal).
     ///
@@ -605,10 +627,35 @@ async fn refresh_session_from_record<S: RefreshTokenStore>(
             now,
         );
 
-        store
+        match store
             .rotate_token(&record.id, &new_record)
             .await
-            .map_err(RefreshError::Store)?;
+            .map_err(RefreshError::Store)?
+        {
+            RotationOutcome::Rotated => {}
+            RotationOutcome::ParentAlreadyRevoked => {
+                // A parallel refresh revoked this parent first: the second
+                // presentation of one token is a reuse, and is handled as
+                // the revoked-record path above handles one.
+                if let Some(ref fid) = record.family_id {
+                    tracing::warn!(
+                        family_id = %fid,
+                        user_id = %record.user_id,
+                        "refresh token rotated concurrently; revoking entire family (compromise signal)"
+                    );
+                    let compromised_devices =
+                        collect_family_device_targets(store, fid, &record).await;
+                    store
+                        .revoke_family(&record.user_id, fid)
+                        .await
+                        .map_err(RefreshError::Store)?;
+                    store
+                        .on_token_compromise(&record.user_id, fid, &compromised_devices)
+                        .await;
+                }
+                return Err(RefreshError::Revoked);
+            }
+        }
 
         Some((new_plaintext, new_record))
     } else {

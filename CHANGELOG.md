@@ -10,6 +10,78 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.9.0] - 2026-10-24
+
+A security release: the findings of the 2026-10-24 review, each with the
+test that failed before the fix. See
+[`docs/production/migrating.md`](docs/production/migrating.md) for the
+breaks and the behaviour changes.
+
+### Changed (breaking)
+
+- **`RefreshTokenStore::rotate_token` returns `RotationOutcome`.**
+  **Migrating:** revoke the parent conditionally (`WHERE revoked = 0`),
+  return `ParentAlreadyRevoked` and store nothing when no row changed, and
+  `Rotated` otherwise.
+- **`ValidationConfig` gains `require_exp`** (default `true`).
+  **Migrating:** add the field to struct literals, or end them with
+  `..ValidationConfig::default()`.
+- **`ValkeyEntityCache::invalidate` returns `Result`.** **Migrating:**
+  handle or propagate the error; it was discarded before.
+- **MSRV is 1.95.0** (was 1.94.0), which `parking_lot` 0.13 requires.
+- **Dependencies**: `cedar-policy` 4.14.0, `lru` 0.19.0, `parking_lot`
+  0.13.0, `sha2` 0.11.1, `proptest` 1.12.0, `rkyv` 0.8.18, `zeroize` 1.9.1,
+  `uuid` 1.29.0, `tokio` 1.54.1, `serde_json` 1.0.154.
+
+### Security
+
+- **A JWT without an integer `exp` is refused.** A missing `exp`, or a
+  float or string `exp`/`nbf`, was skipped and the token accepted forever.
+  `JwtVerifier::require_exp(false)` opts out of the first.
+- **A pinned issuer or audience is a required claim**, not one checked
+  only when present.
+- **The replay store holds a `jti` through the leeway window**, not only
+  until `exp`.
+- **An LDAP bind with an empty password is refused**; a permissive
+  directory answers it as an anonymous success.
+- **Discovery parses the issuer URL**: https, or http to a host that is
+  loopback, without userinfo. The document's `issuer` must equal the URL
+  fetched, and its `jwks_uri` must pass the same rule.
+- **Moka authz-cache invalidation works**; a revoked role authorized until
+  the TTL.
+- **Registered claims cannot be set as custom claims**, and the local IdP
+  refuses `issuer` and `jwks_uri` as custom discovery metadata.
+- **A failed session cycle deletes the old session** instead of leaving it
+  live.
+- **HOTP and TOTP refuse codes shorter than six digits** and a zero TOTP
+  step.
+- **Two refreshes racing on one token are a reuse**: the loser revokes the
+  family instead of minting a second live child.
+- **A fingerprint-bound session presented without a fingerprint is
+  invalidated.**
+- **CSRF guards every method except GET, HEAD, OPTIONS and TRACE.**
+- **Cedar entity ids are escaped on the authz store path.**
+- **Valkey invalidation escapes glob characters** in its patterns.
+- **Rate-limit keys from a header and from the peer address cannot
+  collide.**
+- **`traceparent` is validated**: lowercase hex, no version `ff`, no
+  all-zero ids.
+- **The WebSocket revocation watcher stops when its socket drops.**
+- **The bearer 401 body is JSON-encoded**, not formatted from the error.
+- **`client_secret_basic` form-encodes id and secret** (RFC 6749 §2.3.1).
+- **`mutate_custom` persists an equal-length change.**
+- **The entity-cache setters keep the settings they were not asked to
+  change.**
+- **`rustls` requires 0.23.46** (RUSTSEC-2026-0346 to 0349).
+- **`Cargo.lock` takes `rustls-webpki` 0.103.16, `webpki-roots` 1.0.11 and
+  `ctutils` 0.4.5** (RUSTSEC-2026-0381, 0382, 0385). Adopters resolve their
+  own: run `cargo update -p rustls-webpki -p webpki-roots -p ctutils`.
+- **RUSTSEC-2026-0387 (crypto-bigint 0.5.5) is accepted, not fixed.** It
+  arrives through p256 0.13, which jsonwebtoken, openidconnect and webauthn-rs
+  pin; the defects it names are absent from 0.5.5. Reasoning in `deny.toml`.
+
+---
+
 ## [0.8.1] - 2026-10-15
 
 ### Security

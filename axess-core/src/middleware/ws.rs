@@ -92,7 +92,25 @@ pub struct RevocationAwareSocket {
     /// a leaked future when the wrapper is dropped before revocation fires.
     /// Field is intentionally not consumed elsewhere; its purpose is the
     /// Drop side effect.
-    watch_task: tokio::task::JoinHandle<()>,
+    watch_task: AbortOnDrop,
+}
+
+/// A task handle that ABORTS its task when dropped. Dropping a bare
+/// `JoinHandle` only detaches the task, so every closed socket left a
+/// watcher and its subscription running until the registry fired.
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// The handle itself, for a test that awaits the task's end.
+    pub(crate) fn handle(&self) -> &tokio::task::JoinHandle<()> {
+        &self.0
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl RevocationAwareSocket {
@@ -120,7 +138,7 @@ impl RevocationAwareSocket {
             socket,
             revoke_rx: rx,
             closed: false,
-            watch_task,
+            watch_task: AbortOnDrop(watch_task),
         }
     }
 
@@ -179,6 +197,25 @@ impl RevocationAwareSocket {
     /// callers can `await` task completion in tests; production code
     /// rarely needs this.
     pub fn watch_task(&self) -> &tokio::task::JoinHandle<()> {
-        &self.watch_task
+        self.watch_task.handle()
+    }
+}
+
+#[cfg(test)]
+mod abort_on_drop_tests {
+    use super::AbortOnDrop;
+
+    /// Dropping the wrapper aborts the task; a bare `JoinHandle` only detaches
+    /// it, which is how every closed socket left a watcher running.
+    #[tokio::test]
+    async fn dropping_the_handle_aborts_the_task() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort = task.abort_handle();
+        drop(AbortOnDrop(task));
+        tokio::task::yield_now().await;
+        assert!(
+            abort.is_finished(),
+            "the task must be aborted when its handle is dropped"
+        );
     }
 }

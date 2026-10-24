@@ -459,19 +459,17 @@ impl AuthSession {
         if !guard.data.custom.is_object() {
             guard.data.custom = serde_json::Value::Object(serde_json::Map::new());
         }
-        let before_len = serde_json::to_vec(&guard.data.custom)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        // Compared by VALUE, not by serialized length: a nonce rotated to one
+        // of the same length, or an OAuth state swapped for another, changes
+        // nothing in the length and everything in the bag.
+        let before = guard.data.custom.clone();
         let obj = guard
             .data
             .custom
             .as_object_mut()
             .expect("custom forced to object above");
         let result = f(obj);
-        let after_len = serde_json::to_vec(&guard.data.custom)
-            .map(|v| v.len())
-            .unwrap_or(0);
-        if before_len != after_len {
+        if guard.data.custom != before {
             guard.modified = true;
         }
         result

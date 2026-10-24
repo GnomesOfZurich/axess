@@ -40,7 +40,9 @@ pub mod session {
     pub use axess_core::session::refresh::{RefreshTokenId, TokenFamilyId};
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "valkey"))]
     pub use axess_core::session::{CryptoError, SessionCrypto};
-    pub use axess_core::session::{RefreshToken, RefreshTokenConfig, RefreshTokenStore};
+    pub use axess_core::session::{
+        RefreshToken, RefreshTokenConfig, RefreshTokenStore, RotationOutcome,
+    };
 }
 
 /// Authentication namespace. Prefer `axess::authn::*` in new code.

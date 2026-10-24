@@ -519,12 +519,15 @@ where
 }
 
 fn is_state_changing(method: &axum::http::Method) -> bool {
-    matches!(
+    // A deny-list of the SAFE methods (RFC 9110 §9.2.1), not an allow-list
+    // of the unsafe ones: PURGE, MKCOL, LOCK, PROPPATCH and any custom method
+    // change state and were skipped by the old list.
+    !matches!(
         *method,
-        axum::http::Method::POST
-            | axum::http::Method::PUT
-            | axum::http::Method::PATCH
-            | axum::http::Method::DELETE
+        axum::http::Method::GET
+            | axum::http::Method::HEAD
+            | axum::http::Method::OPTIONS
+            | axum::http::Method::TRACE
     )
 }
 

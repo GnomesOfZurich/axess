@@ -188,6 +188,11 @@ pub use secret::ZeroizedString;
 #[cfg(feature = "hotp")]
 pub(crate) const MAX_HOTP_DIGITS: usize = 10;
 
+/// The fewest digits an HOTP or TOTP code may have (RFC 4226 §5.3, which
+/// RFC 6238 inherits): a shorter code is brute-forceable in a handful of
+/// attempts, and a length of 0 makes the code "0" match every counter.
+pub(crate) const MIN_OTP_DIGITS: usize = 6;
+
 /// Maximum TOTP digit length accepted by verification.
 ///
 /// Lower than [`MAX_HOTP_DIGITS`] because the underlying `totp-rs` crate

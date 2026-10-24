@@ -15,7 +15,9 @@
 //! this module.
 
 use crate::authn::ids::UserId;
-use crate::session::refresh::{RefreshToken, RefreshTokenId, RefreshTokenStore, TokenFamilyId};
+use crate::session::refresh::{
+    RefreshToken, RefreshTokenId, RefreshTokenStore, RotationOutcome, TokenFamilyId,
+};
 use crate::store::{MemoryStore, Store};
 use chrono::Utc;
 use std::time::Duration;
@@ -125,8 +127,21 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
         &self,
         parent_id: &RefreshTokenId,
         new_token: &RefreshToken,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<RotationOutcome, Self::Error> {
+        // Conditional, as the contract requires: a parent already revoked
+        // (or gone) means a parallel refresh won, and nothing is stored.
+        let parent = self
+            .inner
+            .snapshot()
+            .into_iter()
+            .find(|(id, _)| id == parent_id)
+            .map(|(_, token)| token);
+        match parent {
+            Some(parent) if !parent.revoked => {}
+            _ => return Ok(RotationOutcome::ParentAlreadyRevoked),
+        }
         self.revoke_token(parent_id).await?;
-        self.store_token(new_token).await
+        self.store_token(new_token).await?;
+        Ok(RotationOutcome::Rotated)
     }
 }

@@ -265,3 +265,26 @@ fn from_request_returns_extension_value() {
         "missing extension must yield None"
     );
 }
+
+/// W3C Trace Context §3.2: version `ff`, an all-zero trace-id or parent-id,
+/// and uppercase or non-hex fields are invalid and are not propagated.
+#[test]
+fn from_header_rejects_invalid_values_not_only_bad_lengths() {
+    for bad in [
+        "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01",
+        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902bZ-01",
+        "0g-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    ] {
+        assert!(
+            TraceContext::from_header(bad).is_none(),
+            "{bad} must be rejected"
+        );
+    }
+    assert!(
+        TraceContext::from_header("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            .is_some()
+    );
+}

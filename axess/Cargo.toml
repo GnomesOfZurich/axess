@@ -34,7 +34,7 @@ axess-factors = { workspace = true }
 axess-identity = { workspace = true, features = ["serde"] }
 axess-macros = { workspace = true }
 axum = { workspace = true, default-features = false, features = ["json"] }
-cedar-policy = { version = "4.13.0", optional = true }
+cedar-policy = { version = "4.14.0", optional = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

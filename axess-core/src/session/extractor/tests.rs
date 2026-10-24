@@ -109,6 +109,32 @@ mod custom_bag_tests {
         let modified = { session.0.0.read().await.modified };
         assert!(!modified, "no-op mutate_custom should not mark modified");
     }
+
+    /// A change that keeps the bag's serialized length (a nonce rotated to one of
+    /// the same length, an OAuth state swapped for another) is still a change
+    /// and must mark the session modified, or the old value stays live.
+    #[tokio::test]
+    async fn mutate_custom_marks_a_change_of_equal_length() {
+        let session = make_session();
+        session
+            .mutate_custom(|bag| {
+                bag.insert("state".into(), serde_json::json!("aaaa"));
+            })
+            .await;
+        session.0.0.write().await.modified = false;
+        session
+            .mutate_custom(|bag| {
+                bag.insert("state".into(), serde_json::json!("bbbb"));
+            })
+            .await;
+        assert!(
+            session.0.0.read().await.modified,
+            "an equal-length change must be persisted"
+        );
+        session.0.0.write().await.modified = false;
+        session.mutate_custom(|_bag| {}).await;
+        assert!(!session.0.0.read().await.modified, "no change, no write");
+    }
 }
 
 #[cfg(test)]
