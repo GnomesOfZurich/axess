@@ -78,17 +78,17 @@ impl std::error::Error for IdError {}
 /// [`SecureRng`](axess_rng::SecureRng), so production threads
 /// `SystemRng` and tests inject `MockRng` for reproducible runs.
 /// Calling `Uuid::new_v4()` directly bypasses the injection; a CI guard
-/// (PG-072 in the platform ROADMAP) flags any new `Uuid::new_v4()`
+/// flags any new `Uuid::new_v4()`
 /// introductions outside this crate. Direct use of `mint_v4` outside
 /// its typed-id callers is similarly suspect; consider declaring a new
 /// typed id via [`define_id!`](crate::define_id!) instead.
-pub fn mint_v4<R: axess_rng::SecureRng>(rng: &R) -> Uuid {
+pub fn mint_v4<R: axess_rng::SecureRng + ?Sized>(rng: &R) -> Uuid {
     let mut bytes = [0u8; 16];
     rng.fill_bytes(&mut bytes);
     uuid::Builder::from_random_bytes(bytes).into_uuid()
 }
 
-// ── Thread-local RNG override (PG-072) ──────────────────────────────────────
+// ── Thread-local RNG override ──────────────────────────────────────
 
 type RngFiller = Box<dyn FnMut(&mut [u8])>;
 
@@ -109,7 +109,7 @@ std::thread_local! {
 /// `with_thread_local_rng(MockRng::new(seed), || { ... })` to make minting
 /// reproducible across runs.
 ///
-/// **Why this exists** (PG-072 in the platform ROADMAP): the typed
+/// **Why this exists**: the typed
 /// `FooId::new(&rng)` constructor is the DST-correct mint path, but
 /// adopting it requires every minting call site to thread an
 /// `R: SecureRng` parameter through every function signature in its
@@ -268,7 +268,7 @@ macro_rules! define_id {
             /// RFC 4122 variant bits per spec; the remaining 122
             /// bits come from `rng`.
             #[inline]
-            pub fn new<R: axess_rng::SecureRng>(rng: &R) -> Self {
+            pub fn new<R: axess_rng::SecureRng + ?Sized>(rng: &R) -> Self {
                 Self($crate::mint_v4(rng))
             }
 

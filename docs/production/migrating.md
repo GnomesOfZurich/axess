@@ -9,6 +9,150 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.10.0 to 0.11.0
+
+Compile errors first, then schema, then behaviour.
+
+- **`DeviceStore` has four new required methods and every write takes
+  `now`.** Implement `set_trust_level_if(tenant, id, expected, new) ->
+  TrustTransition` as one conditional write, `replace_bindings(tenant, id,
+  expected, new, now) -> BindingsUpdate` as a write of the bindings column
+  alone that refuses a `Revoked` row and answers `Conflict` when the stored
+  bindings are not `expected`, `claim_owner(tenant, id, user, now) ->
+  OwnerClaim` as `UPDATE ... SET user_id = ? WHERE user_id IS NULL`, and
+  `find_by_fingerprint_for_user(tenant, user, hash)` over an index on
+  `(tenant_id, user_id, fingerprint_hash)`. `save(&Device, now)` gains the
+  write time. A store that wraps another forwards all of them and invalidates
+  its cache; a caller of `replace_bindings` passes the bindings it read and
+  retries on `Conflict`.
+- **`Device` has `demoted_at: Option<DateTime<Utc>>`.** Struct literals add
+  it (`None` for a device never trusted).
+- **`ArchiveSink::archive_batch(&self, batch: &ArchiveBatchId, events)`**, and
+  `AuditRetentionSource::EventId` needs `Display`.
+- **`AuditLogWithAnalytics::new(inner, sink, enricher)` returns a pair.** Keep
+  the first; spawn or run the `AnalyticsWorker`, and call `shutdown` on exit
+  so queued events drain. `with_capacity` sizes the queue; `dropped_events`
+  counts what a full queue shed.
+- **`verify_recovery_code(config, submitted, now, pepper)`.** Pass `None` to
+  keep Argon2 rows verifying as before; pass `Some(&pepper)` once you issue
+  keyed codes with `generate_recovery_codes_peppered` and configure
+  `with_recovery_code_pepper` on the service.
+- **`verify_password` returns `PasswordVerifyError`.** Code matching on
+  `password_auth::VerifyError` matches `Malformed` or `Mismatch` instead;
+  `is_ok` and `is_err` callers compile unchanged. Stored hashes verify as
+  before.
+- **`AuthnError` and `AuthFailureReason` have new variants** (`Internal`,
+  `IpPolicy`); exhaustive matches add arms. `ValkeyDeviceStoreError` adds
+  `NotFound`, `Contended` and `UnexpectedScriptReply`; `Contended` means
+  eight compare-and-swap attempts lost, so retry.
+- **`OAuthProvider` implementors:** `build_auth_url(options, rng)`,
+  `build_auth_url_par(options, rng)`, `generate_dpop_proof(.., key_seed, iat,
+  jti_bytes)`. Draw the verifier, state and nonce from `rng` as three 32-byte
+  base64url values. `begin_grant(provider, scopes, rng)` likewise.
+- **`BearerConfig::new(issuers)`** replaces the struct literal; set a clock
+  with `with_clock`. `verify_jwt_signature` is gone from the public API; use
+  `verify_jwt` with a clock.
+- **`SidMap` is a struct.** Code that read the `DashMap` directly uses `get`,
+  `insert`, `remove`, `take_user_sessions` and `len`; the service hands it
+  out through `AuthnService::sid_map()`.
+- **`RateLimitConfig { .. }` literals add `clock`**, or use the builder.
+  **`TraceContextLayer`** becomes `TraceContextLayer::new()`.
+  **`RefreshTokenConfig::hash_pepper`** is read through `pepper()`.
+- **`IdentityPasswordReset::verify_reset_token(&self, user_id, token_hash,
+  now)`.** Implementations judge expiry on `now`; the service passes its
+  clock. `MockIdentityStore::with_clock` is gone; pass `now` instead.
+- **`IdentityAdmin::delete_user`** is required (`not all trait items
+  implemented, missing: delete_user`). It must erase every row naming the
+  user; the in-memory backend and the sqlite example show the set. The
+  panicking default is gone: a backend that cannot erase does not compile.
+- **`SocialProvider::exchange_code` returns `ZeroizedString`.** It derefs to
+  `str`: pass `&token` where a `&str` is wanted and compare with `&*token`.
+- **`AuditRetentionPolicy` has two stages.** Remove `delete_archive_after`,
+  `with_delete_archive_after` and `keep_archive_forever` from your code; the
+  cold sink owns its own expiry.
+- **`MockOAuthProvider` needs the `testing` feature** on axess-factors (or
+  core's or the facade's `testing`, which forward it).
+- **`JwksCache` key sets expire** (`with_max_age`, 24 h default). Start the
+  refresh loop through `AuthnServiceBuilder::with_default_jwks_refresh()` or
+  `with_jwks_refresh(interval)`, or expect `OAuthError::JwksExpired` once the
+  set ages out; a `JwtVerifier` built on `JwksCache::handle()` bypasses the
+  check, so build on `fresh_handle()`.
+- **`SessionRegistryHandle::liveness`** is a provided method; override it to
+  answer `Gone` (not `Unknown`) for a session the registry knows is ended, or
+  subject-registry entries of your sessions are forgotten only on logout.
+- **`decide_step_up` is gone.** Call `decide_step_up_for_user(device, user,
+  policy)`.
+- **`SessionCrypto::encrypt` and `decrypt` warn as deprecated.** Use
+  `encrypt_with_aad(aad, plaintext)` and `decrypt_with_aad(aad, data)` with
+  the row's identity as the AAD.
+
+Schema, run once on existing deployments. **Run the `sessions` statement before
+the new release serves a request**: the new code selects `data_bin`, and a
+table without it makes every load fail and read as an empty session, which
+logs everyone out.
+
+- SQLite: `ALTER TABLE sessions ADD COLUMN data_bin BLOB;`. Postgres:
+  `ALTER TABLE sessions ADD COLUMN IF NOT EXISTS data_bin BYTEA;`. MySQL:
+  `ALTER TABLE sessions ADD COLUMN data_bin LONGBLOB NULL;`. Rows written by
+  0.10.0 read as before and move to bytes on their next save; a row the new
+  release saved cannot be read by the old one, so a rollback signs that user
+  in again.
+
+- SQLite: `ALTER TABLE devices ADD COLUMN demoted_at INTEGER;` then
+  `CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint ON devices
+  (tenant_id, user_id, fingerprint_hash, last_seen_at DESC);`.
+- Postgres: `ALTER TABLE devices ADD COLUMN IF NOT EXISTS demoted_at BIGINT;`
+  and the same `CREATE INDEX IF NOT EXISTS`.
+- MySQL: the `ALTER` block in the `device::storage::mysql` module docs
+  (`bindings` to `MEDIUMTEXT`, ids and `family_id` to `utf8mb4_bin` with the
+  refresh foreign key dropped and re-added around it, `demoted_at`, the
+  user-fingerprint index), and `ALTER TABLE sessions MODIFY data MEDIUMTEXT
+  NOT NULL;`. The collation changes rebuild primary keys and fail if two
+  stored ids differ only in case; resolve those rows first.
+- Valkey: nothing to run. Device keys get new TTLs on their next write, rows
+  reseal on their next write, `cycle` and the device scripts need scripting
+  enabled (the default), and a cluster needs the `{axess}` hash-tag prefix.
+- Rows already `Seen` read as never trusted and are revoked by the first
+  sweep if idle past `seen_idle` (30 days by default).
+
+Behaviour:
+
+- **Sightings are written at most once per five minutes per device.**
+  `last_seen_at` lags use by up to that; `with_sighting_granularity(Duration::zero())`
+  restores the old behaviour.
+- **Capacity eviction of the sid map no longer ends sessions**, only
+  mappings. The TTL prune still ends sessions, at most 128 per login.
+- **An IP-denied login writes an audit row** (`AuthFailureReason::IpPolicy`)
+  and takes as long as any other refusal.
+- **A logout token without `exp` is refused.** A pre-final IdP must send one.
+- **The rate limiter answers 429 for a new key at 262,144 live buckets**
+  instead of sweeping on every request; raise the window or shard keys if a
+  deployment holds more.
+- **Signed requests answer 503 when the replay memory is full**
+  (`max_remembered`, default 100,000).
+- **Argon2 runs on blocking threads.** Under a current-thread test runtime
+  install `KdfExecutor::inline()` through `with_kdf_executor`, or the
+  verification will hop threads.
+- **Password resets apply the tenant's password rules**: `complete_password_reset`
+  answers `Ok(false)` for a password that breaks them;
+  `axess::validation::meets_password_rules` is the check to run first.
+- **Session and device blobs change format**; do not copy a `data` blob
+  between rows.
+- **CSRF after rotating a session in a handler:** read `CsrfIssuer::token()`;
+  `CsrfToken` keeps the pre-rotation value for that request.
+- **The analytics wrapper drops events when its queue is full** and counts
+  them; before it spawned a task per event without bound.
+- **Social login sends no User-Agent on a supplied client without one.**
+- **ID tokens over 8 KiB sign in again.**
+- **A cookieless request on a route with no CSRF layer and no session use
+  gets no Set-Cookie and writes nothing**; a route that mints a CSRF token,
+  modifies the session or reads `session_id()` behaves as before.
+- **A `sub`-only back-channel logout now ends sid-less logins too**, and a
+  mapping dropped at capacity is still ended through `sub`.
+- **AWS and GCP STS calls time out after 30 s** (10 s to connect on the
+  default client), as Azure's did since this release's first cut;
+  `with_timeout` on each client adjusts it.
+
 ## 0.9.0 to 0.10.0
 
 The compile errors come first; the behaviour changes after them are the
@@ -346,7 +490,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.10", features = ["request-id"] }
+axess = { version = "0.11", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating
@@ -548,9 +692,10 @@ If you have no password-reuse policy, implement nothing. The password
 change and reset flows are bounded on this trait, so they become
 unavailable at compile time rather than panicking at runtime.
 
-Note that `IdentityAdmin::delete_user` still has a panicking default. It is
-not called by any axess flow: you reach it only by calling it yourself
-but override it before you rely on it for GDPR erasure.
+Note that `IdentityAdmin::delete_user` still has a panicking default in
+0.10.0 (0.11.0 removes it). It is not called by any axess flow: you reach it
+only by calling it yourself, but override it before you rely on it for GDPR
+erasure.
 
 **Two password-reset methods are no longer on `IdentityAdmin`.**
 `store_reset_token` and `verify_reset_token` moved to a new

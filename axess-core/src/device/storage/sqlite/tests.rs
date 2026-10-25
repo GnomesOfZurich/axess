@@ -16,7 +16,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 /// (otherwise sqlx's default pool would create a fresh empty one
 /// per connection). Plaintext for unit tests; encryption is
 /// covered by the integration suite.
-async fn fresh_store() -> SqliteDeviceStore {
+pub(super) async fn fresh_store() -> SqliteDeviceStore {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -59,6 +59,7 @@ fn build_device(
         first_seen_at: now_at(10, 0),
         last_seen_at: now_at(10, 0),
         revoked_at: None,
+        demoted_at: None,
         bindings,
     }
 }
@@ -85,7 +86,10 @@ async fn save_then_load_round_trips_every_trust_level() {
         if level == DeviceTrustLevel::Revoked {
             device.revoked_at = Some(now_at(11, 0));
         }
-        store.save(&device).await.unwrap();
+        store
+            .save(&device, crate::device::test_now())
+            .await
+            .unwrap();
 
         let loaded = store
             .load(&t, &d)
@@ -115,7 +119,10 @@ async fn save_then_load_round_trips_full_device_record() {
             last_used_at: now_at(10, 0),
         }],
     );
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
     let loaded = store.load(&t, &d).await.unwrap().expect("present");
     assert_eq!(loaded, device, "round-trip must preserve every field");
 }
@@ -132,10 +139,16 @@ async fn save_is_an_upsert_and_overwrites_existing_row() {
     let store = fresh_store().await;
     let (t, u, d) = ids();
     let mut device = build_device(&t, Some(&u), &d, 0xab, vec![]);
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
     device.trust_level = DeviceTrustLevel::Trusted;
     device.last_seen_at = now_at(11, 0);
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let loaded = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(loaded.trust_level, DeviceTrustLevel::Trusted);
@@ -155,8 +168,8 @@ async fn find_by_fingerprint_is_tenant_scoped() {
     dev1.fingerprint_hash = fp;
     let mut dev2 = build_device(&t2, Some(&u), &d2, 0, vec![]);
     dev2.fingerprint_hash = fp;
-    store.save(&dev1).await.unwrap();
-    store.save(&dev2).await.unwrap();
+    store.save(&dev1, crate::device::test_now()).await.unwrap();
+    store.save(&dev2, crate::device::test_now()).await.unwrap();
 
     let found = store.find_by_fingerprint(&t1, &fp).await.unwrap().unwrap();
     assert_eq!(found.id, d1, "find_by_fingerprint must scope by tenant_id");
@@ -175,7 +188,7 @@ async fn find_for_user_returns_newest_first_and_respects_limit() {
         let mut dev = build_device(&t, Some(&u), &did, fp.0, vec![]);
         // Stagger last_seen_at so ordering is deterministic.
         dev.last_seen_at = now_at(fp.1, 0);
-        store.save(&dev).await.unwrap();
+        store.save(&dev, crate::device::test_now()).await.unwrap();
     }
     let found = store.find_for_user(&t, &u, 2).await.unwrap();
     assert_eq!(found.len(), 2, "limit must be respected");
@@ -194,11 +207,17 @@ async fn find_for_user_excludes_other_tenants() {
     let d_t1 = crate::authn::ids::testing::device("d-t1");
     let d_t2 = crate::authn::ids::testing::device("d-t2");
     store
-        .save(&build_device(&t1, Some(&u), &d_t1, 0xa1, vec![]))
+        .save(
+            &build_device(&t1, Some(&u), &d_t1, 0xa1, vec![]),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     store
-        .save(&build_device(&t2, Some(&u), &d_t2, 0xa2, vec![]))
+        .save(
+            &build_device(&t2, Some(&u), &d_t2, 0xa2, vec![]),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     let found = store.find_for_user(&t1, &u, 100).await.unwrap();
@@ -211,7 +230,10 @@ async fn record_sighting_bumps_last_seen_at() {
     let store = fresh_store().await;
     let (t, u, d) = ids();
     store
-        .save(&build_device(&t, Some(&u), &d, 0xab, vec![]))
+        .save(
+            &build_device(&t, Some(&u), &d, 0xab, vec![]),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     let later = now_at(15, 0);
@@ -225,7 +247,10 @@ async fn set_trust_level_to_revoked_stamps_revoked_at() {
     let store = fresh_store().await;
     let (t, u, d) = ids();
     store
-        .save(&build_device(&t, Some(&u), &d, 0xab, vec![]))
+        .save(
+            &build_device(&t, Some(&u), &d, 0xab, vec![]),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     let when = now_at(12, 0);
@@ -243,7 +268,10 @@ async fn set_trust_level_to_non_revoked_clears_revoked_at() {
     let store = fresh_store().await;
     let (t, u, d) = ids();
     store
-        .save(&build_device(&t, Some(&u), &d, 0xab, vec![]))
+        .save(
+            &build_device(&t, Some(&u), &d, 0xab, vec![]),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     // First revoke.
@@ -290,7 +318,10 @@ async fn delete_removes_row_and_refresh_index_via_fk_cascade() {
             last_used_at: now_at(10, 0),
         }],
     );
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     store.delete(&t, &d).await.unwrap();
     assert!(store.load(&t, &d).await.unwrap().is_none());
@@ -317,38 +348,44 @@ async fn save_indexes_refresh_bindings_for_fast_lookup() {
     let d_b = crate::authn::ids::testing::device("d-b");
 
     store
-        .save(&build_device(
-            &t,
-            Some(&u),
-            &d_a,
-            0xa1,
-            vec![DeviceBinding::Refresh {
-                family_id: "fam-1".into(),
-                issued_at: now_at(10, 0),
-                last_used_at: now_at(10, 0),
-            }],
-        ))
-        .await
-        .unwrap();
-    store
-        .save(&build_device(
-            &t,
-            Some(&u),
-            &d_b,
-            0xb2,
-            vec![
-                DeviceBinding::Refresh {
+        .save(
+            &build_device(
+                &t,
+                Some(&u),
+                &d_a,
+                0xa1,
+                vec![DeviceBinding::Refresh {
                     family_id: "fam-1".into(),
                     issued_at: now_at(10, 0),
                     last_used_at: now_at(10, 0),
-                },
-                DeviceBinding::Refresh {
-                    family_id: "fam-2".into(),
-                    issued_at: now_at(10, 0),
-                    last_used_at: now_at(10, 0),
-                },
-            ],
-        ))
+                }],
+            ),
+            crate::device::test_now(),
+        )
+        .await
+        .unwrap();
+    store
+        .save(
+            &build_device(
+                &t,
+                Some(&u),
+                &d_b,
+                0xb2,
+                vec![
+                    DeviceBinding::Refresh {
+                        family_id: "fam-1".into(),
+                        issued_at: now_at(10, 0),
+                        last_used_at: now_at(10, 0),
+                    },
+                    DeviceBinding::Refresh {
+                        family_id: "fam-2".into(),
+                        issued_at: now_at(10, 0),
+                        last_used_at: now_at(10, 0),
+                    },
+                ],
+            ),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
 
@@ -369,32 +406,38 @@ async fn save_replaces_refresh_index_on_upsert() {
     let (t, u, d) = ids();
     // First save with fam-old.
     store
-        .save(&build_device(
-            &t,
-            Some(&u),
-            &d,
-            0xab,
-            vec![DeviceBinding::Refresh {
-                family_id: "fam-old".into(),
-                issued_at: now_at(10, 0),
-                last_used_at: now_at(10, 0),
-            }],
-        ))
+        .save(
+            &build_device(
+                &t,
+                Some(&u),
+                &d,
+                0xab,
+                vec![DeviceBinding::Refresh {
+                    family_id: "fam-old".into(),
+                    issued_at: now_at(10, 0),
+                    last_used_at: now_at(10, 0),
+                }],
+            ),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     // Re-save with fam-new only; fam-old must drop out of the index.
     store
-        .save(&build_device(
-            &t,
-            Some(&u),
-            &d,
-            0xab,
-            vec![DeviceBinding::Refresh {
-                family_id: "fam-new".into(),
-                issued_at: now_at(11, 0),
-                last_used_at: now_at(11, 0),
-            }],
-        ))
+        .save(
+            &build_device(
+                &t,
+                Some(&u),
+                &d,
+                0xab,
+                vec![DeviceBinding::Refresh {
+                    family_id: "fam-new".into(),
+                    issued_at: now_at(11, 0),
+                    last_used_at: now_at(11, 0),
+                }],
+            ),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
 
@@ -440,7 +483,7 @@ async fn cascade_revoke_by_refresh_family_revokes_indexed_devices() {
             }],
         );
         dev.trust_level = DeviceTrustLevel::Trusted;
-        store.save(&dev).await.unwrap();
+        store.save(&dev, crate::device::test_now()).await.unwrap();
     }
 
     let revoked_at = now_at(13, 0);
@@ -461,30 +504,39 @@ async fn cascade_revoke_by_refresh_family_revokes_indexed_devices() {
     );
 }
 
-/// Pin: sweep cascades Trusted → Seen → Revoked in a single call
-/// when last_seen is far enough in the past to clear both windows.
-/// Mirrors the MemoryDeviceStore cascade test, but on SQL.
+/// Pin: a long-idle Trusted device is demoted to Seen by one sweep and
+/// revoked by a later one, never both in a single call.
 #[tokio::test]
-async fn sweep_cascades_through_all_stages_in_one_call() {
+async fn sweep_moves_a_row_one_level_per_call() {
     let store = fresh_store().await;
     let (t, u, d) = ids();
     let now = now_at(20, 0);
     let mut device = build_device(&t, Some(&u), &d, 0xab, vec![]);
     device.trust_level = DeviceTrustLevel::Trusted;
-    // 200 days idle; clears trusted_idle (90d) AND seen_idle (30d).
+    // 200 days idle; clears trusted_idle (90d) AND the later seen window.
     device.last_seen_at = now - chrono::Duration::days(200);
     device.first_seen_at = device.last_seen_at;
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t, now).await.unwrap();
     assert_eq!(counts.trusted_to_seen, 1);
-    assert_eq!(counts.seen_to_revoked, 1);
-    // Cannot purge in the same sweep; revoked_at = now, grace not elapsed.
+    assert_eq!(counts.seen_to_revoked, 0);
     assert_eq!(counts.revoked_purged, 0);
+    let after = store.load(&t, &d).await.unwrap().unwrap();
+    assert_eq!(after.trust_level, DeviceTrustLevel::Seen);
+    assert_eq!(after.demoted_at, Some(now));
 
+    let later = now + chrono::Duration::days(31);
+    let counts = store.sweep(&t, later).await.unwrap();
+    assert_eq!((counts.trusted_to_seen, counts.seen_to_revoked), (0, 1));
+    // Cannot purge in the same sweep; revoked_at = later, grace not elapsed.
+    assert_eq!(counts.revoked_purged, 0);
     let after = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(after.trust_level, DeviceTrustLevel::Revoked);
-    assert_eq!(after.revoked_at, Some(now));
+    assert_eq!(after.revoked_at, Some(later));
 }
 
 /// Pin: revoked rows past grace are hard-deleted; FK cascade
@@ -517,7 +569,10 @@ async fn sweep_purges_revoked_after_grace_window() {
     device.revoked_at = Some(now - chrono::Duration::days(8));
     device.last_seen_at = now - chrono::Duration::days(60);
     device.first_seen_at = device.last_seen_at;
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t, now).await.unwrap();
     assert_eq!(counts.revoked_purged, 1);
@@ -550,7 +605,10 @@ async fn sweep_is_tenant_scoped() {
     foreign.trust_level = DeviceTrustLevel::Trusted;
     foreign.last_seen_at = now - chrono::Duration::days(200);
     foreign.first_seen_at = foreign.last_seen_at;
-    store.save(&foreign).await.unwrap();
+    store
+        .save(&foreign, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t1, now).await.unwrap();
     assert_eq!(counts, SweepCounts::default());
@@ -569,7 +627,10 @@ async fn sweep_does_not_touch_unknown_devices() {
     // Trust level is already Unknown by default; just push last_seen.
     device.last_seen_at = now - chrono::Duration::days(365);
     device.first_seen_at = device.last_seen_at;
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t, now).await.unwrap();
     assert_eq!(counts, SweepCounts::default());
@@ -606,7 +667,10 @@ async fn encrypted_store_round_trips_bindings() {
             last_used_at: now_at(10, 0),
         }],
     );
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     // Confirm the bindings column on disk is NOT plaintext;
     // a stored row that decoded to plaintext would defeat the
@@ -623,3 +687,7 @@ async fn encrypted_store_round_trips_bindings() {
     let loaded = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(loaded, device, "encrypted round-trip must be lossless");
 }
+
+mod family_index;
+mod hardening;
+mod own_fingerprint;

@@ -11,7 +11,9 @@ use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
 use crate::session::layer::SessionLayer;
 use crate::session::layer::handle::{SessionHandle, SessionInner};
-use crate::session::layer::lifecycle::{build_set_cookie, finalize_session, load_session};
+use crate::session::layer::lifecycle::{
+    Fingerprints, build_set_cookie, finalize_session, load_session,
+};
 use crate::session::layer::signing::SigningKeyRing;
 use crate::session::store::SessionStore;
 use axum::{body::Body, http::Request, response::Response};
@@ -43,6 +45,7 @@ pub struct SessionService<S, Inner> {
     config: Arc<SessionConfig>,
     binding: Option<Arc<dyn SessionBinding>>,
     metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    rng: Arc<dyn axess_rng::SecureRng>,
     #[cfg(feature = "device")]
     device_resolver: Option<Arc<dyn ErasedDeviceResolver>>,
 }
@@ -61,6 +64,7 @@ where
             config: self.config.clone(),
             binding: self.binding.clone(),
             metrics: self.metrics.clone(),
+            rng: self.rng.clone(),
             #[cfg(feature = "device")]
             device_resolver: self.device_resolver.clone(),
         }
@@ -90,6 +94,7 @@ where
         let signing_keys = self.signing_keys.clone();
         let session_binding = self.binding.clone();
         let metrics = self.metrics.clone();
+        let rng = self.rng.clone();
         #[cfg(feature = "device")]
         let device_resolver = self.device_resolver.clone();
 
@@ -120,8 +125,11 @@ where
                 &config,
                 metrics.as_deref(),
                 req.headers(),
-                current_fingerprint.as_deref(),
-                previous_fingerprint.as_deref(),
+                Fingerprints {
+                    current: current_fingerprint.as_deref(),
+                    previous: previous_fingerprint.as_deref(),
+                },
+                &*rng,
             )
             .await;
 
@@ -146,7 +154,16 @@ where
             let (load, device_changed) = {
                 let mut load = load;
                 let dc = if let Some(ref resolver) = device_resolver {
-                    let (parts, body) = req.into_parts();
+                    let (mut parts, body) = req.into_parts();
+                    // Hand the resolver the user the session has fully
+                    // authenticated, so a device is matched to its owner.
+                    // A guest, or a session part-way through a login,
+                    // supplies none: its claimed user is not verified.
+                    if load.data.auth_state.is_authenticated()
+                        && let Some(user) = load.data.auth_state.user_id()
+                    {
+                        parts.extensions.insert(crate::device::SessionUser(*user));
+                    }
                     let resolved = resolver.resolve_erased(&parts).await;
                     req = Request::from_parts(parts, body);
                     let differs = resolved != load.data.device_id;
@@ -181,10 +198,12 @@ where
                 // in turn triggers the Set-Cookie emission below:
                 // re-issuing the cookie under the current signing key.
                 modified: load.binding_invalidated || device_changed || load.rotation_fallback_used,
+                needs_persist: false,
                 regenerate: load.binding_invalidated,
                 pre_cycle_id: None,
                 pending_fingerprint: pending_fp,
                 max_custom_bytes: config.max_custom_bytes,
+                rng: rng.clone(),
             };
             let handle = SessionHandle(Arc::new(RwLock::new(inner_state)));
             req.extensions_mut().insert(handle.clone());
@@ -199,6 +218,7 @@ where
                 metrics.as_deref(),
                 &handle,
                 load.existing_id,
+                &*rng,
             )
             .await;
 

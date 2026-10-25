@@ -317,6 +317,11 @@ async fn ensure_device_emits_device_first_seen_on_create_only() {
         assert_eq!(events[0].device_id.as_ref(), Some(&id));
         assert_eq!(events[0].user_id.as_ref(), Some(&u));
         assert_eq!(events[0].tenant_id.as_ref(), Some(&t));
+        assert_eq!(
+            events[0].event_time,
+            now_at(10, 0).timestamp_micros(),
+            "the event is stamped with the caller's `now`, not the wall clock"
+        );
     }
 
     // Second call with same fingerprint; must NOT emit a new event.

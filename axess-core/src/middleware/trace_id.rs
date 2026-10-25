@@ -38,7 +38,7 @@ use std::{
     fmt::Write as _,
     future::Future,
     pin::Pin,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
 };
 use tower::{Layer, Service};
@@ -71,12 +71,13 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
-    /// Generate a new trace context with a random trace ID.
-    fn new_root() -> Self {
+    /// Generate a new trace context with a trace ID and span ID drawn from
+    /// `rng`.
+    fn new_root(rng: &dyn SecureRng) -> Self {
         let mut trace_bytes = [0u8; 16];
         let mut span_bytes = [0u8; 8];
-        axess_rng::SystemRng.fill_bytes(&mut trace_bytes);
-        axess_rng::SystemRng.fill_bytes(&mut span_bytes);
+        rng.fill_bytes(&mut trace_bytes);
+        rng.fill_bytes(&mut span_bytes);
         let trace_id = to_hex(&trace_bytes);
         let parent_id = to_hex(&span_bytes);
         let traceparent = format!("00-{trace_id}-{parent_id}-01");
@@ -89,10 +90,11 @@ impl TraceContext {
     }
 
     /// Parse from a traceparent header value and create a child span.
-    /// Returns `None` if the header is invalid.
+    /// The child's span ID is drawn from `rng`. Returns `None` if the header
+    /// is invalid.
     ///
     /// W3C format: `{version:2}-{trace-id:32}-{parent-id:16}-{flags:2}`
-    fn from_header(value: &str) -> Option<Self> {
+    fn from_header(value: &str, rng: &dyn SecureRng) -> Option<Self> {
         let parts: Vec<&str> = value.trim().split('-').collect();
         if parts.len() != 4 {
             return None;
@@ -126,7 +128,7 @@ impl TraceContext {
 
         // Generate a new parent-id for the child span.
         let mut span_bytes = [0u8; 8];
-        axess_rng::SystemRng.fill_bytes(&mut span_bytes);
+        rng.fill_bytes(&mut span_bytes);
         let parent_id = to_hex(&span_bytes);
 
         let traceparent = format!("00-{trace_id}-{parent_id}-{flags}");
@@ -147,9 +149,18 @@ impl TraceContext {
 /// - If the request has no `traceparent` (or an invalid one), generates a new root trace.
 /// - The `traceparent` is set on both the request (for downstream handlers) and the response.
 /// - A [`TraceContext`] is inserted into request extensions for handler access.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TraceContextMiddleware<S> {
     inner: S,
+    rng: Arc<dyn SecureRng>,
+}
+
+impl<S: std::fmt::Debug> std::fmt::Debug for TraceContextMiddleware<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceContextMiddleware")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> Service<Request<Body>> for TraceContextMiddleware<S>
@@ -168,12 +179,13 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         // Parse or generate trace context.
+        let rng = &*self.rng;
         let ctx = req
             .headers()
             .get(&*TRACEPARENT)
             .and_then(|v| v.to_str().ok())
-            .and_then(TraceContext::from_header)
-            .unwrap_or_else(TraceContext::new_root);
+            .and_then(|v| TraceContext::from_header(v, rng))
+            .unwrap_or_else(|| TraceContext::new_root(rng));
 
         // Set traceparent on the request for downstream middleware/handlers.
         if let Ok(hv) = HeaderValue::from_str(&ctx.traceparent) {
@@ -211,13 +223,37 @@ where
 ///     .route("/api", get(handler))
 ///     .layer(TraceContextLayer::default());
 /// ```
-#[derive(Clone, Debug, Default)]
-pub struct TraceContextLayer;
+#[derive(Clone)]
+pub struct TraceContextLayer {
+    rng: Arc<dyn SecureRng>,
+}
+
+impl std::fmt::Debug for TraceContextLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TraceContextLayer").finish_non_exhaustive()
+    }
+}
+
+impl Default for TraceContextLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl TraceContextLayer {
-    /// Construct a default `TraceContextLayer` (zero-sized, no configuration).
+    /// Construct a `TraceContextLayer` that draws trace and span IDs from
+    /// [`SystemRng`](axess_rng::SystemRng).
     pub fn new() -> Self {
-        Self
+        Self {
+            rng: Arc::new(axess_rng::SystemRng),
+        }
+    }
+
+    /// Draw trace and span IDs from `rng` instead, so a seeded RNG makes
+    /// the IDs reproducible.
+    pub fn with_rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
+        self
     }
 }
 
@@ -225,7 +261,10 @@ impl<S> Layer<S> for TraceContextLayer {
     type Service = TraceContextMiddleware<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        TraceContextMiddleware { inner }
+        TraceContextMiddleware {
+            inner,
+            rng: self.rng.clone(),
+        }
     }
 }
 

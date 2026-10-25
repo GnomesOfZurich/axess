@@ -232,6 +232,31 @@ where
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            let shared = self
+                .shared_entities_for(session, principal, resource, action)
+                .await?;
+            Ok((*shared).clone())
+        })
+    }
+
+    /// Concurrent misses for one key share a single inner-provider call
+    /// (moka's `try_get_with`); a hit returns the cached set without
+    /// copying it.
+    ///
+    /// When the shared load fails, the caller that ran it gets the
+    /// provider's own error. Callers that joined that load get an
+    /// [`AuthzError::EntityBuild`] carrying its message, because the error
+    /// value is shared and `AuthzError` is not `Clone`.
+    fn shared_entities_for<'a>(
+        &'a self,
+        session: &'a AuthSession,
+        principal: &'a EntityUid,
+        resource: &'a EntityUid,
+        action: &'a EntityUid,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<Entities>, AuthzError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
             let tenant = session.tenant_id().await.map(|t| t.to_string().to_string());
             let key = EntityCacheKey {
                 principal: principal.clone(),
@@ -240,16 +265,18 @@ where
                 action: action.clone(),
             };
 
-            if let Some(cached) = self.cache.get(&key).await {
-                return Ok((*cached).clone());
-            }
-
-            let entities = self
-                .inner
-                .entities_for(session, principal, resource, action)
-                .await?;
-            self.cache.insert(key, Arc::new(entities.clone())).await;
-            Ok(entities)
+            self.cache
+                .try_get_with(key, async {
+                    self.inner
+                        .entities_for(session, principal, resource, action)
+                        .await
+                        .map(Arc::new)
+                })
+                .await
+                .map_err(|shared| {
+                    Arc::try_unwrap(shared)
+                        .unwrap_or_else(|shared| AuthzError::EntityBuild(shared.to_string()))
+                })
         })
     }
 }
@@ -301,10 +328,8 @@ mod tests {
         }
     }
 
-    /// Construct a guest (unauthenticated) `AuthSession` for unit tests.
-    /// Reaches into `pub(crate)` `SessionInner` / `SessionHandle`: usable
-    /// only from inside axess-core; mirrors the pattern in
-    /// `session::extractor::tests::make_session`.
+    /// Construct a guest (unauthenticated) `AuthSession` for unit tests,
+    /// through the `pub(crate)` `SessionInner` / `SessionHandle`.
     fn guest_session() -> AuthSession {
         use crate::session::SessionData;
         use crate::session::id::SessionId;
@@ -315,8 +340,10 @@ mod tests {
             id: SessionId::new(&axess_rng::SystemRng),
             data: SessionData::default(),
             modified: false,
+            needs_persist: false,
             regenerate: false,
             pre_cycle_id: None,
+            rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
         };

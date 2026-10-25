@@ -8,7 +8,9 @@
 use crate::oidc::error::OidcError;
 use jsonwebtoken::jwk::JwkSet;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use axess_clock::{Clock, SystemClock};
 use tokio::sync::Mutex as AsyncMutex;
 
 /// Lower bound on the gap between consecutive JWKS refreshes per cache.
@@ -20,6 +22,21 @@ use tokio::sync::Mutex as AsyncMutex;
 /// more than the time to verify one re-issued JWT, while still squashing
 /// herds on rotation events.
 pub const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long after a FAILED fetch further refresh calls are refused without
+/// touching the network. Without it, N concurrent unknown-`kid` callers
+/// against a failing endpoint each wait their turn on the single-flight lock
+/// and each issue their own request, which is the herd the success debounce
+/// exists to prevent, at the moment the endpoint is least able to take it.
+const JWKS_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Default maximum age of a cached key set: 24 hours.
+///
+/// A key set older than this is refused by [`JwksCache::ensure_fresh`] until a
+/// refresh succeeds, so a revoked or rotated-out signing key cannot stay
+/// trusted for ever by a process whose refresh loop has stopped or whose IdP
+/// is unreachable. Change it with [`JwksCache::with_max_age`].
+pub const DEFAULT_JWKS_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Refreshable JWKS cache backed by an HTTP `jwks_uri`.
 ///
@@ -39,13 +56,60 @@ pub const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 ///    If a peer just refreshed within [`MIN_JWKS_REFRESH_INTERVAL`], the
 ///    waiter returns `Ok(())` without re-hitting the network; the herd
 ///    collapses into one fetch + N free returns.
-#[derive(Debug)]
+/// 3. After a failed fetch, refuses further refreshes for
+///    `JWKS_FAILURE_BACKOFF` without touching the network, and never
+///    replaces the cached keys with a failed or empty result: the previous
+///    key set keeps serving until a fetch succeeds.
+///
+/// # Maximum age
+///
+/// A key set has a maximum age ([`DEFAULT_JWKS_MAX_AGE`], set with
+/// [`with_max_age`](Self::with_max_age)), counted from the last successful
+/// fetch. [`ensure_fresh`](Self::ensure_fresh) and
+/// [`fresh_handle`](Self::fresh_handle) refuse a key set older than that and
+/// keep refusing until [`refresh`](Self::refresh) succeeds, so verification
+/// fails closed when nothing keeps the keys current. The OAuth provider
+/// checks it before every logout-token verification. [`handle`](Self::handle)
+/// is the unchecked view for callers that apply their own policy. Keep the
+/// keys current with a periodic refresh (the OAuth service can start one);
+/// without it the keys expire by `max_age`.
+///
+/// # Clock
+///
+/// The debounce and the failure back-off are measured on an injected
+/// [`Clock`] ([`SystemClock`] unless [`with_clock`](Self::with_clock) says
+/// otherwise), so a `MockClock` steps through both windows without
+/// sleeping. A wall clock can step backwards; a stamp that lies in the
+/// future is treated as an expired window rather than suppressing refreshes
+/// until real time catches up.
 pub struct JwksCache {
     jwks_uri: String,
     http_client: openidconnect::reqwest::Client,
     jwks: Arc<RwLock<JwkSet>>,
     refresh_lock: Arc<AsyncMutex<()>>,
-    last_refresh: Arc<Mutex<Option<Instant>>>,
+    clock: Arc<dyn Clock>,
+    /// Unix milliseconds of the last successful refresh.
+    last_refresh: Arc<Mutex<Option<i64>>>,
+    /// Unix milliseconds of the last failed fetch.
+    last_failure: Arc<Mutex<Option<i64>>>,
+    /// Unix milliseconds at which the current key set was fetched.
+    fetched_at: Arc<Mutex<i64>>,
+    max_age: Duration,
+}
+
+impl std::fmt::Debug for JwksCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwksCache")
+            .field("jwks_uri", &self.jwks_uri)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Whether fewer than `window` has passed between the stamp and `now`.
+/// A stamp after `now` (the clock stepped back) is not inside any window.
+fn within(stamp_ms: i64, now_ms: i64, window: Duration) -> bool {
+    let elapsed = now_ms.saturating_sub(stamp_ms);
+    elapsed >= 0 && i128::from(elapsed) < window.as_millis() as i128
 }
 
 impl JwksCache {
@@ -67,7 +131,11 @@ impl JwksCache {
             http_client: http_client.clone(),
             jwks: Arc::new(RwLock::new(jwks)),
             refresh_lock: Arc::new(AsyncMutex::new(())),
+            clock: Arc::new(SystemClock),
             last_refresh: Arc::new(Mutex::new(None)),
+            last_failure: Arc::new(Mutex::new(None)),
+            fetched_at: Arc::new(Mutex::new(SystemClock.now().timestamp_millis())),
+            max_age: DEFAULT_JWKS_MAX_AGE,
         })
     }
 
@@ -86,8 +154,66 @@ impl JwksCache {
             http_client: http_client.clone(),
             jwks: Arc::new(RwLock::new(jwks)),
             refresh_lock: Arc::new(AsyncMutex::new(())),
+            clock: Arc::new(SystemClock),
             last_refresh: Arc::new(Mutex::new(None)),
+            last_failure: Arc::new(Mutex::new(None)),
+            fetched_at: Arc::new(Mutex::new(SystemClock.now().timestamp_millis())),
+            max_age: DEFAULT_JWKS_MAX_AGE,
         }
+    }
+
+    /// Measure the refresh debounce, the failure back-off and the key set's
+    /// age on `clock`. The key set held at this moment counts as fetched now:
+    /// install the clock right after construction.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        *self
+            .fetched_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = clock.now().timestamp_millis();
+        self.clock = clock;
+        self
+    }
+
+    /// Set the maximum age of the key set (default [`DEFAULT_JWKS_MAX_AGE`]).
+    /// Keep it well above the refresh interval, or a single failed refresh
+    /// stops verification.
+    #[must_use]
+    pub fn with_max_age(mut self, max_age: Duration) -> Self {
+        self.max_age = max_age;
+        self
+    }
+
+    /// The configured maximum age of the key set.
+    pub fn max_age(&self) -> Duration {
+        self.max_age
+    }
+
+    /// Refuse a key set older than the maximum age.
+    ///
+    /// Returns [`OidcError::JwksExpired`] until a [`refresh`](Self::refresh)
+    /// succeeds. A fetch time in the future (the clock stepped back) counts
+    /// as fresh.
+    pub fn ensure_fresh(&self) -> Result<(), OidcError> {
+        let fetched = *self
+            .fetched_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let age_ms = self.clock.now().timestamp_millis().saturating_sub(fetched);
+        if age_ms > 0 && u128::from(age_ms.unsigned_abs()) > self.max_age.as_millis() {
+            return Err(OidcError::JwksExpired {
+                age_secs: age_ms.unsigned_abs() / 1000,
+                max_age_secs: self.max_age.as_secs(),
+            });
+        }
+        Ok(())
+    }
+
+    /// [`handle`](Self::handle), but only while the key set is within its
+    /// maximum age.
+    pub fn fresh_handle(&self) -> Result<Arc<RwLock<JwkSet>>, OidcError> {
+        self.ensure_fresh()?;
+        Ok(self.jwks.clone())
     }
 
     /// JWKS endpoint URL the cache fetches from.
@@ -110,7 +236,7 @@ impl JwksCache {
     pub async fn refresh(&self) -> Result<(), OidcError> {
         let refresh_guard = self.refresh_lock.lock().await;
 
-        let now = Instant::now();
+        let now_ms = self.clock.now().timestamp_millis();
         let last = self
             .last_refresh
             .lock()
@@ -118,17 +244,50 @@ impl JwksCache {
             .as_ref()
             .copied();
         if let Some(prev) = last
-            && now.duration_since(prev) < MIN_JWKS_REFRESH_INTERVAL
+            && within(prev, now_ms, MIN_JWKS_REFRESH_INTERVAL)
         {
             tracing::debug!(
                 jwks_uri = %self.jwks_uri,
-                age_secs = now.duration_since(prev).as_secs(),
+                age_secs = now_ms.saturating_sub(prev) / 1000,
                 "JWKS refresh coalesced; peer refreshed within debounce window",
             );
             return Ok(());
         }
 
-        let new_jwks = fetch_key_set(&self.http_client, &self.jwks_uri).await?;
+        let last_failure = self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .copied();
+        if let Some(prev) = last_failure
+            && within(prev, now_ms, JWKS_FAILURE_BACKOFF)
+        {
+            return Err(OidcError::JwksFetch(
+                "refresh suppressed: the previous fetch failed moments ago".to_string(),
+            ));
+        }
+
+        let fetched = match fetch_key_set(&self.http_client, &self.jwks_uri).await {
+            // A key set with no keys can verify nothing; installing it would
+            // evict the last good keys and fail every login until the next
+            // successful fetch. Keep serving what we have.
+            Ok(set) if set.keys.is_empty() => Err(OidcError::JwksParse(
+                "the endpoint returned a key set with no keys".to_string(),
+            )),
+            other => other,
+        };
+        let new_jwks = match fetched {
+            Ok(set) => set,
+            Err(e) => {
+                *self
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(self.clock.now().timestamp_millis());
+                return Err(e);
+            }
+        };
 
         let mut guard = self.jwks.write().unwrap_or_else(|poisoned| {
             tracing::warn!("JWKS RwLock was poisoned; recovering with fresh data");
@@ -136,9 +295,18 @@ impl JwksCache {
         });
         *guard = new_jwks;
         *self
+            .fetched_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.clock.now().timestamp_millis();
+        *self
             .last_refresh
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(self.clock.now().timestamp_millis());
+        *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         tracing::info!(jwks_uri = %self.jwks_uri, "JWKS refreshed successfully");
         drop(refresh_guard);
         Ok(())
@@ -172,136 +340,4 @@ async fn fetch_key_set(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    fn sample_jwks_json() -> serde_json::Value {
-        serde_json::json!({
-            "keys": [{
-                "kty": "RSA",
-                "use": "sig",
-                "alg": "RS256",
-                "kid": "k1",
-                "n": "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
-                "e": "AQAB",
-            }],
-        })
-    }
-
-    #[tokio::test]
-    async fn fetch_loads_jwks_from_endpoint() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sample_jwks_json()))
-            .mount(&server)
-            .await;
-
-        let client = openidconnect::reqwest::Client::new();
-        let cache = JwksCache::fetch(format!("{}/jwks.json", server.uri()), &client)
-            .await
-            .expect("fetch ok");
-
-        let handle = cache.handle();
-        let jwks = handle.read().unwrap();
-        assert_eq!(jwks.keys.len(), 1);
-    }
-
-    /// `refresh` collapses concurrent callers into a single outbound
-    /// fetch. The mock expects exactly one call: any wider count means
-    /// the debounce window collapsed.
-    #[tokio::test]
-    async fn refresh_debounces_within_window() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sample_jwks_json()))
-            .expect(2) // initial fetch + one refresh; subsequent refreshes debounced
-            .mount(&server)
-            .await;
-
-        let client = openidconnect::reqwest::Client::new();
-        let cache = JwksCache::fetch(format!("{}/jwks.json", server.uri()), &client)
-            .await
-            .expect("fetch ok");
-
-        cache.refresh().await.expect("first refresh ok");
-
-        // Subsequent immediate refreshes coalesce; no additional GET.
-        cache.refresh().await.expect("second refresh ok");
-        cache.refresh().await.expect("third refresh ok");
-    }
-
-    #[tokio::test]
-    async fn fetch_propagates_parse_errors() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks.json"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
-            .mount(&server)
-            .await;
-
-        let client = openidconnect::reqwest::Client::new();
-        let err = JwksCache::fetch(format!("{}/jwks.json", server.uri()), &client)
-            .await
-            .expect_err("parse failure must propagate");
-        assert!(
-            matches!(err, OidcError::JwksParse(_)),
-            "expected JwksParse, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_refuses_non_success_status_even_with_valid_key_set_body() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks.json"))
-            .respond_with(ResponseTemplate::new(503).set_body_json(sample_jwks_json()))
-            .mount(&server)
-            .await;
-        let client = openidconnect::reqwest::Client::new();
-        let err = JwksCache::fetch(format!("{}/jwks.json", server.uri()), &client)
-            .await
-            .expect_err("a 503 must not seed the cache");
-        assert!(matches!(err, OidcError::JwksFetch(_)), "got {err:?}");
-    }
-
-    #[tokio::test]
-    async fn refresh_keeps_cached_keys_when_endpoint_errors_with_key_set_body() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/jwks.json"))
-            .respond_with(
-                ResponseTemplate::new(500).set_body_json(serde_json::json!({ "keys": [] })),
-            )
-            .mount(&server)
-            .await;
-        let client = openidconnect::reqwest::Client::new();
-        let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
-        let cache = JwksCache::from_parts(format!("{}/jwks.json", server.uri()), &client, seed);
-
-        let err = cache.refresh().await.expect_err("a 500 must be an error");
-        assert!(matches!(err, OidcError::JwksFetch(_)), "got {err:?}");
-        assert_eq!(
-            cache.handle().read().unwrap().keys.len(),
-            1,
-            "cached keys must survive a failed refresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn fetch_and_refresh_refuse_plain_http_to_a_remote_host() {
-        let client = openidconnect::reqwest::Client::new();
-        let err = JwksCache::fetch("http://keys.example.com/jwks.json", &client)
-            .await
-            .expect_err("plain http to a remote host must be refused");
-        assert!(matches!(err, OidcError::NonHttpsIssuer(_)), "got {err:?}");
-
-        let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
-        let cache = JwksCache::from_parts("http://keys.example.com/jwks.json", &client, seed);
-        let err = cache.refresh().await.expect_err("refresh must refuse too");
-        assert!(matches!(err, OidcError::NonHttpsIssuer(_)), "got {err:?}");
-    }
-}
+mod tests;

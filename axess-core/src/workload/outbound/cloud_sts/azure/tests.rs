@@ -230,3 +230,39 @@ fn tenant_is_confined_to_one_path_segment() {
         );
     }
 }
+
+/// A token endpoint that never answers must not hold the caller forever:
+/// the request ends in a transport error at the configured timeout, even
+/// on an HTTP client supplied without one.
+#[tokio::test]
+async fn a_silent_token_endpoint_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tenant-guid/oauth2/v2.0/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token": "t"}))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let client = AzureFicClient::new("tenant", "client")
+        .with_token_endpoint(endpoint(&server))
+        .with_http_client(reqwest::Client::new())
+        .with_timeout(std::time::Duration::from_millis(150));
+
+    let started = std::time::Instant::now();
+    let err = client
+        .acquire_token(&AzureFicRequest::new("fed").with_scope("s"))
+        .await
+        .expect_err("must time out");
+    assert!(matches!(err, AzureFicError::Transport(_)), "{err:?}");
+    // The proof is that the call ended before the server would have
+    // answered (its delay is 5 s), not how fast a loaded machine scheduled
+    // it: a tighter bound measured the host and failed under a full build.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ended after the mock's delay, so the timeout did not end it: {:?}",
+        started.elapsed()
+    );
+}

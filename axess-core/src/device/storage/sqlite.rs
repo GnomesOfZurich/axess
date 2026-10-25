@@ -28,6 +28,7 @@
 //!     first_seen_at    INTEGER NOT NULL,
 //!     last_seen_at     INTEGER NOT NULL,
 //!     revoked_at       INTEGER,
+//!     demoted_at       INTEGER,
 //!     bindings         TEXT    NOT NULL,
 //!     PRIMARY KEY (tenant_id, id)
 //! );
@@ -36,6 +37,8 @@
 //!     ON devices (tenant_id, fingerprint_hash);
 //! CREATE INDEX IF NOT EXISTS idx_devices_user
 //!     ON devices (tenant_id, user_id, last_seen_at DESC);
+//! CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint
+//!     ON devices (tenant_id, user_id, fingerprint_hash, last_seen_at DESC);
 //!
 //! -- Index table for fast `find_by_refresh_family`. One row per
 //! -- `DeviceBinding::Refresh` carried by a device.
@@ -50,6 +53,33 @@
 //!
 //! CREATE INDEX IF NOT EXISTS idx_device_bindings_refresh_family
 //!     ON device_bindings_refresh (tenant_id, family_id);
+//! ```
+//!
+//! `demoted_at` is the instant a `Trusted` row was moved down to `Seen`; it
+//! is `NULL` for a device that was never trusted and is cleared by every
+//! other transition. The sweep reads it to give a demoted device its full
+//! `seen_idle` window from the demotion.
+//!
+//! # Upgrading an existing deployment
+//!
+//! `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so a
+//! deployment created before `demoted_at` existed must run, once:
+//!
+//! ```sql
+//! ALTER TABLE devices ADD COLUMN demoted_at INTEGER;
+//! ```
+//!
+//! Rows that were already `Seen` carry `NULL` and so read as never trusted:
+//! the first sweep after the upgrade revokes those idle for more than
+//! `seen_idle` (30 days by default), including ones demoted earlier.
+//!
+//! `find_by_fingerprint_for_user` is served by
+//! `idx_devices_user_fingerprint`. `init_schema` creates it on startup
+//! (`IF NOT EXISTS`); to add it without running `init_schema`, run:
+//!
+//! ```sql
+//! CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint
+//!     ON devices (tenant_id, user_id, fingerprint_hash, last_seen_at DESC);
 //! ```
 //!
 //! # Encryption
@@ -73,16 +103,26 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use axess_clock::Clock;
+#[cfg(test)]
+use chrono::TimeZone;
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
-use axess_clock::{Clock, SystemClock};
-
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::device::storage::sql_common::{BindingsCodec, SqlDeviceStoreError, trust_level_codec};
-use crate::device::store::{DeviceStore, SweepConfig, SweepCounts};
+use crate::device::storage::sql_common::{
+    BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
+    SqlDeviceStoreError, SwapPlan, SweepCutoffs, TrustWrite, bindings_update_after_miss,
+    claim_after_miss, decode_all, decode_optional, parse_stored_trust, plan_bindings_swap,
+    push_family_rows, require_row, select_devices, transition_after_miss, utc_to_unix,
+};
+use crate::device::store::{
+    BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
+};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
+
+mod sweep;
 
 /// SQLite-backed [`DeviceStore`].
 ///
@@ -101,7 +141,6 @@ use crate::session::crypto::SessionCrypto;
 pub struct SqliteDeviceStore {
     pool: SqlitePool,
     codec: BindingsCodec,
-    clock: Arc<dyn Clock>,
     sweep_config: SweepConfig,
 }
 
@@ -111,7 +150,6 @@ impl SqliteDeviceStore {
         Self {
             pool,
             codec: BindingsCodec::encrypted(crypto),
-            clock: Arc::new(SystemClock),
             sweep_config: SweepConfig::default(),
         }
     }
@@ -126,16 +164,15 @@ impl SqliteDeviceStore {
         Self {
             pool,
             codec: BindingsCodec::plaintext(),
-            clock: Arc::new(SystemClock),
             sweep_config: SweepConfig::default(),
         }
     }
 
-    /// Inject a [`Clock`] for deterministic-simulation testing. The
-    /// clock is read on every `record_sighting` / `set_trust_level`
-    /// call where the caller did not supply an explicit `now`.
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+    /// Has no effect: every time-dependent method of the store is given the
+    /// instant it works from, so there is no clock to inject.
+    #[deprecated(note = "the store reads time only from the `now` its methods are given")]
+    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
+        let _ = clock;
         self
     }
 
@@ -166,6 +203,7 @@ impl SqliteDeviceStore {
                 first_seen_at    INTEGER NOT NULL,
                 last_seen_at     INTEGER NOT NULL,
                 revoked_at       INTEGER,
+                demoted_at       INTEGER,
                 bindings         TEXT    NOT NULL,
                 PRIMARY KEY (tenant_id, id)
             )
@@ -183,6 +221,13 @@ impl SqliteDeviceStore {
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_devices_user \
              ON devices (tenant_id, user_id, last_seen_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint \
+             ON devices (tenant_id, user_id, fingerprint_hash, last_seen_at DESC)",
         )
         .execute(&self.pool)
         .await?;
@@ -211,97 +256,48 @@ impl SqliteDeviceStore {
 
         Ok(())
     }
+}
 
-    /// Decode a row read from `devices` back into a [`Device`]. Shared
-    /// across the various `SELECT *` paths.
-    fn decode_row(&self, row: DeviceRow) -> Result<Device, SqlDeviceStoreError> {
-        let DeviceRow {
-            tenant_id,
-            id,
-            user_id,
-            trust_level,
-            fingerprint_hash,
-            first_seen_at,
-            last_seen_at,
-            revoked_at,
-            bindings,
-        } = row;
+/// Current trust level of a device row, `None` when the row is absent.
+async fn fetch_trust_level(
+    pool: &SqlitePool,
+    tenant: &str,
+    device_id: &str,
+) -> Result<Option<DeviceTrustLevel>, SqlDeviceStoreError> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT trust_level FROM devices WHERE tenant_id = ?1 AND id = ?2")
+            .bind(tenant)
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await?;
+    parse_stored_trust(stored)
+}
 
-        let tenant = TenantId::try_new(&tenant_id)
-            .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("tenant_id: {e}")))?;
-        let device_id = DeviceId::try_new(&id)
-            .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("device id: {e}")))?;
-        let user = match user_id {
-            Some(u) => Some(
-                UserId::try_new(&u)
-                    .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("user_id: {e}")))?,
-            ),
-            None => None,
-        };
-
-        let trust = trust_level_codec::from_str(&trust_level)
-            .ok_or(SqlDeviceStoreError::UnknownTrustLevel(trust_level))?;
-
-        let fp_bytes: [u8; 32] = fingerprint_hash
-            .try_into()
-            .map_err(|_| SqlDeviceStoreError::MalformedRow("fingerprint_hash length".into()))?;
-
-        let first = unix_to_utc(first_seen_at)?;
-        let last = unix_to_utc(last_seen_at)?;
-        let revoked = match revoked_at {
-            Some(t) => Some(unix_to_utc(t)?),
-            None => None,
-        };
-
-        let bindings = self.codec.decode(&bindings)?;
-
-        Ok(Device {
-            id: device_id,
-            tenant_id: tenant,
-            user_id: user,
-            trust_level: trust,
-            fingerprint_hash: FingerprintHash::from_bytes(fp_bytes),
-            first_seen_at: first,
-            last_seen_at: last,
-            revoked_at: revoked,
-            bindings,
-        })
+/// Replace a device's refresh-family index rows inside `tx`. The family
+/// ids are already distinct ([`refresh_family_ids`]) and the insert is
+/// idempotent as well, so a repeated family can never violate the primary
+/// key and abort the surrounding transaction.
+async fn rewrite_family_index(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tenant: &str,
+    device_id: &str,
+    family_ids: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM device_bindings_refresh WHERE tenant_id = ?1 AND device_id = ?2")
+        .bind(tenant)
+        .bind(device_id)
+        .execute(&mut **tx)
+        .await?;
+    // One multi-row insert per chunk keeps a device with many families to a
+    // handful of statements, well under every dialect's bind-parameter cap.
+    for chunk in family_ids.chunks(FAMILY_INSERT_CHUNK) {
+        let mut insert = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "INSERT OR IGNORE INTO device_bindings_refresh (tenant_id, device_id, family_id) ",
+        );
+        push_family_rows(&mut insert, chunk, tenant, device_id);
+        insert.build().execute(&mut **tx).await?;
     }
-}
-
-/// Raw row shape for `SELECT * FROM devices`. Mirrors the column order
-/// in the schema so `query_as` works without column-name binding.
-#[derive(sqlx::FromRow)]
-struct DeviceRow {
-    tenant_id: String,
-    id: String,
-    user_id: Option<String>,
-    trust_level: String,
-    fingerprint_hash: Vec<u8>,
-    first_seen_at: i64,
-    last_seen_at: i64,
-    revoked_at: Option<i64>,
-    bindings: String,
-}
-
-fn unix_to_utc(secs: i64) -> Result<DateTime<Utc>, SqlDeviceStoreError> {
-    Utc.timestamp_opt(secs, 0).single().ok_or_else(|| {
-        SqlDeviceStoreError::MalformedRow(format!("unrepresentable Unix timestamp: {secs}"))
-    })
-}
-
-fn utc_to_unix(dt: DateTime<Utc>) -> i64 {
-    dt.timestamp()
-}
-
-fn refresh_family_ids(bindings: &[DeviceBinding]) -> Vec<String> {
-    bindings
-        .iter()
-        .filter_map(|b| match b {
-            DeviceBinding::Refresh { family_id, .. } => Some(family_id.clone()),
-            _ => None,
-        })
-        .collect()
+    Ok(())
 }
 
 impl DeviceStore for SqliteDeviceStore {
@@ -313,24 +309,17 @@ impl DeviceStore for SqliteDeviceStore {
         id: &DeviceId,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
-        let tenant = tenant_id.to_string().to_string();
-        let device_id = id.to_string().to_string();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
         async move {
-            let row: Option<DeviceRow> = sqlx::query_as(
-                "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
-                        first_seen_at, last_seen_at, revoked_at, bindings \
-                 FROM devices WHERE tenant_id = ?1 AND id = ?2",
-            )
-            .bind(&tenant)
-            .bind(&device_id)
-            .fetch_optional(&pool)
-            .await?;
-
-            match row {
-                Some(r) => Ok(Some(store.decode_row(r)?)),
-                None => Ok(None),
-            }
+            let row: Option<DeviceRow> =
+                sqlx::query_as(select_devices!("WHERE tenant_id = ?1 AND id = ?2"))
+                    .bind(&tenant)
+                    .bind(&device_id)
+                    .fetch_optional(&pool)
+                    .await?;
+            decode_optional(&codec, row)
         }
     }
 
@@ -340,25 +329,44 @@ impl DeviceStore for SqliteDeviceStore {
         hash: &FingerprintHash,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
-        let tenant = tenant_id.to_string().to_string();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
         let bytes = hash.as_bytes().to_vec();
         async move {
-            let row: Option<DeviceRow> = sqlx::query_as(
-                "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
-                        first_seen_at, last_seen_at, revoked_at, bindings \
-                 FROM devices WHERE tenant_id = ?1 AND fingerprint_hash = ?2 \
-                 ORDER BY last_seen_at DESC LIMIT 1",
-            )
+            let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ?1 AND fingerprint_hash = ?2 \
+                 ORDER BY last_seen_at DESC LIMIT 1"
+            ))
             .bind(&tenant)
             .bind(&bytes)
             .fetch_optional(&pool)
             .await?;
+            decode_optional(&codec, row)
+        }
+    }
 
-            match row {
-                Some(r) => Ok(Some(store.decode_row(r)?)),
-                None => Ok(None),
-            }
+    fn find_by_fingerprint_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        hash: &FingerprintHash,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
+        let uid = user_id.to_string();
+        let bytes = hash.as_bytes().to_vec();
+        async move {
+            let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ?1 AND user_id = ?2 AND fingerprint_hash = ?3 \
+                 ORDER BY last_seen_at DESC LIMIT 1"
+            ))
+            .bind(&tenant)
+            .bind(&uid)
+            .bind(&bytes)
+            .fetch_optional(&pool)
+            .await?;
+            decode_optional(&codec, row)
         }
     }
 
@@ -369,28 +377,21 @@ impl DeviceStore for SqliteDeviceStore {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
-        let tenant = tenant_id.to_string().to_string();
-        let uid = user_id.to_string().to_string();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
+        let uid = user_id.to_string();
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         async move {
-            let rows: Vec<DeviceRow> = sqlx::query_as(
-                "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
-                        first_seen_at, last_seen_at, revoked_at, bindings \
-                 FROM devices WHERE tenant_id = ?1 AND user_id = ?2 \
-                 ORDER BY last_seen_at DESC LIMIT ?3",
-            )
+            let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ?1 AND user_id = ?2 \
+                 ORDER BY last_seen_at DESC LIMIT ?3"
+            ))
             .bind(&tenant)
             .bind(&uid)
             .bind(limit_i64)
             .fetch_all(&pool)
             .await?;
-
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                out.push(store.decode_row(r)?);
-            }
-            Ok(out)
+            decode_all(&codec, rows)
         }
     }
 
@@ -400,13 +401,13 @@ impl DeviceStore for SqliteDeviceStore {
         family_id: &str,
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
-        let tenant = tenant_id.to_string().to_string();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
         let family = family_id.to_string();
         async move {
             let rows: Vec<DeviceRow> = sqlx::query_as(
                 "SELECT d.tenant_id, d.id, d.user_id, d.trust_level, d.fingerprint_hash, \
-                        d.first_seen_at, d.last_seen_at, d.revoked_at, d.bindings \
+                        d.first_seen_at, d.last_seen_at, d.revoked_at, d.demoted_at, d.bindings \
                  FROM devices d \
                  INNER JOIN device_bindings_refresh r \
                    ON d.tenant_id = r.tenant_id AND d.id = r.device_id \
@@ -417,30 +418,20 @@ impl DeviceStore for SqliteDeviceStore {
             .bind(&family)
             .fetch_all(&pool)
             .await?;
-
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                out.push(store.decode_row(r)?);
-            }
-            Ok(out)
+            decode_all(&codec, rows)
         }
     }
 
-    fn save(&self, device: &Device) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn save(
+        &self,
+        device: &Device,
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
         let device = device.clone();
         async move {
-            let bindings_blob = codec.encode(&device.bindings)?;
-            let trust = trust_level_codec::to_str(device.trust_level);
-            let fp = device.fingerprint_hash.as_bytes().to_vec();
-            let user_id_col = device.user_id.as_ref().map(|u| u.to_string().to_string());
-            let first = utc_to_unix(device.first_seen_at);
-            let last = utc_to_unix(device.last_seen_at);
-            let revoked = device.revoked_at.map(utc_to_unix);
-            let family_ids = refresh_family_ids(&device.bindings);
-            let tenant = device.tenant_id.to_string().to_string();
-            let id = device.id.to_string().to_string();
+            let w = DeviceWrite::new(&codec, &device)?;
 
             // Wrap the device-row upsert and the refresh-binding index
             // refresh in a single transaction so a concurrent
@@ -452,8 +443,8 @@ impl DeviceStore for SqliteDeviceStore {
                 r#"
                 INSERT INTO devices
                     (tenant_id, id, user_id, trust_level, fingerprint_hash,
-                     first_seen_at, last_seen_at, revoked_at, bindings)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     first_seen_at, last_seen_at, revoked_at, demoted_at, bindings)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(tenant_id, id) DO UPDATE SET
                     user_id          = excluded.user_id,
                     trust_level      = excluded.trust_level,
@@ -461,42 +452,24 @@ impl DeviceStore for SqliteDeviceStore {
                     first_seen_at    = excluded.first_seen_at,
                     last_seen_at     = excluded.last_seen_at,
                     revoked_at       = excluded.revoked_at,
+                    demoted_at       = excluded.demoted_at,
                     bindings         = excluded.bindings
                 "#,
             )
-            .bind(&tenant)
-            .bind(&id)
-            .bind(user_id_col.as_deref())
-            .bind(trust)
-            .bind(&fp)
-            .bind(first)
-            .bind(last)
-            .bind(revoked)
-            .bind(&bindings_blob)
+            .bind(&w.tenant)
+            .bind(&w.id)
+            .bind(w.user_id.as_deref())
+            .bind(w.trust)
+            .bind(&w.fingerprint)
+            .bind(w.first_seen_at)
+            .bind(w.last_seen_at)
+            .bind(w.revoked_at)
+            .bind(w.demoted_at)
+            .bind(&w.bindings)
             .execute(&mut *tx)
             .await?;
 
-            // Replace the refresh-binding index rows for this device.
-            sqlx::query(
-                "DELETE FROM device_bindings_refresh \
-                 WHERE tenant_id = ?1 AND device_id = ?2",
-            )
-            .bind(&tenant)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-
-            for family_id in &family_ids {
-                sqlx::query(
-                    "INSERT INTO device_bindings_refresh \
-                     (tenant_id, device_id, family_id) VALUES (?1, ?2, ?3)",
-                )
-                .bind(&tenant)
-                .bind(&id)
-                .bind(family_id)
-                .execute(&mut *tx)
-                .await?;
-            }
+            rewrite_family_index(&mut tx, &w.tenant, &w.id, &w.family_ids).await?;
 
             tx.commit().await?;
             Ok(())
@@ -510,11 +483,11 @@ impl DeviceStore for SqliteDeviceStore {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
-        let tenant = tenant_id.to_string().to_string();
-        let device_id = id.to_string().to_string();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
         let ts = utc_to_unix(now);
         async move {
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE devices SET last_seen_at = ?3 \
                  WHERE tenant_id = ?1 AND id = ?2",
             )
@@ -522,8 +495,9 @@ impl DeviceStore for SqliteDeviceStore {
             .bind(&device_id)
             .bind(ts)
             .execute(&pool)
-            .await?;
-            Ok(())
+            .await?
+            .rows_affected();
+            require_row(updated, tenant, device_id)
         }
     }
 
@@ -535,28 +509,184 @@ impl DeviceStore for SqliteDeviceStore {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
-        let tenant = tenant_id.to_string().to_string();
-        let device_id = id.to_string().to_string();
-        let trust = trust_level_codec::to_str(level);
-        let ts = utc_to_unix(now);
-        // Set/clear `revoked_at` symmetrically with the trust transition
-        // so MemoryDeviceStore semantics are preserved across backends.
-        let revoked_at = match level {
-            DeviceTrustLevel::Revoked => Some(ts),
-            _ => None,
-        };
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        let w = TrustWrite::new(level, now);
         async move {
-            sqlx::query(
-                "UPDATE devices SET trust_level = ?3, revoked_at = ?4 \
+            // The CASE reads the row's level from before this statement's
+            // assignments.
+            let updated = sqlx::query(
+                "UPDATE devices SET trust_level = ?3, revoked_at = ?4, \
+                        demoted_at = CASE WHEN ?5 = 0 THEN NULL \
+                                          WHEN trust_level = 'Trusted' THEN ?6 \
+                                          ELSE demoted_at END \
                  WHERE tenant_id = ?1 AND id = ?2",
             )
             .bind(&tenant)
             .bind(&device_id)
-            .bind(trust)
-            .bind(revoked_at)
+            .bind(w.trust)
+            .bind(w.revoked_at)
+            .bind(w.to_seen)
+            .bind(w.now)
             .execute(&pool)
+            .await?
+            .rows_affected();
+            require_row(updated, tenant, device_id)
+        }
+    }
+
+    fn set_trust_level_if(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        let w = GuardedTrustWrite::new(expected, level, now);
+        async move {
+            // One conditional UPDATE: the engine checks the current level
+            // and writes in a single statement, so a revocation that lands
+            // first makes this match no row instead of being overwritten.
+            let updated = sqlx::query("UPDATE devices SET trust_level = ?4, revoked_at = ?5, demoted_at = CASE WHEN ?6 = 1 THEN demoted_at ELSE ?7 END WHERE tenant_id = ?1 AND id = ?2 AND trust_level = ?3")
+            .bind(&tenant)
+            .bind(&device_id)
+            .bind(w.expected)
+            .bind(w.new)
+            .bind(w.revoked_at)
+            .bind(w.keep_demoted)
+            .bind(w.demoted_at)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            if updated > 0 {
+                return Ok(TrustTransition::Applied);
+            }
+            let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
+            Ok(transition_after_miss(current, expected))
+        }
+    }
+
+    fn replace_bindings(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let expected = expected.to_vec();
+        let bindings = bindings.to_vec();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        async move {
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT trust_level, bindings FROM devices WHERE tenant_id = ?1 AND id = ?2",
+            )
+            .bind(&tenant)
+            .bind(&device_id)
+            .fetch_optional(&pool)
             .await?;
-            Ok(())
+            let swap =
+                match plan_bindings_swap(&codec, &tenant, &device_id, row, &expected, &bindings)? {
+                    SwapPlan::Settled(outcome) => return Ok(outcome),
+                    SwapPlan::Write(swap) => swap,
+                };
+            let mut tx = pool.begin().await?;
+            // Only the bindings column is written, only on a row that is not
+            // Revoked, and only while it still holds the bytes that were
+            // read: the engine evaluates the conditions and the write
+            // together, so a revocation cannot be undone, a revoked device
+            // cannot gain a binding, and a concurrent bindings edit makes
+            // this match no row instead of being overwritten.
+            let updated = sqlx::query("UPDATE devices SET bindings = ?3 WHERE tenant_id = ?1 AND id = ?2 AND trust_level <> 'Revoked' AND bindings = ?4")
+                .bind(&tenant)
+                .bind(&device_id)
+                .bind(&swap.blob)
+                .bind(&swap.stored)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if updated == 0 {
+                // Nothing written (the transaction rolls back on drop).
+                let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
+                return Ok(bindings_update_after_miss(current));
+            }
+            rewrite_family_index(&mut tx, &tenant, &device_id, &swap.family_ids).await?;
+            tx.commit().await?;
+            Ok(BindingsUpdate::Written)
+        }
+    }
+
+    fn claim_owner(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        let user = user.to_string();
+        async move {
+            // One conditional UPDATE: the owner is set only while there is
+            // none, so of two users racing for an unowned device exactly one
+            // matches a row.
+            let updated = sqlx::query(
+                "UPDATE devices SET user_id = ?3 \
+                 WHERE tenant_id = ?1 AND id = ?2 AND user_id IS NULL",
+            )
+            .bind(&tenant)
+            .bind(&device_id)
+            .bind(&user)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            if updated > 0 {
+                return Ok(OwnerClaim::Claimed);
+            }
+            let owner: Option<Option<String>> =
+                sqlx::query_scalar("SELECT user_id FROM devices WHERE tenant_id = ?1 AND id = ?2")
+                    .bind(&tenant)
+                    .bind(&device_id)
+                    .fetch_optional(&pool)
+                    .await?;
+            Ok(claim_after_miss(owner, &user))
+        }
+    }
+
+    fn find_active_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
+        let uid = user_id.to_string();
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        async move {
+            // The Revoked filter is part of the WHERE clause, so it is
+            // applied before ORDER BY ... LIMIT: revoked rows never use up
+            // the limit.
+            let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ?1 AND user_id = ?2 \
+                   AND trust_level <> 'Revoked' \
+                 ORDER BY last_seen_at DESC LIMIT ?3"
+            ))
+            .bind(&tenant)
+            .bind(&uid)
+            .bind(limit_i64)
+            .fetch_all(&pool)
+            .await?;
+            decode_all(&codec, rows)
         }
     }
 
@@ -566,8 +696,8 @@ impl DeviceStore for SqliteDeviceStore {
         id: &DeviceId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
-        let tenant = tenant_id.to_string().to_string();
-        let device_id = id.to_string().to_string();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
         async move {
             // FK ON DELETE CASCADE removes the matching
             // `device_bindings_refresh` rows.
@@ -586,78 +716,9 @@ impl DeviceStore for SqliteDeviceStore {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let cfg = self.sweep_config;
-        let tenant = tenant_id.to_string().to_string();
-        let now_secs = utc_to_unix(now);
-        async move {
-            // All three transitions are pure SQL UPDATE/DELETE with
-            // affected-row counts; no row reads in user space, no
-            // per-row roundtrips. Order matters: do the cascade in
-            // demotion order so a long-idle Trusted device flows
-            // Trusted → Seen → Revoked in a single sweep call.
-            //
-            // Threshold semantics: `signed_duration_since(last_seen) > window`
-            // ⇔ `last_seen_at < now - window`. The bind-side comparison
-            // mirrors the in-memory store exactly.
-            let trusted_cutoff = now_secs - cfg.trusted_idle.num_seconds();
-            let seen_cutoff = now_secs - cfg.seen_idle.num_seconds();
-            let grace_cutoff = now_secs - cfg.revoked_grace.num_seconds();
-
-            // Stage 1: Trusted → Seen.
-            let trusted_demoted = sqlx::query(
-                "UPDATE devices SET trust_level = 'Seen' \
-                 WHERE tenant_id = ?1 \
-                   AND trust_level = 'Trusted' \
-                   AND last_seen_at < ?2",
-            )
-            .bind(&tenant)
-            .bind(trusted_cutoff)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-
-            // Stage 2: Seen → Revoked. Captures both natively-Seen rows
-            // AND ones that were just demoted by stage 1 in this same
-            // sweep; same cascade semantics as the in-memory impl.
-            let seen_demoted = sqlx::query(
-                "UPDATE devices SET trust_level = 'Revoked', revoked_at = ?3 \
-                 WHERE tenant_id = ?1 \
-                   AND trust_level = 'Seen' \
-                   AND last_seen_at < ?2",
-            )
-            .bind(&tenant)
-            .bind(seen_cutoff)
-            .bind(now_secs)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-
-            // Stage 3: Revoked → purge. ON DELETE CASCADE handles
-            // the `device_bindings_refresh` rows.
-            //
-            // We compare against `revoked_at`, NOT `last_seen_at`, so
-            // a device just demoted in stage 2 (revoked_at = now) is
-            // NOT eligible for purge in this sweep; its grace clock
-            // starts now and a future sweep finishes the job.
-            let purged = sqlx::query(
-                "DELETE FROM devices \
-                 WHERE tenant_id = ?1 \
-                   AND trust_level = 'Revoked' \
-                   AND revoked_at IS NOT NULL \
-                   AND revoked_at < ?2",
-            )
-            .bind(&tenant)
-            .bind(grace_cutoff)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-
-            Ok(SweepCounts {
-                trusted_to_seen: trusted_demoted,
-                seen_to_revoked: seen_demoted,
-                revoked_purged: purged,
-            })
-        }
+        let cutoffs = SweepCutoffs::new(&self.sweep_config, now);
+        let tenant = tenant_id.to_string();
+        async move { sweep::run(&pool, &tenant, &cutoffs).await }
     }
 }
 
@@ -685,3 +746,14 @@ impl HealthCheck for SqliteDeviceStore {
 }
 #[cfg(test)]
 mod tests;
+
+/// Store constructor shared with tests in other modules.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// A plaintext store over one in-memory connection, schema applied.
+    pub(crate) async fn store() -> SqliteDeviceStore {
+        super::tests::fresh_store().await
+    }
+}

@@ -19,15 +19,39 @@ pub const MAX_IAT_AGE_SECS: i64 = 300;
 /// JWTs aimed at the public logout endpoint.
 pub const MAX_LOGOUT_TOKEN_BYTES: usize = 8 * 1024;
 
+/// Maximum ID token size (1 MiB). An ID token from a directory-backed IdP
+/// can carry hundreds of group or role claims and legitimately exceed the
+/// logout-token cap; the bound only has to keep a hostile or broken IdP
+/// response from driving an unbounded base64 and JSON decode.
+pub const MAX_ID_TOKEN_BYTES: usize = 1024 * 1024;
+
 /// Decode the payload (second segment) of a JWT without signature verification.
 ///
 /// Returns the parsed JSON payload. This is used for claim inspection only;
 /// the caller is responsible for verifying the signature separately (e.g. via
 /// the provider's JWKS) before trusting any fields.
+///
+/// Refuses tokens over [`MAX_LOGOUT_TOKEN_BYTES`], because it runs on the
+/// public logout endpoint. The login path reads ID tokens with
+/// [`decode_id_token_payload`] instead.
 pub fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, String> {
-    if token.len() > MAX_LOGOUT_TOKEN_BYTES {
+    decode_payload_capped(token, MAX_LOGOUT_TOKEN_BYTES, "logout token")
+}
+
+/// Decode the payload of an ID token that the caller has already verified,
+/// refusing tokens over [`MAX_ID_TOKEN_BYTES`].
+pub fn decode_id_token_payload(token: &str) -> Result<serde_json::Value, String> {
+    decode_payload_capped(token, MAX_ID_TOKEN_BYTES, "ID token")
+}
+
+fn decode_payload_capped(
+    token: &str,
+    max_bytes: usize,
+    what: &str,
+) -> Result<serde_json::Value, String> {
+    if token.len() > max_bytes {
         return Err(format!(
-            "logout token too large ({} bytes, max {MAX_LOGOUT_TOKEN_BYTES})",
+            "{what} too large ({} bytes, max {max_bytes})",
             token.len()
         ));
     }
@@ -161,6 +185,34 @@ mod tests {
             err.contains("too large"),
             "8193 bytes must trigger the size guard (got: {err})"
         );
+    }
+
+    fn token_with_groups(n: usize) -> String {
+        let groups: Vec<String> = (0..n)
+            .map(|i| format!("00000000-0000-0000-0000-{i:012}"))
+            .collect();
+        let payload = serde_json::json!({ "sub": "u", "groups": groups }).to_string();
+        format!("e30.{}.sig", URL_SAFE_NO_PAD.encode(payload))
+    }
+
+    /// A 9 KiB ID token with many groups decodes on the login path and is
+    /// still refused by the logout-token decoder.
+    #[test]
+    fn id_token_over_logout_cap_decodes_on_login_path_only() {
+        let token = token_with_groups(250);
+        assert!(token.len() > 9 * 1024, "fixture is {} bytes", token.len());
+        assert!(token.len() < MAX_ID_TOKEN_BYTES);
+        let payload = decode_id_token_payload(&token).expect("login path accepts it");
+        assert_eq!(payload["groups"].as_array().map(Vec::len), Some(250));
+        let err = decode_jwt_payload(&token).expect_err("logout path refuses it");
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    /// The ID-token cap is strict greater-than and bounded.
+    #[test]
+    fn id_token_decoder_refuses_over_its_own_cap() {
+        let err = decode_id_token_payload(&"x".repeat(MAX_ID_TOKEN_BYTES + 1)).expect_err("cap");
+        assert!(err.contains("ID token too large"), "{err}");
     }
 
     /// `aud_contains` accepts an array `aud` whose elements contain the

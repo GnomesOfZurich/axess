@@ -257,6 +257,17 @@ impl OutboundOAuthClient {
     /// Defaults: empty scope list, 30-second refresh threshold,
     /// [`SystemClock`], default [`reqwest::Client`]. Override via the
     /// `with_*` builder methods.
+    ///
+    /// The default [`reqwest::Client`] sends no `User-Agent` and follows
+    /// redirects. Some token endpoints refuse a request without a
+    /// `User-Agent`; pass a configured client to
+    /// [`with_http_client`](Self::with_http_client) for those, and for
+    /// timeouts or redirect policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default [`reqwest::Client`] cannot be built, which
+    /// happens when the TLS backend fails to initialise.
     pub fn new(token_url: Url, auth_method: ClientAuthMethod) -> Self {
         Self {
             token_url,

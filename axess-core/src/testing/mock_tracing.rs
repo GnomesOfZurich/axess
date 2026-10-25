@@ -73,18 +73,21 @@ impl TracingCapture {
             .clone()
     }
 
-    /// Check whether any captured event contains the given substring.
+    /// Check whether any captured event's message (which includes its
+    /// recorded fields as `name=value`) contains the given substring. The
+    /// event's target is not searched: a needle equal to a module path would
+    /// otherwise match every event from that module whatever it said. Read
+    /// [`CapturedEvent::target`] to assert on the target.
     pub fn contains(&self, needle: &str) -> bool {
-        self.events()
-            .iter()
-            .any(|e| e.message.contains(needle) || e.target.contains(needle))
+        self.events().iter().any(|e| e.message.contains(needle))
     }
 
-    /// Check whether any captured event at the given level contains the substring.
+    /// Check whether any captured event at the given level has a message
+    /// containing the substring (see [`contains`](Self::contains)).
     pub fn contains_at_level(&self, level: Level, needle: &str) -> bool {
         self.events()
             .iter()
-            .any(|e| e.level == level && (e.message.contains(needle) || e.target.contains(needle)))
+            .any(|e| e.level == level && e.message.contains(needle))
     }
 }
 
@@ -173,6 +176,17 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(events[0].message.contains("login attempt"));
         assert!(events[0].message.contains("alice"));
+    }
+
+    /// A target name on its own is not a match: only what the event said is.
+    #[test]
+    fn a_target_name_alone_does_not_match() {
+        let capture = TracingCapture::install();
+        tracing::warn!(target: "axess::audit::archive", "unrelated text");
+        assert!(!capture.contains("axess::audit::archive"));
+        assert!(!capture.contains_at_level(Level::WARN, "axess::audit"));
+        assert!(capture.contains("unrelated text"));
+        assert_eq!(capture.events()[0].target, "axess::audit::archive");
     }
 
     #[test]

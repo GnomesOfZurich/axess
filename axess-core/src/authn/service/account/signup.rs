@@ -112,7 +112,13 @@ where
             return Ok(SignupOutcome::AlreadyExists);
         }
 
-        // 3. Create the user.
+        // 3. Create the user in the tenant that was just validated. The
+        // caller names the tenant by slug and cannot know its id, so the
+        // `tenant_id` on the record they built is a placeholder at best;
+        // trusting it would store the row in one tenant while the session's
+        // pending workflow (and the existence check above) named another.
+        let mut user = user;
+        user.tenant_id = tenant.id;
         let user_id = user.id;
         let tenant_id = tenant.id;
 

@@ -51,6 +51,20 @@
 //! The identifier is normalised to lowercase before keying so `Alice`
 //! and `alice` share a bucket.
 //!
+//! # Memory bound
+//!
+//! Bucket keys are truncated to a fixed length, expired buckets are swept
+//! once per sweep interval (an eighth of the window, at least one second)
+//! by whichever request first sees the interval elapsed, and the table
+//! holds at most 262,144 buckets. A request whose key has no bucket yet is
+//! answered 429 while the table is full; keys that already have a bucket
+//! are unaffected, and no live bucket is evicted to make room.
+//!
+//! # Time
+//!
+//! Window starts and sweeps read [`RateLimitConfig::clock`](crate::middleware::ratelimit::RateLimitConfig::clock), so a test
+//! advances a mock clock past the window instead of sleeping.
+//!
 //! # Layered rate limiting
 //!
 //! In production, layer per-IP (volumetric), per-user (brute-force), and
@@ -58,20 +72,22 @@
 //! in-process buckets; distributed rate limiting belongs at the gateway
 //! with a shared store (Valkey / Redis).
 
+use axess_clock::{Clock, SystemClock};
 use axum::{
     body::Body,
     http::{Request, Response, StatusCode},
 };
-use dashmap::DashMap;
+use chrono::{DateTime, Utc};
+use dashmap::{DashMap, mapref::entry::Entry};
 use std::{
     future::Future,
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tower::{Layer, Service};
 
@@ -148,7 +164,7 @@ pub enum KeyExtractor {
 }
 
 /// Rate-limit configuration for a single layer instance.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RateLimitConfig {
     /// Maximum number of requests allowed within the window.
     pub max_requests: u32,
@@ -158,6 +174,21 @@ pub struct RateLimitConfig {
     pub key_extractor: KeyExtractor,
     /// When `true`, 429 responses include a `Retry-After` header (seconds).
     pub retry_after: bool,
+    /// Time source for window starts and expiry sweeps. Defaults to
+    /// [`SystemClock`]; tests inject a mock clock and advance it past the
+    /// window instead of sleeping.
+    pub clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for RateLimitConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimitConfig")
+            .field("max_requests", &self.max_requests)
+            .field("window", &self.window)
+            .field("key_extractor", &self.key_extractor)
+            .field("retry_after", &self.retry_after)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Builder for [`RateLimitConfig`].
@@ -166,6 +197,7 @@ pub struct RateLimitConfigBuilder {
     window: Duration,
     key_extractor: KeyExtractor,
     retry_after: bool,
+    clock: Arc<dyn Clock>,
 }
 
 impl RateLimitConfig {
@@ -176,6 +208,7 @@ impl RateLimitConfig {
             window: Duration::from_secs(60),
             key_extractor: KeyExtractor::PeerIp,
             retry_after: true,
+            clock: Arc::new(SystemClock),
         }
     }
 }
@@ -202,6 +235,12 @@ impl RateLimitConfigBuilder {
     /// Include `Retry-After` header in 429 responses (default: `true`).
     pub fn retry_after(mut self, enabled: bool) -> Self {
         self.retry_after = enabled;
+        self
+    }
+
+    /// Time source (default: [`SystemClock`]).
+    pub fn clock(mut self, clock: impl Clock) -> Self {
+        self.clock = Arc::new(clock);
         self
     }
 
@@ -237,26 +276,42 @@ impl RateLimitConfigBuilder {
             window: self.window,
             key_extractor: self.key_extractor,
             retry_after: self.retry_after,
+            clock: self.clock,
         }
     }
 }
 
 // ── Token bucket ─────────────────────────────────────────────────────────────
 
+/// Number of buckets at which a request for a key with no bucket is refused.
+/// Live buckets are never evicted to make room: a flood of distinct keys
+/// cannot push a real client's bucket out and reset its count, so the
+/// limiter answers the flood with 429 until the next expiry sweep frees room.
+const HARD_BUCKET_CAP: usize = 256 * 1024;
+
+/// Smallest gap between two expiry sweeps.
+const MIN_SWEEP_INTERVAL_MS: u64 = 1_000;
+
+/// Milliseconds since the Unix epoch, floored at zero.
+fn epoch_millis(now: DateTime<Utc>) -> u64 {
+    u64::try_from(now.timestamp_millis()).unwrap_or(0)
+}
+
 /// A single token bucket tracking remaining tokens and the window start.
 #[derive(Debug)]
 struct TokenBucket {
     /// Tokens remaining in the current window.
     remaining: u32,
-    /// When the current window started.
-    window_start: Instant,
+    /// When the current window started, in epoch milliseconds from the
+    /// injected clock.
+    window_start_ms: u64,
 }
 
 impl TokenBucket {
-    fn new(max: u32, now: Instant) -> Self {
+    fn new(max: u32, now_ms: u64) -> Self {
         Self {
             remaining: max,
-            window_start: now,
+            window_start_ms: now_ms,
         }
     }
 }
@@ -266,9 +321,14 @@ impl TokenBucket {
 struct BucketStore {
     buckets: Arc<DashMap<String, TokenBucket>>,
     max_requests: u32,
-    window: Duration,
-    /// Request counter for deterministic eviction scheduling.
-    request_count: Arc<AtomicU64>,
+    window_ms: u64,
+    clock: Arc<dyn Clock>,
+    /// Number of entries in `buckets`, kept beside the map so the per-request
+    /// cap check does not read-lock every shard the way `DashMap::len` does.
+    bucket_count: Arc<AtomicUsize>,
+    /// Clock time (epoch milliseconds) of the last expiry sweep. The caller
+    /// that wins the compare-exchange on it runs the sweep; the rest carry on.
+    last_sweep_ms: Arc<AtomicU64>,
 }
 
 /// Result of trying to acquire a token.
@@ -277,35 +337,70 @@ enum Acquire {
     Allowed { remaining: u32 },
     /// Rate limited; seconds until the bucket resets.
     Limited { retry_after_secs: u64 },
+    /// The bucket table is at its hard cap and this key has no bucket yet;
+    /// refused until a sweep frees room.
+    Saturated { retry_after_secs: u64 },
 }
 
 impl BucketStore {
-    fn new(max_requests: u32, window: Duration) -> Self {
+    fn new(max_requests: u32, window: Duration, clock: Arc<dyn Clock>) -> Self {
+        let now_ms = epoch_millis(clock.now());
         Self {
             buckets: Arc::new(DashMap::new()),
             max_requests,
-            window,
-            request_count: Arc::new(AtomicU64::new(0)),
+            window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            clock,
+            bucket_count: Arc::new(AtomicUsize::new(0)),
+            last_sweep_ms: Arc::new(AtomicU64::new(now_ms)),
         }
     }
 
-    fn try_acquire(&self, key: &str) -> Acquire {
-        self.try_acquire_at(key, Instant::now())
+    /// Gap between sweeps: an eighth of the window, never under a second.
+    fn sweep_interval_ms(&self) -> u64 {
+        (self.window_ms / 8).max(MIN_SWEEP_INTERVAL_MS)
     }
 
-    /// Deterministic variant accepting an explicit `now` for testing.
-    fn try_acquire_at(&self, key: &str, now: Instant) -> Acquire {
-        let mut entry = self
-            .buckets
-            .entry(key.to_owned())
-            .or_insert_with(|| TokenBucket::new(self.max_requests, now));
+    fn try_acquire(&self, key: &str) -> Acquire {
+        self.try_acquire_at(key, self.clock.now())
+    }
 
-        let bucket = entry.value_mut();
+    /// Take a token for `key` at an explicit `now`.
+    fn try_acquire_at(&self, key: &str, now: DateTime<Utc>) -> Acquire {
+        let now_ms = epoch_millis(now);
+        self.sweep_if_due(now_ms);
 
-        // Reset window if expired.
-        if now.duration_since(bucket.window_start) >= self.window {
+        // A key that already has a bucket is never refused for capacity.
+        if let Some(mut bucket) = self.buckets.get_mut(key) {
+            return self.take(&mut bucket, now_ms);
+        }
+
+        // Reserve a slot before inserting so concurrent first requests for
+        // distinct keys cannot overshoot the cap.
+        if self.bucket_count.fetch_add(1, Ordering::AcqRel) >= HARD_BUCKET_CAP {
+            self.bucket_count.fetch_sub(1, Ordering::AcqRel);
+            return Acquire::Saturated {
+                retry_after_secs: (self.sweep_interval_ms() / 1_000).max(1),
+            };
+        }
+        match self.buckets.entry(key.to_owned()) {
+            Entry::Occupied(mut occupied) => {
+                self.bucket_count.fetch_sub(1, Ordering::AcqRel);
+                self.take(occupied.get_mut(), now_ms)
+            }
+            Entry::Vacant(vacant) => {
+                let mut bucket = vacant.insert(TokenBucket::new(self.max_requests, now_ms));
+                self.take(&mut bucket, now_ms)
+            }
+        }
+    }
+
+    fn take(&self, bucket: &mut TokenBucket, now_ms: u64) -> Acquire {
+        // A clock that steps backwards reads as zero elapsed, not as a
+        // window that has not started.
+        let elapsed = now_ms.saturating_sub(bucket.window_start_ms);
+        if elapsed >= self.window_ms {
             bucket.remaining = self.max_requests;
-            bucket.window_start = now;
+            bucket.window_start_ms = now_ms;
         }
 
         if bucket.remaining > 0 {
@@ -314,24 +409,57 @@ impl BucketStore {
                 remaining: bucket.remaining,
             }
         } else {
-            let elapsed = now.duration_since(bucket.window_start);
-            let retry_after = self.window.saturating_sub(elapsed).as_secs().max(1);
+            let elapsed = now_ms.saturating_sub(bucket.window_start_ms);
+            let retry_after_ms = self.window_ms.saturating_sub(elapsed);
             Acquire::Limited {
-                retry_after_secs: retry_after,
+                retry_after_secs: retry_after_ms.div_ceil(1_000).max(1),
             }
         }
     }
 
-    /// Remove buckets whose window has expired.  Called lazily to avoid
-    /// accumulating stale entries over long uptimes.
-    fn evict_expired(&self) {
-        self.evict_expired_at(Instant::now());
+    /// Run an expiry sweep when one is due, on at most one caller.
+    ///
+    /// Due means a sweep interval has passed on the injected clock since the
+    /// last one. The compare-exchange on the stamp picks the caller that
+    /// sweeps; every other request in the same interval skips straight on,
+    /// so the full-table scan runs once per interval instead of once per
+    /// request.
+    fn sweep_if_due(&self, now_ms: u64) {
+        let last = self.last_sweep_ms.load(Ordering::Acquire);
+        if now_ms.saturating_sub(last) < self.sweep_interval_ms() {
+            return;
+        }
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.evict_expired_ms(now_ms);
+        }
     }
 
-    /// Deterministic variant accepting an explicit `now` for testing.
-    fn evict_expired_at(&self, now: Instant) {
-        self.buckets
-            .retain(|_, bucket| now.duration_since(bucket.window_start) < self.window);
+    /// Remove buckets whose window has expired at the injected clock's time.
+    #[cfg(test)]
+    fn evict_expired(&self) {
+        self.evict_expired_at(self.clock.now());
+    }
+
+    /// Remove buckets whose window has expired at `now`.
+    #[cfg(test)]
+    fn evict_expired_at(&self, now: DateTime<Utc>) {
+        self.evict_expired_ms(epoch_millis(now));
+    }
+
+    fn evict_expired_ms(&self, now_ms: u64) {
+        let mut removed = 0usize;
+        self.buckets.retain(|_, bucket| {
+            let live = now_ms.saturating_sub(bucket.window_start_ms) < self.window_ms;
+            if !live {
+                removed += 1;
+            }
+            live
+        });
+        self.bucket_count.fetch_sub(removed, Ordering::AcqRel);
     }
 }
 
@@ -550,7 +678,7 @@ impl RateLimitLayer {
     /// Create a new rate-limit layer from the given configuration.
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
-            store: BucketStore::new(config.max_requests, config.window),
+            store: BucketStore::new(config.max_requests, config.window, config.clock),
             key_extractor: config.key_extractor,
             retry_after: config.retry_after,
             metrics: None,
@@ -607,28 +735,6 @@ where
         let key = extract_key(&req, &self.key_extractor);
         let retry_after_enabled = self.retry_after;
 
-        // Lazy eviction. Two triggers:
-        //   (1) every 128 requests; bounded steady-state cleanup that
-        //       keeps the map small under normal load and tightens the
-        //       window an attacker has to inflate it before cleanup fires
-        //       (the previous 1024-request interval gave a much larger
-        //       gap to inject distinct keys);
-        //   (2) any time the bucket count exceeds the soft cap, force an
-        //       immediate eviction sweep; this is the brake on
-        //       attacker-driven growth where unique keys are sent at
-        //       high rate.
-        // Combined with the per-key `MAX_KEY_LEN` truncation in
-        // `extract_key`, total memory usage stays bounded even under a
-        // unique-key flood: O(MAX_BUCKETS * (MAX_KEY_LEN + bucket-size)).
-        const EVICT_INTERVAL: u64 = 128;
-        const SOFT_BUCKET_CAP: usize = 64 * 1024;
-        let count = self.store.request_count.fetch_add(1, Ordering::Relaxed);
-        if (count.is_multiple_of(EVICT_INTERVAL) || self.store.buckets.len() > SOFT_BUCKET_CAP)
-            && !self.store.buckets.is_empty()
-        {
-            self.store.evict_expired();
-        }
-
         let metrics = self.metrics.clone();
         match self.store.try_acquire(&key) {
             Acquire::Allowed { remaining } => {
@@ -646,7 +752,7 @@ where
                     Ok(resp)
                 })
             }
-            Acquire::Limited { retry_after_secs } => {
+            Acquire::Limited { retry_after_secs } | Acquire::Saturated { retry_after_secs } => {
                 if let Some(ref m) = metrics {
                     m.rate_limit_rejected();
                 }

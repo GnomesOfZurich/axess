@@ -157,9 +157,18 @@ pub trait AuthnAnalyticsSink: Send + Sync + 'static {
 }
 ```
 
-The sink is a fire-and-forget dispatcher. A failed dispatch is
-logged and dropped; the buffer's retry semantics handle the
-transient cases. The implementations the
+The sink never runs on the authentication path. `AuditLogWithAnalytics`
+places each event on a bounded queue (10,000 events by default,
+`with_capacity` to change it) once the regulatory write has
+succeeded, and a worker you run drains the queue into the sink one
+event at a time, in order. A full queue sheds the analytics copy and
+counts it (`dropped_events()`), logging at the first drop and each
+time the total doubles; the regulatory record is never shed. A failed
+dispatch is logged and dropped, so a sink that needs retries owns
+them. Start the worker with `AnalyticsWorker::spawn` and keep the
+handle; `flush()` waits for the queue to empty and `shutdown()` flushes
+and releases the handle, after which the worker finishes. The
+implementations the
 `audit-archive-fs` feature provides cover the filesystem case;
 for streaming or columnar stores, the implementation is the
 application's.
@@ -253,6 +262,7 @@ pub trait AuditArchiver: Send + Sync + 'static {
 
     fn archive_batch(
         &self,
+        batch: &ArchiveBatchId,
         events: &[AuthEvent],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -264,6 +274,13 @@ pub trait AuditArchiver: Send + Sync + 'static {
 The trait has one write verb and a name. `archive_batch` takes the
 events by slice, so an implementation that streams them does not force
 an allocation, and returns your own `Self::Error`.
+
+The `batch` id is derived from the source ids of the batch's first and
+last events and its size, so a batch the loop re-sends after a failed
+`mark_archived` carries the same id. An archiver that records the ids it
+has applied can skip the repeat; `FilesystemAuditArchiver` does, in a
+`.batches` file beside each day file. Your `EventId` type must be
+`Display`, since the loop renders the first and last ids to build the id.
 
 There is no purge verb. Deleting from the cold store is the cold
 store's business (an S3 lifecycle rule, a partition drop, a retention
@@ -280,7 +297,6 @@ transitions on a configurable schedule:
 let retention_policy = AuditRetentionPolicy {
     archive_after: Duration::from_secs(30 * 86400),   // 30 days; default is 90
     purge_hot_after_archive: Duration::from_secs(7 * 86400),
-    delete_archive_after: None,                       // never purge archive
 };
 
 let loop_handle = AuditRetentionLoop::new(
@@ -297,24 +313,27 @@ The loop ticks once per `tick_interval`, hourly by default, archiving
 up to `batch_size` events per tick. Each tick reads the hot-tier events
 that have aged past `archive_after`, hands them to the archiver, and
 purges the hot rows whose archive copy was made more than
-`purge_hot_after_archive` ago. `spawn` returns a `JoinHandle`; the loop
-runs until that handle is dropped. `tick` is public too, for a
+`purge_hot_after_archive` ago. `spawn` returns a `JoinHandle`; dropping
+it leaves the loop running, so call `abort` on it to stop retention.
+The loop rests a full interval after each tick, so a tick that overruns
+is not followed by catch-up ticks. The cutoffs come from the injected clock, while the pacing is
+the Tokio timer's. `tick` is public too, for a
 deployment that would rather drive it from its own scheduler and read
 the `RetentionTickReport` each pass returns.
 
-The `delete_archive_after` field is the optional final
-transition. `None` means the archive grows indefinitely; a
-configured duration means the archive itself is purged at that
-age.
+The policy ends at the hot purge. The cold sink owns its own expiry,
+so the archive grows until the sink's lifecycle rule, WORM retention
+setting or scheduled job removes something, and axess never deletes
+from it.
 
 The defaults (90 days hot, then the verification window before the hot
-row goes, and no archive deletion) are conservative for finance.
-`delete_archive_after: None` is the right default for most adopters,
-because regulators penalise premature deletion far more harshly than
-they reward storage savings. PCI-DSS asks
-for one year of audit retention, which the defaults satisfy by
-keeping events in the archive indefinitely. Other regulatory
-regimes have different requirements; tune to match.
+row goes) are conservative for finance. Leaving the cold sink without an
+expiry is the right choice for most adopters, because regulators
+penalise premature deletion far more harshly than they reward storage
+savings. PCI-DSS asks for one year of audit retention, which the
+defaults satisfy by keeping events in the archive until the sink is told
+otherwise. Other regulatory regimes have different requirements; tune
+the sink's expiry to match.
 
 ### Filesystem archive
 

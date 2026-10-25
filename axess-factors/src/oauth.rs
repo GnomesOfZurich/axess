@@ -18,14 +18,15 @@
 //!
 //! # Deterministic simulation testing
 //!
-//! Use [`MockOAuthProvider`](crate::oauth::MockOAuthProvider) in tests to simulate OIDC discovery and token
-//! exchange without HTTP. Configure it with [`MockOAuthProvider::with_user`](crate::oauth::MockOAuthProvider::with_user)
-//! or [`MockOAuthProvider::with_failure`](crate::oauth::MockOAuthProvider::with_failure).
+//! Under the `testing` feature, `MockOAuthProvider` simulates OIDC discovery and token exchange
+//! without HTTP. Configure it with its `with_user` or `with_failure` builders.
 
+#[cfg(any(test, feature = "testing"))]
 pub mod mock;
 pub mod provider;
 pub mod types;
 
+#[cfg(any(test, feature = "testing"))]
 pub use mock::MockOAuthProvider;
 pub use provider::OAuthProviderConfig;
 #[cfg(feature = "fapi")]

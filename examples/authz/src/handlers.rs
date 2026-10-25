@@ -4,6 +4,11 @@
 //! - `require()`; hard 403 on denial (typical for mutations)
 //! - `is_permitted()`; boolean check (typical for UI capability hints)
 //! - `batch_check()`; multiple checks in one call (typical for list views)
+//!
+//! The user id in each path and the `mfa` query flag are demo inputs chosen
+//! by the caller. A real handler takes the principal from the session
+//! (`AuthSession::user_id()`) and the MFA fact from the session's verified
+//! factors; accepting either from the request would let any caller claim them.
 
 use crate::AppState;
 use axess::authorization::{AuthzDenied, AuthzError, StandardRequestContext};
@@ -130,8 +135,9 @@ pub async fn edit_document(
 
 /// Delete a document. Requires MFA verification (ABAC policy).
 ///
-/// The `mfa` query parameter simulates MFA status for this example.
-/// In a real app, MFA status comes from the authenticated session.
+/// The `mfa` query parameter simulates MFA status for this example, which
+/// makes it caller-controlled: do not copy it. In a real app MFA status comes
+/// from the authenticated session, never from the request.
 pub async fn delete_document(
     State(state): State<AppState>,
     Path((user_id, doc_id)): Path<(String, String)>,

@@ -12,4 +12,4 @@ pub mod logout_token;
 
 pub use discovery::{Discovery, DiscoveryDocument};
 pub use error::OidcError;
-pub use jwks_cache::{JwksCache, MIN_JWKS_REFRESH_INTERVAL};
+pub use jwks_cache::{DEFAULT_JWKS_MAX_AGE, JwksCache, MIN_JWKS_REFRESH_INTERVAL};

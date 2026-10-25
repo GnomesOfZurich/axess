@@ -70,8 +70,8 @@ use axess_cache::ClockTtlCache;
 use axess_clock::{Clock, SystemClock};
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::device::store::{DeviceStore, SweepCounts};
-use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
+use crate::device::store::{BindingsUpdate, DeviceStore, OwnerClaim, SweepCounts, TrustTransition};
+use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 
 /// Default cache capacity: same shape as [`EntityCache`](super::super::cache::EntityCache).
 const DEFAULT_CAPACITY: usize = 10_000;
@@ -264,6 +264,19 @@ where
         self.inner.find_for_user(tenant_id, user_id, limit)
     }
 
+    fn find_by_fingerprint_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        hash: &FingerprintHash,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        // Forwarded so the inner store's indexed lookup is used rather
+        // than the trait's scan-based default. Not cached, for the same
+        // reason as `find_for_user`.
+        self.inner
+            .find_by_fingerprint_for_user(tenant_id, user_id, hash)
+    }
+
     fn find_by_refresh_family(
         &self,
         tenant_id: &TenantId,
@@ -274,7 +287,11 @@ where
         self.inner.find_by_refresh_family(tenant_id, family_id)
     }
 
-    fn save(&self, device: &Device) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn save(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let key = (device.tenant_id, device.id);
         let cache = self.cache.clone();
         let inner = self.inner.clone();
@@ -284,7 +301,7 @@ where
             // row while the write was in flight is dropped by the
             // invalidation instead of staying cached. The invalidation
             // runs on failure too, since the stored row is then unknown.
-            let result = inner.save(&device).await;
+            let result = inner.save(&device, now).await;
             cache.invalidate(&key);
             result
         }
@@ -324,6 +341,72 @@ where
         let device = *id;
         async move {
             let result = inner.set_trust_level(&tenant, &device, level, now).await;
+            cache.invalidate(&key);
+            result
+        }
+    }
+
+    fn set_trust_level_if(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
+        let key = (*tenant_id, *id);
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let tenant = *tenant_id;
+        let device = *id;
+        async move {
+            let result = inner
+                .set_trust_level_if(&tenant, &device, expected, level, now)
+                .await;
+            cache.invalidate(&key);
+            result
+        }
+    }
+
+    fn replace_bindings(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
+        let key = (*tenant_id, *id);
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let tenant = *tenant_id;
+        let device = *id;
+        let expected = expected.to_vec();
+        let bindings = bindings.to_vec();
+        async move {
+            let result = inner
+                .replace_bindings(&tenant, &device, &expected, &bindings, now)
+                .await;
+            cache.invalidate(&key);
+            result
+        }
+    }
+
+    fn claim_owner(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
+        let key = (*tenant_id, *id);
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let tenant = *tenant_id;
+        let device = *id;
+        let user = *user;
+        async move {
+            let result = inner.claim_owner(&tenant, &device, &user, now).await;
             cache.invalidate(&key);
             result
         }

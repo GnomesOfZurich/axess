@@ -16,14 +16,45 @@ mod custom_bag_tests {
             id: SessionId::new(&axess_rng::SystemRng),
             data: SessionData::default(),
             modified: false,
+            needs_persist: false,
             regenerate: false,
             pre_cycle_id: None,
+            rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
         };
         AuthSession(crate::session::layer::SessionHandle(Arc::new(RwLock::new(
             inner,
         ))))
+    }
+
+    /// A bag stored as a non-object (an array here) is replaced by an object
+    /// instead of panicking on the string index.
+    #[tokio::test]
+    async fn set_custom_on_a_non_object_bag_does_not_panic() {
+        let session = make_session();
+        session.0.0.write().await.data.custom = serde_json::json!([1, 2, 3]);
+
+        assert!(session.set_custom("k", serde_json::json!("v")).await);
+
+        let bag = session.with_data(|d| d.custom.clone()).await;
+        assert_eq!(bag, serde_json::json!({ "k": "v" }));
+    }
+
+    /// The byte count equals the length of the compact serialization.
+    #[test]
+    fn json_byte_len_matches_the_serialized_length() {
+        for v in [
+            serde_json::json!(null),
+            serde_json::json!({}),
+            serde_json::json!({ "a": [1, 2.5, "x\"y"], "b": { "c": null }, "é": "ü" }),
+        ] {
+            assert_eq!(
+                crate::session::data::json_byte_len(&v),
+                serde_json::to_vec(&v).unwrap().len(),
+                "{v}"
+            );
+        }
     }
 
     /// Closure-form accessor borrows the state without
@@ -148,8 +179,10 @@ mod extractor_tests {
             id: SessionId::new(&axess_rng::SystemRng),
             data: SessionData::default(),
             modified: false,
+            needs_persist: false,
             regenerate: false,
             pre_cycle_id: None,
+            rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
         };

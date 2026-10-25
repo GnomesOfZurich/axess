@@ -14,7 +14,15 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
+use crate::session::store::SessionLiveness;
 use subtle::ConstantTimeEq;
+
+#[cfg(test)]
+mod audit_failure;
+#[cfg(test)]
+mod sid_map_upkeep;
+#[cfg(test)]
+mod subject_registry;
 
 impl<I, F> AuthnService<I, F>
 where
@@ -182,20 +190,26 @@ where
     /// OAuth flow) or exceeds the length cap (compromised IdP
     /// returning an inflated `sid` claim; without the cap each OAuth
     /// login would amortize that length into permanent map memory).
-    /// Back-channel logout by `sub` still works in either case.
+    /// The subject registry is filled in either case, so back-channel logout
+    /// by `sub` still works.
     ///
     /// Strategy when an entry would be inserted:
-    /// 1. **TTL prune**: drop entries older than `SID_MAP_TTL` (24h).
-    ///    Steady-state cleanup so an OIDC session the IdP never
-    ///    explicitly logged out eventually ages out.
+    /// 1. **TTL prune**: drop entries older than `SID_MAP_TTL` (24h) and
+    ///    end their sessions, at most `PRUNE_BATCH` per call so one login
+    ///    never waits on an unbounded run of registry calls; a backlog
+    ///    drains over the logins that follow. The entries come off the
+    ///    front of an insertion-ordered queue, so the cost is the number
+    ///    pruned, not the size of the map.
     /// 2. **Capacity evict**: if at/over `self.inner.sid_map_capacity`
     ///    (default `DEFAULT_SID_MAP_CAPACITY = 10 000`; override via
-    ///    [`AuthnServiceBuilder::with_sid_map_capacity`]) after TTL prune,
-    ///    evict a *batch* of oldest entries via a single bounded
-    ///    scan. Sort + `take(BATCH)` is O(N log K) for K=128, keeping
-    ///    the per-batch cost bounded under burst load.
-    /// 3. **Atomic swap**: `DashMap::insert` returns any displaced
-    ///    value atomically. We invalidate the displaced session in the
+    ///    [`AuthnServiceBuilder::with_sid_map_capacity`]) after the prune,
+    ///    drop the `EVICT_BATCH` oldest mappings from the same queue. Only
+    ///    the mapping goes: the user's session stays valid, and a logout
+    ///    from the IdP for that `sid` finds nothing under its key. The
+    ///    subject registry entry goes only if the session is already gone,
+    ///    so a logout token that carries a `sub` as well still ends it.
+    /// 3. **Atomic swap**: the insert returns any displaced mapping under
+    ///    the same lock. The displaced session is invalidated in the
     ///    registry after the swap. Doing the swap atomically (not
     ///    `remove()` then `insert()`) closes the window where a
     ///    concurrent OAuth completion for the same
@@ -207,7 +221,7 @@ where
         sid: &crate::session::id::SessionId,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        use crate::federation::backchannel_logout::SidKey;
+        use crate::federation::sid_map::SidKey;
 
         // Cap oidc_sid length. A compromised IdP can return
         // an arbitrarily long `sid` claim; without a cap, every OAuth
@@ -225,6 +239,21 @@ where
         let max_sid_map_entries = self.inner.sid_map_capacity;
         const SID_MAP_TTL: chrono::TimeDelta = chrono::TimeDelta::hours(24);
         const EVICT_BATCH: usize = 128;
+        const PRUNE_BATCH: usize = 128;
+
+        let issuer = self
+            .inner
+            .oauth_providers
+            .get(claims.provider.as_ref())
+            .and_then(|p| p.issuer().map(|s| s.to_string()))
+            .unwrap_or_else(|| claims.provider.to_string());
+
+        // Every login enters the subject registry, with or without a `sid`,
+        // so a logout by `sub` alone can always find the session.
+        self.inner
+            .sid_map
+            .register_subject_session(&issuer, user.id, *sid);
+        self.sweep_subject_registry().await;
 
         let Some(oidc_sid) = claims.oidc_sid.as_ref().filter(|s| {
             if s.len() > MAX_OIDC_SID_BYTES {
@@ -242,63 +271,58 @@ where
             return;
         };
 
-        let issuer = self
-            .inner
-            .oauth_providers
-            .get(claims.provider.as_ref())
-            .and_then(|p| p.issuer().map(|s| s.to_string()))
-            .unwrap_or_else(|| claims.provider.to_string());
         let key: SidKey = (issuer.clone(), oidc_sid.clone());
 
-        // Phase 1: TTL prune.
+        // Phase 1: TTL prune, bounded per call.
         let cutoff = now - SID_MAP_TTL;
-        let stale_keys: Vec<SidKey> = self
+        for (evict_key, (evict_user, evict_sid, _)) in self
             .inner
             .sid_map
-            .iter()
-            .filter(|e| e.value().2 < cutoff)
-            .map(|e| e.key().clone())
-            .collect();
-        for evict_key in stale_keys {
-            if let Some((_, (evict_user, evict_sid, _))) = self.inner.sid_map.remove(&evict_key) {
-                if let Some(reg) = &self.inner.registry {
-                    reg.invalidate_session(&evict_user, &evict_sid).await;
+            .evict_inserted_before(cutoff, PRUNE_BATCH)
+        {
+            if let Some(reg) = &self.inner.registry {
+                reg.invalidate_session(&evict_user, &evict_sid).await;
+            }
+            self.inner
+                .sid_map
+                .forget_subject_session(&evict_key.0, &evict_user, &evict_sid);
+            tracing::debug!(
+                evicted_iss = %evict_key.0,
+                evicted_oidc_sid = %evict_key.1,
+                "sid_map: evicted stale entry (TTL expired)"
+            );
+        }
+
+        // Phase 2: capacity-based batch eviction. Drops the mapping only;
+        // the user's session is still valid.
+        if self.inner.sid_map.len() >= max_sid_map_entries {
+            for (evict_key, (evict_user, evict_sid, _)) in
+                self.inner.sid_map.evict_oldest(EVICT_BATCH)
+            {
+                // The subject registry keeps a live session reachable by
+                // `sub`; only a session the registry reports gone is forgotten there, never one
+                // whose liveness it could not answer.
+                if let Some(reg) = &self.inner.registry
+                    && reg.liveness(&evict_user, &evict_sid).await == SessionLiveness::Gone
+                {
+                    self.inner.sid_map.forget_subject_session(
+                        &evict_key.0,
+                        &evict_user,
+                        &evict_sid,
+                    );
                 }
-                tracing::debug!(
+                tracing::warn!(
                     evicted_iss = %evict_key.0,
                     evicted_oidc_sid = %evict_key.1,
-                    "sid_map: evicted stale entry (TTL expired)"
+                    user_id = %evict_user,
+                    "sid_map capacity reached; dropped oldest mapping (its session stays valid \
+                 and a logout by `sub` still reaches it)"
                 );
             }
         }
 
-        // Phase 2: capacity-based batch eviction.
-        if self.inner.sid_map.len() >= max_sid_map_entries {
-            let mut oldest: Vec<(chrono::DateTime<chrono::Utc>, SidKey)> = self
-                .inner
-                .sid_map
-                .iter()
-                .map(|e| (e.value().2, e.key().clone()))
-                .collect();
-            oldest.sort_by_key(|(ts, _)| *ts);
-            for (_, evict_key) in oldest.into_iter().take(EVICT_BATCH) {
-                if let Some((_, (evict_user, evict_sid, _))) = self.inner.sid_map.remove(&evict_key)
-                {
-                    if let Some(reg) = &self.inner.registry {
-                        reg.invalidate_session(&evict_user, &evict_sid).await;
-                    }
-                    tracing::warn!(
-                        evicted_iss = %evict_key.0,
-                        evicted_oidc_sid = %evict_key.1,
-                        user_id = %evict_user,
-                        "sid_map capacity reached; evicted oldest mapping"
-                    );
-                }
-            }
-        }
-
         // Atomic swap with displaced-mapping invalidation.
-        let displaced = self.inner.sid_map.insert(key, (user.id, *sid, now));
+        let displaced = self.inner.sid_map.insert(key, user.id, *sid, now);
         if let Some((old_user_id, old_session_id, _)) = displaced {
             tracing::warn!(
                 iss = %issuer,
@@ -308,6 +332,28 @@ where
             );
             if let Some(reg) = &self.inner.registry {
                 reg.invalidate_session(&old_user_id, &old_session_id).await;
+            }
+            self.inner
+                .sid_map
+                .forget_subject_session(&issuer, &old_user_id, &old_session_id);
+        }
+    }
+
+    /// Check a bounded batch of the subject registry against the session
+    /// registry and forget the sessions that are gone, so sessions that ended
+    /// by expiry or logout do not accumulate. Live sessions stay, and so do
+    /// sessions whose liveness the registry could not answer. Without a
+    /// registry nothing can be judged and nothing is forgotten.
+    async fn sweep_subject_registry(&self) {
+        const SWEEP_BATCH: usize = 64;
+        let Some(reg) = &self.inner.registry else {
+            return;
+        };
+        for (issuer, user, session) in self.inner.sid_map.sweep_subject_candidates(SWEEP_BATCH) {
+            if reg.liveness(&user, &session).await == SessionLiveness::Gone {
+                self.inner
+                    .sid_map
+                    .forget_subject_session(&issuer, &user, &session);
             }
         }
     }
@@ -381,16 +427,28 @@ where
         // sequence.
         self.maintain_oidc_sid_map(user, claims, &sid, now).await;
 
-        self.emit_audit_at(
-            AuthEventBuilder::success(AuthEventType::Authenticated)
-                .attributed_to(&user.id, &user.tenant_id)
-                .with_factor(FactorKind::Federated(
-                    crate::authn::factor::FederatedProvider::Custom(claims.provider.to_string()),
-                ))
-                .with_session(sid),
-            now,
-        )
-        .await?;
+        let emitted = self
+            .emit_audit_at(
+                AuthEventBuilder::success(AuthEventType::Authenticated)
+                    .attributed_to(&user.id, &user.tenant_id)
+                    .with_factor(FactorKind::Federated(
+                        crate::authn::factor::FederatedProvider::Custom(
+                            claims.provider.to_string(),
+                        ),
+                    ))
+                    .with_session(sid),
+                now,
+            )
+            .await;
+        if let Err(e) = emitted {
+            // The login is refused, so nothing of it may stay reachable:
+            // not the registry entry, not the session state, and not the
+            // back-channel `sid` mapping installed above.
+            self.inner.sid_map.remove_session(&sid);
+            self.end_session_after_audit_failure(&user.id, session)
+                .await;
+            return Err(e);
+        }
 
         Ok(())
     }

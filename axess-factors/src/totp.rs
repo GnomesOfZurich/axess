@@ -258,9 +258,10 @@ fn percent_encode_component(input: &str) -> String {
 /// (rather than `rand::Rng` directly) is what keeps TOTP enrollment
 /// paths DST-compatible across the whole axess stack.
 pub fn generate_totp_secret<R: axess_rng::SecureRng>(rng: &R) -> String {
-    let mut bytes = [0u8; 20];
-    rng.fill_bytes(&mut bytes);
-    base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &bytes)
+    // The raw draw is the secret itself; wipe it once it is encoded.
+    let mut bytes = Zeroizing::new([0u8; 20]);
+    rng.fill_bytes(&mut *bytes);
+    base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &*bytes)
 }
 
 /// Build the standard `otpauth://totp/...` URI a TOTP authenticator app

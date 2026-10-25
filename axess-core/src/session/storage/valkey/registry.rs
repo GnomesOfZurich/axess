@@ -5,22 +5,61 @@
 //! eviction ordering) and the pub/sub revocation channel layout.
 
 use super::internal::{
-    DEFAULT_PREFIX, ValkeyStoreError, registry_key, revocation_session_channel,
+    DEFAULT_PREFIX, ValkeyStoreError, registry_cutoff_ms, registry_key, registry_key_ttl_secs,
+    registry_member_live, registry_member_ttl_ms, revocation_session_channel,
     revocation_user_channel,
 };
+use super::subscriber::SharedSubscriber;
 use crate::session::{id::SessionId, store::SessionRegistry};
 use axess_clock::{Clock, SystemClock};
 use fred::prelude::*;
+use fred::types::sorted_sets::{ZRange, ZRangeBound, ZRangeKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
 
+/// Lower bound of the expired range: every score from the beginning.
+fn expired_min() -> ZRange {
+    ZRange {
+        kind: ZRangeKind::Inclusive,
+        range: ZRangeBound::NegInfiniteScore,
+    }
+}
+
+/// Upper bound of the expired range: scores at or below `cutoff`.
+fn expired_max(cutoff: f64) -> ZRange {
+    ZRange {
+        kind: ZRangeKind::Inclusive,
+        range: ZRangeBound::Score(cutoff),
+    }
+}
+
+/// Lower bound of the live range: scores strictly above `cutoff`.
+fn live_min(cutoff: f64) -> ZRange {
+    ZRange {
+        kind: ZRangeKind::Exclusive,
+        range: ZRangeBound::Score(cutoff),
+    }
+}
+
+/// Upper bound of the live range: no upper limit.
+fn live_max() -> ZRange {
+    ZRange {
+        kind: ZRangeKind::Inclusive,
+        range: ZRangeBound::InfiniteScore,
+    }
+}
+
 // ── ValkeySessionRegistry ────────────────────────────────────────────────────
 
-/// Valkey-backed session registry using sets.
+/// Valkey-backed session registry using sorted sets.
 ///
-/// Each user has a Valkey set containing their valid session IDs.
-/// Forced logout removes the set (or a single member).
+/// Each user has a sorted set containing their valid session IDs, scored by
+/// registration time in epoch milliseconds. A member lives for the
+/// registry's `ttl` after its score: reads treat an older member as absent
+/// and prune it, so a session whose own key has long expired neither counts
+/// toward `max_sessions_per_user` nor validates. Forced logout removes the
+/// set (or a single member).
 /// Clone is cheap: the inner client is `Arc`-based.
 ///
 /// Per-session FIFO ordering uses an injected [`Clock`] for the
@@ -38,6 +77,9 @@ pub struct ValkeySessionRegistry {
     /// Injected clock for the FIFO ordering score. Defaults to
     /// [`SystemClock`]; tests override via [`with_clock`].
     clock: Arc<dyn Clock>,
+    /// The subscriber connection shared by this registry's revocation
+    /// watchers and those of its clones.
+    pub(super) subscriber: Arc<SharedSubscriber>,
 }
 
 impl ValkeySessionRegistry {
@@ -48,6 +90,7 @@ impl ValkeySessionRegistry {
             prefix: DEFAULT_PREFIX.into(),
             ttl: Duration::from_secs(24 * 60 * 60),
             clock: Arc::new(SystemClock),
+            subscriber: SharedSubscriber::new(),
         }
     }
 
@@ -58,6 +101,7 @@ impl ValkeySessionRegistry {
             prefix: prefix.into(),
             ttl,
             clock: Arc::new(SystemClock),
+            subscriber: SharedSubscriber::new(),
         }
     }
 
@@ -81,7 +125,9 @@ impl SessionRegistry for ValkeySessionRegistry {
     ) -> Result<(), Self::Error> {
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
         let sid_str = session_id.to_string();
-        let ttl_secs = self.ttl.as_secs().min(i64::MAX as u64) as i64;
+        let ttl_secs = registry_key_ttl_secs(self.ttl);
+        let now_ms = self.clock.now().timestamp_millis();
+        let cutoff = registry_cutoff_ms(now_ms, registry_member_ttl_ms(self.ttl));
 
         // ZADD with score = epoch ms (from the injected `Clock`).
         // Subsequent ZRANGE 0 -1 returns members oldest-first by
@@ -89,10 +135,13 @@ impl SessionRegistry for ValkeySessionRegistry {
         // relies on for FIFO semantics. Pipeline ZADD + EXPIRE in a
         // single round-trip so a crash between the two commands
         // cannot leave the sorted set without a TTL (orphan registry
-        // entries). `self.clock.now()` honours an injected
-        // `MockClock` for deterministic test ordering.
-        let score = self.clock.now().timestamp_millis() as f64;
+        // entries). `now_ms` comes from the injected clock, so a
+        // `MockClock` gives deterministic ordering.
+        let score = now_ms as f64;
         let pipeline = self.client.pipeline();
+        pipeline
+            .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
+            .await?;
         pipeline
             .zadd::<(), _, _>(&key, None, None, false, false, (score, sid_str))
             .await?;
@@ -118,7 +167,15 @@ impl SessionRegistry for ValkeySessionRegistry {
         // `None` if absent: equivalent to the previous SISMEMBER
         // boolean, but reading from the sorted-set storage shape.
         let score: Option<f64> = self.client.zscore(&key, &sid_str).await?;
-        Ok(score.is_some())
+        let now_ms = self.clock.now().timestamp_millis();
+        let live = score.is_some_and(|score| {
+            registry_member_live(score, now_ms, registry_member_ttl_ms(self.ttl))
+        });
+        if score.is_some() && !live {
+            // Expired member: drop it so it stops occupying a slot.
+            self.client.zrem::<(), _, _>(&key, &sid_str).await?;
+        }
+        Ok(live)
     }
 
     async fn invalidate_user(
@@ -179,56 +236,63 @@ impl SessionRegistry for ValkeySessionRegistry {
         // default `Ok(vec![])`, silently disabling the limit for every
         // Valkey-backed deployment.
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
+        let now_ms = self.clock.now().timestamp_millis();
+        let cutoff = registry_cutoff_ms(now_ms, registry_member_ttl_ms(self.ttl));
+        self.client
+            .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
+            .await?;
         let members: Vec<String> = self
             .client
-            .zrange(&key, 0i64, -1i64, None, false, None, false)
+            .zrangebyscore(&key, live_min(cutoff), live_max(), false, None)
             .await?;
         Ok(members.into_iter().filter_map(|s| s.parse().ok()).collect())
     }
 
     async fn watch_revocation(&self, user_id: &crate::authn::ids::UserId, session_id: &SessionId) {
-        // Spawns a fresh subscriber connection per call. For deployments
-        // with thousands of concurrent long-lived watchers (typically
-        // WebSocket or SSE), consider replacing this with a shared
-        // subscriber + local fan-out (one Redis subscriber connection
-        // serving N waiters via DashMap<channel, broadcast>). The trait
-        // contract is unchanged by that optimisation.
+        // Every watcher of this registry (and its clones) shares one
+        // subscriber connection, opened by the first and closed with the
+        // last; each takes its own receiver from the connection's local
+        // broadcast and keeps the messages for its two channels.
         let user_channel = revocation_user_channel(&self.prefix, user_id.to_string().as_str());
         let session_channel = revocation_session_channel(&self.prefix, &session_id.to_string());
 
-        let subscriber = self.client.clone_new();
-        if subscriber.init().await.is_err() {
+        let Some(mut watch) = self.subscriber.join(&self.client, &self.prefix).await else {
             // Connection failure: degrade to never-resolving future.
             // Caller will fall back to next-request validity check.
             std::future::pending::<()>().await;
             return;
-        }
+        };
 
-        let mut messages = subscriber.message_rx();
-
-        // Race-free: subscribe BEFORE the post-subscribe is_valid check
-        // so a revocation arriving during subscription still wakes us.
-        if subscriber
-            .subscribe(vec![user_channel.clone(), session_channel.clone()])
-            .await
-            .is_err()
-        {
-            let _ = subscriber.quit().await;
-            std::future::pending::<()>().await;
-            return;
-        }
-
-        // Post-subscribe revocation check: the session may have been
-        // invalidated between session resolution and our subscribe call.
-        // If so, return immediately.
+        // Race-free: the receiver exists BEFORE the post-subscribe is_valid
+        // check, so a revocation arriving after the check still wakes us.
+        // The session may also have been invalidated between session
+        // resolution and joining; if so, return immediately.
         if let Ok(false) = self.is_valid(user_id, session_id).await {
-            let _ = subscriber.quit().await;
             return;
         }
 
-        // Await the first message on either channel.
-        let _ = messages.recv().await;
-        let _ = subscriber.quit().await;
+        loop {
+            match watch.messages.recv().await {
+                Ok(message) => {
+                    let channel: &str = &message.channel;
+                    if channel == user_channel || channel == session_channel {
+                        return;
+                    }
+                }
+                // Messages were dropped for a slow receiver: one of them may
+                // have been ours, so the registry decides.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if let Ok(false) = self.is_valid(user_id, session_id).await {
+                        return;
+                    }
+                }
+                // The connection is gone: fall back to the next request's
+                // validity check.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
     }
 }
 

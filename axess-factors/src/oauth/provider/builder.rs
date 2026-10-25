@@ -98,11 +98,13 @@ impl OAuthProviderConfig {
         self
     }
 
-    /// Swap the clock used for FAPI `nbf` / clock-skew checks. Defaults
-    /// to [`SystemClock`](axess_clock::SystemClock). Pass a
-    /// `MockClock` under DST so the
-    /// time-bound validation is deterministic.
+    /// Swap the clock behind every time-bound decision the provider makes:
+    /// ID-token `exp` and `iat` (inside `openidconnect`), the FAPI `nbf`
+    /// check, back-channel logout token lifetimes, and the JWKS refresh
+    /// debounce. Defaults to [`SystemClock`](axess_clock::SystemClock).
+    /// Pass a `MockClock` under DST so all of them are deterministic.
     pub fn with_clock(mut self, clock: std::sync::Arc<dyn axess_clock::Clock>) -> Self {
+        self.jwks_cache = self.jwks_cache.with_clock(clock.clone());
         self.clock = clock;
         self
     }

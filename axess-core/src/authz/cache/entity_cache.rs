@@ -249,24 +249,13 @@ where
     /// ```
     pub fn flush_metrics(&self, metrics: &dyn crate::metrics::AuthnMetrics) {
         let snapshot = self.stats();
-        // One event per unit because the trait surface mirrors the
-        // existing per-event method shape (`auth_attempt`,
-        // `session_created`, …). Adopters wiring batched counter
-        // backends can implement the trait method as a single counter
-        // increment per call; no per-event allocation if the impl is
-        // a `fetch_add`.
-        for _ in 0..snapshot.hits {
-            metrics.authz_cache_hit();
-        }
-        for _ in 0..snapshot.misses {
-            metrics.authz_cache_miss();
-        }
-        for _ in 0..snapshot.capacity_evictions {
-            metrics.authz_cache_eviction();
-        }
-        for _ in 0..snapshot.invalidations {
-            metrics.authz_cache_invalidation();
-        }
+        // One call per counter, carrying the window's total: a busy cache
+        // accumulates millions of hits between flushes, and one virtual call
+        // per hit would make the flush itself a cost.
+        metrics.authz_cache_hits(snapshot.hits);
+        metrics.authz_cache_misses(snapshot.misses);
+        metrics.authz_cache_evictions(snapshot.capacity_evictions);
+        metrics.authz_cache_invalidations(snapshot.invalidations);
         self.reset_stats();
     }
 }
@@ -307,6 +296,23 @@ where
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            let shared = self
+                .shared_entities_for(session, principal, resource, action)
+                .await?;
+            Ok((*shared).clone())
+        })
+    }
+
+    fn shared_entities_for<'a>(
+        &'a self,
+        session: &'a AuthSession,
+        principal: &'a EntityUid,
+        resource: &'a EntityUid,
+        action: &'a EntityUid,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Arc<Entities>, AuthzError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
             let tenant = session.tenant_id().await.map(|t| t.to_string().to_string());
             let key = EntityCacheKey {
                 principal: principal.clone(),
@@ -319,8 +325,7 @@ where
             // one inner-provider call instead of N parallel DB hits.
             // `get_or_try_insert_with` also handles the cache-hit fast path
             // and the "promote to cache on success" step.
-            let arc = self
-                .cache
+            self.cache
                 .get_or_try_insert_with(key, || async {
                     let entities = self
                         .inner
@@ -328,8 +333,7 @@ where
                         .await?;
                     Ok::<Arc<Entities>, AuthzError>(Arc::new(entities))
                 })
-                .await?;
-            Ok((*arc).clone())
+                .await
         })
     }
 }

@@ -96,15 +96,16 @@ where
         let user = match user {
             Some(u) => u,
             None => {
-                // Burn comparable wall time on the miss path. We can't write
-                // to the database (no user_id), but we can at least amortize
-                // the dominant work the success path will perform; the
-                // store_reset_token round-trip is application-specific and
-                // typically much smaller than the Argon2id verify in
-                // complete_password_reset, so this matters less than for
-                // login. Two-step UX still inherently signals existence
-                // (the user only gets the email when they exist); apps
-                // should additionally always return the same UI message.
+                // The miss path draws the token and hashes it (above) but has
+                // no `user_id` to write a reset token or an audit row for, so
+                // it returns without the two store round trips the found
+                // path makes. That gap is small beside the Argon2id work in
+                // `complete_password_reset`, which is where reset cost lives,
+                // but it is not zero: an observer with a precise clock can
+                // tell the paths apart. The two-step flow signals existence
+                // anyway (the user only gets the email when they exist), so
+                // apps should always return the same UI message and deliver
+                // the email out of band.
                 return Ok(None);
             }
         };
@@ -171,15 +172,19 @@ where
     ///
     /// The token is single-use, consumed on verification. Returns `Ok(true)`
     /// if the reset succeeded, `Ok(false)` if the token was invalid, expired,
-    /// or the new password violates the tenant's history-reuse rule.
+    /// the new password does not meet the tenant's
+    /// [`PasswordRules`](crate::authn::factor::PasswordRules) (minimum length
+    /// and complexity, checked before the token is spent), or it violates the
+    /// tenant's history-reuse rule.
     ///
     /// # Arguments
     ///
     /// * `user_id`: the user's opaque ID (from the reset link context).
     /// * `token`: the plaintext reset token.
     /// * `new_password`: the plaintext new password. Hashed internally with
-    ///   `axess_factors::generate_password_hash` *after* the history-reuse
-    ///   check passes, so passing the hash here would defeat the check.
+    ///   Argon2id (salt from the service's RNG, on the service's KDF
+    ///   executor) *after* the history-reuse check passes, so passing the
+    ///   hash here would defeat the check.
     #[tracing::instrument(skip(self, token, new_password))]
     pub async fn complete_password_reset(
         &self,
@@ -203,11 +208,6 @@ where
             return Ok(false);
         }
 
-        if !self.verify_reset_token_hash(user_id, token).await? {
-            return Ok(false);
-        }
-
-        // Update the password factor.
         let user = self
             .inner
             .identity
@@ -215,50 +215,6 @@ where
             .await
             .map_err(AuthnError::Store)?
             .ok_or(AuthnError::NoFlow)?;
-
-        let user_scope = AuthnScope::User {
-            tenant_id: user.tenant_id,
-            user_id: user.id,
-        };
-
-        // Record the old hash in password history.
-        //
-        // Unconditional, and the guard below is about whether an *old
-        // password exists*, not about whether the backend keeps history.
-        // That distinction used to matter a great deal: the method carried
-        // a default body that panicked, so a backend which had not
-        // overridden it unwound here on the first password change any user
-        // made. It now lives on `IdentityPasswordHistory`, which has no
-        // defaults, and this flow is bounded on that trait, so a store
-        // without history cannot reach this line at all.
-        if let Some(FactorConfig::Password(ref old_config)) = self
-            .inner
-            .factors
-            .load_factor(&user_scope, FactorKind::Password)
-            .await
-            .map_err(AuthnError::Store)?
-        {
-            // Every change records the hash it installs, so the replaced
-            // hash is normally already the newest entry. Record it only
-            // when it is not (the first change of an account that had no
-            // history), or each hash would count twice and a check over the
-            // last N passwords would cover about N/2.
-            let old_hash: &str = &old_config.hash;
-            let latest = self
-                .inner
-                .identity
-                .password_history(user_id, 1)
-                .await
-                .map_err(AuthnError::Store)?;
-            if latest.first().map(String::as_str) != Some(old_hash) {
-                self.inner
-                    .identity
-                    .record_password_hash(user_id, old_hash)
-                    .await
-                    .map_err(AuthnError::Store)?;
-            }
-        }
-
         let rules = self
             .inner
             .identity
@@ -266,52 +222,44 @@ where
             .await
             .map_err(AuthnError::Store)?;
 
-        if self
-            .verify_new_password_not_in_history(user_id, new_password, &rules)
-            .await?
-        {
-            return Ok(false); // Password was used before.
+        // The new password must satisfy the tenant's rules, the same ones
+        // the factor is stored with. Checked before the token is read so a
+        // refused password does not spend the single-use token: the person
+        // can pick another and use the same link. The answer is the same
+        // `Ok(false)` as a bad token or a reused password.
+        if !crate::validation::meets_password_rules(new_password, &rules) {
+            tracing::warn!(
+                user_id = %user_id,
+                "password reset refused: new password does not meet the tenant's password rules"
+            );
+            return Ok(false);
         }
 
-        // Hash AFTER the history check passes; the check verifies the new
-        // plaintext against each old Argon2 hash, so it MUST receive
-        // plaintext. Hashing earlier would feed a PHC string into Argon2's
+        if !self.verify_reset_token_hash(user_id, token).await? {
+            return Ok(false);
+        }
+
+        let user_scope = AuthnScope::User {
+            tenant_id: user.tenant_id,
+            user_id: user.id,
+        };
+
+        self.record_replaced_hash(user_id, &user_scope).await?;
+
+        // One blocking task checks the new password against every stored
+        // hash and, when it is not a reuse, hashes it. The check verifies the
+        // new plaintext against each old Argon2 hash, so it MUST receive
+        // plaintext; hashing earlier would feed a PHC string into Argon2's
         // plaintext slot and the check would never match.
-        let new_password_hash = axess_factors::generate_password_hash(new_password);
+        let Some(new_password_hash) = self
+            .check_history_and_hash(user_id, new_password, &rules)
+            .await?
+        else {
+            return Ok(false); // Password was used before.
+        };
 
-        // Order the writes so that the *worst* possible partial
-        // failure is benign.
-        //
-        //   * Record the NEW hash in history BEFORE activating it via
-        //     `save_factor`. If the history write fails, we abort with
-        //     the old password still live; no policy bypass.
-        //   * If the history write succeeds and `save_factor` fails, the
-        //     new hash is in history but not active. The user retries
-        //     with a different password (or the same password; which
-        //     will fail the history check, prompting them to pick a new
-        //     one). This is strictly better than the prior order, which
-        //     could leave a *live new password* missing from history,
-        //     letting the user re-use it on the next reset and silently
-        //     violate the password-rotation policy.
-        //
-        // Production backends should override `record_password_hash` and
-        // `save_factor` to share a single SQL transaction; until then,
-        // this ordering minimises blast radius.
-        self.inner
-            .identity
-            .record_password_hash(user_id, &new_password_hash)
-            .await
-            .map_err(AuthnError::Store)?;
-
-        let new_config = FactorConfig::Password(crate::authn::factor::PasswordConfig {
-            hash: crate::authn::factor::ZeroizedString::new(new_password_hash),
-            rules,
-        });
-        self.inner
-            .factors
-            .save_factor(&user_scope, new_config)
-            .await
-            .map_err(AuthnError::Store)?;
+        self.install_new_password(user_id, &user_scope, new_password_hash, rules)
+            .await?;
 
         // Reset failed attempts.
         self.inner
@@ -379,18 +327,119 @@ where
         };
         self.inner
             .identity
-            .verify_reset_token(user_id, &hash)
+            .verify_reset_token(user_id, &hash, self.inner.clock.now())
             .await
             .map_err(AuthnError::Store)
     }
 
-    /// Check whether `new_password` (plaintext) Argon2-verifies against
-    /// any of the user's last `rules.history_count` stored hashes.
+    /// Record the hash about to be replaced in the password history.
     ///
-    /// Returns `Ok(true)` if the password was previously used (caller
-    /// rejects the reset), `Ok(false)` if it's safe to use. Returns
-    /// `Ok(false)` immediately when `rules.history_count == 0` (history
-    /// check disabled).
+    /// Nothing is recorded when the account has no password factor, or when
+    /// the replaced hash is already the newest history entry.
+    async fn record_replaced_hash(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        user_scope: &AuthnScope,
+    ) -> Result<(), AuthnError<I::Error>> {
+        // Record the old hash in password history.
+        //
+        // Unconditional, and the guard below is about whether an *old
+        // password exists*, not about whether the backend keeps history.
+        // That distinction used to matter a great deal: the method carried
+        // a default body that panicked, so a backend which had not
+        // overridden it unwound here on the first password change any user
+        // made. It now lives on `IdentityPasswordHistory`, which has no
+        // defaults, and this flow is bounded on that trait, so a store
+        // without history cannot reach this line at all.
+        if let Some(FactorConfig::Password(ref old_config)) = self
+            .inner
+            .factors
+            .load_factor(user_scope, FactorKind::Password)
+            .await
+            .map_err(AuthnError::Store)?
+        {
+            // Every change records the hash it installs, so the replaced
+            // hash is normally already the newest entry. Record it only
+            // when it is not (the first change of an account that had no
+            // history), or each hash would count twice and a check over the
+            // last N passwords would cover about N/2.
+            let old_hash: &str = &old_config.hash;
+            let latest = self
+                .inner
+                .identity
+                .password_history(user_id, 1)
+                .await
+                .map_err(AuthnError::Store)?;
+            if latest.first().map(String::as_str) != Some(old_hash) {
+                self.inner
+                    .identity
+                    .record_password_hash(user_id, old_hash)
+                    .await
+                    .map_err(AuthnError::Store)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the new hash in history, then make it the live password.
+    ///
+    /// The order is the guarantee: see the comment on the writes.
+    async fn install_new_password(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        user_scope: &AuthnScope,
+        new_password_hash: String,
+        rules: crate::authn::factor::PasswordRules,
+    ) -> Result<(), AuthnError<I::Error>> {
+        // Order the writes so that the *worst* possible partial
+        // failure is benign.
+        //
+        //   * Record the NEW hash in history BEFORE activating it via
+        //     `save_factor`. If the history write fails, we abort with
+        //     the old password still live; no policy bypass.
+        //   * If the history write succeeds and `save_factor` fails, the
+        //     new hash is in history but not active. The user retries
+        //     with a different password (or the same password; which
+        //     will fail the history check, prompting them to pick a new
+        //     one). This is strictly better than the prior order, which
+        //     could leave a *live new password* missing from history,
+        //     letting the user re-use it on the next reset and silently
+        //     violate the password-rotation policy.
+        //
+        // Production backends should override `record_password_hash` and
+        // `save_factor` to share a single SQL transaction; until then,
+        // this ordering minimises blast radius.
+        self.inner
+            .identity
+            .record_password_hash(user_id, &new_password_hash)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        let new_config = FactorConfig::Password(crate::authn::factor::PasswordConfig {
+            hash: crate::authn::factor::ZeroizedString::new(new_password_hash),
+            rules,
+        });
+        self.inner
+            .factors
+            .save_factor(user_scope, new_config)
+            .await
+            .map_err(AuthnError::Store)?;
+        Ok(())
+    }
+
+    /// Check `new_password` (plaintext) against the user's last
+    /// `rules.history_count` stored hashes and, when it is not among them,
+    /// return its Argon2id hash.
+    ///
+    /// Returns `Ok(None)` if the password was previously used (caller rejects
+    /// the reset) and `Ok(Some(hash))` if it is safe to use. With
+    /// `rules.history_count == 0` the history check is disabled and the hash
+    /// is returned directly.
+    ///
+    /// The whole job (up to `history_count` verifications and one hash) is
+    /// one task on the service's [`KdfExecutor`](crate::blocking::KdfExecutor),
+    /// so a reset holds neither a runtime worker nor more than one blocking
+    /// slot. The salt is drawn from the service's RNG before the task starts.
     ///
     /// **Security invariant, preserve on every refactor:** the loop
     /// iterates ALL history entries to constant time, even after a match
@@ -413,27 +462,36 @@ where
     /// parameters; feeding an already-hashed PHC string here means
     /// Argon2 hashes the PHC string itself, which never matches anything
     /// real and silently disables the entire history-reuse check.
-    async fn verify_new_password_not_in_history(
+    async fn check_history_and_hash(
         &self,
         user_id: &crate::authn::ids::UserId,
         new_password: &str,
         rules: &crate::authn::factor::PasswordRules,
-    ) -> Result<bool, AuthnError<I::Error>> {
-        if rules.history_count == 0 {
-            return Ok(false);
-        }
-        let history = self
+    ) -> Result<Option<String>, AuthnError<I::Error>> {
+        let history = if rules.history_count == 0 {
+            Vec::new()
+        } else {
+            self.inner
+                .identity
+                .password_history(user_id, rules.history_count)
+                .await
+                .map_err(AuthnError::Store)?
+        };
+        let salt = axess_factors::generate_password_salt(&self.inner.rng);
+        let candidate = zeroize::Zeroizing::new(new_password.to_owned());
+        let outcome = self
             .inner
-            .identity
-            .password_history(user_id, rules.history_count)
-            .await
-            .map_err(AuthnError::Store)?;
-        let mut reused = false;
-        for old_hash in &history {
-            if axess_factors::verify_password(new_password, old_hash).is_ok() {
-                reused = true;
-            }
-        }
-        Ok(reused)
+            .kdf
+            .run(move || {
+                let mut reused = false;
+                for old_hash in &history {
+                    if axess_factors::verify_password(candidate.as_str(), old_hash).is_ok() {
+                        reused = true;
+                    }
+                }
+                (!reused).then(|| axess_factors::hash_password_with_salt(candidate.as_str(), &salt))
+            })
+            .await?;
+        Ok(outcome)
     }
 }

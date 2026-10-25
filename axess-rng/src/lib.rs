@@ -77,7 +77,9 @@ impl<R: SecureRng + ?Sized> SecureRng for std::sync::Arc<R> {
     }
 }
 
-/// Production implementation using OS-provided cryptographically secure RNG.
+/// Production implementation backed by `rand::rng()`: a per-thread ChaCha
+/// CSPRNG seeded from the operating system and reseeded periodically and
+/// after a fork.
 ///
 /// # Platform support
 ///

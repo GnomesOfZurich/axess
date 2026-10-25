@@ -233,3 +233,22 @@ fn workload_principal_with_custom_issuer_round_trips() {
     let json = serde_json::to_string(&p).expect("serialize");
     assert_eq!(serde_json::from_str::<Principal>(&json).unwrap(), p);
 }
+
+#[test]
+fn issuer_custom_refuses_every_built_in_wire_string() {
+    for built_in in Issuer::BUILT_IN {
+        assert!(
+            Issuer::custom(built_in.as_str()).is_err(),
+            "{} is a built-in issuer name",
+            built_in.as_str()
+        );
+    }
+    assert!(Issuer::custom("local_idp").is_ok());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn issuer_deserialization_refuses_a_custom_label_naming_a_built_in() {
+    let wire = r#"{"kind":"custom","label":"jwt_svid"}"#;
+    assert!(serde_json::from_str::<Issuer>(wire).is_err());
+}

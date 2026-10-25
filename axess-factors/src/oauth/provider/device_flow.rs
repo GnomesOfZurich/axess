@@ -130,6 +130,7 @@ pub(super) async fn poll_device_token(
         let nonce_for_verify = nonce.unwrap_or("");
         let claims = cfg
             .extract_claims_from_response(&token_response, nonce_for_verify)
+            .await
             .map_err(|e| {
                 OAuthError::IdTokenValidation(format!(
                     "device code flow: ID token extraction failed: {e}"

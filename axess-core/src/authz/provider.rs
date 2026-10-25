@@ -275,6 +275,35 @@ pub trait RequestEntityProvider: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     >;
+
+    /// [`entities_for`](Self::entities_for), returning the entity set
+    /// behind an [`Arc`](std::sync::Arc).
+    ///
+    /// Callers that only evaluate policies against the set (the
+    /// `require_authz!` macro among them) use this method so that a caching
+    /// decorator can hand out the cached set without copying it. The
+    /// default wraps the result of `entities_for`; the decorators in
+    /// [`crate::authz::cache`] override it to return the shared cached
+    /// value, and their `entities_for` clones out of it.
+    fn shared_entities_for<'a>(
+        &'a self,
+        session: &'a crate::session::AuthSession,
+        principal: &'a EntityUid,
+        resource: &'a EntityUid,
+        action: &'a EntityUid,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<std::sync::Arc<Entities>, AuthzError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            self.entities_for(session, principal, resource, action)
+                .await
+                .map(std::sync::Arc::new)
+        })
+    }
 }
 
 // ── Entity UID helpers ──────────────────────────────────────────────────────

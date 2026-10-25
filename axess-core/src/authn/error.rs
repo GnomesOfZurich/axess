@@ -17,6 +17,7 @@ use crate::authn::types::EntityState;
 /// | `Locked` | `423 Locked` | Account locked due to too many failed attempts; retry after cooldown. |
 /// | `InvalidAssertion` | `401 Unauthorized` | FIDO2 cryptographic validation failed; credential rejected. |
 /// | `ExternalService` | `502 Bad Gateway` | Upstream provider (LDAP, OAuth IdP) returned an error or timed out. |
+/// | `Internal` | `500 Internal Server Error` | The library failed in a way that is not the client's fault and not a store error (a hashing task panicked or the blocking pool shut down). |
 ///
 /// These are suggestions for handler authors. The library does not convert
 /// errors to HTTP responses automatically; that mapping belongs in your
@@ -93,6 +94,21 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     /// attempted cross-tenant pivot.
     #[error("cross-tenant operation refused")]
     CrossTenant,
+
+    /// The library itself failed: a blocking task (password hashing) panicked
+    /// or the blocking pool was shut down. Not the client's fault and not a
+    /// store error; suggested HTTP status `500`. The message is for logs and
+    /// is never put in a response body.
+    #[error("internal error: {0}")]
+    Internal(String),
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<crate::blocking::KdfError>
+    for AuthnError<E>
+{
+    fn from(e: crate::blocking::KdfError) -> Self {
+        AuthnError::Internal(e.to_string())
+    }
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
@@ -158,9 +174,10 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
     /// `IntoResponse`-shaped conversion taking the reference time
     /// explicitly. Test code with [`MockClock`](crate::testing::MockClock)
     /// uses this to pin the `Retry-After` header against a controllable
-    /// clock; the trait impl below delegates here with `Utc::now()`
-    /// for production callers, which produces wall-clock behaviour
-    /// that's correct but non-deterministic across runs.
+    /// clock. The `IntoResponse` impl below delegates here with `Utc::now()`
+    /// because that trait method cannot take a clock (a declared exception
+    /// to the injected-clock rule); handlers that hold a clock call this
+    /// method directly.
     ///
     /// Adopters who don't enable the `default-error-response` feature
     /// can still construct their own `IntoResponse` impl on top of
@@ -189,6 +206,10 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
                 (StatusCode::BAD_GATEWAY, "external service unavailable")
             }
             AuthnError::CrossTenant => (StatusCode::FORBIDDEN, "cross-tenant operation refused"),
+            AuthnError::Internal(_) => {
+                tracing::error!(error = %self, "internal authentication error");
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+            }
         };
 
         // Include `until_iso` in the body so JSON-only clients
@@ -225,9 +246,14 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
 #[cfg(feature = "default-error-response")]
 impl<E: std::error::Error + Send + Sync + 'static> axum::response::IntoResponse for AuthnError<E> {
     /// Delegates to [`AuthnError::into_response_at`] with `chrono::Utc::now()`
-    /// as the reference time. Production-correct but non-deterministic;
-    /// tests asserting on `Retry-After` should call `into_response_at`
-    /// directly with a `MockClock`-derived timestamp.
+    /// as the reference time.
+    ///
+    /// This is a declared exception to the injected-clock rule: axum's
+    /// `IntoResponse::into_response` takes no arguments, so the trait method
+    /// cannot be handed a clock. Code that has one (a handler holding the
+    /// service's clock, and every test) calls
+    /// `into_response_at(clock.now())` instead and the exception never
+    /// applies.
     fn into_response(self) -> axum::response::Response {
         self.into_response_at(chrono::Utc::now())
     }
@@ -237,6 +263,13 @@ impl<E: std::error::Error + Send + Sync + 'static> axum::response::IntoResponse 
 mod into_response_tests {
     use super::*;
     use axum::response::IntoResponse;
+
+    /// The reference time the tests pass to `into_response_at`.
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
 
     /// Concrete error type so the generic impl is monomorphised.
     #[derive(Debug, thiserror::Error)]
@@ -273,11 +306,15 @@ mod into_response_tests {
                 axum::http::StatusCode::BAD_GATEWAY,
             ),
             (AuthnError::CrossTenant, axum::http::StatusCode::FORBIDDEN),
+            (
+                AuthnError::Internal("hash task panicked".into()),
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
 
         for (err, expected_status) in cases {
             let label = format!("{err:?}");
-            let response = err.into_response();
+            let response = err.into_response_at(fixed_now());
             assert_eq!(
                 response.status(),
                 expected_status,
@@ -305,9 +342,9 @@ mod into_response_tests {
     async fn locked_with_future_until_emits_retry_after_and_until_iso() {
         use axum::http::header;
 
-        let until = chrono::Utc::now() + chrono::Duration::seconds(900);
+        let until = fixed_now() + chrono::Duration::seconds(900);
         let err: AuthnError<TestStoreError> = AuthnError::Locked { until: Some(until) };
-        let response = err.into_response();
+        let response = err.into_response_at(fixed_now());
 
         assert_eq!(response.status(), axum::http::StatusCode::LOCKED);
 
@@ -348,7 +385,7 @@ mod into_response_tests {
         use axum::http::header;
 
         let err: AuthnError<TestStoreError> = AuthnError::Locked { until: None };
-        let response = err.into_response();
+        let response = err.into_response_at(fixed_now());
 
         assert_eq!(response.status(), axum::http::StatusCode::LOCKED);
         assert!(
@@ -372,14 +409,14 @@ mod into_response_tests {
         use crate::authn::types::StatusDetail;
         use axum::http::header;
 
-        let until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let until = fixed_now() + chrono::Duration::seconds(60);
         let detail = StatusDetail {
             reason: "test suspend".into(),
-            since: chrono::Utc::now(),
+            since: fixed_now(),
             until: Some(until),
         };
         let err: AuthnError<TestStoreError> = AuthnError::NotActive(EntityState::Suspended(detail));
-        let response = err.into_response();
+        let response = err.into_response_at(fixed_now());
 
         assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
         assert!(
@@ -396,9 +433,9 @@ mod into_response_tests {
     async fn locked_with_past_until_omits_retry_after() {
         use axum::http::header;
 
-        let past = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let past = fixed_now() - chrono::Duration::seconds(60);
         let err: AuthnError<TestStoreError> = AuthnError::Locked { until: Some(past) };
-        let response = err.into_response();
+        let response = err.into_response_at(fixed_now());
 
         assert!(
             response.headers().get(header::RETRY_AFTER).is_none(),
@@ -425,7 +462,7 @@ mod into_response_tests {
     ///   for completeness.
     #[test]
     fn retry_secs_from_pins_strict_greater_boundary() {
-        let now = chrono::Utc::now();
+        let now = fixed_now();
 
         // until == now: delta = 0. Must return None; kills `>= 0` mutation
         // (which would emit `Some(0)` and produce a `Retry-After: 0`

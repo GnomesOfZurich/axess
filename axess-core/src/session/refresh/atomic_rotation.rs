@@ -2,7 +2,7 @@
 //! (revokes nothing, inserts nothing) leaves the parent token usable so
 //! the user is not silently logged out of every device.
 
-use super::test_support::{fixture_tenant, fixture_user, now, test_config};
+use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
 use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ struct AtomicRotateStore {
 impl AtomicRotateStore {
     fn new() -> Self {
         Self {
-            inner: MemoryRefreshTokenStore::new(),
+            inner: store(),
             fail_rotate: AtomicBool::new(false),
         }
     }
@@ -154,7 +154,7 @@ async fn rotate_token_on_memory_store_revokes_parent_and_stores_child() {
     // infallible, so the revoke + insert pair is observably atomic.
     // This test pins the post-rotation state: the parent record is
     // marked revoked and the active set carries only the new child.
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(456);
     let ts = now();

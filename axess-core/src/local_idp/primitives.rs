@@ -505,18 +505,15 @@ pub trait IssuanceListener: Send + Sync {
     fn on_mint(&self, event: &IssuanceEvent<'_>);
 }
 
-/// Panics if the claim set's `exp - iat` (or `exp - now` if `iat` is
-/// unset) exceeds `max_ttl`. Called from
-/// [`LocalIdpFixture::mint_with_header`](crate::testing::local_idp::LocalIdpFixture::mint_with_header)
-/// when the fixture has a TTL policy configured. Reference time picks
-/// `iat` when present so adopters with stable test clocks see
-/// deterministic behaviour; when `iat` is absent we fall back to
-/// `Utc::now()`.
+/// Panics if the claim set's lifetime `exp - now` exceeds `max_ttl`.
+/// Called from
+/// [`LocalIdpFixture::mint_with_header_at`](crate::testing::local_idp::LocalIdpFixture::mint_with_header_at)
+/// when the fixture has a TTL policy configured. The lifetime is measured
+/// from the supplied `now`, never from a caller-supplied `iat`, so a
+/// future-dated `iat` cannot shrink it.
 #[cfg(any(test, feature = "testing"))]
-pub(crate) fn enforce_max_ttl(claims: &MintClaims, max_ttl: Duration) {
-    // From now, not from a caller-supplied `issued_at` (see
-    // `enforce_max_ttl_fallible`).
-    let lifetime = claims.expires_at - Utc::now();
+pub(crate) fn enforce_max_ttl(claims: &MintClaims, max_ttl: Duration, now: DateTime<Utc>) {
+    let lifetime = claims.expires_at - now;
     assert!(
         lifetime <= max_ttl,
         "LocalIdpFixture::mint refusing token with lifetime {lifetime} \
@@ -530,9 +527,8 @@ pub(crate) fn enforce_max_ttl(claims: &MintClaims, max_ttl: Duration) {
 /// `max_ttl`. Production-side counterpart to [`enforce_max_ttl`];
 /// `LocalIdp::mint` surfaces this as `IssuanceError::LifetimeExceedsCap`
 /// rather than panicking. Reference time is the supplied `now`
-/// (typically `Clock::now()`); the fixture's variant inlines
-/// `Utc::now()` for tests that don't inject a clock, while
-/// production always has one.
+/// (typically `Clock::now()`); the fixture's variant takes the same
+/// `now` through its `_at` mint methods.
 pub(crate) fn enforce_max_ttl_fallible(
     claims: &MintClaims,
     max_ttl: Duration,

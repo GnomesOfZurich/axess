@@ -20,6 +20,7 @@
 //! monolith.
 
 mod jwks_refresh;
+pub(crate) use jwks_refresh::JwksRefreshTask;
 mod login;
 mod refresh;
 mod tokens;

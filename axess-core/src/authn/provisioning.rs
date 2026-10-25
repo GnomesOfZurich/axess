@@ -1,19 +1,20 @@
-//! Atomic tenant creation.
+//! Tenant provisioning.
 //!
-//! A tenant cannot exist in a half-provisioned state: no factors, no
-//! enabled auth method, or both. The single public entry point
-//! [`create_tenant`] inserts the tenant row, materialises the chosen
-//! [`FactorTemplate`] entries into tenant-scoped `factor_configs`, and
-//! persists an [`AuthMethod`], all via the [`IdentityStore`] /
-//! [`FactorStore`] trait methods. The caller bundles the inputs into a
-//! [`TenantBootstrap`].
+//! A tenant should not exist half-provisioned: no factors, no enabled auth
+//! method, or both. The single public entry point [`create_tenant`] inserts
+//! the tenant row, materialises the chosen [`FactorTemplate`] entries into
+//! tenant-scoped `factor_configs`, and persists an [`AuthMethod`], all via
+//! the [`IdentityStore`] / [`FactorStore`] trait methods, in that order. The
+//! caller bundles the inputs into a [`TenantBootstrap`].
 //!
-//! If any step fails, the operation returns an error and the caller's
-//! store is left in whatever partial state it reached. Backends that
-//! care about atomicity should implement `create_tenant` / `create_user`
-//! / `save_factor` / `save_method` inside a single transaction; the
-//! trait doesn't impose this because not every backend supports
-//! transactions (memory mocks in particular).
+//! The sequence is **not atomic**. It is four store calls, and if one fails
+//! the operation returns an error and the caller's store is left in
+//! whatever partial state it reached. Backends that care about atomicity
+//! should implement `create_tenant` / `save_factor` / `save_method` so
+//! that they share one transaction; the trait doesn't impose this because
+//! not every backend supports transactions (memory mocks in particular).
+//! What this module does guarantee is about the inputs: it refuses a
+//! bootstrap with no factors, and it refuses the reserved system tenant id.
 //!
 //! ## Why this module owns the API shape
 //!
@@ -78,7 +79,7 @@ impl<E: std::error::Error + Send + Sync + 'static> std::error::Error for Provisi
 
 // ── TenantBootstrap ──────────────────────────────────────────────────────────
 
-/// Everything needed to provision a tenant atomically.
+/// Everything needed to provision a tenant.
 ///
 /// Pass this to [`create_tenant`]. The caller is responsible for
 /// attaching audit metadata (`created_by`) so the produced `users` /
@@ -138,7 +139,7 @@ impl TenantBootstrap {
 
 // ── create_tenant ────────────────────────────────────────────────────────────
 
-/// Atomically provision a new tenant.
+/// Provision a new tenant.
 ///
 /// Steps, in order:
 ///
@@ -157,9 +158,10 @@ impl TenantBootstrap {
 ///
 /// # Atomicity
 ///
-/// axess-core does not wrap the four store calls in a transaction;
-/// individual backends should do so in their implementations if they
-/// want all-or-nothing semantics. On failure between steps 2 and 4,
+/// There is none at this level: axess-core does not wrap the store calls
+/// in a transaction, and the in-memory mocks cannot. A backend that wants
+/// all-or-nothing semantics implements the individual store methods over
+/// a shared transaction. On failure between steps 2 and 4,
 /// the tenant row exists but may have partial factor or no-method
 /// state; the caller can retry or compensate as their lifecycle
 /// requires.

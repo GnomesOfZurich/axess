@@ -1,4 +1,10 @@
-//! Shared logic for SQL-backed device stores (SQLite, PostgreSQL).
+//! Shared logic for SQL-backed device stores (SQLite, PostgreSQL, MySQL).
+//!
+//! Everything that does not depend on a dialect lives here: row decoding,
+//! the sweep thresholds, the compare-and-swap decisions (trust level,
+//! bindings, owner claim) and the column values each write binds. A
+//! backend keeps only its DDL, its placeholders and bind order, its upsert
+//! syntax and its collation notes.
 //!
 //! Mirrors the shape of
 //! [`session::storage::session_codec`](crate::session::storage::session_codec):
@@ -19,8 +25,12 @@
 //! without giving up the tenant-scoped query primitives that drive
 //! the rest of the device subsystem.
 
-use crate::device::types::DeviceBinding;
-use crate::session::crypto::{CryptoError, SessionCrypto};
+use chrono::{DateTime, TimeZone, Utc};
+
+use crate::authn::ids::{DeviceId, TenantId, UserId};
+use crate::device::store::{BindingsUpdate, OwnerClaim, SweepConfig, TrustTransition};
+use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
+use crate::session::crypto::{BoundFormat, CryptoError, SessionCrypto};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 /// Codec for the bindings column on a device row.
@@ -29,6 +39,19 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 /// optionally encrypts with AES-256-GCM. The encrypted output is then
 /// base64-encoded so the column stays TEXT: same shape as the
 /// session store, intentionally.
+///
+/// # Binding to the device row
+///
+/// An encrypted blob is `AXD 0x01 || nonce(12) || ciphertext+tag` (marker
+/// bytes `0x41 0x58 0x44 0x01`) with AES-GCM additional authenticated data
+/// `"axess.device-bindings.v1" || 0x00 || tenant_id || 0x00 || device_id`
+/// (the UTF-8 bytes of both ids). The ids are supplied again on every read,
+/// so a bindings blob copied into another device's row fails
+/// authentication. A blob with the marker is never opened under an empty
+/// AAD; a blob without it predates binding and is opened under the empty
+/// AAD, then rewritten in the bound format by the next `save`, so the
+/// legacy fallback ages out as devices are saved. Plaintext codecs have
+/// nothing to bind.
 ///
 /// `SessionCrypto` is reused as a *generic* AES-256-GCM envelope
 /// primitive. The "session" prefix in its name is historical; the
@@ -52,10 +75,19 @@ impl BindingsCodec {
     }
 
     /// Serialise (and optionally encrypt) the bindings vector.
-    pub fn encode(&self, bindings: &[DeviceBinding]) -> Result<String, SqlDeviceStoreError> {
+    pub fn encode(
+        &self,
+        tenant_id: &str,
+        device_id: &str,
+        bindings: &[DeviceBinding],
+    ) -> Result<String, SqlDeviceStoreError> {
         let bytes = rmp_serde::to_vec_named(bindings)?;
         let payload = match &self.crypto {
-            Some(crypto) => crypto.encrypt(&bytes)?,
+            Some(crypto) => crypto.seal_bound(
+                BoundFormat::DEVICE_BINDINGS,
+                &row_id(tenant_id, device_id),
+                &bytes,
+            )?,
             None => bytes,
         };
         Ok(BASE64.encode(payload))
@@ -64,7 +96,12 @@ impl BindingsCodec {
     /// Deserialise (and optionally decrypt) the bindings vector.
     /// Empty input is treated as `Vec::new()` so legacy NULL columns
     /// or rows written before the bindings column existed still load.
-    pub fn decode(&self, stored: &str) -> Result<Vec<DeviceBinding>, SqlDeviceStoreError> {
+    pub fn decode(
+        &self,
+        tenant_id: &str,
+        device_id: &str,
+        stored: &str,
+    ) -> Result<Vec<DeviceBinding>, SqlDeviceStoreError> {
         if stored.is_empty() {
             return Ok(Vec::new());
         }
@@ -72,11 +109,53 @@ impl BindingsCodec {
             .decode(stored)
             .map_err(|_| SqlDeviceStoreError::Crypto(CryptoError))?;
         let plaintext = match &self.crypto {
-            Some(crypto) => crypto.decrypt(&payload)?,
+            Some(crypto) => {
+                let opened = crypto.open_bound(
+                    BoundFormat::DEVICE_BINDINGS,
+                    &row_id(tenant_id, device_id),
+                    &payload,
+                )?;
+                if opened.legacy {
+                    tracing::debug!("bindings blob predates row binding; re-sealed on next save");
+                }
+                opened.plaintext
+            }
             None => payload,
         };
         Ok(rmp_serde::from_slice(&plaintext)?)
     }
+}
+
+/// Row identity authenticated into an encrypted bindings blob.
+fn row_id(tenant_id: &str, device_id: &str) -> Vec<u8> {
+    let mut id = Vec::with_capacity(tenant_id.len() + 1 + device_id.len());
+    id.extend_from_slice(tenant_id.as_bytes());
+    id.push(0);
+    id.extend_from_slice(device_id.as_bytes());
+    id
+}
+
+/// Most refresh-family rows written by one `INSERT`: three binds per row
+/// keeps a statement far below the 32 766 variable cap of the tightest
+/// dialect (SQLite).
+pub(crate) const FAMILY_INSERT_CHUNK: usize = 500;
+
+/// The distinct refresh-family ids carried by `bindings`, in first-seen
+/// order. The `device_bindings_refresh` index is keyed on
+/// `(tenant, device, family)`, so a device that carries the same family
+/// twice must contribute it once: inserting it twice would violate that
+/// key and abort the whole transaction.
+pub(crate) fn refresh_family_ids(bindings: &[DeviceBinding]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    bindings
+        .iter()
+        .filter_map(|b| match b {
+            DeviceBinding::Refresh { family_id, .. } => Some(family_id),
+            _ => None,
+        })
+        .filter(|family_id| seen.insert(family_id.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Wire-form trust-level identifiers persisted in the `trust_level`
@@ -116,6 +195,17 @@ pub enum SqlDeviceStoreError {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
+    /// The targeted device does not exist in the tenant. Returned by
+    /// `record_sighting` and `set_trust_level`, as the in-memory store
+    /// does, so a write to a missing device is never reported as success.
+    #[error("device not found: tenant={tenant_id} id={device_id}")]
+    NotFound {
+        /// Tenant scope of the missed lookup.
+        tenant_id: String,
+        /// Opaque device id whose lookup missed.
+        device_id: String,
+    },
+
     /// MessagePack encoding of the bindings vector failed.
     #[error("device-bindings MessagePack encoding failed: {0}")]
     Encode(#[from] rmp_serde::encode::Error),
@@ -140,6 +230,376 @@ pub enum SqlDeviceStoreError {
     /// either written by a buggy producer or hand-edited.
     #[error("malformed stored value: {0}")]
     MalformedRow(String),
+}
+
+/// Seconds since the Unix epoch back to a UTC instant; a value chrono
+/// cannot represent is a corrupt row, not a panic.
+pub(crate) fn unix_to_utc(secs: i64) -> Result<DateTime<Utc>, SqlDeviceStoreError> {
+    Utc.timestamp_opt(secs, 0).single().ok_or_else(|| {
+        SqlDeviceStoreError::MalformedRow(format!("unrepresentable Unix timestamp: {secs}"))
+    })
+}
+
+/// The whole-second Unix form every timestamp column stores.
+pub(crate) fn utc_to_unix(dt: DateTime<Utc>) -> i64 {
+    dt.timestamp()
+}
+
+/// `SELECT` of every `devices` column, in [`DeviceRow`] field order,
+/// followed by `$tail` (the `WHERE`/`ORDER BY` part, which carries the
+/// dialect's placeholders).
+macro_rules! select_devices {
+    ($tail:literal) => {
+        concat!(
+            "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
+             first_seen_at, last_seen_at, revoked_at, demoted_at, bindings \
+             FROM devices ",
+            $tail
+        )
+    };
+}
+pub(crate) use select_devices;
+
+/// Raw row shape for the `devices` table. Mirrors the column order in
+/// the schema so `query_as` works without column-name binding.
+#[derive(sqlx::FromRow)]
+pub(crate) struct DeviceRow {
+    tenant_id: String,
+    id: String,
+    user_id: Option<String>,
+    trust_level: String,
+    fingerprint_hash: Vec<u8>,
+    first_seen_at: i64,
+    last_seen_at: i64,
+    revoked_at: Option<i64>,
+    demoted_at: Option<i64>,
+    bindings: String,
+}
+
+impl DeviceRow {
+    /// Decode a stored row into a [`Device`], validating every id,
+    /// timestamp and the trust level, and opening the bindings blob.
+    pub(crate) fn into_device(self, codec: &BindingsCodec) -> Result<Device, SqlDeviceStoreError> {
+        let Self {
+            tenant_id,
+            id,
+            user_id,
+            trust_level,
+            fingerprint_hash,
+            first_seen_at,
+            last_seen_at,
+            revoked_at,
+            demoted_at,
+            bindings,
+        } = self;
+
+        let tenant = TenantId::try_new(&tenant_id)
+            .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("tenant_id: {e}")))?;
+        let device_id = DeviceId::try_new(&id)
+            .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("device id: {e}")))?;
+        let user = match user_id {
+            Some(u) => Some(
+                UserId::try_new(&u)
+                    .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("user_id: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let trust = trust_level_codec::from_str(&trust_level)
+            .ok_or(SqlDeviceStoreError::UnknownTrustLevel(trust_level))?;
+
+        let fp_bytes: [u8; 32] = fingerprint_hash
+            .try_into()
+            .map_err(|_| SqlDeviceStoreError::MalformedRow("fingerprint_hash length".into()))?;
+
+        let first = unix_to_utc(first_seen_at)?;
+        let last = unix_to_utc(last_seen_at)?;
+        let revoked = revoked_at.map(unix_to_utc).transpose()?;
+        let demoted = demoted_at.map(unix_to_utc).transpose()?;
+
+        let bindings = codec.decode(&tenant_id, &id, &bindings)?;
+
+        Ok(Device {
+            id: device_id,
+            tenant_id: tenant,
+            user_id: user,
+            trust_level: trust,
+            fingerprint_hash: FingerprintHash::from_bytes(fp_bytes),
+            first_seen_at: first,
+            last_seen_at: last,
+            revoked_at: revoked,
+            demoted_at: demoted,
+            bindings,
+        })
+    }
+}
+
+/// Decode at most one fetched row.
+pub(crate) fn decode_optional(
+    codec: &BindingsCodec,
+    row: Option<DeviceRow>,
+) -> Result<Option<Device>, SqlDeviceStoreError> {
+    row.map(|r| r.into_device(codec)).transpose()
+}
+
+/// Decode fetched rows in order, stopping at the first that fails.
+pub(crate) fn decode_all(
+    codec: &BindingsCodec,
+    rows: Vec<DeviceRow>,
+) -> Result<Vec<Device>, SqlDeviceStoreError> {
+    rows.into_iter().map(|r| r.into_device(codec)).collect()
+}
+
+/// A stored `trust_level` column value read back as a level; `None` when
+/// the row is absent.
+pub(crate) fn parse_stored_trust(
+    stored: Option<String>,
+) -> Result<Option<DeviceTrustLevel>, SqlDeviceStoreError> {
+    match stored {
+        None => Ok(None),
+        Some(s) => trust_level_codec::from_str(&s)
+            .map(Some)
+            .ok_or(SqlDeviceStoreError::UnknownTrustLevel(s)),
+    }
+}
+
+/// An `UPDATE` that must hit a row: zero rows affected is a missing device.
+pub(crate) fn require_row(
+    rows_affected: u64,
+    tenant: String,
+    device_id: String,
+) -> Result<(), SqlDeviceStoreError> {
+    if rows_affected == 0 {
+        return Err(SqlDeviceStoreError::NotFound {
+            tenant_id: tenant,
+            device_id,
+        });
+    }
+    Ok(())
+}
+
+/// Every column value of a device row, already converted to what the
+/// backends bind, plus the refresh families its index rows need.
+pub(crate) struct DeviceWrite {
+    pub tenant: String,
+    pub id: String,
+    pub user_id: Option<String>,
+    pub trust: &'static str,
+    pub fingerprint: Vec<u8>,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    pub revoked_at: Option<i64>,
+    pub demoted_at: Option<i64>,
+    pub bindings: String,
+    pub family_ids: Vec<String>,
+}
+
+impl DeviceWrite {
+    /// Encode `device` for storage.
+    pub(crate) fn new(codec: &BindingsCodec, device: &Device) -> Result<Self, SqlDeviceStoreError> {
+        let tenant = device.tenant_id.to_string();
+        let id = device.id.to_string();
+        Ok(Self {
+            bindings: codec.encode(&tenant, &id, &device.bindings)?,
+            trust: trust_level_codec::to_str(device.trust_level),
+            fingerprint: device.fingerprint_hash.as_bytes().to_vec(),
+            user_id: device.user_id.as_ref().map(|u| u.to_string()),
+            first_seen_at: utc_to_unix(device.first_seen_at),
+            last_seen_at: utc_to_unix(device.last_seen_at),
+            revoked_at: device.revoked_at.map(utc_to_unix),
+            demoted_at: device.demoted_at.map(utc_to_unix),
+            family_ids: refresh_family_ids(&device.bindings),
+            tenant,
+            id,
+        })
+    }
+}
+
+/// Column values of an unconditional trust-level change.
+///
+/// `revoked_at` is set and cleared symmetrically with the transition so
+/// every backend matches the in-memory store. `to_seen` drives the
+/// `demoted_at` rule of `demotion_stamp`: a Trusted row moving to Seen is
+/// stamped, a Seen target otherwise keeps the column, any other target
+/// clears it. The statement reads the row's level from before its own
+/// assignments.
+pub(crate) struct TrustWrite {
+    pub trust: &'static str,
+    pub revoked_at: Option<i64>,
+    pub to_seen: i64,
+    pub now: i64,
+}
+
+impl TrustWrite {
+    pub(crate) fn new(level: DeviceTrustLevel, now: DateTime<Utc>) -> Self {
+        let now = utc_to_unix(now);
+        Self {
+            trust: trust_level_codec::to_str(level),
+            revoked_at: (level == DeviceTrustLevel::Revoked).then_some(now),
+            to_seen: i64::from(level == DeviceTrustLevel::Seen),
+            now,
+        }
+    }
+}
+
+/// Column values of a compare-and-swap trust-level change.
+///
+/// The row is at `expected` whenever the `UPDATE` matches, so the rule of
+/// `demotion_stamp` is decided before the statement runs: stamp on Trusted
+/// to Seen, keep the stored value for any other move to Seen, clear
+/// otherwise.
+pub(crate) struct GuardedTrustWrite {
+    pub expected: &'static str,
+    pub new: &'static str,
+    pub revoked_at: Option<i64>,
+    pub keep_demoted: i64,
+    pub demoted_at: Option<i64>,
+}
+
+impl GuardedTrustWrite {
+    pub(crate) fn new(
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let now = utc_to_unix(now);
+        let to_seen = level == DeviceTrustLevel::Seen;
+        Self {
+            expected: trust_level_codec::to_str(expected),
+            new: trust_level_codec::to_str(level),
+            revoked_at: (level == DeviceTrustLevel::Revoked).then_some(now),
+            keep_demoted: i64::from(to_seen && expected != DeviceTrustLevel::Trusted),
+            demoted_at: (to_seen && expected == DeviceTrustLevel::Trusted).then_some(now),
+        }
+    }
+}
+
+/// The outcome of a guarded trust change that matched no row, given the
+/// level a re-read found. A row already at `expected` counts as applied:
+/// some engines report zero changed rows for a no-op match.
+pub(crate) fn transition_after_miss(
+    current: Option<DeviceTrustLevel>,
+    expected: DeviceTrustLevel,
+) -> TrustTransition {
+    match current {
+        None => TrustTransition::Missing,
+        Some(current) if current == expected => TrustTransition::Applied,
+        Some(current) => TrustTransition::Refused { current },
+    }
+}
+
+/// What a bindings compare-and-swap does after reading the row.
+pub(crate) enum SwapPlan {
+    /// The read already settles the outcome; nothing is written.
+    Settled(BindingsUpdate),
+    /// Write `blob` where the column still holds `stored`, then rewrite
+    /// the family index to `family_ids`.
+    Write(BindingsSwap),
+}
+
+/// Inputs of the conditional bindings write.
+pub(crate) struct BindingsSwap {
+    /// The stored bytes the read saw: the comparand of the write.
+    pub stored: String,
+    /// The new encoded bindings blob.
+    pub blob: String,
+    /// Distinct refresh families of the new bindings.
+    pub family_ids: Vec<String>,
+}
+
+/// Decide a bindings compare-and-swap from the `(trust_level, bindings)`
+/// pair read for the row. The write is conditional on exactly the stored
+/// bytes, so it is a compare-and-swap on the bindings column: ciphertext
+/// differs on every encode, which is why the stored bytes themselves, not
+/// a re-encoding of `expected`, are the comparand.
+pub(crate) fn plan_bindings_swap(
+    codec: &BindingsCodec,
+    tenant: &str,
+    device_id: &str,
+    row: Option<(String, String)>,
+    expected: &[DeviceBinding],
+    bindings: &[DeviceBinding],
+) -> Result<SwapPlan, SqlDeviceStoreError> {
+    let Some((level, stored)) = row else {
+        return Ok(SwapPlan::Settled(BindingsUpdate::Missing));
+    };
+    match trust_level_codec::from_str(&level) {
+        Some(DeviceTrustLevel::Revoked) => {
+            return Ok(SwapPlan::Settled(BindingsUpdate::Revoked));
+        }
+        Some(_) => {}
+        None => return Err(SqlDeviceStoreError::UnknownTrustLevel(level)),
+    }
+    if codec.decode(tenant, device_id, &stored)? != expected {
+        return Ok(SwapPlan::Settled(BindingsUpdate::Conflict));
+    }
+    Ok(SwapPlan::Write(BindingsSwap {
+        blob: codec.encode(tenant, device_id, bindings)?,
+        family_ids: refresh_family_ids(bindings),
+        stored,
+    }))
+}
+
+/// The outcome of a bindings write that matched no row, given the level a
+/// re-read found: the row vanished, was revoked, or its bindings changed.
+pub(crate) fn bindings_update_after_miss(current: Option<DeviceTrustLevel>) -> BindingsUpdate {
+    match current {
+        None => BindingsUpdate::Missing,
+        Some(DeviceTrustLevel::Revoked) => BindingsUpdate::Revoked,
+        Some(_) => BindingsUpdate::Conflict,
+    }
+}
+
+/// The outcome of an owner claim that matched no row, given the owner a
+/// re-read found. A NULL owner here would mean the row was released
+/// between the two statements; it fails closed.
+pub(crate) fn claim_after_miss(owner: Option<Option<String>>, user: &str) -> OwnerClaim {
+    match owner {
+        None => OwnerClaim::Missing,
+        Some(Some(owner)) if owner == user => OwnerClaim::Claimed,
+        Some(_) => OwnerClaim::OwnedByOther,
+    }
+}
+
+/// Sweep thresholds as Unix seconds. Threshold semantics:
+/// `signed_duration_since(last_seen) > window` is
+/// `last_seen_at < now - window`, so the bind-side comparison mirrors the
+/// in-memory store exactly.
+pub(crate) struct SweepCutoffs {
+    pub now: i64,
+    pub trusted: i64,
+    pub seen: i64,
+    pub grace: i64,
+}
+
+impl SweepCutoffs {
+    pub(crate) fn new(cfg: &SweepConfig, now: DateTime<Utc>) -> Self {
+        let now = utc_to_unix(now);
+        Self {
+            now,
+            trusted: now - cfg.trusted_idle.num_seconds(),
+            seen: now - cfg.seen_idle.num_seconds(),
+            grace: now - cfg.revoked_grace.num_seconds(),
+        }
+    }
+}
+
+/// Append the value rows of one family-index `INSERT` chunk: one
+/// `(tenant, device, family)` tuple per family id.
+pub(crate) fn push_family_rows<DB>(
+    insert: &mut sqlx::QueryBuilder<DB>,
+    chunk: &[String],
+    tenant: &str,
+    device_id: &str,
+) where
+    DB: sqlx::Database,
+    for<'q> &'q str: sqlx::Encode<'q, DB> + sqlx::Type<DB>,
+{
+    insert.push_values(chunk, |mut row, family_id| {
+        row.push_bind(tenant)
+            .push_bind(device_id)
+            .push_bind(family_id.as_str());
+    });
 }
 
 #[cfg(test)]
@@ -171,8 +631,8 @@ mod device_sql_common_tests {
                 last_used_at: now,
             },
         ];
-        let encoded = codec.encode(&bindings).expect("encode");
-        let decoded = codec.decode(&encoded).expect("decode");
+        let encoded = codec.encode("t", "d", &bindings).expect("encode");
+        let decoded = codec.decode("t", "d", &encoded).expect("decode");
         assert_eq!(
             decoded.len(),
             2,
@@ -228,6 +688,21 @@ mod device_sql_common_tests {
         );
     }
 
+    /// A device carrying the same refresh family twice contributes it to
+    /// the index once, and the order of first appearance is kept.
+    #[test]
+    fn refresh_family_ids_are_distinct_and_keep_first_seen_order() {
+        let now = Utc::now();
+        let refresh = |f: &str| DeviceBinding::Refresh {
+            family_id: f.to_string(),
+            issued_at: now,
+            last_used_at: now,
+        };
+        let bindings = vec![refresh("b"), refresh("a"), refresh("b"), refresh("a")];
+        assert_eq!(refresh_family_ids(&bindings), vec!["b", "a"]);
+        assert!(refresh_family_ids(&[]).is_empty());
+    }
+
     /// Belt-and-suspenders: `to_str` and `from_str` form a
     /// bijection on the four variants. Pins both directions in one go.
     #[test]
@@ -247,3 +722,6 @@ mod device_sql_common_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod binding_tests;

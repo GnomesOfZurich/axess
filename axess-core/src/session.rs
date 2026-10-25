@@ -49,5 +49,6 @@ pub use refresh::{
 #[cfg(any(test, feature = "memory"))]
 pub use store::{MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError};
 pub use store::{
-    SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore,
+    SessionLiveness, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle,
+    SessionRevoker, SessionStore,
 };

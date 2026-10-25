@@ -24,7 +24,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use super::super::types::OAuthError;
@@ -54,17 +55,51 @@ pub trait DpopJtiCache: Send + Sync {
 /// resource server; for a fleet, replace with a Valkey-backed implementation.
 #[derive(Clone)]
 pub struct MemoryJtiCache {
-    inner: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
+    inner: Arc<Mutex<JtiStore>>,
     // Source of wall-clock time for eviction. Defaults to
     // `SystemClock`; pass a `MockClock` via `with_clock` to pin time
     // under DST.
     clock: Arc<dyn axess_clock::Clock>,
 }
 
+/// The live `jti`s and, beside them, the same entries ordered by expiry.
+///
+/// Eviction pops the soonest expiry off the heap while it has passed, so a
+/// call costs the number of entries it evicts rather than the number the
+/// cache holds. Every live `jti` has exactly one heap entry: a `jti` is
+/// inserted only when absent from the map, and its heap entry leaves with
+/// it.
+#[derive(Default)]
+pub(crate) struct JtiStore {
+    live: HashMap<String, DateTime<Utc>>,
+    by_expiry: BinaryHeap<Reverse<(DateTime<Utc>, String)>>,
+}
+
+impl JtiStore {
+    /// Drop every entry whose expiry is at or before `now`; return how many.
+    ///
+    /// The comparison is strict (`expires_at > now` keeps an entry), so an
+    /// entry expiring exactly at `now` is gone: a stale `jti` must not
+    /// block a proof the application is willing to consider current.
+    fn evict_expired(&mut self, now: DateTime<Utc>) -> usize {
+        let mut evicted = 0;
+        while let Some(Reverse((expires_at, _))) = self.by_expiry.peek() {
+            if *expires_at > now {
+                break;
+            }
+            if let Some(Reverse((_, jti))) = self.by_expiry.pop() {
+                self.live.remove(&jti);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+}
+
 impl Default for MemoryJtiCache {
     fn default() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(JtiStore::default())),
             clock: Arc::new(axess_clock::SystemClock),
         }
     }
@@ -93,33 +128,31 @@ impl MemoryJtiCache {
     /// [`SystemClock`](axess_clock::SystemClock). Pass a
     /// `MockClock` under DST so
     /// the TTL-eviction path is deterministic.
+    ///
+    /// Use the clock that supplies the `now` handed to
+    /// [`verify_dpop_proof`]: that `now` stamps each entry's expiry, and
+    /// this clock decides when the entry is evicted, so two different
+    /// clocks make entries expire at the wrong moment.
     pub fn with_clock(mut self, clock: Arc<dyn axess_clock::Clock>) -> Self {
         self.clock = clock;
         self
     }
 }
 
-/// Pure helper for [`MemoryJtiCache::try_insert`] with the eviction
-/// `now` lifted to a parameter. Extracted so the boundary mutations
-/// flagged on the body (`> with >=` on the `retain` predicate, etc.)
-/// can be killed by direct unit tests without the `Utc::now()`
-/// dependency on the trait method.
+/// [`MemoryJtiCache::try_insert`] with the eviction `now` lifted to a
+/// parameter, so the expiry boundary is testable to the exact tick.
 pub(crate) fn try_insert_at(
-    map: &mut HashMap<String, DateTime<Utc>>,
+    store: &mut JtiStore,
     jti: &str,
     expires_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> bool {
-    // Lazy eviction; bounded scan keeps the map size proportional to
-    // active proofs in the iat window. Strict `>` so an entry whose
-    // `expires_at` lands exactly on `now` is evicted, not retained;
-    // a stale jti must not block a fresh proof that the application
-    // is willing to consider current.
-    map.retain(|_, exp| *exp > now);
-    if map.contains_key(jti) {
+    store.evict_expired(now);
+    if store.live.contains_key(jti) {
         return false;
     }
-    map.insert(jti.to_string(), expires_at);
+    store.live.insert(jti.to_string(), expires_at);
+    store.by_expiry.push(Reverse((expires_at, jti.to_string())));
     true
 }
 
@@ -139,11 +172,11 @@ pub(crate) fn dpop_replay_window_expiry(
 
 impl DpopJtiCache for MemoryJtiCache {
     fn try_insert(&self, jti: &str, expires_at: DateTime<Utc>) -> bool {
-        let mut map = self
+        let mut store = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        try_insert_at(&mut map, jti, expires_at, self.clock.now())
+        try_insert_at(&mut store, jti, expires_at, self.clock.now())
     }
 }
 
@@ -174,7 +207,8 @@ pub fn verify_dpop_proof(
     req: DpopVerifyRequest<'_>,
     now: DateTime<Utc>,
 ) -> Result<DpopVerified, OAuthError> {
-    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+    use jsonwebtoken::{Algorithm, DecodingKey};
+    use subtle::ConstantTimeEq;
 
     // 1. Structural sanity.
     let parts: Vec<&str> = req.proof_jwt.split('.').collect();
@@ -209,15 +243,31 @@ pub fn verify_dpop_proof(
         .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP `jwk` invalid: {e}")))?;
     let decoding_key = DecodingKey::from_jwk(&jwk)
         .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP key build: {e}")))?;
-    let mut validation = Validation::new(Algorithm::ES256);
-    validation.required_spec_claims.clear();
-    validation.validate_aud = false;
-    validation.validate_exp = false;
-    let token = decode::<serde_json::Value>(req.proof_jwt, &decoding_key, &validation)
-        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP signature verify: {e}")))?;
+    // The header is already parsed above and the payload is parsed once
+    // below, so the signature is checked directly over the signing input
+    // instead of handing the whole token to `decode`, which would parse
+    // both again.
+    crate::jwt::ensure_crypto_provider();
+    let signing_input = &req.proof_jwt[..parts[0].len() + 1 + parts[1].len()];
+    let signature_ok = jsonwebtoken::crypto::verify(
+        parts[2],
+        signing_input.as_bytes(),
+        &decoding_key,
+        Algorithm::ES256,
+    )
+    .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP signature verify: {e}")))?;
+    if !signature_ok {
+        return Err(OAuthError::IdTokenValidation(
+            "DPoP signature verify: signature does not match".to_string(),
+        ));
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP payload b64 decode: {e}")))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| OAuthError::IdTokenValidation(format!("DPoP payload parse: {e}")))?;
 
     // 3. Claim checks.
-    let claims = token.claims;
     let claim_htm = claims.get("htm").and_then(|v| v.as_str()).unwrap_or("");
     if !claim_htm.eq_ignore_ascii_case(req.htm) {
         return Err(OAuthError::IdTokenValidation(format!(
@@ -255,7 +305,7 @@ pub fn verify_dpop_proof(
             )
         })?;
         let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(at.as_bytes()));
-        if claim_ath != expected {
+        if !bool::from(claim_ath.as_bytes().ct_eq(expected.as_bytes())) {
             return Err(OAuthError::IdTokenValidation(
                 "DPoP `ath` does not match SHA-256(access_token)".to_string(),
             ));

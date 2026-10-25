@@ -191,15 +191,20 @@ sign a DPoP proof JWT on each request to a protected resource, and
 the resource server verifies the proof and matches the JWK
 thumbprint against the access token's binding.
 
-Axess exposes the proof-generation primitive through
-`OAuthProvider::generate_dpop_proof`:
+`AuthnService::generate_dpop_proof` builds a proof. It mints a fresh
+ephemeral key for every proof, draws the key bytes and the `jti` from the
+service's `SecureRng`, and stamps `iat` from the service's `Clock`, so a
+seeded RNG and a mock clock reproduce the proof exactly. The provider
+trait method it calls, `OAuthProvider::generate_dpop_proof`, takes those
+values as arguments (`key_seed`, `iat`, `jti_bytes`) and reads neither a
+clock nor a random source itself.
 
 ```rust,ignore
-let proof: DpopProof = provider.generate_dpop_proof(
+let proof: DpopProof = authn.generate_dpop_proof(
+    "bank",                                        // provider name
     "GET",                                         // HTTP method
     "https://resource.example.com/data",           // target URL
     Some(&access_token),                           // bind to this access token
-    &dpop_key,                                     // your key
 )?;
 
 let response = http_client
@@ -210,8 +215,8 @@ let response = http_client
     .await?;
 ```
 
-The proof JWT contains the HTTP method, the target URL, a nonce, a
-timestamp, and the thumbprint of the binding key. The resource
+The proof JWT contains the HTTP method, the target URL, a unique `jti`, an
+`iat` timestamp, and the thumbprint of the binding key. The resource
 server checks all of these against the access token's `cnf`
 (confirmation) claim, which carries the thumbprint at token
 issuance.

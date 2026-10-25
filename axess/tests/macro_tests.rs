@@ -132,6 +132,11 @@ mod authz_tests {
                 action    == App::Action::"View",
                 resource  == App::Doc::"doc-1"
             );
+            permit (
+                principal == App::User::"{alice}",
+                action    == App::Action::"Manage",
+                resource  == App::Platform::"global"
+            );
             "#,
         )
     }
@@ -140,13 +145,20 @@ mod authz_tests {
         "App": {
             "entityTypes": {
                 "User":   { "shape": { "type": "Record", "attributes": {} } },
-                "Doc":    { "shape": { "type": "Record", "attributes": {} } }
+                "Doc":    { "shape": { "type": "Record", "attributes": {} } },
+                "Platform": { "shape": { "type": "Record", "attributes": {} } }
             },
             "actions": {
                 "View": {
                     "appliesTo": {
                         "principalTypes": ["User"],
                         "resourceTypes":  ["Doc"]
+                    }
+                },
+                "Manage": {
+                    "appliesTo": {
+                        "principalTypes": ["User"],
+                        "resourceTypes":  ["Platform"]
                     }
                 }
             }
@@ -248,6 +260,19 @@ mod authz_tests {
                 "/docs/{id}",
                 get(|| async { "doc body" }).layer(require_authz!("App", "View", "Doc:{id}")),
             )
+            .route(
+                "/admin",
+                get(|| async { "admin body" }).layer(require_authz!(
+                    "App",
+                    "Manage",
+                    "Platform:global"
+                )),
+            )
+            .fallback(get(|| async { "fallback body" }).layer(require_authz!(
+                "App",
+                "Manage",
+                "Platform:global"
+            )))
             .route(
                 "/login",
                 axum::routing::post(move |session: axess::AuthSession| async move {
@@ -367,5 +392,101 @@ mod authz_tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "missing extensions should yield 500, not silently allow"
         );
+    }
+
+    #[tokio::test]
+    async fn require_authz_route_without_path_params_authorizes() {
+        let (status, body) = call_protected(build_app("alice"), "/admin").await;
+        assert_eq!(status, StatusCode::OK, "body: {body:?}");
+        let (status, _) = call_protected(build_app("bob"), "/admin").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn require_authz_path_value_cannot_choose_the_entity_type() {
+        // The type comes from the attribute (`App::Doc`); a path value
+        // naming another type stays part of the id and is simply a
+        // different, unpermitted `App::Doc`.
+        for path in [
+            "/docs/Platform::global",
+            "/docs/App::Platform::%22global%22",
+        ] {
+            let (status, _) = call_protected(build_app("alice"), path).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn require_authz_service_without_matched_route_params_authorizes() {
+        // A fallback service is reached without any matched-route
+        // parameters at all; the gate must still evaluate, not 500.
+        let (status, body) = call_protected(build_app("alice"), "/nowhere").await;
+        assert_eq!(status, StatusCode::OK, "body: {body:?}");
+        let (status, _) = call_protected(build_app("bob"), "/nowhere").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn require_authz_service_called_outside_a_router_authorizes() {
+        // No router means no path-parameter extension on the request. The
+        // gate must evaluate from the attribute alone rather than 500.
+        let store = MemorySessionStore::new();
+        let layer = || {
+            SessionLayer::new(store.clone(), [42u8; 32])
+                .with_ttl(Duration::from_secs(3600))
+                .with_secure(false)
+        };
+        let login = Router::new()
+            .route(
+                "/login",
+                axum::routing::post(|session: axess::AuthSession| async move {
+                    session
+                        .set_authenticated(
+                            axess::testing::user("alice"),
+                            axess::testing::tenant("t1"),
+                            chrono::Utc::now(),
+                        )
+                        .await;
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .layer(layer());
+        let resp = login
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie = resp.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let bare = get(|| async { "admin body" })
+            .layer::<_, std::convert::Infallible>(require_authz!(
+                "App",
+                "Manage",
+                "Platform:global"
+            ))
+            .layer::<_, std::convert::Infallible>(Extension(policy_store()))
+            .layer::<_, std::convert::Infallible>(Extension(provider()))
+            .layer::<_, std::convert::Infallible>(layer());
+        let resp = bare
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -16,8 +16,18 @@ pub(super) fn test_config() -> RefreshTokenConfig {
     }
 }
 
+/// The fixed instant the refresh tests run at.
 pub(super) fn now() -> DateTime<Utc> {
-    Utc::now()
+    use chrono::TimeZone;
+    Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+}
+
+/// A store whose clock is [`now`], so row expiry does not depend on when the
+/// test runs.
+pub(super) fn store() -> crate::testing::MemoryRefreshTokenStore {
+    crate::testing::MemoryRefreshTokenStore::new().with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at(now()),
+    ))
 }
 
 pub(super) fn fixture_user() -> UserId {

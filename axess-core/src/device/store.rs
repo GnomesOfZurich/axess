@@ -8,7 +8,7 @@
 //! three-stage demotion ladder.
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
+use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::health::{HealthCheck, HealthStatus};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -16,6 +16,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// How many of a user's devices the default
+/// [`DeviceStore::find_by_fingerprint_for_user`] scans.
+pub const OWN_DEVICE_SCAN_LIMIT: usize = 100;
 
 // ── DeviceStore trait ─────────────────────────────────────────────────────────
 
@@ -47,6 +51,30 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         tenant_id: &TenantId,
         hash: &FingerprintHash,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send;
+
+    /// Look up the device `user_id` owns that carries `hash`, newest-sighted
+    /// first when several do. Unlike [`find_by_fingerprint`](Self::find_by_fingerprint),
+    /// which returns one row for the whole tenant (possibly another user's),
+    /// this finds the caller's own device however many devices the user has.
+    ///
+    /// The default implementation scans the user's
+    /// [`OWN_DEVICE_SCAN_LIMIT`] most recently seen devices, so a user with
+    /// more devices than that can miss an older match. Backends SHOULD
+    /// override it with an indexed query on `(tenant, user, fingerprint)`.
+    fn find_by_fingerprint_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        hash: &FingerprintHash,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        async move {
+            Ok(self
+                .find_for_user(tenant_id, user_id, OWN_DEVICE_SCAN_LIMIT)
+                .await?
+                .into_iter()
+                .find(|d| d.fingerprint_hash == *hash))
+        }
+    }
 
     /// List active devices for a user, newest-sighted first. `limit` caps
     /// the result so a high-cardinality user doesn't blow up
@@ -110,7 +138,15 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send;
 
     /// Persist a new device row, or overwrite an existing one. Idempotent.
-    fn save(&self, device: &Device) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ///
+    /// `now` is the time of the write. A backend that expires rows by
+    /// age derives the row's lifetime from it, so the store never reads the
+    /// wall clock itself.
+    fn save(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     /// Touch the `last_seen_at` timestamp for the given device.
     /// Implementations SHOULD perform this as a single UPDATE rather than
@@ -132,6 +168,125 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         level: DeviceTrustLevel,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Set the trust level to `level` only if the row is currently at
+    /// `expected`; a compare-and-set, so a transition decided from an
+    /// earlier read cannot overwrite a change made in between (most
+    /// importantly a revocation).
+    ///
+    /// Returns [`TrustTransition::Applied`] when the row was at `expected`
+    /// and is now at `level` (with `revoked_at` stamped or cleared exactly
+    /// as [`set_trust_level`](Self::set_trust_level) does),
+    /// [`TrustTransition::Refused`] carrying the level actually found when
+    /// it was not, and [`TrustTransition::Missing`] when no such device
+    /// exists.
+    ///
+    /// Backends MUST implement this as one conditional write in their own
+    /// storage engine. The provided body is a load followed by an
+    /// unconditional write and is NOT safe against a concurrent change; it
+    /// exists so that an out-of-tree backend keeps compiling, and a
+    /// backend that is used with concurrent writers must override it.
+    fn set_trust_level_if(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
+        async move {
+            let Some(device) = self.load(tenant_id, id).await? else {
+                return Ok(TrustTransition::Missing);
+            };
+            if device.trust_level != expected {
+                return Ok(TrustTransition::Refused {
+                    current: device.trust_level,
+                });
+            }
+            self.set_trust_level(tenant_id, id, level, now).await?;
+            Ok(TrustTransition::Applied)
+        }
+    }
+
+    /// Replace the device's bindings with `bindings`, only if they are
+    /// still exactly `expected`, and nothing else; never on a
+    /// [`DeviceTrustLevel::Revoked`] device. A compare-and-swap on the
+    /// bindings: two editors that each read the row, changed it and wrote it
+    /// back cannot both succeed, so neither loses the other's change, and
+    /// unlike [`save`](Self::save) it never writes the trust level,
+    /// `revoked_at` or any other column, so a revocation that lands while
+    /// the caller is working cannot be undone by it and a revoked device
+    /// never gains a binding.
+    ///
+    /// Returns [`BindingsUpdate::Written`], [`BindingsUpdate::Conflict`]
+    /// (the stored bindings differ from `expected`; nothing written, reload
+    /// and decide again), [`BindingsUpdate::Revoked`] (nothing written) or
+    /// [`BindingsUpdate::Missing`].
+    ///
+    /// The same rule as [`set_trust_level_if`](Self::set_trust_level_if)
+    /// applies to the provided body: it is a load and a [`save`](Self::save),
+    /// not safe against a concurrent writer, and a backend with concurrent
+    /// writers must override it with a conditional write.
+    fn replace_bindings(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
+        async move {
+            let Some(mut device) = self.load(tenant_id, id).await? else {
+                return Ok(BindingsUpdate::Missing);
+            };
+            if device.trust_level == DeviceTrustLevel::Revoked {
+                return Ok(BindingsUpdate::Revoked);
+            }
+            if device.bindings != expected {
+                return Ok(BindingsUpdate::Conflict);
+            }
+            device.bindings = bindings.to_vec();
+            self.save(&device, now).await?;
+            Ok(BindingsUpdate::Written)
+        }
+    }
+
+    /// Make `user` the owner of the device if it has none (`user_id IS
+    /// NULL`), as one conditional write.
+    ///
+    /// A device created during a guest request has no owner, and without a
+    /// claim any later user could resolve it. Returns
+    /// [`OwnerClaim::Claimed`] when the device is now owned by `user`
+    /// (including when it already was), [`OwnerClaim::OwnedByOther`] when
+    /// another user owns it (nothing written), and [`OwnerClaim::Missing`]
+    /// when no such device exists. Two users racing for one unowned device:
+    /// exactly one is `Claimed`.
+    ///
+    /// The provided body is a load and a [`save`](Self::save) and is NOT
+    /// safe against a concurrent claim; a backend with concurrent writers
+    /// must override it with a conditional write.
+    fn claim_owner(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
+        async move {
+            let Some(mut device) = self.load(tenant_id, id).await? else {
+                return Ok(OwnerClaim::Missing);
+            };
+            match device.user_id.as_ref() {
+                Some(owner) if owner == user => Ok(OwnerClaim::Claimed),
+                Some(_) => Ok(OwnerClaim::OwnedByOther),
+                None => {
+                    device.user_id = Some(*user);
+                    self.save(&device, now).await?;
+                    Ok(OwnerClaim::Claimed)
+                }
+            }
+        }
+    }
 
     /// Hard-delete the row. Idempotent. Used by the retention sweep once a
     /// `Revoked` device has aged out of the configured grace window, and
@@ -161,6 +316,50 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send;
 }
 
+/// Result of [`DeviceStore::set_trust_level_if`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a refused transition means the device was not changed"]
+pub enum TrustTransition {
+    /// The row was at the expected level and now carries the new one.
+    Applied,
+    /// The row was not at the expected level and was left untouched.
+    /// `current` is the level found; [`DeviceTrustLevel::Revoked`] means a
+    /// revocation won the race.
+    Refused {
+        /// The trust level the row actually had.
+        current: DeviceTrustLevel,
+    },
+    /// No device with that id exists in the tenant.
+    Missing,
+}
+
+/// Result of [`DeviceStore::replace_bindings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a revoked or missing device was not changed"]
+pub enum BindingsUpdate {
+    /// The bindings were replaced.
+    Written,
+    /// The stored bindings are not the ones the caller read (another
+    /// writer changed them first); nothing was written.
+    Conflict,
+    /// The device is revoked; nothing was written.
+    Revoked,
+    /// No device with that id exists in the tenant.
+    Missing,
+}
+
+/// Result of [`DeviceStore::claim_owner`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a claim owned by another user means the device must not be used"]
+pub enum OwnerClaim {
+    /// The device is now owned by the claiming user (newly, or already).
+    Claimed,
+    /// Another user owns the device; nothing was written.
+    OwnedByOther,
+    /// No device with that id exists in the tenant.
+    Missing,
+}
+
 /// Per-stage counts returned by [`DeviceStore::sweep`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SweepCounts {
@@ -178,11 +377,17 @@ pub struct SweepCounts {
 
 /// Retention thresholds driving [`DeviceStore::sweep`].
 ///
-/// The sweep cascades demotions: a device whose last-seen is older
-/// than `trusted_idle + seen_idle` will pass through both demotion
-/// stages in a single sweep call (Trusted → Seen → Revoked); a
-/// further sweep after `revoked_grace` has elapsed since the
-/// just-stamped `revoked_at` finalises the row purge. `Unknown`
+/// The sweep moves each row at most one step per call. A `Trusted` device
+/// un-sighted for more than `trusted_idle` is demoted to `Seen` (never
+/// revoked in the same sweep) and the demotion is stamped on the row
+/// ([`Device::demoted_at`]). A `Seen` device is revoked once `seen_idle` has
+/// passed since the later of its last sighting and its demotion: a `Seen`
+/// device that was never `Trusted` is therefore revoked `seen_idle` after
+/// its last sighting, and one that was demoted gets its full `seen_idle`
+/// window from the demotion (120 days from the last sighting in total with
+/// the defaults, when it was not sighted again). A further sweep after
+/// `revoked_grace` has elapsed since the just-stamped `revoked_at`
+/// finalises the row purge. `Unknown`
 /// devices are NOT demoted by sweep; they can only graduate via an
 /// explicit promotion step; retention of stale `Unknown` rows is the
 /// application's call.
@@ -199,8 +404,9 @@ pub struct SweepConfig {
     /// quarter shouldn't keep its possession-factor status without a
     /// fresh ceremony.
     pub trusted_idle: chrono::Duration,
-    /// How long a `Seen` device may go un-sighted before sweep
-    /// demotes it to `Revoked`.
+    /// How long a `Seen` device may go un-sighted before sweep revokes
+    /// it, counted from the later of its last sighting and its demotion
+    /// from `Trusted` ([`Device::demoted_at`]).
     pub seen_idle: chrono::Duration,
     /// How long a `Revoked` device row sticks around before hard
     /// deletion. Provides an audit-trail window for forensics on
@@ -219,6 +425,38 @@ impl Default for SweepConfig {
 }
 
 impl SweepConfig {
+    /// The level a device settles at after ONE step of the sweep's two
+    /// demotion stages (the `Revoked` purge is separate: it counts from
+    /// `revoked_at`). A row never moves two levels in one call, so a
+    /// `Trusted` device is demoted to `Seen` and gets its `seen_idle` window
+    /// from `now`. `Unknown` and `Revoked` are never moved by these stages.
+    ///
+    /// The `Seen` window runs from the later of `last_seen_at` and
+    /// `demoted_at`, so a device that was never trusted (`demoted_at` is
+    /// `None`) is revoked `seen_idle` after its last sighting, and a demoted
+    /// one `seen_idle` after the demotion unless it is sighted again, which
+    /// restarts the window.
+    pub fn level_after(
+        &self,
+        level: DeviceTrustLevel,
+        last_seen_at: DateTime<Utc>,
+        demoted_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> DeviceTrustLevel {
+        match level {
+            DeviceTrustLevel::Trusted if now - last_seen_at > self.trusted_idle => {
+                DeviceTrustLevel::Seen
+            }
+            DeviceTrustLevel::Seen
+                if now - demoted_at.map_or(last_seen_at, |d| d.max(last_seen_at))
+                    > self.seen_idle =>
+            {
+                DeviceTrustLevel::Revoked
+            }
+            other => other,
+        }
+    }
+
     /// Construct via the builder.
     pub fn builder() -> SweepConfigBuilder {
         SweepConfigBuilder::default()
@@ -261,6 +499,26 @@ impl SweepConfigBuilder {
     }
 }
 
+/// The `demoted_at` a row carries after its trust level moves from `from`
+/// to `to` at `now`, given the value it carried before.
+///
+/// Moving `Trusted` to `Seen` stamps `now`; staying `Seen` (or moving to
+/// `Seen` from a level that was never trusted) keeps what the row had; every
+/// other target clears it, so a promotion to `Trusted` starts a fresh ladder.
+/// Every backend applies exactly this rule.
+pub(crate) fn demotion_stamp(
+    from: DeviceTrustLevel,
+    to: DeviceTrustLevel,
+    current: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    match (from, to) {
+        (DeviceTrustLevel::Trusted, DeviceTrustLevel::Seen) => Some(now),
+        (_, DeviceTrustLevel::Seen) => current,
+        _ => None,
+    }
+}
+
 // ── MemoryDeviceStore ─────────────────────────────────────────────────────────
 
 /// Composite primary key for the in-memory devices table: `(tenant, device)`.
@@ -276,7 +534,9 @@ type FingerprintKey = (TenantId, FingerprintHash);
 ///
 /// **For testing and single-node development only.** Not suitable for
 /// production: data is lost on restart, no encryption at rest, no
-/// cross-node visibility.
+/// cross-node visibility. Lookups by fingerprint use an index; lookups
+/// by user or by refresh family scan every device in every tenant, which
+/// is immaterial at test sizes and not a basis for load testing.
 ///
 /// # Time injection
 ///
@@ -370,6 +630,25 @@ impl DeviceStore for MemoryDeviceStore {
         Ok(self.devices.get(&pk).map(|d| d.clone()))
     }
 
+    async fn find_by_fingerprint_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        hash: &FingerprintHash,
+    ) -> Result<Option<Device>, Self::Error> {
+        Ok(self
+            .devices
+            .iter()
+            .filter(|entry| {
+                let d = entry.value();
+                d.tenant_id == *tenant_id
+                    && d.fingerprint_hash == *hash
+                    && d.user_id.as_ref() == Some(user_id)
+            })
+            .map(|entry| entry.value().clone())
+            .max_by_key(|d| d.last_seen_at))
+    }
+
     async fn find_for_user(
         &self,
         tenant_id: &TenantId,
@@ -415,7 +694,7 @@ impl DeviceStore for MemoryDeviceStore {
         Ok(hits)
     }
 
-    async fn save(&self, device: &Device) -> Result<(), Self::Error> {
+    async fn save(&self, device: &Device, _now: DateTime<Utc>) -> Result<(), Self::Error> {
         let key = Self::key(&device.tenant_id, &device.id);
         let fp_key = (device.tenant_id, device.fingerprint_hash);
         let previous = self.devices.insert(key, device.clone());
@@ -459,6 +738,7 @@ impl DeviceStore for MemoryDeviceStore {
     ) -> Result<(), Self::Error> {
         let key = Self::key(tenant_id, id);
         if let Some(mut entry) = self.devices.get_mut(&key) {
+            entry.demoted_at = demotion_stamp(entry.trust_level, level, entry.demoted_at, now);
             entry.trust_level = level;
             entry.revoked_at = matches!(level, DeviceTrustLevel::Revoked).then_some(now);
             return Ok(());
@@ -467,6 +747,73 @@ impl DeviceStore for MemoryDeviceStore {
             tenant_id: tenant_id.to_string(),
             device_id: id.to_string(),
         })
+    }
+
+    async fn set_trust_level_if(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> Result<TrustTransition, Self::Error> {
+        // The shard lock `get_mut` holds makes the check and the write one
+        // step with respect to every other writer of this row.
+        let Some(mut entry) = self.devices.get_mut(&Self::key(tenant_id, id)) else {
+            return Ok(TrustTransition::Missing);
+        };
+        if entry.trust_level != expected {
+            return Ok(TrustTransition::Refused {
+                current: entry.trust_level,
+            });
+        }
+        entry.demoted_at = demotion_stamp(entry.trust_level, level, entry.demoted_at, now);
+        entry.trust_level = level;
+        entry.revoked_at = matches!(level, DeviceTrustLevel::Revoked).then_some(now);
+        Ok(TrustTransition::Applied)
+    }
+
+    async fn replace_bindings(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        _now: DateTime<Utc>,
+    ) -> Result<BindingsUpdate, Self::Error> {
+        // The shard lock `get_mut` holds makes the comparison and the write
+        // one step with respect to every other writer of this row.
+        let Some(mut entry) = self.devices.get_mut(&Self::key(tenant_id, id)) else {
+            return Ok(BindingsUpdate::Missing);
+        };
+        if entry.trust_level == DeviceTrustLevel::Revoked {
+            return Ok(BindingsUpdate::Revoked);
+        }
+        if entry.bindings != expected {
+            return Ok(BindingsUpdate::Conflict);
+        }
+        entry.bindings = bindings.to_vec();
+        Ok(BindingsUpdate::Written)
+    }
+
+    async fn claim_owner(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        _now: DateTime<Utc>,
+    ) -> Result<OwnerClaim, Self::Error> {
+        let Some(mut entry) = self.devices.get_mut(&Self::key(tenant_id, id)) else {
+            return Ok(OwnerClaim::Missing);
+        };
+        match entry.user_id.as_ref() {
+            Some(owner) if owner == user => Ok(OwnerClaim::Claimed),
+            Some(_) => Ok(OwnerClaim::OwnedByOther),
+            None => {
+                entry.user_id = Some(*user);
+                Ok(OwnerClaim::Claimed)
+            }
+        }
     }
 
     async fn delete(&self, tenant_id: &TenantId, id: &DeviceId) -> Result<(), Self::Error> {
@@ -502,24 +849,20 @@ impl DeviceStore for MemoryDeviceStore {
             if device.tenant_id != *tenant_id {
                 continue;
             }
-            // Trusted → Seen. last_seen_at is NOT bumped; demotion
-            // does not constitute a sighting.
+            // One step per row per sweep. last_seen_at is NOT bumped by a
+            // demotion: demotion does not constitute a sighting.
             let mut current_level = device.trust_level;
-            if current_level == DeviceTrustLevel::Trusted
-                && now.signed_duration_since(device.last_seen_at) > cfg.trusted_idle
-            {
-                actions.push((*entry.key(), Action::DemoteToSeen));
-                counts.trusted_to_seen += 1;
-                current_level = DeviceTrustLevel::Seen;
-            }
-            // Seen → Revoked (cascades from the Trusted → Seen demotion
-            // when last-seen clears both windows).
-            if current_level == DeviceTrustLevel::Seen
-                && now.signed_duration_since(device.last_seen_at) > cfg.seen_idle
-            {
-                actions.push((*entry.key(), Action::DemoteToRevoked));
-                counts.seen_to_revoked += 1;
-                current_level = DeviceTrustLevel::Revoked;
+            match cfg.level_after(current_level, device.last_seen_at, device.demoted_at, now) {
+                DeviceTrustLevel::Seen if current_level == DeviceTrustLevel::Trusted => {
+                    actions.push((*entry.key(), Action::DemoteToSeen));
+                    counts.trusted_to_seen += 1;
+                }
+                DeviceTrustLevel::Revoked if current_level == DeviceTrustLevel::Seen => {
+                    actions.push((*entry.key(), Action::DemoteToRevoked));
+                    counts.seen_to_revoked += 1;
+                    current_level = DeviceTrustLevel::Revoked;
+                }
+                _ => {}
             }
             // Revoked → Purge. Uses the *existing* `revoked_at`, not
             // `now`; a device demoted in this same sweep won't be
@@ -538,12 +881,14 @@ impl DeviceStore for MemoryDeviceStore {
                 Action::DemoteToSeen => {
                     if let Some(mut entry) = self.devices.get_mut(&key) {
                         entry.trust_level = DeviceTrustLevel::Seen;
+                        entry.demoted_at = Some(now);
                     }
                 }
                 Action::DemoteToRevoked => {
                     if let Some(mut entry) = self.devices.get_mut(&key) {
                         entry.trust_level = DeviceTrustLevel::Revoked;
                         entry.revoked_at = Some(now);
+                        entry.demoted_at = None;
                     }
                 }
                 Action::Purge => {
@@ -568,3 +913,9 @@ impl HealthCheck for MemoryDeviceStore {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod ladder;
+
+#[cfg(test)]
+mod claims;

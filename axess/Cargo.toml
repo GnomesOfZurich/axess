@@ -50,7 +50,7 @@ default = ["authz", "device"]
 authz = ["axess-core/authz", "axess-macros/authz", "dep:cedar-policy"]
 device = ["axess-core/device"]
 memory = ["axess-core/memory"]
-testing = ["axess-core/testing", "axess-identity/testing", "memory"]
+testing = ["axess-core/testing", "axess-factors/testing", "axess-identity/testing", "memory"]
 
 # HTTP middleware
 accept-client-id = ["axess-core/accept-client-id"]

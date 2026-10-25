@@ -347,6 +347,12 @@ Rationale: production-file size grows linearly with the feature coverage of its 
 
 Enforced, not remembered: `./scripts/check-inline-tests.sh` fails on any block over the limit, and `./scripts/release-preflight.sh` runs it among its cheap early gates, ahead of clippy and the test run. Note it measures a **block**, not a file: `session/layer/signing.rs` is ~690 lines across three mods of 98/118/191 and is compliant. Files that already are test siblings (`tests.rs`, anything under `tests/`) are exempt: they are where tests were moved to, not production files drowning in them.
 
+### File and function size
+
+Production files stay under **800 lines** and production functions under **150 lines**. Test code (`tests.rs`, `tests/`, `benches/`, `examples/`, `testing/`, files reached only through `#[cfg(test)] mod name;`, and inline test blocks) is not counted.
+
+Enforced against a baseline: `./scripts/check-file-sizes.sh` fails on any offender that is not listed in `scripts/file-size-baseline.txt` and on any listed offender that grew; `./scripts/release-preflight.sh` runs it beside the inline-test gate. The baseline lists the offenders that predate the gate, so split them rather than raise it: when one shrinks or goes under the limit, run `./scripts/check-file-sizes.sh --bless` so the recorded size only goes down. The gate prints how many files and functions it measured and refuses to report clean when it measured none. A split keeps every public path working with `pub use` at the old path.
+
 ## Key Design Decisions
 
 1. **Explicit state machine** for authentication flow; typed `AuthState` transitions prevent invalid moves.

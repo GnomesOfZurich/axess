@@ -111,3 +111,58 @@ async fn max_ttl_survives_with_key_id() {
         .with_key_id("custom");
     assert_eq!(idp.max_ttl(), Some(Duration::minutes(5)));
 }
+
+fn far_future() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
+        .expect("literal parses")
+        .with_timezone(&Utc)
+}
+
+/// The cap is measured from the supplied instant: a five-minute token
+/// anchored in 2100 is within a ten-minute cap, which the wall clock
+/// would call seventy-odd years long.
+#[test]
+fn mint_at_measures_the_cap_from_the_given_instant() {
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
+    let now = far_future();
+    let claims = MintClaims::new("alice", now + Duration::minutes(5)).with_audience("https://api");
+    let _ = idp.mint_at(&claims, now);
+}
+
+#[test]
+#[should_panic(expected = "exceeding the fixture's max_ttl")]
+fn mint_at_rejects_a_lifetime_over_the_cap_from_the_given_instant() {
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
+    let now = far_future();
+    let claims = MintClaims::new("alice", now + Duration::minutes(11)).with_audience("https://api");
+    let _ = idp.mint_at(&claims, now);
+}
+
+/// `mint_jwt_svid_at` takes `iat`, `exp` and the cap from `now`.
+#[tokio::test]
+async fn mint_jwt_svid_at_uses_the_given_instant() {
+    let idp = LocalIdpFixture::new("https://idp").with_max_ttl(Duration::minutes(10));
+    let now = far_future();
+    let token = idp.mint_jwt_svid_at(
+        "test.gnomes",
+        "worker",
+        "acme",
+        "https://api",
+        Duration::minutes(5),
+        now,
+    );
+    let clock = std::sync::Arc::new(crate::testing::MockClock::at(now));
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api")
+        .with_clock(clock);
+    verifier
+        .verify::<CustomClaims>(&token)
+        .await
+        .expect("token minted at the mock instant verifies at that instant");
+    let payload = token.split('.').nth(1).expect("payload segment");
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+        .expect("payload decodes");
+    let json: serde_json::Value = serde_json::from_slice(&bytes).expect("payload is JSON");
+    assert_eq!(json["iat"], now.timestamp());
+    assert_eq!(json["exp"], (now + Duration::minutes(5)).timestamp());
+}

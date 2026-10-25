@@ -4,10 +4,14 @@
 //! contract, key layout, and adopter-facing usage examples.
 
 use super::encryption::{encrypted_codec, encrypted_codec_with_rotation, plaintext_codec};
-use super::internal::{DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, ValkeyStoreError, session_key};
+use super::internal::{
+    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, ValkeyStoreError, ex_seconds,
+    script_unavailable, session_key,
+};
 use crate::session::{
     data::SessionData, id::SessionId, storage::session_codec::SessionCodec, store::SessionStore,
 };
+use fred::bytes::Bytes;
 use fred::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,8 +120,12 @@ impl ValkeySessionStore {
     /// Delegates the MessagePack + AES-GCM round-trip to the shared
     /// [`SessionCodec`], then enforces the Valkey-specific
     /// `max_payload_bytes` cap on the encoded bytes.
-    pub(super) fn encode(&self, data: &SessionData) -> Result<Vec<u8>, ValkeyStoreError> {
-        let encoded = self.codec.encode_bytes(data)?;
+    pub(super) fn encode(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+    ) -> Result<Vec<u8>, ValkeyStoreError> {
+        let encoded = self.codec.encode_bytes(id, data)?;
 
         if encoded.len() > self.max_payload_bytes {
             warn!(
@@ -137,8 +145,12 @@ impl ValkeySessionStore {
     /// Deserialize (and optionally decrypt) session data from storage.
     ///
     /// Delegates to the shared [`SessionCodec`].
-    pub(super) fn decode(&self, bytes: &[u8]) -> Result<SessionData, ValkeyStoreError> {
-        Ok(self.codec.decode_bytes(bytes)?)
+    pub(super) fn decode(
+        &self,
+        id: &SessionId,
+        bytes: &[u8],
+    ) -> Result<SessionData, ValkeyStoreError> {
+        Ok(self.codec.decode_bytes(id, bytes)?)
     }
 }
 
@@ -150,7 +162,7 @@ impl SessionStore for ValkeySessionStore {
         let bytes: Option<Vec<u8>> = self.client.get(&key).await?;
         match bytes {
             Some(b) => {
-                let data = self.decode(&b)?;
+                let data = self.decode(id, &b)?;
                 debug!(session_id = %id, "session loaded from valkey");
                 Ok(Some(data))
             }
@@ -168,10 +180,15 @@ impl SessionStore for ValkeySessionStore {
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         let key = session_key(&self.prefix, id);
-        let bytes = self.encode(data)?;
-        let expiry = Expiration::EX(ttl.as_secs() as i64);
+        let bytes = self.encode(id, data)?;
+        let Some(ex) = ex_seconds(ttl) else {
+            // Already expired: nothing may be stored, and a previous value
+            // under this id must not outlive the expiry it was just given.
+            self.client.del::<(), _>(&key).await?;
+            return Ok(());
+        };
         self.client
-            .set::<(), _, _>(&key, bytes, Some(expiry), None, false)
+            .set::<(), _, _>(&key, bytes, Some(Expiration::EX(ex)), None, false)
             .await?;
         debug!(session_id = %id, ttl_secs = ttl.as_secs(), "session saved to valkey");
         Ok(())
@@ -193,30 +210,51 @@ impl SessionStore for ValkeySessionStore {
     ) -> Result<(), Self::Error> {
         let old_key = session_key(&self.prefix, old_id);
         let new_key = session_key(&self.prefix, new_id);
-        let bytes = self.encode(data)?;
-        let expiry_secs = ttl.as_secs() as i64;
+        let bytes = self.encode(new_id, data)?;
+        let Some(ex) = ex_seconds(ttl) else {
+            // The rotated session is already expired: store nothing and let
+            // the old one go with it.
+            self.client.del::<(), _>(&old_key).await?;
+            return Ok(());
+        };
 
-        // Use a MULTI/EXEC transaction for atomicity: either both the delete
-        // and set succeed, or neither does. A pipeline alone does not provide
-        // this guarantee: interleaved commands from other clients could
-        // observe a state where the old key is deleted but the new key does
-        // not yet exist.
-        let txn = self.client.multi();
-        txn.del::<(), _>(&old_key).await?;
-        txn.set::<(), _, _>(
-            &new_key,
-            bytes,
-            Some(Expiration::EX(expiry_secs)),
-            None,
-            false,
-        )
-        .await?;
-        txn.exec::<()>(false).await?;
+        // One server-side script writes the new key and removes the old one,
+        // so a crash cannot leave both and a failed SET leaves the old
+        // session intact (the script aborts before its DEL).
+        let scripted: Result<i64, _> = self
+            .client
+            .eval(
+                CYCLE_SCRIPT,
+                vec![old_key.clone(), new_key.clone()],
+                vec![Value::Bytes(Bytes::from(bytes.clone())), Value::Integer(ex)],
+            )
+            .await;
+        match scripted {
+            Ok(_) => {}
+            Err(e) if script_unavailable(&e) => {
+                // Scripting is unavailable here (disabled, or the two keys
+                // hash to different cluster slots). Fall back to the
+                // sequenced form: the new key is written and acknowledged
+                // before the old key is touched, so a failed SET returns with
+                // the old session intact. A crash between the calls leaves
+                // both keys until the old one's TTL, the documented orphan
+                // window. (MULTI/EXEC is no substitute: the server runs every
+                // queued command even when an earlier one fails.)
+                warn!(error = %e, "session cycle script unavailable; using SET then DEL");
+                self.client
+                    .set::<(), _, _>(&new_key, bytes, Some(Expiration::EX(ex)), None, false)
+                    .await?;
+                if old_key != new_key {
+                    self.client.del::<(), _>(&old_key).await?;
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         debug!(
             old_session_id = %old_id,
             new_session_id = %new_id,
-            ttl_secs = ttl.as_secs(),
+            ttl_secs = ex,
             "session cycled in valkey"
         );
         Ok(())

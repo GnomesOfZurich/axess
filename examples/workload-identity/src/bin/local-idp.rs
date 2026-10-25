@@ -36,6 +36,10 @@
 //!     v1.pem             # PKCS#8 PEM, every key (current or historical)
 //! ```
 //!
+//! `POST /issue` and `POST /admin/rotate` require
+//! `Authorization: Bearer <token>`. Set `LOCAL_IDP_ADMIN_TOKEN` (16+
+//! characters) or read the one generated at startup from the log.
+//!
 //! See `README.md` for the full curl walkthrough.
 
 use axess::local_idp::{
@@ -236,6 +240,31 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
     }
 }
 
+// ── Key files ────────────────────────────────────────────────────────────────
+
+/// Write a private key to a NEW file readable by the owner only. Refuses an
+/// existing path, so a key that is already in use is never overwritten.
+fn write_private_key(path: &Path, pem: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(pem)
+}
+
+/// A key id becomes a file name, so it must not be able to name a
+/// different path: letters, digits, `-` and `_`, 1 to 64 characters.
+fn valid_kid(kid: &str) -> bool {
+    (1..=64).contains(&kid.len())
+        && kid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 
 /// On a fresh checkout there's no key on disk. Generate one so the
@@ -253,7 +282,7 @@ fn bootstrap_initial_key(root: &Path) -> std::io::Result<()> {
     let pem = key
         .to_pkcs8_pem(LineEnding::LF)
         .expect("PKCS#8 PEM encoding");
-    std::fs::write(historical.join("v1.pem"), pem.as_bytes())?;
+    write_private_key(&historical.join("v1.pem"), pem.as_bytes())?;
     std::fs::write(&pointer, "v1")?;
     tracing::info!(
         kid = "v1",
@@ -271,11 +300,14 @@ fn mint_and_persist_new_key(
     store: &FileLocalIdpKeyStore,
     kid: &str,
 ) -> Result<LocalIdpSigningKey, Box<dyn std::error::Error + Send + Sync>> {
+    if !valid_kid(kid) {
+        return Err("new_kid must be 1 to 64 characters of letters, digits, '-' or '_'".into());
+    }
     let mut rng = rsa::rand_core::OsRng;
     let key = RsaPrivateKey::new(&mut rng, RSA_KEY_BITS)?;
     let pem = key.to_pkcs8_pem(LineEnding::LF)?;
     let path = store.key_path(kid);
-    std::fs::write(&path, pem.as_bytes())?;
+    write_private_key(&path, pem.as_bytes())?;
     let parsed =
         LocalIdpSigningKey::from_rsa_pem(&pem, kid.to_string(), jsonwebtoken::Algorithm::RS256)?;
     Ok(parsed)
@@ -290,6 +322,38 @@ struct AppState {
     // `iat` / `exp` flow through this clock so a DST simulation can
     // pin token issuance time by swapping in a `MockClock`.
     clock: Arc<dyn Clock>,
+    /// Bearer token the mint and rotate endpoints require.
+    admin_token: Arc<str>,
+}
+
+/// Admit only requests carrying `Authorization: Bearer <admin token>`.
+///
+/// `/issue` mints a token for any subject and `/admin/rotate` replaces the
+/// signing key, so neither may be open to whoever can reach the port. The
+/// comparison does not stop at the first differing byte.
+async fn require_admin(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let expected = state.admin_token.as_bytes();
+    let presented = presented.as_bytes();
+    let same_length = presented.len() == expected.len();
+    let diff = expected
+        .iter()
+        .zip(presented.iter().chain(std::iter::repeat(&0)))
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if same_length && diff == 0 {
+        next.run(request).await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
+    }
 }
 
 #[derive(Deserialize)]
@@ -315,6 +379,9 @@ async fn issue_handler(
     State(state): State<AppState>,
     Json(req): Json<IssueRequest>,
 ) -> Result<Json<IssueResponse>, (StatusCode, String)> {
+    if req.ttl_secs <= 0 {
+        return Err((StatusCode::BAD_REQUEST, "ttl_secs must be positive".into()));
+    }
     let now = state.clock.now();
     let mut claims =
         MintClaims::new(req.subject, now + Duration::seconds(req.ttl_secs)).with_issued_at(now);
@@ -326,10 +393,9 @@ async fn issue_handler(
         .mint(&claims)
         .await
         .map_err(|e: IssuanceError<FileKeyStoreError>| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("mint failed: {e}"),
-            )
+            // The cause goes to the log; the caller learns only that it failed.
+            tracing::warn!(error = %e, "mint failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "mint failed".to_string())
         })?;
     Ok(Json(IssueResponse { token }))
 }
@@ -353,17 +419,30 @@ async fn rotate_handler(
     Json(req): Json<RotateRequest>,
 ) -> Result<Json<RotateResponse>, (StatusCode, String)> {
     // Phase 1: generate the new key + write its PEM to historical/.
-    let new_key = mint_and_persist_new_key(&state.store, &req.new_kid)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("keygen: {e}")))?;
+    if !valid_kid(&req.new_kid) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "new_kid must be 1 to 64 characters of letters, digits, '-' or '_'".into(),
+        ));
+    }
+    let new_key = mint_and_persist_new_key(&state.store, &req.new_kid).map_err(|e| {
+        tracing::warn!(error = %e, "key generation failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "key generation failed (does that kid already exist?)".to_string(),
+        )
+    })?;
 
     // Phase 2: ask LocalIdp to rotate. The store's `rotate` impl flips
     // the pointer atomically; LocalIdp updates its in-memory state +
     // JWKS so subsequent mints use the new key.
-    state
-        .idp
-        .rotate_signing_key(new_key)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("rotate: {e}")))?;
+    state.idp.rotate_signing_key(new_key).await.map_err(|e| {
+        tracing::warn!(error = %e, "rotation failed");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rotation failed".to_string(),
+        )
+    })?;
 
     let jwks = state.idp.jwks().await;
     let kids: Vec<String> = jwks
@@ -404,20 +483,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idp = LocalIdp::from_key_store(ISSUER, store.clone())
         .await?
         .with_max_ttl(Duration::hours(1));
+    // The mint and rotate endpoints need a bearer token. Use the one the
+    // operator supplies, or draw a fresh one and print it once.
+    let admin_token: Arc<str> = match std::env::var("LOCAL_IDP_ADMIN_TOKEN") {
+        Ok(t) if t.len() >= 16 => t.into(),
+        Ok(_) => return Err("LOCAL_IDP_ADMIN_TOKEN must be at least 16 characters".into()),
+        Err(_) => {
+            let mut bytes = [0u8; 24];
+            axess::SecureRng::fill_bytes(&axess::SystemRng, &mut bytes);
+            let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            tracing::info!(token = %token, "generated an admin token for /issue and /admin/rotate");
+            token.into()
+        }
+    };
     let state = AppState {
         idp: idp.clone(),
         store,
         clock: Arc::new(SystemClock),
+        admin_token,
     };
 
     // Mount the discovery router and the admin/issue endpoints on the
     // same axum app. The two `Router` instances live under disjoint
     // path prefixes so axum's nest/merge plumbing wires them cleanly.
-    let admin_router: Router = Router::new()
-        .route("/", get(root_handler))
+    let guarded: Router = Router::new()
         .route("/issue", post(issue_handler))
         .route("/admin/rotate", post(rotate_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ))
         .with_state(state);
+    let admin_router: Router = Router::new().route("/", get(root_handler)).merge(guarded);
     let app = admin_router.merge(idp.router());
 
     let listener = tokio::net::TcpListener::bind(BIND).await?;
@@ -429,4 +526,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kid_cannot_name_another_path() {
+        for bad in [
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "..",
+            "v1.pem",
+            "a b",
+            &"k".repeat(65),
+        ] {
+            assert!(!valid_kid(bad), "{bad:?} must be refused");
+        }
+        for good in ["v1", "2026-10_rotation", "K"] {
+            assert!(valid_kid(good), "{good:?} must be accepted");
+        }
+    }
+
+    #[test]
+    fn a_private_key_file_is_never_overwritten_and_is_owner_only() {
+        let dir = std::env::temp_dir().join(format!("local-idp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k.pem");
+        write_private_key(&path, b"first").unwrap();
+        assert!(write_private_key(&path, b"second").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "group/other bits must be clear: {mode:o}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

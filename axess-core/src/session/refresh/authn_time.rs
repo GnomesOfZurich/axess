@@ -5,10 +5,18 @@ use super::test_support::{fixture_tenant, fixture_user, test_config};
 use super::*;
 use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
 
-/// Relative to the real clock: the in-memory store expires rows by it.
+/// A fixed sign-in time, far from the real clock.
 fn login_time() -> DateTime<Utc> {
-    static LOGIN: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
-    *LOGIN.get_or_init(|| Utc::now() - Duration::days(25))
+    use chrono::TimeZone;
+    Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+}
+
+/// A store whose clock is the sign-in time, so row expiry does not depend on
+/// when the test runs.
+fn store_at_login() -> MemoryRefreshTokenStore {
+    MemoryRefreshTokenStore::new().with_clock(std::sync::Arc::new(
+        axess_clock::testing::MockClock::at(login_time()),
+    ))
 }
 
 async fn issue_at_login(store: &MemoryRefreshTokenStore, rng: &MockRng) -> String {
@@ -39,7 +47,7 @@ fn authn_time_of(session: &SessionData) -> DateTime<Utc> {
 
 #[tokio::test]
 async fn refreshed_session_keeps_the_login_time_across_a_long_rotation_chain() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store_at_login();
     let config = test_config();
     let rng = MockRng::new(7);
     let mut plaintext = issue_at_login(&store, &rng).await;
@@ -66,7 +74,7 @@ async fn refreshed_session_keeps_the_login_time_across_a_long_rotation_chain() {
 
 #[tokio::test]
 async fn a_row_without_authn_time_reads_as_its_issue_time() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store_at_login();
     let config = test_config();
     let rng = MockRng::new(8);
     let plaintext = issue_at_login(&store, &rng).await;

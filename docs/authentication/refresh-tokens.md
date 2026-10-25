@@ -63,7 +63,8 @@ token issued at login), so a 29-day-old refresh chain does not pass a
 "recent login" or step-up freshness check. Rotation copies the value from
 parent to child; a store must persist it.
 
-`token_hash` is the SHA-256 hash of the token string, not the string
+`token_hash` is the SHA-256 hash of the token string (HMAC-SHA256
+under the configured pepper when there is one), not the string
 itself. The plaintext token is generated when the token is issued
 (through `SecureRng` for DST), returned to the client once, and never
 stored. The hash is what lives in the database. A database breach that
@@ -178,7 +179,7 @@ pub struct RefreshTokenConfig {
     pub ttl: Duration,
     pub max_per_user: usize,
     pub rotation: bool,
-    pub hash_pepper: Option<Vec<u8>>,
+    pub hash_pepper: Option<Zeroizing<Vec<u8>>>,
 }
 ```
 
@@ -209,7 +210,8 @@ normal use. The recommendation is to leave rotation on; the
 performance cost is negligible.
 
 `hash_pepper` is the optional shared secret used to HMAC the token
-hash. Adding a pepper is a defence-in-depth measure that helps when
+hash, held in `zeroize::Zeroizing` so each copy of the config wipes it
+when dropped. Adding a pepper is a defence-in-depth measure that helps when
 the database is breached but the secrets manager is not. The pepper
 must be stable across the deployment (otherwise existing tokens
 become unverifiable); rotation is supported through the same pattern

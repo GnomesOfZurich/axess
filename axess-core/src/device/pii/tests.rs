@@ -374,3 +374,67 @@ fn parse_refuses_non_canonical_uuid_spellings() {
         assert!(!PiiToken::is_well_formed(&bad));
     }
 }
+
+/// Tokens come from the injected RNG: the same seed mints the same token
+/// sequence, and the token is the v4 UUID built from the RNG's first 16
+/// bytes.
+#[tokio::test]
+async fn tokens_follow_the_injected_rng() {
+    use axess_rng::SecureRng;
+    use axess_rng::testing::MockRng;
+    let mint = |seed| MemoryDevicePiiStore::new().with_rng(std::sync::Arc::new(MockRng::new(seed)));
+    let record = |store: MemoryDevicePiiStore| async move {
+        store
+            .record(
+                &user("u"),
+                &tenant("t"),
+                DevicePiiCategory::DisplayName,
+                "v".into(),
+                Utc::now(),
+            )
+            .await
+            .unwrap()
+    };
+    let (a, b, c) = (
+        record(mint(5)).await,
+        record(mint(5)).await,
+        record(mint(6)).await,
+    );
+    assert_eq!(a, b);
+    assert_ne!(a, c);
+
+    let mut bytes = [0u8; 16];
+    MockRng::new(5).fill_bytes(&mut bytes);
+    let expected = uuid::Builder::from_random_bytes(bytes).into_uuid();
+    assert_eq!(a, PiiToken::from_uuid(expected));
+    assert!(PiiToken::is_well_formed(a.as_str()));
+}
+
+/// The portability export lists mappings oldest first, whatever order the
+/// map iterates in.
+#[tokio::test]
+async fn list_for_subject_is_ordered_by_creation_time() {
+    use chrono::{Duration, TimeZone};
+    let store = MemoryDevicePiiStore::new();
+    let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    // Recorded newest first so insertion order is the reverse of age.
+    for i in (0..40i64).rev() {
+        store
+            .record(
+                &user("u"),
+                &tenant("t"),
+                DevicePiiCategory::DisplayName,
+                format!("v{i}"),
+                base + Duration::minutes(i),
+            )
+            .await
+            .unwrap();
+    }
+    let rows = store
+        .list_for_subject(&user("u"), &tenant("t"))
+        .await
+        .unwrap();
+    let values: Vec<String> = rows.into_iter().map(|m| m.value).collect();
+    let expected: Vec<String> = (0..40).map(|i| format!("v{i}")).collect();
+    assert_eq!(values, expected);
+}

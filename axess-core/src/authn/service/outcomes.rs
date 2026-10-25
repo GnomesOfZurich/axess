@@ -32,7 +32,7 @@ pub enum LoginOutcome {
     /// ([`SessionLayer::with_device_resolver`](crate::session::SessionLayer::with_device_resolver))
     /// and the application substitutes the outcome per the wiring
     /// pattern documented on
-    /// [`decide_step_up`](crate::authn::service::step_up::decide_step_up).
+    /// [`decide_step_up_for_user`](crate::authn::service::step_up::decide_step_up_for_user).
     ///
     /// `allowed_factors` is the set the application may accept as
     /// proof of step-up (typical: `[Fido2, Totp]`, a possession

@@ -295,16 +295,15 @@ asked to re-prove identity (or to prove with a stronger factor) before
 performing a sensitive action. Axess models this by transitioning the
 state from `Authenticated` back to `Authenticating` with a non-empty
 `remaining` list. There is no `require_step_up` orchestrator method.
-What axess ships is the decision, not the transition: `decide_step_up`
-is a free function over a `Device` and a `StepUpPolicy`, returning
-`Some(factors)` when the device's trust level calls for them and `None`
-when it does not. `StepUpPolicy` is a factor list per `DeviceTrustLevel`:
-`unknown` and `seen` demand factors by default, `trusted` and
-`revoked` demand none. When the device was found before the user was
-known, use `decide_step_up_for_user`, which treats a device owned by a
-different user as `Unknown`, so trust earned by one person never
-carries over to another. `begin_login` surfaces the answer as
-`LoginOutcome::StepUpRequired { device_id, allowed_factors }`.
+What axess ships is the decision, not the transition:
+`decide_step_up_for_user` is a free function over a `Device`, the user
+logging in and a `StepUpPolicy`, returning `Some(factors)` when the
+device's trust level calls for them and `None` when it does not.
+`StepUpPolicy` is a factor list per `DeviceTrustLevel`: `unknown` and
+`seen` demand factors by default, `trusted` and `revoked` demand none.
+A device owned by a different user counts as `Unknown`, so trust earned
+by one person never carries over to another. `begin_login` surfaces the
+answer as `LoginOutcome::StepUpRequired { device_id, allowed_factors }`.
 
 Driving the session back into `Authenticating` with that list is the
 caller's step.

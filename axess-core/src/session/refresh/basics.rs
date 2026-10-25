@@ -3,9 +3,9 @@
 //! private helpers `hash_token` and `collect_family_device_targets`
 //! remain in scope.
 
-use super::test_support::{fixture_tenant, fixture_user, now, test_config};
+use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
-use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
+use crate::testing::mock_random::MockRng;
 
 /// Pins the `expires_at = issued_at + ttl` invariant on freshly issued
 /// tokens. `expired_token_rejected` does not pin this: a `+`-to-`-`
@@ -15,7 +15,7 @@ use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
 /// invariant assertion closes that gap.
 #[tokio::test]
 async fn issued_token_expires_after_issuance() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(123);
     let ts = now();
@@ -55,7 +55,7 @@ async fn issued_token_expires_after_issuance() {
 
 #[tokio::test]
 async fn issue_and_refresh_roundtrip() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(42);
     let ts = now();
@@ -94,7 +94,7 @@ async fn issue_and_refresh_roundtrip() {
 
 #[tokio::test]
 async fn expired_token_rejected() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         ttl: Duration::seconds(1),
         ..test_config()
@@ -127,7 +127,7 @@ async fn expired_token_rejected() {
 
 #[tokio::test]
 async fn revoked_token_rejected() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         rotation: false,
         ..test_config()
@@ -162,7 +162,7 @@ async fn revoked_token_rejected() {
 
 #[tokio::test]
 async fn rotation_invalidates_old_token() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         rotation: true,
         ..test_config()
@@ -239,9 +239,9 @@ async fn hash_token_pepper_branch_covered() {
         tenant: &TenantId,
         ts: DateTime<Utc>,
     ) -> String {
-        let store = MemoryRefreshTokenStore::new();
+        let store = store();
         let config = RefreshTokenConfig {
-            hash_pepper: pepper,
+            hash_pepper: pepper.map(zeroize::Zeroizing::new),
             ..test_config()
         };
         let rng = MockRng::new(seed);
@@ -311,7 +311,7 @@ async fn hash_token_pepper_branch_covered() {
 /// the threat model findable when SOC engineers grep the codebase.
 #[tokio::test]
 async fn replayed_rotated_token_revokes_entire_family() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         rotation: true,
         ..test_config()
@@ -361,7 +361,7 @@ async fn replayed_rotated_token_revokes_entire_family() {
 
 #[tokio::test]
 async fn max_per_user_enforced() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         max_per_user: 2,
         rotation: false,
@@ -433,7 +433,7 @@ async fn max_per_user_enforced() {
 
 #[tokio::test]
 async fn revoke_user_tokens_clears_all() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         rotation: false,
         ..test_config()
@@ -487,7 +487,7 @@ async fn revoke_user_tokens_clears_all() {
 
 #[tokio::test]
 async fn device_binding_mismatch_rejected() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = RefreshTokenConfig {
         rotation: false,
         ..test_config()

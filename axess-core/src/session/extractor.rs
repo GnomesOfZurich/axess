@@ -108,8 +108,14 @@ impl AuthSession {
     }
 
     /// Return the session ID.
+    ///
+    /// Reading the id marks the session as needed beyond this request, so a
+    /// cookieless request that keys something on the id still gets a stored
+    /// session and a cookie.
     pub async fn session_id(&self) -> SessionId {
-        self.0.0.read().await.id
+        let mut guard = self.0.0.write().await;
+        guard.needs_persist = true;
+        guard.id
     }
 
     /// Return the resolved [`crate::authn::ids::DeviceId`] for this session, if the device
@@ -503,14 +509,18 @@ impl AuthSession {
     pub async fn set_custom(&self, key: impl Into<String>, value: serde_json::Value) -> bool {
         let mut guard = self.0.0.write().await;
         let key = key.into();
+        // The bag is an object; one that was stored as another JSON type is
+        // replaced by an empty object, as `mutate_custom` does, rather than
+        // indexed (which panics on an array or a scalar).
+        if !guard.data.custom.is_object() {
+            guard.data.custom = serde_json::Value::Object(serde_json::Map::new());
+        }
         let limit = guard.max_custom_bytes;
         if limit > 0 {
             // Speculatively apply the change, check size, and rollback if over limit.
             let prev = guard.data.custom.get(&key).cloned();
             guard.data.custom[key.clone()] = value;
-            let size = serde_json::to_vec(&guard.data.custom)
-                .map(|v| v.len())
-                .unwrap_or(0);
+            let size = crate::session::data::json_byte_len(&guard.data.custom);
             if size > limit {
                 // Rollback.
                 match prev {

@@ -82,14 +82,12 @@ fn sign_jwt(private_der: &[u8], kid: &str, claims: &serde_json::Value) -> String
 }
 
 fn make_config(jwks: JwkSet) -> BearerConfig {
-    BearerConfig {
-        issuers: vec![BearerIssuerConfig {
-            issuer: "https://accounts.example.com".to_string(),
-            audience: Some("my-service".to_string()),
-            jwks: Arc::new(jwks),
-            extra_claims: vec!["namespace".to_string()],
-        }],
-    }
+    BearerConfig::new(vec![BearerIssuerConfig {
+        issuer: "https://accounts.example.com".to_string(),
+        audience: Some("my-service".to_string()),
+        jwks: Arc::new(jwks),
+        extra_claims: vec!["namespace".to_string()],
+    }])
 }
 
 fn valid_claims() -> serde_json::Value {
@@ -278,4 +276,91 @@ fn extra_claims_only_captures_configured_keys() {
         Some(&"staging".to_string())
     );
     assert!(!identity.claims.contains_key("secret_field"));
+}
+
+// ── injected clock ───────────────────────────────────────────────────
+
+/// 2020-09-13T12:26:40Z, years before any real wall clock this suite runs on.
+const MOCK_EPOCH: i64 = 1_600_000_000;
+
+fn mock_clock() -> Arc<axess_clock::testing::MockClock> {
+    use chrono::TimeZone;
+    Arc::new(axess_clock::testing::MockClock::at(
+        chrono::Utc.timestamp_opt(MOCK_EPOCH, 0).unwrap(),
+    ))
+}
+
+fn claims_expiring_at(exp: i64) -> serde_json::Value {
+    serde_json::json!({
+        "iss": "https://accounts.example.com",
+        "sub": "worker",
+        "aud": "my-service",
+        "exp": exp,
+        "nbf": exp - 300,
+    })
+}
+
+#[test]
+fn token_is_judged_against_the_injected_clock_not_the_wall_clock() {
+    let (private_der, jwks, kid) = rsa_keypair();
+    let clock = mock_clock();
+    let config = make_config(jwks).with_clock(clock.clone());
+    // `exp` is years in the real past: the wall clock would call it expired.
+    let token = sign_jwt(&private_der, &kid, &claims_expiring_at(MOCK_EPOCH + 300));
+    let header = format!("Bearer {token}");
+
+    let identity = validate_bearer_token(Some(&header), &config)
+        .expect("a token inside its life on the injected clock is accepted")
+        .expect("identity");
+    assert_eq!(identity.subject, "worker");
+
+    // Past `exp` plus the 60 s default leeway.
+    clock.advance_secs(300 + 61);
+    let result = validate_bearer_token(Some(&header), &config);
+    assert!(
+        matches!(&result, Err(BearerError::Jwt(e)) if e.to_string().contains("token expired")),
+        "advancing the injected clock past exp must expire the token: {result:?}"
+    );
+}
+
+#[test]
+fn nbf_is_judged_against_the_injected_clock() {
+    let (private_der, jwks, kid) = rsa_keypair();
+    let clock = mock_clock();
+    let config = make_config(jwks).with_clock(clock.clone());
+    let mut claims = claims_expiring_at(MOCK_EPOCH + 3600);
+    claims["nbf"] = serde_json::json!(MOCK_EPOCH + 600);
+    let header = format!("Bearer {}", sign_jwt(&private_der, &kid, &claims));
+
+    let early = validate_bearer_token(Some(&header), &config);
+    assert!(
+        matches!(&early, Err(BearerError::Jwt(e)) if e.to_string().contains("not yet valid")),
+        "nbf in the injected future must be refused: {early:?}"
+    );
+
+    clock.advance_secs(600);
+    assert!(
+        validate_bearer_token(Some(&header), &config)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn layer_clock_replaces_the_configured_clock() {
+    let (private_der, jwks, kid) = rsa_keypair();
+    let config = make_config(jwks);
+    let token = sign_jwt(&private_der, &kid, &claims_expiring_at(MOCK_EPOCH + 300));
+    let header = format!("Bearer {token}");
+
+    assert!(
+        validate_bearer_token(Some(&header), &config).is_err(),
+        "the default system clock sees this token as long expired"
+    );
+    let layer = BearerTokenLayer::new(config).with_clock(mock_clock());
+    assert!(
+        validate_bearer_token(Some(&header), &layer.config)
+            .unwrap()
+            .is_some()
+    );
 }

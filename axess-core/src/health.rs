@@ -67,8 +67,19 @@ impl CompositeStatus {
     ///
     /// Use this for external-facing endpoints to avoid leaking infrastructure
     /// information (component names, error messages) to unauthenticated callers.
+    ///
+    /// The message is fixed text: it never names a component or repeats a
+    /// component's own message.
     pub fn for_external(&self) -> HealthStatus {
-        self.worst()
+        match self.worst() {
+            HealthStatus::Healthy => HealthStatus::Healthy,
+            HealthStatus::Degraded(_) => {
+                HealthStatus::Degraded("one or more components degraded".to_string())
+            }
+            HealthStatus::Unhealthy(_) => {
+                HealthStatus::Unhealthy("one or more components unhealthy".to_string())
+            }
+        }
     }
 
     /// Returns the worst status across all components.
@@ -188,6 +199,20 @@ mod tests {
         assert!(!status.is_healthy());
         assert!(status.has_unhealthy());
         assert!(status.worst().is_unhealthy());
+    }
+
+    #[tokio::test]
+    async fn for_external_names_no_component() {
+        let status = CompositeHealthCheck::new()
+            .add("postgres-primary", AlwaysUnhealthy)
+            .check_all()
+            .await;
+        assert_eq!(
+            status.for_external(),
+            HealthStatus::Unhealthy("one or more components unhealthy".to_string())
+        );
+        let shown = format!("{:?}", status.for_external());
+        assert!(!shown.contains("postgres") && !shown.contains("down"));
     }
 
     #[tokio::test]

@@ -58,9 +58,9 @@ impl DeviceStore for HookedStore {
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         self.inner.find_by_refresh_family(t, f)
     }
-    async fn save(&self, d: &Device) -> Result<(), Self::Error> {
+    async fn save(&self, d: &Device, now: DateTime<Utc>) -> Result<(), Self::Error> {
         fire(&self.before_write).await;
-        self.inner.save(d).await
+        self.inner.save(d, now).await
     }
     fn record_sighting(
         &self,
@@ -107,6 +107,7 @@ fn device(level: DeviceTrustLevel) -> Device {
         first_seen_at: now(),
         last_seen_at: now(),
         revoked_at: None,
+        demoted_at: None,
         bindings: Vec::new(),
     }
 }
@@ -115,7 +116,11 @@ fn device(level: DeviceTrustLevel) -> Device {
 async fn setup() -> (CachedDeviceStore<HookedStore>, HookedStore, Device) {
     let hooked = HookedStore::default();
     let d = device(DeviceTrustLevel::Trusted);
-    hooked.inner.save(&d).await.unwrap();
+    hooked
+        .inner
+        .save(&d, crate::device::test_now())
+        .await
+        .unwrap();
     let cached =
         CachedDeviceStore::new(hooked.clone()).with_clock(Arc::new(MockClock::at(now())) as _);
     (cached, hooked, d)
@@ -149,7 +154,10 @@ async fn save_is_not_undone_by_a_load_during_the_write() {
     *hooked.before_write.lock().unwrap() = Some(reader(&cached, &d));
     let mut revoked = d.clone();
     revoked.trust_level = DeviceTrustLevel::Revoked;
-    cached.save(&revoked).await.unwrap();
+    cached
+        .save(&revoked, crate::device::test_now())
+        .await
+        .unwrap();
     let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
     assert_eq!(seen.trust_level, DeviceTrustLevel::Revoked);
 }
@@ -191,7 +199,11 @@ async fn sweep_drops_cached_rows_of_the_tenant() {
         ..HookedStore::default()
     };
     let d = device(DeviceTrustLevel::Trusted);
-    hooked.inner.save(&d).await.unwrap();
+    hooked
+        .inner
+        .save(&d, crate::device::test_now())
+        .await
+        .unwrap();
     let cached = CachedDeviceStore::new(hooked).with_clock(Arc::new(MockClock::at(now())) as _);
     drop(cached.load(&d.tenant_id, &d.id).await.unwrap());
 
@@ -209,7 +221,11 @@ async fn builders_keep_each_others_settings() {
     let clock = Arc::new(MockClock::at(now()));
     let hooked = HookedStore::default();
     let d = device(DeviceTrustLevel::Trusted);
-    hooked.inner.save(&d).await.unwrap();
+    hooked
+        .inner
+        .save(&d, crate::device::test_now())
+        .await
+        .unwrap();
     let cached = CachedDeviceStore::new(hooked)
         .with_ttl(Duration::from_secs(5))
         .with_capacity(7)
@@ -221,4 +237,41 @@ async fn builders_keep_each_others_settings() {
     clock.advance_secs(3);
     drop(cached.load(&d.tenant_id, &d.id).await.unwrap());
     assert_eq!(cached.stats().hits, 1, "entry expires after the 5 s TTL");
+}
+
+/// The conditional writes drop the cached row like every other write, so
+/// the next load sees the new state rather than a cached Trusted one.
+#[tokio::test]
+async fn conditional_writes_invalidate_the_cached_row() {
+    use crate::device::store::{BindingsUpdate, TrustTransition};
+    let (cached, _hooked, d) = setup().await;
+    let (t, id) = (d.tenant_id, d.id);
+    assert_eq!(
+        cached.load(&t, &id).await.unwrap().unwrap().trust_level,
+        DeviceTrustLevel::Trusted
+    );
+
+    let got = cached
+        .set_trust_level_if(
+            &t,
+            &id,
+            DeviceTrustLevel::Trusted,
+            DeviceTrustLevel::Revoked,
+            now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got, TrustTransition::Applied);
+    assert_eq!(
+        cached.load(&t, &id).await.unwrap().unwrap().trust_level,
+        DeviceTrustLevel::Revoked,
+        "a cached Trusted row must not outlive the revocation"
+    );
+    assert_eq!(
+        cached
+            .replace_bindings(&t, &id, &[], &[], crate::device::test_now())
+            .await
+            .unwrap(),
+        BindingsUpdate::Revoked
+    );
 }

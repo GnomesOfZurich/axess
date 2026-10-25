@@ -379,7 +379,7 @@ mod signing_helpers_tests {
     //! pure-function bodies. The encode/decode pair must round-trip a
     //! known `SessionId` and reject malformed inputs.
     use super::*;
-    use axess_rng::SystemRng;
+    use axess_rng::testing::MockRng;
 
     fn fixture_key() -> [u8; 32] {
         [0xA5; 32]
@@ -422,7 +422,7 @@ mod signing_helpers_tests {
     #[test]
     fn decode_cookie_round_trips_a_signed_cookie() {
         let key = fixture_key();
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
         let id_enc = URL_SAFE_NO_PAD.encode(id.as_bytes());
         let mac_enc = sign_bytes(id.as_bytes(), &key);
         let cookie = format!("{id_enc}.{mac_enc}");
@@ -514,7 +514,7 @@ mod rotation_tests {
     //! This is the correct security behavior documented in
     //! `OPERATIONS.md#signing-key-rotation`.
     use super::*;
-    use axess_rng::SystemRng;
+    use axess_rng::testing::MockRng;
 
     /// Craft a signed cookie under a given master's derived cookie
     /// sub-key. Helper mirrors what a real request cookie would carry.
@@ -531,7 +531,7 @@ mod rotation_tests {
     fn no_rotation_verifies_current_and_flags_no_fallback() {
         let master = [0xAA; 32];
         let ring = SigningKeyRing::from_master(master);
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(master, id);
 
         let out = ring
@@ -554,7 +554,7 @@ mod rotation_tests {
             current: SigningKeys::from_master(current),
             previous: Some(SigningKeys::from_master(previous)),
         };
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(current, id);
 
         let out = ring
@@ -578,7 +578,7 @@ mod rotation_tests {
             current: SigningKeys::from_master(current),
             previous: Some(SigningKeys::from_master(previous)),
         };
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(previous, id);
 
         let out = ring
@@ -603,7 +603,7 @@ mod rotation_tests {
             current: SigningKeys::from_master(current),
             previous: Some(SigningKeys::from_master(previous)),
         };
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
         let cookie = cookie_signed_by(unknown, id);
 
         assert!(
@@ -629,7 +629,7 @@ mod rotation_tests {
             previous: Some(SigningKeys::from_master(k1)),
         };
 
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
         let cookie_from_k0 = cookie_signed_by(k0, id);
 
         assert!(
@@ -671,7 +671,7 @@ mod rotation_tests {
     fn ring_clear_previous_ends_rotation_window() {
         let old = [0xAA; 32];
         let new = [0xBB; 32];
-        let id = SessionId::new(&SystemRng);
+        let id = SessionId::new(&MockRng::new(1));
 
         let mut ring = SigningKeyRing::from_master(new);
         ring.set_previous(old);

@@ -319,7 +319,12 @@ impl AuthEventBuilder {
         self
     }
 
-    /// Consume the builder and produce an [`AuthEvent`] timestamped now.
+    /// Consume the builder and produce an [`AuthEvent`] timestamped with the
+    /// system clock.
+    ///
+    /// Code that holds a [`Clock`](axess_clock::Clock) or a `now` calls
+    /// [`build_at`](Self::build_at) instead, so the event time follows the
+    /// injected time.
     pub fn build(self) -> AuthEvent {
         self.build_at(Utc::now())
     }

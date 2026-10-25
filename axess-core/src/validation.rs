@@ -52,6 +52,21 @@ pub fn is_valid_password(
     true
 }
 
+/// Validate a password against a tenant's [`PasswordRules`](crate::authn::factor::PasswordRules):
+/// the minimum length and each complexity requirement the rules switch on.
+/// History reuse (`history_count`) needs the stored hashes and is checked by
+/// the service, not here.
+pub fn meets_password_rules(password: &str, rules: &crate::authn::factor::PasswordRules) -> bool {
+    is_valid_password(
+        password,
+        rules.min_length,
+        rules.require_uppercase,
+        rules.require_lowercase,
+        rules.require_digit,
+        rules.require_special,
+    )
+}
+
 /// Basic regex validation of email addresses (not fully RFC 5322 compliant).
 pub fn is_valid_email(email: &str) -> bool {
     if email.len() > 254 {

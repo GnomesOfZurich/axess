@@ -35,6 +35,7 @@ use crate::device::resolver::{DeviceResolver, ErasedDeviceResolver};
 use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
 use crate::session::store::SessionStore;
+use axess_rng::{SecureRng, SystemRng};
 use signing::SigningKeyRing;
 use std::{sync::Arc, time::Duration};
 use tower_cookies::cookie::SameSite;
@@ -73,6 +74,9 @@ pub struct SessionLayer<S> {
     pub(super) config: Arc<SessionConfig>,
     pub(super) binding: Option<Arc<dyn SessionBinding>>,
     pub(super) metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    /// Source of every session id the layer mints (new sessions and
+    /// rotations). Defaults to [`SystemRng`]; see [`with_rng`](Self::with_rng).
+    pub(super) rng: Arc<dyn SecureRng>,
     /// Optional device resolver invoked once per request between
     /// session-data load and the inner handler. Stamps
     /// [`SessionData::device_id`](crate::session::SessionData::device_id)
@@ -123,6 +127,7 @@ impl<S: SessionStore> SessionLayer<S> {
             config: Arc::new(SessionConfig::default()),
             binding: None,
             metrics: None,
+            rng: Arc::new(SystemRng),
             #[cfg(feature = "device")]
             device_resolver: None,
         }
@@ -334,6 +339,18 @@ impl<S: SessionStore> SessionLayer<S> {
     /// ```
     pub fn with_binding(mut self, binding: impl SessionBinding) -> Self {
         self.binding = Some(Arc::new(binding));
+        self
+    }
+
+    /// Replace the RNG that mints session ids (default: [`SystemRng`]).
+    ///
+    /// Every id the layer creates draws from it: the id of a request that
+    /// arrives without a trusted session, the replacement id after a
+    /// rotation (login, step-up completion, regenerate), and the id minted
+    /// when a binding mismatch resets a session. A seeded RNG makes the
+    /// whole sequence reproducible.
+    pub fn with_rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
         self
     }
 

@@ -65,9 +65,11 @@ where
         // the provider has a PAR endpoint and the caller hasn't opted out.
         let used_par = provider.fapi_config().is_some();
         let (auth_url, csrf_state, nonce, pkce_verifier) = if used_par {
-            provider.build_auth_url_par(options).await?
+            provider
+                .build_auth_url_par(options, &*self.inner.rng)
+                .await?
         } else {
-            provider.build_auth_url(options)?
+            provider.build_auth_url(options, &*self.inner.rng)?
         };
 
         if used_par {

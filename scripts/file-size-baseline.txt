@@ -1,0 +1,13 @@
+# axess file-size baseline: written by `scripts/check-file-sizes.sh --bless`, not by hand.
+# Production files over 800 lines and production functions over 150 lines that
+# already existed when the gate was introduced. The gate fails on any offender
+# not listed here and on any listed offender that grew; shrink them and
+# re-bless so the numbers only go down.
+# format: kind<TAB>lines<TAB>path<TAB>function (functions only)
+file	967	axess-core/src/authn/service/login.rs
+file	1015	axess-core/src/authn/store.rs
+file	984	axess-core/src/device/storage/valkey.rs
+file	921	axess-core/src/device/store.rs
+file	932	axess-core/src/middleware/csrf.rs
+fn	166	axess-core/src/authn/service/fido2_service.rs	finish_discoverable_login
+fn	163	axess-core/src/authn/service/oauth_service/login/finish.rs	finish_oauth_login

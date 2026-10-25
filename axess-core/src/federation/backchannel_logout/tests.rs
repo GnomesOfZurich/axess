@@ -44,7 +44,7 @@ fn setup() -> (
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
-        Arc::new(DashMap::new()),
+        SidMap::new(),
         Arc::new(SystemClock),
     )
     .expect("handler should be created");
@@ -302,7 +302,7 @@ async fn future_iat_rejected() {
 #[tokio::test]
 async fn sid_only_logout_invalidates_session() {
     let registry = MemorySessionRegistry::new();
-    let sid_map: SidMap = Arc::new(DashMap::new());
+    let sid_map: SidMap = SidMap::new();
 
     let rng = MockRng::new(42);
     let session_id = SessionId::new(&rng);
@@ -314,7 +314,7 @@ async fn sid_only_logout_invalidates_session() {
         "https://test-idp.example.com".to_string(),
         "oidc-sid-abc".to_string(),
     );
-    sid_map.insert(key.clone(), (user_id, session_id, chrono::Utc::now()));
+    sid_map.insert(key.clone(), user_id, session_id, chrono::Utc::now());
 
     let providers: Vec<Arc<dyn OAuthProvider>> =
         vec![Arc::new(MockOAuthProvider::new("test-idp").with_user(
@@ -340,7 +340,7 @@ async fn sid_only_logout_invalidates_session() {
     assert_eq!(claims.sid.as_deref(), Some("oidc-sid-abc"));
 
     // Simulate the handler's sid-based invalidation.
-    if let Some((_, (uid, sid, _))) = handler.sid_map.remove(&key) {
+    if let Some((uid, sid, _)) = handler.sid_map.remove(&key) {
         handler.registry.invalidate_session(&uid, &sid).await;
     }
 
@@ -442,7 +442,7 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
             vec![],
             vec![],
         ))];
-    let sid_map: SidMap = Arc::new(DashMap::new());
+    let sid_map: SidMap = SidMap::new();
     let handler = BackChannelLogoutHandler::new(
         &providers,
         Arc::new(SessionRegistryAdapter(registry.clone())),
@@ -459,7 +459,9 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
     registry.register(&user_id, &session_id).await.unwrap();
     sid_map.insert(
         (ISS.to_string(), "some-sid".to_string()),
-        (user_id, session_id, chrono::Utc::now()),
+        user_id,
+        session_id,
+        chrono::Utc::now(),
     );
     assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
@@ -554,7 +556,7 @@ fn handler_with(registry: &MemorySessionRegistry, sid_map: SidMap) -> BackChanne
 #[tokio::test]
 async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
     let registry = MemorySessionRegistry::new();
-    let sid_map: SidMap = Arc::new(DashMap::new());
+    let sid_map: SidMap = SidMap::new();
     let handler = handler_with(&registry, sid_map.clone());
     let rng = MockRng::new(7);
     let session_id = SessionId::new(&rng);
@@ -563,7 +565,9 @@ async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
     // The victim signed in through a different issuer.
     sid_map.insert(
         ("https://other-idp.example.com".to_string(), "s".to_string()),
-        (victim, session_id, chrono::Utc::now()),
+        victim,
+        session_id,
+        chrono::Utc::now(),
     );
 
     let token = raw_token(serde_json::json!({ "sub": victim.to_string(), "jti": "j1" }));
@@ -576,7 +580,7 @@ async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
 #[tokio::test]
 async fn non_uuid_sub_does_not_block_sid_logout() {
     let registry = MemorySessionRegistry::new();
-    let sid_map: SidMap = Arc::new(DashMap::new());
+    let sid_map: SidMap = SidMap::new();
     let handler = handler_with(&registry, sid_map.clone());
     let rng = MockRng::new(8);
     let session_id = SessionId::new(&rng);
@@ -584,7 +588,9 @@ async fn non_uuid_sub_does_not_block_sid_logout() {
     registry.register(&user, &session_id).await.unwrap();
     sid_map.insert(
         (ISS.to_string(), "sid-1".to_string()),
-        (user, session_id, chrono::Utc::now()),
+        user,
+        session_id,
+        chrono::Utc::now(),
     );
 
     let token = raw_token(serde_json::json!({
@@ -598,7 +604,39 @@ async fn non_uuid_sub_does_not_block_sid_logout() {
 #[tokio::test]
 async fn logout_token_without_jti_is_rejected() {
     let registry = MemorySessionRegistry::new();
-    let handler = handler_with(&registry, Arc::new(DashMap::new()));
+    let handler = handler_with(&registry, SidMap::new());
     let token = raw_token(serde_json::json!({ "sid": "sid-1" }));
     assert_eq!(post(&handler, token).await, Err(StatusCode::BAD_REQUEST));
+}
+
+/// A `sub` ends only the sessions the sending issuer established; a
+/// session of the same user from another login path survives.
+#[tokio::test]
+async fn sub_ends_only_the_sessions_the_issuer_established() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map: SidMap = SidMap::new();
+    let handler = handler_with(&registry, sid_map.clone());
+    let rng = MockRng::new(9);
+    let via_issuer = SessionId::new(&rng);
+    let via_other_issuer = SessionId::new(&rng);
+    let via_password = SessionId::new(&rng);
+    let user = axess_identity::testing::user("user-123");
+    for id in [&via_issuer, &via_other_issuer, &via_password] {
+        registry.register(&user, id).await.unwrap();
+    }
+    let now = chrono::Utc::now();
+    sid_map.insert((ISS.to_string(), "a".into()), user, via_issuer, now);
+    sid_map.insert(
+        ("https://other-idp.example.com".to_string(), "b".into()),
+        user,
+        via_other_issuer,
+        now,
+    );
+
+    let token = raw_token(serde_json::json!({ "sub": user.to_string(), "jti": "j9" }));
+    assert_eq!(post(&handler, token).await, Ok(StatusCode::OK));
+
+    assert!(!registry.is_valid(&user, &via_issuer).await.unwrap());
+    assert!(registry.is_valid(&user, &via_other_issuer).await.unwrap());
+    assert!(registry.is_valid(&user, &via_password).await.unwrap());
 }

@@ -75,9 +75,10 @@ where
     /// returned JWT in the `DPoP` header. The `thumbprint` should match the
     /// `jkt` claim in the sender-constrained access token.
     ///
-    /// The 32 bytes used to derive the ephemeral ES256 key are
-    /// drawn from the service's injected [`SecureRng`](axess_rng::SecureRng), so DST tests get
-    /// reproducible DPoP keys instead of `OsRng`.
+    /// The 32 bytes that derive the ephemeral ES256 key, then the 16 bytes
+    /// behind the `jti`, are drawn from the service's injected
+    /// [`SecureRng`](axess_rng::SecureRng), and `iat` is read from its
+    /// injected clock, so DST tests get reproducible proofs.
     ///
     /// Requires the `fapi` feature.
     #[cfg(feature = "fapi")]
@@ -99,6 +100,17 @@ where
         let mut key_seed = [0u8; 32];
         self.inner.rng.fill_bytes(&mut key_seed);
 
-        provider.generate_dpop_proof(http_method, http_url, access_token, key_seed)
+        let mut jti_bytes = [0u8; 16];
+        self.inner.rng.fill_bytes(&mut jti_bytes);
+        let iat = self.inner.clock.now().timestamp();
+
+        provider.generate_dpop_proof(
+            http_method,
+            http_url,
+            access_token,
+            key_seed,
+            iat,
+            jti_bytes,
+        )
     }
 }

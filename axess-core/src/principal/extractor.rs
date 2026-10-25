@@ -221,8 +221,10 @@ mod tests {
             id: SessionId::new(&SystemRng),
             data,
             modified: false,
+            needs_persist: false,
             regenerate: false,
             pre_cycle_id: None,
+            rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
         };

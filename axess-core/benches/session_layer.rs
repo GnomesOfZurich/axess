@@ -103,15 +103,23 @@ fn bench_session_crypto(c: &mut Criterion) {
 
     c.bench_function("session_encrypt_aes256gcm", |b| {
         b.iter(|| {
-            black_box(crypto.encrypt(black_box(&plaintext)).unwrap());
+            black_box(
+                crypto
+                    .encrypt_with_aad(b"bench", black_box(&plaintext))
+                    .unwrap(),
+            );
         })
     });
 
-    let encrypted = crypto.encrypt(&plaintext).unwrap();
+    let encrypted = crypto.encrypt_with_aad(b"bench", &plaintext).unwrap();
 
     c.bench_function("session_decrypt_aes256gcm", |b| {
         b.iter(|| {
-            black_box(crypto.decrypt(black_box(&encrypted)).unwrap());
+            black_box(
+                crypto
+                    .decrypt_with_aad(b"bench", black_box(&encrypted))
+                    .unwrap(),
+            );
         })
     });
 }

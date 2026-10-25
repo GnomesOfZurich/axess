@@ -4,6 +4,8 @@ Demonstrates the Axess authorization layer in isolation. No database, no session
 
 If you want to understand how Cedar policies work with Axess before integrating authentication, start here.
 
+**What to copy and what not to.** The policies, the schema and the entity provider are the reusable part. The acting user in the URL path and the `?mfa=true` flag are demo inputs so `curl` can drive the policies; both are chosen by the caller. In a service the principal comes from the authenticated session and the MFA fact from that session's verified factors, never from the request.
+
 ## Scenario
 
 A document management system with three users and three authorization patterns working together.

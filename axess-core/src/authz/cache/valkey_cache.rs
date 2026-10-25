@@ -333,15 +333,10 @@ where
             // role still cached) is invisible to schema validation
             // regardless.
             match self.client.get::<Option<String>, _>(&key).await {
-                Ok(Some(json_str)) => match serde_json::from_str::<serde_json::Value>(&json_str) {
-                    Ok(json) => match Entities::from_json_value(json, None) {
-                        Ok(entities) => return Ok(entities),
-                        Err(e) => {
-                            warn!(?e, key = %key, "valkey cache: Entities::from_json_value failed; treating as miss");
-                        }
-                    },
+                Ok(Some(json_str)) => match Entities::from_json_str(&json_str, None) {
+                    Ok(entities) => return Ok(entities),
                     Err(e) => {
-                        warn!(?e, key = %key, "valkey cache: serde_json parse failed; treating as miss");
+                        warn!(?e, key = %key, "valkey cache: Entities::from_json_str failed; treating as miss");
                     }
                 },
                 Ok(None) => {} // miss; fall through
@@ -358,8 +353,9 @@ where
 
             // Best-effort populate. Failure to write is a warn, not a hard
             // error; the request already has its answer.
-            match entities.to_json_value() {
-                Ok(json) => match serde_json::to_string(&json) {
+            let mut buf = Vec::new();
+            match entities.write_to_json(&mut buf) {
+                Ok(()) => match String::from_utf8(buf) {
                     Ok(s) => {
                         let ttl_secs = self.ttl.as_secs().min(i64::MAX as u64) as i64;
                         let res: Result<(), _> = self
@@ -370,9 +366,11 @@ where
                             warn!(?e, key = %key, "valkey cache: SET failed");
                         }
                     }
-                    Err(e) => warn!(?e, key = %key, "valkey cache: serde_json serialize failed"),
+                    Err(e) => {
+                        warn!(?e, key = %key, "valkey cache: serialized entities are not UTF-8")
+                    }
                 },
-                Err(e) => warn!(?e, key = %key, "valkey cache: Entities::to_json_value failed"),
+                Err(e) => warn!(?e, key = %key, "valkey cache: Entities::write_to_json failed"),
             }
 
             Ok(entities)

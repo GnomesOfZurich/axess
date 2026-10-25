@@ -1,8 +1,7 @@
 //! Session validity check and the axum middleware that enforces it.
 
-use crate::authn::ids::UserId;
-use crate::authn::store::IdentityStore;
-use crate::authn::types::User;
+use crate::authn::ids::{TenantId, UserId};
+use crate::authn::store::IdentityLookup;
 use crate::session::extractor::AuthSession;
 use crate::session::store::SessionRegistryHandle;
 use axum::response::IntoResponse;
@@ -50,13 +49,13 @@ impl SessionValidator {
                 Some(t) => t,
                 None => return false,
             };
-            match identity.get_user(&user_id).await {
-                Some(user) if user.tenant_id == stated => {}
-                Some(user) => {
+            match identity.get_user_tenant(&user_id).await {
+                Some(actual) if actual == stated => {}
+                Some(actual) => {
                     tracing::warn!(
                         user_id = %user_id,
                         session_tenant = %stated,
-                        actual_tenant = %user.tenant_id,
+                        actual_tenant = %actual,
                         "session tenant_id does not match user's actual tenant; invalidating"
                     );
                     return false;
@@ -103,21 +102,21 @@ pub fn require_valid_session(
 }
 
 pub(super) trait IdentityHandle: Send + Sync + 'static {
-    fn get_user<'a>(
+    fn get_user_tenant<'a>(
         &'a self,
         user_id: &'a UserId,
-    ) -> Pin<Box<dyn Future<Output = Option<User>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Option<TenantId>> + Send + 'a>>;
 }
 
-pub(super) struct IdentityWrapper<I: IdentityStore>(pub(super) Arc<I>);
+pub(super) struct IdentityWrapper<I: IdentityLookup>(pub(super) Arc<I>);
 
-impl<I: IdentityStore + 'static> IdentityHandle for IdentityWrapper<I> {
-    fn get_user<'a>(
+impl<I: IdentityLookup> IdentityHandle for IdentityWrapper<I> {
+    fn get_user_tenant<'a>(
         &'a self,
         user_id: &'a UserId,
-    ) -> Pin<Box<dyn Future<Output = Option<User>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Option<TenantId>> + Send + 'a>> {
         Box::pin(async move {
-            match self.0.get_user(user_id).await {
+            match self.0.get_user_tenant(user_id).await {
                 Ok(opt) => opt,
                 Err(e) => {
                     // Fail closed: store error means tenant consistency cannot
@@ -125,7 +124,7 @@ impl<I: IdentityStore + 'static> IdentityHandle for IdentityWrapper<I> {
                     tracing::warn!(
                         user_id = %user_id,
                         error = %e,
-                        "identity store get_user failed during tenant cross-check"
+                        "identity store get_user_tenant failed during tenant cross-check"
                     );
                     None
                 }
@@ -136,3 +135,6 @@ impl<I: IdentityStore + 'static> IdentityHandle for IdentityWrapper<I> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tenant_lookup;

@@ -4,14 +4,14 @@
 //! against a memory device store transitions the linked devices to
 //! `Revoked`.
 
-use super::test_support::{fixture_tenant, fixture_user, now, test_config};
+use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
 use crate::authn::ids::DeviceId;
 use crate::device::{
     Device, DeviceStore, DeviceTrustLevel, FingerprintHash, MemoryDeviceStore,
     cascade_revoke_devices,
 };
-use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
+use crate::testing::mock_random::MockRng;
 
 fn make_device_id(name: &str) -> DeviceId {
     axess_identity::testing::device(name)
@@ -27,6 +27,7 @@ fn build_trusted_device(tenant: &TenantId, id: &DeviceId, fp: u8, now: DateTime<
         first_seen_at: now,
         last_seen_at: now,
         revoked_at: None,
+        demoted_at: None,
         bindings: Vec::new(),
     }
 }
@@ -39,7 +40,7 @@ fn build_trusted_device(tenant: &TenantId, id: &DeviceId, fp: u8, now: DateTime<
 /// prove the device store reflects the revocation.
 #[tokio::test]
 async fn refresh_compromise_to_device_revocation_full_cascade() {
-    let refresh_store = MemoryRefreshTokenStore::new();
+    let refresh_store = store();
     let device_store = MemoryDeviceStore::new();
     let config = test_config();
     let rng = MockRng::new(201);
@@ -48,7 +49,10 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
     let tenant = fixture_tenant();
     let device_id = make_device_id("dev-cascade");
     device_store
-        .save(&build_trusted_device(&tenant, &device_id, 0xc0, ts))
+        .save(
+            &build_trusted_device(&tenant, &device_id, 0xc0, ts),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
 
@@ -120,7 +124,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
 /// audit events.
 #[tokio::test]
 async fn collect_family_targets_deduplicates_same_device_across_family() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(7);
     let ts = now();
@@ -152,7 +156,7 @@ async fn collect_family_targets_deduplicates_same_device_across_family() {
 
     // Reload the (now-revoked) v1 record so we can call the
     // private collector directly with it.
-    let v1_token_hash = hash_token(&plaintext_v1, config.hash_pepper.as_deref());
+    let v1_token_hash = hash_token(&plaintext_v1, config.pepper());
     let v1_after = store.find_token(&v1_token_hash).await.unwrap().unwrap();
     assert!(v1_after.revoked, "v1 must be revoked after rotation");
 
@@ -186,7 +190,7 @@ async fn collect_family_targets_deduplicates_same_device_across_family() {
 /// total length flips from 1 to 2 and the contents include DB.
 #[tokio::test]
 async fn collect_family_targets_excludes_other_families_for_same_user() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(28);
     let ts = now();
@@ -237,7 +241,7 @@ async fn collect_family_targets_excludes_other_families_for_same_user() {
 
     // Reload record_a as the seen-record (mirrors how the cascade
     // hook invokes the collector after a token reuse is detected).
-    let token_a_hash = hash_token(&plaintext_a, config.hash_pepper.as_deref());
+    let token_a_hash = hash_token(&plaintext_a, config.pepper());
     let seen_a = store.find_token(&token_a_hash).await.unwrap().unwrap();
 
     let targets = collect_family_device_targets(&store, family_a, &seen_a).await;

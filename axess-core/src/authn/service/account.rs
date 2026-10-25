@@ -32,6 +32,7 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
+use std::ops::ControlFlow;
 
 impl<I, F> RequestAuthnService<I, F>
 where
@@ -76,6 +77,103 @@ where
         session.clear().await;
     }
 
+    /// Make a just-authenticated session reachable by the eviction path.
+    ///
+    /// Enforces the concurrent session limit, registers the session and
+    /// re-reads the account status. Breaks with [`FactorOutcome::Locked`]
+    /// (session revoked and cleared) when the account was suspended in the
+    /// meantime; a register failure or a status-read failure clears the
+    /// session and is an error. With no registry configured it does nothing.
+    async fn register_authenticated_session(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        sid: &crate::session::id::SessionId,
+        session: &AuthSession,
+    ) -> Result<ControlFlow<FactorOutcome>, AuthnError<I::Error>> {
+        // Register in the session registry BEFORE any other store
+        // calls. The session has already transitioned to Authenticated in
+        // `advance_factor`; if the registry register is skipped because a
+        // subsequent call errored out early, `invalidate_user` would have
+        // no way to evict this session; it would be authenticated but
+        // un-trackable. Register first so the session is always reachable
+        // by the eviction path even if subsequent steps fail.
+        if let Some(reg) = &self.inner.registry {
+            // Enforce concurrent session limit: evict oldest sessions.
+            if let Some(max) = self.inner.max_sessions_per_user {
+                let active = reg.active_sessions(user_id).await;
+                if active.len() >= max {
+                    let to_evict = active.len() - max + 1;
+                    for old_sid in active.iter().take(to_evict) {
+                        reg.invalidate_session(user_id, old_sid).await;
+                        tracing::info!(
+                            user_id = %user_id,
+                            evicted_session = %old_sid,
+                            "concurrent session limit reached; evicting oldest session"
+                        );
+                        self.inner.metrics.session_invalidated();
+                    }
+                }
+            }
+            // Register-failure must clear the session and
+            // refuse authentication. Without this, the just-set
+            // Authenticated state would ride out as a cookie that
+            // `invalidate_user` cannot reach.
+            if !reg.register(user_id, sid).await {
+                tracing::error!(
+                    user_id = %user_id,
+                    "complete_factor_step register failed; clearing session and \
+                     refusing authentication"
+                );
+                session.clear().await;
+                return Err(AuthnError::NoFlow);
+            }
+
+            // Re-read account status AFTER registering. Closes the
+            // race where a concurrent `suspend_user` call lands its
+            // status-update + `invalidate_user` between this function's
+            // initial status check (in `verify_factor`) and the register
+            // above; without this re-check, the just-registered session
+            // would survive the suspension as if the suspend never happened.
+            match self.current_account_status(user_id).await {
+                Ok(status) if !status.allows_login() => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        status = ?status,
+                        "account status flipped to non-loginable mid-flow; \
+                         revoking just-registered session and refusing authentication"
+                    );
+                    reg.invalidate_session(user_id, sid).await;
+                    // Wipe the in-memory session state so the response cookie
+                    // does not ship a Set-Cookie for an authenticated session.
+                    session.clear().await;
+                    self.inner.metrics.account_locked();
+                    let until = if let crate::authn::types::EntityState::Suspended(detail) = &status
+                    {
+                        detail.until
+                    } else {
+                        None
+                    };
+                    return Ok(ControlFlow::Break(FactorOutcome::Locked { until }));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    // Fail closed on store error; better to force a re-auth
+                    // than risk leaving a session live across an
+                    // inconsistent suspension state.
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "post-register status re-check failed; failing closed"
+                    );
+                    reg.invalidate_session(user_id, sid).await;
+                    session.clear().await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
     /// Shared post-factor-success logic: check if all factors are complete,
     /// and if so, reset the failed-attempt counter, register in the session
     /// registry, and emit an Authenticated audit event.
@@ -102,86 +200,11 @@ where
 
             let sid = session.session_id().await;
 
-            // Register in the session registry BEFORE any other store
-            // calls. The session has already transitioned to Authenticated in
-            // `advance_factor`; if the registry register is skipped because a
-            // subsequent call errored out early, `invalidate_user` would have
-            // no way to evict this session; it would be authenticated but
-            // un-trackable. Register first so the session is always reachable
-            // by the eviction path even if subsequent steps fail.
-            if let Some(reg) = &self.inner.registry {
-                // Enforce concurrent session limit: evict oldest sessions.
-                if let Some(max) = self.inner.max_sessions_per_user {
-                    let active = reg.active_sessions(user_id).await;
-                    if active.len() >= max {
-                        let to_evict = active.len() - max + 1;
-                        for old_sid in active.iter().take(to_evict) {
-                            reg.invalidate_session(user_id, old_sid).await;
-                            tracing::info!(
-                                user_id = %user_id,
-                                evicted_session = %old_sid,
-                                "concurrent session limit reached; evicting oldest session"
-                            );
-                            self.inner.metrics.session_invalidated();
-                        }
-                    }
-                }
-                // Register-failure must clear the session and
-                // refuse authentication. Without this, the just-set
-                // Authenticated state would ride out as a cookie that
-                // `invalidate_user` cannot reach.
-                if !reg.register(user_id, &sid).await {
-                    tracing::error!(
-                        user_id = %user_id,
-                        "complete_factor_step register failed; clearing session and \
-                         refusing authentication"
-                    );
-                    session.clear().await;
-                    return Err(AuthnError::NoFlow);
-                }
-
-                // Re-read account status AFTER registering. Closes the
-                // race where a concurrent `suspend_user` call lands its
-                // status-update + `invalidate_user` between this function's
-                // initial status check (in `verify_factor`) and the register
-                // above; without this re-check, the just-registered session
-                // would survive the suspension as if the suspend never happened.
-                match self.current_account_status(user_id).await {
-                    Ok(status) if !status.allows_login() => {
-                        tracing::warn!(
-                            user_id = %user_id,
-                            status = ?status,
-                            "account status flipped to non-loginable mid-flow; \
-                             revoking just-registered session and refusing authentication"
-                        );
-                        reg.invalidate_session(user_id, &sid).await;
-                        // Wipe the in-memory session state so the response cookie
-                        // does not ship a Set-Cookie for an authenticated session.
-                        session.clear().await;
-                        self.inner.metrics.account_locked();
-                        let until =
-                            if let crate::authn::types::EntityState::Suspended(detail) = &status {
-                                detail.until
-                            } else {
-                                None
-                            };
-                        return Ok(FactorOutcome::Locked { until });
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        // Fail closed on store error; better to force a re-auth
-                        // than risk leaving a session live across an
-                        // inconsistent suspension state.
-                        tracing::warn!(
-                            user_id = %user_id,
-                            error = %e,
-                            "post-register status re-check failed; failing closed"
-                        );
-                        reg.invalidate_session(user_id, &sid).await;
-                        session.clear().await;
-                        return Err(e);
-                    }
-                }
+            if let ControlFlow::Break(outcome) = self
+                .register_authenticated_session(user_id, &sid, session)
+                .await?
+            {
+                return Ok(outcome);
             }
 
             // Reset the failed-attempt counter AFTER registry register

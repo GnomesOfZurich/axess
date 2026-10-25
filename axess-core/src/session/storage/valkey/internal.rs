@@ -36,6 +36,84 @@ pub(super) fn revocation_user_channel(prefix: &str, user_id: &str) -> String {
     format!("{prefix}:revoked-user:{user_id}")
 }
 
+// ── Atomic cycle ─────────────────────────────────────────────────────────────
+
+/// Write the rotated session and drop the old one in a single server-side
+/// step.
+///
+/// KEYS: `[old_session, new_session]`. ARGV: `[payload, ttl_seconds]`.
+/// The SET runs first; if it errors the script aborts before the DEL, so the
+/// old session survives a failed write. A crash cannot land between the two
+/// commands: the server runs the script to completion. When both ids are the
+/// same key the DEL is skipped, so cycling to the same id keeps the session.
+pub(super) const CYCLE_SCRIPT: &str = r#"
+redis.call('SET', KEYS[2], ARGV[1], 'EX', tonumber(ARGV[2]))
+if KEYS[1] ~= KEYS[2] then
+  redis.call('DEL', KEYS[1])
+end
+return 1
+"#;
+
+/// True when an `EVAL` failed because this deployment cannot run the cycle
+/// script, as opposed to the write failing: scripting disabled or absent
+/// (`unknown command`, `NOSCRIPT`, disabled by ACL) or the two keys living in
+/// different cluster slots (`CROSSSLOT`). Only then does `cycle` fall back to
+/// a sequenced SET then DEL; any other error is the caller's.
+pub(super) fn script_unavailable(err: &fred::error::Error) -> bool {
+    let text = err.details().to_ascii_lowercase();
+    [
+        "crossslot",
+        "unknown command",
+        "noscript",
+        "scripting",
+        "noperm",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+// ── TTL helpers ──────────────────────────────────────────────────────────────
+
+use std::time::Duration;
+
+/// Seconds for a Valkey `EX` argument, or `None` when the TTL is already
+/// spent.
+///
+/// `EX 0` is rejected by the server, and truncating a sub-second TTL with
+/// `as_secs()` would produce exactly that, so any non-zero TTL is clamped up
+/// to one second. A zero TTL means the session is already expired: the caller
+/// must not store it.
+pub(super) fn ex_seconds(ttl: Duration) -> Option<i64> {
+    if ttl.is_zero() {
+        return None;
+    }
+    Some(ttl.as_secs().clamp(1, i64::MAX as u64) as i64)
+}
+
+/// A registry member's lifetime in milliseconds (its score is the
+/// registration instant, so it expires at `score + lifetime`).
+pub(super) fn registry_member_ttl_ms(ttl: Duration) -> i64 {
+    ttl.as_millis().min(i64::MAX as u128) as i64
+}
+
+/// True while a registry member registered at `score_ms` is still live.
+pub(super) fn registry_member_live(score_ms: f64, now_ms: i64, member_ttl_ms: i64) -> bool {
+    score_ms + member_ttl_ms as f64 > now_ms as f64
+}
+
+/// Scores at or below this value belong to expired members.
+pub(super) fn registry_cutoff_ms(now_ms: i64, member_ttl_ms: i64) -> f64 {
+    now_ms as f64 - member_ttl_ms as f64
+}
+
+/// Seconds for the registry key's own `EXPIRE`: at least the member
+/// lifetime rounded up, and never below one second, so the key outlives the
+/// newest member it holds and a sub-second TTL cannot wipe the set.
+pub(super) fn registry_key_ttl_secs(ttl: Duration) -> i64 {
+    let ms = registry_member_ttl_ms(ttl);
+    (ms / 1000 + i64::from(ms % 1000 != 0)).max(1)
+}
+
 // ── Error type ───────────────────────────────────────────────────────────────
 
 /// Errors from the Valkey session store or registry.

@@ -86,6 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // models the pattern adopters should copy instead of teaching `rand::*`.
     let mut signing_key = [0u8; 32];
     axess::SystemRng.fill_bytes(&mut signing_key);
+    // The `form_post` callback is a cross-site POST from the provider. Here the
+    // provider is on localhost, which counts as the same site, so the default
+    // `SameSite=Lax` cookie is sent. Against a provider on another site the
+    // browser withholds a `Lax` cookie from that POST and the callback finds no
+    // session: use `.with_same_site(SameSite::None)` there, which browsers
+    // accept only together with `Secure` (so drop `with_secure(false)` too).
     let session_layer = SessionLayer::new(session_store, signing_key).with_secure(false);
 
     let state = AppState {
@@ -247,9 +253,9 @@ async fn login(
         }
         Err(e) => {
             tracing::error!(error = %e, "begin_oauth_login failed");
-            Html(format!(
-                "<h1>Login Error</h1><p>{e}</p><p><a href=\"/\">Back</a></p>"
-            ))
+            Html(
+                r#"<h1>Login Error</h1><p>Could not start the login.</p><p><a href="/">Back</a></p>"#,
+            )
             .into_response()
         }
     }
@@ -315,10 +321,13 @@ async fn handle_callback(
                     "<h2>DPoP Proof (for API calls)</h2>\
                      <p><strong>Thumbprint (jkt):</strong> <code>{}</code></p>\
                      <p><strong>Proof JWT:</strong> <code style=\"word-break:break-all\">{}</code></p>",
-                    proof.thumbprint,
-                    &proof.proof_jwt[..80.min(proof.proof_jwt.len())],
+                    html_escape(&proof.thumbprint),
+                    html_escape(&proof.proof_jwt[..80.min(proof.proof_jwt.len())]),
                 ),
-                Err(e) => format!("<p><em>DPoP not available: {e}</em></p>"),
+                Err(e) => format!(
+                    "<p><em>DPoP not available: {}</em></p>",
+                    html_escape(&e.to_string())
+                ),
             };
 
             Html(format!(
@@ -336,16 +345,15 @@ async fn handle_callback(
 </ul>
 {dpop_demo}
 <form method="POST" action="/auth/logout">
-  <input type="hidden" name="provider" value="{provider}" />
   <button type="submit">Logout (RP-Initiated + Token Revocation)</button>
 </form>
 <p><a href="/">Back to home</a></p>
 </body></html>"#,
-                provider = claims.provider,
-                sub = claims.subject,
-                email = claims.email.as_deref().unwrap_or("(not provided)"),
-                groups = claims.groups.join(", "),
-                roles = claims.roles.join(", "),
+                provider = html_escape(&claims.provider),
+                sub = html_escape(&claims.subject),
+                email = html_escape(claims.email.as_deref().unwrap_or("(not provided)")),
+                groups = html_escape(&claims.groups.join(", ")),
+                roles = html_escape(&claims.roles.join(", ")),
                 id_hint = if claims.id_token_hint.is_some() {
                     "present"
                 } else {
@@ -357,9 +365,9 @@ async fn handle_callback(
         }
         Err(e) => {
             tracing::error!(error = %e, "finish_oauth_login failed");
-            Html(format!(
-                "<h1>Login Failed</h1><p>{e}</p><p><a href=\"/\">Try again</a></p>"
-            ))
+            Html(
+                r#"<h1>Login Failed</h1><p>The provider's answer could not be accepted.</p><p><a href="/">Try again</a></p>"#,
+            )
             .into_response()
         }
     }
@@ -394,18 +402,15 @@ async fn profile(session: AuthSession) -> impl IntoResponse {
 /// 1. Revoke tokens at the IdP (RFC 7009)
 /// 2. Invalidate local session
 /// 3. Redirect to IdP's end_session_endpoint with id_token_hint
-#[derive(Deserialize)]
-struct LogoutParams {
-    provider: Option<String>,
-}
-
+///
+/// The provider is the application's own, not a form field: a request
+/// must not be able to point token revocation and the logout redirect at a
+/// provider of its choosing.
 async fn logout(
     axum::extract::State(state): axum::extract::State<AppState>,
     session: AuthSession,
-    Form(params): Form<LogoutParams>,
 ) -> axum::response::Response {
-    let provider = params.provider.as_deref().unwrap_or(&state.provider_name);
-
+    let provider = state.provider_name.as_str();
     // Step 1: Revoke tokens if available (best-effort).
     // In a real app, you'd retrieve stored tokens from the session or database.
     if let Err(e) = state
@@ -435,4 +440,21 @@ async fn logout(
         info!("IdP has no end_session_endpoint; redirecting home");
         Redirect::temporary("/").into_response()
     }
+}
+
+/// Escape text for interpolation into HTML. Claims and error text come
+/// from the identity provider and are attacker-influenced.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }

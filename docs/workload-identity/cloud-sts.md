@@ -55,7 +55,8 @@ use axess_core::workload::outbound::cloud_sts::aws::{
 };
 
 // Defaults to the global endpoint; `with_endpoint` pins a regional one
-// (or LocalStack), `with_http_client` supplies timeouts or outbound mTLS.
+// (or LocalStack), `with_http_client` supplies a proxy or outbound mTLS.
+// Every call times out after 30 s; `with_timeout` adjusts that.
 let client = AwsStsClient::new();
 
 let request = AssumeRoleWithWebIdentityRequest {

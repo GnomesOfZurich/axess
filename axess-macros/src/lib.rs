@@ -76,7 +76,11 @@ pub fn url_with_redirect_query(
 ) -> Result<Uri, http::Error> {
     let uri = url.parse::<Uri>()?;
 
-    if uri.query().is_some_and(|q| q.contains(redirect_field)) {
+    // Match the parameter NAME exactly, after percent-decoding: `ref=nextgen`
+    // does not carry a `next` parameter, `%6Eext=/x` does.
+    if uri.query().is_some_and(|q| {
+        form_urlencoded::parse(q.as_bytes()).any(|(name, _)| name == redirect_field)
+    }) {
         return Ok(uri);
     };
 
@@ -346,4 +350,44 @@ macro_rules! require_partial_authn {
     (login_url = $login_url:expr) => {
         $crate::require_partial_authn!(login_url = $login_url, redirect_field = "next")
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(url: &str) -> String {
+        url_with_redirect_query(url, "next", "/back".parse().unwrap())
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn name_that_merely_contains_the_field_does_not_suppress_the_redirect() {
+        let out = run("/login?ref=nextgen");
+        assert!(out.contains("next=%2Fback"), "{out}");
+        assert!(out.contains("ref=nextgen"), "{out}");
+    }
+
+    #[test]
+    fn value_containing_the_field_does_not_suppress_the_redirect() {
+        let out = run("/login?utm=next");
+        assert!(out.contains("next=%2Fback"), "{out}");
+    }
+
+    #[test]
+    fn existing_parameter_is_left_alone() {
+        assert_eq!(run("/login?next=/there"), "/login?next=/there");
+        assert_eq!(run("/login?a=1&next=/there"), "/login?a=1&next=/there");
+    }
+
+    #[test]
+    fn percent_encoded_parameter_name_is_recognised() {
+        assert_eq!(run("/login?%6Eext=/there"), "/login?%6Eext=/there");
+    }
+
+    #[test]
+    fn no_query_gets_the_redirect() {
+        assert_eq!(run("/login"), "/login?next=%2Fback");
+    }
 }

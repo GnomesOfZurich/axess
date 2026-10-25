@@ -36,6 +36,7 @@
 // ── Sub-modules ──────────────────────────────────────────────────────────────
 
 mod account;
+mod builder;
 mod factor_pipeline;
 mod login;
 pub mod outcomes;
@@ -54,19 +55,18 @@ pub(crate) mod oauth_service;
 
 pub mod session_validator;
 
+pub use builder::AuthnServiceBuilder;
+#[cfg(feature = "oauth")]
+pub use builder::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
 pub use outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome};
 pub use session_validator::{NoSessionRegistryError, SessionValidator, require_valid_session};
 #[cfg(feature = "device")]
-pub use step_up::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up, decide_step_up_for_user};
+pub use step_up::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_user};
 
 // ── Imports ──────────────────────────────────────────────────────────────────
 
-use crate::{
-    authn::store::{FactorStore, IdentityStore},
-    session::store::{SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle},
-};
-use axess_clock::{Clock, SystemClock};
-use axess_rng::{SecureRng, SystemRng};
+use crate::authn::store::{FactorStore, IdentityStore};
+use axess_clock::Clock;
 use std::sync::Arc;
 
 // ── AuthnService ──────────────────────────────────────────────────────────────
@@ -173,86 +173,6 @@ where
     }
 }
 
-/// Configures an [`AuthnService`], and is what the built handle shares.
-///
-/// Customisation happens here rather than on the built service because the
-/// collaborators sit behind an `Arc` the moment [`build`](Self::build) is
-/// called, where every copy of the handle observes them. After `build` the
-/// same value is the shared collaborator set, which is why the handle's
-/// field is typed as this.
-pub struct AuthnServiceBuilder<I, F>
-where
-    I: IdentityStore,
-    F: FactorStore,
-{
-    pub(crate) identity: Arc<I>,
-    pub(crate) factors: Arc<F>,
-    pub(crate) registry: Option<Arc<dyn SessionRegistryHandle>>,
-    pub(crate) metrics: Arc<dyn crate::metrics::AuthnMetrics>,
-    /// Maximum concurrent sessions per user. `None` means unlimited.
-    pub(crate) max_sessions_per_user: Option<usize>,
-    pub(crate) rng: Arc<dyn SecureRng>,
-    pub(crate) clock: Arc<dyn Clock>,
-    #[cfg(feature = "fido2")]
-    pub(crate) fido2: Option<Arc<dyn axess_factors::fido2::Fido2Provider>>,
-    #[cfg(feature = "fido2")]
-    pub(crate) fido2_options: crate::authn::factor::Fido2Options,
-    #[cfg(feature = "ldap")]
-    pub(crate) ldap: Option<Arc<dyn axess_factors::ldap::LdapProvider>>,
-    #[cfg(feature = "oauth")]
-    pub(crate) oauth_providers: crate::federation::oauth::OAuthProviderRegistry,
-    /// Shared OIDC `sid` → `(user_id, session_id, inserted_at)` map for back-channel logout.
-    /// The timestamp enables TTL-based eviction of stale entries.
-    #[cfg(feature = "oauth")]
-    pub(crate) sid_map: crate::federation::backchannel_logout::SidMap,
-    /// Capacity cap for [`sid_map`](Self::sid_map). When at/over this
-    /// count, `maintain_oidc_sid_map` evicts a batch of oldest entries.
-    /// High-throughput OAuth deployments raise this via
-    /// [`with_sid_map_capacity`](AuthnServiceBuilder::with_sid_map_capacity); the
-    /// default matches the historical hardcoded value.
-    #[cfg(feature = "oauth")]
-    pub(crate) sid_map_capacity: usize,
-}
-
-/// Default capacity cap for the OIDC `sid` → local-session map. High-throughput
-/// OAuth deployments can override via
-/// [`AuthnServiceBuilder::with_sid_map_capacity`].
-#[cfg(feature = "oauth")]
-pub const DEFAULT_SID_MAP_CAPACITY: usize = 10_000;
-
-// ── Constructors and builders ────────────────────────────────────────────────
-
-impl<I, F> AuthnServiceBuilder<I, F>
-where
-    I: IdentityStore,
-    F: FactorStore<Error = I::Error>,
-{
-    /// Start configuring a service. Finish with [`build`](Self::build).
-    pub fn new(identity: I, factors: F) -> Self {
-        Self {
-            identity: Arc::new(identity),
-            factors: Arc::new(factors),
-            registry: None,
-            metrics: Arc::new(crate::metrics::NoopMetrics),
-            max_sessions_per_user: None,
-            rng: Arc::new(SystemRng),
-            clock: Arc::new(SystemClock),
-            #[cfg(feature = "fido2")]
-            fido2: None,
-            #[cfg(feature = "fido2")]
-            fido2_options: Default::default(),
-            #[cfg(feature = "ldap")]
-            ldap: None,
-            #[cfg(feature = "oauth")]
-            oauth_providers: Default::default(),
-            #[cfg(feature = "oauth")]
-            sid_map: Default::default(),
-            #[cfg(feature = "oauth")]
-            sid_map_capacity: DEFAULT_SID_MAP_CAPACITY,
-        }
-    }
-}
-
 impl<B> AuthnService<B, B>
 where
     B: crate::authn::store::AuthnBackend + Clone,
@@ -333,6 +253,16 @@ where
     #[cfg(feature = "oauth")]
     pub fn oauth_providers(&self) -> &crate::federation::oauth::OAuthProviderRegistry {
         &self.inner.oauth_providers
+    }
+
+    /// The OIDC `sid` map this service fills on every OAuth login that
+    /// carries a `sid`. Hand it to
+    /// [`BackChannelLogoutHandler::new`](crate::federation::backchannel_logout::BackChannelLogoutHandler::new)
+    /// and the front-channel handler so an IdP-initiated logout finds the
+    /// sessions this service created. Clones share one map.
+    #[cfg(feature = "oauth")]
+    pub fn sid_map(&self) -> crate::federation::sid_map::SidMap {
+        self.inner.sid_map.clone()
     }
 
     /// `true` when at least one OAuth/OIDC provider has been registered
@@ -448,7 +378,7 @@ where
     /// Create a [`SessionValidator`] that **also** cross-checks the session's
     /// stated `tenant_id` against the user's actual tenant on every call.
     ///
-    /// Adds one `IdentityStore::get_user` lookup per `is_valid` call: wire
+    /// Adds one `IdentityLookup::get_user_tenant` lookup per `is_valid` call: wire
     /// this when your threat model includes session-store tampering or
     /// cross-environment session bleed (shared keys across dev/prod, backup
     /// restored after compromise, etc.). For deployments where the session
@@ -543,8 +473,9 @@ where
         // state the policy was checking for.
         let event = builder.with_audit_context(&self.audit).build_at(event_time);
 
-        let event_type = format!("{:?}", event.event_type);
-        let event_status = format!("{:?}", event.event_status);
+        // Kept for the failure log only; formatting them is deferred to
+        // that branch so a recorded event pays for no strings.
+        let (event_type, event_status) = (event.event_type.clone(), event.event_status.clone());
         match self.inner.identity.record_event(event).await {
             Ok(crate::authn::store::AuditOutcome::Recorded) => Ok(()),
             Ok(crate::authn::store::AuditOutcome::Shed) => {
@@ -556,176 +487,14 @@ where
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    event_type = %event_type,
-                    event_status = %event_status,
+                    event_type = ?event_type,
+                    event_status = ?event_status,
                     "identity store rejected audit event; failing the flow rather \
                      than proceeding unrecorded"
                 );
                 self.inner.metrics.audit_store_outage();
                 Err(crate::authn::error::AuthnError::Store(e))
             }
-        }
-    }
-}
-
-// ── Builder ──────────────────────────────────────────────────────────────────
-
-impl<I, F> AuthnServiceBuilder<I, F>
-where
-    I: IdentityStore,
-    F: FactorStore<Error = I::Error>,
-{
-    /// Replace the RNG (for DST). Type-erased; service shape unchanged.
-    pub fn with_rng(mut self, rng: impl SecureRng) -> Self {
-        self.rng = Arc::new(rng);
-        self
-    }
-
-    /// Replace the clock (for DST). Type-erased; service shape unchanged.
-    pub fn with_clock(mut self, clock: impl Clock) -> Self {
-        self.clock = Arc::new(clock);
-        self
-    }
-
-    /// Attach a FIDO2/WebAuthn provider.
-    ///
-    /// **Single-instance by design.** Calling `with_fido2` twice replaces
-    /// the previously attached provider silently: one deployment, one
-    /// relying-party configuration is the assumption. Multi-tenant apps
-    /// that need per-tenant relying-party ids (e.g. distinct RP-IDs per
-    /// customer domain) must wrap dispatch in the application layer;
-    /// axess-core does not maintain a per-tenant FIDO2 registry.
-    #[cfg(feature = "fido2")]
-    pub fn with_fido2(mut self, provider: impl axess_factors::fido2::Fido2Provider) -> Self {
-        self.fido2 = Some(Arc::new(provider));
-        self
-    }
-
-    /// Configure FIDO2 ceremony timeout and other options stored on the service.
-    #[cfg(feature = "fido2")]
-    pub fn with_fido2_options(mut self, options: crate::authn::factor::Fido2Options) -> Self {
-        self.fido2_options = options;
-        self
-    }
-
-    /// Attach an LDAP provider for directory-based password verification.
-    ///
-    /// When a user's factor chain includes [`FactorKind::LdapBind`](crate::authn::factor::FactorKind::LdapBind), the
-    /// service will verify their password via an LDAP simple bind against
-    /// this provider instead of checking a local password hash.
-    ///
-    /// **Single-instance by design.** Calling `with_ldap` twice replaces
-    /// the previously attached provider silently: one deployment, one
-    /// directory is the assumption. Multi-tenant apps that need
-    /// per-subsidiary directories must wrap dispatch in the application
-    /// layer; axess-core does not maintain a per-tenant LDAP registry.
-    ///
-    /// ```rust,ignore
-    /// let ldap = LdapProviderConfig::new(
-    ///     "ldaps://ad.corp.example.com",
-    ///     "{user}@corp.example.com",
-    /// );
-    /// let authn = AuthnService::builder(identity, factors).with_ldap(ldap).build();
-    /// ```
-    #[cfg(feature = "ldap")]
-    pub fn with_ldap(mut self, provider: impl axess_factors::ldap::LdapProvider) -> Self {
-        self.ldap = Some(Arc::new(provider));
-        self
-    }
-
-    /// Register an OAuth/OIDC identity provider.
-    ///
-    /// Call once per provider at startup. Multiple providers can be registered
-    /// (e.g. Google + GitHub + corporate IdP), each under a distinct name.
-    ///
-    /// **Duplicate name safety.** Registering two providers under the same
-    /// `provider.name()` is a real security-relevant misconfiguration
-    /// (token exchanges for that IdP would then run against whichever
-    /// credentials won the race). The registry emits `tracing::warn!` on
-    /// overwrite and `debug_assert!`s in debug builds; production builds
-    /// keep the new registration and continue, so operators still notice
-    /// via logs.
-    ///
-    /// # Tenancy
-    ///
-    /// **Providers are registered globally on `AuthnService`, not per-tenant.**
-    /// The library does not maintain a per-tenant OAuth registry; that is
-    /// out of scope by design. Two supported patterns:
-    ///
-    /// 1. **Same IdP, multiple tenants (single shared client).** Tenant A
-    ///    and tenant B both federate to the same IdP (e.g. one Azure AD
-    ///    app serving two SaaS tenants). The callback alone cannot tell
-    ///    them apart; the application MUST use
-    ///    [`begin_oauth_login_in_tenant`](AuthnService::begin_oauth_login_in_tenant)
-    ///    to bind the ceremony to a tenant up-front, and the
-    ///    claims→user resolver MUST scope its lookup to the bound tenant.
-    /// 2. **Distinct IdPs, one per set of tenants.** Register one provider
-    ///    per IdP under a stable name (`"acme-corp-azure"`, `"beta-corp-okta"`,
-    ///    etc.); the application maps a tenant → provider-name in its own
-    ///    tenant record and calls [`begin_oauth_login`](AuthnService::begin_oauth_login)
-    ///    with the resolved name. Provider names are stable identifiers,
-    ///    NOT dynamic per-tenant strings: do not derive them from
-    ///    `tenant_id` at registration time (would require re-registration
-    ///    on every tenant create/delete, would collide with reserved
-    ///    identifier characters, and would defeat the introspection story
-    ///    on [`oauth_providers`](AuthnService::oauth_providers)).
-    ///
-    /// If you need genuinely dynamic per-tenant IdP configuration
-    /// (each tenant admin uploads their own client_secret through a UI,
-    /// changing at runtime), that requires provider hot-swap which
-    /// axess-core does not yet support: see the roadmap.
-    #[cfg(feature = "oauth")]
-    pub fn with_oauth_provider(
-        mut self,
-        provider: impl axess_factors::oauth::OAuthProvider,
-    ) -> Self {
-        self.oauth_providers.add(provider);
-        self
-    }
-
-    /// Override the capacity cap for the OIDC `sid` → local-session map that
-    /// powers back-channel logout by `sid`.
-    ///
-    /// The map is populated per successful OAuth login that returns an
-    /// `oidc_sid` claim; when at/over this cap, the maintenance path
-    /// evicts a batch of oldest entries. Default:
-    /// [`DEFAULT_SID_MAP_CAPACITY`] (10 000). Raise for high-throughput
-    /// deployments where legitimate concurrent OIDC sessions exceed the
-    /// default and back-channel logout precision degrades on eviction.
-    #[cfg(feature = "oauth")]
-    pub fn with_sid_map_capacity(mut self, capacity: usize) -> Self {
-        self.sid_map_capacity = capacity;
-        self
-    }
-
-    /// Attach a session registry for forced-logout support.
-    pub fn with_registry(mut self, registry: impl SessionRegistry + 'static) -> Self {
-        self.registry = Some(Arc::new(SessionRegistryAdapter(registry)));
-        self
-    }
-
-    /// Set the maximum number of concurrent sessions per user.
-    ///
-    /// When a user authenticates and already has this many active sessions,
-    /// the oldest session is evicted. `None` (default) means unlimited.
-    pub fn with_max_sessions_per_user(mut self, max: usize) -> Self {
-        self.max_sessions_per_user = Some(max);
-        self
-    }
-
-    /// Attach a metrics hook for observability.
-    ///
-    /// The [`AuthnMetrics`](crate::metrics::AuthnMetrics) trait has no-op
-    /// defaults; implement only the counters you need.
-    pub fn with_metrics(mut self, metrics: impl crate::metrics::AuthnMetrics) -> Self {
-        self.metrics = Arc::new(metrics);
-        self
-    }
-
-    /// Share the collaborators and return the handle.
-    pub fn build(self) -> AuthnService<I, F> {
-        AuthnService {
-            inner: Arc::new(self),
         }
     }
 }

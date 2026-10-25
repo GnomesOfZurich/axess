@@ -329,3 +329,36 @@ fn request_debug_redacts_web_identity_token() {
     assert!(!shown.contains("SECRET-JWT"), "{shown}");
     assert!(shown.contains("arn:aws:iam::1:role/r"));
 }
+
+/// A token endpoint that never answers in time must not hold the caller:
+/// the request ends in a transport error at the configured timeout, even
+/// on an HTTP client supplied without one.
+#[tokio::test]
+async fn a_silent_sts_endpoint_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(VALID_SUCCESS_BODY)
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let client = client(&server)
+        .with_http_client(reqwest::Client::new())
+        .with_timeout(std::time::Duration::from_millis(150));
+
+    let started = std::time::Instant::now();
+    let err = client
+        .assume_role_with_web_identity(&sample_request())
+        .await
+        .expect_err("must time out");
+    assert!(matches!(err, AwsStsError::Transport(_)), "{err:?}");
+    // The proof is that the call ended before the server would have
+    // answered (its delay is 5 s), not how fast a loaded machine scheduled it.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ended after the mock's delay, so the timeout did not end it: {:?}",
+        started.elapsed()
+    );
+}

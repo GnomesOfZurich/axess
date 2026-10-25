@@ -1,7 +1,7 @@
 //! Authentication handlers: login page, login POST, TOTP verify, logout.
 
 use crate::web::app::AppState;
-use crate::web::csrf_hidden_input;
+use crate::web::{csrf_hidden_input, html_escape};
 use axess::AuthSession;
 use axess::authn::{AuditContext, FactorCredential, FactorKind, FactorOutcome, LoginOutcome};
 use axess::csrf::CsrfToken;
@@ -31,6 +31,18 @@ fn render_with_csrf(template: &'static str, csrf: &CsrfToken) -> Html<String> {
             .replace("__CSRF_INPUT__", &csrf_hidden_input(csrf)),
     )
 }
+
+/// Whether `password` satisfies `rules` (length counted in characters).
+fn meets_rules(password: &str, rules: &axess::authn::PasswordRules) -> bool {
+    password.chars().count() >= rules.min_length
+        && (!rules.require_uppercase || password.chars().any(|c| c.is_uppercase()))
+        && (!rules.require_lowercase || password.chars().any(|c| c.is_lowercase()))
+        && (!rules.require_digit || password.chars().any(|c| c.is_ascii_digit()))
+        && (!rules.require_special || password.chars().any(|c| !c.is_alphanumeric()))
+}
+
+/// Tenant that self-service signup creates accounts in.
+const SIGNUP_TENANT: &str = "default";
 
 // ── Form types ────────────────────────────────────────────────────────────────
 
@@ -238,7 +250,6 @@ pub async fn signup_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> 
 
 #[derive(Deserialize)]
 pub struct SignupForm {
-    pub tenant: String,
     pub username: String,
     pub fullname: String,
     pub email: String,
@@ -257,20 +268,33 @@ pub async fn post_signup(
         SignupOutcome, User, ZeroizedString,
     };
 
-    let tenant = if form.tenant.trim().is_empty() {
-        "default"
-    } else {
-        form.tenant.trim()
-    };
+    // The tenant a new account joins is the application's decision (here
+    // the single seeded tenant; a multi-tenant app derives it from the
+    // host name or an invitation), never a field the visitor fills in:
+    // otherwise anyone could create an account inside any tenant by naming it.
+    let tenant = SIGNUP_TENANT;
+
+    // The form's `minlength` is a hint to the browser. Enforce the rules on
+    // the server, where a script that skips the form is checked too.
+    let rules = PasswordRules::default();
+    if !meets_rules(&form.password, &rules) {
+        return Html(signup_with_error(
+            "The password must be at least 12 characters with upper case, lower case and a digit.",
+            &csrf,
+        ))
+        .into_response();
+    }
 
     // Build a Candidate user; not yet activated.
     // Self-service signup: the signup flow itself is the creator, but at
     // this moment the user row has no authenticated session yet. Attribute
     // the `created_by` to the system actor; once the user completes
     // activation their own actions carry their own `updated_by`.
+    // The id is a fresh UUID. The tenant id here is a placeholder:
+    // `begin_signup` resolves `tenant` by name and stores the user there.
     let user = match User::new(
-        form.username.as_str(),
-        "pending",
+        uuid::Uuid::new_v4().to_string(),
+        axess::authn::TenantId::system().to_string(),
         form.username.as_str(),
         form.fullname.as_str(),
         EntityState::Candidate,
@@ -482,7 +506,7 @@ pub async fn post_setup_totp(
   <button type="submit">Verify & Enable TOTP</button>
 </form>
 </body></html>"#,
-                secret = form.secret,
+                secret = html_escape(&form.secret),
             ))
             .into_response();
         }
@@ -809,9 +833,6 @@ fn signup_with_error(msg: &str, csrf: &CsrfToken) -> String {
 const SIGNUP_FORM: &str = r#"
 <form method="POST" action="/signup">
   __CSRF_INPUT__
-  <label>Tenant (leave blank for "default"):<br>
-    <input type="text" name="tenant" placeholder="default">
-  </label><br><br>
   <label>Username:<br>
     <input type="text" name="username" required>
   </label><br><br>
@@ -832,9 +853,6 @@ const SIGNUP_HTML: &str = r#"<!doctype html>
 <h1>Create Account</h1>
 <form method="POST" action="/signup">
   __CSRF_INPUT__
-  <label>Tenant (leave blank for "default"):<br>
-    <input type="text" name="tenant" placeholder="default">
-  </label><br><br>
   <label>Username:<br>
     <input type="text" name="username" required autofocus>
   </label><br><br>

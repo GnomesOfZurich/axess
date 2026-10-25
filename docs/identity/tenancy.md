@@ -99,7 +99,7 @@ combination of "library refuses cross-tenant lookups" and "policy
 denies cross-tenant decisions" produces a deployment where a
 cross-tenant access is structurally impossible.
 
-## Atomic provisioning
+## Provisioning
 
 A tenant comes into existence through `create_tenant`, the verb behind
 any "sign up a new organisation" or "administrator provisions a new
@@ -150,29 +150,26 @@ Bootstrapping with an empty `factors` list is refused outright
 (`ProvisioningError::NoFactorsSpecified`), because a tenant whose users
 cannot present any factor cannot be logged into.
 
-The atomicity matters because a partially-provisioned tenant is a
-landmine. A tenant that exists in the tenant table but has no
-configured method admits any user with the system default method,
-which may not be what the new tenant wants. A tenant with a
-method but no factor configurations for the admin user produces
-an immediate lockout. A tenant with an admin user but no factor
-secret for them is worse: the user record exists, the admin
-cannot log in, and there is no path to recovery without an
-out-of-band intervention.
+A partially-provisioned tenant is a landmine, so the order of the
+steps is chosen to make the partial states the least harmful ones. A
+tenant that exists in the tenant table but has no configured method
+admits any user with the system default method, which may not be what
+the new tenant wants. A tenant with a method but no factor
+configurations for the admin user produces an immediate lockout.
 
-The bootstrap struct is the contract that says "a tenant exists
-only after every one of these has succeeded." The implementation
-runs the create-tenant, create-user, create-factor-config,
-create-method, set-fingerprint-pepper, set-lockout-policy
-operations in a single transaction. On any failure the
-transaction rolls back; nothing is persisted; the call returns an
-error.
+`create_tenant` is four store calls in sequence (the tenant row, one
+`save_factor` per template, then `save_method`), not a transaction.
+If one fails it returns the error and leaves whatever the earlier calls
+wrote; retry or compensate. A backend that wants all-or-nothing makes
+`create_tenant`, `save_factor` and `save_method` share one transaction in
+its own implementation.
 
-A subtler invariant in the bootstrap: every tenant must have at
-least one factor and one enabled method, and the admin user must
-have a factor configuration for every factor the method requires.
-The bootstrap checks both at construction; a misshapen bootstrap
-fails before the transaction starts.
+What the bootstrap does enforce is on the input side: `create_tenant`
+refuses an empty `factors` list and the reserved system tenant id before
+it writes anything, and it saves the method through `save_method`, which
+marks it enabled. It does not check that a user's own factor
+configuration exists for every factor the method requires; that belongs
+to whatever creates the first user.
 
 ## The three-lever lockout
 

@@ -249,6 +249,49 @@ impl axess::authn::IdentityAdmin for OurBackend {
             .await?;
         Ok(())
     }
+
+    /// Erase the user in one transaction: factor configs, auth methods,
+    /// password history, the pending reset token and refresh tokens are
+    /// deleted, audit rows keep their place with the user column cleared
+    /// (the log outlives the account but no longer names it), and the user
+    /// row goes last. A missing user is `RowNotFound`.
+    ///
+    /// Sessions are not touched here: the example's session store keeps
+    /// them encrypted under a key this backend does not hold, with no user
+    /// column to select on, and the example runs no session registry to ask.
+    /// The user's sessions therefore expire on their own. A deployment that
+    /// tracks sessions per user in a registry invalidates
+    /// that user's sessions through it alongside this call.
+    async fn delete_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
+        let id = user_id.to_string();
+        let mut tx = self.pool().begin().await?;
+        let found = sqlx::query("SELECT 1 FROM users WHERE id = ?1")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if found.is_none() {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        for statement in [
+            "DELETE FROM factor_configs WHERE user_id = ?1",
+            "DELETE FROM auth_methods WHERE user_id = ?1",
+            "DELETE FROM password_history WHERE user_id = ?1",
+            "DELETE FROM password_reset_tokens WHERE user_id = ?1",
+            "DELETE FROM refresh_tokens WHERE user_id = ?1",
+        ] {
+            sqlx::query(statement).bind(&id).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE auth_events SET user_id = NULL WHERE user_id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = ?1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 fn status_to_db(status: &EntityState) -> &'static str {
@@ -292,6 +335,7 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
+        now: DateTime<Utc>,
     ) -> Result<bool, Self::Error> {
         // Single transaction: SELECT, compare in constant time, delete on
         // match (single-use). A token whose stored hash matches but has
@@ -318,7 +362,7 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
             tx.commit().await?;
             return Ok(false);
         };
-        if expires_at.with_timezone(&Utc) <= self.clock().now() {
+        if expires_at.with_timezone(&Utc) <= now {
             tx.commit().await?;
             return Ok(false);
         }

@@ -19,7 +19,7 @@ This is the example to start with if you want to understand how the pieces fit t
 | Recovery code | `POST /recovery-code` | A one-time recovery code in place of the TOTP code, offered on the `/totp` page |
 | TOTP enrollment | `GET/POST /setup-totp` | Generate secret, verify code, issue ten recovery codes (shown once), upgrade to password then TOTP-or-recovery-code |
 | Password reset | `GET/POST /forgot-password`, `GET/POST /reset-password` | Token-based reset (token logged to stdout, would be emailed in production) |
-| Logout | `POST /logout` | Session clear and registry invalidation |
+| Logout | `POST /logout` | Session clear (the example runs no session registry; sessions are encrypted with no user column, so `delete_user` erases the user's rows and their sessions expire on their own) |
 | Dashboard | `GET /dashboard` | Protected route via `require_authn!` macro |
 | Health probe | `GET /healthz` | Auth-component health (SQLite `SELECT 1`). In production, combine with your application's own checks. |
 | Metrics | `GET /metrics` | Auth-specific counters (attempts, successes, failures, rate limits). In production, merge into your Prometheus/OTel endpoint. |

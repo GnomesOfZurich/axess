@@ -16,9 +16,9 @@
 //! # Wiring pattern
 //!
 //! ```text
-//! let outcome = service.begin_login(identifier, tenant, &session, ip).await?;
-//! let outcome = match outcome {
-//!     LoginOutcome::FactorRequired(_) if let Some(device) = resolved_device => {
+//! let outcome = service.begin_login(identifier, tenant, &session).await?;
+//! let outcome = match (outcome, resolved_device) {
+//!     (outcome @ LoginOutcome::FactorRequired(_), Some(device)) => {
 //!         match decide_step_up_for_user(&device, &user_id, &policy) {
 //!             Some(allowed_factors) => LoginOutcome::StepUpRequired {
 //!                 device_id: device.id.clone(),
@@ -27,9 +27,12 @@
 //!             None => outcome,
 //!         }
 //!     }
-//!     other => other,
+//!     (other, _) => other,
 //! };
 //! ```
+//!
+//! `user_id` is the id the login is for, which the application holds from
+//! its own identifier lookup; `begin_login` does not return it.
 //!
 //! axess does **not** reach into the device subsystem from
 //! `begin_login`. `Device` resolution is a middleware concern
@@ -52,14 +55,15 @@ use crate::device::types::{Device, DeviceTrustLevel};
 ///
 /// | Trust level | Step-up factors required |
 /// |-------------|--------------------------|
-/// | `Unknown` | `[Fido2, Totp]` (any one, possession factor) |
-/// | `Seen` | `[Fido2, Totp]` |
+/// | `Unknown` | `[Totp]` (a possession factor) |
+/// | `Seen` | `[Totp]` |
 /// | `Trusted` | _none_; Trusted devices skip step-up |
 /// | `Revoked` | _none_; login should already be rejected upstream |
 ///
-/// Override via [`StepUpPolicy::builder`] when your tenant's policy
-/// differs (e.g. tighter for high-value users, looser for known
-/// internal-network ranges, …).
+/// The default lists TOTP only, so it does not change with compile-time
+/// features. Override via [`StepUpPolicy::builder`] to add
+/// `FactorKind::Fido2`, or when your tenant's policy otherwise differs (e.g.
+/// tighter for high-value users, looser for known internal-network ranges, …).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepUpPolicy {
     /// Factor kinds accepted for an `Unknown` device. Empty = no
@@ -103,7 +107,7 @@ impl StepUpPolicy {
     }
 
     /// Borrow the factor list for a given trust level. Used by
-    /// [`decide_step_up`].
+    /// [`decide_step_up_for_user`].
     pub fn for_level(&self, level: DeviceTrustLevel) -> &[FactorKind] {
         match level {
             DeviceTrustLevel::Unknown => &self.unknown,
@@ -173,28 +177,14 @@ impl StepUpPolicyBuilder {
     }
 }
 
-/// Pure decision: given a resolved [`Device`] and a [`StepUpPolicy`],
-/// return the list of step-up factor options the application should
-/// present, or `None` when no step-up is required.
+/// Pure decision: given a resolved [`Device`], the user who is logging in
+/// and a [`StepUpPolicy`], return the list of step-up factor options the
+/// application should present, or `None` when no step-up is required.
 ///
 /// Wraps [`StepUpPolicy::for_level`] with the empty-vec → `None`
 /// translation so callers don't have to write the conditional twice.
 ///
-/// This ignores who owns the device. When the device was found by
-/// fingerprint before the user was known, use
-/// [`decide_step_up_for_user`], which does not let one user inherit
-/// another's `Trusted` device.
-pub fn decide_step_up(device: &Device, policy: &StepUpPolicy) -> Option<Vec<FactorKind>> {
-    let factors = policy.for_level(device.trust_level);
-    if factors.is_empty() {
-        None
-    } else {
-        Some(factors.to_vec())
-    }
-}
-
-/// Like [`decide_step_up`], for the user who is logging in. A device
-/// owned by a different user counts as [`DeviceTrustLevel::Unknown`]:
+/// A device owned by a different user counts as [`DeviceTrustLevel::Unknown`]:
 /// its trust was earned by someone else and does not carry over. An
 /// unowned device, or one the user owns, is judged by its own level.
 pub fn decide_step_up_for_user(
@@ -233,8 +223,13 @@ mod tests {
             first_seen_at: now,
             last_seen_at: now,
             revoked_at: None,
+            demoted_at: None,
             bindings: Vec::new(),
         }
+    }
+
+    fn owner() -> UserId {
+        crate::authn::ids::testing::user("u")
     }
 
     /// Pin: default policy demands step-up on `Unknown` and `Seen`,
@@ -242,10 +237,21 @@ mod tests {
     #[test]
     fn default_policy_step_up_matrix() {
         let p = StepUpPolicy::default();
-        assert!(decide_step_up(&build_device(DeviceTrustLevel::Unknown), &p).is_some());
-        assert!(decide_step_up(&build_device(DeviceTrustLevel::Seen), &p).is_some());
-        assert!(decide_step_up(&build_device(DeviceTrustLevel::Trusted), &p).is_none());
-        assert!(decide_step_up(&build_device(DeviceTrustLevel::Revoked), &p).is_none());
+        assert!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Unknown), &owner(), &p)
+                .is_some()
+        );
+        assert!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Seen), &owner(), &p).is_some()
+        );
+        assert!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Trusted), &owner(), &p)
+                .is_none()
+        );
+        assert!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Revoked), &owner(), &p)
+                .is_none()
+        );
     }
 
     /// Pin: builder overrides. A tenant tightening policy on Trusted
@@ -255,7 +261,8 @@ mod tests {
         let p = StepUpPolicy::builder()
             .trusted(vec![FactorKind::Totp])
             .build();
-        let factors = decide_step_up(&build_device(DeviceTrustLevel::Trusted), &p);
+        let factors =
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Trusted), &owner(), &p);
         assert_eq!(factors, Some(vec![FactorKind::Totp]));
     }
 
@@ -265,7 +272,10 @@ mod tests {
     #[test]
     fn empty_factor_list_produces_none() {
         let p = StepUpPolicy::builder().unknown(Vec::new()).build();
-        assert!(decide_step_up(&build_device(DeviceTrustLevel::Unknown), &p).is_none());
+        assert!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Unknown), &owner(), &p)
+                .is_none()
+        );
     }
 
     /// Pin: `for_level` returns the configured slice for each trust

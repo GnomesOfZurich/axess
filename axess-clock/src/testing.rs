@@ -6,7 +6,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess-clock = { version = "0.10", features = ["testing"] }
+//! axess-clock = { version = "0.11", features = ["testing"] }
 //! ```
 //!
 //! Workspace crates that re-export the trait surface forward the feature
@@ -16,9 +16,12 @@ use crate::Clock;
 use chrono::{DateTime, Utc};
 use std::sync::{Arc, Mutex};
 
-/// A clock whose current time can be set from test code.
+/// A clock whose current time is set by test code and moves only when the
+/// test advances or sets it.
 ///
-/// Default: `Utc::now()` at the time of construction.
+/// [`MockClock::at`] pins a reproducible start. [`MockClock::now`] starts at
+/// the real time of the call and then stays frozen there, so a run that uses
+/// it is not reproducible.
 #[derive(Debug, Clone)]
 pub struct MockClock {
     current: Arc<Mutex<DateTime<Utc>>>,
@@ -32,7 +35,8 @@ impl MockClock {
         }
     }
 
-    /// Create a mock clock set to the current real time.
+    /// Create a mock clock frozen at the real time of this call. Use
+    /// [`MockClock::at`] when the run must be reproducible.
     pub fn now() -> Self {
         Self::at(Utc::now())
     }

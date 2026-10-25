@@ -162,3 +162,105 @@ async fn backend_construction_does_not_panic() {
     migrate(&pool).await;
     let _ = OurBackend::new(pool);
 }
+
+async fn app() -> axum::Router {
+    let pool = fresh_pool().await;
+    migrate(&pool).await;
+    seed(&SystemClock, &pool).await.expect("seed");
+    build_router(pool).await.0
+}
+
+#[tokio::test]
+async fn dashboard_redirects_a_guest_to_login() {
+    let resp = app()
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_redirection(),
+        "a guest must not be served the dashboard (got {})",
+        resp.status()
+    );
+    assert!(
+        resp.headers()["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/login")
+    );
+}
+
+/// GET `/signup`, returning the cookies it set and the CSRF token it
+/// rendered, so a POST can present both as a browser would.
+async fn signup_form(router: &axum::Router) -> (String, String) {
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/signup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookies = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    let marker = r#"name="_csrf" value=""#;
+    let start = html.find(marker).expect("csrf input rendered") + marker.len();
+    let token = html[start..].split('"').next().unwrap().to_string();
+    (cookies, token)
+}
+
+async fn post_signup(router: &axum::Router, password: &str) -> String {
+    let (cookies, token) = signup_form(router).await;
+    let body = format!(
+        "_csrf={token}&username=carol&fullname=Carol+Example&email=carol%40example.com&password={password}"
+    );
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/signup")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", cookies)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    if resp.status().is_redirection() {
+        return format!("redirect {}", resp.headers()["location"].to_str().unwrap());
+    }
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn signup_enforces_the_password_rules_on_the_server() {
+    let router = app().await;
+    let outcome = post_signup(&router, "short").await;
+    assert!(
+        outcome.contains("at least 12 characters"),
+        "a weak password must be refused by the server, got: {outcome}"
+    );
+    let outcome = post_signup(&router, "Gnomes2%2BLongEnough").await;
+    assert_eq!(outcome, "redirect /dashboard");
+}

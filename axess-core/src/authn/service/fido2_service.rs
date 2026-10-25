@@ -11,6 +11,9 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 
+/// Bound on compare-and-swap retries when updating a user's passkey list.
+const MAX_PASSKEY_UPDATE_ATTEMPTS: usize = 8;
+
 // ── FIDO2 ceremony session keys ──────────────────────────────────────────────
 
 pub(crate) mod fido2_keys {
@@ -25,28 +28,75 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Save updated FIDO2 credentials after a successful authentication.
+    /// Apply `mutate` to the user's stored passkey list and persist the
+    /// result with a compare-and-swap, so two concurrent updates (two
+    /// registrations, a registration racing a deletion, a counter update
+    /// racing either) never overwrite one another. A lost swap reloads and
+    /// re-applies `mutate` to the fresh list, up to
+    /// [`MAX_PASSKEY_UPDATE_ATTEMPTS`] times.
+    ///
+    /// `mutate` returns `None` to abandon the update (nothing is written and
+    /// `Ok(None)` is returned) or `Some(value)` to commit. A failed read or
+    /// write is an error, never an empty list.
+    async fn update_fido2_credentials<R>(
+        &self,
+        user_scope: &AuthnScope,
+        mutate: impl Fn(&mut Vec<crate::authn::factor::Fido2Credential>) -> Option<R>,
+    ) -> Result<Option<R>, AuthnError<I::Error>> {
+        for _ in 0..MAX_PASSKEY_UPDATE_ATTEMPTS {
+            let prior = self
+                .inner
+                .factors
+                .load_factor(user_scope, FactorKind::Fido2)
+                .await
+                .map_err(AuthnError::Store)?;
+            let mut credentials = match &prior {
+                Some(FactorConfig::Fido2(cfg)) => cfg.credentials.clone(),
+                _ => Vec::new(),
+            };
+            let Some(outcome) = mutate(&mut credentials) else {
+                return Ok(None);
+            };
+            let next = FactorConfig::Fido2(crate::authn::factor::Fido2Config { credentials });
+            let swapped = match &prior {
+                Some(prior @ FactorConfig::Fido2(_)) => {
+                    self.inner
+                        .factors
+                        .compare_and_save_factor(user_scope, prior, next)
+                        .await
+                }
+                _ => {
+                    self.inner
+                        .factors
+                        .insert_factor_if_absent(user_scope, next)
+                        .await
+                }
+            }
+            .map_err(AuthnError::Store)?;
+            if swapped {
+                return Ok(Some(outcome));
+            }
+        }
+        Err(AuthnError::ExternalService(
+            "passkey list kept changing concurrently; retry".to_string(),
+        ))
+    }
+
+    /// Record a successful authentication on the matching stored passkey.
     async fn save_fido2_credentials(
         &self,
         user_scope: &AuthnScope,
-        credentials: &[crate::authn::factor::Fido2Credential],
         auth_result: &webauthn_rs::prelude::AuthenticationResult,
     ) -> Result<(), AuthnError<I::Error>> {
         let now = self.inner.clock.now();
-        let mut updated = credentials.to_vec();
-        for cred in &mut updated {
-            cred.record_authentication(auth_result, now);
-        }
-        self.inner
-            .factors
-            .save_factor(
-                user_scope,
-                FactorConfig::Fido2(crate::authn::factor::Fido2Config {
-                    credentials: updated,
-                }),
-            )
-            .await
-            .map_err(AuthnError::Store)
+        self.update_fido2_credentials(user_scope, |credentials| {
+            for cred in credentials.iter_mut() {
+                cred.record_authentication(auth_result, now);
+            }
+            Some(())
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Store the ceremony-started timestamp in the session.
@@ -177,7 +227,7 @@ where
             None => return Ok(FactorOutcome::InvalidCredential),
         };
 
-        let FactorConfig::Fido2(cfg) = config else {
+        let FactorConfig::Fido2(_) = config else {
             return Ok(FactorOutcome::InvalidCredential);
         };
 
@@ -234,7 +284,7 @@ where
         // `is_ceremony_expired` fast-path on a stale timestamp.
         self.clear_ceremony_timestamp(session).await;
 
-        self.save_fido2_credentials(user_scope, &cfg.credentials, &auth_result)
+        self.save_fido2_credentials(user_scope, &auth_result)
             .await?;
 
         // Device-binding hook: when the `device` subsystem is wired in
@@ -394,32 +444,22 @@ where
             tenant_id: user.tenant_id,
             user_id: user.id,
         };
-        // A failed read must abort: saving the list as just the new
-        // passkey would overwrite every passkey the user already has.
-        let mut credentials = match self
-            .inner
-            .factors
-            .load_factor(&user_scope, FactorKind::Fido2)
-            .await
-        {
-            Ok(Some(FactorConfig::Fido2(cfg))) => cfg.credentials,
-            Ok(_) => vec![],
-            Err(e) => return Err(AuthnError::Store(e)),
-        };
-        credentials.push(crate::authn::factor::Fido2Credential::new(
-            passkey,
-            credential_name,
-            self.inner.clock.now(),
-        ));
-
-        self.inner
-            .factors
-            .save_factor(
-                &user_scope,
-                FactorConfig::Fido2(crate::authn::factor::Fido2Config { credentials }),
-            )
-            .await
-            .map_err(AuthnError::Store)?;
+        // Read-modify-write under compare-and-swap: a failed read aborts
+        // (never saves just the new passkey over the existing ones), and a
+        // concurrent registration or deletion is merged rather than lost.
+        let registered_at = self.inner.clock.now();
+        self.update_fido2_credentials(&user_scope, |credentials| {
+            if credentials.iter().any(|c| c.cred_id() == &cred_id) {
+                return None;
+            }
+            credentials.push(crate::authn::factor::Fido2Credential::new(
+                passkey.clone(),
+                credential_name,
+                registered_at,
+            ));
+            Some(())
+        })
+        .await?;
 
         // Auto-invoke the device-binding hook. Adopters that wire the
         // `device` subsystem override `Fido2Provider::on_credential_used`
@@ -556,7 +596,7 @@ where
             tenant_id: user.tenant_id,
             user_id: user.id,
         };
-        self.save_fido2_credentials(&user_scope, credentials, &auth_result)
+        self.save_fido2_credentials(&user_scope, &auth_result)
             .await?;
 
         // Auto-invoke the device-binding hook for the credential that
@@ -627,34 +667,22 @@ where
             tenant_id: user.tenant_id,
             user_id: user.id,
         };
-        let mut credentials = match self
-            .inner
-            .factors
-            .load_factor(&user_scope, FactorKind::Fido2)
-            .await
-        {
-            Ok(Some(FactorConfig::Fido2(cfg))) => cfg.credentials,
-            _ => return Ok(false),
-        };
-
-        let original_len = credentials.len();
-        credentials.retain(|c| c.cred_id() != credential_id);
-
-        if credentials.len() == original_len {
+        // A failed read or write is an error to the caller, and `Ok(true)`
+        // is returned only once the swap that removes the credential has
+        // been committed.
+        let removed = self
+            .update_fido2_credentials(&user_scope, |credentials| {
+                let original_len = credentials.len();
+                credentials.retain(|c| c.cred_id() != credential_id);
+                if credentials.len() == original_len || credentials.len() < min_remaining {
+                    return None;
+                }
+                Some(())
+            })
+            .await?;
+        if removed.is_none() {
             return Ok(false);
         }
-        if credentials.len() < min_remaining {
-            return Ok(false);
-        }
-
-        self.inner
-            .factors
-            .save_factor(
-                &user_scope,
-                FactorConfig::Fido2(crate::authn::factor::Fido2Config { credentials }),
-            )
-            .await
-            .map_err(AuthnError::Store)?;
 
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::FactorDisabled)

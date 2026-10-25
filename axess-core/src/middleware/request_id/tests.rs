@@ -257,6 +257,32 @@ async fn test_default_generator() {
 }
 
 #[tokio::test]
+/// Verifies that the seeded generator yields the RNG's UUIDs in order.
+async fn test_rng_generator_is_reproducible() {
+    use axess_rng::testing::MockRng;
+    let service = RequestIdService::new(MockService, RngUuidGenerator::new(MockRng::new(12)));
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let res = ServiceExt::oneshot(service.clone(), Request::new(Body::empty()))
+            .await
+            .expect("service call failed");
+        seen.push(
+            res.headers()
+                .get(X_REQUEST_ID)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let rng = MockRng::new(12);
+    let expect: Vec<String> = (0..2)
+        .map(|_| axess_identity::mint_v4(&rng).to_string())
+        .collect();
+    assert_eq!(seen, expect);
+}
+
+#[tokio::test]
 /// Verifies that the request ID can be retrieved correctly from the request also when
 /// using a custom header name.
 async fn test_custom_header_name() {

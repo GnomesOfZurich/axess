@@ -147,7 +147,7 @@ impl FrontChannelLogoutHandler {
         };
 
         let key: SidKey = (iss.clone(), sid.clone());
-        if let Some((_, (user_id, session_id, _inserted_at))) = handler.sid_map.remove(&key) {
+        if let Some((user_id, session_id, _inserted_at)) = handler.sid_map.remove(&key) {
             tracing::info!(
                 oidc_sid = %sid,
                 user_id = %user_id,
@@ -183,7 +183,6 @@ mod tests {
     use crate::session::store::SessionRegistryAdapter;
     use crate::session::store::{MemorySessionRegistry, SessionRegistry};
     use crate::testing::mock_random::MockRng;
-    use dashmap::DashMap;
 
     fn known_issuers() -> HashSet<String> {
         ["https://idp.example.com".to_string()]
@@ -194,7 +193,7 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_invalidates_by_sid() {
         let registry = MemorySessionRegistry::new();
-        let sid_map: SidMap = Arc::new(DashMap::new());
+        let sid_map: SidMap = SidMap::new();
 
         let rng = MockRng::new(42);
         let session_id = SessionId::new(&rng);
@@ -205,7 +204,7 @@ mod tests {
             "https://idp.example.com".to_string(),
             "oidc-sid-123".to_string(),
         );
-        sid_map.insert(key.clone(), (user_id, session_id, chrono::Utc::now()));
+        sid_map.insert(key.clone(), user_id, session_id, chrono::Utc::now());
         assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
         let handler = FrontChannelLogoutHandler::new(
@@ -215,7 +214,7 @@ mod tests {
         );
 
         // Simulate: valid iss + known sid.
-        if let Some((_, (uid, sid, _))) = handler.sid_map.remove(&key) {
+        if let Some((uid, sid, _)) = handler.sid_map.remove(&key) {
             handler.registry.invalidate_session(&uid, &sid).await;
         }
 
@@ -226,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_unknown_sid_is_noop() {
         let registry = MemorySessionRegistry::new();
-        let sid_map: SidMap = Arc::new(DashMap::new());
+        let sid_map: SidMap = SidMap::new();
         let handler = FrontChannelLogoutHandler::new(
             sid_map,
             Arc::new(SessionRegistryAdapter(registry)),
@@ -242,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_rejects_unknown_issuer() {
         let handler = FrontChannelLogoutHandler::new(
-            Arc::new(DashMap::new()),
+            SidMap::new(),
             Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
             known_issuers(),
         );
@@ -253,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn frontchannel_logout_rejects_missing_iss() {
         let handler = FrontChannelLogoutHandler::new(
-            Arc::new(DashMap::new()),
+            SidMap::new(),
             Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
             known_issuers(),
         );
@@ -286,7 +285,7 @@ mod tests {
 
         // ── Subtest 1: known iss + known sid → 200 + session invalidated.
         let registry = MemorySessionRegistry::new();
-        let sid_map: SidMap = Arc::new(DashMap::new());
+        let sid_map: SidMap = SidMap::new();
         let rng = MockRng::new(7);
         let session_id = SessionId::new(&rng);
         let user_id = axess_identity::testing::user("u1");
@@ -295,7 +294,7 @@ mod tests {
             "https://idp.example.com".to_string(),
             "oidc-sid-XYZ".to_string(),
         );
-        sid_map.insert(key.clone(), (user_id, session_id, chrono::Utc::now()));
+        sid_map.insert(key.clone(), user_id, session_id, chrono::Utc::now());
 
         let handler = FrontChannelLogoutHandler::new(
             sid_map.clone(),

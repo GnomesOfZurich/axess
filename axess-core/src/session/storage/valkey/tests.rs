@@ -9,8 +9,8 @@
 //! `#[ignore]` test below.
 
 use super::internal::{
-    DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, registry_key, revocation_session_channel,
-    revocation_user_channel, session_key,
+    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, registry_key,
+    revocation_session_channel, revocation_user_channel, script_unavailable, session_key,
 };
 use super::registry::ValkeySessionRegistry;
 use super::store::ValkeySessionStore;
@@ -22,6 +22,12 @@ use crate::session::store::{SessionRegistry, SessionStore};
 use axess_rng::SystemRng;
 use fred::prelude::*;
 use std::time::Duration;
+
+fn test_id() -> SessionId {
+    "00000000-0000-4000-8000-000000000001"
+        .parse()
+        .expect("fixed test id")
+}
 
 // The previous `encrypt_decrypt_roundtrip` /
 // `key_rotation_decrypt_with_previous` / `decrypt_wrong_key_fails`
@@ -39,8 +45,10 @@ fn store_encode_decode_encrypted() {
     let key = [99u8; 32];
     let codec = SessionCodec::encrypted(SessionCrypto::new(key));
     let data = SessionData::default();
-    let bytes = codec.encode_bytes(&data).expect("encode_bytes");
-    let restored = codec.decode_bytes(&bytes).expect("decode_bytes");
+    let bytes = codec.encode_bytes(&test_id(), &data).expect("encode_bytes");
+    let restored = codec
+        .decode_bytes(&test_id(), &bytes)
+        .expect("decode_bytes");
     assert_eq!(
         serde_json::to_string(&data).unwrap(),
         serde_json::to_string(&restored).unwrap(),
@@ -57,7 +65,7 @@ fn encode_rejects_oversized_payload() {
     let store = ValkeySessionStore::plaintext(client).with_max_payload(1);
 
     let data = SessionData::default();
-    let result = store.encode(&data);
+    let result = store.encode(&test_id(), &data);
 
     assert!(
         matches!(result, Err(ValkeyStoreError::PayloadTooLarge { .. })),
@@ -74,7 +82,7 @@ fn encode_accepts_payload_within_limit() {
     // Default limit (64 KiB): default SessionData is tiny.
     let store = ValkeySessionStore::plaintext(client);
     let data = SessionData::default();
-    assert!(store.encode(&data).is_ok());
+    assert!(store.encode(&test_id(), &data).is_ok());
 }
 
 // ── pinning tests ───────────────────────────────────────
@@ -159,19 +167,25 @@ fn encode_size_boundary_is_strict_greater_than() {
     let baseline = store
         .clone()
         .with_max_payload(usize::MAX)
-        .encode(&data)
+        .encode(&test_id(), &data)
         .expect("baseline encode")
         .len();
 
     // Exactly at cap: original (`>`) returns Ok; `==` and `>=` reject.
-    let ok_at_cap = store.clone().with_max_payload(baseline).encode(&data);
+    let ok_at_cap = store
+        .clone()
+        .with_max_payload(baseline)
+        .encode(&test_id(), &data);
     assert!(
         ok_at_cap.is_ok(),
         "encode at exactly the cap must succeed (> not >= or ==): {ok_at_cap:?}"
     );
 
     // One under cap: original rejects, `<` mutant accepts.
-    let under_cap = store.clone().with_max_payload(baseline - 1).encode(&data);
+    let under_cap = store
+        .clone()
+        .with_max_payload(baseline - 1)
+        .encode(&test_id(), &data);
     assert!(
         matches!(under_cap, Err(ValkeyStoreError::PayloadTooLarge { .. })),
         "encode one byte under cap must reject (discriminates < mutant): {under_cap:?}"
@@ -203,7 +217,7 @@ fn store_encode_decode_roundtrip_pins_bodies() {
         ..SessionData::default()
     };
 
-    let bytes = store.encode(&data).expect("encode");
+    let bytes = store.encode(&test_id(), &data).expect("encode");
     assert!(
         !bytes.is_empty(),
         "encode must produce a non-empty payload: kills Ok(vec![])"
@@ -213,7 +227,7 @@ fn store_encode_decode_roundtrip_pins_bodies() {
         "encode must produce > 1 byte for non-trivial payload: kills Ok(vec![0/1])"
     );
 
-    let decoded = store.decode(&bytes).expect("decode");
+    let decoded = store.decode(&test_id(), &bytes).expect("decode");
     assert_eq!(
         serde_json::to_string(&data).unwrap(),
         serde_json::to_string(&decoded).unwrap(),
@@ -434,9 +448,9 @@ async fn prune_expired_returns_zero_per_native_expiry_contract() {
 /// Requires a running Valkey instance at `127.0.0.1:6379`.
 /// Run with: `cargo test --features valkey -- --ignored valkey_integration`
 #[tokio::test]
-#[ignore = "requires a running Valkey instance at 127.0.0.1:6379"]
+#[ignore = "requires a running Valkey (VALKEY_URL, default 127.0.0.1:6379)"]
 async fn valkey_integration() {
-    let config = Config::from_url("redis://127.0.0.1:6379").expect("parse redis URL");
+    let config = Config::from_url(&live_client_url()).expect("parse redis URL");
     let client = Client::new(config, None, None, None);
     client.init().await.expect("connect to Valkey");
 
@@ -536,4 +550,97 @@ async fn valkey_integration() {
     old_store.delete(&rot_sid).await.expect("cleanup");
 
     client.quit().await.expect("disconnect");
+}
+
+/// The cycle script writes the new key before it touches the old one, and
+/// only deletes the old key when it differs from the new one.
+#[test]
+fn cycle_script_sets_before_it_deletes_and_spares_a_same_key_cycle() {
+    let set = CYCLE_SCRIPT.find("'SET', KEYS[2]").expect("SET new");
+    let guard = CYCLE_SCRIPT
+        .find("KEYS[1] ~= KEYS[2]")
+        .expect("same-key guard");
+    let del = CYCLE_SCRIPT.find("'DEL', KEYS[1]").expect("DEL old");
+    assert!(set < guard && guard < del);
+}
+
+/// Only "this deployment cannot run the script" errors take the SET then
+/// DEL fallback; a failed write or a dead connection does not.
+#[test]
+fn only_script_unavailability_selects_the_fallback() {
+    use fred::error::{Error, ErrorKind};
+    for text in [
+        "CROSSSLOT Keys in request don't hash to the same slot",
+        "ERR unknown command 'EVAL'",
+        "NOPERM this user has no permissions to run the 'eval' command",
+        "NOSCRIPT No matching script",
+    ] {
+        assert!(
+            script_unavailable(&Error::new(ErrorKind::Unknown, text)),
+            "{text}"
+        );
+    }
+    for text in [
+        "ERR invalid expire time in 'set' command",
+        "connection reset",
+    ] {
+        assert!(
+            !script_unavailable(&Error::new(ErrorKind::Unknown, text)),
+            "{text}"
+        );
+    }
+}
+
+fn live_client_url() -> String {
+    std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
+}
+
+/// A rotation whose SET fails leaves the old session readable; a good
+/// rotation moves it; cycling to the same id keeps it.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_session_cycle_is_atomic() {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let store = ValkeySessionStore::plaintext(client).with_prefix("axt_cycle");
+    let rng = SystemRng;
+    let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+    let data = SessionData::default();
+    store
+        .save(&old, &data, Duration::from_secs(60))
+        .await
+        .unwrap();
+
+    // An out-of-range expiry makes the SET inside the script fail.
+    let failed = store
+        .cycle(&old, &new, &data, Duration::from_secs(u64::MAX / 2))
+        .await;
+    assert!(failed.is_err());
+    assert!(
+        store.load(&old).await.unwrap().is_some(),
+        "old row survives a failed SET"
+    );
+    assert!(store.load(&new).await.unwrap().is_none());
+
+    store
+        .cycle(&old, &new, &data, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(store.load(&old).await.unwrap().is_none());
+    assert!(store.load(&new).await.unwrap().is_some());
+
+    store
+        .cycle(&new, &new, &data, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(
+        store.load(&new).await.unwrap().is_some(),
+        "same-id cycle keeps the session"
+    );
+    store.delete(&new).await.unwrap();
 }

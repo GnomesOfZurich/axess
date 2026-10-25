@@ -58,6 +58,10 @@ REMOVED = {
     # the check is the compiler's now, and `docs/production/audit-events.md`
     # names it to say why the SQL detector outlives it.
     "AuditContextPolicy",
+    # Removed in 0.11.0: `verify_reset_token` takes the instant, so the mock
+    # no longer needs a clock of its own. `docs/production/migrating.md`
+    # names it under "0.10.0 to 0.11.0" to say what replaces it.
+    "MockIdentityStore::with_clock",
 }
 
 ALLOW = {

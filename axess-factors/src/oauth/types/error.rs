@@ -83,6 +83,13 @@ pub enum OAuthError {
     #[error("no key in JWKS matching kid `{0}`; call refresh_jwks() to re-fetch")]
     UnknownKid(String),
 
+    /// The cached JWKS is older than its maximum age and was not used.
+    /// Callers (e.g. back-channel logout) refresh the key set and retry,
+    /// like for [`UnknownKid`](Self::UnknownKid); verification stays refused
+    /// until a refresh succeeds.
+    #[error("cached JWKS is past its maximum age; call refresh_jwks() to re-fetch")]
+    JwksExpired,
+
     /// RFC 7009 §2.2.1: the authorization server received the
     /// revocation request but does not support the supplied token type
     /// (e.g. it can revoke `refresh_token` but not `access_token`).
@@ -198,6 +205,7 @@ impl OAuthError {
             | Self::InsufficientScope
             | Self::DeviceAuthorization(_)
             | Self::UnknownKid(_)
+            | Self::JwksExpired
             | Self::UnsupportedTokenType => false,
         }
     }
@@ -240,6 +248,7 @@ mod oauth_error_is_transient_tests {
             OAuthError::TokenExchange("t".into()),
             OAuthError::IdTokenValidation("v".into()),
             OAuthError::UnknownKid("k".into()),
+            OAuthError::JwksExpired,
             OAuthError::DeviceAuthorization("d".into()),
         ] {
             assert!(!e.is_transient(), "expected permanent: {e:?}");

@@ -11,11 +11,17 @@
 //! constraints (cookie size limits, SameSite policy, stateless
 //! workers, …).
 
-use chrono::Utc;
-use openidconnect::PkceCodeChallenge;
+use axess_clock::{Clock, SystemClock};
+use axess_rng::SecureRng;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chrono::{DateTime, Utc};
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
@@ -57,12 +63,19 @@ pub struct GrantContext {
 ///
 /// `scopes_override`: pass an empty slice to use the provider's
 /// `default_scopes`; pass a non-empty slice to override.
+///
+/// `rng` supplies the PKCE verifier and the `state`: two separate
+/// 32-byte draws, each base64url-encoded without padding (43
+/// characters). The raw bytes are zeroed once encoded. The challenge
+/// is `BASE64URL(SHA-256(verifier))`.
 pub fn begin_grant(
     provider: &DelegatedProvider,
     scopes_override: &[String],
+    rng: &dyn SecureRng,
 ) -> Result<(Url, GrantContext), DelegatedError> {
-    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let state = openidconnect::CsrfToken::new_random();
+    let verifier = random_token(rng);
+    let state = random_token(rng);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
 
     let scopes: Vec<String> = if scopes_override.is_empty() {
         provider.default_scopes.clone()
@@ -77,8 +90,8 @@ pub fn begin_grant(
         q.append_pair("response_type", "code");
         q.append_pair("client_id", &provider.client_id);
         q.append_pair("redirect_uri", provider.redirect_uri.as_str());
-        q.append_pair("state", state.secret());
-        q.append_pair("code_challenge", challenge.as_str());
+        q.append_pair("state", &state);
+        q.append_pair("code_challenge", &challenge);
         q.append_pair("code_challenge_method", "S256");
         if !scope_str.is_empty() {
             q.append_pair("scope", &scope_str);
@@ -86,12 +99,20 @@ pub fn begin_grant(
     }
 
     let context = GrantContext {
-        state: state.secret().clone(),
-        code_verifier: ZeroizedString::from(verifier.secret().clone()),
+        state: (*state).clone(),
+        code_verifier: ZeroizedString::from((*verifier).clone()),
         requested_scopes: scopes,
     };
 
     Ok((auth_url, context))
+}
+
+/// 32 random bytes from `rng`, base64url-encoded without padding. The
+/// raw buffer is zeroed on drop and so is the returned string.
+fn random_token(rng: &dyn SecureRng) -> Zeroizing<String> {
+    let mut raw = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(&mut *raw);
+    Zeroizing::new(URL_SAFE_NO_PAD.encode(*raw))
 }
 
 /// Complete an authorization-code grant: verify the returned `state`
@@ -99,6 +120,9 @@ pub fn begin_grant(
 /// the code + PKCE verifier + client credentials. Returns the
 /// `StoredDelegation` ready to hand to a
 /// [`DelegatedCredentialStore`](super::credential::DelegatedCredentialStore).
+///
+/// Token expiry is computed from the system clock; use
+/// [`complete_grant_at`] to supply the instant.
 pub async fn complete_grant(
     provider: &DelegatedProvider,
     context: &GrantContext,
@@ -106,11 +130,35 @@ pub async fn complete_grant(
     state_from_callback: &str,
     http: &reqwest::Client,
 ) -> Result<StoredDelegation, DelegatedError> {
-    // CSRF check; constant-time comparison would be ideal but the
-    // state values are random per request and not under attacker
-    // influence in a way that timing can leak. Plain `==` is fine
-    // here, mirroring openidconnect's own callback-side handling.
-    if context.state != state_from_callback {
+    complete_grant_at(
+        provider,
+        context,
+        code,
+        state_from_callback,
+        http,
+        SystemClock.now(),
+    )
+    .await
+}
+
+/// [`complete_grant`] with the instant the resulting credential's
+/// `expires_at` is measured from supplied by the caller.
+pub async fn complete_grant_at(
+    provider: &DelegatedProvider,
+    context: &GrantContext,
+    code: &str,
+    state_from_callback: &str,
+    http: &reqwest::Client,
+    now: DateTime<Utc>,
+) -> Result<StoredDelegation, DelegatedError> {
+    // The state is compared in constant time: it is the secret that
+    // binds the callback to the browser that started the flow.
+    let state_matches: bool = context
+        .state
+        .as_bytes()
+        .ct_eq(state_from_callback.as_bytes())
+        .into();
+    if !state_matches {
         return Err(DelegatedError::StateMismatch);
     }
 
@@ -118,34 +166,42 @@ pub async fn complete_grant(
         return Err(DelegatedError::PkceVerifier);
     }
 
-    let form: Vec<(&str, String)> = vec![
-        ("grant_type", "authorization_code".to_string()),
-        ("code", code.to_string()),
-        ("redirect_uri", provider.redirect_uri.to_string()),
-        ("code_verifier", (*context.code_verifier).to_string()),
+    // Borrowed throughout: the verifier and code are never copied into
+    // buffers of this function's own.
+    let redirect_uri = provider.redirect_uri.as_str();
+    let form: Vec<(&str, &str)> = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", &context.code_verifier),
         // RFC 6749 §2.3.1 allows client_id in form body alongside
         // Basic auth; some IdPs require it.
-        ("client_id", provider.client_id.clone()),
+        ("client_id", &provider.client_id),
     ];
 
     let response = post_token_endpoint(http, provider, &form).await?;
-    parse_token_response(provider, response).await
+    parse_token_response(provider, response, now).await
 }
 
 /// Refresh-token grant: RFC 6749 §6. Internal helper shared with
 /// `StoredDelegationSession::get_access_token` on the refresh path.
+///
+/// The expiry is measured from `clock.now()` read after the token
+/// endpoint has answered, so a slow exchange does not shorten the
+/// lifetime recorded for the new access token.
 pub(super) async fn refresh_token_grant(
     provider: &DelegatedProvider,
     refresh_token: &str,
     http: &reqwest::Client,
+    clock: &dyn Clock,
 ) -> Result<StoredDelegation, DelegatedError> {
-    let form: Vec<(&str, String)> = vec![
-        ("grant_type", "refresh_token".to_string()),
-        ("refresh_token", refresh_token.to_string()),
-        ("client_id", provider.client_id.clone()),
+    let form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", &provider.client_id),
     ];
     let response = post_token_endpoint(http, provider, &form).await?;
-    parse_token_response(provider, response).await
+    parse_token_response(provider, response, clock.now()).await
 }
 
 /// POST to the IdP's token endpoint with HTTP Basic auth carrying the
@@ -154,7 +210,7 @@ pub(super) async fn refresh_token_grant(
 async fn post_token_endpoint(
     http: &reqwest::Client,
     provider: &DelegatedProvider,
-    form: &[(&str, String)],
+    form: &[(&str, &str)],
 ) -> Result<reqwest::Response, DelegatedError> {
     let encoded = axess_factors::basic_credentials(&provider.client_id, &provider.client_secret);
 
@@ -191,6 +247,7 @@ struct TokenResponse {
 async fn parse_token_response(
     provider: &DelegatedProvider,
     response: reqwest::Response,
+    now: DateTime<Utc>,
 ) -> Result<StoredDelegation, DelegatedError> {
     let status = response.status();
     if !status.is_success() {
@@ -220,7 +277,7 @@ async fn parse_token_response(
 
     let expires_at = match parsed.expires_in.filter(|s| *s > 0) {
         None => None,
-        Some(s) => Some(axess_factors::expiry_after(Utc::now(), s).ok_or_else(|| {
+        Some(s) => Some(axess_factors::expiry_after(now, s).ok_or_else(|| {
             DelegatedError::MalformedResponse(format!("expires_in {s} is out of range"))
         })?),
     };

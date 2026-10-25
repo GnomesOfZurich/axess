@@ -16,30 +16,109 @@
 
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS devices (
-//!     tenant_id        VARCHAR(64)    NOT NULL,
-//!     id               VARCHAR(64)    NOT NULL,
-//!     user_id          VARCHAR(64),
+//!     tenant_id        VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     id               VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     user_id          VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
 //!     trust_level      VARCHAR(16)    NOT NULL,
 //!     fingerprint_hash VARBINARY(32)  NOT NULL,
 //!     first_seen_at    BIGINT         NOT NULL,
 //!     last_seen_at     BIGINT         NOT NULL,
 //!     revoked_at       BIGINT,
-//!     bindings         TEXT           NOT NULL,
+//!     demoted_at       BIGINT,
+//!     bindings         MEDIUMTEXT     NOT NULL,
 //!     PRIMARY KEY (tenant_id, id),
 //!     INDEX idx_devices_fingerprint (tenant_id, fingerprint_hash),
-//!     INDEX idx_devices_user (tenant_id, user_id, last_seen_at)
+//!     INDEX idx_devices_user (tenant_id, user_id, last_seen_at),
+//!     INDEX idx_devices_user_fingerprint (tenant_id, user_id, fingerprint_hash, last_seen_at)
 //! );
 //!
 //! CREATE TABLE IF NOT EXISTS device_bindings_refresh (
-//!     tenant_id VARCHAR(64) NOT NULL,
-//!     device_id VARCHAR(64) NOT NULL,
-//!     family_id VARCHAR(64) NOT NULL,
+//!     tenant_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     device_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     family_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
 //!     PRIMARY KEY (tenant_id, device_id, family_id),
 //!     INDEX idx_device_bindings_refresh_family (tenant_id, family_id),
 //!     CONSTRAINT fk_device_bindings_refresh_device
 //!         FOREIGN KEY (tenant_id, device_id)
 //!         REFERENCES devices (tenant_id, id) ON DELETE CASCADE
 //! );
+//! ```
+//!
+//! `bindings` is `MEDIUMTEXT` (16 MiB), not `TEXT` (64 KiB): the column holds
+//! the base64 of the serialised, optionally encrypted binding list, which
+//! outgrows 64 KiB for a device with many refresh and WebAuthn bindings, and
+//! MySQL in strict mode then rejects the write. `family_id` is compared
+//! with a binary collation (`utf8mb4_bin`): refresh-family ids are
+//! case-sensitive opaque tokens, and the default case-insensitive collation
+//! would let `find_by_refresh_family("Fam")` match, and revoke, the devices
+//! of family `fam`, and would make two distinct families collide on the
+//! primary key.
+//!
+//! # Upgrading an existing deployment
+//!
+//! `CREATE TABLE IF NOT EXISTS` leaves tables that already exist as they
+//! are, so a deployment created before these two column definitions must
+//! run, once:
+//!
+//! ```sql
+//! ALTER TABLE devices
+//!     MODIFY bindings MEDIUMTEXT NOT NULL;
+//! ALTER TABLE device_bindings_refresh
+//!     MODIFY family_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL;
+//! ```
+//!
+//! The id columns are compared with a binary collation too (see
+//! `DEVICES_DDL`): without it `tenant_id`, `id` and `user_id` use the
+//! table's default, case-insensitive collation, so a device id differing
+//! only in case resolves to the same row. A deployment created before this
+//! must also run, once. The foreign key has to be dropped while the columns
+//! it ties together change collation, and re-added after:
+//!
+//! ```sql
+//! ALTER TABLE device_bindings_refresh
+//!     DROP FOREIGN KEY fk_device_bindings_refresh_device;
+//! ALTER TABLE devices
+//!     MODIFY tenant_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     MODIFY id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     MODIFY user_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+//! ALTER TABLE device_bindings_refresh
+//!     MODIFY tenant_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+//!     MODIFY device_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL;
+//! ALTER TABLE device_bindings_refresh
+//!     ADD CONSTRAINT fk_device_bindings_refresh_device
+//!         FOREIGN KEY (tenant_id, device_id)
+//!         REFERENCES devices (tenant_id, id) ON DELETE CASCADE;
+//! ```
+//!
+//! The `devices` change rebuilds its primary key and fails with a
+//! duplicate-key error if two stored ids differ only in case; resolve those
+//! rows first (the refresh index is rebuilt from `devices.bindings` on the
+//! next `save`).
+//!
+//! A deployment created before `demoted_at` existed (the instant a
+//! `Trusted` row was moved down to `Seen`, `NULL` for a device that was
+//! never trusted) must also run:
+//!
+//! ```sql
+//! ALTER TABLE devices ADD COLUMN demoted_at BIGINT NULL AFTER revoked_at;
+//! ```
+//!
+//! Rows that were already `Seen` carry `NULL` and so read as never trusted:
+//! the first sweep after the upgrade revokes those idle for more than
+//! `seen_idle` (30 days by default), including ones demoted earlier.
+//!
+//! The second statement rebuilds the table's primary key; it fails with a
+//! duplicate-key error if two stored family ids differ only in case, in
+//! which case delete the rows of the family that is not meant to exist
+//! (the index is rebuilt from `devices.bindings` on the next `save`).
+//!
+//! A deployment created before `find_by_fingerprint_for_user` existed must
+//! also add the index that serves it (`CREATE TABLE IF NOT EXISTS` does not
+//! touch an existing table):
+//!
+//! ```sql
+//! ALTER TABLE devices ADD INDEX idx_devices_user_fingerprint
+//!     (tenant_id, user_id, fingerprint_hash, last_seen_at);
 //! ```
 //!
 //! MySQL `CREATE INDEX` is not idempotent (no `IF NOT EXISTS` for
@@ -56,16 +135,24 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use axess_clock::Clock;
+use chrono::{DateTime, Utc};
 use sqlx::MySqlPool;
 
-use axess_clock::{Clock, SystemClock};
-
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::device::storage::sql_common::{BindingsCodec, SqlDeviceStoreError, trust_level_codec};
-use crate::device::store::{DeviceStore, SweepConfig, SweepCounts};
+use crate::device::storage::sql_common::{
+    BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
+    SqlDeviceStoreError, SwapPlan, SweepCutoffs, TrustWrite, bindings_update_after_miss,
+    claim_after_miss, decode_all, decode_optional, parse_stored_trust, plan_bindings_swap,
+    push_family_rows, require_row, select_devices, transition_after_miss, utc_to_unix,
+};
+use crate::device::store::{
+    BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
+};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
+
+mod sweep;
 
 /// MySQL/MariaDB-backed [`DeviceStore`].
 ///
@@ -89,7 +176,6 @@ use crate::session::crypto::SessionCrypto;
 pub struct MysqlDeviceStore {
     pool: MySqlPool,
     codec: BindingsCodec,
-    clock: Arc<dyn Clock>,
     sweep_config: SweepConfig,
 }
 
@@ -99,7 +185,6 @@ impl MysqlDeviceStore {
         Self {
             pool,
             codec: BindingsCodec::encrypted(crypto),
-            clock: Arc::new(SystemClock),
             sweep_config: SweepConfig::default(),
         }
     }
@@ -113,14 +198,15 @@ impl MysqlDeviceStore {
         Self {
             pool,
             codec: BindingsCodec::plaintext(),
-            clock: Arc::new(SystemClock),
             sweep_config: SweepConfig::default(),
         }
     }
 
-    /// Inject a [`Clock`] for deterministic-simulation testing.
-    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+    /// Has no effect: every time-dependent method of the store is given the
+    /// instant it works from, so there is no clock to inject.
+    #[deprecated(note = "the store reads time only from the `now` its methods are given")]
+    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
+        let _ = clock;
         self
     }
 
@@ -132,133 +218,99 @@ impl MysqlDeviceStore {
 
     /// Create tables + indexes. Idempotent.
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS devices (
-                tenant_id        VARCHAR(64)    NOT NULL,
-                id               VARCHAR(64)    NOT NULL,
-                user_id          VARCHAR(64),
-                trust_level      VARCHAR(16)    NOT NULL,
-                fingerprint_hash VARBINARY(32)  NOT NULL,
-                first_seen_at    BIGINT         NOT NULL,
-                last_seen_at     BIGINT         NOT NULL,
-                revoked_at       BIGINT,
-                bindings         TEXT           NOT NULL,
-                PRIMARY KEY (tenant_id, id),
-                INDEX idx_devices_fingerprint (tenant_id, fingerprint_hash),
-                INDEX idx_devices_user (tenant_id, user_id, last_seen_at)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS device_bindings_refresh (
-                tenant_id VARCHAR(64) NOT NULL,
-                device_id VARCHAR(64) NOT NULL,
-                family_id VARCHAR(64) NOT NULL,
-                PRIMARY KEY (tenant_id, device_id, family_id),
-                INDEX idx_device_bindings_refresh_family (tenant_id, family_id),
-                CONSTRAINT fk_device_bindings_refresh_device
-                    FOREIGN KEY (tenant_id, device_id)
-                    REFERENCES devices (tenant_id, id) ON DELETE CASCADE
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(DEVICES_DDL).execute(&self.pool).await?;
+        sqlx::query(DEVICE_BINDINGS_REFRESH_DDL)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
+}
 
-    fn decode_row(&self, row: DeviceRow) -> Result<Device, SqlDeviceStoreError> {
-        let DeviceRow {
-            tenant_id,
-            id,
-            user_id,
-            trust_level,
-            fingerprint_hash,
-            first_seen_at,
-            last_seen_at,
-            revoked_at,
-            bindings,
-        } = row;
+/// `devices` table. The id columns (`tenant_id`, `id`, `user_id`) compare
+/// byte for byte (`utf8mb4_bin`): they are case-sensitive opaque ids, and
+/// the server's default case-insensitive collation would resolve device `Ab`
+/// as device `aB`, find another tenant's or user's row by a differently
+/// cased id, and make two distinct ids collide on the primary key.
+const DEVICES_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS devices (
+    tenant_id        VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    id               VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    user_id          VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+    trust_level      VARCHAR(16)    NOT NULL,
+    fingerprint_hash VARBINARY(32)  NOT NULL,
+    first_seen_at    BIGINT         NOT NULL,
+    last_seen_at     BIGINT         NOT NULL,
+    revoked_at       BIGINT,
+    demoted_at       BIGINT,
+    bindings         MEDIUMTEXT     NOT NULL,
+    PRIMARY KEY (tenant_id, id),
+    INDEX idx_devices_fingerprint (tenant_id, fingerprint_hash),
+    INDEX idx_devices_user (tenant_id, user_id, last_seen_at),
+    INDEX idx_devices_user_fingerprint (tenant_id, user_id, fingerprint_hash, last_seen_at)
+)
+"#;
 
-        let tenant = TenantId::try_new(&tenant_id)
-            .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("tenant_id: {e}")))?;
-        let device_id = DeviceId::try_new(&id)
-            .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("device id: {e}")))?;
-        let user = match user_id {
-            Some(u) => Some(
-                UserId::try_new(&u)
-                    .map_err(|e| SqlDeviceStoreError::MalformedRow(format!("user_id: {e}")))?,
-            ),
-            None => None,
-        };
+/// Refresh-family index table. `tenant_id` and `device_id` carry the same
+/// binary collation as the `devices` columns they reference, which a
+/// foreign key requires.
+const DEVICE_BINDINGS_REFRESH_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS device_bindings_refresh (
+    tenant_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    device_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    family_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    PRIMARY KEY (tenant_id, device_id, family_id),
+    INDEX idx_device_bindings_refresh_family (tenant_id, family_id),
+    CONSTRAINT fk_device_bindings_refresh_device
+        FOREIGN KEY (tenant_id, device_id)
+        REFERENCES devices (tenant_id, id) ON DELETE CASCADE
+)
+"#;
 
-        let trust = trust_level_codec::from_str(&trust_level)
-            .ok_or(SqlDeviceStoreError::UnknownTrustLevel(trust_level))?;
+#[cfg(test)]
+mod schema_tests;
 
-        let fp_bytes: [u8; 32] = fingerprint_hash
-            .try_into()
-            .map_err(|_| SqlDeviceStoreError::MalformedRow("fingerprint_hash length".into()))?;
+/// Current trust level of a device row, `None` when the row is absent.
+async fn fetch_trust_level(
+    pool: &MySqlPool,
+    tenant: &str,
+    device_id: &str,
+) -> Result<Option<DeviceTrustLevel>, SqlDeviceStoreError> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT trust_level FROM devices WHERE tenant_id = ? AND id = ?")
+            .bind(tenant)
+            .bind(device_id)
+            .fetch_optional(pool)
+            .await?;
+    parse_stored_trust(stored)
+}
 
-        let first = unix_to_utc(first_seen_at)?;
-        let last = unix_to_utc(last_seen_at)?;
-        let revoked = match revoked_at {
-            Some(t) => Some(unix_to_utc(t)?),
-            None => None,
-        };
-
-        let bindings = self.codec.decode(&bindings)?;
-
-        Ok(Device {
-            id: device_id,
-            tenant_id: tenant,
-            user_id: user,
-            trust_level: trust,
-            fingerprint_hash: FingerprintHash::from_bytes(fp_bytes),
-            first_seen_at: first,
-            last_seen_at: last,
-            revoked_at: revoked,
-            bindings,
-        })
+/// Replace a device's refresh-family index rows inside `tx`. The family
+/// ids are already distinct ([`refresh_family_ids`]) and the insert is
+/// idempotent as well, so a repeated family can never violate the primary
+/// key and abort the surrounding transaction.
+async fn rewrite_family_index(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    tenant: &str,
+    device_id: &str,
+    family_ids: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM device_bindings_refresh WHERE tenant_id = ? AND device_id = ?")
+        .bind(tenant)
+        .bind(device_id)
+        .execute(&mut **tx)
+        .await?;
+    // One multi-row insert per chunk keeps a device with many families to a
+    // handful of statements, well under every dialect's bind-parameter cap.
+    for chunk in family_ids.chunks(FAMILY_INSERT_CHUNK) {
+        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO device_bindings_refresh (tenant_id, device_id, family_id) ",
+        );
+        push_family_rows(&mut insert, chunk, tenant, device_id);
+        insert.push(" ON DUPLICATE KEY UPDATE family_id = family_id");
+        insert.build().execute(&mut **tx).await?;
     }
-}
-
-#[derive(sqlx::FromRow)]
-struct DeviceRow {
-    tenant_id: String,
-    id: String,
-    user_id: Option<String>,
-    trust_level: String,
-    fingerprint_hash: Vec<u8>,
-    first_seen_at: i64,
-    last_seen_at: i64,
-    revoked_at: Option<i64>,
-    bindings: String,
-}
-
-fn unix_to_utc(secs: i64) -> Result<DateTime<Utc>, SqlDeviceStoreError> {
-    Utc.timestamp_opt(secs, 0).single().ok_or_else(|| {
-        SqlDeviceStoreError::MalformedRow(format!("unrepresentable Unix timestamp: {secs}"))
-    })
-}
-
-fn utc_to_unix(dt: DateTime<Utc>) -> i64 {
-    dt.timestamp()
-}
-
-fn refresh_family_ids(bindings: &[DeviceBinding]) -> Vec<String> {
-    bindings
-        .iter()
-        .filter_map(|b| match b {
-            DeviceBinding::Refresh { family_id, .. } => Some(family_id.clone()),
-            _ => None,
-        })
-        .collect()
+    Ok(())
 }
 
 impl DeviceStore for MysqlDeviceStore {
@@ -270,24 +322,17 @@ impl DeviceStore for MysqlDeviceStore {
         id: &DeviceId,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
+        let codec = self.codec.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
         async move {
-            let row: Option<DeviceRow> = sqlx::query_as(
-                "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
-                        first_seen_at, last_seen_at, revoked_at, bindings \
-                 FROM devices WHERE tenant_id = ? AND id = ?",
-            )
-            .bind(&tenant)
-            .bind(&device_id)
-            .fetch_optional(&pool)
-            .await?;
-
-            match row {
-                Some(r) => Ok(Some(store.decode_row(r)?)),
-                None => Ok(None),
-            }
+            let row: Option<DeviceRow> =
+                sqlx::query_as(select_devices!("WHERE tenant_id = ? AND id = ?"))
+                    .bind(&tenant)
+                    .bind(&device_id)
+                    .fetch_optional(&pool)
+                    .await?;
+            decode_optional(&codec, row)
         }
     }
 
@@ -297,25 +342,44 @@ impl DeviceStore for MysqlDeviceStore {
         hash: &FingerprintHash,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
+        let codec = self.codec.clone();
         let tenant = tenant_id.to_string();
         let bytes = hash.as_bytes().to_vec();
         async move {
-            let row: Option<DeviceRow> = sqlx::query_as(
-                "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
-                        first_seen_at, last_seen_at, revoked_at, bindings \
-                 FROM devices WHERE tenant_id = ? AND fingerprint_hash = ? \
-                 ORDER BY last_seen_at DESC LIMIT 1",
-            )
+            let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ? AND fingerprint_hash = ? \
+                 ORDER BY last_seen_at DESC LIMIT 1"
+            ))
             .bind(&tenant)
             .bind(&bytes)
             .fetch_optional(&pool)
             .await?;
+            decode_optional(&codec, row)
+        }
+    }
 
-            match row {
-                Some(r) => Ok(Some(store.decode_row(r)?)),
-                None => Ok(None),
-            }
+    fn find_by_fingerprint_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        hash: &FingerprintHash,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
+        let uid = user_id.to_string();
+        let bytes = hash.as_bytes().to_vec();
+        async move {
+            let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ? AND user_id = ? AND fingerprint_hash = ? \
+                 ORDER BY last_seen_at DESC LIMIT 1"
+            ))
+            .bind(&tenant)
+            .bind(&uid)
+            .bind(&bytes)
+            .fetch_optional(&pool)
+            .await?;
+            decode_optional(&codec, row)
         }
     }
 
@@ -326,28 +390,21 @@ impl DeviceStore for MysqlDeviceStore {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
+        let codec = self.codec.clone();
         let tenant = tenant_id.to_string();
         let uid = user_id.to_string();
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         async move {
-            let rows: Vec<DeviceRow> = sqlx::query_as(
-                "SELECT tenant_id, id, user_id, trust_level, fingerprint_hash, \
-                        first_seen_at, last_seen_at, revoked_at, bindings \
-                 FROM devices WHERE tenant_id = ? AND user_id = ? \
-                 ORDER BY last_seen_at DESC LIMIT ?",
-            )
+            let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ? AND user_id = ? \
+                 ORDER BY last_seen_at DESC LIMIT ?"
+            ))
             .bind(&tenant)
             .bind(&uid)
             .bind(limit_i64)
             .fetch_all(&pool)
             .await?;
-
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                out.push(store.decode_row(r)?);
-            }
-            Ok(out)
+            decode_all(&codec, rows)
         }
     }
 
@@ -357,13 +414,13 @@ impl DeviceStore for MysqlDeviceStore {
         family_id: &str,
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let store = self.clone();
+        let codec = self.codec.clone();
         let tenant = tenant_id.to_string();
         let family = family_id.to_string();
         async move {
             let rows: Vec<DeviceRow> = sqlx::query_as(
                 "SELECT d.tenant_id, d.id, d.user_id, d.trust_level, d.fingerprint_hash, \
-                        d.first_seen_at, d.last_seen_at, d.revoked_at, d.bindings \
+                        d.first_seen_at, d.last_seen_at, d.revoked_at, d.demoted_at, d.bindings \
                  FROM devices d \
                  INNER JOIN device_bindings_refresh r \
                    ON d.tenant_id = r.tenant_id AND d.id = r.device_id \
@@ -374,44 +431,39 @@ impl DeviceStore for MysqlDeviceStore {
             .bind(&family)
             .fetch_all(&pool)
             .await?;
-
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                out.push(store.decode_row(r)?);
-            }
-            Ok(out)
+            decode_all(&codec, rows)
         }
     }
 
-    fn save(&self, device: &Device) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    fn save(
+        &self,
+        device: &Device,
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
         let device = device.clone();
         async move {
-            let bindings_blob = codec.encode(&device.bindings)?;
-            let trust = trust_level_codec::to_str(device.trust_level);
-            let fp = device.fingerprint_hash.as_bytes().to_vec();
-            let user_id_col = device.user_id.as_ref().map(|u| u.to_string());
-            let first = utc_to_unix(device.first_seen_at);
-            let last = utc_to_unix(device.last_seen_at);
-            let revoked = device.revoked_at.map(utc_to_unix);
-            let family_ids = refresh_family_ids(&device.bindings);
-            let tenant = device.tenant_id.to_string();
-            let id = device.id.to_string();
-
-            let mut tx = pool.begin().await?;
+            let w = DeviceWrite::new(&codec, &device)?;
 
             // MySQL upsert: `INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col)`.
             // `VALUES(col)` reads the value that would have been inserted; works
             // back to MySQL 5.7 and MariaDB 10.x. The modern `AS new` row-alias
             // form is MySQL 8.0.20+ only; staying on `VALUES(...)` keeps
             // MariaDB compatibility without a version-check branch.
+            //
+            // Wrap the device-row upsert and the refresh-binding index
+            // refresh in a single transaction so a concurrent
+            // `find_by_refresh_family` either sees the pre-update or
+            // the post-update set, never a partially-updated index.
+            let mut tx = pool.begin().await?;
+
             sqlx::query(
                 r#"
                 INSERT INTO devices
                     (tenant_id, id, user_id, trust_level, fingerprint_hash,
-                     first_seen_at, last_seen_at, revoked_at, bindings)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     first_seen_at, last_seen_at, revoked_at, demoted_at, bindings)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE
                     user_id          = VALUES(user_id),
                     trust_level      = VALUES(trust_level),
@@ -419,41 +471,24 @@ impl DeviceStore for MysqlDeviceStore {
                     first_seen_at    = VALUES(first_seen_at),
                     last_seen_at     = VALUES(last_seen_at),
                     revoked_at       = VALUES(revoked_at),
+                    demoted_at       = VALUES(demoted_at),
                     bindings         = VALUES(bindings)
                 "#,
             )
-            .bind(&tenant)
-            .bind(&id)
-            .bind(user_id_col.as_deref())
-            .bind(trust)
-            .bind(&fp)
-            .bind(first)
-            .bind(last)
-            .bind(revoked)
-            .bind(&bindings_blob)
+            .bind(&w.tenant)
+            .bind(&w.id)
+            .bind(w.user_id.as_deref())
+            .bind(w.trust)
+            .bind(&w.fingerprint)
+            .bind(w.first_seen_at)
+            .bind(w.last_seen_at)
+            .bind(w.revoked_at)
+            .bind(w.demoted_at)
+            .bind(&w.bindings)
             .execute(&mut *tx)
             .await?;
 
-            sqlx::query(
-                "DELETE FROM device_bindings_refresh \
-                 WHERE tenant_id = ? AND device_id = ?",
-            )
-            .bind(&tenant)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await?;
-
-            for family_id in &family_ids {
-                sqlx::query(
-                    "INSERT INTO device_bindings_refresh \
-                     (tenant_id, device_id, family_id) VALUES (?, ?, ?)",
-                )
-                .bind(&tenant)
-                .bind(&id)
-                .bind(family_id)
-                .execute(&mut *tx)
-                .await?;
-            }
+            rewrite_family_index(&mut tx, &w.tenant, &w.id, &w.family_ids).await?;
 
             tx.commit().await?;
             Ok(())
@@ -471,7 +506,7 @@ impl DeviceStore for MysqlDeviceStore {
         let device_id = id.to_string();
         let ts = utc_to_unix(now);
         async move {
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE devices SET last_seen_at = ? \
                  WHERE tenant_id = ? AND id = ?",
             )
@@ -479,8 +514,9 @@ impl DeviceStore for MysqlDeviceStore {
             .bind(&tenant)
             .bind(&device_id)
             .execute(&pool)
-            .await?;
-            Ok(())
+            .await?
+            .rows_affected();
+            require_row(updated, tenant, device_id)
         }
     }
 
@@ -494,24 +530,185 @@ impl DeviceStore for MysqlDeviceStore {
         let pool = self.pool.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
-        let trust = trust_level_codec::to_str(level);
-        let ts = utc_to_unix(now);
-        let revoked_at = match level {
-            DeviceTrustLevel::Revoked => Some(ts),
-            _ => None,
-        };
+        let w = TrustWrite::new(level, now);
         async move {
-            sqlx::query(
-                "UPDATE devices SET trust_level = ?, revoked_at = ? \
+            // MySQL applies a single-table UPDATE's assignments left to
+            // right and later ones see the earlier results, so `demoted_at`
+            // is assigned BEFORE `trust_level`: its CASE must read the level
+            // the row had before this statement.
+            let updated = sqlx::query(
+                "UPDATE devices SET \
+                        demoted_at = CASE WHEN ? = 0 THEN NULL \
+                                          WHEN trust_level = 'Trusted' THEN ? \
+                                          ELSE demoted_at END, \
+                        trust_level = ?, revoked_at = ? \
                  WHERE tenant_id = ? AND id = ?",
             )
-            .bind(trust)
-            .bind(revoked_at)
+            .bind(w.to_seen)
+            .bind(w.now)
+            .bind(w.trust)
+            .bind(w.revoked_at)
             .bind(&tenant)
             .bind(&device_id)
             .execute(&pool)
+            .await?
+            .rows_affected();
+            require_row(updated, tenant, device_id)
+        }
+    }
+
+    fn set_trust_level_if(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: DeviceTrustLevel,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        let w = GuardedTrustWrite::new(expected, level, now);
+        async move {
+            // One conditional UPDATE: the engine checks the current level
+            // and writes in a single statement, so a revocation that lands
+            // first makes this match no row instead of being overwritten.
+            let updated = sqlx::query("UPDATE devices SET demoted_at = CASE WHEN ? = 1 THEN demoted_at ELSE ? END, trust_level = ?, revoked_at = ? WHERE tenant_id = ? AND id = ? AND trust_level = ?")
+            .bind(w.keep_demoted)
+            .bind(w.demoted_at)
+            .bind(w.new)
+            .bind(w.revoked_at)
+            .bind(&tenant)
+            .bind(&device_id)
+            .bind(w.expected)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            if updated > 0 {
+                return Ok(TrustTransition::Applied);
+            }
+            let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
+            Ok(transition_after_miss(current, expected))
+        }
+    }
+
+    fn replace_bindings(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        expected: &[DeviceBinding],
+        bindings: &[DeviceBinding],
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<BindingsUpdate, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let expected = expected.to_vec();
+        let bindings = bindings.to_vec();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        async move {
+            let row: Option<(String, String)> = sqlx::query_as(
+                "SELECT trust_level, bindings FROM devices WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(&tenant)
+            .bind(&device_id)
+            .fetch_optional(&pool)
             .await?;
-            Ok(())
+            let swap =
+                match plan_bindings_swap(&codec, &tenant, &device_id, row, &expected, &bindings)? {
+                    SwapPlan::Settled(outcome) => return Ok(outcome),
+                    SwapPlan::Write(swap) => swap,
+                };
+            let mut tx = pool.begin().await?;
+            // Only the bindings column is written, only on a row that is not
+            // Revoked, and only while it still holds the bytes that were
+            // read: the engine evaluates the conditions and the write
+            // together, so a revocation cannot be undone, a revoked device
+            // cannot gain a binding, and a concurrent bindings edit makes
+            // this match no row instead of being overwritten.
+            let updated = sqlx::query("UPDATE devices SET bindings = ? WHERE tenant_id = ? AND id = ? AND trust_level <> 'Revoked' AND CAST(bindings AS BINARY) = CAST(? AS BINARY)")
+                .bind(&swap.blob)
+                .bind(&tenant)
+                .bind(&device_id)
+                .bind(&swap.stored)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            if updated == 0 {
+                // Nothing written (the transaction rolls back on drop).
+                let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
+                return Ok(bindings_update_after_miss(current));
+            }
+            rewrite_family_index(&mut tx, &tenant, &device_id, &swap.family_ids).await?;
+            tx.commit().await?;
+            Ok(BindingsUpdate::Written)
+        }
+    }
+
+    fn claim_owner(
+        &self,
+        tenant_id: &TenantId,
+        id: &DeviceId,
+        user: &UserId,
+        _now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let tenant = tenant_id.to_string();
+        let device_id = id.to_string();
+        let user = user.to_string();
+        async move {
+            // One conditional UPDATE: the owner is set only while there is
+            // none, so of two users racing for an unowned device exactly one
+            // matches a row.
+            let updated = sqlx::query(
+                "UPDATE devices SET user_id = ? \
+                 WHERE tenant_id = ? AND id = ? AND user_id IS NULL",
+            )
+            .bind(&user)
+            .bind(&tenant)
+            .bind(&device_id)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+            if updated > 0 {
+                return Ok(OwnerClaim::Claimed);
+            }
+            let owner: Option<Option<String>> =
+                sqlx::query_scalar("SELECT user_id FROM devices WHERE tenant_id = ? AND id = ?")
+                    .bind(&tenant)
+                    .bind(&device_id)
+                    .fetch_optional(&pool)
+                    .await?;
+            Ok(claim_after_miss(owner, &user))
+        }
+    }
+
+    fn find_active_for_user(
+        &self,
+        tenant_id: &TenantId,
+        user_id: &UserId,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let tenant = tenant_id.to_string();
+        let uid = user_id.to_string();
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        async move {
+            // The Revoked filter is part of the WHERE clause, so it is
+            // applied before ORDER BY ... LIMIT: revoked rows never use up
+            // the limit.
+            let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
+                "WHERE tenant_id = ? AND user_id = ? \
+                   AND trust_level <> 'Revoked' \
+                 ORDER BY last_seen_at DESC LIMIT ?"
+            ))
+            .bind(&tenant)
+            .bind(&uid)
+            .bind(limit_i64)
+            .fetch_all(&pool)
+            .await?;
+            decode_all(&codec, rows)
         }
     }
 
@@ -539,58 +736,9 @@ impl DeviceStore for MysqlDeviceStore {
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         let pool = self.pool.clone();
-        let cfg = self.sweep_config;
+        let cutoffs = SweepCutoffs::new(&self.sweep_config, now);
         let tenant = tenant_id.to_string();
-        let now_secs = utc_to_unix(now);
-        async move {
-            let trusted_cutoff = now_secs - cfg.trusted_idle.num_seconds();
-            let seen_cutoff = now_secs - cfg.seen_idle.num_seconds();
-            let grace_cutoff = now_secs - cfg.revoked_grace.num_seconds();
-
-            let trusted_demoted = sqlx::query(
-                "UPDATE devices SET trust_level = 'Seen' \
-                 WHERE tenant_id = ? \
-                   AND trust_level = 'Trusted' \
-                   AND last_seen_at < ?",
-            )
-            .bind(&tenant)
-            .bind(trusted_cutoff)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-
-            let seen_demoted = sqlx::query(
-                "UPDATE devices SET trust_level = 'Revoked', revoked_at = ? \
-                 WHERE tenant_id = ? \
-                   AND trust_level = 'Seen' \
-                   AND last_seen_at < ?",
-            )
-            .bind(now_secs)
-            .bind(&tenant)
-            .bind(seen_cutoff)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-
-            let purged = sqlx::query(
-                "DELETE FROM devices \
-                 WHERE tenant_id = ? \
-                   AND trust_level = 'Revoked' \
-                   AND revoked_at IS NOT NULL \
-                   AND revoked_at < ?",
-            )
-            .bind(&tenant)
-            .bind(grace_cutoff)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-
-            Ok(SweepCounts {
-                trusted_to_seen: trusted_demoted,
-                seen_to_revoked: seen_demoted,
-                revoked_purged: purged,
-            })
-        }
+        async move { sweep::run(&pool, &tenant, &cutoffs).await }
     }
 }
 

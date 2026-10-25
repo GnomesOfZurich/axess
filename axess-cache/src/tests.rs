@@ -704,25 +704,82 @@ fn capacity_returns_configured_value() {
     assert_eq!(c.capacity().get(), 7);
 }
 
-/// `cleanup_expired` uses `expires_at_micros < now_micros`. Pin the
-/// strict comparison: an entry whose expiry exactly equals the
-/// current time must NOT yet be evicted (it would be after the
-/// next microsecond). Mutation `< → <=` would evict the boundary
-/// entry.
+/// `cleanup_expired` evicts an entry whose expiry equals the current
+/// time, matching `get`: the expiry instant is exclusive.
 #[test]
-fn cleanup_expired_does_not_evict_at_exact_expiry() {
+fn cleanup_expired_evicts_at_exact_expiry() {
     let clock = fixed_clock();
     let c = cache(8, 60, clock.clone());
     c.insert("k".into(), 1);
-    // advance EXACTLY to the TTL boundary; expires_at == now.
-    clock.advance_secs(60);
-    let reclaimed = c.cleanup_expired();
-    assert_eq!(
-        reclaimed, 0,
-        "at expires_at == now the entry is still live (kills `< → <=`)"
-    );
-    // One microsecond later it's gone.
+    clock.advance_secs(59);
+    assert_eq!(c.cleanup_expired(), 0, "before expiry the entry is live");
     clock.advance_secs(1);
-    let reclaimed = c.cleanup_expired();
-    assert_eq!(reclaimed, 1, "past the boundary the entry must be evicted");
+    assert_eq!(c.cleanup_expired(), 1, "at expires_at == now it is expired");
+}
+
+#[test]
+fn entry_is_expired_at_exactly_insert_plus_ttl() {
+    let clk = fixed_clock();
+    let c = cache(8, 60, clk.clone());
+    c.insert("k".into(), 1);
+    clk.advance(chrono::Duration::seconds(60) - chrono::Duration::microseconds(1));
+    assert_eq!(c.get(&"k".into()), Some(1), "one microsecond before expiry");
+    clk.advance(chrono::Duration::microseconds(1));
+    assert_eq!(c.get(&"k".into()), None, "expiry instant is exclusive");
+}
+
+#[test]
+fn huge_ttl_saturates_instead_of_wrapping() {
+    let clk = fixed_clock();
+    let c: ClockTtlCache<String, u32> = ClockTtlCache::new(
+        NonZeroUsize::new(8).unwrap(),
+        Duration::MAX,
+        clk.clone() as Arc<dyn Clock>,
+    );
+    c.insert("k".into(), 7);
+    assert_eq!(c.get(&"k".into()), Some(7));
+    clk.advance_secs(10 * 365 * 24 * 3600);
+    assert_eq!(c.get(&"k".into()), Some(7));
+}
+
+#[tokio::test]
+async fn joiner_succeeds_and_is_cached_after_leader_fetch_fails() {
+    use tokio::sync::Notify;
+    let c = Arc::new(cache(8, 60, fixed_clock()));
+    let release = Arc::new(Notify::new());
+    let started = Arc::new(Notify::new());
+
+    let leader = {
+        let (c, release, started) = (c.clone(), release.clone(), started.clone());
+        tokio::spawn(async move {
+            c.get_or_try_insert_with("k".to_string(), || async move {
+                started.notify_one();
+                release.notified().await;
+                Err::<u32, &'static str>("boom")
+            })
+            .await
+        })
+    };
+    started.notified().await;
+    let joiner = {
+        let c = c.clone();
+        tokio::spawn(async move {
+            c.get_or_try_insert_with("k".to_string(), || async { Ok::<u32, &'static str>(9) })
+                .await
+        })
+    };
+    // Let the joiner reach the cell before the leader fails.
+    while c.stats().single_flight_joins == 0 {
+        tokio::task::yield_now().await;
+    }
+    release.notify_one();
+
+    assert_eq!(leader.await.unwrap(), Err("boom"));
+    assert_eq!(joiner.await.unwrap(), Ok(9));
+    assert_eq!(
+        c.get(&"k".to_string()),
+        Some(9),
+        "joiner's result is cached"
+    );
+    assert_eq!(c.pending_loads_count(), 0);
 }

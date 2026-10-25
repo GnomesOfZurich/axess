@@ -254,7 +254,7 @@ pub struct LdapBindFactorConfig {
 /// The enum shape is stable regardless of feature flags. FIDO2 assertions
 /// are stored as `serde_json::Value` and deserialized on demand when the
 /// `fido2` feature is enabled.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FactorCredential {
     /// Plaintext password, zeroized on drop. Compared against a stored Argon2id hash.
     Password(ZeroizedString),
@@ -302,7 +302,11 @@ impl FactorCredential {
     #[cfg(feature = "fido2")]
     pub fn as_public_key_credential(&self) -> Option<webauthn_rs::prelude::PublicKeyCredential> {
         match self {
-            Self::Fido2Assertion(v) => serde_json::from_value(v.clone()).ok(),
+            // `&Value` is a deserializer, so the assertion is read in place.
+            Self::Fido2Assertion(v) => {
+                <webauthn_rs::prelude::PublicKeyCredential as serde::Deserialize>::deserialize(v)
+                    .ok()
+            }
             _ => None,
         }
     }

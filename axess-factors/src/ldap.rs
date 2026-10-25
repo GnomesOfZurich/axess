@@ -148,7 +148,10 @@ pub struct LdapProviderConfig {
     pub bind_dn_template: String,
     /// Use STARTTLS on plain LDAP connections. Ignored for `ldaps://` URLs.
     pub starttls: bool,
-    /// Connection timeout. Default: 5 seconds.
+    /// Upper bound on connecting and on each step after it (the bind, then
+    /// the group search): a server that accepts the connection and then
+    /// stops answering ends in [`LdapError::Timeout`] instead of holding the
+    /// login open. Default: 5 seconds.
     pub connection_timeout: Duration,
     /// Optional group membership search after successful bind.
     pub group_search: Option<LdapGroupSearch>,
@@ -189,7 +192,8 @@ impl LdapProviderConfig {
         self
     }
 
-    /// Set the connection timeout.
+    /// Set the timeout for connecting and for each step after it; see
+    /// [`connection_timeout`](Self::connection_timeout).
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.connection_timeout = timeout;
         self
@@ -273,14 +277,20 @@ impl LdapProvider for LdapProviderConfig {
             .map_err(|_| LdapError::Timeout)?
             .map_err(|e| LdapError::Connection(e.to_string()))?;
 
-            // Drive the connection in the background.
+            // `ldap3` hands back a connection future that must be polled for
+            // the `Ldap` handle to make progress, so it needs a task of its
+            // own; runtime plumbing, not a clock or RNG. It ends when the
+            // handle is dropped, which the timeout below does on expiry.
             tokio::spawn(async move { conn.drive().await });
 
-            // Attempt simple bind.
-            let result = ldap
-                .simple_bind(bind_dn, password)
-                .await
-                .map_err(|e| LdapError::Connection(e.to_string()))?;
+            // The bind and the group search each get the connection
+            // timeout; without it a server that accepts the socket and goes
+            // quiet would hold the login open indefinitely.
+            let result =
+                tokio::time::timeout(self.connection_timeout, ldap.simple_bind(bind_dn, password))
+                    .await
+                    .map_err(|_| LdapError::Timeout)?
+                    .map_err(|e| LdapError::Connection(e.to_string()))?;
 
             if result.rc != 0 {
                 // RC 49 = invalid credentials (standard LDAP result code).
@@ -290,7 +300,12 @@ impl LdapProvider for LdapProviderConfig {
 
             // Optionally search for group memberships using the original
             // identifier (not parsed from the DN; avoids fragile extraction).
-            let groups = self.search_groups(&mut ldap, bind_dn, identifier).await?;
+            let groups = tokio::time::timeout(
+                self.connection_timeout,
+                self.search_groups(&mut ldap, bind_dn, identifier),
+            )
+            .await
+            .map_err(|_| LdapError::Timeout)??;
 
             let _ = ldap.unbind().await;
 
@@ -495,6 +510,31 @@ mod tests {
         let dn = provider.build_bind_dn("alice");
         let err = provider.verify_bind("alice", &dn, "").await.unwrap_err();
         assert!(matches!(err, LdapError::InvalidCredentials));
+    }
+
+    /// A directory that accepts the socket and then never answers the bind
+    /// ends in `Timeout` after the configured bound; it used to hold the
+    /// login open for as long as the peer cared to stay silent.
+    #[tokio::test]
+    async fn a_directory_that_goes_quiet_after_connecting_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ldap://{}", listener.local_addr().unwrap());
+        // Accept and hold the socket open without ever replying.
+        let _quiet = tokio::spawn(async move {
+            let held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+        let provider = LdapProviderConfig::new(url, "uid={user},dc=example")
+            .with_timeout(Duration::from_millis(300));
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            provider.verify_bind("alice", "uid=alice,dc=example", "secret"),
+        )
+        .await
+        .expect("verify_bind must give up by itself, not hang");
+        assert!(matches!(outcome, Err(LdapError::Timeout)), "{outcome:?}");
     }
 
     #[tokio::test]

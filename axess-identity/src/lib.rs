@@ -139,6 +139,10 @@ pub enum Issuer {
 }
 
 impl Issuer {
+    /// Every non-custom variant. A custom label equal to one of their wire
+    /// strings would be indistinguishable from it in audit rows and policies.
+    const BUILT_IN: [Self; 4] = [Self::Cli, Self::JwtSvid, Self::Mtls, Self::OAuth];
+
     /// Build an [`Issuer::Custom`] with a validated label.
     ///
     /// Labels must match `[a-z0-9_]{1,32}` so that wire-strings
@@ -148,7 +152,7 @@ impl Issuer {
     /// `"gitlab_ci"`, `"circleci"`, `"buildkite"`, `"local_idp"`.
     pub fn custom(label: impl AsRef<str>) -> Result<Self, IdentityError> {
         let s = label.as_ref();
-        if matches!(s, "cli" | "jwt_svid" | "mtls" | "oauth") {
+        if Self::BUILT_IN.iter().any(|built_in| built_in.as_str() == s) {
             return Err(IdentityError::InvalidComponent(format!(
                 "Issuer::custom label {s:?} is reserved for a built-in issuer"
             )));

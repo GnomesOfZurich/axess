@@ -240,6 +240,15 @@ pub struct Device {
     pub last_seen_at: DateTime<Utc>,
     /// Set when the device transitions to [`DeviceTrustLevel::Revoked`].
     pub revoked_at: Option<DateTime<Utc>>,
+    /// Set when a `Trusted` device is moved down to [`DeviceTrustLevel::Seen`]
+    /// (by the retention sweep or an explicit downgrade) and cleared by any
+    /// other transition. It is what tells a `Seen` device that was never
+    /// trusted (revoked `seen_idle` after its last sighting) from one that
+    /// was demoted (revoked `seen_idle` after the demotion): the retention
+    /// ladder reads it, nothing else does. Absent in rows written before the
+    /// field existed, which then read as never trusted.
+    #[serde(default)]
+    pub demoted_at: Option<DateTime<Utc>>,
     /// Bindings attached to this device (cookie, webauthn).
     #[serde(default)]
     pub bindings: Vec<DeviceBinding>,

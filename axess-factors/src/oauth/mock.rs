@@ -4,6 +4,9 @@ use super::types::*;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use axess_clock::{Clock, SystemClock};
 
 // ── MockOAuthProvider ────────────────────────────────────────────────────────
 
@@ -39,6 +42,10 @@ pub struct MockOAuthProvider {
     scopes: Vec<String>,
     /// Ceremony timeout.
     ceremony_timeout: std::time::Duration,
+    /// Source of `iat` for [`mock_logout_token`](MockOAuthProvider::mock_logout_token).
+    clock: Arc<dyn Clock>,
+    /// Logout tokens minted so far; makes each `jti` distinct.
+    logout_tokens_minted: AtomicU64,
 }
 
 /// Pre-canned error variants the mock can return on token exchange,
@@ -112,7 +119,16 @@ impl MockOAuthProvider {
                 "profile".to_string(),
             ],
             ceremony_timeout: std::time::Duration::from_secs(600),
+            clock: Arc::new(SystemClock),
+            logout_tokens_minted: AtomicU64::new(0),
         }
+    }
+
+    /// Stamp logout tokens with `clock` instead of the system clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Override the mock issuer URL.
@@ -221,6 +237,10 @@ impl MockOAuthProvider {
     /// * `sid`: The OIDC session ID. Pass `None` to omit.
     ///
     /// At least one of `sub` or `sid` must be provided per the spec.
+    ///
+    /// `iat` is read from the clock set by [`with_clock`](Self::with_clock).
+    /// The `jti` is `mock-jti-{iat}-{n}` where `n` counts the tokens this
+    /// provider has minted, so two tokens in the same second differ.
     pub fn mock_logout_token(&self, sub: Option<&str>, sid: Option<&str>) -> String {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -229,12 +249,13 @@ impl MockOAuthProvider {
             "typ": "JWT"
         });
 
-        let now = chrono::Utc::now().timestamp();
+        let now = self.clock.now().timestamp();
+        let serial = self.logout_tokens_minted.fetch_add(1, Ordering::Relaxed) + 1;
         let mut payload = serde_json::json!({
             "iss": self.issuer_url,
             "aud": self.mock_client_id,
             "iat": now,
-            "jti": format!("mock-jti-{now}"),
+            "jti": format!("mock-jti-{now}-{serial}"),
             "events": {
                 "http://schemas.openid.net/event/backchannel-logout": {}
             }
@@ -407,6 +428,38 @@ impl OAuthProvider for MockOAuthProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn payload_of(token: &str) -> serde_json::Value {
+        MockOAuthProvider::new("any")
+            .verify_logout_jwt(token)
+            .unwrap()
+    }
+
+    #[test]
+    fn logout_token_iat_comes_from_the_injected_clock() {
+        let clock = axess_clock::testing::MockClock::now();
+        let start = clock.now().timestamp();
+        let provider = MockOAuthProvider::new("idp").with_clock(Arc::new(clock.clone()));
+
+        let first = payload_of(&provider.mock_logout_token(Some("u"), None));
+        assert_eq!(first["iat"], start);
+
+        clock.advance_secs(90);
+        let later = payload_of(&provider.mock_logout_token(Some("u"), None));
+        assert_eq!(later["iat"], start + 90);
+    }
+
+    #[test]
+    fn two_logout_tokens_in_one_second_have_different_jtis() {
+        let clock = axess_clock::testing::MockClock::now();
+        let iat = clock.now().timestamp();
+        let provider = MockOAuthProvider::new("idp").with_clock(Arc::new(clock));
+
+        let a = payload_of(&provider.mock_logout_token(Some("u"), None));
+        let b = payload_of(&provider.mock_logout_token(Some("u"), None));
+        assert_eq!(a["jti"], format!("mock-jti-{iat}-1"));
+        assert_eq!(b["jti"], format!("mock-jti-{iat}-2"));
+    }
 
     #[test]
     fn build_claims_omits_groups_key_when_user_groups_empty() {

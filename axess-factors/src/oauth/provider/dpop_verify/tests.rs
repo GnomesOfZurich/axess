@@ -74,10 +74,16 @@ fn jti_cache_retain_strict_greater_pinned_by_past_entry_eviction() {
 /// parameter, so the boundary is testable to the exact tick.
 #[test]
 fn try_insert_at_evicts_when_expiry_equals_now() {
-    let mut map = HashMap::new();
+    let mut store = JtiStore::default();
     let t0 = Utc::now();
-    map.insert("jti-1".to_string(), t0); // expiry exactly at t0
-    let inserted = try_insert_at(&mut map, "jti-1", t0 + chrono::Duration::seconds(60), t0);
+    assert!(try_insert_at(
+        &mut store,
+        "jti-1",
+        t0,
+        t0 - chrono::Duration::seconds(1)
+    ));
+    // expiry exactly at t0
+    let inserted = try_insert_at(&mut store, "jti-1", t0 + chrono::Duration::seconds(60), t0);
     assert!(
         inserted,
         "an entry whose expiry equals now must be evicted by the retain sweep; \
@@ -253,6 +259,45 @@ mod verify_dpop_proof_tests {
             !verified.thumbprint.is_empty(),
             "thumbprint must be non-empty"
         );
+    }
+
+    fn verify(proof: &str, now: DateTime<Utc>) -> Result<DpopVerified, OAuthError> {
+        verify_dpop_proof(
+            DpopVerifyRequest {
+                proof_jwt: proof,
+                htm: "POST",
+                htu: "https://api.example.com/token",
+                access_token: None,
+                max_iat_skew_secs: 60,
+                jti_cache: &cache(),
+            },
+            now,
+        )
+    }
+
+    /// The signature covers header and payload: editing the payload
+    /// without re-signing, or damaging the signature, is refused with the
+    /// signature error and not with a claim error.
+    #[test]
+    fn tampered_payload_or_signature_fails_the_signature_check() {
+        let now = Utc::now();
+        let built = build(Builder::default(), now);
+        let parts: Vec<&str> = built.proof.split('.').collect();
+
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        claims["jti"] = serde_json::json!("another-jti");
+        let forged_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let forged = format!("{}.{}.{}", parts[0], forged_payload, parts[2]);
+        let err = verify(&forged, now).expect_err("edited payload must fail");
+        assert!(err.to_string().contains("signature"), "got {err}");
+
+        let mut sig = parts[2].to_string();
+        let flipped = if sig.starts_with('A') { "B" } else { "A" };
+        sig.replace_range(0..1, flipped);
+        let damaged = format!("{}.{}.{}", parts[0], parts[1], sig);
+        let err = verify(&damaged, now).expect_err("damaged signature must fail");
+        assert!(err.to_string().contains("signature"), "got {err}");
     }
 
     /// A proof whose header carries a non-`ES256` `alg` is rejected
@@ -527,4 +572,46 @@ mod verify_dpop_proof_tests {
     fn cache() -> MemoryJtiCache {
         MemoryJtiCache::new()
     }
+}
+
+// ── eviction cost ────────────────────────────────────────────────────
+
+fn at(secs: i64) -> DateTime<Utc> {
+    DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
+}
+
+/// Inserting live entries never evicts anything: the work per call is the
+/// number of entries that expired, not the number held.
+#[test]
+fn inserting_live_entries_evicts_nothing_however_many_are_held() {
+    let mut store = JtiStore::default();
+    for n in 0..2_000 {
+        assert!(try_insert_at(
+            &mut store,
+            &format!("jti-{n}"),
+            at(1_000 + n),
+            at(0)
+        ));
+        assert_eq!(store.evict_expired(at(0)), 0, "no live entry is touched");
+    }
+    assert_eq!(store.live.len(), 2_000);
+    assert_eq!(store.by_expiry.len(), 2_000);
+}
+
+#[test]
+fn eviction_pops_exactly_the_expired_entries_in_expiry_order() {
+    let mut store = JtiStore::default();
+    // Inserted out of expiry order on purpose.
+    for (jti, exp) in [("c", 30), ("a", 10), ("d", 40), ("b", 20)] {
+        assert!(try_insert_at(&mut store, jti, at(exp), at(0)));
+    }
+    // `b` expires exactly at now (evicted), `c` and `d` survive.
+    assert_eq!(store.evict_expired(at(20)), 2);
+    assert!(!store.live.contains_key("a") && !store.live.contains_key("b"));
+    assert!(store.live.contains_key("c") && store.live.contains_key("d"));
+    assert_eq!(store.live.len(), store.by_expiry.len());
+
+    // An evicted jti is fresh again; a surviving one is still a replay.
+    assert!(try_insert_at(&mut store, "a", at(90), at(20)));
+    assert!(!try_insert_at(&mut store, "c", at(90), at(20)));
 }

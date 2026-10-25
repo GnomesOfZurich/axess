@@ -25,7 +25,7 @@
 //! let handler = BackChannelLogoutHandler::new(
 //!     &providers,          // &[Arc<dyn OAuthProvider>]
 //!     registry,            // Arc<dyn SessionRevoker>
-//!     sid_map,
+//!     authn.sid_map(),     // the map AuthnService fills at login
 //!     clock,               // Arc<dyn Clock>
 //! )
 //! .expect("at least one provider with an issuer and a client id");
@@ -46,14 +46,13 @@
 //! - `events` must contain the back-channel logout event URI
 //! - At least one of `sub` or `sid` must be present
 //! - `jti` must be present, and is single-use within the `iat` window
-//! - A `sub` only logs out a user who signed in through the same issuer
+//! - A `sub` only ends the sessions that the same issuer established
 //!
 //! **Signature verification:** `OAuthProviderConfig` fetches and caches the
 //! IdP's JWKS keys at discovery time, and `verify_logout_jwt` validates the
 //! JWT signature before processing claims. `MockOAuthProvider` skips signature
 //! verification for unsigned test tokens.
 
-use crate::session::id::SessionId;
 use crate::session::store::SessionRevoker;
 use axess_clock::Clock;
 use axess_factors::oauth::OAuthProvider;
@@ -63,7 +62,6 @@ use axess_factors::oidc::logout_token::{
 };
 use axum::extract::{Form, State};
 use axum::http::StatusCode;
-use dashmap::DashMap;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,14 +82,15 @@ pub struct BackChannelLogoutHandler {
     providers_by_issuer: Arc<HashMap<String, ProviderEntry>>,
     /// Session registry for invalidating sessions.
     registry: Arc<dyn SessionRevoker>,
-    /// OIDC `sid` → `(user_id, session_id)` mapping for `sid`-based logout.
+    /// OIDC `(issuer, sid)` → local session mapping for `sid`-based logout,
+    /// and the `(issuer, user)` index behind `sub`-based logout.
     sid_map: SidMap,
     /// Replay cache for `(issuer, jti)` pairs of recently-seen logout tokens.
     /// Within the `iat` acceptance window an attacker who captures one valid
     /// logout token must not be able to re-fire it; without this cache the
     /// 5-minute window allowed silent replay against the same `sub`/`sid`.
     /// Bounded to `JTI_CACHE_MAX` entries with TTL-based eviction.
-    seen_jtis: Arc<DashMap<(String, String), chrono::DateTime<chrono::Utc>>>,
+    seen_jtis: Arc<jti_log::JtiLog>,
     /// Injected clock for the IAT-window check and the JTI replay window.
     /// Production wires `SystemClock`; tests inject `MockClock` so the
     /// 5-minute acceptance window can be exercised deterministically.
@@ -104,38 +103,12 @@ pub struct BackChannelLogoutHandler {
 /// memory-DoS vector.
 const JTI_CACHE_MAX: usize = 16 * 1024;
 
-/// number of entries evicted in one capacity-prune pass. Picked
-/// to amortise the O(N log N) sort across the next BATCH inserts so the
-/// per-call cost stays bounded under burst load. Mirrors `EVICT_BATCH`
-/// in `oauth_service/login.rs::maintain_oidc_sid_map`.
+/// Number of entries evicted in one capacity pass. Evicting a batch rather
+/// than one entry keeps a log sitting at capacity from evicting on every
+/// call. Mirrors `EVICT_BATCH` in `maintain_oidc_sid_map`.
 const JTI_EVICT_BATCH: usize = 128;
 
-/// Shared map of OIDC session IDs to local session identifiers.
-///
-/// Populated by `RequestAuthnService::complete_oauth_login` when the IdP's ID token
-/// contains a `sid` claim. Used by the back-channel logout handler to invalidate
-/// individual sessions by OIDC session ID.
-///
-/// **Key shape:** `(issuer, sid)`. The `sid` is per-issuer in OIDC: two
-/// providers can legitimately mint the same `sid` value for different
-/// sessions, so the issuer must be part of the lookup key. Without this, a
-/// malicious or buggy IdP could cause logout of sessions established via a
-/// different provider by sending a logout token whose `sid` collides with
-/// an existing mapping. Tuple value is
-/// `(user_id, session_id, inserted_at)` enabling TTL-based eviction.
-pub type SidKey = (String, String);
-/// Lookup map from `(issuer, sid)` to the local session triple
-/// `(user_id, session_id, inserted_at)` used for OIDC back-channel logout.
-pub type SidMap = Arc<
-    DashMap<
-        SidKey,
-        (
-            crate::authn::ids::UserId,
-            SessionId,
-            chrono::DateTime<chrono::Utc>,
-        ),
-    >,
->;
+pub use super::sid_map::{SidEntry, SidKey, SidMap};
 
 /// Provider entry for logout token validation: holds both metadata and the
 /// provider itself for JWT signature verification.
@@ -206,7 +179,7 @@ impl BackChannelLogoutHandler {
             providers_by_issuer: Arc::new(by_issuer),
             registry,
             sid_map,
-            seen_jtis: Arc::new(DashMap::new()),
+            seen_jtis: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX, JTI_EVICT_BATCH)),
             clock,
         })
     }
@@ -258,7 +231,7 @@ impl BackChannelLogoutHandler {
         // application cannot use never prevents the `sid` logout.
         if let Some(ref sid) = claims.sid {
             let key: SidKey = (claims.iss.clone(), sid.clone());
-            if let Some((_, (user_id, session_id, _inserted_at))) = handler.sid_map.remove(&key) {
+            if let Some((user_id, session_id, _inserted_at)) = handler.sid_map.remove(&key) {
                 tracing::info!(
                     iss = %claims.iss,
                     oidc_sid = %sid,
@@ -278,26 +251,33 @@ impl BackChannelLogoutHandler {
             }
         }
 
-        // If `sub` is present, invalidate all sessions of that user, but
-        // only a user who signed in through THIS issuer: the sid map records
-        // `(issuer, sid) -> user` for every OIDC login, so a user with no
-        // entry under `claims.iss` was not authenticated by it, and an IdP
-        // must not be able to log out users it never authenticated. A `sub`
-        // that is not a local user id (for example a numeric subject) names
-        // nobody here and is skipped, not an error: the IdP's request has
-        // been handled and `sid` handling above has already run.
+        // If `sub` is present, end the sessions of that user that THIS
+        // issuer established. The sid map records `(issuer, sid) -> user`
+        // and its subject registry records `(issuer, user) -> sessions`, the
+        // latter for every OAuth login including one whose ID token had no
+        // `sid` or whose `sid` mapping was dropped at capacity. So a user with no entry under `claims.iss`
+        // was not authenticated by it, and an IdP must not be able to log
+        // out users it never authenticated, nor end a user's sessions that
+        // came from another issuer or from a password or passkey login. A
+        // `sub` that is not a local user id (for example a numeric subject)
+        // names nobody here and is skipped, not an error: the IdP's request
+        // has been handled and `sid` handling above has already run.
         if let Some(ref sub) = claims.sub {
             match crate::authn::ids::UserId::try_new(sub.as_str()) {
-                Ok(uid) if handler.issuer_authenticated(&claims.iss, &uid) => {
-                    handler.registry.invalidate_user(&uid).await;
-                }
-                Ok(_) => {
-                    tracing::warn!(
-                        iss = %claims.iss,
-                        sub = %sub,
-                        "back-channel logout: no session of this user was established \
-                         through this issuer; ignoring sub"
-                    );
+                Ok(uid) => {
+                    let mut owned = handler.sid_map.take_user_sessions(&claims.iss, &uid);
+                    owned.extend(handler.sid_map.take_subject_sessions(&claims.iss, &uid));
+                    if owned.is_empty() {
+                        tracing::warn!(
+                            iss = %claims.iss,
+                            sub = %sub,
+                            "back-channel logout: no session of this user was established \
+                             through this issuer; ignoring sub"
+                        );
+                    }
+                    for session_id in owned {
+                        handler.registry.invalidate_session(&uid, &session_id).await;
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -344,8 +324,11 @@ impl BackChannelLogoutHandler {
         //    variant rather than substring-matching the error message.
         let payload = match entry.provider.verify_logout_jwt(token) {
             Ok(p) => p,
-            Err(axess_factors::oauth::OAuthError::UnknownKid(kid)) => {
-                tracing::info!(iss = %iss, kid = %kid, "back-channel logout: kid miss; refreshing JWKS");
+            Err(
+                e @ (axess_factors::oauth::OAuthError::UnknownKid(_)
+                | axess_factors::oauth::OAuthError::JwksExpired),
+            ) => {
+                tracing::info!(iss = %iss, reason = %e, "back-channel logout: JWKS unusable; refreshing");
                 if let Err(refresh_err) = entry.provider.refresh_jwks().await {
                     tracing::warn!(iss = %iss, error = %refresh_err, "JWKS refresh failed");
                 }
@@ -444,44 +427,24 @@ impl BackChannelLogoutHandler {
         })
     }
 
-    /// Whether `user` holds a session mapping recorded under `issuer`.
-    fn issuer_authenticated(&self, issuer: &str, user: &crate::authn::ids::UserId) -> bool {
-        self.sid_map
-            .iter()
-            .any(|e| e.key().0 == issuer && e.value().0 == *user)
-    }
-
     /// Record this `(issuer, jti)` as seen. Returns `true` if this is the
     /// first time we have seen the pair (caller may proceed). Returns
     /// `false` if the pair was already in the cache (caller should reject
     /// as a replay). Tokens without a `jti` never reach this point:
     /// `validate_logout_token` refuses them.
     ///
-    /// Eviction:
-    /// - Entries older than [`MAX_IAT_AGE_SECS`] are pruned on each call.
-    /// - If the cache is at [`JTI_CACHE_MAX`] capacity after pruning, the
-    ///   oldest [`JTI_EVICT_BATCH`] entries are evicted in a single sort,
-    ///   O(N log N) once, amortised across the next BATCH inserts.
+    /// Entries older than [`MAX_IAT_AGE_SECS`] are dropped on each call. If
+    /// the log is at [`JTI_CACHE_MAX`] capacity after that, the oldest
+    /// [`JTI_EVICT_BATCH`] entries are dropped to make room. Both come off
+    /// the front of an arrival-ordered queue, so the work is the number of
+    /// entries removed.
     fn record_jti(&self, issuer: &str, jti: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
         let cutoff = now - chrono::Duration::seconds(MAX_IAT_AGE_SECS);
-        let cache = self.seen_jtis.as_ref();
-        cache.retain(|_, seen_at| *seen_at >= cutoff);
-
-        if cache.len() >= JTI_CACHE_MAX {
-            let mut oldest: Vec<(chrono::DateTime<chrono::Utc>, (String, String))> = cache
-                .iter()
-                .map(|e| (*e.value(), e.key().clone()))
-                .collect();
-            oldest.sort_by_key(|(ts, _)| *ts);
-            for (_, evict_key) in oldest.into_iter().take(JTI_EVICT_BATCH) {
-                cache.remove(&evict_key);
-            }
-        }
-
-        let key = (issuer.to_string(), jti.to_string());
-        cache.insert(key, now).is_none()
+        self.seen_jtis.record(issuer, jti, now, cutoff)
     }
 }
+
+mod jti_log;
 
 #[cfg(test)]
 mod tests;

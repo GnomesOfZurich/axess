@@ -288,3 +288,115 @@ fn the_signature_header_follows_the_documented_recipe() {
         format!("t={EPOCH},v1={expected}")
     );
 }
+
+// ── Replay memory ─────────────────────────────────────────────────────────
+
+fn verifier(clock: &MockClock, config: SignedRequests) -> (Verifier, ServiceSecrets) {
+    let secrets: ServiceSecrets = [secret("relay", RELAY)].into_iter().collect();
+    (
+        Verifier::new(config.clock(Arc::new(clock.clone()))),
+        secrets,
+    )
+}
+
+async fn verdict(v: &Verifier, secrets: &ServiceSecrets, at: i64, body: &str) -> StatusCode {
+    match v
+        .verify(secrets, signed(RELAY, at, Method::POST, "/hook", body))
+        .await
+    {
+        Ok(_) => StatusCode::OK,
+        Err(status) => status,
+    }
+}
+
+/// With a tolerance of 80 s the sweep interval is 10 s. An entry that has
+/// expired stays until the next sweep falls due, and is swept when it does.
+#[tokio::test]
+async fn expired_entries_are_swept_on_a_schedule_not_on_every_request() {
+    let clock = clock();
+    let config = SignedRequests::default().tolerance(Duration::from_secs(80));
+    let (v, secrets) = verifier(&clock, config);
+
+    assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
+    clock.advance_secs(75);
+    assert_eq!(verdict(&v, &secrets, EPOCH + 75, "b").await, StatusCode::OK);
+    assert_eq!(v.remembered(), 2);
+
+    // "a" is now 81 s old and expired, but the last sweep was 6 s ago: not
+    // due, so it is still held, and a request every second would not change
+    // that.
+    clock.advance_secs(6);
+    assert_eq!(verdict(&v, &secrets, EPOCH + 81, "c").await, StatusCode::OK);
+    assert_eq!(v.remembered(), 3, "no sweep inside the interval");
+
+    clock.advance_secs(5);
+    assert_eq!(verdict(&v, &secrets, EPOCH + 86, "d").await, StatusCode::OK);
+    assert_eq!(
+        v.remembered(),
+        3,
+        "the sweep dropped only the expired entry"
+    );
+}
+
+/// An expired entry that has not been swept yet does not turn a replay of its
+/// signature into anything but the refusal it already gets.
+#[tokio::test]
+async fn an_unswept_expired_entry_changes_no_answer() {
+    let clock = clock();
+    let config = SignedRequests::default().tolerance(Duration::from_secs(80));
+    let (v, secrets) = verifier(&clock, config);
+    assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
+    clock.advance_secs(75);
+    assert_eq!(verdict(&v, &secrets, EPOCH + 75, "b").await, StatusCode::OK);
+    clock.advance_secs(6);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH, "a").await,
+        StatusCode::UNAUTHORIZED,
+        "stale by timestamp, held or not"
+    );
+}
+
+#[tokio::test]
+async fn a_full_cache_refuses_a_new_signature_and_never_evicts_a_live_one() {
+    let clock = clock();
+    let config = SignedRequests::default()
+        .tolerance(Duration::from_secs(60))
+        .max_remembered(3);
+    let (v, secrets) = verifier(&clock, config);
+    for body in ["1", "2", "3"] {
+        assert_eq!(verdict(&v, &secrets, EPOCH, body).await, StatusCode::OK);
+    }
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH, "4").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(v.remembered(), 3);
+    // The oldest live entry is still held: replaying it is a replay, not a
+    // free pass bought by the flood.
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH, "1").await,
+        StatusCode::UNAUTHORIZED
+    );
+    // Once the three expire, a sweep makes room.
+    clock.advance_secs(61);
+    assert_eq!(verdict(&v, &secrets, EPOCH + 61, "5").await, StatusCode::OK);
+    assert_eq!(v.remembered(), 1);
+}
+
+#[tokio::test]
+async fn a_full_cache_answers_503_through_the_layer() {
+    let clock = clock();
+    let app = signed_app(&clock, SignedRequests::default().max_remembered(1));
+    assert_eq!(
+        send(&app, signed(RELAY, EPOCH, Method::POST, "/hook", "a"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, signed(RELAY, EPOCH, Method::POST, "/hook", "b"))
+            .await
+            .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

@@ -61,3 +61,6 @@ mod valkey_cache;
 
 #[cfg(feature = "valkey-cache")]
 pub use valkey_cache::ValkeyEntityCache;
+
+#[cfg(test)]
+mod shared_entities;

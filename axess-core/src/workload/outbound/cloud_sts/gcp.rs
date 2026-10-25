@@ -70,11 +70,19 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+/// Time allowed to establish a connection, on the default HTTP client.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for one request from send to last response byte, unless
+/// `with_timeout` on the client says otherwise.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::authn::factor::ZeroizedString;
 
@@ -156,6 +164,7 @@ pub struct GcpFederatedToken {
 pub struct GcpStsClient {
     endpoint: Arc<Url>,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 impl Default for GcpStsClient {
@@ -170,7 +179,11 @@ impl GcpStsClient {
     pub fn new() -> Self {
         Self {
             endpoint: Arc::new(default_sts_endpoint()),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -181,9 +194,17 @@ impl GcpStsClient {
         self
     }
 
-    /// Override the HTTP client.
+    /// Override the HTTP client: useful for proxy or outbound mTLS
+    /// configuration. The request timeout applies whichever client is used.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Bound each call to `timeout` (default 30 seconds). The bound applies
+    /// to the request whichever HTTP client is configured.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -217,6 +238,7 @@ impl GcpStsClient {
             .http
             .post((*self.endpoint).clone())
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .timeout(self.timeout)
             .form(&form)
             .send()
             .await
@@ -285,6 +307,7 @@ pub struct GcpServiceAccountImpersonator {
     /// appended at call time.
     endpoint_base: Arc<Url>,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 impl Default for GcpServiceAccountImpersonator {
@@ -298,7 +321,11 @@ impl GcpServiceAccountImpersonator {
     pub fn new() -> Self {
         Self {
             endpoint_base: Arc::new(default_iam_credentials_base()),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -309,9 +336,17 @@ impl GcpServiceAccountImpersonator {
         self
     }
 
-    /// Override the HTTP client.
+    /// Override the HTTP client: useful for proxy or outbound mTLS
+    /// configuration. The request timeout applies whichever client is used.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Bound each call to `timeout` (default 30 seconds). The bound applies
+    /// to the request whichever HTTP client is configured.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -348,6 +383,7 @@ impl GcpServiceAccountImpersonator {
             .http
             .post(url)
             .header(AUTHORIZATION, format!("Bearer {federated_token}"))
+            .timeout(self.timeout)
             .json(&body)
             .send()
             .await

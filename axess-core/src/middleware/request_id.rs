@@ -32,6 +32,7 @@
 //! construct [`RequestIdLayer`](crate::middleware::request_id::RequestIdLayer) with the custom generator type.
 //! `HEADER_NAME` must be lowercase per HTTP/2 + HTTP/3.
 
+use axess_rng::SecureRng;
 use axum::{
     body::Body,
     extract::Request,
@@ -102,6 +103,41 @@ impl RequestIdGenerator for UuidGenerator {
 impl Default for UuidGenerator {
     fn default() -> Self {
         Self
+    }
+}
+
+/// [`RequestIdGenerator`] producing UUIDv4 strings under `x-request-id` from
+/// a caller-supplied [`SecureRng`].
+///
+/// [`UuidGenerator`] draws from the operating system. Use this one where the
+/// ids must be reproducible, passing a seeded RNG.
+#[derive(Clone)]
+pub struct RngUuidGenerator {
+    rng: Arc<dyn SecureRng>,
+}
+
+impl RngUuidGenerator {
+    /// Generate ids from `rng`.
+    pub fn new(rng: impl SecureRng) -> Self {
+        Self { rng: Arc::new(rng) }
+    }
+}
+
+impl std::fmt::Debug for RngUuidGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RngUuidGenerator").finish_non_exhaustive()
+    }
+}
+
+impl RequestIdGenerator for RngUuidGenerator {
+    const HEADER_NAME: HeaderName = X_REQUEST_ID;
+
+    #[cfg(feature = "accept-client-id")]
+    const ID_LENGTH: usize = 36;
+
+    fn generate(&self) -> HeaderValue {
+        HeaderValue::from_str(&axess_identity::mint_v4(&*self.rng).to_string())
+            .expect("UUIDv4 string is always valid ASCII")
     }
 }
 

@@ -129,6 +129,8 @@ The FIDO2 work waits on `webauthn-rs` 0.6 stable. We ride the `0.6.0-dev` pin to
 
 - **Pin `webauthn-rs` to stable.** Single-file bump in `axess-core/Cargo.toml` once `0.6` lands on crates.io.
 
+- **One `argon2` line in the tree.** `webauthn-rs` reaches `argon2` 0.5 through `crypto-glue`, so a build with `fido2` carries `argon2`, `password-hash` and `blake2` in two majors beside the 0.6 line axess uses; without `fido2` the tree has one. Resolves when `webauthn-rs` moves to `argon2` 0.6.
+
 - **FIDO2 example app.** Standalone example with browser-side JS demonstrating registration (Direct attestation), authentication (Preferred UV), and discoverable credentials (Required UV for step-up). Depends on the per-ceremony policy.
 
 - **Cross-Device Authentication (CDA).** `begin_cross_device_authn` / `complete_cross_device_authn` on `Fido2Service` per the FIDO Alliance hybrid-transport spec (QR + BLE proximity); reference example in `examples/fido2/`. Depends on the per-ceremony policy.

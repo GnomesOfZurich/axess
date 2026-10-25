@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.10.0", features = ["testing"] }
+//! axess = { version = "0.11.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -29,7 +29,8 @@
 //!
 //! ### Mocks
 //!
-//! - `mock_authn`: `MockFactorStore` / `MockIdentityStore` / `MockStoreError`.
+//! - `mock_authn`: `MockFactorStore` / `MockIdentityStore` / `MockStoreError`,
+//!   and `CallLog` for asserting the order of store calls.
 //! - `mock_clock`: re-export of [`axess_clock::testing::MockClock`].
 //! - `mock_random`: re-export of [`axess_rng::testing::MockRng`].
 //! - `mock_refresh_store`: `MemoryRefreshTokenStore` + error type.
@@ -81,7 +82,7 @@ pub mod local_idp;
 #[cfg(feature = "testing-oauth")]
 pub mod oauth_wiremock;
 
-pub use mock_authn::{MockFactorStore, MockIdentityStore, MockStoreError};
+pub use mock_authn::{CallLog, MockFactorStore, MockIdentityStore, MockStoreError};
 pub use mock_clock::MockClock;
 pub use mock_random::MockRng;
 pub use mock_refresh_store::{MemoryRefreshStoreError, MemoryRefreshTokenStore};
@@ -105,10 +106,17 @@ pub use axess_identity::testing::MockResolver;
 /// `created_by = updated_by = UserId::system()`,
 /// `created_at = updated_at = chrono::Utc::now()`.
 ///
-/// For deterministic timestamps inject a `MockClock` and call its `now()`,
-/// then overwrite the `created_at` / `updated_at` fields.
+/// For deterministic timestamps use [`user_record_at`].
 pub fn user_record(label: &str, tenant_label: &str) -> crate::authn::types::User {
-    let now = chrono::Utc::now();
+    user_record_at(label, tenant_label, chrono::Utc::now())
+}
+
+/// [`user_record`] with `created_at = updated_at = now`.
+pub fn user_record_at(
+    label: &str,
+    tenant_label: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::authn::types::User {
     crate::authn::types::User {
         id: axess_identity::testing::user(label),
         tenant_id: axess_identity::testing::tenant(tenant_label),
@@ -127,7 +135,14 @@ pub fn user_record(label: &str, tenant_label: &str) -> crate::authn::types::User
 /// from a short label, matching the [`axess_identity::testing::tenant`]
 /// id helper. Mirror of [`user_record`].
 pub fn tenant_record(label: &str) -> crate::authn::types::Tenant {
-    let now = chrono::Utc::now();
+    tenant_record_at(label, chrono::Utc::now())
+}
+
+/// [`tenant_record`] with `created_at = updated_at = now`.
+pub fn tenant_record_at(
+    label: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::authn::types::Tenant {
     crate::authn::types::Tenant {
         id: axess_identity::testing::tenant(label),
         identifier: label.into(),
@@ -143,7 +158,16 @@ pub fn tenant_record(label: &str) -> crate::authn::types::Tenant {
 /// Create an `AuthSession` with a fresh session ID for use in tests.
 ///
 /// This avoids needing access to `pub(crate)` constructors from integration tests.
+/// The id, and every id the session rotates to, comes from the system RNG;
+/// use [`test_session_with_rng`] for a reproducible sequence.
 pub fn test_session() -> crate::session::extractor::AuthSession {
+    test_session_with_rng(axess_rng::SystemRng)
+}
+
+/// [`test_session`] whose initial id and later rotations are drawn from `rng`.
+pub fn test_session_with_rng(
+    rng: impl axess_rng::SecureRng,
+) -> crate::session::extractor::AuthSession {
     use crate::session::{
         data::SessionData,
         id::SessionId,
@@ -152,12 +176,15 @@ pub fn test_session() -> crate::session::extractor::AuthSession {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    let rng: Arc<dyn axess_rng::SecureRng> = Arc::new(rng);
     let inner = SessionInner {
-        id: SessionId::new(&axess_rng::SystemRng),
+        id: SessionId::new(&rng),
         data: SessionData::default(),
         modified: false,
+        needs_persist: false,
         regenerate: false,
         pre_cycle_id: None,
+        rng,
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
     };

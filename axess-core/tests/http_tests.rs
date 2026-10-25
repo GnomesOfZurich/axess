@@ -135,7 +135,15 @@ async fn unmodified_session_does_not_set_cookie() {
     let session_layer = SessionLayer::new(store, signing_key).with_secure(false);
 
     let app = Router::new()
-        .route("/noop", get(|| async { "noop" }))
+        // Reading the id keeps the session, so a cookieless first request
+        // stores it and sets a cookie.
+        .route(
+            "/noop",
+            get(|session: AuthSession| async move {
+                session.session_id().await;
+                "noop"
+            }),
+        )
         .layer(session_layer);
 
     // First request; creates session, sets cookie.
@@ -146,7 +154,7 @@ async fn unmodified_session_does_not_set_cookie() {
         .unwrap();
 
     let cookie = resp1.headers().get(header::SET_COOKIE);
-    // First request always sets a cookie (new session).
+    // A first request that needs its session sets a cookie.
     assert!(cookie.is_some());
 
     // Extract the cookie to send on the second request.
@@ -258,7 +266,9 @@ async fn oversized_custom_data_is_cleared_on_save() {
         .with_max_custom_bytes(32);
 
     async fn fat_set(session: AuthSession) -> impl IntoResponse {
-        // ~256 bytes; comfortably above the 32-byte clamp.
+        // A small write marks the session modified; the ~256 byte payload is
+        // comfortably above the 32-byte clamp.
+        session.set_custom("k", serde_json::json!(1)).await;
         session
             .set_custom("payload", serde_json::Value::String("x".repeat(256)))
             .await;

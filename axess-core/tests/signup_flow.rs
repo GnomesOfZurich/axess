@@ -78,6 +78,30 @@ async fn begin_signup_creates_user_and_sets_pending_workflow() {
 }
 
 #[tokio::test]
+async fn begin_signup_stores_the_user_in_the_tenant_it_validated() {
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+
+    // The record names some other tenant; the slug names `default`.
+    let mut user = candidate_user("u1", "alice@example.com");
+    user.tenant_id = tid("some-other-tenant");
+    service
+        .begin_signup(user, "default", &session)
+        .await
+        .unwrap();
+
+    let stored = identity
+        .find_user("alice@example.com", &test_tenant().id)
+        .await
+        .unwrap()
+        .expect("the user lands in the tenant the slug resolved to");
+    assert_eq!(stored.tenant_id, test_tenant().id);
+    assert_eq!(session.tenant_id().await, Some(test_tenant().id));
+}
+
+#[tokio::test]
 async fn begin_signup_active_user_returns_already_exists() {
     // An *active* user cannot be overwritten by a fresh signup.
     // Only orphan Candidates resume; Active accounts must reject.

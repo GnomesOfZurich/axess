@@ -150,6 +150,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn build_auth_url_par<'a>(
         &'a self,
         options: &'a axess_factors::oauth::OAuthLoginOptions,
+        _rng: &'a dyn axess_rng::SecureRng,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<

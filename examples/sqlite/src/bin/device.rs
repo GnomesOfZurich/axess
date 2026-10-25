@@ -31,7 +31,7 @@ use axess::device::{
 };
 use axess::session::SessionCrypto;
 use axess::{
-    SessionLayer, SystemClock,
+    SecureRng, SessionLayer, SystemClock,
     backends::sqlite::{DeviceStore as SqliteDeviceStore, SessionStore as SqliteSessionStore},
 };
 use axum::{
@@ -71,10 +71,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect("sqlite::memory:")
         .await?;
 
-    // Single envelope key reused for the session and device stores. In
-    // production this comes from a KMS / vault; `[0x42; 32]` here is
-    // demonstration only.
-    let envelope_key = [0x42u8; 32];
+    // Fresh random keys per start (the database is in memory, so nothing
+    // outlives the process anyway). The at-rest envelope key shared by the
+    // session and device stores and the cookie-signing key are different
+    // secrets and must stay different. In production both come from a KMS
+    // or vault and are stable across restarts.
+    let mut envelope_key = [0u8; 32];
+    let mut signing_key = [0u8; 32];
+    let mut pepper = [0u8; 32];
+    axess::SystemRng.fill_bytes(&mut envelope_key);
+    axess::SystemRng.fill_bytes(&mut signing_key);
+    axess::SystemRng.fill_bytes(&mut pepper);
     let crypto = SessionCrypto::new(envelope_key);
 
     // ── 2. session + device stores on the SAME pool ──────────────────────
@@ -93,17 +100,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 4. fingerprint extractor + lifecycle service ─────────────────────
     //
-    // Per-tenant HMAC pepper. In production, derive from a per-tenant
-    // secret in a vault or via a KDF over a master key. Demonstration
-    // hash here is fixed per tenant id; DO NOT use this in production.
-    let pepper_resolver: TenantPepperResolver = Arc::new(|tenant: &TenantId| {
-        let mut out = [0u8; 32];
-        let tenant_bytes = tenant.as_uuid().into_bytes();
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = tenant_bytes[i % tenant_bytes.len()] ^ 0x5a;
-        }
-        out
-    });
+    // Per-tenant HMAC pepper. The pepper must be secret: derived from public
+    // values such as the tenant id, it would let anyone who knows a device's
+    // attributes recompute its fingerprint. This demo draws one random pepper
+    // per start; in production derive a per-tenant secret from a vault or a
+    // KDF over a master key, stable across restarts.
+    let pepper_resolver: TenantPepperResolver = Arc::new(move |_tenant: &TenantId| pepper);
     let extractor = DefaultFingerprintExtractor::new(pepper_resolver);
     let lifecycle =
         DeviceLifecycleService::new(cached_devices.clone()).with_event_sink(NoopDeviceEventSink);
@@ -152,7 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(devices.clone()))
         .layer(Extension(demo_tenant))
         .layer(
-            SessionLayer::new(sessions, envelope_key)
+            SessionLayer::new(sessions, signing_key)
                 .with_secure(false)
                 .with_ttl(Duration::from_secs(3600)),
         );

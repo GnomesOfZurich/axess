@@ -6,11 +6,34 @@
 //! CREATE TABLE IF NOT EXISTS sessions (
 //!   id TEXT PRIMARY KEY,
 //!   data TEXT NOT NULL,
+//!   data_bin BYTEA,
 //!   expires_at BIGINT NOT NULL
 //! );
 //!
 //! CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at);
 //! ```
+//!
+//! `data_bin` holds the session as raw bytes (MessagePack, sealed with
+//! AES-256-GCM when encryption is on). `data` is the base64 text column of
+//! earlier releases: rows written by them keep working because a load reads
+//! `data_bin` first and falls back to `data`, and every save writes
+//! `data_bin` and empties `data`, so a legacy row is rewritten the first
+//! time its session is saved. `data` stays `NOT NULL`, so new rows carry an
+//! empty string there.
+//!
+//! # Upgrading an existing deployment
+//!
+//! `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so a
+//! deployment created by an earlier release must run, once, before the new
+//! code serves a request (a load selects `data_bin`):
+//!
+//! ```sql
+//! ALTER TABLE sessions ADD COLUMN IF NOT EXISTS data_bin BYTEA;
+//! ```
+//!
+//! Rolling back to the earlier release afterwards is safe for rows it wrote
+//! itself, but it cannot read a row this release saved (the text column is
+//! empty): that user signs in again.
 
 use crate::session::storage::session_codec::{SessionCodec, SqlStoreError, expires_at};
 use crate::session::storage::sql_helpers::log_cleanup_outcome;
@@ -93,6 +116,7 @@ impl PostgresSessionStore {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 data TEXT NOT NULL,
+                data_bin BYTEA,
                 expires_at BIGINT NOT NULL
             )
             "#,
@@ -122,9 +146,11 @@ impl PostgresSessionStore {
     /// SQL stores accumulate expired session rows forever unless something
     /// removes them. Production deployments **must** either call this
     /// helper once at startup, run an external scheduled job (e.g. `pg_cron`
-    /// on the database side), or accept unbounded table growth. The
-    /// returned [`tokio::task::JoinHandle`] aborts the loop when dropped,
-    /// so store it for the lifetime of the application.
+    /// on the database side), or accept unbounded table growth. Dropping
+    /// the returned [`tokio::task::JoinHandle`] leaves the loop running;
+    /// keep it so the shutdown path can call `abort`. Which rows expire is
+    /// decided by the injected [`Clock`]; the pacing of the sweeps is the
+    /// Tokio timer's.
     ///
     /// Errors from `cleanup_expired` are logged at `warn` and swallowed;
     /// the loop keeps running so a single transient DB blip does not
@@ -155,15 +181,17 @@ impl SessionStore for PostgresSessionStore {
         let id_str = id.to_string();
         let now = self.clock.now().timestamp();
 
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data FROM sessions WHERE id = $1 AND expires_at > $2")
+        let row: Option<(Option<Vec<u8>>, String)> =
+            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = $1 AND expires_at > $2")
                 .bind(&id_str)
                 .bind(now)
                 .fetch_optional(&self.pool)
                 .await?;
 
         match row {
-            Some((stored,)) => Ok(Some(self.codec.decode(&stored)?)),
+            Some((binary, text)) => {
+                Ok(Some(self.codec.decode_row(id, binary.as_deref(), &text)?))
+            }
             None => Ok(None),
         }
     }
@@ -175,14 +203,14 @@ impl SessionStore for PostgresSessionStore {
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         let id_str = id.to_string();
-        let encoded = self.codec.encode(data)?;
+        let encoded = self.codec.encode_bytes(id, data)?;
         let exp = expires_at(&*self.clock, ttl);
 
         sqlx::query(
             r#"
-            INSERT INTO sessions (id, data, expires_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, expires_at = EXCLUDED.expires_at
+            INSERT INTO sessions (id, data, data_bin, expires_at)
+            VALUES ($1, '', $2, $3)
+            ON CONFLICT (id) DO UPDATE SET data = '', data_bin = EXCLUDED.data_bin, expires_at = EXCLUDED.expires_at
             "#,
         )
         .bind(&id_str)
@@ -210,24 +238,35 @@ impl SessionStore for PostgresSessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
-        let encoded = self.codec.encode(data)?;
+        let encoded = self.codec.encode_bytes(new_id, data)?;
         let exp = expires_at(&*self.clock, ttl);
         let old_str = old_id.to_string();
         let new_str = new_id.to_string();
 
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(&old_str)
-            .execute(&mut *tx)
-            .await?;
+        // Write the new row first, idempotently, and drop the old row only
+        // once the new one is in place within the same transaction: a failed
+        // insert rolls back and leaves the old session untouched.
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (id, data, data_bin, expires_at)
+            VALUES ($1, '', $2, $3)
+            ON CONFLICT (id) DO UPDATE SET data = '', data_bin = EXCLUDED.data_bin, expires_at = EXCLUDED.expires_at
+            "#,
+        )
+        .bind(&new_str)
+        .bind(&encoded)
+        .bind(exp)
+        .execute(&mut *tx)
+        .await?;
 
-        sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES ($1, $2, $3)")
-            .bind(&new_str)
-            .bind(&encoded)
-            .bind(exp)
-            .execute(&mut *tx)
-            .await?;
+        if old_str != new_str {
+            sqlx::query("DELETE FROM sessions WHERE id = $1")
+                .bind(&old_str)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         tx.commit().await?;
         Ok(())

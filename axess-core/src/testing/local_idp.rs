@@ -188,7 +188,7 @@ struct LocalIdpInner {
     extra_public_jwks: Vec<Jwk>,
     issuer: String,
     /// Optional max-TTL policy: if set, [`LocalIdpFixture::mint`]
-    /// panics when `exp - iat (or now if iat is None)` exceeds this
+    /// panics when `exp - now` exceeds this
     /// duration. Models the production-side guardrail against
     /// mistakenly issuing year-long tokens.
     max_ttl: Option<Duration>,
@@ -345,8 +345,9 @@ impl LocalIdpFixture {
 
     /// Cap the maximum lifetime of minted tokens. When set, [`mint`](Self::mint)
     /// / [`mint_with_header`](Self::mint_with_header) /
-    /// [`mint_jwt_svid`](Self::mint_jwt_svid) panic if `exp - iat`
-    /// (or `exp - now`, when `iat` is unset) exceeds `ttl`.
+    /// [`mint_jwt_svid`](Self::mint_jwt_svid) panic if `exp - now`
+    /// exceeds `ttl`. The lifetime is measured from now, never from a
+    /// caller-supplied `iat`, so a future-dated `iat` cannot shrink it.
     ///
     /// Models the production guardrail against accidentally minting
     /// long-lived tokens. The production `LocalIdp` shape will surface
@@ -525,16 +526,41 @@ impl LocalIdpFixture {
     /// Mint a signed JWT. The fixture sets `iss`, header `kid`, and
     /// header `alg` automatically; caller supplies the rest via
     /// [`MintClaims`].
+    ///
+    /// The max-TTL cap, when configured, is measured from the wall clock;
+    /// use [`mint_at`](Self::mint_at) to measure it from a chosen instant.
     pub fn mint(&self, claims: &MintClaims) -> String {
-        self.mint_with_header(claims, &mut Header::new(self.inner.signing_key.algorithm()))
+        self.mint_at(claims, Utc::now())
+    }
+
+    /// Like [`mint`](Self::mint) but measures the max-TTL cap from `now`
+    /// instead of the wall clock, so a test driving a
+    /// [`MockClock`](crate::testing::MockClock) gets exact behaviour.
+    pub fn mint_at(&self, claims: &MintClaims, now: DateTime<Utc>) -> String {
+        self.mint_with_header_at(
+            claims,
+            &mut Header::new(self.inner.signing_key.algorithm()),
+            now,
+        )
     }
 
     /// Mint with caller-supplied header. Adopters reach for this
     /// when they need to set unusual header fields (e.g. test
     /// `x5t` thumbprint matching).
     pub fn mint_with_header(&self, claims: &MintClaims, header: &mut Header) -> String {
+        self.mint_with_header_at(claims, header, Utc::now())
+    }
+
+    /// Like [`mint_with_header`](Self::mint_with_header) but measures the
+    /// max-TTL cap from `now` instead of the wall clock.
+    pub fn mint_with_header_at(
+        &self,
+        claims: &MintClaims,
+        header: &mut Header,
+        now: DateTime<Utc>,
+    ) -> String {
         if let Some(max_ttl) = self.inner.max_ttl {
-            enforce_max_ttl(claims, max_ttl);
+            enforce_max_ttl(claims, max_ttl, now);
         }
         header.kid = Some(self.inner.signing_key.key_id().to_string());
         header.alg = self.inner.signing_key.algorithm();
@@ -557,7 +583,9 @@ impl LocalIdpFixture {
     /// Convenience wrapper to mint a SPIFFE-shaped JWT-SVID with
     /// `sub = "spiffe://<trust_domain>/<service>/<tenant>"` and
     /// the given audience + TTL. The fixture sets `iat = now`,
-    /// `exp = now + ttl`, `iss = self.issuer()`.
+    /// `exp = now + ttl`, `iss = self.issuer()`, with `now` read from the
+    /// wall clock; [`mint_jwt_svid_at`](Self::mint_jwt_svid_at) takes it
+    /// as a parameter.
     pub fn mint_jwt_svid(
         &self,
         trust_domain: &str,
@@ -566,13 +594,26 @@ impl LocalIdpFixture {
         audience: impl Into<String>,
         ttl: Duration,
     ) -> String {
-        let now = Utc::now();
+        self.mint_jwt_svid_at(trust_domain, service, tenant, audience, ttl, Utc::now())
+    }
+
+    /// Like [`mint_jwt_svid`](Self::mint_jwt_svid) with `iat = now`,
+    /// `exp = now + ttl` and the max-TTL cap all taken from `now`.
+    pub fn mint_jwt_svid_at(
+        &self,
+        trust_domain: &str,
+        service: &str,
+        tenant: &str,
+        audience: impl Into<String>,
+        ttl: Duration,
+        now: DateTime<Utc>,
+    ) -> String {
         let exp = now + ttl;
         let subject = format!("spiffe://{trust_domain}/{service}/{tenant}");
         let claims = MintClaims::new(subject, exp)
             .with_audience(audience)
             .with_issued_at(now);
-        self.mint(&claims)
+        self.mint_at(&claims, now)
     }
 }
 

@@ -15,7 +15,10 @@ use axum::{
 use hmac::Mac;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use subtle::ConstantTimeEq;
@@ -102,6 +105,7 @@ impl ServiceSigner {
 pub struct SignedRequests {
     tolerance: Duration,
     max_body_bytes: usize,
+    max_remembered: usize,
     clock: Arc<dyn Clock>,
 }
 
@@ -110,17 +114,19 @@ impl std::fmt::Debug for SignedRequests {
         f.debug_struct("SignedRequests")
             .field("tolerance", &self.tolerance)
             .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_remembered", &self.max_remembered)
             .finish_non_exhaustive()
     }
 }
 
 impl Default for SignedRequests {
     /// Five minutes either side of the server's clock, bodies up to 1 MiB,
-    /// the system clock.
+    /// 100,000 remembered signatures, the system clock.
     fn default() -> Self {
         Self {
             tolerance: Duration::from_secs(300),
             max_body_bytes: 1024 * 1024,
+            max_remembered: 100_000,
             clock: Arc::new(SystemClock),
         }
     }
@@ -144,6 +150,19 @@ impl SignedRequests {
         self
     }
 
+    /// The most accepted signatures remembered at once (minimum 1).
+    ///
+    /// A signature is remembered for the [`tolerance`](Self::tolerance), and
+    /// a live one is never forgotten to make room. When this many are live,
+    /// a request that would add one more is answered `503 Service
+    /// Unavailable` instead of being accepted unchecked for replay: refusing
+    /// is the safe direction, and only holders of a secret can reach it.
+    #[must_use]
+    pub fn max_remembered(mut self, limit: usize) -> Self {
+        self.max_remembered = limit.max(1);
+        self
+    }
+
     /// The clock timestamps are checked against.
     #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -158,9 +177,20 @@ impl SignedRequests {
 /// instances, a replay that reaches a different instance within the
 /// tolerance is not caught. Only verified signatures are remembered, so a
 /// caller without the secret cannot grow it.
+///
+/// Expired entries are swept at most once per `max(tolerance / 8, 1 s)` of
+/// the configured clock, by whichever request wins the claim on the sweep
+/// stamp; the rest only insert. An entry that has outlived the tolerance but
+/// not yet been swept cannot be mistaken for a live one: a request carrying
+/// its signature is older than the tolerance and is refused on its timestamp
+/// first. At [`max_remembered`](SignedRequests::max_remembered) live entries
+/// a sweep is attempted at most once per second, and if the cache is still
+/// full the request is refused with `503`.
 pub(super) struct Verifier {
     config: SignedRequests,
     seen: Mutex<HashMap<[u8; 32], i64>>,
+    /// Unix seconds of the last sweep, claimed with `compare_exchange`.
+    last_sweep: AtomicU64,
 }
 
 impl std::fmt::Debug for Verifier {
@@ -176,7 +206,29 @@ impl Verifier {
         Self {
             config,
             seen: Mutex::new(HashMap::new()),
+            last_sweep: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this caller won the right to sweep: at least `interval`
+    /// seconds have passed since the stamp, and the stamp was moved by us.
+    fn claim_sweep(&self, now: i64, interval: u64) -> bool {
+        let now = u64::try_from(now).unwrap_or(0);
+        let last = self.last_sweep.load(Ordering::Acquire);
+        now.saturating_sub(last) >= interval
+            && self
+                .last_sweep
+                .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    /// Signatures currently remembered, expired-but-unswept ones included.
+    #[cfg(test)]
+    pub(super) fn remembered(&self) -> usize {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// The request with its body restored and its [`ServiceCaller`](super::ServiceCaller)
@@ -215,12 +267,25 @@ impl Verifier {
             })
             .ok_or(StatusCode::UNAUTHORIZED)?;
 
+        let window = tolerance.unsigned_abs();
+        let sweep_due = self.claim_sweep(now, (window / 8).max(1));
         {
             let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
-            seen.retain(|_, at| now.abs_diff(*at) <= tolerance.unsigned_abs());
-            if seen.insert(tag, stamp).is_some() {
+            if sweep_due {
+                seen.retain(|_, at| now.abs_diff(*at) <= window);
+            }
+            if seen.contains_key(&tag) {
                 return Err(StatusCode::UNAUTHORIZED);
             }
+            if seen.len() >= self.config.max_remembered {
+                if self.claim_sweep(now, 1) {
+                    seen.retain(|_, at| now.abs_diff(*at) <= window);
+                }
+                if seen.len() >= self.config.max_remembered {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+            }
+            seen.insert(tag, stamp);
         }
 
         parts.extensions.insert(caller);

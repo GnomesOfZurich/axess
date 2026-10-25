@@ -137,7 +137,7 @@ async fn happy_path_exchanges_code_then_fetches_userinfo() {
         .exchange_code("the-code", "pkce-verifier-stub")
         .await
         .expect("exchange_code");
-    assert_eq!(access_token, "tok-abc");
+    assert_eq!(&*access_token, "tok-abc");
 
     let claims = provider
         .fetch_userinfo(&access_token)
@@ -273,4 +273,43 @@ fn config_debug_does_not_leak_the_client_secret() {
         rendered.contains("id-123"),
         "client_id should remain visible"
     );
+}
+
+// ── User-Agent ownership ─────────────────────────────────────────────
+
+async fn userinfo_mock(server: &MockServer, user_agent: &str) {
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .and(header("user-agent", user_agent))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 7 })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+/// The default client carries the `axess-social/<version>` agent.
+#[tokio::test]
+async fn default_client_sends_the_axess_user_agent() {
+    let server = MockServer::start().await;
+    userinfo_mock(&server, concat!("axess-social/", env!("CARGO_PKG_VERSION"))).await;
+    let claims = make_provider(&server).fetch_userinfo("tok").await.unwrap();
+    assert_eq!(claims.subject, "7");
+}
+
+/// A supplied client's own `User-Agent` is the one that goes out; the
+/// library no longer stamps its own over it.
+#[tokio::test]
+async fn supplied_client_keeps_its_own_user_agent() {
+    let server = MockServer::start().await;
+    userinfo_mock(&server, "adopter-app/3.1").await;
+    let client = reqwest::Client::builder()
+        .user_agent("adopter-app/3.1")
+        .build()
+        .unwrap();
+    let claims = make_provider(&server)
+        .with_http_client(client)
+        .fetch_userinfo("tok")
+        .await
+        .unwrap();
+    assert_eq!(claims.subject, "7");
 }

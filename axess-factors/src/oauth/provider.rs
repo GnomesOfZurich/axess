@@ -19,13 +19,16 @@
 //! that the trait impl and sibling submodules share.
 
 mod builder;
+mod ceremony;
 mod device_flow;
 mod discover;
 #[cfg(feature = "fapi")]
 pub mod dpop_verify;
 mod fapi_flow;
+mod fresh_keys;
 mod jwks;
 mod provider_impl;
+mod refresh_response;
 
 use super::{extract_string_array, types::*};
 use crate::oidc::JwksCache;
@@ -123,96 +126,39 @@ impl OAuthProviderConfig {
         .set_redirect_uri(self.redirect_url.clone())
     }
 
+    /// The provider's clock as the closure openidconnect's ID-token
+    /// verifier reads, so `exp` and `iat` checks follow the injected
+    /// clock instead of the wall clock.
+    pub(crate) fn time_fn(
+        &self,
+    ) -> impl Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync + 'static {
+        let clock = self.clock.clone();
+        move || clock.now()
+    }
+
     /// Extract [`OAuthClaims`] from an openidconnect token response.
     ///
     /// Visible to sibling `provider::` submodules (device_flow, fapi_flow) so
     /// they can reuse the ID-token validation logic without duplicating it.
-    pub(super) fn extract_claims_from_response(
+    pub(super) async fn extract_claims_from_response(
         &self,
         token_response: &openidconnect::core::CoreTokenResponse,
         nonce: &str,
     ) -> Result<OAuthClaims, OAuthError> {
-        use openidconnect::{Nonce, OAuth2TokenResponse, TokenResponse};
+        self.with_fresh_keys(|client| self.claims_from_response_with(client, token_response, nonce))
+            .await
+    }
 
-        let id_token = token_response
-            .id_token()
-            .ok_or_else(|| OAuthError::IdTokenValidation("no ID token in response".to_string()))?;
-
-        // Preserve the raw JWT for RP-Initiated Logout (id_token_hint).
-        // openidconnect's `IdToken` implements `ToString`
-        // explicitly to return the wire-form JWT; call it directly
-        // instead of round-tripping through `serde_json::to_value`, which
-        // only produces a string by accident of the serialize impl and
-        // would silently break if the impl ever switches to a structured
-        // representation. `ToString::to_string` is infallible.
-        let raw_id_token: Option<String> = Some(id_token.to_string());
-
-        let client = self.make_client();
-        let id_token_verifier = client.id_token_verifier();
-        let claims = id_token
-            .claims(&id_token_verifier, &Nonce::new(nonce.to_string()))
-            .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
-
-        // The signature, `iss`, `aud`, `exp` and nonce checks above have run
-        // over exactly these bytes. `IdTokenClaims<EmptyAdditionalClaims>`
-        // discards every claim outside the standard set (`nbf`, `groups`,
-        // `roles`, `sid`, ...), so read those from the verified payload.
-        let verified_payload = raw_id_token
-            .as_deref()
-            .and_then(|jwt| crate::oidc::logout_token::decode_jwt_payload(jwt).ok())
-            .ok_or_else(|| {
-                OAuthError::IdTokenValidation("ID token payload is not readable".to_string())
-            })?;
-
-        // at_hash / c_hash enforcement.
-        //
-        // OIDC Core §3.1.3.6 / §3.2.2.10 specifies `at_hash` (= leftmost
-        // half of the hash of `access_token` under the ID-token signing
-        // alg) when the IdP returns an access token alongside the ID
-        // token. openidconnect 4.x does not enforce this by default;
-        // the verifier short-circuits when no `access_token_hash` is set
-        // on the verifier instance. Enforce it manually here when both
-        // claims and the access token are present, so a tampered
-        // access-token swap is detected even on IdPs that emit the hash.
-        if let Some(claim_hash) = claims.access_token_hash() {
-            use openidconnect::OAuth2TokenResponse;
-            let access_token = OAuth2TokenResponse::access_token(token_response).secret();
-            let alg = id_token
-                .signing_alg()
-                .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
-            let signing_key = id_token
-                .signing_key(&id_token_verifier)
-                .map_err(|e| OAuthError::IdTokenValidation(format!("signing key: {e}")))?;
-            let expected = openidconnect::AccessTokenHash::from_token(
-                &openidconnect::AccessToken::new(access_token.to_string()),
-                alg,
-                signing_key,
-            )
-            .map_err(|e| OAuthError::IdTokenValidation(format!("at_hash compute: {e}")))?;
-            if expected.as_str() != claim_hash.as_str() {
-                return Err(OAuthError::IdTokenValidation(
-                    "at_hash claim does not match access_token; IdP-side tampering or \
-                     wrong access token routed"
-                        .to_string(),
-                ));
-            }
-        }
-        // c_hash is computed from the authorization code; we don't have
-        // the original code at this point in the flow (it was consumed
-        // by the token exchange), so c_hash enforcement would need to
-        // happen earlier. Document the gap and leave c_hash for the
-        // FAPI-mode verifier to be added once the upstream openidconnect
-        // crate exposes it.
-
-        // FAPI 2.0 §5.2.2; when FAPI is configured, enforce
-        // strict ID-token lifetime AND require `nbf`. openidconnect's
-        // default verifier honours `exp` (rejects expired tokens) but
-        // does NOT cap `exp - iat` nor require `nbf`. The doc on
-        // FapiConfig advertises both; the enforcement was missing.
+    /// FAPI 2.0 §5.2.2 limits on a verified ID token: its lifetime
+    /// (`exp - iat`, in seconds) is within the configured cap and its `nbf`,
+    /// read from the verified payload, is present and not in the future.
+    /// Does nothing when FAPI is not configured.
+    fn enforce_fapi_id_token(
+        &self,
+        lifetime: i64,
+        verified_payload: &serde_json::Value,
+    ) -> Result<(), OAuthError> {
         if let Some(fapi) = &self.fapi {
-            let exp = claims.expiration();
-            let iat = claims.issue_time();
-            let lifetime = (exp - iat).num_seconds();
             if lifetime <= 0 || lifetime > fapi.max_id_token_lifetime_secs as i64 {
                 return Err(OAuthError::IdTokenValidation(format!(
                     "ID token lifetime {lifetime}s exceeds FAPI cap of {}s (exp - iat)",
@@ -246,6 +192,103 @@ impl OAuthProviderConfig {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// [`extract_claims_from_response`](Self::extract_claims_from_response)
+    /// against the verifier of `client`.
+    fn claims_from_response_with(
+        &self,
+        client: &OidcClient,
+        token_response: &openidconnect::core::CoreTokenResponse,
+        nonce: &str,
+    ) -> Result<OAuthClaims, OAuthError> {
+        use openidconnect::{Nonce, OAuth2TokenResponse, TokenResponse};
+
+        let id_token = token_response
+            .id_token()
+            .ok_or_else(|| OAuthError::IdTokenValidation("no ID token in response".to_string()))?;
+
+        // Preserve the raw JWT for RP-Initiated Logout (id_token_hint).
+        // openidconnect's `IdToken` implements `ToString`
+        // explicitly to return the wire-form JWT; call it directly
+        // instead of round-tripping through `serde_json::to_value`, which
+        // only produces a string by accident of the serialize impl and
+        // would silently break if the impl ever switches to a structured
+        // representation. `ToString::to_string` is infallible.
+        let raw_id_token: Option<String> = Some(id_token.to_string());
+
+        let id_token_verifier = client.id_token_verifier().set_time_fn(self.time_fn());
+        let claims = id_token
+            .claims(&id_token_verifier, &Nonce::new(nonce.to_string()))
+            .map_err(fresh_keys::claims_error)?;
+
+        // The signature, `iss`, `aud`, `exp` and nonce checks above have run
+        // over exactly these bytes. `IdTokenClaims<EmptyAdditionalClaims>`
+        // discards every claim outside the standard set (`nbf`, `groups`,
+        // `roles`, `sid`, ...), so read those from the verified payload.
+        let verified_payload = raw_id_token
+            .as_deref()
+            .and_then(|jwt| crate::oidc::logout_token::decode_id_token_payload(jwt).ok())
+            .ok_or_else(|| {
+                OAuthError::IdTokenValidation("ID token payload is not readable".to_string())
+            })?;
+
+        // at_hash / c_hash enforcement.
+        //
+        // OIDC Core §3.1.3.6 / §3.2.2.10 specifies `at_hash` (= leftmost
+        // half of the hash of `access_token` under the ID-token signing
+        // alg) when the IdP returns an access token alongside the ID
+        // token. openidconnect 4.x does not enforce this by default;
+        // the verifier short-circuits when no `access_token_hash` is set
+        // on the verifier instance. Enforce it manually here when both
+        // claims and the access token are present, so a tampered
+        // access-token swap is detected even on IdPs that emit the hash.
+        if let Some(claim_hash) = claims.access_token_hash() {
+            use openidconnect::OAuth2TokenResponse;
+            let access_token = OAuth2TokenResponse::access_token(token_response).secret();
+            let alg = id_token
+                .signing_alg()
+                .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
+            let signing_key = id_token
+                .signing_key(&id_token_verifier)
+                .map_err(|e| OAuthError::IdTokenValidation(format!("signing key: {e}")))?;
+            let expected = openidconnect::AccessTokenHash::from_token(
+                &openidconnect::AccessToken::new(access_token.to_string()),
+                alg,
+                signing_key,
+            )
+            .map_err(|e| OAuthError::IdTokenValidation(format!("at_hash compute: {e}")))?;
+            use subtle::ConstantTimeEq as _;
+            if !bool::from(
+                expected
+                    .as_str()
+                    .as_bytes()
+                    .ct_eq(claim_hash.as_str().as_bytes()),
+            ) {
+                return Err(OAuthError::IdTokenValidation(
+                    "at_hash claim does not match access_token; IdP-side tampering or \
+                     wrong access token routed"
+                        .to_string(),
+                ));
+            }
+        }
+        // c_hash is computed from the authorization code; we don't have
+        // the original code at this point in the flow (it was consumed
+        // by the token exchange), so c_hash enforcement would need to
+        // happen earlier. Document the gap and leave c_hash for the
+        // FAPI-mode verifier to be added once the upstream openidconnect
+        // crate exposes it.
+
+        // FAPI 2.0 §5.2.2; when FAPI is configured, enforce
+        // strict ID-token lifetime AND require `nbf`. openidconnect's
+        // default verifier honours `exp` (rejects expired tokens) but
+        // does NOT cap `exp - iat` nor require `nbf`. The doc on
+        // FapiConfig advertises both; the enforcement was missing.
+        self.enforce_fapi_id_token(
+            (claims.expiration() - claims.issue_time()).num_seconds(),
+            &verified_payload,
+        )?;
 
         let subject = claims.subject().to_string();
         let email = claims.email().map(|e| e.as_str().to_string());

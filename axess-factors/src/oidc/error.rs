@@ -36,6 +36,18 @@ pub enum OidcError {
     #[error("JWKS fetch failed: {0}")]
     JwksFetch(String),
 
+    /// The cached key set is older than the cache's maximum age, so it is not
+    /// used to verify anything until a refresh succeeds.
+    #[error(
+        "cached JWKS is {age_secs} s old, past its {max_age_secs} s maximum age; refresh required"
+    )]
+    JwksExpired {
+        /// Seconds since the key set was fetched.
+        age_secs: u64,
+        /// The cache's maximum age, in seconds.
+        max_age_secs: u64,
+    },
+
     /// The JWKS body was fetched but could not be parsed as RFC 7517 JSON.
     #[error("JWKS parse failed: {0}")]
     JwksParse(String),

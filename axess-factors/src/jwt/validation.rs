@@ -14,14 +14,13 @@
 //! deterministic-simulation tests: advance the clock past `exp` and
 //! verify rejection without relying on real wall-clock latency.
 //!
-//! The simpler [`verify_jwt_signature`] wrapper defaults to
-//! [`axess_clock::SystemClock`] so existing
-//! callers that don't need DST keep their signature unchanged.
+//! Every production caller passes its own clock to [`verify_jwt`]; the
+//! wall-clock convenience wrapper exists only for this crate's tests.
 
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 
-use axess_clock::{Clock, SystemClock};
+use axess_clock::Clock;
 
 /// Default allowed asymmetric algorithms for JWT verification.
 ///
@@ -132,25 +131,14 @@ impl Default for ValidationConfig {
     }
 }
 
-/// Verify a JWT signature against a JWKS key set.
+/// Verify a JWT signature against a JWKS key set on the wall clock.
 ///
-/// Returns the decoded claims on success. Reusable across OAuth logout,
-/// backchannel logout, and future bearer token middleware.
-///
-/// When `expected_audience` is `Some`, the `aud` claim is validated against
-/// it by `jsonwebtoken`. When `None`, audience validation is disabled.
-///
-/// **Clock**: defaults to [`SystemClock`] for the wall-clock-driven
-/// callers (today's bearer / OAuth back-channel logout). DST-driven
-/// callers should use [`verify_jwt`] with an injected [`Clock`]
-/// or the [`crate::jwt::verifier::JwtVerifier`] builder
-/// with `with_clock`.
-///
-/// For richer claim validation (issuer pinning, configurable clock skew,
-/// `nbf` requirement), use [`verify_jwt`] directly with a
-/// [`ValidationConfig`] or the [`crate::jwt::verifier::JwtVerifier`]
-/// builder.
-pub fn verify_jwt_signature(
+/// Test-only convenience over [`verify_jwt`] with a default
+/// [`ValidationConfig`] and [`axess_clock::SystemClock`]. Production code
+/// calls [`verify_jwt`] with the clock it was configured with, so a
+/// `MockClock` governs `exp` and `nbf` on every path.
+#[cfg(test)]
+pub(crate) fn verify_jwt_signature(
     token: &str,
     jwks: &JwkSet,
     expected_audience: Option<&str>,
@@ -158,13 +146,19 @@ pub fn verify_jwt_signature(
 ) -> Result<serde_json::Value, JwtError> {
     let mut config = ValidationConfig::new();
     config.audience = expected_audience.map(String::from);
-    verify_jwt(token, jwks, &config, allowed_algorithms, &SystemClock)
+    verify_jwt(
+        token,
+        jwks,
+        &config,
+        allowed_algorithms,
+        &axess_clock::SystemClock,
+    )
 }
 
 /// Verify a JWT signature and validate registered claims per the
 /// supplied [`ValidationConfig`] against an injected [`Clock`].
 ///
-/// Adds four knobs over [`verify_jwt_signature`]:
+/// Beyond signature verification it adds four knobs:
 /// 1. **Issuer pinning**: when `config.issuer` is `Some`, `iss` mismatch is rejected.
 /// 2. **Clock skew**: `config.leeway_secs` is applied to `exp` and `nbf`.
 /// 3. **`nbf` requirement**: when `config.require_nbf` is `true`, a token without

@@ -29,12 +29,15 @@
 //!
 //! # Hot path
 //!
-//! Sinks are called fire-and-forget: the auth hot path MUST NOT
-//! block on analytics writes. Sinks that need durability should
-//! buffer and flush asynchronously, accepting the trade-off that a
-//! crash between event emission and flush loses analytics data (but
-//! never the regulatory `AuthEvent`, which is on a separate
-//! synchronous path).
+//! The auth hot path MUST NOT block on analytics writes.
+//! [`AuditLogWithAnalytics`] enqueues each event on a bounded channel
+//! with a non-blocking `try_send` and a worker the caller owns
+//! ([`AnalyticsWorker`]) drains it into the sink. When the queue is
+//! full the analytics copy is dropped and counted
+//! ([`dropped_events`](AuditLogWithAnalytics::dropped_events)); the
+//! regulatory `AuthEvent` is on a separate synchronous path and is never
+//! dropped. A crash between emission and the sink's flush loses analytics
+//! data, which is the trade the stream makes.
 
 use crate::authn::event::AuthEvent;
 #[cfg(feature = "device")]
@@ -189,11 +192,14 @@ impl RichAuthnEvent {
 ///
 /// # Hot path
 ///
-/// `record_rich` is called fire-and-forget from the auth path. The
-/// returned future is spawned without `.await` so a slow sink never
-/// stalls authentication. Sinks that need durability should buffer
-/// internally and flush asynchronously; an unbounded channel with a
-/// dedicated drain task is the usual shape.
+/// `record_rich` is not called from the auth path: [`AnalyticsWorker`]
+/// calls it, one event at a time in the order the events were recorded,
+/// from a queue that is bounded, so a slow sink costs queue space and then
+/// dropped analytics events, never authentication latency. Because calls
+/// are sequential, a sink that needs throughput should buffer internally
+/// and flush in batches; one that blocks for a long time per event will fill
+/// the queue. Do not put an unbounded channel in front of it: the bounded
+/// queue is what keeps a stalled sink from growing memory.
 ///
 /// # Error handling
 ///
@@ -209,11 +215,10 @@ pub trait AuthnAnalyticsSink: Send + Sync + 'static {
 
     /// Sink a denormalised analytics event.
     ///
-    /// The implementation MUST NOT block the auth path. axess spawns
-    /// this call without awaiting, so a sink that takes seconds to
-    /// flush will not slow login; but the event is at risk of being
-    /// dropped on process shutdown if the sink hasn't drained its
-    /// buffer.
+    /// Called from the [`AnalyticsWorker`], never from the auth path, so a
+    /// sink that takes seconds to flush does not slow login. The event is at
+    /// risk of being lost on process shutdown if the sink has not flushed its
+    /// own buffer; see [`AuditLogWithAnalytics::shutdown`].
     fn record_rich(
         &self,
         event: RichAuthnEvent,
@@ -253,6 +258,20 @@ impl AuthnAnalyticsSink for NoopAuthnAnalyticsSink {
 
 // ── AuditLogWithAnalytics ──────────────────────────────────────────────────────────────
 
+/// Queue capacity used by [`AuditLogWithAnalytics::new`].
+pub const DEFAULT_ANALYTICS_QUEUE: usize = 10_000;
+
+enum Message {
+    Event(Box<AuthEvent>),
+    /// Acknowledged once every event queued before it has been handled.
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The analytics queue or its worker is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the analytics worker is not running")]
+pub struct AnalyticsClosed;
+
 /// Decorator that splits the regulatory audit path so every
 /// [`record_event`](crate::authn::store::IdentityAuthnLog::record_event) call
 /// also reaches an [`AuthnAnalyticsSink`].
@@ -263,14 +282,24 @@ impl AuthnAnalyticsSink for NoopAuthnAnalyticsSink {
 /// context is available (GeoIP, UA parser, device resolver, …).
 ///
 /// The hot path stays synchronous: the inner log's `record_event` is
-/// awaited so a regulatory write failure surfaces to the caller. The
-/// analytics path runs in a `tokio::spawn` task so an enricher panic
-/// or a slow sink does not block authentication.
+/// awaited so a regulatory write failure surfaces to the caller. Only after
+/// that write returns `Recorded` is the event placed on a bounded queue, with
+/// `try_send`, inside the same returned future. Nothing is spawned per event
+/// and construction needs no runtime. A full queue drops the analytics copy
+/// and counts it ([`dropped_events`](Self::dropped_events)); a warning is
+/// logged at the first drop and each time the total reaches a power of two.
+///
+/// [`new`](Self::new) returns the decorator and an [`AnalyticsWorker`] that
+/// the caller runs, so its lifetime is the caller's: spawn it with
+/// [`AnalyticsWorker::spawn`] and keep the handle. The worker ends, after
+/// handling everything still queued, when every decorator handle is dropped;
+/// [`flush`](Self::flush) waits for the queue to empty and
+/// [`shutdown`](Self::shutdown) does both ends of a graceful stop.
 ///
 /// ```rust,ignore
 /// use axess_core::authn::audit::analytics::{AuditLogWithAnalytics, RichAuthnEvent};
 ///
-/// let log = AuditLogWithAnalytics::new(
+/// let (log, worker) = AuditLogWithAnalytics::new(
 ///     postgres_backend,
 ///     iggy_sink,
 ///     |event| async move {
@@ -282,11 +311,17 @@ impl AuthnAnalyticsSink for NoopAuthnAnalyticsSink {
 ///             .with_geo_asn(geo.asn)
 ///     },
 /// );
+/// let drain = worker.spawn();
+/// // ... serve ...
+/// log.shutdown().await;
+/// drain.await.ok();
 /// ```
 pub struct AuditLogWithAnalytics<L, S, E> {
     inner: L,
     sink: std::sync::Arc<S>,
-    enricher: std::sync::Arc<E>,
+    queue: tokio::sync::mpsc::Sender<Message>,
+    dropped: std::sync::atomic::AtomicU64,
+    enricher: std::marker::PhantomData<fn() -> E>,
 }
 
 impl<L, S, E> AuditLogWithAnalytics<L, S, E>
@@ -295,16 +330,39 @@ where
     S: AuthnAnalyticsSink,
     E: Send + Sync + 'static,
 {
-    /// Construct a tee decorator. The `enricher` closure receives the
+    /// Construct a tee decorator with a queue of
+    /// [`DEFAULT_ANALYTICS_QUEUE`] events. The `enricher` closure receives the
     /// regulatory `AuthEvent` and returns a future yielding the
     /// denormalised `RichAuthnEvent`: adopters do GeoIP / UA parsing
     /// / device-trust resolution inside this closure.
-    pub fn new(inner: L, sink: S, enricher: E) -> Self {
-        Self {
-            inner,
-            sink: std::sync::Arc::new(sink),
+    ///
+    /// Run the returned worker, or no event ever reaches the sink.
+    pub fn new(inner: L, sink: S, enricher: E) -> (Self, AnalyticsWorker<S, E>) {
+        Self::with_capacity(inner, sink, enricher, DEFAULT_ANALYTICS_QUEUE)
+    }
+
+    /// As [`new`](Self::new) with a queue of `capacity` events (minimum 1).
+    pub fn with_capacity(
+        inner: L,
+        sink: S,
+        enricher: E,
+        capacity: usize,
+    ) -> (Self, AnalyticsWorker<S, E>) {
+        let (queue, rx) = tokio::sync::mpsc::channel(capacity.max(1));
+        let sink = std::sync::Arc::new(sink);
+        let worker = AnalyticsWorker {
+            rx,
+            sink: std::sync::Arc::clone(&sink),
             enricher: std::sync::Arc::new(enricher),
-        }
+        };
+        let log = Self {
+            inner,
+            sink,
+            queue,
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            enricher: std::marker::PhantomData,
+        };
+        (log, worker)
     }
 
     /// Borrow the inner regulatory log.
@@ -316,6 +374,111 @@ where
     /// dashboards that want to read sink-side state directly.
     pub fn sink(&self) -> &std::sync::Arc<S> {
         &self.sink
+    }
+
+    /// How many analytics events were dropped because the queue was full or
+    /// the worker had stopped. Regulatory records are never counted here.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait until every event queued so far has been handled by the sink.
+    ///
+    /// Events dropped for want of queue space are not recoverable and are not
+    /// waited for. Fails with [`AnalyticsClosed`] if the worker is not running.
+    pub async fn flush(&self) -> Result<(), AnalyticsClosed> {
+        let (ack, done) = tokio::sync::oneshot::channel();
+        self.queue
+            .send(Message::Flush(ack))
+            .await
+            .map_err(|_| AnalyticsClosed)?;
+        done.await.map_err(|_| AnalyticsClosed)
+    }
+
+    /// Flush the queue and release this handle. Once the last handle is gone
+    /// the worker finishes; await the handle [`AnalyticsWorker::spawn`]
+    /// returned to know the sink has seen everything.
+    pub async fn shutdown(self) {
+        let _ = self.flush().await;
+    }
+
+    /// Place `event` on the queue without waiting.
+    fn enqueue(&self, event: AuthEvent) {
+        use std::sync::atomic::Ordering;
+        if self
+            .queue
+            .try_send(Message::Event(Box::new(event)))
+            .is_err()
+        {
+            let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if total.is_power_of_two() {
+                tracing::warn!(
+                    target: "axess::audit::analytics",
+                    sink = %self.sink.name(),
+                    dropped_total = total,
+                    "analytics queue full or worker stopped; dropping analytics event \
+                     (the regulatory record is unaffected)",
+                );
+            }
+        }
+    }
+}
+
+/// Drains the analytics queue into the sink. Created by
+/// [`AuditLogWithAnalytics::new`] and run by the caller.
+///
+/// Events are handled one at a time in the order they were recorded. The
+/// enricher and the sink run in a task of their own for each event, so a panic
+/// in either is logged and costs that event only.
+pub struct AnalyticsWorker<S, E> {
+    rx: tokio::sync::mpsc::Receiver<Message>,
+    sink: std::sync::Arc<S>,
+    enricher: std::sync::Arc<E>,
+}
+
+impl<S, E, EFut> AnalyticsWorker<S, E>
+where
+    S: AuthnAnalyticsSink,
+    E: Fn(AuthEvent) -> EFut + Send + Sync + 'static,
+    EFut: std::future::Future<Output = RichAuthnEvent> + Send + 'static,
+{
+    /// Handle queued events until every [`AuditLogWithAnalytics`] handle has
+    /// been dropped and the queue is empty.
+    pub async fn run(mut self) {
+        while let Some(message) = self.rx.recv().await {
+            match message {
+                Message::Flush(ack) => {
+                    let _ = ack.send(());
+                }
+                Message::Event(event) => {
+                    let sink = std::sync::Arc::clone(&self.sink);
+                    let enricher = std::sync::Arc::clone(&self.enricher);
+                    let one = tokio::spawn(async move {
+                        let rich = enricher(*event).await;
+                        let sink_name = sink.name();
+                        if let Err(e) = sink.record_rich(rich).await {
+                            tracing::warn!(
+                                sink = %sink_name,
+                                error = %e,
+                                "authn analytics sink rejected event; regulatory record is unaffected",
+                            );
+                        }
+                    });
+                    if let Err(e) = one.await {
+                        tracing::error!(
+                            target: "axess::audit::analytics",
+                            error = %e,
+                            "analytics enricher or sink panicked; event lost, worker continues",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the worker on the current tokio runtime and return its handle.
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(self.run())
     }
 }
 
@@ -346,6 +509,14 @@ where
     ) -> impl std::future::Future<Output = Result<Option<crate::authn::types::User>, Self::Error>> + Send
     {
         self.inner.get_user(user_id)
+    }
+
+    fn get_user_tenant(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+    ) -> impl std::future::Future<Output = Result<Option<crate::authn::ids::TenantId>, Self::Error>> + Send
+    {
+        self.inner.get_user_tenant(user_id)
     }
 
     fn find_tenant(
@@ -386,36 +557,21 @@ where
     E: Fn(AuthEvent) -> EFut + Send + Sync + 'static,
     EFut: std::future::Future<Output = RichAuthnEvent> + Send + 'static,
 {
-    fn record_event(
+    async fn record_event(
         &self,
         event: AuthEvent,
-    ) -> impl std::future::Future<
-        Output = Result<
-            crate::authn::store::AuditOutcome,
-            <L as crate::authn::store::IdentityLookup>::Error,
-        >,
-    > + Send {
-        // Clone for the analytics path; the regulatory path takes
-        // ownership for `inner.record_event`.
-        let event_for_analytics = event.clone();
-        let sink = std::sync::Arc::clone(&self.sink);
-        let enricher = std::sync::Arc::clone(&self.enricher);
-
-        tokio::spawn(async move {
-            let rich = enricher(event_for_analytics).await;
-            let sink_name = sink.name();
-            if let Err(e) = sink.record_rich(rich).await {
-                tracing::warn!(
-                    sink = %sink_name,
-                    error = %e,
-                    "authn analytics sink rejected event; regulatory record is unaffected",
-                );
-            }
-        });
-
-        // Regulatory write is awaited synchronously; its failure
-        // surfaces to the caller. Analytics failure does not.
-        self.inner.record_event(event)
+    ) -> Result<crate::authn::store::AuditOutcome, <L as crate::authn::store::IdentityLookup>::Error>
+    {
+        // The regulatory write comes first. Analytics sees only events
+        // the regulatory log holds: a failed write fails the flow, and
+        // a shed event is a deliberate gap, so neither may appear in
+        // the analytics stream as if it had happened on the record.
+        let for_analytics = event.clone();
+        let outcome = self.inner.record_event(event).await?;
+        if outcome == crate::authn::store::AuditOutcome::Recorded {
+            self.enqueue(for_analytics);
+        }
+        Ok(outcome)
     }
 
     fn record_failed_attempt(
@@ -438,39 +594,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn noop_sink_accepts_any_event() {
-        let sink = NoopAuthnAnalyticsSink;
-        let event = RichAuthnEvent::from_event(make_test_event());
-        assert!(sink.record_rich(event).await.is_ok());
-        assert_eq!(sink.name(), "noop");
-    }
-
-    #[test]
-    fn rich_event_builder_chain_populates_optionals() {
-        let event = make_test_event();
-        let rich = RichAuthnEvent::from_event(event)
-            .with_geo_country("CH")
-            .with_geo_asn(13335)
-            .with_tag("channel", "mobile");
-
-        assert_eq!(rich.geo_country.as_deref(), Some("CH"));
-        assert_eq!(rich.geo_asn, Some(13335));
-        assert_eq!(rich.tags.len(), 1);
-        assert_eq!(rich.tags[0], ("channel".to_string(), "mobile".to_string()));
-    }
-
-    fn make_test_event() -> AuthEvent {
-        use crate::authn::event::{AuthEventBuilder, AuthEventStatus, AuthEventType};
-        AuthEventBuilder::new(
-            None,
-            None,
-            AuthEventType::LoginAttempt,
-            AuthEventStatus::Failure,
-        )
-        .build()
-    }
-}
+mod tests;

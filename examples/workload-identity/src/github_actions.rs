@@ -38,6 +38,20 @@
 //! let principal = resolver.resolve().await?;
 //! ```
 //!
+//! # Trust is decided by what you do with the claims
+//!
+//! GitHub signs tokens for every repository on the platform with the one
+//! issuer above, and any workflow can request one for any audience. A valid
+//! signature and audience therefore prove only "some GitHub workflow", not
+//! "yours". Before honouring the identity this mapper builds:
+//!
+//! - look the `repository_owner` up in an allowlist and refuse an owner you
+//!   do not know (the `tenant_id` argument above is that lookup, so it must
+//!   fail closed);
+//! - authorize on the whole workload id, never on the owner alone;
+//! - for anything that deploys or mutates, require the `ref` (or the
+//!   `environment`) to be a protected one, not just any branch.
+//!
 //! # SPIFFE path shape
 //!
 //! Recipe synthesises `spiffe://<trust_domain>/<repo>/<owner>` so the

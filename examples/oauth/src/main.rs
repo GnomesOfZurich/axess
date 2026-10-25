@@ -169,7 +169,8 @@ async fn login(
         Ok((auth_url, _csrf)) => Redirect::temporary(auth_url.as_str()).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "begin_oauth_login failed");
-            Html(format!("<h1>Error</h1><p>{e}</p><a href=\"/\">Back</a>")).into_response()
+            Html("<h1>Error</h1><p>Could not start the login.</p><a href=\"/\">Back</a>")
+                .into_response()
         }
     }
 }
@@ -197,6 +198,9 @@ async fn callback(
         Ok(claims) => {
             // In a real app, you'd look up or create a User from claims.subject,
             // then call state.authn.complete_oauth_login(&user, &claims, &session).
+            // Match on (provider, subject), never on the e-mail address: an
+            // address is only evidence when the provider says it is verified,
+            // and even then it can change hands.
             // For this example, we just show the claims.
             Html(format!(
                 r#"<!doctype html>
@@ -212,22 +216,20 @@ async fn callback(
 </ul>
 <p><a href="/">Back to home</a></p>
 </body></html>"#,
-                claims.provider,
-                claims.subject,
-                claims.email.as_deref().unwrap_or("(not provided)"),
+                html_escape(&claims.provider),
+                html_escape(&claims.subject),
+                html_escape(claims.email.as_deref().unwrap_or("(not provided)")),
                 claims
                     .email_verified
                     .map_or("(not provided)".to_string(), |v| v.to_string()),
-                claims.name.as_deref().unwrap_or("(not provided)"),
+                html_escape(claims.name.as_deref().unwrap_or("(not provided)")),
             ))
             .into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "finish_oauth_login failed");
-            Html(format!(
-                "<h1>Login Failed</h1><p>{e}</p><a href=\"/\">Try again</a>"
-            ))
-            .into_response()
+            Html("<h1>Login Failed</h1><p>The provider's answer could not be accepted.</p><a href=\"/\">Try again</a>")
+                .into_response()
         }
     }
 }
@@ -252,4 +254,22 @@ async fn profile(session: AuthSession) -> impl IntoResponse {
     } else {
         Redirect::temporary("/auth/login/google").into_response()
     }
+}
+
+/// Escape text for interpolation into HTML. Everything the IdP returns
+/// (names, e-mail addresses, error descriptions) is attacker-influenced and
+/// goes through this before it reaches a page.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }

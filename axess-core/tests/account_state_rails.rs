@@ -95,14 +95,14 @@ async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
     .await
     .unwrap();
     let refused = svc
-        .complete_password_reset(&uid("u1"), &token, "a-long-new-passphrase-9!")
+        .complete_password_reset(&uid("u1"), &token, "A-long-new-passphrase-9!")
         .await
         .unwrap();
     assert!(!refused, "a suspended account's password must not change");
 
     svc.activate_user(&uid("u1")).await.unwrap();
     let accepted = svc
-        .complete_password_reset(&uid("u1"), &token, "a-long-new-passphrase-9!")
+        .complete_password_reset(&uid("u1"), &token, "A-long-new-passphrase-9!")
         .await
         .unwrap();
     assert!(

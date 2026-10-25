@@ -16,8 +16,10 @@ fn fresh_inner(id: SessionId) -> SessionInner {
         id,
         data: SessionData::default(),
         modified: false,
+        needs_persist: false,
         regenerate: false,
         pre_cycle_id: None,
+        rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
     }
@@ -122,7 +124,7 @@ async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
     inner.max_custom_bytes = 0;
     let handle = handle_from(inner);
 
-    let _ = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+    let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
     let guard = handle.0.read().await;
     assert_eq!(
         guard.data.custom, big,
@@ -149,7 +151,7 @@ async fn finalize_session_cap_skipped_when_session_not_modified() {
     inner.regenerate = false;
     let handle = handle_from(inner);
 
-    let _ = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+    let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
     let guard = handle.0.read().await;
     assert_eq!(
         guard.data.custom, big,
@@ -187,7 +189,7 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         inner.data.custom = payload.clone();
         inner.modified = true;
         let handle = handle_from(inner);
-        let _ = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+        let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
         let guard = handle.0.read().await;
         assert_eq!(
             guard.data.custom, payload,
@@ -203,7 +205,7 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         inner.data.custom = over.clone();
         inner.modified = true;
         let handle = handle_from(inner);
-        let _ = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+        let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
         let guard = handle.0.read().await;
         assert_eq!(
             guard.data.custom,
@@ -233,7 +235,7 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
     inner.modified = true;
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
     assert!(
         outcome.session_changed,
         "modified=true alone must mark session_changed (kills `||→&&` on line 764)"
@@ -312,7 +314,7 @@ async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() 
         .expect("seed");
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
     assert_ne!(
         outcome.final_id, id,
         "the old id must never be re-issued after a failed cycle"
@@ -353,7 +355,7 @@ async fn finalize_session_session_changed_or_over_regenerate_alone() {
         .expect("seed");
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id)).await;
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
     assert!(
         outcome.session_changed,
         "regenerate=true alone must mark session_changed (kills 764:62 `||→&&` on second OR)"
@@ -400,7 +402,15 @@ async fn finalize_session_emits_session_created_on_regenerate() {
         .expect("seed");
     let handle = handle_from(inner);
 
-    let _ = finalize_session(&store, &cfg, Some(&metrics), &handle, Some(id)).await;
+    let _ = finalize_session(
+        &store,
+        &cfg,
+        Some(&metrics),
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
     assert_eq!(
         metrics.session_created_calls.load(Ordering::SeqCst),
         1,
@@ -427,7 +437,7 @@ async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
     inner.regenerate = false;
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, None).await;
+    let outcome = finalize_session(&store, &cfg, None, &handle, None, &MockRng::new(1)).await;
     assert_eq!(
         store.save_calls.load(Ordering::SeqCst),
         1,
@@ -484,8 +494,11 @@ async fn load_session_keeps_session_when_fingerprint_matches() {
         &cfg,
         None,
         &headers,
-        Some(stored_fp.as_str()),
-        None,
+        Fingerprints {
+            current: Some(stored_fp.as_str()),
+            previous: None,
+        },
+        &MockRng::new(1),
     )
     .await;
 
@@ -531,7 +544,16 @@ async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprin
         .unwrap(),
     );
 
-    let outcome = load_session(&store, &keys, &cfg, None, &headers, None, None).await;
+    let outcome = load_session(
+        &store,
+        &keys,
+        &cfg,
+        None,
+        &headers,
+        Fingerprints::default(),
+        &MockRng::new(1),
+    )
+    .await;
     assert!(
         outcome.binding_invalidated,
         "no binding material against a bound session must invalidate it"
@@ -541,4 +563,58 @@ async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprin
         Some(id),
         "the bound id must not be kept"
     );
+}
+
+// ── injected RNG ───────────────────────────────────────────────────
+
+/// A request with no cookie runs under the id the supplied RNG yields first.
+#[tokio::test]
+async fn load_session_mints_the_fresh_id_from_the_supplied_rng() {
+    let store = MemorySessionStore::new();
+    let keys = SigningKeyRing::from_master([0xCC; 32]);
+    let cfg = SessionConfig::default();
+    let headers = axum::http::HeaderMap::new();
+
+    let outcome = load_session(
+        &store,
+        &keys,
+        &cfg,
+        None,
+        &headers,
+        Fingerprints::default(),
+        &MockRng::new(77),
+    )
+    .await;
+
+    assert_eq!(outcome.id, SessionId::new(&MockRng::new(77)));
+    assert_eq!(outcome.existing_id, None);
+}
+
+/// A regenerate with no stashed pre-rotation id replaces the id from the
+/// supplied RNG and cycles from the id the session held.
+#[tokio::test]
+async fn finalize_session_replacement_id_comes_from_the_supplied_rng() {
+    let store = MemorySessionStore::new();
+    let cfg = SessionConfig::default();
+    let id = SessionId::new(&MockRng::new(1));
+    let mut inner = fresh_inner(id);
+    inner.regenerate = true;
+    let handle = handle_from(inner);
+
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(78)).await;
+
+    assert_eq!(outcome.final_id, SessionId::new(&MockRng::new(78)));
+}
+
+/// The id a handler-side rotation mints is the layer RNG's next draw.
+#[tokio::test]
+async fn rotate_id_draws_from_the_inner_rng() {
+    let id = SessionId::new(&MockRng::new(1));
+    let mut inner = fresh_inner(id);
+    inner.rng = Arc::new(MockRng::new(79));
+
+    inner.rotate_id();
+
+    assert_eq!(inner.id, SessionId::new(&MockRng::new(79)));
+    assert_eq!(inner.pre_cycle_id, Some(id));
 }

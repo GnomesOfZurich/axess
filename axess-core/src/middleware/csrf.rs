@@ -80,25 +80,23 @@
 //! session change (e.g. login, which regenerates the session) must re-read
 //! it afterwards or its first post-login state-changing request will 403.
 //!
-//! **Rotation-mid-request footgun.** The token in the request extension
-//! is bound to the session id observed at request entry. If the handler
-//! both (a) reads `CsrfToken` from the extensions to embed in a body
-//! rendered on the same response AND (b) rotates the session
-//! (e.g. `handle.rotate_id()` after login), the response `Set-Cookie`
-//! ships a *different* token bound to the post-rotation id; the
-//! embedded value silently mismatches and the client's next
-//! state-changing request 403s. Handlers that rotate MUST redirect
-//! (302) rather than render inline, or re-read the token from the
-//! post-rotation `SessionHandle` before embedding.
+//! **Rotating the session in the handler.** The [`CsrfToken`](crate::middleware::csrf::CsrfToken) request
+//! extension is bound to the session id observed at request entry, and a
+//! handler cannot change a value it was handed by clone. A handler that
+//! rotates the session (e.g. after login) and then embeds a token in the
+//! page it renders must therefore take the [`CsrfIssuer`](crate::middleware::csrf::CsrfIssuer) request extension
+//! and call [`CsrfIssuer::token`](crate::middleware::csrf::CsrfIssuer::token) *after* rotating: it returns a token bound
+//! to the post-rotation id, and it is the very token the layer ships as the
+//! response `Set-Cookie`, so the embedded value and the cookie always agree.
+//! Before any rotation `token()` returns the same value as the [`CsrfToken`](crate::middleware::csrf::CsrfToken)
+//! extension.
 
-use axess_rng::{SecureRng, SystemRng};
+use axess_rng::SecureRng;
 use axum::{
     body::Body,
     http::{HeaderValue, Request, Response, StatusCode, header},
     response::IntoResponse,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use hmac::Mac;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -106,7 +104,9 @@ use std::task::{Context, Poll};
 use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 use url::Url;
+use zeroize::Zeroizing;
 
+use crate::session::id::SessionId;
 use crate::session::layer::SessionHandle;
 
 /// Default cookie name for the CSRF token.
@@ -132,7 +132,10 @@ use crate::cookies::MAX_COOKIE_VALUE_BYTES;
 /// Configuration for [`CsrfLayer`].
 #[derive(Clone)]
 pub struct CsrfConfig {
-    signing_key: Arc<[u8; 32]>,
+    /// Wiped when the last clone of the config drops.
+    signing_key: Arc<Zeroizing<[u8; 32]>>,
+    /// Source of every token nonce.
+    rng: Arc<dyn SecureRng>,
     cookie_name: Arc<str>,
     header_name: Arc<str>,
     form_field_name: Arc<str>,
@@ -166,7 +169,8 @@ impl CsrfConfig {
     /// when sessions cycle.
     pub fn new(signing_key: [u8; 32]) -> Self {
         Self {
-            signing_key: Arc::new(signing_key),
+            signing_key: Arc::new(Zeroizing::new(signing_key)),
+            rng: Arc::new(axess_rng::SystemRng),
             cookie_name: DEFAULT_CSRF_COOKIE.into(),
             header_name: DEFAULT_CSRF_HEADER.into(),
             form_field_name: DEFAULT_CSRF_FORM_FIELD.into(),
@@ -176,6 +180,13 @@ impl CsrfConfig {
             path: "/".into(),
             allowed_origins: Arc::from(Vec::new()),
         }
+    }
+
+    /// Draw token nonces from `rng` (default: `SystemRng`), so a seeded RNG
+    /// makes the issued tokens reproducible.
+    pub fn rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
+        self
     }
 
     /// Override the cookie name.
@@ -310,6 +321,87 @@ impl CsrfToken {
     }
 }
 
+/// Hands a handler the CSRF token that is valid for the session id *as it is
+/// now*, including after the handler has rotated the session.
+///
+/// Injected as a request extension by [`CsrfLayer`] next to [`CsrfToken`].
+/// Call [`token`](Self::token) after rotating the session and embed the
+/// result: it is the token the layer sets as the response cookie, so a
+/// client that submits it passes the double-submit check on its next
+/// request. Cheap to clone.
+#[derive(Clone)]
+pub struct CsrfIssuer {
+    state: Arc<IssuerState>,
+}
+
+struct IssuerState {
+    signing_key: Arc<Zeroizing<[u8; 32]>>,
+    rng: Arc<dyn SecureRng>,
+    handle: Option<SessionHandle>,
+    /// Session id observed at request entry and the token handed out for it.
+    entry: Option<(SessionId, String)>,
+    /// Token minted for a session id the handler rotated to.
+    rotated: std::sync::Mutex<Option<(SessionId, String)>>,
+}
+
+impl CsrfIssuer {
+    fn new(
+        signing_key: Arc<Zeroizing<[u8; 32]>>,
+        rng: Arc<dyn SecureRng>,
+        handle: Option<SessionHandle>,
+        entry: Option<(SessionId, String)>,
+    ) -> Self {
+        Self {
+            state: Arc::new(IssuerState {
+                signing_key,
+                rng,
+                handle,
+                entry,
+                rotated: std::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    /// The token bound to the session's current id.
+    ///
+    /// Equal to the [`CsrfToken`] extension until the session id changes;
+    /// after a rotation, a token bound to the new id (minted once, then
+    /// returned unchanged on every later call and used for the response
+    /// cookie). Empty when the request carries no session handle.
+    pub async fn token(&self) -> CsrfToken {
+        let Some(handle) = &self.state.handle else {
+            return CsrfToken(String::new());
+        };
+        let current = handle.0.read().await.id;
+        CsrfToken(self.token_for(current))
+    }
+
+    fn token_for(&self, current: SessionId) -> String {
+        if let Some((entry_id, token)) = &self.state.entry
+            && *entry_id == current
+        {
+            return token.clone();
+        }
+        let mut rotated = self
+            .state
+            .rotated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match rotated.as_ref() {
+            Some((id, token)) if *id == current => token.clone(),
+            _ => {
+                let token = mint_token(
+                    current.as_bytes(),
+                    &self.state.signing_key,
+                    &*self.state.rng,
+                );
+                *rotated = Some((current, token.clone()));
+                token
+            }
+        }
+    }
+}
+
 /// Tower layer that issues and validates CSRF tokens.
 #[derive(Clone)]
 pub struct CsrfLayer {
@@ -362,7 +454,6 @@ where
 
         Box::pin(async move {
             let cookie_token = extract_cookie_token(&req, &config.cookie_name);
-            let method = req.method().clone();
 
             // Read the current session id from the handle the session layer
             // injects. The token is HMAC-bound to this id, so the session
@@ -378,105 +469,32 @@ where
             // Validate on state-changing methods. GET/HEAD/OPTIONS pass through
             // because they must be safe (idempotent, no side effects) per
             // RFC 9110 section 9.2.1; and CSRF only matters for unsafe verbs.
-            if is_state_changing(&method) {
-                // Fail closed: without a session id we cannot verify the
-                // binding, so a mis-ordered layer stack (CsrfLayer outside the
-                // session layer) is rejected rather than silently validating
-                // an unbound token.
-                let Some(session_id) = session_id else {
-                    tracing::warn!(
-                        method = %method,
-                        path = %req.uri().path(),
-                        "csrf: no session id on state-changing request \
-                         (CsrfLayer must be layered inside the session layer)"
-                    );
-                    return Ok((StatusCode::FORBIDDEN, "CSRF validation failed").into_response());
-                };
-
-                // Origin/Referer defence in depth, if configured. Runs
-                // BEFORE the body-buffering path so a mismatched Origin
-                // never triggers form-body extraction.
-                if !config.allowed_origins.is_empty()
-                    && !origin_matches_allowed(&req, &config.allowed_origins)
+            if is_state_changing(req.method()) {
+                req = match validate_state_changing(
+                    req,
+                    &config,
+                    session_id,
+                    cookie_token.as_deref(),
+                )
+                .await
                 {
-                    tracing::warn!(
-                        method = %method,
-                        path = %req.uri().path(),
-                        "csrf: Origin/Referer validation failed"
-                    );
-                    return Ok((StatusCode::FORBIDDEN, "CSRF validation failed").into_response());
-                }
-
-                // Extract the presented token, possibly by buffering a
-                // form-urlencoded body. `req` may be re-created with its
-                // body restored.
-                let (extracted, req_after) = match extract_presented_token(req, &config).await {
-                    Ok(pair) => pair,
-                    Err(reason) => {
-                        tracing::warn!(
-                            method = %method,
-                            reason = %reason,
-                            "csrf: request rejected during token extraction"
-                        );
-                        return Ok(
-                            (StatusCode::FORBIDDEN, "CSRF validation failed").into_response()
-                        );
-                    }
+                    Ok(req) => req,
+                    Err(Refused) => return Ok(forbidden()),
                 };
-                req = req_after;
-                let presented = extracted;
-                let cookie_present = cookie_token.as_deref();
-                if !validate_pair(
-                    cookie_present,
-                    presented.as_deref(),
-                    session_id.as_bytes(),
-                    &config.signing_key,
-                ) {
-                    tracing::warn!(
-                        method = %method,
-                        path = %req.uri().path(),
-                        cookie_present = cookie_present.is_some(),
-                        header_or_form_present = presented.is_some(),
-                        "csrf: token validation failed"
-                    );
-                    return Ok((StatusCode::FORBIDDEN, "CSRF validation failed").into_response());
-                }
             }
 
-            // Provisional mint decision before the handler runs. Handlers
-            // that read `CsrfToken` from the request extension (to embed
-            // in an HTML form, say) need SOME value; give them either
-            // the presented cookie or a fresh mint bound to the current
-            // session id. A token can only be minted when a session id
-            // is present to bind it to; without one we leave the client
-            // tokenless rather than issue an unbound token.
-            //
-            // A presented cookie that does not verify against the session id
-            // at entry (left over from before the id changed) is not handed
-            // to the handler: embedding it would render a form whose first
-            // submit is refused. It is treated as absent here, so the handler
-            // sees a fresh token bound to the current id, and the same token
-            // goes out as the replacement cookie. Validation of a
-            // state-changing request is unchanged and has already run.
-            let usable_cookie = cookie_token.as_deref().filter(|c| {
-                !c.is_empty()
-                    && session_id
-                        .as_ref()
-                        .is_none_or(|sid| validate_token(c, sid.as_bytes(), &config.signing_key))
-            });
-            let provisional_mint = match (usable_cookie, session_id.as_ref()) {
-                (Some(_), _) => None,
-                (None, Some(sid_at_entry)) => {
-                    Some(mint_token(sid_at_entry.as_bytes(), &config.signing_key))
-                }
-                (None, None) => None,
-            };
-            let extension_token = provisional_mint
-                .clone()
-                .or_else(|| usable_cookie.map(str::to_owned))
-                .or_else(|| cookie_token.clone())
-                .unwrap_or_default();
+            let EntryToken {
+                provisional_mint,
+                extension_token,
+            } = entry_token(&config, cookie_token.as_deref(), session_id);
+            let issuer = CsrfIssuer::new(
+                config.signing_key.clone(),
+                config.rng.clone(),
+                session_handle.clone(),
+                session_id.map(|sid| (sid, extension_token.clone())),
+            );
             req.extensions_mut().insert(CsrfToken(extension_token));
+            req.extensions_mut().insert(issuer.clone());
 
             let mut response = inner.call(req).await?;
 
@@ -494,33 +512,21 @@ where
                 Some(handle) => Some(handle.0.read().await.id),
                 None => None,
             };
-            // The token the client would present next request: either the
-            // freshly-provisioned mint (if we issued one) or the cookie
-            // they sent this request. Empty string means "no token to
-            // present": treat as absent.
-            let effective_cookie = provisional_mint
-                .as_deref()
-                .or(cookie_token.as_deref())
-                .filter(|t| !t.is_empty());
-            let token_to_set = match (effective_cookie, session_id_after.as_ref()) {
-                (Some(existing), Some(sid_after))
-                    if validate_token(existing, sid_after.as_bytes(), &config.signing_key) =>
-                {
-                    // Cookie still binds to the post-handler session id
-                    // (usually because the handler didn't rotate). Mint
-                    // only if we chose to at entry.
-                    provisional_mint
-                }
-                (_, Some(sid_after)) => {
-                    // Either no effective cookie, or the effective cookie
-                    // no longer binds to the current session id (typical
-                    // after `session.regenerate()`). Mint fresh so the
-                    // client's next request presents a valid pair.
-                    Some(mint_token(sid_after.as_bytes(), &config.signing_key))
-                }
-                (_, None) => None,
-            };
+            let token_to_set = replacement_token(
+                &config,
+                &issuer,
+                provisional_mint,
+                cookie_token.as_deref(),
+                session_id_after,
+            );
 
+            if token_to_set.is_some()
+                && let Some(handle) = &session_handle
+            {
+                // A token bound to the id needs the session stored and its
+                // cookie set, or the next request cannot present it.
+                handle.mark_needs_persist().await;
+            }
             if let Some(new_token) = token_to_set {
                 let cookie = build_cookie(&config, &new_token);
                 if let Ok(hv) = HeaderValue::from_str(&cookie) {
@@ -530,6 +536,187 @@ where
 
             Ok(response)
         })
+    }
+}
+
+/// A state-changing request the CSRF check refuses.
+struct Refused;
+
+/// The response for a request the CSRF check refuses.
+fn forbidden() -> Response<Body> {
+    (StatusCode::FORBIDDEN, "CSRF validation failed").into_response()
+}
+
+/// Decide whether a state-changing request carries a valid CSRF token.
+///
+/// Fails closed: with no session id there is nothing to bind the token to,
+/// so the request is refused. The Origin/Referer check runs before any body
+/// is buffered. On success the request is returned with its body intact (a
+/// form-encoded body may have been read to find the token); on failure the
+/// request is refused with [`Refused`].
+async fn validate_state_changing(
+    mut req: Request<Body>,
+    config: &CsrfConfig,
+    session_id: Option<SessionId>,
+    cookie_token: Option<&str>,
+) -> Result<Request<Body>, Refused> {
+    let method = req.method().clone();
+    // Fail closed: without a session id we cannot verify the
+    // binding, so a mis-ordered layer stack (CsrfLayer outside the
+    // session layer) is rejected rather than silently validating
+    // an unbound token.
+    let Some(session_id) = session_id else {
+        tracing::warn!(
+            method = %method,
+            path = %req.uri().path(),
+            "csrf: no session id on state-changing request \
+             (CsrfLayer must be layered inside the session layer)"
+        );
+        return Err(Refused);
+    };
+
+    // Origin/Referer defence in depth, if configured. Runs
+    // BEFORE the body-buffering path so a mismatched Origin
+    // never triggers form-body extraction.
+    if !config.allowed_origins.is_empty() && !origin_matches_allowed(&req, &config.allowed_origins)
+    {
+        tracing::warn!(
+            method = %method,
+            path = %req.uri().path(),
+            "csrf: Origin/Referer validation failed"
+        );
+        return Err(Refused);
+    }
+
+    // Extract the presented token, possibly by buffering a
+    // form-urlencoded body. `req` may be re-created with its
+    // body restored.
+    let (extracted, req_after) = match extract_presented_token(req, config).await {
+        Ok(pair) => pair,
+        Err(reason) => {
+            tracing::warn!(
+                method = %method,
+                reason = %reason,
+                "csrf: request rejected during token extraction"
+            );
+            return Err(Refused);
+        }
+    };
+    req = req_after;
+    let presented = extracted;
+    let cookie_present = cookie_token;
+    if !validate_pair(
+        cookie_present,
+        presented.as_deref(),
+        session_id.as_bytes(),
+        &config.signing_key,
+    ) {
+        tracing::warn!(
+            method = %method,
+            path = %req.uri().path(),
+            cookie_present = cookie_present.is_some(),
+            header_or_form_present = presented.is_some(),
+            "csrf: token validation failed"
+        );
+        return Err(Refused);
+    }
+    Ok(req)
+}
+
+/// The token handed to the handler before it runs.
+struct EntryToken {
+    /// A fresh token minted for this response, when the client has no usable one.
+    provisional_mint: Option<String>,
+    /// The value the handler sees in the [`CsrfToken`] extension.
+    extension_token: String,
+}
+
+/// Decide which token the handler sees at request entry.
+///
+/// Handlers
+/// that read `CsrfToken` from the request extension (to embed
+/// in an HTML form, say) need SOME value; give them either
+/// the presented cookie or a fresh mint bound to the current
+/// session id. A token can only be minted when a session id
+/// is present to bind it to; without one we leave the client
+/// tokenless rather than issue an unbound token.
+///
+/// A presented cookie that does not verify against the session id
+/// at entry (left over from before the id changed) is not handed
+/// to the handler: embedding it would render a form whose first
+/// submit is refused. It is treated as absent here, so the handler
+/// sees a fresh token bound to the current id, and the same token
+/// goes out as the replacement cookie. Validation of a
+/// state-changing request is unchanged and has already run.
+fn entry_token(
+    config: &CsrfConfig,
+    cookie_token: Option<&str>,
+    session_id: Option<SessionId>,
+) -> EntryToken {
+    let usable_cookie = cookie_token.filter(|c| {
+        !c.is_empty()
+            && session_id
+                .as_ref()
+                .is_none_or(|sid| validate_token(c, sid.as_bytes(), &config.signing_key))
+    });
+    let provisional_mint = match (usable_cookie, session_id.as_ref()) {
+        (Some(_), _) => None,
+        (None, Some(sid_at_entry)) => Some(mint_token(
+            sid_at_entry.as_bytes(),
+            &config.signing_key,
+            &*config.rng,
+        )),
+        (None, None) => None,
+    };
+    let extension_token = provisional_mint
+        .clone()
+        .or_else(|| usable_cookie.map(str::to_owned))
+        .or_else(|| cookie_token.map(str::to_owned))
+        .unwrap_or_default();
+    EntryToken {
+        provisional_mint,
+        extension_token,
+    }
+}
+
+/// The token to ship as `Set-Cookie` after the handler ran, if any.
+///
+/// The post-handler session id decides: if the cookie the client will present
+/// next no longer verifies against it (typical after `session.regenerate()`), a
+/// token for the new id is issued; otherwise only a token minted at entry is sent.
+fn replacement_token(
+    config: &CsrfConfig,
+    issuer: &CsrfIssuer,
+    provisional_mint: Option<String>,
+    cookie_token: Option<&str>,
+    session_id_after: Option<SessionId>,
+) -> Option<String> {
+    // The token the client would present next request: either the
+    // freshly-provisioned mint (if we issued one) or the cookie
+    // they sent this request. Empty string means "no token to
+    // present": treat as absent.
+    let effective_cookie = provisional_mint
+        .as_deref()
+        .or(cookie_token)
+        .filter(|t| !t.is_empty());
+    match (effective_cookie, session_id_after.as_ref()) {
+        (Some(existing), Some(sid_after))
+            if validate_token(existing, sid_after.as_bytes(), &config.signing_key) =>
+        {
+            // Cookie still binds to the post-handler session id
+            // (usually because the handler didn't rotate). Mint
+            // only if we chose to at entry.
+            provisional_mint
+        }
+        (_, Some(sid_after)) => {
+            // Either no effective cookie, or the effective cookie
+            // no longer binds to the current session id (typical
+            // after `session.regenerate()`). Use the issuer's token
+            // for the new id: it is the one a handler that rotated
+            // may already have embedded in its response body.
+            Some(issuer.token_for(*sid_after))
+        }
+        (_, None) => None,
     }
 }
 
@@ -675,42 +862,6 @@ fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) -> bool {
     allowed.iter().any(|a| a.as_ref() == origin)
 }
 
-fn mint_token(session_id: &[u8], signing_key: &[u8; 32]) -> String {
-    let mut nonce = [0u8; TOKEN_NONCE_BYTES];
-    SystemRng.fill_bytes(&mut nonce);
-    let tag = compute_tag(&nonce, session_id, signing_key);
-    let mut combined = Vec::with_capacity(TOKEN_NONCE_BYTES + tag.len());
-    combined.extend_from_slice(&nonce);
-    combined.extend_from_slice(&tag);
-    URL_SAFE_NO_PAD.encode(&combined)
-}
-
-fn compute_tag(nonce: &[u8], session_id: &[u8], signing_key: &[u8; 32]) -> [u8; 32] {
-    // MAC over `nonce || session_id`. Binding the session id into the tag is
-    // what makes a token minted under one session fail validation under
-    // another: the nonce is echoed in the token but the id is not, so an
-    // attacker cannot recompute the tag for a different session without the
-    // key. The nonce has a fixed length (`TOKEN_NONCE_BYTES`), so the
-    // concatenation is unambiguous and needs no separator.
-    let mut mac = crate::hmac::new_signer(signing_key);
-    mac.update(nonce);
-    mac.update(session_id);
-    mac.finalize().into_bytes().into()
-}
-
-fn validate_token(token: &str, session_id: &[u8], signing_key: &[u8; 32]) -> bool {
-    let bytes = match URL_SAFE_NO_PAD.decode(token) {
-        Ok(b) => b,
-        Err(_) => return false,
-    };
-    if bytes.len() != TOKEN_NONCE_BYTES + 32 {
-        return false;
-    }
-    let (nonce, tag) = bytes.split_at(TOKEN_NONCE_BYTES);
-    let expected = compute_tag(nonce, session_id, signing_key);
-    expected.ct_eq(tag).into()
-}
-
 fn validate_pair(
     cookie_token: Option<&str>,
     presented: Option<&str>,
@@ -743,5 +894,11 @@ fn build_cookie(config: &CsrfConfig, token: &str) -> String {
     cookie.to_string()
 }
 
+mod token;
+use token::{mint_token, validate_token};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rotation_tests;

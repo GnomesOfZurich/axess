@@ -1,8 +1,45 @@
-//! Background helper that periodically refreshes a provider's JWKS.
+//! Refreshing providers' JWKS: one pass ([`refresh_providers_jwks`]) and a
+//! background loop around it ([`spawn_jwks_refresh`]).
+//!
+//! # Runtime boundary
+//!
+//! [`refresh_providers_jwks`] has no timer, so under deterministic tests it
+//! is the entry point: call it and the clock behind each provider's refresh
+//! debounce decides what is fetched. [`spawn_jwks_refresh`] is the one piece
+//! that waits on `tokio::time::interval` and `tokio::spawn`; that is runtime
+//! plumbing outside the `Clock` seam, and a test advancing a `MockClock`
+//! does not wake it.
 
 use std::sync::Arc;
 
+use super::error::OAuthError;
 use super::provider::OAuthProvider;
+
+/// Refresh the JWKS of every provider once, in order, and return the
+/// providers whose refresh failed with their errors.
+///
+/// A failure never stops the pass: each provider is attempted. An empty
+/// result means every refresh succeeded (or was coalesced by the provider's
+/// own debounce). Failures are logged at `warn`.
+pub async fn refresh_providers_jwks(
+    providers: &[Arc<dyn OAuthProvider>],
+) -> Vec<(Arc<str>, OAuthError)> {
+    let mut failures = Vec::new();
+    for provider in providers {
+        match provider.refresh_jwks().await {
+            Ok(()) => tracing::debug!(provider = %provider.name(), "JWKS refresh ok"),
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider.name(),
+                    error = %e,
+                    "JWKS refresh failed; will retry next tick"
+                );
+                failures.push((provider.name().clone(), e));
+            }
+        }
+    }
+    failures
+}
 
 /// Spawn a background task that periodically calls
 /// [`OAuthProvider::refresh_jwks`] on `provider`.
@@ -27,14 +64,18 @@ use super::provider::OAuthProvider;
 ///
 /// # Returned handle
 ///
-/// The returned [`tokio::task::JoinHandle`] aborts the loop when
-/// dropped. Store it for the lifetime of the application so it can
-/// be drained on graceful shutdown; see the OPERATIONS.md
-/// "Graceful shutdown" section for the recommended pattern.
+/// Dropping the returned [`tokio::task::JoinHandle`] does NOT stop the
+/// loop; it keeps running and holds `provider`. Keep the handle for the
+/// lifetime of the application and call `abort()` on it at shutdown; see
+/// the OPERATIONS.md "Graceful shutdown" section.
 ///
 /// Errors from `refresh_jwks` are logged at `warn` and swallowed;
 /// the loop keeps running so a transient IdP outage does not
-/// permanently halt refresh.
+/// permanently halt refresh. Each tick is one
+/// [`refresh_providers_jwks`] pass over `provider`.
+///
+/// This function is runtime-boundary code: the tick comes from
+/// `tokio::time::interval`, not from an injected `Clock`.
 ///
 /// ```rust,ignore
 /// let provider = Arc::new(OAuthProviderConfig::discover(...).await?);
@@ -59,18 +100,7 @@ pub fn spawn_jwks_refresh(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match provider.refresh_jwks().await {
-                Ok(()) => {
-                    tracing::debug!(provider = %provider.name(), "JWKS refresh ok");
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = %provider.name(),
-                        error = %e,
-                        "JWKS refresh failed; will retry next tick"
-                    );
-                }
-            }
+            refresh_providers_jwks(std::slice::from_ref(&provider)).await;
         }
     })
 }

@@ -209,7 +209,9 @@ the trait surface is rejected.
 
 The exceptions are extremely narrow: the `axess-cache` crate's
 `moka-cache` feature uses wall-clock-driven eviction (opt-in,
-documented as DST-breaking), and the production `SystemClock`
+documented as DST-breaking), the `IntoResponse` impl for `AuthnError`
+(the trait method cannot take a clock; call `into_response_at` where one
+is held), and the production `SystemClock`
 and `SystemRng` implementations delegate to the OS (these are
 the only places where the OS calls happen). New code introduces
 no further exception and no workaround that hides the same

@@ -57,6 +57,7 @@
 //!   (see [`docs/identity/device.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/identity/device.md) §5.7).
 
 use crate::authn::ids::{TenantId, UserId};
+use axess_rng::{SecureRng, SystemRng};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -77,13 +78,19 @@ use uuid::Uuid;
 pub struct PiiToken(Arc<str>);
 
 impl PiiToken {
-    /// Mint a fresh token with a v4 UUID.
-    ///
-    /// The UUID is sourced from [`Uuid::new_v4`] (OS-randomness). Tests
-    /// that need deterministic tokens should construct via
-    /// [`PiiToken::from_uuid`] with a [`MockRng`](crate::testing::mock_random::MockRng)-derived value.
+    /// Mint a fresh token with a v4 UUID drawn from the operating
+    /// system's randomness. Use [`PiiToken::mint`] to draw from an injected
+    /// [`SecureRng`] instead.
     pub fn new() -> Self {
-        Self::from_uuid(Uuid::new_v4())
+        Self::mint(&SystemRng)
+    }
+
+    /// Mint a token whose v4 UUID is built from 16 bytes drawn from `rng`,
+    /// so a seeded RNG yields a reproducible token.
+    pub fn mint(rng: &dyn SecureRng) -> Self {
+        let mut bytes = [0u8; 16];
+        rng.fill_bytes(&mut bytes);
+        Self::from_uuid(uuid::Builder::from_random_bytes(bytes).into_uuid())
     }
 
     /// Construct from an explicit UUID. Use from a DST harness that
@@ -304,15 +311,45 @@ pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
 /// Infallible in-memory [`DevicePiiStore`]. Backed by a [`DashMap`]
 /// keyed on the token. **For tests and single-node examples only.**
-#[derive(Debug, Clone, Default)]
+///
+/// Tokens are minted from the store's RNG ([`SystemRng`] unless
+/// [`with_rng`](Self::with_rng) says otherwise), and
+/// [`list_for_subject`](DevicePiiStore::list_for_subject) returns mappings
+/// oldest first, ties broken by token, so the order does not depend on the
+/// map's iteration order.
+#[derive(Clone)]
 pub struct MemoryDevicePiiStore {
     mappings: Arc<DashMap<PiiToken, DevicePiiMapping>>,
+    rng: Arc<dyn SecureRng>,
+}
+
+impl Default for MemoryDevicePiiStore {
+    fn default() -> Self {
+        Self {
+            mappings: Arc::default(),
+            rng: Arc::new(SystemRng),
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryDevicePiiStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryDevicePiiStore")
+            .field("mappings", &self.mappings.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryDevicePiiStore {
     /// Construct an empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Mint tokens from `rng`, for deterministic-simulation tests.
+    pub fn with_rng(mut self, rng: Arc<dyn SecureRng>) -> Self {
+        self.rng = rng;
+        self
     }
 
     /// Number of mappings currently stored. Useful in tests asserting
@@ -344,7 +381,7 @@ impl DevicePiiStore for MemoryDevicePiiStore {
         value: String,
         now: DateTime<Utc>,
     ) -> Result<PiiToken, Self::Error> {
-        let token = PiiToken::new();
+        let token = PiiToken::mint(&*self.rng);
         let mapping = DevicePiiMapping {
             token: token.clone(),
             subject_id: *subject_id,
@@ -400,12 +437,18 @@ impl DevicePiiStore for MemoryDevicePiiStore {
         subject_id: &UserId,
         tenant_id: &TenantId,
     ) -> Result<Vec<DevicePiiMapping>, Self::Error> {
-        Ok(self
+        let mut out: Vec<DevicePiiMapping> = self
             .mappings
             .iter()
             .filter(|m| &m.subject_id == subject_id && &m.tenant_id == tenant_id)
             .map(|m| m.value().clone())
-            .collect())
+            .collect();
+        out.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.token.as_str().cmp(b.token.as_str()))
+        });
+        Ok(out)
     }
 }
 

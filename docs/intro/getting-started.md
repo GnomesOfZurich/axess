@@ -28,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.10"             # facade -- depend on this, never on the internal crates
+axess = "0.11"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -41,7 +41,7 @@ turn on `memory` for the in-memory session store and `testing` for
 real database needs neither.
 
 ```toml
-axess = { version = "0.10.0", features = ["memory", "testing"] }
+axess = { version = "0.11.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the
@@ -211,7 +211,8 @@ state machine or the backend.
 
 ## Signing keys
 
-The example uses `[0; 32]` as the signing key. That is fine for a
+The example draws a fresh random 32-byte signing key each time it
+starts, so a restart signs everyone out. That is fine for a
 five-minute demonstration. It is not fine for anything else.
 
 In production the signing key is a 32-byte random value loaded from a

@@ -116,6 +116,7 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
+        now: DateTime<Utc>,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 ```

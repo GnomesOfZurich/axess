@@ -222,10 +222,14 @@ things that differ between deployments:
 - `tenant_fn`, defaulting to a `TenantId` in the request extensions.
 - `client_ip_fn`, defaulting to `None`, because reading it means
   either `ConnectInfo` or a trusted `X-Forwarded-For`.
-- `user_fn`, defaulting to `None`, because the resolver runs before
-  authentication.
-- `new_id_fn`, defaulting to a v4 UUID, overridden in DST tests for
-  determinism.
+- `user_fn`, defaulting to the user the session layer found
+  authenticated on the session (`SessionUser` in the request
+  extensions) and `None` for a guest, so an authenticated request only
+  ever reuses a device its user owns.
+- `new_id_fn`, unset by default: a new device gets a v4 UUID drawn
+  from the resolver's RNG (`with_rng`, default `SystemRng`), so a
+  seeded RNG makes device ids reproducible. Set it to replace the id
+  scheme.
 
 If `tenant_fn` yields `None` the resolver short-circuits to `Ok(None)`:
 there is no meaningful device without a tenant scope, for the
@@ -271,6 +275,31 @@ context* covers for the Cedar entity cache. Cache the data, not
 the decision; invalidate eagerly on mutation; let TTLs catch the
 cases the invalidation missed.
 
+### Sighting writes and the per-user lookup
+
+`DeviceLifecycleService::ensure_device` runs on the request path, so it
+avoids a store write per request. A known device whose `last_seen_at` is
+less than the sighting granularity before `now` (five minutes by default,
+`with_sighting_granularity`) is returned without a write; a granularity
+of zero records every sighting. `last_seen_at` therefore lags real use by
+up to the granularity, which the retention sweep's windows (days) absorb.
+
+When the fingerprint's device belongs to another user (two people behind
+one office address with the same browser), `ensure_device` looks for the
+caller's own device with `DeviceStore::find_by_fingerprint_for_user`. The
+SQL stores answer it from the `idx_devices_user_fingerprint` index on
+`(tenant_id, user_id, fingerprint_hash, last_seen_at)`, so a user with
+any number of devices finds the right one. SQLite and Postgres create the
+index in `init_schema`. A MySQL deployment created earlier adds it once:
+
+```sql
+ALTER TABLE devices ADD INDEX idx_devices_user_fingerprint
+    (tenant_id, user_id, fingerprint_hash, last_seen_at);
+```
+
+A store that does not override the method falls back to scanning the
+user's 100 most recently seen devices.
+
 ### PII tokenisation and GDPR
 
 The device record carries personally-identifiable information.
@@ -307,6 +336,15 @@ goes quiet.
 
 The thresholds are a `SweepConfig`, not a tenant column: `trusted_idle`
 (ninety days by default), `seen_idle` (thirty) and `revoked_grace`. A
+`Seen` row is revoked `seen_idle` after the later of its last sighting
+and the moment it was demoted from `Trusted` (`Device::demoted_at`). A
+`Seen` device that was never trusted is therefore revoked 30 days after
+its last sighting, and a Trusted device that goes quiet is demoted at 90
+days and revoked 30 days after that (120 days from the last sighting) and
+is never revoked in the sweep that demotes it. A sighting after the
+demotion restarts the Seen window. The stamp is set on every move from
+`Trusted` to `Seen` and cleared by a move to any level but `Seen`, so promoting a
+device again starts a fresh ladder. A
 deployment that needs different retention per tenant holds its own
 config per tenant and passes the right one. Axess does not store that
 mapping, and `Tenant` carries no retention field to hold it.

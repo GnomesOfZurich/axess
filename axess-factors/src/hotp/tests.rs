@@ -218,3 +218,34 @@ fn hotp_generate_sha512_matches_totp_rs_oracle() {
         );
     }
 }
+
+/// A code is digits and nothing else. `"+12345"` parses as the number 12345,
+/// which is the value of a real six-digit code with a leading zero, so a
+/// numeric comparison must refuse it before it parses.
+#[test]
+fn a_signed_code_never_matches_a_code_with_a_leading_zero() {
+    let (counter, code) = (0..2_000u64)
+        .map(|c| (c, hotp_generate(RFC_4226_SECRET, c, 6, HotpAlgorithm::Sha1)))
+        .find(|(_, code)| code.starts_with('0'))
+        .expect("some counter below 2000 yields a leading zero");
+    let secret = base32::encode(
+        base32::Alphabet::Rfc4648 { padding: false },
+        RFC_4226_SECRET,
+    );
+
+    assert_eq!(
+        verify_hotp(&secret, &code, counter, 6, 0, HotpAlgorithm::Sha1),
+        Some(counter),
+        "the real code with its leading zero verifies"
+    );
+    let signed = format!("+{}", &code[1..]);
+    assert_eq!(
+        verify_hotp(&secret, &signed, counter, 6, 0, HotpAlgorithm::Sha1),
+        None
+    );
+    let spaced = format!(" {}", &code[1..]);
+    assert_eq!(
+        verify_hotp(&secret, &spaced, counter, 6, 0, HotpAlgorithm::Sha1),
+        None
+    );
+}

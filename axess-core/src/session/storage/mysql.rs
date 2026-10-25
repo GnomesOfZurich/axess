@@ -5,16 +5,48 @@
 //! ```sql
 //! CREATE TABLE IF NOT EXISTS sessions (
 //!   id VARCHAR(64) PRIMARY KEY,
-//!   data TEXT NOT NULL,
+//!   data MEDIUMTEXT NOT NULL,
+//!   data_bin LONGBLOB,
 //!   expires_at BIGINT NOT NULL,
 //!   INDEX idx_sessions_expires_at (expires_at)
 //! );
 //! ```
 //!
-//! The schema mirrors the Postgres backend (TEXT data, BIGINT
+//! The schema mirrors the Postgres backend (text `data`, BIGINT
 //! Unix-epoch-seconds expiry) so the same codec output round-trips
 //! identically across SQL backends. Only the DDL dialect, placeholder
 //! syntax (`?` vs `$N`), and UPSERT idiom differ.
+//!
+//! `data` is `MEDIUMTEXT` (16 MiB), not `TEXT` (64 KiB): the column holds the
+//! base64 of the serialised, optionally encrypted session, and a session
+//! whose custom data approaches its own size limit outgrows 64 KiB, which
+//! MySQL in strict mode then rejects on write.
+//!
+//! # Upgrading an existing deployment
+//!
+//! `CREATE TABLE IF NOT EXISTS` leaves an existing table as it is, so a
+//! deployment created with `data TEXT` must run, once:
+//!
+//! ```sql
+//! ALTER TABLE sessions MODIFY data MEDIUMTEXT NOT NULL;
+//! ```
+//!
+//! and, for the binary column, once, before the new code serves a request
+//! (a load selects `data_bin`):
+//!
+//! ```sql
+//! ALTER TABLE sessions ADD COLUMN data_bin LONGBLOB NULL;
+//! ```
+//!
+//! `data_bin` holds the session as raw bytes (MessagePack, sealed with
+//! AES-256-GCM when encryption is on). `data` is the base64 text column of
+//! earlier releases: rows written by them keep working because a load reads
+//! `data_bin` first and falls back to `data`, and every save writes
+//! `data_bin` and empties `data`, so a legacy row is rewritten the first
+//! time its session is saved. `data` stays `NOT NULL`, so new rows carry an
+//! empty string there. Rolling back to the earlier release afterwards cannot
+//! read a row this release saved (the text column is empty): that user signs
+//! in again.
 
 use crate::session::storage::session_codec::{SessionCodec, SqlStoreError, expires_at};
 use crate::session::storage::sql_helpers::log_cleanup_outcome;
@@ -23,6 +55,17 @@ use axess_clock::{Clock, SystemClock};
 use sqlx::MySqlPool;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// The `sessions` table. `data` is `MEDIUMTEXT`: see the module docs.
+const SESSIONS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS sessions (
+    id VARCHAR(64) PRIMARY KEY,
+    data MEDIUMTEXT NOT NULL,
+    data_bin LONGBLOB,
+    expires_at BIGINT NOT NULL,
+    INDEX idx_sessions_expires_at (expires_at)
+)
+"#;
 
 /// Backward-compatible alias: adopters can write `MysqlStoreError`
 /// for readability; the underlying type is the shared [`SqlStoreError`].
@@ -94,18 +137,7 @@ impl MysqlSessionStore {
     /// for indexes before MariaDB 10.5.4 / MySQL 8.0.29), so the
     /// index is declared inline in the CREATE TABLE statement instead.
     pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS sessions (
-                id VARCHAR(64) PRIMARY KEY,
-                data TEXT NOT NULL,
-                expires_at BIGINT NOT NULL,
-                INDEX idx_sessions_expires_at (expires_at)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(SESSIONS_DDL).execute(&self.pool).await?;
 
         Ok(())
     }
@@ -143,15 +175,17 @@ impl SessionStore for MysqlSessionStore {
         let id_str = id.to_string();
         let now = self.clock.now().timestamp();
 
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data FROM sessions WHERE id = ? AND expires_at > ?")
+        let row: Option<(Option<Vec<u8>>, String)> =
+            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ? AND expires_at > ?")
                 .bind(&id_str)
                 .bind(now)
                 .fetch_optional(&self.pool)
                 .await?;
 
         match row {
-            Some((stored,)) => Ok(Some(self.codec.decode(&stored)?)),
+            Some((binary, text)) => {
+                Ok(Some(self.codec.decode_row(id, binary.as_deref(), &text)?))
+            }
             None => Ok(None),
         }
     }
@@ -163,7 +197,7 @@ impl SessionStore for MysqlSessionStore {
         ttl: Duration,
     ) -> Result<(), Self::Error> {
         let id_str = id.to_string();
-        let encoded = self.codec.encode(data)?;
+        let encoded = self.codec.encode_bytes(id, data)?;
         let exp = expires_at(&*self.clock, ttl);
 
         // MySQL UPSERT; `ON DUPLICATE KEY UPDATE` updates the existing
@@ -174,9 +208,9 @@ impl SessionStore for MysqlSessionStore {
         // compatible with MariaDB through 10.x.
         sqlx::query(
             r#"
-            INSERT INTO sessions (id, data, expires_at)
-            VALUES (?, ?, ?)
-            ON DUPLICATE KEY UPDATE data = VALUES(data), expires_at = VALUES(expires_at)
+            INSERT INTO sessions (id, data, data_bin, expires_at)
+            VALUES (?, '', ?, ?)
+            ON DUPLICATE KEY UPDATE data = '', data_bin = VALUES(data_bin), expires_at = VALUES(expires_at)
             "#,
         )
         .bind(&id_str)
@@ -204,24 +238,35 @@ impl SessionStore for MysqlSessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
-        let encoded = self.codec.encode(data)?;
+        let encoded = self.codec.encode_bytes(new_id, data)?;
         let exp = expires_at(&*self.clock, ttl);
         let old_str = old_id.to_string();
         let new_str = new_id.to_string();
 
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM sessions WHERE id = ?")
-            .bind(&old_str)
-            .execute(&mut *tx)
-            .await?;
+        // Write the new row first, idempotently, and drop the old row only
+        // once the new one is in place within the same transaction: a failed
+        // insert rolls back and leaves the old session untouched.
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (id, data, data_bin, expires_at)
+            VALUES (?, '', ?, ?)
+            ON DUPLICATE KEY UPDATE data = '', data_bin = VALUES(data_bin), expires_at = VALUES(expires_at)
+            "#,
+        )
+        .bind(&new_str)
+        .bind(&encoded)
+        .bind(exp)
+        .execute(&mut *tx)
+        .await?;
 
-        sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?, ?, ?)")
-            .bind(&new_str)
-            .bind(&encoded)
-            .bind(exp)
-            .execute(&mut *tx)
-            .await?;
+        if old_str != new_str {
+            sqlx::query("DELETE FROM sessions WHERE id = ?")
+                .bind(&old_str)
+                .execute(&mut *tx)
+                .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -283,6 +328,9 @@ impl crate::store::Store<SessionId, SessionData> for MysqlSessionStore {
         <Self as SessionStore>::prune_expired(self)
     }
 }
+
+#[cfg(test)]
+mod schema_tests;
 
 #[cfg(test)]
 mod mysql_tests {

@@ -38,11 +38,11 @@ pub mod store;
 pub mod types;
 
 pub use audit::analytics::{
-    AuditLogWithAnalytics, AuthnAnalyticsSink, NoopAuthnAnalyticsSink, RichAuthnEvent,
-    UserAgentSummary,
+    AnalyticsClosed, AnalyticsWorker, AuditLogWithAnalytics, AuthnAnalyticsSink,
+    NoopAuthnAnalyticsSink, RichAuthnEvent, UserAgentSummary,
 };
 pub use audit::archive::{
-    AuditArchiver, AuditRetentionLoop, AuditRetentionPolicy, AuditRetentionSource,
+    ArchiveBatchId, AuditArchiver, AuditRetentionLoop, AuditRetentionPolicy, AuditRetentionSource,
     NoopAuditArchiver, RetentionError, RetentionTickReport,
 };
 #[cfg(feature = "audit-archive-fs")]
@@ -58,12 +58,12 @@ pub use factor::{
 };
 pub use ids::{DeviceId, IdError, TenantId, UserId};
 pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
-#[cfg(feature = "oauth")]
-pub use service::DEFAULT_SID_MAP_CAPACITY;
 pub use service::{
     AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome, NoSessionRegistryError,
     PrepareOutcome, RequestAuthnService, SessionValidator, SignupOutcome, require_valid_session,
 };
+#[cfg(feature = "oauth")]
+pub use service::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
 pub use store::{
     AuditOutcome, AuditQuery, AuthMethod, AuthnBackend, EventQueryFilter, FactorStore,
     IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,

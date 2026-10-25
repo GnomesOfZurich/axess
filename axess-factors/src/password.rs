@@ -2,18 +2,117 @@
 //! [`PasswordConfig`] / [`PasswordRules`] data the orchestrator
 //! persists per user.
 //!
-//! Re-exports the `password_auth` crate's [`generate_hash`] (renamed to
-//! [`generate_password_hash`]) and [`verify_password`] functions. The
-//! library is a thin Argon2id wrapper that picks recommended parameters,
-//! generates a per-hash random salt, and stores the parameter set in the
-//! encoded hash so verification works without the application tracking
-//! parameters separately.
+//! Hashing is Argon2id with the explicit parameter set
+//! [`ARGON2_M_COST_KIB`] / [`ARGON2_T_COST`] / [`ARGON2_P_COST`], built
+//! through `argon2` directly so no dependency release can move the work
+//! factors. Verification goes through the same crate's
+//! `PasswordVerifier` on the stored PHC string. The salt is [`PASSWORD_SALT_LEN`] bytes from a [`SecureRng`], so a
+//! deterministic RNG yields a reproducible hash; [`generate_password_hash`]
+//! draws it from the operating system. The parameter set is written into the
+//! PHC string, so [`verify_password`] needs no configuration and keeps
+//! verifying hashes made under any earlier parameter set.
 //!
-//! [`generate_hash`]: password_auth::generate_hash
-//! [`verify_password`]: password_auth::verify_password
-//! [`generate_password_hash`]: crate::generate_password_hash
+//! Argon2 is deliberately slow (tens of milliseconds): call these from
+//! blocking context. The orchestrator runs them through
+//! `axess_core::blocking`.
+//!
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
+use argon2::{Algorithm, Argon2, Params, Version};
+use axess_rng::SecureRng;
+use std::fmt;
 
-pub use password_auth::{generate_hash as generate_password_hash, verify_password};
+/// Argon2id memory cost in KiB (19 MiB).
+pub const ARGON2_M_COST_KIB: u32 = 19 * 1024;
+/// Argon2id iteration count.
+pub const ARGON2_T_COST: u32 = 2;
+/// Argon2id parallelism.
+pub const ARGON2_P_COST: u32 = 1;
+/// Bytes of salt in a new hash.
+pub const PASSWORD_SALT_LEN: usize = 16;
+
+fn argon2() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("the compiled-in Argon2 parameters are valid");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// Why [`verify_password`] did not accept a password.
+///
+/// This is the crate's own type: it does not expose the hashing library's
+/// error, so a dependency upgrade cannot change a public signature. Callers
+/// must treat both variants as a failed login and must not tell the user
+/// which one occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordVerifyError {
+    /// The stored value is not a PHC string this crate can verify.
+    Malformed,
+    /// The stored hash is well formed and the password does not match it.
+    Mismatch,
+}
+
+impl fmt::Display for PasswordVerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "stored password hash is not a valid PHC string",
+            Self::Mismatch => "password does not match the stored hash",
+        })
+    }
+}
+
+impl std::error::Error for PasswordVerifyError {}
+
+/// Check `password` against a stored Argon2 PHC string.
+///
+/// Every parameter (algorithm variant, version, memory, iterations,
+/// parallelism, salt, output length) is read from `hash`, so hashes made under
+/// any earlier parameter set keep verifying and the pinned constants only
+/// govern new hashes. The comparison of the derived tag is constant time.
+/// Slow by design: call from blocking context.
+pub fn verify_password(password: impl AsRef<[u8]>, hash: &str) -> Result<(), PasswordVerifyError> {
+    match argon2().verify_password(password.as_ref(), hash) {
+        Ok(()) => Ok(()),
+        Err(argon2::password_hash::Error::PasswordInvalid) => Err(PasswordVerifyError::Mismatch),
+        Err(_) => Err(PasswordVerifyError::Malformed),
+    }
+}
+
+/// Draw a fresh salt from `rng`.
+pub fn generate_password_salt(rng: &(impl SecureRng + ?Sized)) -> [u8; PASSWORD_SALT_LEN] {
+    let mut salt = [0u8; PASSWORD_SALT_LEN];
+    rng.fill_bytes(&mut salt);
+    salt
+}
+
+/// Argon2id hash of `password` under `salt`, as a PHC string.
+///
+/// The slow half of hashing, split from salt generation so a caller can draw
+/// the salt on the async side (in deterministic order) and move only owned
+/// bytes into a blocking task.
+pub fn hash_password_with_salt(
+    password: impl AsRef<[u8]>,
+    salt: &[u8; PASSWORD_SALT_LEN],
+) -> String {
+    argon2()
+        .hash_password_with_salt(password.as_ref(), salt)
+        .expect("Argon2id hashing with fixed valid parameters cannot fail")
+        .to_string()
+}
+
+/// Hash `password` with a salt drawn from `rng`.
+pub fn generate_password_hash_with_rng(
+    rng: &(impl SecureRng + ?Sized),
+    password: impl AsRef<[u8]>,
+) -> String {
+    hash_password_with_salt(password, &generate_password_salt(rng))
+}
+
+/// Hash `password` with a salt from the operating system's RNG.
+///
+/// Prefer [`generate_password_hash_with_rng`] where the caller holds an
+/// injected RNG.
+pub fn generate_password_hash(password: impl AsRef<[u8]>) -> String {
+    generate_password_hash_with_rng(&axess_rng::SystemRng, password)
+}
 
 use crate::secret::ZeroizedString;
 use serde::{Deserialize, Serialize};
@@ -65,6 +164,43 @@ impl Default for PasswordRules {
 mod tests {
     use super::*;
 
+    struct FixedRng(u8);
+    impl SecureRng for FixedRng {
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            dest.fill(self.0);
+        }
+    }
+
+    #[test]
+    fn the_phc_string_carries_the_pinned_parameters() {
+        let hash = generate_password_hash_with_rng(&FixedRng(1), "Gnomes2+");
+        assert!(
+            hash.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"),
+            "unexpected parameter block: {hash}"
+        );
+    }
+
+    #[test]
+    fn the_salt_comes_from_the_injected_rng() {
+        let a = generate_password_hash_with_rng(&FixedRng(7), "pw");
+        let b = generate_password_hash_with_rng(&FixedRng(7), "pw");
+        let c = generate_password_hash_with_rng(&FixedRng(8), "pw");
+        assert_eq!(a, b, "same salt and password give the same hash");
+        assert_ne!(a, c, "a different salt gives a different hash");
+        // 16 bytes of 0x07 in unpadded standard base64.
+        assert!(
+            a.contains("$BwcHBwcHBwcHBwcHBwcHBw$"),
+            "salt not from rng: {a}"
+        );
+    }
+
+    #[test]
+    fn hashes_verify_and_wrong_passwords_do_not() {
+        let hash = generate_password_hash("correct horse");
+        assert!(verify_password("correct horse", &hash).is_ok());
+        assert!(verify_password("battery staple", &hash).is_err());
+    }
+
     #[test]
     fn password_rules_default_is_pinned() {
         let r = PasswordRules::default();
@@ -76,3 +212,6 @@ mod tests {
         assert_eq!(r.history_count, 0);
     }
 }
+
+#[cfg(test)]
+mod legacy_hashes;

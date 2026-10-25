@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS auth_events (
 -- sessions — managed by SqliteSessionStore.
 CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,          -- UUID as string
-    data        TEXT NOT NULL,             -- JSON-encoded SessionData
+    data        TEXT NOT NULL,             -- legacy text form; empty on saved rows
+    data_bin    BLOB,                      -- MessagePack SessionData, sealed when encrypted
     expires_at  INTEGER NOT NULL           -- Unix timestamp (seconds)
 );
 

@@ -4,8 +4,25 @@
 //! 360+ lines of `OkService` / fixture scaffolding.
 
 use super::*;
+use axess_clock::testing::MockClock;
 use axum::http::HeaderValue;
+use chrono::TimeZone;
 use tower::ServiceExt;
+
+mod sweep;
+
+/// A fixed origin well away from the real clock.
+fn t_zero() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+}
+
+fn secs(t: DateTime<Utc>, n: i64) -> DateTime<Utc> {
+    t + chrono::Duration::seconds(n)
+}
+
+fn test_store(max: u32, window: Duration) -> BucketStore {
+    BucketStore::new(max, window, Arc::new(MockClock::at(t_zero())))
+}
 
 /// Trivial inner service that always returns 200 OK.
 #[derive(Clone)]
@@ -98,9 +115,9 @@ async fn request_exceeding_limit_returns_429() {
 
 #[tokio::test]
 async fn window_reset_allows_new_requests() {
-    let store = BucketStore::new(1, Duration::from_secs(1));
+    let store = test_store(1, Duration::from_secs(1));
 
-    let t0 = Instant::now();
+    let t0 = t_zero();
 
     // First request succeeds.
     assert!(matches!(
@@ -115,7 +132,7 @@ async fn window_reset_allows_new_requests() {
     ));
 
     // After the window resets, requests succeed again.
-    let t1 = t0 + Duration::from_secs(2);
+    let t1 = secs(t0, 2);
     assert!(matches!(
         store.try_acquire_at("k", t1),
         Acquire::Allowed { .. }
@@ -216,13 +233,13 @@ async fn concurrent_access_does_not_panic() {
 
 #[tokio::test]
 async fn evict_expired_removes_stale_buckets() {
-    let store = BucketStore::new(1, Duration::from_secs(10));
+    let store = test_store(1, Duration::from_secs(10));
 
-    let t0 = Instant::now();
+    let t0 = t_zero();
     store.try_acquire_at("stale", t0);
 
     // Advance well past the window.
-    let t1 = t0 + Duration::from_secs(20);
+    let t1 = secs(t0, 20);
 
     // Insert a fresh bucket at t1.
     store.try_acquire_at("fresh", t1);
@@ -303,37 +320,6 @@ async fn rotating_header_values_without_identity_share_the_peer_bucket() {
             "a new header value must not buy a new bucket"
         );
     }
-}
-
-#[tokio::test]
-async fn eviction_triggers_on_request_count_not_just_bucket_size() {
-    // Regression test: eviction used to require >1024 buckets AND len%512==0.
-    // Now it triggers every 1024 requests via atomic counter.
-    let store = BucketStore::new(100, Duration::from_secs(1));
-    let t0 = Instant::now();
-
-    // Create a stale bucket.
-    store.try_acquire_at("stale", t0);
-
-    // Advance time past window.
-    let t1 = t0 + Duration::from_secs(5);
-
-    // Simulate 1024 requests on a single key (few buckets, many requests).
-    for _ in 0..1024 {
-        store.try_acquire_at("active", t1);
-        // Manually increment counter to match what the service call does.
-        store.request_count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    // Force eviction at t1.
-    store.evict_expired_at(t1);
-
-    // Stale bucket should be gone.
-    assert!(
-        !store.buckets.contains_key("stale"),
-        "stale bucket should have been evicted"
-    );
-    assert!(store.buckets.contains_key("active"));
 }
 
 // ── Per-username login lockout DoS mitigation ───────────────────
@@ -504,38 +490,38 @@ fn truncate_key_walks_back_to_char_boundary_on_multibyte() {
     );
 }
 
-/// The public `evict_expired` wrapper must delegate to
-/// `evict_expired_at(Instant::now())`. The body replacement
-/// `evict_expired with ()` is otherwise indistinguishable, since every
-/// existing test calls `evict_expired_at` directly.
+/// The `evict_expired` wrapper reads the store's clock: advancing the mock
+/// clock past the window is what ages the bucket out.
 #[tokio::test]
-async fn evict_expired_delegates_to_at_helper() {
-    let store = BucketStore::new(1, Duration::from_millis(20));
-    // Insert a bucket via the public path (uses Instant::now()).
+async fn evict_expired_reads_the_store_clock() {
+    let clock = MockClock::at(t_zero());
+    let store = BucketStore::new(1, Duration::from_secs(20), Arc::new(clock.clone()));
     store.try_acquire("aged-out");
     assert!(store.buckets.contains_key("aged-out"));
-    // Wait past the window.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Public wrapper must call the helper with current time and prune.
+    store.evict_expired();
+    assert!(
+        store.buckets.contains_key("aged-out"),
+        "a bucket inside its window survives"
+    );
+    clock.advance_secs(21);
     store.evict_expired();
     assert!(
         !store.buckets.contains_key("aged-out"),
-        "evict_expired() must delegate to evict_expired_at(Instant::now()), \
-         not be a no-op"
+        "evict_expired() must read the injected clock"
     );
 }
 
 /// `evict_expired_at` retains buckets while
-/// `now.duration_since(window_start) < self.window`: strict less-than.
+/// `now - window_start < window`: strict less-than.
 /// At exactly `window`, the bucket must evict. Pins the `< → <=`
 /// mutation, which would keep buckets at the boundary.
 #[tokio::test]
 async fn evict_expired_at_evicts_when_age_equals_window() {
-    let store = BucketStore::new(1, Duration::from_secs(10));
-    let t0 = Instant::now();
+    let store = test_store(1, Duration::from_secs(10));
+    let t0 = t_zero();
     store.try_acquire_at("at-cutoff", t0);
     // Evict at exactly window-end: duration_since = 10s, original < 10s = false (evict).
-    store.evict_expired_at(t0 + Duration::from_secs(10));
+    store.evict_expired_at(secs(t0, 10));
     assert!(
         !store.buckets.contains_key("at-cutoff"),
         "at age == window the bucket must evict (strict `<`, not `<=`)"

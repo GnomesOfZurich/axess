@@ -267,6 +267,7 @@ fn validate_key_id(id: &str) -> Result<(), KeyProviderError> {
 pub struct EncryptedDelegatedCredentialStore<S, K> {
     inner: S,
     keys: K,
+    rng: Arc<dyn SecureRng>,
 }
 
 impl<S, K> EncryptedDelegatedCredentialStore<S, K>
@@ -275,8 +276,24 @@ where
     K: KeyProvider,
 {
     /// Construct with the given inner store and key provider.
+    ///
+    /// Envelope nonces come from [`SystemRng`](axess_rng::SystemRng); use
+    /// [`with_rng`](Self::with_rng) to supply another source.
     pub fn new(inner: S, keys: K) -> Self {
-        Self { inner, keys }
+        Self {
+            inner,
+            keys,
+            rng: Arc::new(axess_rng::SystemRng),
+        }
+    }
+
+    /// Replace the RNG that draws each envelope's 96-bit nonce.
+    ///
+    /// Every encrypted field takes a fresh draw, so a seeded RNG makes the
+    /// stored envelopes reproducible. Production wiring keeps the default.
+    pub fn with_rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
+        self
     }
 
     /// Borrow the inner store. Provided for adopter ops (e.g.
@@ -344,14 +361,14 @@ where
         let current = self.keys.current().map_err(|e| e.to_string())?;
 
         let aad_access = build_aad(&provider, tenant, user, FIELD_ACCESS);
-        let access_env = encrypt_envelope(&current, &access_token, &aad_access)
+        let access_env = encrypt_envelope(&current, &*self.rng, &access_token, &aad_access)
             .map_err(|e| format!("encrypt access_token: {e}"))?;
 
         let refresh_env = match refresh_token.as_deref() {
             Some(rt) => {
                 let aad_refresh = build_aad(&provider, tenant, user, FIELD_REFRESH);
                 Some(ZeroizedString::from(
-                    encrypt_envelope(&current, rt, &aad_refresh)
+                    encrypt_envelope(&current, &*self.rng, rt, &aad_refresh)
                         .map_err(|e| format!("encrypt refresh_token: {e}"))?,
                 ))
             }
@@ -413,6 +430,7 @@ enum EnvelopeError {
 
 fn encrypt_envelope(
     current: &CurrentKey,
+    rng: &dyn SecureRng,
     plaintext: &str,
     aad: &[u8],
 ) -> Result<String, EnvelopeError> {
@@ -420,7 +438,7 @@ fn encrypt_envelope(
         Aes256Gcm::new_from_slice(current.key.as_array()).map_err(|_| EnvelopeError::Encrypt)?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    axess_rng::SystemRng.fill_bytes(&mut nonce_bytes);
+    rng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| EnvelopeError::Encrypt)?;
 
     let ct = cipher
@@ -491,5 +509,7 @@ fn decrypt_envelope<K: KeyProvider>(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod rng_tests;
 #[cfg(test)]
 mod tests;

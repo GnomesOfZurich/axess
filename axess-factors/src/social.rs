@@ -223,6 +223,15 @@ where
     /// rejects unrecognised query parameters; modern OAuth 2.0
     /// implementations accept PKCE even when not required, and it's a
     /// strict security improvement.
+    ///
+    /// The HTTP client is built here with no redirects, a 30-second
+    /// per-operation timeout and an `axess-social/<version>` `User-Agent`
+    /// (GitHub, among others, refuses requests without one).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default `reqwest` client cannot be built, which happens
+    /// when the TLS backend fails to initialise.
     pub fn new(config: SocialProviderConfig, claim_mapper: F) -> Self {
         Self {
             name: Arc::from(config.name.as_str()),
@@ -239,6 +248,7 @@ where
             http: reqwest::ClientBuilder::new()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(std::time::Duration::from_secs(30))
+                .user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client build"),
             rng: Arc::new(SystemRng),
@@ -271,6 +281,10 @@ where
     /// adopter needs a custom User-Agent (some providers reject the
     /// default), a custom TLS provider, an outbound HTTP proxy, or a
     /// different per-op timeout.
+    ///
+    /// The `User-Agent` belongs to the client: a supplied client sends
+    /// whatever it was built with, and none if it was built with none.
+    /// Set one on it for providers that require it.
     ///
     /// Adopters are responsible for keeping the no-redirect SSRF
     /// defense in their custom client; the library does not enforce
@@ -350,13 +364,14 @@ where
     /// Exchange an authorization code for an access token.
     ///
     /// Sends the standard RFC 6749 §4.1.3 token request to the
-    /// provider's token endpoint. Returns the access token only;
+    /// provider's token endpoint. Returns the access token only, as a
+    /// [`ZeroizedString`] that is zeroed when dropped and derefs to `str`;
     /// social providers do not issue ID tokens.
     pub async fn exchange_code(
         &self,
         code: &str,
         pkce_verifier: &str,
-    ) -> Result<String, SocialError> {
+    ) -> Result<ZeroizedString, SocialError> {
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -382,7 +397,7 @@ where
         // JSON. Parse defensively.
         #[derive(Deserialize)]
         struct TokenResponse {
-            access_token: String,
+            access_token: ZeroizedString,
         }
         let body: TokenResponse = resp.json().await.map_err(|e| {
             SocialError::InvalidResponse(format!(
@@ -400,14 +415,6 @@ where
             .get(&self.userinfo_endpoint)
             .bearer_auth(access_token)
             .header("Accept", "application/json")
-            // Some providers (notably GitHub) require a User-Agent.
-            // axess by default sends `axess-social/<version>`; adopters
-            // can pre-bake a customised client and pass it in via a
-            // future `with_http_client` if they need to override.
-            .header(
-                "User-Agent",
-                concat!("axess-social/", env!("CARGO_PKG_VERSION")),
-            )
             .send()
             .await?
             .error_for_status()?

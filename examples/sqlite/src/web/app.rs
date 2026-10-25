@@ -169,7 +169,10 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
             get(auth::setup_totp_page).post(auth::post_setup_totp),
         )
         .route("/logout", post(auth::logout))
-        .route("/dashboard", get(protected::dashboard))
+        // Every route that needs a signed-in user goes through
+        // `protected::router`, which guards them with `require_authn!`. A
+        // handler registered here directly runs for guests too.
+        .merge(protected::router())
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .with_state(state)
@@ -227,6 +230,11 @@ async fn healthz(axum::extract::State(state): axum::extract::State<AppState>) ->
 }
 
 /// `GET /metrics`; expose authentication counters.
+///
+/// Unauthenticated here so the example can be curled. Serve it on an
+/// internal-only listener or behind the operator's network policy, not on the
+/// public port: the counters tell an attacker how hard the rate limiter and
+/// lockout are being hit.
 ///
 /// These are axess-specific metrics (auth attempts, failures, rate limit
 /// rejections). In production, merge these into your application's metrics

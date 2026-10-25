@@ -152,13 +152,22 @@ pub fn verify_hotp(
     // authentication bypass under adversarial inputs. On overflow we
     // stop iterating; matched stays whatever it was on prior iterations.
     let mut matched: Option<u64> = None;
+    // Compare numbers, not strings: the supplied code is read once, and each
+    // window step is a `u64` rather than a freshly allocated padded string.
+    // A code is `length` ASCII digits and nothing else (a sign or a space
+    // would otherwise parse), so equal values mean equal padded codes.
     let trimmed_code = code.trim();
+    let supplied = (trimmed_code.len() == length
+        && trimmed_code.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| trimmed_code.parse::<u64>().ok())
+    .flatten();
+    let supplied_value = supplied.unwrap_or(u64::MAX);
     for offset in 0..=window {
         let Some(candidate_counter) = counter.checked_add(offset) else {
             break;
         };
-        let expected = hotp_generate(&secret_bytes, candidate_counter, length, algorithm);
-        let is_match = bool::from(expected.as_bytes().ct_eq(trimmed_code.as_bytes()));
+        let expected = hotp_value(&secret_bytes, candidate_counter, length, algorithm);
+        let is_match = supplied.is_some() && bool::from(expected.ct_eq(&supplied_value));
         if is_match && matched.is_none() {
             matched = Some(candidate_counter);
         }
@@ -167,19 +176,29 @@ pub fn verify_hotp(
     matched
 }
 
-/// Generate an HOTP code per RFC 4226.
-///
-/// 1. HMAC(secret, counter_be_bytes) → digest (length depends on algorithm)
-/// 2. Dynamic truncation → 31-bit integer
-/// 3. Modulo 10^digits → zero-padded decimal string
-///
-/// Supports SHA-1 (RFC 4226), SHA-256, and SHA-512 variants.
+/// Generate an HOTP code per RFC 4226 as a zero-padded decimal string.
+#[cfg(test)]
 pub(crate) fn hotp_generate(
     secret: &[u8],
     counter: u64,
     digits: usize,
     algorithm: HotpAlgorithm,
 ) -> String {
+    format!(
+        "{:0>width$}",
+        hotp_value(secret, counter, digits, algorithm),
+        width = digits,
+    )
+}
+
+/// The HOTP code per RFC 4226 as a number below `10^digits`.
+///
+/// 1. HMAC(secret, counter_be_bytes) → digest (length depends on algorithm)
+/// 2. Dynamic truncation → 31-bit integer
+/// 3. Modulo 10^digits
+///
+/// Supports SHA-1 (RFC 4226), SHA-256, and SHA-512 variants.
+fn hotp_value(secret: &[u8], counter: u64, digits: usize, algorithm: HotpAlgorithm) -> u64 {
     use hmac::{Hmac, KeyInit, Mac};
     use zeroize::Zeroize;
 
@@ -237,7 +256,7 @@ pub(crate) fn hotp_generate(
     // makes the full `MAX_HOTP_DIGITS = 10` range usable without
     // panicking on the boundary.
     let modulus: u64 = 10u64.pow(digits as u32);
-    format!("{:0>width$}", u64::from(binary) % modulus, width = digits,)
+    u64::from(binary) % modulus
 }
 
 #[cfg(test)]

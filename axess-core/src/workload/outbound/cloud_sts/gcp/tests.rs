@@ -281,3 +281,72 @@ async fn service_account_is_confined_to_one_path_segment() {
         .await
         .expect("slash and query characters stay inside the account segment");
 }
+
+/// A silent STS endpoint must not hold the caller: the exchange ends in a
+/// transport error at the configured timeout, even on an HTTP client
+/// supplied without one.
+#[tokio::test]
+async fn a_silent_sts_endpoint_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "access_token": "federated",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                }))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let client = GcpStsClient::new()
+        .with_endpoint(sts_endpoint(&server))
+        .with_http_client(reqwest::Client::new())
+        .with_timeout(std::time::Duration::from_millis(150));
+
+    let started = std::time::Instant::now();
+    let err = client
+        .exchange_token("jwt", &sample_audience(), &["scope"])
+        .await
+        .expect_err("must time out");
+    assert!(matches!(err, GcpError::Transport(_)), "{err:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ended after the mock's delay, so the timeout did not end it: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The impersonation call carries the same bound.
+#[tokio::test]
+async fn a_silent_iam_credentials_endpoint_times_out() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "accessToken": "ya29.sa",
+                    "expireTime": "2030-01-01T00:00:00Z",
+                }))
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let client = GcpServiceAccountImpersonator::new()
+        .with_endpoint_base(iam_base(&server))
+        .with_http_client(reqwest::Client::new())
+        .with_timeout(std::time::Duration::from_millis(150));
+
+    let started = std::time::Instant::now();
+    let err = client
+        .generate_access_token("federated", "sa@p.iam.gserviceaccount.com", &["s"], None)
+        .await
+        .expect_err("must time out");
+    assert!(matches!(err, GcpError::Transport(_)), "{err:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "ended after the mock's delay, so the timeout did not end it: {:?}",
+        started.elapsed()
+    );
+}

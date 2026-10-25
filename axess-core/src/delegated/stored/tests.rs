@@ -8,6 +8,7 @@
 use super::*;
 use axess_clock::testing::MockClock;
 use axess_identity::{TenantId, UserId};
+use axess_rng::testing::MockRng;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use std::sync::Arc;
@@ -45,7 +46,7 @@ fn build_provider(server_uri: &str) -> Arc<DelegatedProvider> {
 fn begin_grant_produces_well_formed_authorization_url() {
     let server_uri = "https://idp.example";
     let provider = build_provider(server_uri);
-    let (url, context) = begin_grant(&provider, &[]).expect("begin_grant");
+    let (url, context) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     // The URL must point at the configured authorization endpoint
     // and carry every RFC 6749 + RFC 7636 required param.
@@ -77,8 +78,12 @@ fn begin_grant_produces_well_formed_authorization_url() {
 #[test]
 fn begin_grant_respects_scope_override() {
     let provider = build_provider("https://idp.example");
-    let (url, _ctx) =
-        begin_grant(&provider, &["calendar.events".to_string()]).expect("begin_grant");
+    let (url, _ctx) = begin_grant(
+        &provider,
+        &["calendar.events".to_string()],
+        &MockRng::new(1),
+    )
+    .expect("begin_grant");
     let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
     assert_eq!(
         q.get("scope").map(String::as_str),
@@ -107,7 +112,7 @@ async fn complete_grant_exchanges_code_for_credential() {
         .await;
 
     let provider = build_provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     let http = reqwest::Client::new();
     let cred = complete_grant(&provider, &ctx, "auth-code-42", &ctx.state, &http)
@@ -126,7 +131,7 @@ async fn complete_grant_rejects_state_mismatch() {
     // No mock mounted; `complete_grant` must reject before any HTTP
     // call lands.
     let provider = build_provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     let http = reqwest::Client::new();
     let err = complete_grant(&provider, &ctx, "code", "WRONG-STATE", &http)
@@ -153,7 +158,7 @@ async fn complete_grant_surfaces_token_endpoint_error() {
         .mount(&server)
         .await;
     let provider = build_provider(&server.uri());
-    let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     let http = reqwest::Client::new();
     let err = complete_grant(&provider, &ctx, "code", &ctx.state, &http)
@@ -402,7 +407,7 @@ async fn complete_grant_form_encodes_basic_credentials() {
         "a:b%c+d",
         Url::parse("https://gnomes.local/callback").unwrap(),
     );
-    let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+    let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     complete_grant(&provider, &ctx, "c", &ctx.state, &reqwest::Client::new())
         .await
         .expect("secret with reserved characters reaches the IdP intact");
@@ -421,7 +426,7 @@ async fn complete_grant_refuses_out_of_range_expires_in() {
             .mount(&server)
             .await;
         let provider = build_provider(&server.uri());
-        let (_url, ctx) = begin_grant(&provider, &[]).expect("begin_grant");
+        let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
         let err = complete_grant(&provider, &ctx, "c", &ctx.state, &reqwest::Client::new())
             .await
             .expect_err("out-of-range lifetime is refused, not a panic or an expired token");

@@ -106,14 +106,16 @@ where
     }
 
     /// Look up a key. Returns `None` if absent or expired (and removes
-    /// the expired entry as a side effect; lazy TTL sweep).
+    /// the expired entry as a side effect; lazy TTL sweep). An entry is
+    /// expired from exactly `insert + ttl` onward: the expiry instant is
+    /// exclusive.
     pub fn get(&self, key: &K) -> Option<V> {
         let now_micros = self.clock.now().timestamp_micros();
         let mut guard = self.inner.lock();
         // LruCache::get updates recency, which is what we want on a hit;
         // on an expired-hit we then `pop` to evict.
         if let Some(entry) = guard.get(key)
-            && entry.expires_at_micros >= now_micros
+            && entry.expires_at_micros > now_micros
         {
             let v = entry.value.clone();
             drop(guard);
@@ -132,7 +134,10 @@ where
     /// Insert or replace a value with the configured TTL.
     pub fn insert(&self, key: K, value: V) {
         let now_micros = self.clock.now().timestamp_micros();
-        let expires_at_micros = now_micros.saturating_add(self.ttl.as_micros() as i64);
+        // A TTL beyond i64 microseconds saturates to "never expires" instead
+        // of wrapping negative (which would make every entry born expired).
+        let ttl_micros = i64::try_from(self.ttl.as_micros()).unwrap_or(i64::MAX);
+        let expires_at_micros = now_micros.saturating_add(ttl_micros);
         let mut guard = self.inner.lock();
         let len_before = guard.len();
         let cap = guard.cap().get();
@@ -273,7 +278,7 @@ where
         let to_remove: Vec<K> = guard
             .iter()
             .filter_map(|(k, e)| {
-                if e.expires_at_micros < now_micros {
+                if e.expires_at_micros <= now_micros {
                     Some(k.clone())
                 } else {
                     None
@@ -300,10 +305,11 @@ where
     ///
     /// # Errors
     ///
-    /// On `fetcher` error the in-flight cell is removed so subsequent
-    /// callers retry rather than re-await a known-failing future. The
-    /// error is propagated to every concurrent caller that joined this
-    /// in-flight load.
+    /// On `fetcher` error the in-flight cell is removed once no joiner is
+    /// waiting on it, so subsequent callers retry rather than re-await a
+    /// known-failing future. A joiner that arrived while the failing fetch
+    /// was in flight runs its own fetcher and its result is cached as usual;
+    /// the failing caller alone receives the error.
     ///
     /// # Panic safety
     ///
@@ -451,6 +457,10 @@ where
     }
 }
 
+/// References to an in-flight cell held when no joiner is waiting: the map
+/// entry, the load's local handle and its [`InflightGuard`].
+const IDLE_CELL_REFS: usize = 3;
+
 /// RAII guard that removes an in-flight cell from the cache's
 /// pending-loads map on drop (including panic-unwind), gated on
 /// `Arc::ptr_eq` so a slot replaced mid-resolve is left intact.
@@ -471,8 +481,16 @@ where
 {
     fn drop(&mut self) {
         let mut inflight = self.cache.inflight.lock();
+        // Joiners clone the cell under this same lock, so the count is
+        // exact here: the map's reference, the caller's local `cell` and
+        // this guard's make three. Anything above that is a joiner still
+        // waiting on the cell (the leader failed and the joiner is running
+        // its own fetch). Leave the slot for it: removing it would let a
+        // third caller start a duplicate fetch and would make the joiner's
+        // successful result skip promotion. The last participant out removes it.
         if let Some(existing) = inflight.get(&self.key)
             && Arc::ptr_eq(existing, &self.cell)
+            && Arc::strong_count(&self.cell) <= IDLE_CELL_REFS
         {
             inflight.remove(&self.key);
         }

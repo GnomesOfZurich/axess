@@ -258,3 +258,32 @@ async fn create_uses_injected_clock_for_timestamps() {
     assert_eq!(device.first_seen_at, frozen);
     assert_eq!(device.last_seen_at, frozen);
 }
+
+/// The default new-device id is a UUID drawn from the resolver's RNG: with a
+/// seeded RNG the first device gets the first draw and a second device (a
+/// different browser) the second.
+#[tokio::test]
+async fn default_device_ids_are_the_injected_rngs_draws() {
+    use axess_rng::testing::MockRng;
+    let resolver = make_resolver().with_rng(MockRng::new(41));
+    let tenant = crate::authn::ids::testing::tenant("t1");
+
+    let first = resolver
+        .resolve(&req_with(Some("Browser/1"), Some(tenant), None))
+        .await
+        .unwrap()
+        .expect("created");
+    let second = resolver
+        .resolve(&req_with(Some("Browser/2"), Some(tenant), None))
+        .await
+        .unwrap()
+        .expect("created");
+
+    let rng = MockRng::new(41);
+    let expect = |rng: &MockRng| {
+        DeviceId::try_new(axess_identity::mint_v4(rng).to_string()).expect("uuid is a device id")
+    };
+    assert_eq!(first, expect(&rng));
+    assert_eq!(second, expect(&rng));
+    assert_ne!(first, second);
+}

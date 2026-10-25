@@ -5,6 +5,14 @@
 //! 698 lines of logic.
 
 use super::*;
+use base64::Engine as _;
+
+mod seeded;
+
+/// A token minted with the system RNG, for the tests that only need a valid one.
+fn mint(session_id: &[u8], key: &[u8; 32]) -> String {
+    mint_token(session_id, key, &axess_rng::SystemRng)
+}
 
 /// A stand-in session id for the crypto-level tests. Real ids are
 /// `SessionId::as_bytes()` slices; the binding only cares that the same
@@ -30,8 +38,10 @@ fn session_handle(seed: u64) -> SessionHandle {
         id: SessionId::new(&rng),
         data: SessionData::default(),
         modified: false,
+        needs_persist: false,
         regenerate: false,
         pre_cycle_id: None,
+        rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
     };
@@ -41,7 +51,7 @@ fn session_handle(seed: u64) -> SessionHandle {
 #[test]
 fn token_round_trip_validates() {
     let key = [7u8; 32];
-    let token = mint_token(SID, &key);
+    let token = mint(SID, &key);
     assert!(validate_token(&token, SID, &key));
 }
 
@@ -49,14 +59,14 @@ fn token_round_trip_validates() {
 fn token_with_wrong_key_rejected() {
     let key = [7u8; 32];
     let other_key = [9u8; 32];
-    let token = mint_token(SID, &key);
+    let token = mint(SID, &key);
     assert!(!validate_token(&token, SID, &other_key));
 }
 
 #[test]
 fn truncated_token_rejected() {
     let key = [7u8; 32];
-    let token = mint_token(SID, &key);
+    let token = mint(SID, &key);
     let truncated = &token[..token.len() - 4];
     assert!(!validate_token(truncated, SID, &key));
 }
@@ -76,7 +86,7 @@ fn empty_token_rejected() {
 #[test]
 fn token_bound_to_session_rejects_other_session() {
     let key = [7u8; 32];
-    let token = mint_token(b"session-A".as_slice(), &key);
+    let token = mint(b"session-A".as_slice(), &key);
     // Same session: accepted.
     assert!(
         validate_token(&token, b"session-A".as_slice(), &key),
@@ -102,11 +112,11 @@ fn token_bound_to_session_rejects_other_session() {
 #[test]
 fn validate_pair_requires_both_match_and_signature() {
     let key = [7u8; 32];
-    let valid = mint_token(SID, &key);
+    let valid = mint(SID, &key);
     // Both match and valid signature.
     assert!(validate_pair(Some(&valid), Some(&valid), SID, &key));
     // Mismatch.
-    let other = mint_token(SID, &key);
+    let other = mint(SID, &key);
     assert!(!validate_pair(Some(&valid), Some(&other), SID, &key));
     // Missing cookie.
     assert!(!validate_pair(None, Some(&valid), SID, &key));
@@ -140,7 +150,7 @@ fn is_state_changing_only_unsafe_verbs() {
 fn validate_pair_rejects_empty_strings() {
     let key = [7u8; 32];
     assert!(!validate_pair(Some(""), Some(""), SID, &key));
-    let valid = mint_token(SID, &key);
+    let valid = mint(SID, &key);
     assert!(!validate_pair(Some(""), Some(&valid), SID, &key));
     assert!(!validate_pair(Some(&valid), Some(""), SID, &key));
 }
@@ -800,7 +810,7 @@ async fn csrf_service_fails_closed_without_session_handle() {
     let service = CsrfLayer::new(config.clone()).layer(echo_body);
 
     // A token that is internally valid for *some* session.
-    let token = mint_token(b"some-session", &key);
+    let token = mint(b"some-session", &key);
 
     // POST with matching cookie+header but no session handle in the
     // extensions → fail closed with 403.
@@ -845,7 +855,7 @@ async fn csrf_service_remints_stale_cookie_on_safe_verb() {
     // regenerate: the cookie is stale relative to the session id
     // that the request now carries.
     let handle_a = session_handle(1);
-    let stale_token = mint_token(b"some-other-session", &key);
+    let stale_token = mint(b"some-other-session", &key);
 
     let req = Request::builder()
         .method(Method::GET)
@@ -917,7 +927,7 @@ async fn csrf_service_remints_when_handler_rotates_session() {
 
     let handle = session_handle(1);
     let sid_before = handle.0.read().await.id;
-    let token_before = mint_token(sid_before.as_bytes(), &key);
+    let token_before = mint(sid_before.as_bytes(), &key);
 
     let req = Request::builder()
         .method(Method::GET)
@@ -1074,7 +1084,7 @@ async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
     let service = CsrfLayer::new(config.clone()).layer(echo_token);
 
     let handle = session_handle(5);
-    let stale_token = mint_token(b"the-session-before-it-changed", &key);
+    let stale_token = mint(b"the-session-before-it-changed", &key);
     let req = Request::builder()
         .method(Method::GET)
         .uri("/form")

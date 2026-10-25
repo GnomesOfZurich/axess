@@ -87,7 +87,7 @@ fn hotp_attempt_limit_burns_lookahead_window() {
         ..Default::default()
     });
     let cred = FactorCredential::OtpCode(Arc::from("123456"));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now());
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now(), None);
     match outcome {
         VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(updated)) => {
             assert_eq!(updated.counter, 105);
@@ -110,7 +110,7 @@ fn hotp_zero_max_attempts_burns_at_default_limit() {
     // "755224" is the correct code for counter 0; once the default limit
     // is reached it must no longer be accepted.
     let cred = FactorCredential::OtpCode(Arc::from("755224"));
-    match verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now()) {
+    match verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now(), None) {
         VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(updated)) => {
             assert_eq!(updated.counter, 1);
             assert_eq!(updated.attempt_count, 0);
@@ -133,7 +133,7 @@ fn hotp_success_advances_counter_by_one() {
         max_attempts: 5,
     });
     let cred = FactorCredential::OtpCode(Arc::from("755224"));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now());
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now(), None);
     match outcome {
         VerifyOutcome::PassWithUpdate(FactorConfig::Hotp(updated)) => {
             assert_eq!(updated.counter, 1);
@@ -158,7 +158,7 @@ fn email_otp_zero_max_attempts_burns_at_default_limit() {
         ..Default::default()
     });
     let cred = FactorCredential::OtpCode(Arc::from("12345678"));
-    match verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now()) {
+    match verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None) {
         VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(updated)) => {
             assert!(updated.pending_hash.is_none());
         }
@@ -177,7 +177,7 @@ fn email_otp_without_expiry_is_rejected() {
         ..Default::default()
     });
     let cred = FactorCredential::OtpCode(Arc::from(code));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now());
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None);
     assert!(matches!(outcome, VerifyOutcome::Fail));
 }
 
@@ -206,7 +206,7 @@ fn email_otp_at_expiry_boundary_still_valid() {
         ..Default::default()
     });
     let cred = FactorCredential::OtpCode(Arc::from(code));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, now);
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, now, None);
     assert!(matches!(outcome, VerifyOutcome::PassWithUpdate(_)));
 }
 
@@ -221,7 +221,7 @@ fn password_at_max_length_succeeds() {
         rules: Default::default(),
     });
     let cred = FactorCredential::Password(ZeroizedString::new(&max_password));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::Password, Utc::now());
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::Password, Utc::now(), None);
     assert!(matches!(outcome, VerifyOutcome::Pass));
 }
 
@@ -251,7 +251,7 @@ fn totp_success_passes_replay_guard_and_returns_update() {
     });
     let cred = FactorCredential::OtpCode(Arc::from("94287082"));
     let now = Utc.timestamp_opt(59, 0).unwrap();
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::Totp, now);
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::Totp, now, None);
     match outcome {
         VerifyOutcome::PassWithUpdate(FactorConfig::Totp(updated)) => {
             assert_eq!(updated.last_step, Some(1));
@@ -279,7 +279,7 @@ fn hotp_code_at_max_length_continues_to_verify_with_update() {
     });
     let at_max = "1".repeat(MAX_OTP_CODE_BYTES);
     let cred = FactorCredential::OtpCode(Arc::from(at_max.as_str()));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now());
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::Hotp, Utc::now(), None);
     match outcome {
         VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(updated)) => {
             assert_eq!(updated.attempt_count, 1);
@@ -372,7 +372,7 @@ fn email_otp_code_at_max_length_continues_to_verify_with_update() {
     });
     let at_max = "1".repeat(MAX_OTP_CODE_BYTES);
     let cred = FactorCredential::OtpCode(Arc::from(at_max.as_str()));
-    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now());
+    let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None);
     match outcome {
         VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(updated)) => {
             assert_eq!(updated.attempt_count, 1);

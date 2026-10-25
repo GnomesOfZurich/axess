@@ -71,6 +71,28 @@ pub struct SessionData {
     pub custom: serde_json::Value,
 }
 
+/// Length in bytes of `value` serialized as compact JSON, counted without
+/// building the string.
+pub(crate) fn json_byte_len(value: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    // A `Value` always serializes, so the error arm is unreachable; a count of
+    // zero is the same fallback the size check has always used.
+    if serde_json::to_writer(&mut count, value).is_err() {
+        return 0;
+    }
+    count.0
+}
+
 fn default_version() -> u8 {
     1
 }

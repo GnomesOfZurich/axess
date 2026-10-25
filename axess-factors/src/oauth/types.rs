@@ -24,7 +24,7 @@ pub use client_credentials::ClientCredentialsToken;
 pub use device_flow::{DeviceAuthResponse, DeviceTokenOutcome};
 pub use error::OAuthError;
 pub use fapi::{DpopProof, FapiConfig, ParResponse, SenderConstraint};
-pub use jwks_refresh::spawn_jwks_refresh;
+pub use jwks_refresh::{refresh_providers_jwks, spawn_jwks_refresh};
 pub use login_options::{OAuthLoginOptions, ResponseMode};
 pub use provider::{AuthUrlResult, OAuthProvider};
 

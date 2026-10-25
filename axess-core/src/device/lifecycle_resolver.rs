@@ -21,8 +21,8 @@
 //! |------|---------|------------------|
 //! | `tenant_fn` | `parts.extensions.get::<TenantId>()` | when tenant lives elsewhere (subdomain, JWT claim, …) |
 //! | `client_ip_fn` | the address [`client_ip::layer`](crate::client_ip::layer) resolved, or `None` without it | override only where the address comes from somewhere axess cannot see, such as a platform's own header |
-//! | `user_fn` | always `None` | when an upstream auth layer has already injected a `UserId` extension |
-//! | `new_id_fn` | `uuid::Uuid::new_v4().to_string()` | when you have a deterministic id scheme (e.g. DST tests with `MockRng`) |
+//! | `user_fn` | the user the session layer authenticated ([`SessionUser`](crate::device::SessionUser)), `None` for a guest | when an upstream auth layer has already injected a `UserId` extension |
+//! | `new_id_fn` | a UUID v4 drawn from the resolver's RNG (`with_rng`, default `SystemRng`) | when you have an id scheme of your own; for a deterministic UUID scheme under test, seed the RNG instead |
 //!
 //! # Tenant-less requests
 //!
@@ -36,6 +36,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use axess_clock::Clock;
+use axess_rng::SecureRng;
 use axum::http::request::Parts;
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
@@ -54,11 +55,12 @@ type TenantFn = Arc<dyn Fn(&Parts) -> Option<TenantId> + Send + Sync>;
 type ClientIpFn = Arc<dyn Fn(&Parts) -> Option<IpAddr> + Send + Sync>;
 
 /// Function shape: pull a [`UserId`] from request [`Parts`]. Default
-/// returns `None` (the resolver runs *before* authn, so no user yet).
+/// returns the [`SessionUser`](crate::device::SessionUser) the session layer
+/// supplied for an authenticated session, `None` otherwise.
 type UserFn = Arc<dyn Fn(&Parts) -> Option<UserId> + Send + Sync>;
 
-/// Function shape: mint a fresh [`DeviceId`]. Default uses
-/// `uuid::Uuid::new_v4()`.
+/// Function shape: mint a fresh [`DeviceId`]. Unset by default, in which
+/// case the id is a UUID v4 drawn from the resolver's RNG.
 type NewIdFn = Arc<dyn Fn() -> DeviceId + Send + Sync>;
 
 /// Built-in [`DeviceResolver`] composing
@@ -80,7 +82,8 @@ where
     tenant_fn: TenantFn,
     client_ip_fn: ClientIpFn,
     user_fn: UserFn,
-    new_id_fn: NewIdFn,
+    new_id_fn: Option<NewIdFn>,
+    rng: Arc<dyn SecureRng>,
 }
 
 impl<E, S, C> Clone for LifecycleDeviceResolver<E, S, C>
@@ -98,6 +101,7 @@ where
             client_ip_fn: self.client_ip_fn.clone(),
             user_fn: self.user_fn.clone(),
             new_id_fn: self.new_id_fn.clone(),
+            rng: self.rng.clone(),
         }
     }
 }
@@ -121,7 +125,8 @@ where
             tenant_fn: default_tenant_fn(),
             client_ip_fn: default_client_ip_fn(),
             user_fn: default_user_fn(),
-            new_id_fn: default_new_id_fn(),
+            new_id_fn: None,
+            rng: Arc::new(axess_rng::SystemRng),
         }
     }
 
@@ -157,14 +162,23 @@ where
         self
     }
 
-    /// Override the new-id minting strategy. Default uses
-    /// `uuid::Uuid::new_v4()`. Override for DST tests to inject a
-    /// deterministic generator.
+    /// Override the new-id minting strategy. Without it a new device's id
+    /// is a UUID v4 drawn from the resolver's RNG; see
+    /// [`with_rng`](Self::with_rng).
     pub fn with_new_id_fn<F>(mut self, f: F) -> Self
     where
         F: Fn() -> DeviceId + Send + Sync + 'static,
     {
-        self.new_id_fn = Arc::new(f);
+        self.new_id_fn = Some(Arc::new(f));
+        self
+    }
+
+    /// Replace the RNG that mints new device ids (default: `SystemRng`).
+    ///
+    /// Ignored when [`with_new_id_fn`](Self::with_new_id_fn) is set. A seeded
+    /// RNG makes the sequence of device ids reproducible.
+    pub fn with_rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
         self
     }
 }
@@ -191,9 +205,13 @@ where
         let user = (self.user_fn)(parts);
         let now = self.clock.now();
         let new_id_fn = self.new_id_fn.clone();
+        let rng = self.rng.clone();
         let id = self
             .lifecycle
-            .ensure_device(&tenant, user.as_ref(), fp, now, move || (new_id_fn)())
+            .ensure_device(&tenant, user.as_ref(), fp, now, move || match new_id_fn {
+                Some(f) => f(),
+                None => mint_device_id(&*rng),
+            })
             .await?;
         Ok(Some(id))
     }
@@ -221,19 +239,22 @@ fn default_client_ip_fn() -> ClientIpFn {
 }
 
 fn default_user_fn() -> UserFn {
+    // The user the session layer found authenticated on this session.
+    // `None` for a guest, so a guest still resolves the fingerprint's
+    // device; an authenticated user only ever gets a device they own.
     Arc::new(|parts: &Parts| {
-        parts.uri.host();
-        None
+        parts
+            .extensions
+            .get::<crate::device::SessionUser>()
+            .map(|u| u.0)
     })
 }
 
-fn default_new_id_fn() -> NewIdFn {
-    Arc::new(|| {
-        // `try_new` validates against control chars / oversize; a UUID
-        // string never trips either, so the unwrap is total.
-        DeviceId::try_new(uuid::Uuid::new_v4().to_string())
-            .expect("uuid::Uuid::new_v4() always produces a DeviceId-valid string")
-    })
+fn mint_device_id(rng: &dyn SecureRng) -> DeviceId {
+    // `try_new` validates against control chars / oversize; a UUID
+    // string never trips either, so the expect is total.
+    DeviceId::try_new(axess_identity::mint_v4(rng).to_string())
+        .expect("a UUID string is always a valid DeviceId")
 }
 
 #[cfg(test)]

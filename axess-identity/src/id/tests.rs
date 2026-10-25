@@ -165,7 +165,7 @@ fn define_id_macro_yields_v4_via_new() {
     assert!(!id.is_nil());
 }
 
-/// PG-072: `mint_v4_default()` honours the thread-local RNG override.
+/// `mint_v4_default()` honours the thread-local RNG override.
 /// Same seed via `with_thread_local_rng` produces the same Uuid both
 /// times, confirming DST reproducibility through the no-arg helper.
 #[test]

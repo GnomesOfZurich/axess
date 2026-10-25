@@ -1,15 +1,15 @@
 //! `refresh_session_with_status_check` gates rotation on the
 //! caller's status predicate.
 
-use super::test_support::{fixture_tenant, fixture_user, now, test_config};
+use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
-use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
+use crate::testing::mock_random::MockRng;
 
 /// Predicate returns `true` → behaves identically to bare
 /// [`refresh_session`]: rotation succeeds, new token is issued.
 #[tokio::test]
 async fn status_check_true_allows_rotation() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(331);
     let ts = now();
@@ -56,7 +56,7 @@ async fn status_check_true_allows_rotation() {
 /// restores access without forcing a full re-login.
 #[tokio::test]
 async fn status_check_false_refuses_and_preserves_token() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(332);
     let ts = now();
@@ -97,7 +97,7 @@ async fn status_check_false_refuses_and_preserves_token() {
     // Original token must still be present and not revoked; the
     // refusal is non-destructive so a later un-suspension can use
     // the same family.
-    let token_hash = hash_token(&plaintext, config.hash_pepper.as_deref());
+    let token_hash = hash_token(&plaintext, config.pepper());
     let still_there = store
         .find_token(&token_hash)
         .await
@@ -119,7 +119,7 @@ async fn status_check_false_refuses_and_preserves_token() {
 /// SOC sees the compromise signal).
 #[tokio::test]
 async fn revoked_token_bypasses_status_check() {
-    let store = MemoryRefreshTokenStore::new();
+    let store = store();
     let config = test_config();
     let rng = MockRng::new(333);
     let ts = now();

@@ -42,6 +42,8 @@ use std::sync::Arc;
 pub struct InMemoryBackend {
     pub(crate) identity: MockIdentityStore,
     pub(crate) factors: MockFactorStore,
+    clock: Arc<dyn axess_clock::Clock>,
+    sessions: Option<crate::session::MemorySessionRegistry>,
 }
 
 impl Default for InMemoryBackend {
@@ -53,10 +55,39 @@ impl Default for InMemoryBackend {
 impl InMemoryBackend {
     /// Create an empty backend with no users or tenants.
     pub fn new() -> Self {
+        let factors = MockFactorStore::new();
         Self {
-            identity: MockIdentityStore::new(),
-            factors: MockFactorStore::new(),
+            // Linked, so erasing a user also erases its factor configs and
+            // auth methods.
+            identity: MockIdentityStore::new().with_factor_store(&factors),
+            factors,
+            clock: Arc::new(axess_clock::SystemClock),
+            sessions: None,
         }
+    }
+
+    /// Name the [`MemorySessionRegistry`](crate::session::MemorySessionRegistry)
+    /// this backend's users sign in through, so
+    /// [`delete_user`](crate::authn::store::IdentityAdmin::delete_user) also
+    /// ends every session registered for the erased user. The backend holds no
+    /// sessions itself; without the link only identity and factor data are
+    /// erased.
+    pub fn with_session_registry(
+        mut self,
+        registry: crate::session::MemorySessionRegistry,
+    ) -> Self {
+        self.sessions = Some(registry);
+        self
+    }
+
+    /// Stamp the tenants and users registered afterwards with `clock`
+    /// (default: the system clock).
+    ///
+    /// Call this first in the builder chain: a record registered before it
+    /// keeps the time it was created with.
+    pub fn with_clock(mut self, clock: impl axess_clock::Clock) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     /// Register a default tenant with the given ID and display name.
@@ -70,7 +101,7 @@ impl InMemoryBackend {
     ) -> Self {
         let id_arc: Arc<str> = id.into();
         let name = name.into();
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
         let tenant = Tenant {
             // Typed `TenantId` is a Uuid newtype; derive deterministically
             // from the human identifier so repeated calls produce the
@@ -110,7 +141,7 @@ impl InMemoryBackend {
         let user_id = axess_identity::testing::user(&username);
         let tenant_id = axess_identity::testing::tenant(&tenant_id_arc);
 
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
         let user = User {
             id: user_id,
             tenant_id,
@@ -221,6 +252,23 @@ impl crate::authn::store::IdentityAdmin for InMemoryBackend {
     ) -> Result<(), Self::Error> {
         self.identity.suspend_user(user_id, detail).await
     }
+
+    /// Erase the user from the identity store (row, identifier index, failed
+    /// attempts, password history, pending reset token), from the factor
+    /// store (every factor config and auth method), and, when a registry is
+    /// linked with [`with_session_registry`](Self::with_session_registry),
+    /// invalidate its sessions. A missing user is `NotFound`.
+    async fn delete_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
+        self.identity.delete_user(user_id).await?;
+        if let Some(registry) = &self.sessions {
+            use crate::session::store::SessionRegistry as _;
+            match registry.invalidate_user(user_id).await {
+                Ok(()) => {}
+                Err(never) => match never {},
+            }
+        }
+        Ok(())
+    }
 }
 
 impl crate::authn::store::IdentityPasswordHistory for InMemoryBackend {
@@ -330,7 +378,10 @@ impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
         &self,
         user_id: &UserId,
         token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Self::Error> {
-        self.identity.verify_reset_token(user_id, token_hash).await
+        self.identity
+            .verify_reset_token(user_id, token_hash, now)
+            .await
     }
 }

@@ -135,6 +135,26 @@ impl PolicyStore {
     }
 }
 
+/// The rendered principal, action and resource of a decision, kept only
+/// while the decision event is enabled.
+struct DecisionSubject {
+    principal: String,
+    action: String,
+    resource: String,
+}
+
+impl DecisionSubject {
+    /// Render the three UIDs, or `None` when no subscriber is interested in
+    /// the decision event.
+    fn capture(principal: &EntityUid, action: &EntityUid, resource: &EntityUid) -> Option<Self> {
+        tracing::enabled!(target: "axess::authz::decision", tracing::Level::INFO).then(|| Self {
+            principal: principal.to_string(),
+            action: action.to_string(),
+            resource: resource.to_string(),
+        })
+    }
+}
+
 impl PolicyEvaluator for PolicyStore {
     fn is_authorized(
         &self,
@@ -144,10 +164,10 @@ impl PolicyEvaluator for PolicyStore {
         resource: EntityUid,
         context: Context,
     ) -> AuthzDecision {
-        // Captured before move into Request for the audit event.
-        let principal_str = principal.to_string();
-        let action_str = action.to_string();
-        let resource_str = resource.to_string();
+        // Captured before move into Request for the audit event, and only when
+        // a subscriber listens to the decision target: rendering three UIDs
+        // per decision is wasted work otherwise.
+        let subject = DecisionSubject::capture(&principal, &action, &resource);
         let started = std::time::Instant::now();
 
         let cedar_req = match Request::new(principal, action, resource, context, Some(&self.schema))
@@ -155,15 +175,17 @@ impl PolicyEvaluator for PolicyStore {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!("Cedar request validation failed: {e:?}");
-                tracing::info!(
-                    target: "axess::authz::decision",
-                    principal = %principal_str,
-                    action = %action_str,
-                    resource = %resource_str,
-                    decision = "deny",
-                    reason = "request_validation_failed",
-                    latency_us = started.elapsed().as_micros() as u64,
-                );
+                if let Some(subject) = &subject {
+                    tracing::info!(
+                        target: "axess::authz::decision",
+                        principal = %subject.principal,
+                        action = %subject.action,
+                        resource = %subject.resource,
+                        decision = "deny",
+                        reason = "request_validation_failed",
+                        latency_us = started.elapsed().as_micros() as u64,
+                    );
+                }
                 return AuthzDecision::Deny;
             }
         };
@@ -189,15 +211,17 @@ impl PolicyEvaluator for PolicyStore {
                 errors = ?errors,
                 "Cedar policy evaluation errors: denied"
             );
-            tracing::info!(
-                target: "axess::authz::decision",
-                principal = %principal_str,
-                action = %action_str,
-                resource = %resource_str,
-                decision = "deny",
-                reason = "policy_evaluation_error",
-                latency_us = latency_us,
-            );
+            if let Some(subject) = &subject {
+                tracing::info!(
+                    target: "axess::authz::decision",
+                    principal = %subject.principal,
+                    action = %subject.action,
+                    resource = %subject.resource,
+                    decision = "deny",
+                    reason = "policy_evaluation_error",
+                    latency_us = latency_us,
+                );
+            }
             return AuthzDecision::Deny;
         }
 
@@ -206,28 +230,32 @@ impl PolicyEvaluator for PolicyStore {
                 tracing::trace!(reasons = ?reasons, "Cedar: allowed");
                 // Structured audit event; see `axess::authz::audit` module
                 // docs for the documented schema and target.
-                tracing::info!(
-                    target: "axess::authz::decision",
-                    principal = %principal_str,
-                    action = %action_str,
-                    resource = %resource_str,
-                    decision = "allow",
-                    reasons = ?reasons,
-                    latency_us = latency_us,
-                );
+                if let Some(subject) = &subject {
+                    tracing::info!(
+                        target: "axess::authz::decision",
+                        principal = %subject.principal,
+                        action = %subject.action,
+                        resource = %subject.resource,
+                        decision = "allow",
+                        reasons = ?reasons,
+                        latency_us = latency_us,
+                    );
+                }
                 AuthzDecision::Allow
             }
             Decision::Deny => {
                 tracing::debug!(reasons = ?reasons, "Cedar: denied");
-                tracing::info!(
-                    target: "axess::authz::decision",
-                    principal = %principal_str,
-                    action = %action_str,
-                    resource = %resource_str,
-                    decision = "deny",
-                    reasons = ?reasons,
-                    latency_us = latency_us,
-                );
+                if let Some(subject) = &subject {
+                    tracing::info!(
+                        target: "axess::authz::decision",
+                        principal = %subject.principal,
+                        action = %subject.action,
+                        resource = %subject.resource,
+                        decision = "deny",
+                        reasons = ?reasons,
+                        latency_us = latency_us,
+                    );
+                }
                 AuthzDecision::Deny
             }
         }
@@ -253,6 +281,9 @@ pub(super) fn make_uid(
     // `alice` and chokes on `"` or `\`, so two ids could name one entity.
     super::provider::make_entity_uid(namespace, type_name, id)
 }
+
+#[cfg(test)]
+mod decision_log;
 
 #[cfg(test)]
 mod authz_store_tests {

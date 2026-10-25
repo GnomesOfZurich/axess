@@ -103,11 +103,18 @@ async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResp
     // Store CSRF state + PKCE verifier in short-lived cookies. A real
     // app would use the SessionLayer's pre-auth session instead; cookies
     // keep this example focused on the social flow.
+    //
+    // `Lax` still sends them on the top-level GET the provider redirects
+    // back with, and withholds them from cross-site sub-requests. Add
+    // `set_secure(true)` behind TLS; it is left off only so this works on
+    // http://localhost.
     let mut state_cookie = Cookie::new("oauth_state", csrf_state);
     state_cookie.set_http_only(true);
+    state_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     state_cookie.set_path("/");
     let mut pkce_cookie = Cookie::new("oauth_pkce", auth.pkce_verifier);
     pkce_cookie.set_http_only(true);
+    pkce_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     pkce_cookie.set_path("/");
     cookies.add(state_cookie);
     cookies.add(pkce_cookie);
@@ -145,16 +152,20 @@ async fn callback(
         .unwrap_or_default();
 
     // Clear the pre-auth cookies; they have served their purpose.
-    cookies.remove(Cookie::new("oauth_state", ""));
-    cookies.remove(Cookie::new("oauth_pkce", ""));
+    // A removal only matches the cookie it replaces when the path agrees.
+    for name in ["oauth_state", "oauth_pkce"] {
+        let mut gone = Cookie::new(name, "");
+        gone.set_path("/");
+        cookies.remove(gone);
+    }
 
     let access_token = match state.github.exchange_code(&q.code, &pkce_verifier).await {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "token exchange failed");
-            return Html(format!(
-                "<h1>Auth failed</h1><p>Token exchange: {e}</p><p><a href=\"/\">Back</a></p>"
-            ))
+            return Html(
+                r#"<h1>Auth failed</h1><p>The token exchange was refused.</p><p><a href="/">Back</a></p>"#,
+            )
             .into_response();
         }
     };
@@ -163,20 +174,22 @@ async fn callback(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "userinfo fetch failed");
-            return Html(format!(
-                "<h1>Auth failed</h1><p>Userinfo: {e}</p><p><a href=\"/\">Back</a></p>"
-            ))
+            return Html(
+                r#"<h1>Auth failed</h1><p>The profile could not be fetched.</p><p><a href="/">Back</a></p>"#,
+            )
             .into_response();
         }
     };
 
-    let login = claims
-        .raw
-        .get("login")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(no login)");
-    let email = claims.email.as_deref().unwrap_or("(no email)");
-    let name = claims.display_name.as_deref().unwrap_or("(no name)");
+    let login = html_escape(
+        claims
+            .raw
+            .get("login")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no login)"),
+    );
+    let email = html_escape(claims.email.as_deref().unwrap_or("(no email)"));
+    let name = html_escape(claims.display_name.as_deref().unwrap_or("(no name)"));
 
     Html(format!(
         r#"<!doctype html>
@@ -197,8 +210,8 @@ pre{{background:#f4f4f4;padding:1em;overflow:auto}}</style>
 <p><strong>Reminder:</strong> these claims are TLS-trusted, not signed-and-verified.</p>
 <p><a href="/">Back</a></p>
 </body></html>"#,
-        claims.subject,
-        serde_json::to_string_pretty(&claims.raw).unwrap_or_default(),
+        html_escape(&claims.subject),
+        html_escape(&serde_json::to_string_pretty(&claims.raw).unwrap_or_default()),
     ))
     .into_response()
 }
@@ -213,4 +226,22 @@ fn missing_creds() -> ! {
          for non-GitHub providers."
     );
     std::process::exit(2);
+}
+
+/// Escape text for interpolation into HTML. Everything the IdP returns
+/// (names, e-mail addresses, error descriptions) is attacker-influenced and
+/// goes through this before it reaches a page.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }

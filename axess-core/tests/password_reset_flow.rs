@@ -150,7 +150,7 @@ async fn begin_password_reset_expires_at_is_in_the_future() {
         .await
         .unwrap();
     let result = svc
-        .complete_password_reset(&uid("u1"), &token, "new-password-123")
+        .complete_password_reset(&uid("u1"), &token, "New-password-123")
         .await
         .unwrap();
     assert!(
@@ -197,7 +197,7 @@ async fn complete_password_reset_in_tenant_accepts_same_tenant() {
         .unwrap()
         .expect("token");
     let result = svc
-        .complete_password_reset_in_tenant(&user.id, &user.tenant_id, &token, "new-password-123")
+        .complete_password_reset_in_tenant(&user.id, &user.tenant_id, &token, "New-password-123")
         .await
         .unwrap();
     assert!(result, "same-tenant must continue and reset succeeds");
@@ -215,7 +215,7 @@ async fn complete_password_reset_invalid_token_returns_false() {
     let user = fixture_user("u1", "alice", "t1");
     let svc = make_service_with_user(user.clone());
     let result = svc
-        .complete_password_reset(&user.id, "never-issued-token", "new-password-123")
+        .complete_password_reset(&user.id, "never-issued-token", "New-password-123")
         .await
         .unwrap();
     assert!(
@@ -290,7 +290,7 @@ async fn complete_password_reset_rejects_password_reuse() {
     // plaintext, store the resulting PHC string in history, then call
     // `complete_password_reset` with the same plaintext; Argon2's verify
     // recomputes the candidate under the stored salt and matches.
-    let reused_plaintext = "reused-password";
+    let reused_plaintext = "Reused-password-1";
     let history_entry = axess_factors::generate_password_hash(reused_plaintext);
     inspector
         .record_password_hash(&user.id, &history_entry)
@@ -326,7 +326,7 @@ async fn complete_password_reset_valid_token_returns_true() {
         .unwrap()
         .expect("token");
     let result = svc
-        .complete_password_reset(&user.id, &token, "new-password-123")
+        .complete_password_reset(&user.id, &token, "New-password-123")
         .await
         .unwrap();
     assert!(result, "valid token must return Ok(true), got {result}");
@@ -344,7 +344,7 @@ async fn password_history_records_each_hash_once() {
     let svc = AuthnService::new(identity, MockFactorStore::new())
         .with_audit_context(AuditContext::default());
 
-    for password in ["first-password-1", "second-password-2", "third-password-3"] {
+    for password in ["First-password-1", "Second-password-2", "Third-password-3"] {
         let token = svc
             .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
             .await
@@ -359,4 +359,119 @@ async fn password_history_records_each_hash_once() {
 
     let history = inspector.password_history(&user.id, 10).await.unwrap();
     assert_eq!(history.len(), 3, "one entry per password: {history:?}");
+}
+
+// ── the tenant's password rules ────────────────────────────────────────
+
+/// A password the tenant's rules refuse never replaces the old one, and it
+/// does not spend the reset token: the same link then works with a
+/// compliant password. One case per rule, plus the default minimum length.
+#[tokio::test]
+async fn a_reset_to_a_password_that_breaks_the_rules_is_refused_and_keeps_the_old_one() {
+    use axess_core::authn::factor::{
+        FactorConfig, FactorKind, PasswordConfig, PasswordRules, ZeroizedString,
+    };
+    use axess_core::authn::store::FactorStore;
+    use axess_core::authn::types::AuthnScope;
+
+    let user = fixture_user("u1", "alice", "t1");
+    let rules = PasswordRules {
+        require_special: true,
+        ..PasswordRules::default()
+    };
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(user.clone())
+        .with_password_rules(&user.tenant_id, rules.clone());
+    let scope = AuthnScope::User {
+        tenant_id: user.tenant_id,
+        user_id: user.id,
+    };
+    let old_password = "Old-password-1!";
+    let factors = MockFactorStore::new().with_factor(
+        scope.clone(),
+        FactorConfig::Password(PasswordConfig {
+            hash: ZeroizedString::new(axess_factors::generate_password_hash(old_password)),
+            rules,
+        }),
+    );
+    let inspector = factors.clone();
+    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let token = svc
+        .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
+        .await
+        .unwrap()
+        .expect("token");
+
+    for (weak, why) in [
+        ("Sh0rt!", "below min_length"),
+        ("no-uppercase-here-1!", "no uppercase"),
+        ("NO-LOWERCASE-HERE-1!", "no lowercase"),
+        ("No-digits-in-this-one!", "no digit"),
+        ("NoSpecialCharsHere12", "no special character"),
+    ] {
+        let done = svc
+            .complete_password_reset(&user.id, &token, weak)
+            .await
+            .unwrap();
+        assert!(!done, "{why}: {weak:?} must be refused");
+    }
+
+    let Some(FactorConfig::Password(config)) = inspector
+        .load_factor(&scope, FactorKind::Password)
+        .await
+        .unwrap()
+    else {
+        panic!("the password factor must still exist");
+    };
+    assert!(
+        axess_factors::verify_password(old_password, &config.hash).is_ok(),
+        "the old password still works"
+    );
+
+    // The refusals spent nothing: the same token takes a compliant password.
+    let done = svc
+        .complete_password_reset(&user.id, &token, "New-password-1!")
+        .await
+        .unwrap();
+    assert!(done, "a compliant password is accepted with the same token");
+}
+
+/// The service hands its own clock reading to the store, so a token issued
+/// on a mock clock far from real time is refused one second after its ttl
+/// and accepted one second before it. A store that judged expiry on the
+/// machine's clock would see a 2031 expiry as years away and accept both.
+#[tokio::test]
+async fn complete_password_reset_judges_expiry_on_the_service_clock() {
+    use chrono::TimeZone;
+    let origin = Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap();
+    let ttl = std::time::Duration::from_secs(300);
+    for (advance_secs, accepted) in [(299, true), (301, false)] {
+        let clock = axess_clock::testing::MockClock::at(origin);
+        let identity = MockIdentityStore::new()
+            .with_tenant(test_tenant())
+            .with_user(fixture_user("u1", "alice", "t1"));
+        identity
+            .record_password_hash(&uid("u1"), "previous-hash")
+            .await
+            .unwrap();
+        let svc = AuthnService::builder(identity, MockFactorStore::new())
+            .with_clock(clock.clone())
+            .build()
+            .with_audit_context(AuditContext::default());
+        let token = svc
+            .begin_password_reset("alice", "default", ttl)
+            .await
+            .unwrap()
+            .expect("token expected");
+        clock.advance(chrono::Duration::seconds(advance_secs));
+        let redeemed = svc
+            .complete_password_reset(&uid("u1"), &token, "New-password-123")
+            .await
+            .unwrap();
+        assert_eq!(
+            redeemed, accepted,
+            "token redeemed {advance_secs} s after issue on a 300 s ttl"
+        );
+    }
 }

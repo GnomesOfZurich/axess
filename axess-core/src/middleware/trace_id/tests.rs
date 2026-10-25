@@ -5,6 +5,16 @@ use super::*;
 use axum::http::Request;
 use tower::ServiceExt;
 
+mod seeded;
+
+fn parse(value: &str) -> Option<TraceContext> {
+    TraceContext::from_header(value, &axess_rng::testing::MockRng::new(1))
+}
+
+fn root() -> TraceContext {
+    TraceContext::new_root(&axess_rng::testing::MockRng::new(1))
+}
+
 fn test_app() -> TraceContextMiddleware<axum::Router> {
     let app = axum::Router::new().route(
         "/test",
@@ -20,7 +30,7 @@ fn test_app() -> TraceContextMiddleware<axum::Router> {
             }
         }),
     );
-    TraceContextLayer.layer(app)
+    TraceContextLayer::new().layer(app)
 }
 
 #[tokio::test]
@@ -146,7 +156,7 @@ fn from_header_rejects_each_individual_length_mismatch() {
     // Bad version: 3 chars instead of 2.
     let bad = format!("000-{good_trace}-{good_parent}-{good_flags}");
     assert!(
-        TraceContext::from_header(&bad).is_none(),
+        parse(&bad).is_none(),
         "3-char version must reject (kills `||` -> `&&` at line 96:31)"
     );
 
@@ -154,7 +164,7 @@ fn from_header_rejects_each_individual_length_mismatch() {
     let short_trace = "4bf92f3577b34da6a3ce929d0e0e473"; // 31 chars
     let bad = format!("{good_version}-{short_trace}-{good_parent}-{good_flags}");
     assert!(
-        TraceContext::from_header(&bad).is_none(),
+        parse(&bad).is_none(),
         "31-char trace_id must reject (kills `||` -> `&&` at line 96:55)"
     );
 
@@ -162,23 +172,20 @@ fn from_header_rejects_each_individual_length_mismatch() {
     let short_parent = "00f067aa0ba902b"; // 15 chars
     let bad = format!("{good_version}-{good_trace}-{short_parent}-{good_flags}");
     assert!(
-        TraceContext::from_header(&bad).is_none(),
+        parse(&bad).is_none(),
         "15-char parent_id must reject (kills `||` -> `&&` at line 96:73)"
     );
 
     // Bad flags: 1 char instead of 2.
     let bad = format!("{good_version}-{good_trace}-{good_parent}-1");
     assert!(
-        TraceContext::from_header(&bad).is_none(),
+        parse(&bad).is_none(),
         "1-char flags must reject (kills `||` -> `&&` at line 96:79)"
     );
 
     // Sanity: all-good still accepts.
     let good = format!("{good_version}-{good_trace}-{good_parent}-{good_flags}");
-    assert!(
-        TraceContext::from_header(&good).is_some(),
-        "well-formed traceparent must parse"
-    );
+    assert!(parse(&good).is_some(), "well-formed traceparent must parse");
 }
 
 /// `from_header` rejects non-hex characters in either
@@ -191,17 +198,14 @@ fn from_header_rejects_non_hex_independently() {
     // Non-hex trace_id (contains 'g'), valid flags.
     let bad = "00-gbf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
     assert!(
-        TraceContext::from_header(bad).is_none(),
+        parse(bad).is_none(),
         "non-hex trace_id must reject even when flags are hex \
              (kills `||` -> `&&` at line 100:13)"
     );
 
     // Valid trace_id, non-hex flags. Flags has 2 chars but 'g' is non-hex.
     let bad = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g";
-    assert!(
-        TraceContext::from_header(bad).is_none(),
-        "non-hex flags must reject"
-    );
+    assert!(parse(bad).is_none(), "non-hex flags must reject");
 }
 
 /// The `sampled` flag is decoded from the lowest bit of
@@ -223,7 +227,7 @@ fn from_header_decodes_sampled_bit_correctly() {
     // flags=01 → sampled=true. Kills `& → ^` (1^1=0 ≠ 1) and
     // `== → !=` (false instead of true).
     let header = format!("00-{trace}-{parent}-01");
-    let ctx = TraceContext::from_header(&header).expect("01 must parse");
+    let ctx = parse(&header).expect("01 must parse");
     assert!(
         ctx.sampled,
         "flags=01 must yield sampled=true (kills `& -> ^` and `== -> !=`)"
@@ -233,7 +237,7 @@ fn from_header_decodes_sampled_bit_correctly() {
     // mutant says sampled when original says not-sampled) and
     // `== → !=` symmetrically.
     let header = format!("00-{trace}-{parent}-00");
-    let ctx = TraceContext::from_header(&header).expect("00 must parse");
+    let ctx = parse(&header).expect("00 must parse");
     assert!(
         !ctx.sampled,
         "flags=00 must yield sampled=false (kills `& -> |`)"
@@ -247,7 +251,7 @@ fn from_header_decodes_sampled_bit_correctly() {
 #[test]
 fn from_request_returns_extension_value() {
     let mut req = Request::new(Body::empty());
-    let ctx = TraceContext::new_root();
+    let ctx = root();
     let trace_id = ctx.trace_id.clone();
     req.extensions_mut().insert(ctx);
 
@@ -278,13 +282,7 @@ fn from_header_rejects_invalid_values_not_only_bad_lengths() {
         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902bZ-01",
         "0g-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
     ] {
-        assert!(
-            TraceContext::from_header(bad).is_none(),
-            "{bad} must be rejected"
-        );
+        assert!(parse(bad).is_none(), "{bad} must be rejected");
     }
-    assert!(
-        TraceContext::from_header("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-            .is_some()
-    );
+    assert!(parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_some());
 }

@@ -17,9 +17,18 @@ use crate::session::id::SessionId;
 use crate::session::layer::handle::SessionHandle;
 use crate::session::layer::signing::SigningKeyRing;
 use crate::session::store::SessionStore;
-use axess_rng::SystemRng;
+use axess_rng::SecureRng;
 use subtle::ConstantTimeEq;
 use tower_cookies::cookie::Cookie;
+
+/// The binding fingerprints computed from a request: the one under the
+/// current signing key, and the one under the previous key while a rotation
+/// window is open.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Fingerprints<'a> {
+    pub(crate) current: Option<&'a str>,
+    pub(crate) previous: Option<&'a str>,
+}
 
 /// Outcome of [`load_session`].
 ///
@@ -48,7 +57,8 @@ pub(crate) struct LoadOutcome {
 /// Outcome of [`finalize_session`].
 ///
 /// `final_id` is the id the response cookie should carry.
-/// `session_changed` toggles whether a `Set-Cookie` header is emitted.
+/// `session_changed` toggles whether the session is persisted and a
+/// `Set-Cookie` header is emitted.
 pub(crate) struct FinalizeOutcome {
     pub(crate) final_id: SessionId,
     pub(crate) session_changed: bool,
@@ -70,8 +80,8 @@ pub(crate) async fn load_session<S>(
     config: &SessionConfig,
     metrics: Option<&dyn crate::metrics::AuthnMetrics>,
     headers: &axum::http::HeaderMap,
-    current_fingerprint: Option<&str>,
-    previous_fingerprint: Option<&str>,
+    fingerprints: Fingerprints<'_>,
+    rng: &dyn SecureRng,
 ) -> LoadOutcome
 where
     S: SessionStore + Send + Sync + 'static,
@@ -134,6 +144,10 @@ where
     // path without falling back. The session data is thereby marked
     // for persistence via the modified/rotation_fallback_used signal
     // read at the finalize + response-cookie stages.
+    let Fingerprints {
+        current: current_fingerprint,
+        previous: previous_fingerprint,
+    } = fingerprints;
     let mut binding_invalidated = false;
     // A session that was BOUND (it stores a fingerprint) and a request that
     // presents no binding material is a mismatch, not a skip: leaving the
@@ -174,8 +188,7 @@ where
         }
     }
 
-    let rng = SystemRng;
-    let id = existing_id.unwrap_or_else(|| SessionId::new(&rng));
+    let id = existing_id.unwrap_or_else(|| SessionId::new(rng));
 
     LoadOutcome {
         id,
@@ -217,6 +230,7 @@ pub(crate) async fn finalize_session<S>(
     metrics: Option<&dyn crate::metrics::AuthnMetrics>,
     handle: &SessionHandle,
     existing_id: Option<SessionId>,
+    rng: &dyn SecureRng,
 ) -> FinalizeOutcome
 where
     S: SessionStore + Send + Sync + 'static,
@@ -226,9 +240,7 @@ where
 
     // Enforce custom data size limit to prevent session-bloat DoS.
     if config.max_custom_bytes > 0 && guard.modified {
-        let custom_size = serde_json::to_vec(&guard.data.custom)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let custom_size = crate::session::data::json_byte_len(&guard.data.custom);
         if custom_size > config.max_custom_bytes {
             tracing::warn!(
                 custom_size,
@@ -239,7 +251,12 @@ where
         }
     }
 
-    let session_changed = guard.modified || guard.regenerate || existing_id.is_none();
+    // A request without a trusted session persists the fresh guest and sets a
+    // cookie only when something needs it (a modification, a CSRF token bound
+    // to the id, a handler that read the id); an untouched cookieless request
+    // leaves the store empty and the response without `Set-Cookie`.
+    let fresh_needed = existing_id.is_none() && (guard.modified || guard.needs_persist);
+    let session_changed = guard.modified || guard.regenerate || fresh_needed;
     if session_changed
         && (guard.regenerate || existing_id.is_none())
         && let Some(m) = metrics
@@ -249,10 +266,9 @@ where
 
     let final_id = if session_changed {
         if guard.regenerate {
-            let rng = SystemRng;
             let old_id = guard.pre_cycle_id.take().unwrap_or_else(|| {
                 let prev = guard.id;
-                guard.id = SessionId::new(&rng);
+                guard.id = SessionId::new(rng);
                 prev
             });
             let new_id = guard.id;

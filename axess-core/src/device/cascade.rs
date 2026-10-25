@@ -114,6 +114,7 @@ mod tests {
             first_seen_at: now,
             last_seen_at: now,
             revoked_at: None,
+            demoted_at: None,
             bindings: Vec::<DeviceBinding>::new(),
         }
     }
@@ -124,8 +125,8 @@ mod tests {
         let tenant = t("tenant-1");
         let dev_a = d("dev-a", 0xaa, &tenant);
         let dev_b = d("dev-b", 0xbb, &tenant);
-        store.save(&dev_a).await.unwrap();
-        store.save(&dev_b).await.unwrap();
+        store.save(&dev_a, crate::device::test_now()).await.unwrap();
+        store.save(&dev_b, crate::device::test_now()).await.unwrap();
 
         let targets = vec![(tenant, dev_a.id), (tenant, dev_b.id)];
         let now = Utc::now();
@@ -147,7 +148,7 @@ mod tests {
         let store = MemoryDeviceStore::new();
         let tenant = t("tenant-1");
         let dev_a = d("dev-a", 0xaa, &tenant);
-        store.save(&dev_a).await.unwrap();
+        store.save(&dev_a, crate::device::test_now()).await.unwrap();
 
         let targets = vec![
             (tenant, dev_a.id),

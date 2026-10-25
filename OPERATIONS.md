@@ -98,7 +98,7 @@ store.init_schema().await?;
 let _cleanup = store.spawn_cleanup_task(Duration::from_secs(3600));
 ```
 
-`PostgresSessionStore::spawn_cleanup_task` and `MysqlSessionStore::spawn_cleanup_task` work the same way. The returned `JoinHandle` aborts the loop when dropped; store it for the lifetime of the application (or pass it through to graceful shutdown, see below).
+`PostgresSessionStore::spawn_cleanup_task` and `MysqlSessionStore::spawn_cleanup_task` work the same way. Dropping the returned `JoinHandle` leaves the loop running; keep it so the shutdown path can call `abort` (see below).
 
 Valkey manages expiration natively via TTL; no cleanup needed.
 

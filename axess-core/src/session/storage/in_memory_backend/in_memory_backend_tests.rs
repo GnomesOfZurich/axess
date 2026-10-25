@@ -9,6 +9,7 @@ use crate::authn::event::{AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEven
 use crate::authn::store::IdentityPasswordHistory;
 use crate::authn::store::{IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordReset};
 use crate::authn::types::StatusDetail;
+use axess_clock::Clock as _;
 use chrono::Utc;
 
 fn t() -> TenantId {
@@ -393,7 +394,7 @@ async fn reset_token_round_trip_through_backend() {
 
     // Wrong hash before anything is stored; must be false.
     let pre = backend
-        .verify_reset_token(&user_id, wrong_hash)
+        .verify_reset_token(&user_id, wrong_hash, Utc::now())
         .await
         .unwrap();
     assert!(
@@ -408,18 +409,118 @@ async fn reset_token_round_trip_through_backend() {
 
     // Wrong hash against a stored token; still false (kills `Ok(true)`).
     let bad = backend
-        .verify_reset_token(&user_id, wrong_hash)
+        .verify_reset_token(&user_id, wrong_hash, Utc::now())
         .await
         .unwrap();
     assert!(!bad, "verify_reset_token must reject a non-matching hash");
 
     // Correct hash; true (kills `Ok(false)` and `store_reset_token -> Ok(())`).
     let ok = backend
-        .verify_reset_token(&user_id, token_hash)
+        .verify_reset_token(&user_id, token_hash, Utc::now())
         .await
         .unwrap();
     assert!(
         ok,
         "verify_reset_token must accept the matching hash before expiry"
     );
+}
+
+/// Records registered after `with_clock` carry the injected time, and a reset
+/// token issued on that clock expires on the instant the caller passes.
+#[tokio::test]
+async fn with_clock_stamps_records_and_judges_reset_expiry() {
+    use chrono::TimeZone;
+    let origin = Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap();
+    let clock = axess_clock::testing::MockClock::at(origin);
+    let backend = InMemoryBackend::new()
+        .with_clock(clock.clone())
+        .with_default_tenant("default", "Default Tenant")
+        .with_user_password("alice", "default", "Gnomes2+");
+
+    let tenant = backend.find_tenant("default").await.unwrap().unwrap();
+    let user = backend.get_user(&u()).await.unwrap().unwrap();
+    assert_eq!(tenant.created_at, origin);
+    assert_eq!(user.created_at, origin);
+
+    backend
+        .store_reset_token(&u(), "h", origin + chrono::Duration::minutes(10))
+        .await
+        .unwrap();
+    clock.advance(chrono::Duration::minutes(10));
+    assert!(
+        !backend
+            .verify_reset_token(&u(), "h", clock.now())
+            .await
+            .unwrap()
+    );
+}
+
+/// Erasing a user leaves nothing a lookup can find: the row, the identifier
+/// index, the factor config, the auth methods, the reset token, the password
+/// history, and the user's registered session. Another user is untouched.
+#[tokio::test]
+async fn delete_user_erases_every_trace_and_the_session() {
+    use crate::session::MemorySessionRegistry;
+    use crate::session::store::SessionRegistry as _;
+
+    let registry = MemorySessionRegistry::new();
+    let backend = InMemoryBackend::new()
+        .with_session_registry(registry.clone())
+        .with_default_tenant("default", "Default Tenant")
+        .with_user_password("alice", "default", "Gnomes2+")
+        .with_user_password("bob", "default", "Gnomes2+");
+    let bob = axess_identity::testing::user("bob");
+    let rng = axess_rng::SystemRng;
+    let session = crate::session::SessionId::new(&rng);
+    let bobs_session = crate::session::SessionId::new(&rng);
+    registry.register(&u(), &session).await.unwrap();
+    registry.register(&bob, &bobs_session).await.unwrap();
+    backend
+        .record_password_hash(&u(), "old-hash")
+        .await
+        .unwrap();
+    backend
+        .store_reset_token(&u(), "h", Utc::now() + chrono::Duration::hours(1))
+        .await
+        .unwrap();
+    assert!(
+        backend
+            .load_factor(&user_scope(), FactorKind::Password)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    backend.delete_user(&u()).await.unwrap();
+
+    assert!(backend.get_user(&u()).await.unwrap().is_none());
+    assert!(backend.find_user("alice", &t()).await.unwrap().is_none());
+    assert!(
+        backend
+            .load_factor(&user_scope(), FactorKind::Password)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .available_methods(&u(), &t())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(backend.password_history(&u(), 10).await.unwrap().is_empty());
+    assert!(
+        !backend
+            .verify_reset_token(&u(), "h", Utc::now())
+            .await
+            .unwrap()
+    );
+    assert!(!registry.is_valid(&u(), &session).await.unwrap());
+    assert!(registry.is_valid(&bob, &bobs_session).await.unwrap());
+    assert!(backend.get_user(&bob).await.unwrap().is_some());
+    assert!(matches!(
+        backend.delete_user(&u()).await,
+        Err(MockStoreError::NotFound)
+    ));
 }

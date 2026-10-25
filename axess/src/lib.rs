@@ -45,6 +45,12 @@ pub mod session {
     };
 }
 
+/// Where password hashing runs: [`KdfExecutor`](blocking::KdfExecutor) and its
+/// error.
+pub mod blocking {
+    pub use axess_core::blocking::*;
+}
+
 /// Authentication namespace. Prefer `axess::authn::*` in new code.
 pub mod authn {
     pub use axess_core::{
@@ -62,9 +68,10 @@ pub mod authn {
         require_valid_session,
     };
     pub use axess_factors::{
-        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, RECOVERY_CODE_COUNT,
-        RecoveryCodesConfig, StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm,
-        TotpVerifyParams, build_totp_uri, generate_password_hash, generate_recovery_codes,
+        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, PepperTooShort, RECOVERY_CODE_COUNT,
+        RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD,
+        TotpAlgorithm, TotpVerifyParams, build_totp_uri, generate_password_hash,
+        generate_password_hash_with_rng, generate_recovery_codes, generate_recovery_codes_peppered,
         generate_totp_secret, normalize_recovery_code, verify_hotp, verify_password,
         verify_recovery_code, verify_totp,
     };
@@ -219,15 +226,15 @@ pub mod backends {
 #[cfg(feature = "device")]
 pub mod device {
     pub use axess_core::{
-        AttestationClass, CachedDeviceStore, DefaultFingerprintExtractor, Device, DeviceBinding,
-        DeviceEventSink, DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory,
-        DevicePiiMapping, DevicePiiResolver, DevicePiiStore, DeviceResolver, DeviceStore,
-        DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
-        MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
-        NoopDeviceResolver, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, StepUpPolicy,
-        StepUpPolicyBuilder, SweepConfig, SweepConfigBuilder, SweepCounts, TenantPepperResolver,
-        cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up,
-        decide_step_up_for_user,
+        AttestationClass, BindingsUpdate, CachedDeviceStore, DefaultFingerprintExtractor, Device,
+        DeviceBinding, DeviceEventSink, DeviceFingerprintExtractor, DeviceLifecycleService,
+        DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, DeviceResolver,
+        DeviceStore, DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver,
+        MemoryDevicePiiStore, MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError,
+        NoopDeviceEventSink, NoopDeviceResolver, OwnerClaim, PiiToken, REDACTED_PLACEHOLDER,
+        RedactedResolver, SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig,
+        SweepConfigBuilder, SweepCounts, TenantPepperResolver, TrustTransition,
+        cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up_for_user,
     };
 }
 
@@ -285,6 +292,10 @@ pub use axess_core::{KeyExtractor, RateLimitConfig, RateLimitConfigBuilder, Rate
 pub mod client_ip {
     pub use axess_core::client_ip::{CidrParseError, ClientIp, Source, TrustedProxies, layer};
 }
+
+/// Input validation helpers (`is_valid_password`, `meets_password_rules`,
+/// `is_valid_email`, ...). Re-exports [`axess_core::validation`].
+pub use axess_core::validation;
 
 /// JWT verification primitives and, under `jwt-svid`, SPIFFE JWT-SVID
 /// resolution.
@@ -398,10 +409,12 @@ pub mod delegated {
 
 // Factor verification functions from axess-factors
 pub use axess_factors::{
-    GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, RECOVERY_CODE_COUNT, RecoveryCodesConfig,
-    StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams, build_totp_uri,
-    generate_password_hash, generate_recovery_codes, generate_totp_secret, normalize_recovery_code,
-    verify_hotp, verify_password, verify_recovery_code, verify_totp,
+    GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, PepperTooShort, RECOVERY_CODE_COUNT,
+    RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD,
+    TotpAlgorithm, TotpVerifyParams, build_totp_uri, generate_password_hash,
+    generate_password_hash_with_rng, generate_recovery_codes, generate_recovery_codes_peppered,
+    generate_totp_secret, normalize_recovery_code, verify_hotp, verify_password,
+    verify_recovery_code, verify_totp,
 };
 
 // Macros re-exported from axess-macros where they live.

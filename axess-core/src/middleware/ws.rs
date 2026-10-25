@@ -119,6 +119,12 @@ impl RevocationAwareSocket {
     /// The provided `registry`, `user_id`, and `session_id` are moved into
     /// a background task that awaits `registry.watch_revocation`. The
     /// task is cancelled when the wrapper is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime, because the watcher is
+    /// started with `tokio::spawn`. A WebSocket upgrade handler always runs
+    /// inside one.
     pub fn new<R>(socket: WebSocket, registry: R, user_id: UserId, session_id: SessionId) -> Self
     where
         R: SessionRegistry,
@@ -188,7 +194,7 @@ impl RevocationAwareSocket {
     ///
     /// Useful for handlers that need direct access for `split()` or
     /// other axum-specific operations. The revocation watch task is
-    /// dropped (revocation will no longer auto-close).
+    /// aborted (revocation will no longer auto-close).
     pub fn into_inner(self) -> WebSocket {
         self.socket
     }

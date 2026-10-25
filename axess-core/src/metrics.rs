@@ -159,6 +159,45 @@ pub trait AuthnMetrics: Send + Sync + 'static {
     /// policy change, principal revocation). Useful for verifying that
     /// downstream invalidation actually reaches the cache layer.
     fn authz_cache_invalidation(&self) {}
+
+    /// `count` authz entity lookups were found in cache. Called by
+    /// [`EntityCache::flush_metrics`](crate::authz::cache::EntityCache::flush_metrics)
+    /// with a whole reporting window's total, so a counter backend can add
+    /// it in one step. The default calls
+    /// [`authz_cache_hit`](Self::authz_cache_hit) `count` times, so
+    /// an implementation of the per-event method alone keeps working.
+    fn authz_cache_hits(&self, count: u64) {
+        for _ in 0..count {
+            self.authz_cache_hit();
+        }
+    }
+
+    /// `count` authz entity lookups missed. Batched form of
+    /// [`authz_cache_miss`](Self::authz_cache_miss); see
+    /// [`authz_cache_hits`](Self::authz_cache_hits).
+    fn authz_cache_misses(&self, count: u64) {
+        for _ in 0..count {
+            self.authz_cache_miss();
+        }
+    }
+
+    /// `count` entries were evicted by capacity pressure. Batched form of
+    /// [`authz_cache_eviction`](Self::authz_cache_eviction); see
+    /// [`authz_cache_hits`](Self::authz_cache_hits).
+    fn authz_cache_evictions(&self, count: u64) {
+        for _ in 0..count {
+            self.authz_cache_eviction();
+        }
+    }
+
+    /// `count` entries were cleared by invalidation. Batched form of
+    /// [`authz_cache_invalidation`](Self::authz_cache_invalidation); see
+    /// [`authz_cache_hits`](Self::authz_cache_hits).
+    fn authz_cache_invalidations(&self, count: u64) {
+        for _ in 0..count {
+            self.authz_cache_invalidation();
+        }
+    }
 }
 
 /// No-op metrics implementation. Used when no metrics backend is configured.

@@ -30,15 +30,27 @@ pub struct PasswordConfig {
 }
 ```
 
-There are no Argon2 parameters to set, and no pepper. Hashing is the
-`password_auth` crate's `generate_password_hash` / `verify_password`
-pair, which picks recommended Argon2id parameters, generates a fresh
-random salt per hash, and encodes the parameter set into the stored
-hash itself, in PHC string format (the Password Hashing Competition's
-`$argon2id$v=19$m=...` encoding). Verification reads the parameters back out of the stored hash,
-so raising the cost later is a matter of upgrading the crate and
-rehashing on next login. Old hashes keep verifying against the
-parameters they were made with.
+There are no Argon2 parameters to set, and no pepper. Hashing is
+`generate_password_hash` / `verify_password` from `axess-factors`, which
+hash with Argon2id under a fixed parameter set (19 MiB of memory, two
+passes, one lane; the constants `ARGON2_M_COST_KIB`, `ARGON2_T_COST` and
+`ARGON2_P_COST`), draw a fresh 16-byte salt per hash, and encode the
+parameter set into the stored hash itself, in PHC string format (the
+Password Hashing Competition's `$argon2id$v=19$m=...` encoding). The
+parameters are written out in the crate rather than inherited from a
+dependency's defaults, so a dependency release cannot change them.
+Verification reads the parameters back out of the stored hash, so raising
+the cost later is a matter of changing the constants and rehashing on
+next login. Old hashes keep verifying against the parameters they were
+made with.
+
+The service takes the salt from its injected `SecureRng` and runs every
+hash and verification on a blocking pool, so a burst of logins does not
+hold the async runtime's workers. Both are configurable:
+`AuthnServiceBuilder::with_rng` and `with_kdf_executor` (a
+`KdfExecutor` limits concurrent hashes to the CPU count by default;
+`KdfExecutor::inline` runs them on the calling task and counts them, for
+deterministic tests).
 
 That also means the cost is not yours to tune from axess, and the
 answer to "can I use a pepper" is that you would have to apply it
@@ -248,6 +260,21 @@ per code. It returns the codes in display form (`ABCDE-FGHJK`) for the user
 to see exactly once, and a `RecoveryCodesConfig` holding only their
 Argon2id hashes. Persist the config as the user's
 `FactorConfig::RecoveryCodes`; never store or log the display form.
+
+Checking a set stored that way costs up to ten Argon2id runs, which the
+service performs as one blocking job. `generate_recovery_codes_peppered`
+stores each code as an HMAC-SHA256 under a server-side
+`RecoveryCodePepper` instead: the stored form is `hmac-sha256:` followed
+by 64 hex digits, and checking a whole set costs microseconds and no
+hash. Hand the service the same pepper with
+`AuthnServiceBuilder::with_recovery_code_pepper`. A 50-bit code does not
+survive an offline search against a fast hash, so the keyed form is only
+as strong as the pepper staying out of the database: keep at least 32
+random bytes in your secret store, never beside the rows, and expect a
+leaked database without the pepper to reveal nothing usable. A keyed
+row never verifies on a service with no pepper. Rows without the
+`hmac-sha256:` prefix are Argon2id rows and verify as they always did,
+so existing sets keep working and a set may mix both forms.
 
 Offer the codes beside the factor they back up, in one step:
 

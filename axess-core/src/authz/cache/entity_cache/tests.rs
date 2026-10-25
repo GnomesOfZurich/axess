@@ -61,8 +61,10 @@ fn guest_session() -> AuthSession {
         id: SessionId::new(&axess_rng::SystemRng),
         data: SessionData::default(),
         modified: false,
+        needs_persist: false,
         regenerate: false,
         pre_cycle_id: None,
+        rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
     };
@@ -227,4 +229,59 @@ fn fluent_setters_keep_each_others_settings() {
     let clocked = cached.with_clock(Arc::new(MockClock::at(chrono::Utc::now())));
     assert_eq!(clocked.ttl, std::time::Duration::from_secs(5));
     assert_eq!(clocked.capacity, 100);
+}
+
+/// Counts calls into the metrics sink and the totals they carried.
+#[derive(Default)]
+struct BatchMetrics {
+    calls: AtomicUsize,
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl crate::metrics::AuthnMetrics for BatchMetrics {
+    fn authz_cache_hits(&self, count: u64) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.hits.fetch_add(count, Ordering::SeqCst);
+    }
+    fn authz_cache_misses(&self, _: u64) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+    fn authz_cache_evictions(&self, _: u64) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+    fn authz_cache_invalidations(&self, _: u64) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A flush reports each counter in one call whatever the window's total.
+#[tokio::test]
+async fn flush_metrics_reports_totals_in_one_call_per_counter() {
+    let cached = EntityCache::new(CountingProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let (s, p, a, r) = (guest_session(), principal(), action(), doc("d"));
+    for _ in 0..501 {
+        cached.entities_for(&s, &p, &r, &a).await.unwrap();
+    }
+    let sink = BatchMetrics::default();
+    cached.flush_metrics(&sink);
+    assert_eq!(sink.hits.load(Ordering::SeqCst), 500);
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 4);
+}
+
+/// An implementation of the per-event methods alone still sees every event.
+#[test]
+fn per_event_metrics_implementations_receive_batched_totals() {
+    use crate::metrics::AuthnMetrics;
+    #[derive(Default)]
+    struct PerEvent(AtomicUsize);
+    impl AuthnMetrics for PerEvent {
+        fn authz_cache_hit(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let sink = PerEvent::default();
+    sink.authz_cache_hits(7);
+    assert_eq!(sink.0.load(Ordering::SeqCst), 7);
 }

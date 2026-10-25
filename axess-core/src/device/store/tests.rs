@@ -19,6 +19,7 @@ fn d(id: &str, fp: u8, last_seen: DateTime<Utc>) -> Device {
         first_seen_at: last_seen,
         last_seen_at: last_seen,
         revoked_at: None,
+        demoted_at: None,
         bindings: Vec::<DeviceBinding>::new(),
     }
 }
@@ -27,7 +28,10 @@ fn d(id: &str, fp: u8, last_seen: DateTime<Utc>) -> Device {
 async fn save_then_load_round_trips() {
     let store = MemoryDeviceStore::new();
     let device = d("dev-1", 0xaa, Utc::now());
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let loaded = store.load(&t(), &device.id).await.unwrap();
     assert_eq!(loaded, Some(device));
@@ -37,7 +41,10 @@ async fn save_then_load_round_trips() {
 async fn find_by_fingerprint_is_tenant_scoped() {
     let store = MemoryDeviceStore::new();
     let now = Utc::now();
-    store.save(&d("dev-1", 0xaa, now)).await.unwrap();
+    store
+        .save(&d("dev-1", 0xaa, now), crate::device::test_now())
+        .await
+        .unwrap();
 
     let other_tenant = axess_identity::testing::tenant("tenant-2");
     let hit_same = store
@@ -62,8 +69,8 @@ async fn find_for_user_returns_newest_first_and_respects_limit() {
     let t0 = Utc::now();
     let older = d("dev-old", 0x11, t0 - chrono::Duration::days(2));
     let newer = d("dev-new", 0x22, t0 - chrono::Duration::hours(1));
-    store.save(&older).await.unwrap();
-    store.save(&newer).await.unwrap();
+    store.save(&older, crate::device::test_now()).await.unwrap();
+    store.save(&newer, crate::device::test_now()).await.unwrap();
 
     let listed = store.find_for_user(&t(), &u(), 10).await.unwrap();
     assert_eq!(listed.len(), 2);
@@ -79,7 +86,10 @@ async fn record_sighting_touches_last_seen() {
     let store = MemoryDeviceStore::new();
     let initial = Utc::now();
     let device = d("dev-1", 0xaa, initial);
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let later = initial + chrono::Duration::hours(1);
     store
@@ -97,7 +107,10 @@ async fn set_trust_level_to_revoked_stamps_revoked_at() {
     let store = MemoryDeviceStore::new();
     let now = Utc::now();
     let device = d("dev-1", 0xaa, now);
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let revoked_at = now + chrono::Duration::minutes(5);
     store
@@ -118,7 +131,10 @@ async fn set_trust_level_to_non_revoked_clears_revoked_at() {
     let store = MemoryDeviceStore::new();
     let now = Utc::now();
     let device = d("dev-1", 0xaa, now);
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     store
         .set_trust_level(&t(), &device.id, DeviceTrustLevel::Revoked, now)
@@ -138,7 +154,10 @@ async fn set_trust_level_to_non_revoked_clears_revoked_at() {
 async fn delete_removes_both_primary_and_fingerprint_index() {
     let store = MemoryDeviceStore::new();
     let device = d("dev-1", 0xaa, Utc::now());
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     store.delete(&t(), &device.id).await.unwrap();
 
@@ -162,11 +181,17 @@ async fn len_and_is_empty_track_save_and_delete() {
     assert!(store.is_empty());
 
     let now = Utc::now();
-    store.save(&d("dev-1", 0xaa, now)).await.unwrap();
+    store
+        .save(&d("dev-1", 0xaa, now), crate::device::test_now())
+        .await
+        .unwrap();
     assert_eq!(store.len(), 1);
     assert!(!store.is_empty());
 
-    store.save(&d("dev-2", 0xbb, now)).await.unwrap();
+    store
+        .save(&d("dev-2", 0xbb, now), crate::device::test_now())
+        .await
+        .unwrap();
     assert_eq!(store.len(), 2);
     assert!(!store.is_empty());
 
@@ -198,12 +223,18 @@ async fn find_for_user_filters_out_cross_tenant_rows_for_same_user_id() {
     let other_tenant = axess_identity::testing::tenant("tenant-2");
 
     // tenant-1: real device for u.
-    store.save(&d("dev-mine", 0xaa, now)).await.unwrap();
+    store
+        .save(&d("dev-mine", 0xaa, now), crate::device::test_now())
+        .await
+        .unwrap();
     // tenant-2: same user_id, different tenant. The && guard
     // must exclude this from a tenant-1 listing.
     let mut foreign = d("dev-foreign", 0xbb, now);
     foreign.tenant_id = other_tenant;
-    store.save(&foreign).await.unwrap();
+    store
+        .save(&foreign, crate::device::test_now())
+        .await
+        .unwrap();
 
     let listed = store.find_for_user(&t(), &u(), 10).await.unwrap();
     assert_eq!(
@@ -243,12 +274,18 @@ async fn find_active_for_user_excludes_revoked_devices() {
 
     let mut trusted = d("dev-trusted", 0xaa, now);
     trusted.trust_level = DeviceTrustLevel::Trusted;
-    store.save(&trusted).await.unwrap();
+    store
+        .save(&trusted, crate::device::test_now())
+        .await
+        .unwrap();
 
     let mut revoked = d("dev-revoked", 0xbb, now);
     revoked.trust_level = DeviceTrustLevel::Revoked;
     revoked.revoked_at = Some(now);
-    store.save(&revoked).await.unwrap();
+    store
+        .save(&revoked, crate::device::test_now())
+        .await
+        .unwrap();
 
     let active = store.find_active_for_user(&t(), &u(), 10).await.unwrap();
     let ids: Vec<_> = active.iter().map(|d| d.id).collect();
@@ -308,7 +345,10 @@ async fn with_sweep_config_overrides_default_windows() {
     let t0 = Utc::now();
     let mut device = d("dev-trusted", 0xaa, t0);
     device.trust_level = DeviceTrustLevel::Trusted;
-    store.save(&device).await.unwrap();
+    store
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     // Sweep 2s later; past the 1s trusted window.
     let counts = store
@@ -339,41 +379,52 @@ async fn sweep_walks_retention_ladder_and_counts_transitions() {
     let t0 = Utc::now();
     let other_tenant = axess_identity::testing::tenant("tenant-other");
 
-    // Trusted, idle 2 days → demote to Seen (and cascade to
-    // Revoked because seen window is also exceeded; 2 days > 1
-    // day seen_idle as well).
-    let mut trusted = d("dev-trusted", 0xaa, t0 - chrono::Duration::days(2));
+    // Trusted, idle 3 days → demote to Seen, and no further: a row moves
+    // one level per sweep even though 3 days > trusted_idle + seen_idle.
+    let mut trusted = d("dev-trusted", 0xaa, t0 - chrono::Duration::days(3));
     trusted.trust_level = DeviceTrustLevel::Trusted;
-    store.save(&trusted).await.unwrap();
+    store
+        .save(&trusted, crate::device::test_now())
+        .await
+        .unwrap();
 
-    // Seen, idle 2 days → demote to Revoked.
-    let mut seen = d("dev-seen", 0xbb, t0 - chrono::Duration::days(2));
+    // Seen, idle 3 days → demote to Revoked.
+    let mut seen = d("dev-seen", 0xbb, t0 - chrono::Duration::days(3));
     seen.trust_level = DeviceTrustLevel::Seen;
-    store.save(&seen).await.unwrap();
+    store.save(&seen, crate::device::test_now()).await.unwrap();
 
     // Revoked 2 days ago → past the 1-day grace → purge.
     let mut revoked_old = d("dev-revoked-old", 0xcc, t0);
     revoked_old.trust_level = DeviceTrustLevel::Revoked;
     revoked_old.revoked_at = Some(t0 - chrono::Duration::days(2));
-    store.save(&revoked_old).await.unwrap();
+    store
+        .save(&revoked_old, crate::device::test_now())
+        .await
+        .unwrap();
 
     // Revoked just now → still in grace → keep.
     let mut revoked_fresh = d("dev-revoked-fresh", 0xdd, t0);
     revoked_fresh.trust_level = DeviceTrustLevel::Revoked;
     revoked_fresh.revoked_at = Some(t0);
-    store.save(&revoked_fresh).await.unwrap();
+    store
+        .save(&revoked_fresh, crate::device::test_now())
+        .await
+        .unwrap();
 
     // Different tenant, would-be-demoted; must be skipped by
     // the `device.tenant_id != *tenant_id` guard on line 479.
-    let mut foreign = d("dev-foreign", 0xee, t0 - chrono::Duration::days(2));
+    let mut foreign = d("dev-foreign", 0xee, t0 - chrono::Duration::days(3));
     foreign.tenant_id = other_tenant;
     foreign.trust_level = DeviceTrustLevel::Trusted;
-    store.save(&foreign).await.unwrap();
+    store
+        .save(&foreign, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t(), t0).await.unwrap();
 
-    // Trusted → Seen (1) + cascade Seen → Revoked (2 total: the
-    // freshly-demoted and the originally-Seen one).
+    // Trusted → Seen (1); Seen → Revoked (1: only the originally-Seen
+    // one, the freshly-demoted row starts its Seen window now).
     assert_eq!(
         counts.trusted_to_seen, 1,
         "exactly one device crossed the Trusted window in this tenant; \
@@ -381,9 +432,12 @@ async fn sweep_walks_retention_ladder_and_counts_transitions() {
          foreign device or excluding the in-scope one"
     );
     assert_eq!(
-        counts.seen_to_revoked, 2,
-        "Trusted cascade + originally-Seen device demote to Revoked"
+        counts.seen_to_revoked, 1,
+        "only the originally-Seen device is revoked; the demoted one waits"
     );
+    let demoted = store.load(&t(), &trusted.id).await.unwrap().unwrap();
+    assert_eq!(demoted.trust_level, DeviceTrustLevel::Seen);
+    assert_eq!(demoted.demoted_at, Some(t0));
     assert_eq!(
         counts.revoked_purged, 1,
         "only the 2-day-old Revoked is past the 1-day grace; fresh stays"
@@ -432,7 +486,10 @@ async fn sweep_window_boundary_is_strict_greater() {
     // Last seen exactly 60s ago; sit right on the boundary.
     let mut trusted = d("dev-edge", 0xab, t0 - chrono::Duration::seconds(60));
     trusted.trust_level = DeviceTrustLevel::Trusted;
-    store.save(&trusted).await.unwrap();
+    store
+        .save(&trusted, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t(), t0).await.unwrap();
     assert_eq!(
@@ -459,8 +516,9 @@ async fn sweep_window_boundary_is_strict_greater() {
 /// Seen with a wide Trusted-idle window.
 #[tokio::test]
 async fn sweep_seen_idle_boundary_is_strict_greater() {
+    // A never-trusted Seen row is revoked past `seen_idle` = 60 s.
     let cfg = SweepConfig::builder()
-        .trusted_idle(chrono::Duration::days(365))
+        .trusted_idle(chrono::Duration::seconds(1))
         .seen_idle(chrono::Duration::seconds(60))
         .revoked_grace(chrono::Duration::days(7))
         .build();
@@ -469,7 +527,7 @@ async fn sweep_seen_idle_boundary_is_strict_greater() {
 
     let mut seen = d("dev-seen-edge", 0xcd, t0 - chrono::Duration::seconds(60));
     seen.trust_level = DeviceTrustLevel::Seen;
-    store.save(&seen).await.unwrap();
+    store.save(&seen, crate::device::test_now()).await.unwrap();
 
     let counts = store.sweep(&t(), t0).await.unwrap();
     assert_eq!(
@@ -499,7 +557,10 @@ async fn sweep_revoked_grace_boundary_is_strict_greater() {
     let mut revoked = d("dev-revoked-edge", 0xef, t0);
     revoked.trust_level = DeviceTrustLevel::Revoked;
     revoked.revoked_at = Some(t0 - chrono::Duration::seconds(60));
-    store.save(&revoked).await.unwrap();
+    store
+        .save(&revoked, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t(), t0).await.unwrap();
     assert_eq!(
@@ -537,7 +598,10 @@ async fn sweep_seen_revoked_guard_requires_both_conditions() {
     let mut revoked = d("dev-stale-revoked", 0x99, t0 - chrono::Duration::days(2));
     revoked.trust_level = DeviceTrustLevel::Revoked;
     revoked.revoked_at = Some(t0);
-    store.save(&revoked).await.unwrap();
+    store
+        .save(&revoked, crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t(), t0).await.unwrap();
     assert_eq!(
@@ -555,8 +619,14 @@ async fn sweep_seen_revoked_guard_requires_both_conditions() {
 async fn resave_with_new_fingerprint_drops_old_index_entry() {
     let store = MemoryDeviceStore::new();
     let now = Utc::now();
-    store.save(&d("dev-1", 0xaa, now)).await.unwrap();
-    store.save(&d("dev-1", 0xbb, now)).await.unwrap();
+    store
+        .save(&d("dev-1", 0xaa, now), crate::device::test_now())
+        .await
+        .unwrap();
+    store
+        .save(&d("dev-1", 0xbb, now), crate::device::test_now())
+        .await
+        .unwrap();
 
     let old = FingerprintHash::from_bytes([0xaa; 32]);
     assert!(
@@ -582,8 +652,14 @@ async fn resave_with_new_fingerprint_drops_old_index_entry() {
 async fn delete_keeps_index_entry_owned_by_another_device() {
     let store = MemoryDeviceStore::new();
     let now = Utc::now();
-    store.save(&d("dev-1", 0xaa, now)).await.unwrap();
-    store.save(&d("dev-2", 0xaa, now)).await.unwrap();
+    store
+        .save(&d("dev-1", 0xaa, now), crate::device::test_now())
+        .await
+        .unwrap();
+    store
+        .save(&d("dev-2", 0xaa, now), crate::device::test_now())
+        .await
+        .unwrap();
     store.delete(&t(), &d("dev-1", 0xaa, now).id).await.unwrap();
 
     let fp = FingerprintHash::from_bytes([0xaa; 32]);
@@ -603,8 +679,11 @@ async fn sweep_purge_keeps_index_entry_owned_by_another_device() {
     let mut old = d("dev-old", 0xcc, t0 - chrono::Duration::days(1));
     old.trust_level = DeviceTrustLevel::Revoked;
     old.revoked_at = Some(t0 - chrono::Duration::days(1));
-    store.save(&old).await.unwrap();
-    store.save(&d("dev-live", 0xcc, t0)).await.unwrap();
+    store.save(&old, crate::device::test_now()).await.unwrap();
+    store
+        .save(&d("dev-live", 0xcc, t0), crate::device::test_now())
+        .await
+        .unwrap();
 
     let counts = store.sweep(&t(), t0).await.unwrap();
     assert_eq!(counts.revoked_purged, 1);
@@ -621,13 +700,16 @@ async fn find_active_for_user_applies_limit_after_dropping_revoked() {
     let store = MemoryDeviceStore::new();
     let now = Utc::now();
     store
-        .save(&d("active", 0x01, now - chrono::Duration::days(3)))
+        .save(
+            &d("active", 0x01, now - chrono::Duration::days(3)),
+            crate::device::test_now(),
+        )
         .await
         .unwrap();
     for (name, fp, age) in [("rev-1", 0x02, 1), ("rev-2", 0x03, 2)] {
         let mut dev = d(name, fp, now - chrono::Duration::days(age));
         dev.trust_level = DeviceTrustLevel::Revoked;
-        store.save(&dev).await.unwrap();
+        store.save(&dev, crate::device::test_now()).await.unwrap();
     }
     let got = store.find_active_for_user(&t(), &u(), 1).await.unwrap();
     assert_eq!(got.len(), 1);

@@ -99,6 +99,11 @@ step "Documented imports" "$AXESS_DIR/scripts/check-facade-paths.sh"
 # it before the rule was enforced rather than remembered.
 step "Inline test block sizes" "$AXESS_DIR/scripts/check-inline-tests.sh"
 
+# Also sub-second. Production files stay under 800 lines and functions under
+# 150, against a baseline of the offenders that predate the gate, so the
+# numbers only go down.
+step "File and function sizes" "$AXESS_DIR/scripts/check-file-sizes.sh"
+
 # Sub-second too, and the only gate that reads Markdown. `check-doc-links.sh`
 # runs rustdoc and sees Rust intra-doc links; nothing saw the READMEs, which
 # is how a crates.io front page came to link at a chapter that had moved.

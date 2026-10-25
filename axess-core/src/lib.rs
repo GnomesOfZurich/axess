@@ -180,9 +180,13 @@ pub use axess_factors::ldap::{
 #[cfg(feature = "oauth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
 pub use axess_factors::oauth::{
-    AuthUrlResult, MockOAuthProvider, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProvider,
-    OAuthProviderConfig, ResponseMode, UserInfoClaims, spawn_jwks_refresh,
+    AuthUrlResult, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProvider, OAuthProviderConfig,
+    ResponseMode, UserInfoClaims, spawn_jwks_refresh,
 };
+
+#[cfg(all(feature = "oauth", any(test, feature = "testing")))]
+#[cfg_attr(docsrs, doc(cfg(all(feature = "oauth", feature = "testing"))))]
+pub use axess_factors::oauth::MockOAuthProvider;
 
 #[cfg(feature = "fapi")]
 #[cfg_attr(docsrs, doc(cfg(feature = "fapi")))]
@@ -191,21 +195,19 @@ pub use axess_factors::oauth::{DpopProof, FapiConfig, ParResponse, SenderConstra
 #[cfg(feature = "device")]
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
 pub use device::{
-    AttestationClass, CachedDeviceStore, DefaultFingerprintExtractor, Device, DeviceBinding,
-    DeviceEventSink, DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory,
-    DevicePiiMapping, DevicePiiResolver, DevicePiiStore, DeviceResolver, DeviceStore,
-    DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
+    AttestationClass, BindingsUpdate, CachedDeviceStore, DefaultFingerprintExtractor, Device,
+    DeviceBinding, DeviceEventSink, DeviceFingerprintExtractor, DeviceLifecycleService,
+    DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, DeviceResolver,
+    DeviceStore, DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
-    NoopDeviceResolver, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, SweepConfig,
-    SweepConfigBuilder, SweepCounts, TenantPepperResolver, cascade_revoke_by_refresh_family,
-    cascade_revoke_devices,
+    NoopDeviceResolver, OwnerClaim, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, SessionUser,
+    SweepConfig, SweepConfigBuilder, SweepCounts, TenantPepperResolver, TrustTransition,
+    cascade_revoke_by_refresh_family, cascade_revoke_devices,
 };
 
 #[cfg(feature = "device")]
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
-pub use authn::service::{
-    StepUpPolicy, StepUpPolicyBuilder, decide_step_up, decide_step_up_for_user,
-};
+pub use authn::service::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_user};
 
 #[cfg(all(
     feature = "device",
@@ -268,6 +270,8 @@ pub mod store;
 /// Re-exported from [`session::cookies`]; lives next to the session
 /// middleware that is its primary consumer.
 pub use session::cookies;
+/// Where deliberately slow, CPU-bound work (password hashing) runs.
+pub mod blocking;
 /// Composite health-check primitives.
 pub mod health;
 /// HMAC helpers used by the session-layer signing + CSRF middleware.

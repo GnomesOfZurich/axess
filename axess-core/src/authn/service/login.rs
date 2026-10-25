@@ -1,7 +1,8 @@
 //! Login flow: begin_login, prepare_factor, verify_factor, check_session, logout.
 
 use super::outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome};
-use super::verification::{VerifyOutcome, generate_otp_code, verify_credential};
+use super::verification::{VerifyOutcome, generate_otp_code, verify_credential_blocking};
+use crate::authn::types::{Tenant, User};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
@@ -10,6 +11,16 @@ use crate::authn::{
     types::{AuthnScope, EntityState},
 };
 use crate::session::extractor::AuthSession;
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
+/// The method and steps a login begins with.
+struct FirstFactor {
+    method_name: Arc<str>,
+    steps: Vec<FactorStep>,
+    first_kind: FactorKind,
+}
+
 impl<I, F> super::RequestAuthnService<I, F>
 where
     I: IdentityStore,
@@ -42,6 +53,47 @@ where
             return Ok(LoginOutcome::InvalidCredentials);
         }
 
+        let tenant = match self.admit_tenant(identifier, tenant_identifier).await? {
+            ControlFlow::Continue(tenant) => tenant,
+            ControlFlow::Break(outcome) => return Ok(outcome),
+        };
+        let user = match self.find_loginnable_user(identifier, &tenant).await? {
+            ControlFlow::Continue(user) => user,
+            ControlFlow::Break(outcome) => return Ok(outcome),
+        };
+        let first = match self.select_first_factor(&user, &tenant).await? {
+            ControlFlow::Continue(first) => first,
+            ControlFlow::Break(outcome) => return Ok(outcome),
+        };
+
+        // 5. Begin the authentication flow in the session.
+        session
+            .begin_authenticating(user.id, tenant.id, first.method_name, first.steps)
+            .await;
+
+        // Record login attempt event.
+        self.emit_audit(
+            AuthEventBuilder::success(AuthEventType::LoginAttempt)
+                .attributed_to(&user.id, &tenant.id)
+                .with_factor(first.first_kind.clone()),
+        )
+        .await?;
+
+        Ok(LoginOutcome::FactorRequired(first.first_kind))
+    }
+
+    /// Resolve the tenant a login names and admit the request against it.
+    ///
+    /// Breaks with [`LoginOutcome::InvalidCredentials`] for an unknown
+    /// tenant, an invalid tenant row, a tenant whose status bars logins and
+    /// a request the tenant IP policy refuses. Every one of those goes
+    /// through [`reject_pre_user`](Self::reject_pre_user) so their store
+    /// calls and audit rows are indistinguishable from one another.
+    async fn admit_tenant(
+        &self,
+        identifier: &str,
+        tenant_identifier: &str,
+    ) -> Result<ControlFlow<LoginOutcome, Tenant>, AuthnError<I::Error>> {
         // 1. Find tenant. An unknown tenant is a credential failure like
         // any other, not a distinct error: returning `NotActive` here made
         // tenant existence observable, because that variant maps to 403
@@ -63,13 +115,6 @@ where
         {
             Some(t) => t,
             None => {
-                let dummy_tenant =
-                    crate::authn::ids::TenantId::try_new(uuid::Uuid::new_v4().to_string())
-                        .expect("fresh v4 UUID is a valid TenantId");
-                let _ = self
-                    .find_user_with_timing_equalization(identifier, &dummy_tenant)
-                    .await;
-                self.inner.metrics.auth_failure();
                 // Unattributed: there is no tenant and so no user to name.
                 // Emitting anyway is what keeps the audit failure mode from
                 // becoming an enumeration oracle, because an audit-store
@@ -77,24 +122,19 @@ where
                 // user's wrong password. It also closes a SOC blind spot: a
                 // credential-stuffing run against identifiers that do not
                 // exist used to leave no audit row at all.
-                self.emit_audit(
-                    AuthEventBuilder::failure(AuthEventType::LoginAttempt)
-                        .with_error(AuthFailureReason::UnknownTenant),
-                )
-                .await?;
-                return Ok(LoginOutcome::InvalidCredentials);
+                return self
+                    .reject_pre_user(identifier, None, AuthFailureReason::UnknownTenant, false)
+                    .await
+                    .map(ControlFlow::Break);
             }
         };
 
         if let Err(e) = tenant.validate() {
             tracing::error!(error = %e, "IdentityStore returned invalid Tenant");
-            self.inner.metrics.auth_failure();
-            self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
-                    .with_error(AuthFailureReason::InvalidTenantRow),
-            )
-            .await?;
-            return Ok(LoginOutcome::InvalidCredentials);
+            return self
+                .reject_pre_user(identifier, None, AuthFailureReason::InvalidTenantRow, false)
+                .await
+                .map(ControlFlow::Break);
         }
 
         // 1a. Enforce tenant-level status. A Suspended or Terminated
@@ -118,22 +158,34 @@ where
                 status = ?tenant.status,
                 "login rejected: tenant status does not allow login"
             );
-            let dummy_user_tenant =
-                crate::authn::ids::TenantId::try_new(uuid::Uuid::new_v4().to_string())
-                    .expect("fresh v4 UUID is a valid TenantId");
-            let _ = self
-                .find_user_with_timing_equalization(identifier, &dummy_user_tenant)
-                .await;
-            self.inner.metrics.auth_failure();
-            self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
-                    .maybe_attributed_to(None, Some(&tenant.id))
-                    .with_error(AuthFailureReason::NotActive),
-            )
-            .await?;
-            return Ok(LoginOutcome::InvalidCredentials);
+            return self
+                .reject_pre_user(
+                    identifier,
+                    Some(&tenant.id),
+                    AuthFailureReason::NotActive,
+                    false,
+                )
+                .await
+                .map(ControlFlow::Break);
         }
 
+        if let ControlFlow::Break(outcome) =
+            self.enforce_tenant_ip_policy(identifier, &tenant).await?
+        {
+            return Ok(ControlFlow::Break(outcome));
+        }
+        Ok(ControlFlow::Continue(tenant))
+    }
+
+    /// Enforce the tenant IP policy against the address of this request.
+    ///
+    /// Breaks with [`LoginOutcome::InvalidCredentials`] when the address is
+    /// barred, or when the policy restricts and no address was resolved.
+    async fn enforce_tenant_ip_policy(
+        &self,
+        identifier: &str,
+        tenant: &Tenant,
+    ) -> Result<ControlFlow<LoginOutcome>, AuthnError<I::Error>> {
         // 1b. Enforce the tenant IP policy against the address this handle
         // was derived with. Until 0.7.0 the address was a parameter and the
         // check ran only `if let Some(ip)`, so a caller passing `None`
@@ -148,6 +200,10 @@ where
             .ip_policy_for_tenant(&tenant.id)
             .await
             .map_err(AuthnError::Store)?;
+        // Both refusals are answered by `reject_pre_user`, exactly as an
+        // unknown identifier is, so a request from a barred address makes the
+        // same store calls, in the same order, as one from a permitted
+        // address naming a user who does not exist.
         match self.audit.ip_address {
             Some(ip) if !policy.is_allowed(ip) => {
                 tracing::warn!(
@@ -155,8 +211,15 @@ where
                     client_ip = %ip,
                     "login rejected by tenant IP policy"
                 );
-                self.inner.metrics.auth_failure();
-                return Ok(LoginOutcome::InvalidCredentials);
+                return self
+                    .reject_pre_user(
+                        identifier,
+                        Some(&tenant.id),
+                        AuthFailureReason::IpPolicy,
+                        true,
+                    )
+                    .await
+                    .map(ControlFlow::Break);
             }
             // A policy that restricts, and no address to test against it:
             // the only safe reading is that it is not satisfied. An empty
@@ -176,12 +239,32 @@ where
                      client address, so the policy cannot be satisfied; install \
                      axess::client_ip::layer on the router"
                 );
-                self.inner.metrics.auth_failure();
-                return Ok(LoginOutcome::InvalidCredentials);
+                return self
+                    .reject_pre_user(
+                        identifier,
+                        Some(&tenant.id),
+                        AuthFailureReason::IpPolicy,
+                        true,
+                    )
+                    .await
+                    .map(ControlFlow::Break);
             }
             _ => {}
         }
+        Ok(ControlFlow::Continue(()))
+    }
 
+    /// Look the user up and require an account status that allows login.
+    ///
+    /// Breaks with the outcome for an unknown identifier
+    /// ([`LoginOutcome::InvalidCredentials`]) and for a locked account
+    /// ([`LoginOutcome::Locked`]); a non-active, non-locked account is an
+    /// [`AuthnError::NotActive`] error. Each refusal emits its audit row.
+    async fn find_loginnable_user(
+        &self,
+        identifier: &str,
+        tenant: &Tenant,
+    ) -> Result<ControlFlow<LoginOutcome, User>, AuthnError<I::Error>> {
         // 2. Find user with timing equalization; when the identifier is
         // unknown OR the returned User fails validation, the helper
         // still runs the same store queries the happy path would,
@@ -204,7 +287,7 @@ where
                         .with_error(AuthFailureReason::UnknownIdentifier),
                 )
                 .await?;
-                return Ok(LoginOutcome::InvalidCredentials);
+                return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
             }
         };
 
@@ -242,11 +325,22 @@ where
                 } else {
                     None
                 };
-                return Ok(LoginOutcome::Locked { until });
+                return Ok(ControlFlow::Break(LoginOutcome::Locked { until }));
             }
             return Err(AuthnError::NotActive(status));
         }
+        Ok(ControlFlow::Continue(user))
+    }
 
+    /// Pick the user's first available authentication method and its steps.
+    ///
+    /// Breaks with [`LoginOutcome::InvalidCredentials`] when the user has no
+    /// method, or none with a usable step, after emitting the audit row.
+    async fn select_first_factor(
+        &self,
+        user: &User,
+        tenant: &Tenant,
+    ) -> Result<ControlFlow<LoginOutcome, FirstFactor>, AuthnError<I::Error>> {
         // 4. Load available authentication methods.
         let methods = self
             .inner
@@ -272,7 +366,7 @@ where
             .await?;
             // Same answer as an unknown identifier. `NoFlow` here told a
             // caller that the account exists and has nothing configured.
-            return Ok(LoginOutcome::InvalidCredentials);
+            return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
         };
 
         // The method's own steps, choices included: a step offering
@@ -291,25 +385,66 @@ where
                     .with_error(AuthFailureReason::NoFactorsConfigured),
             )
             .await?;
-            return Ok(LoginOutcome::InvalidCredentials);
+            return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
         }
 
         let first_kind = steps[0].primary().cloned().ok_or(AuthnError::NoFlow)?;
+        Ok(ControlFlow::Continue(FirstFactor {
+            method_name: method.name.clone(),
+            steps,
+            first_kind,
+        }))
+    }
 
-        // 5. Begin the authentication flow in the session.
-        session
-            .begin_authenticating(user.id, tenant.id, method.name.clone(), steps)
+    /// Refuse a login attempt that is turned away before any user is known.
+    ///
+    /// Every such refusal, whatever its cause, makes the same store calls in
+    /// the same order as a permitted request naming an identifier that does
+    /// not exist, and answers with the same [`LoginOutcome::InvalidCredentials`]:
+    ///
+    /// 1. `ip_policy_for_tenant`, against the real tenant earlier in the flow
+    ///    when `policy_read` is true, and otherwise here against a throwaway
+    ///    tenant id (the unknown, malformed and suspended tenant refusals
+    ///    never reach the real read);
+    /// 2. the user lookup, `account_status` and `available_methods` against
+    ///    throwaway ids (see [`find_user_with_timing_equalization`](Self::find_user_with_timing_equalization));
+    /// 3. the metric, then one audit row carrying `reason`.
+    ///
+    /// A caller who can tell these refusals apart by latency, or by whether an
+    /// audit row was written, learns whether a tenant exists, is suspended, or
+    /// has an IP allowlist. Lookup errors are discarded for the same reason: a
+    /// store hiccup on the throwaway ids must not show as a different answer.
+    /// No password hash runs on any of these paths, so there is nothing to
+    /// equalize there.
+    ///
+    /// `attributed_tenant` names the tenant on the audit row when there is
+    /// one; an unknown tenant has none.
+    async fn reject_pre_user(
+        &self,
+        identifier: &str,
+        attributed_tenant: Option<&crate::authn::ids::TenantId>,
+        reason: AuthFailureReason,
+        policy_read: bool,
+    ) -> Result<LoginOutcome, AuthnError<I::Error>> {
+        let dummy_tenant = self.dummy_tenant_id();
+        if !policy_read {
+            let _ = self
+                .inner
+                .identity
+                .ip_policy_for_tenant(&dummy_tenant)
+                .await;
+        }
+        let _ = self
+            .find_user_with_timing_equalization(identifier, &dummy_tenant)
             .await;
-
-        // Record login attempt event.
+        self.inner.metrics.auth_failure();
         self.emit_audit(
-            AuthEventBuilder::success(AuthEventType::LoginAttempt)
-                .attributed_to(&user.id, &tenant.id)
-                .with_factor(first_kind.clone()),
+            AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                .maybe_attributed_to(None, attributed_tenant)
+                .with_error(reason),
         )
         .await?;
-
-        Ok(LoginOutcome::FactorRequired(first_kind))
+        Ok(LoginOutcome::InvalidCredentials)
     }
 
     /// Prepare the current factor challenge, if the factor kind requires it.
@@ -382,124 +517,12 @@ where
             | FactorKind::LdapBind
             | FactorKind::RecoveryCode => Ok(PrepareOutcome::Ready),
 
-            FactorKind::EmailOtp => {
-                // Load the EmailOtp config to get the destination and parameters.
-                let user_scope = AuthnScope::User { tenant_id, user_id };
-                let config = self
-                    .inner
-                    .factors
-                    .resolve_factor(&user_scope, FactorKind::EmailOtp)
-                    .await
-                    .map_err(AuthnError::Store)?
-                    .ok_or(AuthnError::NoFlow)?
-                    .config;
-
-                // Take ownership of the inner cfg up front so we don't
-                // need a second destructure (which used to require an
-                // unreachable arm for "config changed kind mid-function").
-                let FactorConfig::EmailOtp(mut cfg) = config else {
-                    return Err(AuthnError::NoFlow);
-                };
-
-                // Cooldown: reject if a pending code hasn't expired yet.
-                // This prevents email bombing; the application can only trigger
-                // one send per TTL window.
-                let now = self.inner.clock.now();
-                if cfg.pending_until.is_some_and(|until| now < until) {
-                    return Ok(PrepareOutcome::AlreadySent {
-                        destination: cfg.email.clone(),
-                    });
-                }
-
-                let email = cfg.email.clone();
-                let code_length = cfg.code_length as usize;
-                let ttl_secs = cfg.ttl_secs;
-
-                // Reject unreasonable code lengths to prevent DoS via
-                // misconfigured factor config.
-                if !(4..=8).contains(&code_length) {
-                    tracing::error!(code_length, "email OTP code_length out of bounds (4–8)");
-                    return Err(AuthnError::NoFlow);
-                }
-
-                // Generate a random numeric code using the injectable RNG.
-                // Wrap in ZeroizedString so it's cleared from memory after use.
-                let code = crate::authn::factor::ZeroizedString::new(generate_otp_code(
-                    &self.inner.rng,
-                    code_length,
-                ));
-
-                // Hash the code with Argon2id for storage.
-                let hash = axess_factors::generate_password_hash(&*code);
-
-                // Compute expiry from config TTL.
-                let expires = now + chrono::Duration::seconds(ttl_secs as i64);
-
-                cfg.pending_hash = Some(crate::authn::factor::ZeroizedString::new(hash));
-                cfg.pending_until = Some(expires);
-
-                // Save to user scope (per-user pending state).
-                self.inner
-                    .factors
-                    .save_factor(&user_scope, FactorConfig::EmailOtp(cfg))
-                    .await
-                    .map_err(AuthnError::Store)?;
-
-                Ok(PrepareOutcome::SendOtp {
-                    code,
-                    destination: email,
-                })
-            }
+            FactorKind::EmailOtp => self.prepare_email_otp(&tenant_id, &user_id).await,
 
             FactorKind::Fido2 => {
                 #[cfg(feature = "fido2")]
                 {
-                    let webauthn = match &self.inner.fido2 {
-                        Some(w) => w,
-                        None => return Ok(PrepareOutcome::Ready),
-                    };
-
-                    // Load stored credentials.
-                    let user_scope = AuthnScope::User { tenant_id, user_id };
-                    let config = self
-                        .inner
-                        .factors
-                        .resolve_factor(&user_scope, FactorKind::Fido2)
-                        .await
-                        .map_err(AuthnError::Store)?
-                        .ok_or(AuthnError::NoFlow)?
-                        .config;
-
-                    let FactorConfig::Fido2(cfg) = &config else {
-                        return Err(AuthnError::NoFlow);
-                    };
-
-                    if cfg.credentials.is_empty() {
-                        return Err(AuthnError::NoFlow);
-                    }
-
-                    // Extract raw passkeys for the ceremony.
-                    let passkeys: Vec<_> =
-                        cfg.credentials.iter().map(|c| c.passkey.clone()).collect();
-
-                    // Start the authentication ceremony.
-                    let (challenge, auth_state) =
-                        webauthn.start_authentication(&passkeys).map_err(|e| {
-                            tracing::warn!("FIDO2 start_passkey_authentication failed: {e:?}");
-                            AuthnError::NoFlow
-                        })?;
-
-                    // Store the ceremony state and timestamp in the session.
-                    let state_json =
-                        serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
-                    session.set_custom(fido2_keys::AUTH_STATE, state_json).await;
-                    self.stamp_ceremony_start(session).await;
-
-                    let challenge_json =
-                        serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
-                    Ok(PrepareOutcome::Fido2Challenge {
-                        challenge: challenge_json,
-                    })
+                    self.prepare_fido2(session, &tenant_id, &user_id).await
                 }
 
                 #[cfg(not(feature = "fido2"))]
@@ -513,6 +536,155 @@ where
                 Ok(PrepareOutcome::Ready)
             }
         }
+    }
+
+    /// Issue an email one-time code for the current `EmailOtp` step.
+    ///
+    /// Refuses while a pending code is still live, draws and hashes a fresh
+    /// code, stores the hash and expiry in the user's factor config and
+    /// hands the plaintext back for the caller to deliver.
+    async fn prepare_email_otp(
+        &self,
+        tenant_id: &crate::authn::ids::TenantId,
+        user_id: &crate::authn::ids::UserId,
+    ) -> Result<PrepareOutcome, AuthnError<I::Error>> {
+        // Load the EmailOtp config to get the destination and parameters.
+        let user_scope = AuthnScope::User {
+            tenant_id: *tenant_id,
+            user_id: *user_id,
+        };
+        let config = self
+            .inner
+            .factors
+            .resolve_factor(&user_scope, FactorKind::EmailOtp)
+            .await
+            .map_err(AuthnError::Store)?
+            .ok_or(AuthnError::NoFlow)?
+            .config;
+
+        // Take ownership of the inner cfg up front so we don't
+        // need a second destructure (which used to require an
+        // unreachable arm for "config changed kind mid-function").
+        let FactorConfig::EmailOtp(mut cfg) = config else {
+            return Err(AuthnError::NoFlow);
+        };
+
+        // Cooldown: reject if a pending code hasn't expired yet.
+        // This prevents email bombing; the application can only trigger
+        // one send per TTL window.
+        let now = self.inner.clock.now();
+        if cfg.pending_until.is_some_and(|until| now < until) {
+            return Ok(PrepareOutcome::AlreadySent {
+                destination: cfg.email.clone(),
+            });
+        }
+
+        let email = cfg.email.clone();
+        let code_length = cfg.code_length as usize;
+        let ttl_secs = cfg.ttl_secs;
+
+        // Reject unreasonable code lengths to prevent DoS via
+        // misconfigured factor config.
+        if !(4..=8).contains(&code_length) {
+            tracing::error!(code_length, "email OTP code_length out of bounds (4–8)");
+            return Err(AuthnError::NoFlow);
+        }
+
+        // Generate a random numeric code using the injectable RNG.
+        // Wrap in ZeroizedString so it's cleared from memory after use.
+        let code = crate::authn::factor::ZeroizedString::new(generate_otp_code(
+            &self.inner.rng,
+            code_length,
+        ));
+
+        // Hash the code with Argon2id for storage, off the executor.
+        // The salt is drawn here, from the injected RNG, so a
+        // deterministic RNG pins the stored hash; only owned bytes
+        // move into the blocking task.
+        let salt = axess_factors::generate_password_salt(&self.inner.rng);
+        let to_hash = zeroize::Zeroizing::new(code.to_string());
+        let hash = self
+            .inner
+            .kdf
+            .run(move || axess_factors::hash_password_with_salt(to_hash.as_str(), &salt))
+            .await?;
+
+        // Compute expiry from config TTL.
+        let expires = now + chrono::Duration::seconds(ttl_secs as i64);
+
+        cfg.pending_hash = Some(crate::authn::factor::ZeroizedString::new(hash));
+        cfg.pending_until = Some(expires);
+
+        // Save to user scope (per-user pending state).
+        self.inner
+            .factors
+            .save_factor(&user_scope, FactorConfig::EmailOtp(cfg))
+            .await
+            .map_err(AuthnError::Store)?;
+
+        Ok(PrepareOutcome::SendOtp {
+            code,
+            destination: email,
+        })
+    }
+
+    /// Start a WebAuthn authentication ceremony for the current `Fido2` step.
+    ///
+    /// Without a configured relying party the step is `Ready`; otherwise the
+    /// ceremony state and its start time go into the session and the
+    /// challenge is returned for the browser.
+    #[cfg(feature = "fido2")]
+    async fn prepare_fido2(
+        &self,
+        session: &AuthSession,
+        tenant_id: &crate::authn::ids::TenantId,
+        user_id: &crate::authn::ids::UserId,
+    ) -> Result<PrepareOutcome, AuthnError<I::Error>> {
+        let webauthn = match &self.inner.fido2 {
+            Some(w) => w,
+            None => return Ok(PrepareOutcome::Ready),
+        };
+
+        // Load stored credentials.
+        let user_scope = AuthnScope::User {
+            tenant_id: *tenant_id,
+            user_id: *user_id,
+        };
+        let config = self
+            .inner
+            .factors
+            .resolve_factor(&user_scope, FactorKind::Fido2)
+            .await
+            .map_err(AuthnError::Store)?
+            .ok_or(AuthnError::NoFlow)?
+            .config;
+
+        let FactorConfig::Fido2(cfg) = &config else {
+            return Err(AuthnError::NoFlow);
+        };
+
+        if cfg.credentials.is_empty() {
+            return Err(AuthnError::NoFlow);
+        }
+
+        // Extract raw passkeys for the ceremony.
+        let passkeys: Vec<_> = cfg.credentials.iter().map(|c| c.passkey.clone()).collect();
+
+        // Start the authentication ceremony.
+        let (challenge, auth_state) = webauthn.start_authentication(&passkeys).map_err(|e| {
+            tracing::warn!("FIDO2 start_passkey_authentication failed: {e:?}");
+            AuthnError::NoFlow
+        })?;
+
+        // Store the ceremony state and timestamp in the session.
+        let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
+        session.set_custom(fido2_keys::AUTH_STATE, state_json).await;
+        self.stamp_ceremony_start(session).await;
+
+        let challenge_json = serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
+        Ok(PrepareOutcome::Fido2Challenge {
+            challenge: challenge_json,
+        })
     }
 
     /// Verify a factor credential during an in-progress authentication flow.
@@ -596,7 +768,15 @@ where
         }
 
         self.inner.metrics.factor_attempt();
-        let outcome = verify_credential(credential, &config, &current_kind, self.inner.clock.now());
+        let outcome = verify_credential_blocking(
+            &self.inner.kdf,
+            credential,
+            &config,
+            &current_kind,
+            self.inner.clock.now(),
+            self.inner.recovery_pepper.as_ref(),
+        )
+        .await?;
 
         if let VerifyOutcome::FailWithUpdate(updated_config) = &outcome {
             self.persist_fail_with_update(&user_scope, current_kind.clone(), updated_config)
@@ -678,6 +858,8 @@ where
 pub(crate) use super::fido2_service::fido2_keys;
 
 #[cfg(test)]
+mod equalization_tests;
+#[cfg(test)]
 mod login_tests;
 #[cfg(test)]
 mod security_tests;
@@ -705,6 +887,19 @@ where
         }
     }
 
+    /// A random v4 UUID drawn from the service's RNG, so a deterministic
+    /// RNG pins the throwaway ids the equalization lookups run against.
+    fn dummy_uuid(&self) -> uuid::Uuid {
+        let mut bytes = [0u8; 16];
+        self.inner.rng.fill_bytes(&mut bytes);
+        uuid::Builder::from_random_bytes(bytes).into_uuid()
+    }
+
+    fn dummy_tenant_id(&self) -> crate::authn::ids::TenantId {
+        crate::authn::ids::TenantId::try_new(self.dummy_uuid().to_string())
+            .expect("a UUID is a valid TenantId")
+    }
+
     /// Look up a user by identifier with timing-equalization on miss.
     ///
     /// Returns `Ok(Some(user))` on a clean find + `validate()`,
@@ -722,7 +917,7 @@ where
     /// side-channel on top of that. This is the same trade-off
     /// Gmail, Microsoft, and most banks accept.
     ///
-    /// The dummy UUID is generated per request so it cannot collide
+    /// The dummy UUID is drawn from the service's RNG per request so it cannot collide
     /// with any real user (including the reserved
     /// [`UserId::system()`](crate::authn::ids::UserId::system)),
     /// preserving timing-equalization semantics regardless of which
@@ -747,27 +942,20 @@ where
             .map_err(AuthnError::Store)?;
 
         if let Some(u) = user_opt {
-            return match u.validate() {
-                Ok(()) => Ok(Some(u)),
-                Err(e) => {
-                    tracing::error!(error = %e, "IdentityStore returned invalid User");
-                    // Validate-fail returns `None` *without* running
-                    // the dummy queries below: the user exists (find_user
-                    // already paid that cost), the observable response
-                    // matches the unknown-user path, and a validate
-                    // failure on a stored row indicates internal data
-                    // corruption, not an attacker-driven enumeration
-                    // probe. Re-evaluate if the threat model changes.
-                    Ok(None)
-                }
-            };
+            match u.validate() {
+                Ok(()) => return Ok(Some(u)),
+                // A stored row that fails validation is answered like an
+                // unknown identifier, including the dummy queries below, so
+                // it costs the same store calls as one.
+                Err(e) => tracing::error!(error = %e, "IdentityStore returned invalid User"),
+            }
         }
 
-        // Unknown identifier; run the same store queries the
-        // happy path would, against a fresh-UUID dummy, to keep
-        // response time independent of identifier existence.
-        let dummy_id = crate::authn::ids::UserId::try_new(uuid::Uuid::new_v4().to_string())
-            .expect("fresh v4 UUID is a valid UserId");
+        // Unknown identifier, or a row that failed validation; run the same
+        // store queries the happy path would, against a fresh-UUID dummy, to
+        // keep response time independent of identifier existence.
+        let dummy_id = crate::authn::ids::UserId::try_new(self.dummy_uuid().to_string())
+            .expect("a UUID is a valid UserId");
         let _ = self.inner.identity.account_status(&dummy_id).await;
         let _ = self
             .inner

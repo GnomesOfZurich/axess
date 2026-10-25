@@ -8,7 +8,7 @@
 
 use crate::session::data::SessionData;
 use crate::session::id::SessionId;
-use axess_rng::SystemRng;
+use axess_rng::SecureRng;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -31,6 +31,13 @@ pub(crate) struct SessionInner {
     pub data: SessionData,
     /// Set to `true` when any field of `data` is changed; triggers a save on response.
     pub(crate) modified: bool,
+    /// Set to `true` when something needs this session to exist beyond the
+    /// request even though its payload is unchanged: the CSRF layer minted a
+    /// token bound to the id, or a handler read the id to key something on it.
+    /// A request that arrived without a session cookie persists its fresh
+    /// session and sets a cookie only when this or `modified` is set; any
+    /// modification implies it.
+    pub(crate) needs_persist: bool,
     /// Set to `true` when the session id has been cycled (or must be cycled
     /// even though the payload is unchanged, e.g. binding-mismatch reset).
     /// Triggers a `store.cycle(pre_cycle_id, id, ...)` on response.
@@ -51,6 +58,17 @@ pub(crate) struct SessionInner {
     /// Maximum custom data size (bytes). Mirrors `SessionConfig::max_custom_bytes`
     /// so `set_custom` can enforce the limit eagerly.
     pub(crate) max_custom_bytes: usize,
+    /// Source of the ids minted by [`rotate_id`](Self::rotate_id); the
+    /// layer shares its own RNG here so a seeded RNG drives every id.
+    pub(crate) rng: Arc<dyn SecureRng>,
+}
+
+impl SessionHandle {
+    /// Record that this session must outlive the request: see
+    /// [`SessionInner::needs_persist`].
+    pub(crate) async fn mark_needs_persist(&self) {
+        self.0.write().await.needs_persist = true;
+    }
 }
 
 impl SessionInner {
@@ -59,8 +77,7 @@ impl SessionInner {
     /// Sets `regenerate = true` so the layer knows to call `store.cycle` on
     /// the way out instead of `store.save`.
     pub(crate) fn rotate_id(&mut self) {
-        let rng = SystemRng;
-        let new_id = SessionId::new(&rng);
+        let new_id = SessionId::new(&*self.rng);
         if self.pre_cycle_id.is_none() {
             self.pre_cycle_id = Some(self.id);
         }

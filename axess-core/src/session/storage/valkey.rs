@@ -14,8 +14,9 @@
 //!
 //! Key rotation is supported: pass both the current key and the previous key.
 //! On load, the store tries the current key first; if decryption fails, it
-//! retries with the previous key. The next save always uses the current key,
-//! so rotated data is transparently re-encrypted on access.
+//! retries with the previous key. A save always uses the current key, so a
+//! row is re-sealed under it when it is next written; a row that is only read
+//! stays under the previous key until it expires.
 //!
 //! # Key layout
 //!
@@ -35,11 +36,9 @@
 //! [`max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
 //! eviction loop in `complete_factor_step` can FIFO-evict (rather than
 //! arbitrary-evict, which an attacker could exploit by spawning a burst
-//! of short-lived sessions to push the legitimate user out). Previously
-//! this used a plain Redis SET (`SADD`/`SISMEMBER`/`SREM`) and never
-//! overrode `active_sessions`, so the trait default `Ok(vec![])` made
-//! `max_sessions_per_user` enforcement silently no-op for every Valkey
-//! deployment.
+//! of short-lived sessions to push the legitimate user out). A plain SET
+//! has no order to enumerate, so `active_sessions` could not honour the
+//! contract and `max_sessions_per_user` would never fire.
 //!
 //! # Usage
 //!
@@ -70,9 +69,14 @@ mod encryption;
 mod internal;
 mod registry;
 mod store;
+mod subscriber;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod ttl_tests;
+#[cfg(test)]
+mod watch_tests;
 
 pub use internal::ValkeyStoreError;
 pub use registry::ValkeySessionRegistry;

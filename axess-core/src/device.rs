@@ -25,17 +25,22 @@
 //! devices.init_schema().await?;
 //!
 //! // 3. opt-in: hot-path cache decorator
-//! let cached_devices = CachedDeviceStore::new(devices, ttl, capacity);
+//! let cached_devices = CachedDeviceStore::new(devices)
+//!     .with_ttl(ttl)
+//!     .with_capacity(capacity);
 //!
-//! // 4. opt-in: lifecycle service (ensure-or-create + promote-on-authn)
-//! let lifecycle = DeviceLifecycleService::new(cached_devices, NoopDeviceEventSink, clock);
+//! // 4. lifecycle service (ensure-or-create + promote-on-authn);
+//! //    audit events are opt-in through `with_event_sink`
+//! let lifecycle = DeviceLifecycleService::new(cached_devices);
 //!
-//! // 5. opt-in: Axum extractor that resolves the device per request
+//! // 5. opt-in: resolver that finds or mints the device per request
 //! let extractor = DefaultFingerprintExtractor::new(per_tenant_pepper);
-//! let resolver  = LifecycleDeviceResolver::new(lifecycle, extractor, clock);
+//! let resolver  = LifecycleDeviceResolver::new(extractor, lifecycle, clock);
 //!
-//! router.layer(SessionLayer::new(sessions, key))
-//!       .layer(resolver);
+//! // 6. hand the resolver to the session layer
+//! let layer = SessionLayer::new(sessions, signing_key)
+//!     .with_device_resolver(resolver);
+//! router.layer(layer);
 //! ```
 
 pub mod cache;
@@ -62,10 +67,10 @@ pub use pii::{
     DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver,
 };
-pub use resolver::{DeviceResolver, NoopDeviceResolver};
+pub use resolver::{DeviceResolver, NoopDeviceResolver, SessionUser};
 pub use store::{
-    DeviceStore, MemoryDeviceStore, MemoryDeviceStoreError, SweepConfig, SweepConfigBuilder,
-    SweepCounts,
+    BindingsUpdate, DeviceStore, MemoryDeviceStore, MemoryDeviceStoreError, OWN_DEVICE_SCAN_LIMIT,
+    OwnerClaim, SweepConfig, SweepConfigBuilder, SweepCounts, TrustTransition,
 };
 pub use types::{AttestationClass, Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 
@@ -74,3 +79,11 @@ pub use types::{AttestationClass, Device, DeviceBinding, DeviceTrustLevel, Finge
 // `Option<DeviceId>` ungated and must not change shape based on whether
 // the `device` feature is enabled. Re-exported here for ergonomic access.
 pub use crate::authn::ids::DeviceId;
+
+/// A fixed instant for tests that write device rows and do not depend on
+/// when the write happens.
+#[cfg(test)]
+pub(crate) fn test_now() -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc.with_ymd_and_hms(2031, 3, 1, 12, 0, 0).unwrap()
+}

@@ -9,8 +9,8 @@
 //! [`OAuthProviderConfig::extract_claims_from_response`].
 
 use super::OAuthProviderConfig;
-use crate::oauth::extract_string_array;
 use crate::oauth::types::*;
+use axess_rng::SecureRng;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,22 +52,28 @@ impl OAuthProvider for OAuthProviderConfig {
         // - audience binding when supplied
         // The back-channel logout handler's downstream `aud_contains`
         // check is now redundant defense rather than the only one.
-        use crate::jwt::validation::{ALLOWED_ALGORITHMS, JwtError, verify_jwt_signature};
+        use crate::jwt::validation::{ALLOWED_ALGORITHMS, JwtError, ValidationConfig, verify_jwt};
 
         // Recover from a poisoned lock. The data may be stale, but
         // verification will simply fail with a "no matching kid"
         // error and trigger a refresh.
-        let handle = self.jwks_cache.handle();
+        let handle = self.jwks_cache.fresh_handle().map_err(|e| match e {
+            crate::oidc::OidcError::JwksExpired { .. } => OAuthError::JwksExpired,
+            other => OAuthError::Discovery(other.to_string()),
+        })?;
         let jwks_guard = handle.read().unwrap_or_else(|poisoned| {
             tracing::warn!("JWKS RwLock was poisoned; recovering for read");
             poisoned.into_inner()
         });
 
-        verify_jwt_signature(
+        let mut config = ValidationConfig::new();
+        config.audience = Some(self.client_id.as_str().to_string());
+        verify_jwt(
             token,
             &jwks_guard,
-            Some(self.client_id.as_str()),
+            &config,
             ALLOWED_ALGORITHMS,
+            &*self.clock,
         )
         .map_err(|e| match e {
             JwtError::UnknownKid(kid) => OAuthError::UnknownKid(kid),
@@ -160,99 +166,10 @@ impl OAuthProvider for OAuthProviderConfig {
                 .await
                 .map_err(|e| OAuthError::TokenExchange(format!("{e}")))?;
 
-            // Refresh token responses may include a new ID token. If they do,
-            // we validate it (but without nonce verification since the refresh
-            // flow has no nonce). If no ID token is returned, the refresh only
-            // renewed the access token; we cannot extract OIDC claims.
-            use openidconnect::{OAuth2TokenResponse, TokenResponse};
-
-            let id_token = token_response.id_token().ok_or_else(|| {
-                OAuthError::IdTokenValidation(
-                    "no ID token in refresh response; IdP may not return ID tokens on refresh"
-                        .to_string(),
-                )
-            })?;
-
-            let client_for_verify = self.make_client();
-            let verifier = client_for_verify.id_token_verifier();
-
-            // Preserve raw JWT for RP-Initiated Logout.
-            // See `extract_claims_from_response`; call IdToken's
-            // `ToString` impl directly rather than the fragile
-            // serde_json round-trip.
-            let raw_id_token: Option<String> = Some(id_token.to_string());
-
-            // Skip nonce verification for refresh: the nonce was validated
-            // during the original login. Refresh responses typically don't
-            // include a nonce, or include the same one from the original flow.
-            // Passing a closure that accepts any nonce (or none) satisfies the
-            // NonceVerifier trait.
-            let claims = id_token
-                .claims(&verifier, |_: Option<&openidconnect::Nonce>| Ok(()))
-                .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
-
-            // Re-bind `iss` to the originally-configured issuer.
-            // openidconnect's verifier validates `iss` against the metadata
-            // it was constructed with, but in a MITM scenario where the
-            // attacker can sit between us and the token endpoint AND can
-            // also offer a JWKS-trusted key signing a different `iss`, the
-            // refresh response could quietly switch issuers. Compare the
-            // claim against the metadata-resolved issuer we cached at
-            // discovery time.
-            let configured_iss = self.metadata.issuer().as_str();
-            let claim_iss = claims.issuer().as_str();
-            if claim_iss != configured_iss {
-                return Err(OAuthError::IdTokenValidation(format!(
-                    "refresh-response iss `{claim_iss}` does not match \
-                     configured provider issuer `{configured_iss}`"
-                )));
-            }
-
-            let subject = claims.subject().to_string();
-            let email = claims.email().map(|e| e.as_str().to_string());
-            let email_verified = claims.email_verified();
-            let name = {
-                let localized = claims.name();
-                localized
-                    .and_then(|n| n.get(None))
-                    .map(|n| n.as_str().to_string())
-            };
-
-            let additional_claims = serde_json::to_value(claims)
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-
-            let groups = extract_string_array(&additional_claims, "groups");
-            let roles = extract_string_array(&additional_claims, "roles");
-            let oidc_sid = additional_claims
-                .get("sid")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Zeroize bearer-class tokens.
-            use crate::secret::ZeroizedString;
-            let new_access_token = Some(ZeroizedString::new(
-                OAuth2TokenResponse::access_token(&token_response)
-                    .secret()
-                    .to_string(),
-            ));
-            let new_refresh_token = OAuth2TokenResponse::refresh_token(&token_response)
-                .map(|t| ZeroizedString::new(t.secret().to_string()));
-
-            Ok(OAuthClaims {
-                provider: self.name.clone(),
-                subject,
-                email,
-                email_verified,
-                name,
-                groups,
-                roles,
-                access_token: new_access_token,
-                refresh_token: new_refresh_token
-                    .or_else(|| Some(ZeroizedString::new(refresh_token.to_string()))),
-                oidc_sid,
-                id_token_hint: raw_id_token.map(ZeroizedString::new),
-                additional_claims,
+            self.with_fresh_keys(|client| {
+                self.claims_from_refresh_response(client, &token_response, refresh_token)
             })
+            .await
         })
     }
 
@@ -277,24 +194,29 @@ impl OAuthProvider for OAuthProviderConfig {
                 .map_err(|e| OAuthError::TokenExchange(format!("{e}")))?;
 
             self.extract_claims_from_response(&token_response, &nonce)
+                .await
         })
     }
 
-    fn build_auth_url(&self, options: &OAuthLoginOptions) -> Result<AuthUrlResult, OAuthError> {
-        use openidconnect::{
-            CsrfToken, Nonce, PkceCodeChallenge, Scope, core::CoreAuthenticationFlow,
-        };
+    fn build_auth_url(
+        &self,
+        options: &OAuthLoginOptions,
+        rng: &dyn SecureRng,
+    ) -> Result<AuthUrlResult, OAuthError> {
+        use openidconnect::{Scope, core::CoreAuthenticationFlow};
 
-        let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
+        let secrets = super::ceremony::mint(rng);
+        let csrf_state = secrets.csrf_state;
+        let nonce = secrets.nonce;
 
         let client = self.make_client();
         let mut auth_request = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
-                CsrfToken::new_random,
-                Nonce::new_random,
+                move || csrf_state,
+                move || nonce,
             )
-            .set_pkce_challenge(pkce_challenge);
+            .set_pkce_challenge(secrets.pkce_challenge);
 
         for scope in &self.scopes {
             auth_request = auth_request.add_scope(Scope::new(scope.clone()));
@@ -319,15 +241,16 @@ impl OAuthProvider for OAuthProviderConfig {
             auth_url,
             csrf_state.secret().clone(),
             nonce.secret().clone(),
-            pkce_verifier.secret().to_string(),
+            secrets.pkce_verifier.secret().to_string(),
         ))
     }
 
     fn build_auth_url_par<'a>(
         &'a self,
         options: &'a OAuthLoginOptions,
+        rng: &'a dyn SecureRng,
     ) -> Pin<Box<dyn Future<Output = Result<AuthUrlResult, OAuthError>> + Send + 'a>> {
-        Box::pin(super::fapi_flow::build_auth_url_par(self, options))
+        Box::pin(super::fapi_flow::build_auth_url_par(self, options, rng))
     }
 
     fn fapi_config(&self) -> Option<&FapiConfig> {
@@ -348,8 +271,17 @@ impl OAuthProvider for OAuthProviderConfig {
         http_url: &str,
         access_token: Option<&str>,
         key_seed: [u8; 32],
+        iat: i64,
+        jti_bytes: [u8; 16],
     ) -> Result<DpopProof, OAuthError> {
-        super::fapi_flow::generate_dpop_proof(http_method, http_url, access_token, key_seed)
+        super::fapi_flow::generate_dpop_proof(
+            http_method,
+            http_url,
+            access_token,
+            key_seed,
+            iat,
+            jti_bytes,
+        )
     }
 
     fn build_end_session_url(

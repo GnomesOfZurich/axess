@@ -19,8 +19,10 @@
 //!
 //! 1. Extracts the `Authorization: Bearer <token>` header.
 //! 2. Decodes the JWT header to find the `kid`.
-//! 3. Verifies the signature against the issuer's JWKS (cached).
-//! 4. Validates standard claims (`exp`, `iss`, `aud`).
+//! 3. Verifies the signature against the key set configured for the issuer
+//!    (a snapshot the caller refreshes; the layer does not fetch or cache).
+//! 4. Validates standard claims (`exp`, `nbf` against the configured
+//!    [`Clock`](axess_clock::Clock), `iss`, `aud`).
 //! 5. Inserts a [`WorkloadIdentity`] into request extensions.
 //!
 //! Requests without a bearer token pass through unchanged (the layer is
@@ -34,7 +36,8 @@
 //! need cookie-based session state; the JWT *is* the credential on every
 //! request. There is no session store interaction.
 
-use crate::jwt::validation::{self, ALLOWED_ALGORITHMS, JwtError};
+use crate::jwt::validation::{self, ALLOWED_ALGORITHMS, JwtError, ValidationConfig};
+use axess_clock::{Clock, SystemClock};
 use jsonwebtoken::jwk::JwkSet;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -97,12 +100,42 @@ pub struct BearerIssuerConfig {
 // ── BearerConfig ─────────────────────────────────────────────────────────────
 
 /// Configuration for the bearer token middleware.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BearerConfig {
     /// Trusted issuers. A token is accepted if its `iss` matches any
     /// issuer in this list AND the signature verifies against that
     /// issuer's JWKS.
     pub issuers: Vec<BearerIssuerConfig>,
+    /// Clock `exp` and `nbf` are judged against. [`SystemClock`] unless
+    /// replaced through [`with_clock`](Self::with_clock).
+    clock: Arc<dyn Clock>,
+}
+
+impl BearerConfig {
+    /// Configuration trusting `issuers`, judging token lifetimes on the
+    /// system clock.
+    pub fn new(issuers: Vec<BearerIssuerConfig>) -> Self {
+        Self {
+            issuers,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    /// Judge `exp` and `nbf` against `clock`. Pass a `MockClock` to drive
+    /// token expiry deterministically.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+}
+
+impl std::fmt::Debug for BearerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerConfig")
+            .field("issuers", &self.issuers)
+            .finish_non_exhaustive()
+    }
 }
 
 // ── Validation logic ─────────────────────────────────────────────────────────
@@ -137,11 +170,14 @@ pub fn validate_bearer_token(
         .ok_or_else(|| BearerError::UntrustedIssuer(iss.to_string()))?;
 
     // Verify signature against the issuer's JWKS.
-    let claims = validation::verify_jwt_signature(
+    let mut validation_config = ValidationConfig::new();
+    validation_config.audience = issuer_cfg.audience.clone();
+    let claims = validation::verify_jwt(
         token,
         &issuer_cfg.jwks,
-        issuer_cfg.audience.as_deref(),
+        &validation_config,
         ALLOWED_ALGORITHMS,
+        &*config.clock,
     )
     .map_err(|e| BearerError::Jwt(JwtVerificationError::from(e)))?;
 
@@ -242,6 +278,16 @@ pub struct BearerTokenLayer {
 impl BearerTokenLayer {
     /// Create a new bearer token layer with the given configuration.
     pub fn new(config: BearerConfig) -> Self {
+        Self {
+            config: Arc::new(config),
+        }
+    }
+
+    /// Judge `exp` and `nbf` against `clock`, replacing the one the
+    /// configuration carried.
+    #[must_use]
+    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
+        let config = (*self.config).clone().with_clock(clock);
         Self {
             config: Arc::new(config),
         }

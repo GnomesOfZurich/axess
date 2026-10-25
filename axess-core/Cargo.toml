@@ -37,7 +37,7 @@ base64 = { workspace = true }
 cedar-policy = { version = "4.14.0", optional = true }
 chrono = { workspace = true, features = ["serde"] }
 dashmap = { version = "6.2.1", features = ["serde"] }
-fred = { version = "10.1.0", features = ["transactions", "i-std", "i-cluster", "blocking-encoding", "replicas"], optional = true }
+fred = { version = "10.1.0", features = ["transactions", "i-std", "i-cluster", "i-scripts", "blocking-encoding", "replicas"], optional = true }
 hmac = { workspace = true }
 # No backend here either: see axess-factors' note. The adopter picks with
 # `jwt-aws-lc` or `jwt-rust-crypto`, which this crate passes through.
@@ -100,12 +100,13 @@ zeroize = { workspace = true }
 # dev-deps overrides so `cargo test` sees `axess_clock::testing::MockClock`
 # etc. without forcing production builds to compile the mocks.
 axess-clock = { workspace = true, features = ["testing"] }
+axess-factors = { workspace = true, features = ["testing"] }
 axess-identity = { workspace = true, features = ["testing"] }
 axess-rng = { workspace = true, features = ["testing"] }
 base32 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 http-body-util = "0.1.5"
-hyper = { version = "1.11.1", features = ["full"] }
+hyper = { version = "1.12.0", features = ["full"] }
 proptest = { workspace = true }
 # rcgen mints X509-SVID certs with SPIFFE URIs in SAN for mTLS resolver tests.
 rcgen = "0.14.10"
@@ -151,6 +152,7 @@ memory = []
 # feature-gated `testing` surface (uniform-gate workspace policy).
 testing = [
     "memory",
+    "axess-factors/testing",
     "axess-clock/testing",
     "axess-rng/testing",
     "axess-identity/testing",

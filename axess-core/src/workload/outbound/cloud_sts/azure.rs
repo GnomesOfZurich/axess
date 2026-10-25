@@ -51,12 +51,21 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use url::Url;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::authn::factor::ZeroizedString;
+
+/// Time allowed to establish a connection, on the default HTTP client.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for one token request from send to last response byte,
+/// unless [`AzureFicClient::with_timeout`] says otherwise.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -101,6 +110,15 @@ impl std::fmt::Debug for AzureFicRequest {
             .field("federated_token", &"[redacted]")
             .field("scopes", &self.scopes)
             .finish()
+    }
+}
+
+impl Drop for AzureFicRequest {
+    /// Zeroes the federated token's buffer. Copies made by `Clone` are
+    /// each zeroed when they drop; the form body reqwest builds from the
+    /// token is beyond this type's reach.
+    fn drop(&mut self) {
+        self.federated_token.zeroize();
     }
 }
 
@@ -180,11 +198,16 @@ pub enum AzureFicError {
 ///
 /// One client per (tenant, application). Construct at startup and
 /// reuse: `clone()` is cheap (`Arc`-backed reqwest client).
+///
+/// Every token request is bounded by a timeout (30 seconds by default,
+/// [`with_timeout`](Self::with_timeout)), whichever HTTP client is used,
+/// and the default client also bounds connection setup to 10 seconds.
 #[derive(Clone)]
 pub struct AzureFicClient {
     token_endpoint: Arc<Url>,
     client_id: String,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 impl AzureFicClient {
@@ -198,8 +221,19 @@ impl AzureFicClient {
         Self {
             token_endpoint: Arc::new(token_endpoint_for_tenant(tenant.as_ref())),
             client_id: client_id.into(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Bound each token request to `timeout` (default 30 seconds). The
+    /// bound applies to the request whichever HTTP client is configured.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Override the token endpoint URL. Use for Azure sovereign
@@ -246,16 +280,20 @@ impl AzureFicClient {
             .http
             .post((*self.token_endpoint).clone())
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .timeout(self.timeout)
             .form(&form)
             .send()
             .await
             .map_err(|e| AzureFicError::Transport(e.to_string()))?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AzureFicError::Transport(e.to_string()))?;
+        // The success body carries the access token, so it is zeroed on drop.
+        let body = Zeroizing::new(
+            response
+                .text()
+                .await
+                .map_err(|e| AzureFicError::Transport(e.to_string()))?,
+        );
 
         if !status.is_success() {
             return Err(parse_azure_error(status.as_u16(), &body));

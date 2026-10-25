@@ -73,7 +73,7 @@ pub type AuthUrlResult = (url::Url, String, String, String);
 /// Abstraction over OAuth/OIDC token operations.
 ///
 /// Production: implemented by [`OAuthProviderConfig`](super::super::OAuthProviderConfig) (uses real HTTP).
-/// Tests: [`MockOAuthProvider`](super::super::MockOAuthProvider) (configurable responses, no HTTP).
+/// Tests: `MockOAuthProvider`, behind the `testing` feature (configurable responses, no HTTP).
 ///
 /// This trait covers the HTTP-dependent parts of the OAuth flow so that
 /// tests can replace them with deterministic behavior.
@@ -127,8 +127,16 @@ pub trait OAuthProvider: Send + Sync + 'static {
 
     /// Build an authorization URL for the OAuth flow.
     ///
+    /// The PKCE verifier, the CSRF state and the nonce are drawn from `rng`,
+    /// so a seeded generator reproduces them exactly.
+    ///
     /// Returns `(authorization_url, csrf_state, nonce, pkce_verifier)`.
-    fn build_auth_url(&self, options: &OAuthLoginOptions) -> Result<AuthUrlResult, OAuthError> {
+    fn build_auth_url(
+        &self,
+        options: &OAuthLoginOptions,
+        rng: &dyn axess_rng::SecureRng,
+    ) -> Result<AuthUrlResult, OAuthError> {
+        let _ = rng;
         // Default rejects without inspecting the options; adopters override
         // to actually construct the URL. Include a hint about what was
         // rejected so the error log carries a forensics breadcrumb.
@@ -251,12 +259,14 @@ pub trait OAuthProvider: Send + Sync + 'static {
     ///
     /// Like `build_auth_url`, but sends the authorization parameters to the
     /// PAR endpoint server-to-server first, then returns a minimal redirect URL
-    /// containing only `client_id` and the opaque `request_uri`.
+    /// containing only `client_id` and the opaque `request_uri`. The PKCE
+    /// verifier, the CSRF state and the nonce are drawn from `rng`.
     ///
     /// Returns `(authorization_url, csrf_state, nonce, pkce_verifier)`.
     fn build_auth_url_par<'a>(
         &'a self,
         _options: &'a OAuthLoginOptions,
+        _rng: &'a dyn axess_rng::SecureRng,
     ) -> Pin<Box<dyn Future<Output = Result<AuthUrlResult, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             Err(OAuthError::Config(
@@ -287,16 +297,21 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// returned JWT in the `DPoP` header of the HTTP request.
     ///
     /// `key_seed` supplies 32 bytes of entropy used to derive the ephemeral
-    /// ES256 key. Production callers should fill it from the application's
-    /// [`SecureRng`](axess_rng::SecureRng); this preserves the
-    /// DST contract (deterministic FAPI tests) and keeps `OsRng` use out
-    /// of trait implementations.
+    /// ES256 key, `jti_bytes` the 16 random bytes behind the proof's `jti`
+    /// (rendered as a version-4 UUID), and `iat` is the Unix second the
+    /// proof claims to be issued at. Production callers fill the bytes
+    /// from the application's [`SecureRng`](axess_rng::SecureRng) and take
+    /// `iat` from its [`Clock`](axess_clock::Clock); an implementation
+    /// reads neither a random source nor a clock of its own, so the same
+    /// arguments give the same proof.
     fn generate_dpop_proof(
         &self,
         _http_method: &str,
         _http_url: &str,
         _access_token: Option<&str>,
         _key_seed: [u8; 32],
+        _iat: i64,
+        _jti_bytes: [u8; 16],
     ) -> Result<DpopProof, OAuthError> {
         Err(OAuthError::Config(
             "DPoP not supported by this provider".to_string(),

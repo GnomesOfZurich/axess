@@ -42,10 +42,19 @@
 //!
 //! [`DeviceStore`]: super::store::DeviceStore
 
-use crate::authn::ids::DeviceId;
+use crate::authn::ids::{DeviceId, UserId};
 use axum::http::request::Parts;
 use std::future::Future;
 use std::pin::Pin;
+
+/// The user a session has fully authenticated, placed in the request
+/// extensions by the session layer before a [`DeviceResolver`] runs.
+///
+/// Absent for a guest and for a session part-way through a login, so a
+/// resolver that reads it never attributes a device to a user who has
+/// not proved who they are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionUser(pub UserId);
 
 /// Resolve (or create) the [`DeviceId`] associated with an inbound HTTP
 /// request.

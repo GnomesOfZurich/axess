@@ -60,9 +60,14 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// registry holds the pre-cycle id while the cookie carries the
     /// post-cycle one. See the internal `SessionInner::rotate_id` helper.
     ///
-    /// Implementations MUST perform the delete and insert atomically (single
-    /// transaction) so a crash mid-cycle never leaves the user with both
-    /// rows or neither.
+    /// Implementations MUST write the new row before the old row is removed,
+    /// and MUST NOT remove the old row when the write fails, so a failed
+    /// rotation leaves the user with their old session rather than neither.
+    /// Transactional backends (SQL) do both in one transaction so a crash
+    /// mid-cycle never leaves both rows or neither; a backend without
+    /// multi-key atomicity that preserves the order (Valkey) may leave both
+    /// rows after a crash, which the orphan window below bounds. Writing the
+    /// new id must be idempotent: a retry of the same rotation succeeds.
     ///
     /// # Orphan window
     ///
@@ -256,6 +261,17 @@ pub trait SessionRevoker: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
+/// What the registry can say about one session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLiveness {
+    /// The registry holds the session as valid.
+    Valid,
+    /// The registry answered and does not hold the session as valid.
+    Gone,
+    /// The registry could not answer (an error), so nothing is known.
+    Unknown,
+}
+
 /// Dyn-safe full handle for the session registry. Adds session
 /// registration + validity-check + active-session listing on top of
 /// [`SessionRevoker`].
@@ -267,6 +283,29 @@ pub trait SessionRegistryHandle: SessionRevoker {
         user_id: &'a crate::authn::ids::UserId,
         session_id: &'a SessionId,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+    /// Three-way liveness of a session: [`SessionLiveness::Gone`] only when
+    /// the registry answered that the session is not valid, and
+    /// [`SessionLiveness::Unknown`] when it could not answer. Bookkeeping
+    /// that drops state for ended sessions acts on `Gone` alone.
+    ///
+    /// The default cannot tell an error from a negative answer, because
+    /// [`is_valid`](Self::is_valid) fails closed with `false`; it reports
+    /// `Unknown` for `false`. [`SessionRegistryAdapter`] overrides it with the
+    /// exact answer.
+    fn liveness<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        session_id: &'a SessionId,
+    ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>> {
+        Box::pin(async move {
+            if self.is_valid(user_id, session_id).await {
+                SessionLiveness::Valid
+            } else {
+                SessionLiveness::Unknown
+            }
+        })
+    }
 
     /// Register a session under the user. Returns `true` on success,
     /// `false` on registry error. Callers that *require* the registry
@@ -326,6 +365,27 @@ impl<T: SessionRegistry + 'static> SessionRevoker for SessionRegistryAdapter<T> 
 }
 
 impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdapter<T> {
+    fn liveness<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+        session_id: &'a SessionId,
+    ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>> {
+        Box::pin(async move {
+            match self.0.is_valid(user_id, session_id).await {
+                Ok(true) => SessionLiveness::Valid,
+                Ok(false) => SessionLiveness::Gone,
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        error = %e,
+                        "session registry liveness check failed; treating as unknown"
+                    );
+                    SessionLiveness::Unknown
+                }
+            }
+        })
+    }
+
     fn is_valid<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,

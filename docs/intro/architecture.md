@@ -276,6 +276,12 @@ The default `ClockTtlCache` takes a `Clock` trait and is DST-clean. If
 your test suite runs against the default configuration, you are inside
 the determinism envelope.
 
+A second carve-out is axum's `IntoResponse` for `AuthnError`, behind the
+`default-error-response` feature. The trait method takes no arguments, so
+it reads the wall clock to compute `Retry-After`. Anything that holds a
+clock calls `AuthnError::into_response_at(clock.now())`, which is
+deterministic, and the trait impl is only the convenience path.
+
 ## Storage backends
 
 Identity persistence is adopter-owned. Axess does not prescribe a user

@@ -10,8 +10,8 @@
 //!
 //! # Module layout
 //!
-//! - `password`: Argon2id hashing/verification re-exports from
-//!   `password_auth` (`password` feature).
+//! - `password`: Argon2id hashing (explicit parameters, injectable salt) and
+//!   verification through `argon2` (`password` feature).
 //! - `hotp`: HOTP per RFC 4226 with SHA-1 / SHA-256 / SHA-512
 //!   variants (`hotp` feature).
 //! - `totp`: TOTP per RFC 6238, secret generation, and `otpauth://`
@@ -125,7 +125,11 @@ pub mod social;
 pub mod totp;
 
 #[cfg(feature = "password")]
-pub use password::{PasswordConfig, PasswordRules, generate_password_hash, verify_password};
+pub use password::{
+    PasswordConfig, PasswordRules, PasswordVerifyError, generate_password_hash,
+    generate_password_hash_with_rng, generate_password_salt, hash_password_with_salt,
+    verify_password,
+};
 
 #[cfg(feature = "hotp")]
 pub use hotp::{HOTP_LENGTH, HotpAlgorithm, HotpConfig, verify_hotp};
@@ -140,8 +144,9 @@ pub use totp::{
 pub use email_otp::EmailOtpConfig;
 #[cfg(feature = "recovery_code")]
 pub use recovery_code::{
-    GeneratedRecoveryCodes, RECOVERY_CODE_ALPHABET, RECOVERY_CODE_COUNT, RECOVERY_CODE_LENGTH,
-    RecoveryCodesConfig, StoredRecoveryCode, generate_recovery_codes, normalize_recovery_code,
+    GeneratedRecoveryCodes, PepperTooShort, RECOVERY_CODE_ALPHABET, RECOVERY_CODE_COUNT,
+    RECOVERY_CODE_LENGTH, RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode,
+    generate_recovery_codes, generate_recovery_codes_peppered, normalize_recovery_code,
     verify_recovery_code,
 };
 
@@ -161,7 +166,10 @@ pub use ldap::{
 pub use mtls::{MtlsError, MtlsResolver, PeerCertChain, SpiffeIdComponents, peek_spiffe};
 
 #[cfg(feature = "oidc")]
-pub use oidc::{Discovery, DiscoveryDocument, JwksCache, MIN_JWKS_REFRESH_INTERVAL, OidcError};
+pub use oidc::{
+    DEFAULT_JWKS_MAX_AGE, Discovery, DiscoveryDocument, JwksCache, MIN_JWKS_REFRESH_INTERVAL,
+    OidcError,
+};
 
 #[cfg(feature = "bearer")]
 pub use bearer::{

@@ -140,6 +140,17 @@ use webauthn_rs::prelude::*;
 /// 5 minutes). No server-side network calls are involved, so no HTTP timeout
 /// is needed.
 ///
+/// # Declared determinism exception
+///
+/// [`DefaultFido2Provider`] delegates to `webauthn-rs`, which draws challenge
+/// bytes from the thread RNG and checks attestation validity against the
+/// system clock; neither can be injected through its API. Everything axess
+/// itself decides around a ceremony (its timeout, timestamps, the credential
+/// list) uses the service's injected `Clock`. A test
+/// that needs a reproducible ceremony substitutes the provider:
+/// [`MockFido2Provider`] returns configured outcomes with no randomness and
+/// no clock.
+///
 /// # Limitations (webauthn-rs 0.6)
 ///
 /// The `Webauthn` struct hardcodes `UserVerificationPolicy::Required` in

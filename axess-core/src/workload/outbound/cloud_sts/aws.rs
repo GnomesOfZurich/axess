@@ -60,11 +60,19 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use url::Url;
+
+/// Time allowed to establish a connection, on the default HTTP client.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time allowed for one request from send to last response byte, unless
+/// `with_timeout` on the client says otherwise.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::authn::factor::ZeroizedString;
 
@@ -252,10 +260,14 @@ pub enum AwsStsError {
 ///
 /// Clone is cheap (the underlying [`reqwest::Client`] is `Arc`-backed
 /// internally); construct once at startup and reuse across requests.
+///
+/// Every call is bounded by a timeout (30 seconds by default,
+/// [`with_timeout`](Self::with_timeout)), whichever HTTP client is used.
 #[derive(Clone)]
 pub struct AwsStsClient {
     endpoint: Arc<Url>,
     http: reqwest::Client,
+    timeout: Duration,
 }
 
 impl Default for AwsStsClient {
@@ -270,7 +282,11 @@ impl AwsStsClient {
     pub fn new() -> Self {
         Self {
             endpoint: Arc::new(default_endpoint()),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
+            timeout: DEFAULT_REQUEST_TIMEOUT,
         }
     }
 
@@ -282,10 +298,17 @@ impl AwsStsClient {
         self
     }
 
-    /// Override the HTTP client: useful for timeout / proxy / outbound
-    /// mTLS configuration.
+    /// Override the HTTP client: useful for proxy or outbound mTLS
+    /// configuration. The request timeout applies whichever client is used.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
+        self
+    }
+
+    /// Bound each call to `timeout` (default 30 seconds). The bound applies
+    /// to the request whichever HTTP client is configured.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -307,6 +330,7 @@ impl AwsStsClient {
             .http
             .post((*self.endpoint).clone())
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .timeout(self.timeout)
             .form(&form)
             .send()
             .await

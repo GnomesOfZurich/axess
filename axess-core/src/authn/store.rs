@@ -175,6 +175,21 @@ pub trait IdentityLookup: Send + Sync + 'static {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<Option<User>, Self::Error>> + Send;
 
+    /// The tenant `user_id` belongs to, or `Ok(None)` when no such user
+    /// exists. Called on every request by the session validator's tenant
+    /// cross-check, which needs nothing else about the user.
+    ///
+    /// The default loads the whole user through
+    /// [`get_user`](Self::get_user). Override it with a query that selects
+    /// only the tenant column when a user row is wide or a read crosses a
+    /// network.
+    fn get_user_tenant(
+        &self,
+        user_id: &UserId,
+    ) -> impl std::future::Future<Output = Result<Option<TenantId>, Self::Error>> + Send {
+        async move { Ok(self.get_user(user_id).await?.map(|u| u.tenant_id)) }
+    }
+
     /// Look up a user by ID, requiring the result's `tenant_id` to match
     /// `expected_tenant`. Returns `Ok(None)` when the user does not exist
     /// OR when the user exists in a different tenant; the caller cannot
@@ -427,24 +442,14 @@ pub trait IdentityAdmin: IdentityAuthnLog {
     /// with user-identifying columns pseudonymised. After `Ok(())`,
     /// `get_user` / `find_user` / `account_status` MUST report the user
     /// gone and any in-flight session MUST fail its next `is_valid`
-    /// check. The default impl panics so a missing override surfaces
-    /// loudly the first time an admin tries to honour an erasure
-    /// request; production backends serving EU/UK users MUST override.
+    /// check. There is no default body: a backend that cannot erase does
+    /// not compile, instead of panicking the first time an admin honours an
+    /// erasure request. The in-memory backend and the sqlite example show
+    /// the set of rows to delete.
     fn delete_user(
         &self,
         user_id: &UserId,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        let _ = user_id;
-        async {
-            unimplemented!(
-                "IdentityAdmin::delete_user is required for GDPR Article 17 \
-                 (right to erasure). Override this method on your backend to \
-                 delete the user row, factor configs, refresh tokens, sessions, \
-                 and password history. See the trait method docs for the full \
-                 contract."
-            )
-        }
-    }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 // ── IdentityStore (umbrella) ─────────────────────────────────────────────────
@@ -499,9 +504,8 @@ pub trait IdentityPasswordReset: IdentityLookup {
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Look up the stored hash for `user_id`, compare it against
-    /// `token_hash` in **constant time**, check the expiry, and delete the
-    /// row on a successful match so the token is single-use.
+    /// Compare the stored hash for `user_id` with `token_hash` in **constant time**, deleting the
+    /// row on a match (single-use). Expired means `expires_at <= now`, the caller's clock reading.
     ///
     /// Return `Ok(false)` for absent, expired and mismatched alike; the
     /// caller does not distinguish them and neither should the response.
@@ -509,6 +513,7 @@ pub trait IdentityPasswordReset: IdentityLookup {
         &self,
         user_id: &UserId,
         token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 }
 
@@ -609,6 +614,13 @@ impl<L: IdentityLookup> IdentityLookup for NoopAuthnLog<L> {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<Option<User>, Self::Error>> + Send {
         self.0.get_user(user_id)
+    }
+
+    fn get_user_tenant(
+        &self,
+        user_id: &UserId,
+    ) -> impl std::future::Future<Output = Result<Option<TenantId>, Self::Error>> + Send {
+        self.0.get_user_tenant(user_id)
     }
 
     fn find_tenant(

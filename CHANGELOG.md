@@ -10,6 +10,213 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.11.0] - 2026-10-25
+
+### Changed (breaking)
+
+- **`DeviceStore` requires `set_trust_level_if`, `replace_bindings`,
+  `claim_owner` and `find_by_fingerprint_for_user`; `save`, `replace_bindings`
+  and `claim_owner` take the time of the write.** All are conditional writes
+  in every backend.
+- **`Device` carries `demoted_at`.** SQL stores need an `ALTER TABLE` and a
+  `CREATE INDEX` (module docs); Valkey rows carry it in the blob.
+- **Device sightings are written at most once per `sighting_granularity`**
+  (default five minutes).
+- **`record_sighting` and `set_trust_level` answer `NotFound`** for a missing
+  device. `ValkeyDeviceStoreError` gains `NotFound`, `Contended`,
+  `UnexpectedScriptReply`.
+- **Valkey device rows expire by the full ladder** and are sealed to their key.
+- **MySQL device and session tables**: ids and `family_id` are `utf8mb4_bin`,
+  `devices.bindings` and `sessions.data` are `MEDIUMTEXT` (module docs carry
+  the `ALTER`s).
+- **`decide_step_up` is removed**; use `decide_step_up_for_user`.
+- **Session and device blobs are sealed to their row**; old blobs read and
+  reseal on save. `SessionCrypto::encrypt` and `decrypt` are deprecated for
+  `encrypt_with_aad` and `decrypt_with_aad`.
+- **`SessionStore::cycle` on Valkey is one server-side step.**
+- **`ArchiveSink::archive_batch` takes an `ArchiveBatchId`**;
+  `AuditRetentionSource::EventId` must implement `Display`.
+- **`AuditLogWithAnalytics::new` returns `(Self, AnalyticsWorker)`**; events
+  queue on a bounded channel the caller drains (`with_capacity`, `flush`,
+  `shutdown`, `dropped_events`).
+- **`verify_recovery_code` takes `Option<&RecoveryCodePepper>`**; a keyed row
+  without a pepper fails closed.
+- **`verify_password` returns `PasswordVerifyError`** (`Malformed`,
+  `Mismatch`). `password-auth` is removed; `argon2` 0.6 hashes and verifies
+  with the same parameters and output.
+- **`AuthnError::Internal` and `AuthFailureReason::IpPolicy` are new
+  variants.** An IP-denied login writes an audit row.
+- **`OAuthProvider::build_auth_url` and `build_auth_url_par` take `&dyn
+  SecureRng`; `generate_dpop_proof` takes `iat` and `jti_bytes`;
+  `begin_grant` takes the RNG.** `complete_grant_at(.., now)` is added.
+- **`BearerConfig::new(issuers)` with `with_clock`; `BearerTokenLayer::with_clock`.**
+  `verify_jwt_signature` is test-only.
+- **`SidMap` is a struct** with an insertion-ordered queue and an
+  `(issuer, user)` index; `AuthnService::sid_map()` returns it. Capacity
+  eviction drops the mapping without ending the session; TTL pruning ends at
+  most 128 sessions per login.
+- **`verify_logout_jwt` requires `exp`.**
+- **`RateLimitConfig` has a public `clock` field.** Windows are clock
+  milliseconds; one sweep per `max(window / 8, 1 s)`; at 262,144 buckets a new
+  key answers 429 with `Retry-After`. The 64K soft cap is gone.
+- **`TraceContextLayer` is a struct** (`TraceContextLayer::new()`).
+- **`RefreshTokenConfig::hash_pepper` is `Option<Zeroizing<Vec<u8>>>`**, read
+  through `pepper()`.
+- **Social login sets the User-Agent on the default client only.**
+- **Features:** `oauth` enables `axess-rng`, `subtle`, `chrono`; `fapi`
+  enables `sha2`.
+- **`CsrfIssuer::token` is the token after rotating a session in a handler**;
+  `CsrfToken` keeps the pre-rotation value for that request.
+
+- **`IdentityPasswordReset::verify_reset_token(user_id, token_hash, now)`**
+  judges expiry on the instant passed. `MockIdentityStore::with_clock` is gone.
+- **SQL session stores keep the session as bytes** in a new nullable
+  `data_bin` column (BLOB, BYTEA, LONGBLOB); loads read it first and fall back
+  to the legacy text, rewriting on the next save. The `ALTER` is required
+  before the new release serves a request (module docs).
+- **A cookieless request stores a session and sets a cookie only when
+  something needs it**: a modification, a CSRF token shipped, or
+  `AuthSession::session_id()` read.
+- **`AuditRetentionPolicy::delete_archive_after`, `with_delete_archive_after`
+  and `keep_archive_forever` are removed**; the policy is two-stage and the
+  cold sink owns its own expiry.
+- **`MockOAuthProvider` is behind axess-factors' `testing` feature**, forwarded
+  by core's and the facade's `testing`.
+- **Cached JWKS keys expire.** `JwksCache::with_max_age` (default 24 h);
+  `fresh_handle` refuses an older key set with `OidcError::JwksExpired` and
+  `OAuthError::JwksExpired` until a refresh succeeds; ID-token, refresh-token
+  and logout-token verification all read the refreshable key set and retry
+  once after a refresh on an unknown kid or an expired set.
+  `AuthnServiceBuilder::with_jwks_refresh(interval)` and
+  `with_default_jwks_refresh()` (1 h) start the loop with the service and stop
+  it with the last clone; without the loop, keys expire by `max_age` and
+  verification fails closed.
+- **`SidMap` carries a subject registry** keyed by issuer and subject that
+  every OAuth login enters, with or without a `sid`; a `sub`-only back-channel
+  logout ends sid-less and capacity-evicted logins through it. Capacity
+  eviction never forgets a live session.
+- **`SessionRegistryHandle::liveness` (`SessionLiveness::{Valid, Gone,
+  Unknown}`)** is a provided method; the adapter maps a registry error to
+  `Unknown`, and only `Gone` lets a subject entry be forgotten.
+- **`IdentityAdmin::delete_user` has no default body.** A backend that cannot
+  erase does not compile.
+- **`SocialProvider::exchange_code` returns a `ZeroizedString`**, zeroed on
+  drop; it derefs to `str`.
+
+### Added
+
+- `axess::blocking::KdfExecutor` and `AuthnServiceBuilder::with_kdf_executor`:
+  Argon2 runs on blocking threads behind a CPU-count semaphore, inline under
+  tests.
+- Keyed recovery codes: `RecoveryCodePepper`, `generate_recovery_codes_peppered`,
+  `with_recovery_code_pepper`; verified in constant time with no Argon2.
+- Injected RNG: `SessionLayer::with_rng`, `CsrfConfig::rng`,
+  `LifecycleDeviceResolver::with_rng`, `EncryptedDelegatedCredentialStore::with_rng`,
+  `TraceContextLayer::with_rng`, `RngUuidGenerator`, `PiiToken::mint(&dyn
+  SecureRng)`, `MemoryDevicePiiStore::with_rng`.
+- Injected clock: `JwksCache::with_clock`, `OAuthProviderConfig::with_clock`
+  (reaching openidconnect's ID-token checks), `MockOAuthProvider::with_clock`,
+  `MemoryRefreshTokenStore::with_clock`,
+  `InMemoryBackend::with_clock`; `impl Clock for Arc<C>`.
+- `AuthnService::refresh_all_jwks()` and
+  `axess_factors::oauth::refresh_providers_jwks`.
+- `SignedRequests::max_remembered(n)` (default 100,000); 503 when full.
+- `IdentityLookup::get_user_tenant`; `require_valid_session` reads only it.
+- `RequestEntityProvider::shared_entities_for -> Arc<Entities>`; both caches
+  return the cached `Arc`, `require_authz!` calls it.
+- `AuthnMetrics::authz_cache_{hits,misses,evictions,invalidations}(count)`.
+- Delegated sessions share one HTTP client; refresh is single-flight per
+  tenant, user and provider.
+- `AzureFicClient::with_timeout` (30 s default); `AzureFicRequest` zeroes its
+  token on drop.
+- `AwsStsClient::with_timeout`, `GcpStsClient::with_timeout` and
+  `GcpServiceAccountImpersonator::with_timeout` (30 s default, 10 s connect
+  timeout on the default client); the bound applies whichever HTTP client is
+  supplied.
+- `MAX_ID_TOKEN_BYTES` (1 MiB).
+- Public: `TrustTransition`, `BindingsUpdate`, `OwnerClaim`, `ArchiveBatchId`,
+  `SessionUser`, `JtiLog`, `OWN_DEVICE_SCAN_LIMIT`, `axess::validation`.
+- Test support: `testing::CallLog` with `with_call_log` on both mock stores,
+  `MockIdentityStore::delete_user`, `user_record_at`, `tenant_record_at`,
+  `test_session_with_rng`, `LocalIdpFixture::mint_at`, `mint_jwt_svid_at`.
+- `scripts/check-file-sizes.sh`: files at most 800 lines, functions at most
+  150, baselined.
+
+- `IdentityAdmin::delete_user` implemented by `InMemoryBackend` (every row
+  naming the user; `with_session_registry` ends the sessions too) and by the
+  sqlite example.
+- `SessionCodec::decode_row` and `encode_bytes`; `SharedSubscriber` behind
+  the Valkey registry: revocation watchers share one subscriber connection,
+  the last watcher out quits it.
+- `DEFAULT_JWKS_MAX_AGE`, `DEFAULT_JWKS_REFRESH_INTERVAL`, `JwksCache::ensure_fresh`.
+- `SidMap::register_subject_session`, `take_subject_sessions`,
+  `forget_subject_session`, `sweep_subject_candidates`, `subject_len`.
+
+### Fixed
+
+- ID-token verification keys refresh: a token signed with a key the IdP
+  rotated in after discovery verifies after one refresh, and an unpublished
+  key is refused after exactly one.
+- A registry outage no longer drops live subject entries from the sid map.
+- Argon2 no longer runs on the async executor.
+- Every pre-user refusal of `begin_login` makes the same store calls in the
+  same order and leaves one audit row.
+- Session ids, CSRF nonces, trace and request ids, envelope nonces, device
+  ids, PKCE verifiers, states, nonces and DPoP `iat`/`jti` come from the
+  injected RNG and clock.
+- Bearer, ID-token, logout-token and delegated-refresh lifetimes are judged on
+  the injected clock.
+- Valkey device writes are compare-and-swap; concurrent bindings edits,
+  promotions and passkey writes no longer undo a revocation.
+- A Trusted device idle past 90 days is demoted, a demoted device is revoked 30
+  days later, a never-trusted device after 30 idle days, in every store.
+- A device created during a guest request is owned by its first user.
+- A password reset enforces the tenant's password rules.
+- A retried audit batch is written once; the retention loop rests a full
+  interval between ticks; the filesystem archive writes a batch all or none.
+- A retention of `Duration::MAX` keeps everything; analytics receive an event
+  only after its regulatory write succeeded.
+- The rate limiter, the signed-request replay cache and the DPoP `jti` cache
+  no longer scan their tables on every request.
+- `require_valid_session` no longer loads the whole user.
+- Valkey device reads use one `MGET` per 512 members and prune expired
+  members.
+- The sid map is pruned in bounded batches by insertion order; back-channel
+  logout by subject uses an index.
+- DPoP proof generation installs the JWT crypto provider before signing.
+- The DPoP proof is parsed once; `at_hash` and `ath` compare in constant time;
+  HOTP compares codes numerically; LDAP bind and search are bounded by
+  `connection_timeout`; TOTP secret bytes, the CSRF key and the refresh pepper
+  are wiped.
+- `set_custom` on a non-object session bag no longer panics.
+- Session rotation on SQLite and Postgres upserts before deleting; Valkey
+  TTLs under one second store as one second; the session registry prunes
+  expired members.
+- `require_authz!` keeps a `::`-namespaced entity type whole, refuses a
+  placeholder in the type position and authorizes a route with no path
+  parameters.
+- Deleting a device no longer drops another device's fingerprint lookup; a
+  device carrying the same refresh family twice saves;
+  `find_active_for_user` filters revoked devices before its limit.
+- An audit failure on OAuth login ends the session and drops its `sid`
+  mapping; a `sub`-only back-channel logout ends only the sending issuer's
+  sessions.
+- The JWKS cache keeps its keys on an empty refresh and backs off five seconds
+  after a failed one.
+- `url_with_redirect_query` matches the parameter name; cache entries expire
+  at exactly `insert + ttl`; `Issuer::custom` refuses every built-in name;
+  `begin_signup` stores the user in the tenant it validated; passkey writes
+  commit through `compare_and_save_factor`.
+- The public health message names no component.
+- Docs match the code: provisioning, step-up defaults, the FIDO2 and
+  `into_response` clock exceptions, the detach semantics of the JWKS refresh
+  and archive handles, the local IdP TTL cap, the device composition recipe.
+- The testing mocks hold the traits' contracts; the examples require a
+  session, validate on the server, escape IdP values and bind Keycloak to
+  loopback.
+
+---
+
 ## [0.10.0] - 2026-10-25
 
 ### Changed (breaking)
@@ -81,13 +288,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - **A zero JWKS refresh interval ended the refresh task.**
   `MemoryStore::prune_expired` underflowed. The first form after a session id
   change failed on submit.
-
-### Known
-
-- `DeviceStore` has no atomic update: `promote_on_authn` and
-  `bind_webauthn_credential` can overwrite a concurrent revocation.
-- The default device resolver supplies no user, so the ownership rule needs
-  an adopter-supplied resolver or `ensure_device` with the user.
 
 ---
 

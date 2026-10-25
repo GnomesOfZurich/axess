@@ -31,6 +31,7 @@ fn build_device(t: &TenantId, u: &UserId, d: &DeviceId) -> Device {
         first_seen_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         last_seen_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
         revoked_at: None,
+        demoted_at: None,
         bindings: Vec::new(),
     }
 }
@@ -39,7 +40,10 @@ fn build_device(t: &TenantId, u: &UserId, d: &DeviceId) -> Device {
 async fn load_caches_after_first_hit() {
     let inner = MemoryDeviceStore::new();
     let (t, u, d) = ids();
-    inner.save(&build_device(&t, &u, &d)).await.unwrap();
+    inner
+        .save(&build_device(&t, &u, &d), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     // First load; cache miss → populates.
@@ -71,7 +75,10 @@ async fn load_does_not_cache_none_results() {
 async fn save_invalidates_and_repopulates() {
     let inner = MemoryDeviceStore::new();
     let (t, u, d) = ids();
-    inner.save(&build_device(&t, &u, &d)).await.unwrap();
+    inner
+        .save(&build_device(&t, &u, &d), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     // Warm cache.
@@ -80,7 +87,10 @@ async fn save_invalidates_and_repopulates() {
     // Mutate via cached store: trust-level promotion.
     let mut updated = build_device(&t, &u, &d);
     updated.trust_level = DeviceTrustLevel::Trusted;
-    cached.save(&updated).await.unwrap();
+    cached
+        .save(&updated, crate::device::test_now())
+        .await
+        .unwrap();
 
     // Next load returns the new value (no stale cached version).
     let loaded = cached.load(&t, &d).await.unwrap().unwrap();
@@ -95,7 +105,10 @@ async fn save_invalidates_and_repopulates() {
 async fn set_trust_level_invalidates_cached_row() {
     let inner = MemoryDeviceStore::new();
     let (t, u, d) = ids();
-    inner.save(&build_device(&t, &u, &d)).await.unwrap();
+    inner
+        .save(&build_device(&t, &u, &d), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(cached.load(&t, &d).await.unwrap()); // warm
@@ -118,7 +131,10 @@ async fn set_trust_level_invalidates_cached_row() {
 async fn delete_invalidates_and_subsequent_load_is_none() {
     let inner = MemoryDeviceStore::new();
     let (t, u, d) = ids();
-    inner.save(&build_device(&t, &u, &d)).await.unwrap();
+    inner
+        .save(&build_device(&t, &u, &d), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(cached.load(&t, &d).await.unwrap()); // warm
@@ -137,7 +153,10 @@ async fn record_sighting_does_not_invalidate() {
     // and would defeat the cache. This test pins that contract.
     let inner = MemoryDeviceStore::new();
     let (t, u, d) = ids();
-    inner.save(&build_device(&t, &u, &d)).await.unwrap();
+    inner
+        .save(&build_device(&t, &u, &d), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(cached.load(&t, &d).await.unwrap()); // warm
@@ -161,7 +180,10 @@ async fn find_by_fingerprint_does_not_prime_by_id_cache() {
     let (t, u, d) = ids();
     let device = build_device(&t, &u, &d);
     let fp = device.fingerprint_hash;
-    inner.save(&device).await.unwrap();
+    inner
+        .save(&device, crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(
@@ -207,13 +229,17 @@ async fn refresh_cascade_revocation_propagates_through_cache() {
             first_seen_at: now,
             last_seen_at: now,
             revoked_at: None,
+            demoted_at: None,
             bindings: vec![DeviceBinding::Refresh {
                 family_id: "fam-stolen".to_string(),
                 issued_at: now,
                 last_used_at: now,
             }],
         };
-        inner.save(&device).await.unwrap();
+        inner
+            .save(&device, crate::device::test_now())
+            .await
+            .unwrap();
     }
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
@@ -260,8 +286,14 @@ async fn invalidate_all_drops_every_entry() {
     let u = crate::authn::ids::testing::user("u1");
     let d1 = crate::authn::ids::testing::device("d1");
     let d2 = crate::authn::ids::testing::device("d2");
-    inner.save(&build_device(&t1, &u, &d1)).await.unwrap();
-    inner.save(&build_device(&t2, &u, &d2)).await.unwrap();
+    inner
+        .save(&build_device(&t1, &u, &d1), crate::device::test_now())
+        .await
+        .unwrap();
+    inner
+        .save(&build_device(&t2, &u, &d2), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(cached.load(&t1, &d1).await.unwrap());
@@ -291,8 +323,14 @@ async fn invalidate_tenant_drops_only_matching_entries() {
     let u = crate::authn::ids::testing::user("u1");
     let d1 = crate::authn::ids::testing::device("d1");
     let d2 = crate::authn::ids::testing::device("d2");
-    inner.save(&build_device(&t1, &u, &d1)).await.unwrap();
-    inner.save(&build_device(&t2, &u, &d2)).await.unwrap();
+    inner
+        .save(&build_device(&t1, &u, &d1), crate::device::test_now())
+        .await
+        .unwrap();
+    inner
+        .save(&build_device(&t2, &u, &d2), crate::device::test_now())
+        .await
+        .unwrap();
 
     let cached = CachedDeviceStore::new(inner.clone()).with_clock(fixed_clock() as _);
     drop(cached.load(&t1, &d1).await.unwrap());

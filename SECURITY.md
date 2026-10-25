@@ -288,7 +288,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 |---|---|
 | `AuthEvent` regulatory audit trail | Six device-identity event variants + the full authn event surface. |
 | `AuthnMetrics` | 17-method trait (counters + timers) with no-op defaults. |
-| `AuditArchiver` + `AuditRetentionPolicy` | Hot / cold tiering with three-stage retention (90d / 7d / never defaults). `FilesystemAuditArchiver` reference impl behind `audit-archive-fs`. |
+| `AuditArchiver` + `AuditRetentionPolicy` | Hot / cold tiering with two-stage retention (90d / 7d defaults, the cold sink owns its own expiry). `FilesystemAuditArchiver` reference impl behind `audit-archive-fs`. |
 | `AuthnAnalyticsSink` + `RichAuthnEvent` | Denormalised analytics path parallel to the regulatory `AuthEvent`. serde + rkyv derives for Apache Iggy / ClickHouse / DuckDB / Snowflake. |
 | `TracingCapture` | Test subscriber for asserting on emitted `tracing` events. |
 

@@ -8,13 +8,77 @@ use std::collections::HashMap;
 use axess_core::authz::{AuthzError, make_entity_uid};
 use cedar_policy::EntityUid;
 
+/// A path parameter was not valid UTF-8 once percent-decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidPathParam;
+
+/// Path parameters of the matched route, percent-decoded.
+///
+/// A request that carries no routing information (a bare service, a
+/// fallback) has no parameters, which is an empty map and not an error. Only
+/// a parameter that is not valid UTF-8 once decoded is an error.
+pub async fn path_params(
+    parts: &mut axess_core::axum::http::request::Parts,
+) -> Result<HashMap<String, String>, InvalidPathParam> {
+    use axess_core::axum::extract::{
+        FromRequestParts, RawPathParams, rejection::RawPathParamsRejection,
+    };
+    match RawPathParams::from_request_parts(parts, &()).await {
+        Ok(raw) => Ok(raw
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()),
+        Err(RawPathParamsRejection::MissingPathParams(_)) => Ok(HashMap::new()),
+        Err(_) => Err(InvalidPathParam),
+    }
+}
+
+/// Index of the `:` that separates the entity type from the id in a
+/// resource template: the first colon that is not half of a `::`.
+const fn type_id_separator(template: &str) -> Option<usize> {
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                i += 2;
+                continue;
+            }
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Compile-time check used by `require_authz!`: the type part of the
+/// resource template must not contain a `{placeholder}`, so a request value
+/// can only ever become the entity id.
+pub const fn assert_resource_type_is_literal(template: &str) {
+    let Some(end) = type_id_separator(template) else {
+        return;
+    };
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < end {
+        assert!(
+            bytes[i] != b'{' && bytes[i] != b'}',
+            "require_authz! resource type must be a literal; only the id part may use placeholders"
+        );
+        i += 1;
+    }
+}
+
 /// Build the principal, action and resource UIDs for `require_authz!`.
 ///
 /// The resource template is split into `Type:id` *before* path parameters are
-/// substituted, so a parameter value can never move the split point. Every UID
-/// is built through [`make_entity_uid`], which stores the id as an opaque
-/// string: quotes, backslashes and `\u{..}` escapes in a user id or path
-/// parameter stay data and cannot become another principal or resource.
+/// substituted, at the first `:` that is not half of a `::` (so a namespaced
+/// type such as `Sub::Doc:{id}` keeps its whole namespace). Only the id part
+/// is interpolated: a placeholder in the type part is refused, so a request
+/// value can never choose the entity type. Every UID is built through
+/// [`make_entity_uid`], which stores the id as an opaque string: quotes,
+/// backslashes and `\u{..}` escapes in a user id or path parameter stay data
+/// and cannot become another principal or resource.
 pub fn build_uids(
     namespace: &str,
     action: &str,
@@ -22,21 +86,27 @@ pub fn build_uids(
     params: &HashMap<String, String>,
     user_id: &str,
 ) -> Result<(EntityUid, EntityUid, EntityUid), AuthzError> {
-    let (type_template, id_template) = resource_template.split_once(':').ok_or_else(|| {
+    let split = type_id_separator(resource_template).ok_or_else(|| {
         AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` must be 'TypeName:id' shape"
         ))
     })?;
-    if let Some(name) = unknown_placeholder(resource_template, params) {
+    let (resource_type, id_template) =
+        (&resource_template[..split], &resource_template[split + 1..]);
+    if resource_type.contains(['{', '}']) {
+        return Err(AuthzError::InvalidEntityUid(format!(
+            "resource template `{resource_template}` has a placeholder in its type; only the id may come from the request"
+        )));
+    }
+    if let Some(name) = unknown_placeholder(id_template, params) {
         return Err(AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` names path parameter `{name}`, which the route does not have"
         )));
     }
-    let resource_type = interpolate_path_params(type_template, params);
     let resource_id = interpolate_path_params(id_template, params);
     let principal = make_entity_uid(namespace, "User", user_id)?;
     let action = make_entity_uid(namespace, "Action", action)?;
-    let resource = make_entity_uid(namespace, &resource_type, &resource_id)?;
+    let resource = make_entity_uid(namespace, resource_type, &resource_id)?;
     Ok((principal, action, resource))
 }
 
@@ -138,6 +208,58 @@ mod tests {
         let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1").unwrap();
         assert_eq!(resource.type_name().to_string(), "App::Doc");
         assert_eq!(resource.id().unescaped(), "Admin:1");
+    }
+
+    #[test]
+    fn namespaced_type_keeps_its_whole_namespace() {
+        let p = params(&[("id", "d1")]);
+        let (_, _, r) = build_uids("Gnomes", "Read", "Sub::Document:{id}", &p, "u1").unwrap();
+        assert_eq!(r.type_name().to_string(), "Gnomes::Sub::Document");
+        assert_eq!(r.id().unescaped(), "d1");
+    }
+
+    #[test]
+    fn two_level_namespace_argument_is_kept() {
+        let p = params(&[("id", "d1")]);
+        let (principal, action, r) =
+            build_uids("Gnomes::Sub", "Read", "Document:{id}", &p, "u1").unwrap();
+        assert_eq!(r.type_name().to_string(), "Gnomes::Sub::Document");
+        assert_eq!(principal.type_name().to_string(), "Gnomes::Sub::User");
+        assert_eq!(action.type_name().to_string(), "Gnomes::Sub::Action");
+    }
+
+    #[test]
+    fn path_value_with_double_colon_or_quote_cannot_change_the_type() {
+        for value in ["Admin::Root", r#"x"::A::"y"#, "A::B:C", "::"] {
+            let p = params(&[("id", value)]);
+            let (_, _, r) = build_uids("App", "Read", "Doc:{id}", &p, "u1").unwrap();
+            assert_eq!(r.type_name().to_string(), "App::Doc", "{value}");
+            assert_eq!(r.id().unescaped(), value);
+        }
+    }
+
+    #[test]
+    fn placeholder_in_the_type_position_is_refused() {
+        let p = params(&[("kind", "Admin"), ("id", "1")]);
+        assert!(build_uids("App", "Read", "{kind}:{id}", &p, "u1").is_err());
+        assert!(build_uids("App", "Read", "Pre{kind}:{id}", &p, "u1").is_err());
+        assert!(build_uids("App", "Read", "Doc:{id}", &p, "u1").is_ok());
+    }
+
+    #[test]
+    fn parameterless_template_builds_from_the_attribute_alone() {
+        let (_, _, r) = build_uids("App", "Manage", "Platform:global", &params(&[]), "u1").unwrap();
+        assert_eq!(r.type_name().to_string(), "App::Platform");
+        assert_eq!(r.id().unescaped(), "global");
+    }
+
+    #[test]
+    fn const_check_accepts_literal_types_and_ids_with_placeholders() {
+        const _: () = assert_resource_type_is_literal("Doc:{id}");
+        const _: () = assert_resource_type_is_literal("Sub::Doc:{id}");
+        const _: () = assert_resource_type_is_literal("Platform:global");
+        assert_eq!(type_id_separator("A::B:c"), Some(4));
+        assert_eq!(type_id_separator("A::B"), None);
     }
 
     #[test]

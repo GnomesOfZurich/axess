@@ -5,7 +5,9 @@
 //! 1. **Ensure-or-create**: given a fingerprint, look up the existing
 //!    `Device` row or create a fresh one with
 //!    [`DeviceTrustLevel::Unknown`]. Idempotent on the existing-device
-//!    path; bumps `last_seen_at` either way.
+//!    path; bumps `last_seen_at` either way (at most once per sighting
+//!    granularity for a known device, see
+//!    [`DeviceLifecycleService::with_sighting_granularity`]).
 //! 2. **Promote-on-authn**: atomically transition `Unknown → Seen`
 //!    when authentication succeeds. No-op when the device is already
 //!    `Seen`, `Trusted`, or `Revoked`; never re-elevates a revoked
@@ -25,18 +27,21 @@
 //!   pre-computed [`FingerprintHash`]. Choosing the input set
 //!   (User-Agent family, IP /24, Accept-Language, …), the
 //!   tenant-scoped HMAC pepper, and the parsing strategy is an
-//!   application concern that varies by deployment. axess will
-//!   eventually ship a default extractor (separate iteration); the
-//!   lifecycle layer is fingerprint-agnostic.
+//!   application concern that varies by deployment;
+//!   [`DefaultFingerprintExtractor`](crate::device::DefaultFingerprintExtractor)
+//!   is the stock choice, and the lifecycle layer is
+//!   fingerprint-agnostic.
 //! - **Wire itself into middleware.** The decision of *where* in the
-//!   request pipeline `ensure_device` runs (session middleware,
-//!   authn service, application-specific layer) is left to the
-//!   consumer. This keeps the helper testable in isolation and lets
-//!   apps make the cost trade-offs.
-//! - **Refresh-cascade revocation.** When a refresh-token family is
-//!   revoked, every `Device` bound to that family must transition to
-//!   `Revoked`. That requires `DeviceBinding` to track refresh-family
-//!   identifiers, which it does not yet. Tracked separately.
+//!   request pipeline `ensure_device` runs is made by the
+//!   [`DeviceResolver`](crate::device::DeviceResolver) the session layer
+//!   is given (see
+//!   [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)),
+//!   or by application code calling it directly. This keeps the helper
+//!   testable in isolation and lets apps make the cost trade-offs.
+//! - **Revoke devices when a refresh family is compromised.** That is
+//!   [`cascade_revoke_by_refresh_family`](crate::device::cascade_revoke_by_refresh_family),
+//!   which finds the devices through
+//!   [`DeviceStore::find_by_refresh_family`].
 
 use chrono::{DateTime, Utc};
 use std::future::Future;
@@ -46,12 +51,20 @@ use crate::authn::event::{AuthEventBuilder, AuthEventType};
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::authn::service::FactorOutcome;
 use crate::device::events::{DeviceEventSink, NoopDeviceEventSink};
-use crate::device::store::DeviceStore;
+#[cfg(feature = "fido2")]
+use crate::device::store::BindingsUpdate;
+use crate::device::store::{DeviceStore, OwnerClaim, TrustTransition};
 use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
 
-/// How many of a user's own devices `ensure_device` scans for a matching
-/// fingerprint when the fingerprint lookup returned someone else's.
-const OWN_DEVICE_SCAN_LIMIT: usize = 100;
+/// How long after a device's recorded `last_seen_at` `ensure_device`
+/// treats another sighting as redundant, unless
+/// [`DeviceLifecycleService::with_sighting_granularity`] says otherwise.
+const DEFAULT_SIGHTING_GRANULARITY_SECS: i64 = 300;
+
+/// How often a bindings edit re-reads the row and tries again after losing a
+/// compare-and-swap to a concurrent edit.
+#[cfg(feature = "fido2")]
+const BINDINGS_RETRIES: usize = 16;
 
 /// `true` when `device` may serve a request made by `user`: the device is
 /// unowned, the request is not yet attributed to a user (a guest), or the
@@ -79,6 +92,9 @@ where
     /// Defaults to [`NoopDeviceEventSink`] so deployments that don't
     /// (yet) record audit events run unchanged.
     event_sink: Arc<dyn DeviceEventSink>,
+    /// A known device whose `last_seen_at` is newer than this is not
+    /// written again by `ensure_device`.
+    sighting_granularity: chrono::Duration,
 }
 
 impl<S> DeviceLifecycleService<S>
@@ -92,7 +108,20 @@ where
         Self {
             store,
             event_sink: Arc::new(NoopDeviceEventSink),
+            sighting_granularity: chrono::Duration::seconds(DEFAULT_SIGHTING_GRANULARITY_SECS),
         }
+    }
+
+    /// Set how stale a device's `last_seen_at` must be before
+    /// [`ensure_device`](Self::ensure_device) writes a new sighting
+    /// (default 5 minutes). A request for a device seen more recently
+    /// than `granularity` before `now` performs no write, so a busy
+    /// client costs one store write per window rather than one per
+    /// request. [`Duration::zero`](chrono::Duration::zero) records every
+    /// sighting.
+    pub fn with_sighting_granularity(mut self, granularity: chrono::Duration) -> Self {
+        self.sighting_granularity = granularity;
+        self
     }
 
     /// Wire a [`DeviceEventSink`] so device-lifecycle transitions emit
@@ -111,7 +140,9 @@ where
     }
 
     /// Look up a device by `fingerprint` within `tenant`. If present,
-    /// bump `last_seen_at = now` and return its `device_id`. If absent,
+    /// bump `last_seen_at = now` (skipped when the device was seen within
+    /// the [sighting granularity](Self::with_sighting_granularity)) and
+    /// return its `device_id`. If absent,
     /// create a new row at [`DeviceTrustLevel::Unknown`] using
     /// `new_id_fn()` for the device_id and return it.
     ///
@@ -127,17 +158,16 @@ where
     ///
     /// `user` is `None` for guest sessions (pre-authn requests). The
     /// `user_id` field on the created Device row is set to whatever
-    /// is passed in; updates that arrive later (e.g. when authn
-    /// completes for a previously-guest device) need to call
-    /// [`DeviceStore::save`] directly via [`Self::store`]; this
-    /// helper deliberately doesn't touch user_id on the existing-
-    /// device path to keep the create-vs-find branches symmetric.
+    /// is passed in. A device that exists without an owner (it was made
+    /// during a guest request) is claimed by the first authenticated user
+    /// that resolves it, through [`DeviceStore::claim_owner`], so it cannot
+    /// be reused by a later user; a user who loses that race gets a device
+    /// of their own.
     ///
-    /// `new_id_fn` is the application's choice of identifier scheme.
-    /// Pass `|| DeviceId::try_new(Uuid::new_v4().to_string()).unwrap()`
-    /// for the canonical UUID-v4 shape, or a deterministic generator
-    /// driven by `MockRng` for tests.
-    /// Only called on the create path.
+    /// `new_id_fn` is the application's choice of identifier scheme: a
+    /// UUID v4 built from an injected [`SecureRng`](axess_rng::SecureRng)
+    /// (a seeded one under test) is the canonical shape. Only called on
+    /// the create path.
     pub fn ensure_device(
         &self,
         tenant: &TenantId,
@@ -159,24 +189,37 @@ where
                 .await?
             {
                 if is_usable_by(&existing, user.as_ref()) {
-                    self.store
-                        .record_sighting(&tenant, &existing.id, now)
-                        .await?;
-                    return Ok(existing.id);
+                    // An unowned device (made during a guest request) is
+                    // claimed by the first authenticated user to reach it,
+                    // as one conditional write; otherwise any later user
+                    // could resolve it. A user who loses the race to
+                    // another falls through and gets a device of their own.
+                    let usable = match (existing.user_id.as_ref(), user.as_ref()) {
+                        (None, Some(user)) => matches!(
+                            self.store
+                                .claim_owner(&tenant, &existing.id, user, now)
+                                .await?,
+                            OwnerClaim::Claimed
+                        ),
+                        _ => true,
+                    };
+                    if usable {
+                        self.note_sighting(&tenant, &existing, now).await?;
+                        return Ok(existing.id);
+                    }
                 }
                 // The lookup by fingerprint returns one row, which may be
-                // another user's. Look through the caller's own devices
-                // before minting a new one, so a repeat visit finds the
-                // same device again.
+                // another user's. Look for the caller's own device with
+                // that fingerprint before minting a new one, so a repeat
+                // visit finds the same device again however many devices
+                // the user has.
                 if let Some(user) = user.as_ref() {
                     let own = self
                         .store
-                        .find_for_user(&tenant, user, OWN_DEVICE_SCAN_LIMIT)
-                        .await?
-                        .into_iter()
-                        .find(|d| d.fingerprint_hash == fingerprint);
+                        .find_by_fingerprint_for_user(&tenant, user, &fingerprint)
+                        .await?;
                     if let Some(own) = own {
-                        self.store.record_sighting(&tenant, &own.id, now).await?;
+                        self.note_sighting(&tenant, &own, now).await?;
                         return Ok(own.id);
                     }
                 }
@@ -193,9 +236,10 @@ where
                 first_seen_at: now,
                 last_seen_at: now,
                 revoked_at: None,
+                demoted_at: None,
                 bindings: Vec::new(),
             };
-            self.store.save(&device).await?;
+            self.store.save(&device, now).await?;
 
             // Emit `DeviceFirstSeen` after the row commit so a
             // sink failure can never fail the device creation. The
@@ -204,11 +248,27 @@ where
             let event = AuthEventBuilder::success(AuthEventType::DeviceFirstSeen)
                 .maybe_attributed_to(user.as_ref(), Some(&tenant))
                 .with_device(id)
-                .build();
+                .build_at(now);
             self.event_sink.emit(event).await;
 
             Ok(id)
         }
+    }
+
+    /// Record a sighting of `device` unless it was seen within the
+    /// sighting granularity of `now`.
+    async fn note_sighting(
+        &self,
+        tenant: &TenantId,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> Result<(), S::Error> {
+        if now.signed_duration_since(device.last_seen_at) < self.sighting_granularity
+            && now >= device.last_seen_at
+        {
+            return Ok(());
+        }
+        self.store.record_sighting(tenant, &device.id, now).await
     }
 
     /// Promote a device's trust level after a successful
@@ -237,7 +297,11 @@ where
     /// don't downgrade trust" semantic.
     ///
     /// Returns the trust level the device is in after the call.
-    /// `Ok(None)` if the `device_id` doesn't resolve: defensive,
+    /// `Ok(Some(DeviceTrustLevel::Revoked))` is the "not promoted because
+    /// revoked" outcome, whether the device was already revoked when it was
+    /// loaded or was revoked between the load and the promotion; the
+    /// promotion is a conditional write ([`DeviceStore::set_trust_level_if`])
+    /// so the revocation is never overwritten. `Ok(None)` if the `device_id` doesn't resolve: defensive,
     /// callers shouldn't see this if they pass an id from
     /// [`Self::ensure_device`].
     pub fn promote_on_authn(
@@ -256,11 +320,36 @@ where
 
             match device.trust_level {
                 DeviceTrustLevel::Unknown => {
-                    self.store
-                        .set_trust_level(&tenant, &device_id, DeviceTrustLevel::Seen, now)
-                        .await?;
-                    self.store.record_sighting(&tenant, &device_id, now).await?;
-                    Ok(Some(DeviceTrustLevel::Seen))
+                    // One conditional write: the device becomes Seen only
+                    // if it is still Unknown, so a revocation that landed
+                    // after the load above is not overwritten.
+                    match self
+                        .store
+                        .set_trust_level_if(
+                            &tenant,
+                            &device_id,
+                            DeviceTrustLevel::Unknown,
+                            DeviceTrustLevel::Seen,
+                            now,
+                        )
+                        .await?
+                    {
+                        TrustTransition::Applied => {
+                            self.store.record_sighting(&tenant, &device_id, now).await?;
+                            Ok(Some(DeviceTrustLevel::Seen))
+                        }
+                        // Revoked in between: not promoted, and reported as
+                        // Revoked, never as Seen.
+                        TrustTransition::Refused {
+                            current: DeviceTrustLevel::Revoked,
+                        } => Ok(Some(DeviceTrustLevel::Revoked)),
+                        // Another request promoted it first.
+                        TrustTransition::Refused { current } => {
+                            self.store.record_sighting(&tenant, &device_id, now).await?;
+                            Ok(Some(current))
+                        }
+                        TrustTransition::Missing => Ok(None),
+                    }
                 }
                 DeviceTrustLevel::Seen | DeviceTrustLevel::Trusted => {
                     self.store.record_sighting(&tenant, &device_id, now).await?;
@@ -321,8 +410,10 @@ where
     /// binding is appended and a [`AuthEventType::DeviceBindingAdded`]
     /// audit event is emitted.
     ///
-    /// Returns `Ok(true)` when a new binding was added, `Ok(false)` when
-    /// deduplicated, `Ok(None)`-shaped `Err` when the device doesn't exist.
+    /// Returns `Ok(true)` when a new binding was added and `Ok(false)` when
+    /// nothing was added: the credential was already bound, the device does
+    /// not exist, or the device is `Revoked` (a revoked device never gains a
+    /// binding, including when it was revoked while this call ran).
     #[cfg(feature = "fido2")]
     pub fn bind_webauthn_credential(
         &self,
@@ -336,40 +427,69 @@ where
         let device_id = *device_id;
         let event_sink = self.event_sink.clone();
         async move {
-            let mut device = match self.store.load(&tenant, &device_id).await? {
-                Some(d) => d,
-                None => return Ok(false),
+            let mut attempts = 0;
+            let device = loop {
+                let mut device = match self.store.load(&tenant, &device_id).await? {
+                    Some(d) => d,
+                    None => return Ok(false),
+                };
+
+                // A revoked device gains no bindings.
+                if device.trust_level == DeviceTrustLevel::Revoked {
+                    return Ok(false);
+                }
+
+                // Dedup: don't add a second binding for the same credential.
+                let already_bound = device.bindings.iter().any(|b| {
+                    matches!(
+                        b,
+                        crate::device::types::DeviceBinding::WebAuthn {
+                            credential_id: cid, ..
+                        } if cid == &credential_id
+                    )
+                });
+                if already_bound {
+                    return Ok(false);
+                }
+
+                let before = device.bindings.clone();
+                device
+                    .bindings
+                    .push(crate::device::types::DeviceBinding::WebAuthn {
+                        credential_id: credential_id.clone(),
+                        attestation_class,
+                        bound_at: now,
+                        last_used_at: now,
+                    });
+                // Bindings-only compare-and-swap that refuses a revoked row:
+                // a revocation made since the load is neither undone nor
+                // given a new binding, and a concurrent bindings edit makes
+                // this conflict, so the row is re-read and the change
+                // decided again instead of one edit overwriting the other.
+                match self
+                    .store
+                    .replace_bindings(&tenant, &device_id, &before, &device.bindings, now)
+                    .await?
+                {
+                    BindingsUpdate::Written => break device,
+                    BindingsUpdate::Conflict if attempts < BINDINGS_RETRIES => attempts += 1,
+                    BindingsUpdate::Conflict => {
+                        tracing::warn!(
+                            "device bindings kept changing under concurrent writers; \
+                             WebAuthn binding not recorded"
+                        );
+                        return Ok(false);
+                    }
+                    BindingsUpdate::Revoked | BindingsUpdate::Missing => return Ok(false),
+                }
             };
 
-            // Dedup: don't add a second binding for the same credential.
-            let already_bound = device.bindings.iter().any(|b| {
-                matches!(
-                    b,
-                    crate::device::types::DeviceBinding::WebAuthn {
-                        credential_id: cid, ..
-                    } if cid == &credential_id
-                )
-            });
-            if already_bound {
-                return Ok(false);
-            }
-
-            device
-                .bindings
-                .push(crate::device::types::DeviceBinding::WebAuthn {
-                    credential_id: credential_id.clone(),
-                    attestation_class,
-                    bound_at: now,
-                    last_used_at: now,
-                });
-            self.store.save(&device).await?;
-
-            // Emit `DeviceBindingAdded` after the save so the
+            // Emit `DeviceBindingAdded` after the write so the
             // binding is persisted even if the sink fails.
             let event = AuthEventBuilder::success(AuthEventType::DeviceBindingAdded)
                 .maybe_attributed_to(device.user_id.as_ref(), Some(&tenant))
                 .with_device(device_id)
-                .build();
+                .build_at(now);
             event_sink.emit(event).await;
 
             Ok(true)
@@ -379,8 +499,10 @@ where
     /// Update the `last_used_at` timestamp on an existing
     /// `DeviceBinding::WebAuthn` after a successful FIDO2 assertion.
     ///
-    /// No-op if the device doesn't exist or has no `WebAuthn` binding
-    /// matching `credential_id`.
+    /// No-op if the device doesn't exist, is `Revoked`, or has no `WebAuthn`
+    /// binding matching `credential_id`. A concurrent bindings edit makes the
+    /// write conflict; the row is then re-read and the update applied to what
+    /// is stored now.
     #[cfg(feature = "fido2")]
     pub fn record_webauthn_usage(
         &self,
@@ -393,29 +515,44 @@ where
         let device_id = *device_id;
         let credential_id = credential_id.to_owned();
         async move {
-            let mut device = match self.store.load(&tenant, &device_id).await? {
-                Some(d) => d,
-                None => return Ok(()),
-            };
+            for _ in 0..=BINDINGS_RETRIES {
+                let device = match self.store.load(&tenant, &device_id).await? {
+                    Some(d) => d,
+                    None => return Ok(()),
+                };
 
-            let mut touched = false;
-            for binding in &mut device.bindings {
-                if let crate::device::types::DeviceBinding::WebAuthn {
-                    credential_id: cid,
-                    last_used_at,
-                    ..
-                } = binding
-                    && cid == &credential_id
+                let mut bindings = device.bindings.clone();
+                let mut touched = false;
+                for binding in &mut bindings {
+                    if let crate::device::types::DeviceBinding::WebAuthn {
+                        credential_id: cid,
+                        last_used_at,
+                        ..
+                    } = binding
+                        && cid == &credential_id
+                    {
+                        *last_used_at = now;
+                        touched = true;
+                        break;
+                    }
+                }
+                if !touched {
+                    return Ok(());
+                }
+                // Bindings-only; a revoked device is left as it is.
+                match self
+                    .store
+                    .replace_bindings(&tenant, &device_id, &device.bindings, &bindings, now)
+                    .await?
                 {
-                    *last_used_at = now;
-                    touched = true;
-                    break;
+                    BindingsUpdate::Conflict => continue,
+                    _ => return Ok(()),
                 }
             }
-
-            if touched {
-                self.store.save(&device).await?;
-            }
+            tracing::warn!(
+                "device bindings kept changing under concurrent writers; \
+                 WebAuthn last-used time not recorded"
+            );
             Ok(())
         }
     }
@@ -426,3 +563,9 @@ mod tests;
 
 #[cfg(test)]
 mod ownership;
+
+#[cfg(test)]
+mod sighting;
+
+#[cfg(test)]
+mod races;

@@ -139,6 +139,10 @@ to `./keys/historical/v1.pem`. The server binds to `127.0.0.1:3000`
 with issuer `http://localhost:3000`. Override the key directory with
 `LOCAL_IDP_KEY_DIR=…`.
 
+`POST /issue` and `POST /admin/rotate` require
+`Authorization: Bearer $TOKEN`. Set `LOCAL_IDP_ADMIN_TOKEN` (16 or more
+characters) before starting, or copy the token the server logs at startup.
+
 ### File layout
 
 ```
@@ -166,12 +170,14 @@ curl -s http://localhost:3000/jwks.json | jq '.keys[].kid'
 
 # 3. Mint a token
 curl -s -X POST http://localhost:3000/issue \
+  -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"subject":"worker-1","audience":"https://api","ttl_secs":300}'
 # { "token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0..." }
 
 # 4. Rotate to a new key
 curl -s -X POST http://localhost:3000/admin/rotate \
+  -H "authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"new_kid":"v2"}'
 # { "new_current": "v2", "historical": ["v2", "v1"] }
@@ -190,8 +196,9 @@ curl -s http://localhost:3000/jwks.json | jq '.keys[].kid'
 - **Production HTTPS.** Real deployments terminate TLS upstream or
   use `axum-server` with a `RustlsConfig`. Either is purely an axum
   concern.
-- **AuthZ on `/admin/rotate`.** Add a `require_authz!` middleware
-  layer (see `axess-macros`) gating the route to operators.
+- **Per-operator authorization on `/admin/rotate`.** One shared bearer
+  token guards both admin routes here. A real deployment gates the route
+  to named operators (see `require_authz!` in `axess-macros`).
 - **`tokio::fs` for non-blocking I/O.** The example uses `std::fs`
   for clarity. The key-store operations are small and infrequent
   enough that the blocking cost is invisible at the example's

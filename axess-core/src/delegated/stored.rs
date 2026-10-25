@@ -42,9 +42,11 @@ pub use encrypted::{
     CurrentKey, EncryptedDelegatedCredentialStore, EncryptionKey, KeyProvider, KeyProviderError,
     MemoryKeyProvider,
 };
-pub use grant::{GrantContext, begin_grant, complete_grant};
+pub use grant::{GrantContext, begin_grant, complete_grant, complete_grant_at};
 pub use provider::DelegatedProvider;
 pub use session::StoredDelegationSession;
 
+#[cfg(test)]
+mod dst_tests;
 #[cfg(test)]
 mod tests;

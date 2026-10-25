@@ -7,6 +7,7 @@
 
 use super::super::types::{AuthUrlResult, OAuthError, OAuthLoginOptions, ParResponse};
 use super::OAuthProviderConfig;
+use axess_rng::SecureRng;
 
 /// Build an authorization URL using the Pushed Authorization Request (PAR)
 /// endpoint (RFC 9126). Unlike the standard flow, the request parameters
@@ -15,12 +16,14 @@ use super::OAuthProviderConfig;
 pub(super) async fn build_auth_url_par(
     cfg: &OAuthProviderConfig,
     options: &OAuthLoginOptions,
+    rng: &dyn SecureRng,
 ) -> Result<AuthUrlResult, OAuthError> {
-    use openidconnect::{CsrfToken, Nonce, PkceCodeChallenge};
-
-    let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let csrf_state = CsrfToken::new_random();
-    let nonce = Nonce::new_random();
+    let super::ceremony::CeremonySecrets {
+        pkce_challenge,
+        pkce_verifier,
+        csrf_state,
+        nonce,
+    } = super::ceremony::mint(rng);
 
     // Collect all scopes.
     let mut all_scopes: Vec<String> = cfg.scopes.clone();
@@ -131,21 +134,24 @@ pub(super) async fn push_authorization_request(
 /// resource-server request, and returns the JWT together with the RFC 7638
 /// JWK thumbprint (which the IdP echoes back in `cnf.jkt`).
 ///
-/// # Caller-supplied entropy
+/// # Caller-supplied entropy and time
 ///
-/// The 32 random bytes used to derive the ephemeral key are passed in by
-/// the caller rather than read from `OsRng` directly, so deterministic
-/// simulation tests get reproducible DPoP keys via a seeded
-/// [`SecureRng`](axess_rng::SecureRng). The bytes are
-/// interpreted as a P-256 scalar (big-endian); on the cosmically unlikely
-/// chance that they fall outside the curve order, the input is hashed
-/// once and retried.
+/// Nothing here reads a clock or a random source. The caller passes the
+/// 32 bytes that derive the ephemeral key, the 16 bytes that become the
+/// `jti` (as a version-4 UUID) and the `iat` Unix second, so the same
+/// inputs give the same header and payload and a seeded
+/// [`SecureRng`](axess_rng::SecureRng) with a mock clock reproduces the
+/// whole proof. The key bytes are interpreted as a P-256 scalar
+/// (big-endian); on the cosmically unlikely chance that they fall outside
+/// the curve order, the input is hashed once and retried.
 #[cfg(feature = "fapi")]
 pub(super) fn generate_dpop_proof(
     http_method: &str,
     http_url: &str,
     access_token: Option<&str>,
     mut key_seed: [u8; 32],
+    iat: i64,
+    jti_bytes: [u8; 16],
 ) -> Result<super::super::types::DpopProof, OAuthError> {
     use jsonwebtoken::{Algorithm, EncodingKey};
     use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -213,13 +219,14 @@ pub(super) fn generate_dpop_proof(
         "y": y_b64,
     });
 
-    let now = chrono::Utc::now().timestamp();
-    let jti = uuid::Uuid::new_v4().to_string();
+    let jti = uuid::Builder::from_random_bytes(jti_bytes)
+        .into_uuid()
+        .to_string();
 
     let mut payload = serde_json::json!({
         "htm": http_method,
         "htu": http_url,
-        "iat": now,
+        "iat": iat,
         "jti": jti,
     });
 
@@ -239,11 +246,16 @@ pub(super) fn generate_dpop_proof(
     let payload_b64 = b64.encode(payload.to_string().as_bytes());
     let signing_input = format!("{header_b64}.{payload_b64}");
 
+    // The first jsonwebtoken sign or verify in a process fixes its crypto
+    // provider; under feature unification that first call must be ours,
+    // or the crate's own fallback panics on every later use.
+    crate::jwt::ensure_crypto_provider();
     let signature =
         jsonwebtoken::crypto::sign(signing_input.as_bytes(), &encoding_key, Algorithm::ES256)
             .map_err(|e| OAuthError::Config(format!("DPoP signing failed: {e}")))?;
 
     let proof_jwt = format!("{signing_input}.{signature}");
+    zeroize::Zeroize::zeroize(&mut key_seed);
 
     Ok(super::super::types::DpopProof {
         proof_jwt,
@@ -254,6 +266,9 @@ pub(super) fn generate_dpop_proof(
 #[cfg(all(test, feature = "fapi"))]
 mod fapi_tests {
     use super::*;
+
+    const IAT: i64 = 1_767_225_600;
+    const JTI: [u8; 16] = [0xab; 16];
 
     /// Confirm `BTreeMap`-driven canonical JWK matches the
     /// hand-crafted lex-ordered JSON the previous implementation used.
@@ -284,11 +299,14 @@ mod fapi_tests {
         let seed_b = [0x22u8; 32];
 
         let proof_a1 =
-            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_a).unwrap();
+            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_a, IAT, JTI)
+                .unwrap();
         let proof_a2 =
-            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_a).unwrap();
+            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_a, IAT, JTI)
+                .unwrap();
         let proof_b =
-            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_b).unwrap();
+            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_b, IAT, JTI)
+                .unwrap();
 
         assert_eq!(
             proof_a1.thumbprint, proof_a2.thumbprint,
@@ -316,7 +334,8 @@ mod fapi_tests {
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ];
-        let proof = generate_dpop_proof("GET", "https://rs.example.com/", None, seed).unwrap();
+        let proof =
+            generate_dpop_proof("GET", "https://rs.example.com/", None, seed, IAT, JTI).unwrap();
         // Pin the digest. If this string ever changes, the canonical
         // JWK form changed; review carefully before updating.
         let expected = "6UoWwDCkLjV0J-pQG8c0THxbVhBcpR0AZDift1Yl5DM";
@@ -324,5 +343,43 @@ mod fapi_tests {
             proof.thumbprint, expected,
             "pinned thumbprint changed; JWK canonicalisation may have regressed"
         );
+    }
+
+    fn decode_part(jwt: &str, index: usize) -> serde_json::Value {
+        use base64::Engine as _;
+        let part = jwt.split('.').nth(index).expect("jwt part");
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .expect("base64url");
+        serde_json::from_slice(&bytes).expect("json")
+    }
+
+    /// `iat` and `jti` are the caller's values, not a clock read and a
+    /// fresh UUID, and the whole proof (header and payload) repeats.
+    #[test]
+    fn iat_and_jti_are_exactly_what_the_caller_supplied() {
+        let seed = [0x33u8; 32];
+        let proof =
+            generate_dpop_proof("POST", "https://a.example/t", None, seed, IAT, JTI).unwrap();
+        let payload = decode_part(&proof.proof_jwt, 1);
+        assert_eq!(payload["iat"], IAT);
+        assert_eq!(payload["jti"], "abababab-abab-4bab-abab-abababababab");
+        assert_eq!(payload["htm"], "POST");
+        assert_eq!(payload["htu"], "https://a.example/t");
+
+        let again =
+            generate_dpop_proof("POST", "https://a.example/t", None, seed, IAT, JTI).unwrap();
+        assert_eq!(
+            decode_part(&again.proof_jwt, 0),
+            decode_part(&proof.proof_jwt, 0)
+        );
+        assert_eq!(decode_part(&again.proof_jwt, 1), payload);
+
+        let later =
+            generate_dpop_proof("POST", "https://a.example/t", None, seed, IAT + 1, [1; 16])
+                .unwrap();
+        let later_payload = decode_part(&later.proof_jwt, 1);
+        assert_eq!(later_payload["iat"], IAT + 1);
+        assert_ne!(later_payload["jti"], payload["jti"]);
     }
 }

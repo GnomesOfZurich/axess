@@ -18,8 +18,8 @@ detail in another chapter; the list here is the inventory.
 
 The session signing key is loaded from the deployment's secrets
 manager. The key is 32 bytes of cryptographic randomness, stable
-across process restarts. The development placeholder
-(`[0; 32]` from *Getting started*) is replaced.
+across process restarts. The per-start random key from
+*Getting started* is replaced.
 
 The session envelope key is loaded the same way. The two keys
 are independent; one is for HMAC signing the cookie, the other

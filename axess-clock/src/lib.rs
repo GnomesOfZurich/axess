@@ -56,6 +56,14 @@ pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> DateTime<Utc>;
 }
 
+/// A shared clock is a clock, so an `Arc<dyn Clock>` can be handed to any
+/// API that takes `impl Clock`.
+impl<C: Clock + ?Sized> Clock for std::sync::Arc<C> {
+    fn now(&self) -> DateTime<Utc> {
+        (**self).now()
+    }
+}
+
 /// Production [`Clock`] backed by [`chrono::Utc::now`].
 #[derive(Debug, Default)]
 pub struct SystemClock;

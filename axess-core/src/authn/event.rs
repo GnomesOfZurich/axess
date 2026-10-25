@@ -406,6 +406,9 @@ pub enum AuthFailureReason {
     UnknownTenant,
     /// The tenant row was present but could not be interpreted.
     InvalidTenantRow,
+    /// The tenant's IP policy refused the request: the client address is not
+    /// allowed, or the policy restricts and no address was resolved.
+    IpPolicy,
     /// No identity matched the identifier supplied at login.
     UnknownIdentifier,
     /// An administrator tried to impersonate across a tenant boundary.
@@ -449,6 +452,7 @@ impl AuthFailureReason {
             Self::NoFactorsConfigured => "no_factors_configured",
             Self::UnknownTenant => "unknown_tenant",
             Self::InvalidTenantRow => "invalid_tenant_row",
+            Self::IpPolicy => "ip_policy",
             Self::UnknownIdentifier => "unknown_identifier",
             Self::CrossTenantImpersonation => "cross_tenant_impersonation",
             Self::TokenRefresh => "token_refresh",
@@ -473,6 +477,7 @@ impl From<&str> for AuthFailureReason {
             "no_factors_configured" => Self::NoFactorsConfigured,
             "unknown_tenant" => Self::UnknownTenant,
             "invalid_tenant_row" => Self::InvalidTenantRow,
+            "ip_policy" => Self::IpPolicy,
             "unknown_identifier" => Self::UnknownIdentifier,
             "cross_tenant_impersonation" => Self::CrossTenantImpersonation,
             "token_refresh" => Self::TokenRefresh,

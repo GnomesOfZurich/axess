@@ -6,7 +6,7 @@
 
 // ANCHOR: wiring
 use axess::authn::{AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome};
-use axess::{AuthSession, InMemoryBackend, MemorySessionStore, SessionLayer};
+use axess::{AuthSession, InMemoryBackend, MemorySessionStore, SecureRng, SessionLayer, SystemRng};
 use axum::Json;
 use axum::extract::State;
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
@@ -20,7 +20,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Session store + 3. signing key.
     let session_store = MemorySessionStore::new();
-    let signing_key: [u8; 32] = [0; 32]; // PLACEHOLDER, see "Signing keys" below.
+    // A fresh random key per start: fine for a demo, where a restart only
+    // signs everyone out. See "Signing keys" below for what production does.
+    let mut signing_key = [0u8; 32];
+    SystemRng.fill_bytes(&mut signing_key);
 
     // 4. AuthnService -- type-erased over clock and RNG; production wires
     //    SystemClock + SystemRng.
@@ -110,7 +113,11 @@ async fn login(
         Ok(LoginOutcome::StepUpRequired { .. }) => {
             return (StatusCode::UNAUTHORIZED, "step-up required").into_response();
         }
-        Err(e) => return (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
+        Err(e) => {
+            // The cause belongs in the log, not in the response.
+            eprintln!("begin_login failed: {e}");
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
     }
 
     // 2. Verify the password factor. Note the argument order:
@@ -136,7 +143,10 @@ async fn login(
         Ok(FactorOutcome::Locked { until }) => {
             (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response()
         }
-        Err(e) => (StatusCode::UNAUTHORIZED, format!("{e}")).into_response(),
+        Err(e) => {
+            eprintln!("verify_factor failed: {e}");
+            (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
+        }
     }
 }
 // ANCHOR_END: login

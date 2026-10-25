@@ -9,7 +9,9 @@ services:
       KC_HOSTNAME_STRICT: "false"
       KC_HOSTNAME: "localhost"
     ports:
-      - "8080:8080"
+      # Loopback only: the realm ships admin/admin and alice/alice, which
+      # must not be reachable from the rest of the network.
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./fapi-realm.json:/opt/keycloak/data/import/fapi-realm.json:Z
     command:

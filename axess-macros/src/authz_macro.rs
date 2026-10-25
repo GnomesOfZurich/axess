@@ -26,9 +26,13 @@
 /// 2. **`action`**: Cedar action name, e.g. `"ViewLedger"`.
 ///    Combined with namespace into `Namespace::Action::"ActionName"`.
 /// 3. **`resource`**: Resource pattern, e.g. `"Ledger:{id}"` or
-///    `"Platform:tenant"`. Format is `"<TypeName>:<id>"`. Path parameters
-///    matching `{name}` are substituted from the request's path-params at
-///    runtime. Combined with namespace into `Namespace::TypeName::"id"`.
+///    `"Platform:tenant"`. Format is `"<TypeName>:<id>"`, split at the first
+///    single `:` (a `::` belongs to a namespaced type such as
+///    `"Sub::Ledger:{id}"`). Path parameters matching `{name}` are
+///    substituted into the id part only, at runtime; a placeholder in the
+///    type part is rejected at compile time, so a request can never choose
+///    the entity type. Combined with namespace into
+///    `Namespace::TypeName::"id"`.
 ///
 /// # Required request extensions
 ///
@@ -37,9 +41,12 @@
 ///
 /// - `Arc<axess_core::authz::PolicyStore>`: the loaded Cedar policies,
 ///   typically constructed once at app startup.
-/// - `Arc<cedar_policy::Entities>`: the Cedar entity set for this
-///   request's principal (and the resources they may touch). Apps populate
-///   this via their own entity-provider layer.
+/// - `Arc<dyn axess_core::authz::RequestEntityProvider>`: builds the Cedar
+///   entity set for each request from the session, the principal, the
+///   resource and the action (`entities_for`). Wrap it in the caching
+///   decorators from `axess_core::authz::cache` where entity construction is
+///   costly. The extension must be stored under exactly this type: an
+///   `Arc<MyProvider>` is a different type to the extension map.
 ///
 /// If either extension is missing, the macro returns `500 Internal Server
 /// Error` and logs at `error!` level; this is a configuration bug, not
@@ -50,58 +57,85 @@
 /// - **401 Unauthorized**: caller is not authenticated.
 /// - **403 Forbidden**: Cedar policy denied the request
 ///   (returns `axess_core::authz::AuthzDenied`).
+/// - **400 Bad Request**: a path parameter is not valid UTF-8 after
+///   percent-decoding.
 /// - **500 Internal Server Error**: missing extensions, malformed
 ///   namespace/action/resource that can't be parsed as `EntityUid`.
 ///
 /// # Examples
 ///
 /// ```ignore
+/// use std::sync::Arc;
+/// use axess_core::authz::{PolicyStore, RequestEntityProvider};
 /// use axess_macros::require_authz;
-/// use axum::{Router, routing::get};
+/// use axum::{Extension, Router, routing::get};
+///
+/// let store: Arc<PolicyStore> = Arc::new(load_policies()?);
+/// let provider: Arc<dyn RequestEntityProvider> = Arc::new(MyEntityProvider::new(db));
 ///
 /// let app = Router::new()
-///     // Resource ID extracted from `:id` path param at runtime:
+///     // Resource ID extracted from `{id}` path param at runtime:
 ///     .route("/ledgers/{id}",
 ///            get(get_ledger).layer(require_authz!("MyApp", "ViewLedger", "Ledger:{id}")))
 ///     // Static resource, no path params needed:
 ///     .route("/users",
-///            get(list_users).layer(require_authz!("MyApp", "ManageUsers", "Platform:global")));
+///            get(list_users).layer(require_authz!("MyApp", "ManageUsers", "Platform:global")))
+///     // The two extensions every `require_authz!` reads, installed outside
+///     // the gates (layers added last run first):
+///     .layer(Extension(store))
+///     .layer(Extension(provider));
 /// ```
 ///
 /// # Path-param interpolation
 ///
-/// Placeholders like `{id}` are substituted at request time using
-/// `axum::extract::Path<HashMap<String, String>>`. The macro registers
-/// this extractor automatically; it doesn't conflict with handler-side
-/// `Path<T>` extractors because they share the same parsed path data.
+/// Placeholders like `{id}` are substituted at request time from the
+/// matched route's raw path parameters. The macro reads them itself; it
+/// doesn't conflict with handler-side `Path<T>` extractors because they
+/// share the same parsed path data. A route with no path parameters (or a
+/// request that never went through a router) evaluates from the attribute
+/// alone.
 ///
 /// Unknown placeholders (no matching path param) make the macro return 500;
 /// fail-loud rather than evaluating Cedar against a malformed UID. Substituted
 /// values are opaque ids: quotes, backslashes and `\u{..}` escapes stay data.
 #[macro_export]
 macro_rules! require_authz {
-    // PD-073: `$namespace` is `:expr` rather than `:literal` so consuming
+    // `$namespace` is `:expr` rather than `:literal` so consuming
     // crates can pass a runtime value (e.g. `$crate::cedar_namespace()`)
     // and switch Cedar namespaces per-deployment without recompiling. The
     // `$action` and `$resource` matchers stay `:literal` because they
     // identify the policy decision point and shouldn't change at runtime.
     ($namespace:expr, $action:literal, $resource:literal) => {{
         $crate::axum::middleware::from_fn(
-            |path_params: $crate::axum::extract::Path<
-                ::std::collections::HashMap<::std::string::String, ::std::string::String>,
-             >,
-             auth_session: $crate::AuthSession,
+            |auth_session: $crate::AuthSession,
              req: $crate::axum::extract::Request,
              next: $crate::axum::middleware::Next| async move {
                 use ::std::sync::Arc;
                 use $crate::axum::response::IntoResponse;
 
+                // The entity TYPE comes from the attribute alone: a
+                // placeholder in the type position is a compile error.
+                const _: () = $crate::__macro_support::assert_resource_type_is_literal($resource);
+
+                // Path parameters, if the route has any. A request that
+                // reached this gate without routing (no parameters at all)
+                // simply has none.
+                let (mut req_parts, req_body) = req.into_parts();
+                let path_params =
+                    match $crate::__macro_support::path_params(&mut req_parts).await {
+                        ::std::result::Result::Ok(p) => p,
+                        ::std::result::Result::Err(_) => {
+                            return $crate::axum::http::StatusCode::BAD_REQUEST.into_response();
+                        }
+                    };
+                let req = $crate::axum::extract::Request::from_parts(req_parts, req_body);
+
                 // 1. Authn; Cedar deny is wasted work for an anonymous caller.
-                if !auth_session.is_authenticated().await {
-                    return $crate::axum::http::StatusCode::UNAUTHORIZED.into_response();
-                }
-                let user_id = match auth_session.user_id().await {
-                    ::std::option::Option::Some(id) => id.to_string(),
+                //    One read of the session answers both "is it authenticated"
+                //    and "as whom", so the id cannot come from a different
+                //    state than the check.
+                let user_id = match auth_session.snapshot().await {
+                    ::std::option::Option::Some(snapshot) => snapshot.user_id.to_string(),
                     ::std::option::Option::None => {
                         return $crate::axum::http::StatusCode::UNAUTHORIZED.into_response();
                     }
@@ -143,7 +177,7 @@ macro_rules! require_authz {
                 //    from formatted text, so request data cannot inject syntax.
                 let (principal, action_uid_parsed, resource) =
                     match $crate::__macro_support::build_uids(
-                        $namespace, $action, $resource, &path_params.0, &user_id,
+                        $namespace, $action, $resource, &path_params, &user_id,
                     ) {
                         ::std::result::Result::Ok(uids) => uids,
                         ::std::result::Result::Err(e) => {
@@ -162,7 +196,7 @@ macro_rules! require_authz {
                 //    tenant_id (and any other session state) when constructing
                 //    principal attributes.
                 let entities = match provider
-                    .entities_for(&auth_session, &principal, &resource, &action_uid_parsed)
+                    .shared_entities_for(&auth_session, &principal, &resource, &action_uid_parsed)
                     .await
                 {
                     ::std::result::Result::Ok(e) => e,

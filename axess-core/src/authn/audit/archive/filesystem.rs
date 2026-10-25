@@ -16,14 +16,34 @@
 //!
 //! Each `archive_batch` call:
 //! 1. Groups events by day.
-//! 2. Opens the day file in append mode (creates parents if missing).
-//! 3. Writes every event for that day in one buffered write.
-//! 4. `fsync`s the file before returning.
+//! 2. Opens every day file in append mode (creates parents if missing)
+//!    and records each file's length.
+//! 3. Writes every day's events in one buffered write per file.
+//! 4. `fsync`s every file before returning.
 //!
 //! If `fsync` succeeds the call returns `Ok(())`; the adopter then
 //! takes that as the green light to mark hot-table rows as archived.
-//! If any step fails the call returns `Err`, the rows stay hot, and
-//! the next scheduled tick retries the whole batch.
+//! If any step fails, every file already touched is truncated back to
+//! its recorded length and the call returns `Err`: the batch is
+//! all-or-nothing, so the rows stay hot and the next scheduled tick
+//! retries the whole batch without duplicating the days that had
+//! already been written.
+//!
+//! # Retried batches
+//!
+//! The retention loop archives before it marks rows archived, so a
+//! failed mark makes the next tick send the same events again, under the
+//! same [`ArchiveBatchId`]. Next to each day file the archiver keeps
+//! `audit-{YYYY-MM-DD}.jsonl.batches`, one applied batch id per line,
+//! written and `fsync`ed in the same all-or-nothing step as the events. A
+//! batch whose id is already recorded for any of its days is skipped, so
+//! the retry does not duplicate it. Identical events in different batches
+//! have different ids and are both appended.
+//!
+//! The one remaining window is a crash after the event files are durable
+//! and before the id is: the retry then appends the batch again, which
+//! is at-least-once delivery and never loss. Consumers should still
+//! tolerate a repeated line.
 //!
 //! # Not for production at scale
 //!
@@ -58,7 +78,7 @@
 //! tightly coupled to the deployment's compliance regime, so we leave
 //! the wrapper to adopters rather than ship a generic stub.
 
-use crate::authn::audit::archive::AuditArchiver;
+use crate::authn::audit::archive::{ArchiveBatchId, AuditArchiver};
 use crate::authn::event::AuthEvent;
 use chrono::Datelike;
 use std::io::Write as _;
@@ -121,10 +141,78 @@ impl FilesystemAuditArchiver {
     }
 }
 
+/// The sidecar that records the batch ids applied to a day file.
+fn batches_path(day_file: &std::path::Path) -> PathBuf {
+    let mut name = day_file.as_os_str().to_owned();
+    name.push(".batches");
+    PathBuf::from(name)
+}
+
+/// True when `batch_id` is one of the lines of the sidecar at `path`. A
+/// missing sidecar records nothing.
+fn batch_recorded(path: &std::path::Path, batch_id: &str) -> std::io::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text.lines().any(|l| l == batch_id)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Append every buffer to its file, or leave every file as it was.
+///
+/// Each file's length is recorded before anything is written. All files are
+/// opened, written and `fsync`ed; if any step fails, every file already
+/// touched is truncated back to its recorded length, so a failed batch
+/// leaves no whole or partial line behind and the caller's retry cannot
+/// duplicate records. `before_write` runs ahead of each file's write with
+/// that file's index and exists so tests can inject a failure mid-batch.
+fn append_all_or_none(
+    plan: &[(PathBuf, Vec<u8>)],
+    before_write: &mut dyn FnMut(usize) -> std::io::Result<()>,
+) -> Result<(), FilesystemArchiveError> {
+    let mut touched: Vec<(std::fs::File, u64)> = Vec::with_capacity(plan.len());
+    let outcome = (|| -> Result<(), FilesystemArchiveError> {
+        for (path, _) in plan {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            let original_len = file.metadata()?.len();
+            touched.push((file, original_len));
+        }
+        for (i, (_, buf)) in plan.iter().enumerate() {
+            before_write(i)?;
+            touched[i].0.write_all(buf)?;
+        }
+        for (file, _) in &touched {
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        for (file, original_len) in &touched {
+            if let Err(e) = file.set_len(*original_len).and_then(|()| file.sync_all()) {
+                tracing::error!(
+                    error = %e,
+                    "could not roll back a partially written audit archive file"
+                );
+            }
+        }
+    }
+    outcome
+}
+
 impl AuditArchiver for FilesystemAuditArchiver {
     type Error = FilesystemArchiveError;
 
-    async fn archive_batch(&self, events: &[AuthEvent]) -> Result<(), Self::Error> {
+    async fn archive_batch(
+        &self,
+        batch: &ArchiveBatchId,
+        events: &[AuthEvent],
+    ) -> Result<(), Self::Error> {
         if events.is_empty() {
             return Ok(());
         }
@@ -159,35 +247,42 @@ impl AuditArchiver for FilesystemAuditArchiver {
         // ultimately use a thread-pool; doing it explicitly keeps
         // the async/blocking boundary visible.
         let root = self.root.clone();
+        let batch_line = format!("{batch}\n");
         tokio::task::spawn_blocking(move || -> Result<(), FilesystemArchiveError> {
-            for (day, lines) in by_day {
-                let path = root
-                    .join(format!("{:04}", day.year()))
+            let day_path = |day: chrono::NaiveDate| {
+                root.join(format!("{:04}", day.year()))
                     .join(format!("{:02}", day.month()))
                     .join(format!("{:02}", day.day()))
-                    .join(format!("audit-{}.jsonl", day.format("%Y-%m-%d")));
-
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    .join(format!("audit-{}.jsonl", day.format("%Y-%m-%d")))
+            };
+            // A batch is written to every day file or to none, and its id is
+            // recorded in the same step, so an id recorded for any of its
+            // days means all of its events are already there.
+            for day in by_day.keys() {
+                if batch_recorded(&batches_path(&day_path(*day)), batch_line.trim_end())? {
+                    return Ok(());
                 }
-
-                let mut file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&path)?;
-
-                // One buffered write for the whole day's slice;
-                // each line ends with `\n` so the file remains
-                // valid JSONL even on partial-flush mid-batch.
-                let mut buf = Vec::with_capacity(lines.iter().map(|s| s.len() + 1).sum());
-                for line in lines {
-                    buf.extend_from_slice(line.as_bytes());
-                    buf.push(b'\n');
-                }
-                file.write_all(&buf)?;
-                file.sync_all()?;
             }
-            Ok(())
+            let mut plan: Vec<(PathBuf, Vec<u8>)> = by_day
+                .into_iter()
+                .map(|(day, lines)| {
+                    let path = day_path(day);
+                    // Each line ends with `\n` so a file is valid JSONL
+                    // whenever its length is a recorded boundary.
+                    let mut buf = Vec::with_capacity(lines.iter().map(|s| s.len() + 1).sum());
+                    for line in lines {
+                        buf.extend_from_slice(line.as_bytes());
+                        buf.push(b'\n');
+                    }
+                    (path, buf)
+                })
+                .collect();
+            let ids: Vec<(PathBuf, Vec<u8>)> = plan
+                .iter()
+                .map(|(path, _)| (batches_path(path), batch_line.clone().into_bytes()))
+                .collect();
+            plan.extend(ids);
+            append_all_or_none(&plan, &mut |_| Ok(()))
         })
         .await
         .map_err(|join_err| {
@@ -211,7 +306,11 @@ mod tests {
     use crate::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
     use chrono::{TimeZone, Utc};
 
-    fn make_event(year: i32, month: u32, day: u32) -> AuthEvent {
+    pub(super) fn bid(name: &str) -> ArchiveBatchId {
+        ArchiveBatchId::from_parts(name, name, 1)
+    }
+
+    pub(super) fn make_event(year: i32, month: u32, day: u32) -> AuthEvent {
         use crate::authn::event::AuthEventBuilder;
         AuthEventBuilder::new(
             None,
@@ -232,7 +331,7 @@ mod tests {
     async fn empty_batch_is_noop() {
         let tmp = tempdir();
         let archiver = FilesystemAuditArchiver::new(tmp.path());
-        assert!(archiver.archive_batch(&[]).await.is_ok());
+        assert!(archiver.archive_batch(&bid("empty"), &[]).await.is_ok());
         // No directory created for an empty batch.
         assert!(!tmp.path().join("2026").exists());
     }
@@ -243,7 +342,7 @@ mod tests {
         let archiver = FilesystemAuditArchiver::new(tmp.path());
         let events = vec![make_event(2026, 5, 19), make_event(2026, 5, 19)];
 
-        archiver.archive_batch(&events).await.unwrap();
+        archiver.archive_batch(&bid("b"), &events).await.unwrap();
 
         let path = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap());
         assert!(path.exists(), "expected day file at {:?}", path);
@@ -266,7 +365,7 @@ mod tests {
             make_event(2026, 5, 19),
         ];
 
-        archiver.archive_batch(&events).await.unwrap();
+        archiver.archive_batch(&bid("b"), &events).await.unwrap();
 
         let day1 = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 18).unwrap());
         let day2 = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap());
@@ -275,22 +374,57 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&day2).unwrap().lines().count(), 2);
     }
 
+    /// Identical events sent as DIFFERENT batches are different events as
+    /// far as the archive is concerned: both are appended.
     #[tokio::test]
-    async fn repeated_batches_append_rather_than_overwrite() {
+    async fn identical_events_in_different_batches_append() {
         let tmp = tempdir();
         let archiver = FilesystemAuditArchiver::new(tmp.path());
 
         archiver
-            .archive_batch(&[make_event(2026, 5, 19)])
+            .archive_batch(&bid("one"), &[make_event(2026, 5, 19)])
             .await
             .unwrap();
         archiver
-            .archive_batch(&[make_event(2026, 5, 19)])
+            .archive_batch(&bid("two"), &[make_event(2026, 5, 19)])
             .await
             .unwrap();
 
         let path = archiver.path_for_date(chrono::NaiveDate::from_ymd_opt(2026, 5, 19).unwrap());
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn failure_on_second_file_restores_every_file() {
+        let tmp = tempdir();
+        let day1 = tmp.path().join("a/audit-1.jsonl");
+        let day2 = tmp.path().join("b/audit-2.jsonl");
+        std::fs::create_dir_all(day1.parent().unwrap()).unwrap();
+        std::fs::write(&day1, b"{\"earlier\":1}\n").unwrap();
+        let plan = vec![
+            (day1.clone(), b"{\"new\":1}\n{\"new\":2}\n".to_vec()),
+            (day2.clone(), b"{\"new\":3}\n".to_vec()),
+        ];
+
+        let mut fail_second = |i: usize| {
+            if i == 1 {
+                Err(std::io::Error::other("injected"))
+            } else {
+                Ok(())
+            }
+        };
+        let err = append_all_or_none(&plan, &mut fail_second).expect_err("injected failure");
+        assert!(matches!(err, FilesystemArchiveError::Io(_)));
+        assert_eq!(std::fs::read(&day1).unwrap(), b"{\"earlier\":1}\n");
+        assert_eq!(std::fs::read(&day2).unwrap(), b"");
+
+        // The retry of the same batch lands each record exactly once.
+        append_all_or_none(&plan, &mut |_| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&day1).unwrap(),
+            "{\"earlier\":1}\n{\"new\":1}\n{\"new\":2}\n"
+        );
+        assert_eq!(std::fs::read_to_string(&day2).unwrap(), "{\"new\":3}\n");
     }
 
     #[tokio::test]
@@ -302,7 +436,7 @@ mod tests {
 
     /// Minimal in-test tempdir without pulling the `tempfile` crate.
     /// Uses the std `temp_dir` + a counter; cleaned up on `Drop`.
-    fn tempdir() -> TempDir {
+    pub(super) fn tempdir() -> TempDir {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -312,11 +446,11 @@ mod tests {
         TempDir { path }
     }
 
-    struct TempDir {
+    pub(super) struct TempDir {
         path: PathBuf,
     }
     impl TempDir {
-        fn path(&self) -> &std::path::Path {
+        pub(super) fn path(&self) -> &std::path::Path {
             &self.path
         }
     }
@@ -326,3 +460,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod retry;

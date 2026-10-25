@@ -118,8 +118,8 @@ proptest! {
     /// Pins the boundary semantic across the full Cartesian space of
     /// (TTL, advance); easy to write, easy to break with off-by-one.
     ///
-    /// Boundary is `>=`: at exactly `expires_at_micros == now_micros`,
-    /// the entry is still present (matches the implementation).
+    /// The expiry instant is exclusive: at exactly
+    /// `expires_at_micros == now_micros` the entry is already gone.
     #[test]
     fn ttl_boundary_get_within_returns_some_after_returns_none(
         capacity in 4usize..=32,
@@ -134,7 +134,7 @@ proptest! {
         clock.advance_secs(advance_secs);
         let result = cache.get(&42);
         // Compare in i64; both sides fit since ttl_secs <= 300.
-        if advance_secs <= ttl_secs as i64 {
+        if advance_secs < ttl_secs as i64 {
             prop_assert_eq!(
                 result, Some(v),
                 "advance={}, ttl={}; within TTL boundary, expected Some({})",
