@@ -77,6 +77,26 @@ where
         session.clear().await;
     }
 
+    /// Invalidate up to `count` of `active` (oldest first), never `keep`.
+    async fn evict_oldest(
+        &self,
+        reg: &dyn crate::session::store::SessionRegistryHandle,
+        user_id: &crate::authn::ids::UserId,
+        active: &[crate::session::id::SessionId],
+        count: usize,
+        keep: &crate::session::id::SessionId,
+    ) {
+        for old_sid in active.iter().filter(|s| *s != keep).take(count) {
+            reg.invalidate_session(user_id, old_sid).await;
+            tracing::info!(
+                user_id = %user_id,
+                evicted_session = %old_sid,
+                "concurrent session limit reached; evicting oldest session"
+            );
+            self.inner.metrics.session_invalidated();
+        }
+    }
+
     /// Make a just-authenticated session reachable by the eviction path.
     ///
     /// Enforces the concurrent session limit, registers the session and
@@ -101,18 +121,9 @@ where
             // Enforce concurrent session limit: evict oldest sessions.
             if let Some(max) = self.inner.max_sessions_per_user {
                 let active = reg.active_sessions(user_id).await;
-                if active.len() >= max {
-                    let to_evict = active.len() - max + 1;
-                    for old_sid in active.iter().take(to_evict) {
-                        reg.invalidate_session(user_id, old_sid).await;
-                        tracing::info!(
-                            user_id = %user_id,
-                            evicted_session = %old_sid,
-                            "concurrent session limit reached; evicting oldest session"
-                        );
-                        self.inner.metrics.session_invalidated();
-                    }
-                }
+                let to_evict = (active.len() + 1).saturating_sub(max);
+                self.evict_oldest(reg.as_ref(), user_id, &active, to_evict, sid)
+                    .await;
             }
             // Register-failure must clear the session and
             // refuse authentication. Without this, the just-set
@@ -126,6 +137,18 @@ where
                 );
                 session.clear().await;
                 return Err(AuthnError::NoFlow);
+            }
+
+            // Trim again now that this session is registered. The count above
+            // and the register are separate registry calls, so parallel logins
+            // can each see room and together leave the user above the cap;
+            // every one of them trims here, oldest first and never itself, so
+            // the set converges on the cap.
+            if let Some(max) = self.inner.max_sessions_per_user {
+                let active = reg.active_sessions(user_id).await;
+                let surplus = active.len().saturating_sub(max);
+                self.evict_oldest(reg.as_ref(), user_id, &active, surplus, sid)
+                    .await;
             }
 
             // Re-read account status AFTER registering. Closes the

@@ -42,7 +42,8 @@ pub struct StoredDelegation {
     /// IdPs only return a refresh token on the first authorization;
     /// subsequent refreshes may or may not rotate it (RFC 6749 §6).
     pub refresh_token: Option<ZeroizedString>,
-    /// When the `access_token` becomes invalid. `None` means the IdP
+    /// When the `access_token` becomes invalid. `expires_in: 0` is
+    /// `Some(now)`, a token that expired on arrival. `None` means the IdP
     /// did not return `expires_in`; treat as "unknown, refresh on
     /// every use" (conservative) or "long-lived, never refresh"
     /// (provider-specific knowledge required).

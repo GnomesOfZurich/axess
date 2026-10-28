@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::store::CycleOutcome;
 use axess_rng::SystemRng;
 
 fn uid(s: &str) -> crate::authn::ids::UserId {
@@ -176,10 +177,13 @@ async fn cycle_moves_data_to_new_id() {
         .save(&old_id, &data, Duration::from_secs(60))
         .await
         .unwrap();
-    store
-        .cycle(&old_id, &new_id, &data, Duration::from_secs(60))
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .cycle(&old_id, &new_id, &data, Duration::from_secs(60), true)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
 
     assert!(
         store.load(&old_id).await.unwrap().is_none(),

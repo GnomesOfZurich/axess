@@ -98,8 +98,11 @@ impl RefreshToken {
 pub struct RefreshTokenConfig {
     /// Token time-to-live. Default: 30 days.
     pub ttl: Duration,
-    /// Maximum active tokens per user. Default: 10.
-    /// When exceeded, the oldest token is auto-revoked.
+    /// Maximum active tokens per user. Default: 10. The minimum is 1: a
+    /// cap of 0 is refused with [`RefreshError::InvalidConfig`] by every
+    /// issuing and refreshing function (a token cannot be both issued and
+    /// kept under a cap of zero). When the cap is reached, the oldest token
+    /// is auto-revoked.
     pub max_per_user: usize,
     /// Whether to rotate tokens on each use. Default: true.
     /// When enabled, each refresh invalidates the old token and issues a new one.
@@ -111,6 +114,10 @@ pub struct RefreshTokenConfig {
     /// database); a leaked refresh-token-hash table cannot be pre-image
     /// scanned without it.
     ///
+    /// An empty pepper is a configuration error
+    /// ([`RefreshError::InvalidConfig`]): `Some` always means keyed hashing,
+    /// never a silent fall back to the unkeyed hash.
+    ///
     /// **Migration:** changing the pepper (including switching from
     /// `None` to `Some`) invalidates every existing refresh token. Plan
     /// the rollout accordingly. Default `None` for backward compat.
@@ -121,6 +128,28 @@ pub struct RefreshTokenConfig {
 }
 
 impl RefreshTokenConfig {
+    /// Check the invariants every issuing and refreshing function relies on:
+    /// `max_per_user` is at least 1 and a configured `hash_pepper` is not
+    /// empty. Those functions call this first and return
+    /// [`RefreshError::InvalidConfig`] with the same message; call it at
+    /// start-up to fail early.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_per_user == 0 {
+            return Err("max_per_user must be at least 1");
+        }
+        if self.hash_pepper.as_ref().is_some_and(|p| p.is_empty()) {
+            return Err("hash_pepper must not be empty; use None for the unkeyed hash");
+        }
+        Ok(())
+    }
+
+    /// [`validate`](Self::validate) as the error the refresh functions return.
+    pub(super) fn check<E: std::error::Error + Send + Sync + 'static>(
+        &self,
+    ) -> Result<(), RefreshError<E>> {
+        self.validate().map_err(RefreshError::InvalidConfig)
+    }
+
     /// The pepper bytes, when one is configured.
     pub fn pepper(&self) -> Option<&[u8]> {
         self.hash_pepper.as_deref().map(Vec::as_slice)
@@ -187,6 +216,11 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
     /// [`IdentityStore`](crate::authn::store::IdentityStore) reference.
     #[error("account is not active")]
     AccountInactive,
+
+    /// The [`RefreshTokenConfig`] is unusable (see
+    /// [`RefreshTokenConfig::validate`]); nothing was read or written.
+    #[error("invalid refresh token configuration: {0}")]
+    InvalidConfig(&'static str),
 
     /// An error from the underlying store.
     #[error("store error: {0}")]

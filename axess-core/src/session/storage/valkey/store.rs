@@ -5,11 +5,14 @@
 
 use super::encryption::{encrypted_codec, encrypted_codec_with_rotation, plaintext_codec};
 use super::internal::{
-    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, ValkeyStoreError, ex_seconds,
-    script_unavailable, session_key,
+    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, RESEAL_SCRIPT, ValkeyStoreError,
+    ex_seconds, script_unavailable, session_key,
 };
 use crate::session::{
-    data::SessionData, id::SessionId, storage::session_codec::SessionCodec, store::SessionStore,
+    data::SessionData,
+    id::SessionId,
+    storage::session_codec::SessionCodec,
+    store::{CycleOutcome, SessionStore},
 };
 use fred::bytes::Bytes;
 use fred::prelude::*;
@@ -144,13 +147,53 @@ impl ValkeySessionStore {
 
     /// Deserialize (and optionally decrypt) session data from storage.
     ///
-    /// Delegates to the shared [`SessionCodec`].
+    /// Delegates to the shared [`SessionCodec`]. The load path calls the
+    /// codec directly so it can re-seal a stale blob.
+    #[cfg(test)]
     pub(super) fn decode(
         &self,
         id: &SessionId,
         bytes: &[u8],
     ) -> Result<SessionData, ValkeyStoreError> {
         Ok(self.codec.decode_bytes(id, bytes)?)
+    }
+
+    /// Choose whether blobs written before row binding are read; see
+    /// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs). The default is
+    /// to read them and re-seal each on load. Has no effect on a plaintext
+    /// store.
+    pub fn with_legacy_blobs(mut self, policy: crate::session::crypto::LegacyBlobs) -> Self {
+        self.codec = self.codec.with_legacy_blobs(policy);
+        self
+    }
+
+    /// Re-seal a blob that was read without the current row binding. Best
+    /// effort and conditional on the key still holding the bytes that were
+    /// read (so a save that landed meanwhile is kept); the key keeps its
+    /// expiry. Without scripting the blob is re-sealed by its next save.
+    async fn reseal(&self, id: &SessionId, old: &[u8], data: &SessionData) {
+        let key = session_key(&self.prefix, id);
+        let sealed = match self.encode(id, data) {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                warn!(error = %e, "could not re-seal a stale session blob");
+                return;
+            }
+        };
+        let result: Result<i64, _> = self
+            .client
+            .eval(
+                RESEAL_SCRIPT,
+                vec![key],
+                vec![
+                    Value::Bytes(Bytes::from(old.to_vec())),
+                    Value::Bytes(Bytes::from(sealed)),
+                ],
+            )
+            .await;
+        if let Err(e) = result {
+            warn!(error = %e, "could not re-seal a stale session blob");
+        }
     }
 }
 
@@ -162,7 +205,10 @@ impl SessionStore for ValkeySessionStore {
         let bytes: Option<Vec<u8>> = self.client.get(&key).await?;
         match bytes {
             Some(b) => {
-                let data = self.decode(id, &b)?;
+                let (data, stale) = self.codec.decode_bytes_checked(id, &b)?;
+                if stale {
+                    self.reseal(id, &b, &data).await;
+                }
                 debug!(session_id = %id, "session loaded from valkey");
                 Ok(Some(data))
             }
@@ -201,51 +247,101 @@ impl SessionStore for ValkeySessionStore {
         Ok(())
     }
 
+    async fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        let key = session_key(&self.prefix, id);
+        let bytes = self.encode(id, data)?;
+        let Some(ex) = ex_seconds(ttl) else {
+            // Already expired: nothing may stay stored under this id.
+            self.client.del::<(), _>(&key).await?;
+            return Ok(false);
+        };
+        // `SET ... XX` writes only while the key exists, so a session deleted
+        // since the caller loaded it is not brought back.
+        let written: Option<String> = self
+            .client
+            .set(
+                &key,
+                bytes,
+                Some(Expiration::EX(ex)),
+                Some(SetOptions::XX),
+                false,
+            )
+            .await?;
+        Ok(written.is_some())
+    }
+
     async fn cycle(
         &self,
         old_id: &SessionId,
         new_id: &SessionId,
         data: &SessionData,
         ttl: Duration,
-    ) -> Result<(), Self::Error> {
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
         let old_key = session_key(&self.prefix, old_id);
         let new_key = session_key(&self.prefix, new_id);
         let bytes = self.encode(new_id, data)?;
         let Some(ex) = ex_seconds(ttl) else {
             // The rotated session is already expired: store nothing and let
             // the old one go with it.
-            self.client.del::<(), _>(&old_key).await?;
-            return Ok(());
+            let removed: i64 = self.client.del(&old_key).await?;
+            return Ok(if require_old && removed == 0 && old_key != new_key {
+                CycleOutcome::SessionGone
+            } else {
+                CycleOutcome::Rotated
+            });
         };
 
-        // One server-side script writes the new key and removes the old one,
-        // so a crash cannot leave both and a failed SET leaves the old
-        // session intact (the script aborts before its DEL).
+        // One server-side script removes the old key and writes the new one,
+        // deciding on the DEL's count whether the old session was live.
         let scripted: Result<i64, _> = self
             .client
             .eval(
                 CYCLE_SCRIPT,
                 vec![old_key.clone(), new_key.clone()],
-                vec![Value::Bytes(Bytes::from(bytes.clone())), Value::Integer(ex)],
+                vec![
+                    Value::Bytes(Bytes::from(bytes.clone())),
+                    Value::Integer(ex),
+                    Value::from(if require_old { "1" } else { "0" }),
+                ],
             )
             .await;
         match scripted {
+            Ok(0) => return Ok(CycleOutcome::SessionGone),
             Ok(_) => {}
             Err(e) if script_unavailable(&e) => {
                 // Scripting is unavailable here (disabled, or the two keys
                 // hash to different cluster slots). Fall back to the
-                // sequenced form: the new key is written and acknowledged
-                // before the old key is touched, so a failed SET returns with
-                // the old session intact. A crash between the calls leaves
-                // both keys until the old one's TTL, the documented orphan
-                // window. (MULTI/EXEC is no substitute: the server runs every
-                // queued command even when an earlier one fails.)
-                warn!(error = %e, "session cycle script unavailable; using SET then DEL");
-                self.client
-                    .set::<(), _, _>(&new_key, bytes, Some(Expiration::EX(ex)), None, false)
-                    .await?;
+                // sequenced form: the old key is deleted first because its
+                // count decides whether the session was live, then the new
+                // key is written. A failed SET after the DEL leaves the user
+                // signed out, which the layer's fail-closed path wants anyway;
+                // a crash between the calls leaves neither key. (MULTI/EXEC
+                // is no substitute: the server runs every queued command even
+                // when an earlier one fails.)
+                warn!(error = %e, "session cycle script unavailable; using DEL then SET");
                 if old_key != new_key {
-                    self.client.del::<(), _>(&old_key).await?;
+                    let removed: i64 = self.client.del(&old_key).await?;
+                    if require_old && removed == 0 {
+                        return Ok(CycleOutcome::SessionGone);
+                    }
+                    self.client
+                        .set::<(), _, _>(&new_key, bytes, Some(Expiration::EX(ex)), None, false)
+                        .await?;
+                } else {
+                    let options = require_old.then_some(SetOptions::XX);
+                    let written: Option<String> = self
+                        .client
+                        .set(&new_key, bytes, Some(Expiration::EX(ex)), options, false)
+                        .await?;
+                    if require_old && written.is_none() {
+                        return Ok(CycleOutcome::SessionGone);
+                    }
                 }
             }
             Err(e) => return Err(e.into()),
@@ -257,7 +353,7 @@ impl SessionStore for ValkeySessionStore {
             ttl_secs = ex,
             "session cycled in valkey"
         );
-        Ok(())
+        Ok(CycleOutcome::Rotated)
     }
 
     /// Valkey/Redis evicts expired keys natively (active +

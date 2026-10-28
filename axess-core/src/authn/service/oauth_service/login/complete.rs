@@ -17,8 +17,12 @@ use crate::session::extractor::AuthSession;
 use crate::session::store::SessionLiveness;
 use subtle::ConstantTimeEq;
 
+mod concurrent;
+
 #[cfg(test)]
 mod audit_failure;
+#[cfg(test)]
+mod concurrency;
 #[cfg(test)]
 mod sid_map_upkeep;
 #[cfg(test)]
@@ -186,16 +190,22 @@ where
     /// Maintain the `(issuer, oidc_sid)` → local-session
     /// mapping that powers OIDC back-channel logout by `sid`.
     ///
-    /// **Skipped entirely** when `claims.oidc_sid` is missing (non-OIDC
+    /// **Skipped entirely** when no session registry is configured (nothing
+    /// could be ended, and the entries would never be forgotten). The `sid`
+    /// mapping alone is skipped when `claims.oidc_sid` is missing (non-OIDC
     /// OAuth flow) or exceeds the length cap (compromised IdP
     /// returning an inflated `sid` claim; without the cap each OAuth
     /// login would amortize that length into permanent map memory).
     /// The subject registry is filled in either case, so back-channel logout
     /// by `sub` still works.
     ///
+    /// Returns the sessions the pruning and the swap took out of the map. The
+    /// caller ends them with `end_displaced_sessions` once the login has
+    /// succeeded, because a refused login must end nobody's session.
+    ///
     /// Strategy when an entry would be inserted:
     /// 1. **TTL prune**: drop entries older than `SID_MAP_TTL` (24h) and
-    ///    end their sessions, at most `PRUNE_BATCH` per call so one login
+    ///    return their sessions to be ended, at most `PRUNE_BATCH` per call so one login
     ///    never waits on an unbounded run of registry calls; a backlog
     ///    drains over the logins that follow. The entries come off the
     ///    front of an insertion-ordered queue, so the cost is the number
@@ -209,8 +219,8 @@ where
     ///    subject registry entry goes only if the session is already gone,
     ///    so a logout token that carries a `sub` as well still ends it.
     /// 3. **Atomic swap**: the insert returns any displaced mapping under
-    ///    the same lock. The displaced session is invalidated in the
-    ///    registry after the swap. Doing the swap atomically (not
+    ///    the same lock. The displaced session is returned to be ended.
+    ///    Doing the swap atomically (not
     ///    `remove()` then `insert()`) closes the window where a
     ///    concurrent OAuth completion for the same
     ///    `(issuer, oidc_sid)` could be silently overwritten.
@@ -220,8 +230,15 @@ where
         claims: &axess_factors::oauth::OAuthClaims,
         sid: &crate::session::id::SessionId,
         now: chrono::DateTime<chrono::Utc>,
-    ) {
+    ) -> Vec<SubjectSession> {
         use crate::federation::sid_map::SidKey;
+
+        // Without a session registry no session is registered anywhere a
+        // logout could end it, so a mapping or a subject entry would only
+        // accumulate: neither is recorded.
+        if self.inner.registry.is_none() {
+            return Vec::new();
+        }
 
         // Cap oidc_sid length. A compromised IdP can return
         // an arbitrarily long `sid` claim; without a cap, every OAuth
@@ -252,7 +269,7 @@ where
         // so a logout by `sub` alone can always find the session.
         self.inner
             .sid_map
-            .register_subject_session(&issuer, user.id, *sid);
+            .register_subject_session(&issuer, &claims.subject, user.id, *sid);
         self.sweep_subject_registry().await;
 
         let Some(oidc_sid) = claims.oidc_sid.as_ref().filter(|s| {
@@ -268,10 +285,13 @@ where
                 true
             }
         }) else {
-            return;
+            return Vec::new();
         };
 
         let key: SidKey = (issuer.clone(), oidc_sid.clone());
+        // Sessions this login displaces or ages out. They end only once the
+        // login has succeeded, so they are returned, not ended here.
+        let mut to_end = Vec::new();
 
         // Phase 1: TTL prune, bounded per call.
         let cutoff = now - SID_MAP_TTL;
@@ -280,37 +300,22 @@ where
             .sid_map
             .evict_inserted_before(cutoff, PRUNE_BATCH)
         {
-            if let Some(reg) = &self.inner.registry {
-                reg.invalidate_session(&evict_user, &evict_sid).await;
-            }
-            self.inner
-                .sid_map
-                .forget_subject_session(&evict_key.0, &evict_user, &evict_sid);
             tracing::debug!(
                 evicted_iss = %evict_key.0,
                 evicted_oidc_sid = %evict_key.1,
                 "sid_map: evicted stale entry (TTL expired)"
             );
+            to_end.push((evict_key.0, evict_user, evict_sid));
         }
 
         // Phase 2: capacity-based batch eviction. Drops the mapping only;
-        // the user's session is still valid.
+        // the user's session is still valid. The subject registry keeps a
+        // live session reachable by `sub`; only a session the registry
+        // reports gone is forgotten there, never one whose liveness it could
+        // not answer. The liveness checks of the batch run concurrently.
         if self.inner.sid_map.len() >= max_sid_map_entries {
-            for (evict_key, (evict_user, evict_sid, _)) in
-                self.inner.sid_map.evict_oldest(EVICT_BATCH)
-            {
-                // The subject registry keeps a live session reachable by
-                // `sub`; only a session the registry reports gone is forgotten there, never one
-                // whose liveness it could not answer.
-                if let Some(reg) = &self.inner.registry
-                    && reg.liveness(&evict_user, &evict_sid).await == SessionLiveness::Gone
-                {
-                    self.inner.sid_map.forget_subject_session(
-                        &evict_key.0,
-                        &evict_user,
-                        &evict_sid,
-                    );
-                }
+            let evicted = self.inner.sid_map.evict_oldest(EVICT_BATCH);
+            for (evict_key, (evict_user, _, _)) in &evicted {
                 tracing::warn!(
                     evicted_iss = %evict_key.0,
                     evicted_oidc_sid = %evict_key.1,
@@ -319,10 +324,18 @@ where
                  and a logout by `sub` still reaches it)"
                 );
             }
+            let candidates = evicted
+                .into_iter()
+                .map(|(key, (user, session, _))| (key.0, user, session))
+                .collect();
+            self.forget_gone_subject_sessions(candidates).await;
         }
 
         // Atomic swap with displaced-mapping invalidation.
-        let displaced = self.inner.sid_map.insert(key, user.id, *sid, now);
+        let displaced = self
+            .inner
+            .sid_map
+            .insert(key, &claims.subject, user.id, *sid, now);
         if let Some((old_user_id, old_session_id, _)) = displaced {
             tracing::warn!(
                 iss = %issuer,
@@ -330,12 +343,48 @@ where
                 old_user = %old_user_id,
                 "SidMap atomic swap displaced existing mapping; invalidating old session"
             );
-            if let Some(reg) = &self.inner.registry {
-                reg.invalidate_session(&old_user_id, &old_session_id).await;
-            }
+            to_end.push((issuer, old_user_id, old_session_id));
+        }
+        to_end
+    }
+
+    /// End the sessions a successful login displaced or aged out of the `sid`
+    /// map, and forget them in the subject registry. The invalidations run
+    /// concurrently.
+    async fn end_displaced_sessions(&self, sessions: Vec<SubjectSession>) {
+        let Some(reg) = &self.inner.registry else {
+            return;
+        };
+        let ended = concurrent::bounded(sessions, |(_, user, session)| {
+            let reg = std::sync::Arc::clone(reg);
+            async move { reg.invalidate_session(&user, &session).await }
+        })
+        .await;
+        for ((issuer, user, session), ()) in ended {
             self.inner
                 .sid_map
-                .forget_subject_session(&issuer, &old_user_id, &old_session_id);
+                .forget_subject_session(&issuer, &user, &session);
+        }
+    }
+
+    /// Ask the registry about each `(issuer, user, session)`, concurrently,
+    /// and forget in the subject registry those it reports gone. A session
+    /// whose liveness the registry could not answer stays.
+    async fn forget_gone_subject_sessions(&self, candidates: Vec<SubjectSession>) {
+        let Some(reg) = &self.inner.registry else {
+            return;
+        };
+        let answers = concurrent::bounded(candidates, |(_, user, session)| {
+            let reg = std::sync::Arc::clone(reg);
+            async move { reg.liveness(&user, &session).await }
+        })
+        .await;
+        for ((issuer, user, session), liveness) in answers {
+            if liveness == SessionLiveness::Gone {
+                self.inner
+                    .sid_map
+                    .forget_subject_session(&issuer, &user, &session);
+            }
         }
     }
 
@@ -346,18 +395,20 @@ where
     /// registry nothing can be judged and nothing is forgotten.
     async fn sweep_subject_registry(&self) {
         const SWEEP_BATCH: usize = 64;
-        let Some(reg) = &self.inner.registry else {
+        if self.inner.registry.is_none() {
             return;
-        };
-        for (issuer, user, session) in self.inner.sid_map.sweep_subject_candidates(SWEEP_BATCH) {
-            if reg.liveness(&user, &session).await == SessionLiveness::Gone {
-                self.inner
-                    .sid_map
-                    .forget_subject_session(&issuer, &user, &session);
-            }
         }
+        let candidates = self.inner.sid_map.sweep_subject_candidates(SWEEP_BATCH);
+        self.forget_gone_subject_sessions(candidates).await;
     }
 }
+
+/// `(issuer, local user, session)`: one entry of the subject registry.
+type SubjectSession = (
+    String,
+    crate::authn::ids::UserId,
+    crate::session::id::SessionId,
+);
 
 impl<I, F> RequestAuthnService<I, F>
 where
@@ -425,7 +476,7 @@ where
         // `sid`. Self-contained; see helper for the TTL-prune /
         // capacity-evict / atomic-swap-with-displaced-invalidation
         // sequence.
-        self.maintain_oidc_sid_map(user, claims, &sid, now).await;
+        let displaced = self.maintain_oidc_sid_map(user, claims, &sid, now).await;
 
         let emitted = self
             .emit_audit_at(
@@ -449,6 +500,10 @@ where
                 .await;
             return Err(e);
         }
+
+        // The login stands, so the sessions it displaced or aged out of the
+        // map end now; a refused login would have ended nobody's.
+        self.end_displaced_sessions(displaced).await;
 
         Ok(())
     }

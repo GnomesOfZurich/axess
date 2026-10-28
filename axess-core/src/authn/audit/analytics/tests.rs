@@ -222,3 +222,18 @@ async fn flush_reports_a_stopped_worker() {
     log.record_event(event_at(1)).await.unwrap();
     assert_eq!(log.dropped_events(), 1, "a stopped worker counts as a drop");
 }
+
+/// A worker that exists but is never run is not a closed one: the flush waits
+/// for it, as its documentation says, and does not fail.
+#[tokio::test]
+async fn flush_waits_for_a_worker_that_is_held_but_not_run() {
+    let (log, worker) =
+        AuditLogWithAnalytics::new(MockIdentityStore::new(), RecordingSink::default(), enrich);
+    let waited = tokio::time::timeout(std::time::Duration::from_millis(100), log.flush()).await;
+    assert!(
+        waited.is_err(),
+        "flush must still be waiting, got {waited:?}"
+    );
+    drop(worker);
+    assert_eq!(log.flush().await, Err(AnalyticsClosed));
+}

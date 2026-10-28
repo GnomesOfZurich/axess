@@ -5,11 +5,12 @@
 //! workload identity verifiers, federated IdP token checkers, custom
 //! validators.
 
+mod body;
 pub mod discovery;
 pub mod error;
 pub mod jwks_cache;
 pub mod logout_token;
 
-pub use discovery::{Discovery, DiscoveryDocument};
+pub use discovery::{Discovery, DiscoveryDocument, MAX_DISCOVERY_BYTES};
 pub use error::OidcError;
-pub use jwks_cache::{DEFAULT_JWKS_MAX_AGE, JwksCache, MIN_JWKS_REFRESH_INTERVAL};
+pub use jwks_cache::{DEFAULT_JWKS_MAX_AGE, JwksCache, MAX_JWKS_BYTES, MIN_JWKS_REFRESH_INTERVAL};

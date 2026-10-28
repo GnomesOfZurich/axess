@@ -84,17 +84,22 @@ use sqlx::PgPool;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::storage::sql_common::{
     BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
-    SqlDeviceStoreError, SwapPlan, SweepCutoffs, TrustWrite, bindings_update_after_miss,
-    claim_after_miss, decode_all, decode_optional, parse_stored_trust, plan_bindings_swap,
-    push_family_rows, require_row, select_devices, transition_after_miss, utc_to_unix,
+    SqlDeviceStoreError, SwapPlan, SweepCutoffs, TRANSITION_ATTEMPTS, TrustWrite,
+    bindings_update_after_miss, claim_after_miss, decode_all, decode_optional, parse_stored_trust,
+    plan_bindings_swap, push_family_rows, require_row, select_devices, transition_after_miss,
+    utc_to_unix,
 };
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
+    blocks_save, for_save,
 };
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
 
+mod reseal;
 mod sweep;
+
+use reseal::reseal_rows;
 
 /// PostgreSQL-backed [`DeviceStore`].
 ///
@@ -281,7 +286,9 @@ impl DeviceStore for PostgresDeviceStore {
                     .bind(&device_id)
                     .fetch_optional(&pool)
                     .await?;
-            decode_optional(&codec, row)
+            let (device, reseal) = decode_optional(&codec, row)?;
+            reseal_rows(&pool, reseal).await;
+            Ok(device)
         }
     }
 
@@ -297,13 +304,15 @@ impl DeviceStore for PostgresDeviceStore {
         async move {
             let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = $1 AND fingerprint_hash = $2 \
-                 ORDER BY last_seen_at DESC LIMIT 1"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT 1"
             ))
             .bind(&tenant)
             .bind(&bytes)
             .fetch_optional(&pool)
             .await?;
-            decode_optional(&codec, row)
+            let (device, reseal) = decode_optional(&codec, row)?;
+            reseal_rows(&pool, reseal).await;
+            Ok(device)
         }
     }
 
@@ -321,14 +330,16 @@ impl DeviceStore for PostgresDeviceStore {
         async move {
             let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = $1 AND user_id = $2 AND fingerprint_hash = $3 \
-                 ORDER BY last_seen_at DESC LIMIT 1"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT 1"
             ))
             .bind(&tenant)
             .bind(&uid)
             .bind(&bytes)
             .fetch_optional(&pool)
             .await?;
-            decode_optional(&codec, row)
+            let (device, reseal) = decode_optional(&codec, row)?;
+            reseal_rows(&pool, reseal).await;
+            Ok(device)
         }
     }
 
@@ -346,14 +357,16 @@ impl DeviceStore for PostgresDeviceStore {
         async move {
             let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = $1 AND user_id = $2 \
-                 ORDER BY last_seen_at DESC LIMIT $3"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT $3"
             ))
             .bind(&tenant)
             .bind(&uid)
             .bind(limit_i64)
             .fetch_all(&pool)
             .await?;
-            decode_all(&codec, rows)
+            let (devices, reseals) = decode_all(&codec, rows)?;
+            reseal_rows(&pool, reseals).await;
+            Ok(devices)
         }
     }
 
@@ -374,24 +387,26 @@ impl DeviceStore for PostgresDeviceStore {
                  INNER JOIN device_bindings_refresh r \
                    ON d.tenant_id = r.tenant_id AND d.id = r.device_id \
                  WHERE r.tenant_id = $1 AND r.family_id = $2 \
-                 ORDER BY d.last_seen_at DESC",
+                 ORDER BY d.last_seen_at DESC, d.id ASC",
             )
             .bind(&tenant)
             .bind(&family)
             .fetch_all(&pool)
             .await?;
-            decode_all(&codec, rows)
+            let (devices, reseals) = decode_all(&codec, rows)?;
+            reseal_rows(&pool, reseals).await;
+            Ok(devices)
         }
     }
 
     fn save(
         &self,
         device: &Device,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
-        let device = device.clone();
+        let device = for_save(device, now);
         async move {
             let w = DeviceWrite::new(&codec, &device)?;
 
@@ -400,6 +415,23 @@ impl DeviceStore for PostgresDeviceStore {
             // `find_by_refresh_family` either sees the pre-update or
             // the post-update set, never a partially-updated index.
             let mut tx = pool.begin().await?;
+
+            // A save never un-revokes: a device loaded before a revocation
+            // and saved after it leaves the revoked row as it is. The row
+            // is read (and, where the engine supports it, locked) in the
+            // transaction that then writes it.
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT trust_level FROM devices WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+            )
+            .bind(&w.tenant)
+            .bind(&w.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(stored) = parse_stored_trust(stored)?
+                && blocks_save(stored, device.trust_level)
+            {
+                return Ok(());
+            }
 
             sqlx::query(
                 r#"
@@ -450,7 +482,9 @@ impl DeviceStore for PostgresDeviceStore {
         let ts = utc_to_unix(now);
         async move {
             let updated = sqlx::query(
-                "UPDATE devices SET last_seen_at = $3 \
+                "UPDATE devices SET last_seen_at = CASE \
+                     WHEN trust_level <> 'Revoked' AND last_seen_at < $3 THEN $3 \
+                     ELSE last_seen_at END \
                  WHERE tenant_id = $1 AND id = $2",
             )
             .bind(&tenant)
@@ -513,7 +547,8 @@ impl DeviceStore for PostgresDeviceStore {
             // One conditional UPDATE: the engine checks the current level
             // and writes in a single statement, so a revocation that lands
             // first makes this match no row instead of being overwritten.
-            let updated = sqlx::query("UPDATE devices SET trust_level = $4, revoked_at = $5, demoted_at = CASE WHEN $6::bigint = 1 THEN demoted_at ELSE $7::bigint END WHERE tenant_id = $1 AND id = $2 AND trust_level = $3")
+            for _ in 0..TRANSITION_ATTEMPTS {
+                let updated = sqlx::query("UPDATE devices SET trust_level = $4, revoked_at = $5, demoted_at = CASE WHEN $6::bigint = 1 THEN demoted_at ELSE $7::bigint END WHERE tenant_id = $1 AND id = $2 AND trust_level = $3")
             .bind(&tenant)
             .bind(&device_id)
             .bind(w.expected)
@@ -524,11 +559,17 @@ impl DeviceStore for PostgresDeviceStore {
             .execute(&pool)
             .await?
             .rows_affected();
-            if updated > 0 {
-                return Ok(TrustTransition::Applied);
+                if updated > 0 {
+                    return Ok(TrustTransition::Applied);
+                }
+                let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
+                if let Some(outcome) = transition_after_miss(current, expected) {
+                    return Ok(outcome);
+                }
+                // The row is at `expected` again: the write lost a race with
+                // a change that has since been undone. Try it again.
             }
-            let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
-            Ok(transition_after_miss(current, expected))
+            Ok(TrustTransition::Refused { current: expected })
         }
     }
 
@@ -575,7 +616,11 @@ impl DeviceStore for PostgresDeviceStore {
                 .await?
                 .rows_affected();
             if updated == 0 {
-                // Nothing written (the transaction rolls back on drop).
+                // Nothing written. The transaction is ended before the
+                // re-read, which needs a pooled connection of its own: with
+                // a one-connection pool it would otherwise wait for the
+                // connection this transaction still holds.
+                tx.rollback().await?;
                 let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
                 return Ok(bindings_update_after_miss(current));
             }
@@ -641,14 +686,16 @@ impl DeviceStore for PostgresDeviceStore {
             let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = $1 AND user_id = $2 \
                    AND trust_level <> 'Revoked' \
-                 ORDER BY last_seen_at DESC LIMIT $3"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT $3"
             ))
             .bind(&tenant)
             .bind(&uid)
             .bind(limit_i64)
             .fetch_all(&pool)
             .await?;
-            decode_all(&codec, rows)
+            let (devices, reseals) = decode_all(&codec, rows)?;
+            reseal_rows(&pool, reseals).await;
+            Ok(devices)
         }
     }
 
@@ -705,7 +752,8 @@ impl HealthCheck for PostgresDeviceStore {
     }
 }
 
-// Integration tests live in `axess-core/tests/postgres_device_store.rs`
-//; they require a running Postgres at $POSTGRES_URL and run with
-// `cargo test -- --ignored`. Mirrors the pattern used by
-// `tests/postgres_store.rs` for the session-store equivalent.
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod reseal_tests;

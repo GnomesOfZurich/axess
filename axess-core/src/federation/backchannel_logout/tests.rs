@@ -314,7 +314,13 @@ async fn sid_only_logout_invalidates_session() {
         "https://test-idp.example.com".to_string(),
         "oidc-sid-abc".to_string(),
     );
-    sid_map.insert(key.clone(), user_id, session_id, chrono::Utc::now());
+    sid_map.insert(
+        key.clone(),
+        "idp-subject",
+        user_id,
+        session_id,
+        chrono::Utc::now(),
+    );
 
     let providers: Vec<Arc<dyn OAuthProvider>> =
         vec![Arc::new(MockOAuthProvider::new("test-idp").with_user(
@@ -459,6 +465,7 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
     registry.register(&user_id, &session_id).await.unwrap();
     sid_map.insert(
         (ISS.to_string(), "some-sid".to_string()),
+        &user_id.to_string(),
         user_id,
         session_id,
         chrono::Utc::now(),
@@ -565,6 +572,7 @@ async fn sub_does_not_log_out_a_user_who_never_signed_in_through_the_issuer() {
     // The victim signed in through a different issuer.
     sid_map.insert(
         ("https://other-idp.example.com".to_string(), "s".to_string()),
+        &victim.to_string(),
         victim,
         session_id,
         chrono::Utc::now(),
@@ -588,6 +596,7 @@ async fn non_uuid_sub_does_not_block_sid_logout() {
     registry.register(&user, &session_id).await.unwrap();
     sid_map.insert(
         (ISS.to_string(), "sid-1".to_string()),
+        "idp-subject",
         user,
         session_id,
         chrono::Utc::now(),
@@ -625,9 +634,16 @@ async fn sub_ends_only_the_sessions_the_issuer_established() {
         registry.register(&user, id).await.unwrap();
     }
     let now = chrono::Utc::now();
-    sid_map.insert((ISS.to_string(), "a".into()), user, via_issuer, now);
+    sid_map.insert(
+        (ISS.to_string(), "a".into()),
+        &user.to_string(),
+        user,
+        via_issuer,
+        now,
+    );
     sid_map.insert(
         ("https://other-idp.example.com".to_string(), "b".into()),
+        &user.to_string(),
         user,
         via_other_issuer,
         now,
@@ -639,4 +655,43 @@ async fn sub_ends_only_the_sessions_the_issuer_established() {
     assert!(!registry.is_valid(&user, &via_issuer).await.unwrap());
     assert!(registry.is_valid(&user, &via_other_issuer).await.unwrap());
     assert!(registry.is_valid(&user, &via_password).await.unwrap());
+}
+
+/// A token whose `iat` is the furthest accepted into the future stays
+/// acceptable for `MAX_IAT_AGE_SECS` after that `iat`, which is longer than
+/// `MAX_IAT_AGE_SECS` after it first arrived. Its `jti` must be remembered
+/// for the whole span, or the token replays once the first sighting ages out.
+#[tokio::test]
+async fn jti_is_remembered_for_the_whole_span_a_token_stays_acceptable() {
+    use axess_clock::testing::MockClock;
+    use axess_factors::oidc::logout_token::{JTI_RETENTION_SECS, MAX_IAT_FUTURE_SECS};
+
+    let registry = MemorySessionRegistry::new();
+    let clock = MockClock::now();
+    let providers: Vec<Arc<dyn OAuthProvider>> = vec![Arc::new(MockOAuthProvider::new("test-idp"))];
+    let handler = BackChannelLogoutHandler::new(
+        &providers,
+        Arc::new(SessionRegistryAdapter(registry.clone())),
+        SidMap::new(),
+        Arc::new(clock.clone()),
+    )
+    .expect("handler");
+    assert_eq!(JTI_RETENTION_SECS, 300 + MAX_IAT_FUTURE_SECS);
+
+    let iat = clock.now().timestamp() + MAX_IAT_FUTURE_SECS;
+    let token = raw_token(serde_json::json!({ "sid": "s", "jti": "edge", "iat": iat }));
+    assert_eq!(post(&handler, token.clone()).await, Ok(StatusCode::OK));
+
+    // 350 s later the token's iat is 290 s old, so it is still acceptable;
+    // the first sighting is 350 s old, past the old 300 s retention.
+    clock.advance_secs(350);
+    assert_eq!(
+        post(&handler, token.clone()).await,
+        Err(StatusCode::BAD_REQUEST),
+        "the replay is refused while the token's iat is still acceptable"
+    );
+
+    // Once the iat itself is stale the token is refused on age instead.
+    clock.advance_secs(100);
+    assert_eq!(post(&handler, token).await, Err(StatusCode::BAD_REQUEST));
 }

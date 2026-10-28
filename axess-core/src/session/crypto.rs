@@ -12,6 +12,20 @@
 //! only ever read stays under the previous key until it expires. Keep the
 //! previous key configured for at least one session lifetime after the
 //! rotation, and retire it after that.
+//!
+//! # Blobs from before row binding
+//!
+//! Every blob the stores write names the row it belongs to in its AAD (the
+//! additional authenticated data of the AES-GCM seal). A blob written by an earlier release carries no marker
+//! and no binding, so it opens under any row id, which is exactly what an
+//! attacker with write access to the store (or a restored backup) needs to
+//! move a sealed row from one id to another. [`LegacyBlobs`] says what to do
+//! with such blobs: [`Accept`](LegacyBlobs::Accept), the default, reads them
+//! and the stores re-seal them in the bound format the next time the row is
+//! written; [`Reject`](LegacyBlobs::Reject) refuses them, which a deployment
+//! sets once its rows have aged out (one session lifetime after the upgrade,
+//! for sessions). Reject fails closed: a refused row reads as a
+//! decryption failure and the user signs in again.
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
@@ -32,12 +46,29 @@ impl Drop for EncryptionKey {
     }
 }
 
+/// Whether blobs written before row binding (no marker, empty AAD) are read.
+///
+/// See the module documentation. Marked blobs are never affected: they are
+/// always opened under their row's AAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LegacyBlobs {
+    /// Read a blob without the format marker under the empty AAD and let
+    /// the store re-seal it in the bound format. The default, so an upgrade
+    /// keeps existing rows readable.
+    #[default]
+    Accept,
+    /// Refuse a blob without the format marker. Set it once no legacy rows
+    /// remain; a row that is left reads as a decryption failure.
+    Reject,
+}
+
 /// AES-256-GCM encryption configuration with optional key rotation.
 #[derive(Clone)]
 pub struct SessionCrypto {
     current: Arc<EncryptionKey>,
     previous: Option<Arc<EncryptionKey>>,
     rng: Arc<dyn SecureRng>,
+    legacy: LegacyBlobs,
 }
 
 /// Error from encrypt/decrypt operations.
@@ -54,7 +85,15 @@ impl SessionCrypto {
             current: Arc::new(EncryptionKey(key)),
             previous: None,
             rng: Arc::new(SystemRng),
+            legacy: LegacyBlobs::default(),
         }
+    }
+
+    /// Choose whether blobs written before row binding are read. See
+    /// [`LegacyBlobs`]; the default is [`LegacyBlobs::Accept`].
+    pub fn with_legacy_blobs(mut self, policy: LegacyBlobs) -> Self {
+        self.legacy = policy;
+        self
     }
 
     /// Swap the RNG used for nonce generation. Production code keeps the
@@ -194,7 +233,9 @@ impl SessionCrypto {
 /// A sealed blob is `magic || nonce || ciphertext`, where the AES-GCM
 /// additional authenticated data is `label || 0x00 || row_id`. The row id is
 /// not stored in the blob; it is supplied again on open, so a blob copied into
-/// a row with a different id fails authentication.
+/// a row with a different id fails authentication. A row id made of several
+/// parts is length-prefixed (see `device_row_id`) so two different part
+/// lists can never concatenate to the same bytes.
 #[derive(Clone, Copy)]
 pub(crate) struct BoundFormat {
     /// Four-byte format marker written at the start of every sealed blob.
@@ -210,17 +251,33 @@ impl BoundFormat {
         label: b"axess.session.v1",
     };
 
-    /// Device bindings, bound to the tenant and device id.
+    /// Device bindings, bound to the tenant and device id (length-prefixed).
     #[cfg(any(test, feature = "sqlite", feature = "postgres", feature = "mysql"))]
     pub(crate) const DEVICE_BINDINGS: Self = Self {
+        magic: *b"AXD\x02",
+        label: b"axess.device-bindings.v2",
+    };
+
+    /// The device-bindings format of 0.11.0: the tenant and device id were
+    /// joined with a single zero byte. Still read, and replaced by
+    /// [`DEVICE_BINDINGS`](Self::DEVICE_BINDINGS) on the next write.
+    #[cfg(any(test, feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub(crate) const DEVICE_BINDINGS_V1: Self = Self {
         magic: *b"AXD\x01",
         label: b"axess.device-bindings.v1",
     };
 
     /// A whole device row in the Valkey store, bound to the tenant and
-    /// device id.
-    #[cfg(feature = "valkey")]
+    /// device id (length-prefixed).
+    #[cfg(any(test, feature = "valkey"))]
     pub(crate) const DEVICE_ROW: Self = Self {
+        magic: *b"AXR\x02",
+        label: b"axess.device-row.v2",
+    };
+
+    /// The device-row format of 0.11.0 (zero-byte joined ids). Still read.
+    #[cfg(any(test, feature = "valkey"))]
+    pub(crate) const DEVICE_ROW_V1: Self = Self {
         magic: *b"AXR\x01",
         label: b"axess.device-row.v1",
     };
@@ -241,12 +298,49 @@ impl BoundFormat {
     }
 }
 
+/// Row identity of a device row: each of the tenant and device id as a
+/// big-endian `u32` length followed by its UTF-8 bytes.
+#[cfg(any(
+    test,
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "valkey"
+))]
+pub(crate) fn device_row_id(tenant: &str, device: &str) -> Vec<u8> {
+    let mut id = Vec::with_capacity(8 + tenant.len() + device.len());
+    for part in [tenant, device] {
+        id.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        id.extend_from_slice(part.as_bytes());
+    }
+    id
+}
+
+/// The row identity the 0.11.0 device formats bound: tenant and device id
+/// joined with one zero byte. Kept only to read those rows.
+#[cfg(any(
+    test,
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "valkey"
+))]
+pub(crate) fn device_row_id_v1(tenant: &str, device: &str) -> Vec<u8> {
+    let mut id = Vec::with_capacity(tenant.len() + 1 + device.len());
+    id.extend_from_slice(tenant.as_bytes());
+    id.push(0);
+    id.extend_from_slice(device.as_bytes());
+    id
+}
+
 /// Result of [`SessionCrypto::open_bound`].
 pub(crate) struct Opened {
     /// The decrypted plaintext.
     pub(crate) plaintext: Vec<u8>,
-    /// True when the blob predates row binding (no format marker, empty AAD).
-    pub(crate) legacy: bool,
+    /// True when the blob is not in the current bound format: an earlier
+    /// bound format, or no marker and no binding at all. The caller re-seals
+    /// it.
+    pub(crate) stale: bool,
 }
 
 impl SessionCrypto {
@@ -267,26 +361,43 @@ impl SessionCrypto {
 
     /// Open a blob for `row_id`.
     ///
-    /// A blob that starts with the format marker is bound-format and is only
-    /// ever tried under the bound AAD; it never falls back to the empty AAD.
-    /// A blob without the marker is a pre-binding blob and is tried under the
-    /// empty AAD, flagged `legacy` so the caller re-seals it on the next save.
+    /// A blob that starts with the current format's marker is only ever tried
+    /// under that format's AAD. A blob that starts with the marker of one of
+    /// the `earlier` formats is tried under that format's AAD and the row id
+    /// it paired with (an earlier release derived the id differently), and is
+    /// flagged `stale`. A blob with none of these markers is a pre-binding
+    /// blob: it is refused under [`LegacyBlobs::Reject`], and otherwise tried
+    /// under the empty AAD and flagged `stale`. No marked blob ever falls
+    /// back to the empty AAD.
     pub(crate) fn open_bound(
         &self,
         format: BoundFormat,
         row_id: &[u8],
+        earlier: &[(BoundFormat, Vec<u8>)],
         data: &[u8],
     ) -> Result<Opened, CryptoError> {
-        match data.strip_prefix(&format.magic[..]) {
-            Some(body) => Ok(Opened {
+        if let Some(body) = data.strip_prefix(&format.magic[..]) {
+            return Ok(Opened {
                 plaintext: self.decrypt_with_aad(&format.aad(row_id), body)?,
-                legacy: false,
-            }),
-            None => Ok(Opened {
-                plaintext: self.decrypt_unbound(data)?,
-                legacy: true,
-            }),
+                stale: false,
+            });
         }
+        for (old, old_id) in earlier {
+            if let Some(body) = data.strip_prefix(&old.magic[..]) {
+                return Ok(Opened {
+                    plaintext: self.decrypt_with_aad(&old.aad(old_id), body)?,
+                    stale: true,
+                });
+            }
+        }
+        if self.legacy == LegacyBlobs::Reject {
+            tracing::warn!("refusing a blob without a row binding (legacy blobs are rejected)");
+            return Err(CryptoError);
+        }
+        Ok(Opened {
+            plaintext: self.decrypt_unbound(data)?,
+            stale: true,
+        })
     }
 }
 

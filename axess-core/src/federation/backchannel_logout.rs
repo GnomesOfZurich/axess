@@ -57,7 +57,7 @@ use crate::session::store::SessionRevoker;
 use axess_clock::Clock;
 use axess_factors::oauth::OAuthProvider;
 use axess_factors::oidc::logout_token::{
-    IatCheck, MAX_IAT_AGE_SECS, aud_contains, azp_satisfied, check_iat, decode_jwt_payload,
+    IatCheck, JTI_RETENTION_SECS, aud_contains, azp_satisfied, check_iat, decode_jwt_payload,
     events_contains_logout,
 };
 use axum::extract::{Form, State};
@@ -199,7 +199,7 @@ impl BackChannelLogoutHandler {
         // Replay protection: `validate_logout_token` guarantees a `jti`, so
         // refuse to act on the same `(issuer, jti)` twice within the IAT
         // window. Without this an attacker who captures a valid logout
-        // token can re-fire it for up to MAX_IAT_AGE_SECS.
+        // token can re-fire it for as long as its `iat` stays acceptable.
         let Some(ref jti) = claims.jti else {
             return Err(StatusCode::BAD_REQUEST);
         };
@@ -251,42 +251,34 @@ impl BackChannelLogoutHandler {
             }
         }
 
-        // If `sub` is present, end the sessions of that user that THIS
-        // issuer established. The sid map records `(issuer, sid) -> user`
-        // and its subject registry records `(issuer, user) -> sessions`, the
-        // latter for every OAuth login including one whose ID token had no
-        // `sid` or whose `sid` mapping was dropped at capacity. So a user with no entry under `claims.iss`
-        // was not authenticated by it, and an IdP must not be able to log
-        // out users it never authenticated, nor end a user's sessions that
-        // came from another issuer or from a password or passkey login. A
-        // `sub` that is not a local user id (for example a numeric subject)
-        // names nobody here and is skipped, not an error: the IdP's request
-        // has been handled and `sid` handling above has already run.
+        // If `sub` is present, end the sessions of that IdP subject that THIS
+        // issuer established. The sid map records `(issuer, sid)` and its
+        // subject registry records `(issuer, sub) -> (local user, session)`,
+        // the latter for every OAuth login including one whose ID token had
+        // no `sid` or whose `sid` mapping was dropped at capacity. `sub` is
+        // the IdP's own identifier and is looked up as such: after account
+        // linking it differs from the local user id the session is
+        // registered under, so each hit carries that id for the registry
+        // call. A subject with no entry under `claims.iss` was not
+        // authenticated by it, and an IdP must not be able to log out users
+        // it never authenticated, nor end sessions that came from another
+        // issuer or from a password or passkey login. Both lookups are by
+        // exact value; `sid` handling above has already run.
         if let Some(ref sub) = claims.sub {
-            match crate::authn::ids::UserId::try_new(sub.as_str()) {
-                Ok(uid) => {
-                    let mut owned = handler.sid_map.take_user_sessions(&claims.iss, &uid);
-                    owned.extend(handler.sid_map.take_subject_sessions(&claims.iss, &uid));
-                    if owned.is_empty() {
-                        tracing::warn!(
-                            iss = %claims.iss,
-                            sub = %sub,
-                            "back-channel logout: no session of this user was established \
-                             through this issuer; ignoring sub"
-                        );
-                    }
-                    for session_id in owned {
-                        handler.registry.invalidate_session(&uid, &session_id).await;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        iss = %claims.iss,
-                        sub = %sub,
-                        error = %e,
-                        "back-channel logout: sub is not a local user id; ignoring sub"
-                    );
-                }
+            let owned = handler.sid_map.take_subject_sessions(&claims.iss, sub);
+            if owned.is_empty() {
+                tracing::warn!(
+                    iss = %claims.iss,
+                    sub = %sub,
+                    "back-channel logout: no session of this subject was established \
+                     through this issuer; ignoring sub"
+                );
+            }
+            for (user_id, session_id) in owned {
+                handler
+                    .registry
+                    .invalidate_session(&user_id, &session_id)
+                    .await;
             }
         }
 
@@ -433,13 +425,14 @@ impl BackChannelLogoutHandler {
     /// as a replay). Tokens without a `jti` never reach this point:
     /// `validate_logout_token` refuses them.
     ///
-    /// Entries older than [`MAX_IAT_AGE_SECS`] are dropped on each call. If
+    /// Entries older than [`JTI_RETENTION_SECS`] (the full span over which
+    /// one token's `iat` is accepted) are dropped on each call. If
     /// the log is at [`JTI_CACHE_MAX`] capacity after that, the oldest
     /// [`JTI_EVICT_BATCH`] entries are dropped to make room. Both come off
     /// the front of an arrival-ordered queue, so the work is the number of
     /// entries removed.
     fn record_jti(&self, issuer: &str, jti: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
-        let cutoff = now - chrono::Duration::seconds(MAX_IAT_AGE_SECS);
+        let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
         self.seen_jtis.record(issuer, jti, now, cutoff)
     }
 }

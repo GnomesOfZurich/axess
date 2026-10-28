@@ -42,6 +42,10 @@
 #[cfg(any(feature = "delegated-stored", feature = "delegated-exchange"))]
 pub mod error;
 
+/// Bounded reads of token-endpoint bodies.
+#[cfg(any(feature = "delegated-stored", feature = "delegated-exchange"))]
+mod body;
+
 /// Stored delegation: refresh token persisted at rest
 /// (`delegated-stored` feature).
 #[cfg(feature = "delegated-stored")]

@@ -41,12 +41,21 @@ pub(super) fn revocation_user_channel(prefix: &str, user_id: &str) -> String {
 /// Write the rotated session and drop the old one in a single server-side
 /// step.
 ///
-/// KEYS: `[old_session, new_session]`. ARGV: `[payload, ttl_seconds]`.
-/// The SET runs first; if it errors the script aborts before the DEL, so the
-/// old session survives a failed write. A crash cannot land between the two
-/// commands: the server runs the script to completion. When both ids are the
-/// same key the DEL is skipped, so cycling to the same id keeps the session.
+/// KEYS: `[old_session, new_session]`. ARGV: `[payload, ttl_seconds,
+/// require_old]` where `require_old` is `"1"` or `"0"`. The script returns
+/// `0` and writes nothing when `require_old` is set and the old session is
+/// not stored (a logout or revocation removed it after the request loaded
+/// it), and `1` after the new session was written. The check, the SET and
+/// the DEL run as one step, so of two racing rotations exactly one sees a
+/// live old key. The SET runs before the DEL; if it errors the script aborts
+/// before the DEL and the old session survives a failed write. When both ids
+/// are the same key the DEL is skipped and the key is only rewritten while
+/// it exists (under `require_old`), so cycling to the same id keeps the
+/// session.
 pub(super) const CYCLE_SCRIPT: &str = r#"
+if ARGV[3] == '1' and redis.call('EXISTS', KEYS[1]) == 0 then
+  return 0
+end
 redis.call('SET', KEYS[2], ARGV[1], 'EX', tonumber(ARGV[2]))
 if KEYS[1] ~= KEYS[2] then
   redis.call('DEL', KEYS[1])
@@ -71,6 +80,19 @@ pub(super) fn script_unavailable(err: &fred::error::Error) -> bool {
     .iter()
     .any(|needle| text.contains(needle))
 }
+
+/// Replace a stored session blob with its re-sealed form, only while the key
+/// still holds exactly the bytes that were read, and keep its expiry.
+///
+/// KEYS: `[session]`. ARGV: `[old_blob, new_blob]`. Returns `1` when the
+/// blob was replaced and `0` when the key changed or went away meanwhile.
+pub(super) const RESEAL_SCRIPT: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'KEEPTTL')
+  return 1
+end
+return 0
+"#;
 
 // ── TTL helpers ──────────────────────────────────────────────────────────────
 

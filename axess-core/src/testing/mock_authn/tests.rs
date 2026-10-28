@@ -133,3 +133,22 @@ async fn a_reset_token_expires_on_the_instant_passed_in() {
         "and stays refused after it"
     );
 }
+
+/// The tenant lookup the session validator makes on every request answers
+/// from the user's tenant alone and names itself in the call log.
+#[tokio::test]
+async fn get_user_tenant_answers_with_the_tenant_only() {
+    use crate::authn::store::IdentityLookup;
+    let log = CallLog::new();
+    let user = user_record("u1", "t1");
+    let store = MockIdentityStore::new()
+        .with_call_log(&log)
+        .with_user(user.clone());
+    assert_eq!(
+        store.get_user_tenant(&user.id).await.unwrap(),
+        Some(user.tenant_id)
+    );
+    let stranger = axess_identity::testing::user("nobody");
+    assert_eq!(store.get_user_tenant(&stranger).await.unwrap(), None);
+    assert_eq!(log.calls(), vec!["get_user_tenant", "get_user_tenant"]);
+}

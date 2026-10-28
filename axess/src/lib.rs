@@ -39,9 +39,9 @@ pub use axess_core::{MemorySessionRegistry, MemorySessionStore};
 pub mod session {
     pub use axess_core::session::refresh::{RefreshTokenId, TokenFamilyId};
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "valkey"))]
-    pub use axess_core::session::{CryptoError, SessionCrypto};
+    pub use axess_core::session::{CryptoError, LegacyBlobs, SessionCrypto};
     pub use axess_core::session::{
-        RefreshToken, RefreshTokenConfig, RefreshTokenStore, RotationOutcome,
+        CycleOutcome, RefreshToken, RefreshTokenConfig, RefreshTokenStore, RotationOutcome,
     };
 }
 
@@ -233,7 +233,7 @@ pub mod device {
         MemoryDevicePiiStore, MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError,
         NoopDeviceEventSink, NoopDeviceResolver, OwnerClaim, PiiToken, REDACTED_PLACEHOLDER,
         RedactedResolver, SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig,
-        SweepConfigBuilder, SweepCounts, TenantPepperResolver, TrustTransition,
+        SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
         cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up_for_user,
     };
 }

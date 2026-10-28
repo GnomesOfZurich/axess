@@ -7,7 +7,12 @@
 use axess_clock::testing::MockClock;
 use axess_core::{
     SqliteSessionStore,
-    session::{crypto::SessionCrypto, data::SessionData, id::SessionId, store::SessionStore},
+    session::{
+        crypto::SessionCrypto,
+        data::SessionData,
+        id::SessionId,
+        store::{CycleOutcome, SessionStore},
+    },
 };
 use axess_identity::{TenantId, UserId};
 use axess_rng::SystemRng;
@@ -146,7 +151,13 @@ async fn cycle_replaces_old_with_new() {
     store.save(&id_old, &data, ttl).await.unwrap();
 
     let id_new = SessionId::new(&rng);
-    store.cycle(&id_old, &id_new, &data, ttl).await.unwrap();
+    assert_eq!(
+        store
+            .cycle(&id_old, &id_new, &data, ttl, true)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
     assert_ne!(id_old, id_new);
     assert!(store.load(&id_old).await.unwrap().is_none());
     assert!(store.load(&id_new).await.unwrap().is_some());

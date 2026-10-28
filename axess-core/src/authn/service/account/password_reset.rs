@@ -41,6 +41,17 @@ where
     /// The token expires after `ttl`. Returns the plaintext token that the
     /// application should embed in a reset link.
     ///
+    /// A `ttl` of zero, or one longer than seven days, is refused with
+    /// [`AuthnError::Internal`] before anything is looked up, so a bad value
+    /// fails the same way for a registered and an unregistered identifier.
+    ///
+    /// An identifier that does not resolve (unknown tenant, inactive tenant
+    /// or unknown user) makes the same store round trips as one that does:
+    /// one tenant lookup, one user lookup, one token write and one audit
+    /// write. The write goes to a reserved user id and carries an already
+    /// expired token whose plaintext is discarded, so it can never be
+    /// redeemed; the audit row is a failure with no user attributed.
+    ///
     /// # Arguments
     ///
     /// * `identifier`: the user's login identifier (email, username).
@@ -53,36 +64,41 @@ where
         tenant_identifier: &str,
         ttl: std::time::Duration,
     ) -> Result<Option<String>, AuthnError<I::Error>> {
+        let now = self.inner.clock.now();
+        let expires_at = chrono::Duration::from_std(ttl)
+            .ok()
+            .filter(|d| *d > chrono::Duration::zero() && *d <= chrono::Duration::days(7))
+            .and_then(|d| now.checked_add_signed(d))
+            .ok_or_else(|| {
+                AuthnError::Internal(
+                    "password reset ttl must be positive and at most seven days".to_string(),
+                )
+            })?;
+
         // Look up the user. If not found, return Ok(None) to avoid
-        // leaking whether the identifier exists (timing equalized below).
+        // leaking whether the identifier exists.
         let tenant = self
             .inner
             .identity
             .find_tenant(tenant_identifier)
             .await
             .map_err(AuthnError::Store)?;
+        let tenant_active = tenant.as_ref().is_some_and(|t| t.status.is_active());
+        let tenant_id = tenant.map_or(crate::authn::ids::TenantId::SYSTEM, |t| t.id);
 
-        let tenant = match tenant {
-            Some(t) if t.status.is_active() => t,
-            _ => return Ok(None),
-        };
-
+        // The user lookup runs for every tenant outcome so the number of
+        // round trips does not depend on it.
         let user = self
             .inner
             .identity
-            .find_user(identifier, &tenant.id)
+            .find_user(identifier, &tenant_id)
             .await
-            .map_err(AuthnError::Store)?;
-
-        let user = match user {
-            Some(u) if u.validate().is_ok() => Some(u),
-            _ => None,
-        };
+            .map_err(AuthnError::Store)?
+            .filter(|u| tenant_active && u.validate().is_ok());
 
         // Generate token: 32 random bytes → URL-safe base64. Done
         // unconditionally so the not-found path performs the same RNG +
-        // SHA-256 work as the found path, narrowing the timing side
-        // channel that would otherwise leak account existence.
+        // SHA-256 work as the found path.
         let mut token_bytes = [0u8; 32];
         self.inner.rng.fill_bytes(&mut token_bytes);
         use base64::Engine as _;
@@ -93,25 +109,23 @@ where
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
         };
 
-        let user = match user {
-            Some(u) => u,
-            None => {
-                // The miss path draws the token and hashes it (above) but has
-                // no `user_id` to write a reset token or an audit row for, so
-                // it returns without the two store round trips the found
-                // path makes. That gap is small beside the Argon2id work in
-                // `complete_password_reset`, which is where reset cost lives,
-                // but it is not zero: an observer with a precise clock can
-                // tell the paths apart. The two-step flow signals existence
-                // anyway (the user only gets the email when they exist), so
-                // apps should always return the same UI message and deliver
-                // the email out of band.
-                return Ok(None);
-            }
+        let Some(user) = user else {
+            // The same two writes the found path makes. The token is
+            // already expired and its plaintext is dropped, so nothing
+            // can redeem it; its store error is ignored, since a store
+            // may reject a row for a user that does not exist.
+            let _ = self
+                .inner
+                .identity
+                .store_reset_token(&crate::authn::ids::UserId::SYSTEM, &hash, now)
+                .await;
+            self.emit_audit(AuthEventBuilder::failure(
+                AuthEventType::PasswordResetRequested,
+            ))
+            .await?;
+            return Ok(None);
         };
 
-        let expires_at =
-            self.inner.clock.now() + chrono::Duration::from_std(ttl).unwrap_or_default();
         self.inner
             .identity
             .store_reset_token(&user.id, &hash, expires_at)
@@ -148,13 +162,16 @@ where
         // re-runs inside `complete_password_reset`, but the cost is tiny
         // compared to history hashing and we get a fast-path tenant
         // refusal here.
-        let user = self
+        let Some(user) = self
             .inner
             .identity
             .get_user(user_id)
             .await
             .map_err(AuthnError::Store)?
-            .ok_or(AuthnError::NoFlow)?;
+        else {
+            // Same answer as a known user with a bad token.
+            return Ok(false);
+        };
         if &user.tenant_id != expected_tenant {
             tracing::warn!(
                 user_id = %user_id,
@@ -174,8 +191,11 @@ where
     /// if the reset succeeded, `Ok(false)` if the token was invalid, expired,
     /// the new password does not meet the tenant's
     /// [`PasswordRules`](crate::authn::factor::PasswordRules) (minimum length
-    /// and complexity, checked before the token is spent), or it violates the
-    /// tenant's history-reuse rule.
+    /// and complexity), or it violates the tenant's history-reuse rule. A
+    /// password refused for either reason leaves the token unspent, so the
+    /// person can pick another with the same link. A tenant that is missing
+    /// or not active refuses the reset the same way. An unknown `user_id`
+    /// answers `Ok(false)` as a bad token does.
     ///
     /// # Arguments
     ///
@@ -208,13 +228,36 @@ where
             return Ok(false);
         }
 
-        let user = self
+        let Some(user) = self
             .inner
             .identity
             .get_user(user_id)
             .await
             .map_err(AuthnError::Store)?
-            .ok_or(AuthnError::NoFlow)?;
+        else {
+            // Same answer as a known user with a bad token, so the route
+            // is not an oracle for which user ids exist.
+            return Ok(false);
+        };
+        // A token issued before the tenant was suspended must not reset a
+        // password afterwards, as `begin_password_reset` refuses an inactive
+        // tenant. Refused before the token is read, so it is not spent; the
+        // answer is the same `Ok(false)` as a bad token.
+        let tenant_active = self
+            .inner
+            .identity
+            .get_tenant(&user.tenant_id)
+            .await
+            .map_err(AuthnError::Store)?
+            .is_some_and(|t| t.status.is_active());
+        if !tenant_active {
+            tracing::warn!(
+                user_id = %user_id,
+                tenant = %user.tenant_id,
+                "password reset refused: tenant is missing or not active"
+            );
+            return Ok(false);
+        }
         let rules = self
             .inner
             .identity
@@ -235,7 +278,11 @@ where
             return Ok(false);
         }
 
-        if !self.verify_reset_token_hash(user_id, token).await? {
+        // Look at the token without spending it: a token that does not
+        // match stops the flow before any costly work, and one that does is
+        // spent only after the new password has passed the history check, so
+        // a refused password leaves the link usable.
+        if !self.reset_token_matches(user_id, token, false).await? {
             return Ok(false);
         }
 
@@ -255,8 +302,14 @@ where
             .check_history_and_hash(user_id, new_password, &rules)
             .await?
         else {
-            return Ok(false); // Password was used before.
+            return Ok(false); // Password was used before; the token is kept.
         };
+
+        // Spend the token. Of two requests that both got this far, exactly
+        // one wins; the other changes nothing.
+        if !self.reset_token_matches(user_id, token, true).await? {
+            return Ok(false);
+        }
 
         self.install_new_password(user_id, &user_scope, new_password_hash, rules)
             .await?;
@@ -300,24 +353,25 @@ where
     I: IdentityStore + IdentityPasswordReset + IdentityPasswordHistory,
     F: FactorStore<Error = I::Error>,
 {
-    /// Hash the supplied plaintext token via SHA-256 and verify it
-    /// against the store's per-user reset-token record.
+    /// Hash the supplied plaintext token via SHA-256 and compare it with the
+    /// store's per-user reset-token record, spending the record when `spend`
+    /// is set.
     ///
-    /// Returns `Ok(true)` when the token matches the current
-    /// outstanding reset token for `user_id`. Returns `Ok(false)`
-    /// when the token doesn't match (consumed, expired, never
-    /// issued, or simply wrong): caller maps to "reset failed."
-    /// Errors only on store outage.
+    /// Returns `Ok(true)` when the token matches the current outstanding
+    /// reset token for `user_id`. Returns `Ok(false)` when it doesn't
+    /// (consumed, expired, never issued, or simply wrong): caller maps to
+    /// "reset failed." Errors only on store outage.
     ///
     /// SHA-256 (rather than HMAC or Argon2) matches the begin-side
     /// `record_reset_token` storage shape: the token is high-entropy
     /// (32 random bytes from `SecureRng`, base64-encoded) and
     /// single-use, so a fast hash is appropriate. If begin-side
     /// hashing changes, this must change in lockstep.
-    async fn verify_reset_token_hash(
+    async fn reset_token_matches(
         &self,
         user_id: &crate::authn::ids::UserId,
         token: &str,
+        spend: bool,
     ) -> Result<bool, AuthnError<I::Error>> {
         use base64::Engine as _;
         let hash = {
@@ -325,11 +379,19 @@ where
             let digest = sha2::Sha256::digest(token.as_bytes());
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
         };
-        self.inner
-            .identity
-            .verify_reset_token(user_id, &hash, self.inner.clock.now())
-            .await
-            .map_err(AuthnError::Store)
+        let now = self.inner.clock.now();
+        if spend {
+            self.inner
+                .identity
+                .verify_reset_token(user_id, &hash, now)
+                .await
+        } else {
+            self.inner
+                .identity
+                .check_reset_token(user_id, &hash, now)
+                .await
+        }
+        .map_err(AuthnError::Store)
     }
 
     /// Record the hash about to be replaced in the password history.

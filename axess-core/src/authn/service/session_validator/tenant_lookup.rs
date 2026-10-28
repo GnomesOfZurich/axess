@@ -32,6 +32,9 @@ impl IdentityLookup for TenantOnly {
         self.tenant_calls.fetch_add(1, Ordering::SeqCst);
         Ok(Some(self.tenant))
     }
+    async fn get_tenant(&self, _: &TenantId) -> Result<Option<Tenant>, Infallible> {
+        unreachable!("not used by the validator")
+    }
     async fn find_tenant(&self, _: &str) -> Result<Option<Tenant>, Infallible> {
         unreachable!("not used by the validator")
     }

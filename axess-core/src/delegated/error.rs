@@ -16,7 +16,8 @@ pub enum DelegatedError {
     TokenEndpoint {
         /// HTTP status code from the upstream token endpoint.
         status: u16,
-        /// Best-effort response body for adopter logging.
+        /// Best-effort response body for adopter logging: the first 1 KiB,
+        /// with `…[truncated]` appended when the body was longer.
         body: String,
     },
     /// 2xx response body failed to deserialise as an RFC 6749 / RFC 8693
@@ -42,6 +43,12 @@ pub enum DelegatedError {
     /// users as "you need to (re)connect your `<provider>` account".
     #[error("no delegated credential for this (tenant, user, provider)")]
     NotConnected,
+    /// The credential's `token_type` is not `Bearer`. A bearer string cannot
+    /// carry a sender-constrained token (DPoP, MAC): sent as a plain bearer it
+    /// would be rejected downstream or, worse, used without its binding.
+    /// Read the credential from the store to handle such a token.
+    #[error("delegated credential has token_type `{0}`, not Bearer")]
+    UnsupportedTokenType(String),
     /// The stored refresh token was rejected by the IdP; typically
     /// because the user revoked the grant in their account settings,
     /// or the provider's refresh-token TTL elapsed. Adopters should

@@ -326,7 +326,7 @@ impl AwsStsClient {
     ) -> Result<AssumeRoleWithWebIdentityResponse, AwsStsError> {
         let form = build_form(request);
 
-        let response = self
+        let mut response = self
             .http
             .post((*self.endpoint).clone())
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -337,10 +337,15 @@ impl AwsStsClient {
             .map_err(|e| AwsStsError::Transport(e.to_string()))?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AwsStsError::Transport(e.to_string()))?;
+        // The STS answer is a small XML document; error bodies are cut to
+        // 1 KiB, which holds the error code and message.
+        let body = axess_factors::http_body::read_for_status(
+            &mut response,
+            axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| AwsStsError::Transport(e.to_string()))?;
+        let body = String::from_utf8_lossy(&body);
 
         if !status.is_success() {
             return Err(parse_error(status.as_u16(), &body));

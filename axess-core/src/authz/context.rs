@@ -74,6 +74,46 @@ pub trait BuildRequestContext: Send + Sync {
     fn to_cedar_context(&self) -> Result<Context, AuthzError>;
 }
 
+// ── RequestContextProvider ────────────────────────────────────────────────────
+
+/// Builds the Cedar [`Context`] for one request of a `require_authz!` gate.
+///
+/// The macro looks for an `Arc<dyn RequestContextProvider>` in the request
+/// extensions and calls [`context_for`](Self::context_for) with the session
+/// and the request head. Install it with an `Extension` layer beside the
+/// policy store and the entity provider; the extension must be stored under
+/// exactly this type (an `Arc<MyProvider>` is a different type to the
+/// extension map).
+///
+/// Derive facts such as MFA status from the session or from state the
+/// application's own layers wrote into the request extensions, never from a
+/// header, a query parameter or any other value the caller writes.
+///
+/// # Without a provider
+///
+/// When no provider is installed the gate evaluates with an empty context.
+/// That is safe for a policy set that never mentions `context`. For one that
+/// does it fails closed in two ways: a context attribute the action's schema
+/// declares required makes the request invalid, which `PolicyStore` denies,
+/// and `PolicyStore` also denies any request in which a policy errors during
+/// evaluation. The schema validator refuses a policy that reads an optional
+/// attribute without a `context has ..` guard, so the one case an empty
+/// context can permit is a policy that guards its access and treats absence
+/// as allowed. Declare the attributes policies rely on as required, and
+/// install a provider wherever policies reason about the context.
+///
+/// # Errors
+///
+/// An `Err` is treated as a denial: the gate answers 403 and logs the error.
+pub trait RequestContextProvider: Send + Sync {
+    /// Produce the Cedar context for this request.
+    fn context_for<'a>(
+        &'a self,
+        session: &'a crate::session::AuthSession,
+        request: &'a axum::http::request::Parts,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Context, AuthzError>> + Send + 'a>>;
+}
+
 // ── NoContext ─────────────────────────────────────────────────────────────────
 
 /// Zero-overhead context for applications that do not use ABAC in Cedar policies.

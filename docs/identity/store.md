@@ -38,6 +38,11 @@ pub trait IdentityLookup: Send + Sync + 'static {
         user_id: &UserId,
     ) -> impl Future<Output = Result<Option<User>, Self::Error>> + Send;
 
+    fn get_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> impl Future<Output = Result<Option<Tenant>, Self::Error>> + Send;
+
     fn find_tenant(
         &self,
         identifier: &str,
@@ -118,6 +123,15 @@ pub trait IdentityPasswordReset: IdentityLookup {
         token_hash: &str,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
+    // Same comparison, but the row stays: the flow checks with this
+    // first and spends the token with `verify_reset_token` last.
+    fn check_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 }
 ```
 
@@ -147,8 +161,8 @@ and the flows that need them are bounded on those traits, so a store that
 has not implemented them cannot reach the flow and the omission is a
 compile error rather than a panic.
 
-`IdentityPasswordReset` holds `store_reset_token` and
-`verify_reset_token`. The reason is the shape of a mistake rather than a
+`IdentityPasswordReset` holds `store_reset_token`, `verify_reset_token`
+and `check_reset_token`. The reason is the shape of a mistake rather than a
 preference. `begin_password_reset` answers `Ok(None)` for an identifier
 it cannot find and reaches the store only for one it can, so a panicking
 default answered an unauthenticated "forgot password" request with a 200
@@ -313,7 +327,7 @@ impl IdentityLookup for OurBackend {
 
         Ok(row.map(|r| user_from_row(self.clock(), &r)))
     }
-    // ... find_tenant, default_tenant, account_status
+    // ... get_tenant, find_tenant, default_tenant, account_status
 }
 ```
 

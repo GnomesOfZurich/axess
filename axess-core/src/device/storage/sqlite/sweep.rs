@@ -15,6 +15,17 @@ pub(super) async fn run(
     // affected-row counts; no row reads in user space, no
     // per-row roundtrips.
 
+    // Stage 0: a revoked row saved without a revocation time (by an older
+    // version) starts its grace now, so stage 3 can age it out. Not counted:
+    // no level changes.
+    sqlx::query(
+        "UPDATE devices SET revoked_at = ?2 WHERE tenant_id = ?1 AND trust_level = 'Revoked' AND revoked_at IS NULL",
+    )
+    .bind(tenant)
+    .bind(cutoffs.now)
+    .execute(pool)
+    .await?;
+
     // Stage 1: Trusted → Seen, stamped with the demotion. A row is
     // moved one level per sweep, so a demoted row gets its whole
     // Seen window from `now`.

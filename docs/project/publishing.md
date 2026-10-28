@@ -158,7 +158,7 @@ on the published version. The shape:
 mkdir /tmp/axess-smoke
 cd /tmp/axess-smoke
 cargo new --name axess-smoke .
-echo 'axess = "0.11"' >> Cargo.toml
+echo 'axess = "0.12"' >> Cargo.toml
 cargo build
 ```
 

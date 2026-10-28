@@ -30,7 +30,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::store::{BindingsUpdate, OwnerClaim, SweepConfig, TrustTransition};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
-use crate::session::crypto::{BoundFormat, CryptoError, SessionCrypto};
+use crate::session::crypto::{
+    BoundFormat, CryptoError, SessionCrypto, device_row_id, device_row_id_v1,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 /// Codec for the bindings column on a device row.
@@ -42,15 +44,20 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 ///
 /// # Binding to the device row
 ///
-/// An encrypted blob is `AXD 0x01 || nonce(12) || ciphertext+tag` (marker
-/// bytes `0x41 0x58 0x44 0x01`) with AES-GCM additional authenticated data
-/// `"axess.device-bindings.v1" || 0x00 || tenant_id || 0x00 || device_id`
-/// (the UTF-8 bytes of both ids). The ids are supplied again on every read,
-/// so a bindings blob copied into another device's row fails
-/// authentication. A blob with the marker is never opened under an empty
-/// AAD; a blob without it predates binding and is opened under the empty
-/// AAD, then rewritten in the bound format by the next `save`, so the
-/// legacy fallback ages out as devices are saved. Plaintext codecs have
+/// An encrypted blob is `AXD 0x02 || nonce(12) || ciphertext+tag` (marker
+/// bytes `0x41 0x58 0x44 0x02`) with AES-GCM additional authenticated data
+/// `"axess.device-bindings.v2" || 0x00 || len(tenant_id) || tenant_id ||
+/// len(device_id) || device_id`, each length a big-endian `u32` and each id
+/// its UTF-8 bytes, so two different id pairs can never produce the same
+/// AAD. The ids are supplied again on every read, so a bindings blob copied
+/// into another device's row fails authentication. A blob with a marker is
+/// never opened under an empty AAD. The 0.11.0 form (`AXD 0x01`, the ids
+/// joined by one zero byte) is still read. A blob without any marker
+/// predates binding and is opened under the empty AAD unless the crypto was
+/// set to reject such blobs ([`LegacyBlobs`](crate::session::crypto::LegacyBlobs)).
+/// A bindings write seals the current form, and so does a read that finds an
+/// older form (a conditional write of the exact bytes it read), so the older
+/// forms age out as devices are written or read. Plaintext codecs have
 /// nothing to bind.
 ///
 /// `SessionCrypto` is reused as a *generic* AES-256-GCM envelope
@@ -85,7 +92,7 @@ impl BindingsCodec {
         let payload = match &self.crypto {
             Some(crypto) => crypto.seal_bound(
                 BoundFormat::DEVICE_BINDINGS,
-                &row_id(tenant_id, device_id),
+                &device_row_id(tenant_id, device_id),
                 &bytes,
             )?,
             None => bytes,
@@ -102,37 +109,74 @@ impl BindingsCodec {
         device_id: &str,
         stored: &str,
     ) -> Result<Vec<DeviceBinding>, SqlDeviceStoreError> {
+        self.decode_checked(tenant_id, device_id, stored)
+            .map(|(bindings, _)| bindings)
+    }
+
+    /// Like [`decode`](Self::decode), and also reports whether the stored
+    /// blob is in an older format than the one a write seals, so a reader
+    /// can re-seal it. An empty column and a plaintext codec are never
+    /// stale.
+    pub fn decode_checked(
+        &self,
+        tenant_id: &str,
+        device_id: &str,
+        stored: &str,
+    ) -> Result<(Vec<DeviceBinding>, bool), SqlDeviceStoreError> {
         if stored.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
         let payload = BASE64
             .decode(stored)
             .map_err(|_| SqlDeviceStoreError::Crypto(CryptoError))?;
-        let plaintext = match &self.crypto {
+        let (plaintext, stale) = match &self.crypto {
             Some(crypto) => {
                 let opened = crypto.open_bound(
                     BoundFormat::DEVICE_BINDINGS,
-                    &row_id(tenant_id, device_id),
+                    &device_row_id(tenant_id, device_id),
+                    &[(
+                        BoundFormat::DEVICE_BINDINGS_V1,
+                        device_row_id_v1(tenant_id, device_id),
+                    )],
                     &payload,
                 )?;
-                if opened.legacy {
-                    tracing::debug!("bindings blob predates row binding; re-sealed on next save");
-                }
-                opened.plaintext
+                (opened.plaintext, opened.stale)
             }
-            None => payload,
+            None => (payload, false),
         };
-        Ok(rmp_serde::from_slice(&plaintext)?)
+        Ok((rmp_serde::from_slice(&plaintext)?, stale))
     }
 }
 
-/// Row identity authenticated into an encrypted bindings blob.
-fn row_id(tenant_id: &str, device_id: &str) -> Vec<u8> {
-    let mut id = Vec::with_capacity(tenant_id.len() + 1 + device_id.len());
-    id.extend_from_slice(tenant_id.as_bytes());
-    id.push(0);
-    id.extend_from_slice(device_id.as_bytes());
-    id
+/// A stale bindings blob read from a row, with the current-format blob
+/// that should replace it. The write is conditional on the exact bytes
+/// that were read, so it never overwrites a save that landed meanwhile.
+pub(crate) struct Reseal {
+    pub tenant: String,
+    pub id: String,
+    /// The stored bytes the read saw: the comparand of the write.
+    pub stored: String,
+    /// The same bindings sealed in the current format.
+    pub blob: String,
+}
+
+/// Log the outcome of a re-seal attempt. A re-seal is housekeeping: it
+/// never fails the read that found the stale blob.
+pub(crate) fn note_reseal(result: Result<u64, sqlx::Error>, reseal: &Reseal) {
+    match result {
+        Ok(0) => tracing::debug!(
+            tenant_id = %reseal.tenant,
+            device_id = %reseal.id,
+            "bindings re-seal skipped: the row changed after it was read"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            tenant_id = %reseal.tenant,
+            device_id = %reseal.id,
+            %error,
+            "bindings re-seal failed; the row keeps its older format"
+        ),
+    }
 }
 
 /// Most refresh-family rows written by one `INSERT`: three binds per row
@@ -278,8 +322,13 @@ pub(crate) struct DeviceRow {
 
 impl DeviceRow {
     /// Decode a stored row into a [`Device`], validating every id,
-    /// timestamp and the trust level, and opening the bindings blob.
-    pub(crate) fn into_device(self, codec: &BindingsCodec) -> Result<Device, SqlDeviceStoreError> {
+    /// timestamp and the trust level, and opening the bindings blob. When
+    /// the blob is in an older format the [`Reseal`] that replaces it is
+    /// returned beside the device.
+    pub(crate) fn into_device(
+        self,
+        codec: &BindingsCodec,
+    ) -> Result<(Device, Option<Reseal>), SqlDeviceStoreError> {
         let Self {
             tenant_id,
             id,
@@ -317,9 +366,20 @@ impl DeviceRow {
         let revoked = revoked_at.map(unix_to_utc).transpose()?;
         let demoted = demoted_at.map(unix_to_utc).transpose()?;
 
-        let bindings = codec.decode(&tenant_id, &id, &bindings)?;
+        let (decoded, stale) = codec.decode_checked(&tenant_id, &id, &bindings)?;
+        let reseal = if stale {
+            Some(Reseal {
+                blob: codec.encode(&tenant_id, &id, &decoded)?,
+                tenant: tenant_id,
+                id,
+                stored: bindings,
+            })
+        } else {
+            None
+        };
+        let bindings = decoded;
 
-        Ok(Device {
+        let device = Device {
             id: device_id,
             tenant_id: tenant,
             user_id: user,
@@ -330,24 +390,36 @@ impl DeviceRow {
             revoked_at: revoked,
             demoted_at: demoted,
             bindings,
-        })
+        };
+        Ok((device, reseal))
     }
 }
 
-/// Decode at most one fetched row.
+/// Decode at most one fetched row, with the re-seal its blob needs.
 pub(crate) fn decode_optional(
     codec: &BindingsCodec,
     row: Option<DeviceRow>,
-) -> Result<Option<Device>, SqlDeviceStoreError> {
-    row.map(|r| r.into_device(codec)).transpose()
+) -> Result<(Option<Device>, Option<Reseal>), SqlDeviceStoreError> {
+    match row.map(|r| r.into_device(codec)).transpose()? {
+        Some((device, reseal)) => Ok((Some(device), reseal)),
+        None => Ok((None, None)),
+    }
 }
 
-/// Decode fetched rows in order, stopping at the first that fails.
+/// Decode fetched rows in order, stopping at the first that fails, with
+/// the re-seals the stale blobs among them need.
 pub(crate) fn decode_all(
     codec: &BindingsCodec,
     rows: Vec<DeviceRow>,
-) -> Result<Vec<Device>, SqlDeviceStoreError> {
-    rows.into_iter().map(|r| r.into_device(codec)).collect()
+) -> Result<(Vec<Device>, Vec<Reseal>), SqlDeviceStoreError> {
+    let mut devices = Vec::with_capacity(rows.len());
+    let mut reseals = Vec::new();
+    for row in rows {
+        let (device, reseal) = row.into_device(codec)?;
+        devices.push(device);
+        reseals.extend(reseal);
+    }
+    Ok((devices, reseals))
 }
 
 /// A stored `trust_level` column value read back as a level; `None` when
@@ -474,17 +546,23 @@ impl GuardedTrustWrite {
     }
 }
 
+/// How often a guarded trust change is tried when it keeps missing a row
+/// that a re-read finds at the expected level.
+pub(crate) const TRANSITION_ATTEMPTS: usize = 4;
+
 /// The outcome of a guarded trust change that matched no row, given the
-/// level a re-read found. A row already at `expected` counts as applied:
-/// some engines report zero changed rows for a no-op match.
+/// level a re-read found. `None` means the row is at `expected` after all:
+/// the write lost a race with a change that has since been undone, nothing
+/// was written, and the caller must try the write again rather than report
+/// a transition that did not happen.
 pub(crate) fn transition_after_miss(
     current: Option<DeviceTrustLevel>,
     expected: DeviceTrustLevel,
-) -> TrustTransition {
+) -> Option<TrustTransition> {
     match current {
-        None => TrustTransition::Missing,
-        Some(current) if current == expected => TrustTransition::Applied,
-        Some(current) => TrustTransition::Refused { current },
+        None => Some(TrustTransition::Missing),
+        Some(current) if current == expected => None,
+        Some(current) => Some(TrustTransition::Refused { current }),
     }
 }
 
@@ -561,10 +639,11 @@ pub(crate) fn claim_after_miss(owner: Option<Option<String>>, user: &str) -> Own
     }
 }
 
-/// Sweep thresholds as Unix seconds. Threshold semantics:
-/// `signed_duration_since(last_seen) > window` is
-/// `last_seen_at < now - window`, so the bind-side comparison mirrors the
-/// in-memory store exactly.
+/// Sweep thresholds as Unix seconds. Every timestamp column holds whole
+/// seconds, and `SweepConfig::level_after` compares whole seconds too:
+/// `now_s - last_seen_s > window_s` is `last_seen_s < now_s - window_s`, so
+/// the bind-side comparison takes exactly the decision the in-memory store
+/// takes, whatever the sub-second part of the instants.
 pub(crate) struct SweepCutoffs {
     pub now: i64,
     pub trusted: i64,

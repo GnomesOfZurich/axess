@@ -52,6 +52,23 @@
 /// Error` and logs at `error!` level; this is a configuration bug, not
 /// a per-request error.
 ///
+/// # Request context
+///
+/// Optionally, `Arc<dyn axess_core::authz::RequestContextProvider>` builds
+/// the Cedar context (`context.mfa_verified` and similar attributes) from the
+/// session and the request head. When the provider returns an error the gate
+/// answers 403. When no provider is installed the gate evaluates with an
+/// empty context: policies that never read `context` are unaffected, and
+/// `PolicyStore` denies every request whose action schema requires a context
+/// attribute (the request is invalid) or in which a policy errors during
+/// evaluation. A policy that guards an optional attribute with
+/// `context has ..` and treats absence as allowed is the one case an empty
+/// context can permit, so declare the attributes policies rely on as
+/// required and install a provider wherever policies reason about the
+/// context. As with
+/// the entity provider, the extension must be stored under exactly the
+/// `Arc<dyn RequestContextProvider>` type.
+///
 /// # Failure responses
 ///
 /// - **401 Unauthorized**: caller is not authenticated.
@@ -107,7 +124,7 @@ macro_rules! require_authz {
     // identify the policy decision point and shouldn't change at runtime.
     ($namespace:expr, $action:literal, $resource:literal) => {{
         $crate::axum::middleware::from_fn(
-            |auth_session: $crate::AuthSession,
+            move |auth_session: $crate::AuthSession,
              req: $crate::axum::extract::Request,
              next: $crate::axum::middleware::Next| async move {
                 use ::std::sync::Arc;
@@ -212,14 +229,44 @@ macro_rules! require_authz {
                     }
                 };
 
-                // 6. Cedar evaluation. AuthzDenied is the standard 403 response.
+                // 6. The request context. A provider in the extensions builds
+                //    it from the session and the request head; an error is a
+                //    denial. Without a provider the context is empty, which
+                //    the policy store fails closed on for any policy that
+                //    reads it.
+                let (req_parts, req_body) = req.into_parts();
+                let context = match req_parts
+                    .extensions
+                    .get::<Arc<dyn $crate::__authz::RequestContextProvider>>()
+                    .cloned()
+                {
+                    ::std::option::Option::Some(cp) => {
+                        match cp.context_for(&auth_session, &req_parts).await {
+                            ::std::result::Result::Ok(c) => c,
+                            ::std::result::Result::Err(e) => {
+                                $crate::tracing::warn!(
+                                    ?e,
+                                    principal = %principal,
+                                    resource = %resource,
+                                    action = %action_uid_parsed,
+                                    "context_for failed; treating as deny"
+                                );
+                                return $crate::__authz::AuthzDenied.into_response();
+                            }
+                        }
+                    }
+                    ::std::option::Option::None => $crate::__cedar::Context::empty(),
+                };
+                let req = $crate::axum::extract::Request::from_parts(req_parts, req_body);
+
+                // 7. Cedar evaluation. AuthzDenied is the standard 403 response.
                 let decision = $crate::__authz::PolicyEvaluator::is_authorized(
                     &*store,
                     &entities,
                     principal,
                     action_uid_parsed,
                     resource,
-                    $crate::__cedar::Context::empty(),
+                    context,
                 );
                 match decision {
                     $crate::__authz::AuthzDecision::Allow => next.run(req).await,

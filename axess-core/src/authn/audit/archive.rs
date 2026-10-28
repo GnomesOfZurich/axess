@@ -57,11 +57,13 @@ use std::time::Duration;
 
 /// Stable identity of one archive batch.
 ///
-/// Derived from the source ids of the batch's first and last events and its
-/// size, so the retention loop hands the same id to the archiver every time
-/// it re-sends the same rows after a failed `mark_archived`. An archiver
-/// that records the ids it has applied can then skip a repeat. The value is
-/// a lowercase hex digest, safe to use in file names and object keys.
+/// Derived from the source id of every event in the batch, so the retention
+/// loop hands the same id to the archiver every time it re-sends the same
+/// rows after a failed `mark_archived`, whatever order the select returned
+/// them in. An archiver that records the ids it has applied can then skip a
+/// repeat. Two batches that differ in any row, even one in the middle, have
+/// different ids. The value is a lowercase hex digest, safe to use in file
+/// names and object keys.
 ///
 /// The id is stable for a re-selection of the same rows. If rows became
 /// eligible between two ticks and the retry selects a larger batch, it has
@@ -70,19 +72,23 @@ use std::time::Duration;
 pub struct ArchiveBatchId(String);
 
 impl ArchiveBatchId {
-    /// The id for a batch of `count` events whose first and last source ids
-    /// render as `first` and `last`.
-    pub fn from_parts(first: &str, last: &str, count: usize) -> Self {
+    /// The id for a batch whose events have the given source ids, which
+    /// render as the strings in `ids`. The order they are given in does not
+    /// matter.
+    pub fn from_ids<I, S>(ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         use sha2::{Digest, Sha256};
+        let mut sorted: Vec<S> = ids.into_iter().collect();
+        sorted.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
         let mut h = Sha256::new();
-        for part in [
-            first.as_bytes(),
-            last.as_bytes(),
-            count.to_string().as_bytes(),
-        ] {
+        h.update((sorted.len() as u64).to_be_bytes());
+        for id in &sorted {
             // Length-prefixed so ("ab","c") and ("a","bc") differ.
-            h.update((part.len() as u64).to_be_bytes());
-            h.update(part);
+            h.update((id.as_ref().len() as u64).to_be_bytes());
+            h.update(id.as_ref().as_bytes());
         }
         let mut hex = String::with_capacity(64);
         for b in h.finalize() {
@@ -293,8 +299,8 @@ pub trait AuditRetentionSource: Send + Sync + 'static {
     /// which rows just got archived so `mark_archived` can target
     /// them precisely.
     ///
-    /// It must be `Display`: the first and last ids of a batch name it to
-    /// the archiver (see [`ArchiveBatchId`]).
+    /// It must be `Display`: the ids of a batch name it to the archiver (see
+    /// [`ArchiveBatchId`]).
     type EventId: Clone + std::fmt::Display + Send + Sync + 'static;
 
     /// Backend-specific error type.
@@ -326,10 +332,15 @@ pub trait AuditRetentionSource: Send + Sync + 'static {
     ) -> impl std::future::Future<Output = Result<u64, Self::Error>> + Send;
 }
 
+/// The most ticks one [`AuditRetentionLoop::drain`] runs before it yields
+/// back to the loop's rest interval.
+pub const MAX_TICKS_PER_DRAIN: usize = 100;
+
 /// Outcome of one retention-loop tick.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RetentionTickReport {
-    /// Number of events successfully shipped to the archiver this tick.
+    /// Number of events successfully shipped to the archiver this tick (or,
+    /// from `drain`, across all its ticks).
     pub archived: u64,
     /// Number of hot rows deleted post-verification-window this tick.
     pub purged: u64,
@@ -367,9 +378,10 @@ where
 ///    handle detaches the task, which keeps running; abort the handle
 ///    (tokio's `abort` on it) to stop it.
 ///
-/// The loop runs one tick per `tick_interval` (default 1 hour),
-/// archiving up to `batch_size` events per tick (default 10 000).
-/// Override with the fluent setters before `spawn`.
+/// The loop wakes once per `tick_interval` (default 1 hour) and ticks back to
+/// back while ticks come back full (see [`drain`](Self::drain)), archiving up
+/// to `batch_size` events per tick (default 10 000). Override with the fluent
+/// setters before `spawn`.
 ///
 /// # Time
 ///
@@ -377,9 +389,9 @@ where
 /// [`Clock`](axess_clock::Clock): the archive and purge cutoffs come from
 /// `clock.now()`. The pacing of the ticks themselves is the Tokio runtime's
 /// timer (`tokio::time::sleep`), outside the `Clock` seam; drive
-/// [`tick`](Self::tick) from your own scheduler to control it. A tick that
-/// overruns the interval is followed by a full interval of rest rather than
-/// by catch-up ticks for the intervals it missed.
+/// [`tick`](Self::tick) or [`drain`](Self::drain) from your own scheduler to
+/// control it. A drain that overruns the interval is followed by a full
+/// interval of rest rather than by catch-up drains for the intervals it missed.
 pub struct AuditRetentionLoop<S, A>
 where
     S: AuditRetentionSource,
@@ -453,12 +465,7 @@ where
 
         if !batch.is_empty() {
             let (ids, events): (Vec<S::EventId>, Vec<AuthEvent>) = batch.into_iter().unzip();
-            let batch_id = match (ids.first(), ids.last()) {
-                (Some(first), Some(last)) => {
-                    ArchiveBatchId::from_parts(&first.to_string(), &last.to_string(), ids.len())
-                }
-                _ => unreachable!("the batch is not empty"),
-            };
+            let batch_id = ArchiveBatchId::from_ids(ids.iter().map(ToString::to_string));
             self.archiver
                 .archive_batch(&batch_id, &events)
                 .await
@@ -480,10 +487,37 @@ where
         Ok(report)
     }
 
+    /// Run ticks back to back until the backlog is cleared.
+    ///
+    /// Calls [`tick`](Self::tick) again while the last one archived a full
+    /// batch, and stops at the first short batch (nothing more is eligible),
+    /// at the first error, or after [`MAX_TICKS_PER_DRAIN`] ticks, so a
+    /// source that never runs dry cannot hold the task forever; the next wake
+    /// carries on. The reports are summed. When a later tick fails, the
+    /// batches the earlier ones archived stay archived and marked, and the
+    /// error is what comes back.
+    pub async fn drain(&self) -> Result<RetentionTickReport, RetentionError<S::Error, A::Error>> {
+        let mut total = RetentionTickReport::default();
+        for _ in 0..MAX_TICKS_PER_DRAIN {
+            let report = self.tick().await?;
+            total.archived += report.archived;
+            total.purged += report.purged;
+            if report.archived < self.batch_size as u64 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
     /// Spawn the loop on the current Tokio runtime. Dropping the returned
     /// `JoinHandle` does not stop the loop (the task is detached); call
     /// `abort` on it to stop retention, and keep it for that purpose for
     /// the lifetime of the application.
+    ///
+    /// The task drains the backlog (see [`drain`](Self::drain)) as soon as
+    /// it starts and again after each `tick_interval`, so a process that
+    /// restarts more often than the interval still archives, and sustained
+    /// volume above one batch per interval does not pile up in the hot table.
     ///
     /// Tick errors are logged at `warn` and the loop keeps running
     /// so a single transient DB / archive blip does not silently
@@ -493,23 +527,23 @@ where
         let interval_dur = self.tick_interval;
         tokio::spawn(async move {
             loop {
-                // A full interval of rest after each tick, however long the
-                // tick took: an overrunning tick is not followed by catch-up
-                // ticks for the intervals it missed.
-                tokio::time::sleep(interval_dur).await;
-                match self.tick().await {
+                match self.drain().await {
                     Ok(report) if report.archived > 0 || report.purged > 0 => {
                         tracing::debug!(
                             archived = report.archived,
                             purged = report.purged,
-                            "audit retention tick",
+                            "audit retention drain",
                         );
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(error = %e, "audit retention tick failed; loop continuing");
+                        tracing::warn!(error = %e, "audit retention drain failed; loop continuing");
                     }
                 }
+                // A full interval of rest after each drain, however long it
+                // took: an overrunning drain is not followed by catch-up
+                // drains for the intervals it missed.
+                tokio::time::sleep(interval_dur).await;
             }
         })
     }
@@ -523,6 +557,8 @@ mod filesystem;
 pub use filesystem::{FilesystemArchiveError, FilesystemAuditArchiver};
 
 #[cfg(test)]
+mod drain;
+#[cfg(test)]
 mod pacing;
 
 #[cfg(test)]
@@ -533,7 +569,7 @@ mod tests {
     async fn noop_archiver_accepts_any_batch() {
         let archiver = NoopAuditArchiver;
         let result = archiver
-            .archive_batch(&ArchiveBatchId::from_parts("0", "0", 0), &[])
+            .archive_batch(&ArchiveBatchId::from_ids(["0"]), &[])
             .await;
         assert!(result.is_ok());
     }

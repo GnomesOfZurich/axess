@@ -250,12 +250,13 @@ pub fn generate_recovery_codes_peppered(
 }
 
 /// The canonical form of a code as a person typed it: whitespace and the
-/// display dash removed, upper-cased; so `abcde fghjk` and `ABCDE-FGHJK`
-/// are the same code.
+/// display dash removed, ASCII letters upper-cased; so `abcde fghjk` and
+/// `ABCDE-FGHJK` are the same code. Any other character is kept, so input
+/// with a stray symbol never normalises to a valid code.
 pub fn normalize_recovery_code(raw: &str) -> ZeroizedString {
     ZeroizedString::new(
         raw.chars()
-            .filter(char::is_ascii_alphanumeric)
+            .filter(|c| !c.is_whitespace() && *c != '-')
             .map(|c| c.to_ascii_uppercase())
             .collect::<String>(),
     )

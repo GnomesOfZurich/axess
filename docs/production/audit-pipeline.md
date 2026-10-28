@@ -275,12 +275,13 @@ The trait has one write verb and a name. `archive_batch` takes the
 events by slice, so an implementation that streams them does not force
 an allocation, and returns your own `Self::Error`.
 
-The `batch` id is derived from the source ids of the batch's first and
-last events and its size, so a batch the loop re-sends after a failed
-`mark_archived` carries the same id. An archiver that records the ids it
-has applied can skip the repeat; `FilesystemAuditArchiver` does, in a
-`.batches` file beside each day file. Your `EventId` type must be
-`Display`, since the loop renders the first and last ids to build the id.
+The `batch` id is derived from the source id of every event in the batch
+(in any order), so a batch the loop re-sends after a failed
+`mark_archived` carries the same id, and two batches that differ in any
+row do not. An archiver that records the ids it has applied can skip the
+repeat; `FilesystemAuditArchiver` does, in a `.batches` file beside each
+day file. Your `EventId` type must be `Display`, since the loop renders
+the ids to build the id.
 
 There is no purge verb. Deleting from the cold store is the cold
 store's business (an S3 lifecycle rule, a partition drop, a retention
@@ -309,15 +310,18 @@ let loop_handle = AuditRetentionLoop::new(
 .spawn();                                       // JoinHandle<()>
 ```
 
-The loop ticks once per `tick_interval`, hourly by default, archiving
-up to `batch_size` events per tick. Each tick reads the hot-tier events
+The loop wakes when it starts and then once per `tick_interval`, hourly
+by default, and on each wake ticks back to back while a tick comes back
+full (`drain`, at most 100 ticks per wake), so a backlog larger than
+`batch_size` clears without waiting an interval per batch. A tick archives
+up to `batch_size` events. Each tick reads the hot-tier events
 that have aged past `archive_after`, hands them to the archiver, and
 purges the hot rows whose archive copy was made more than
 `purge_hot_after_archive` ago. `spawn` returns a `JoinHandle`; dropping
 it leaves the loop running, so call `abort` on it to stop retention.
-The loop rests a full interval after each tick, so a tick that overruns
-is not followed by catch-up ticks. The cutoffs come from the injected clock, while the pacing is
-the Tokio timer's. `tick` is public too, for a
+The loop rests a full interval after each drain, so one that overruns
+is not followed by catch-up drains. The cutoffs come from the injected clock, while the pacing is
+the Tokio timer's. `tick` and `drain` are public too, for a
 deployment that would rather drive it from its own scheduler and read
 the `RetentionTickReport` each pass returns.
 
@@ -343,17 +347,26 @@ writes archived events to a day-partitioned JSONL directory:
 
 ```text
 /var/lib/axess/audit/
-    YYYY-MM-DD.jsonl
-    YYYY-MM-DD.jsonl
-    YYYY-MM-DD.jsonl
+    .archive.lock
+    YYYY/MM/DD/audit-YYYY-MM-DD.jsonl
+    YYYY/MM/DD/audit-YYYY-MM-DD.jsonl.batches
     ...
 ```
 
-Each file is append-only, fsynced per batch, and contains
+Each file is append-only, fsynced per batch (together with the folders
+it created, so a crash after a batch is acknowledged cannot lose a day
+file), and contains
 newline-delimited JSON-encoded events. The format is readable by
 standard tools (`grep`, `jq`, `awk`), survives forensic
 investigation, and lifts cleanly into cloud object storage when
 the deployment moves the archive there.
+
+Writers on one root take an exclusive lock on `.archive.lock` for the
+whole batch (duplicate check, writes, rollback and fsync), so two
+archivers or two processes pointed at the same directory cannot race or
+undo each other's batches, and a call that times out cannot release the
+lock while its writes are still running. Give each archiver its own root
+unless that sharing is intended.
 
 The reference implementation is for deployments with
 straightforward audit-storage needs. Larger deployments typically

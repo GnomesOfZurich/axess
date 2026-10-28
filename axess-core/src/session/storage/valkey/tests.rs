@@ -14,11 +14,11 @@ use super::internal::{
 };
 use super::registry::ValkeySessionRegistry;
 use super::store::ValkeySessionStore;
-use crate::session::crypto::SessionCrypto;
+use crate::session::crypto::{BoundFormat, SessionCrypto};
 use crate::session::data::SessionData;
 use crate::session::id::SessionId;
 use crate::session::storage::session_codec::SessionCodec;
-use crate::session::store::{SessionRegistry, SessionStore};
+use crate::session::store::{CycleOutcome, SessionRegistry, SessionStore};
 use axess_rng::SystemRng;
 use fred::prelude::*;
 use std::time::Duration;
@@ -320,7 +320,13 @@ async fn cycle_propagates_error_against_unreachable_valkey() {
     let new = SessionId::new(&rng);
     let result = tokio::time::timeout(
         Duration::from_secs(3),
-        store.cycle(&old, &new, &SessionData::default(), Duration::from_secs(60)),
+        store.cycle(
+            &old,
+            &new,
+            &SessionData::default(),
+            Duration::from_secs(60),
+            true,
+        ),
     )
     .await;
     assert!(
@@ -472,10 +478,13 @@ async fn valkey_integration() {
 
     // Store: cycle -> old gone, new exists.
     let new_sid = SessionId::new(&rng);
-    store
-        .cycle(&sid, &new_sid, &data, ttl)
-        .await
-        .expect("cycle");
+    assert_eq!(
+        store
+            .cycle(&sid, &new_sid, &data, ttl, true)
+            .await
+            .expect("cycle"),
+        CycleOutcome::Rotated
+    );
     assert!(store.load(&sid).await.expect("load old").is_none());
     assert!(store.load(&new_sid).await.expect("load new").is_some());
 
@@ -552,16 +561,18 @@ async fn valkey_integration() {
     client.quit().await.expect("disconnect");
 }
 
-/// The cycle script writes the new key before it touches the old one, and
-/// only deletes the old key when it differs from the new one.
+/// The cycle script checks the old key first, writes the new key before it
+/// touches the old one, and only deletes the old key when it differs from the
+/// new one.
 #[test]
-fn cycle_script_sets_before_it_deletes_and_spares_a_same_key_cycle() {
+fn cycle_script_checks_then_sets_then_deletes_and_spares_a_same_key_cycle() {
+    let check = CYCLE_SCRIPT.find("'EXISTS', KEYS[1]").expect("EXISTS old");
     let set = CYCLE_SCRIPT.find("'SET', KEYS[2]").expect("SET new");
     let guard = CYCLE_SCRIPT
         .find("KEYS[1] ~= KEYS[2]")
         .expect("same-key guard");
     let del = CYCLE_SCRIPT.find("'DEL', KEYS[1]").expect("DEL old");
-    assert!(set < guard && guard < del);
+    assert!(check < set && set < guard && guard < del);
 }
 
 /// Only "this deployment cannot run the script" errors take the SET then
@@ -618,7 +629,7 @@ async fn valkey_session_cycle_is_atomic() {
 
     // An out-of-range expiry makes the SET inside the script fail.
     let failed = store
-        .cycle(&old, &new, &data, Duration::from_secs(u64::MAX / 2))
+        .cycle(&old, &new, &data, Duration::from_secs(u64::MAX / 2), true)
         .await;
     assert!(failed.is_err());
     assert!(
@@ -627,20 +638,103 @@ async fn valkey_session_cycle_is_atomic() {
     );
     assert!(store.load(&new).await.unwrap().is_none());
 
-    store
-        .cycle(&old, &new, &data, Duration::from_secs(60))
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .cycle(&old, &new, &data, Duration::from_secs(60), true)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
     assert!(store.load(&old).await.unwrap().is_none());
     assert!(store.load(&new).await.unwrap().is_some());
 
-    store
-        .cycle(&new, &new, &data, Duration::from_secs(60))
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .cycle(&new, &new, &data, Duration::from_secs(60), true)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
     assert!(
         store.load(&new).await.unwrap().is_some(),
         "same-id cycle keeps the session"
     );
     store.delete(&new).await.unwrap();
+}
+
+/// The shared "an ended session stays ended" checks against a live Valkey,
+/// through the cycle script and `SET ... XX`.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_store_never_revives_an_ended_session() {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let store = ValkeySessionStore::plaintext(client).with_prefix("axt_revival");
+    crate::session::store::revival_tests::run_all(&store).await;
+}
+
+/// The same checks with the encrypted codec.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_encrypted_store_never_revives_an_ended_session() {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let store = ValkeySessionStore::new(client, [11u8; 32]).with_prefix("axt_revival_enc");
+    crate::session::store::revival_tests::run_all(&store).await;
+}
+
+/// A load re-seals a blob that carries no row binding and keeps the key's
+/// expiry; with legacy blobs rejected the same blob is refused instead.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_load_reseals_an_unbound_blob_and_reject_refuses_it() {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let key = [13u8; 32];
+    let store = ValkeySessionStore::new(client.clone(), key).with_prefix("axt_reseal");
+    let id = SessionId::new(&SystemRng);
+    let redis_key = format!("axt_reseal:sess:{id}");
+    let unbound = SessionCrypto::new(key)
+        .encrypt_unbound(&rmp_serde::to_vec_named(&SessionData::default()).unwrap())
+        .unwrap();
+    client
+        .set::<(), _, _>(
+            &redis_key,
+            unbound.clone(),
+            Some(Expiration::EX(600)),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+    let strict = ValkeySessionStore::new(client.clone(), key)
+        .with_prefix("axt_reseal")
+        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Reject);
+    assert!(strict.load(&id).await.is_err(), "reject refuses the blob");
+    let untouched: Vec<u8> = client.get(&redis_key).await.unwrap();
+    assert_eq!(untouched, unbound, "a refused blob is left as it is");
+
+    assert!(store.load(&id).await.unwrap().is_some());
+    let after: Vec<u8> = client.get(&redis_key).await.unwrap();
+    assert!(BoundFormat::SESSION.marks(&after), "re-sealed by the load");
+    let ttl: i64 = client.ttl(&redis_key).await.unwrap();
+    assert!((1..=600).contains(&ttl), "the expiry is kept: {ttl}");
+    assert!(strict.load(&id).await.unwrap().is_some(), "now bound");
+    store.delete(&id).await.unwrap();
 }

@@ -89,26 +89,32 @@ pub trait RefreshTokenStore: Send + Sync {
         family_id: &TokenFamilyId,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Atomically issue a new refresh token while evicting the
-    /// per-user cap-overflow set in a **single transaction**.
+    /// Atomically issue a new refresh token under the per-user cap: store
+    /// `new_token` and revoke the user's oldest active tokens (by
+    /// `issued_at`) until at most `max_per_user` remain, **counted inside the
+    /// same transaction as the insert**.
     ///
-    /// The naive sequence (`revoke_token(evict[i])` ... then
-    /// `store_token(new)`) is not atomic. If a `store_token` failure
-    /// arrives after the evictions, the user has just lost N legitimate
-    /// active tokens for nothing; if it arrives before, an in-flight
-    /// concurrent issue could push the active set above the cap.
+    /// # Why the cap is a parameter
+    ///
+    /// A caller that read [`active_tokens`](Self::active_tokens), chose the
+    /// surplus and then wrote would race with a concurrent issue for the same
+    /// user: both see the same count, each evicts for itself, and the user
+    /// ends above the cap. Counting and evicting must therefore happen in the
+    /// store's own atomic step, which needs the cap.
     ///
     /// # Requirement
     ///
-    /// This method is **required**: implementations MUST wrap the
-    /// per-id revocations and the new-token insert in a single transaction
-    /// (or equivalent atomic primitive) so partial-failure semantics
-    /// match; either all evictions land and the new token is stored, or
-    /// nothing changes.
-    fn issue_with_eviction(
+    /// This method is **required**. Implementations MUST serialise
+    /// concurrent issues for one user (a transaction whose first statement
+    /// is the eviction `UPDATE`, a row lock on the user, a per-user lock, or
+    /// a server-side script) and MUST make the evictions and the insert land
+    /// together or not at all, so a failed insert never costs the user
+    /// tokens. `max_per_user` is at least 1: the caller validates the
+    /// configuration before it gets here.
+    fn issue_capped(
         &self,
-        evict_ids: &[RefreshTokenId],
         new_token: &RefreshToken,
+        max_per_user: usize,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
     /// Atomically rotate a refresh token: revoke `parent_id` and insert

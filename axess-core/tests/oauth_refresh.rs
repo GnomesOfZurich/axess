@@ -31,7 +31,7 @@ async fn oauth_refresh_roundtrip() {
         .with_audit_context(AuditContext::default());
 
     let claims = authn
-        .refresh_oauth_token("refresh-idp", "stored-refresh-token")
+        .refresh_oauth_token("refresh-idp", "stored-refresh-token", "user-99")
         .await
         .expect("refresh should succeed");
 
@@ -60,7 +60,7 @@ async fn oauth_refresh_empty_token_rejected() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let result = authn.refresh_oauth_token("test-idp2", "").await;
+    let result = authn.refresh_oauth_token("test-idp2", "", "user-1").await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::NoRefreshToken
@@ -86,7 +86,9 @@ async fn oauth_refresh_unknown_provider_rejected() {
     let authn = AuthnService::new(identity.clone(), MockFactorStore::new())
         .with_audit_context(AuditContext::default());
 
-    let result = authn.refresh_oauth_token("nonexistent", "some-token").await;
+    let result = authn
+        .refresh_oauth_token("nonexistent", "some-token", "user-1")
+        .await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::UnknownProvider(_)
@@ -133,4 +135,43 @@ async fn oauth_userinfo_unknown_provider_rejected() {
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::UnknownProvider(_)
     ));
+}
+
+/// A refresh response for another subject is refused (OIDC Core 12.2) and
+/// audited as a provider rejection; the same response for the recorded
+/// subject is accepted.
+#[tokio::test]
+async fn oauth_refresh_refuses_a_response_for_another_subject() {
+    use axess_core::authn::event::AuthEventStatus;
+    use axess_factors::oauth::{MockOAuthProvider, OAuthError};
+
+    let mock =
+        MockOAuthProvider::new("sub-idp").with_user("user-99", "c@example.com", vec![], vec![]);
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let authn = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_oauth_provider(mock)
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let err = authn
+        .refresh_oauth_token("sub-idp", "stored-refresh-token", "someone-else")
+        .await
+        .expect_err("a different subject must be refused");
+    assert!(
+        matches!(err, OAuthError::IdTokenValidation(_)),
+        "got {err:?}"
+    );
+    assert!(
+        identity
+            .events()
+            .iter()
+            .any(|e| matches!(e.event_status, AuthEventStatus::Failure)
+                && e.error == Some(AuthFailureReason::TokenRefreshProviderRejected)),
+        "the mismatch is audited as a provider rejection"
+    );
+
+    authn
+        .refresh_oauth_token("sub-idp", "stored-refresh-token", "user-99")
+        .await
+        .expect("the recorded subject is accepted");
 }

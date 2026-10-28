@@ -93,7 +93,7 @@ impl KdfExecutor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let _permit = self
+        let permit = self
             .permits
             .clone()
             .acquire_owned()
@@ -101,10 +101,19 @@ impl KdfExecutor {
             .map_err(|_| KdfError::Closed)?;
         self.started.fetch_add(1, Ordering::Relaxed);
         match self.mode {
-            Mode::Inline => Ok(job()),
-            Mode::Pool => tokio::task::spawn_blocking(job)
-                .await
-                .map_err(|e| KdfError::Join(e.to_string())),
+            Mode::Inline => {
+                let _permit = permit;
+                Ok(job())
+            }
+            // The permit moves into the blocking closure, so it is released
+            // when the job ends and not when the caller's future is dropped:
+            // a dropped `JoinHandle` detaches the job without stopping it.
+            Mode::Pool => tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                job()
+            })
+            .await
+            .map_err(|e| KdfError::Join(e.to_string())),
         }
     }
 }
@@ -169,6 +178,38 @@ mod tests {
         }
         assert!(ticks_during(KdfExecutor::pool()).await > 0);
         assert_eq!(ticks_during(KdfExecutor::inline()).await, 0);
+    }
+
+    /// A caller that is dropped mid-job (a client that disconnects) must not
+    /// free its permit while the job is still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dropped_caller_keeps_its_permit_until_the_job_ends() {
+        let ex = Arc::new(KdfExecutor::pool_with_permits(1));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let job = |running: Arc<AtomicUsize>, peak: Arc<AtomicUsize>| {
+            move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                running.fetch_sub(1, Ordering::SeqCst);
+            }
+        };
+        let first = {
+            let (ex, r, p) = (ex.clone(), running.clone(), peak.clone());
+            tokio::spawn(async move { ex.run(job(r, p)).await })
+        };
+        while running.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        first.abort();
+        let _ = first.await;
+        ex.run(job(running.clone(), peak.clone())).await.unwrap();
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "the second job started while the first still ran"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

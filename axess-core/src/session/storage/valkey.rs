@@ -72,6 +72,8 @@ mod store;
 mod subscriber;
 
 #[cfg(test)]
+mod registry_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod ttl_tests;

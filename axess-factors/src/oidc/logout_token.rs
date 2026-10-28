@@ -13,6 +13,16 @@ pub const BACKCHANNEL_LOGOUT_EVENT: &str = "http://schemas.openid.net/event/back
 /// Maximum age of a logout token's `iat` claim (5 minutes).
 pub const MAX_IAT_AGE_SECS: i64 = 300;
 
+/// How far in the future a logout token's `iat` may be (clock skew), in
+/// seconds.
+pub const MAX_IAT_FUTURE_SECS: i64 = 60;
+
+/// How long a logout token's `jti` must be remembered to refuse a replay: a
+/// token is accepted from `MAX_IAT_FUTURE_SECS` before its `iat` until
+/// `MAX_IAT_AGE_SECS` after it, so the same token can arrive this many
+/// seconds apart.
+pub const JTI_RETENTION_SECS: i64 = MAX_IAT_AGE_SECS + MAX_IAT_FUTURE_SECS;
+
 /// Maximum logout token size (8 KiB). Real OIDC logout tokens are typically
 /// well under 2 KiB; the larger limit allows headroom for unusual claim
 /// payloads while still preventing memory DoS via crafted multi-megabyte
@@ -134,7 +144,7 @@ pub fn check_iat(payload: &serde_json::Value, now: i64) -> IatCheck {
         return IatCheck::Missing;
     };
     let age = now - iat;
-    if (-60..=MAX_IAT_AGE_SECS).contains(&age) {
+    if (-MAX_IAT_FUTURE_SECS..=MAX_IAT_AGE_SECS).contains(&age) {
         IatCheck::Ok
     } else {
         IatCheck::OutOfRange { iat, now }

@@ -54,6 +54,18 @@ impl JtiLog {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.drop_front_while(|seen_at| seen_at < cutoff, usize::MAX);
         if inner.seen.len() >= self.capacity {
+            // Everything left is inside the replay window (the expired
+            // entries went above), so making room forgets live tokens. Only
+            // the IdP can fill the log, with signature-verified tokens;
+            // refusing its genuine logouts instead would leave the sessions
+            // they name alive, which is the worse failure. Say so, so the
+            // capacity can be raised.
+            tracing::warn!(
+                capacity = self.capacity,
+                evicted = self.evict_batch,
+                "back-channel logout jti log full of live entries; evicting the oldest, \
+                 whose tokens can now replay until they expire"
+            );
             inner.drop_front_while(|_| true, self.evict_batch);
         }
         let key = (issuer.to_string(), jti.to_string());

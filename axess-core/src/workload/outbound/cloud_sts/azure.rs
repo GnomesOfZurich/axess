@@ -276,7 +276,7 @@ impl AzureFicClient {
             ("client_assertion", &request.federated_token),
         ];
 
-        let response = self
+        let mut response = self
             .http
             .post((*self.token_endpoint).clone())
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -289,11 +289,14 @@ impl AzureFicClient {
         let status = response.status();
         // The success body carries the access token, so it is zeroed on drop.
         let body = Zeroizing::new(
-            response
-                .text()
-                .await
-                .map_err(|e| AzureFicError::Transport(e.to_string()))?,
+            axess_factors::http_body::read_for_status(
+                &mut response,
+                axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| AzureFicError::Transport(e.to_string()))?,
         );
+        let body = Zeroizing::new(String::from_utf8_lossy(&body).into_owned());
 
         if !status.is_success() {
             return Err(parse_azure_error(status.as_u16(), &body));

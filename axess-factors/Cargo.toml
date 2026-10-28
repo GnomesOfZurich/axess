@@ -130,7 +130,10 @@ jwt-rust-crypto = ["jwt", "jsonwebtoken?/rust_crypto"]
 # backend features and the `compile_error!` that demands one are both out of
 # scope. It resolved to `jsonwebtoken []`, no crypto at all, and panicked
 # on the first verification, which is the bug the backend features exist for.
-oidc = ["jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio", "dep:thiserror", "dep:base64", "dep:url"]
+oidc = ["http-body", "jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio", "dep:thiserror", "dep:base64", "dep:url"]
+
+# Bounded reads of remote HTTP response bodies (`axess_factors::http_body`).
+http-body = ["dep:reqwest"]
 
 # OAuth ceremony surface
 fapi = ["oauth", "dep:p256", "dep:sha2"]
@@ -144,7 +147,7 @@ bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]
 # OIDC (no signed identity assertion; identity comes from a
 # TLS-trusted userinfo HTTPS GET). See `src/social.rs` module docs
 # for the full delta and when to reach for this vs OIDC.
-social = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio"]
+social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio"]
 # SPIFFE JWT-SVID: kept separate because it implements the SPIFFE
 # *spec* (mandatory `spiffe://` URI in `sub`, trust-domain extracted
 # from the URI), not just a claim shape. The generic `WorkloadResolver`
@@ -153,7 +156,7 @@ social = ["dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-r
 # an adopter-supplied claim parser plus mapping closure; see the
 # `axess-example-workload-identity` crate for ready-made recipes.
 jwt-svid = ["jwt", "axess-identity/serde"]
-outbound-oauth = ["jwt", "dep:reqwest", "dep:tokio", "dep:url", "dep:uuid", "dep:axess-clock", "dep:axess-rng", "dep:chrono", "dep:base64", "dep:thiserror"]
+outbound-oauth = ["http-body", "jwt", "dep:reqwest", "dep:tokio", "dep:url", "dep:uuid", "dep:axess-clock", "dep:axess-rng", "dep:chrono", "dep:base64", "dep:thiserror"]
 
 # Umbrella over the full federation surface
 federation = ["jwt", "jwt-svid", "oauth", "bearer", "outbound-oauth"]

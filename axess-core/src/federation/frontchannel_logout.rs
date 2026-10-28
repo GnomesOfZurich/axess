@@ -204,7 +204,13 @@ mod tests {
             "https://idp.example.com".to_string(),
             "oidc-sid-123".to_string(),
         );
-        sid_map.insert(key.clone(), user_id, session_id, chrono::Utc::now());
+        sid_map.insert(
+            key.clone(),
+            "idp-subject",
+            user_id,
+            session_id,
+            chrono::Utc::now(),
+        );
         assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
         let handler = FrontChannelLogoutHandler::new(
@@ -294,7 +300,13 @@ mod tests {
             "https://idp.example.com".to_string(),
             "oidc-sid-XYZ".to_string(),
         );
-        sid_map.insert(key.clone(), user_id, session_id, chrono::Utc::now());
+        sid_map.insert(
+            key.clone(),
+            "idp-subject",
+            user_id,
+            session_id,
+            chrono::Utc::now(),
+        );
 
         let handler = FrontChannelLogoutHandler::new(
             sid_map.clone(),

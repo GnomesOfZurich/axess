@@ -49,6 +49,7 @@ pub use axess_core::authz::{
     NoContext,
     PolicyEvaluator,
     PolicyStore,
+    RequestContextProvider,
     RequestEntityProvider,
     StandardRequestContext,
     make_action_uid,

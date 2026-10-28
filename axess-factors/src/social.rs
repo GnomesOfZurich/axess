@@ -391,6 +391,13 @@ where
             .send()
             .await?
             .error_for_status()?;
+        let mut resp = resp;
+        let bytes =
+            crate::http_body::read_limited(&mut resp, crate::http_body::MAX_TOKEN_BODY_BYTES)
+                .await
+                .map_err(|e| {
+                    SocialError::InvalidResponse(format!("token endpoint response: {e}"))
+                })?;
 
         // GitHub returns either application/json or form-urlencoded based on
         // the Accept header; we ask for JSON. Other providers always return
@@ -399,7 +406,7 @@ where
         struct TokenResponse {
             access_token: ZeroizedString,
         }
-        let body: TokenResponse = resp.json().await.map_err(|e| {
+        let body: TokenResponse = serde_json::from_slice(&bytes).map_err(|e| {
             SocialError::InvalidResponse(format!(
                 "token endpoint did not return JSON access_token: {e}"
             ))
@@ -410,16 +417,20 @@ where
     /// Fetch the userinfo response, run the adopter-supplied claim
     /// mapper, and return the normalised claims.
     pub async fn fetch_userinfo(&self, access_token: &str) -> Result<SocialClaims, SocialError> {
-        let raw: serde_json::Value = self
+        let mut resp = self
             .http
             .get(&self.userinfo_endpoint)
             .bearer_auth(access_token)
             .header("Accept", "application/json")
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let bytes =
+            crate::http_body::read_limited(&mut resp, crate::http_body::MAX_USERINFO_BODY_BYTES)
+                .await
+                .map_err(|e| SocialError::InvalidResponse(format!("userinfo response: {e}")))?;
+        let raw: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| SocialError::InvalidResponse(format!("userinfo is not JSON: {e}")))?;
 
         (self.claim_mapper)(&raw)
     }

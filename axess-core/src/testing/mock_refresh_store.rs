@@ -29,6 +29,9 @@ use std::time::Duration;
 #[derive(Clone, Default)]
 pub struct MemoryRefreshTokenStore {
     inner: MemoryStore<RefreshTokenId, RefreshToken>,
+    /// Serialises `issue_capped`, so the cap count and its evictions are
+    /// one step to concurrent issuers.
+    issue_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Infallible error for the in-memory refresh token store. Aliased to
@@ -122,13 +125,18 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
     // the shared map lock for the duration of its mutation, and the
     // observable end state matches a transactional revoke+insert.
 
-    async fn issue_with_eviction(
+    async fn issue_capped(
         &self,
-        evict_ids: &[RefreshTokenId],
         new_token: &RefreshToken,
+        max_per_user: usize,
     ) -> Result<(), Self::Error> {
-        for id in evict_ids {
-            self.revoke_token(id).await?;
+        // One issue at a time per store: the count, the evictions and the
+        // insert below are a single step to every other issuer.
+        let _serial = self.issue_lock.lock().await;
+        let active = self.active_tokens(&new_token.user_id).await?;
+        let surplus = (active.len() + 1).saturating_sub(max_per_user);
+        for token in active.iter().take(surplus) {
+            self.revoke_token(&token.id).await?;
         }
         self.store_token(new_token).await
     }

@@ -156,10 +156,17 @@ fn bench_memory_store(c: &mut Criterion) {
             // Cycle deletes the old ID and inserts under the new one; measures
             // the full session fixation prevention cost.
             let new_id = SessionId::new(&SystemRng);
-            store
-                .cycle(black_box(&id), black_box(&new_id), black_box(&data), ttl)
+            let outcome = store
+                .cycle(
+                    black_box(&id),
+                    black_box(&new_id),
+                    black_box(&data),
+                    ttl,
+                    false,
+                )
                 .await
                 .unwrap();
+            assert_eq!(outcome, axess_core::session::CycleOutcome::Rotated);
             black_box(new_id);
         })
     });

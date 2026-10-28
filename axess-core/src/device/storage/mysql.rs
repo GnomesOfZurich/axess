@@ -141,18 +141,25 @@ use sqlx::MySqlPool;
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::storage::sql_common::{
-    BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
-    SqlDeviceStoreError, SwapPlan, SweepCutoffs, TrustWrite, bindings_update_after_miss,
-    claim_after_miss, decode_all, decode_optional, parse_stored_trust, plan_bindings_swap,
-    push_family_rows, require_row, select_devices, transition_after_miss, utc_to_unix,
+    BindingsCodec, DeviceRow, DeviceWrite, GuardedTrustWrite, SqlDeviceStoreError, SwapPlan,
+    SweepCutoffs, TRANSITION_ATTEMPTS, TrustWrite, bindings_update_after_miss, claim_after_miss,
+    decode_all, decode_optional, parse_stored_trust, plan_bindings_swap, require_row,
+    select_devices, transition_after_miss, utc_to_unix,
 };
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
+    blocks_save, for_save,
 };
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
 
+mod family;
+mod reseal;
 mod sweep;
+
+use reseal::reseal_rows;
+
+use family::{fetch_trust_level, rewrite_family_index};
 
 /// MySQL/MariaDB-backed [`DeviceStore`].
 ///
@@ -270,49 +277,6 @@ CREATE TABLE IF NOT EXISTS device_bindings_refresh (
 #[cfg(test)]
 mod schema_tests;
 
-/// Current trust level of a device row, `None` when the row is absent.
-async fn fetch_trust_level(
-    pool: &MySqlPool,
-    tenant: &str,
-    device_id: &str,
-) -> Result<Option<DeviceTrustLevel>, SqlDeviceStoreError> {
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT trust_level FROM devices WHERE tenant_id = ? AND id = ?")
-            .bind(tenant)
-            .bind(device_id)
-            .fetch_optional(pool)
-            .await?;
-    parse_stored_trust(stored)
-}
-
-/// Replace a device's refresh-family index rows inside `tx`. The family
-/// ids are already distinct ([`refresh_family_ids`]) and the insert is
-/// idempotent as well, so a repeated family can never violate the primary
-/// key and abort the surrounding transaction.
-async fn rewrite_family_index(
-    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-    tenant: &str,
-    device_id: &str,
-    family_ids: &[String],
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM device_bindings_refresh WHERE tenant_id = ? AND device_id = ?")
-        .bind(tenant)
-        .bind(device_id)
-        .execute(&mut **tx)
-        .await?;
-    // One multi-row insert per chunk keeps a device with many families to a
-    // handful of statements, well under every dialect's bind-parameter cap.
-    for chunk in family_ids.chunks(FAMILY_INSERT_CHUNK) {
-        let mut insert = sqlx::QueryBuilder::<sqlx::MySql>::new(
-            "INSERT INTO device_bindings_refresh (tenant_id, device_id, family_id) ",
-        );
-        push_family_rows(&mut insert, chunk, tenant, device_id);
-        insert.push(" ON DUPLICATE KEY UPDATE family_id = family_id");
-        insert.build().execute(&mut **tx).await?;
-    }
-    Ok(())
-}
-
 impl DeviceStore for MysqlDeviceStore {
     type Error = SqlDeviceStoreError;
 
@@ -332,7 +296,9 @@ impl DeviceStore for MysqlDeviceStore {
                     .bind(&device_id)
                     .fetch_optional(&pool)
                     .await?;
-            decode_optional(&codec, row)
+            let (device, reseal) = decode_optional(&codec, row)?;
+            reseal_rows(&pool, reseal).await;
+            Ok(device)
         }
     }
 
@@ -348,13 +314,15 @@ impl DeviceStore for MysqlDeviceStore {
         async move {
             let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = ? AND fingerprint_hash = ? \
-                 ORDER BY last_seen_at DESC LIMIT 1"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT 1"
             ))
             .bind(&tenant)
             .bind(&bytes)
             .fetch_optional(&pool)
             .await?;
-            decode_optional(&codec, row)
+            let (device, reseal) = decode_optional(&codec, row)?;
+            reseal_rows(&pool, reseal).await;
+            Ok(device)
         }
     }
 
@@ -372,14 +340,16 @@ impl DeviceStore for MysqlDeviceStore {
         async move {
             let row: Option<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = ? AND user_id = ? AND fingerprint_hash = ? \
-                 ORDER BY last_seen_at DESC LIMIT 1"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT 1"
             ))
             .bind(&tenant)
             .bind(&uid)
             .bind(&bytes)
             .fetch_optional(&pool)
             .await?;
-            decode_optional(&codec, row)
+            let (device, reseal) = decode_optional(&codec, row)?;
+            reseal_rows(&pool, reseal).await;
+            Ok(device)
         }
     }
 
@@ -397,14 +367,16 @@ impl DeviceStore for MysqlDeviceStore {
         async move {
             let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = ? AND user_id = ? \
-                 ORDER BY last_seen_at DESC LIMIT ?"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT ?"
             ))
             .bind(&tenant)
             .bind(&uid)
             .bind(limit_i64)
             .fetch_all(&pool)
             .await?;
-            decode_all(&codec, rows)
+            let (devices, reseals) = decode_all(&codec, rows)?;
+            reseal_rows(&pool, reseals).await;
+            Ok(devices)
         }
     }
 
@@ -425,28 +397,33 @@ impl DeviceStore for MysqlDeviceStore {
                  INNER JOIN device_bindings_refresh r \
                    ON d.tenant_id = r.tenant_id AND d.id = r.device_id \
                  WHERE r.tenant_id = ? AND r.family_id = ? \
-                 ORDER BY d.last_seen_at DESC",
+                 ORDER BY d.last_seen_at DESC, d.id ASC",
             )
             .bind(&tenant)
             .bind(&family)
             .fetch_all(&pool)
             .await?;
-            decode_all(&codec, rows)
+            let (devices, reseals) = decode_all(&codec, rows)?;
+            reseal_rows(&pool, reseals).await;
+            Ok(devices)
         }
     }
 
     fn save(
         &self,
         device: &Device,
-        _now: DateTime<Utc>,
+        now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
-        let device = device.clone();
+        let device = for_save(device, now);
         async move {
             let w = DeviceWrite::new(&codec, &device)?;
 
             // MySQL upsert: `INSERT … ON DUPLICATE KEY UPDATE col = VALUES(col)`.
+            // MySQL applies the assignments left to right and a later one
+            // sees the columns an earlier one changed, so `trust_level`,
+            // which every guard reads, is assigned last.
             // `VALUES(col)` reads the value that would have been inserted; works
             // back to MySQL 5.7 and MariaDB 10.x. The modern `AS new` row-alias
             // form is MySQL 8.0.20+ only; staying on `VALUES(...)` keeps
@@ -458,6 +435,26 @@ impl DeviceStore for MysqlDeviceStore {
             // the post-update set, never a partially-updated index.
             let mut tx = pool.begin().await?;
 
+            // A save never un-revokes: a device loaded before a revocation
+            // and saved after it leaves the revoked row as it is. The row is
+            // read here only to skip the index rewrite and the write; the
+            // upsert below carries the same rule itself, so a revocation
+            // that lands between the two statements is still not undone.
+            // (No `FOR UPDATE`: on an absent row it takes a gap lock, and
+            // two first saves would deadlock on their inserts.)
+            let stored: Option<String> = sqlx::query_scalar(
+                "SELECT trust_level FROM devices WHERE tenant_id = ? AND id = ?",
+            )
+            .bind(&w.tenant)
+            .bind(&w.id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(stored) = parse_stored_trust(stored)?
+                && blocks_save(stored, device.trust_level)
+            {
+                return Ok(());
+            }
+
             sqlx::query(
                 r#"
                 INSERT INTO devices
@@ -465,14 +462,14 @@ impl DeviceStore for MysqlDeviceStore {
                      first_seen_at, last_seen_at, revoked_at, demoted_at, bindings)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE
-                    user_id          = VALUES(user_id),
-                    trust_level      = VALUES(trust_level),
-                    fingerprint_hash = VALUES(fingerprint_hash),
-                    first_seen_at    = VALUES(first_seen_at),
-                    last_seen_at     = VALUES(last_seen_at),
-                    revoked_at       = VALUES(revoked_at),
-                    demoted_at       = VALUES(demoted_at),
-                    bindings         = VALUES(bindings)
+                    user_id          = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', user_id, VALUES(user_id)),
+                    fingerprint_hash = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', fingerprint_hash, VALUES(fingerprint_hash)),
+                    first_seen_at    = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', first_seen_at, VALUES(first_seen_at)),
+                    last_seen_at     = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', last_seen_at, VALUES(last_seen_at)),
+                    revoked_at       = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', revoked_at, VALUES(revoked_at)),
+                    demoted_at       = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', demoted_at, VALUES(demoted_at)),
+                    bindings         = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', bindings, VALUES(bindings)),
+                    trust_level      = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', trust_level, VALUES(trust_level))
                 "#,
             )
             .bind(&w.tenant)
@@ -507,9 +504,12 @@ impl DeviceStore for MysqlDeviceStore {
         let ts = utc_to_unix(now);
         async move {
             let updated = sqlx::query(
-                "UPDATE devices SET last_seen_at = ? \
+                "UPDATE devices SET last_seen_at = CASE \
+                     WHEN trust_level <> 'Revoked' AND last_seen_at < ? THEN ? \
+                     ELSE last_seen_at END \
                  WHERE tenant_id = ? AND id = ?",
             )
+            .bind(ts)
             .bind(ts)
             .bind(&tenant)
             .bind(&device_id)
@@ -573,7 +573,8 @@ impl DeviceStore for MysqlDeviceStore {
             // One conditional UPDATE: the engine checks the current level
             // and writes in a single statement, so a revocation that lands
             // first makes this match no row instead of being overwritten.
-            let updated = sqlx::query("UPDATE devices SET demoted_at = CASE WHEN ? = 1 THEN demoted_at ELSE ? END, trust_level = ?, revoked_at = ? WHERE tenant_id = ? AND id = ? AND trust_level = ?")
+            for _ in 0..TRANSITION_ATTEMPTS {
+                let updated = sqlx::query("UPDATE devices SET demoted_at = CASE WHEN ? = 1 THEN demoted_at ELSE ? END, trust_level = ?, revoked_at = ? WHERE tenant_id = ? AND id = ? AND trust_level = ?")
             .bind(w.keep_demoted)
             .bind(w.demoted_at)
             .bind(w.new)
@@ -584,11 +585,17 @@ impl DeviceStore for MysqlDeviceStore {
             .execute(&pool)
             .await?
             .rows_affected();
-            if updated > 0 {
-                return Ok(TrustTransition::Applied);
+                if updated > 0 {
+                    return Ok(TrustTransition::Applied);
+                }
+                let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
+                if let Some(outcome) = transition_after_miss(current, expected) {
+                    return Ok(outcome);
+                }
+                // The row is at `expected` again: the write lost a race with
+                // a change that has since been undone. Try it again.
             }
-            let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
-            Ok(transition_after_miss(current, expected))
+            Ok(TrustTransition::Refused { current: expected })
         }
     }
 
@@ -635,7 +642,11 @@ impl DeviceStore for MysqlDeviceStore {
                 .await?
                 .rows_affected();
             if updated == 0 {
-                // Nothing written (the transaction rolls back on drop).
+                // Nothing written. The transaction is ended before the
+                // re-read, which needs a pooled connection of its own: with
+                // a one-connection pool it would otherwise wait for the
+                // connection this transaction still holds.
+                tx.rollback().await?;
                 let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
                 return Ok(bindings_update_after_miss(current));
             }
@@ -701,14 +712,16 @@ impl DeviceStore for MysqlDeviceStore {
             let rows: Vec<DeviceRow> = sqlx::query_as(select_devices!(
                 "WHERE tenant_id = ? AND user_id = ? \
                    AND trust_level <> 'Revoked' \
-                 ORDER BY last_seen_at DESC LIMIT ?"
+                 ORDER BY last_seen_at DESC, id ASC LIMIT ?"
             ))
             .bind(&tenant)
             .bind(&uid)
             .bind(limit_i64)
             .fetch_all(&pool)
             .await?;
-            decode_all(&codec, rows)
+            let (devices, reseals) = decode_all(&codec, rows)?;
+            reseal_rows(&pool, reseals).await;
+            Ok(devices)
         }
     }
 
@@ -765,11 +778,8 @@ impl HealthCheck for MysqlDeviceStore {
     }
 }
 
-// No dedicated integration test module: this backend tracks the
-// PostgresDeviceStore's test coverage shape (compile-time
-// trait-impl + workspace `cargo check --features mysql` against the
-// CI MySQL service). The session-store integration suite under
-// `axess-core/tests/` exercises the parallel `MysqlSessionStore`
-// against the same container; if device flows ever need adopter-
-// reproducible end-to-end coverage on MySQL, mirror the
-// `sqlite_store.rs` device-test pattern here.
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod reseal_tests;

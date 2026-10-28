@@ -41,11 +41,14 @@ use std::time::Duration;
 ///
 /// # Upgrade path
 ///
-/// No migration is needed. Reads accept both formats; every write
-/// (`save`, `cycle`) seals in the bound format, so a pre-binding row is
-/// rewritten the first time the session is saved after upgrading and the
-/// legacy fallback ages out within one session TTL. Sessions that are never
-/// saved again simply expire. Plaintext codecs have nothing to bind.
+/// No migration is needed. Reads accept both formats and the store that read
+/// a pre-binding row re-seals it in the bound format right away (a
+/// conditional write that keeps the row's expiry and never overwrites a
+/// newer save); every write (`save`, `update`, `cycle`) seals the bound
+/// format too. Once no pre-binding rows remain, set
+/// [`LegacyBlobs::Reject`](crate::session::crypto::LegacyBlobs::Reject) so a
+/// blob without a binding, which opens under any session id, is refused.
+/// Plaintext codecs have nothing to bind.
 ///
 /// Used by [`SqliteSessionStore`](super::sqlite::SqliteSessionStore),
 /// [`PostgresSessionStore`](super::postgres::PostgresSessionStore), and
@@ -69,6 +72,14 @@ impl SessionCodec {
         Self { crypto: None }
     }
 
+    /// Apply a [`LegacyBlobs`] choice to the codec's crypto. A plaintext
+    /// codec has nothing to refuse and is returned unchanged.
+    #[cfg(feature = "valkey")]
+    pub fn with_legacy_blobs(mut self, policy: crate::session::crypto::LegacyBlobs) -> Self {
+        self.crypto = self.crypto.map(|c| c.with_legacy_blobs(policy));
+        self
+    }
+
     /// The legacy text form of a stored value: base64 of
     /// [`encode_bytes`](Self::encode_bytes). Production writes use the
     /// binary column; this exists so tests can plant rows as an earlier
@@ -80,40 +91,45 @@ impl SessionCodec {
 
     /// Decode a SQL row: the binary column when it holds a value, the legacy
     /// base64 text column otherwise. A row an earlier release wrote has only
-    /// the text; every save writes the binary column and empties the text, so
-    /// a legacy row is rewritten the first time its session is saved.
+    /// the text; every save writes the binary column and empties the text.
+    ///
+    /// The flag says the row is stale: its blob lacks the current row
+    /// binding, or it still lives in the legacy text column. The SQL stores
+    /// re-seal a stale row on load.
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
     pub fn decode_row(
         &self,
         id: &SessionId,
         binary: Option<&[u8]>,
         text: &str,
-    ) -> Result<SessionData, SqlStoreError> {
+    ) -> Result<(SessionData, bool), SqlStoreError> {
         match binary {
-            Some(bytes) => self.decode_bytes(id, bytes),
-            None => self.decode(id, text),
+            Some(bytes) => self.decode_bytes_checked(id, bytes),
+            None => {
+                let (data, _) = self.decode_text(id, text)?;
+                Ok((data, true))
+            }
         }
     }
 
-    /// Deserialize (and optionally decrypt) session data from the legacy
-    /// base64 text column.
-    ///
-    /// Reads base64 MessagePack and the older plaintext JSON rows. SQL-only;
-    /// the binary column and Valkey use [`decode_bytes`](Self::decode_bytes).
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-    pub fn decode(&self, id: &SessionId, stored: &str) -> Result<SessionData, SqlStoreError> {
+    fn decode_text(
+        &self,
+        id: &SessionId,
+        stored: &str,
+    ) -> Result<(SessionData, bool), SqlStoreError> {
         // Plaintext-legacy fast path: a JSON object always starts with
         // `{`, which is never a valid base64 character. If we see one,
         // we know we are reading a pre-MessagePack plaintext row; decode
         // it as JSON and return.
         if self.crypto.is_none() && stored.starts_with('{') {
-            return Ok(serde_json::from_str(stored)?);
+            return Ok((serde_json::from_str(stored)?, true));
         }
 
         let payload = BASE64
             .decode(stored)
             .map_err(|_| SqlStoreError::Crypto(crate::session::crypto::CryptoError))?;
-        self.decode_bytes(id, &payload)
+        self.decode_bytes_checked(id, &payload)
     }
 
     /// Serialize (and optionally encrypt) session data for binary
@@ -139,27 +155,42 @@ impl SessionCodec {
     /// Counterpart to [`encode_bytes`](Self::encode_bytes).
     /// Tries MessagePack first; falls back to JSON to tolerate legacy
     /// blobs that adopters may still have in storage from before the
-    /// MessagePack switch.
+    /// MessagePack switch. Production reads use
+    /// [`decode_bytes_checked`](Self::decode_bytes_checked), which also
+    /// reports whether the blob needs re-sealing.
+    #[cfg(test)]
     pub fn decode_bytes(
         &self,
         id: &SessionId,
         payload: &[u8],
     ) -> Result<SessionData, SqlStoreError> {
+        Ok(self.decode_bytes_checked(id, payload)?.0)
+    }
+
+    /// [`decode_bytes`](Self::decode_bytes) plus whether the blob is stale:
+    /// sealed without the row binding of the current format. A stale blob is
+    /// re-sealed by the store that read it ([`encode_bytes`](Self::encode_bytes)
+    /// writes the current format).
+    pub fn decode_bytes_checked(
+        &self,
+        id: &SessionId,
+        payload: &[u8],
+    ) -> Result<(SessionData, bool), SqlStoreError> {
         let opened;
+        let mut stale = false;
         let plaintext: &[u8] = match &self.crypto {
             Some(crypto) => {
-                opened = crypto.open_bound(BoundFormat::SESSION, id.as_bytes(), payload)?;
-                if opened.legacy {
-                    tracing::debug!("session blob predates id binding; re-sealed on next save");
-                }
+                opened = crypto.open_bound(BoundFormat::SESSION, id.as_bytes(), &[], payload)?;
+                stale = opened.stale;
                 &opened.plaintext
             }
             None => payload,
         };
-        match rmp_serde::from_slice(plaintext) {
-            Ok(data) => Ok(data),
-            Err(_) => Ok(serde_json::from_slice(plaintext)?),
-        }
+        let data = match rmp_serde::from_slice(plaintext) {
+            Ok(data) => data,
+            Err(_) => serde_json::from_slice(plaintext)?,
+        };
+        Ok((data, stale))
     }
 }
 

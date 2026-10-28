@@ -9,7 +9,7 @@ use axess_core::session::{
     extractor::AuthSession,
     id::SessionId,
     layer::SessionLayer,
-    store::{MemorySessionStore, SessionStore},
+    store::{CycleOutcome, MemorySessionStore, SessionStore},
 };
 use axum::{
     Router,
@@ -58,9 +58,20 @@ impl SessionStore for CountingStore {
         new: &SessionId,
         d: &SessionData,
         ttl: Duration,
-    ) -> Result<(), Self::Error> {
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
         self.writes.fetch_add(1, Ordering::SeqCst);
-        self.inner.cycle(old, new, d, ttl).await
+        self.inner.cycle(old, new, d, ttl, require_old).await
+    }
+
+    async fn update(
+        &self,
+        id: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        self.inner.update(id, d, ttl).await
     }
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {

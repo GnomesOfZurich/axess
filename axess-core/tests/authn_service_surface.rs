@@ -247,7 +247,7 @@ async fn max_sessions_per_user_evicts_oldest_to_keep_under_cap() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity, factors)
         .with_registry(registry.clone())
-        .with_max_sessions_per_user(2)
+        .with_max_sessions_per_user(std::num::NonZeroUsize::new(2).unwrap())
         .build()
         .with_audit_context(AuditContext::default());
 

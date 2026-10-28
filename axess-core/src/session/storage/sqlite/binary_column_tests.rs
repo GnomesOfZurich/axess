@@ -113,10 +113,13 @@ async fn a_cycle_writes_the_new_row_as_bytes() {
     plant_legacy(&store, &old).await;
     let loaded = store.load(&old).await.unwrap().unwrap();
 
-    store
-        .cycle(&old, &new, &loaded, Duration::from_secs(60))
-        .await
-        .unwrap();
+    assert_eq!(
+        store
+            .cycle(&old, &new, &loaded, Duration::from_secs(60), true)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
 
     let (bin, text) = columns(&store, &new).await;
     assert!(bin.is_some() && text.is_empty());

@@ -13,6 +13,10 @@ use crate::oidc::jwks_cache::JwksCache;
 use jsonwebtoken::jwk::JwkSet;
 use std::sync::{Arc, RwLock};
 
+/// Largest discovery document body read (1 MiB). Real documents are a few
+/// kilobytes; a larger body is refused while it arrives, not buffered.
+pub const MAX_DISCOVERY_BYTES: usize = 1024 * 1024;
+
 /// Path appended to the issuer URL when fetching the discovery document
 /// (OIDC Core 1.0 §4.1).
 const WELL_KNOWN_SUFFIX: &str = "/.well-known/openid-configuration";
@@ -61,17 +65,21 @@ impl DiscoveryDocument {
         require_https_or_loopback(issuer_url)?;
 
         let url = format!("{}{WELL_KNOWN_SUFFIX}", issuer_url.trim_end_matches('/'));
-        let body = http_client
+        let mut response = http_client
             .get(&url)
             .send()
             .await
             .map_err(|e| OidcError::DiscoveryFetch(format!("{e}")))?
             // A 500 with a JSON body is not a discovery document.
             .error_for_status()
-            .map_err(|e| OidcError::DiscoveryFetch(format!("{e}")))?
-            .bytes()
-            .await
-            .map_err(|e| OidcError::DiscoveryFetch(format!("read body: {e}")))?;
+            .map_err(|e| OidcError::DiscoveryFetch(format!("{e}")))?;
+        let body = crate::oidc::body::read_capped(
+            &mut response,
+            MAX_DISCOVERY_BYTES,
+            || OidcError::DiscoveryFetch("discovery body exceeds limit".to_string()),
+            |e| OidcError::DiscoveryFetch(format!("read body: {e}")),
+        )
+        .await?;
 
         let raw: serde_json::Value =
             serde_json::from_slice(&body).map_err(|e| OidcError::DiscoveryParse(format!("{e}")))?;

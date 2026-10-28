@@ -143,7 +143,7 @@ async fn real_provider_begin_registration_stores_ceremony_state() {
         "registration state should be stored in session"
     );
 
-    let ceremony_ts = session.get_custom("axess.fido2.ceremony_started").await;
+    let ceremony_ts = session.get_custom("axess.fido2.reg_started").await;
     assert!(
         ceremony_ts.is_some() && !ceremony_ts.as_ref().unwrap().is_null(),
         "ceremony timestamp should be stored in session"

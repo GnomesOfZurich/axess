@@ -385,7 +385,9 @@ where
     /// Wait until every event queued so far has been handled by the sink.
     ///
     /// Events dropped for want of queue space are not recoverable and are not
-    /// waited for. Fails with [`AnalyticsClosed`] if the worker is not running.
+    /// waited for. Fails with [`AnalyticsClosed`] if the worker has been
+    /// dropped or has finished. If the worker exists but is not being run,
+    /// this waits until it is.
     pub async fn flush(&self) -> Result<(), AnalyticsClosed> {
         let (ack, done) = tokio::sync::oneshot::channel();
         self.queue
@@ -398,6 +400,9 @@ where
     /// Flush the queue and release this handle. Once the last handle is gone
     /// the worker finishes; await the handle [`AnalyticsWorker::spawn`]
     /// returned to know the sink has seen everything.
+    ///
+    /// Like [`flush`](Self::flush), this waits for as long as the worker exists
+    /// but is not being run.
     pub async fn shutdown(self) {
         let _ = self.flush().await;
     }
@@ -517,6 +522,14 @@ where
     ) -> impl std::future::Future<Output = Result<Option<crate::authn::ids::TenantId>, Self::Error>> + Send
     {
         self.inner.get_user_tenant(user_id)
+    }
+
+    fn get_tenant(
+        &self,
+        tenant_id: &crate::authn::ids::TenantId,
+    ) -> impl std::future::Future<Output = Result<Option<crate::authn::types::Tenant>, Self::Error>> + Send
+    {
+        self.inner.get_tenant(tenant_id)
     }
 
     fn find_tenant(

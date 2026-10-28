@@ -42,15 +42,19 @@
 //! AES-256-GCM when encryption is on). `data` is the base64 text column of
 //! earlier releases: rows written by them keep working because a load reads
 //! `data_bin` first and falls back to `data`, and every save writes
-//! `data_bin` and empties `data`, so a legacy row is rewritten the first
-//! time its session is saved. `data` stays `NOT NULL`, so new rows carry an
+//! `data_bin` and empties `data`, so a legacy row is rewritten when it is
+//! loaded (the store re-seals it) or saved. `data` stays `NOT NULL`, so new rows carry an
 //! empty string there. Rolling back to the earlier release afterwards cannot
 //! read a row this release saved (the text column is empty): that user signs
 //! in again.
 
 use crate::session::storage::session_codec::{SessionCodec, SqlStoreError, expires_at};
 use crate::session::storage::sql_helpers::log_cleanup_outcome;
-use crate::session::{data::SessionData, id::SessionId, store::SessionStore};
+use crate::session::{
+    data::SessionData,
+    id::SessionId,
+    store::{CycleOutcome, SessionStore},
+};
 use axess_clock::{Clock, SystemClock};
 use sqlx::MySqlPool;
 use std::sync::Arc;
@@ -142,6 +146,59 @@ impl MysqlSessionStore {
         Ok(())
     }
 
+    /// Re-seal a row that was read in an older form (a blob without the
+    /// current row binding, or the legacy text column) in the current
+    /// format. Best effort: the write is conditional on the row still
+    /// holding exactly the bytes that were read, so a save that landed
+    /// meanwhile is never overwritten, and the row keeps its expiry. A
+    /// failure is logged and the row is re-sealed by its next save.
+    async fn reseal(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        binary: Option<&[u8]>,
+        text: &str,
+        now: i64,
+    ) {
+        let sealed = match self.codec.encode_bytes(id, data) {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not re-seal a stale session row");
+                return;
+            }
+        };
+        let id_str = id.to_string();
+        let result = match binary {
+            Some(old) => {
+                sqlx::query(
+                    "UPDATE sessions SET data = '', data_bin = ? \
+                     WHERE id = ? AND expires_at > ? AND data_bin = ?",
+                )
+                .bind(&sealed)
+                .bind(&id_str)
+                .bind(now)
+                .bind(old)
+                .execute(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE sessions SET data = '', data_bin = ? \
+                     WHERE id = ? AND expires_at > ? AND data_bin IS NULL AND data = ?",
+                )
+                .bind(&sealed)
+                .bind(&id_str)
+                .bind(now)
+                .bind(text)
+                .execute(&self.pool)
+                .await
+            }
+        };
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "could not re-seal a stale session row");
+        }
+    }
+
     /// Delete all sessions whose `expires_at` is in the past.
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now = self.clock.now().timestamp();
@@ -184,7 +241,11 @@ impl SessionStore for MysqlSessionStore {
 
         match row {
             Some((binary, text)) => {
-                Ok(Some(self.codec.decode_row(id, binary.as_deref(), &text)?))
+                let (data, stale) = self.codec.decode_row(id, binary.as_deref(), &text)?;
+                if stale {
+                    self.reseal(id, &data, binary.as_deref(), &text, now).await;
+                }
+                Ok(Some(data))
             }
             None => Ok(None),
         }
@@ -231,23 +292,90 @@ impl SessionStore for MysqlSessionStore {
         Ok(())
     }
 
+    async fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        let id_str = id.to_string();
+        let encoded = self.codec.encode_bytes(id, data)?;
+        let exp = expires_at(&*self.clock, ttl);
+        let now = self.clock.now().timestamp();
+
+        let result = sqlx::query(
+            "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
+             WHERE id = ? AND expires_at > ?",
+        )
+        .bind(&encoded)
+        .bind(exp)
+        .bind(&id_str)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn cycle(
         &self,
         old_id: &SessionId,
         new_id: &SessionId,
         data: &SessionData,
         ttl: Duration,
-    ) -> Result<(), Self::Error> {
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
         let encoded = self.codec.encode_bytes(new_id, data)?;
         let exp = expires_at(&*self.clock, ttl);
+        let now = self.clock.now().timestamp();
         let old_str = old_id.to_string();
         let new_str = new_id.to_string();
 
         let mut tx = self.pool.begin().await?;
 
-        // Write the new row first, idempotently, and drop the old row only
-        // once the new one is in place within the same transaction: a failed
-        // insert rolls back and leaves the old session untouched.
+        // The delete of the old row comes first and decides whether the
+        // rotation may proceed: it takes the row lock, so a logout that
+        // deleted the row first leaves nothing to remove here, and a logout
+        // that arrives later waits for this transaction. With `require_old`
+        // a delete that removed no live row rolls the transaction back (by
+        // dropping it) instead of writing the authenticated data under the
+        // new id.
+        if old_str == new_str {
+            if require_old {
+                let replaced = sqlx::query(
+                    "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
+                     WHERE id = ? AND expires_at > ?",
+                )
+                .bind(&encoded)
+                .bind(exp)
+                .bind(&new_str)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                if replaced.rows_affected() == 0 {
+                    return Ok(CycleOutcome::SessionGone);
+                }
+                tx.commit().await?;
+                return Ok(CycleOutcome::Rotated);
+            }
+        } else {
+            let removed = sqlx::query("DELETE FROM sessions WHERE id = ? AND expires_at > ?")
+                .bind(&old_str)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            if require_old && removed.rows_affected() == 0 {
+                return Ok(CycleOutcome::SessionGone);
+            }
+            if removed.rows_affected() == 0 {
+                // An expired remnant of the old id is removed too.
+                sqlx::query("DELETE FROM sessions WHERE id = ?")
+                    .bind(&old_str)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
         sqlx::query(
             r#"
             INSERT INTO sessions (id, data, data_bin, expires_at)
@@ -261,15 +389,8 @@ impl SessionStore for MysqlSessionStore {
         .execute(&mut *tx)
         .await?;
 
-        if old_str != new_str {
-            sqlx::query("DELETE FROM sessions WHERE id = ?")
-                .bind(&old_str)
-                .execute(&mut *tx)
-                .await?;
-        }
-
         tx.commit().await?;
-        Ok(())
+        Ok(CycleOutcome::Rotated)
     }
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -331,6 +452,9 @@ impl crate::store::Store<SessionId, SessionData> for MysqlSessionStore {
 
 #[cfg(test)]
 mod schema_tests;
+
+#[cfg(test)]
+mod live_tests;
 
 #[cfg(test)]
 mod mysql_tests {
@@ -421,6 +545,7 @@ mod mysql_tests {
                 &sample_id(),
                 &SessionData::default(),
                 Duration::from_secs(60),
+                true,
             )
             .await;
         assert!(

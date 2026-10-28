@@ -161,7 +161,8 @@ impl Harness {
             "events": { axess_factors::oidc::logout_token::BACKCHANNEL_LOGOUT_EVENT: {} },
         });
         if sub {
-            payload["sub"] = self.user.id.to_string().into();
+            // The IdP's own subject, which is not the local user id.
+            payload["sub"] = "external-sub".into();
         }
         if let Some(sid) = sid {
             payload["sid"] = sid.into();
@@ -183,7 +184,8 @@ impl Harness {
 }
 
 /// A login whose ID token carried no `sid` has no `sid` mapping, and a
-/// `sub`-only logout token still ends it.
+/// `sub`-only logout token still ends it. The token names the IdP's subject
+/// (`external-sub`), not the local user id the session is registered under.
 #[tokio::test]
 async fn sid_less_login_is_ended_by_a_sub_only_logout() {
     let h = harness(100);

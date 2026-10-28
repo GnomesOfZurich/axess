@@ -231,11 +231,12 @@ issue a new token in the same family. Two requests racing each other
 must result in one rotation and one detected reuse, not two
 rotations.
 
-`issue_with_eviction` must atomically issue a new token and evict the
-oldest if the user is at the `max_per_user` cap. A non-atomic
-implementation can leave a user with eleven active tokens
-momentarily, which is harmless, or evict the wrong token under
-contention, which can log a legitimate session out for no reason.
+`issue_capped` must atomically issue a new token and evict the oldest
+until the user has at most `max_per_user` active tokens, counting inside
+the same transaction as the insert. An implementation that counts first
+and writes after lets two concurrent issues for one user both pass the
+cap, and can evict the wrong token under contention, which logs a
+legitimate session out for no reason.
 
 `revoke_family` must atomically revoke every token in a family.
 Partial revocation defeats the detection mechanism: an attacker

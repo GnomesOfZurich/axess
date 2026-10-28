@@ -147,6 +147,39 @@ where
         }
     }
 
+    /// Replace the value and deadline of a key only while a live entry is
+    /// stored under it, in one step under the map's shard lock. Returns
+    /// `false` (and writes nothing) for an absent or expired key.
+    pub fn replace_live(&self, key: &K, value: &V, ttl: Duration) -> bool {
+        let now = self.clock.now();
+        match self.inner.get_mut(key) {
+            Some(mut entry) if entry.expires_at > now => {
+                entry.value = value.clone();
+                entry.expires_at = self.deadline(now, ttl);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove a key and report whether a live (unexpired) entry was removed.
+    /// An expired entry is removed too but reported as `false`.
+    pub fn remove_live(&self, key: &K) -> bool {
+        let now = self.clock.now();
+        self.inner
+            .remove(key)
+            .is_some_and(|(_, entry)| entry.expires_at > now)
+    }
+
+    /// The expiry instant for a TTL starting at `now`, saturating at the
+    /// far future for a TTL too large to represent.
+    fn deadline(&self, now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
+        ChronoDuration::from_std(ttl)
+            .ok()
+            .and_then(|d| now.checked_add_signed(d))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+
     /// Synchronous prune for callers that want to reclaim expired
     /// entries without an `await`. The async [`Store::prune_expired`]
     /// wraps this; both have identical semantics.
@@ -217,10 +250,7 @@ where
         // an explicit "never expire" sentinel). Fall back to a far-
         // future deadline rather than panicking.
         let now = self.clock.now();
-        let expires_at = ChronoDuration::from_std(ttl)
-            .ok()
-            .and_then(|d| now.checked_add_signed(d))
-            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let expires_at = self.deadline(now, ttl);
         self.inner.insert(
             key.clone(),
             Entry {

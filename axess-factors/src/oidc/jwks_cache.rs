@@ -38,6 +38,10 @@ const JWKS_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
 /// is unreachable. Change it with [`JwksCache::with_max_age`].
 pub const DEFAULT_JWKS_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Largest JWKS response body read (1 MiB). A key set is a few kilobytes; a
+/// larger body is refused while it arrives, not buffered.
+pub const MAX_JWKS_BYTES: usize = 1024 * 1024;
+
 /// Refreshable JWKS cache backed by an HTTP `jwks_uri`.
 ///
 /// Owns a cloned [`openidconnect::reqwest::Client`] so [`refresh`](Self::refresh) is callable
@@ -315,15 +319,15 @@ impl JwksCache {
 
 /// GET `jwks_uri` and parse the body as a key set.
 ///
-/// Refuses a non-HTTPS `jwks_uri` (loopback excepted) and any non-2xx
-/// response, so an error page that happens to parse as a key set can never
+/// Refuses a non-HTTPS `jwks_uri` (loopback excepted), a body over
+/// [`MAX_JWKS_BYTES`] and any non-2xx response, so an error page that happens to parse as a key set can never
 /// replace trusted keys.
 async fn fetch_key_set(
     http_client: &openidconnect::reqwest::Client,
     jwks_uri: &str,
 ) -> Result<JwkSet, OidcError> {
     crate::oidc::discovery::require_https_or_loopback(jwks_uri)?;
-    let response = http_client
+    let mut response = http_client
         .get(jwks_uri)
         .send()
         .await
@@ -332,10 +336,13 @@ async fn fetch_key_set(
     if !status.is_success() {
         return Err(OidcError::JwksFetch(format!("HTTP {status}")));
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| OidcError::JwksFetch(format!("read body: {e}")))?;
+    let bytes = crate::oidc::body::read_capped(
+        &mut response,
+        MAX_JWKS_BYTES,
+        || OidcError::JwksFetch("JWKS body exceeds limit".to_string()),
+        |e| OidcError::JwksFetch(format!("read body: {e}")),
+    )
+    .await?;
     serde_json::from_slice(&bytes).map_err(|e| OidcError::JwksParse(format!("{e}")))
 }
 

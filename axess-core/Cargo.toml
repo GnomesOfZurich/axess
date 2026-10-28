@@ -118,7 +118,9 @@ rmp-serde = "1.3.1"
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 serial_test = "4.0.1"
 sha1 = { workspace = true }
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres"] }
+# `tls-rustls-aws-lc-rs`: MySQL 8 signs in with `caching_sha2_password`, which
+# needs TLS (or an RSA exchange); the live MySQL tests connect over TLS.
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres", "tls-rustls-aws-lc-rs"] }
 subtle = { workspace = true }
 # Satisfies `#[cfg(test)] mod tests` in authz/audit.rs and the doc-test
 # examples, which need a subscriber without the `testing` feature on.
@@ -207,10 +209,10 @@ delegated-stored = ["oauth", "outbound-oauth", "dep:reqwest"]
 delegated-stored-encrypted = ["delegated-stored", "dep:aes-gcm"]
 
 # Cloud STS: federated workload-identity → cloud temporary credentials
-aws-sts = ["dep:reqwest", "dep:quick-xml"]
-azure-fic = ["dep:reqwest"]
+aws-sts = ["axess-factors/http-body", "dep:reqwest", "dep:quick-xml"]
+azure-fic = ["axess-factors/http-body", "dep:reqwest"]
 cloud-sts = ["aws-sts", "gcp-wif", "azure-fic"]
-gcp-wif = ["dep:reqwest"]
+gcp-wif = ["axess-factors/http-body", "dep:reqwest"]
 
 # In-process IdP: mints workload JWTs for tests + on-host issuance
 # Primitive types (`LocalIdpSigningKey`, `MintClaims`, `IssuanceListener`)

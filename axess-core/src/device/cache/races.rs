@@ -194,7 +194,8 @@ async fn sweep_drops_cached_rows_of_the_tenant() {
         inner: MemoryDeviceStore::new().with_sweep_config(
             crate::device::store::SweepConfig::builder()
                 .trusted_idle(chrono::Duration::days(1))
-                .build(),
+                .build()
+                .unwrap(),
         ),
         ..HookedStore::default()
     };

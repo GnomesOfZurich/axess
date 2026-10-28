@@ -10,7 +10,11 @@
 use axess_clock::testing::MockClock;
 use axess_core::{
     PostgresSessionStore,
-    session::{data::SessionData, id::SessionId, store::SessionStore},
+    session::{
+        data::SessionData,
+        id::SessionId,
+        store::{CycleOutcome, SessionStore},
+    },
 };
 use axess_rng::SystemRng;
 use serial_test::serial;
@@ -132,7 +136,13 @@ async fn cycle_replaces_old_with_new() {
     store.save(&old_id, &data, ttl).await.unwrap();
 
     let new_id = SessionId::new(&rng);
-    store.cycle(&old_id, &new_id, &data, ttl).await.unwrap();
+    assert_eq!(
+        store
+            .cycle(&old_id, &new_id, &data, ttl, true)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
     assert_ne!(old_id, new_id);
     assert!(store.load(&old_id).await.unwrap().is_none());
     assert!(store.load(&new_id).await.unwrap().is_some());
@@ -287,4 +297,45 @@ async fn msgpack_roundtrip_preserves_custom_bag() {
         .unwrap();
     let loaded = store.load(&id).await.unwrap().expect("loaded");
     assert_eq!(loaded.custom, data.custom);
+}
+
+/// A session that was deleted is not brought back by `update` or by a
+/// `cycle` that requires its old row; a never-stored old id still rotates
+/// when the row is not required.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn an_ended_session_is_not_revived_by_update_or_cycle() {
+    let Some((store, _pool)) = make_store().await else {
+        return;
+    };
+    let rng = SystemRng;
+    let data = SessionData::default();
+    let ttl = Duration::from_secs(60);
+
+    let id = SessionId::new(&rng);
+    store.save(&id, &data, ttl).await.unwrap();
+    assert!(store.update(&id, &data, ttl).await.unwrap());
+    store.delete(&id).await.unwrap();
+    assert!(!store.update(&id, &data, ttl).await.unwrap());
+    assert!(store.load(&id).await.unwrap().is_none());
+
+    let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+    store.save(&old, &data, ttl).await.unwrap();
+    store.delete(&old).await.unwrap();
+    assert_eq!(
+        store.cycle(&old, &new, &data, ttl, true).await.unwrap(),
+        CycleOutcome::SessionGone
+    );
+    assert!(store.load(&new).await.unwrap().is_none());
+
+    let (fresh_old, fresh_new) = (SessionId::new(&rng), SessionId::new(&rng));
+    assert_eq!(
+        store
+            .cycle(&fresh_old, &fresh_new, &data, ttl, false)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
+    assert!(store.load(&fresh_new).await.unwrap().is_some());
 }

@@ -9,7 +9,11 @@ use axum::http::HeaderValue;
 use chrono::TimeZone;
 use tower::ServiceExt;
 
+mod key_bounds;
+mod sliding_window;
 mod sweep;
+
+use keys::{MAX_KEY_LEN, extract_peer_ip};
 
 /// A fixed origin well away from the real clock.
 fn t_zero() -> DateTime<Utc> {
@@ -423,73 +427,6 @@ fn login_identifier_rejects_empty_input() {
 
 // ── Mutation-coverage tests ────────────────────────────────────────────────
 
-/// Keys at exactly `MAX_KEY_LEN` bytes are passed through
-/// unchanged. Pins the `>` operator at line 412 against `==`/`>=`
-/// (which would truncate at the boundary too) and `<` (which would
-/// truncate everything *under* the cap, the inverse of the intent).
-#[test]
-fn truncate_key_at_max_key_len_unchanged() {
-    let key = "x".repeat(MAX_KEY_LEN);
-    let out = truncate_key(key.clone());
-    assert_eq!(
-        out.len(),
-        MAX_KEY_LEN,
-        "key length at exactly MAX_KEY_LEN must pass through"
-    );
-    assert_eq!(out, key, "at-cap key must be byte-identical");
-}
-
-/// Keys one byte over the cap are truncated. Pairs with the
-/// at-cap test to discriminate `>` from `<`.
-#[test]
-fn truncate_key_one_byte_over_cap_is_truncated() {
-    let key = "x".repeat(MAX_KEY_LEN + 1);
-    let out = truncate_key(key);
-    assert_eq!(
-        out.len(),
-        MAX_KEY_LEN,
-        "one byte over MAX_KEY_LEN must truncate to MAX_KEY_LEN"
-    );
-}
-
-/// When a multi-byte char straddles the cap, `truncate_key`
-/// walks back to the previous UTF-8 boundary so the resulting `String`
-/// is valid UTF-8 (otherwise `String::truncate` panics). Pins three
-/// mutations on the walk loop:
-/// - `delete !` at line 415: the loop becomes `while is_char_boundary
-///   { cut -= 1; }`. Starting at `cut = 256` (mid-emoji, not a
-///   boundary), the loop body is skipped immediately and `cut` stays
-///   at 256; `String::truncate(256)` then panics on the non-boundary,
-///   causing the test to fail.
-/// - `-= → +=` at line 416: `cut` walks UP, exits at the string end,
-///   and `truncate(end)` is a no-op; output length stays at 258
-///   instead of 254.
-/// - `-= → /=` at line 416: `cut /= 1` is a no-op, the loop never
-///   exits → mutant times out.
-///
-/// Setup: `"a"×254 + "🚀"` is 254 + 4 = 258 bytes. The cap (256) lands
-/// in the middle of the emoji, so the walk-back must reach 254.
-#[test]
-fn truncate_key_walks_back_to_char_boundary_on_multibyte() {
-    let key = "a".repeat(MAX_KEY_LEN - 2) + "🚀";
-    assert_eq!(key.len(), MAX_KEY_LEN + 2, "test fixture: 258-byte key");
-
-    let out = truncate_key(key);
-    assert_eq!(
-        out.len(),
-        MAX_KEY_LEN - 2,
-        "walk-back must land at UTF-8 boundary (254), not 256/258"
-    );
-    assert!(
-        out.is_char_boundary(out.len()),
-        "truncated key must end on a char boundary"
-    );
-    assert!(
-        !out.contains('🚀'),
-        "truncated key must drop the straddling multi-byte char"
-    );
-}
-
 /// The `evict_expired` wrapper reads the store's clock: advancing the mock
 /// clock past the window is what ages the bucket out.
 #[tokio::test]
@@ -506,25 +443,31 @@ async fn evict_expired_reads_the_store_clock() {
     clock.advance_secs(21);
     store.evict_expired();
     assert!(
+        store.buckets.contains_key("aged-out"),
+        "one window on it still weighs on the estimate"
+    );
+    clock.advance_secs(20);
+    store.evict_expired();
+    assert!(
         !store.buckets.contains_key("aged-out"),
         "evict_expired() must read the injected clock"
     );
 }
 
 /// `evict_expired_at` retains buckets while
-/// `now - window_start < window`: strict less-than.
-/// At exactly `window`, the bucket must evict. Pins the `< → <=`
+/// `now - window_start < 2 * window`: strict less-than.
+/// At exactly two windows, the bucket must evict. Pins the `< → <=`
 /// mutation, which would keep buckets at the boundary.
 #[tokio::test]
 async fn evict_expired_at_evicts_when_age_equals_window() {
     let store = test_store(1, Duration::from_secs(10));
     let t0 = t_zero();
     store.try_acquire_at("at-cutoff", t0);
-    // Evict at exactly window-end: duration_since = 10s, original < 10s = false (evict).
-    store.evict_expired_at(secs(t0, 10));
+    // Evict at exactly two windows: 20 s, original < 20 s = false (evict).
+    store.evict_expired_at(secs(t0, 20));
     assert!(
         !store.buckets.contains_key("at-cutoff"),
-        "at age == window the bucket must evict (strict `<`, not `<=`)"
+        "at age == two windows the bucket must evict (strict `<`, not `<=`)"
     );
 }
 

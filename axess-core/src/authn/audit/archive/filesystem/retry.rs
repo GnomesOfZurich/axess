@@ -31,17 +31,17 @@ async fn the_same_batch_id_is_not_appended_twice() {
 }
 
 #[test]
-fn batch_ids_follow_first_last_and_count() {
-    let id = |a, b, n| ArchiveBatchId::from_parts(a, b, n);
-    assert_eq!(id("1", "9", 5), id("1", "9", 5));
-    assert_ne!(id("1", "9", 5), id("1", "9", 6));
-    assert_ne!(id("1", "9", 5), id("2", "9", 5));
+fn batch_ids_follow_every_id_and_not_their_order() {
+    let id = |ids: &[&str]| ArchiveBatchId::from_ids(ids.iter().copied());
+    assert_eq!(id(&["1", "5", "9"]), id(&["9", "1", "5"]));
+    assert_ne!(id(&["1", "5", "9"]), id(&["1", "6", "9"]), "a middle row");
+    assert_ne!(id(&["1", "9"]), id(&["1", "5", "9"]));
     assert_ne!(
-        id("ab", "c", 1),
-        id("a", "bc", 1),
-        "parts are not concatenated"
+        id(&["ab", "c"]),
+        id(&["a", "bc"]),
+        "ids are not concatenated"
     );
-    assert_eq!(id("1", "9", 5).as_str().len(), 64);
+    assert_eq!(id(&["1"]).as_str().len(), 64);
 }
 
 /// A source whose first `mark_archived` fails, as a database blip would.

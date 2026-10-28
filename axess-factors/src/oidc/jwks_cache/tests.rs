@@ -347,3 +347,85 @@ async fn a_clock_stepping_backwards_does_not_expire_the_key_set() {
         .ensure_fresh()
         .expect("a fetch time in the future is fresh");
 }
+
+/// A chunked response (no `Content-Length`) of `total` bytes of padding
+/// inside a JSON string, served by a raw socket so the length is not declared.
+async fn serve_chunked(total: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0u8; 2048];
+        let _ = socket.read(&mut request).await;
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    transfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+        let _ = socket.write_all(head.as_bytes()).await;
+        let mut sent = 0;
+        while sent < total {
+            let n = (total - sent).min(16 * 1024);
+            let chunk = format!("{n:x}\r\n{}\r\n", "a".repeat(n));
+            if socket.write_all(chunk.as_bytes()).await.is_err() {
+                return;
+            }
+            sent += n;
+        }
+        let _ = socket.write_all(b"0\r\n\r\n").await;
+    });
+    format!("http://{addr}/jwks.json")
+}
+
+#[tokio::test]
+async fn refresh_refuses_a_chunked_body_over_the_cap_and_keeps_the_old_keys() {
+    let uri = serve_chunked(MAX_JWKS_BYTES + 1).await;
+    let client = openidconnect::reqwest::Client::new();
+    let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
+    let cache = JwksCache::from_parts(uri, &client, seed);
+
+    let err = cache.refresh().await.expect_err("oversized body");
+
+    assert!(
+        matches!(&err, OidcError::JwksFetch(m) if m == "JWKS body exceeds limit"),
+        "got {err:?}"
+    );
+    assert_eq!(cache.handle().read().unwrap().keys.len(), 1);
+}
+
+#[tokio::test]
+async fn refresh_refuses_a_declared_length_over_the_cap() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/jwks.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![b'a'; MAX_JWKS_BYTES + 1], "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let client = openidconnect::reqwest::Client::new();
+    let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
+    let cache = JwksCache::from_parts(format!("{}/jwks.json", server.uri()), &client, seed);
+
+    let err = cache.refresh().await.expect_err("oversized body");
+
+    assert!(
+        matches!(&err, OidcError::JwksFetch(m) if m == "JWKS body exceeds limit"),
+        "got {err:?}"
+    );
+}
+
+/// A key set exactly at the cap is read (and then fails to parse as keys,
+/// which is a parse error, not a size error).
+#[tokio::test]
+async fn a_body_at_the_cap_is_read_in_full() {
+    let uri = serve_chunked(MAX_JWKS_BYTES).await;
+    let client = openidconnect::reqwest::Client::new();
+    let seed: JwkSet = serde_json::from_value(sample_jwks_json()).unwrap();
+    let cache = JwksCache::from_parts(uri, &client, seed);
+
+    let err = cache.refresh().await.expect_err("padding is not a key set");
+
+    assert!(matches!(err, OidcError::JwksParse(_)), "got {err:?}");
+}

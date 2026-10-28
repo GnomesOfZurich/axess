@@ -7,13 +7,16 @@
 //! Per RFC 9449 §11.1 a complete verifier must check:
 //!
 //! 1. JWT structure (3 segments) and `typ: dpop+jwt` header.
-//! 2. Embedded `jwk` header parses into a supported algorithm public key
-//!    AND signs over the JWT signing input.
-//! 3. `htm` claim equals the request method.
+//! 2. Embedded `jwk` header parses into a supported algorithm public key,
+//!    carries no private key member (RFC 9449 §4.2), AND signs over the JWT
+//!    signing input.
+//! 3. `htm` claim equals the request method, exactly (HTTP methods are
+//!    case-sensitive).
 //! 4. `htu` claim equals the request URL (scheme + host + path, no
 //!    query/fragment per spec recommendation).
 //! 5. `iat` claim is within `max_iat_skew_secs` of now.
 //! 6. `jti` claim is not present in the replay cache; insert it on success.
+//!    A full cache refuses the proof rather than forgetting a live `jti`.
 //! 7. (Optional) `ath` claim equals SHA-256(access_token) when an access
 //!    token accompanies the DPoP-protected request.
 //!
@@ -42,7 +45,9 @@ pub struct DpopVerified {
 /// Pluggable replay-cache for DPoP `jti` claims.
 ///
 /// `try_insert` returns `true` when the jti was inserted (proof is fresh),
-/// `false` when the jti is already present (replay; reject the request).
+/// `false` when the jti is already present (replay; reject the request) or
+/// when the cache cannot take another live entry. Forgetting a live `jti` to
+/// make room would let its proof replay, so a bounded cache refuses instead.
 /// Implementations are responsible for evicting entries past their `expires_at`.
 pub trait DpopJtiCache: Send + Sync {
     /// Insert `jti` with the given expiration. Returns `true` when the entry
@@ -51,11 +56,22 @@ pub trait DpopJtiCache: Send + Sync {
     fn try_insert(&self, jti: &str, expires_at: DateTime<Utc>) -> bool;
 }
 
+/// Live entries a [`MemoryJtiCache`] holds by default. A proof needs a valid
+/// signature but any key will do, so without a bound a client could grow the
+/// cache as fast as it can send requests.
+pub const DEFAULT_JTI_CAPACITY: usize = 262_144;
+
 /// Memory-backed jti cache with TTL eviction. Suitable for a single-process
 /// resource server; for a fleet, replace with a Valkey-backed implementation.
+///
+/// Holds at most [`DEFAULT_JTI_CAPACITY`] live entries (change it with
+/// [`with_capacity`](Self::with_capacity)). At the bound `try_insert` returns
+/// `false`, so proofs are refused until entries expire: the cost of a flood is
+/// availability for the length of the replay window, not memory.
 #[derive(Clone)]
 pub struct MemoryJtiCache {
     inner: Arc<Mutex<JtiStore>>,
+    capacity: usize,
     // Source of wall-clock time for eviction. Defaults to
     // `SystemClock`; pass a `MockClock` via `with_clock` to pin time
     // under DST.
@@ -100,6 +116,7 @@ impl Default for MemoryJtiCache {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(JtiStore::default())),
+            capacity: DEFAULT_JTI_CAPACITY,
             clock: Arc::new(axess_clock::SystemClock),
         }
     }
@@ -137,18 +154,27 @@ impl MemoryJtiCache {
         self.clock = clock;
         self
     }
+
+    /// Bound the number of live entries. Size it above the proofs a
+    /// legitimate fleet presents in twice the `iat` skew.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity;
+        self
+    }
 }
 
 /// [`MemoryJtiCache::try_insert`] with the eviction `now` lifted to a
-/// parameter, so the expiry boundary is testable to the exact tick.
+/// parameter, so the expiry boundary is testable to the exact tick. `false`
+/// for a replay and for a store already holding `capacity` live entries.
 pub(crate) fn try_insert_at(
     store: &mut JtiStore,
     jti: &str,
     expires_at: DateTime<Utc>,
     now: DateTime<Utc>,
+    capacity: usize,
 ) -> bool {
     store.evict_expired(now);
-    if store.live.contains_key(jti) {
+    if store.live.contains_key(jti) || store.live.len() >= capacity {
         return false;
     }
     store.live.insert(jti.to_string(), expires_at);
@@ -163,11 +189,15 @@ pub(crate) fn try_insert_at(
 /// caught by the still-cached entry rather than slipping past
 /// eviction. Extracted so the multiplier mutation (`* with /`,
 /// `* with +`) is pinned by a single-line unit test.
+///
+/// `None` when the window does not fit the date range (an absurd skew), so
+/// the caller refuses the proof instead of panicking on the addition.
 pub(crate) fn dpop_replay_window_expiry(
     iat_time: DateTime<Utc>,
     max_iat_skew_secs: i64,
-) -> DateTime<Utc> {
-    iat_time + chrono::Duration::seconds(max_iat_skew_secs * 2)
+) -> Option<DateTime<Utc>> {
+    let window = chrono::Duration::try_seconds(max_iat_skew_secs.checked_mul(2)?)?;
+    iat_time.checked_add_signed(window)
 }
 
 impl DpopJtiCache for MemoryJtiCache {
@@ -176,9 +206,17 @@ impl DpopJtiCache for MemoryJtiCache {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        try_insert_at(&mut store, jti, expires_at, self.clock.now())
+        try_insert_at(&mut store, jti, expires_at, self.clock.now(), self.capacity)
     }
 }
+
+/// Largest `max_iat_skew_secs` [`verify_dpop_proof`] accepts: one day.
+pub const MAX_IAT_SKEW_SECS: i64 = 86_400;
+
+/// Members of a JWK that hold private key material (RFC 7517 §4, RFC 7518
+/// §6): an EC or OKP `d`, the RSA `p`, `q`, `dp`, `dq`, `qi` and `oth`, and a
+/// symmetric `k`. RFC 9449 §4.2 forbids them in a proof's `jwk` header.
+const PRIVATE_JWK_MEMBERS: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
 /// Inputs to [`verify_dpop_proof`].
 pub struct DpopVerifyRequest<'a> {
@@ -195,7 +233,9 @@ pub struct DpopVerifyRequest<'a> {
     pub access_token: Option<&'a str>,
     /// Maximum allowed clock skew for `iat`, in seconds. RFC 9449
     /// §11.1.2 suggests "a few seconds"; 60 is a typical operational
-    /// upper bound.
+    /// upper bound. Must be within `0..=`[`MAX_IAT_SKEW_SECS`]; a value
+    /// outside that range makes every verification fail, so a misconfigured
+    /// "disable" value cannot switch the freshness check off.
     pub max_iat_skew_secs: i64,
     /// Replay cache instance.
     pub jti_cache: &'a dyn DpopJtiCache,
@@ -209,6 +249,13 @@ pub fn verify_dpop_proof(
 ) -> Result<DpopVerified, OAuthError> {
     use jsonwebtoken::{Algorithm, DecodingKey};
     use subtle::ConstantTimeEq;
+
+    if !(0..=MAX_IAT_SKEW_SECS).contains(&req.max_iat_skew_secs) {
+        return Err(OAuthError::IdTokenValidation(format!(
+            "DPoP `max_iat_skew_secs` must be within 0..={MAX_IAT_SKEW_SECS}; got {}",
+            req.max_iat_skew_secs
+        )));
+    }
 
     // 1. Structural sanity.
     let parts: Vec<&str> = req.proof_jwt.split('.').collect();
@@ -237,6 +284,20 @@ pub fn verify_dpop_proof(
     let jwk_value = header.get("jwk").ok_or_else(|| {
         OAuthError::IdTokenValidation("DPoP header missing required `jwk`".to_string())
     })?;
+
+    // RFC 9449 §4.2: the proof's key is public. A header that carries the
+    // private half has handed it to everyone who can read the request.
+    let jwk_members = jwk_value.as_object().ok_or_else(|| {
+        OAuthError::IdTokenValidation("DPoP `jwk` must be a JSON object".to_string())
+    })?;
+    if PRIVATE_JWK_MEMBERS
+        .iter()
+        .any(|member| jwk_members.contains_key(*member))
+    {
+        return Err(OAuthError::IdTokenValidation(
+            "DPoP `jwk` must not contain private key material".to_string(),
+        ));
+    }
 
     // 2. Build the verifier from the embedded JWK.
     let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value.clone())
@@ -269,7 +330,7 @@ pub fn verify_dpop_proof(
 
     // 3. Claim checks.
     let claim_htm = claims.get("htm").and_then(|v| v.as_str()).unwrap_or("");
-    if !claim_htm.eq_ignore_ascii_case(req.htm) {
+    if claim_htm != req.htm {
         return Err(OAuthError::IdTokenValidation(format!(
             "DPoP `htm` mismatch; proof says `{claim_htm}`, request is `{}`",
             req.htm
@@ -317,10 +378,11 @@ pub fn verify_dpop_proof(
     let jti = claims.get("jti").and_then(|v| v.as_str()).ok_or_else(|| {
         OAuthError::IdTokenValidation("DPoP missing required `jti` claim".to_string())
     })?;
-    let expires_at = dpop_replay_window_expiry(iat_time, req.max_iat_skew_secs);
+    let expires_at = dpop_replay_window_expiry(iat_time, req.max_iat_skew_secs)
+        .ok_or_else(|| OAuthError::IdTokenValidation("DPoP skew window overflow".to_string()))?;
     if !req.jti_cache.try_insert(jti, expires_at) {
         return Err(OAuthError::IdTokenValidation(format!(
-            "DPoP `jti` `{jti}` replayed within skew window; rejecting"
+            "DPoP `jti` `{jti}` replayed within skew window, or the replay cache is full; rejecting"
         )));
     }
 

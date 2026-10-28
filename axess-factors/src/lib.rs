@@ -55,6 +55,10 @@ pub mod bearer;
 pub mod federation;
 #[cfg(feature = "hotp")]
 pub mod hotp;
+/// Bounded reads of remote HTTP response bodies (`http-body` feature, on
+/// with every feature that makes outbound requests).
+#[cfg(feature = "http-body")]
+pub mod http_body;
 /// JWT validation + `JwtVerifier` builder + SPIFFE JWT-SVID resolver
 /// (`jwt` / `jwt-svid` features). Adopters performing JWT verification
 /// (workload identity, federated OIDC checks, custom logout flows) share

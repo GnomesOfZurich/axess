@@ -269,6 +269,28 @@ denies at runtime, which is the conservative answer but a silent
 one: the reason is on the `axess::authz::decision` target, not in
 a returned error.
 
+### The context in `require_authz!`
+
+The `require_authz!` gate reads an optional
+`Arc<dyn RequestContextProvider>` from the request extensions and
+calls `context_for(&session, &request_parts)` to build the Cedar
+context for each request. A provider that returns an error makes the
+gate answer 403. Install it with an `Extension` layer beside the
+policy store and the entity provider, under exactly the
+`Arc<dyn RequestContextProvider>` type, and derive values such as
+MFA status from the session, never from the request.
+
+Without a provider the gate evaluates with an empty context. A policy
+set that never reads `context` is unaffected. A context attribute the
+action's schema declares required makes the request invalid, and the
+policy store denies it; a policy that errors during evaluation is
+denied as well. The one case an empty context can permit is a policy
+that guards an optional attribute with `context has ..` and treats its
+absence as allowed, so declare the attributes policies rely on as
+required, and install a provider wherever policies reason about the
+context. `examples/authz` shows the `DeleteDocument` rule that needs
+`mfa_verified`.
+
 ### When to extend the context
 
 The custom keys exist to bridge application state that does not

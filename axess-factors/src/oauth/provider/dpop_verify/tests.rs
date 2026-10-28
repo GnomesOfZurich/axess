@@ -80,10 +80,17 @@ fn try_insert_at_evicts_when_expiry_equals_now() {
         &mut store,
         "jti-1",
         t0,
-        t0 - chrono::Duration::seconds(1)
+        t0 - chrono::Duration::seconds(1),
+        usize::MAX
     ));
     // expiry exactly at t0
-    let inserted = try_insert_at(&mut store, "jti-1", t0 + chrono::Duration::seconds(60), t0);
+    let inserted = try_insert_at(
+        &mut store,
+        "jti-1",
+        t0 + chrono::Duration::seconds(60),
+        t0,
+        usize::MAX,
+    );
     assert!(
         inserted,
         "an entry whose expiry equals now must be evicted by the retain sweep; \
@@ -100,19 +107,79 @@ fn dpop_replay_window_expiry_is_iat_plus_two_skew() {
     let iat = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     assert_eq!(
         dpop_replay_window_expiry(iat, 60),
-        iat + chrono::Duration::seconds(120),
+        Some(iat + chrono::Duration::seconds(120)),
         "expires_at must be iat + 2 × max_iat_skew_secs"
     );
     assert_eq!(
         dpop_replay_window_expiry(iat, 30),
-        iat + chrono::Duration::seconds(60),
+        Some(iat + chrono::Duration::seconds(60)),
     );
     assert_eq!(
         dpop_replay_window_expiry(iat, 1),
-        iat + chrono::Duration::seconds(2),
+        Some(iat + chrono::Duration::seconds(2)),
         "skew=1 produces a 2-second window; kills `* → /` (would round to 0) and \
          `* → +` (would give iat + 1s + ε)"
     );
+}
+
+/// A skew too large for the date range is `None`, not a panic or a wrapped
+/// date: doubling overflows `i64`, the seconds overflow `Duration`, or the
+/// sum overflows `DateTime`.
+#[test]
+fn dpop_replay_window_expiry_is_none_when_the_window_does_not_fit() {
+    let iat = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    assert_eq!(dpop_replay_window_expiry(iat, i64::MAX), None);
+    assert_eq!(dpop_replay_window_expiry(iat, i64::MAX / 2), None);
+    assert!(dpop_replay_window_expiry(iat, 1_000_000_000_000).is_some());
+}
+
+/// At the bound the cache refuses a new `jti` instead of forgetting a live
+/// one, and room returns once entries expire. A replay is still refused.
+#[test]
+fn the_memory_cache_refuses_new_entries_at_capacity_and_recovers_on_expiry() {
+    let mut store = JtiStore::default();
+    assert!(try_insert_at(&mut store, "a", at(100), at(0), 2));
+    assert!(try_insert_at(&mut store, "b", at(100), at(0), 2));
+    assert!(!try_insert_at(&mut store, "c", at(100), at(0), 2), "full");
+    assert!(
+        !try_insert_at(&mut store, "a", at(100), at(0), 2),
+        "a live entry was not forgotten to make room"
+    );
+    assert!(
+        try_insert_at(&mut store, "c", at(300), at(100), 2),
+        "both expired, so there is room again"
+    );
+}
+
+#[test]
+fn the_memory_cache_capacity_is_configurable_and_bounds_the_public_api() {
+    let cache = MemoryJtiCache::new().with_capacity(1);
+    let expires = Utc::now() + chrono::Duration::seconds(60);
+    assert!(cache.try_insert("a", expires));
+    assert!(!cache.try_insert("b", expires));
+}
+
+/// A skew outside `0..=MAX_IAT_SKEW_SECS` refuses every proof, including a
+/// valid one, and never panics (`i64::MAX` meaning "disable" is the case this
+/// pins).
+#[test]
+fn an_out_of_range_skew_refuses_verification_without_panicking() {
+    let cache = cache();
+    for skew in [i64::MAX, i64::MIN, -1, MAX_IAT_SKEW_SECS + 1] {
+        let res = verify_dpop_proof(
+            DpopVerifyRequest {
+                proof_jwt: "a.b.c",
+                htm: "POST",
+                htu: "https://api.example.com/foo",
+                access_token: None,
+                max_iat_skew_secs: skew,
+                jti_cache: &cache,
+            },
+            Utc::now(),
+        );
+        let err = res.expect_err("out-of-range skew");
+        assert!(format!("{err}").contains("max_iat_skew_secs"), "{err}");
+    }
 }
 
 /// Direct unit tests on `verify_dpop_proof` using ES256-signed proofs.
@@ -136,6 +203,9 @@ mod verify_dpop_proof_tests {
         ath: Option<&'a str>,
         typ: &'a str,
         alg_in_header: &'a str,
+        /// An extra member added to the header's `jwk`, with the proof
+        /// signed again over the rewritten header.
+        jwk_extra: Option<(&'a str, serde_json::Value)>,
     }
 
     impl Default for Builder<'_> {
@@ -148,6 +218,7 @@ mod verify_dpop_proof_tests {
                 ath: None,
                 typ: "dpop+jwt",
                 alg_in_header: "ES256",
+                jwk_extra: None,
             }
         }
     }
@@ -159,6 +230,8 @@ mod verify_dpop_proof_tests {
 
     fn build(b: Builder<'_>, now: DateTime<Utc>) -> Built {
         use base64::Engine as _;
+        // Signing happens before any verification installs the provider.
+        crate::jwt::ensure_crypto_provider();
         let b64 = &URL_SAFE_NO_PAD;
 
         // Generate an ephemeral P-256 keypair.
@@ -223,6 +296,25 @@ mod verify_dpop_proof_tests {
             format!("{}.{}.{}", new_hdr, parts[1], parts[2])
         } else {
             proof
+        };
+
+        let proof = match b.jwk_extra {
+            None => proof,
+            Some((member, value)) => {
+                let parts: Vec<&str> = proof.splitn(3, '.').collect();
+                let hdr_bytes = URL_SAFE_NO_PAD.decode(parts[0]).unwrap();
+                let mut hdr: serde_json::Value = serde_json::from_slice(&hdr_bytes).unwrap();
+                hdr["jwk"][member] = value;
+                let new_hdr = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&hdr).unwrap());
+                let signing_input = format!("{new_hdr}.{}", parts[1]);
+                let signature = jsonwebtoken::crypto::sign(
+                    signing_input.as_bytes(),
+                    &encoding_key,
+                    Algorithm::ES256,
+                )
+                .expect("re-sign");
+                format!("{signing_input}.{signature}")
+            }
         };
 
         Built {
@@ -369,9 +461,8 @@ mod verify_dpop_proof_tests {
         );
     }
 
-    /// `htm` mismatch rejects (case-insensitive compare). Kills
-    /// `delete !` on the htm predicate which would invert it and
-    /// accept ONLY mismatched htms.
+    /// `htm` mismatch rejects. Kills `delete !` on the htm predicate which
+    /// would invert it and accept ONLY mismatched htms.
     #[test]
     fn htm_mismatch_rejected() {
         let now = Utc::now();
@@ -396,6 +487,75 @@ mod verify_dpop_proof_tests {
         );
         let err = result.expect_err("htm mismatch must reject");
         assert!(format!("{err}").contains("htm"));
+    }
+
+    /// HTTP methods are case-sensitive (RFC 9110 section 9.1, RFC 9449
+    /// section 4.3): a proof for `post` does not authorise a `POST`.
+    #[test]
+    fn htm_is_compared_case_sensitively() {
+        let now = Utc::now();
+        let lower = build(
+            Builder {
+                htm: "post",
+                ..Builder::default()
+            },
+            now,
+        );
+        let err = verify(&lower.proof, now).expect_err("`post` is not `POST`");
+        assert!(format!("{err}").contains("htm"), "{err}");
+
+        let exact = build(Builder::default(), now);
+        verify(&exact.proof, now).expect("`POST` is accepted");
+    }
+
+    /// RFC 9449 section 4.2: a `jwk` carrying private key material is
+    /// refused, for every private member, even though the signature is valid.
+    /// The same proof without the member verifies and keeps its thumbprint.
+    #[test]
+    fn a_jwk_with_private_key_material_is_rejected() {
+        let now = Utc::now();
+        let clean = build(Builder::default(), now);
+        let ok = verify(&clean.proof, now).expect("clean proof verifies");
+        assert_eq!(ok.thumbprint, clean.expected_thumbprint);
+
+        for member in ["d", "p", "q", "dp", "dq", "qi", "oth", "k"] {
+            let built = build(
+                Builder {
+                    jwk_extra: Some((member, serde_json::json!("AQAB"))),
+                    ..Builder::default()
+                },
+                now,
+            );
+            let err = verify(&built.proof, now)
+                .expect_err(&format!("a jwk with `{member}` must be refused"));
+            assert!(
+                format!("{err}").contains("private key material"),
+                "member {member}: {err}"
+            );
+        }
+    }
+
+    /// A valid proof with an absurd skew is refused with an error. Before the
+    /// range check the replay window addition overflowed after acceptance.
+    #[test]
+    fn a_valid_proof_with_an_absurd_skew_is_an_error_not_a_panic() {
+        let now = Utc::now();
+        let built = build(Builder::default(), now);
+        let cache = cache();
+        for skew in [i64::MAX, i64::MAX / 2, 1_000_000_000_000] {
+            let result = verify_dpop_proof(
+                DpopVerifyRequest {
+                    proof_jwt: &built.proof,
+                    htm: "POST",
+                    htu: "https://api.example.com/token",
+                    access_token: None,
+                    max_iat_skew_secs: skew,
+                    jti_cache: &cache,
+                },
+                now,
+            );
+            assert!(result.is_err(), "skew {skew} must be refused");
+        }
     }
 
     /// `htu` mismatch rejects. Kills `!= → ==` on the htu check.
@@ -590,7 +750,8 @@ fn inserting_live_entries_evicts_nothing_however_many_are_held() {
             &mut store,
             &format!("jti-{n}"),
             at(1_000 + n),
-            at(0)
+            at(0),
+            usize::MAX
         ));
         assert_eq!(store.evict_expired(at(0)), 0, "no live entry is touched");
     }
@@ -603,7 +764,7 @@ fn eviction_pops_exactly_the_expired_entries_in_expiry_order() {
     let mut store = JtiStore::default();
     // Inserted out of expiry order on purpose.
     for (jti, exp) in [("c", 30), ("a", 10), ("d", 40), ("b", 20)] {
-        assert!(try_insert_at(&mut store, jti, at(exp), at(0)));
+        assert!(try_insert_at(&mut store, jti, at(exp), at(0), usize::MAX));
     }
     // `b` expires exactly at now (evicted), `c` and `d` survive.
     assert_eq!(store.evict_expired(at(20)), 2);
@@ -612,6 +773,6 @@ fn eviction_pops_exactly_the_expired_entries_in_expiry_order() {
     assert_eq!(store.live.len(), store.by_expiry.len());
 
     // An evicted jti is fresh again; a surviving one is still a replay.
-    assert!(try_insert_at(&mut store, "a", at(90), at(20)));
-    assert!(!try_insert_at(&mut store, "c", at(90), at(20)));
+    assert!(try_insert_at(&mut store, "a", at(90), at(20), usize::MAX));
+    assert!(!try_insert_at(&mut store, "c", at(90), at(20), usize::MAX));
 }

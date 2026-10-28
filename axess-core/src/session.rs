@@ -37,7 +37,7 @@ pub use config::{SameSite, SessionConfig, SessionConfigBuilder};
     feature = "mysql",
     feature = "valkey"
 ))]
-pub use crypto::{CryptoError, SessionCrypto};
+pub use crypto::{CryptoError, LegacyBlobs, SessionCrypto};
 pub use data::{AuthState, SessionData, WorkflowKind, WorkflowState};
 pub use extractor::{AuthSession, SessionMissing};
 pub use id::SessionId;
@@ -46,9 +46,9 @@ pub use refresh::{
     IssueRequest, RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
     RotationOutcome,
 };
-#[cfg(any(test, feature = "memory"))]
-pub use store::{MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError};
 pub use store::{
-    SessionLiveness, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle,
+    CycleOutcome, SessionLiveness, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle,
     SessionRevoker, SessionStore,
 };
+#[cfg(any(test, feature = "memory"))]
+pub use store::{MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError};

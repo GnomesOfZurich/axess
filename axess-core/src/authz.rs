@@ -74,7 +74,7 @@ pub mod store;
 // the only correct walk behind the `authz` feature: the rate limiter could
 // not reach it without compiling Cedar, so it read the headers itself and
 // was spoofable for three releases.
-pub use context::{BuildRequestContext, NoContext, StandardRequestContext};
+pub use context::{BuildRequestContext, NoContext, RequestContextProvider, StandardRequestContext};
 pub use error::{AuthzDenied, AuthzError};
 pub use provider::{
     AuthzEntityProvider, RequestEntityProvider, make_action_uid, make_entity_uid,

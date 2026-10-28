@@ -42,7 +42,8 @@ pub mod __cedar {
 #[doc(hidden)]
 pub mod __authz {
     pub use axess_core::authz::{
-        AuthzDecision, AuthzDenied, PolicyEvaluator, PolicyStore, RequestEntityProvider,
+        AuthzDecision, AuthzDenied, PolicyEvaluator, PolicyStore, RequestContextProvider,
+        RequestEntityProvider,
     };
 }
 

@@ -73,12 +73,23 @@ distinct peer IP; when a key has hit the limit within the window,
 subsequent requests get a 429 (`Too Many Requests`) with a
 `Retry-After` header.
 
-The window is a sliding token bucket. The math: each key has a
-bucket of `max_requests` tokens; each request consumes one;
-tokens regenerate at a rate of `max_requests` per `window`. A
-burst of more than `max_requests` requests within a short
-interval consumes all the tokens; subsequent requests are
-rejected until enough tokens have regenerated.
+The window is a sliding-window counter. Each key keeps the number of
+requests admitted in the current fixed window and in the one before it. A
+request is admitted when the previous count, weighted by how much of it still
+overlaps the trailing window, plus the current count leaves room under
+`max_requests`. A burst split across a window boundary is therefore counted
+once: with a limit of five per minute, five requests at the end of one minute
+are followed by a refusal, not by five more at the start of the next, and the
+allowance comes back gradually as the old requests age out. `Retry-After` is
+the time at which the request would be admitted.
+
+Keys are bounded so no one caller controls how many buckets exist. A key
+longer than 256 bytes is cut and ends in a digest of the whole, so long
+identifiers that share a prefix keep separate buckets. An IPv6 client is keyed
+by its /64 prefix, and `KeyExtractor::Header` maps a user's header values onto
+16 sub-buckets, so one authenticated user cannot fill the table by sending
+distinct values. The debug log for a refused request carries a short
+fingerprint of the key, not the key.
 
 The buckets live in this process, in a `DashMap`, and there is no
 option to put them anywhere else. That is a deliberate scope

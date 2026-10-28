@@ -49,4 +49,6 @@ pub use session::StoredDelegationSession;
 #[cfg(test)]
 mod dst_tests;
 #[cfg(test)]
+mod response_tests;
+#[cfg(test)]
 mod tests;

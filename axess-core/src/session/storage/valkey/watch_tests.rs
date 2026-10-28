@@ -173,3 +173,63 @@ async fn valkey_watch_aborting_one_leaves_the_other_and_aborting_both_closes() {
     })
     .await;
 }
+
+/// A subscriber connection that died is not reused: the next watcher opens a
+/// new one and is woken by its revocation. Before, the dead client was kept
+/// while any watcher held it and every later watcher waited forever.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_watch_replaces_a_dead_subscriber_connection() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    let admin = connect().await;
+    let registry = ValkeySessionRegistry::with_options(
+        connect().await,
+        format!("axt_watch_c_{}", user()),
+        Duration::from_secs(60),
+    );
+    let before = subscriber_connections(&admin).await;
+
+    let (u1, u2) = (user(), user());
+    let (s1, s2) = (
+        registered(&registry, &u1).await,
+        registered(&registry, &u2).await,
+    );
+    let w1 = watch(&registry, u1, s1);
+    eventually("first watcher joined", || async {
+        registry.subscriber.watcher_count() == 1
+    })
+    .await;
+    assert_eq!(subscriber_connections(&admin).await, before + 1);
+
+    // Kill every pub/sub connection on the server.
+    let kill = CustomCommand::new_static("CLIENT", ClusterHash::FirstKey, false);
+    let _: i64 = admin
+        .custom(kill, vec!["KILL", "TYPE", "pubsub"])
+        .await
+        .expect("CLIENT KILL");
+    eventually("the subscriber connection is gone", || async {
+        subscriber_connections(&admin).await == before
+    })
+    .await;
+
+    let w2 = watch(&registry, u2, s2);
+    eventually("second watcher joined", || async {
+        registry.subscriber.watcher_count() == 2
+    })
+    .await;
+    eventually("a new subscriber connection is open", || async {
+        subscriber_connections(&admin).await == before + 1
+    })
+    .await;
+
+    registry.invalidate_session(&u2, &s2).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), w2)
+        .await
+        .expect("the new watcher receives its revocation")
+        .unwrap();
+    registry.invalidate_session(&u1, &s1).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), w1)
+        .await
+        .expect("the first watcher is served by the replacement connection")
+        .unwrap();
+}

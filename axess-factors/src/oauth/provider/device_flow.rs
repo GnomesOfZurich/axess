@@ -31,7 +31,7 @@ pub(super) async fn request_device_code(
         form.push(("scope", &scope_str));
     }
 
-    let response = cfg
+    let mut response = cfg
         .http_client
         .post(device_url)
         .form(&form)
@@ -42,10 +42,10 @@ pub(super) async fn request_device_code(
         })?;
 
     let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| OAuthError::DeviceAuthorization(format!("response read failed: {e}")))?;
+    let body =
+        crate::http_body::read_for_status(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
+            .await
+            .map_err(|e| OAuthError::DeviceAuthorization(format!("response read failed: {e}")))?;
 
     if !status.is_success() {
         let error_body = String::from_utf8_lossy(&body);
@@ -99,7 +99,7 @@ pub(super) async fn poll_device_token(
         form.push(("client_secret", secret.secret()));
     }
 
-    let response = cfg
+    let mut response = cfg
         .http_client
         .post(&token_url)
         .form(&form)
@@ -108,10 +108,10 @@ pub(super) async fn poll_device_token(
         .map_err(|e| OAuthError::TokenExchange(format!("device token poll failed: {e}")))?;
 
     let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| OAuthError::TokenExchange(format!("response read failed: {e}")))?;
+    let body =
+        crate::http_body::read_for_status(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
+            .await
+            .map_err(|e| OAuthError::TokenExchange(format!("response read failed: {e}")))?;
 
     if status.is_success() {
         // Token granted; extract claims from the ID token.

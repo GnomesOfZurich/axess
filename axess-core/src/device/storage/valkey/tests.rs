@@ -7,8 +7,9 @@ use fred::bytes::Bytes;
 
 use super::policy::{SweepStep, plan_sweep, ttl_seconds};
 use super::scripts::{
-    CAS_WRITE, DELETE_IF_POINTS_AT, PRUNE_ABSENT, REMOVE_DEVICE, ScriptStatus, cas_write_args,
-    pair_replies, parse_status, prune_args, remove_args, row_keys,
+    DROP_STALE_FINGERPRINT, PRUNE_ABSENT, PRUNE_MISMATCH, REMOVE_DEVICE, ScriptStatus, WRITE_ROW,
+    pair_replies, parse_status, prune_args, prune_mismatch_args, remove_args, row_keys,
+    write_row_args,
 };
 use super::*;
 
@@ -164,8 +165,8 @@ fn status_mapping() {
 }
 
 #[test]
-fn cas_write_args_are_ordered_and_binary_safe() {
-    let args = cas_write_args(&[0, 255, 1], &[9, 0], Some(42), "dev-1");
+fn write_row_args_are_ordered_and_binary_safe() {
+    let args = write_row_args(Some(&[0, 255, 1]), &[9, 0], Some(42), "dev-1", &["A", "R"]);
     assert_eq!(
         args,
         vec![
@@ -173,24 +174,37 @@ fn cas_write_args_are_ordered_and_binary_safe() {
             Value::Bytes(Bytes::from_static(&[9, 0])),
             Value::Integer(42),
             Value::Bytes(Bytes::from_static(b"dev-1")),
+            Value::Bytes(Bytes::from_static(b"A")),
+            Value::Bytes(Bytes::from_static(b"R")),
         ]
     );
-    // No expiry is encoded as 0, which the script treats as "persist".
-    assert_eq!(cas_write_args(b"a", b"b", None, "d")[2], Value::Integer(0));
+    // No expiry is encoded as 0, which the script treats as "persist"; no
+    // expectation is encoded as empty, which the script reads as "absent".
+    let bare = write_row_args(None, b"b", None, "d", &[]);
+    assert_eq!(bare[0], Value::Bytes(Bytes::new()));
+    assert_eq!(bare[2], Value::Integer(0));
+    assert_eq!(bare.len(), 4);
 }
 
 #[test]
 fn remove_args_encode_unconditional_as_empty() {
     assert_eq!(
-        remove_args(None, "d"),
+        remove_args(None, "d", &[]),
         vec![
             Value::Bytes(Bytes::new()),
             Value::Bytes(Bytes::from_static(b"d"))
         ]
     );
     assert_eq!(
-        remove_args(Some(b"row"), "d")[0],
+        remove_args(Some(b"row"), "d", &["R"])[0],
         Value::Bytes(Bytes::from_static(b"row"))
+    );
+    assert_eq!(
+        remove_args(None, "d", &["R", "F"])[2..],
+        [
+            Value::Bytes(Bytes::from_static(b"R")),
+            Value::Bytes(Bytes::from_static(b"F"))
+        ]
     );
 }
 
@@ -198,13 +212,33 @@ fn remove_args_encode_unconditional_as_empty() {
 fn scripts_compare_before_they_write_or_delete() {
     let pos = |s: &str, needle: &str| s.find(needle).unwrap_or_else(|| panic!("{needle}"));
     // The row swap compares the stored bytes to the expectation before SET.
-    assert!(pos(CAS_WRITE, "current ~= ARGV[1]") < pos(CAS_WRITE, "'SET'"));
-    // The fingerprint index is touched only while it points at this device.
-    assert!(pos(CAS_WRITE, "GET', KEYS[2]) == ARGV[4]") < pos(CAS_WRITE, "'EXPIRE'"));
+    assert!(pos(WRITE_ROW, "current ~= ARGV[1]") < pos(WRITE_ROW, "'SET'"));
+    // The index changes ride after the row write, in the same script.
+    assert!(pos(WRITE_ROW, "'SET', KEYS[1]") < pos(WRITE_ROW, "'SADD'"));
+    // The fingerprint set is written after the row, and the single-id key of
+    // an earlier release goes only while it points at this device.
+    assert!(pos(WRITE_ROW, "'SET', KEYS[1]") < pos(WRITE_ROW, "'SADD', KEYS[2]"));
+    assert!(pos(WRITE_ROW, "GET', KEYS[3]) == ARGV[4]") < pos(WRITE_ROW, "'DEL', KEYS[3]"));
     assert!(pos(REMOVE_DEVICE, "current ~= ARGV[1]") < pos(REMOVE_DEVICE, "'DEL', KEYS[1]"));
-    assert!(pos(REMOVE_DEVICE, "GET', KEYS[2]) == ARGV[2]") < pos(REMOVE_DEVICE, "'DEL', KEYS[2]"));
+    assert!(pos(REMOVE_DEVICE, "'SREM', KEYS[2], ARGV[2]") > pos(REMOVE_DEVICE, "'DEL', KEYS[1]"));
+    assert!(pos(REMOVE_DEVICE, "GET', KEYS[3]) == ARGV[2]") < pos(REMOVE_DEVICE, "'DEL', KEYS[3]"));
+    // A stale fingerprint entry goes only if it points here AND the row is
+    // still the bytes that were judged.
     assert!(
-        pos(DELETE_IF_POINTS_AT, "GET', KEYS[1]) == ARGV[1]") < pos(DELETE_IF_POINTS_AT, "'DEL'")
+        pos(DROP_STALE_FINGERPRINT, "GET', KEYS[1]) == ARGV[1]")
+            < pos(DROP_STALE_FINGERPRINT, "'DEL'")
+    );
+    assert!(
+        pos(DROP_STALE_FINGERPRINT, "GET', KEYS[2]) == ARGV[2]")
+            < pos(DROP_STALE_FINGERPRINT, "'DEL'")
+    );
+    // A mismatched member is removed only while its row is the judged bytes.
+    assert!(
+        pos(PRUNE_MISMATCH, "GET', KEYS[i + 1]) == ARGV[n + i]") < pos(PRUNE_MISMATCH, "'SREM'")
+    );
+    assert_eq!(
+        prune_mismatch_args(&[("a".into(), b"ra".to_vec()), ("b".into(), b"rb".to_vec())]).len(),
+        4
     );
 }
 
@@ -221,7 +255,7 @@ fn a_sealed_row_does_not_open_under_another_device_id() {
     let s = offline_store();
     let a = device(DeviceTrustLevel::Trusted, t0());
     let sealed = s.encode_row(&a).unwrap();
-    assert!(sealed.starts_with(b"AXR\x01"));
+    assert!(sealed.starts_with(b"AXR\x02"));
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     assert_eq!(s.decode_row(&tenant, &id, &sealed).unwrap(), a);
     assert!(s.decode_row(&tenant, "dev-2", &sealed).is_err());
@@ -240,13 +274,58 @@ fn a_legacy_row_reads_and_is_resealed_bound() {
         .unwrap()
         .encrypt_unbound(&rmp_serde::to_vec_named(&a).unwrap())
         .unwrap();
-    assert!(!legacy.starts_with(b"AXR\x01"));
+    assert!(!legacy.starts_with(b"AXR\x02"));
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     let read = s.decode_row(&tenant, &id, &legacy).unwrap();
     assert_eq!(read, a);
     let resealed = s.encode_row(&read).unwrap();
-    assert!(resealed.starts_with(b"AXR\x01"));
+    assert!(resealed.starts_with(b"AXR\x02"));
     assert!(s.decode_row(&tenant, "dev-2", &resealed).is_err());
+}
+
+/// A row sealed by 0.11.0 (`AXR 0x01`, ids joined by a zero byte) still
+/// reads under its own device, not under another, and the next encode seals
+/// the current format.
+#[test]
+fn a_row_of_the_previous_sealed_format_reads_and_is_resealed() {
+    use crate::session::crypto::{BoundFormat, device_row_id_v1};
+    let s = offline_store();
+    let a = device(DeviceTrustLevel::Seen, t0());
+    let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
+    let body = s
+        .crypto
+        .as_ref()
+        .unwrap()
+        .encrypt_with_aad(
+            &BoundFormat::DEVICE_ROW_V1.aad(&device_row_id_v1(&tenant, &id)),
+            &rmp_serde::to_vec_named(&a).unwrap(),
+        )
+        .unwrap();
+    let mut old = b"AXR\x01".to_vec();
+    old.extend_from_slice(&body);
+
+    assert_eq!(s.decode_row(&tenant, &id, &old).unwrap(), a);
+    assert!(s.decode_row(&tenant, "dev-2", &old).is_err());
+    assert!(s.encode_row(&a).unwrap().starts_with(b"AXR\x02"));
+}
+
+/// With legacy blobs rejected, an unmarked row is refused and a marked one
+/// reads.
+#[test]
+fn rejecting_legacy_blobs_refuses_an_unmarked_row() {
+    use crate::session::crypto::LegacyBlobs;
+    let s = offline_store().with_legacy_blobs(LegacyBlobs::Reject);
+    let a = device(DeviceTrustLevel::Seen, t0());
+    let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
+    let legacy = s
+        .crypto
+        .as_ref()
+        .unwrap()
+        .encrypt_unbound(&rmp_serde::to_vec_named(&a).unwrap())
+        .unwrap();
+    assert!(s.decode_row(&tenant, &id, &legacy).is_err());
+    let sealed = s.encode_row(&a).unwrap();
+    assert_eq!(s.decode_row(&tenant, &id, &sealed).unwrap(), a);
 }
 
 /// A row from before `demoted_at` existed reads with no demotion.
@@ -334,10 +413,18 @@ async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
     // The stale swap must be refused rather than resurrect the row.
     let mut resurrected = d.clone();
     resurrected.last_seen_at = now + Duration::seconds(5);
-    let args = cas_write_args(&stale, &s.encode_row(&resurrected).unwrap(), Some(600), &id);
-    let fp = fingerprint_key(&s.prefix, &tenant, &fingerprint_hex(&d.fingerprint_hash));
+    let args = write_row_args(
+        Some(&stale),
+        &s.encode_row(&resurrected).unwrap(),
+        Some(600),
+        &id,
+        &[],
+    );
+    let hex = fingerprint_hex(&d.fingerprint_hash);
+    let fp_set = fingerprint_set_key(&s.prefix, &tenant, &hex);
+    let fp = fingerprint_key(&s.prefix, &tenant, &hex);
     let status = s
-        .run_script(CAS_WRITE, vec![row_key, fp], args)
+        .run_script(WRITE_ROW, vec![row_key, fp_set, fp], args)
         .await
         .unwrap();
     assert_eq!(status, ScriptStatus::Conflict);
@@ -657,5 +744,85 @@ fn pruning_rechecks_absence_inside_the_script() {
     assert_eq!(
         prune_args(&members).len(),
         row_keys("p", "t", &members).len()
+    );
+}
+
+mod consistency;
+mod reseal;
+mod twins;
+
+/// A row moving between families, owners and fingerprints plans exactly the
+/// index changes that follow, and a removal plans only removals.
+#[test]
+fn index_plans_follow_the_row_change() {
+    use super::index::{IndexOp, plan_indexes};
+    let now = t0();
+    let refresh = |f: &str| DeviceBinding::Refresh {
+        family_id: f.into(),
+        issued_at: now,
+        last_used_at: now,
+    };
+    let mut before = device(DeviceTrustLevel::Seen, now);
+    before.bindings = vec![refresh("fam-a"), refresh("fam-keep")];
+    let mut after = before.clone();
+    after.bindings = vec![refresh("fam-keep"), refresh("fam-b")];
+    after.user_id = None;
+    after.fingerprint_hash = FingerprintHash::from_bytes([0xbb; 32]);
+
+    let t = before.tenant_id.to_string();
+    let u = before.user_id.unwrap().to_string();
+    let plan = plan_indexes("p", Some(&before), Some(&after));
+    let op = |key: String| plan.op_for(&key);
+    assert_eq!(
+        op(row::family_index_key("p", &t, "fam-a")),
+        Some(IndexOp::Remove)
+    );
+    assert_eq!(
+        op(row::family_index_key("p", &t, "fam-b")),
+        Some(IndexOp::Add)
+    );
+    assert_eq!(
+        op(row::family_index_key("p", &t, "fam-keep")),
+        Some(IndexOp::Add)
+    );
+    assert_eq!(op(row::user_index_key("p", &t, &u)), Some(IndexOp::Remove));
+    assert_eq!(op(row::tenant_index_key("p", &t)), Some(IndexOp::Add));
+    assert_eq!(
+        op(row::fingerprint_key(
+            "p",
+            &t,
+            &row::fingerprint_hex(&before.fingerprint_hash)
+        )),
+        Some(IndexOp::DropFingerprint)
+    );
+    assert_eq!(
+        op(row::fingerprint_set_key(
+            "p",
+            &t,
+            &row::fingerprint_hex(&before.fingerprint_hash)
+        )),
+        Some(IndexOp::Remove)
+    );
+
+    let gone = plan_indexes("p", Some(&before), None);
+    assert_eq!(
+        gone.op_for(&row::tenant_index_key("p", &t)),
+        Some(IndexOp::Remove)
+    );
+    assert_eq!(
+        gone.op_for(&row::user_index_key("p", &t, &u)),
+        Some(IndexOp::Remove)
+    );
+    assert!(gone.ops().iter().all(|op| *op == "R"));
+}
+
+/// A revoked row with no revocation time is stamped, not kept forever.
+#[test]
+fn a_revoked_row_without_a_time_is_planned_for_stamping() {
+    let mut d = device(DeviceTrustLevel::Revoked, t0());
+    d.revoked_at = None;
+    assert_eq!(
+        plan_sweep(&d, &SweepConfig::default(), t0()),
+        SweepStep::StampRevoked
     );
 }

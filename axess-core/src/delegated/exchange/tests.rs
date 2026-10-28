@@ -205,3 +205,43 @@ async fn exchange_form_encodes_basic_credentials() {
     let req = TokenExchangeRequest::new("user-jwt", token_types::JWT);
     client.exchange(&req).await.expect("exchange");
 }
+
+/// A huge error body is cut to 1 KiB and a 1 MiB success body is refused;
+/// neither is buffered whole.
+#[tokio::test]
+async fn exchange_bounds_the_response_bodies() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_raw(vec![b'x'; 10 * 1024 * 1024], "text/plain"),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", None);
+    let req = TokenExchangeRequest::new("t", token_types::JWT);
+    let err = client.exchange(&req).await.expect_err("500");
+    let DelegatedError::TokenEndpoint { body, .. } = err else {
+        panic!("expected TokenEndpoint, got {err:?}");
+    };
+    assert!(
+        body.len() <= 1024 + "…[truncated]".len(),
+        "held {}",
+        body.len()
+    );
+
+    let mut big = br#"{"access_token":"t","pad":""#.to_vec();
+    big.extend(std::iter::repeat_n(b'a', 1024 * 1024));
+    big.extend_from_slice(br#""}"#);
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(big, "application/json"))
+        .mount(&server)
+        .await;
+    let err = client.exchange(&req).await.expect_err("oversized");
+    assert!(
+        matches!(err, DelegatedError::MalformedResponse(_)),
+        "got {err:?}"
+    );
+}

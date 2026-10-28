@@ -30,6 +30,10 @@ where
     /// * `provider_name`: Name of the registered OAuth provider.
     /// * `refresh_token`: The refresh token obtained from a previous login
     ///   (stored in [`OAuthClaims::refresh_token`](axess_factors::oauth::OAuthClaims::refresh_token)).
+    /// * `expected_subject`: The IdP subject the login recorded
+    ///   ([`OAuthClaims::subject`](axess_factors::oauth::OAuthClaims::subject)).
+    ///   A response for any other subject is refused (OIDC Core 12.2) and
+    ///   audited as a provider rejection.
     ///
     /// # Returns
     ///
@@ -41,6 +45,7 @@ where
         &self,
         provider_name: &str,
         refresh_token: &str,
+        expected_subject: &str,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
         use axess_factors::oauth::OAuthError;
 
@@ -74,7 +79,10 @@ where
         };
         let provider = provider.clone();
 
-        let claims = match provider.refresh_token(refresh_token).await {
+        let claims = match provider
+            .refresh_token_for_subject(refresh_token, expected_subject)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 self.record_oauth_refresh_failure(

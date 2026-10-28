@@ -1,5 +1,5 @@
 //! `RefreshTokenStore` impl. `revoke_family` is a single UPDATE statement;
-//! `rotate_token` and `issue_with_eviction` wrap their revoke + insert pair
+//! `rotate_token` and `issue_capped` wrap their revoke + insert pair
 //! in a `sqlx::Pool::begin()` transaction so partial-failure semantics match
 //! the trait contract; either every side-effect lands or none does.
 
@@ -8,7 +8,7 @@ use axess::authn::{DeviceId, UserId};
 use axess::session::{
     RefreshToken, RefreshTokenId, RefreshTokenStore, RotationOutcome, TokenFamilyId,
 };
-use sqlx::{AssertSqlSafe, Row};
+use sqlx::Row;
 
 use super::{BackendError, OurBackend, parse_db_datetime};
 
@@ -106,28 +106,30 @@ impl RefreshTokenStore for OurBackend {
             .collect())
     }
 
-    async fn issue_with_eviction(
+    async fn issue_capped(
         &self,
-        evict_ids: &[RefreshTokenId],
         new_token: &RefreshToken,
+        max_per_user: usize,
     ) -> Result<(), Self::Error> {
-        // Single transaction: evictions + insert land together or neither
-        // side-effect persists. Builds a parameterised IN list sized to
-        // `evict_ids.len()` so the eviction step is one round trip, not N.
+        // Single transaction whose first statement is the eviction UPDATE:
+        // it takes SQLite's write lock before the count is read, so two
+        // concurrent issues for one user run one after the other and the
+        // second one counts the first one's token.
         let mut tx = self.pool().begin().await?;
 
-        if !evict_ids.is_empty() {
-            let placeholders = (1..=evict_ids.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("UPDATE refresh_tokens SET revoked = 1 WHERE id IN ({placeholders})");
-            let mut q = sqlx::query(AssertSqlSafe(sql.as_str()));
-            for id in evict_ids {
-                q = q.bind(id.to_string());
-            }
-            q.execute(&mut *tx).await?;
-        }
+        sqlx::query(
+            "UPDATE refresh_tokens SET revoked = 1
+              WHERE id IN (
+                SELECT id FROM refresh_tokens
+                 WHERE user_id = ?1 AND revoked = 0
+                 ORDER BY issued_at ASC
+                 LIMIT MAX(0, (SELECT COUNT(*) FROM refresh_tokens
+                                WHERE user_id = ?1 AND revoked = 0) - ?2 + 1))",
+        )
+        .bind(new_token.user_id.to_string())
+        .bind(i64::try_from(max_per_user).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             "INSERT INTO refresh_tokens

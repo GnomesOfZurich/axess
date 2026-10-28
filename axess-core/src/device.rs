@@ -70,7 +70,7 @@ pub use pii::{
 pub use resolver::{DeviceResolver, NoopDeviceResolver, SessionUser};
 pub use store::{
     BindingsUpdate, DeviceStore, MemoryDeviceStore, MemoryDeviceStoreError, OWN_DEVICE_SCAN_LIMIT,
-    OwnerClaim, SweepConfig, SweepConfigBuilder, SweepCounts, TrustTransition,
+    OwnerClaim, SweepConfig, SweepConfigBuilder, SweepConfigError, SweepCounts, TrustTransition,
 };
 pub use types::{AttestationClass, Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 

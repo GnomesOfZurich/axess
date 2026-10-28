@@ -111,6 +111,30 @@ pub trait OAuthProvider: Send + Sync + 'static {
         refresh_token: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>>;
 
+    /// [`refresh_token`](Self::refresh_token), refusing a response whose
+    /// subject is not `expected_subject`.
+    ///
+    /// OIDC Core 12.2 requires the ID token of a refresh response to carry the
+    /// same `sub` as the original one: a token for another subject must never
+    /// be taken as a refresh of this session's identity. Callers pass the
+    /// subject the login recorded (`OAuthClaims::subject`). Providers need not
+    /// override this; it checks whatever `refresh_token` returns.
+    fn refresh_token_for_subject<'a>(
+        &'a self,
+        refresh_token: &'a str,
+        expected_subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            let claims = self.refresh_token(refresh_token).await?;
+            if claims.subject != expected_subject {
+                return Err(OAuthError::IdTokenValidation(
+                    "refresh-response `sub` does not match the subject of the session".to_string(),
+                ));
+            }
+            Ok(claims)
+        })
+    }
+
     /// Exchange an authorization code for claims.
     fn exchange_code<'a>(
         &'a self,

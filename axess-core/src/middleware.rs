@@ -17,7 +17,7 @@ pub mod trace_id;
 #[cfg(feature = "service-secret")]
 pub mod service_secret;
 
-/// Composable token-bucket rate limiting.
+/// Composable sliding-window rate limiting.
 pub mod ratelimit;
 
 /// CSRF protection (signed double-submit cookie).

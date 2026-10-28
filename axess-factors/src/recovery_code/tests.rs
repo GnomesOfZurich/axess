@@ -49,6 +49,26 @@ fn normalizing_undoes_display_formatting_and_case() {
 }
 
 #[test]
+fn normalizing_keeps_every_character_it_is_not_documented_to_drop() {
+    assert_eq!(&*normalize_recovery_code(" xxxxx xxxxx "), "XXXXXXXXXX");
+    assert_eq!(&*normalize_recovery_code("XXXXX-XXXXX"), "XXXXXXXXXX");
+    assert_eq!(&*normalize_recovery_code("XXXXX!XXXXX"), "XXXXX!XXXXX");
+    assert_ne!(
+        &*normalize_recovery_code("AB!CD"),
+        &*normalize_recovery_code("ABCD")
+    );
+
+    let rng = CountingRng(std::sync::atomic::AtomicU8::new(1));
+    let set = generate_recovery_codes(&rng, 1);
+    let shown: &str = set.display[0].as_ref();
+    let noisy = format!("{shown}!");
+    assert!(
+        verify_recovery_code(&set.config, &noisy, at(1), None).is_none(),
+        "a code with a stray symbol must not verify"
+    );
+}
+
+#[test]
 fn a_set_holds_only_hashes_and_verifies_each_code_once() {
     let rng = CountingRng(std::sync::atomic::AtomicU8::new(1));
     let set = generate_recovery_codes(&rng, 3);

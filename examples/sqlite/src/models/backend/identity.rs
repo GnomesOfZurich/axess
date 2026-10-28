@@ -48,6 +48,36 @@ impl axess::authn::IdentityLookup for OurBackend {
         Ok(row.map(|r| user_from_row(self.clock(), &r)))
     }
 
+    async fn get_tenant(&self, tenant_id: &TenantId) -> Result<Option<Tenant>, Self::Error> {
+        let row = sqlx::query(
+            "SELECT id, identifier, name, status,
+                    created_by, created_at, updated_by, updated_at
+             FROM tenants WHERE id = ?1",
+        )
+        .bind(tenant_id.to_string())
+        .fetch_optional(self.pool())
+        .await?;
+
+        Ok(row.map(|r| tenant_from_row(self.clock(), &r)))
+    }
+
+    async fn get_user_tenant(&self, user_id: &UserId) -> Result<Option<TenantId>, Self::Error> {
+        // Only the tenant column: the session validator asks on every request
+        // and needs nothing else about the user.
+        let tenant: Option<String> =
+            sqlx::query_scalar("SELECT tenant_id FROM users WHERE id = ?1")
+                .bind(user_id.to_string())
+                .fetch_optional(self.pool())
+                .await?;
+        tenant
+            .map(|t| {
+                TenantId::try_new(t.as_str()).map_err(|e| {
+                    BackendError::Backend(format!("users.tenant_id is not a valid TenantId: {e}"))
+                })
+            })
+            .transpose()
+    }
+
     async fn find_tenant(&self, identifier: &str) -> Result<Option<Tenant>, Self::Error> {
         let row = sqlx::query(
             "SELECT id, identifier, name, status,
@@ -382,6 +412,37 @@ impl axess::authn::IdentityPasswordReset for OurBackend {
             .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    async fn check_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, Self::Error> {
+        // The same comparison as `verify_reset_token`, without the delete.
+        use subtle::ConstantTimeEq;
+
+        let row = sqlx::query(
+            "SELECT token_hash, expires_at FROM password_reset_tokens WHERE user_id = ?1",
+        )
+        .bind(user_id.to_string())
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let stored_hash: String = row.get("token_hash");
+        let expires_at_str: String = row.get("expires_at");
+        let Ok(expires_at) = DateTime::parse_from_rfc3339(&expires_at_str) else {
+            return Ok(false);
+        };
+        Ok(expires_at.with_timezone(&Utc) > now
+            && stored_hash
+                .as_bytes()
+                .ct_eq(token_hash.as_bytes())
+                .unwrap_u8()
+                == 1)
     }
 }
 

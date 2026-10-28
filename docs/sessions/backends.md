@@ -38,14 +38,25 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         id: &SessionId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Replace a session that is still stored; `Ok(false)` when it is gone.
+    fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
     /// Atomically delete the old row and store the data under the new id.
+    /// With `require_old`, a missing old row returns
+    /// `CycleOutcome::SessionGone` and writes nothing.
     fn cycle(
         &self,
         old_id: &SessionId,
         new_id: &SessionId,
         data: &SessionData,
         ttl: Duration,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+        require_old: bool,
+    ) -> impl Future<Output = Result<CycleOutcome, Self::Error>> + Send;
 
     fn prune_expired(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
@@ -262,9 +273,17 @@ The operational notes:
   defaults to seconds rather than microseconds. Axess handles all
   three internally; your code is identical.
 
-- MariaDB 10.x and later versions are compatible with the same
-  schema and the same SQL. The CI runs against both MySQL 8.x and
-  MariaDB 10.x.
+- MariaDB 10.x and later are meant to work with the same schema and
+  the same SQL, but CI runs the live session and device suites
+  against MySQL 8 only, so MariaDB is untested.
+
+- A MySQL 8 account uses `caching_sha2_password` by default, and
+  sqlx can sign in with it only over TLS or with its `mysql-rsa`
+  feature. Without either, the pool fails to connect with "RSA auth
+  backend disabled". The pool is yours, so the choice is in your own
+  `sqlx` dependency: enable a TLS feature such as
+  `tls-rustls-aws-lc-rs` and connect with TLS required, or enable
+  `mysql-rsa`. Axess enables neither.
 
 - Timezone handling differs. MySQL stores `DATETIME` values as
   naive timestamps in the server's timezone; the backend

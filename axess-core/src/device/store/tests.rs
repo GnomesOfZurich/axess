@@ -312,7 +312,8 @@ fn sweep_config_builder_carries_setters_into_build() {
         .trusted_idle(chrono::Duration::days(7))
         .seen_idle(chrono::Duration::days(3))
         .revoked_grace(chrono::Duration::days(1))
-        .build();
+        .build()
+        .unwrap();
     assert_eq!(cfg.trusted_idle, chrono::Duration::days(7));
     assert_eq!(cfg.seen_idle, chrono::Duration::days(3));
     assert_eq!(cfg.revoked_grace, chrono::Duration::days(1));
@@ -339,7 +340,8 @@ async fn with_sweep_config_overrides_default_windows() {
         .trusted_idle(chrono::Duration::seconds(1))
         .seen_idle(chrono::Duration::days(30))
         .revoked_grace(chrono::Duration::days(7))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(tight);
 
     let t0 = Utc::now();
@@ -374,7 +376,8 @@ async fn sweep_walks_retention_ladder_and_counts_transitions() {
         .trusted_idle(chrono::Duration::days(1))
         .seen_idle(chrono::Duration::days(1))
         .revoked_grace(chrono::Duration::days(1))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
     let t0 = Utc::now();
     let other_tenant = axess_identity::testing::tenant("tenant-other");
@@ -479,7 +482,8 @@ async fn sweep_window_boundary_is_strict_greater() {
         .trusted_idle(chrono::Duration::seconds(60))
         .seen_idle(chrono::Duration::seconds(60))
         .revoked_grace(chrono::Duration::seconds(60))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
     let t0 = Utc::now();
 
@@ -497,14 +501,14 @@ async fn sweep_window_boundary_is_strict_greater() {
         "exactly-at-threshold device must NOT demote; `> → >=` would flip this"
     );
 
-    // One nanosecond past; must demote.
+    // One second past (the comparison is on whole seconds); must demote.
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::nanoseconds(1))
+        .sweep(&t(), t0 + chrono::Duration::seconds(1))
         .await
         .unwrap();
     assert_eq!(
         counts.trusted_to_seen, 1,
-        "one-nanosecond-past-threshold must demote; `> → ==` would never fire"
+        "one-second-past-threshold must demote; `> → ==` would never fire"
     );
 }
 
@@ -521,7 +525,8 @@ async fn sweep_seen_idle_boundary_is_strict_greater() {
         .trusted_idle(chrono::Duration::seconds(1))
         .seen_idle(chrono::Duration::seconds(60))
         .revoked_grace(chrono::Duration::days(7))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
     let t0 = Utc::now();
 
@@ -536,7 +541,7 @@ async fn sweep_seen_idle_boundary_is_strict_greater() {
     );
 
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::nanoseconds(1))
+        .sweep(&t(), t0 + chrono::Duration::seconds(1))
         .await
         .unwrap();
     assert_eq!(counts.seen_to_revoked, 1);
@@ -550,7 +555,8 @@ async fn sweep_revoked_grace_boundary_is_strict_greater() {
         .trusted_idle(chrono::Duration::days(365))
         .seen_idle(chrono::Duration::days(365))
         .revoked_grace(chrono::Duration::seconds(60))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
     let t0 = Utc::now();
 
@@ -570,7 +576,7 @@ async fn sweep_revoked_grace_boundary_is_strict_greater() {
     assert!(store.load(&t(), &revoked.id).await.unwrap().is_some());
 
     let counts = store
-        .sweep(&t(), t0 + chrono::Duration::nanoseconds(1))
+        .sweep(&t(), t0 + chrono::Duration::seconds(1))
         .await
         .unwrap();
     assert_eq!(counts.revoked_purged, 1);
@@ -589,7 +595,8 @@ async fn sweep_seen_revoked_guard_requires_both_conditions() {
         .trusted_idle(chrono::Duration::days(365))
         .seen_idle(chrono::Duration::seconds(60))
         .revoked_grace(chrono::Duration::days(365))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
     let t0 = Utc::now();
 
@@ -673,7 +680,8 @@ async fn delete_keeps_index_entry_owned_by_another_device() {
 async fn sweep_purge_keeps_index_entry_owned_by_another_device() {
     let cfg = SweepConfig::builder()
         .revoked_grace(chrono::Duration::seconds(1))
-        .build();
+        .build()
+        .unwrap();
     let store = MemoryDeviceStore::new().with_sweep_config(cfg);
     let t0 = Utc::now();
     let mut old = d("dev-old", 0xcc, t0 - chrono::Duration::days(1));

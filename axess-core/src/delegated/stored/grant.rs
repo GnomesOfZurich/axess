@@ -26,6 +26,8 @@ use zeroize::Zeroizing;
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
 
+use crate::delegated::body::{read_error_body, read_success_body};
+
 use super::credential::StoredDelegation;
 use super::provider::DelegatedProvider;
 
@@ -112,7 +114,8 @@ pub fn begin_grant(
 fn random_token(rng: &dyn SecureRng) -> Zeroizing<String> {
     let mut raw = Zeroizing::new([0u8; 32]);
     rng.fill_bytes(&mut *raw);
-    Zeroizing::new(URL_SAFE_NO_PAD.encode(*raw))
+    // Borrowed, so the secret is not copied to an unwiped temporary.
+    Zeroizing::new(URL_SAFE_NO_PAD.encode(raw.as_slice()))
 }
 
 /// Complete an authorization-code grant: verify the returned `state`
@@ -158,7 +161,9 @@ pub async fn complete_grant_at(
         .as_bytes()
         .ct_eq(state_from_callback.as_bytes())
         .into();
-    if !state_matches {
+    // An empty state on both sides compares equal and checks nothing: a
+    // context without a state is refused, not matched.
+    if context.state.is_empty() || !state_matches {
         return Err(DelegatedError::StateMismatch);
     }
 
@@ -180,7 +185,16 @@ pub async fn complete_grant_at(
     ];
 
     let response = post_token_endpoint(http, provider, &form).await?;
-    parse_token_response(provider, response, now).await
+    let grant = parse_token_response(provider, response, now).await?;
+    // RFC 6749 §5.1: an omitted `scope` means the granted scope is the one
+    // requested.
+    let scopes = grant
+        .scope
+        .unwrap_or_else(|| context.requested_scopes.clone());
+    Ok(StoredDelegation {
+        scopes,
+        ..grant.credential
+    })
 }
 
 /// Refresh-token grant: RFC 6749 §6. Internal helper shared with
@@ -194,7 +208,7 @@ pub(super) async fn refresh_token_grant(
     refresh_token: &str,
     http: &reqwest::Client,
     clock: &dyn Clock,
-) -> Result<StoredDelegation, DelegatedError> {
+) -> Result<TokenGrant, DelegatedError> {
     let form: Vec<(&str, &str)> = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -202,6 +216,15 @@ pub(super) async fn refresh_token_grant(
     ];
     let response = post_token_endpoint(http, provider, &form).await?;
     parse_token_response(provider, response, clock.now()).await
+}
+
+/// A parsed token response: the credential it describes, and the scope the
+/// endpoint stated. `scope` is `None` when the response omitted the field,
+/// which RFC 6749 §5.1 and §6 define as "unchanged", so each caller falls
+/// back to the scopes it already knows; `credential.scopes` is empty then.
+pub(super) struct TokenGrant {
+    pub(super) credential: StoredDelegation,
+    pub(super) scope: Option<Vec<String>>,
 }
 
 /// POST to the IdP's token endpoint with HTTP Basic auth carrying the
@@ -246,12 +269,12 @@ struct TokenResponse {
 
 async fn parse_token_response(
     provider: &DelegatedProvider,
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     now: DateTime<Utc>,
-) -> Result<StoredDelegation, DelegatedError> {
+) -> Result<TokenGrant, DelegatedError> {
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(&mut response).await;
         // 400 + `invalid_grant` body specifically signals refresh-token
         // rejection; RFC 6749 §5.2. Surface the dedicated variant so
         // adopter UX can route to "please reconnect".
@@ -264,9 +287,8 @@ async fn parse_token_response(
         });
     }
 
-    let parsed: TokenResponse = response
-        .json()
-        .await
+    let body = read_success_body(&mut response).await?;
+    let parsed: TokenResponse = serde_json::from_slice(&body)
         .map_err(|e| DelegatedError::MalformedResponse(e.to_string()))?;
 
     if parsed.access_token.is_empty() {
@@ -275,24 +297,28 @@ async fn parse_token_response(
         ));
     }
 
-    let expires_at = match parsed.expires_in.filter(|s| *s > 0) {
+    // `expires_in: 0` is a token that is already expired, not one that never
+    // expires: it gets `expires_at = now` and is refreshed on next use.
+    let expires_at = match parsed.expires_in {
         None => None,
         Some(s) => Some(axess_factors::expiry_after(now, s).ok_or_else(|| {
             DelegatedError::MalformedResponse(format!("expires_in {s} is out of range"))
         })?),
     };
 
-    let scopes: Vec<String> = parsed
+    let scope: Option<Vec<String>> = parsed
         .scope
-        .map(|s| s.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default();
+        .map(|s| s.split_whitespace().map(str::to_string).collect());
 
-    Ok(StoredDelegation {
-        provider: provider.name.clone(),
-        access_token: parsed.access_token,
-        refresh_token: parsed.refresh_token,
-        expires_at,
-        scopes,
-        token_type: parsed.token_type.unwrap_or_else(|| "Bearer".to_string()),
+    Ok(TokenGrant {
+        credential: StoredDelegation {
+            provider: provider.name.clone(),
+            access_token: parsed.access_token,
+            refresh_token: parsed.refresh_token,
+            expires_at,
+            scopes: Vec::new(),
+            token_type: parsed.token_type.unwrap_or_else(|| "Bearer".to_string()),
+        },
+        scope,
     })
 }

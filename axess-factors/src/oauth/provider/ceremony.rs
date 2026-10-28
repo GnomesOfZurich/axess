@@ -27,7 +27,9 @@ pub(super) struct CeremonySecrets {
 fn draw(rng: &dyn SecureRng) -> String {
     let mut raw = Zeroizing::new([0u8; SECRET_BYTES]);
     rng.fill_bytes(&mut *raw);
-    URL_SAFE_NO_PAD.encode(*raw)
+    // Encode from the borrowed buffer: `*raw` would copy the secret to an
+    // unwiped stack temporary.
+    URL_SAFE_NO_PAD.encode(raw.as_slice())
 }
 
 /// Mint the verifier, then the state, then the nonce, in that draw order.
@@ -50,7 +52,7 @@ mod tests {
     fn expected(rng: &MockRng) -> String {
         let mut raw = [0u8; SECRET_BYTES];
         rng.fill_bytes(&mut raw);
-        URL_SAFE_NO_PAD.encode(raw)
+        URL_SAFE_NO_PAD.encode(raw.as_slice())
     }
 
     #[test]

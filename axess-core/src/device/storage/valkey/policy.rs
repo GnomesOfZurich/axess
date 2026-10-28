@@ -56,6 +56,9 @@ pub(super) enum SweepStep {
     },
     /// The revoked grace has elapsed.
     Purge,
+    /// A revoked row that carries no revocation time: stamp it, so its
+    /// grace starts and a later sweep can purge it.
+    StampRevoked,
 }
 
 /// Decide the sweep action for a row.
@@ -71,8 +74,9 @@ pub(super) enum SweepStep {
 pub(super) fn plan_sweep(device: &Device, cfg: &SweepConfig, now: DateTime<Utc>) -> SweepStep {
     if device.trust_level == DeviceTrustLevel::Revoked {
         return match device.revoked_at {
-            Some(r) if now.signed_duration_since(r) > cfg.revoked_grace => SweepStep::Purge,
-            _ => SweepStep::Keep,
+            Some(r) if cfg.purge_due(r, now) => SweepStep::Purge,
+            Some(_) => SweepStep::Keep,
+            None => SweepStep::StampRevoked,
         };
     }
     let next = cfg.level_after(

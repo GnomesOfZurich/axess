@@ -43,6 +43,8 @@ mod atomic_rotation;
 mod authn_time;
 #[cfg(test)]
 mod basics;
+#[cfg(test)]
+mod config_tests;
 #[cfg(all(test, feature = "device"))]
 mod device_cascade;
 #[cfg(test)]
@@ -74,15 +76,13 @@ mod refresh_unit_tests {
         assert_ne!(without, with, "peppered hash must differ from unpeppered");
     }
 
-    /// Pin: hash_token with empty pepper falls back to SHA-256 (same as None).
+    /// Pin: `Some` pepper is always keyed, even an empty one: it never falls
+    /// back to the unkeyed hash (the config check refuses it before use).
     #[test]
-    fn hash_token_empty_pepper_falls_back_to_sha256() {
+    fn hash_token_some_pepper_is_never_the_unkeyed_hash() {
         let none_pepper = hash_token("token", None);
         let empty_pepper = hash_token("token", Some(b""));
-        assert_eq!(
-            none_pepper, empty_pepper,
-            "empty pepper must fall back to SHA-256 path"
-        );
+        assert_ne!(none_pepper, empty_pepper);
     }
 
     /// Pin: different inputs produce different hashes (collision resistance).
@@ -153,6 +153,10 @@ mod refresh_unit_tests {
             (RefreshError::Revoked, "revoked"),
             (RefreshError::DeviceMismatch, "device mismatch"),
             (RefreshError::AccountInactive, "not active"),
+            (
+                RefreshError::InvalidConfig("max_per_user"),
+                "invalid refresh",
+            ),
             (RefreshError::Store(io::Error::other("boom")), "store error"),
         ];
         for (err, expected_substr) in variants {

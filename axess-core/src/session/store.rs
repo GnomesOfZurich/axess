@@ -17,6 +17,17 @@ use std::time::Duration;
 
 // ── SessionStore ──────────────────────────────────────────────────────────────
 
+/// What [`SessionStore::cycle`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum CycleOutcome {
+    /// The data is stored under the new id and the old row is gone.
+    Rotated,
+    /// The old row was required but was not live (deleted or expired since
+    /// the caller loaded it). Nothing was written.
+    SessionGone,
+}
+
 /// Typed, async session storage backend.
 ///
 /// Implementors: [`MemorySessionStore`], `SqliteSessionStore`, `ValkeySessionStore`.
@@ -49,6 +60,24 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         id: &SessionId,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Replace the data of a session that is still stored.
+    ///
+    /// Returns `Ok(true)` when a live (stored, unexpired) row under `id` was
+    /// replaced, and `Ok(false)` when there is none: the session was deleted
+    /// (logout, administrator revocation, front-channel logout) or expired
+    /// since the caller loaded it. In the `false` case nothing is written, so
+    /// a request that was in flight while its session was ended cannot bring
+    /// the session back. [`save`](Self::save) stays the way to create a row.
+    ///
+    /// The check and the write are one atomic step in every shipped backend
+    /// (an `UPDATE ... WHERE`, a `SET ... XX`, a guarded map entry).
+    fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+
     /// Atomically delete the old session row and store the data under the
     /// caller-supplied new id.
     ///
@@ -60,14 +89,21 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// registry holds the pre-cycle id while the cookie carries the
     /// post-cycle one. See the internal `SessionInner::rotate_id` helper.
     ///
-    /// Implementations MUST write the new row before the old row is removed,
-    /// and MUST NOT remove the old row when the write fails, so a failed
-    /// rotation leaves the user with their old session rather than neither.
-    /// Transactional backends (SQL) do both in one transaction so a crash
-    /// mid-cycle never leaves both rows or neither; a backend without
-    /// multi-key atomicity that preserves the order (Valkey) may leave both
-    /// rows after a crash, which the orphan window below bounds. Writing the
-    /// new id must be idempotent: a retry of the same rotation succeeds.
+    /// `require_old` says whether the old row must still be live. The layer
+    /// passes `true` when the request ran under a stored session, so a
+    /// rotation that races a logout does not carry the authenticated data
+    /// over to the new id: the delete of the old row decides, and when it
+    /// removed nothing the call returns [`CycleOutcome::SessionGone`] and
+    /// writes nothing. With `require_old == false` (a login on a fresh
+    /// guest whose id was never stored) the old row may be absent and the
+    /// new row is always written.
+    ///
+    /// A failed write MUST leave the caller able to fail closed: the layer
+    /// deletes the old id after any error, so a backend that cannot keep the
+    /// old row on failure (the Valkey fallback without scripting) does not
+    /// weaken the guarantee. Transactional backends (SQL) do the delete and
+    /// the write in one transaction; Valkey runs one script. Writing the new
+    /// id must be idempotent: a retry of the same rotation succeeds.
     ///
     /// # Orphan window
     ///
@@ -84,7 +120,8 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         new_id: &SessionId,
         data: &SessionData,
         ttl: Duration,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+        require_old: bool,
+    ) -> impl std::future::Future<Output = Result<CycleOutcome, Self::Error>> + Send;
 
     /// Bulk-delete every session row whose TTL has elapsed.
     /// Returns the number of rows reclaimed.
@@ -565,23 +602,48 @@ impl SessionStore for MemorySessionStore {
         self.inner.delete(id).await
     }
 
+    async fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        let replaced = self.inner.replace_live(id, data, ttl);
+        if replaced {
+            self.maybe_auto_purge();
+        }
+        Ok(replaced)
+    }
+
     async fn cycle(
         &self,
         old_id: &SessionId,
         new_id: &SessionId,
         data: &SessionData,
         ttl: Duration,
-    ) -> Result<(), Self::Error> {
-        // `Store<K, V>` has no atomic-rename primitive; cycle is a
-        // session-domain operation (rotate the id, preserve the data).
-        // Two operations on the same DashMap-backed backend are
-        // effectively atomic from the perspective of a single-process
-        // session store; multi-node backends override `SessionStore::cycle`
-        // with whatever native atomic the backend exposes.
-        self.inner.delete(old_id).await?;
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
+        // The removal of the old row decides: `remove_live` takes the entry
+        // out of the map in one step, so of two racing rotations (or a
+        // rotation and a logout) exactly one sees a live row. Same id: the
+        // row is replaced in place, never removed.
+        if old_id == new_id {
+            if require_old {
+                return Ok(if self.inner.replace_live(new_id, data, ttl) {
+                    CycleOutcome::Rotated
+                } else {
+                    CycleOutcome::SessionGone
+                });
+            }
+        } else {
+            let was_live = self.inner.remove_live(old_id);
+            if require_old && !was_live {
+                return Ok(CycleOutcome::SessionGone);
+            }
+        }
         self.inner.put(new_id, data, ttl).await?;
         self.maybe_auto_purge();
-        Ok(())
+        Ok(CycleOutcome::Rotated)
     }
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -710,3 +772,6 @@ mod memory_store_clock_tests;
 
 #[cfg(test)]
 mod memory_registry_tests;
+
+#[cfg(test)]
+pub(crate) mod revival_tests;

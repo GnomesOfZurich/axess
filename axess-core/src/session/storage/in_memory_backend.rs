@@ -202,6 +202,14 @@ impl crate::authn::store::IdentityLookup for InMemoryBackend {
         self.identity.get_user(user_id).await
     }
 
+    async fn get_tenant(&self, tenant_id: &TenantId) -> Result<Option<Tenant>, Self::Error> {
+        self.identity.get_tenant(tenant_id).await
+    }
+
+    async fn get_user_tenant(&self, user_id: &UserId) -> Result<Option<TenantId>, Self::Error> {
+        self.identity.get_user_tenant(user_id).await
+    }
+
     async fn find_tenant(&self, identifier: &str) -> Result<Option<Tenant>, Self::Error> {
         self.identity.find_tenant(identifier).await
     }
@@ -382,6 +390,17 @@ impl crate::authn::store::IdentityPasswordReset for InMemoryBackend {
     ) -> Result<bool, Self::Error> {
         self.identity
             .verify_reset_token(user_id, token_hash, now)
+            .await
+    }
+
+    async fn check_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Self::Error> {
+        self.identity
+            .check_reset_token(user_id, token_hash, now)
             .await
     }
 }

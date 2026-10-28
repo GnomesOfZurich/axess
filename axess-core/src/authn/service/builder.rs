@@ -305,9 +305,12 @@ where
     /// Set the maximum number of concurrent sessions per user.
     ///
     /// When a user authenticates and already has this many active sessions,
-    /// the oldest session is evicted. `None` (default) means unlimited.
-    pub fn with_max_sessions_per_user(mut self, max: usize) -> Self {
-        self.max_sessions_per_user = Some(max);
+    /// the oldest session is evicted. Not calling this (the default) means
+    /// unlimited. The cap is a [`NonZeroUsize`](std::num::NonZeroUsize): a cap
+    /// of 0 cannot hold a session that has just logged in, and used to behave
+    /// as 1 without saying so.
+    pub fn with_max_sessions_per_user(mut self, max: std::num::NonZeroUsize) -> Self {
+        self.max_sessions_per_user = Some(max.get());
         self
     }
 

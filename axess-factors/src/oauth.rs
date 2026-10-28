@@ -14,7 +14,8 @@
 //!
 //! If the IdP returned a refresh token (e.g. `offline_access` scope was
 //! requested), use `AuthnService::refresh_oauth_token` to exchange it for
-//! new tokens without re-authenticating the user.
+//! new tokens without re-authenticating the user. Pass the subject the login
+//! recorded: a refresh response for any other subject is refused.
 //!
 //! # Deterministic simulation testing
 //!

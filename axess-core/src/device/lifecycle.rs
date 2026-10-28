@@ -183,45 +183,47 @@ where
             // device owned by a different user is not reused: a shared
             // office, NAT or VPN gives two people the same fingerprint,
             // and the second must not inherit the first one's trust.
-            if let Some(existing) = self
+            let existing = self
                 .store
                 .find_by_fingerprint(&tenant, &fingerprint)
-                .await?
+                .await?;
+            if let Some(existing) = existing
+                && is_usable_by(&existing, user.as_ref())
             {
-                if is_usable_by(&existing, user.as_ref()) {
-                    // An unowned device (made during a guest request) is
-                    // claimed by the first authenticated user to reach it,
-                    // as one conditional write; otherwise any later user
-                    // could resolve it. A user who loses the race to
-                    // another falls through and gets a device of their own.
-                    let usable = match (existing.user_id.as_ref(), user.as_ref()) {
-                        (None, Some(user)) => matches!(
-                            self.store
-                                .claim_owner(&tenant, &existing.id, user, now)
-                                .await?,
-                            OwnerClaim::Claimed
-                        ),
-                        _ => true,
-                    };
-                    if usable {
-                        self.note_sighting(&tenant, &existing, now).await?;
-                        return Ok(existing.id);
-                    }
+                // An unowned device (made during a guest request) is
+                // claimed by the first authenticated user to reach it,
+                // as one conditional write; otherwise any later user
+                // could resolve it. A user who loses the race to
+                // another falls through and gets a device of their own.
+                let usable = match (existing.user_id.as_ref(), user.as_ref()) {
+                    (None, Some(user)) => matches!(
+                        self.store
+                            .claim_owner(&tenant, &existing.id, user, now)
+                            .await?,
+                        OwnerClaim::Claimed
+                    ),
+                    _ => true,
+                };
+                if usable {
+                    self.note_sighting(&tenant, &existing, now).await?;
+                    return Ok(existing.id);
                 }
-                // The lookup by fingerprint returns one row, which may be
-                // another user's. Look for the caller's own device with
-                // that fingerprint before minting a new one, so a repeat
-                // visit finds the same device again however many devices
-                // the user has.
-                if let Some(user) = user.as_ref() {
-                    let own = self
-                        .store
-                        .find_by_fingerprint_for_user(&tenant, user, &fingerprint)
-                        .await?;
-                    if let Some(own) = own {
-                        self.note_sighting(&tenant, &own, now).await?;
-                        return Ok(own.id);
-                    }
+            }
+            // The lookup by fingerprint returns one row, which may be
+            // another user's, or none at all for a device a store has not
+            // yet indexed under the fingerprint (a Valkey row last written
+            // by 0.11.0, whose index named a deleted twin). Look for the
+            // caller's own device with that fingerprint before minting a new
+            // one, so a repeat visit finds the same device again however
+            // many devices the user has.
+            if let Some(user) = user.as_ref() {
+                let own = self
+                    .store
+                    .find_by_fingerprint_for_user(&tenant, user, &fingerprint)
+                    .await?;
+                if let Some(own) = own {
+                    self.note_sighting(&tenant, &own, now).await?;
+                    return Ok(own.id);
                 }
             }
 
@@ -263,8 +265,10 @@ where
         device: &Device,
         now: DateTime<Utc>,
     ) -> Result<(), S::Error> {
-        if now.signed_duration_since(device.last_seen_at) < self.sighting_granularity
-            && now >= device.last_seen_at
+        // A request that is older than the last recorded sighting (an
+        // out-of-order arrival, or a node whose clock lags) records nothing.
+        if now <= device.last_seen_at
+            || now.signed_duration_since(device.last_seen_at) < self.sighting_granularity
         {
             return Ok(());
         }

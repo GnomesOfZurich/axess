@@ -202,29 +202,18 @@ async fn rotation_invalidates_old_token() {
     assert!(matches!(result, Err(RefreshError::Revoked)));
 }
 
-/// Cover the `hash_token` pepper-conditional branch.
-/// Mutation-testing baseline surfaced three live mutants
-/// at `hash_token`'s `match guard !pep.is_empty()`: the conditional
-/// pepper path was never exercised by tests. This test asserts:
+/// Cover the `hash_token` pepper branch through the public
+/// `issue_refresh_token`:
 ///
-/// 1. **`Some(empty)` falls through to SHA-256.** An empty pepper
-///    must produce the same hash as `None`. Kills the
-///    `replace match guard with true` mutant (which would HMAC
-///    with an empty key instead of falling back).
-/// 2. **`Some(non_empty)` uses HMAC, not SHA-256.** A populated
-///    pepper must produce a different hash than `None`. Kills the
-///    `replace match guard with false` mutant (which would never
-///    take the HMAC path) and the `delete !` mutant (which inverts
-///    the guard).
-/// 3. **Different peppers produce different hashes.** A pepper
+/// 1. **`Some(non_empty)` uses HMAC, not SHA-256.** A populated
+///    pepper must produce a different hash than `None`.
+/// 2. **Different peppers produce different hashes.** A pepper
 ///    rotation invalidates old hashes: confirms the HMAC key is
 ///    actually mixed in, not constant-folded.
 ///
-/// Driven through the public `issue_refresh_token` so the test
-/// asserts the contract of the on-the-wire `RefreshTokenRecord`,
-/// not just the private helper. The shared `MockRng` seed pins
-/// the random plaintext so the only thing varying between runs
-/// is the pepper.
+/// An empty pepper is a configuration error and is covered in
+/// `config_tests`. The shared `MockRng` seed pins the random plaintext so
+/// the only thing varying between runs is the pepper.
 #[tokio::test]
 async fn hash_token_pepper_branch_covered() {
     let user = fixture_user();
@@ -264,21 +253,17 @@ async fn hash_token_pepper_branch_covered() {
     }
 
     let h_none = hash_with(None, SEED, &user, &tenant, ts).await;
-    let h_empty = hash_with(Some(Vec::new()), SEED, &user, &tenant, ts).await;
     let h_pepper_a = hash_with(Some(b"pepper-a".to_vec()), SEED, &user, &tenant, ts).await;
     let h_pepper_b = hash_with(Some(b"pepper-b".to_vec()), SEED, &user, &tenant, ts).await;
 
-    // (1) Some(empty) must equal None; both fall through to SHA-256.
-    assert_eq!(
-        h_none, h_empty,
-        "Some(empty) pepper must take the same SHA-256 fallback as None",
-    );
-    // (2) Some(non_empty) must differ from None.
+    // (1) An empty pepper is refused by the config check (see
+    // `config_tests`), so it never reaches a hash.
+    // (1) Some(non_empty) must differ from None.
     assert_ne!(
         h_none, h_pepper_a,
         "Some(non-empty) pepper must take the HMAC path, not the SHA-256 fallback",
     );
-    // (3) Different peppers produce different hashes.
+    // (2) Different peppers produce different hashes.
     assert_ne!(
         h_pepper_a, h_pepper_b,
         "Different peppers must produce different HMAC outputs",

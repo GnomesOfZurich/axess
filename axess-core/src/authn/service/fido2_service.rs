@@ -20,7 +20,23 @@ pub(crate) mod fido2_keys {
     pub const AUTH_STATE: &str = "axess.fido2.auth_state";
     pub const REG_STATE: &str = "axess.fido2.reg_state";
     pub const DISC_STATE: &str = "axess.fido2.disc_state";
-    pub const CEREMONY_STARTED: &str = "axess.fido2.ceremony_started";
+    /// When the authentication ceremony began; paired with [`AUTH_STATE`].
+    pub const AUTH_STARTED: &str = "axess.fido2.auth_started";
+    /// When the registration ceremony began; paired with [`REG_STATE`].
+    pub const REG_STARTED: &str = "axess.fido2.reg_started";
+    /// When the discoverable ceremony began; paired with [`DISC_STATE`].
+    pub const DISC_STARTED: &str = "axess.fido2.disc_started";
+
+    /// The timestamp key that belongs to a ceremony state key. Each ceremony
+    /// has its own, so starting one never refreshes the timeout of stale
+    /// state another one left behind.
+    pub fn started_key(state_key: &str) -> &'static str {
+        match state_key {
+            AUTH_STATE => AUTH_STARTED,
+            REG_STATE => REG_STARTED,
+            _ => DISC_STARTED,
+        }
+    }
 }
 
 impl<I, F> AuthnService<I, F>
@@ -82,57 +98,64 @@ where
         ))
     }
 
-    /// Record a successful authentication on the matching stored passkey.
+    /// Record a successful authentication on the stored passkey it used.
+    ///
+    /// Returns `Ok(false)`, writing nothing, when the stored list no longer
+    /// holds the credential that produced `auth_result` (the passkey was
+    /// deleted after the ceremony began) or the user has no passkeys at all.
+    /// The caller must treat that as a failed assertion.
     async fn save_fido2_credentials(
         &self,
         user_scope: &AuthnScope,
         auth_result: &webauthn_rs::prelude::AuthenticationResult,
-    ) -> Result<(), AuthnError<I::Error>> {
+    ) -> Result<bool, AuthnError<I::Error>> {
         let now = self.inner.clock.now();
-        self.update_fido2_credentials(user_scope, |credentials| {
-            for cred in credentials.iter_mut() {
-                cred.record_authentication(auth_result, now);
-            }
-            Some(())
-        })
-        .await
-        .map(|_| ())
+        let saved = self
+            .update_fido2_credentials(user_scope, |credentials| {
+                let used = credentials
+                    .iter_mut()
+                    .find(|c| c.cred_id() == auth_result.cred_id())?;
+                used.record_authentication(auth_result, now);
+                Some(())
+            })
+            .await?;
+        Ok(saved.is_some())
     }
 
-    /// Store the ceremony-started timestamp in the session.
-    pub(super) async fn stamp_ceremony_start(&self, session: &AuthSession) {
+    /// Store the ceremony-started timestamp for the ceremony that owns
+    /// `state_key`.
+    pub(super) async fn stamp_ceremony_start(&self, session: &AuthSession, state_key: &str) {
         session
             .set_custom(
-                fido2_keys::CEREMONY_STARTED,
+                fido2_keys::started_key(state_key),
                 serde_json::Value::String(self.inner.clock.now().to_rfc3339()),
             )
             .await;
     }
 
-    /// Clear ceremony state keys from the session.
+    /// Clear a ceremony's state key and its timestamp from the session.
     pub(super) async fn clear_ceremony_state(&self, session: &AuthSession, state_key: &str) {
         session.set_custom(state_key, serde_json::Value::Null).await;
-        session
-            .set_custom(fido2_keys::CEREMONY_STARTED, serde_json::Value::Null)
-            .await;
+        self.clear_ceremony_timestamp(session, state_key).await;
     }
 
     /// Clear ONLY the ceremony timestamp; the state key has already been
     /// consumed via [`AuthSession::take_custom`]. Used by the hardened
     /// paths that take the ceremony state atomically with the read.
-    pub(super) async fn clear_ceremony_timestamp(&self, session: &AuthSession) {
+    pub(super) async fn clear_ceremony_timestamp(&self, session: &AuthSession, state_key: &str) {
         session
-            .set_custom(fido2_keys::CEREMONY_STARTED, serde_json::Value::Null)
+            .set_custom(fido2_keys::started_key(state_key), serde_json::Value::Null)
             .await;
     }
 
-    /// Check if the FIDO2 ceremony has exceeded the configured timeout.
+    /// Check if the FIDO2 ceremony that owns `state_key` has exceeded the
+    /// configured timeout.
     ///
     /// Fails closed: if the ceremony timestamp is missing or unparseable,
     /// the ceremony is considered expired. This prevents stale or corrupted
     /// sessions from bypassing timeout enforcement.
-    pub(super) async fn is_ceremony_expired(&self, session: &AuthSession) -> bool {
-        let Some(started) = session.get_custom(fido2_keys::CEREMONY_STARTED).await else {
+    pub(super) async fn is_ceremony_expired(&self, session: &AuthSession, state_key: &str) -> bool {
+        let Some(started) = session.get_custom(fido2_keys::started_key(state_key)).await else {
             // No timestamp → ceremony was never properly started; fail closed.
             tracing::warn!("FIDO2 ceremony timestamp missing; treating as expired (fail closed)");
             return true;
@@ -177,7 +200,8 @@ where
 
         let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
         session.set_custom(fido2_keys::DISC_STATE, state_json).await;
-        self.stamp_ceremony_start(session).await;
+        self.stamp_ceremony_start(session, fido2_keys::DISC_STATE)
+            .await;
 
         serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
     }
@@ -212,6 +236,68 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
+    /// Audit and name the refusal of a passkey ceremony for an account that
+    /// may not log in. A lockout carries `Locked` (with its `until`), the
+    /// other non-active states a `Failure` tagged `NotActive`, so a dashboard
+    /// separates brute-force probes from administrative-state mismatches.
+    /// `event` is `FactorEnabled` for an account-management action and
+    /// `FactorVerified` for a login. A failed audit write is returned in
+    /// place of the refusal.
+    async fn refuse_inactive_account(
+        &self,
+        user: &crate::authn::types::User,
+        status: crate::authn::types::EntityState,
+        event: AuthEventType,
+        session: Option<&AuthSession>,
+    ) -> AuthnError<I::Error> {
+        let builder = if status.is_locked() {
+            AuthEventBuilder::locked(event)
+        } else {
+            AuthEventBuilder::failure(event).with_error(AuthFailureReason::NotActive)
+        };
+        let mut builder = builder
+            .attributed_to(&user.id, &user.tenant_id)
+            .with_factor(FactorKind::Fido2);
+        if let Some(session) = session {
+            builder = builder.with_session(session.session_id().await);
+        }
+        if let Err(e) = self.emit_audit(builder).await {
+            return e;
+        }
+        if let crate::authn::types::EntityState::Suspended(detail) = &status {
+            self.inner.metrics.account_locked();
+            return AuthnError::Locked {
+                until: detail.until,
+            };
+        }
+        AuthnError::NotActive(status)
+    }
+
+    /// Retire a failed discoverable ceremony and name the failure.
+    ///
+    /// The ceremony state is cleared BEFORE the failure is recorded, so a
+    /// store error while recording cannot leave it behind. The failure goes
+    /// through the canonical helper so counter-store errors are muted (no
+    /// lockout-evading side channel) and the audit row precedes the counter.
+    /// A lockout passes its `until` to the caller; every other verdict is
+    /// `InvalidAssertion`. A store error from the helper is returned as is.
+    async fn discoverable_failure(
+        &self,
+        user: &crate::authn::types::User,
+        session: &AuthSession,
+    ) -> AuthnError<I::Error> {
+        self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
+            .await;
+        match self
+            .record_factor_failure(&user.id, &user.tenant_id, &FactorKind::Fido2, session)
+            .await
+        {
+            Ok(FactorOutcome::Locked { until }) => AuthnError::Locked { until },
+            Ok(_) => AuthnError::InvalidAssertion,
+            Err(e) => e,
+        }
+    }
+
     /// Verify a FIDO2/WebAuthn authentication assertion.
     pub(super) async fn verify_fido2_factor(
         &self,
@@ -248,8 +334,12 @@ where
             _ => return Ok(FactorOutcome::InvalidCredential),
         };
 
-        if self.is_ceremony_expired(session).await {
-            self.clear_ceremony_timestamp(session).await;
+        if self
+            .is_ceremony_expired(session, fido2_keys::AUTH_STATE)
+            .await
+        {
+            self.clear_ceremony_timestamp(session, fido2_keys::AUTH_STATE)
+                .await;
             return Ok(FactorOutcome::InvalidCredential);
         }
 
@@ -257,7 +347,8 @@ where
             match serde_json::from_value(state_json) {
                 Ok(s) => s,
                 Err(_) => {
-                    self.clear_ceremony_timestamp(session).await;
+                    self.clear_ceremony_timestamp(session, fido2_keys::AUTH_STATE)
+                        .await;
                     return Ok(FactorOutcome::InvalidCredential);
                 }
             };
@@ -266,7 +357,8 @@ where
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("FIDO2 finish_passkey_authentication failed: {e:?}");
-                self.clear_ceremony_timestamp(session).await;
+                self.clear_ceremony_timestamp(session, fido2_keys::AUTH_STATE)
+                    .await;
                 // Route through the canonical failure helper so FIDO2
                 // matches the canonical audit ordering and store-error muting.
                 return self
@@ -282,10 +374,20 @@ where
         // the session is in a clean state; the user can begin a fresh
         // ceremony immediately rather than tripping the
         // `is_ceremony_expired` fast-path on a stale timestamp.
-        self.clear_ceremony_timestamp(session).await;
+        self.clear_ceremony_timestamp(session, fido2_keys::AUTH_STATE)
+            .await;
 
-        self.save_fido2_credentials(user_scope, &auth_result)
-            .await?;
+        // A passkey deleted after the ceremony began is no longer a
+        // credential of this user: the assertion verified against a stale
+        // list, so it counts as a failed attempt and authenticates nothing.
+        if !self
+            .save_fido2_credentials(user_scope, &auth_result)
+            .await?
+        {
+            return self
+                .record_factor_failure(user_id, tenant_id, &FactorKind::Fido2, session)
+                .await;
+        }
 
         // Device-binding hook: when the `device` subsystem is wired in
         // via a custom `Fido2Provider`, this updates
@@ -322,32 +424,9 @@ where
 
         let status = self.current_account_status(&user.id).await?;
         if !status.allows_login() {
-            // Emit an audit row so a registration attempt from a suspended
-            // user leaves SOC visibility. A lockout carries `Locked`, the
-            // other non-active states `Failure` with a tag, so a dashboard
-            // separates brute-force probes from administrative-state
-            // mismatches on the status column. Audit type is
-            // `FactorEnabled` rather than `FactorVerified` because this is
-            // an account-management action, not a login.
-            let builder = if status.is_locked() {
-                AuthEventBuilder::locked(AuthEventType::FactorEnabled)
-            } else {
-                AuthEventBuilder::failure(AuthEventType::FactorEnabled)
-                    .with_error(AuthFailureReason::NotActive)
-            };
-            self.emit_audit(
-                builder
-                    .attributed_to(&user.id, &user.tenant_id)
-                    .with_factor(FactorKind::Fido2),
-            )
-            .await?;
-            if let crate::authn::types::EntityState::Suspended(detail) = &status {
-                self.inner.metrics.account_locked();
-                return Err(AuthnError::Locked {
-                    until: detail.until,
-                });
-            }
-            return Err(AuthnError::NotActive(status));
+            return Err(self
+                .refuse_inactive_account(user, status, AuthEventType::FactorEnabled, None)
+                .await);
         }
 
         let user_scope = AuthnScope::User {
@@ -393,7 +472,8 @@ where
 
         let state_json = serde_json::to_value(&reg_state).map_err(|_| AuthnError::NoFlow)?;
         session.set_custom(fido2_keys::REG_STATE, state_json).await;
-        self.stamp_ceremony_start(session).await;
+        self.stamp_ceremony_start(session, fido2_keys::REG_STATE)
+            .await;
 
         let challenge_json = serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
         Ok((challenge_json, new_id))
@@ -413,19 +493,35 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
-        if self.is_ceremony_expired(session).await {
-            self.clear_ceremony_state(session, fido2_keys::REG_STATE)
+        // Take the state first so two parallel finishes cannot both consume
+        // one challenge, and so a failed finish leaves nothing to replay.
+        let state_json = session.take_custom(fido2_keys::REG_STATE).await;
+        if self
+            .is_ceremony_expired(session, fido2_keys::REG_STATE)
+            .await
+        {
+            self.clear_ceremony_timestamp(session, fido2_keys::REG_STATE)
                 .await;
             return Err(AuthnError::NoFlow);
         }
-
-        let state_json = session
-            .get_custom(fido2_keys::REG_STATE)
-            .await
-            .ok_or(AuthnError::NoFlow)?;
+        self.clear_ceremony_timestamp(session, fido2_keys::REG_STATE)
+            .await;
+        let state_json = match state_json {
+            Some(v) if !v.is_null() => v,
+            _ => return Err(AuthnError::NoFlow),
+        };
 
         let reg_state: webauthn_rs::prelude::PasskeyRegistration =
             serde_json::from_value(state_json).map_err(|_| AuthnError::NoFlow)?;
+
+        // The account may have been suspended or locked since the
+        // ceremony began; begin refused it, so finish refuses it too.
+        let status = self.current_account_status(&user.id).await?;
+        if !status.allows_login() {
+            return Err(self
+                .refuse_inactive_account(user, status, AuthEventType::FactorEnabled, None)
+                .await);
+        }
 
         let passkey = webauthn
             .finish_registration(response, &reg_state)
@@ -448,18 +544,24 @@ where
         // (never saves just the new passkey over the existing ones), and a
         // concurrent registration or deletion is merged rather than lost.
         let registered_at = self.inner.clock.now();
-        self.update_fido2_credentials(&user_scope, |credentials| {
-            if credentials.iter().any(|c| c.cred_id() == &cred_id) {
-                return None;
-            }
-            credentials.push(crate::authn::factor::Fido2Credential::new(
-                passkey.clone(),
-                credential_name,
-                registered_at,
-            ));
-            Some(())
-        })
-        .await?;
+        let added = self
+            .update_fido2_credentials(&user_scope, |credentials| {
+                if credentials.iter().any(|c| c.cred_id() == &cred_id) {
+                    return None;
+                }
+                credentials.push(crate::authn::factor::Fido2Credential::new(
+                    passkey.clone(),
+                    credential_name,
+                    registered_at,
+                ));
+                Some(())
+            })
+            .await?;
+        // `None` is a credential id that is already registered: nothing was
+        // stored, so no device binding and no `FactorSetup` audit.
+        if added.is_none() {
+            return Err(AuthnError::NoFlow);
+        }
 
         // Auto-invoke the device-binding hook. Adopters that wire the
         // `device` subsystem override `Fido2Provider::on_credential_used`
@@ -472,9 +574,6 @@ where
         if let Some(device_id) = session.device_id().await {
             webauthn.on_credential_used(&cred_id, &device_id);
         }
-
-        self.clear_ceremony_state(session, fido2_keys::REG_STATE)
-            .await;
 
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::FactorSetup)
@@ -504,35 +603,15 @@ where
         if !status.allows_login() {
             self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
                 .await;
-            // Emit an audit row, with `Locked` for a lockout and `Failure`
-            // plus a tag for the other non-active states, preserving
-            // `until` for the Locked path by walking the
-            // `EntityState::Suspended` deep-nested form. The discoverable
-            // path runs OUTSIDE the factor pipeline so it can't piggy-back
-            // on `enforce_account_status`'s audit emit; mirror it here.
-            let builder = if status.is_locked() {
-                AuthEventBuilder::locked(AuthEventType::FactorVerified)
-            } else {
-                AuthEventBuilder::failure(AuthEventType::FactorVerified)
-                    .with_error(AuthFailureReason::NotActive)
-            };
-            self.emit_audit(
-                builder
-                    .attributed_to(&user.id, &user.tenant_id)
-                    .with_factor(FactorKind::Fido2)
-                    .with_session(session.session_id().await),
-            )
-            .await?;
-            if let crate::authn::types::EntityState::Suspended(detail) = &status {
-                self.inner.metrics.account_locked();
-                return Err(AuthnError::Locked {
-                    until: detail.until,
-                });
-            }
-            return Err(AuthnError::NotActive(status));
+            return Err(self
+                .refuse_inactive_account(user, status, AuthEventType::FactorVerified, Some(session))
+                .await);
         }
 
-        if self.is_ceremony_expired(session).await {
+        if self
+            .is_ceremony_expired(session, fido2_keys::DISC_STATE)
+            .await
+        {
             self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
                 .await;
             return Err(AuthnError::NoFlow);
@@ -547,11 +626,14 @@ where
             _ => return Err(AuthnError::NoFlow),
         };
 
-        let auth_state: webauthn_rs::prelude::DiscoverableAuthentication =
-            serde_json::from_value(state_json).map_err(|_| {
-                // State already removed; clear timestamp too.
-                AuthnError::NoFlow
-            })?;
+        let Ok(auth_state) =
+            serde_json::from_value::<webauthn_rs::prelude::DiscoverableAuthentication>(state_json)
+        else {
+            // The state is already taken; retire the timestamp too.
+            self.clear_ceremony_timestamp(session, fido2_keys::DISC_STATE)
+                .await;
+            return Err(AuthnError::NoFlow);
+        };
 
         let discoverable_keys: Vec<webauthn_rs::prelude::DiscoverableKey> =
             credentials.iter().map(|c| (&c.passkey).into()).collect();
@@ -564,31 +646,7 @@ where
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!("FIDO2 finish_discoverable_authentication failed: {e:?}");
-
-                // Route through the canonical failure helper so the
-                // two invariants hold here: counter-store errors must
-                // NOT propagate as `Err(AuthnError::Store)` (would be a
-                // distinguishable timing/error side-channel letting
-                // attackers brute-force without tripping lockout), and
-                // the audit emit must happen BEFORE the counter
-                // increment.
-                let outcome = self
-                    .record_factor_failure(&user.id, &user.tenant_id, &FactorKind::Fido2, session)
-                    .await?;
-
-                self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                    .await;
-
-                return match outcome {
-                    // Pass `until` through to the caller so the
-                    // FIDO2 discoverable path matches the same lockout
-                    // shape as the cookie/factor path.
-                    FactorOutcome::Locked { until } => Err(AuthnError::Locked { until }),
-                    // `record_factor_failure` only emits `Locked` or
-                    // `InvalidCredential`; the wildcard covers
-                    // `InvalidCredential` defensively.
-                    _ => Err(AuthnError::InvalidAssertion),
-                };
+                return Err(self.discoverable_failure(user, session).await);
             }
         };
 
@@ -596,8 +654,15 @@ where
             tenant_id: user.tenant_id,
             user_id: user.id,
         };
-        self.save_fido2_credentials(&user_scope, &auth_result)
-            .await?;
+        // A passkey deleted after the ceremony began is no longer a
+        // credential of this user, however valid the assertion was against
+        // the caller's list.
+        if !self
+            .save_fido2_credentials(&user_scope, &auth_result)
+            .await?
+        {
+            return Err(self.discoverable_failure(user, session).await);
+        }
 
         // Auto-invoke the device-binding hook for the credential that
         // just satisfied this assertion. Mirrors the call in
@@ -618,7 +683,8 @@ where
         // status-recheck or registry-error path inside complete_factor_step
         // does not leave a stale ceremony timestamp
         // that the next request would interpret as "ceremony in progress".
-        self.clear_ceremony_timestamp(session).await;
+        self.clear_ceremony_timestamp(session, fido2_keys::DISC_STATE)
+            .await;
 
         // Reset the failed-attempt counter BEFORE flipping the session to
         // Authenticated. Same reasoning as the standard

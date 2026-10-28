@@ -201,8 +201,8 @@ pub use device::{
     DeviceStore, DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
     NoopDeviceResolver, OwnerClaim, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, SessionUser,
-    SweepConfig, SweepConfigBuilder, SweepCounts, TenantPepperResolver, TrustTransition,
-    cascade_revoke_by_refresh_family, cascade_revoke_devices,
+    SweepConfig, SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver,
+    TrustTransition, cascade_revoke_by_refresh_family, cascade_revoke_devices,
 };
 
 #[cfg(feature = "device")]

@@ -135,3 +135,30 @@ async fn an_old_device_beyond_the_scan_limit_is_still_found() {
     );
     assert_eq!(store.len(), before, "no device is minted");
 }
+
+/// A request that arrives with a time older than the recorded sighting (an
+/// out-of-order arrival, or a node whose clock lags) records nothing.
+#[tokio::test]
+async fn an_older_request_does_not_move_the_last_sighting_back() {
+    let svc = DeviceLifecycleService::new(MemoryDeviceStore::new());
+    let (tenant, user) = (testing::tenant("t"), testing::user("u"));
+    let id = testing::device("d");
+    svc.ensure_device(&tenant, Some(&user), fp(1), at(), || id)
+        .await
+        .unwrap();
+    let later = at() + Duration::hours(2);
+    svc.ensure_device(&tenant, Some(&user), fp(1), later, || unreachable!())
+        .await
+        .unwrap();
+    assert_eq!(last_seen(&svc, &id).await, later);
+
+    let lagging = at() + Duration::hours(1);
+    svc.ensure_device(&tenant, Some(&user), fp(1), lagging, || unreachable!())
+        .await
+        .unwrap();
+    assert_eq!(
+        last_seen(&svc, &id).await,
+        later,
+        "the later sighting stands"
+    );
+}

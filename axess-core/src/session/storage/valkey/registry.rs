@@ -9,9 +9,10 @@ use super::internal::{
     registry_member_live, registry_member_ttl_ms, revocation_session_channel,
     revocation_user_channel,
 };
-use super::subscriber::SharedSubscriber;
+use super::subscriber::{Event, SharedSubscriber};
 use crate::session::{id::SessionId, store::SessionRegistry};
 use axess_clock::{Clock, SystemClock};
+use axess_rng::{SecureRng, SystemRng};
 use fred::prelude::*;
 use fred::types::sorted_sets::{ZRange, ZRangeBound, ZRangeKind};
 use std::sync::Arc;
@@ -50,6 +51,9 @@ fn live_max() -> ZRange {
     }
 }
 
+/// Upper bound of the delay before a watcher's recheck, in milliseconds.
+const RECHECK_JITTER_MAX_MS: u64 = 250;
+
 // ── ValkeySessionRegistry ────────────────────────────────────────────────────
 
 /// Valkey-backed session registry using sorted sets.
@@ -77,6 +81,10 @@ pub struct ValkeySessionRegistry {
     /// Injected clock for the FIFO ordering score. Defaults to
     /// [`SystemClock`]; tests override via [`with_clock`].
     clock: Arc<dyn Clock>,
+    /// Random source for the delay before a watcher's recheck after dropped
+    /// messages. Defaults to [`SystemRng`]; tests override via
+    /// [`with_rng`](Self::with_rng).
+    rng: Arc<dyn SecureRng>,
     /// The subscriber connection shared by this registry's revocation
     /// watchers and those of its clones.
     pub(super) subscriber: Arc<SharedSubscriber>,
@@ -90,6 +98,7 @@ impl ValkeySessionRegistry {
             prefix: DEFAULT_PREFIX.into(),
             ttl: Duration::from_secs(24 * 60 * 60),
             clock: Arc::new(SystemClock),
+            rng: Arc::new(SystemRng),
             subscriber: SharedSubscriber::new(),
         }
     }
@@ -101,6 +110,7 @@ impl ValkeySessionRegistry {
             prefix: prefix.into(),
             ttl,
             clock: Arc::new(SystemClock),
+            rng: Arc::new(SystemRng),
             subscriber: SharedSubscriber::new(),
         }
     }
@@ -112,6 +122,25 @@ impl ValkeySessionRegistry {
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
         self
+    }
+
+    /// Inject the [`SecureRng`] that draws the delay each revocation watcher
+    /// waits before it rechecks the registry after dropped pub/sub messages.
+    /// Defaults to [`SystemRng`].
+    pub fn with_rng(mut self, rng: Arc<dyn SecureRng>) -> Self {
+        self.rng = rng;
+        self
+    }
+
+    /// The delay before one watcher's recheck: uniform over
+    /// `0..=RECHECK_JITTER_MAX_MS` milliseconds, so the watchers of one burst
+    /// spread their registry reads over that window instead of issuing them
+    /// together.
+    pub(super) fn recheck_delay(&self) -> Duration {
+        let mut bytes = [0u8; 4];
+        self.rng.fill_bytes(&mut bytes);
+        let draw = u64::from(u32::from_le_bytes(bytes));
+        Duration::from_millis(draw % (RECHECK_JITTER_MAX_MS + 1))
     }
 }
 
@@ -168,12 +197,18 @@ impl SessionRegistry for ValkeySessionRegistry {
         // boolean, but reading from the sorted-set storage shape.
         let score: Option<f64> = self.client.zscore(&key, &sid_str).await?;
         let now_ms = self.clock.now().timestamp_millis();
-        let live = score.is_some_and(|score| {
-            registry_member_live(score, now_ms, registry_member_ttl_ms(self.ttl))
-        });
+        let member_ttl_ms = registry_member_ttl_ms(self.ttl);
+        let live = score.is_some_and(|score| registry_member_live(score, now_ms, member_ttl_ms));
         if score.is_some() && !live {
-            // Expired member: drop it so it stops occupying a slot.
-            self.client.zrem::<(), _, _>(&key, &sid_str).await?;
+            // Expired member: drop it so it stops occupying a slot. The
+            // removal is by score range, the same one `register` and
+            // `active_sessions` use, not by member: a `ZREM` of the member
+            // would also remove a session that was registered again with a
+            // fresh score between the read above and this write.
+            let cutoff = registry_cutoff_ms(now_ms, member_ttl_ms);
+            self.client
+                .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
+                .await?;
         }
         Ok(live)
     }
@@ -256,41 +291,43 @@ impl SessionRegistry for ValkeySessionRegistry {
         let user_channel = revocation_user_channel(&self.prefix, user_id.to_string().as_str());
         let session_channel = revocation_session_channel(&self.prefix, &session_id.to_string());
 
-        let Some(mut watch) = self.subscriber.join(&self.client, &self.prefix).await else {
+        let Some(watch) = self
+            .subscriber
+            .join(&self.client, &self.prefix, [user_channel, session_channel])
+            .await
+        else {
             // Connection failure: degrade to never-resolving future.
             // Caller will fall back to next-request validity check.
             std::future::pending::<()>().await;
             return;
         };
 
-        // Race-free: the receiver exists BEFORE the post-subscribe is_valid
-        // check, so a revocation arriving after the check still wakes us.
-        // The session may also have been invalidated between session
-        // resolution and joining; if so, return immediately.
+        // Race-free: the watcher's slot exists BEFORE the post-subscribe
+        // is_valid check, so a revocation arriving after the check still
+        // wakes us. The session may also have been invalidated between
+        // session resolution and joining; if so, return immediately.
         if let Ok(false) = self.is_valid(user_id, session_id).await {
             return;
         }
 
         loop {
-            match watch.messages.recv().await {
-                Ok(message) => {
-                    let channel: &str = &message.channel;
-                    if channel == user_channel || channel == session_channel {
-                        return;
-                    }
-                }
+            match watch.slot.next().await {
+                Event::Revoked => return,
                 // Messages were dropped for a slow receiver: one of them may
-                // have been ours, so the registry decides.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                // have been ours, so the registry decides, after a delay of
+                // its own so a burst does not turn into one instant of
+                // checks from every watcher.
+                Event::Recheck => {
+                    tokio::time::sleep(self.recheck_delay()).await;
                     if let Ok(false) = self.is_valid(user_id, session_id).await {
                         return;
                     }
                 }
-                // The connection is gone: fall back to the next request's
-                // validity check.
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    std::future::pending::<()>().await;
-                }
+                // The connection is gone: keep waiting. A watcher that joins
+                // later opens a new connection and flags this one for a
+                // recheck; until then the next request's validity check is
+                // the fallback.
+                Event::Closed => {}
             }
         }
     }

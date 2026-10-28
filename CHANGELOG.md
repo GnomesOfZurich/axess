@@ -10,6 +10,112 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.12.0] - 2026-10-28
+
+### Changed (breaking)
+
+- **`IdentityLookup::get_tenant`** is required. A password reset refuses, and
+  keeps the token, when the tenant is missing or not active.
+- **`IdentityPasswordReset::check_reset_token`** is required.
+  `begin_password_reset` answers `Err(Internal)` for a ttl of 0 or over seven
+  days; `complete_password_reset*` answers `Ok(false)` for an unknown user.
+- **`SessionStore::update`** is required, and **`SessionStore::cycle`** takes
+  `require_old: bool` and returns `CycleOutcome`. A rotation or a save no
+  longer revives a session ended mid-request.
+- **`RefreshTokenStore::issue_with_eviction(evict_ids, new)` is
+  `issue_capped(new, max_per_user)`**: the store counts, evicts and inserts in
+  one step. `RefreshError::InvalidConfig` refuses an empty pepper and a cap of
+  zero.
+- **`AuthnServiceBuilder::with_max_sessions_per_user` takes `NonZeroUsize`.**
+- **`SweepConfigBuilder::build` returns `Result<SweepConfig,
+  SweepConfigError>`**; sweep windows are whole seconds in every store.
+- **`SidMap::insert`, `register_subject_session` and `take_subject_sessions`
+  take the IdP subject**, and `take_subject_sessions` returns `(UserId,
+  SessionId)` pairs. `take_user_sessions` is removed.
+- **`refresh_oauth_token` takes `expected_subject`**; a refresh response for
+  another subject is refused and audited as `TokenRefreshProviderRejected`.
+- **`DelegatedError::UnsupportedTokenType`**: a non-`Bearer` credential is
+  refused.
+- **`ArchiveBatchId::from_parts(first, last, count)` is `from_ids(ids)`.**
+- **The FIDO2 session keys are `axess.fido2.{auth,reg,disc}_started`**; a
+  ceremony begun before the upgrade fails closed.
+- **`normalize_recovery_code` drops only whitespace and dashes.**
+- **Device blobs are sealed as `AXD\x02` and `AXR\x02`**, with tenant and
+  device id length-prefixed. 0.11.0 blobs and unbound blobs still read and are
+  re-sealed on read; 0.11.0 cannot read the new format.
+- **The Valkey device fingerprint index is a set under `dev:fps`.** The old
+  single-id `dev:fp` key is still read, and the next write of the device it
+  names moves it into the set. On a cluster, the new keys share the store's
+  hash-slot prefix.
+
+### Added
+
+- `RequestContextProvider`: `require_authz!` reads it from the request
+  extensions and evaluates with the context it returns; a provider error
+  answers 403.
+- `LegacyBlobs::{Accept, Reject}`, `SessionCrypto::with_legacy_blobs` and the
+  Valkey stores' `with_legacy_blobs`. Sessions and devices re-seal a stale blob
+  when they read it, in every store, so legacy rows can be drained and then
+  refused.
+- `CycleOutcome`, `RefreshTokenConfig::validate`,
+  `ValkeySessionRegistry::with_rng`, `SweepConfig::purge_due`,
+  `AuditRetentionLoop::drain`, `MemoryJtiCache::with_capacity`,
+  `OAuthProvider::refresh_token_for_subject` (provided).
+- `axess_factors::http_body`: bounded reads for remote response bodies.
+- Live Postgres and MySQL suites for the session and device stores, run by
+  CI's ignored-test step.
+
+### Fixed
+
+- A passkey deleted between ceremony start and finish no longer logs in, and
+  the authentication, registration and discoverable ceremonies are single-use
+  and separate. Registration re-checks account status.
+- `require_authz!` evaluated every policy with an empty context, so a rule
+  reading `context` could never permit; it now uses the provided context.
+- A `sub`-only back-channel logout ends the sessions of the IdP subject (it
+  had parsed `sub` as a local user id and found nothing for linked users), and
+  a logout token's `jti` is remembered for the whole span its `iat` is
+  accepted.
+- Parallel email-OTP requests cannot bypass the cooldown.
+- A refused new password keeps the reset link, and an unknown identifier costs
+  the same as a known one.
+- One user can no longer fill the rate limiter: at most 16 header buckets per
+  user, IPv6 keyed by /64, keys over 256 bytes hashed. The window slides, so
+  twice the limit no longer passes across a boundary. The log carries a key
+  fingerprint, not the key.
+- The KDF permit is held until Argon2 finishes, also when the request is
+  dropped.
+- Parallel logins converge on the session cap and the refresh-token cap.
+- Device stores no longer undo one another's decisions: the memory sweep never
+  reapplies a stale decision over a revoke, a save never un-revokes a stored
+  row, `record_sighting` never moves time back and skips revoked devices, and
+  Valkey rows and their indexes change in one script, with stale index members
+  neither listed, revoked nor returned by fingerprint.
+- Device finders order by `last_seen_at` descending, then id, in every store; a
+  revoked device saved without `revoked_at` is stamped and purged; one
+  undecodable row no longer stops a sweep; and a fingerprint stays findable
+  while any device in the tenant carries it.
+- A guarded trust change whose write missed is retried instead of reported
+  applied; a losing bindings swap no longer waits on its own connection.
+- The Valkey revocation listener wakes only the watchers of the revoked
+  session, rechecks after a lag with jitter, and replaces a dead subscriber.
+  `is_valid` no longer prunes a session registered again meanwhile.
+- DPoP: a `jwk` with private members is refused, `htm` is compared exactly,
+  the iat skew is bounded and checked without overflow, and the `jti` cache
+  is bounded.
+- Every remote response body is read with a cap: token and PAR 64 KiB,
+  userinfo 256 KiB, JWKS and discovery 1 MiB, error bodies cut to 1 KiB.
+- Delegated tokens: `expires_in: 0` is already expired, an omitted `scope`
+  keeps the requested or stored scopes, and an empty grant state is refused.
+- An OAuth login ends displaced sessions only after the login succeeds, and
+  runs its registry calls concurrently, at most 16 at a time.
+- The audit archive cannot lose a batch on a half-failed rollback; two
+  archivers sharing a root cannot write one batch twice (`.archive.lock`); new
+  day directories are synced; retention drains a backlog and starts at boot.
+- `testing::LocalIdp` installs a JWT crypto provider before signing.
+
+---
+
 ## [0.11.0] - 2026-10-25
 
 ### Changed (breaking)
@@ -211,9 +317,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 - Docs match the code: provisioning, step-up defaults, the FIDO2 and
   `into_response` clock exceptions, the detach semantics of the JWKS refresh
   and archive handles, the local IdP TTL cap, the device composition recipe.
-- The testing mocks hold the traits' contracts; the examples require a
-  session, validate on the server, escape IdP values and bind Keycloak to
-  loopback.
 
 ---
 

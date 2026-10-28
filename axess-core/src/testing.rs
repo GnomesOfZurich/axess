@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.11.0", features = ["testing"] }
+//! axess = { version = "0.12.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -65,6 +65,9 @@ pub mod mock_random;
 pub mod mock_refresh_store;
 
 pub mod mock_tracing;
+
+#[cfg(all(test, any(feature = "postgres", feature = "mysql")))]
+pub(crate) mod sql_live;
 
 // Authz mocks are not restricted to #[cfg(test)] so that downstream crates
 // can use them in their own test suites.

@@ -9,6 +9,90 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.11.0 to 0.12.0
+
+A security release. Compile errors first, then storage, then behaviour.
+
+- **`IdentityLookup` requires `get_tenant(&TenantId) -> Option<Tenant>`**
+  (`not all trait items implemented, missing: get_tenant`). Look the tenant
+  up by id; a store that wraps another forwards it. Password reset calls it
+  before reading the token.
+- **`IdentityPasswordReset` requires `check_reset_token`.** It answers
+  whether a token is valid for the user without spending it; the in-memory
+  backend and the sqlite example show it.
+- **`SessionStore` requires `update(id, data, ttl) -> bool`**, which writes
+  only a live row and answers `false` for a missing or expired one, and
+  **`cycle(old, new, data, ttl, require_old)` returns `CycleOutcome`**: with
+  `require_old` set, a missing old row answers `SessionGone` and writes
+  nothing. A wrapper forwards both.
+- **`RefreshTokenStore::issue_with_eviction` is `issue_capped(new,
+  max_per_user)`.** Count the user's active tokens, revoke the oldest past
+  the cap and insert, in one transaction or one script.
+- **`with_max_sessions_per_user(NonZeroUsize)`**: pass
+  `NonZeroUsize::new(n).unwrap()` or a constant. Zero is no longer
+  representable.
+- **`SweepConfigBuilder::build()` returns a `Result`**; a window that is not
+  a whole number of seconds is `SweepConfigError::SubSecondWindow`.
+- **`SidMap::insert(key, subject, user, session, at)`,
+  `register_subject_session(issuer, subject, user, session)` and
+  `take_subject_sessions(issuer, subject) -> Vec<(UserId, SessionId)>`.** Pass
+  the IdP `sub`, not the local user id. `take_user_sessions` is gone.
+- **`refresh_oauth_token(provider, refresh_token, expected_subject)`**: pass
+  the subject the session was signed in as.
+- **`ArchiveBatchId::from_ids(ids)`** replaces `from_parts(first, last,
+  count)`. Ids now cover every event in the batch, so a batch archived but not
+  marked under 0.11.0 is archived once more.
+- **Exhaustive matches** add `RefreshError::InvalidConfig` and
+  `DelegatedError::UnsupportedTokenType`.
+
+Storage. No `ALTER` is needed in any backend.
+
+- Session and device rows written by 0.11.0 read as before and are re-sealed
+  to their row the first time they are read. Device blobs use a new format
+  (`AXD\x02`, `AXR\x02`) that 0.11.0 cannot open, so roll back only with a
+  backup taken before the upgrade.
+- To refuse legacy blobs, first let every row be read or written once, then
+  set `SessionCrypto::with_legacy_blobs(LegacyBlobs::Reject)` (and the same
+  method on `ValkeySessionStore` and `ValkeyDeviceStore`). An unbound blob
+  then fails to open instead of opening under any row id.
+- Valkey: the device fingerprint index moves from the `dev:fp` string key to
+  the `dev:fps` set, one device at a time, on the device's next write. Until
+  then the old key is still read. Re-sealing needs `SET ... KEEPTTL` (Redis
+  6.0 or Valkey). On a cluster the new keys need the same hash-tag prefix as
+  the others.
+- MySQL 8: a default account signs in with `caching_sha2_password`, which
+  sqlx supports only over TLS or with its `mysql-rsa` feature. Enable one in
+  your own `sqlx` dependency (see the backends guide).
+
+Behaviour:
+
+- **A password reset answers `Ok(false)` and keeps the token** when the
+  tenant is missing or not active, when the user is unknown (was
+  `Err(NoFlow)`), and when the new password is refused.
+  `begin_password_reset` refuses a ttl of 0 or over seven days with
+  `Err(Internal)`.
+- **`require_authz!` with no `RequestContextProvider` evaluates with an empty
+  context, as before.** A policy that reads `context` needs a provider in the
+  request extensions. A policy guarded with `context has ..` that treats
+  absence as allowed stays fail-open; write such guards to deny on absence.
+- **A FIDO2 ceremony begun before the upgrade fails** and must be started
+  again.
+- **Recovery codes with stray symbols no longer match**: normalisation drops
+  only whitespace and dashes.
+- **Rate limiting**: the window slides, header buckets are capped at 16 per
+  user, IPv6 clients share a bucket per /64, and keys over 256 bytes are
+  hashed. Limits tuned against the fixed window may admit fewer requests at a
+  boundary.
+- **Remote response bodies are capped** (token 64 KiB, userinfo 256 KiB, JWKS
+  and discovery 1 MiB). A provider answering more fails the call.
+- **A non-`Bearer` delegated token is refused**, and a refresh response for
+  another subject fails with `OAuthError::IdTokenValidation`.
+- **Sweep cutoffs are whole seconds**, so a device can move one second later
+  than under 0.11.0.
+- **The audit archive takes `.archive.lock` in its root**; two archivers
+  sharing a root now wait for each other. The retention loop drains a backlog
+  at start instead of waiting a full interval.
+
 ## 0.10.0 to 0.11.0
 
 Compile errors first, then schema, then behaviour.
@@ -490,7 +574,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.11", features = ["request-id"] }
+axess = { version = "0.12", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

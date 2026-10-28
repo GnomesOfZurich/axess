@@ -566,6 +566,10 @@ impl LocalIdpFixture {
         header.alg = self.inner.signing_key.algorithm();
         let claims_json = build_claims_json(&self.inner.issuer, claims);
         let key = self.inner.signing_key.encoding_key();
+        // Signing needs a crypto provider, and with two backends compiled in
+        // `jsonwebtoken` cannot pick one; without this an adopter's test
+        // panics unless something earlier in the process installed one.
+        axess_factors::jwt::ensure_crypto_provider();
         let token =
             encode(header, &claims_json, &key).expect("JWT encode never fails on valid inputs");
         if let Some(listener) = &self.inner.issuance_listener {

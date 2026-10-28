@@ -4,8 +4,9 @@
 
 use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
+use crate::authn::ids::DeviceId;
 use crate::testing::{MemoryRefreshTokenStore, mock_random::MockRng};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Wraps `MemoryRefreshTokenStore` with an injectable `rotate_token`
 /// failure that does NOT touch the underlying store. Models a
@@ -14,6 +15,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct AtomicRotateStore {
     inner: MemoryRefreshTokenStore,
     fail_rotate: AtomicBool,
+    fail_revoke_family: AtomicBool,
+    compromise_calls: AtomicUsize,
 }
 
 impl AtomicRotateStore {
@@ -21,6 +24,8 @@ impl AtomicRotateStore {
         Self {
             inner: store(),
             fail_rotate: AtomicBool::new(false),
+            fail_revoke_family: AtomicBool::new(false),
+            compromise_calls: AtomicUsize::new(0),
         }
     }
 
@@ -65,6 +70,9 @@ impl RefreshTokenStore for AtomicRotateStore {
         user_id: &UserId,
         family_id: &TokenFamilyId,
     ) -> Result<(), Self::Error> {
+        if self.fail_revoke_family.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("simulated revoke failure"));
+        }
         self.inner
             .revoke_family(user_id, family_id)
             .await
@@ -96,13 +104,22 @@ impl RefreshTokenStore for AtomicRotateStore {
             .map_err(std::io::Error::other)
     }
 
-    async fn issue_with_eviction(
+    async fn on_token_compromise(
         &self,
-        evict_ids: &[RefreshTokenId],
+        _user_id: &UserId,
+        _family_id: &TokenFamilyId,
+        _compromised_devices: &[(TenantId, DeviceId)],
+    ) {
+        self.compromise_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn issue_capped(
+        &self,
         new_token: &RefreshToken,
+        max_per_user: usize,
     ) -> Result<(), Self::Error> {
         self.inner
-            .issue_with_eviction(evict_ids, new_token)
+            .issue_capped(new_token, max_per_user)
             .await
             .map_err(std::io::Error::other)
     }
@@ -266,4 +283,53 @@ async fn second_refresh_with_one_token_is_refused_as_reuse() {
             .is_empty(),
         "reuse revokes the whole family"
     );
+}
+
+/// When revoking the family of a reused token fails, the caller gets the
+/// store's error rather than `Revoked`, and the compromise hook does not run:
+/// the hook's contract is "called after `revoke_family` has revoked the
+/// family", and reporting `Revoked` would tell the caller a compromise was
+/// handled when the family is still live. The reused token itself is refused
+/// either way (an `Err`, never a session).
+#[tokio::test]
+async fn failed_family_revoke_on_reuse_is_a_store_error_and_not_a_handled_compromise() {
+    let store = AtomicRotateStore::new();
+    let config = test_config();
+    let rng = MockRng::new(459);
+    let ts = now();
+    let (plaintext, _parent) = issue_refresh_token(
+        IssueRequest {
+            user_id: &fixture_user(),
+            tenant_id: &fixture_tenant(),
+            device_info: None,
+            family_id: None,
+            device_id: None,
+        },
+        &config,
+        &store,
+        &rng,
+        ts,
+    )
+    .await
+    .unwrap();
+    refresh_session(&plaintext, &store, &config, &rng, ts, None)
+        .await
+        .unwrap();
+
+    store.fail_revoke_family.store(true, Ordering::SeqCst);
+    let reuse = refresh_session(&plaintext, &store, &config, &rng, ts, None).await;
+    assert!(
+        matches!(reuse, Err(RefreshError::Store(_))),
+        "a failed revoke is reported as the store error it is: {reuse:?}"
+    );
+    assert_eq!(
+        store.compromise_calls.load(Ordering::SeqCst),
+        0,
+        "the hook runs only after the family was revoked"
+    );
+
+    store.fail_revoke_family.store(false, Ordering::SeqCst);
+    let retry = refresh_session(&plaintext, &store, &config, &rng, ts, None).await;
+    assert!(matches!(retry, Err(RefreshError::Revoked)));
+    assert_eq!(store.compromise_calls.load(Ordering::SeqCst), 1);
 }

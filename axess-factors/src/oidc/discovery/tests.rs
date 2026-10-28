@@ -220,3 +220,27 @@ async fn discovery_fetch_chains_jwks() {
     let handle = discovery.jwks();
     assert_eq!(handle.read().unwrap().keys.len(), 1);
 }
+
+/// A discovery body over the cap is refused, not buffered.
+#[tokio::test]
+async fn a_discovery_body_over_the_cap_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![b'a'; MAX_DISCOVERY_BYTES + 1], "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let client = openidconnect::reqwest::Client::new();
+
+    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+        .await
+        .expect_err("oversized body");
+
+    assert!(
+        matches!(&err, OidcError::DiscoveryFetch(m) if m == "discovery body exceeds limit"),
+        "got {err:?}"
+    );
+}

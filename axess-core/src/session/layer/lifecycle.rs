@@ -16,7 +16,7 @@ use crate::session::data::SessionData;
 use crate::session::id::SessionId;
 use crate::session::layer::handle::SessionHandle;
 use crate::session::layer::signing::SigningKeyRing;
-use crate::session::store::SessionStore;
+use crate::session::store::{CycleOutcome, SessionStore};
 use axess_rng::SecureRng;
 use subtle::ConstantTimeEq;
 use tower_cookies::cookie::Cookie;
@@ -256,7 +256,7 @@ where
     // to the id, a handler that read the id); an untouched cookieless request
     // leaves the store empty and the response without `Set-Cookie`.
     let fresh_needed = existing_id.is_none() && (guard.modified || guard.needs_persist);
-    let session_changed = guard.modified || guard.regenerate || fresh_needed;
+    let mut session_changed = guard.modified || guard.regenerate || fresh_needed;
     if session_changed
         && (guard.regenerate || existing_id.is_none())
         && let Some(m) = metrics
@@ -272,8 +272,23 @@ where
                 prev
             });
             let new_id = guard.id;
-            match store.cycle(&old_id, &new_id, &guard.data, config.ttl).await {
-                Ok(()) => new_id,
+            // A request that ran under a stored session requires that row to
+            // still be live: a logout that removed it while the request ran
+            // must not be undone by moving the data to the new id.
+            let require_old = existing_id.is_some();
+            match store
+                .cycle(&old_id, &new_id, &guard.data, config.ttl, require_old)
+                .await
+            {
+                Ok(CycleOutcome::Rotated) => new_id,
+                Ok(CycleOutcome::SessionGone) => {
+                    tracing::info!(
+                        "session was ended while its request ran; \
+                         not carrying it over to the rotated id"
+                    );
+                    guard.data = SessionData::default();
+                    new_id
+                }
                 Err(e) => {
                     // Fail closed in the STORE as well as in this response: the
                     // row under `old_id` may still say Authenticated, so the old
@@ -295,13 +310,32 @@ where
                     new_id
                 }
             }
+        } else if existing_id.is_some() {
+            // The request ran under a stored session: replace it only while
+            // it is still stored. A delete that landed while the request ran
+            // (logout, administrator revocation) is final, and the response
+            // does not re-issue a cookie for the ended session.
+            match store.update(&guard.id, &guard.data, config.ttl).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!("session was ended while its request ran; changes discarded");
+                    guard.data = SessionData::default();
+                    session_changed = false;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "session store update failed; session changes may be lost"
+                    );
+                }
+            }
+            guard.id
         } else {
-            // Persist under the id the request already ran under. For a fresh
-            // guest (`existing_id.is_none()`) that id was minted safely by
-            // `load_session` (never the client-supplied cookie id: session
-            // fixation is prevented there and, on privilege change, by the
-            // `regenerate` branch above). Keeping it: rather than minting a
-            // second, different id for the response cookie, is what lets a
+            // A fresh guest: `existing_id` is `None`, so its id was minted
+            // safely by `load_session` (never the client-supplied cookie id:
+            // session fixation is prevented there and, on privilege change, by
+            // the `regenerate` branch above). Keeping it, rather than minting
+            // a second, different id for the response cookie, is what lets a
             // CSRF token minted *during* this request (bound to the same id)
             // still validate on the client's next request. Minting a fresh id
             // here would orphan both the token and any handler-time work keyed

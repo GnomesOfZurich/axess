@@ -234,7 +234,7 @@ impl GcpStsClient {
             ("subject_token_type", STS_SUBJECT_TOKEN_TYPE_JWT),
         ];
 
-        let response = self
+        let mut response = self
             .http
             .post((*self.endpoint).clone())
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -246,16 +246,20 @@ impl GcpStsClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = axess_factors::http_body::read_error_snippet(&mut response).await;
             return Err(GcpError::Sts {
                 http_status: status.as_u16(),
                 body,
             });
         }
 
-        let parsed: GcpStsResponseBody = response
-            .json()
-            .await
+        let body = axess_factors::http_body::read_limited(
+            &mut response,
+            axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| GcpError::MalformedResponse(format!("STS body: {e}")))?;
+        let parsed: GcpStsResponseBody = serde_json::from_slice(&body)
             .map_err(|e| GcpError::MalformedResponse(format!("STS JSON: {e}")))?;
         if parsed.access_token.is_empty() {
             return Err(GcpError::MalformedResponse(
@@ -379,7 +383,7 @@ impl GcpServiceAccountImpersonator {
             lifetime: lifetime_seconds.map(|secs| format!("{secs}s")),
         };
 
-        let response = self
+        let mut response = self
             .http
             .post(url)
             .header(AUTHORIZATION, format!("Bearer {federated_token}"))
@@ -391,16 +395,20 @@ impl GcpServiceAccountImpersonator {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = axess_factors::http_body::read_error_snippet(&mut response).await;
             return Err(GcpError::IamCredentials {
                 http_status: status.as_u16(),
                 body,
             });
         }
 
-        let parsed: GenerateAccessTokenResponse = response
-            .json()
-            .await
+        let body = axess_factors::http_body::read_limited(
+            &mut response,
+            axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+        )
+        .await
+        .map_err(|e| GcpError::MalformedResponse(format!("IAM Credentials body: {e}")))?;
+        let parsed: GenerateAccessTokenResponse = serde_json::from_slice(&body)
             .map_err(|e| GcpError::MalformedResponse(format!("IAM Credentials JSON: {e}")))?;
         if parsed.access_token.is_empty() {
             return Err(GcpError::MalformedResponse(

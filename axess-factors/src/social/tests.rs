@@ -313,3 +313,98 @@ async fn supplied_client_keeps_its_own_user_agent() {
         .unwrap();
     assert_eq!(claims.subject, "7");
 }
+
+// ── response size caps ───────────────────────────────────────────────────────
+
+/// A JSON object padded with a string member to exactly `total` bytes.
+fn padded_json(prefix: &str, total: usize) -> Vec<u8> {
+    let suffix = r#""}"#;
+    let pad = total - prefix.len() - suffix.len();
+    let mut body = prefix.as_bytes().to_vec();
+    body.extend(std::iter::repeat_n(b'a', pad));
+    body.extend_from_slice(suffix.as_bytes());
+    assert_eq!(body.len(), total);
+    body
+}
+
+async fn serve(server: &MockServer, route: &str, body: Vec<u8>) {
+    Mock::given(method(if route == "/user" { "GET" } else { "POST" }))
+        .and(path(route))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_token_body_over_the_cap_is_refused() {
+    let server = MockServer::start().await;
+    let body = padded_json(
+        r#"{"access_token":"t","pad":""#,
+        crate::http_body::MAX_TOKEN_BODY_BYTES + 1,
+    );
+    serve(&server, "/login/oauth/access_token", body).await;
+
+    let err = make_provider(&server)
+        .exchange_code("c", "v")
+        .await
+        .expect_err("oversized token body");
+
+    assert!(
+        matches!(&err, SocialError::InvalidResponse(m) if m.contains("exceeds")),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_token_body_at_the_cap_is_read() {
+    let server = MockServer::start().await;
+    let body = padded_json(
+        r#"{"access_token":"t","pad":""#,
+        crate::http_body::MAX_TOKEN_BODY_BYTES,
+    );
+    serve(&server, "/login/oauth/access_token", body).await;
+
+    let token = make_provider(&server)
+        .exchange_code("c", "v")
+        .await
+        .expect("a body of exactly the cap is read");
+
+    assert_eq!(&*token, "t");
+}
+
+#[tokio::test]
+async fn a_userinfo_body_over_the_cap_is_refused() {
+    let server = MockServer::start().await;
+    let body = padded_json(
+        r#"{"id":1,"pad":""#,
+        crate::http_body::MAX_USERINFO_BODY_BYTES + 1,
+    );
+    serve(&server, "/user", body).await;
+
+    let err = make_provider(&server)
+        .fetch_userinfo("tok")
+        .await
+        .expect_err("oversized userinfo body");
+
+    assert!(
+        matches!(&err, SocialError::InvalidResponse(m) if m.contains("exceeds")),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_userinfo_body_at_the_cap_is_read() {
+    let server = MockServer::start().await;
+    let body = padded_json(
+        r#"{"id":1,"pad":""#,
+        crate::http_body::MAX_USERINFO_BODY_BYTES,
+    );
+    serve(&server, "/user", body).await;
+
+    let claims = make_provider(&server)
+        .fetch_userinfo("tok")
+        .await
+        .expect("a body of exactly the cap is read");
+
+    assert_eq!(claims.subject, "1");
+}

@@ -1,7 +1,7 @@
 //! Login flow: begin_login, prepare_factor, verify_factor, check_session, logout.
 
 use super::outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome};
-use super::verification::{VerifyOutcome, generate_otp_code, verify_credential_blocking};
+use super::verification::{VerifyOutcome, verify_credential_blocking};
 use crate::authn::types::{Tenant, User};
 use crate::authn::{
     error::AuthnError,
@@ -538,96 +538,6 @@ where
         }
     }
 
-    /// Issue an email one-time code for the current `EmailOtp` step.
-    ///
-    /// Refuses while a pending code is still live, draws and hashes a fresh
-    /// code, stores the hash and expiry in the user's factor config and
-    /// hands the plaintext back for the caller to deliver.
-    async fn prepare_email_otp(
-        &self,
-        tenant_id: &crate::authn::ids::TenantId,
-        user_id: &crate::authn::ids::UserId,
-    ) -> Result<PrepareOutcome, AuthnError<I::Error>> {
-        // Load the EmailOtp config to get the destination and parameters.
-        let user_scope = AuthnScope::User {
-            tenant_id: *tenant_id,
-            user_id: *user_id,
-        };
-        let config = self
-            .inner
-            .factors
-            .resolve_factor(&user_scope, FactorKind::EmailOtp)
-            .await
-            .map_err(AuthnError::Store)?
-            .ok_or(AuthnError::NoFlow)?
-            .config;
-
-        // Take ownership of the inner cfg up front so we don't
-        // need a second destructure (which used to require an
-        // unreachable arm for "config changed kind mid-function").
-        let FactorConfig::EmailOtp(mut cfg) = config else {
-            return Err(AuthnError::NoFlow);
-        };
-
-        // Cooldown: reject if a pending code hasn't expired yet.
-        // This prevents email bombing; the application can only trigger
-        // one send per TTL window.
-        let now = self.inner.clock.now();
-        if cfg.pending_until.is_some_and(|until| now < until) {
-            return Ok(PrepareOutcome::AlreadySent {
-                destination: cfg.email.clone(),
-            });
-        }
-
-        let email = cfg.email.clone();
-        let code_length = cfg.code_length as usize;
-        let ttl_secs = cfg.ttl_secs;
-
-        // Reject unreasonable code lengths to prevent DoS via
-        // misconfigured factor config.
-        if !(4..=8).contains(&code_length) {
-            tracing::error!(code_length, "email OTP code_length out of bounds (4–8)");
-            return Err(AuthnError::NoFlow);
-        }
-
-        // Generate a random numeric code using the injectable RNG.
-        // Wrap in ZeroizedString so it's cleared from memory after use.
-        let code = crate::authn::factor::ZeroizedString::new(generate_otp_code(
-            &self.inner.rng,
-            code_length,
-        ));
-
-        // Hash the code with Argon2id for storage, off the executor.
-        // The salt is drawn here, from the injected RNG, so a
-        // deterministic RNG pins the stored hash; only owned bytes
-        // move into the blocking task.
-        let salt = axess_factors::generate_password_salt(&self.inner.rng);
-        let to_hash = zeroize::Zeroizing::new(code.to_string());
-        let hash = self
-            .inner
-            .kdf
-            .run(move || axess_factors::hash_password_with_salt(to_hash.as_str(), &salt))
-            .await?;
-
-        // Compute expiry from config TTL.
-        let expires = now + chrono::Duration::seconds(ttl_secs as i64);
-
-        cfg.pending_hash = Some(crate::authn::factor::ZeroizedString::new(hash));
-        cfg.pending_until = Some(expires);
-
-        // Save to user scope (per-user pending state).
-        self.inner
-            .factors
-            .save_factor(&user_scope, FactorConfig::EmailOtp(cfg))
-            .await
-            .map_err(AuthnError::Store)?;
-
-        Ok(PrepareOutcome::SendOtp {
-            code,
-            destination: email,
-        })
-    }
-
     /// Start a WebAuthn authentication ceremony for the current `Fido2` step.
     ///
     /// Without a configured relying party the step is `Ready`; otherwise the
@@ -679,7 +589,8 @@ where
         // Store the ceremony state and timestamp in the session.
         let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
         session.set_custom(fido2_keys::AUTH_STATE, state_json).await;
-        self.stamp_ceremony_start(session).await;
+        self.stamp_ceremony_start(session, fido2_keys::AUTH_STATE)
+            .await;
 
         let challenge_json = serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
         Ok(PrepareOutcome::Fido2Challenge {
@@ -857,6 +768,7 @@ where
 #[cfg(feature = "fido2")]
 pub(crate) use super::fido2_service::fido2_keys;
 
+mod email_otp;
 #[cfg(test)]
 mod equalization_tests;
 #[cfg(test)]

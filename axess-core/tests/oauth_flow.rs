@@ -180,7 +180,7 @@ async fn mock_oauth_provider_returns_configured_user() {
         .with_audit_context(AuditContext::default());
 
     let claims = authn
-        .refresh_oauth_token("mock-idp", "any-refresh-token")
+        .refresh_oauth_token("mock-idp", "any-refresh-token", "user-42")
         .await
         .expect("mock refresh should succeed");
 
@@ -208,7 +208,9 @@ async fn mock_oauth_provider_simulates_failure() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let result = authn.refresh_oauth_token("failing-idp", "some-token").await;
+    let result = authn
+        .refresh_oauth_token("failing-idp", "some-token", "user-1")
+        .await;
     assert!(result.is_err());
 
     let err = result.unwrap_err();

@@ -45,8 +45,8 @@ ROOT = pathlib.Path(".")
 # that migration section is retired. A permanent entry means the gate has
 # stopped checking something it should.
 #
-# Holds bare type names and `Type::member` alike; both branches below
-# consult it. Until 0.7.0 only the `Type::member` branch did, so a removed
+# Holds bare type and method names and `Type::member` alike; every branch
+# below consults it. Until 0.7.0 only the `Type::member` branch did, so a removed
 # *type* had no way through the gate at all and the only recourse was
 # ALLOW, which would have been a false claim about provenance.
 REMOVED = {
@@ -62,6 +62,10 @@ REMOVED = {
     # no longer needs a clock of its own. `docs/production/migrating.md`
     # names it under "0.10.0 to 0.11.0" to say what replaces it.
     "MockIdentityStore::with_clock",
+    # Removed in 0.12.0: the store counts, evicts and inserts in one step
+    # through `issue_capped`. `docs/production/migrating.md` names it under
+    # "0.11.0 to 0.12.0" to say what replaces it.
+    "RefreshTokenStore::issue_with_eviction", "issue_with_eviction",
 }
 
 ALLOW = {
@@ -79,6 +83,10 @@ ALLOW = {
     # Not ours: the `getrandom` crate, and `cluster`, which is a feature of
     # a redis client rather than of axess.
     "getrandom", "cluster",
+    # A feature of sqlx, not of axess: the backends chapter and the
+    # migration guide name it as one of the two ways an adopter's own sqlx
+    # can sign in to a default MySQL 8 account.
+    "mysql-rsa",
     # Features named precisely because axess does NOT ship them: `spire` is
     # on the ROADMAP, and `wif-gitlab` is the per-issuer adapter the
     # federation chapter explains why there is no point building.
@@ -453,7 +461,7 @@ for d in docs:
 
         for m in method_pat.finditer(line):
             name = m.group(1) or m.group(2)
-            if name in ALLOW or name in local:
+            if name in ALLOW or name in local or name in REMOVED:
                 continue
             checked += 1
             if name not in lower_defined:

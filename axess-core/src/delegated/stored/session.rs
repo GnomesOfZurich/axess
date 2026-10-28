@@ -44,6 +44,18 @@ fn default_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// The access token as a bearer string, for a `Bearer` credential only. A
+/// sender-constrained token (DPoP, MAC) cannot be used as a bare bearer.
+fn bearer(cred: &StoredDelegation) -> Result<String, DelegatedError> {
+    if cred.token_type.eq_ignore_ascii_case("Bearer") {
+        Ok((*cred.access_token).to_string())
+    } else {
+        Err(DelegatedError::UnsupportedTokenType(
+            cred.token_type.clone(),
+        ))
+    }
+}
+
 type RefreshKey = (TenantId, UserId, String);
 
 /// The lock serialising refreshes of one `(tenant, user, provider)`
@@ -145,7 +157,7 @@ where
         let cred = self.load_credential().await?;
         let skew = chrono::Duration::seconds(self.refresh_skew_secs);
         if cred.is_fresh(self.clock.now(), skew) {
-            return Ok((*cred.access_token).to_string());
+            return bearer(&cred);
         }
 
         // Stale. Only one refresh per credential runs at a time: a
@@ -157,7 +169,7 @@ where
         // A caller ahead of us may have refreshed while we waited.
         let cred = self.load_credential().await?;
         if cred.is_fresh(self.clock.now(), skew) {
-            return Ok((*cred.access_token).to_string());
+            return bearer(&cred);
         }
 
         match self.refresh(&cred).await {
@@ -166,7 +178,7 @@ where
                 // loaded it. Reload once before giving up.
                 let latest = self.load_credential().await?;
                 if latest.is_fresh(self.clock.now(), skew) {
-                    return Ok((*latest.access_token).to_string());
+                    return bearer(&latest);
                 }
                 if latest.refresh_token.as_deref() != cred.refresh_token.as_deref() {
                     return self.refresh(&latest).await;
@@ -201,14 +213,18 @@ where
 
         // RFC 6749 §6: some IdPs rotate the refresh token (return a
         // new one in the response), others keep the existing one
-        // valid (omit it). Preserve the original on omission.
+        // valid (omit it). Preserve the original on omission. The same
+        // section says an omitted `scope` means the scope is unchanged, so
+        // the stored scopes survive a response that does not restate them.
         let final_credential = StoredDelegation {
             refresh_token: refreshed
+                .credential
                 .refresh_token
                 .or_else(|| cred.refresh_token.clone()),
-            ..refreshed
+            scopes: refreshed.scope.unwrap_or_else(|| cred.scopes.clone()),
+            ..refreshed.credential
         };
-        let access = (*final_credential.access_token).to_string();
+        let access = bearer(&final_credential)?;
         self.store
             .save(&self.tenant, &self.user, final_credential)
             .await

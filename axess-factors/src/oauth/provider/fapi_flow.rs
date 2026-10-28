@@ -102,7 +102,7 @@ pub(super) async fn push_authorization_request(
     }
     form.extend_from_slice(params);
 
-    let response = cfg
+    let mut response = cfg
         .http_client
         .post(par_url)
         .form(&form)
@@ -111,10 +111,10 @@ pub(super) async fn push_authorization_request(
         .map_err(|e| OAuthError::TokenExchange(format!("PAR request failed: {e}")))?;
 
     let status = response.status();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| OAuthError::TokenExchange(format!("PAR response read failed: {e}")))?;
+    let body =
+        crate::http_body::read_for_status(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
+            .await
+            .map_err(|e| OAuthError::TokenExchange(format!("PAR response read failed: {e}")))?;
 
     if !status.is_success() {
         let error_body = String::from_utf8_lossy(&body);

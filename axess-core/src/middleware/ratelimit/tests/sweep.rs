@@ -30,12 +30,17 @@ async fn the_layer_window_follows_the_injected_clock() {
     let still = ServiceExt::oneshot(svc.clone(), make_request_with_ip("10.1.1.1")).await;
     assert_eq!(status(still), StatusCode::TOO_MANY_REQUESTS);
 
+    // The window has ended, but the request it admitted still counts.
     clock.advance_secs(1);
+    let next = ServiceExt::oneshot(svc.clone(), make_request_with_ip("10.1.1.1")).await;
+    assert_eq!(status(next), StatusCode::TOO_MANY_REQUESTS);
+
+    clock.advance_secs(60);
     let after = ServiceExt::oneshot(svc.clone(), make_request_with_ip("10.1.1.1")).await;
     assert_eq!(
         status(after),
         StatusCode::OK,
-        "the window resets exactly when the injected clock passes it"
+        "the allowance is free once the injected clock is two windows on"
     );
 }
 
@@ -45,14 +50,17 @@ fn retry_after_is_the_time_left_on_the_injected_clock() {
     let t0 = t_zero();
     store.try_acquire_at("k", t0);
     match store.try_acquire_at("k", secs(t0, 45)) {
-        Acquire::Limited { retry_after_secs } => assert_eq!(retry_after_secs, 15),
+        // 15 s to the window end, then the first millisecond of the next
+        // window in which the old request no longer counts, rounded up.
+        Acquire::Limited { retry_after_secs } => assert_eq!(retry_after_secs, 16),
         _ => panic!("the bucket is empty at +45 s"),
     }
 }
 
 #[test]
 fn a_sweep_runs_once_per_interval_and_not_once_per_request() {
-    // A 2 s window sweeps every 1 s (the floor).
+    // A 2 s window sweeps every 1 s (the floor) and keeps a bucket for two
+    // windows, 4 s.
     let store = test_store(5, Duration::from_secs(2));
     let t0 = t_zero();
 
@@ -60,20 +68,45 @@ fn a_sweep_runs_once_per_interval_and_not_once_per_request() {
     // Due (2.0 s since construction): "y" is still live, nothing goes.
     store.try_acquire_at("p", millis(t0, 2_000));
     assert_eq!(store.buckets.len(), 2);
+    // Due again, and nothing has aged out yet.
+    store.try_acquire_at("s", millis(t0, 4_000));
+    assert_eq!(store.buckets.len(), 3);
 
-    // "y" expired at 2.5 s, but the last sweep was 0.7 s ago: not due.
-    store.try_acquire_at("q", millis(t0, 2_700));
+    // "y" aged out at 4.5 s, but the last sweep was 0.7 s ago: not due.
+    store.try_acquire_at("q", millis(t0, 4_700));
     assert!(
         store.buckets.contains_key("y"),
         "a request inside the sweep interval must not scan the table"
     );
-    assert_eq!(store.bucket_count.load(Ordering::Acquire), 3);
+    assert_eq!(store.bucket_count.load(Ordering::Acquire), 4);
 
     // 1.0 s after the last sweep: due, and "y" goes.
-    store.try_acquire_at("r", millis(t0, 3_000));
+    store.try_acquire_at("r", millis(t0, 5_000));
     assert!(!store.buckets.contains_key("y"));
-    assert_eq!(store.bucket_count.load(Ordering::Acquire), 3);
-    assert_eq!(store.buckets.len(), 3);
+    assert_eq!(store.bucket_count.load(Ordering::Acquire), 4);
+    assert_eq!(store.buckets.len(), 4);
+}
+
+/// A clock that steps back leaves the sweep stamp in the future. The sweep
+/// treats that as due and re-anchors, so a saturated table is not left
+/// without sweeps until the clock catches up.
+#[test]
+fn a_clock_step_back_does_not_stop_the_sweeps() {
+    let store = test_store(1, Duration::from_secs(8));
+    let t0 = t_zero();
+    store.try_acquire_at("old", t0);
+    // Sweep stamp moves to +1000 s.
+    store.try_acquire_at("anchor", secs(t0, 1_000));
+    assert!(!store.buckets.contains_key("old"));
+    // The clock steps back an hour; an entry created then must still be swept
+    // once it has aged, long before the clock reaches +1000 s again.
+    let back = secs(t0, -3_600);
+    store.try_acquire_at("after-step", back);
+    store.try_acquire_at("tick", secs(back, 60));
+    assert!(
+        !store.buckets.contains_key("after-step"),
+        "a stale stamp in the future must not suppress sweeps"
+    );
 }
 
 #[test]
@@ -97,7 +130,7 @@ fn the_bucket_count_tracks_inserts_and_evictions() {
     }
     store.try_acquire_at("k0", t0);
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 50);
-    store.evict_expired_at(secs(t0, 10));
+    store.evict_expired_at(secs(t0, 20));
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 0);
     assert!(store.buckets.is_empty());
 }
@@ -137,9 +170,9 @@ fn at_the_hard_cap_a_new_key_is_refused_and_a_known_key_is_not_evicted() {
         Acquire::Limited { .. }
     ));
 
-    // Once the window has passed the sweep frees the table and the key fits.
+    // Once two windows have passed the sweep frees the table and the key fits.
     assert!(matches!(
-        store.try_acquire_at("newcomer", secs(t0, 601)),
+        store.try_acquire_at("newcomer", secs(t0, 1_201)),
         Acquire::Allowed { .. }
     ));
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 1);

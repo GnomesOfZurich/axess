@@ -12,6 +12,7 @@ use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
 use url::Url;
 
+use crate::delegated::body::{read_error_body, read_success_body};
 use crate::delegated::error::DelegatedError;
 use axess_factors::ZeroizedString;
 
@@ -234,7 +235,7 @@ impl TokenExchangeClient {
             req = req.header(AUTHORIZATION, format!("Basic {encoded}"));
         }
 
-        let response = req
+        let mut response = req
             .form(&form)
             .send()
             .await
@@ -242,16 +243,15 @@ impl TokenExchangeClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(&mut response).await;
             return Err(DelegatedError::TokenEndpoint {
                 status: status.as_u16(),
                 body,
             });
         }
 
-        let parsed: TokenExchangeResponseBody = response
-            .json()
-            .await
+        let body = read_success_body(&mut response).await?;
+        let parsed: TokenExchangeResponseBody = serde_json::from_slice(&body)
             .map_err(|e| DelegatedError::MalformedResponse(e.to_string()))?;
         if parsed.access_token.is_empty() {
             return Err(DelegatedError::MalformedResponse(

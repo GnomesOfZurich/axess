@@ -1,4 +1,4 @@
-//! Composable tower layer for token-bucket rate limiting.
+//! Composable tower layer for sliding-window rate limiting.
 //!
 //! Provides defense-in-depth rate limiting that complements any external API
 //! gateway. Buckets are keyed per IP, user, tenant, or arbitrary header value.
@@ -53,12 +53,25 @@
 //!
 //! # Memory bound
 //!
-//! Bucket keys are truncated to a fixed length, expired buckets are swept
+//! Bucket keys are bounded to a fixed length (a longer key is cut and ends
+//! in a digest of the whole, so long identifiers sharing a prefix keep
+//! separate buckets), an IPv6 client is keyed by its /64 prefix, and a
+//! header value only selects one of 16 sub-buckets of its user, so no one
+//! identity can create more than a handful of buckets. A bucket is dropped
+//! once two windows have passed since its window began, because until then
+//! the previous window still counts. Expired buckets are swept
 //! once per sweep interval (an eighth of the window, at least one second)
 //! by whichever request first sees the interval elapsed, and the table
 //! holds at most 262,144 buckets. A request whose key has no bucket yet is
 //! answered 429 while the table is full; keys that already have a bucket
 //! are unaffected, and no live bucket is evicted to make room.
+//!
+//! # Window
+//!
+//! Each key keeps a count for the current fixed window and the one before.
+//! A request is admitted when the previous count, weighted by how much of it
+//! still overlaps the trailing window, plus the current count leaves room, so
+//! a burst split across a window boundary is counted once and not twice.
 //!
 //! # Time
 //!
@@ -90,6 +103,9 @@ use std::{
     time::Duration,
 };
 use tower::{Layer, Service};
+
+mod keys;
+use keys::extract_key;
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -152,12 +168,16 @@ pub enum KeyExtractor {
     /// time and no limit at all. So the header only subdivides a bucket the
     /// caller cannot choose: when the request carries a [`RateLimitUserId`]
     /// extension (set after authentication) and the header, the key is the
-    /// user id plus the header value. Otherwise the key is the TCP peer
+    /// user id plus a slot derived from the header value. Otherwise the key is
+    /// the TCP peer
     /// address, exactly as for [`KeyExtractor::PeerIp`], so an unauthenticated
     /// caller cannot select its own bucket by choosing a header.
     ///
-    /// An authenticated user can still vary the header to spread their own
-    /// traffic over several buckets. Pair this with a [`KeyExtractor::UserId`]
+    /// The header value selects one of 16 sub-buckets of the user by digest,
+    /// so a user sending any number of distinct values holds at most 16
+    /// buckets and cannot fill the shared table; two values can land in the
+    /// same sub-bucket. An authenticated user can still spread their own
+    /// traffic over those 16. Pair this with a [`KeyExtractor::UserId`]
     /// layer when that matters. Install the layer after authentication so the
     /// extension is present.
     Header(String),
@@ -168,7 +188,7 @@ pub enum KeyExtractor {
 pub struct RateLimitConfig {
     /// Maximum number of requests allowed within the window.
     pub max_requests: u32,
-    /// Duration of the sliding window.
+    /// Length of the trailing window `max_requests` applies to.
     pub window: Duration,
     /// Strategy for deriving the bucket key from each request.
     pub key_extractor: KeyExtractor,
@@ -297,20 +317,30 @@ fn epoch_millis(now: DateTime<Utc>) -> u64 {
     u64::try_from(now.timestamp_millis()).unwrap_or(0)
 }
 
-/// A single token bucket tracking remaining tokens and the window start.
+/// One key's sliding-window counter: the requests admitted in the current
+/// fixed window and in the one before it.
+///
+/// The estimate of requests in the trailing window is the previous window's
+/// count weighted by how much of it still overlaps, plus the current count,
+/// all in integer arithmetic. It never undercounts a burst that straddles a
+/// window boundary, so about `max_requests` pass in any trailing window and
+/// not twice that.
 #[derive(Debug)]
 struct TokenBucket {
-    /// Tokens remaining in the current window.
-    remaining: u32,
+    /// Requests admitted in the window that began at `window_start_ms`.
+    curr: u32,
+    /// Requests admitted in the window before it.
+    prev: u32,
     /// When the current window started, in epoch milliseconds from the
     /// injected clock.
     window_start_ms: u64,
 }
 
 impl TokenBucket {
-    fn new(max: u32, now_ms: u64) -> Self {
+    fn new(now_ms: u64) -> Self {
         Self {
-            remaining: max,
+            curr: 0,
+            prev: 0,
             window_start_ms: now_ms,
         }
     }
@@ -388,33 +418,93 @@ impl BucketStore {
                 self.take(occupied.get_mut(), now_ms)
             }
             Entry::Vacant(vacant) => {
-                let mut bucket = vacant.insert(TokenBucket::new(self.max_requests, now_ms));
+                let mut bucket = vacant.insert(TokenBucket::new(now_ms));
                 self.take(&mut bucket, now_ms)
             }
         }
     }
 
     fn take(&self, bucket: &mut TokenBucket, now_ms: u64) -> Acquire {
-        // A clock that steps backwards reads as zero elapsed, not as a
-        // window that has not started.
-        let elapsed = now_ms.saturating_sub(bucket.window_start_ms);
-        if elapsed >= self.window_ms {
-            bucket.remaining = self.max_requests;
-            bucket.window_start_ms = now_ms;
-        }
-
-        if bucket.remaining > 0 {
-            bucket.remaining -= 1;
+        self.roll(bucket, now_ms);
+        let estimate = self.estimate(bucket, now_ms);
+        if estimate < u128::from(self.max_requests) {
+            bucket.curr += 1;
+            let remaining = u128::from(self.max_requests) - estimate - 1;
             Acquire::Allowed {
-                remaining: bucket.remaining,
+                remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
             }
         } else {
-            let elapsed = now_ms.saturating_sub(bucket.window_start_ms);
-            let retry_after_ms = self.window_ms.saturating_sub(elapsed);
             Acquire::Limited {
-                retry_after_secs: retry_after_ms.div_ceil(1_000).max(1),
+                retry_after_secs: self.wait_ms(bucket, now_ms).div_ceil(1_000).max(1),
             }
         }
+    }
+
+    /// Advance `bucket` to the window containing `now_ms`.
+    ///
+    /// One window on, the current count becomes the previous one; two or
+    /// more on, both are zero. A clock that steps backwards re-anchors the
+    /// window at the earlier time and keeps the counts, so the bucket does
+    /// not stay limited until the clock catches up with a future start.
+    fn roll(&self, bucket: &mut TokenBucket, now_ms: u64) {
+        if now_ms < bucket.window_start_ms {
+            bucket.window_start_ms = now_ms;
+            return;
+        }
+        let windows = (now_ms - bucket.window_start_ms) / self.window_ms;
+        match windows {
+            0 => {}
+            1 => {
+                bucket.prev = bucket.curr;
+                bucket.curr = 0;
+                bucket.window_start_ms += self.window_ms;
+            }
+            _ => {
+                bucket.prev = 0;
+                bucket.curr = 0;
+                bucket.window_start_ms =
+                    now_ms - (now_ms - bucket.window_start_ms) % self.window_ms;
+            }
+        }
+    }
+
+    /// Requests counted in the trailing window ending at `now_ms`.
+    fn estimate(&self, bucket: &TokenBucket, now_ms: u64) -> u128 {
+        let into = u128::from(now_ms.saturating_sub(bucket.window_start_ms));
+        let window = u128::from(self.window_ms);
+        let overlap = window.saturating_sub(into);
+        u128::from(bucket.prev) * overlap / window + u128::from(bucket.curr)
+    }
+
+    /// Milliseconds until a request would be admitted, for a bucket that has
+    /// just refused one.
+    fn wait_ms(&self, bucket: &TokenBucket, now_ms: u64) -> u64 {
+        let window = u128::from(self.window_ms);
+        let max = u128::from(self.max_requests);
+        let into = u128::from(now_ms.saturating_sub(bucket.window_start_ms));
+        // Room left in the current window once the next request is counted.
+        let (prev, headroom, wait_to_window_end) =
+            match max.checked_sub(u128::from(bucket.curr) + 1) {
+                Some(headroom) => (u128::from(bucket.prev), headroom, 0),
+                // The current window is full: wait for it to end, after which its
+                // count is the previous window's.
+                None => (
+                    u128::from(bucket.curr),
+                    max - 1,
+                    window.saturating_sub(into),
+                ),
+            };
+        // The estimate is admitting once `prev * overlap / window <= headroom`
+        // in integer division, that is `overlap <= ((headroom + 1) * window - 1) / prev`.
+        let needed_into = ((headroom + 1) * window - 1)
+            .checked_div(prev)
+            .map_or(0, |largest_overlap| window - largest_overlap.min(window));
+        let wait = if wait_to_window_end > 0 {
+            wait_to_window_end + needed_into
+        } else {
+            needed_into.saturating_sub(into)
+        };
+        u64::try_from(wait).unwrap_or(u64::MAX)
     }
 
     /// Run an expiry sweep when one is due, on at most one caller.
@@ -426,7 +516,10 @@ impl BucketStore {
     /// request.
     fn sweep_if_due(&self, now_ms: u64) {
         let last = self.last_sweep_ms.load(Ordering::Acquire);
-        if now_ms.saturating_sub(last) < self.sweep_interval_ms() {
+        // A clock that stepped back leaves the stamp in the future; that
+        // counts as due, so the stamp re-anchors instead of the sweep
+        // waiting for the clock to catch up while the table fills.
+        if now_ms >= last && now_ms - last < self.sweep_interval_ms() {
             return;
         }
         if self
@@ -438,13 +531,13 @@ impl BucketStore {
         }
     }
 
-    /// Remove buckets whose window has expired at the injected clock's time.
+    /// Remove buckets that no longer weigh on the estimate at the injected clock's time.
     #[cfg(test)]
     fn evict_expired(&self) {
         self.evict_expired_at(self.clock.now());
     }
 
-    /// Remove buckets whose window has expired at `now`.
+    /// Remove buckets that no longer weigh on the estimate at `now`.
     #[cfg(test)]
     fn evict_expired_at(&self, now: DateTime<Utc>) {
         self.evict_expired_ms(epoch_millis(now));
@@ -453,7 +546,10 @@ impl BucketStore {
     fn evict_expired_ms(&self, now_ms: u64) {
         let mut removed = 0usize;
         self.buckets.retain(|_, bucket| {
-            let live = now_ms.saturating_sub(bucket.window_start_ms) < self.window_ms;
+            // A bucket still weighs on the estimate for one window past the
+            // one it was last rolled into, so it lives for two.
+            let live =
+                now_ms.saturating_sub(bucket.window_start_ms) < self.window_ms.saturating_mul(2);
             if !live {
                 removed += 1;
             }
@@ -510,35 +606,6 @@ impl RateLimitLoginIdentifier {
     }
 }
 
-/// Sentinel bucket key for unauthenticated requests when the extractor is
-/// scoped to an authenticated identity (`UserId` / `TenantId`). All such
-/// requests share a single bucket so the per-identity rate limit cannot be
-/// trivially evaded by sending unauthenticated traffic; they are
-/// rate-limited collectively under this key.
-const ANONYMOUS_BUCKET: &str = "__anonymous__";
-
-/// Bucket for requests whose origin could not be established: no peer
-/// address, or no `ClientIp` because the layer is not installed. Everything
-/// unattributable shares it, which limits harder rather than less.
-///
-/// The failure mode is worth stating plainly, because it is total. On a
-/// route where nothing resolves an address, every caller shares this one
-/// bucket, so a single client can exhaust the limit for everybody. That is
-/// the correct trade against the alternative, which is keying on something
-/// the caller chooses and so enforcing nothing at all, but it is a denial
-/// of service reachable from a misconfiguration rather than from a bug.
-/// Install the layer, and alert on a non-zero count of audit rows carrying
-/// `ip_source = 'unknown'`, which is the same misconfiguration seen from
-/// the other side.
-const UNKNOWN_BUCKET: &str = "unknown";
-
-/// Hard cap on bucket-key length (bytes). Header- and identity-derived
-/// keys are truncated to this size before being used as a `DashMap` key, so
-/// an attacker who sets megabyte-sized `X-Forwarded-For` / `X-User-Id` /
-/// custom-header values cannot inflate per-bucket allocation. Real values
-/// (IP addresses, UUIDs, identifiers) are far smaller than this.
-const MAX_KEY_LEN: usize = 256;
-
 /// Whether the builder should emit the "very low max_requests" warning.
 fn should_warn_very_low_max_requests(max_requests: u32) -> bool {
     max_requests < 5
@@ -547,120 +614,6 @@ fn should_warn_very_low_max_requests(max_requests: u32) -> bool {
 /// Whether the builder should emit the "window exceeds 1 hour" warning.
 fn should_warn_very_long_window(window: std::time::Duration) -> bool {
     window > std::time::Duration::from_secs(3600)
-}
-
-fn truncate_key(mut key: String) -> String {
-    if key.len() > MAX_KEY_LEN {
-        // Truncate at a UTF-8 boundary to keep the resulting string valid.
-        let mut cut = MAX_KEY_LEN;
-        while !key.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        key.truncate(cut);
-    }
-    key
-}
-
-fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
-    let raw = match extractor {
-        KeyExtractor::ClientIp => extract_resolved_client_ip(req),
-        KeyExtractor::PeerIp => extract_peer_ip(req),
-        KeyExtractor::UserId => req
-            .extensions()
-            .get::<RateLimitUserId>()
-            .map(|u| u.0.to_string())
-            .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
-        KeyExtractor::TenantId => req
-            .extensions()
-            .get::<RateLimitTenantId>()
-            .map(|t| t.0.to_string())
-            .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
-        KeyExtractor::LoginIdentifier => req
-            .extensions()
-            .get::<RateLimitLoginIdentifier>()
-            .map(|i| i.as_str().to_owned())
-            .unwrap_or_else(|| ANONYMOUS_BUCKET.to_owned()),
-        // A header value is the caller's own claim, so it only subdivides a
-        // bucket the caller cannot choose: an authenticated identity. Without
-        // one, every value would be a fresh bucket for the asking. The
-        // identity and the `h:` prefix keep one user's header values out of
-        // another user's buckets and out of the address buckets.
-        KeyExtractor::Header(name) => {
-            match (
-                req.extensions().get::<RateLimitUserId>(),
-                header_str(req, name),
-            ) {
-                (Some(user), Some(v)) => format!("h:{}:{v}", user.0),
-                _ => format!("ip:{}", extract_peer_ip(req)),
-            }
-        }
-    };
-    truncate_key(raw)
-}
-
-/// Read the address `client_ip::layer` resolved for this request.
-///
-/// No header is consulted here. A missing `ClientIp` means the layer is
-/// not installed, and the answer is the shared bucket rather than a guess:
-/// a guess would be the caller's own claim, which is what this replaced.
-fn extract_resolved_client_ip(req: &Request<Body>) -> String {
-    match req.extensions().get::<crate::client_ip::ClientIp>() {
-        Some(ip) => match ip.get() {
-            Some(addr) => addr.to_string(),
-            None => UNKNOWN_BUCKET.to_owned(),
-        },
-        None => {
-            use std::sync::Once;
-            static WARN: Once = Once::new();
-            WARN.call_once(|| {
-                tracing::warn!(
-                    "ClientIp rate limiting: no ClientIp in request extensions; \
-                     all requests share one bucket. Wrap the router in \
-                     axess_core::client_ip::layer."
-                );
-            });
-            UNKNOWN_BUCKET.to_owned()
-        }
-    }
-}
-
-/// Extract client IP from the TCP peer address stored in request extensions.
-///
-/// Looks for axum's `ConnectInfo<SocketAddr>` (populated when the server
-/// is mounted via `Router::into_make_service_with_connect_info::<SocketAddr>()`),
-/// then falls back to a bare `SocketAddr` (which some integrations insert
-/// directly, e.g. test harnesses that wire the extension by hand).
-///
-/// Falls back to a shared bucket (`"unknown"`) if no peer address is
-/// available. This is fail-closed: all unknown-origin requests share one
-/// bucket, meaning stricter (not weaker) rate limiting.
-fn extract_peer_ip(req: &Request<Body>) -> String {
-    let ext = req.extensions();
-    let addr = ext
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0)
-        .or_else(|| ext.get::<std::net::SocketAddr>().copied());
-    addr.map(|addr| addr.ip().to_string()).unwrap_or_else(|| {
-        use std::sync::Once;
-        static WARN: Once = Once::new();
-        WARN.call_once(|| {
-            tracing::warn!(
-                "PeerIp rate limiting: no SocketAddr in request extensions; \
-                     all requests will share a single bucket. Use \
-                     Router::into_make_service_with_connect_info::<SocketAddr>() \
-                     or, behind a proxy, client_ip::layer with \
-                     KeyExtractor::ClientIp."
-            );
-        });
-        UNKNOWN_BUCKET.to_owned()
-    })
-}
-
-fn header_str(req: &Request<Body>, name: &str) -> Option<String> {
-    req.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned())
 }
 
 // ── Tower Layer / Service ────────────────────────────────────────────────────
@@ -757,7 +710,7 @@ where
                     m.rate_limit_rejected();
                 }
                 tracing::debug!(
-                    key = %key,
+                    key_fingerprint = %keys::fingerprint(&key),
                     retry_after = retry_after_secs,
                     "rate limit exceeded"
                 );

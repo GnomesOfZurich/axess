@@ -17,16 +17,18 @@ use subtle::ConstantTimeEq;
 /// so a pre-image scan of the resulting hash table cannot be carried
 /// out without knowing the pepper (which lives in application config
 /// rather than the DB). When `None`, falls back to the previous
-/// unsalted `SHA-256(plaintext)` for backward compat.
+/// unsalted `SHA-256(plaintext)` for backward compat. `Some` is always
+/// keyed: an empty pepper is refused earlier, by
+/// [`RefreshTokenConfig::validate`].
 pub(super) fn hash_token(plaintext: &str, pepper: Option<&[u8]>) -> String {
     match pepper {
-        Some(pep) if !pep.is_empty() => {
+        Some(pep) => {
             use hmac::Mac;
             let mut mac = crate::hmac::new_signer(pep);
             mac.update(plaintext.as_bytes());
             URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
         }
-        _ => {
+        None => {
             let digest = Sha256::digest(plaintext.as_bytes());
             URL_SAFE_NO_PAD.encode(digest)
         }
@@ -67,7 +69,9 @@ pub struct IssueRequest<'a> {
 /// transmit the plaintext to the client over a secure channel.
 ///
 /// If the user already has `config.max_per_user` active tokens, the oldest ones
-/// are revoked to make room.
+/// are revoked to make room, atomically with the insert
+/// ([`RefreshTokenStore::issue_capped`]). A config that fails
+/// [`RefreshTokenConfig::validate`] is refused before the store is touched.
 pub async fn issue_refresh_token<S: RefreshTokenStore>(
     req: IssueRequest<'_>,
     config: &RefreshTokenConfig,
@@ -75,27 +79,14 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
     rng: &impl SecureRng,
     now: DateTime<Utc>,
 ) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
-    // Enforce per-user cap by revoking oldest tokens.
-    let active = store
-        .active_tokens(req.user_id)
-        .await
-        .map_err(RefreshError::Store)?;
-
-    let evict_ids: Vec<RefreshTokenId> = if active.len() >= config.max_per_user {
-        let to_revoke = active.len() - config.max_per_user + 1;
-        active.iter().take(to_revoke).map(|t| t.id).collect()
-    } else {
-        Vec::new()
-    };
-
+    config.check()?;
     let (plaintext, record) = build_refresh_token(req, config, rng, now, None);
 
-    // Cap-eviction + insert in one trait call so production
-    // backends can wrap them in a single transaction. The naive
-    // `for revoke; … store` had a window where a mid-sequence failure
-    // could leave the user under-revoked or with no replacement token.
+    // The cap is enforced by the store, in the same transaction as the
+    // insert: a count read here and acted on afterwards would let two
+    // concurrent issues for one user both pass and exceed the cap.
     store
-        .issue_with_eviction(&evict_ids, &record)
+        .issue_capped(&record, config.max_per_user)
         .await
         .map_err(RefreshError::Store)?;
 
@@ -138,6 +129,7 @@ pub async fn refresh_session<S: RefreshTokenStore>(
     now: DateTime<Utc>,
     device_info: Option<&str>,
 ) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
+    config.check()?;
     let token_hash = hash_token(plaintext, config.pepper());
 
     let record = store
@@ -379,6 +371,7 @@ where
     FStat: FnOnce(&UserId) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    config.check()?;
     let token_hash = hash_token(plaintext, config.pepper());
 
     let record = store
@@ -513,6 +506,7 @@ pub async fn revoke_refresh_token<S: RefreshTokenStore>(
     store: &S,
     config: &RefreshTokenConfig,
 ) -> Result<(), RefreshError<S::Error>> {
+    config.check()?;
     let token_hash = hash_token(plaintext, config.pepper());
 
     let record = store

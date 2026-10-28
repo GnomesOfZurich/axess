@@ -36,6 +36,7 @@ struct CallCountingStore {
     inner: MemorySessionStore,
     cycle_calls: Arc<AtomicUsize>,
     save_calls: Arc<AtomicUsize>,
+    update_calls: Arc<AtomicUsize>,
 }
 
 impl CallCountingStore {
@@ -44,6 +45,7 @@ impl CallCountingStore {
             inner: MemorySessionStore::new(),
             cycle_calls: Arc::new(AtomicUsize::new(0)),
             save_calls: Arc::new(AtomicUsize::new(0)),
+            update_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -71,9 +73,21 @@ impl crate::session::store::SessionStore for CallCountingStore {
         new_id: &SessionId,
         data: &SessionData,
         ttl: Duration,
-    ) -> Result<(), Self::Error> {
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
         self.cycle_calls.fetch_add(1, Ordering::SeqCst);
-        self.inner.cycle(old_id, new_id, data, ttl).await
+        self.inner
+            .cycle(old_id, new_id, data, ttl, require_old)
+            .await
+    }
+    async fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        self.update_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.update(id, data, ttl).await
     }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         self.inner.prune_expired().await
@@ -117,6 +131,11 @@ async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
         ..Default::default()
     };
     let id = SessionId::new(&MockRng::new(1));
+    store
+        .inner
+        .save(&id, &SessionData::default(), cfg.ttl)
+        .await
+        .unwrap();
     let big = serde_json::json!({"k": "v".repeat(100_000)});
     let mut inner = fresh_inner(id);
     inner.data.custom = big.clone();
@@ -185,6 +204,11 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
     // Case A: custom_size == max → keep.
     {
         let id = SessionId::new(&MockRng::new(3));
+        store
+            .inner
+            .save(&id, &SessionData::default(), cfg.ttl)
+            .await
+            .unwrap();
         let mut inner = fresh_inner(id);
         inner.data.custom = payload.clone();
         inner.modified = true;
@@ -201,6 +225,11 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
     let over = serde_json::Value::String("x".repeat(target));
     {
         let id = SessionId::new(&MockRng::new(4));
+        store
+            .inner
+            .save(&id, &SessionData::default(), cfg.ttl)
+            .await
+            .unwrap();
         let mut inner = fresh_inner(id);
         inner.data.custom = over.clone();
         inner.modified = true;
@@ -231,6 +260,11 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
     let store = CallCountingStore::new();
     let cfg = SessionConfig::default();
     let id = SessionId::new(&MockRng::new(5));
+    store
+        .inner
+        .save(&id, &SessionData::default(), cfg.ttl)
+        .await
+        .unwrap();
     let mut inner = fresh_inner(id);
     inner.modified = true;
     let handle = handle_from(inner);
@@ -241,9 +275,14 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
         "modified=true alone must mark session_changed (kills `||→&&` on line 764)"
     );
     assert_eq!(
-        store.save_calls.load(Ordering::SeqCst),
+        store.update_calls.load(Ordering::SeqCst),
         1,
-        "modified+existing must take the save branch"
+        "modified+existing must take the update branch"
+    );
+    assert_eq!(
+        store.save_calls.load(Ordering::SeqCst),
+        0,
+        "a stored session is updated, never upserted"
     );
     assert_eq!(
         store.cycle_calls.load(Ordering::SeqCst),
@@ -285,8 +324,17 @@ impl crate::session::store::SessionStore for FailingCycleStore {
         _new_id: &SessionId,
         _data: &SessionData,
         _ttl: Duration,
-    ) -> Result<(), Self::Error> {
+        _require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
         Err(std::io::Error::other("store unavailable"))
+    }
+    async fn update(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        Ok(self.inner.update(id, data, ttl).await.unwrap())
     }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         Ok(0)
@@ -617,4 +665,90 @@ async fn rotate_id_draws_from_the_inner_rng() {
 
     assert_eq!(inner.id, SessionId::new(&MockRng::new(79)));
     assert_eq!(inner.pre_cycle_id, Some(id));
+}
+
+/// A request that ran under a stored session and modified it, while the
+/// session was deleted (logout elsewhere): the save path must not write the
+/// row back, and the response must not re-issue a cookie for it.
+#[tokio::test]
+async fn finalize_session_does_not_revive_a_session_deleted_mid_request() {
+    let store = MemorySessionStore::new();
+    let cfg = SessionConfig::default();
+    let id = SessionId::new(&MockRng::new(31));
+    store
+        .save(&id, &SessionData::default(), cfg.ttl)
+        .await
+        .unwrap();
+    let mut inner = fresh_inner(id);
+    inner.modified = true;
+    inner.data.custom = serde_json::json!({"cart": 1});
+    let handle = handle_from(inner);
+
+    store.delete(&id).await.unwrap();
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+
+    assert!(
+        store.load(&id).await.unwrap().is_none(),
+        "a deleted session must stay deleted"
+    );
+    assert!(
+        !outcome.session_changed,
+        "no cookie is re-issued for an ended session"
+    );
+    assert_eq!(
+        handle.0.read().await.data.custom,
+        SessionData::default().custom
+    );
+}
+
+/// A rotation (login) whose old session was deleted mid-request must not
+/// carry the authenticated data to the new id.
+#[tokio::test]
+async fn finalize_session_rotation_of_a_deleted_session_yields_a_guest() {
+    let store = MemorySessionStore::new();
+    let cfg = SessionConfig::default();
+    let old = SessionId::new(&MockRng::new(41));
+    let new = SessionId::new(&MockRng::new(42));
+    store
+        .save(&old, &SessionData::default(), cfg.ttl)
+        .await
+        .unwrap();
+    let mut inner = fresh_inner(new);
+    inner.regenerate = true;
+    inner.pre_cycle_id = Some(old);
+    inner.data.custom = serde_json::json!({"authenticated": true});
+    let handle = handle_from(inner);
+
+    store.delete(&old).await.unwrap();
+    let outcome = finalize_session(&store, &cfg, None, &handle, Some(old), &MockRng::new(1)).await;
+
+    assert_eq!(outcome.final_id, new);
+    assert!(
+        store.load(&new).await.unwrap().is_none(),
+        "the rotated id must not hold the data of an ended session"
+    );
+    assert_eq!(
+        handle.0.read().await.data.custom,
+        SessionData::default().custom
+    );
+}
+
+/// A login on a fresh guest (`existing_id` is `None`, the old id was never
+/// stored) still rotates.
+#[tokio::test]
+async fn finalize_session_rotation_without_a_stored_session_still_writes() {
+    let store = MemorySessionStore::new();
+    let cfg = SessionConfig::default();
+    let old = SessionId::new(&MockRng::new(51));
+    let new = SessionId::new(&MockRng::new(52));
+    let mut inner = fresh_inner(new);
+    inner.regenerate = true;
+    inner.pre_cycle_id = Some(old);
+    inner.data.custom = serde_json::json!({"authenticated": true});
+    let handle = handle_from(inner);
+
+    let outcome = finalize_session(&store, &cfg, None, &handle, None, &MockRng::new(1)).await;
+
+    assert_eq!(outcome.final_id, new);
+    assert!(store.load(&new).await.unwrap().is_some());
 }

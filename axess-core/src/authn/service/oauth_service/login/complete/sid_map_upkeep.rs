@@ -148,3 +148,31 @@ async fn the_service_hands_out_the_map_it_fills() {
     h.login("sid-a").await;
     assert_eq!(handle.len(), 1, "a handle taken earlier sees the login");
 }
+
+/// Without a session registry nothing can be ended by a logout, so a login
+/// records no `sid` mapping and no subject entry: neither would ever be
+/// forgotten.
+#[tokio::test]
+async fn a_service_without_a_registry_records_nothing() {
+    let user = user_record("u1", "t1");
+    let identity = MockIdentityStore::new()
+        .with_tenant(tenant_record("t1"))
+        .with_user(user.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(MockClock::now())
+        .build();
+    for n in 0..5 {
+        let session = test_session();
+        let c = claims(&format!("sid-{n}"));
+        let lock = compute_claim_lock("test", &c.subject, &session).await;
+        session
+            .set_custom(oauth_keys::CLAIM_LOCK, serde_json::Value::String(lock))
+            .await;
+        svc.with_audit_context(crate::authn::event::AuditContext::default())
+            .complete_oauth_login(&user, &c, &session)
+            .await
+            .expect("login");
+    }
+    assert!(svc.sid_map().is_empty());
+    assert_eq!(svc.sid_map().subject_len(), 0);
+}

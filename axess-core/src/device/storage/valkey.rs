@@ -12,7 +12,8 @@
 //! | Pattern | Type | Purpose |
 //! |---------|------|---------|
 //! | `{prefix}:dev:{tenant}:{id}` | string (msgpack, optionally encrypted) | the device row |
-//! | `{prefix}:dev:fp:{tenant}:{hex_hash}` | string (device_id) | `find_by_fingerprint` index |
+//! | `{prefix}:dev:fps:{tenant}:{hex_hash}` | set of device_ids | `find_by_fingerprint` index |
+//! | `{prefix}:dev:fp:{tenant}:{hex_hash}` | string (device_id) | the single-id fingerprint index of earlier releases; read when present, removed by the next write of the device it names, never created |
 //! | `{prefix}:dev:user:{tenant}:{user}` | set of device_ids | `find_for_user` / `find_by_fingerprint_for_user` index |
 //! | `{prefix}:dev:fam:{tenant}:{family}` | set of device_ids | `find_by_refresh_family` index |
 //! | `{prefix}:dev:tenant:{tenant}` | set of device_ids | sweep walker (avoids `SCAN *`) |
@@ -39,12 +40,25 @@
 //!
 //! `find_for_user`, `find_by_fingerprint_for_user`, `find_by_refresh_family`
 //! and the sweep read the rows an index lists with one `MGET` per 512
-//! members, not one `GET` per member. A member whose row is gone (expired or
-//! deleted) is removed from the index by a script that re-checks that the
-//! row is still absent, so a device saved again in the meantime keeps its
-//! entry. `find_for_user` still reads the user's whole set and sorts it in
-//! process; a per-user sorted set scored by `last_seen_at` would bound that
-//! read but changes the index layout.
+//! members, not one `GET` per member. An index is a hint, never proof: each
+//! reader keeps only the rows that still match what it asked for (the user
+//! owns the device, the device is still bound to the family), so a stale
+//! entry can neither return another user's device nor make a refresh-family
+//! cascade revoke a device that has left the family. `find_by_fingerprint`
+//! likewise reads the devices its fingerprint set lists and returns only
+//! those whose row still carries the fingerprint, the newest sighting first
+//! and the smaller id on a tie, as every other backend does.
+//!
+//! Stale entries are tidied by scripts that re-check before they remove: a
+//! member whose row is gone is removed only if the row is still absent, so a
+//! device saved again in the meantime keeps its entry; a member whose row
+//! does not match is removed only while the row still holds the bytes that
+//! were judged (the fingerprint set is pruned the same way as the others, and
+//! a single-id key of an earlier release only while it points at that device
+//! and its row is unchanged). `find_for_user` still reads the user's whole set
+//! and sorts it in process (newest first, ties by device id); a per-user
+//! sorted set scored by `last_seen_at` would bound that read but changes the
+//! index layout.
 //!
 //! # Atomicity
 //!
@@ -55,23 +69,48 @@
 //! `MAX_ATTEMPTS` times, then fails with
 //! [`ValkeyDeviceStoreError::Contended`]).
 //!
+//! The same script that writes (or deletes) the row also moves the row in
+//! and out of the tenant, user and refresh-family indexes and re-points the
+//! fingerprint index. Two writers therefore cannot apply their index
+//! changes in the opposite order to their row writes: the one whose script
+//! runs second sees the first one's row and conflicts instead.
+//!
 //! | Operation | Guarantee |
 //! |-----------|-----------|
-//! | `record_sighting` | Atomic CAS. Never writes to a `Revoked` row (a sighting cannot undo a revocation). Missing row: `NotFound`. |
+//! | `record_sighting` | Atomic CAS. `last_seen_at` only moves forward. Never writes to a `Revoked` row (a sighting cannot undo a revocation) and still succeeds. Missing row: `NotFound`. |
 //! | `set_trust_level` | Atomic CAS against every other writer; the explicit level wins over the row it read. Missing row: `NotFound`. |
 //! | `set_trust_level_if` | The expected level is checked against the bytes the CAS then replaces; a row at another level (a revocation that won) is refused, never overwritten. |
-//! | `replace_bindings` | Atomic CAS on the row, and only while the bindings are still the ones the caller read (`Conflict` otherwise); a `Revoked` row is refused and never gains a binding. The refresh-family index is brought in line after the swap. |
-//! | `claim_owner` | Atomic CAS; sets the owner only on a row that has none, and adds the device to the owner's index. |
-//! | `sweep` | Per row, atomic CAS demotion or CAS purge. Only ever demotes, so it cannot resurrect a `Revoked` row; a row changed under it is re-planned from its new state. |
-//! | `delete` | Row delete is unconditional; the fingerprint index is removed only if it still points at this device. |
-//! | `save` | Whole-row last-writer-wins `SET` (not a CAS); stale fingerprint index entries are removed only if they still point at this device. |
+//! | `replace_bindings` | Atomic CAS on the row, and only while the bindings are still the ones the caller read (`Conflict` otherwise); a `Revoked` row is refused and never gains a binding. The refresh-family indexes change in the same script. |
+//! | `claim_owner` | Atomic CAS; sets the owner only on a row that has none, and adds the device to the owner's index in the same script. |
+//! | `sweep` | Per row, atomic CAS demotion or CAS purge. Only ever demotes, so it cannot resurrect a `Revoked` row; a row changed under it is re-planned from its new state. A row that cannot be decoded is logged and skipped. A revoked row with no `revoked_at` is stamped. |
+//! | `delete` | One script removes the row, its fingerprint entry (only while it points at this device) and its index entries, conditional on the row as read; a writer that changed it meanwhile makes the delete run again on the fresh row. |
+//! | `save` | A CAS against the row as read (or its absence), retried on a conflict, so the last writer wins without two saves interleaving their index changes. A stored `Revoked` row is left as it is by a save that is not itself revoked; a revoked row saved without `revoked_at` gets the write time. |
 //!
-//! The scripts address two keys (row and fingerprint index); on a Valkey
-//! cluster give them one hash slot with a prefix such as `{axess}`.
+//! The scripts address several keys (row, fingerprint index, membership
+//! indexes); on a Valkey cluster give them one hash slot with a prefix such
+//! as `{axess}`.
 //!
-//! The fingerprint index is only ever removed, re-pointed or re-expired by an
-//! operation on the device it points at, so two devices sharing a fingerprint
-//! never drop each other's lookup.
+//! The fingerprint index is a set of the ids of every device that carries the
+//! fingerprint, so deleting or purging one of several devices that share it
+//! leaves the others findable, owned or not. Only an operation on a device
+//! adds or removes that device's id, in the script that writes its row.
+//!
+//! # Upgrading the fingerprint index
+//!
+//! Earlier releases kept one device id under a string key
+//! (`{prefix}:dev:fp:...`). The set lives under a different key
+//! (`{prefix}:dev:fps:...`), so the two layouts never meet in one key and
+//! a read cannot fail on a key of the wrong type. `find_by_fingerprint` reads
+//! the set and the old key and treats the old key's device as one more
+//! candidate, so nothing stored by an older release goes missing. The next
+//! write of a device (a sighting, a trust change, a save) adds it to the set
+//! and deletes the old key if that points at it; a delete does the same.
+//! There is no migration step to run. A device that an old key never named
+//! stays unlisted until its next write, as it was before.
+//!
+//! The set has no expiry of its own (a key's expiry cannot cover some of its
+//! members). A member whose row has expired is dropped by the first read that
+//! finds the row gone, like the other membership indexes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,27 +121,28 @@ use fred::prelude::*;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
-    demotion_stamp,
+    demotion_stamp, order_newest_first,
 };
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
 use std::future::Future;
 
+mod apply;
+mod index;
 mod policy;
+mod read;
 mod row;
 mod scripts;
+mod sweep;
 #[cfg(test)]
 mod tests;
 
-use policy::{SweepStep, plan_sweep};
+use apply::{Applied, Step};
 use row::{
-    device_key, family_index_key, fingerprint_hex, fingerprint_key, tenant_index_key,
-    user_index_key,
+    device_key, family_index_key, fingerprint_hex, fingerprint_key, fingerprint_set_key,
+    tenant_index_key, user_index_key,
 };
-use scripts::{
-    CAS_WRITE, DELETE_IF_POINTS_AT, PRUNE_ABSENT, REMOVE_DEVICE, ScriptStatus, cas_write_args,
-    pair_replies, parse_status, prune_args, remove_args, row_keys,
-};
+use scripts::DROP_STALE_FINGERPRINT;
 
 /// Bound on re-read/retry rounds when a concurrent writer keeps changing a
 /// row between our read and our compare-and-swap.
@@ -246,10 +286,13 @@ impl ValkeyDeviceStore {
         tenant: &str,
         id: &str,
     ) -> Result<Option<Device>, ValkeyDeviceStoreError> {
-        let key = device_key(&self.prefix, tenant, id);
-        let bytes: Option<Vec<u8>> = self.client.get(&key).await?;
-        match bytes {
-            Some(b) => Ok(Some(self.decode_row(tenant, id, &b)?)),
+        match self.get_row_checked(tenant, id).await? {
+            Some((device, raw, stale)) => {
+                if stale {
+                    self.reseal_row(&device, &raw).await;
+                }
+                Ok(Some(device))
+            }
             None => Ok(None),
         }
     }
@@ -263,211 +306,29 @@ impl ValkeyDeviceStore {
         }
     }
 
-    /// Read the rows behind `members` with one `MGET` per [`MGET_CHUNK`]
-    /// members. Returns the rows that exist, paired with their member id in
-    /// index order, and the members whose row is gone.
-    async fn get_rows(
-        &self,
-        tenant: &str,
-        members: &[String],
-    ) -> Result<(Vec<(String, Device)>, Vec<String>), ValkeyDeviceStoreError> {
-        let mut live = Vec::with_capacity(members.len());
-        let mut gone = Vec::new();
-        for chunk in members.chunks(MGET_CHUNK) {
-            let replies: Vec<Value> = self
-                .client
-                .mget(row_keys(&self.prefix, tenant, chunk))
-                .await?;
-            let paired = pair_replies(chunk, replies).map_err(|msg| {
-                ValkeyDeviceStoreError::Connection(fred::error::Error::new(
-                    fred::error::ErrorKind::Parse,
-                    msg,
-                ))
-            })?;
-            for (id, raw) in paired {
-                match raw {
-                    Some(raw) => {
-                        let device = self.decode_row(tenant, &id, &raw)?;
-                        live.push((id, device));
-                    }
-                    None => gone.push(id),
-                }
-            }
-        }
-        Ok((live, gone))
-    }
-
-    /// Drop `gone` from the membership set `index_key`, each only if its row
-    /// is still absent when the script runs. Housekeeping: a failure is
-    /// logged and the next read tries again.
-    async fn prune_absent(&self, index_key: &str, tenant: &str, gone: &[String]) {
-        if gone.is_empty() {
-            return;
-        }
-        let mut keys = Vec::with_capacity(gone.len() + 1);
-        keys.push(index_key.to_string());
-        keys.extend(row_keys(&self.prefix, tenant, gone));
-        let reply: Result<i64, _> = self.client.eval(PRUNE_ABSENT, keys, prune_args(gone)).await;
-        if let Err(e) = reply {
-            tracing::warn!(error = %e, "device index prune failed; retried on the next read");
-        }
-    }
-
-    async fn run_script(
-        &self,
-        script: &'static str,
-        keys: Vec<String>,
-        args: Vec<Value>,
-    ) -> Result<ScriptStatus, ValkeyDeviceStoreError> {
-        let reply: String = self.client.eval(script, keys, args).await?;
-        parse_status(&reply).ok_or(ValkeyDeviceStoreError::UnexpectedScriptReply(reply))
-    }
-
-    /// Remove a fingerprint index entry only if it still points at `id`.
-    async fn delete_fingerprint_if_points_at(
+    /// Remove a fingerprint index entry that points at `id`, but only while
+    /// `id`'s row still holds the bytes (`raw`) that were found not to carry
+    /// the fingerprint.
+    async fn drop_stale_fingerprint(
         &self,
         fp_key: &str,
+        tenant: &str,
         id: &str,
+        raw: &[u8],
     ) -> Result<(), ValkeyDeviceStoreError> {
         let _: i64 = self
             .client
             .eval(
-                DELETE_IF_POINTS_AT,
-                vec![fp_key.to_string()],
-                vec![Value::from(id)],
+                DROP_STALE_FINGERPRINT,
+                vec![fp_key.to_string(), device_key(&self.prefix, tenant, id)],
+                vec![
+                    Value::from(id),
+                    Value::Bytes(fred::bytes::Bytes::copy_from_slice(raw)),
+                ],
             )
             .await?;
         Ok(())
     }
-
-    /// Read a row, let `decide` choose what to do with it, and apply that
-    /// decision atomically; on a concurrent change re-read and decide again.
-    async fn apply<F>(
-        &self,
-        tenant: &str,
-        id: &str,
-        now: DateTime<Utc>,
-        decide: F,
-    ) -> Result<Applied, ValkeyDeviceStoreError>
-    where
-        F: Fn(&Device) -> Step,
-    {
-        let row_key = device_key(&self.prefix, tenant, id);
-        for _ in 0..MAX_ATTEMPTS {
-            let raw: Option<Vec<u8>> = self.client.get(&row_key).await?;
-            let Some(raw) = raw else {
-                return Ok(Applied::Missing);
-            };
-            let device = self.decode_row(tenant, id, &raw)?;
-            let fp_key = fingerprint_key(
-                &self.prefix,
-                tenant,
-                &fingerprint_hex(&device.fingerprint_hash),
-            );
-            let keys = vec![row_key.clone(), fp_key];
-            let (status, outcome) = match decide(&device) {
-                Step::Skip => return Ok(Applied::Skipped(device)),
-                Step::Write(new) => {
-                    let payload = self.encode_row(&new)?;
-                    let ttl = self.ttl_seconds_for(&new, now);
-                    let args = cas_write_args(&raw, &payload, ttl, id);
-                    (
-                        self.run_script(CAS_WRITE, keys, args).await?,
-                        Applied::Written { before: device },
-                    )
-                }
-                Step::Remove => {
-                    let args = remove_args(Some(&raw), id);
-                    (
-                        self.run_script(REMOVE_DEVICE, keys, args).await?,
-                        Applied::Removed(device),
-                    )
-                }
-            };
-            match status {
-                ScriptStatus::Ok => return Ok(outcome),
-                ScriptStatus::Missing => return Ok(Applied::Missing),
-                ScriptStatus::Conflict => continue,
-            }
-        }
-        Err(ValkeyDeviceStoreError::Contended {
-            tenant_id: tenant.to_string(),
-            device_id: id.to_string(),
-        })
-    }
-
-    /// Bring the refresh-family index in line with a device's new bindings:
-    /// add the families it now carries, drop the ones it no longer does.
-    async fn reindex_families(
-        &self,
-        tenant: &str,
-        id: &str,
-        before: &[DeviceBinding],
-        after: &[DeviceBinding],
-    ) -> Result<(), ValkeyDeviceStoreError> {
-        let families = |bs: &[DeviceBinding]| -> Vec<String> {
-            bs.iter()
-                .filter_map(|b| match b {
-                    DeviceBinding::Refresh { family_id, .. } => Some(family_id.clone()),
-                    _ => None,
-                })
-                .collect()
-        };
-        let (old, new) = (families(before), families(after));
-        for family in &new {
-            let idx = family_index_key(&self.prefix, tenant, family);
-            let _: () = self.client.sadd(&idx, id).await?;
-        }
-        for family in old.iter().filter(|f| !new.contains(f)) {
-            let idx = family_index_key(&self.prefix, tenant, family);
-            let _: () = self.client.srem(&idx, id).await?;
-        }
-        Ok(())
-    }
-
-    /// Drop the secondary index entries that pointed at a removed device.
-    async fn remove_index_entries(
-        &self,
-        tenant: &str,
-        id: &str,
-        device: &Device,
-    ) -> Result<(), ValkeyDeviceStoreError> {
-        let tenant_idx = tenant_index_key(&self.prefix, tenant);
-        let _: () = self.client.srem(&tenant_idx, id).await?;
-        if let Some(uid) = &device.user_id {
-            let user_idx = user_index_key(&self.prefix, tenant, &uid.to_string());
-            let _: () = self.client.srem(&user_idx, id).await?;
-        }
-        for binding in &device.bindings {
-            if let DeviceBinding::Refresh { family_id, .. } = binding {
-                let fam_idx = family_index_key(&self.prefix, tenant, family_id);
-                let _: () = self.client.srem(&fam_idx, id).await?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The decision [`ValkeyDeviceStore::apply`] takes for the row it read.
-enum Step {
-    /// Leave the row alone (the caller learns the row it was decided on).
-    Skip,
-    /// Replace the row with this value.
-    Write(Device),
-    /// Delete the row.
-    Remove,
-}
-
-/// What [`ValkeyDeviceStore::apply`] did.
-enum Applied {
-    /// The row does not exist (or vanished before the write).
-    Missing,
-    /// The decision was to leave the row; carries the row as read.
-    Skipped(Device),
-    /// The new row was stored; carries the row as it was read.
-    Written { before: Device },
-    /// The row was deleted; carries the row as read.
-    Removed(Device),
 }
 
 impl DeviceStore for ValkeyDeviceStore {
@@ -491,14 +352,45 @@ impl DeviceStore for ValkeyDeviceStore {
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
-        let hex = fingerprint_hex(hash);
+        let hash = *hash;
         async move {
-            let fp_key = fingerprint_key(&store.prefix, &tenant, &hex);
-            let device_id: Option<String> = store.client.get(&fp_key).await?;
-            match device_id {
-                Some(id) => store.get_device(&tenant, &id).await,
-                None => Ok(None),
+            let hex = fingerprint_hex(&hash);
+            let set_key = fingerprint_set_key(&store.prefix, &tenant, &hex);
+            // The set lists every device that carries the fingerprint. It is
+            // a hint: only rows that still carry it are returned, and the
+            // read tidies the entries that do not.
+            let mut found = store
+                .read_index(&set_key, &tenant, |d| d.fingerprint_hash == hash)
+                .await?;
+            // An earlier release kept one id under a string key. It names a
+            // device the set may not list yet (the next write of that device
+            // moves it), so it is read as one more candidate.
+            let legacy_key = fingerprint_key(&store.prefix, &tenant, &hex);
+            let legacy: Option<String> = store.client.get(&legacy_key).await?;
+            if let Some(id) = legacy
+                && !found.iter().any(|d| d.id.to_string() == id)
+            {
+                match store.get_row_checked(&tenant, &id).await? {
+                    Some((d, raw, stale)) if d.fingerprint_hash == hash => {
+                        if stale {
+                            store.reseal_row(&d, &raw).await;
+                        }
+                        found.push(d);
+                    }
+                    Some((_, raw, _)) => {
+                        if let Err(e) = store
+                            .drop_stale_fingerprint(&legacy_key, &tenant, &id, &raw)
+                            .await
+                        {
+                            tracing::warn!(error = %e, "stale fingerprint entry not dropped");
+                        }
+                    }
+                    None => {}
+                }
             }
+            // The same device every other backend returns: newest sighting,
+            // then the smaller id.
+            Ok(found.into_iter().min_by(order_newest_first))
         }
     }
 
@@ -510,15 +402,14 @@ impl DeviceStore for ValkeyDeviceStore {
     ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
-        let user = user_id.to_string();
+        let user = *user_id;
         async move {
-            let idx = user_index_key(&store.prefix, &tenant, &user);
-            let members: Vec<String> = store.client.smembers(&idx).await?;
-            let (rows, gone) = store.get_rows(&tenant, &members).await?;
-            store.prune_absent(&idx, &tenant, &gone).await;
-            let mut out: Vec<Device> = rows.into_iter().map(|(_, d)| d).collect();
+            let idx = user_index_key(&store.prefix, &tenant, &user.to_string());
+            let mut out = store
+                .read_index(&idx, &tenant, |d| d.user_id.as_ref() == Some(&user))
+                .await?;
             // Newest-sighted first; matches Memory + SQL impls.
-            out.sort_by_key(|d| std::cmp::Reverse(d.last_seen_at));
+            out.sort_by(order_newest_first);
             out.truncate(limit);
             Ok(out)
         }
@@ -532,20 +423,19 @@ impl DeviceStore for ValkeyDeviceStore {
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
-        let user = user_id.to_string();
+        let user = *user_id;
         let hash = *hash;
         async move {
             // The user's whole index is read (no scan limit), so a user with
             // many devices never misses an older match.
-            let idx = user_index_key(&store.prefix, &tenant, &user);
-            let members: Vec<String> = store.client.smembers(&idx).await?;
-            let (rows, gone) = store.get_rows(&tenant, &members).await?;
-            store.prune_absent(&idx, &tenant, &gone).await;
-            Ok(rows
+            let idx = user_index_key(&store.prefix, &tenant, &user.to_string());
+            let owned = store
+                .read_index(&idx, &tenant, |d| d.user_id.as_ref() == Some(&user))
+                .await?;
+            Ok(owned
                 .into_iter()
-                .map(|(_, d)| d)
                 .filter(|d| d.fingerprint_hash == hash)
-                .max_by_key(|d| d.last_seen_at))
+                .min_by(order_newest_first))
         }
     }
 
@@ -559,11 +449,14 @@ impl DeviceStore for ValkeyDeviceStore {
         let family = family_id.to_string();
         async move {
             let idx = family_index_key(&store.prefix, &tenant, &family);
-            let members: Vec<String> = store.client.smembers(&idx).await?;
-            let (rows, gone) = store.get_rows(&tenant, &members).await?;
-            store.prune_absent(&idx, &tenant, &gone).await;
-            let mut out: Vec<Device> = rows.into_iter().map(|(_, d)| d).collect();
-            out.sort_by_key(|d| std::cmp::Reverse(d.last_seen_at));
+            let mut out = store
+                .read_index(&idx, &tenant, |d| {
+                    d.bindings.iter().any(|b| {
+                        matches!(b, DeviceBinding::Refresh { family_id: f, .. } if *f == family)
+                    })
+                })
+                .await?;
+            out.sort_by(order_newest_first);
             Ok(out)
         }
     }
@@ -575,88 +468,7 @@ impl DeviceStore for ValkeyDeviceStore {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let store = self.clone();
         let device = device.clone();
-        async move {
-            let ttl_secs = store.ttl_seconds_for(&device, now);
-            let payload = store.encode_row(&device)?;
-            let tenant = device.tenant_id.to_string();
-            let id = device.id.to_string();
-
-            let row_key = device_key(&store.prefix, &tenant, &id);
-            let fp_key = fingerprint_key(
-                &store.prefix,
-                &tenant,
-                &fingerprint_hex(&device.fingerprint_hash),
-            );
-            let tenant_idx = tenant_index_key(&store.prefix, &tenant);
-
-            // Resolve existing fingerprint to handle re-keys: when the
-            // saved row has a different fingerprint than what's currently
-            // stored, drop the stale fingerprint index entry.
-            if let Some(prev) = store.get_device(&tenant, &id).await? {
-                let prev_hex = fingerprint_hex(&prev.fingerprint_hash);
-                if prev_hex != fingerprint_hex(&device.fingerprint_hash) {
-                    let stale_fp = fingerprint_key(&store.prefix, &tenant, &prev_hex);
-                    store
-                        .delete_fingerprint_if_points_at(&stale_fp, &id)
-                        .await?;
-                }
-                // Remove stale family-index entries for any Refresh
-                // bindings that are no longer present in the new device.
-                let new_families: Vec<&str> = device
-                    .bindings
-                    .iter()
-                    .filter_map(|b| match b {
-                        DeviceBinding::Refresh { family_id, .. } => Some(family_id.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                for binding in &prev.bindings {
-                    if let DeviceBinding::Refresh { family_id, .. } = binding
-                        && !new_families.contains(&family_id.as_str())
-                    {
-                        let stale_idx = family_index_key(&store.prefix, &tenant, family_id);
-                        let _: () = store.client.srem(&stale_idx, &id).await?;
-                    }
-                }
-                // Remove stale user-index entry if user_id changed.
-                if let Some(prev_user) = &prev.user_id
-                    && device.user_id.as_ref() != Some(prev_user)
-                {
-                    let stale_user_idx =
-                        user_index_key(&store.prefix, &tenant, &prev_user.to_string());
-                    let _: () = store.client.srem(&stale_user_idx, &id).await?;
-                }
-            }
-
-            // Write the row with its TTL (none for an Unknown row).
-            let expiration = ttl_secs.map(Expiration::EX);
-            let _: () = store
-                .client
-                .set(&row_key, payload, expiration.clone(), None, false)
-                .await?;
-            // Fingerprint index → device id. Same TTL so it ages out
-            // alongside the row.
-            let _: () = store
-                .client
-                .set(&fp_key, &id, expiration, None, false)
-                .await?;
-
-            // Tenant + user + family indexes (sets, no TTL; pruned by
-            // the sweep when the rows they reference are gone).
-            let _: () = store.client.sadd(&tenant_idx, &id).await?;
-            if let Some(uid) = &device.user_id {
-                let user_idx = user_index_key(&store.prefix, &tenant, &uid.to_string());
-                let _: () = store.client.sadd(&user_idx, &id).await?;
-            }
-            for binding in &device.bindings {
-                if let DeviceBinding::Refresh { family_id, .. } = binding {
-                    let fam_idx = family_index_key(&store.prefix, &tenant, family_id);
-                    let _: () = store.client.sadd(&fam_idx, &id).await?;
-                }
-            }
-
-            Ok(())
-        }
+        async move { store.save_row(&device, now).await }
     }
 
     fn record_sighting(
@@ -670,10 +482,11 @@ impl DeviceStore for ValkeyDeviceStore {
         let device_id = id.to_string();
         async move {
             // Atomic compare-and-swap: only last_seen_at (and with it the
-            // TTL) changes, and a Revoked row is never written.
+            // TTL) changes, a Revoked row is never written, and the time
+            // never moves backwards.
             let applied = store
                 .apply(&tenant, &device_id, now, |d| {
-                    if d.trust_level == DeviceTrustLevel::Revoked {
+                    if d.trust_level == DeviceTrustLevel::Revoked || now <= d.last_seen_at {
                         return Step::Skip;
                     }
                     let mut next = d.clone();
@@ -748,7 +561,7 @@ impl DeviceStore for ValkeyDeviceStore {
                 Applied::Skipped(found) => TrustTransition::Refused {
                     current: found.trust_level,
                 },
-                Applied::Written { .. } | Applied::Removed(_) => TrustTransition::Applied,
+                Applied::Written { .. } | Applied::Removed => TrustTransition::Applied,
             })
         }
     }
@@ -788,13 +601,7 @@ impl DeviceStore for ValkeyDeviceStore {
                     Ok(BindingsUpdate::Revoked)
                 }
                 Applied::Skipped(_) => Ok(BindingsUpdate::Conflict),
-                Applied::Written { before } => {
-                    store
-                        .reindex_families(&tenant, &device_id, &before.bindings, &bindings)
-                        .await?;
-                    Ok(BindingsUpdate::Written)
-                }
-                Applied::Removed(_) => Ok(BindingsUpdate::Written),
+                Applied::Written { .. } | Applied::Removed => Ok(BindingsUpdate::Written),
             }
         }
     }
@@ -829,11 +636,7 @@ impl DeviceStore for ValkeyDeviceStore {
                 Applied::Missing => Ok(OwnerClaim::Missing),
                 Applied::Skipped(found) if found.user_id == Some(user) => Ok(OwnerClaim::Claimed),
                 Applied::Skipped(_) => Ok(OwnerClaim::OwnedByOther),
-                Applied::Written { .. } | Applied::Removed(_) => {
-                    let idx = user_index_key(&store.prefix, &tenant, &user.to_string());
-                    let _: () = store.client.sadd(&idx, &device_id).await?;
-                    Ok(OwnerClaim::Claimed)
-                }
+                Applied::Written { .. } | Applied::Removed => Ok(OwnerClaim::Claimed),
             }
         }
     }
@@ -847,33 +650,14 @@ impl DeviceStore for ValkeyDeviceStore {
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
         async move {
-            // Read first so we can also drop the fingerprint and family
-            // index entries. Cheaper than scanning every fingerprint
-            // index for matches.
-            let device = store.get_device(&tenant, &device_id).await?;
-            let row_key = device_key(&store.prefix, &tenant, &device_id);
-            let tenant_idx = tenant_index_key(&store.prefix, &tenant);
-
-            let Some(d) = device else {
-                let _: () = store.client.del(&row_key).await?;
+            // The row, its fingerprint entry (only while it points at this
+            // device) and its index entries go in one script.
+            let applied = store.remove_row(&tenant, &device_id).await?;
+            if matches!(applied, Applied::Missing) {
+                let tenant_idx = tenant_index_key(&store.prefix, &tenant);
                 let _: () = store.client.srem(&tenant_idx, &device_id).await?;
-                return Ok(());
-            };
-            // Row delete is unconditional; the fingerprint index is
-            // removed only if it still points at this device.
-            let fp_key = fingerprint_key(
-                &store.prefix,
-                &tenant,
-                &fingerprint_hex(&d.fingerprint_hash),
-            );
-            store
-                .run_script(
-                    REMOVE_DEVICE,
-                    vec![row_key, fp_key],
-                    remove_args(None, &device_id),
-                )
-                .await?;
-            store.remove_index_entries(&tenant, &device_id, &d).await
+            }
+            Ok(())
         }
     }
 
@@ -884,80 +668,7 @@ impl DeviceStore for ValkeyDeviceStore {
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
-        async move {
-            let mut counts = SweepCounts::default();
-            // Walk the per-tenant device-id index. Native key TTLs would
-            // eventually evict stale rows on their own, but TTL alone
-            // can't move a Trusted device to Seen; only the explicit
-            // demotion ladder can. Hence the walk.
-            let tenant_idx = tenant_index_key(&store.prefix, &tenant);
-            let members: Vec<String> = store.client.smembers(&tenant_idx).await?;
-            let cfg = store.sweep_config;
-
-            for chunk in members.chunks(MGET_CHUNK) {
-                // Rows are read a chunk at a time. A row that needs no change
-                // is settled by that read alone; only a row that must be
-                // demoted or purged goes on to its own compare-and-swap, which
-                // reads it again.
-                let (rows, gone) = store.get_rows(&tenant, chunk).await?;
-                // Rows already TTL-evicted: clean the tenant index.
-                store.prune_absent(&tenant_idx, &tenant, &gone).await;
-                for (member, row) in rows {
-                    if matches!(plan_sweep(&row, &cfg, now), SweepStep::Keep) {
-                        continue;
-                    }
-                    // Each row is planned against the bytes it is then
-                    // swapped or deleted under, so a revocation that lands
-                    // mid-sweep re-plans the row instead of being overwritten.
-                    let applied = store
-                        .apply(&tenant, &member, now, |d| match plan_sweep(d, &cfg, now) {
-                            SweepStep::Keep => Step::Skip,
-                            SweepStep::Purge => Step::Remove,
-                            SweepStep::Demote { level, .. } => {
-                                let mut next = d.clone();
-                                next.demoted_at =
-                                    demotion_stamp(d.trust_level, level, d.demoted_at, now);
-                                next.trust_level = level;
-                                if level == DeviceTrustLevel::Revoked {
-                                    next.revoked_at = Some(now);
-                                }
-                                Step::Write(next)
-                            }
-                        })
-                        .await;
-                    match applied {
-                        // Vanished between the chunk read and the swap.
-                        Ok(Applied::Missing) => {
-                            store
-                                .prune_absent(&tenant_idx, &tenant, std::slice::from_ref(&member))
-                                .await;
-                        }
-                        Ok(Applied::Skipped(_)) => {}
-                        Ok(Applied::Written { before, .. }) => {
-                            if let SweepStep::Demote {
-                                trusted_to_seen,
-                                seen_to_revoked,
-                                ..
-                            } = plan_sweep(&before, &cfg, now)
-                            {
-                                counts.trusted_to_seen += u64::from(trusted_to_seen);
-                                counts.seen_to_revoked += u64::from(seen_to_revoked);
-                            }
-                        }
-                        Ok(Applied::Removed(d)) => {
-                            counts.revoked_purged += 1;
-                            store.remove_index_entries(&tenant, &member, &d).await?;
-                        }
-                        // A row that stays contended is retried by the next
-                        // sweep; it must not abort the rest of the walk.
-                        Err(ValkeyDeviceStoreError::Contended { .. }) => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-            }
-
-            Ok(counts)
-        }
+        async move { store.sweep_tenant(&tenant, now).await }
     }
 }
 

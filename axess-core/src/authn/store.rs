@@ -210,6 +210,12 @@ pub trait IdentityLookup: Send + Sync + 'static {
         }
     }
 
+    /// Look up a tenant by its id, or `Ok(None)` when none exists.
+    fn get_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> impl std::future::Future<Output = Result<Option<Tenant>, Self::Error>> + Send;
+
     /// Look up a tenant by its identifier (slug, domain, etc.).
     fn find_tenant(
         &self,
@@ -456,11 +462,7 @@ pub trait IdentityAdmin: IdentityAuthnLog {
 
 /// Umbrella alias for the all-three-tier identity store: the typical
 /// production-backend shape. The blanket impl below makes any
-/// `T: IdentityAdmin` satisfy `IdentityStore` automatically, so any
-/// adopter that implements all three tiers (`IdentityLookup` +
-/// `IdentityAuthnLog` + `IdentityAdmin`) is automatically an
-/// `IdentityStore`. Most existing code that takes `T: IdentityStore`
-/// keeps compiling unchanged.
+/// `T: IdentityAdmin` an `IdentityStore`.
 pub trait IdentityStore: IdentityAdmin {}
 impl<T: IdentityAdmin> IdentityStore for T {}
 
@@ -471,19 +473,10 @@ impl<T: IdentityAdmin> IdentityStore for T {}
 /// Deliberately separate from [`IdentityAdmin`], and deliberately
 /// without default bodies, because neither possible default is safe.
 ///
-/// A default that panics turns
+/// A default that panics would fail
 /// [`RequestAuthnService::begin_password_reset`](crate::authn::service::RequestAuthnService::begin_password_reset)
-/// into a user-enumeration oracle. That function answers `Ok(None)` for
-/// an identifier it cannot find and reaches the store only for one it
-/// can, so an unattended backend would answer an unauthenticated
-/// "forgot password" request with 200 for an address that is not
-/// registered and a panic for one that is. The function equalizes its
-/// timing precisely to avoid leaking that, and a panicking default gives
-/// it away on the status code.
-///
-/// A default that silently succeeds is worse: recovery appears to work,
-/// no token is ever stored, and every subsequent verification fails for
-/// a reason nothing explains.
+/// on an unauthenticated route, and one that silently succeeds is worse:
+/// recovery appears to work while no token is ever stored.
 ///
 /// So the requirement is moved into the type system. A store that does
 /// not implement this trait cannot call the reset flow, and the failure
@@ -510,6 +503,16 @@ pub trait IdentityPasswordReset: IdentityLookup {
     /// Return `Ok(false)` for absent, expired and mismatched alike; the
     /// caller does not distinguish them and neither should the response.
     fn verify_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+
+    /// [`verify_reset_token`](Self::verify_reset_token)'s constant-time
+    /// comparison, leaving the row in place. The reset flow checks with this
+    /// first and spends the token last, so a refused password keeps the link.
+    fn check_reset_token(
         &self,
         user_id: &UserId,
         token_hash: &str,
@@ -621,6 +624,13 @@ impl<L: IdentityLookup> IdentityLookup for NoopAuthnLog<L> {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<Option<TenantId>, Self::Error>> + Send {
         self.0.get_user_tenant(user_id)
+    }
+
+    fn get_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> impl std::future::Future<Output = Result<Option<Tenant>, Self::Error>> + Send {
+        self.0.get_tenant(tenant_id)
     }
 
     fn find_tenant(

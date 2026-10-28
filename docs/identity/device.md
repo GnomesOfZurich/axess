@@ -342,7 +342,12 @@ and the moment it was demoted from `Trusted` (`Device::demoted_at`). A
 its last sighting, and a Trusted device that goes quiet is demoted at 90
 days and revoked 30 days after that (120 days from the last sighting) and
 is never revoked in the sweep that demotes it. A sighting after the
-demotion restarts the Seen window. The stamp is set on every move from
+demotion restarts the Seen window. Every window is compared in whole
+seconds, which is how the SQL backends store timestamps, so all
+backends take the same decision for the same row;
+`SweepConfigBuilder::build` returns an error for a window with a
+fractional second. A `Revoked` row that has no `revoked_at` is stamped
+by the sweep and purged one grace period later. The stamp is set on every move from
 `Trusted` to `Seen` and cleared by a move to any level but `Seen`, so promoting a
 device again starts a fresh ladder. A
 deployment that needs different retention per tenant holds its own
@@ -367,7 +372,7 @@ axess ships five `DeviceStore` implementations:
 | `SqliteDeviceStore` | `sqlite` | SQLx pool, `INSERT … ON CONFLICT`, schema in `init_schema()`. |
 | `PostgresDeviceStore` | `postgres` | SQLx pool, same surface as the sqlite backend with the Postgres dialect. |
 | `MysqlDeviceStore` | `mysql` | SQLx pool, MySQL dialect (`?` binds, `ON DUPLICATE KEY UPDATE`, `VARBINARY(32)`). Compatible with MySQL 8.x and MariaDB 10.5+. |
-| `ValkeyDeviceStore` | `valkey` | Hash-per-device + per-tenant fingerprint index. Server-side `EXPIRE` handles purge. |
+| `ValkeyDeviceStore` | `valkey` | Key-per-device + per-tenant fingerprint index (a set of the ids that carry each fingerprint, so devices sharing one all stay findable). Server-side `EXPIRE` handles purge. |
 
 All five SQL/Valkey backends share the same trait surface; switching
 between them requires only the `init_schema` call against the new
@@ -399,7 +404,11 @@ otherwise be only by hash. Read the docstring on
 `find_by_fingerprint` for the rationale.
 
 **`save` must be atomic.** `save` is documented as idempotent
-upsert. Implementations that do `SELECT` + `INSERT` racy-checks
+upsert. It never moves a stored `Revoked` row to another level (a
+`Device` loaded before a revocation and saved after it leaves the
+revoked row alone; reinstating is an explicit `set_trust_level`), and
+a `Revoked` row saved without `revoked_at` is stamped with the write
+time so the sweep can purge it. Implementations that do `SELECT` + `INSERT` racy-checks
 must wrap them in a transaction or use the dialect's native
 upsert (`ON CONFLICT`, `ON DUPLICATE KEY UPDATE`, `MERGE`, or
 `SETNX` for KV stores). A non-atomic `save` produces lost updates
@@ -407,7 +416,10 @@ under concurrent device-promotion calls.
 
 **`record_sighting` is hot-path.** Every authenticated request
 touches this. Implement it as a single `UPDATE … SET last_seen_at
-= ?` rather than a load-modify-save round trip. The shipped
+= ?` rather than a load-modify-save round trip. It is monotonic
+(`last_seen_at` becomes the later of the stored time and the new one,
+so a late request never moves it back) and it leaves a `Revoked` row
+alone while still succeeding. The shipped
 backends are a guide. The `CachedDeviceStore` decorator (see
 caching, above) shields the underlying store from read pressure
 but the write path runs through every request.

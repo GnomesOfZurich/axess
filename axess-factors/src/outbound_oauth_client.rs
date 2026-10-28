@@ -404,7 +404,7 @@ impl OutboundOAuthClient {
             }
         }
 
-        let response = request
+        let mut response = request
             .form(&form)
             .send()
             .await
@@ -412,16 +412,18 @@ impl OutboundOAuthClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = crate::http_body::read_error_snippet(&mut response).await;
             return Err(OAuthClientError::TokenEndpoint {
                 status: status.as_u16(),
                 body,
             });
         }
 
-        let parsed: TokenResponse = response
-            .json()
-            .await
+        let body =
+            crate::http_body::read_limited(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
+                .await
+                .map_err(|e| OAuthClientError::MalformedResponse(e.to_string()))?;
+        let parsed: TokenResponse = serde_json::from_slice(&body)
             .map_err(|e| OAuthClientError::MalformedResponse(e.to_string()))?;
 
         if parsed.access_token.is_empty() {

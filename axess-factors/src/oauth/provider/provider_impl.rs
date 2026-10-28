@@ -117,7 +117,7 @@ impl OAuthProvider for OAuthProviderConfig {
                 .url()
                 .clone();
 
-            let response = self
+            let mut response = self
                 .http_client
                 .get(userinfo_url)
                 .bearer_auth(access_token)
@@ -136,12 +136,14 @@ impl OAuthProvider for OAuthProviderConfig {
                 }
             }
 
-            let body = response
-                .text()
-                .await
-                .map_err(|e| OAuthError::UserInfo(format!("failed to read response body: {e}")))?;
+            let body = crate::http_body::read_limited(
+                &mut response,
+                crate::http_body::MAX_USERINFO_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| OAuthError::UserInfo(format!("failed to read response body: {e}")))?;
 
-            let claims: UserInfoClaims = serde_json::from_str(&body)
+            let claims: UserInfoClaims = serde_json::from_slice(&body)
                 .map_err(|e| OAuthError::UserInfo(format!("failed to parse response: {e}")))?;
 
             Ok(claims)
@@ -343,7 +345,7 @@ impl OAuthProvider for OAuthProviderConfig {
                 form.push(("token_type_hint", hint));
             }
 
-            let response = self
+            let mut response = self
                 .http_client
                 .post(revocation_url)
                 .form(&form)
@@ -359,10 +361,7 @@ impl OAuthProvider for OAuthProviderConfig {
                 return Ok(());
             }
 
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable>".to_string());
+            let body = crate::http_body::read_error_snippet(&mut response).await;
 
             // Surface RFC 7009 / 6749 error semantics rather than
             // collapsing every non-2xx into a generic TokenExchange error.
@@ -424,7 +423,7 @@ impl OAuthProvider for OAuthProviderConfig {
                 form.push(("scope", &scope_str));
             }
 
-            let response = self
+            let mut response = self
                 .http_client
                 .post(&token_url)
                 .form(&form)
@@ -435,10 +434,12 @@ impl OAuthProvider for OAuthProviderConfig {
                 })?;
 
             let status = response.status();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| OAuthError::TokenExchange(format!("response read failed: {e}")))?;
+            let body = crate::http_body::read_for_status(
+                &mut response,
+                crate::http_body::MAX_TOKEN_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| OAuthError::TokenExchange(format!("response read failed: {e}")))?;
 
             if !status.is_success() {
                 let error_body = String::from_utf8_lossy(&body);

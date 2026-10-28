@@ -257,6 +257,22 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
             .map(|r| r.clone()))
     }
 
+    async fn get_tenant(&self, tenant_id: &TenantId) -> Result<Option<Tenant>, Self::Error> {
+        note(&self.call_log, "get_tenant");
+        Ok(self
+            .tenants_by_id
+            .get(tenant_id.to_string().as_str())
+            .map(|r| r.clone()))
+    }
+
+    async fn get_user_tenant(&self, user_id: &UserId) -> Result<Option<TenantId>, Self::Error> {
+        note(&self.call_log, "get_user_tenant");
+        Ok(self
+            .users
+            .get(user_id.to_string().as_str())
+            .map(|r| r.tenant_id))
+    }
+
     async fn find_tenant(&self, identifier: &str) -> Result<Option<Tenant>, Self::Error> {
         note(&self.call_log, "find_tenant");
         Ok(self.tenants.get(identifier).map(|r| r.clone()))
@@ -424,6 +440,7 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         token_hash: &str,
         expires_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Self::Error> {
+        note(&self.call_log, "store_reset_token");
         self.reset_tokens
             .insert(user_id.to_string(), (token_hash.to_string(), expires_at));
         Ok(())
@@ -448,6 +465,21 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
                 },
             )
             .is_some())
+    }
+
+    async fn check_reset_token(
+        &self,
+        user_id: &UserId,
+        token_hash: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, Self::Error> {
+        Ok(self
+            .reset_tokens
+            .get(user_id.to_string().as_str())
+            .is_some_and(|entry| {
+                let (stored_hash, expires_at) = entry.value();
+                *expires_at > now && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
+            }))
     }
 }
 
