@@ -68,8 +68,12 @@ const BINDINGS_RETRIES: usize = 16;
 
 /// `true` when `device` may serve a request made by `user`: the device is
 /// unowned, the request is not yet attributed to a user (a guest), or the
-/// owner is that user.
+/// owner is that user. A revoked device serves nobody: a request that
+/// matches one is treated as a new device, as the device chapter describes.
 fn is_usable_by(device: &Device, user: Option<&UserId>) -> bool {
+    if device.trust_level == DeviceTrustLevel::Revoked {
+        return false;
+    }
     match (device.user_id.as_ref(), user) {
         (Some(owner), Some(user)) => owner == user,
         _ => true,
@@ -156,6 +160,18 @@ where
     /// as is; compare the owner with the authenticating user before
     /// trusting it (see [`decide_step_up_for_user`](crate::authn::service::decide_step_up_for_user)).
     ///
+    /// A `Revoked` device is never reused or touched: a request whose
+    /// fingerprint matches one gets a new `Unknown` device, so a sighting
+    /// cannot extend a revoked row and no user can claim it.
+    ///
+    /// Two requests that both find no device and both create one are
+    /// reconciled after the write: the store's lookup order picks one
+    /// device and the other deletes itself, so both requests return the same
+    /// id. The store has no atomic create-if-absent, so a request that
+    /// created its device and looked again before the other one saved can
+    /// still leave two devices behind; the next lookup returns the same one
+    /// of them every time, and the retention sweep ages the other out.
+    ///
     /// `user` is `None` for guest sessions (pre-authn requests). The
     /// `user_id` field on the created Device row is set to whatever
     /// is passed in. A device that exists without an owner (it was made
@@ -179,10 +195,31 @@ where
         let tenant = *tenant;
         let user = user.cloned();
         async move {
-            // Fast path: device already known by this fingerprint. A
-            // device owned by a different user is not reused: a shared
-            // office, NAT or VPN gives two people the same fingerprint,
-            // and the second must not inherit the first one's trust.
+            // An identified user first looks for a device they own with this
+            // fingerprint. That lookup is the cheap one (a store indexes it
+            // per user), and it is the request path of everyone who has
+            // signed in before, so it runs before the lookup that must weigh
+            // every device sharing the fingerprint. It also finds the user's
+            // device when the newest device with the fingerprint is
+            // someone else's, or is a store's not-yet-indexed twin (a Valkey
+            // row last written by 0.11.0, whose index named a deleted twin).
+            if let Some(user) = user.as_ref() {
+                let own = self
+                    .store
+                    .find_by_fingerprint_for_user(&tenant, user, &fingerprint)
+                    .await?;
+                if let Some(own) = own
+                    && is_usable_by(&own, Some(user))
+                {
+                    self.note_sighting(&tenant, &own, now).await?;
+                    return Ok(own.id);
+                }
+            }
+
+            // Device already known by this fingerprint. One owned by a
+            // different user is not reused: a shared office, NAT or VPN gives
+            // two people the same fingerprint, and the second must not
+            // inherit the first one's trust.
             let existing = self
                 .store
                 .find_by_fingerprint(&tenant, &fingerprint)
@@ -209,23 +246,6 @@ where
                     return Ok(existing.id);
                 }
             }
-            // The lookup by fingerprint returns one row, which may be
-            // another user's, or none at all for a device a store has not
-            // yet indexed under the fingerprint (a Valkey row last written
-            // by 0.11.0, whose index named a deleted twin). Look for the
-            // caller's own device with that fingerprint before minting a new
-            // one, so a repeat visit finds the same device again however
-            // many devices the user has.
-            if let Some(user) = user.as_ref() {
-                let own = self
-                    .store
-                    .find_by_fingerprint_for_user(&tenant, user, &fingerprint)
-                    .await?;
-                if let Some(own) = own {
-                    self.note_sighting(&tenant, &own, now).await?;
-                    return Ok(own.id);
-                }
-            }
 
             // Create path: brand-new device at Unknown.
             let id = new_id_fn();
@@ -242,6 +262,33 @@ where
                 bindings: Vec::new(),
             };
             self.store.save(&device, now).await?;
+
+            // The lookup above and the save are separate store calls, so a
+            // concurrent first sighting of the same fingerprint may have
+            // created a device meanwhile. Both then exist; the lookup order
+            // (newest sighting, then the smaller id) names one of them, and
+            // the device that loses removes itself, so the racing requests
+            // settle on one device instead of each keeping its own.
+            let settled = match user.as_ref() {
+                Some(user) => {
+                    self.store
+                        .find_by_fingerprint_for_user(&tenant, user, &fingerprint)
+                        .await?
+                }
+                None => {
+                    self.store
+                        .find_by_fingerprint(&tenant, &fingerprint)
+                        .await?
+                }
+            };
+            if let Some(winner) = settled
+                && winner.id != id
+                && is_usable_by(&winner, user.as_ref())
+            {
+                self.store.delete(&tenant, &id).await?;
+                self.note_sighting(&tenant, &winner, now).await?;
+                return Ok(winner.id);
+            }
 
             // Emit `DeviceFirstSeen` after the row commit so a
             // sink failure can never fail the device creation. The
@@ -272,7 +319,10 @@ where
         {
             return Ok(());
         }
-        self.store.record_sighting(tenant, &device.id, now).await
+        self.store
+            .record_sighting(tenant, &device.id, now)
+            .await
+            .map(drop)
     }
 
     /// Promote a device's trust level after a successful
@@ -285,6 +335,9 @@ where
     /// | `Unknown` | `Seen` (recorded with `record_sighting(now)`) |
     /// | `Seen` | `Seen` (no-op; `last_seen_at` bumped) |
     /// | `Trusted` | `Trusted` (no-op; `last_seen_at` bumped) |
+    ///
+    /// A `Seen` or `Trusted` device that is revoked between the load and the
+    /// sighting is reported as `Revoked`, with `last_seen_at` unchanged.
     /// | `Revoked` | `Revoked` (no-op; `last_seen_at` **not** bumped) |
     ///
     /// **Never re-elevates a `Revoked` device.** Revocation is a
@@ -339,8 +392,11 @@ where
                         .await?
                     {
                         TrustTransition::Applied => {
-                            self.store.record_sighting(&tenant, &device_id, now).await?;
-                            Ok(Some(DeviceTrustLevel::Seen))
+                            // The level the sighting found, so a revocation
+                            // that landed after the promotion is reported.
+                            let level =
+                                self.store.record_sighting(&tenant, &device_id, now).await?;
+                            Ok(Some(level))
                         }
                         // Revoked in between: not promoted, and reported as
                         // Revoked, never as Seen.
@@ -348,16 +404,21 @@ where
                             current: DeviceTrustLevel::Revoked,
                         } => Ok(Some(DeviceTrustLevel::Revoked)),
                         // Another request promoted it first.
-                        TrustTransition::Refused { current } => {
-                            self.store.record_sighting(&tenant, &device_id, now).await?;
-                            Ok(Some(current))
+                        TrustTransition::Refused { .. } => {
+                            let level =
+                                self.store.record_sighting(&tenant, &device_id, now).await?;
+                            Ok(Some(level))
                         }
                         TrustTransition::Missing => Ok(None),
                     }
                 }
                 DeviceTrustLevel::Seen | DeviceTrustLevel::Trusted => {
-                    self.store.record_sighting(&tenant, &device_id, now).await?;
-                    Ok(Some(device.trust_level))
+                    // The sighting reports the level the row has when it is
+                    // applied; a device revoked since the load above is
+                    // reported as `Revoked` and its `last_seen_at` is left
+                    // alone.
+                    let level = self.store.record_sighting(&tenant, &device_id, now).await?;
+                    Ok(Some(level))
                 }
                 DeviceTrustLevel::Revoked => {
                     // Terminal; no last_seen bump, no trust change.
@@ -562,6 +623,9 @@ where
     }
 }
 
+mod proof;
+pub use proof::{DeviceRequest, ResolvedDevice};
+
 #[cfg(test)]
 mod tests;
 
@@ -573,3 +637,6 @@ mod sighting;
 
 #[cfg(test)]
 mod races;
+
+#[cfg(test)]
+mod settling;

@@ -17,13 +17,17 @@ use std::sync::Mutex;
 /// The operation name and `now` of one store write.
 pub(crate) type WriteTime = (&'static str, DateTime<Utc>);
 
-type Hook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+pub(crate) type Hook = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 /// Delegates every operation to `inner`; the hook fires once after a load.
 #[derive(Clone)]
 pub(crate) struct AfterLoad<S: DeviceStore> {
     pub(crate) inner: S,
     hook: Arc<Mutex<Option<Hook>>>,
+    /// Fires once after a `find_by_fingerprint` has read its answer and
+    /// before it returns: the window between the lifecycle's lookup and its
+    /// create, in which a competing first sighting can land.
+    find_hook: Arc<Mutex<Option<Hook>>>,
     /// The `now` each write (`save`, `replace_bindings`, `claim_owner`) was
     /// given, in call order.
     pub(crate) write_times: Arc<Mutex<Vec<WriteTime>>>,
@@ -34,8 +38,14 @@ impl<S: DeviceStore> AfterLoad<S> {
         Self {
             inner,
             hook: Arc::new(Mutex::new(None)),
+            find_hook: Arc::new(Mutex::new(None)),
             write_times: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Arm the hook that runs after the next `find_by_fingerprint` answer.
+    pub(crate) fn after_next_find(&self, hook: Hook) {
+        *self.find_hook.lock().unwrap() = Some(hook);
     }
 
     /// Arm the hook: `revoke` the device the next time it is loaded.
@@ -92,12 +102,17 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         }
         Ok(row)
     }
-    fn find_by_fingerprint(
+    async fn find_by_fingerprint(
         &self,
         t: &TenantId,
         h: &FingerprintHash,
-    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
-        self.inner.find_by_fingerprint(t, h)
+    ) -> Result<Option<Device>, Self::Error> {
+        let row = self.inner.find_by_fingerprint(t, h).await?;
+        let hook = self.find_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+        Ok(row)
     }
     fn find_for_user(
         &self,
@@ -127,7 +142,7 @@ impl<S: DeviceStore> DeviceStore for AfterLoad<S> {
         t: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         self.inner.record_sighting(t, id, now)
     }
     fn set_trust_level(

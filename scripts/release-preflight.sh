@@ -10,6 +10,8 @@
 #   --allow-dirty  passed through to `cargo package` so package steps do not
 #                  require a clean tree (still fails if a listed file is
 #                  actually missing).
+#   Needs VALKEY_URL, POSTGRES_URL and MYSQL_URL for the live-store step;
+#   scripts/check-live-stores.sh has the container recipe.
 #   --with-fuzz    additionally runs the fuzz-smoke step (nightly toolchain +
 #                  cargo-fuzz required; adds ~3-5 min warm, 15-20 min cold).
 #                  Off by default because CI runs it on every PR anyway.
@@ -182,6 +184,11 @@ step "Book code compiles" bash -c '
 
 step "Clippy" cargo clippy --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features --all-targets -- -D warnings
 step "Workspace tests" cargo test --manifest-path "$AXESS_DIR/Cargo.toml" --workspace --all-features
+# The stores that need a server. CI runs them in its "Test Suite" job and the
+# preflight used not to, which is how 0.13.0 was tagged with four Valkey
+# device tests red. The script refuses without the three URLs; it never
+# passes over an empty run.
+step "Live-store tests (Valkey, PostgreSQL, MySQL)" "$AXESS_DIR/scripts/check-live-stores.sh"
 # Was `cargo doc -p axess -p axess-core` with warnings allowed, which is how 29
 # unresolved intra-doc links reached 0.5.0: it documented two crates of
 # eighteen and treated the warnings as advice. The script covers the whole
@@ -198,6 +205,12 @@ step "MSRV build + lib tests" "$AXESS_DIR/scripts/check-msrv.sh"
 # the RUSTSEC advisory database (CVSS 4.0 handling that cargo-deny 0.18.x
 # doesn't do yet, per the note on the CI Security Audit job). Both gate the
 # release: a deny hit or an unpatched advisory blocks the tag.
+# The two advisory ignore lists must name the same ids: cargo-deny and
+# cargo-audit read different files, and a drift between them means one gate
+# accepts an advisory the other fails.
+advisory_ids() { grep -oE '^[[:space:]]*"RUSTSEC-[0-9]{4}-[0-9]{4}"' "$1" | tr -d ' "' | sort -u; }
+step "Advisory ignore lists agree (deny.toml vs .cargo/audit.toml)" \
+    diff <(advisory_ids "$AXESS_DIR/deny.toml") <(advisory_ids "$AXESS_DIR/.cargo/audit.toml")
 step "Supply-chain policy (cargo deny)" cargo deny --manifest-path "$AXESS_DIR/Cargo.toml" check licenses sources bans
 step "Security advisories (cargo audit)" cargo audit --file "$AXESS_DIR/Cargo.lock" --deny warnings
 

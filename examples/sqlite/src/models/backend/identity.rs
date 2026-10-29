@@ -192,22 +192,119 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
     }
 
     async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
-        sqlx::query("UPDATE users SET failed_attempts = failed_attempts + 1 WHERE id = ?1")
-            .bind(user_id.to_string())
-            .execute(self.pool())
-            .await?;
-
-        let row = sqlx::query("SELECT failed_attempts FROM users WHERE id = ?1")
-            .bind(user_id.to_string())
-            .fetch_one(self.pool())
-            .await?;
+        // One statement: the increment and the read cannot be separated by
+        // a concurrent failure. A failure older than the policy's window
+        // starts the count again instead of adding to it.
+        let now = self.clock().now();
+        let window = chrono::Duration::from_std(
+            axess::authn::IdentityLookup::lockout_policy(self).attempt_window,
+        )
+        .unwrap_or_else(|_| chrono::Duration::hours(1));
+        let row = sqlx::query(
+            "UPDATE users
+             SET failed_attempts = CASE
+                     WHEN last_failed_at IS NULL OR last_failed_at < ?3 THEN 1
+                     ELSE failed_attempts + 1
+                 END,
+                 last_failed_at = ?2
+             WHERE id = ?1
+             RETURNING failed_attempts",
+        )
+        .bind(user_id.to_string())
+        .bind(failure_time(now))
+        .bind(failure_time(now - window))
+        .fetch_one(self.pool())
+        .await?;
 
         let count: i64 = row.get("failed_attempts");
         Ok(count as u32)
     }
 
+    async fn reserve_attempt(
+        &self,
+        user_id: &UserId,
+        policy: &axess::authn::LockoutPolicy,
+    ) -> Result<Option<u32>, Self::Error> {
+        // The test and the increment are one statement. The count is fresh
+        // (replaced by one) when there is no failure, the last is older than
+        // the attempt window, or a timed lockout has run out; otherwise the
+        // guess is granted while the count is under the limit. When no row is
+        // updated the account is at its limit and the guess is refused, so
+        // parallel guesses cannot pass it.
+        let now = self.clock().now();
+        let back = |d: std::time::Duration| {
+            failure_time(now - chrono::Duration::from_std(d).unwrap_or(chrono::Duration::hours(1)))
+        };
+        let window_start = back(policy.attempt_window);
+        let lock_ended_by = policy.duration.map(back);
+        let row = sqlx::query(
+            "UPDATE users
+             SET failed_attempts = CASE
+                     WHEN last_failed_at IS NULL OR last_failed_at < ?3
+                          OR (failed_attempts >= ?4 AND ?5 IS NOT NULL AND last_failed_at <= ?5)
+                     THEN 1
+                     ELSE failed_attempts + 1
+                 END,
+                 last_failed_at = ?2
+             WHERE id = ?1
+               AND (last_failed_at IS NULL OR last_failed_at < ?3
+                    OR failed_attempts < ?4
+                    OR (?5 IS NOT NULL AND last_failed_at <= ?5))
+             RETURNING failed_attempts",
+        )
+        .bind(user_id.to_string())
+        .bind(failure_time(now))
+        .bind(window_start)
+        .bind(i64::from(policy.effective_max_attempts()))
+        .bind(lock_ended_by)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(row.map(|row| row.get::<i64, _>("failed_attempts") as u32))
+    }
+
+    async fn release_attempt(&self, user_id: &UserId) -> Result<(), Self::Error> {
+        sqlx::query(
+            "UPDATE users
+             SET last_failed_at = CASE WHEN failed_attempts <= 1 THEN NULL ELSE last_failed_at END,
+                 failed_attempts = MAX(failed_attempts - 1, 0)
+             WHERE id = ?1",
+        )
+        .bind(user_id.to_string())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn failed_attempts(
+        &self,
+        user_id: &UserId,
+    ) -> Result<(u32, Option<DateTime<Utc>>), Self::Error> {
+        let row = sqlx::query("SELECT failed_attempts, last_failed_at FROM users WHERE id = ?1")
+            .bind(user_id.to_string())
+            .fetch_optional(self.pool())
+            .await?;
+        let Some(row) = row else {
+            return Ok((0, None));
+        };
+        let count: i64 = row.get("failed_attempts");
+        let last: Option<String> = row.get("last_failed_at");
+        let last = last
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|t| t.with_timezone(&Utc));
+        // Failures older than the window have expired, as in the increment.
+        let window = chrono::Duration::from_std(
+            axess::authn::IdentityLookup::lockout_policy(self).attempt_window,
+        )
+        .unwrap_or_else(|_| chrono::Duration::hours(1));
+        if last.is_some_and(|t| self.clock().now() - t > window) {
+            return Ok((0, None));
+        }
+        Ok((count as u32, last))
+    }
+
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        sqlx::query("UPDATE users SET failed_attempts = 0 WHERE id = ?1")
+        sqlx::query("UPDATE users SET failed_attempts = 0, last_failed_at = NULL WHERE id = ?1")
             .bind(user_id.to_string())
             .execute(self.pool())
             .await?;
@@ -487,4 +584,10 @@ impl axess::authn::IdentityPasswordHistory for OurBackend {
         .await?;
         Ok(rows.into_iter().map(|r| r.get("hash")).collect())
     }
+}
+
+/// A failure time in the one fixed-width form the window comparison in
+/// SQL sorts correctly as text.
+fn failure_time(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }

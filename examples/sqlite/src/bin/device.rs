@@ -24,10 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axess::authn::{FactorKind, LoginOutcome, TenantId, UserId};
+use axess::client_ip::{self, TrustedProxies};
 use axess::device::{
     CachedDeviceStore, DefaultFingerprintExtractor, DeviceLifecycleService, DeviceResolver,
     DeviceStore, DeviceTrustLevel, LifecycleDeviceResolver, NoopDeviceEventSink, StepUpPolicy,
-    TenantPepperResolver, decide_step_up_for_user,
+    TenantPepperResolver, decide_step_up_for_optional, decide_step_up_for_user,
 };
 use axess::session::SessionCrypto;
 use axess::{
@@ -155,14 +156,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(demo_tenant))
         .layer(
             SessionLayer::new(sessions, signing_key)
-                .with_secure(false)
+                .with_secure(secure_cookies())
                 .with_ttl(Duration::from_secs(3600)),
         );
+
+    // The client address is part of the device fingerprint. Without this
+    // layer the resolver leaves it out (and logs a warning once), and every
+    // client with the same headers matches one device from anywhere. This
+    // demo trusts no proxy: the peer address is the client.
+    let app = client_ip::layer(app, TrustedProxies::loopback_only());
 
     let addr: SocketAddr = "127.0.0.1:3000".parse()?;
     tracing::info!(%addr, "device example listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // `ConnectInfo` carries the peer address the `client_ip` layer reads.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -315,12 +327,7 @@ async fn step_up_check(
     let (parts, _body) = req.into_parts();
     let device_id = match resolver.resolve(&parts).await {
         Ok(Some(id)) => id,
-        Ok(None) => {
-            return (
-                StatusCode::OK,
-                Json(json!({"outcome": "no-device", "reason": "request too thin to fingerprint"})),
-            );
-        }
+        Ok(None) => return unknown_device_outcome("request too thin to fingerprint"),
         Err(e) => {
             tracing::error!(error = %e, "device resolve failed");
             return (
@@ -331,12 +338,7 @@ async fn step_up_check(
     };
     let device = match devices.load(&tenant, &device_id).await {
         Ok(Some(d)) => d,
-        Ok(None) => {
-            return (
-                StatusCode::OK,
-                Json(json!({"outcome": "no-device", "reason": "resolved id did not load"})),
-            );
-        }
+        Ok(None) => return unknown_device_outcome("resolved id did not load"),
         Err(e) => {
             tracing::error!(error = %e, "device load failed");
             return (
@@ -345,6 +347,19 @@ async fn step_up_check(
             );
         }
     };
+    // A revoked device is refused outright: the step-up policy decides what
+    // a factor is worth on a device that is trusted to some degree, and a
+    // revoked one is not.
+    if device.trust_level == DeviceTrustLevel::Revoked {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "outcome": "refused",
+                "device_id": device.id,
+                "trust_level": trust_str(device.trust_level),
+            })),
+        );
+    }
     let policy = StepUpPolicy::default();
     match decide_step_up_for_user(&device, &DEMO_USER, &policy) {
         Some(allowed_factors) => {
@@ -393,4 +408,39 @@ fn trust_str(level: DeviceTrustLevel) -> &'static str {
         DeviceTrustLevel::Trusted => "trusted",
         DeviceTrustLevel::Revoked => "revoked",
     }
+}
+
+/// The outcome for a request with no resolved device. A client chooses
+/// whether to send the headers a fingerprint needs, so a request without a
+/// device is judged as an `Unknown` one, with the policy's `unknown`
+/// factors, and not waved through.
+fn unknown_device_outcome(reason: &str) -> (StatusCode, Json<serde_json::Value>) {
+    let policy = StepUpPolicy::default();
+    match decide_step_up_for_optional(None, &DEMO_USER, &policy) {
+        Some(allowed_factors) => {
+            let factor_names: Vec<String> = allowed_factors.iter().map(factor_kind_str).collect();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "outcome": "step-up-required",
+                    "reason": reason,
+                    "allowed_factors": factor_names,
+                })),
+            )
+        }
+        None => (
+            StatusCode::OK,
+            Json(json!({"outcome": "no-step-up", "reason": reason})),
+        ),
+    }
+}
+
+/// Cookies are `Secure` unless `AXESS_DEV_INSECURE_COOKIES=1` is set, for a
+/// browser that refuses `Secure` cookies over plain HTTP. Local use only.
+fn secure_cookies() -> bool {
+    let insecure = std::env::var("AXESS_DEV_INSECURE_COOKIES").is_ok_and(|v| v == "1");
+    if insecure {
+        eprintln!("WARNING: AXESS_DEV_INSECURE_COOKIES=1, cookies are sent without Secure");
+    }
+    !insecure
 }

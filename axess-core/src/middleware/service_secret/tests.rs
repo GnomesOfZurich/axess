@@ -11,6 +11,12 @@ use tower::ServiceExt;
 const RELAY: &str = "relay-secret-0123456789abcdef0123456789";
 const OTHER: &str = "other-secret-0123456789abcdef0123456789";
 const EPOCH: i64 = 1_790_000_000;
+const AUDIENCE: &str = "billing";
+
+/// The default configuration a route needs: addressed to [`AUDIENCE`].
+fn addressed() -> SignedRequests {
+    SignedRequests::default().audience(AUDIENCE)
+}
 
 fn secret(name: &str, value: &str) -> ServiceSecret {
     ServiceSecret::new(name, value).expect("long enough")
@@ -83,7 +89,7 @@ async fn a_wrong_or_missing_secret_is_unauthorized_with_a_bearer_challenge() {
 async fn an_unconfigured_route_answers_not_found_in_every_mode() {
     for layer in [
         ServiceSecretLayer::bearer(ServiceSecrets::new()),
-        ServiceSecretLayer::signed(ServiceSecrets::new(), SignedRequests::default()),
+        ServiceSecretLayer::signed(ServiceSecrets::new(), addressed()).expect("addressed"),
     ] {
         let (status, _, _) =
             send(&app(layer), post_with(Some(("authorization", "Bearer x")))).await;
@@ -176,16 +182,17 @@ fn signed_app(clock: &MockClock, config: SignedRequests) -> Router {
     let secrets: ServiceSecrets = [secret("relay", RELAY), secret("other", OTHER)]
         .into_iter()
         .collect();
-    app(ServiceSecretLayer::signed(
-        secrets,
-        config.clock(Arc::new(clock.clone())),
-    ))
+    app(
+        ServiceSecretLayer::signed(secrets, config.clock(Arc::new(clock.clone())))
+            .expect("addressed"),
+    )
 }
 
 fn signed(value: &str, at: i64, method: Method, target: &str, body: &str) -> Request<Body> {
-    let header = secret("caller", value)
-        .signer()
-        .sign(at, &method, target, body.as_bytes());
+    let header =
+        secret("caller", value)
+            .signer()
+            .sign_for(AUDIENCE, at, &method, target, body.as_bytes());
     Request::builder()
         .method(Method::POST)
         .uri("/hook")
@@ -200,14 +207,14 @@ fn clock() -> MockClock {
 
 #[tokio::test]
 async fn a_signed_request_reaches_the_handler_with_its_body_and_caller() {
-    let app = signed_app(&clock(), SignedRequests::default());
+    let app = signed_app(&clock(), addressed());
     let (status, _, body) = send(&app, signed(OTHER, EPOCH, Method::POST, "/hook", "{}")).await;
     assert_eq!((status, body.as_str()), (StatusCode::OK, "other:{}"));
 }
 
 #[tokio::test]
 async fn a_signature_over_anything_else_is_refused() {
-    let app = signed_app(&clock(), SignedRequests::default());
+    let app = signed_app(&clock(), addressed());
     let tampered = {
         let mut req = signed(RELAY, EPOCH, Method::POST, "/hook", "{}");
         *req.body_mut() = Body::from("{\"x\":1}");
@@ -224,7 +231,7 @@ async fn a_signature_over_anything_else_is_refused() {
             "/hook",
             "{}",
         ),
-        post_with(Some(("x-axess-signature", "t=1,v1=zz"))),
+        post_with(Some(("x-axess-signature", "t=1,v2=zz"))),
         post_with(None),
     ] {
         assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
@@ -233,7 +240,7 @@ async fn a_signature_over_anything_else_is_refused() {
 
 #[tokio::test]
 async fn a_signature_outside_the_tolerance_is_refused_either_side() {
-    let config = SignedRequests::default().tolerance(Duration::from_secs(60));
+    let config = addressed().tolerance(Duration::from_secs(60));
     let app = signed_app(&clock(), config);
     for at in [EPOCH - 61, EPOCH + 61] {
         let req = signed(RELAY, at, Method::POST, "/hook", "");
@@ -246,7 +253,7 @@ async fn a_signature_outside_the_tolerance_is_refused_either_side() {
 #[tokio::test]
 async fn a_replayed_signature_is_refused_and_forgotten_after_the_tolerance() {
     let clock = clock();
-    let app = signed_app(&clock, SignedRequests::default());
+    let app = signed_app(&clock, addressed());
     let first = send(&app, signed(RELAY, EPOCH, Method::POST, "/hook", "x")).await;
     assert_eq!(first.0, StatusCode::OK);
     let again = send(&app, signed(RELAY, EPOCH, Method::POST, "/hook", "x")).await;
@@ -258,16 +265,20 @@ async fn a_replayed_signature_is_refused_and_forgotten_after_the_tolerance() {
 
 #[tokio::test]
 async fn a_body_over_the_limit_is_refused_before_the_signature_is_checked() {
-    let app = signed_app(&clock(), SignedRequests::default().max_body_bytes(4));
+    let app = signed_app(&clock(), addressed().max_body_bytes(4));
     let req = signed(RELAY, EPOCH, Method::POST, "/hook", "12345");
     assert_eq!(send(&app, req).await.0, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[test]
 fn the_signature_header_follows_the_documented_recipe() {
-    let header = secret("relay", RELAY)
-        .signer()
-        .sign(EPOCH, &Method::POST, "/hook?a=1", b"body");
+    let header = secret("relay", RELAY).signer().sign_for(
+        AUDIENCE,
+        EPOCH,
+        &Method::POST,
+        "/hook?a=1",
+        b"body",
+    );
 
     let mut key = crate::session::hmac::new_signer(RELAY.as_bytes());
     hmac::Mac::update(&mut key, b"axess-service-signature-v1");
@@ -275,7 +286,7 @@ fn the_signature_header_follows_the_documented_recipe() {
     let mut mac = crate::session::hmac::new_signer(&key);
     hmac::Mac::update(
         &mut mac,
-        format!("v1\n{EPOCH}\nPOST\n/hook?a=1\nbody").as_bytes(),
+        format!("v2\n{EPOCH}\nPOST\n/hook?a=1\nbilling\nbody").as_bytes(),
     );
     let expected: String = hmac::Mac::finalize(mac)
         .into_bytes()
@@ -285,7 +296,7 @@ fn the_signature_header_follows_the_documented_recipe() {
 
     assert_eq!(
         header.to_str().expect("ascii"),
-        format!("t={EPOCH},v1={expected}")
+        format!("t={EPOCH},v2={expected}")
     );
 }
 
@@ -314,7 +325,7 @@ async fn verdict(v: &Verifier, secrets: &ServiceSecrets, at: i64, body: &str) ->
 #[tokio::test]
 async fn expired_entries_are_swept_on_a_schedule_not_on_every_request() {
     let clock = clock();
-    let config = SignedRequests::default().tolerance(Duration::from_secs(80));
+    let config = addressed().tolerance(Duration::from_secs(80));
     let (v, secrets) = verifier(&clock, config);
 
     assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
@@ -343,7 +354,7 @@ async fn expired_entries_are_swept_on_a_schedule_not_on_every_request() {
 #[tokio::test]
 async fn an_unswept_expired_entry_changes_no_answer() {
     let clock = clock();
-    let config = SignedRequests::default().tolerance(Duration::from_secs(80));
+    let config = addressed().tolerance(Duration::from_secs(80));
     let (v, secrets) = verifier(&clock, config);
     assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
     clock.advance_secs(75);
@@ -359,7 +370,7 @@ async fn an_unswept_expired_entry_changes_no_answer() {
 #[tokio::test]
 async fn a_full_cache_refuses_a_new_signature_and_never_evicts_a_live_one() {
     let clock = clock();
-    let config = SignedRequests::default()
+    let config = addressed()
         .tolerance(Duration::from_secs(60))
         .max_remembered(3);
     let (v, secrets) = verifier(&clock, config);
@@ -386,7 +397,7 @@ async fn a_full_cache_refuses_a_new_signature_and_never_evicts_a_live_one() {
 #[tokio::test]
 async fn a_full_cache_answers_503_through_the_layer() {
     let clock = clock();
-    let app = signed_app(&clock, SignedRequests::default().max_remembered(1));
+    let app = signed_app(&clock, addressed().max_remembered(1));
     assert_eq!(
         send(&app, signed(RELAY, EPOCH, Method::POST, "/hook", "a"))
             .await
@@ -399,4 +410,147 @@ async fn a_full_cache_answers_503_through_the_layer() {
             .0,
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+/// The unaddressed form an older caller still sends.
+fn signed_v1(value: &str, at: i64, target: &str, body: &str) -> Request<Body> {
+    let key = secret("caller", value).signing_key;
+    let tag = signature::sign_bytes(&key, at, &Method::POST, target, body.as_bytes());
+    let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+    Request::builder()
+        .method(Method::POST)
+        .uri("/hook")
+        .header(SIGNATURE_HEADER, format!("t={at},v1={hex}"))
+        .body(Body::from(body.to_owned()))
+        .expect("request")
+}
+
+fn signed_for(audience: &str, value: &str, at: i64, target: &str, body: &str) -> Request<Body> {
+    let header = secret("caller", value).signer().sign_for(
+        audience,
+        at,
+        &Method::POST,
+        target,
+        body.as_bytes(),
+    );
+    Request::builder()
+        .method(Method::POST)
+        .uri("/hook")
+        .header(SIGNATURE_HEADER, header)
+        .body(Body::from(body.to_owned()))
+        .expect("request")
+}
+
+/// A route takes only a `v2` signature made for its own audience. A request
+/// signed for another recipient that shares the secret (`v2` with a different
+/// name) and a plain `v1` are both refused by the default configuration,
+/// which is the replay a `v1` signature allowed.
+#[tokio::test]
+async fn a_route_refuses_v1_and_a_v2_made_for_another_recipient() {
+    let app = signed_app(&clock(), addressed());
+
+    let ok = signed_for(AUDIENCE, RELAY, EPOCH, "/hook", "{}");
+    assert_eq!(send(&app, ok).await.0, StatusCode::OK);
+
+    for req in [
+        signed_for("reports", RELAY, EPOCH, "/hook", "{}"),
+        signed_v1(RELAY, EPOCH, "/hook", "{}"),
+    ] {
+        assert_eq!(send(&app, req).await.0, StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// An unaddressed route does not build: there is no default recipient to
+/// fall back to, and the error names the missing setting.
+#[test]
+fn a_route_without_an_audience_or_a_window_refuses_to_build() {
+    let err = ServiceSecretLayer::signed(ServiceSecrets::new(), SignedRequests::default())
+        .expect_err("no audience");
+    assert!(matches!(err, ServiceSecretError::MissingAudience));
+    assert!(err.to_string().contains("audience"), "{err}");
+
+    assert!(
+        ServiceSecretLayer::signed(
+            ServiceSecrets::new(),
+            SignedRequests::default().accept_unaddressed_until(Utc::now()),
+        )
+        .is_ok(),
+        "a window alone addresses the route"
+    );
+}
+
+/// Inside the window the route reads `v1`; at the instant and after it,
+/// nothing does, and a `v2` for its audience is read throughout.
+#[tokio::test]
+async fn v1_is_read_inside_the_window_and_refused_once_the_clock_passes_it() {
+    let clock = clock();
+    let until = Utc.timestamp_opt(EPOCH + 1_000, 0).single().expect("valid");
+    let app = signed_app(&clock, addressed().accept_unaddressed_until(until));
+
+    let inside = signed_v1(RELAY, EPOCH, "/hook", "a");
+    assert_eq!(send(&app, inside).await.0, StatusCode::OK);
+    let for_other = signed_for("reports", RELAY, EPOCH, "/hook", "a");
+    assert_eq!(send(&app, for_other).await.0, StatusCode::UNAUTHORIZED);
+
+    clock.advance_secs(1_000);
+    let after = signed_v1(RELAY, EPOCH + 1_000, "/hook", "b");
+    assert_eq!(send(&app, after).await.0, StatusCode::UNAUTHORIZED);
+    let v2 = signed_for(AUDIENCE, RELAY, EPOCH + 1_000, "/hook", "b");
+    assert_eq!(send(&app, v2).await.0, StatusCode::OK);
+}
+
+/// A route with a window and no audience reads `v1` inside it and nothing
+/// after, and never a `v2`.
+#[tokio::test]
+async fn a_windowed_route_without_an_audience_reads_only_v1_until_the_instant() {
+    let clock = clock();
+    let until = Utc.timestamp_opt(EPOCH + 100, 0).single().expect("valid");
+    let app = signed_app(
+        &clock,
+        SignedRequests::default().accept_unaddressed_until(until),
+    );
+    let v2 = signed_for(AUDIENCE, RELAY, EPOCH, "/hook", "a");
+    assert_eq!(send(&app, v2).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        send(&app, signed_v1(RELAY, EPOCH, "/hook", "a")).await.0,
+        StatusCode::OK
+    );
+    clock.advance_secs(100);
+    let after = signed_v1(RELAY, EPOCH + 100, "/hook", "b");
+    assert_eq!(send(&app, after).await.0, StatusCode::UNAUTHORIZED);
+}
+
+/// After the clock steps back past the last sweep, sweeping carries on: the
+/// stamp in the future counted as "not due", so a full cache of entries
+/// stamped by the later clock was never swept and refused every request
+/// with 503 until the clock caught up.
+#[tokio::test]
+async fn sweeping_resumes_after_the_clock_steps_back() {
+    let clock = clock();
+    let config = addressed()
+        .tolerance(Duration::from_secs(60))
+        .max_remembered(3);
+    let (v, secrets) = verifier(&clock, config);
+
+    let later = EPOCH + 10_000;
+    clock.advance_secs(10_000);
+    for body in ["1", "2", "3"] {
+        assert_eq!(verdict(&v, &secrets, later, body).await, StatusCode::OK);
+    }
+    assert_eq!(
+        verdict(&v, &secrets, later, "4").await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "full at the later time"
+    );
+
+    // The clock steps back an hour; the three entries are now far in the
+    // future and no longer count as live.
+    clock.advance_secs(-3_600);
+    let earlier = later - 3_600;
+    assert_eq!(
+        verdict(&v, &secrets, earlier, "5").await,
+        StatusCode::OK,
+        "the cache is swept even though its last sweep stamp is in the future"
+    );
+    assert_eq!(v.remembered(), 1);
 }

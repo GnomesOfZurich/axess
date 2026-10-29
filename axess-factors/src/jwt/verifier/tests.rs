@@ -557,3 +557,72 @@ fn compute_replay_ttl_covers_the_leeway_window() {
         Duration::from_secs(24 * 60 * 60)
     );
 }
+
+/// The pins are visible to a resolver that wants to insist on them.
+#[test]
+fn the_pins_are_reported() {
+    let (_, jwks, _) = rsa_keypair();
+    let bare = JwtVerifier::new(handle(jwks.clone()));
+    assert!(!bare.has_issuer() && !bare.has_audience());
+    let pinned = JwtVerifier::new(handle(jwks))
+        .with_issuer("https://idp.example.com")
+        .with_audience("svc");
+    assert!(pinned.has_issuer() && pinned.has_audience());
+    // Keeping the pins across the replay-store type change.
+    let with_store = pinned.with_replay_store(NoReplay);
+    assert!(with_store.has_issuer() && with_store.has_audience());
+}
+
+/// A verifier with no audience pin and no waiver refuses every token, since a
+/// token minted for another service of the same issuer would otherwise
+/// verify; the waiver and the pin each lift the refusal.
+#[tokio::test]
+async fn a_missing_audience_pin_refuses_unless_waived() {
+    let (der, jwks, kid) = rsa_keypair();
+    let claims = serde_json::json!({
+        "sub": "s",
+        "exp": now_secs() + 300,
+    });
+    let token = sign(&claims, &kid, &der);
+
+    let bare = JwtVerifier::new(handle(jwks.clone()));
+    let err = bare
+        .verify::<serde_json::Value>(&token)
+        .await
+        .expect_err("no audience decision, no verification");
+    assert!(err.to_string().contains("audience"), "{err}");
+
+    let waived = JwtVerifier::new(handle(jwks.clone())).allow_any_audience();
+    waived.verify::<serde_json::Value>(&token).await.unwrap();
+
+    let pinned = JwtVerifier::new(handle(jwks)).with_audience("svc");
+    let mut with_aud = claims;
+    with_aud["aud"] = serde_json::json!("svc");
+    pinned
+        .verify::<serde_json::Value>(&sign(&with_aud, &kid, &der))
+        .await
+        .unwrap();
+}
+
+/// A correctly signed token over the size limit is refused: the limit
+/// applies to the verifier (and so to the JWT-SVID resolver built on it), not
+/// only to the claim helper.
+#[tokio::test]
+async fn an_oversized_signed_token_is_refused() {
+    let (der, jwks, kid) = rsa_keypair();
+    let now = now_secs();
+    let token = sign(
+        &serde_json::json!({
+            "iss": "https://idp.example.com",
+            "sub": "workload-42",
+            "aud": "my-svc",
+            "exp": now + 3600,
+            "padding": "p".repeat(crate::jwt::claims::MAX_JWT_BYTES),
+        }),
+        &kid,
+        &der,
+    );
+    let verifier = JwtVerifier::new(handle(jwks)).with_audience("my-svc");
+    let err = verifier.verify::<WorkloadClaims>(&token).await.unwrap_err();
+    assert!(matches!(err, JwtError::TooLarge { .. }), "{err:?}");
+}

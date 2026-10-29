@@ -280,3 +280,41 @@ async fn custom_claim_deser_failure_rejected() {
 fn issuer_oauth_wire_string_is_stable() {
     assert_eq!(Issuer::OAuth.as_str(), "oauth");
 }
+
+/// A workload token is only valid for the audience it names, and a shared
+/// issuer makes `aud` the only separation between services: a verifier that
+/// pins no audience (or no issuer) is refused even for a token it would
+/// otherwise verify.
+#[tokio::test]
+async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(&okta_claims(), &kid, &der);
+    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let handle = || Arc::new(RwLock::new(jwks.clone()));
+    let unpinned: [Arc<JwtVerifier>; 3] = [
+        Arc::new(JwtVerifier::new(handle()).with_issuer("https://gnomes.okta.com")),
+        Arc::new(JwtVerifier::new(handle()).with_audience("axess-platform")),
+        Arc::new(
+            JwtVerifier::new(handle())
+                .with_issuer("https://gnomes.okta.com")
+                .allow_any_audience(),
+        ),
+    ];
+    for verifier in unpinned {
+        let resolver = WorkloadResolver::new(
+            verifier,
+            trust.clone(),
+            sample_tenant(),
+            Issuer::OAuth,
+            token.clone(),
+            okta_mapper(trust.clone()),
+        );
+        assert!(
+            matches!(
+                resolver.resolve().await,
+                Err(IdentityError::NotAuthenticated)
+            ),
+            "an unpinned verifier must be refused"
+        );
+    }
+}

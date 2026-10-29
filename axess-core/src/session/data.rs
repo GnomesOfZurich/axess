@@ -69,6 +69,41 @@ pub struct SessionData {
     pub device_id: Option<DeviceId>,
     /// Escape hatch for application-specific data stored alongside the session.
     pub custom: serde_json::Value,
+    /// Write counter: the session layer raises it on every write to the
+    /// store. A store's compare-and-swap
+    /// ([`SessionStore::update_if_revision`](super::store::SessionStore::update_if_revision))
+    /// compares it, which is what makes a one-shot custom value single-use
+    /// across concurrent requests. Sessions stored before the field existed
+    /// read as `0`.
+    #[serde(default)]
+    pub revision: u64,
+    /// When the layer last re-armed the stored row's lifetime: set by every
+    /// write and by the idle-expiry refresh of a read-only request. `None`
+    /// for a session stored before the field existed, which is refreshed on
+    /// its next request.
+    #[serde(default)]
+    pub touched_at: Option<DateTime<Utc>>,
+}
+
+/// Custom key under which the login service stamps the flow in flight. The
+/// transition to `Authenticated` keeps it: the registration step that follows
+/// reads it to check the credentials did not change meanwhile.
+pub(crate) const LOGIN_FLOW_KEY: &str = "axess.login.flow";
+
+/// Drop the pre-login contents of the custom bag when a session becomes
+/// authenticated, keeping the key the login service owns for the flow in
+/// flight and the keys the application registered to be carried across.
+///
+/// State an anonymous visitor could put in a session (a cart, a locale, a
+/// planted value) must not ride into the authenticated session, so the
+/// default keeps nothing else.
+pub(crate) fn retain_across_login(custom: &mut serde_json::Value, preserved: &[String]) {
+    match custom {
+        serde_json::Value::Object(map) => {
+            map.retain(|key, _| key == LOGIN_FLOW_KEY || preserved.iter().any(|p| p == key));
+        }
+        other => *other = serde_json::Value::default(),
+    }
 }
 
 /// Length in bytes of `value` serialized as compact JSON, counted without
@@ -105,6 +140,8 @@ impl Default for SessionData {
             fingerprint: None,
             device_id: None,
             custom: serde_json::Value::default(),
+            revision: 0,
+            touched_at: None,
         }
     }
 }
@@ -324,6 +361,34 @@ impl AuthState {
             attempt_count: 0,
             last_attempt: None,
         };
+    }
+
+    /// Turn an `Authenticated` state back into `Authenticating` for a
+    /// step-up: the user and tenant are kept, `steps` become the remaining
+    /// steps, and the factors already completed are carried over so the
+    /// state that results from finishing the step holds them all.
+    ///
+    /// Returns `false`, changing nothing, from any state but `Authenticated`.
+    pub(crate) fn begin_step_up(&mut self, steps: Vec<FactorStep>) -> bool {
+        let AuthState::Authenticated {
+            user_id,
+            tenant_id,
+            factors_completed,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        *self = AuthState::Authenticating {
+            user_id: *user_id,
+            tenant_id: *tenant_id,
+            method_name: Arc::from("step-up"),
+            remaining: steps,
+            completed: std::mem::take(factors_completed),
+            attempt_count: 0,
+            last_attempt: None,
+        };
+        true
     }
 
     /// Replace the state with `Authenticated { … }`.

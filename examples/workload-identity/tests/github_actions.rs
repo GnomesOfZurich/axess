@@ -8,13 +8,19 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use axess_example_workload_identity::github_actions::{GitHubActionsClaims, github_actions_mapper};
+use axess_example_workload_identity::github_actions::{
+    GitHubActionsClaims, GitHubAllowlist, github_actions_mapper,
+};
 use axess_factors::federation::workload::WorkloadResolver;
 use axess_identity::{Issuer, Principal, PrincipalResolver, TenantId, TrustDomain};
 
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUDIENCE: &str = "axess-platform";
 const TRUST_DOMAIN: &str = "github.actions";
+
+fn allowlist() -> GitHubAllowlist {
+    GitHubAllowlist::new().owner_id("123456")
+}
 
 fn sample_tenant() -> TenantId {
     TenantId::from_bytes([42u8; 16])
@@ -29,6 +35,8 @@ fn github_claims(now: i64, exp: i64) -> serde_json::Value {
         "iat": now,
         "repository": "gnomes/axess",
         "repository_owner": "gnomes",
+        "repository_id": "987654321",
+        "repository_owner_id": "123456",
         "actor": "octocat",
         "workflow": "ci",
         "ref": "refs/heads/main",
@@ -51,7 +59,7 @@ async fn recipe_resolves_real_github_shape_token() {
         sample_tenant(),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust.clone()),
+        github_actions_mapper(trust.clone(), allowlist()),
     );
 
     let principal = resolver.resolve().await.expect("recipe must resolve");
@@ -60,15 +68,17 @@ async fn recipe_resolves_real_github_shape_token() {
     };
     assert_eq!(
         w.workload_id.as_str(),
-        "spiffe://github.actions/axess/gnomes"
+        "spiffe://github.actions/987654321/123456"
     );
     assert_eq!(w.trust_domain, trust);
     assert_eq!(w.issuer.as_str(), "github_actions");
     assert_eq!(w.tenant_id, sample_tenant());
-    assert_eq!(w.service_name, "axess");
-    assert_eq!(w.tenant_slug, "gnomes");
-    // All five attribute fields preserved.
+    assert_eq!(w.service_name, "987654321");
+    assert_eq!(w.tenant_slug, "123456");
+    // The names travel as attributes; the five optional fields are preserved.
     let expected: BTreeMap<String, serde_json::Value> = [
+        ("repository", "gnomes/axess"),
+        ("repository_owner", "gnomes"),
         ("actor", "octocat"),
         ("workflow", "ci"),
         ("ref", "refs/heads/main"),
@@ -99,7 +109,7 @@ async fn recipe_rejects_repository_owner_mismatch() {
         sample_tenant(),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust),
+        github_actions_mapper(trust, allowlist()),
     );
 
     let err = resolver
@@ -128,6 +138,8 @@ async fn recipe_omits_missing_optional_attributes() {
             "iat": now,
             "repository": "gnomes/axess",
             "repository_owner": "gnomes",
+            "repository_id": "987654321",
+            "repository_owner_id": "123456",
         }),
         "gha-min",
         &der,
@@ -141,7 +153,7 @@ async fn recipe_omits_missing_optional_attributes() {
         sample_tenant(),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust),
+        github_actions_mapper(trust, allowlist()),
     );
 
     let Principal::Workload(w) = resolver
@@ -151,5 +163,68 @@ async fn recipe_omits_missing_optional_attributes() {
     else {
         panic!("expected Workload");
     };
-    assert!(w.attributes.is_empty(), "no optional fields → no attrs");
+    assert_eq!(
+        w.attributes.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["repository", "repository_owner"],
+        "no optional fields: only the audit names"
+    );
+}
+
+async fn resolve_with(
+    claims_edit: impl FnOnce(&mut serde_json::Value),
+    allow: GitHubAllowlist,
+) -> Result<Principal, axess_identity::IdentityError> {
+    let (der, jwks) = common::rsa_keypair("gha-id");
+    let (now, exp) = common::now_and_exp();
+    let mut claims = github_claims(now, exp);
+    claims_edit(&mut claims);
+    let token = common::sign(&claims, "gha-id", &der);
+    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
+    WorkloadResolver::<GitHubActionsClaims, _, _>::new(
+        verifier,
+        trust.clone(),
+        sample_tenant(),
+        Issuer::custom("github_actions").unwrap(),
+        token,
+        github_actions_mapper(trust, allow),
+    )
+    .resolve()
+    .await
+}
+
+/// A recycled organisation name carries a different owner id: the token has
+/// the name the operator trusted and is still refused.
+#[tokio::test]
+async fn a_reused_owner_name_with_a_different_owner_id_is_refused() {
+    let out = resolve_with(
+        |c| c["repository_owner_id"] = serde_json::json!("999999"),
+        allowlist(),
+    )
+    .await;
+    assert!(out.is_err(), "{out:?}");
+}
+
+/// A token without the immutable ids is refused rather than falling back to names.
+#[tokio::test]
+async fn a_token_without_the_numeric_ids_is_refused() {
+    let out = resolve_with(
+        |c| {
+            c.as_object_mut().unwrap().remove("repository_id");
+        },
+        allowlist(),
+    )
+    .await;
+    assert!(out.is_err(), "{out:?}");
+}
+
+/// When repository ids are listed, a sibling repository of a trusted owner is refused.
+#[tokio::test]
+async fn a_repository_outside_the_listed_ids_is_refused() {
+    let only_other = GitHubAllowlist::new().owner_id("123456").repository_id("1");
+    assert!(resolve_with(|_| {}, only_other).await.is_err());
+    let listed = GitHubAllowlist::new()
+        .owner_id("123456")
+        .repository_id("987654321");
+    assert!(resolve_with(|_| {}, listed).await.is_ok());
 }

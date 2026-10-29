@@ -5,8 +5,8 @@
 //! Variants for SHA-1 (RFC default), SHA-256, and SHA-512 cover the
 //! OATH-compliant hardware-token universe.
 
+use crate::factor_secret::FactorSecret;
 use crate::otp_algorithm::OtpAlgorithm;
-use crate::secret::ZeroizedString;
 use crate::{MAX_HOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -35,8 +35,12 @@ pub const HOTP_LENGTH: usize = 6;
 /// HOTP factor configuration (RFC 4226).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HotpConfig {
-    /// Shared secret (raw bytes, base32-encoded for provisioning URIs). Zeroized on drop.
-    pub secret: ZeroizedString,
+    /// Shared secret (raw bytes, base32-encoded for provisioning URIs). Plain
+    /// text is zeroized in memory on drop, redacted in `Debug`, and written to
+    /// the store as it stands; seal it with a `FactorSecretCipher` to keep it
+    /// encrypted at rest. See the OTP secret section of the password and TOTP
+    /// guide.
+    pub secret: FactorSecret,
     /// Number of digits in the generated code (typically 6).
     pub digits: u8,
     /// HMAC algorithm used for code derivation.
@@ -71,7 +75,7 @@ fn default_max_hotp_attempts() -> u8 {
 impl Default for HotpConfig {
     fn default() -> Self {
         Self {
-            secret: ZeroizedString::new(""),
+            secret: FactorSecret::Plain(crate::secret::ZeroizedString::new("")),
             digits: 6,
             algorithm: OtpAlgorithm::Sha1,
             counter: 0,

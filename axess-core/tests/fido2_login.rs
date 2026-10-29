@@ -10,6 +10,7 @@ use axess_core::authn::error::AuthnError;
 use axess_core::authn::factor::{
     FactorConfig, FactorCredential, FactorKind, Fido2Config, Fido2Credential, Fido2Options,
 };
+use axess_core::authn::service::FactorOutcome;
 use axess_core::authn::service::{AuthnService, RequestAuthnService};
 use axess_core::authn::store::{AuthMethod, FactorStore, IdentityAdmin};
 use axess_core::authn::types::{AuthnScope, StatusDetail};
@@ -19,7 +20,7 @@ use axess_core::testing::{
     test_session,
 };
 use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider};
-use common::{test_tenant, test_user, uid};
+use common::{session_for, test_tenant, test_user, uid};
 use url::Url;
 use webauthn_rs::prelude::*;
 
@@ -135,6 +136,20 @@ struct Fixture {
 /// A user with passkey `AAAA` stored (when `with_passkey`) and a
 /// FIDO2-only login method.
 fn fixture(with_passkey: bool) -> Fixture {
+    fixture_with(
+        with_passkey,
+        vec![vec![FactorKind::Fido2]],
+        axess_core::authn::types::EntityState::Active,
+    )
+}
+
+/// As [`fixture`], with the user's login methods (each a list of required
+/// factors, in order) and the tenant's status chosen by the test.
+fn fixture_with(
+    with_passkey: bool,
+    methods: Vec<Vec<FactorKind>>,
+    tenant_status: axess_core::authn::types::EntityState,
+) -> Fixture {
     let user = test_user("u1", "alice");
     let scope = AuthnScope::User {
         tenant_id: user.tenant_id,
@@ -142,10 +157,13 @@ fn fixture(with_passkey: bool) -> Fixture {
     };
     let clock = MockClock::now();
     let stored_at = chrono::Utc::now();
-    let mut factors = MockFactorStore::new().with_method(
-        &uid("u1"),
-        AuthMethod::sequential("fido2", vec![FactorKind::Fido2], scope.clone()),
-    );
+    let mut factors = MockFactorStore::new();
+    for (n, kinds) in methods.into_iter().enumerate() {
+        factors = factors.with_method(
+            &uid("u1"),
+            AuthMethod::sequential(format!("method-{n}"), kinds, scope.clone()),
+        );
+    }
     if with_passkey {
         factors = factors.with_factor(
             scope.clone(),
@@ -159,8 +177,10 @@ fn fixture(with_passkey: bool) -> Fixture {
             .unwrap()
             .build()
             .unwrap();
+    let mut tenant = test_tenant();
+    tenant.status = tenant_status;
     let identity = MockIdentityStore::new()
-        .with_default_tenant(test_tenant())
+        .with_default_tenant(tenant)
         .with_user(user);
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_fido2(AcceptingProvider(DefaultFido2Provider::new(webauthn)))
@@ -193,7 +213,12 @@ async fn stored(f: &Fixture) -> Option<Vec<Fido2Credential>> {
 async fn delete_first(f: &Fixture) {
     let removed = f
         .service
-        .delete_fido2_credential(&test_user("u1", "alice"), passkey(AAAA).cred_id(), 0)
+        .delete_fido2_credential(
+            &test_user("u1", "alice"),
+            &session_for(&test_user("u1", "alice")).await,
+            passkey(AAAA).cred_id(),
+            0,
+        )
         .await
         .unwrap();
     assert!(removed);
@@ -367,7 +392,7 @@ async fn a_discoverable_failure_leaves_no_ceremony_timestamp() {
 async fn a_registration_finishes_once_and_audits_once() {
     let f = fixture(true);
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -403,7 +428,7 @@ async fn a_registration_finishes_once_and_audits_once() {
 async fn a_registration_of_an_already_stored_passkey_is_refused_without_an_audit() {
     let f = fixture(true);
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -431,7 +456,7 @@ async fn a_registration_of_an_already_stored_passkey_is_refused_without_an_audit
 async fn a_failed_registration_finish_consumes_the_state() {
     let f = fixture(true);
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -457,7 +482,7 @@ async fn a_failed_registration_finish_consumes_the_state() {
 async fn an_account_suspended_mid_registration_cannot_add_a_passkey() {
     let f = fixture(true);
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -488,7 +513,7 @@ async fn an_account_suspended_mid_registration_cannot_add_a_passkey() {
 async fn starting_one_ceremony_does_not_refresh_another_ones_timeout() {
     let f = fixture(true);
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     // A registration left in flight, then the clock runs past the timeout.
     f.service
         .begin_fido2_registration(&user, &session)
@@ -509,5 +534,132 @@ async fn starting_one_ceremony_does_not_refresh_another_ones_timeout() {
         stored(&f).await.unwrap().len(),
         1,
         "the stale registration did not complete"
+    );
+}
+
+// ── The passkey login honours the user's own method and the tenant ──────────
+
+#[tokio::test]
+async fn a_passkey_only_method_ends_authenticated_with_the_passkey_recorded() {
+    let f = fixture(true);
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let outcome = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, FactorOutcome::Authenticated),
+        "{outcome:?}"
+    );
+    match session.auth_state().await {
+        axess_core::session::data::AuthState::Authenticated {
+            factors_completed, ..
+        } => assert_eq!(factors_completed, vec![FactorKind::Fido2]),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_password_then_passkey_method_is_not_satisfied_by_the_passkey_alone() {
+    let f = fixture_with(
+        true,
+        vec![vec![FactorKind::Password, FactorKind::Fido2]],
+        axess_core::authn::types::EntityState::Active,
+    );
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
+    assert!(!session.is_authenticated().await);
+}
+
+#[tokio::test]
+async fn a_passkey_then_more_method_continues_with_the_next_factor() {
+    let f = fixture_with(
+        true,
+        vec![vec![FactorKind::Fido2, FactorKind::Totp]],
+        axess_core::authn::types::EntityState::Active,
+    );
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let outcome = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, FactorOutcome::FactorRequired(FactorKind::Totp)),
+        "{outcome:?}"
+    );
+    assert!(!session.is_authenticated().await);
+}
+
+#[tokio::test]
+async fn a_suspended_tenant_refuses_the_passkey_login() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let f = fixture_with(
+        true,
+        vec![vec![FactorKind::Fido2]],
+        EntityState::Suspended(StatusDetail {
+            reason: "hold".into(),
+            since: chrono::Utc::now(),
+            until: None,
+        }),
+    );
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::InvalidAssertion), "{err:?}");
+    assert!(!session.is_authenticated().await);
+}
+
+#[tokio::test]
+async fn a_tenant_bound_ceremony_refuses_a_user_of_another_tenant() {
+    let f = fixture(true);
+    let session = test_session();
+    f.service
+        .begin_discoverable_login_in_tenant(&axess_identity::testing::tenant("t2"), &session)
+        .await
+        .unwrap();
+    let list = stored(&f).await.unwrap_or_default();
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::CrossTenant), "{err:?}");
+    assert!(!session.is_authenticated().await);
+}
+
+#[tokio::test]
+async fn a_missing_ceremony_state_does_not_leave_its_timestamp_behind() {
+    let f = fixture(true);
+    let session = test_session();
+    session
+        .set_custom(
+            "axess.fido2.disc_started",
+            serde_json::Value::String(f.clock.now().to_rfc3339()),
+        )
+        .await;
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &[], &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
+    let left = session.get_custom("axess.fido2.disc_started").await;
+    assert!(
+        left.as_ref().is_none_or(|v| v.is_null()),
+        "stamp left behind: {left:?}"
     );
 }

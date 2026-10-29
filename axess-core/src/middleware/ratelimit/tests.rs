@@ -9,11 +9,14 @@ use axum::http::HeaderValue;
 use chrono::TimeZone;
 use tower::ServiceExt;
 
+mod hardening;
 mod key_bounds;
 mod sliding_window;
 mod sweep;
 
-use keys::{MAX_KEY_LEN, extract_peer_ip};
+use keys::{MAX_KEY_LEN, extract_key, resolve_target};
+use std::sync::atomic::Ordering;
+use store::HARD_BUCKET_CAP;
 
 /// A fixed origin well away from the real clock.
 fn t_zero() -> DateTime<Utc> {
@@ -482,17 +485,17 @@ fn extract_peer_ip_reads_socket_addr_from_extensions() {
     let mut req = Request::new(Body::empty());
     let addr: SocketAddr = "192.0.2.7:54321".parse().expect("test addr");
     req.extensions_mut().insert(addr);
-    let ip = extract_peer_ip(&req);
+    let ip = resolve_target(&req, &KeyExtractor::PeerIp).key;
     assert_eq!(
-        ip, "192.0.2.7",
-        "extract_peer_ip must return the SocketAddr's IP"
+        ip, "ip:192.0.2.7",
+        "the peer key must carry the SocketAddr's IP"
     );
 
     // No SocketAddr → fail-closed shared bucket name.
     let req = Request::new(Body::empty());
-    let ip = extract_peer_ip(&req);
+    let ip = resolve_target(&req, &KeyExtractor::PeerIp).key;
     assert_eq!(
-        ip, "unknown",
+        ip, "ip:unknown",
         "missing SocketAddr must fall through to the shared 'unknown' bucket"
     );
 }

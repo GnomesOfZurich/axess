@@ -227,6 +227,7 @@ mod tests {
             rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
+            consume: None,
         };
         let handle = SessionHandle(Arc::new(RwLock::new(inner)));
         let request = Request::builder()

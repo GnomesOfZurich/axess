@@ -6,6 +6,18 @@
 //! URI (`spiffe://<trust_domain>/...`) and the trust domain matches the
 //! pinned expectation.
 //!
+//! # Trust domains and the root store
+//!
+//! This module checks that the certificate's trust domain equals the one
+//! pinned in [`MtlsResolver`]. It does not validate the chain: the TLS
+//! terminator does. The terminator's client-certificate root store must
+//! therefore hold only the CA bundle of the pinned trust domain. A root
+//! store that mixes the bundles of several trust domains lets any of those
+//! authorities mint a certificate that chains correctly, so keep one
+//! resolver and one root store per trust domain, or verify per trust
+//! domain bundle in the terminator. A leaf with more than one SPIFFE URI
+//! SAN, or one that may sign certificates, is refused.
+//!
 //! # Wiring expectations
 //!
 //! axess does not terminate TLS; adopters do, in front of axess. The
@@ -158,20 +170,27 @@ pub fn peek_spiffe(peer_cert: &CertificateDer<'_>) -> Result<SpiffeIdComponents,
         .map_err(|e| MtlsError::CertParse(e.to_string()))?
         .ok_or(MtlsError::NoSan)?;
 
-    // Per SPIFFE X509-SVID spec §3: the SVID identifier MUST appear in
-    // the URI SAN. Walk the URIs and take the first that starts with
-    // `spiffe://`. Multiple SPIFFE URIs in one cert is not part of the
-    // SVID spec; if it ever surfaces in practice, take the first one
-    // (deterministic).
-    let spiffe_uri = san_ext
+    // X509-SVID spec: a leaf names exactly one SPIFFE ID, in the URI SAN,
+    // and is never a CA. A certificate with two SPIFFE URIs is ambiguous
+    // about who it is, and "take the first" would let whoever controls the
+    // SAN order pick the identity, so it is refused. So is a certificate
+    // that may sign other certificates (basicConstraints CA, keyCertSign,
+    // cRLSign): such a certificate is a CA, not a workload leaf.
+    let mut spiffe_uris = san_ext
         .value
         .general_names
         .iter()
-        .find_map(|name| match name {
+        .filter_map(|name| match name {
             GeneralName::URI(uri) if uri.starts_with("spiffe://") => Some(*uri),
             _ => None,
-        })
-        .ok_or(MtlsError::NoSpiffeUri)?;
+        });
+    let spiffe_uri = spiffe_uris.next().ok_or(MtlsError::NoSpiffeUri)?;
+    if spiffe_uris.next().is_some() {
+        return Err(MtlsError::Identity(IdentityError::InvalidSpiffeId(
+            "certificate carries more than one SPIFFE URI SAN".into(),
+        )));
+    }
+    reject_signing_leaf(&cert)?;
 
     let workload_id = WorkloadId::parse(spiffe_uri).map_err(MtlsError::Identity)?;
     let (trust_domain, service_name, tenant_slug) =
@@ -183,6 +202,33 @@ pub fn peek_spiffe(peer_cert: &CertificateDer<'_>) -> Result<SpiffeIdComponents,
         service_name,
         tenant_slug,
     })
+}
+
+/// Refuse a certificate that is allowed to sign other certificates.
+fn reject_signing_leaf(cert: &X509Certificate<'_>) -> Result<(), MtlsError> {
+    let bad = |what: &str| {
+        MtlsError::Identity(IdentityError::InvalidSpiffeId(format!(
+            "X509-SVID leaf must not be a signing certificate ({what})"
+        )))
+    };
+    let basic = cert
+        .basic_constraints()
+        .map_err(|e| MtlsError::CertParse(e.to_string()))?;
+    if basic.is_some_and(|b| b.value.ca) {
+        return Err(bad("basicConstraints CA"));
+    }
+    let usage = cert
+        .key_usage()
+        .map_err(|e| MtlsError::CertParse(e.to_string()))?;
+    if let Some(u) = usage {
+        if u.value.key_cert_sign() {
+            return Err(bad("keyCertSign"));
+        }
+        if u.value.crl_sign() {
+            return Err(bad("cRLSign"));
+        }
+    }
+    Ok(())
 }
 
 /// Resolver that produces [`Principal::Workload`] from a SPIFFE

@@ -38,6 +38,17 @@
 //! let principal = resolver.resolve().await?;
 //! ```
 //!
+//! # Pin the service-account UID
+//!
+//! A service account is named by `(namespace, name)`, and a name can be
+//! deleted and created again by anyone who may create service accounts in
+//! that namespace; the new account's tokens then carry the name you
+//! trusted. The `uid` claim does not survive that: a recreated account gets
+//! a new UID. [`k8s_sa_mapper`] records the UID as the `sa_uid` attribute
+//! but does not require it. Use [`k8s_sa_mapper_pinned`] with
+//! [`SaUidPins`] to refuse a token whose UID is missing or not the one
+//! registered for its `(namespace, name)`.
+//!
 //! # SPIFFE path shape
 //!
 //! Recipe synthesises `spiffe://<trust_domain>/<sa_name>/<namespace>`
@@ -46,7 +57,7 @@
 //! if you prefer the other order or want to encode `pod.name` /
 //! `pod.uid` as additional path segments.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use axess_factors::federation::workload::WorkloadMapping;
 use axess_factors::jwt::verifier::VerifiedClaims;
@@ -90,6 +101,56 @@ pub struct K8sNamespacedClaims {
 pub struct K8sCustomClaims {
     #[serde(rename = "kubernetes.io")]
     pub kubernetes_io: K8sNamespacedClaims,
+}
+
+/// The service-account UIDs a deployment trusts, keyed by
+/// `(namespace, service-account name)`.
+#[derive(Debug, Clone, Default)]
+pub struct SaUidPins(HashMap<(String, String), String>);
+
+impl SaUidPins {
+    /// An empty set, which refuses every token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Trust the service account `name` in `namespace` only with this UID.
+    pub fn pin(
+        mut self,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        uid: impl Into<String>,
+    ) -> Self {
+        self.0.insert((namespace.into(), name.into()), uid.into());
+        self
+    }
+
+    fn admits(&self, namespace: &str, name: &str, uid: Option<&str>) -> bool {
+        let pinned = self.0.get(&(namespace.to_string(), name.to_string()));
+        matches!((pinned, uid), (Some(p), Some(u)) if p == u)
+    }
+}
+
+/// Like [`k8s_sa_mapper`], but refuses a token whose service-account UID is
+/// absent or differs from the one pinned for its `(namespace, name)`, and
+/// every account that is not pinned at all.
+pub fn k8s_sa_mapper_pinned(
+    trust_domain: TrustDomain,
+    pins: SaUidPins,
+) -> impl Fn(&VerifiedClaims<K8sCustomClaims>) -> Result<WorkloadMapping, IdentityError> + Send + Sync
+{
+    let inner = k8s_sa_mapper(trust_domain);
+    move |claims| {
+        let ns = &claims.custom.kubernetes_io;
+        if !pins.admits(
+            &ns.namespace,
+            &ns.serviceaccount.name,
+            ns.serviceaccount.uid.as_deref(),
+        ) {
+            return Err(IdentityError::NotAuthenticated);
+        }
+        inner(claims)
+    }
 }
 
 /// Build the claim-mapping closure for [`WorkloadResolver`](axess_factors::federation::workload::WorkloadResolver).

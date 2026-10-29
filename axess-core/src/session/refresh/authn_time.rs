@@ -56,9 +56,17 @@ async fn refreshed_session_keeps_the_login_time_across_a_long_rotation_chain() {
     let mut now = login_time();
     for _ in 0..3 {
         now += Duration::days(10) - Duration::hours(8);
-        let (session, next) = refresh_session(&plaintext, &store, &config, &rng, now, None)
-            .await
-            .unwrap();
+        let (session, next) = refresh_session_with_status_check(
+            &plaintext,
+            &store,
+            &config,
+            &rng,
+            now,
+            None,
+            |_| async { true },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             authn_time_of(&session),
             login_time(),
@@ -79,13 +87,14 @@ async fn a_row_without_authn_time_reads_as_its_issue_time() {
     let rng = MockRng::new(8);
     let plaintext = issue_at_login(&store, &rng).await;
 
-    let (session, _) = refresh_session(
+    let (session, _) = refresh_session_with_status_check(
         &plaintext,
         &store,
         &config,
         &rng,
         login_time() + Duration::days(2),
         None,
+        |_| async { true },
     )
     .await
     .unwrap();

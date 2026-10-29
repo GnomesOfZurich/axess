@@ -3,8 +3,7 @@
 //!
 //! Each method is a thin pass-through to the configured provider; the
 //! security-relevant logic (allowlist enforcement on logout redirects,
-//! ephemeral-key sourcing for DPoP) lives on the provider implementation
-//! itself.
+//! proof signing for DPoP) lives on the provider implementation itself.
 
 use crate::authn::service::AuthnService;
 use crate::authn::store::{FactorStore, IdentityStore};
@@ -21,7 +20,9 @@ where
     /// and redirect the user back to `post_logout_redirect_uri`.
     ///
     /// Returns `None` if the provider doesn't advertise an `end_session_endpoint`
-    /// in its OIDC discovery metadata.
+    /// in its OIDC discovery metadata. A `post_logout_redirect_uri` is
+    /// forwarded only when it matches an entry of the provider's configured
+    /// allowlist exactly; with no allowlist configured it is dropped.
     ///
     /// # Arguments
     ///
@@ -69,14 +70,30 @@ where
         provider.revoke_token(token, token_type_hint).await
     }
 
+    /// A fresh DPoP key for one session, drawn from the service's injected
+    /// [`SecureRng`](axess_rng::SecureRng).
+    ///
+    /// RFC 9449 binds an access token to one key (`cnf.jkt`) and requires
+    /// every proof presented with that token to be signed by it. Make one key
+    /// when the session starts, keep it for the token's life (the key exports its
+    /// scalar for that), and pass it to every
+    /// [`generate_dpop_proof`](Self::generate_dpop_proof) call.
+    ///
+    /// Requires the `fapi` feature.
+    #[cfg(feature = "fapi")]
+    pub fn new_dpop_key(&self) -> axess_factors::oauth::DpopKey {
+        axess_factors::oauth::DpopKey::generate(&*self.inner.rng)
+    }
+
     /// Generate a DPoP proof JWT for an API call to a resource server.
     ///
-    /// The proof binds the request to an ephemeral key pair. Include the
-    /// returned JWT in the `DPoP` header. The `thumbprint` should match the
-    /// `jkt` claim in the sender-constrained access token.
+    /// The proof is signed with `key`, the one key the token is bound to, so
+    /// two proofs for different URLs report the same `thumbprint`, which is
+    /// the `jkt` of the sender-constrained access token. Include the returned
+    /// JWT in the `DPoP` header. Pass `access_token` to add the `ath` claim
+    /// that ties the proof to that token.
     ///
-    /// The 32 bytes that derive the ephemeral ES256 key, then the 16 bytes
-    /// behind the `jti`, are drawn from the service's injected
+    /// The 16 bytes behind the `jti` are drawn from the service's injected
     /// [`SecureRng`](axess_rng::SecureRng), and `iat` is read from its
     /// injected clock, so DST tests get reproducible proofs.
     ///
@@ -85,6 +102,7 @@ where
     pub fn generate_dpop_proof(
         &self,
         provider_name: &str,
+        key: &axess_factors::oauth::DpopKey,
         http_method: &str,
         http_url: &str,
         access_token: Option<&str>,
@@ -97,20 +115,10 @@ where
             .get(provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?;
 
-        let mut key_seed = [0u8; 32];
-        self.inner.rng.fill_bytes(&mut key_seed);
-
         let mut jti_bytes = [0u8; 16];
         self.inner.rng.fill_bytes(&mut jti_bytes);
         let iat = self.inner.clock.now().timestamp();
 
-        provider.generate_dpop_proof(
-            http_method,
-            http_url,
-            access_token,
-            key_seed,
-            iat,
-            jti_bytes,
-        )
+        provider.generate_dpop_proof(key, http_method, http_url, access_token, iat, jti_bytes)
     }
 }

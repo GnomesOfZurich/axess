@@ -76,6 +76,28 @@ pub fn verify_password(password: impl AsRef<[u8]>, hash: &str) -> Result<(), Pas
     }
 }
 
+/// Whether `hash` was made under parameters other than the pinned ones, so a
+/// successful login is the moment to hash the password again.
+///
+/// True for a well-formed PHC string whose algorithm, version, memory cost,
+/// iteration count or parallelism differ from [`ARGON2_M_COST_KIB`],
+/// [`ARGON2_T_COST`] and [`ARGON2_P_COST`] under Argon2id version 19. A hash
+/// that does not parse answers false: [`verify_password`] refuses it, so no
+/// login reaches the point of replacing it.
+pub fn password_needs_rehash(hash: &str) -> bool {
+    let Ok(parsed) = argon2::PasswordHash::new(hash) else {
+        return false;
+    };
+    let Ok(params) = Params::try_from(&parsed) else {
+        return false;
+    };
+    parsed.algorithm != argon2::ARGON2ID_IDENT
+        || parsed.version != Some(u32::from(Version::V0x13))
+        || params.m_cost() != ARGON2_M_COST_KIB
+        || params.t_cost() != ARGON2_T_COST
+        || params.p_cost() != ARGON2_P_COST
+}
+
 /// Draw a fresh salt from `rng`.
 pub fn generate_password_salt(rng: &(impl SecureRng + ?Sized)) -> [u8; PASSWORD_SALT_LEN] {
     let mut salt = [0u8; PASSWORD_SALT_LEN];
@@ -199,6 +221,55 @@ mod tests {
         let hash = generate_password_hash("correct horse");
         assert!(verify_password("correct horse", &hash).is_ok());
         assert!(verify_password("battery staple", &hash).is_err());
+    }
+
+    #[test]
+    fn a_hash_under_the_pinned_parameters_needs_no_rehash() {
+        let hash = generate_password_hash_with_rng(&FixedRng(1), "Gnomes2+");
+        assert!(!password_needs_rehash(&hash));
+    }
+
+    #[test]
+    fn a_hash_under_weaker_parameters_needs_a_rehash() {
+        let salt = [3u8; PASSWORD_SALT_LEN];
+        for (m, t, p) in [
+            (ARGON2_M_COST_KIB / 2, ARGON2_T_COST, ARGON2_P_COST),
+            (ARGON2_M_COST_KIB, ARGON2_T_COST - 1, ARGON2_P_COST),
+            (ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST + 1),
+        ] {
+            let params = Params::new(m, t, p, None).unwrap();
+            let weaker = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let hash = weaker
+                .hash_password_with_salt(b"pw", &salt)
+                .unwrap()
+                .to_string();
+            assert!(password_needs_rehash(&hash), "m={m} t={t} p={p}: {hash}");
+            assert!(verify_password("pw", &hash).is_ok(), "still verifies");
+        }
+    }
+
+    #[test]
+    fn another_variant_or_version_needs_a_rehash() {
+        let salt = [3u8; PASSWORD_SALT_LEN];
+        let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None).unwrap();
+        let argon2i = Argon2::new(Algorithm::Argon2i, Version::V0x13, params.clone());
+        let hash = argon2i
+            .hash_password_with_salt(b"pw", &salt)
+            .unwrap()
+            .to_string();
+        assert!(password_needs_rehash(&hash), "{hash}");
+        let old = Argon2::new(Algorithm::Argon2id, Version::V0x10, params);
+        let hash = old
+            .hash_password_with_salt(b"pw", &salt)
+            .unwrap()
+            .to_string();
+        assert!(password_needs_rehash(&hash), "{hash}");
+    }
+
+    #[test]
+    fn a_string_that_is_not_a_hash_is_not_rehashed() {
+        assert!(!password_needs_rehash("not a phc string"));
+        assert!(!password_needs_rehash(""));
     }
 
     #[test]

@@ -79,7 +79,7 @@ fn apply_email_otp_failure_zero_max_attempts_applies_default_limit() {
 #[test]
 fn hotp_attempt_limit_burns_lookahead_window() {
     let cfg = FactorConfig::Hotp(HotpConfig {
-        secret: ZeroizedString::new(RFC_4226_SECRET_B32),
+        secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         counter: 100,
         attempt_count: 5,
         max_attempts: 5,
@@ -100,7 +100,7 @@ fn hotp_attempt_limit_burns_lookahead_window() {
 #[test]
 fn hotp_zero_max_attempts_burns_at_default_limit() {
     let cfg = FactorConfig::Hotp(HotpConfig {
-        secret: ZeroizedString::new(RFC_4226_SECRET_B32),
+        secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         counter: 0,
         attempt_count: 5,
         max_attempts: 0,
@@ -124,7 +124,7 @@ fn hotp_zero_max_attempts_burns_at_default_limit() {
 #[test]
 fn hotp_success_advances_counter_by_one() {
     let cfg = FactorConfig::Hotp(HotpConfig {
-        secret: ZeroizedString::new(RFC_4226_SECRET_B32),
+        secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         digits: 6,
         algorithm: OtpAlgorithm::Sha1,
         counter: 0,
@@ -241,7 +241,7 @@ fn totp_success_passes_replay_guard_and_returns_update() {
     use chrono::TimeZone;
 
     let cfg = FactorConfig::Totp(TotpConfig {
-        secret: ZeroizedString::new(RFC_4226_SECRET_B32),
+        secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         digits: 8,
         period_secs: 30,
         algorithm: OtpAlgorithm::Sha1,
@@ -271,7 +271,7 @@ fn totp_success_passes_replay_guard_and_returns_update() {
 fn hotp_code_at_max_length_continues_to_verify_with_update() {
     use crate::validation::MAX_OTP_CODE_BYTES;
     let cfg = FactorConfig::Hotp(HotpConfig {
-        secret: ZeroizedString::new(RFC_4226_SECRET_B32),
+        secret: ZeroizedString::new(RFC_4226_SECRET_B32).into(),
         counter: 100,
         attempt_count: 0,
         max_attempts: 5,
@@ -380,4 +380,26 @@ fn email_otp_code_at_max_length_continues_to_verify_with_update() {
         }
         _ => panic!("expected FailWithUpdate when continuing through length guard"),
     }
+}
+
+// ── email OTP burn keeps the cooldown ────────────────────────────
+
+#[test]
+fn email_otp_burn_clears_the_code_but_keeps_pending_until() {
+    let until = Utc::now() + chrono::Duration::minutes(5);
+    let prior = EmailOtpConfig {
+        pending_hash: Some(ZeroizedString::new("hash")),
+        pending_until: Some(until),
+        attempt_count: 5,
+        max_attempts: 5,
+        ..Default::default()
+    };
+    let next = apply_email_otp_failure(&prior);
+    assert!(next.pending_hash.is_none());
+    assert_eq!(next.attempt_count, 0);
+    assert_eq!(
+        next.pending_until,
+        Some(until),
+        "the cooldown survives the burn"
+    );
 }

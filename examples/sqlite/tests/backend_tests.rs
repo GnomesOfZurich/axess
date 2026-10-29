@@ -23,6 +23,7 @@ use tower::ServiceExt;
 /// in a test uses its own.
 struct Browser {
     router: Router,
+    pool: sqlx::SqlitePool,
     cookies: BTreeMap<String, String>,
     peer: SocketAddr,
 }
@@ -45,9 +46,10 @@ impl Browser {
             .expect("connect in-memory sqlite");
         sqlx::migrate!().run(&pool).await.expect("migrations");
         seed(&SystemClock, &pool).await.expect("seed");
-        let (router, _store) = build_router(pool).await;
+        let (router, _store) = build_router(pool.clone()).await;
         Self {
             router,
+            pool,
             cookies: BTreeMap::new(),
             peer: "192.0.2.1:50000".parse().expect("address"),
         }
@@ -217,5 +219,69 @@ async fn a_recovery_code_stands_in_for_totp_once() {
         Some("/dashboard"),
         "{}",
         page.body
+    );
+}
+
+/// The stored TOTP row for alice, as the database holds it.
+async fn stored_totp(pool: &sqlx::SqlitePool) -> (String, String) {
+    let config: String = sqlx::query_scalar(
+        "SELECT config_json FROM factor_configs
+          WHERE kind = 'totp' AND user_id = '00000000-0000-0000-0000-000000000010'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("one totp row");
+    let methods: String = sqlx::query_scalar(
+        "SELECT group_concat(steps_json) FROM auth_methods WHERE name = 'password+totp'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("method row");
+    (config, methods)
+}
+
+#[tokio::test]
+async fn an_enrolled_totp_factor_is_not_replaced_from_the_session() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+
+    let setup = browser.send("GET", "/setup-totp", None).await;
+    let secret = attribute(&setup.body, r#"name="secret" value=""#);
+    let token = attribute(&setup.body, r#"name="_csrf" value=""#);
+    let code = totp_code(&secret);
+    let fields = vec![
+        ("secret", secret.as_str()),
+        ("code", &code),
+        ("_csrf", &token),
+    ];
+    let enrolled = browser.send("POST", "/setup-totp", Some(fields)).await;
+    assert_eq!(enrolled.status, StatusCode::OK, "{}", enrolled.body);
+    let before = stored_totp(&browser.pool).await;
+    assert!(
+        before.0.contains("last_step\":") && !before.0.contains("last_step\":null"),
+        "enrolment must record the verified step: {}",
+        before.0
+    );
+
+    // A hijacked session posts its own secret and a valid code for it.
+    let attacker = axess::generate_totp_secret(&axess::SystemRng);
+    let attacker_code = totp_code(&attacker);
+    let token = browser.token_from("/dashboard").await;
+    let fields = vec![
+        ("secret", attacker.as_str()),
+        ("code", &attacker_code),
+        ("_csrf", &token),
+    ];
+    let page = browser.send("POST", "/setup-totp", Some(fields)).await;
+    assert!(
+        page.status.is_redirection() || !page.status.is_success(),
+        "a replace must be refused, got {} {}",
+        page.status,
+        page.body
+    );
+    assert_eq!(
+        stored_totp(&browser.pool).await,
+        before,
+        "the stored factor, recovery codes and method must be unchanged"
     );
 }

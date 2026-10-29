@@ -41,6 +41,16 @@ pub async fn refresh_providers_jwks(
     failures
 }
 
+/// The refresh ticker. A stall (a suspended host, a long GC, a busy runtime)
+/// makes ticks late; the default `Burst` behaviour then fires every missed
+/// tick back to back, which is a burst of requests to an endpoint that
+/// rate-limits. `Delay` fires once and resumes the normal spacing.
+fn refresh_ticker(interval: std::time::Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
 /// Spawn a background task that periodically calls
 /// [`OAuthProvider::refresh_jwks`] on `provider`.
 ///
@@ -95,7 +105,7 @@ pub fn spawn_jwks_refresh(
         interval
     };
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
+        let mut ticker = refresh_ticker(interval);
         // Skip the immediate first tick; discovery just ran, JWKS is fresh.
         ticker.tick().await;
         loop {
@@ -103,4 +113,17 @@ pub fn spawn_jwks_refresh(
             refresh_providers_jwks(std::slice::from_ref(&provider)).await;
         }
     })
+}
+
+#[cfg(test)]
+mod ticker_tests {
+    use super::*;
+    use tokio::time::MissedTickBehavior;
+
+    /// A late tick must not be followed by a burst of the ticks it missed.
+    #[tokio::test]
+    async fn the_refresh_ticker_delays_after_a_stall() {
+        let ticker = refresh_ticker(std::time::Duration::from_secs(3600));
+        assert_eq!(ticker.missed_tick_behavior(), MissedTickBehavior::Delay);
+    }
 }

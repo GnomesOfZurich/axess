@@ -214,9 +214,12 @@ async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
         .with_clock(MockClock::clone(&clock))
         .build();
 
+    // The key is drawn once, from the service's rng; each proof then draws
+    // only its `jti`.
+    let key = authn.new_dpop_key();
     let proof = |c: &str| {
         authn
-            .generate_dpop_proof("test", "GET", "https://rs.example/x", Some(c))
+            .generate_dpop_proof("test", &key, "GET", "https://rs.example/x", Some(c))
             .expect("proof")
     };
     let payload = |jwt: &str| -> serde_json::Value {
@@ -234,10 +237,16 @@ async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
     assert_eq!(first["iat"], MOCK_EPOCH);
     assert_eq!(second["iat"], MOCK_EPOCH + 30);
 
-    // Per proof the service draws 32 key-seed bytes, then 16 `jti` bytes.
+    // The key takes the first 32 bytes; each proof then takes 16 `jti` bytes.
     let reference = MockRng::new(5);
     let mut seed = [0u8; 32];
     reference.fill_bytes(&mut seed);
+    assert_eq!(
+        key.thumbprint().unwrap(),
+        axess_factors::oauth::DpopKey::from_seed(seed)
+            .thumbprint()
+            .unwrap()
+    );
     let mut jti = [0u8; 16];
     reference.fill_bytes(&mut jti);
     assert_eq!(
@@ -543,9 +552,12 @@ async fn refresh_response_id_token_with_a_rotated_key_verifies() {
     let id_token = id_token_with_exp(&new_der, "test-key-2", &server.uri(), MOCK_EPOCH + 3600);
     mount_token_endpoint(&server, &id_token).await;
 
-    let claims = provider
-        .refresh_token("refresh-1")
+    let outcome = provider
+        .refresh_token("refresh-1", Some("n-1"))
         .await
         .expect("the rotated key is picked up on refresh too");
+    let claims = outcome
+        .id_token_claims
+        .expect("the response had an ID token");
     assert_eq!(claims.subject, "alice");
 }

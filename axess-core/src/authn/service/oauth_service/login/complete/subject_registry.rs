@@ -120,6 +120,7 @@ impl Harness {
             oidc_sid: sid.map(str::to_string),
             id_token_hint: None,
             additional_claims: serde_json::Value::Null,
+            dpop_key: None,
         };
         let session = test_session();
         let lock = compute_claim_lock(PROVIDER, &claims.subject, &session).await;

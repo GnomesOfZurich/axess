@@ -60,11 +60,12 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn refresh_token<'a>(
         &'a self,
         refresh_token: &'a str,
+        _original_nonce: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
                     Output = Result<
-                        axess_factors::oauth::OAuthClaims,
+                        axess_factors::oauth::RefreshOutcome,
                         axess_factors::oauth::OAuthError,
                     >,
                 > + Send

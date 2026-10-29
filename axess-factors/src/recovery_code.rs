@@ -273,18 +273,29 @@ fn find_match(
     config: &RecoveryCodesConfig,
     candidate: &str,
     candidate_mac: Option<&[u8; MAC_LEN]>,
-) -> (Option<usize>, usize) {
+    previous_mac: Option<&[u8; MAC_LEN]>,
+) -> (Option<usize>, usize, bool) {
     let mut found = Choice::from(0);
+    let mut via_previous = Choice::from(0);
     let mut index = 0u64;
     let mut examined = 0usize;
     for (i, code) in config.codes.iter().enumerate() {
         examined += 1;
         let unspent = Choice::from(code.used_at.is_none() as u8);
+        let mut cur_equal = Choice::from(0);
+        let mut prev_equal = Choice::from(0);
         let equal = match code.keyed_mac() {
-            Some(stored) => match candidate_mac {
-                Some(mac) => mac.ct_eq(&stored),
-                None => Choice::from(0),
-            },
+            Some(stored) => {
+                // Both comparisons always run, so a row sealed under the
+                // previous pepper costs the same as one under the current.
+                if let Some(mac) = candidate_mac {
+                    cur_equal = mac.ct_eq(&stored);
+                }
+                if let Some(mac) = previous_mac {
+                    prev_equal = mac.ct_eq(&stored);
+                }
+                cur_equal | prev_equal
+            }
             None if bool::from(unspent) => {
                 Choice::from(verify_password(candidate, &code.hash).is_ok() as u8)
             }
@@ -293,10 +304,12 @@ fn find_match(
         let hit = equal & unspent;
         let take = hit & !found;
         index = u64::conditional_select(&index, &(i as u64), take);
+        let only_previous = prev_equal & !cur_equal;
+        via_previous = Choice::conditional_select(&via_previous, &only_previous, take);
         found |= hit;
     }
     let matched = bool::from(found).then_some(index as usize);
-    (matched, examined)
+    (matched, examined, bool::from(via_previous))
 }
 
 /// Verify `submitted` against the unspent codes in `config`. On a match,
@@ -309,12 +322,41 @@ fn find_match(
 /// runs Argon2id for each: see
 /// [`RecoveryCodesConfig::needs_slow_verification`] and run those off an async
 /// executor's worker threads.
+///
+/// After a pepper rotation use [`verify_recovery_code_rotating`].
 pub fn verify_recovery_code(
     config: &RecoveryCodesConfig,
     submitted: &str,
     now: DateTime<Utc>,
     pepper: Option<&RecoveryCodePepper>,
 ) -> Option<RecoveryCodesConfig> {
+    verify_recovery_code_rotating(config, submitted, now, pepper, None).map(|m| m.config)
+}
+
+/// A successful verification: the config with the matched code spent, and
+/// whether the row was keyed under the previous pepper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryMatch {
+    /// The config to persist, with the matched code marked used.
+    pub config: RecoveryCodesConfig,
+    /// True when the code matched only under the previous pepper. A keyed
+    /// row cannot be re-keyed without its plaintext, so the set is still
+    /// sealed under the retired secret: prompt the user to generate a new
+    /// set, and drop the previous pepper once no stored set uses it.
+    pub matched_previous_pepper: bool,
+}
+
+/// [`verify_recovery_code`] while a pepper rotation is in flight: a keyed row
+/// matches under `pepper` (current) or `previous`. Sets generated before the
+/// rotation stay usable until their owners regenerate them; new sets are made
+/// under the current pepper with [`generate_recovery_codes_peppered`].
+pub fn verify_recovery_code_rotating(
+    config: &RecoveryCodesConfig,
+    submitted: &str,
+    now: DateTime<Utc>,
+    pepper: Option<&RecoveryCodePepper>,
+    previous: Option<&RecoveryCodePepper>,
+) -> Option<RecoveryMatch> {
     let normalized = normalize_recovery_code(submitted);
     let candidate: &str = normalized.as_ref();
     if candidate.len() != RECOVERY_CODE_LENGTH
@@ -325,11 +367,20 @@ pub fn verify_recovery_code(
         return None;
     }
     let candidate_mac = pepper.map(|p| p.mac(candidate));
-    let (matched, _) = find_match(config, candidate, candidate_mac.as_ref());
+    let previous_mac = previous.map(|p| p.mac(candidate));
+    let (matched, _, via_previous) = find_match(
+        config,
+        candidate,
+        candidate_mac.as_ref(),
+        previous_mac.as_ref(),
+    );
     let index = matched?;
     let mut updated = config.clone();
     updated.codes[index].used_at = Some(now);
-    Some(updated)
+    Some(RecoveryMatch {
+        config: updated,
+        matched_previous_pepper: via_previous,
+    })
 }
 
 #[cfg(test)]

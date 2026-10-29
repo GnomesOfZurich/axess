@@ -3,7 +3,7 @@
 use super::{RequestAuthnService, outcomes::FactorOutcome};
 use crate::authn::{
     error::AuthnError,
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::{FactorConfig, FactorCredential, FactorKind},
     ids::{TenantId, UserId},
     store::{FactorStore, IdentityStore},
@@ -18,6 +18,10 @@ where
     /// Verify a password credential via LDAP simple bind.
     ///
     /// Called from `verify_factor` when the current factor is `LdapBind`.
+    /// `reserved` is the count `reserve_guess` took for this attempt. A check
+    /// that ends before the bind (no provider, an oversized password, a bad
+    /// DN) keeps its reservation, so it counts as the failure it is.
+    ///
     /// The user submits a `FactorCredential::Password`: same input as local
     /// password auth, but verified against the directory instead of a stored hash.
     #[tracing::instrument(skip(self, credential, config, session))]
@@ -28,6 +32,7 @@ where
         user_id: &UserId,
         tenant_id: &TenantId,
         session: &AuthSession,
+        reserved: Option<u32>,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
         let ldap = match &self.inner.ldap {
             Some(l) => l,
@@ -96,18 +101,26 @@ where
         match ldap.verify_bind(&user.identifier, &bind_dn, password).await {
             Ok(_result) => {
                 self.inner.metrics.factor_success();
+                self.release_guess(reserved, user_id).await;
 
-                // Reset failed attempts on successful bind.
-                session
-                    .advance_factor(&FactorKind::LdapBind, self.inner.clock.now())
-                    .await;
-
+                // The audit row first: a failed write must leave the session
+                // where it was, where the other order had already advanced it
+                // (possibly to Authenticated) for a factor that was never
+                // recorded.
                 self.emit_audit(
                     AuthEventBuilder::success(AuthEventType::FactorVerified)
                         .attributed_to(user_id, tenant_id)
                         .with_factor(FactorKind::LdapBind),
                 )
                 .await?;
+
+                session
+                    .advance_factor(
+                        &FactorKind::LdapBind,
+                        self.inner.clock.now(),
+                        &self.inner.preserved_custom_keys,
+                    )
+                    .await;
 
                 self.complete_factor_step(user_id, tenant_id, session).await
             }
@@ -116,15 +129,35 @@ where
                 // matches the audit ordering (audit BEFORE counter increment)
                 // and store-error muting. Earlier this arm hand-rolled
                 // the same logic with the audit and counter calls swapped.
-                self.record_factor_failure(user_id, tenant_id, &FactorKind::LdapBind, session)
-                    .await
+                self.record_factor_failure_after(
+                    reserved,
+                    user_id,
+                    tenant_id,
+                    &FactorKind::LdapBind,
+                    session,
+                )
+                .await
             }
             Err(e) => {
                 // Log the full error server-side for diagnostics; return a
                 // generic message to callers to avoid leaking LDAP server
                 // hostnames, connection details, or schema information.
-                tracing::error!(error = %e, bind_dn = %bind_dn, "LDAP bind failed (non-credential error)");
+                // The DN is the user's directory identity: it identifies the
+                // person in a log line, so the user id stands in for it.
+                tracing::error!(error = %e, user_id = %user_id, "LDAP bind failed (non-credential error)");
                 self.inner.metrics.factor_failure();
+                // An outage says nothing about the credential: the guess it
+                // reserved is given back.
+                self.release_guess(reserved, user_id).await;
+                // An outage of the directory is still an attempt at this
+                // factor: record it, so the trail shows the login stopped here.
+                self.emit_audit(
+                    AuthEventBuilder::failure(AuthEventType::FactorVerified)
+                        .attributed_to(user_id, tenant_id)
+                        .with_factor(FactorKind::LdapBind)
+                        .with_error(AuthFailureReason::Other("external_service".to_owned())),
+                )
+                .await?;
                 Err(AuthnError::ExternalService(
                     "external authentication unavailable".to_string(),
                 ))

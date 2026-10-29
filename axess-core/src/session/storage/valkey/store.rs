@@ -5,14 +5,14 @@
 
 use super::encryption::{encrypted_codec, encrypted_codec_with_rotation, plaintext_codec};
 use super::internal::{
-    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, RESEAL_SCRIPT, ValkeyStoreError,
-    ex_seconds, script_unavailable, session_key,
+    COMPARE_SET_SCRIPT, CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, RESEAL_SCRIPT,
+    ValkeyStoreError, ex_seconds, expired_cycle_outcome, script_unavailable, session_key,
 };
 use crate::session::{
     data::SessionData,
     id::SessionId,
     storage::session_codec::SessionCodec,
-    store::{CycleOutcome, SessionStore},
+    store::{ConditionalUpdate, CycleOutcome, SessionStore},
 };
 use fred::bytes::Bytes;
 use fred::prelude::*;
@@ -275,6 +275,48 @@ impl SessionStore for ValkeySessionStore {
         Ok(written.is_some())
     }
 
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<ConditionalUpdate, Self::Error> {
+        let key = session_key(&self.prefix, id);
+        let Some(old): Option<Vec<u8>> = self.client.get(&key).await? else {
+            return Ok(ConditionalUpdate::Gone);
+        };
+        let (stored, _) = self.codec.decode_bytes_checked(id, &old)?;
+        if stored.revision != expected_revision {
+            return Ok(ConditionalUpdate::Conflict);
+        }
+        let Some(ex) = ex_seconds(ttl) else {
+            // Already expired: nothing loadable may be stored.
+            return Ok(ConditionalUpdate::Gone);
+        };
+        let bytes = self.encode(id, data)?;
+        // The script writes only while the key still holds the bytes that
+        // were compared. A deployment without scripting returns the error
+        // rather than a weaker compare: the caller then fails closed.
+        let swapped: i64 = self
+            .client
+            .eval(
+                COMPARE_SET_SCRIPT,
+                vec![key],
+                vec![
+                    Value::Bytes(Bytes::from(old)),
+                    Value::Bytes(Bytes::from(bytes)),
+                    Value::Integer(ex),
+                ],
+            )
+            .await?;
+        Ok(match swapped {
+            1 => ConditionalUpdate::Written,
+            0 => ConditionalUpdate::Conflict,
+            _ => ConditionalUpdate::Gone,
+        })
+    }
+
     async fn cycle(
         &self,
         old_id: &SessionId,
@@ -290,11 +332,7 @@ impl SessionStore for ValkeySessionStore {
             // The rotated session is already expired: store nothing and let
             // the old one go with it.
             let removed: i64 = self.client.del(&old_key).await?;
-            return Ok(if require_old && removed == 0 && old_key != new_key {
-                CycleOutcome::SessionGone
-            } else {
-                CycleOutcome::Rotated
-            });
+            return Ok(expired_cycle_outcome(require_old, removed));
         };
 
         // One server-side script removes the old key and writes the new one,

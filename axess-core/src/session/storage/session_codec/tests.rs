@@ -34,6 +34,22 @@ fn new_blobs_carry_the_marker() {
     assert!(BoundFormat::SESSION.marks(&blob));
 }
 
+fn accepting_codec() -> SessionCodec {
+    SessionCodec::encrypted(
+        SessionCrypto::new([8u8; 32])
+            .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    )
+}
+
+#[test]
+fn a_legacy_blob_is_refused_by_default() {
+    let legacy = SessionCrypto::new([8u8; 32])
+        .encrypt_unbound(&rmp_serde::to_vec_named(&sample()).unwrap())
+        .unwrap();
+    assert!(codec().decode_bytes(&id(1), &legacy).is_err());
+    assert!(accepting_codec().decode_bytes(&id(1), &legacy).is_ok());
+}
+
 #[test]
 fn legacy_blob_reads_and_is_resealed_by_the_next_encode() {
     let crypto = SessionCrypto::new([8u8; 32]);
@@ -42,7 +58,7 @@ fn legacy_blob_reads_and_is_resealed_by_the_next_encode() {
         .unwrap();
     assert!(!BoundFormat::SESSION.marks(&legacy));
 
-    let loaded = codec().decode_bytes(&id(1), &legacy).unwrap();
+    let loaded = accepting_codec().decode_bytes(&id(1), &legacy).unwrap();
     assert_eq!(loaded.custom, sample().custom);
 
     let resealed = codec().encode_bytes(&id(1), &loaded).unwrap();

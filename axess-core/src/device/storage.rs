@@ -19,6 +19,9 @@
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub(crate) mod sql_common;
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub(crate) mod sweep_batches;
+
 #[cfg(feature = "mysql")]
 pub mod mysql;
 #[cfg(feature = "postgres")]

@@ -706,7 +706,9 @@ async fn valkey_load_reseals_an_unbound_blob_and_reject_refuses_it() {
     );
     client.init().await.expect("connect");
     let key = [13u8; 32];
-    let store = ValkeySessionStore::new(client.clone(), key).with_prefix("axt_reseal");
+    let store = ValkeySessionStore::new(client.clone(), key)
+        .with_prefix("axt_reseal")
+        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept);
     let id = SessionId::new(&SystemRng);
     let redis_key = format!("axt_reseal:sess:{id}");
     let unbound = SessionCrypto::new(key)
@@ -737,4 +739,18 @@ async fn valkey_load_reseals_an_unbound_blob_and_reject_refuses_it() {
     assert!((1..=600).contains(&ttl), "the expiry is kept: {ttl}");
     assert!(strict.load(&id).await.unwrap().is_some(), "now bound");
     store.delete(&id).await.unwrap();
+}
+
+/// The compare-and-swap contract against a live Valkey, encrypted and not.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_update_if_revision_keeps_the_contract() {
+    let config = Config::from_url(&live_client_url()).expect("parse redis URL");
+    let client = Client::new(config, None, None, None);
+    client.init().await.expect("connect to Valkey");
+    let encrypted =
+        ValkeySessionStore::encrypted(client.clone(), [5u8; 32]).with_prefix("axess_cas");
+    crate::testing::store_contract::assert_update_if_revision_contract(&encrypted).await;
+    let plain = ValkeySessionStore::plaintext(client).with_prefix("axess_cas_plain");
+    crate::testing::store_contract::assert_update_if_revision_contract(&plain).await;
 }

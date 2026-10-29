@@ -347,7 +347,7 @@ async fn hotp_counter_advances_and_old_rejected() {
         .with_factor(
             user_scope(),
             FactorConfig::Hotp(HotpConfig {
-                secret: ZeroizedString::new(secret),
+                secret: ZeroizedString::new(secret).into(),
                 counter: 0,
                 ..HotpConfig::default()
             }),

@@ -19,6 +19,8 @@ struct HookedStore {
     inner: MemoryDeviceStore,
     before_write: Arc<Mutex<Option<Hook>>>,
     after_load: Arc<Mutex<Option<Hook>>>,
+    /// Fires once, right after a trust-level write has reached storage.
+    after_write: Arc<Mutex<Option<Hook>>>,
 }
 
 async fn fire(slot: &Mutex<Option<Hook>>) {
@@ -67,7 +69,7 @@ impl DeviceStore for HookedStore {
         t: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         self.inner.record_sighting(t, id, now)
     }
     async fn set_trust_level(
@@ -78,7 +80,9 @@ impl DeviceStore for HookedStore {
         now: DateTime<Utc>,
     ) -> Result<(), Self::Error> {
         fire(&self.before_write).await;
-        self.inner.set_trust_level(t, id, level, now).await
+        let result = self.inner.set_trust_level(t, id, level, now).await;
+        fire(&self.after_write).await;
+        result
     }
     async fn delete(&self, t: &TenantId, id: &DeviceId) -> Result<(), Self::Error> {
         fire(&self.before_write).await;
@@ -275,4 +279,29 @@ async fn conditional_writes_invalidate_the_cached_row() {
             .unwrap(),
         BindingsUpdate::Revoked
     );
+}
+
+/// A revocation whose future is dropped after the store committed it (a
+/// request cancelled, a timeout) still drops the cached row: without the
+/// drop guard the cache would keep serving the Trusted row for a full TTL
+/// although the device is revoked in storage.
+#[tokio::test]
+async fn a_revocation_cancelled_after_the_write_still_drops_the_cached_row() {
+    let (cached, hooked, d) = setup().await;
+    assert_eq!(
+        cached
+            .load(&d.tenant_id, &d.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .trust_level,
+        DeviceTrustLevel::Trusted,
+        "the Trusted row is cached"
+    );
+    *hooked.after_write.lock().unwrap() = Some(Box::new(|| Box::pin(std::future::pending::<()>())));
+    let revoke = cached.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now());
+    let outcome = tokio::time::timeout(Duration::from_millis(50), revoke).await;
+    assert!(outcome.is_err(), "the write was cancelled while it waited");
+    let seen = cached.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(seen.trust_level, DeviceTrustLevel::Revoked);
 }

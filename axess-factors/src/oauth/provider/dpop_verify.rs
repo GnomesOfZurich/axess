@@ -15,8 +15,10 @@
 //! 4. `htu` claim equals the request URL (scheme + host + path, no
 //!    query/fragment per spec recommendation).
 //! 5. `iat` claim is within `max_iat_skew_secs` of now.
-//! 6. `jti` claim is not present in the replay cache; insert it on success.
-//!    A full cache refuses the proof rather than forgetting a live `jti`.
+//! 6. `jti` claim is 1 to [`MAX_JTI_BYTES`] bytes and not present in the
+//!    replay cache; insert it on success. A full cache refuses the proof
+//!    rather than forgetting a live `jti`. A proof over [`MAX_PROOF_BYTES`] is
+//!    refused before it is decoded.
 //! 7. (Optional) `ath` claim equals SHA-256(access_token) when an access
 //!    token accompanies the DPoP-protected request.
 //!
@@ -58,7 +60,9 @@ pub trait DpopJtiCache: Send + Sync {
 
 /// Live entries a [`MemoryJtiCache`] holds by default. A proof needs a valid
 /// signature but any key will do, so without a bound a client could grow the
-/// cache as fast as it can send requests.
+/// cache as fast as it can send requests. Each entry is a 32-byte digest of
+/// the `jti` in each of two structures, whatever the `jti`'s length, so the
+/// bound is a bound in bytes too.
 pub const DEFAULT_JTI_CAPACITY: usize = 262_144;
 
 /// Memory-backed jti cache with TTL eviction. Suitable for a single-process
@@ -87,8 +91,17 @@ pub struct MemoryJtiCache {
 /// it.
 #[derive(Default)]
 pub(crate) struct JtiStore {
-    live: HashMap<String, DateTime<Utc>>,
-    by_expiry: BinaryHeap<Reverse<(DateTime<Utc>, String)>>,
+    live: HashMap<JtiDigest, DateTime<Utc>>,
+    by_expiry: BinaryHeap<Reverse<(DateTime<Utc>, JtiDigest)>>,
+}
+
+/// SHA-256 of a `jti`. The store keys on the digest so that an entry costs a
+/// fixed 32 bytes in each structure however long the `jti` the sender chose.
+pub(crate) type JtiDigest = [u8; 32];
+
+/// The digest a [`JtiStore`] keys a `jti` by.
+pub(crate) fn jti_digest(jti: &str) -> JtiDigest {
+    Sha256::digest(jti.as_bytes()).into()
 }
 
 impl JtiStore {
@@ -174,21 +187,23 @@ pub(crate) fn try_insert_at(
     capacity: usize,
 ) -> bool {
     store.evict_expired(now);
-    if store.live.contains_key(jti) || store.live.len() >= capacity {
+    let digest = jti_digest(jti);
+    if store.live.contains_key(&digest) || store.live.len() >= capacity {
         return false;
     }
-    store.live.insert(jti.to_string(), expires_at);
-    store.by_expiry.push(Reverse((expires_at, jti.to_string())));
+    store.live.insert(digest, expires_at);
+    store.by_expiry.push(Reverse((expires_at, digest)));
     true
 }
 
 /// Pure helper for the verify-side replay-window upper bound: the
 /// `expires_at` value stored in the jti cache after a successful
-/// verification. Spec rationale: window the entry by `2×` the
-/// configured `iat` skew so a sliding `iat` re-presentation gets
-/// caught by the still-cached entry rather than slipping past
-/// eviction. Extracted so the multiplier mutation (`* with /`,
-/// `* with +`) is pinned by a single-line unit test.
+/// verification. The window is `2 * skew + 1` seconds from `iat`: the skew
+/// check truncates to whole seconds, so a proof is accepted up to
+/// `iat + skew + 0.999 s`, and the entry must outlive that moment by the
+/// whole of the span over which the proof stays acceptable. Without the
+/// extra second a skew of zero stored an entry that expired at `iat`, and the
+/// same proof was accepted again for the rest of that second.
 ///
 /// `None` when the window does not fit the date range (an absurd skew), so
 /// the caller refuses the proof instead of panicking on the addition.
@@ -196,7 +211,7 @@ pub(crate) fn dpop_replay_window_expiry(
     iat_time: DateTime<Utc>,
     max_iat_skew_secs: i64,
 ) -> Option<DateTime<Utc>> {
-    let window = chrono::Duration::try_seconds(max_iat_skew_secs.checked_mul(2)?)?;
+    let window = chrono::Duration::try_seconds(max_iat_skew_secs.checked_mul(2)?.checked_add(1)?)?;
     iat_time.checked_add_signed(window)
 }
 
@@ -212,6 +227,14 @@ impl DpopJtiCache for MemoryJtiCache {
 
 /// Largest `max_iat_skew_secs` [`verify_dpop_proof`] accepts: one day.
 pub const MAX_IAT_SKEW_SECS: i64 = 86_400;
+
+/// Longest proof [`verify_dpop_proof`] reads, in bytes. A real proof (header
+/// with an EC key, a handful of claims, a signature) is under 1 KiB; anything
+/// past this is refused before it is split or decoded.
+pub const MAX_PROOF_BYTES: usize = 8 * 1024;
+
+/// Longest `jti` [`verify_dpop_proof`] accepts, in bytes. A UUID is 36.
+pub const MAX_JTI_BYTES: usize = 256;
 
 /// Members of a JWK that hold private key material (RFC 7517 §4, RFC 7518
 /// §6): an EC or OKP `d`, the RSA `p`, `q`, `dp`, `dq`, `qi` and `oth`, and a
@@ -241,6 +264,23 @@ pub struct DpopVerifyRequest<'a> {
     pub jti_cache: &'a dyn DpopJtiCache,
 }
 
+/// RFC 9449 §4.2: the proof's key is public. A header that carries the
+/// private half has handed it to everyone who can read the request.
+fn refuse_private_key_material(jwk_value: &serde_json::Value) -> Result<(), OAuthError> {
+    let jwk_members = jwk_value.as_object().ok_or_else(|| {
+        OAuthError::IdTokenValidation("DPoP `jwk` must be a JSON object".to_string())
+    })?;
+    if PRIVATE_JWK_MEMBERS
+        .iter()
+        .any(|member| jwk_members.contains_key(*member))
+    {
+        return Err(OAuthError::IdTokenValidation(
+            "DPoP `jwk` must not contain private key material".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verify a single DPoP proof. Returns the canonical JWK thumbprint of
 /// the signing key on success.
 pub fn verify_dpop_proof(
@@ -257,7 +297,13 @@ pub fn verify_dpop_proof(
         )));
     }
 
-    // 1. Structural sanity.
+    // 1. Structural sanity. A proof is self-signed, so anyone can mint one:
+    // the size is bounded before anything is split or decoded.
+    if req.proof_jwt.len() > MAX_PROOF_BYTES {
+        return Err(OAuthError::IdTokenValidation(format!(
+            "DPoP proof exceeds {MAX_PROOF_BYTES} bytes"
+        )));
+    }
     let parts: Vec<&str> = req.proof_jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(OAuthError::IdTokenValidation(
@@ -285,19 +331,7 @@ pub fn verify_dpop_proof(
         OAuthError::IdTokenValidation("DPoP header missing required `jwk`".to_string())
     })?;
 
-    // RFC 9449 §4.2: the proof's key is public. A header that carries the
-    // private half has handed it to everyone who can read the request.
-    let jwk_members = jwk_value.as_object().ok_or_else(|| {
-        OAuthError::IdTokenValidation("DPoP `jwk` must be a JSON object".to_string())
-    })?;
-    if PRIVATE_JWK_MEMBERS
-        .iter()
-        .any(|member| jwk_members.contains_key(*member))
-    {
-        return Err(OAuthError::IdTokenValidation(
-            "DPoP `jwk` must not contain private key material".to_string(),
-        ));
-    }
+    refuse_private_key_material(jwk_value)?;
 
     // 2. Build the verifier from the embedded JWK.
     let jwk: jsonwebtoken::jwk::Jwk = serde_json::from_value(jwk_value.clone())
@@ -378,12 +412,19 @@ pub fn verify_dpop_proof(
     let jti = claims.get("jti").and_then(|v| v.as_str()).ok_or_else(|| {
         OAuthError::IdTokenValidation("DPoP missing required `jti` claim".to_string())
     })?;
+    if jti.is_empty() || jti.len() > MAX_JTI_BYTES {
+        return Err(OAuthError::IdTokenValidation(format!(
+            "DPoP `jti` must be 1 to {MAX_JTI_BYTES} bytes"
+        )));
+    }
     let expires_at = dpop_replay_window_expiry(iat_time, req.max_iat_skew_secs)
         .ok_or_else(|| OAuthError::IdTokenValidation("DPoP skew window overflow".to_string()))?;
     if !req.jti_cache.try_insert(jti, expires_at) {
-        return Err(OAuthError::IdTokenValidation(format!(
-            "DPoP `jti` `{jti}` replayed within skew window, or the replay cache is full; rejecting"
-        )));
+        // The `jti` is the sender's string and is not echoed back.
+        return Err(OAuthError::IdTokenValidation(
+            "DPoP `jti` replayed within skew window, or the replay cache is full; rejecting"
+                .to_string(),
+        ));
     }
 
     // 6. RFC 7638 JWK thumbprint of the signing key, returned for the
@@ -421,5 +462,7 @@ fn jwk_thumbprint_es256(jwk_value: &serde_json::Value) -> Result<String, OAuthEr
     Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
 }
 
+#[cfg(all(test, feature = "fapi"))]
+mod hardening_tests;
 #[cfg(test)]
 mod tests;

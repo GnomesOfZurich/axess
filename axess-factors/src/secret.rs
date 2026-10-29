@@ -7,10 +7,16 @@ use zeroize::Zeroize;
 
 /// A `String` that is zeroed in memory on drop.
 ///
-/// Used for secrets at rest in memory (password hashes, OTP secrets,
-/// OAuth bearer tokens, refresh tokens, stored delegated credentials)
-/// to reduce the window during which sensitive data is recoverable
-/// from a process dump.
+/// Used for secrets held in memory (password hashes, OTP secrets, OAuth
+/// bearer tokens, refresh tokens, stored delegated credentials) to reduce
+/// the window during which sensitive data is recoverable from a process
+/// dump, and redacted in `Debug` so it stays out of logs.
+///
+/// This is not protection at rest. The type serialises as the plain string,
+/// so whatever persists a value that contains one writes the secret in
+/// plaintext. An OTP secret is sealed instead: see
+/// [`FactorSecret`](crate::factor_secret::FactorSecret) and the OTP secret
+/// section of the password and TOTP guide.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ZeroizedString(String);
 

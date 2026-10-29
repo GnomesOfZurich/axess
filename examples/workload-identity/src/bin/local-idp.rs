@@ -238,6 +238,39 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
             Ok(())
         }
     }
+
+    fn retire(
+        &self,
+        key_id: &str,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        let store = self.clone();
+        let kid = key_id.to_string();
+        async move {
+            let _guard = store.rotate_lock.lock().await;
+            // A kid that is not a plain name cannot address a key file, and
+            // the current key is never retired from under the pointer.
+            if !valid_kid(&kid) || store.read_pointer()? == kid {
+                return Ok(false);
+            }
+            let from = store.key_path(&kid);
+            if !from.exists() {
+                return Ok(false);
+            }
+            // Moved aside, not deleted: the file is the only copy of a key
+            // that signed tokens, and the move is what a later audit needs.
+            let retired_dir = store.root.join("retired");
+            std::fs::create_dir_all(&retired_dir).map_err(|e| FileKeyStoreError::Io {
+                path: retired_dir.display().to_string(),
+                source: e,
+            })?;
+            let to = retired_dir.join(format!("{kid}.pem"));
+            std::fs::rename(&from, &to).map_err(|e| FileKeyStoreError::Io {
+                path: from.display().to_string(),
+                source: e,
+            })?;
+            Ok(true)
+        }
+    }
 }
 
 // ── Key files ────────────────────────────────────────────────────────────────
@@ -370,6 +403,33 @@ fn default_ttl_secs() -> i64 {
     300
 }
 
+/// Longest token lifetime `/issue` grants, in seconds. Matches the cap the
+/// IdP itself enforces, so the request is refused here with a clear status
+/// instead of failing inside the mint.
+const MAX_TTL_SECS: i64 = 3600;
+
+/// Validate an `/issue` request and compute the token's expiry. A lifetime
+/// outside `1..=MAX_TTL_SECS` is refused (a huge value would overflow the
+/// date arithmetic), and a token must name an audience: one without `aud` is
+/// accepted by every verifier that does not pin one.
+fn validated_expiry(
+    now: chrono::DateTime<chrono::Utc>,
+    ttl_secs: i64,
+    audience: Option<&str>,
+) -> Result<chrono::DateTime<chrono::Utc>, (StatusCode, String)> {
+    if !(1..=MAX_TTL_SECS).contains(&ttl_secs) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("ttl_secs must be between 1 and {MAX_TTL_SECS}"),
+        ));
+    }
+    if audience.is_none_or(|a| a.trim().is_empty()) {
+        return Err((StatusCode::BAD_REQUEST, "audience is required".into()));
+    }
+    now.checked_add_signed(Duration::seconds(ttl_secs))
+        .ok_or((StatusCode::BAD_REQUEST, "ttl_secs out of range".into()))
+}
+
 #[derive(Serialize)]
 struct IssueResponse {
     token: String,
@@ -379,12 +439,9 @@ async fn issue_handler(
     State(state): State<AppState>,
     Json(req): Json<IssueRequest>,
 ) -> Result<Json<IssueResponse>, (StatusCode, String)> {
-    if req.ttl_secs <= 0 {
-        return Err((StatusCode::BAD_REQUEST, "ttl_secs must be positive".into()));
-    }
     let now = state.clock.now();
-    let mut claims =
-        MintClaims::new(req.subject, now + Duration::seconds(req.ttl_secs)).with_issued_at(now);
+    let expires_at = validated_expiry(now, req.ttl_secs, req.audience.as_deref())?;
+    let mut claims = MintClaims::new(req.subject, expires_at).with_issued_at(now);
     if let Some(aud) = req.audience {
         claims = claims.with_audience(aud);
     }
@@ -456,6 +513,31 @@ async fn rotate_handler(
     }))
 }
 
+#[derive(Deserialize)]
+struct RetireRequest {
+    kid: String,
+}
+
+/// Drop a historical key from the JWKS once no token it signed can still be
+/// valid (rotation time plus [`MAX_TTL_SECS`]).
+async fn retire_handler(
+    State(state): State<AppState>,
+    Json(req): Json<RetireRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    match state.idp.retire_historical_key(&req.kid).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((StatusCode::NOT_FOUND, "no such historical key".into())),
+        Err(IssuanceError::RetireCurrentKey) => Err((
+            StatusCode::CONFLICT,
+            "the current key cannot be retired; rotate first".into(),
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "retire failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, "retire failed".into()))
+        }
+    }
+}
+
 async fn root_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -482,7 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = FileLocalIdpKeyStore::new(key_dir);
     let idp = LocalIdp::from_key_store(ISSUER, store.clone())
         .await?
-        .with_max_ttl(Duration::hours(1));
+        .with_max_ttl(Duration::seconds(MAX_TTL_SECS));
     // The mint and rotate endpoints need a bearer token. Use the one the
     // operator supplies, or draw a fresh one and print it once.
     let admin_token: Arc<str> = match std::env::var("LOCAL_IDP_ADMIN_TOKEN") {
@@ -492,7 +574,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut bytes = [0u8; 24];
             axess::SecureRng::fill_bytes(&axess::SystemRng, &mut bytes);
             let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            tracing::info!(token = %token, "generated an admin token for /issue and /admin/rotate");
+            // Printed once to stderr, never through the log pipeline, where a
+            // bearer credential would be retained and shipped.
+            eprintln!("generated admin token for /issue and /admin/rotate: {token}");
+            tracing::info!("generated an admin token; printed once to stderr");
             token.into()
         }
     };
@@ -509,6 +594,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let guarded: Router = Router::new()
         .route("/issue", post(issue_handler))
         .route("/admin/rotate", post(rotate_handler))
+        .route("/admin/retire", post(retire_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -531,6 +617,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_refuses_a_huge_lifetime_and_a_missing_audience() {
+        let now = chrono::Utc::now();
+        // These used to reach `now + Duration::seconds(..)`, which panics
+        // on overflow, or minted a token with no audience.
+        for ttl in [i64::MAX, i64::MIN, 0, -1, MAX_TTL_SECS + 1] {
+            let err = validated_expiry(now, ttl, Some("api")).unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "ttl {ttl}");
+        }
+        for aud in [None, Some(""), Some("  ")] {
+            let err = validated_expiry(now, 60, aud).unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "aud {aud:?}");
+        }
+        assert_eq!(
+            validated_expiry(now, MAX_TTL_SECS, Some("api")).unwrap(),
+            now + Duration::seconds(MAX_TTL_SECS)
+        );
+    }
 
     #[test]
     fn a_kid_cannot_name_another_path() {

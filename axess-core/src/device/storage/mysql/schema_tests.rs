@@ -1,6 +1,6 @@
 //! The MySQL DDL, checked as text (no server is needed).
 
-use super::{DEVICE_BINDINGS_REFRESH_DDL, DEVICES_DDL};
+use super::schema::{DEVICE_BINDINGS_REFRESH_DDL, DEVICES_DDL};
 
 const BIN: &str = "VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin";
 

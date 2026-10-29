@@ -31,8 +31,8 @@ mod template;
 
 pub use axess_factors::Fido2Config;
 pub use axess_factors::{
-    EmailOtpConfig, HotpConfig, OtpAlgorithm, PasswordConfig, PasswordRules, RecoveryCodesConfig,
-    StoredRecoveryCode, TotpConfig, ZeroizedString,
+    EmailOtpConfig, FactorSecret, HotpConfig, OtpAlgorithm, PasswordConfig, PasswordRules,
+    RecoveryCodesConfig, SealedFactorSecret, StoredRecoveryCode, TotpConfig, ZeroizedString,
 };
 pub use template::{FactorTemplate, default_catalog};
 

@@ -287,3 +287,35 @@ fn min_length_counts_characters_not_bytes() {
     assert!(!is_valid_password("äöüéè", 8, false, false, false, false));
     assert!(is_valid_password("äöüéèàçñ", 8, false, false, false, false));
 }
+
+// ── identifiers: invisible characters and normalisation ──────────
+
+#[test]
+fn identifiers_with_invisible_format_characters_are_refused() {
+    assert!(is_acceptable_identifier("admin"));
+    assert!(
+        !is_acceptable_identifier("admin\u{200B}"),
+        "zero width space"
+    );
+    assert!(!is_acceptable_identifier("ad\u{202E}min"), "bidi override");
+    assert!(!is_acceptable_identifier("admin\u{FEFF}"));
+    assert!(!is_acceptable_identifier("admin\u{FDD0}"), "noncharacter");
+    // Spelled-in joiners of ordinary words stay.
+    assert!(is_acceptable_identifier(
+        "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}"
+    ));
+}
+
+#[test]
+fn identifiers_must_be_in_nfc() {
+    assert!(is_acceptable_identifier("caf\u{00E9}"));
+    assert!(!is_acceptable_identifier("cafe\u{0301}"), "decomposed form");
+}
+
+#[test]
+fn a_password_over_the_hashing_limit_is_refused_by_the_rules() {
+    let long = "a".repeat(MAX_PASSWORD_BYTES + 1);
+    assert!(!is_valid_password(&long, 3, false, false, false, false));
+    let at_limit = "a".repeat(MAX_PASSWORD_BYTES);
+    assert!(is_valid_password(&at_limit, 3, false, false, false, false));
+}

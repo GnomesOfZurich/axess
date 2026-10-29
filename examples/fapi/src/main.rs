@@ -91,8 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `SameSite=Lax` cookie is sent. Against a provider on another site the
     // browser withholds a `Lax` cookie from that POST and the callback finds no
     // session: use `.with_same_site(SameSite::None)` there, which browsers
-    // accept only together with `Secure` (so drop `with_secure(false)` too).
-    let session_layer = SessionLayer::new(session_store, signing_key).with_secure(false);
+    // accept only together with `Secure` (so keep cookies `Secure`).
+    let session_layer = SessionLayer::new(session_store, signing_key).with_secure(secure_cookies());
 
     let state = AppState {
         authn: Arc::new(authn),
@@ -193,10 +193,15 @@ async fn build_live_service() -> Result<(Service, String), Box<dyn std::error::E
         "http://localhost:3000/auth/callback",
     )
     .await?
+    // Without this list the logout redirect below is dropped: only an exact
+    // match is forwarded to the IdP.
+    .with_allowed_post_logout_redirect_uris(["http://127.0.0.1:3000/"])
+    // The token request carries a DPoP proof, and the key it is signed with
+    // comes back in the claims. ID tokens must be signed with PS256, ES256
+    // or EdDSA: widen `allowed_id_token_algs` only for an IdP that cannot.
     .with_fapi(FapiConfig {
         sender_constraint: SenderConstraint::DPoP,
-        require_jarm: false,
-        max_id_token_lifetime_secs: 300,
+        ..FapiConfig::default()
     })?;
     info!("OIDC discovery complete; FAPI 2.0 profile enabled");
 
@@ -311,23 +316,31 @@ async fn handle_callback(
 
             // Demonstrate DPoP proof generation (would be used for API calls
             // to resource servers that require sender-constrained tokens).
-            let dpop_demo = match state.authn.generate_dpop_proof(
-                &state.provider_name,
-                "GET",
-                "https://api.bank.example.com/accounts",
-                claims.access_token.as_deref(),
-            ) {
-                Ok(proof) => format!(
-                    "<h2>DPoP Proof (for API calls)</h2>\
-                     <p><strong>Thumbprint (jkt):</strong> <code>{}</code></p>\
-                     <p><strong>Proof JWT:</strong> <code style=\"word-break:break-all\">{}</code></p>",
-                    html_escape(&proof.thumbprint),
-                    html_escape(&proof.proof_jwt[..80.min(proof.proof_jwt.len())]),
-                ),
-                Err(e) => format!(
-                    "<p><em>DPoP not available: {}</em></p>",
-                    html_escape(&e.to_string())
-                ),
+            // The key is the one the token request was signed with and the
+            // access token is bound to; keep it for the token's life and sign
+            // every proof for the token with it.
+            let dpop_demo = match claims.dpop_key.as_deref() {
+                None => "<p><em>No DPoP key: this login was not sender-constrained.</em></p>"
+                    .to_string(),
+                Some(dpop_key) => match state.authn.generate_dpop_proof(
+                    &state.provider_name,
+                    dpop_key,
+                    "GET",
+                    "https://api.bank.example.com/accounts",
+                    claims.access_token.as_deref(),
+                ) {
+                    Ok(proof) => format!(
+                        "<h2>DPoP Proof (for API calls)</h2>\
+                         <p><strong>Thumbprint (jkt):</strong> <code>{}</code></p>\
+                         <p><strong>Proof JWT:</strong> <code style=\"word-break:break-all\">{}</code></p>",
+                        html_escape(&proof.thumbprint),
+                        html_escape(&proof.proof_jwt[..80.min(proof.proof_jwt.len())]),
+                    ),
+                    Err(e) => format!(
+                        "<p><em>DPoP not available: {}</em></p>",
+                        html_escape(&e.to_string())
+                    ),
+                },
             };
 
             Html(format!(
@@ -408,6 +421,7 @@ async fn profile(session: AuthSession) -> impl IntoResponse {
 /// provider of its choosing.
 async fn logout(
     axum::extract::State(state): axum::extract::State<AppState>,
+    audit: AuditContext,
     session: AuthSession,
 ) -> axum::response::Response {
     let provider = state.provider_name.as_str();
@@ -421,8 +435,13 @@ async fn logout(
         tracing::warn!(error = %e, "token revocation failed (expected in mock mode)");
     }
 
-    // Step 2: Invalidate local session.
-    session.clear().await;
+    // Step 2: End the local session. `logout` drops the registry entry,
+    // records the logout, and clears the session and rotates its id whatever
+    // the audit store does; a bare `session.clear()` would do the last two
+    // only.
+    if let Err(e) = state.authn.with_audit_context(audit).logout(&session).await {
+        tracing::error!(error = %e, "logout could not be recorded; the session is cleared regardless");
+    }
     info!("Local session invalidated");
 
     // Step 3: Redirect to IdP's end_session_endpoint (RP-Initiated Logout).
@@ -434,11 +453,11 @@ async fn logout(
         None, // state; optional CSRF for the redirect back
     ) {
         info!("Redirecting to IdP end_session_endpoint");
-        Redirect::temporary(end_session_url.as_str()).into_response()
+        Redirect::to(end_session_url.as_str()).into_response()
     } else {
         // IdP doesn't support RP-Initiated Logout; redirect home.
         info!("IdP has no end_session_endpoint; redirecting home");
-        Redirect::temporary("/").into_response()
+        Redirect::to("/").into_response()
     }
 }
 
@@ -457,4 +476,14 @@ fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+/// Cookies are `Secure` unless `AXESS_DEV_INSECURE_COOKIES=1` is set, for a
+/// browser that refuses `Secure` cookies over plain HTTP. Local use only.
+fn secure_cookies() -> bool {
+    let insecure = std::env::var("AXESS_DEV_INSECURE_COOKIES").is_ok_and(|v| v == "1");
+    if insecure {
+        eprintln!("WARNING: AXESS_DEV_INSECURE_COOKIES=1, cookies are sent without Secure");
+    }
+    !insecure
 }

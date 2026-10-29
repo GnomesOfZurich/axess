@@ -101,7 +101,7 @@ fn hotp_config(counter: u64) -> FactorConfig {
 
 fn hotp_config_with_attempts(counter: u64, attempt_count: u8) -> FactorConfig {
     FactorConfig::Hotp(HotpConfig {
-        secret: ZeroizedString::new("JBSWY3DPEHPK3PXP".to_string()),
+        secret: ZeroizedString::new("JBSWY3DPEHPK3PXP".to_string()).into(),
         counter,
         attempt_count,
         ..HotpConfig::default()
@@ -818,7 +818,7 @@ async fn authenticating_state_returns_none_for_authenticated_session() {
     let session = authenticating_session(vec![FactorKind::Password]).await;
     // Advance through the only remaining factor to flip to Authenticated.
     session
-        .advance_factor(&FactorKind::Password, Utc::now())
+        .advance_factor(&FactorKind::Password, Utc::now(), &[])
         .await;
     assert!(session.is_authenticated().await);
     assert!(

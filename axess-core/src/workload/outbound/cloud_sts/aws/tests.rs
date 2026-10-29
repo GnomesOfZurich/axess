@@ -362,3 +362,57 @@ async fn a_silent_sts_endpoint_times_out() {
         started.elapsed()
     );
 }
+
+#[test]
+fn parsed_credentials_block_debug_does_not_print_the_secrets() {
+    let body = r#"<AssumeRoleWithWebIdentityResponse><AssumeRoleWithWebIdentityResult>
+<Credentials><AccessKeyId>AKIAEXAMPLEKEYID</AccessKeyId>
+<SecretAccessKey>wJalrSECRETsecretKEYvalue</SecretAccessKey>
+<SessionToken>FwoGZXIvYXdzSESSIONTOKEN</SessionToken>
+<Expiration>2030-01-01T00:00:00Z</Expiration></Credentials>
+<AssumedRoleUser><Arn>arn:aws:sts::1:assumed-role/r/s</Arn><AssumedRoleId>AROA:s</AssumedRoleId></AssumedRoleUser>
+<SubjectFromWebIdentityToken>sub</SubjectFromWebIdentityToken>
+</AssumeRoleWithWebIdentityResult></AssumeRoleWithWebIdentityResponse>"#;
+    let parsed: StsSuccessEnvelope = quick_xml::de::from_str(body).expect("parses");
+    let shown = format!("{parsed:?}");
+    for secret in [
+        "AKIAEXAMPLEKEYID",
+        "wJalrSECRETsecretKEYvalue",
+        "SESSIONTOKEN",
+    ] {
+        assert!(!shown.contains(secret), "Debug leaked {secret}: {shown}");
+    }
+}
+
+#[tokio::test]
+async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
+    let client = AwsStsClient::new().with_endpoint(Url::parse("http://192.0.2.1:9/").unwrap());
+    let err = client
+        .assume_role_with_web_identity(&sample_request())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AwsStsError::Transport(m) if m.contains("must be https")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn the_default_client_does_not_follow_a_redirect() {
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(VALID_SUCCESS_BODY, "text/xml"))
+        .expect(0)
+        .mount(&target)
+        .await;
+    let first = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", target.uri().as_str()))
+        .expect(1)
+        .mount(&first)
+        .await;
+    let result = client(&first)
+        .assume_role_with_web_identity(&sample_request())
+        .await;
+    assert!(result.is_err());
+}

@@ -6,9 +6,11 @@
 //! - `batch_check()`; multiple checks in one call (typical for list views)
 //!
 //! The user id in each path and the `mfa` query flag are demo inputs chosen
-//! by the caller. A real handler takes the principal from the session
-//! (`AuthSession::user_id()`) and the MFA fact from the session's verified
-//! factors; accepting either from the request would let any caller claim them.
+//! by the caller. A real handler builds its authorization session from the
+//! authenticated session (`AuthzStore::for_session`, which refuses a session
+//! that is not fully authenticated) and takes the MFA fact from the session's
+//! verified factors; accepting either from the request would let any caller
+//! claim them.
 
 use crate::AppState;
 use axess::authorization::{AuthzDenied, AuthzError, StandardRequestContext};

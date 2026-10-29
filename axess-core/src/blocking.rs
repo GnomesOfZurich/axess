@@ -18,7 +18,7 @@
 //! ends.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use tokio::sync::Semaphore;
 
@@ -31,6 +31,12 @@ pub enum KdfError {
     /// The admission semaphore was closed.
     #[error("blocking executor is shut down")]
     Closed,
+    /// The executor is saturated: the waiting queue is at its limit, or the
+    /// job waited longer than the acquire timeout for a permit. Answer
+    /// `503 Service Unavailable` (with a `Retry-After`) rather than queueing
+    /// more work.
+    #[error("blocking executor is busy")]
+    Busy,
 }
 
 #[derive(Debug)]
@@ -49,6 +55,21 @@ pub struct KdfExecutor {
     mode: Mode,
     permits: Arc<Semaphore>,
     started: AtomicU64,
+    /// Most jobs allowed to wait for a permit; `usize::MAX` is unbounded.
+    max_queue: usize,
+    /// Longest a job may wait for a permit.
+    acquire_timeout: Option<std::time::Duration>,
+    /// Jobs waiting for a permit now.
+    waiting: AtomicUsize,
+}
+
+/// Counts a job as waiting for as long as it holds the guard.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl KdfExecutor {
@@ -65,6 +86,9 @@ impl KdfExecutor {
             mode: Mode::Pool,
             permits: Arc::new(Semaphore::new(permits.max(1))),
             started: AtomicU64::new(0),
+            max_queue: usize::MAX,
+            acquire_timeout: None,
+            waiting: AtomicUsize::new(0),
         }
     }
 
@@ -76,7 +100,28 @@ impl KdfExecutor {
             mode: Mode::Inline,
             permits: Arc::new(Semaphore::new(Semaphore::MAX_PERMITS)),
             started: AtomicU64::new(0),
+            max_queue: usize::MAX,
+            acquire_timeout: None,
+            waiting: AtomicUsize::new(0),
         }
+    }
+
+    /// Refuse a job with [`KdfError::Busy`] when `limit` jobs are already
+    /// waiting for a permit. Unbounded by default, which lets a burst of
+    /// logins queue without limit; bound it where login traffic is
+    /// unauthenticated.
+    #[must_use]
+    pub fn with_max_queue(mut self, limit: usize) -> Self {
+        self.max_queue = limit;
+        self
+    }
+
+    /// Refuse a job with [`KdfError::Busy`] when it has waited `timeout` for
+    /// a permit.
+    #[must_use]
+    pub fn with_acquire_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.acquire_timeout = Some(timeout);
+        self
     }
 
     /// How many jobs have been started on this executor.
@@ -93,12 +138,7 @@ impl KdfExecutor {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| KdfError::Closed)?;
+        let permit = self.acquire().await?;
         self.started.fetch_add(1, Ordering::Relaxed);
         match self.mode {
             Mode::Inline => {
@@ -114,6 +154,29 @@ impl KdfExecutor {
             })
             .await
             .map_err(|e| KdfError::Join(e.to_string())),
+        }
+    }
+}
+
+impl KdfExecutor {
+    /// Take a permit, within the queue and time limits.
+    async fn acquire(&self) -> Result<tokio::sync::OwnedSemaphorePermit, KdfError> {
+        // A free permit is taken without queueing.
+        if let Ok(permit) = self.permits.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        if self.waiting.fetch_add(1, Ordering::AcqRel) >= self.max_queue {
+            self.waiting.fetch_sub(1, Ordering::AcqRel);
+            return Err(KdfError::Busy);
+        }
+        let _waiting = Waiting(&self.waiting);
+        let acquire = self.permits.clone().acquire_owned();
+        match self.acquire_timeout {
+            Some(limit) => tokio::time::timeout(limit, acquire)
+                .await
+                .map_err(|_| KdfError::Busy)?
+                .map_err(|_| KdfError::Closed),
+            None => acquire.await.map_err(|_| KdfError::Closed),
         }
     }
 }
@@ -240,5 +303,61 @@ mod tests {
             "peak concurrency {} exceeded the 2 permits",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    /// With one permit held, a queue of one admits one waiter and refuses the
+    /// next with `Busy`; the waiter then runs once the permit frees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_full_queue_is_refused_as_busy() {
+        let ex = Arc::new(KdfExecutor::pool_with_permits(1).with_max_queue(1));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let holder = {
+            let (ex, release) = (ex.clone(), release.clone());
+            tokio::spawn(async move {
+                ex.run(move || {
+                    release.wait();
+                })
+                .await
+            })
+        };
+        while ex.jobs_started() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let waiter = {
+            let ex = ex.clone();
+            tokio::spawn(async move { ex.run(|| 7).await })
+        };
+        while ex.waiting.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let refused = ex.run(|| 8).await;
+        assert!(matches!(refused, Err(KdfError::Busy)), "got {refused:?}");
+        release.wait();
+        holder.await.unwrap().unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap(), 7);
+        assert_eq!(ex.waiting.load(Ordering::SeqCst), 0);
+    }
+
+    /// A job that waits past the acquire timeout is refused as `Busy`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_long_wait_is_refused_as_busy() {
+        let ex = Arc::new(
+            KdfExecutor::pool_with_permits(1)
+                .with_acquire_timeout(std::time::Duration::from_millis(50)),
+        );
+        let holder = {
+            let ex = ex.clone();
+            tokio::spawn(async move {
+                ex.run(|| std::thread::sleep(std::time::Duration::from_millis(300)))
+                    .await
+            })
+        };
+        while ex.jobs_started() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let refused = ex.run(|| 1).await;
+        assert!(matches!(refused, Err(KdfError::Busy)), "got {refused:?}");
+        holder.await.unwrap().unwrap();
+        assert_eq!(ex.run(|| 2).await.unwrap(), 2);
     }
 }

@@ -51,8 +51,12 @@ Or sign up at `/signup` to create your own account, then enroll TOTP from the da
 ### Password reset flow
 
 1. Go to `/forgot-password` and enter a username.
-2. Check the server log for the reset token (in production this would be emailed).
-3. Go to `/reset-password`, enter the user ID, token, and new password.
+2. Check the server log for the reset link (log target `dev_mail`, written by debug builds only; in production it would be emailed). The token is never logged at info level.
+3. Open the link, `/reset-password?user_id=...&tenant_id=...&token=...`, and choose a new password. A password that breaks the tenant's rules is reported as such and the link stays valid.
+
+### Cookies and local HTTP
+
+Session and CSRF cookies are `Secure`. Browsers accept them on `http://localhost`; for a browser or host name that does not, set `AXESS_DEV_INSECURE_COOKIES=1` (a warning banner is logged). Never set it behind a real host name.
 
 ## Project structure
 
@@ -72,6 +76,8 @@ templates/             HTML templates
 **Backend implementation.** `OurBackend` implements both `IdentityStore` and `FactorStore` on one struct wrapping a `SqlitePool`. This is the typical pattern. See `src/models/backend.rs`.
 
 **Factor storage.** Password hashes and TOTP secrets are stored as JSON-serialized `FactorConfig` values. The `save_factor` method uses SQLite `ON CONFLICT ... DO UPDATE` for upserts.
+
+**TOTP secrets at rest.** The router builds a `FactorSecretCipher` from a key kept in `db/factor-secret.key` (created on first start; in production load it from a secrets manager) and passes it to the service with `with_factor_secret_cipher`. Enrolment seals the secret with `seal_config` before `save_factor`, so the `config_json` column holds ciphertext bound to that user's row. Bob's seeded secret is plain text, which the cipher reads for thirty days (`LegacyBlobs::AcceptUntil`) and seals on his first successful login; set a fixed date in a real deployment.
 
 **Auth method storage.** Each user has an `auth_methods` row holding their `FactorStep`s as JSON: `[{"Required":"Password"}]` after signup, and after TOTP enrollment `[{"Required":"Password"},{"AnyOf":["Totp","RecoveryCode"]}]`, a second step with a choice. `verify_factor` takes either credential for that step and prompts for TOTP first.
 

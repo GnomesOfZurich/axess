@@ -193,8 +193,8 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | Feature | Notes |
 |---|---|
 | Password | Argon2id hashing with workspace-pinned parameters, per-user lockout, password-reuse history, plaintext zeroized after hash. |
-| TOTP (RFC 6238) | Constant-time comparison, last-step replay guard, SHA-1 / SHA-256 / SHA-512, 6–8 digit codes. |
-| HOTP (RFC 4226) | Counter advancement, zeroized secrets, same algorithm options as TOTP. |
+| TOTP (RFC 6238) | Constant-time comparison, last-step replay guard, SHA-1 / SHA-256 / SHA-512, 6–8 digit codes, secret sealed at rest with a `FactorSecretCipher`. |
+| HOTP (RFC 4226) | Counter advancement, zeroized secrets, secret sealed at rest with a `FactorSecretCipher`, same algorithm options as TOTP. |
 | Email OTP | 8-digit default, Argon2-hashed codes at rest, TTL-bound, single-use. |
 | FIDO2 / WebAuthn | Registration + authentication + clone detection + discoverable / passwordless. Per-ceremony UV / attestation policy waits on `webauthn-rs` 0.6 stable; see [ROADMAP.md](ROADMAP.md). |
 | LDAP bind | Verifier over `ldap3` with TLS via rustls. Bind only; schema mapping is the application's responsibility. |
@@ -322,7 +322,10 @@ Axess processes personal data as part of authentication. This section documents 
 ### What axess NEVER logs or stores
 
 - Plaintext passwords (only Argon2id hashes are stored; input is zeroized after hashing)
-- TOTP/HOTP secrets in logs (stored encrypted in `FactorConfig`, zeroized on drop)
+- TOTP/HOTP secrets in logs (zeroized on drop and redacted in `Debug`). At rest they are
+  sealed with AES-256-GCM, bound to the tenant, user and factor, once you pass a
+  `FactorSecretCipher` to `AuthnServiceBuilder::with_factor_secret_cipher`; without one they
+  are whatever your `FactorStore` writes, plaintext (see `docs/factors/password-totp.md`)
 - Session cookie values
 - OAuth tokens (access, refresh, ID tokens); these stay in memory only during the exchange
 - PKCE verifiers, CSRF state tokens (cleared from session after use)

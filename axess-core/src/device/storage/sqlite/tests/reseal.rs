@@ -21,7 +21,10 @@ async fn encrypted_store() -> SqliteDeviceStore {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let store = SqliteDeviceStore::new(pool, SessionCrypto::new(KEY));
+    let store = SqliteDeviceStore::new(
+        pool,
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     store.init_schema().await.unwrap();
     store
 }
@@ -65,7 +68,7 @@ async fn overwrite_blob(store: &SqliteDeviceStore, device: &DeviceId, blob: &str
 }
 
 fn is_current_format(stored: &str) -> bool {
-    BASE64.decode(stored).unwrap().starts_with(b"AXD\x02")
+    BASE64.decode(stored).unwrap().starts_with(b"AXD\x82")
 }
 
 /// Save a device, then replace its stored blob with `old(tenant, device)`.
@@ -226,4 +229,40 @@ async fn a_failed_reseal_still_returns_the_device() {
     let loaded = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(loaded.bindings, bindings);
     assert!(!is_current_format(&stored_blob(&store, &d).await));
+}
+
+/// A blob in the current format that only the previous key opens is
+/// re-sealed under the current key by the read that found it, so the
+/// previous key can be dropped without leaving unreadable rows.
+#[tokio::test]
+async fn a_read_reseals_a_current_format_blob_sealed_under_the_previous_key() {
+    const NEW_KEY: [u8; 32] = [0x99; 32];
+    let old_store = encrypted_store().await;
+    let (t, u, d) = ids();
+    let bindings = vec![refresh("fam-rotate")];
+    old_store
+        .save(
+            &build_device(&t, Some(&u), &d, 7, bindings.clone()),
+            now_at(10, 0),
+        )
+        .await
+        .unwrap();
+    let before = stored_blob(&old_store, &d).await;
+
+    let rotated = SqliteDeviceStore::new(
+        old_store.pool.clone(),
+        SessionCrypto::new(NEW_KEY).with_previous_key(KEY),
+    );
+    let loaded = rotated.load(&t, &d).await.unwrap().unwrap();
+    assert_eq!(loaded.bindings, bindings);
+    assert_ne!(
+        stored_blob(&old_store, &d).await,
+        before,
+        "the read wrote the row back under the current key"
+    );
+
+    // The previous key is gone: the row must still open.
+    let only_new = SqliteDeviceStore::new(old_store.pool.clone(), SessionCrypto::new(NEW_KEY));
+    let again = only_new.load(&t, &d).await.unwrap().unwrap();
+    assert_eq!(again.bindings, bindings);
 }

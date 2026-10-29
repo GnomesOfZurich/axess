@@ -11,6 +11,7 @@ use cedar_policy::{Entities, EntityUid};
 use fred::prelude::*;
 use tracing::warn;
 
+use super::generation::Generations;
 use crate::authz::error::AuthzError;
 use crate::authz::provider::RequestEntityProvider;
 use crate::health::{HealthCheck, HealthStatus};
@@ -52,10 +53,22 @@ const DEFAULT_TTL_SECS: u64 = 60;
 ///
 /// # Cache key
 ///
-/// `{prefix}:authz-entities:{principal}|{resource}|{action}`: the three
-/// `EntityUid` `Display` representations joined with `|`. Cedar UIDs are
-/// already serialisable text and unique enough that no extra hashing is
-/// needed.
+/// `{prefix}:authz-entities:{principal}|{tenant}|{resource}|{action}|{discriminator}`:
+/// the three `EntityUid` `Display` representations and the tenant joined
+/// with `|`, then the SHA-256 (hex) of the inner provider's
+/// [`cache_discriminator`](RequestEntityProvider::cache_discriminator), or
+/// nothing when it has none. Cedar UIDs are already serialisable text and
+/// unique enough that no extra hashing is needed.
+///
+/// # Caching contract
+///
+/// An entry is shared by every session of the same user and tenant that
+/// asks for the same resource and action, for the whole TTL, on every pod.
+/// Entities that depend on other session state (MFA status, step-up
+/// recency, impersonation) must not be cached unless the provider names
+/// that state in its discriminator. The supported shape is to keep the
+/// entities to durable facts and put per-session facts in the Cedar
+/// context, which is never cached.
 ///
 /// # Invalidation contract (load-bearing for security)
 ///
@@ -92,6 +105,15 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// application-specific (which data mutations require which scope of
 /// cache eviction). See the design doc for the recommended pattern.
 ///
+/// # Invalidation racing a load
+///
+/// An invalidation on this pod bumps a local generation before it deletes.
+/// A load that started before and finishes after does not write its result,
+/// and deletes it if the write was already issued, so a stale build cannot
+/// outlive the invalidation that should have removed it. The guard is local
+/// to the pod: an invalidation that runs on another pod reaches this one
+/// only through the application's own cross-pod propagation.
+///
 /// # Errors
 ///
 /// Errors from the inner provider are NOT cached. Errors from Valkey
@@ -107,6 +129,7 @@ where
     client: Client,
     prefix: Arc<str>,
     ttl: Duration,
+    generations: Generations,
 }
 
 impl<P> ValkeyEntityCache<P>
@@ -121,6 +144,7 @@ where
             client,
             prefix: DEFAULT_PREFIX.into(),
             ttl: Duration::from_secs(DEFAULT_TTL_SECS),
+            generations: Generations::new(),
         }
     }
 
@@ -136,6 +160,7 @@ where
             client,
             prefix: prefix.into(),
             ttl,
+            generations: Generations::new(),
         }
     }
 
@@ -160,19 +185,26 @@ where
         tenant: Option<&str>,
         resource: &EntityUid,
         action: &EntityUid,
+        discriminator: Option<&str>,
     ) -> String {
         format!(
-            "{}:authz-entities:{principal}|{t}|{resource}|{action}",
+            "{}:authz-entities:{principal}|{t}|{resource}|{action}|{d}",
             self.prefix,
             t = tenant.unwrap_or(""),
+            d = discriminator.map(hash_discriminator).unwrap_or_default(),
         )
     }
 
-    /// Invalidate the cache entry for `(principal, tenant, resource, action)`.
+    /// Invalidate the cache entries for `(principal, tenant, resource,
+    /// action)`, whatever their cache discriminator.
     ///
     /// Operates on the local Valkey state only; for cross-pod propagation,
     /// publish on `{prefix}:authz-entities-invalidated:{principal}` and
     /// have each pod subscribe.
+    ///
+    /// Because a load already in flight on this pod must not repopulate the
+    /// entry, a local generation of the principal is bumped as well, so
+    /// loads of that principal that started before this call do not write.
     pub async fn invalidate(
         &self,
         principal: &EntityUid,
@@ -180,8 +212,16 @@ where
         resource: &EntityUid,
         action: &EntityUid,
     ) -> Result<(), fred::error::Error> {
-        let key = self.cache_key(principal, tenant, resource, action);
-        self.client.del(&key).await
+        self.generations.bump_principal(principal);
+        let pattern = format!(
+            "{}:authz-entities:{}|{}|{}|{}|*",
+            self.prefix,
+            glob_escape(&principal.to_string()),
+            glob_escape(tenant.unwrap_or("")),
+            glob_escape(&resource.to_string()),
+            glob_escape(&action.to_string()),
+        );
+        self.scan_and_delete(&pattern).await
     }
 
     /// Borrow the inner provider for read access.
@@ -227,6 +267,7 @@ where
     /// matching keys in batches. Cheap for small caches, O(N) over
     /// the live key set otherwise.
     pub async fn invalidate_all(&self) -> Result<(), fred::error::Error> {
+        self.generations.bump_all();
         let pattern = self.key_prefix_pattern();
         self.scan_and_delete(&pattern).await
     }
@@ -241,10 +282,29 @@ where
         &self,
         principal: &EntityUid,
     ) -> Result<(), fred::error::Error> {
+        self.generations.bump_principal(principal);
         let pattern = format!(
             "{}:authz-entities:{}|*",
             self.prefix,
             glob_escape(&principal.to_string())
+        );
+        self.scan_and_delete(&pattern).await
+    }
+
+    /// Drop every cache entry built for `resource`, for every principal.
+    ///
+    /// Uses the glob `{prefix}:authz-entities:*|{resource}|*`; the resource
+    /// segment is delimited by `|` on both sides. Loads of that resource
+    /// that started on this pod before the call do not write their result.
+    pub async fn invalidate_resource(
+        &self,
+        resource: &EntityUid,
+    ) -> Result<(), fred::error::Error> {
+        self.generations.bump_resource(resource);
+        let pattern = format!(
+            "{}:authz-entities:*|{}|*",
+            self.prefix,
+            glob_escape(&resource.to_string())
         );
         self.scan_and_delete(&pattern).await
     }
@@ -259,9 +319,19 @@ where
     /// so the pattern is safe; if you adopt a custom EntityUid format
     /// that does, prefer a per-tenant key prefix instead.
     pub async fn invalidate_tenant(&self, tenant: &str) -> Result<(), fred::error::Error> {
+        self.generations.bump_tenant(tenant);
         let pattern = format!("{}:authz-entities:*|{}|*", self.prefix, glob_escape(tenant));
         self.scan_and_delete(&pattern).await
     }
+}
+
+/// The key segment for a cache discriminator: its SHA-256 as lower-case
+/// hex, so an arbitrary string cannot carry the `|` separator or a glob
+/// character into the key.
+fn hash_discriminator(discriminator: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(discriminator.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Escape the characters SCAN MATCH reads as a glob (`*`, `?`, `[`, `]`,
@@ -295,12 +365,23 @@ where
     async fn invalidate_all(&self) -> Result<(), Self::Error> {
         ValkeyEntityCache::invalidate_all(self).await
     }
+
+    async fn invalidate_resource(&self, resource: &EntityUid) -> Result<(), Self::Error> {
+        ValkeyEntityCache::invalidate_resource(self, resource).await
+    }
 }
 
 impl<P> RequestEntityProvider for ValkeyEntityCache<P>
 where
     P: RequestEntityProvider,
 {
+    fn cache_discriminator<'a>(
+        &'a self,
+        session: &'a AuthSession,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.inner.cache_discriminator(session)
+    }
+
     fn entities_for<'a>(
         &'a self,
         session: &'a AuthSession,
@@ -313,7 +394,19 @@ where
         Box::pin(async move {
             let tenant = session.tenant_id().await;
             let tenant_str = tenant.as_ref().map(|t| t.to_string());
-            let key = self.cache_key(principal, tenant_str.as_deref(), resource, action);
+            let discriminator = self.inner.cache_discriminator(session).await;
+            let key = self.cache_key(
+                principal,
+                tenant_str.as_deref(),
+                resource,
+                action,
+                discriminator.as_deref(),
+            );
+            // Taken before the provider is read; see the struct docs on an
+            // invalidation racing a load.
+            let generation = self
+                .generations
+                .snapshot(principal, tenant_str.as_deref(), resource);
 
             // Cache lookup. Failures (network, deser) degrade to miss
             // with a warn; never break authorization for a cache fault.
@@ -351,6 +444,15 @@ where
                 .entities_for(session, principal, resource, action)
                 .await?;
 
+            // An invalidation ran while the provider was being read: the
+            // result may be the state it removed, so it is not stored.
+            if !self
+                .generations
+                .is_current(generation, principal, tenant_str.as_deref(), resource)
+            {
+                return Ok(entities);
+            }
+
             // Best-effort populate. Failure to write is a warn, not a hard
             // error; the request already has its answer.
             let mut buf = Vec::new();
@@ -364,6 +466,15 @@ where
                             .await;
                         if let Err(e) = res {
                             warn!(?e, key = %key, "valkey cache: SET failed");
+                        } else if !self.generations.is_current(
+                            generation,
+                            principal,
+                            tenant_str.as_deref(),
+                            resource,
+                        ) {
+                            // An invalidation slipped in between the check
+                            // and the write: take the write back.
+                            let _: Result<(), _> = self.client.del(&key).await;
                         }
                     }
                     Err(e) => {
@@ -460,10 +571,10 @@ mod tests {
         let r2 = uid("App::Doc::\"doc-2\"");
         let a = uid("App::Action::\"View\"");
 
-        let k1 = c.cache_key(&p, Some("t1"), &r1, &a);
-        let k2 = c.cache_key(&p, Some("t1"), &r2, &a);
-        let k3 = c.cache_key(&p, Some("t2"), &r1, &a);
-        let k_none = c.cache_key(&p, None, &r1, &a);
+        let k1 = c.cache_key(&p, Some("t1"), &r1, &a, None);
+        let k2 = c.cache_key(&p, Some("t1"), &r2, &a, None);
+        let k3 = c.cache_key(&p, Some("t2"), &r1, &a, None);
+        let k_none = c.cache_key(&p, None, &r1, &a, None);
 
         assert!(
             k1.contains("alice") && k1.contains("doc-1") && k1.contains("View"),
@@ -483,5 +594,24 @@ mod tests {
             !k1.is_empty() && k1 != "xyzzy",
             "kills `String::new()` and `xyzzy` mutations"
         );
+    }
+
+    /// A session-state discriminator separates entries of one user and
+    /// tenant, and reaches the key only as a hash.
+    #[test]
+    fn cache_key_separates_sessions_by_discriminator_without_leaking_it() {
+        let c = cache();
+        let p = uid("App::User::\"alice\"");
+        let r = uid("App::Doc::\"doc-1\"");
+        let a = uid("App::Action::\"View\"");
+
+        let plain = c.cache_key(&p, Some("t1"), &r, &a, None);
+        let mfa = c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=1"));
+        let no_mfa = c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=0"));
+        assert_ne!(mfa, no_mfa);
+        assert_ne!(plain, mfa);
+        assert!(!mfa.contains("mfa=1"), "the discriminator is hashed: {mfa}");
+        assert_eq!(mfa, c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=1")));
+        assert_eq!(hash_discriminator("mfa=1").len(), 64);
     }
 }

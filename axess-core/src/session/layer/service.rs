@@ -9,10 +9,12 @@
 use crate::device::resolver::ErasedDeviceResolver;
 use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
+use crate::session::id::SessionId;
 use crate::session::layer::SessionLayer;
-use crate::session::layer::handle::{SessionHandle, SessionInner};
+use crate::session::layer::handle::{ConsumeTarget, SessionHandle, SessionInner};
 use crate::session::layer::lifecycle::{
-    Fingerprints, build_set_cookie, finalize_session, load_session,
+    FinalizeOutcome, Fingerprints, LoadPolicy, apply_session_cookie, finalize_session,
+    load_session, settle_registry,
 };
 use crate::session::layer::signing::SigningKeyRing;
 use crate::session::store::SessionStore;
@@ -46,9 +48,19 @@ pub struct SessionService<S, Inner> {
     binding: Option<Arc<dyn SessionBinding>>,
     metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
     rng: Arc<dyn axess_rng::SecureRng>,
+    clock: Arc<dyn axess_clock::Clock>,
+    registry: Option<Arc<dyn crate::session::store::SessionRegistryHandle>>,
+    unknown_liveness: crate::session::layer::UnknownLiveness,
     #[cfg(feature = "device")]
     device_resolver: Option<Arc<dyn ErasedDeviceResolver>>,
 }
+
+/// Request extension marking a request that arrived without a session the
+/// layer could trust, so the session it runs under is a fresh guest that
+/// exists only in memory until something asks for it to be stored. The CSRF
+/// layer reads it to avoid storing a session for traffic that never uses one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FreshSession;
 
 impl<S, Inner> Layer<Inner> for SessionLayer<S>
 where
@@ -56,12 +68,22 @@ where
 {
     type Service = SessionService<S, Inner>;
 
+    /// # Panics
+    ///
+    /// Panics when the configuration is invalid; see the `# Panics` section
+    /// of [`SessionLayer`].
     fn layer(&self, inner: Inner) -> Self::Service {
+        // The one place the whole configuration is checked: setters run in
+        // any order, so only here can the combination be judged.
+        let config = Arc::new((*self.config).clone().finalize());
         SessionService {
             inner,
             store: self.store.clone(),
             signing_keys: self.signing_keys.clone(),
-            config: self.config.clone(),
+            config,
+            clock: self.clock.clone(),
+            registry: self.registry.clone(),
+            unknown_liveness: self.unknown_liveness,
             binding: self.binding.clone(),
             metrics: self.metrics.clone(),
             rng: self.rng.clone(),
@@ -95,6 +117,9 @@ where
         let session_binding = self.binding.clone();
         let metrics = self.metrics.clone();
         let rng = self.rng.clone();
+        let clock = self.clock.clone();
+        let registry = self.registry.clone();
+        let unknown_liveness = self.unknown_liveness;
         #[cfg(feature = "device")]
         let device_resolver = self.device_resolver.clone();
 
@@ -123,58 +148,29 @@ where
                 &store,
                 &signing_keys,
                 &config,
-                metrics.as_deref(),
                 req.headers(),
                 Fingerprints {
                     current: current_fingerprint.as_deref(),
                     previous: previous_fingerprint.as_deref(),
                 },
                 &*rng,
+                &LoadPolicy {
+                    registry: registry.as_deref(),
+                    unknown: unknown_liveness,
+                    clock: &*clock,
+                    metrics: metrics.as_deref(),
+                },
             )
             .await;
 
-            // 1c. Resolve the device for this request. Best-effort;
-            //     `Err(_)` is logged and treated as `None` by the
-            //     erasure wrapper. We mark the session modified iff
-            //     the resolved id differs from the loaded one, so an
-            //     unchanged device on a stable session does not trigger
-            //     a gratuitous save on every request.
-            //
-            //     `axum::body::Body` is `!Sync`, so `&Request<Body>`
-            //     cannot be borrowed across an `await`. Split the
-            //     request into `(Parts, Body)`, run the resolver
-            //     against the parts, then reassemble before the inner
-            //     service call.
-            //
-            //     The `mut load` shadow binding scopes the mutability
-            //     to the device-enabled branch; under
-            //     `cfg(not(feature = "device"))` the outer `load`
-            //     stays immutable so no lint suppression is needed.
+            // 1c. Resolve the device for this request (best-effort; see
+            //     `resolve_device`). The session is marked modified iff the
+            //     resolved id differs from the loaded one.
             #[cfg(feature = "device")]
-            let (load, device_changed) = {
-                let mut load = load;
-                let dc = if let Some(ref resolver) = device_resolver {
-                    let (mut parts, body) = req.into_parts();
-                    // Hand the resolver the user the session has fully
-                    // authenticated, so a device is matched to its owner.
-                    // A guest, or a session part-way through a login,
-                    // supplies none: its claimed user is not verified.
-                    if load.data.auth_state.is_authenticated()
-                        && let Some(user) = load.data.auth_state.user_id()
-                    {
-                        parts.extensions.insert(crate::device::SessionUser(*user));
-                    }
-                    let resolved = resolver.resolve_erased(&parts).await;
-                    req = Request::from_parts(parts, body);
-                    let differs = resolved != load.data.device_id;
-                    if differs {
-                        load.data.device_id = resolved;
-                    }
-                    differs
-                } else {
-                    false
-                };
-                (load, dc)
+            let (load, device_changed, device_cookie) = {
+                let resolved = resolve_device(load, req, device_resolver).await;
+                req = resolved.request;
+                (resolved.load, resolved.changed, resolved.cookie)
             };
             #[cfg(not(feature = "device"))]
             let device_changed = false;
@@ -189,52 +185,263 @@ where
                 None
             };
 
-            let inner_state = SessionInner {
-                id: load.id,
-                data: load.data,
-                // `rotation_fallback_used` is folded into `modified`
-                // so the finalize path persists the (possibly-updated)
-                // fingerprint AND flips `session_changed = true`, which
-                // in turn triggers the Set-Cookie emission below:
-                // re-issuing the cookie under the current signing key.
-                modified: load.binding_invalidated || device_changed || load.rotation_fallback_used,
-                needs_persist: false,
-                regenerate: load.binding_invalidated,
-                pre_cycle_id: None,
-                pending_fingerprint: pending_fp,
-                max_custom_bytes: config.max_custom_bytes,
-                rng: rng.clone(),
-            };
+            let existing_id = load.existing_id;
+            let inner_state = seed_session_state(
+                load,
+                device_changed,
+                pending_fp,
+                &config,
+                rng.clone(),
+                Arc::new(store.clone()),
+            );
             let handle = SessionHandle(Arc::new(RwLock::new(inner_state)));
             req.extensions_mut().insert(handle.clone());
+            if existing_id.is_none() {
+                req.extensions_mut().insert(FreshSession);
+            }
 
-            // 3. Call the inner service.
-            let response = inner.call(req).await?;
+            // 3. Call the inner service. The finalize is owed to the session
+            //    whatever becomes of this future (see `FinishGuard`).
+            let finish = Finish {
+                store,
+                config: config.clone(),
+                metrics,
+                clock,
+                rng,
+                registry,
+                handle: handle.clone(),
+                existing_id,
+            };
+            let mut owed = FinishGuard(Some(finish));
+            let response = inner.call(req).await;
+            let Some(finish) = owed.0.take() else {
+                return response;
+            };
+            let mut response = match response {
+                Ok(response) => response,
+                // The guard is gone, so run the finish here before
+                // returning the handler's error.
+                Err(error) => {
+                    tokio::spawn(finish.run());
+                    return Err(error);
+                }
+            };
 
-            // 4. Finalize; custom-data size enforcement + save-or-cycle decision.
-            let outcome = finalize_session(
-                &store,
+            // 4 + 5. Finalize in a task of its own, then set the cookie only
+            //     when the session was created or changed.
+            let (outcome, registered) = finish_in_task(finish, &handle).await;
+            apply_session_cookie(
+                &signing_keys,
                 &config,
-                metrics.as_deref(),
-                &handle,
-                load.existing_id,
-                &*rng,
-            )
-            .await;
+                &outcome,
+                registered,
+                response.headers_mut(),
+            );
 
-            // 5. Set the cookie only when the session was created or changed.
-            //    Omitting Set-Cookie on unmodified responses reduces header bloat
-            //    and prevents spurious cache invalidation on CDN / reverse proxies.
-            let mut response = response;
-            if outcome.session_changed
-                && let Some(hv) = build_set_cookie(&signing_keys, &config, outcome.final_id)
-            {
+            // A device token issued by this request reaches the browser in
+            // its own cookie.
+            #[cfg(feature = "device")]
+            if let Some(cookie) = device_cookie {
                 response
                     .headers_mut()
-                    .append(axum::http::header::SET_COOKIE, hv);
+                    .append(axum::http::header::SET_COOKIE, cookie);
+                crate::session::layer::lifecycle::mark_cookie_response(response.headers_mut());
             }
 
             Ok(response)
         })
+    }
+}
+
+/// The in-memory session state a request starts from, built from what the
+/// load found. `rotation_fallback_used` is folded into `modified` so the
+/// finalize path persists the re-signed fingerprint and re-issues the cookie
+/// under the current key. A device found for a session that has no stored
+/// row yet is carried in memory and persisted only when something else saves
+/// the session, so a cookieless request stores nothing.
+fn seed_session_state<S>(
+    load: crate::session::layer::lifecycle::LoadOutcome,
+    device_changed: bool,
+    pending_fingerprint: Option<String>,
+    config: &SessionConfig,
+    rng: Arc<dyn axess_rng::SecureRng>,
+    store: Arc<S>,
+) -> SessionInner
+where
+    S: SessionStore + Send + Sync + 'static,
+    S::Error: Send + Sync + 'static,
+{
+    let row_stored = load.existing_id.is_some();
+    SessionInner {
+        id: load.id,
+        data: load.data,
+        modified: load.binding_invalidated
+            || (device_changed && row_stored)
+            || load.rotation_fallback_used
+            || load.session_ended,
+        needs_persist: false,
+        regenerate: load.binding_invalidated,
+        pre_cycle_id: None,
+        pending_fingerprint,
+        max_custom_bytes: config.max_custom_bytes,
+        rng,
+        consume: Some(ConsumeTarget {
+            store,
+            ttl: config.ttl,
+            row_stored,
+        }),
+    }
+}
+
+/// What [`resolve_device`] hands back.
+#[cfg(feature = "device")]
+struct ResolvedDevice {
+    load: crate::session::layer::lifecycle::LoadOutcome,
+    /// The resolved id differs from the loaded one.
+    changed: bool,
+    request: Request<Body>,
+    /// The `Set-Cookie` of a device token this request was issued.
+    cookie: Option<axum::http::HeaderValue>,
+}
+
+/// Run the owed [`Finish`] in a task of its own, so that dropping the caller
+/// cannot cut it short.
+async fn finish_in_task<S>(finish: Finish<S>, handle: &SessionHandle) -> (FinalizeOutcome, bool)
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+    S::Error: Send + Sync + 'static,
+{
+    match tokio::spawn(finish.run()).await {
+        Ok(settled) => settled,
+        Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+        Err(_) => {
+            // The runtime is shutting down: nothing was settled, so no cookie
+            // is set for a session that may not be stored.
+            let id = handle.0.read().await.id;
+            (
+                FinalizeOutcome {
+                    final_id: id,
+                    session_changed: false,
+                    rotation: None,
+                },
+                false,
+            )
+        }
+    }
+}
+
+/// Everything that must still run after the handler of a request: the
+/// session's write to the store and the move of its registry entry.
+struct Finish<S> {
+    store: S,
+    config: Arc<SessionConfig>,
+    metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    clock: Arc<dyn axess_clock::Clock>,
+    rng: Arc<dyn axess_rng::SecureRng>,
+    registry: Option<Arc<dyn crate::session::store::SessionRegistryHandle>>,
+    handle: SessionHandle,
+    existing_id: Option<SessionId>,
+}
+
+impl<S> Finish<S>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+    S::Error: Send + Sync + 'static,
+{
+    async fn run(self) -> (FinalizeOutcome, bool) {
+        let outcome = finalize_session(
+            &self.store,
+            &self.config,
+            self.metrics.as_deref(),
+            &*self.clock,
+            &self.handle,
+            self.existing_id,
+            &*self.rng,
+        )
+        .await;
+        let registered = settle_registry(&self.store, self.registry.as_deref(), &outcome).await;
+        (outcome, registered)
+    }
+}
+
+/// Runs the owed [`Finish`] in a task of its own when the request future is
+/// dropped before the handler returned.
+struct FinishGuard<S>(Option<Finish<S>>)
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+    S::Error: Send + Sync + 'static;
+
+impl<S> Drop for FinishGuard<S>
+where
+    S: SessionStore + Clone + Send + Sync + 'static,
+    S::Error: Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let Some(finish) = self.0.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(finish.run());
+            }
+            Err(_) => tracing::error!(
+                "a request was dropped outside a runtime; its session was not finalized"
+            ),
+        }
+    }
+}
+
+/// Resolve the device for a request and stamp it on the loaded session.
+///
+/// `Err(_)` from the resolver is logged and treated as `None` by the erasure
+/// wrapper. `axum::body::Body` is `!Sync`, so `&Request<Body>` cannot be
+/// borrowed across an `await`: the request is split into `(Parts, Body)`, the
+/// resolver runs against the parts, and the request is reassembled. Reports
+/// whether the resolved id differs from the loaded one, so an unchanged
+/// device on a stable session does not trigger a save on every request.
+#[cfg(feature = "device")]
+async fn resolve_device(
+    mut load: crate::session::layer::lifecycle::LoadOutcome,
+    req: Request<Body>,
+    resolver: Option<Arc<dyn ErasedDeviceResolver>>,
+) -> ResolvedDevice {
+    let Some(resolver) = resolver else {
+        return ResolvedDevice {
+            load,
+            changed: false,
+            request: req,
+            cookie: None,
+        };
+    };
+    let (mut parts, body) = req.into_parts();
+    // Hand the resolver the user the session has fully authenticated, so a
+    // device is matched to its owner. A guest, or a session part-way through
+    // a login, supplies none: its claimed user is not verified.
+    if load.data.auth_state.is_authenticated()
+        && let Some(user) = load.data.auth_state.user_id()
+    {
+        parts.extensions.insert(crate::device::SessionUser(*user));
+        // The device the session was last bound to, for a request that
+        // presents no device token.
+        if let Some(device) = load.data.device_id {
+            parts
+                .extensions
+                .insert(crate::device::SessionDevice(device));
+        }
+    }
+    let slot = crate::device::DeviceCookieSlot::default();
+    parts.extensions.insert(slot.clone());
+    let resolved = resolver.resolve_erased(&parts).await;
+    parts.extensions.remove::<crate::device::DeviceCookieSlot>();
+    let request = Request::from_parts(parts, body);
+    let changed = resolved != load.data.device_id;
+    if changed {
+        load.data.device_id = resolved;
+    }
+    ResolvedDevice {
+        load,
+        changed,
+        request,
+        cookie: slot.take(),
     }
 }

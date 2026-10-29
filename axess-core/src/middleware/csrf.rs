@@ -24,6 +24,10 @@
 //! (native mobile, server-to-server) that hit the same routes without
 //! an `Origin` header.
 //!
+//! With an allow-list configured, a WebSocket upgrade (a `GET` with
+//! `Upgrade: websocket`, which the token check never sees) must present an
+//! allowed `Origin` too, and is refused with `403` otherwise.
+//!
 //! The token is `HMAC(signing_key, nonce || session_id)`, so it is bound to
 //! the session that was current when it was minted: a token minted under one
 //! session id fails validation once the request carries a different session
@@ -100,10 +104,10 @@ use axum::{
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
-use url::Url;
 use zeroize::Zeroizing;
 
 use crate::session::id::SessionId;
@@ -147,6 +151,9 @@ pub struct CsrfConfig {
     /// (or `Referer`-derived origin) matching one of these exact strings
     /// in addition to passing the token check.
     allowed_origins: Arc<[Arc<str>]>,
+    /// Issue a token (and so store a session) on every request that arrives
+    /// without one, whether or not a handler uses it.
+    mint_on_every_request: bool,
 }
 
 /// Whether [`CsrfConfig::require_origin`] should warn about entries it dropped.
@@ -164,9 +171,13 @@ fn should_warn_dropped_origins(kept: usize, rejected: usize) -> bool {
 }
 
 impl CsrfConfig {
-    /// Create a new config with the given HMAC signing key. Reuse the same
-    /// key as your session layer so token rotation is handled automatically
-    /// when sessions cycle.
+    /// Create a new config with the given HMAC signing key. Use a key of its
+    /// own: either an independent 32-byte secret, or a purpose-bound subkey
+    /// of the session layer's master key (`SessionLayer::derive_subkey`,
+    /// for example with the label `axess.v1.csrf`). Do not pass the session
+    /// master itself, so a leak of one use does not hand over the other.
+    /// There is no previous-key fallback: changing this key invalidates the
+    /// tokens already rendered into open forms, and those pages reload.
     pub fn new(signing_key: [u8; 32]) -> Self {
         Self {
             signing_key: Arc::new(Zeroizing::new(signing_key)),
@@ -179,7 +190,23 @@ impl CsrfConfig {
             same_site: tower_cookies::cookie::SameSite::Lax,
             path: "/".into(),
             allowed_origins: Arc::from(Vec::new()),
+            mint_on_every_request: false,
         }
+    }
+
+    /// Issue a CSRF token, and store a session to bind it to, on every
+    /// request that arrives without a session cookie, even when no handler
+    /// reads the token (default: `false`).
+    ///
+    /// By default a cookieless request stores a session and sets cookies
+    /// only when a handler actually used the token, through the
+    /// [`CsrfToken`] extension or [`CsrfIssuer::token`]. That keeps bots,
+    /// health checks and asset requests from writing a row each. Turn this
+    /// on for a single-page app that reads the token cookie in JavaScript on
+    /// its first load without any handler touching the extension.
+    pub fn mint_on_every_request(mut self, mint: bool) -> Self {
+        self.mint_on_every_request = mint;
+        self
     }
 
     /// Draw token nonces from `rng` (default: `SystemRng`), so a seeded RNG
@@ -220,6 +247,12 @@ impl CsrfConfig {
     /// Set the cookie `Secure` attribute (default: true). Set to `false`
     /// only in local development over HTTP.
     pub fn secure(mut self, secure: bool) -> Self {
+        if !secure {
+            tracing::warn!(
+                "CsrfConfig: Secure cookie flag disabled; the CSRF cookie will be \
+                 sent over plain HTTP. Do not use in production."
+            );
+        }
         self.secure = secure;
         self
     }
@@ -301,106 +334,8 @@ impl CsrfConfig {
     }
 }
 
-/// The CSRF token to inject into form fields or AJAX headers.
-///
-/// Available as a request extension after the [`CsrfLayer`] runs. The token
-/// is rotated automatically per response when no cookie was presented.
-#[derive(Clone, Debug)]
-/// The CSRF token for the current request.
-///
-/// Available as a request extension after [`CsrfLayer`] runs. Inject it
-/// into HTML forms as a hidden field or expose it to your SPA via a
-/// dedicated endpoint. The token is HMAC-bound to the session and
-/// rotated automatically when no cookie was present.
-pub struct CsrfToken(pub String);
-
-impl CsrfToken {
-    /// Borrow the token as a `&str` for templating into forms or headers.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Hands a handler the CSRF token that is valid for the session id *as it is
-/// now*, including after the handler has rotated the session.
-///
-/// Injected as a request extension by [`CsrfLayer`] next to [`CsrfToken`].
-/// Call [`token`](Self::token) after rotating the session and embed the
-/// result: it is the token the layer sets as the response cookie, so a
-/// client that submits it passes the double-submit check on its next
-/// request. Cheap to clone.
-#[derive(Clone)]
-pub struct CsrfIssuer {
-    state: Arc<IssuerState>,
-}
-
-struct IssuerState {
-    signing_key: Arc<Zeroizing<[u8; 32]>>,
-    rng: Arc<dyn SecureRng>,
-    handle: Option<SessionHandle>,
-    /// Session id observed at request entry and the token handed out for it.
-    entry: Option<(SessionId, String)>,
-    /// Token minted for a session id the handler rotated to.
-    rotated: std::sync::Mutex<Option<(SessionId, String)>>,
-}
-
-impl CsrfIssuer {
-    fn new(
-        signing_key: Arc<Zeroizing<[u8; 32]>>,
-        rng: Arc<dyn SecureRng>,
-        handle: Option<SessionHandle>,
-        entry: Option<(SessionId, String)>,
-    ) -> Self {
-        Self {
-            state: Arc::new(IssuerState {
-                signing_key,
-                rng,
-                handle,
-                entry,
-                rotated: std::sync::Mutex::new(None),
-            }),
-        }
-    }
-
-    /// The token bound to the session's current id.
-    ///
-    /// Equal to the [`CsrfToken`] extension until the session id changes;
-    /// after a rotation, a token bound to the new id (minted once, then
-    /// returned unchanged on every later call and used for the response
-    /// cookie). Empty when the request carries no session handle.
-    pub async fn token(&self) -> CsrfToken {
-        let Some(handle) = &self.state.handle else {
-            return CsrfToken(String::new());
-        };
-        let current = handle.0.read().await.id;
-        CsrfToken(self.token_for(current))
-    }
-
-    fn token_for(&self, current: SessionId) -> String {
-        if let Some((entry_id, token)) = &self.state.entry
-            && *entry_id == current
-        {
-            return token.clone();
-        }
-        let mut rotated = self
-            .state
-            .rotated
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match rotated.as_ref() {
-            Some((id, token)) if *id == current => token.clone(),
-            _ => {
-                let token = mint_token(
-                    current.as_bytes(),
-                    &self.state.signing_key,
-                    &*self.state.rng,
-                );
-                *rotated = Some((current, token.clone()));
-                token
-            }
-        }
-    }
-}
+mod issuer;
+pub use issuer::{CsrfIssuer, CsrfToken};
 
 /// Tower layer that issues and validates CSRF tokens.
 #[derive(Clone)]
@@ -410,7 +345,14 @@ pub struct CsrfLayer {
 
 impl CsrfLayer {
     /// Construct a layer that issues and validates CSRF tokens with `config`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cookie name carries a `__Host-` or `__Secure-` prefix
+    /// the configuration cannot honour (no `Secure`, or for `__Host-` a path
+    /// other than `/`): browsers drop such a cookie silently.
     pub fn new(config: CsrfConfig) -> Self {
+        check_cookie_rules(&config.cookie_name, config.secure, &config.path);
         Self { config }
     }
 }
@@ -466,6 +408,20 @@ where
                 None => None,
             };
 
+            // A WebSocket upgrade is a GET the browser sends with cookies
+            // from any origin, and the CSRF token never applies to it. With
+            // an allow-list configured it gets the same Origin gate.
+            if !config.allowed_origins.is_empty()
+                && is_websocket_upgrade(&req)
+                && !origin_matches_allowed(&req, &config.allowed_origins)
+            {
+                tracing::warn!(
+                    path = %req.uri().path(),
+                    "csrf: WebSocket upgrade refused, Origin not in the allow-list"
+                );
+                return Ok(forbidden());
+            }
+
             // Validate on state-changing methods. GET/HEAD/OPTIONS pass through
             // because they must be safe (idempotent, no side effects) per
             // RFC 9110 section 9.2.1; and CSRF only matters for unsafe verbs.
@@ -487,13 +443,24 @@ where
                 provisional_mint,
                 extension_token,
             } = entry_token(&config, cookie_token.as_deref(), session_id);
+            // A request the session layer could not tie to a stored session
+            // runs under a guest that exists only in memory. Storing it for a
+            // token nobody reads is storage amplification from unauthenticated
+            // traffic, so the token's use decides.
+            let fresh_session = req
+                .extensions()
+                .get::<crate::session::layer::FreshSession>()
+                .is_some();
+            let read = Arc::new(AtomicBool::new(false));
             let issuer = CsrfIssuer::new(
                 config.signing_key.clone(),
                 config.rng.clone(),
                 session_handle.clone(),
                 session_id.map(|sid| (sid, extension_token.clone())),
+                read.clone(),
             );
-            req.extensions_mut().insert(CsrfToken(extension_token));
+            req.extensions_mut()
+                .insert(CsrfToken::tracked(extension_token, read.clone()));
             req.extensions_mut().insert(issuer.clone());
 
             let mut response = inner.call(req).await?;
@@ -512,13 +479,23 @@ where
                 Some(handle) => Some(handle.0.read().await.id),
                 None => None,
             };
-            let token_to_set = replacement_token(
+            let mut token_to_set = replacement_token(
                 &config,
                 &issuer,
                 provisional_mint,
                 cookie_token.as_deref(),
                 session_id_after,
             );
+            // Nobody read the token and the session id is the one the request
+            // began with (a rotation stores its session regardless): leave
+            // the guest unstored and the response without cookies.
+            if fresh_session
+                && !config.mint_on_every_request
+                && !read.load(Ordering::Relaxed)
+                && session_id_after == session_id
+            {
+                token_to_set = None;
+            }
 
             if token_to_set.is_some()
                 && let Some(handle) = &session_handle
@@ -531,6 +508,7 @@ where
                 let cookie = build_cookie(&config, &new_token);
                 if let Ok(hv) = HeaderValue::from_str(&cookie) {
                     response.headers_mut().append(header::SET_COOKIE, hv);
+                    crate::session::layer::mark_cookie_response(response.headers_mut());
                 }
             }
 
@@ -815,53 +793,6 @@ async fn extract_presented_token(
     Ok((field, restored))
 }
 
-/// Canonicalize an origin string ("scheme://host[:port]") to a form suitable
-/// for exact-match comparison against the allow-list.
-///
-/// Delegates to [`url::Url::origin`] so the comparison honours RFC 6454:
-/// scheme + host are compared case-insensitively, `userinfo@` is stripped,
-/// and the default port is dropped for `http` / `https`. Tuple origins
-/// serialize to `"scheme://host[:port]"`; opaque origins (`"null"`,
-/// non-tuple-origin schemes) are rejected.
-fn normalize_origin(raw: &str) -> Option<String> {
-    let parsed = Url::parse(raw).ok()?;
-    match parsed.origin() {
-        url::Origin::Tuple(..) => Some(parsed.origin().ascii_serialization()),
-        url::Origin::Opaque(_) => None,
-    }
-}
-
-/// Compare the request's `Origin` (fallback `Referer`-derived) origin
-/// against the allowed list. Any missing / malformed / non-matching
-/// case fails closed.
-fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) -> bool {
-    // Origin first: browsers set it on cross-origin state-changing
-    // requests. `Origin: null` (opaque origin, cross-origin redirect,
-    // sandboxed iframe) is normalized to `None` and treated as failure.
-    if let Some(header) = req.headers().get(header::ORIGIN) {
-        let Ok(s) = header.to_str() else { return false };
-        let Some(origin) = normalize_origin(s) else {
-            return false;
-        };
-        return allowed.iter().any(|a| a.as_ref() == origin);
-    }
-
-    // Fall back to Referer: some browsers omit Origin on same-origin
-    // POSTs. Extract the origin component and match. If Referer is
-    // absent AND Origin was absent, fail closed (attacker can strip
-    // both).
-    let Some(referer) = req.headers().get(header::REFERER) else {
-        return false;
-    };
-    let Ok(referer_str) = referer.to_str() else {
-        return false;
-    };
-    let Some(origin) = normalize_origin(referer_str) else {
-        return false;
-    };
-    allowed.iter().any(|a| a.as_ref() == origin)
-}
-
 fn validate_pair(
     cookie_token: Option<&str>,
     presented: Option<&str>,
@@ -894,6 +825,8 @@ fn build_cookie(config: &CsrfConfig, token: &str) -> String {
     cookie.to_string()
 }
 
+mod guards;
+use guards::{check_cookie_rules, is_websocket_upgrade, normalize_origin, origin_matches_allowed};
 mod token;
 use token::{mint_token, validate_token};
 
@@ -902,3 +835,6 @@ mod tests;
 
 #[cfg(test)]
 mod rotation_tests;
+
+#[cfg(test)]
+mod upgrade_tests;

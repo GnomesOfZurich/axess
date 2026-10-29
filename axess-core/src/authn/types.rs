@@ -425,6 +425,68 @@ impl Default for LockoutPolicy {
     }
 }
 
+/// A lockout derived from the failure counter and the policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DerivedLockout {
+    /// When the lockout ends; `None` means it lasts until an administrator
+    /// resets the counter.
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl LockoutPolicy {
+    /// The failure threshold in force: `max_attempts`, with zero read as the
+    /// default of five. Zero used to lock an account on its first failure
+    /// (and, once the lockout is derived from the counter, would lock every
+    /// account before any failure), where the OTP attempt limits already
+    /// read zero as the default.
+    pub fn effective_max_attempts(&self) -> u32 {
+        if self.max_attempts == 0 {
+            Self::default().max_attempts
+        } else {
+            self.max_attempts
+        }
+    }
+
+    /// Whether `failed_attempts`, the last of which happened at
+    /// `last_failure_at`, locks the account at `now` under this policy.
+    ///
+    /// Locked means at least [`effective_max_attempts`](Self::effective_max_attempts)
+    /// failures and either no `duration` (a lockout that lasts until an
+    /// administrator resets the counter) or a last failure less than
+    /// `duration` ago. A store that cannot say when the last failure was
+    /// (`None`) cannot have a timed lockout expire, so it stays locked:
+    /// the safe reading of a missing timestamp.
+    ///
+    /// `attempt_window` is not consulted here. It bounds how long failures
+    /// accumulate, which is the store's job when it increments; it must not
+    /// unlock an account whose lockout is longer than the window.
+    pub fn derived_lockout(
+        &self,
+        failed_attempts: u32,
+        last_failure_at: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<DerivedLockout> {
+        if failed_attempts < self.effective_max_attempts() {
+            return None;
+        }
+        let Some(duration) = self.duration else {
+            return Some(DerivedLockout { until: None });
+        };
+        let Some(last) = last_failure_at else {
+            return Some(DerivedLockout { until: None });
+        };
+        let until = chrono::Duration::from_std(duration)
+            .ok()
+            .and_then(|d| last.checked_add_signed(d));
+        match until {
+            Some(until) if now >= until => None,
+            Some(until) => Some(DerivedLockout { until: Some(until) }),
+            // A duration too large to represent never ends.
+            None => Some(DerivedLockout { until: None }),
+        }
+    }
+}
+
 /// Per-tenant IP access policy.
 ///
 /// Specifies allowed and/or denied IP addresses and CIDR ranges.

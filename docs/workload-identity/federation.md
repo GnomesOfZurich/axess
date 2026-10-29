@@ -107,6 +107,15 @@ The recipe synthesises a SPIFFE-shape workload id of the form
 `spiffe://cluster.local/<sa_name>/<namespace>`. Adjust the
 recipe's path layout if your trust-domain convention differs.
 
+A service account is named by `(namespace, name)`, and anyone who may create
+service accounts in that namespace can delete one and create another under
+the same name. The `kubernetes.io.serviceaccount.uid` claim does not survive
+that: a recreated account has a new UID. `k8s_sa_mapper` records the UID as
+the `sa_uid` attribute but does not require it. To refuse a recreated or
+unregistered account, use `k8s_sa_mapper_pinned` with a `SaUidPins` listing the
+UID registered for each `(namespace, name)` you trust; it rejects a token whose
+UID is missing or different.
+
 ### GitHub Actions OIDC
 
 GitHub Actions can issue OIDC tokens for workflow runs. The token
@@ -117,7 +126,7 @@ organisation against your application.
 
 ```rust,ignore
 use axess_example_workload_identity::github_actions::{
-    github_actions_mapper, GitHubActionsClaims,
+    github_actions_mapper, GitHubActionsClaims, GitHubAllowlist,
 };
 use axess_factors::federation::workload::WorkloadResolver;
 use axess_factors::jwt::verifier::JwtVerifier;
@@ -137,13 +146,23 @@ let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
     tenant_id,
     Issuer::custom("github_actions").unwrap(),
     bearer_token,
-    github_actions_mapper(trust_domain),
+    // Trust owners and repositories by immutable numeric id, not by name.
+    github_actions_mapper(
+        trust_domain,
+        GitHubAllowlist::new().owner_id("123456").repository_id("987654321"),
+    ),
 );
 let principal = resolver.resolve().await?;
 ```
 
-The recipe synthesises `spiffe://github.actions/<repo>/<owner>`
-and preserves `actor`, `workflow`, `ref`, `sha`, `event_name` as
+The recipe synthesises `spiffe://github.actions/<repository_id>/<owner_id>`
+from the numeric `repository_id` and `repository_owner_id` claims, and
+refuses a token that lacks them or whose owner is not on the allowlist.
+Names are not an identity: a renamed, deleted or transferred organisation or
+repository frees its old name, and whoever registers it next signs tokens
+that carry the name you trusted. The names (`repository`,
+`repository_owner`) are kept as attributes for audit. The recipe also
+preserves `actor`, `workflow`, `ref`, `sha`, `event_name` as
 Cedar attributes for policy use (allow only deploys from the
 default branch, require a specific workflow file, etc.).
 

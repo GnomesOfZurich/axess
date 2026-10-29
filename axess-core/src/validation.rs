@@ -32,6 +32,12 @@ pub fn is_valid_password(
     require_digit: bool,
     require_special: bool,
 ) -> bool {
+    // A password login refuses anything over `MAX_PASSWORD_BYTES` before
+    // hashing it, so a longer one accepted here (at signup or a reset) would
+    // be a password its owner can never log in with.
+    if password.len() > MAX_PASSWORD_BYTES {
+        return false;
+    }
     // Characters, not UTF-8 bytes: a 5-character password of 2-byte
     // letters must not satisfy a minimum of 8.
     if password.chars().count() < min_length {
@@ -144,6 +150,49 @@ pub const MAX_OAUTH_PARAM_BYTES: usize = 4096;
 pub fn is_printable(s: &str) -> bool {
     s.chars()
         .all(|c| c == ' ' || (!c.is_control() && c != '\u{FEFF}'))
+}
+
+/// Whether `c` is an invisible format character (Unicode category Cf: zero
+/// width space and joiners, bidirectional controls, soft hyphen, word joiner
+/// and the like) or a noncharacter. None of them has any business in a
+/// login identifier (the zero width non-joiner and joiner, U+200C and U+200D,
+/// are spelled into ordinary words in several scripts and are allowed), and each makes two identifiers look the same on screen
+/// while comparing different.
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}'
+        | '\u{0600}'..='\u{0605}'
+        | '\u{061C}'
+        | '\u{06DD}'
+        | '\u{070F}'
+        | '\u{180E}'
+        | '\u{200B}'
+        | '\u{200E}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{2066}'..='\u{206F}'
+        | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{E0001}'
+        | '\u{E0020}'..='\u{E007F}'
+        | '\u{FDD0}'..='\u{FDEF}'
+    ) || (u32::from(c) & 0xFFFE) == 0xFFFE
+}
+
+/// Whether a login identifier is acceptable at signup: printable, free of
+/// invisible format characters and noncharacters, and already in Unicode
+/// normalisation form C.
+///
+/// `admin` and `admin\u{200B}` are different strings to a store and the
+/// same name to a person; so are a composed `\u{00E9}` and an `e` followed
+/// by a combining accent. Rather than rewrite what the caller typed (the
+/// stored identifier would then differ from what they will type at login),
+/// signup refuses a non-NFC identifier, and the application normalises
+/// input to NFC at its edge (browsers send NFC for typed text).
+pub fn is_acceptable_identifier(identifier: &str) -> bool {
+    is_printable(identifier)
+        && !identifier.chars().any(is_invisible_format_char)
+        && unicode_normalization::is_nfc(identifier)
 }
 
 /// Constant-time comparison of two secret byte slices.

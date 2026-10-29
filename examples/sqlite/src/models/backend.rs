@@ -69,6 +69,21 @@ impl OurBackend {
     }
 }
 
+/// Readiness of the identity store: one round trip. The error text goes to
+/// the log by the caller, not to the probe's response.
+impl axess::HealthCheck for OurBackend {
+    fn check(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axess::HealthStatus> + Send + '_>> {
+        Box::pin(async move {
+            match sqlx::query("SELECT 1").execute(&self.pool).await {
+                Ok(_) => axess::HealthStatus::Healthy,
+                Err(e) => axess::HealthStatus::Unhealthy(e.to_string()),
+            }
+        })
+    }
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]

@@ -14,7 +14,12 @@ async fn sealing_store(tag: &str) -> ValkeyDeviceStore {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    ValkeyDeviceStore::new(client, [7u8; 32]).with_prefix(format!("axr_{tag}_{nanos}"))
+    // These tests read rows of the earlier formats on purpose, so the store
+    // runs inside the accepting window; the default refuses them, which the
+    // offline tests in `super` cover.
+    ValkeyDeviceStore::new(client, [7u8; 32])
+        .with_prefix(format!("axr_{tag}_{nanos}"))
+        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept)
 }
 
 fn unbound_row(s: &ValkeyDeviceStore, d: &Device) -> Vec<u8> {
@@ -67,7 +72,7 @@ async fn overwrite(s: &ValkeyDeviceStore, d: &Device, bytes: Vec<u8>) {
 }
 
 fn is_current(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"AXR\x02")
+    bytes.starts_with(b"AXR\x82")
 }
 
 /// Save a Seen device, then swap its stored bytes for `old(store, device)`.
@@ -165,4 +170,87 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
     s.reseal_row(&read, &raw).await;
     assert_eq!(stored(&s, &d).await, saved);
     assert_eq!(s.load(&d.tenant_id, &d.id).await.unwrap().unwrap(), newer);
+}
+
+/// A row sealed by a store on key one is read by a store on key two with key
+/// one as the previous key, the read re-seals it under key two, and a store
+/// on key two alone then reads it.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
+    let old = sealing_store("rot").await;
+    let d = device(DeviceTrustLevel::Seen, Utc::now());
+    old.save(&d, Utc::now()).await.unwrap();
+    let before = stored(&old, &d).await;
+
+    let rotated = ValkeyDeviceStore::with_crypto(
+        old.client.clone(),
+        SessionCrypto::new([9u8; 32]).with_previous_key([7u8; 32]),
+    )
+    .with_prefix(old.prefix.to_string());
+    assert_eq!(rotated.load(&d.tenant_id, &d.id).await.unwrap().unwrap(), d);
+    assert_ne!(stored(&old, &d).await, before, "the read re-sealed the row");
+
+    let new_only =
+        ValkeyDeviceStore::new(old.client.clone(), [9u8; 32]).with_prefix(old.prefix.to_string());
+    assert_eq!(
+        new_only.load(&d.tenant_id, &d.id).await.unwrap().unwrap(),
+        d
+    );
+}
+
+/// A stored row that no configured key opens does not stop the device from
+/// being saved again: the save replaces it.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_save_replaces_a_row_that_cannot_be_decoded() {
+    let s = sealing_store("undec").await;
+    let d = device(DeviceTrustLevel::Seen, Utc::now());
+    s.save(&d, Utc::now()).await.unwrap();
+    overwrite(&s, &d, b"not a sealed row at all, but long enough".to_vec()).await;
+    assert!(s.load(&d.tenant_id, &d.id).await.is_err());
+
+    s.save(&d, Utc::now()).await.unwrap();
+    assert_eq!(s.load(&d.tenant_id, &d.id).await.unwrap().unwrap(), d);
+}
+
+/// The sweep skips a row it can read in the chunk read and not when the
+/// swap reads it again, instead of aborting the tenant.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn the_sweep_skips_a_damaged_row_and_finishes_the_tenant() {
+    let s = sealing_store("sweepdmg").await;
+    let t0 = Utc::now() - chrono::Duration::days(200);
+    let mut bad = device(DeviceTrustLevel::Trusted, t0);
+    bad.id = axess_identity::testing::device("damaged");
+    let mut good = device(DeviceTrustLevel::Trusted, t0);
+    good.id = axess_identity::testing::device("healthy");
+    good.fingerprint_hash = FingerprintHash::from_bytes([0xbb; 32]);
+    s.save(&bad, t0).await.unwrap();
+    s.save(&good, t0).await.unwrap();
+    overwrite(&s, &bad, b"damaged damaged damaged damaged".to_vec()).await;
+
+    let counts = s.sweep(&good.tenant_id, Utc::now()).await.unwrap();
+    assert_eq!(counts.trusted_to_seen, 1, "the healthy row was demoted");
+}
+
+/// A legacy single-id fingerprint key whose row expired is removed by the
+/// lookup that finds the row gone.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_lookup_removes_a_legacy_fingerprint_key_whose_row_expired() {
+    let s = sealing_store("legacyfp").await;
+    let d = device(DeviceTrustLevel::Seen, Utc::now());
+    let (tenant, id) = (d.tenant_id.to_string(), d.id.to_string());
+    let legacy = fingerprint_key(&s.prefix, &tenant, &fingerprint_hex(&d.fingerprint_hash));
+    let _: () = s.client.set(&legacy, &id, None, None, false).await.unwrap();
+
+    assert!(
+        s.find_by_fingerprint(&d.tenant_id, &d.fingerprint_hash)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let left: Option<String> = s.client.get(&legacy).await.unwrap();
+    assert_eq!(left, None, "the key of an expired row is gone");
 }

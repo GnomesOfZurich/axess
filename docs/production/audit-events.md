@@ -152,10 +152,24 @@ path.
 | variant | wire string | emitted by |
 |---|---|---|
 | `SessionExpired` | `session_expired` | adopter |
-| `SessionInvalidated` | `session_invalidated` | adopter |
+| `SessionInvalidated` | `session_invalidated` | axess, on the audited kick methods |
 
-Both belong to the `SessionStore` implementation, which owns when a
-session ends.
+`SessionExpired` belongs to the `SessionStore` implementation, which
+owns when a session ends. `SessionInvalidated` is written by the
+`invalidate_session` and `invalidate_user_sessions` methods of the
+request-scoped authentication service, which take a `Actor`, end
+the sessions and then record the user, the session when one was named and
+the acting administrator (none for `Actor::System`). 
+
+The back-channel logout handler ends sessions on the IdP's word, with no
+administrator and no user request. It writes a row for each session it ends
+when given a hook: pass `authn.backchannel_logout_audit()` to
+`BackChannelLogoutHandler::with_audit`, and each session gets a
+`SessionInvalidated` row naming the user and the session, with no actor and
+no client address. Without the hook the logout is not recorded by axess. A
+failing audit write is logged and does not undo the logout. A session ended by
+any other path that does not go through these methods is not recorded by
+axess.
 
 ### Devices
 
@@ -213,7 +227,7 @@ Every event is the same struct. There are no per-variant field sets:
 | `device_id` | `Option<DeviceId>` | omitted from the wire form entirely when absent |
 | `ip_address` | `Option<IpAddr>` | typed, so a forged or malformed value cannot be stored. `None` where nothing trustworthy resolved |
 | `ip_source` | `Source` | how the address was arrived at: `unknown`, `peer`, `forwarded` or `supplied` |
-| `user_agent` | `Option<String>` | from the request the context was extracted from |
+| `user_agent` | `Option<String>` | from the request the context was extracted from, cut to 512 bytes (on a character boundary, with `...` appended when anything was cut) because the client sets it |
 | `request_id` | `Option<String>` | the typed value the request-id layer left behind, under the `request-id` feature; `None` without it |
 | `trace_id` | `Option<String>` | the W3C trace id, under the `trace-id` feature |
 | `geo_country` | `Option<String>` | ISO 3166-1 alpha-2, derived from the IP |

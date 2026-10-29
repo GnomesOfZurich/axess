@@ -47,7 +47,10 @@ use axess::service_secret::{ServiceSecret, ServiceSecretLayer, ServiceSecrets, S
 let secrets: ServiceSecrets = ServiceSecret::from_env("intake", "INTAKE_WEBHOOK_SECRET")?
     .into_iter()
     .collect();
-let router = router.layer(ServiceSecretLayer::signed(secrets, SignedRequests::default()));
+let router = router.layer(ServiceSecretLayer::signed(
+    secrets,
+    SignedRequests::default().audience("intake"),
+)?);
 ```
 
 The caller:
@@ -56,7 +59,7 @@ The caller:
 let signer = ServiceSecret::from_env("intake", "INTAKE_WEBHOOK_SECRET")?
     .expect("configured")
     .signer();
-let header = signer.sign(now_unix_seconds, &Method::POST, "/public/intake/bounce", &body);
+let header = signer.sign_for("intake", now_unix_seconds, &Method::POST, "/public/intake/bounce", &body);
 client.post(url).header(SIGNATURE_HEADER, header).body(body).send().await?;
 ```
 
@@ -71,10 +74,27 @@ The replay memory is per process. Behind several instances, a request
 replayed to a different instance inside the window is not caught.
 Handlers that change state should still be idempotent.
 
+A signature names its recipient. The route is configured with
+`SignedRequests::audience("intake")`, the caller signs with
+`ServiceSigner::sign_for("intake", ...)`, and the signature covers that name
+(`v2`), so what one recipient receives does not verify at another service
+that shares the secret. A `SignedRequests` with no audience is refused by
+`ServiceSecretLayer::signed` with `ServiceSecretError::MissingAudience`.
+Even so, give every recipient its own secret: a secret shared by two
+recipients is one recipient's compromise away from being both's.
+
+Callers written before the audience existed sign `v1`, which names no
+recipient and can be replayed against any other service sharing the secret.
+A route refuses `v1` unless it opts in for a migration window with
+`SignedRequests::accept_unaddressed_until(instant)`, checked against the
+route's clock. Move the callers to `sign_for` first, set the window to the
+date by which they will have moved, and delete the setting afterwards (at the
+instant the route stops reading `v1` whether or not it is deleted).
+
 A caller not written in Rust can sign by following the recipe on
 `SIGNATURE_HEADER`: an HMAC-SHA256 key derived from the secret, then an
 HMAC-SHA256 over the version, timestamp, method, request target and
-body, sent as `t=<seconds>,v1=<hex>`.
+body, sent as `t=<seconds>,v2=<hex>`, with the audience between the request target and the body.
 
 ## Presented secrets
 

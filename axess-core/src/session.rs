@@ -16,7 +16,8 @@ pub mod cookies;
     feature = "sqlite",
     feature = "postgres",
     feature = "mysql",
-    feature = "valkey"
+    feature = "valkey",
+    feature = "delegated-stored-encrypted"
 ))]
 pub mod crypto;
 pub mod data;
@@ -24,8 +25,10 @@ pub mod extractor;
 pub mod hmac;
 pub mod id;
 pub mod layer;
+pub mod legacy_blobs;
 pub mod refresh;
 pub mod store;
+pub mod weak_key;
 
 pub mod storage;
 
@@ -35,20 +38,23 @@ pub use config::{SameSite, SessionConfig, SessionConfigBuilder};
     feature = "sqlite",
     feature = "postgres",
     feature = "mysql",
-    feature = "valkey"
+    feature = "valkey",
+    feature = "delegated-stored-encrypted"
 ))]
-pub use crypto::{CryptoError, LegacyBlobs, SessionCrypto};
+pub use crypto::{CryptoError, SessionCrypto};
 pub use data::{AuthState, SessionData, WorkflowKind, WorkflowState};
 pub use extractor::{AuthSession, SessionMissing};
 pub use id::SessionId;
-pub use layer::SessionLayer;
+pub use layer::{SessionLayer, UnknownLiveness};
+pub use legacy_blobs::LegacyBlobs;
 pub use refresh::{
-    IssueRequest, RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
-    RotationOutcome,
+    DeviceTokenRevocation, IssueRequest, RefreshError, RefreshToken, RefreshTokenConfig,
+    RefreshTokenStore, RotationOutcome,
 };
 pub use store::{
-    CycleOutcome, SessionLiveness, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle,
-    SessionRevoker, SessionStore,
+    ConditionalUpdate, CycleOutcome, RevocationError, SessionLiveness, SessionRegistry,
+    SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore,
 };
 #[cfg(any(test, feature = "memory"))]
 pub use store::{MemoryRegistryError, MemorySessionRegistry, MemorySessionStore, MemoryStoreError};
+pub use weak_key::{WeakKeyError, is_constant_key};

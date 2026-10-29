@@ -83,13 +83,46 @@ are followed by a refusal, not by five more at the start of the next, and the
 allowance comes back gradually as the old requests age out. `Retry-After` is
 the time at which the request would be admitted.
 
-Keys are bounded so no one caller controls how many buckets exist. A key
-longer than 256 bytes is cut and ends in a digest of the whole, so long
-identifiers that share a prefix keep separate buckets. An IPv6 client is keyed
-by its /64 prefix, and `KeyExtractor::Header` maps a user's header values onto
-16 sub-buckets, so one authenticated user cannot fill the table by sending
-distinct values. The debug log for a refused request carries a short
-fingerprint of the key, not the key.
+Keys are bounded so no one caller controls how many buckets exist. Every
+key starts with its kind (`ip:`, `user:`, `login:`), so a value a caller
+chooses, such as a login name, can never equal a sentinel or another kind's
+key. A key longer than 187 bytes is cut to a fixed 256 bytes ending in a
+digest of the whole, so long identifiers that share a prefix keep separate
+buckets and no uncut key can be crafted to equal a cut one. An IPv6 client is
+keyed by its /64 prefix, and `KeyExtractor::Header` maps a user's header
+values onto 16 sub-buckets, so one authenticated user cannot fill the table by
+sending distinct values.
+
+A /64 per client still leaves one IPv6 allocation able to mint 65,536 buckets
+in a /48. Each IPv4 /24 and IPv6 /48 therefore holds at most 1,024 live
+buckets; a further client of that prefix shares the prefix's overflow bucket
+and is limited together with the other overflow clients. The prefix budget is
+a fixed constant. A very large site (a university behind one /48) can be
+squeezed into the overflow bucket by its own scale; where that matters, key on
+something the site controls (`UserId`) instead of its address. The budget does
+not stop an attacker who holds many separate /48s, which is why the hard cap of
+262,144 buckets stays.
+
+Login identifiers are minted by unauthenticated callers, so once the table is
+three quarters full a new identifier folds into an overflow bucket of its
+origin (the IPv4 address, or the IPv6 /48) instead of taking a slot.
+Identifiers that already have a bucket keep it.
+
+The debug log for a refused request carries a short fingerprint of the key,
+not the key. It is an HMAC under a random key drawn when the layer is built
+(from the `SecureRng` given to the builder, the system generator by default),
+so a log line cannot be matched against a dictionary of email addresses, and
+two layer instances fingerprint the same key differently.
+
+The remaining-requests header (`x-ratelimit-remaining`) is sent only when the
+bucket belongs to the caller (an address, a user, a header slot). A
+login-identifier, tenant or shared bucket is drawn on by other people, and its
+remaining count would tell the caller how many attempts they made, so it is
+left out.
+
+A clock that steps backwards does not strand buckets: a bucket whose window
+starts in the future is re-anchored at the next sweep and ages out two windows
+later.
 
 The buckets live in this process, in a `DashMap`, and there is no
 option to put them anywhere else. That is a deliberate scope
@@ -157,9 +190,18 @@ not defend a login route: an attacker spreading attempts across many
 IPs stays under every per-IP budget while hammering one username, and
 with a lockout policy in place that is a denial of service against that
 account rather than a break-in attempt. Keying on the submitted
-identifier, normalised to lowercase so `Alice` and `alice` share a
-bucket, bounds the attempts per account regardless of where they came
-from. Put a `LoginIdentifier` limiter on every login-class route, and
+identifier, normalised (Unicode NFKC, lowercase, zero-width and other
+invisible format characters removed) so `Alice`, `alice` and a spelling with a
+hidden character share a bucket, bounds the attempts per account regardless of
+where they came from. A store may fold more than that (a case-insensitive
+collation, a dotted local part), so where it does, add a second limiter on the
+resolved user id.
+
+In a multi-tenant application build the extension with
+`RateLimitLoginIdentifier::new_in_tenant`: the same address in two tenants is
+then two buckets, and repeated logins naming `ceo@victim.com` against another
+tenant cannot exhaust the victim tenant's budget. `new` keys on the identifier
+alone and is for single-tenant applications. Put a `LoginIdentifier` limiter on every login-class route, and
 layer a `PeerIp` one beside it for the volumetric case.
 
 ### Per-endpoint rate limits

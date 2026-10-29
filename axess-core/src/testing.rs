@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.12.0", features = ["testing"] }
+//! axess = { version = "0.13.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -65,6 +65,7 @@ pub mod mock_random;
 pub mod mock_refresh_store;
 
 pub mod mock_tracing;
+pub mod store_contract;
 
 #[cfg(all(test, any(feature = "postgres", feature = "mysql")))]
 pub(crate) mod sql_live;
@@ -190,6 +191,7 @@ pub fn test_session_with_rng(
         rng,
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     crate::session::extractor::AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
@@ -289,7 +291,7 @@ mod session_ext {
         }
 
         async fn advance_factor(&self, kind: &FactorKind, authn_time: DateTime<Utc>) {
-            AuthSession::advance_factor(self, kind, authn_time).await;
+            AuthSession::advance_factor(self, kind, authn_time, &[]).await;
         }
 
         async fn record_attempt_at(&self, now: DateTime<Utc>) {

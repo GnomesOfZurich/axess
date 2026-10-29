@@ -513,3 +513,11 @@ async fn authenticated_state_roundtrip_byte_perfect() {
     assert_eq!(loaded.custom, data.custom, "custom bag must round-trip");
     assert_eq!(loaded.version, data.version, "version must round-trip");
 }
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+async fn update_if_revision_keeps_the_contract_plaintext_and_encrypted() {
+    use axess_core::testing::store_contract::assert_update_if_revision_contract;
+    assert_update_if_revision_contract(&make_store().await).await;
+    assert_update_if_revision_contract(&make_encrypted_store([7u8; 32], None).await).await;
+}

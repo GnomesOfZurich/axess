@@ -224,3 +224,58 @@ fn from_chain_rejects_an_empty_chain() {
         Ok(_) => panic!("empty chain has no leaf"),
     }
 }
+
+fn cert_with(params: CertificateParams) -> CertificateDer<'static> {
+    let key = KeyPair::generate().expect("KeyPair::generate");
+    params.self_signed(&key).expect("self_signed").der().clone()
+}
+
+fn svid_params(uris: &[&str]) -> CertificateParams {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.subject_alt_names = uris
+        .iter()
+        .map(|u| SanType::URI((*u).try_into().expect("Ia5String")))
+        .collect();
+    params
+}
+
+#[test]
+fn peek_spiffe_rejects_two_spiffe_uri_sans() {
+    let cert = cert_with(svid_params(&[
+        "spiffe://gnomes.local/billing/acme",
+        "spiffe://gnomes.local/admin/acme",
+    ]));
+    let err = peek_spiffe(&cert).expect_err("two SPIFFE URIs are ambiguous");
+    assert!(
+        matches!(err, MtlsError::Identity(IdentityError::InvalidSpiffeId(_))),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn peek_spiffe_rejects_ca_leaf() {
+    let mut params = svid_params(&["spiffe://gnomes.local/billing/acme"]);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let err = peek_spiffe(&cert_with(params)).expect_err("a CA is not a workload leaf");
+    assert!(matches!(err, MtlsError::Identity(_)), "{err:?}");
+}
+
+#[test]
+fn peek_spiffe_rejects_cert_sign_and_crl_sign_leaves() {
+    for usage in [
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ] {
+        let mut params = svid_params(&["spiffe://gnomes.local/billing/acme"]);
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature, usage];
+        let err = peek_spiffe(&cert_with(params)).expect_err("signing usage must reject");
+        assert!(matches!(err, MtlsError::Identity(_)), "{err:?}");
+    }
+}
+
+#[test]
+fn peek_spiffe_accepts_a_digital_signature_leaf() {
+    let mut params = svid_params(&["spiffe://gnomes.local/billing/acme"]);
+    params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    assert!(peek_spiffe(&cert_with(params)).is_ok());
+}

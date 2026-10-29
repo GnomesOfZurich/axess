@@ -45,10 +45,15 @@ step-up.
 
 `Revoked` is the terminal state. The device was lost, the user
 removed it, the security team forced a revocation, or the system
-detected compromise. Tokens bound to the device are revoked,
-sessions bound to it are deleted, and further authentication
-attempts from the fingerprint are blocked until the user
-explicitly re-establishes the device.
+detected compromise. Revoking through `revoke_device` marks the device
+and revokes every refresh token issued to it; a plain
+`set_trust_level(Revoked)` marks the device only (see *Revoking a
+device*). A revoked row is never reused and never touched by a sighting.
+Revocation does not block future logins: the fingerprint is a hint the
+client controls, so a request that changes any input of it (the
+`User-Agent`, the language, the network range) is a different
+fingerprint and registers as a new `Unknown` device. Lock an account out
+by rotating its credentials and factors, not by revoking a device.
 
 The transitions move strictly forward through the ladder.
 `Unknown` becomes `Seen` on first successful login. `Seen` becomes
@@ -101,13 +106,17 @@ The fingerprint pepper is the secret the HMAC uses. Two design
 choices matter.
 
 The pepper is per-tenant, not global. Each tenant has its own
-pepper, stored alongside the tenant record. The choice means that
+pepper, supplied by the application through a `TenantPepperResolver`
+(a function from a tenant id to 32 bytes) that reads it from the
+deployment's secrets manager or the tenant record. The choice means that
 a fingerprint hash from tenant A cannot be matched against tenant
 B's hashes; a breach that leaks one tenant's pepper compromises
 only that tenant's fingerprint hashes.
 
 The pepper is rotated when the tenant is suspended or when the
-deployment chooses to invalidate all device records. Rotation
+deployment chooses to invalidate all device records. There is no
+rotation call in axess: you rotate by changing what the resolver
+returns for that tenant. Rotation
 invalidates every device record under the tenant (their
 fingerprint hashes no longer match the new pepper); existing
 sessions remain valid (they do not depend on the device record),
@@ -122,27 +131,59 @@ Refresh tokens, step-up decisions, and recognising a returning device.
 
 ### How devices interact with refresh tokens
 
-The cascade between devices and refresh tokens is bidirectional
-and is what makes "revoke this device" actually mean "revoke every
-session this device can refresh."
+A refresh token records the device it was issued to
+(`RefreshToken::device_id`), and every token of a rotation family
+carries the same device id. The link works in both directions, and
+neither direction is implicit: each takes a call you make.
 
-In one direction: when a device is revoked, every refresh token
-that carries `device_id = revoked_device` is invalidated. The next
-attempt to use any of those tokens fails. The application's
-session layer detects this on the next refresh and treats the
-session as expired.
+**Revoking a device.** `revoke_device(device_store, refresh_store,
+tenant, device_id, now)` marks the device `Revoked` and then revokes every
+refresh token issued to it, through `RefreshTokenStore::revoke_device_tokens`
+(one statement per backend, scoped by tenant). It attempts both halves
+even if one fails, returns the number of tokens revoked, and reports a
+store that cannot revoke by device (`RevokeDeviceError::TokensUnsupported`)
+instead of skipping it. After it, the next refresh with one of those tokens
+fails with `Revoked` and issues nothing, and a token of the same user's
+other device still refreshes. Plain `DeviceStore::set_trust_level` changes
+the device row and touches no token: a lost device's tokens keep
+refreshing until something revokes them.
 
-In the other direction: when a refresh token family is invalidated
-through reuse detection (the family-revoke mechanism covered in
-*Refresh tokens*), the cascade marks the bound devices as
-compromised. The compromise is the shortcut from `Trusted` (or
-`Seen`) to `Revoked` without an intermediate state.
+Sessions that were already issued are not ended by either call. A session
+ends at its own expiry or through the session store, and carries
+`device_id` for an application that wants to check the device on each
+request.
 
-The cascade is what makes the system robust against both
-operator-initiated revocation ("the device was lost") and
-attack-driven revocation ("a token was stolen"). The two cases
-converge on the same revocation primitive; both directions of
-cascade fire from the same code path.
+**Checking the device on refresh.** `refresh_session_with_device_check`
+is `refresh_session` that first loads the token's device and refuses with
+`RefreshError::DeviceRevoked` when it is `Revoked` or no longer exists,
+before anything is rotated. A token without a device id is refreshed as
+usual, and a device store that cannot answer refuses with
+`RefreshError::DeviceStore` instead of letting the refresh through. Use it
+as the second line behind `revoke_device`, and as the only line for a
+refresh store without revoke-by-device.
+
+**A compromised family.** When a rotated-out token is reused, the family
+is revoked and `RefreshTokenStore::on_token_compromise` is called with the
+`(tenant, device)` pairs of the family. The default hook only logs,
+because a refresh store holds no device store. Wrap the store in
+`CascadingRefreshStore::new(refresh_store, device_store, clock)` to have
+the hook revoke those devices, with the wrapped store's own hook still
+called afterwards.
+
+**The device binding of a token.** The `device_info` string a caller
+passes when it issues a token is not stored. The token stores a keyed digest
+of it together with the token's device id (`hb1:` and the base64url of an
+HMAC-SHA256 under the refresh pepper), so a database dump holds no client
+strings, and the stored value matches only the device id on the same row.
+Refresh recomputes the digest from the string the caller presents and
+compares in constant time; the replacement token inherits the stored value.
+Pass the keyed fingerprint (the hex of the `FingerprintHash` the extractor
+computed) rather than a raw `User-Agent`: the string is still whatever the
+client's request yields, and the device id link above is the strong binding.
+Configure `RefreshTokenConfig::hash_pepper` so the digest is keyed; without
+one it is an unkeyed hash. A token issued by an earlier release stores the
+raw string; it is still honoured, and the token that replaces it carries the
+digest.
 
 ### Step-up policies
 
@@ -170,6 +211,87 @@ The pattern composes with the other authorisation styles. A policy
 that requires both FIDO2 and a Trusted device is the two
 constraints together; a policy that allows any of three different
 ways to clear the bar is the disjunction in one rule.
+
+### A fingerprint is a hint, not proof
+
+The default `DefaultFingerprintExtractor` keys a hash on the
+`User-Agent`, the first `Accept-Language` entry and the client address
+truncated to a /24 (IPv4) or /48 (IPv6) range. Every input is chosen by the
+client or shared by anyone on the same network, so anyone who knows a
+user's headers produces the same fingerprint and is matched to the same
+device row. A match means "this request looks like that device", never
+"this is that device".
+
+Consequences for how you use it:
+
+- The default `StepUpPolicy` asks for a factor on a `Trusted` device
+  as well as on `Unknown` and `Seen` ones, and on `Revoked` ones (an empty
+  `revoked` list means the `unknown` list applies). Setting `trusted` to an
+  empty list lets a trusted device skip step-up, which is only safe when a
+  second signal the client cannot copy, such as a device certificate or a
+  key held by your app, backs the match.
+- A request the device layer cannot fingerprint (no `User-Agent`, or an
+  unavailable device store) has no device. Neither has a guest that presents
+  no valid device cookie: no device row is written for a visitor who never
+  signs in. Judge it with
+  `decide_step_up_for_optional(None, ..)`, which uses the `unknown` factors,
+  not as "no step-up".
+- Without `client_ip::layer` the address is left out of the fingerprint
+  and clients with the same headers match one device from anywhere. The
+  resolver logs a warning once when it finds no layer; install it, as the
+  device example does.
+- An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is reduced to its IPv4 /24
+  before hashing. Deployments upgrading from a release that did not do this
+  see new fingerprints for clients that reach them through a dual-stack
+  listener, so those clients register as new devices once.
+
+### The device token
+
+Because a fingerprint can be copied, `LifecycleDeviceResolver` does not find a
+device by it. A device is found by a token the client holds and cannot guess.
+
+When a request carries an authenticated user and no valid token, the resolver
+creates a new `Unknown` device for that user and mints a random 32-byte token.
+The row stores only a SHA-256 digest of the token (as a
+`DeviceBinding::Cookie`), and the token goes to the browser in a cookie,
+
+```text
+__Host-axess_device=<device id>.<token>; Secure; HttpOnly; SameSite=Strict; Path=/
+```
+
+valid for 400 days, the longest a browser keeps one. A later request presents
+the cookie; the resolver loads the row by the id in it and compares the token's
+digest with the row's in constant time. A request without a valid token never
+inherits a device by matching headers, whoever the device belongs to and
+whatever its trust level: the headers that copy a fingerprint copy nothing
+else.
+
+- `DeviceCookieConfig` names the cookie. `DeviceCookieConfig::insecure_for_local_development`
+  drops the `__Host-` prefix and `Secure` for a server on plain HTTP, which a
+  browser would otherwise reject; never use it behind HTTPS.
+- The session layer sends the cookie. It puts a `DeviceCookieSlot` in the
+  request extensions, the resolver leaves the `Set-Cookie` value there when it
+  issues a token, and the layer appends it to the response. A resolver you
+  write yourself does the same, or issues its own cookie.
+- `SameSite=Strict` keeps the cookie off cross-site requests, so a visit that
+  arrives from another site carries the session cookie and not this one. The
+  session layer tells the resolver which device the session was last bound
+  to (`SessionDevice`), and the resolver keeps it for an authenticated user
+  instead of minting another.
+- A guest request that presents a valid cookie is recognised, so step-up can
+  judge a returning `Trusted` browser before sign-in; it writes nothing, not
+  even a sighting.
+- A `Revoked` device is not recognised by its token; the request gets a new
+  `Unknown` device.
+- Devices created by an earlier release have no token. They are never matched
+  by fingerprint again: each browser gets a new device (and a cookie) at its
+  next authenticated request, so trust earned on the old row has to be earned
+  once more. The old rows age out through the retention sweep.
+- Clearing cookies is a new device, as it should be.
+
+`DeviceLifecycleService::ensure_device`, which matches by fingerprint, is
+still there for an application that proves the device some other way (a
+device certificate, a key held by your app). It carries the limits above.
 
 ### Identifying a device
 
@@ -220,8 +342,10 @@ features and either matching an existing device or minting one with
 things that differ between deployments:
 
 - `tenant_fn`, defaulting to a `TenantId` in the request extensions.
-- `client_ip_fn`, defaulting to `None`, because reading it means
-  either `ConnectInfo` or a trusted `X-Forwarded-For`.
+- `client_ip_fn`, defaulting to the address `client_ip::layer` resolved,
+  and to `None` (with a one-time warning) when that layer is not installed,
+  because reading the address yourself means either `ConnectInfo` or a
+  trusted `X-Forwarded-For`.
 - `user_fn`, defaulting to the user the session layer found
   authenticated on the session (`SessionUser` in the request
   extensions) and `None` for a guest, so an authenticated request only
@@ -258,13 +382,15 @@ cache value is the `Device` record. The TTL is short (a few
 seconds) so revocations propagate quickly; the LRU bound
 constrains memory under fan-out scenarios.
 
-Revoking a device is `DeviceStore::set_trust_level(tenant_id, id,
-DeviceTrustLevel::Revoked, now)`. There is no `revoke` verb, and there
-is no cache invalidation hook: the TTL is the only thing that expires a
-cached `Device`, so a revocation is visible to other readers within a
-few seconds rather than immediately. Keep the TTL short for that
-reason, and call `set_trust_level` on the same instance you read
-through if you need the change to be visible to yourself at once.
+Revoking a device is `revoke_device` (device and refresh tokens), or
+`DeviceStore::set_trust_level(tenant_id, id, DeviceTrustLevel::Revoked,
+now)` for the row alone. There is no `revoke` verb on the store. Every write
+through a `CachedDeviceStore` drops the cached row once the write finishes,
+and also when the future running it is dropped after the store has
+committed (a cancelled request), so the instance you wrote through never
+serves the pre-write row. Other instances and other processes learn of the
+change when their cached entry expires, a few seconds later by default: keep
+the TTL short for that reason.
 
 `delete` is the harder form, removing the record outright. Prefer
 `Revoked` where the audit trail matters: a deleted device leaves no
@@ -284,9 +410,18 @@ less than the sighting granularity before `now` (five minutes by default,
 of zero records every sighting. `last_seen_at` therefore lags real use by
 up to the granularity, which the retention sweep's windows (days) absorb.
 
-When the fingerprint's device belongs to another user (two people behind
-one office address with the same browser), `ensure_device` looks for the
-caller's own device with `DeviceStore::find_by_fingerprint_for_user`. The
+`DeviceStore::record_sighting` returns the trust level the row had when the
+sighting was applied. `DeviceLifecycleService::promote_on_authn` reports that
+level, so a device revoked between its load and its sighting comes back as
+`Revoked`, with `last_seen_at` unchanged. `ensure_device` never reuses or
+touches a revoked device (a request that matches one gets a new `Unknown`
+device), and two first sightings of one fingerprint that race settle on one
+device: the one that sorts later removes itself.
+
+For an identified user `ensure_device` looks for the caller's own device
+first, with `DeviceStore::find_by_fingerprint_for_user`, and only then at the
+newest device that carries the fingerprint, which may belong to another user
+(two people behind one office address with the same browser). The
 SQL stores answer it from the `idx_devices_user_fingerprint` index on
 `(tenant_id, user_id, fingerprint_hash, last_seen_at)`, so a user with
 any number of devices finds the right one. SQLite and Postgres create the
@@ -298,7 +433,10 @@ ALTER TABLE devices ADD INDEX idx_devices_user_fingerprint
 ```
 
 A store that does not override the method falls back to scanning the
-user's 100 most recently seen devices.
+user's 100 most recently seen devices. The Valkey store keeps a set per
+(tenant, fingerprint, user), so the lookup reads only the devices that can
+match; devices written by an earlier release are found through the user's
+index once and added to the set.
 
 ### PII tokenisation and GDPR
 
@@ -404,11 +542,13 @@ otherwise be only by hash. Read the docstring on
 `find_by_fingerprint` for the rationale.
 
 **`save` must be atomic.** `save` is documented as idempotent
-upsert. It never moves a stored `Revoked` row to another level (a
-`Device` loaded before a revocation and saved after it leaves the
-revoked row alone; reinstating is an explicit `set_trust_level`), and
-a `Revoked` row saved without `revoked_at` is stamped with the write
-time so the sweep can purge it. Implementations that do `SELECT` + `INSERT` racy-checks
+upsert. It never changes a stored `Revoked` row (a `Device` loaded
+before a revocation and saved after it leaves the revoked row alone,
+and a save of a revoked copy does not rewrite its `revoked_at` or
+bindings; reinstating is an explicit `set_trust_level`), and a
+`Revoked` row saved for the first time without `revoked_at` is stamped
+with the write time so the sweep can purge it. Setting `Revoked` on a
+row that already is keeps its first `revoked_at`. Implementations that do `SELECT` + `INSERT` racy-checks
 must wrap them in a transaction or use the dialect's native
 upsert (`ON CONFLICT`, `ON DUPLICATE KEY UPDATE`, `MERGE`, or
 `SETNX` for KV stores). A non-atomic `save` produces lost updates
@@ -419,7 +559,9 @@ touches this. Implement it as a single `UPDATE … SET last_seen_at
 = ?` rather than a load-modify-save round trip. It is monotonic
 (`last_seen_at` becomes the later of the stored time and the new one,
 so a late request never moves it back) and it leaves a `Revoked` row
-alone while still succeeding. The shipped
+alone while still succeeding. It returns the trust level the row has
+(`Revoked` for a revoked one), which callers report instead of the level
+they loaded earlier. The shipped
 backends are a guide. The `CachedDeviceStore` decorator (see
 caching, above) shields the underlying store from read pressure
 but the write path runs through every request.

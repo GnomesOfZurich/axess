@@ -21,26 +21,59 @@ impl OAuthProviderConfig {
         self
     }
 
+    /// Require every back-channel logout token to carry the `typ` header
+    /// `logout+jwt` (OpenID Connect Back-Channel Logout 1.0, section 2.4).
+    ///
+    /// By default a token is taken when its `typ` is `logout+jwt`, `JWT` or
+    /// `Logout` (any case, with or without `application/`), or when it has
+    /// none, because IdPs in the field send all of those. Only the types of
+    /// other tokens signed by the same key (`dpop+jwt`, `at+jwt`) are
+    /// refused. Turn this on for an IdP known to send the explicit type, and
+    /// a token with another `typ` or none is refused too.
+    pub fn with_required_logout_typ(mut self) -> Self {
+        self.require_logout_typ = true;
+        self
+    }
+
     /// Override the ceremony timeout (default: 10 minutes).
     pub fn with_ceremony_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.ceremony_timeout = timeout;
         self
     }
 
-    /// Enable FAPI 2.0 Baseline Profile for this provider.
+    /// Enable the FAPI 2.0 profile for this provider.
     ///
-    /// Enforces: mandatory PAR, sender-constrained tokens (DPoP or MTLS),
-    /// and stricter ID token lifetime validation. Requires the IdP to
-    /// advertise a `pushed_authorization_request_endpoint` in discovery.
-    pub fn with_fapi(mut self, config: FapiConfig) -> Result<Self, OAuthError> {
-        if self.par_endpoint.is_none() {
-            return Err(OAuthError::Config(
-                "FAPI 2.0 requires pushed_authorization_request_endpoint in provider metadata"
-                    .to_string(),
-            ));
-        }
-        self.fapi = Some(config);
-        Ok(self)
+    /// What the profile then means:
+    ///
+    /// * **Sender-constrained tokens.** With [`SenderConstraint::DPoP`](crate::oauth::SenderConstraint::DPoP) the
+    ///   token request carries a DPoP proof signed by a key the service makes
+    ///   for the login (and repeats on `use_dpop_nonce`), the response must
+    ///   say `token_type` `DPoP`, and the key comes back in
+    ///   `OAuthClaims::dpop_key` to be kept for the token's life. With
+    ///   [`SenderConstraint::Mtls`](crate::oauth::SenderConstraint::Mtls) the certificate and key are loaded here
+    ///   into the HTTP client, the server's `mtls_endpoint_aliases` replace the
+    ///   token, userinfo, revocation and PAR endpoints it lists, and the
+    ///   client secret is no longer sent (the certificate authenticates).
+    /// * **PAR** is required: the provider must have a PAR endpoint.
+    /// * **ID tokens** must carry `nbf`, live no longer than
+    ///   `max_id_token_lifetime_secs`, and be signed with one of
+    ///   `allowed_id_token_algs` (`PS256`, `ES256`, `EdDSA` by default),
+    ///   whatever the IdP advertises.
+    /// * **JARM** when `require_jarm` is set: authorization requests ask for
+    ///   `response_mode=jwt` and the callback is finished with the response
+    ///   JWT; a plain callback is refused.
+    ///
+    /// Reads the mTLS certificate and key files synchronously; call it at
+    /// startup, not on a request path.
+    ///
+    /// # Errors
+    ///
+    /// [`OAuthError::Config`] when the provider has no PAR endpoint, an
+    /// algorithm name is not an asymmetric one this provider verifies (or the
+    /// list is empty), the mTLS files cannot be read or parsed, or an
+    /// advertised mTLS alias is not a secure URL.
+    pub fn with_fapi(self, config: FapiConfig) -> Result<Self, OAuthError> {
+        self.enable_fapi(config)
     }
 
     /// Manually set the PAR endpoint (RFC 9126).
@@ -77,10 +110,15 @@ impl OAuthProviderConfig {
 
     /// Configure the set of `post_logout_redirect_uri` values accepted by
     /// [`build_end_session_url`](crate::oauth::OAuthProvider::build_end_session_url). Each entry must match exactly (no glob /
-    /// substring matching); values not in the list are silently dropped
-    /// before being passed to the IdP, defeating phishing chains where an
-    /// attacker tricks a user-controlled redirect parameter through the
-    /// logout flow.
+    /// substring matching); values not in the list are dropped (with a
+    /// warning) before being passed to the IdP, defeating phishing chains
+    /// where an attacker tricks a user-controlled redirect parameter through
+    /// the logout flow.
+    ///
+    /// The list is empty by default and an empty list forwards nothing: a
+    /// provider that exposes a logout link with a redirect parameter must
+    /// list the destinations it accepts here, and each must also be
+    /// registered at the IdP.
     pub fn with_allowed_post_logout_redirect_uris(
         mut self,
         uris: impl IntoIterator<Item = impl Into<String>>,

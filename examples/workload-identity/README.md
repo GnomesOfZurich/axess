@@ -53,7 +53,7 @@ Three options:
 
 ```rust,ignore
 use axess_example_workload_identity::github_actions::{
-    github_actions_mapper, GitHubActionsClaims,
+    github_actions_mapper, GitHubActionsClaims, GitHubAllowlist,
 };
 use axess_factors::federation::workload::WorkloadResolver;
 use axess_factors::jwt::verifier::JwtVerifier;
@@ -75,10 +75,23 @@ let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
     tenant_id,
     Issuer::custom("github_actions").unwrap(),
     bearer_token,
-    github_actions_mapper(trust_domain),
+    // Trust owners and repositories by their immutable numeric ids, never by
+    // name: a renamed or deleted organisation frees its old name.
+    github_actions_mapper(
+        trust_domain,
+        GitHubAllowlist::new().owner_id("123456").repository_id("987654321"),
+    ),
 );
 let principal = resolver.resolve().await?;
 ```
+
+The mapper requires the `repository_id` and `repository_owner_id` claims and
+refuses a token without them or with an owner id that is not on the allowlist.
+The names (`repository`, `repository_owner`) are kept as attributes for audit.
+
+For Kubernetes, `k8s_sa_mapper_pinned` with `SaUidPins` refuses a service
+account whose UID is not the one registered for its namespace and name, which
+is what stops a deleted and recreated account from inheriting the old name.
 
 ## Writing your own recipe
 

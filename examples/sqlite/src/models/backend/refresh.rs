@@ -3,14 +3,14 @@
 //! in a `sqlx::Pool::begin()` transaction so partial-failure semantics match
 //! the trait contract; either every side-effect lands or none does.
 
-use axess::Clock;
-use axess::authn::{DeviceId, UserId};
+use axess::authn::{DeviceId, TenantId, UserId};
 use axess::session::{
-    RefreshToken, RefreshTokenId, RefreshTokenStore, RotationOutcome, TokenFamilyId,
+    DeviceTokenRevocation, RefreshToken, RefreshTokenId, RefreshTokenStore, RevocationReason,
+    RotationOutcome, TokenFamilyId,
 };
 use sqlx::Row;
 
-use super::{BackendError, OurBackend, parse_db_datetime};
+use super::{BackendError, OurBackend};
 
 impl RefreshTokenStore for OurBackend {
     type Error = BackendError;
@@ -41,31 +41,42 @@ impl RefreshTokenStore for OurBackend {
     async fn find_token(&self, token_hash: &str) -> Result<Option<RefreshToken>, Self::Error> {
         let row = sqlx::query(
             "SELECT id, user_id, tenant_id, token_hash, family_id, device_id,
-                    device_info, issued_at, expires_at, revoked, authn_time
+                    device_info, issued_at, expires_at, revoked, authn_time,
+                    revoked_reason, revoked_at
                FROM refresh_tokens
               WHERE token_hash = ?1",
         )
         .bind(token_hash)
         .fetch_optional(self.pool())
         .await?;
-        Ok(row
-            .as_ref()
-            .map(|r| refresh_token_from_row(self.clock(), r)))
+        row.as_ref().map(refresh_token_from_row).transpose()
     }
 
     async fn revoke_token(&self, token_id: &RefreshTokenId) -> Result<(), Self::Error> {
-        sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?1")
-            .bind(token_id.to_string())
-            .execute(self.pool())
-            .await?;
+        sqlx::query(
+            "UPDATE refresh_tokens
+                SET revoked = 1, revoked_reason = ?2, revoked_at = ?3
+              WHERE id = ?1 AND revoked = 0",
+        )
+        .bind(token_id.to_string())
+        .bind(RevocationReason::Explicit.as_str())
+        .bind(self.clock().now().to_rfc3339())
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
     async fn revoke_user_tokens(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?1")
-            .bind(user_id.to_string())
-            .execute(self.pool())
-            .await?;
+        sqlx::query(
+            "UPDATE refresh_tokens
+                SET revoked = 1, revoked_reason = ?2, revoked_at = ?3
+              WHERE user_id = ?1 AND revoked = 0",
+        )
+        .bind(user_id.to_string())
+        .bind(RevocationReason::Explicit.as_str())
+        .bind(self.clock().now().to_rfc3339())
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
@@ -79,20 +90,44 @@ impl RefreshTokenStore for OurBackend {
         // family revoke.
         sqlx::query(
             "UPDATE refresh_tokens
-                SET revoked = 1
-              WHERE user_id = ?1 AND family_id = ?2",
+                SET revoked = 1, revoked_reason = ?3, revoked_at = ?4
+              WHERE user_id = ?1 AND family_id = ?2 AND revoked = 0",
         )
         .bind(user_id.to_string())
         .bind(family_id.to_string())
+        .bind(RevocationReason::Compromise.as_str())
+        .bind(self.clock().now().to_rfc3339())
         .execute(self.pool())
         .await?;
         Ok(())
     }
 
+    async fn revoke_device_tokens(
+        &self,
+        tenant_id: &TenantId,
+        device_id: &DeviceId,
+    ) -> Result<DeviceTokenRevocation, Self::Error> {
+        // Single statement, scoped by tenant: a rotation racing with it
+        // either lands before (and its child carries the device id, so is
+        // revoked too) or after (and finds a revoked parent).
+        let done = sqlx::query(
+            "UPDATE refresh_tokens SET revoked = 1
+              WHERE tenant_id = ?1 AND device_id = ?2 AND revoked = 0",
+        )
+        .bind(tenant_id.to_string())
+        .bind(device_id.to_string())
+        .execute(self.pool())
+        .await?;
+        Ok(DeviceTokenRevocation::Revoked {
+            tokens: done.rows_affected(),
+        })
+    }
+
     async fn active_tokens(&self, user_id: &UserId) -> Result<Vec<RefreshToken>, Self::Error> {
         let rows = sqlx::query(
             "SELECT id, user_id, tenant_id, token_hash, family_id, device_id,
-                    device_info, issued_at, expires_at, revoked, authn_time
+                    device_info, issued_at, expires_at, revoked, authn_time,
+                    revoked_reason, revoked_at
                FROM refresh_tokens
               WHERE user_id = ?1 AND revoked = 0
               ORDER BY issued_at ASC",
@@ -100,10 +135,7 @@ impl RefreshTokenStore for OurBackend {
         .bind(user_id.to_string())
         .fetch_all(self.pool())
         .await?;
-        Ok(rows
-            .iter()
-            .map(|r| refresh_token_from_row(self.clock(), r))
-            .collect())
+        rows.iter().map(refresh_token_from_row).collect()
     }
 
     async fn issue_capped(
@@ -118,7 +150,8 @@ impl RefreshTokenStore for OurBackend {
         let mut tx = self.pool().begin().await?;
 
         sqlx::query(
-            "UPDATE refresh_tokens SET revoked = 1
+            "UPDATE refresh_tokens
+                SET revoked = 1, revoked_reason = ?3, revoked_at = ?4
               WHERE id IN (
                 SELECT id FROM refresh_tokens
                  WHERE user_id = ?1 AND revoked = 0
@@ -128,6 +161,8 @@ impl RefreshTokenStore for OurBackend {
         )
         .bind(new_token.user_id.to_string())
         .bind(i64::try_from(max_per_user).unwrap_or(i64::MAX))
+        .bind(RevocationReason::Evicted.as_str())
+        .bind(self.clock().now().to_rfc3339())
         .execute(&mut *tx)
         .await?;
 
@@ -166,12 +201,17 @@ impl RefreshTokenStore for OurBackend {
         let mut tx = self.pool().begin().await?;
         // Conditional: a parent already revoked means a parallel refresh won
         // the race; nothing is inserted and the caller treats it as reuse.
-        let revoked_now =
-            sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE id = ?1 AND revoked = 0")
-                .bind(parent_id.to_string())
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
+        let revoked_now = sqlx::query(
+            "UPDATE refresh_tokens
+                SET revoked = 1, revoked_reason = ?2, revoked_at = ?3
+              WHERE id = ?1 AND revoked = 0",
+        )
+        .bind(parent_id.to_string())
+        .bind(RevocationReason::Rotated.as_str())
+        .bind(new_token.issued_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if revoked_now == 0 {
             tx.rollback().await?;
             return Ok(RotationOutcome::ParentAlreadyRevoked);
@@ -200,37 +240,153 @@ impl RefreshTokenStore for OurBackend {
     }
 }
 
+/// The text columns of a `refresh_tokens` row, before they are decoded.
+struct RawRefreshRow {
+    id: String,
+    user_id: String,
+    tenant_id: String,
+    token_hash: String,
+    family_id: Option<String>,
+    device_id: Option<String>,
+    device_info: Option<String>,
+    issued_at: String,
+    expires_at: String,
+    revoked: i64,
+    authn_time: Option<String>,
+    revoked_reason: Option<String>,
+    revoked_at: Option<String>,
+}
+
 /// Hydrate a `RefreshToken` from a `refresh_tokens` row.
-fn refresh_token_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) -> RefreshToken {
-    use axess::authn::TenantId;
+fn refresh_token_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RefreshToken, BackendError> {
+    RawRefreshRow {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        tenant_id: row.get("tenant_id"),
+        token_hash: row.get("token_hash"),
+        family_id: row.get("family_id"),
+        device_id: row.get("device_id"),
+        device_info: row.get("device_info"),
+        issued_at: row.get("issued_at"),
+        expires_at: row.get("expires_at"),
+        revoked: row.get("revoked"),
+        authn_time: row.get("authn_time"),
+        revoked_reason: row.get("revoked_reason"),
+        revoked_at: row.get("revoked_at"),
+    }
+    .decode()
+}
 
-    let id: String = row.get("id");
-    let user_id: String = row.get("user_id");
-    let tenant_id: String = row.get("tenant_id");
-    let token_hash: String = row.get("token_hash");
-    let family_id: Option<String> = row.get("family_id");
-    let device_id: Option<String> = row.get("device_id");
-    let device_info: Option<String> = row.get("device_info");
-    let issued_at: String = row.get("issued_at");
-    let expires_at: String = row.get("expires_at");
-    let revoked: i64 = row.get("revoked");
-    let authn_time: Option<String> = row.get("authn_time");
+/// A timestamp column that must be valid. A row whose `expires_at` or
+/// `issued_at` cannot be read is an integrity failure, not "now": falling
+/// back to the current time would hand back a token that is neither expired
+/// nor ageing, and the caller would honour it.
+fn strict_datetime(
+    column: &str,
+    value: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, BackendError> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.into());
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .map(|dt| dt.and_utc())
+        .map_err(|_| BackendError::Backend(format!("refresh_tokens.{column} is not a timestamp")))
+}
 
-    RefreshToken {
-        id: RefreshTokenId::try_new(&id).expect("refresh_tokens.id must be a valid RefreshTokenId"),
-        user_id: UserId::try_new(&user_id).expect("refresh_tokens.user_id invalid"),
-        tenant_id: TenantId::try_new(&tenant_id).expect("refresh_tokens.tenant_id invalid"),
-        token_hash,
-        issued_at: parse_db_datetime(clock, &issued_at),
-        expires_at: parse_db_datetime(clock, &expires_at),
-        revoked: revoked != 0,
-        device_info,
-        family_id: family_id
-            .as_deref()
-            .map(|s| TokenFamilyId::try_new(s).expect("refresh_tokens.family_id invalid")),
-        device_id: device_id
-            .as_deref()
-            .map(|s| DeviceId::try_new(s).expect("refresh_tokens.device_id invalid")),
-        authn_time: authn_time.as_deref().map(|t| parse_db_datetime(clock, t)),
+impl RawRefreshRow {
+    /// Decode, failing closed: a malformed id or required timestamp is an
+    /// error (no panic, no substituted value). `authn_time` is optional
+    /// context, so an unreadable one becomes `None`, which the refresh path
+    /// treats as "authentication time unknown".
+    fn decode(self) -> Result<RefreshToken, BackendError> {
+        use axess::authn::TenantId;
+        let bad = |column: &str| BackendError::Backend(format!("refresh_tokens.{column} invalid"));
+        Ok(RefreshToken {
+            id: RefreshTokenId::try_new(&self.id).map_err(|_| bad("id"))?,
+            user_id: UserId::try_new(&self.user_id).map_err(|_| bad("user_id"))?,
+            tenant_id: TenantId::try_new(&self.tenant_id).map_err(|_| bad("tenant_id"))?,
+            token_hash: self.token_hash,
+            issued_at: strict_datetime("issued_at", &self.issued_at)?,
+            expires_at: strict_datetime("expires_at", &self.expires_at)?,
+            revoked: self.revoked != 0,
+            device_info: self.device_info,
+            family_id: self
+                .family_id
+                .as_deref()
+                .map(|s| TokenFamilyId::try_new(s).map_err(|_| bad("family_id")))
+                .transpose()?,
+            device_id: self
+                .device_id
+                .as_deref()
+                .map(|s| DeviceId::try_new(s).map_err(|_| bad("device_id")))
+                .transpose()?,
+            authn_time: self
+                .authn_time
+                .as_deref()
+                .and_then(|t| strict_datetime("authn_time", t).ok()),
+            revoked_reason: self
+                .revoked_reason
+                .as_deref()
+                .and_then(RevocationReason::parse),
+            revoked_at: self
+                .revoked_at
+                .as_deref()
+                .and_then(|t| strict_datetime("revoked_at", t).ok()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw() -> RawRefreshRow {
+        RawRefreshRow {
+            id: "00000000-0000-4000-8000-000000000001".into(),
+            user_id: "00000000-0000-4000-8000-000000000002".into(),
+            tenant_id: "00000000-0000-4000-8000-000000000003".into(),
+            token_hash: "h".into(),
+            family_id: None,
+            device_id: None,
+            device_info: None,
+            issued_at: "2030-01-01T00:00:00Z".into(),
+            expires_at: "2030-02-01T00:00:00Z".into(),
+            revoked: 0,
+            authn_time: Some("2030-01-01T00:00:00Z".into()),
+            revoked_reason: None,
+            revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_row_decodes() {
+        let token = raw().decode().expect("decodes");
+        assert!(token.authn_time.is_some());
+    }
+
+    #[test]
+    fn a_corrupt_expiry_or_issue_time_fails_closed_instead_of_becoming_now() {
+        for edit in [
+            (|r: &mut RawRefreshRow| r.expires_at = "garbage".into()) as fn(&mut RawRefreshRow),
+            |r| r.issued_at = String::new(),
+        ] {
+            let mut r = raw();
+            edit(&mut r);
+            assert!(r.decode().is_err());
+        }
+    }
+
+    #[test]
+    fn a_bad_id_is_an_error_not_a_panic() {
+        let mut r = raw();
+        r.id = String::new();
+        assert!(r.decode().is_err());
+    }
+
+    #[test]
+    fn an_unreadable_authn_time_becomes_none() {
+        let mut r = raw();
+        r.authn_time = Some("not a time".into());
+        assert_eq!(r.decode().expect("decodes").authn_time, None);
     }
 }

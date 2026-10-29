@@ -164,3 +164,62 @@ async fn wrong_issuer_rejected_before_mapper_runs() {
         "wrong iss must reject before mapper runs"
     );
 }
+
+async fn resolve_pinned(
+    edit: impl FnOnce(&mut serde_json::Value),
+    pins: axess_example_workload_identity::kubernetes::SaUidPins,
+) -> Result<Principal, axess_identity::IdentityError> {
+    use axess_example_workload_identity::kubernetes::k8s_sa_mapper_pinned;
+    let (der, jwks) = common::rsa_keypair("k8s-pin");
+    let (now, exp) = common::now_and_exp();
+    let mut claims = k8s_claims(now, exp);
+    edit(&mut claims);
+    let token = common::sign(&claims, "k8s-pin", &der);
+    let verifier = common::build_verifier(jwks, ISSUER, AUDIENCE);
+    let trust = TrustDomain::new(TRUST_DOMAIN).unwrap();
+    WorkloadResolver::<K8sCustomClaims, _, _>::new(
+        verifier,
+        trust.clone(),
+        sample_tenant(),
+        Issuer::custom("kubernetes").unwrap(),
+        token,
+        k8s_sa_mapper_pinned(trust, pins),
+    )
+    .resolve()
+    .await
+}
+
+#[tokio::test]
+async fn pinned_mapper_refuses_a_recreated_service_account() {
+    use axess_example_workload_identity::kubernetes::SaUidPins;
+    let pins = SaUidPins::new().pin(
+        "tenant-acme",
+        "billing-api",
+        "11111111-2222-3333-4444-555555555555",
+    );
+    assert!(resolve_pinned(|_| {}, pins.clone()).await.is_ok());
+
+    // Same namespace and name, new UID: the account was deleted and recreated.
+    let recreated = resolve_pinned(
+        |c| c["kubernetes.io"]["serviceaccount"]["uid"] = serde_json::json!("ffff"),
+        pins.clone(),
+    )
+    .await;
+    assert!(recreated.is_err(), "{recreated:?}");
+
+    // No UID claim at all.
+    let no_uid = resolve_pinned(
+        |c| {
+            c["kubernetes.io"]["serviceaccount"]
+                .as_object_mut()
+                .unwrap()
+                .remove("uid");
+        },
+        pins,
+    )
+    .await;
+    assert!(no_uid.is_err(), "{no_uid:?}");
+
+    // An account nobody pinned.
+    assert!(resolve_pinned(|_| {}, SaUidPins::new()).await.is_err());
+}

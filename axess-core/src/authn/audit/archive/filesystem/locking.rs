@@ -121,6 +121,7 @@ fn an_unrestorable_marker_leaves_the_events_in_place() {
     ];
 
     let result = append_all_or_none(
+        tmp.path(),
         &data,
         &markers,
         &mut Faults {
@@ -134,6 +135,7 @@ fn an_unrestorable_marker_leaves_the_events_in_place() {
                 }
             }),
             // The first marker cannot be restored.
+            trace: Box::new(|_| {}),
             before_rollback: Box::new(|i| {
                 if i == 2 {
                     Err(std::io::Error::other("rollback failed"))
@@ -164,6 +166,7 @@ fn an_unrestorable_event_file_leaves_a_retryable_batch() {
     let data = vec![(d1.clone(), b"E1\n".to_vec())];
     let markers = vec![(m1.clone(), b"id\n".to_vec())];
     let result = append_all_or_none(
+        tmp.path(),
         &data,
         &markers,
         &mut Faults {
@@ -174,6 +177,7 @@ fn an_unrestorable_event_file_leaves_a_retryable_batch() {
                     Ok(())
                 }
             }),
+            trace: Box::new(|_| {}),
             before_rollback: Box::new(|i| {
                 if i == 0 {
                     Err(std::io::Error::other("rollback failed"))
@@ -199,7 +203,7 @@ fn new_folders_and_the_root_they_hang_from_are_synced() {
         root.join("2026/05/19"),
     ];
     let file = root.join("2026/05/19/audit-2026-05-19.jsonl");
-    let dirs = dirs_to_sync(&created, &[file.as_path()]);
+    let dirs = dirs_to_sync(&root, &created, &[file.as_path()]);
     for want in [
         "/archive",
         "/archive/2026",
@@ -243,9 +247,9 @@ async fn archiving_into_new_folders_succeeds_end_to_end() {
     assert!(archiver.root().join(".archive.lock").exists());
 }
 
-/// The id check reads a line at a time and stops at a match.
+/// The id check finds an id in a large sidecar, and reads the file once.
 #[test]
-fn batch_recorded_finds_an_id_in_a_large_sidecar() {
+fn recorded_finds_an_id_in_a_large_sidecar_with_one_read() {
     let tmp = tempdir();
     let path = tmp.path().join("audit.jsonl.batches");
     let mut text = String::new();
@@ -253,8 +257,23 @@ fn batch_recorded_finds_an_id_in_a_large_sidecar() {
         text.push_str(&format!("{i:064}\n"));
     }
     std::fs::write(&path, text).unwrap();
-    assert!(batch_recorded(&path, &format!("{:064}", 3)).unwrap());
-    assert!(batch_recorded(&path, &format!("{:064}", 49_999)).unwrap());
-    assert!(!batch_recorded(&path, &format!("{:064}", 50_000)).unwrap());
-    assert!(!batch_recorded(&tmp.path().join("missing"), "x").unwrap());
+    let mut cache = sidecar::SidecarCache::default();
+    let id = |n: u32| format!("{n:064}");
+    assert!(cache.recorded(&path, &id(3), "no-such-marker").unwrap());
+    assert!(
+        cache
+            .recorded(&path, &id(49_999), "no-such-marker")
+            .unwrap()
+    );
+    assert!(
+        !cache
+            .recorded(&path, &id(50_000), "no-such-marker")
+            .unwrap()
+    );
+    assert!(
+        !cache
+            .recorded(&tmp.path().join("missing"), "x", "x y")
+            .unwrap()
+    );
+    assert_eq!(cache.loads(), 1, "one read for four questions");
 }

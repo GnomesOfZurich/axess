@@ -36,7 +36,9 @@ pub mod grant;
 pub mod provider;
 pub mod session;
 
-pub use credential::{DelegatedCredentialStore, MemoryDelegatedCredentialStore, StoredDelegation};
+pub use credential::{
+    CredentialSwap, DelegatedCredentialStore, MemoryDelegatedCredentialStore, StoredDelegation,
+};
 #[cfg(feature = "delegated-stored-encrypted")]
 pub use encrypted::{
     CurrentKey, EncryptedDelegatedCredentialStore, EncryptionKey, KeyProvider, KeyProviderError,
@@ -47,7 +49,11 @@ pub use provider::DelegatedProvider;
 pub use session::StoredDelegationSession;
 
 #[cfg(test)]
+mod cancel_tests;
+#[cfg(test)]
 mod dst_tests;
+#[cfg(test)]
+mod endpoint_tests;
 #[cfg(test)]
 mod response_tests;
 #[cfg(test)]

@@ -7,10 +7,25 @@
 ignore = [
     # rsa: Marvin Attack timing sidechannel (RUSTSEC-2023-0071)
     # Severity: 5.9 (medium). No fixed version available.
-    # Pulled transitively by: sqlx-mysql, openidconnect, crypto-glue (webauthn-rs).
-    # Risk to axess: low. We do not use RSA for session encryption or key
-    # exchange. The crate is used by upstream deps for JWT signature verification
-    # and by our dev-dependency for test key generation.
+    #
+    # Reachability (the same text as the entry in deny.toml, which is the
+    # reference; scripts/release-preflight.sh fails if the two lists of ids
+    # differ):
+    #   - Transitively, via sqlx-mysql, openidconnect and crypto-glue
+    #     (webauthn-rs).
+    #   - Directly, as an optional runtime dependency of axess-core enabled by
+    #     `local-idp`, for RSA-2048 keygen and PKCS#1 parsing in
+    #     `LocalIdpSigningKey`.
+    #   - Directly, under `jwt-rust-crypto`, because jsonwebtoken's
+    #     `rust_crypto` backend performs RS256 signing and verification
+    #     through this crate.
+    #
+    # Risk: a timing sidechannel on RSA private-key operations. The exposed
+    # operation is RS256 *signing*, which only happens when `local-idp` is
+    # enabled (off by default) and the deployment mints its own tokens. Such
+    # a deployment should prefer ES256, or the `jwt-aws-lc` backend.
+    # Verification-only deployments are not exposed.
+    #
     # Resolution: wait for rsa crate maintainers to release a fix.
     "RUSTSEC-2023-0071",
 

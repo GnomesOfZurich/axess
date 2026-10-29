@@ -11,12 +11,81 @@
 use crate::authn::ids::{DeviceId, TenantId};
 use crate::device::store::DeviceStore;
 use crate::device::types::DeviceTrustLevel;
+use crate::session::refresh::{DeviceTokenRevocation, RefreshTokenStore};
 use chrono::{DateTime, Utc};
+
+/// Why [`revoke_device`] could not finish. Either failure leaves the other
+/// half done, so the call is safe to repeat.
+#[derive(Debug, thiserror::Error)]
+pub enum RevokeDeviceError<DE, RE>
+where
+    DE: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    /// The device store could not mark the device revoked (a missing device
+    /// is among the causes). Its tokens were revoked all the same.
+    #[error("device revocation failed: {0}")]
+    Device(#[source] DE),
+
+    /// The refresh-token store failed while revoking the device's tokens.
+    /// The device is marked revoked.
+    #[error("revoking the device's refresh tokens failed: {0}")]
+    Tokens(#[source] RE),
+
+    /// The refresh-token store has no revoke-by-device operation (see
+    /// [`RefreshTokenStore::revoke_device_tokens`]); the device is marked
+    /// revoked and its tokens are untouched. Check the device on refresh
+    /// with
+    /// [`refresh_session_with_device_check`](crate::session::refresh::refresh_session_with_device_check)
+    /// or implement the method.
+    #[error("the refresh-token store cannot revoke tokens by device")]
+    TokensUnsupported,
+}
+
+/// Revoke a device and the refresh tokens issued to it.
+///
+/// Marks the device [`DeviceTrustLevel::Revoked`] and then revokes every
+/// token whose `device_id` is `device_id` in `tenant_id`, whatever user or
+/// family it belongs to. Setting the trust level alone does neither: it
+/// changes the device row and leaves its tokens refreshing. This is the one
+/// call that means "revoke this device".
+///
+/// Both halves are attempted even if the first fails, so a device whose row
+/// is already gone still has its tokens revoked, and the first failure is
+/// returned. Returns the number of tokens revoked.
+///
+/// Sessions already issued to the device are not touched: a session ends
+/// at its own expiry or when it is revoked through the session store, and
+/// carries the device id (`SessionData::device_id`) for an application that
+/// wants to check the device on each request.
+pub async fn revoke_device<D, R>(
+    device_store: &D,
+    refresh_store: &R,
+    tenant_id: &TenantId,
+    device_id: &DeviceId,
+    now: DateTime<Utc>,
+) -> Result<u64, RevokeDeviceError<D::Error, R::Error>>
+where
+    D: DeviceStore,
+    R: RefreshTokenStore,
+{
+    let device = device_store
+        .set_trust_level(tenant_id, device_id, DeviceTrustLevel::Revoked, now)
+        .await;
+    let tokens = refresh_store
+        .revoke_device_tokens(tenant_id, device_id)
+        .await;
+    device.map_err(RevokeDeviceError::Device)?;
+    match tokens.map_err(RevokeDeviceError::Tokens)? {
+        DeviceTokenRevocation::Revoked { tokens } => Ok(tokens),
+        DeviceTokenRevocation::Unsupported => Err(RevokeDeviceError::TokensUnsupported),
+    }
+}
 
 /// Transition a list of devices to [`DeviceTrustLevel::Revoked`].
 ///
 /// Designed to be called from a refresh-token-store override of
-/// [`RefreshTokenStore::on_token_compromise`](crate::session::refresh::RefreshTokenStore::on_token_compromise).
+/// [`RefreshTokenStore::on_token_compromise`].
 /// Each `(tenant, device)` pair triggers an independent
 /// [`DeviceStore::set_trust_level`] call; per-target failures are logged
 /// at `warn` level and do not abort the overall cascade. The
@@ -66,7 +135,7 @@ pub async fn cascade_revoke_devices<D: DeviceStore>(
 /// Composes [`DeviceStore::find_by_refresh_family`] +
 /// [`cascade_revoke_devices`]: the canonical wiring for refresh-token-
 /// family compromise. Designed to be called from a
-/// [`RefreshTokenStore`](crate::session::refresh::RefreshTokenStore)
+/// [`RefreshTokenStore`]
 /// override of `on_token_compromise` (or equivalent application hook)
 /// once a rotated-out refresh token is detected being reused.
 ///

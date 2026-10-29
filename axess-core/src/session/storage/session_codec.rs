@@ -32,23 +32,27 @@ use std::time::Duration;
 /// stored value copied from one row into a row with a different id fails
 /// authentication instead of decrypting under the new id.
 ///
-/// A blob that carries the marker is only ever opened under the bound AAD and
-/// never falls back to an empty AAD. A blob without the marker predates this
-/// format (random nonce first, empty AAD) and is opened under the empty AAD.
-/// The two cannot be confused except when a pre-binding nonce happens to begin
-/// with the four marker bytes (probability 2^-32 per legacy row); such a row
-/// fails to open and the user signs in again.
+/// A blob that carries the marker is opened under the bound AAD. A blob
+/// without the marker predates this format (random nonce first, empty AAD)
+/// and is opened under the empty AAD only when the
+/// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) policy reads such
+/// blobs. A pre-binding nonce that happens to begin with the four marker
+/// bytes (probability 2^-32 per legacy row) is tried as a pre-binding blob
+/// after the bound open fails, under a policy that reads them; under the
+/// default policy such a row is refused and the user signs in again.
 ///
 /// # Upgrade path
 ///
-/// No migration is needed. Reads accept both formats and the store that read
-/// a pre-binding row re-seals it in the bound format right away (a
+/// The default policy refuses a blob without a binding, which opens under
+/// any session id. A deployment that still holds pre-binding rows sets
+/// [`LegacyBlobs::AcceptUntil`](crate::session::crypto::LegacyBlobs::AcceptUntil)
+/// for one session lifetime: reads then accept both formats and the store
+/// that read a pre-binding row re-seals it in the bound format right away (a
 /// conditional write that keeps the row's expiry and never overwrites a
 /// newer save); every write (`save`, `update`, `cycle`) seals the bound
-/// format too. Once no pre-binding rows remain, set
-/// [`LegacyBlobs::Reject`](crate::session::crypto::LegacyBlobs::Reject) so a
-/// blob without a binding, which opens under any session id, is refused.
-/// Plaintext codecs have nothing to bind.
+/// format too. Session data carries no session id, so the cutoff is the only
+/// protection against a moved legacy row. Plaintext codecs have nothing to
+/// bind.
 ///
 /// Used by [`SqliteSessionStore`](super::sqlite::SqliteSessionStore),
 /// [`PostgresSessionStore`](super::postgres::PostgresSessionStore), and
@@ -196,12 +200,20 @@ impl SessionCodec {
 
 /// Compute the `expires_at` Unix timestamp from the current time and a TTL.
 /// SQL-only; Valkey delegates TTL enforcement to the server (`EXPIRE`).
+///
+/// The expiry is whole seconds, and a sub-second TTL is raised to one second
+/// (as the Valkey store does), so any positive TTL leaves the row loadable
+/// for at least a second (a row loads only while `expires_at` is after now).
+/// A zero TTL gives `now`, a row that can never be loaded; the write paths
+/// report that as an ended session.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub(crate) fn expires_at(clock: &dyn axess_clock::Clock, ttl: Duration) -> i64 {
-    clock
-        .now()
-        .timestamp()
-        .saturating_add(ttl.as_secs().min(i64::MAX as u64) as i64)
+    let secs = if ttl.is_zero() {
+        0
+    } else {
+        ttl.as_secs().clamp(1, i64::MAX as u64) as i64
+    };
+    clock.now().timestamp().saturating_add(secs)
 }
 
 /// Shared error type for backend session stores.

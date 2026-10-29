@@ -28,20 +28,22 @@ pub mod testing {
 // Session layer. Kept at the root because `SessionLayer` and the core
 // session types are common facade entry points.
 pub use axess_core::{
-    AuthSession, AuthState, SameSite, SessionBinding, SessionConfig, SessionConfigBuilder,
-    SessionData, SessionId, SessionLayer, SessionRegistry, SessionRegistryAdapter,
-    SessionRegistryHandle, SessionRevoker, SessionStore, UserAgentBinding,
+    AuthSession, AuthState, ConditionalUpdate, RevocationError, SameSite, SessionBinding,
+    SessionConfig, SessionConfigBuilder, SessionData, SessionId, SessionLayer, SessionRegistry,
+    SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore, UserAgentBinding,
 };
 #[cfg(any(test, feature = "memory"))]
 pub use axess_core::{MemorySessionRegistry, MemorySessionStore};
 
 /// Session sub-module re-exports (crypto, refresh tokens, etc.).
 pub mod session {
-    pub use axess_core::session::refresh::{RefreshTokenId, TokenFamilyId};
+    pub use axess_core::session::LegacyBlobs;
+    pub use axess_core::session::refresh::{RefreshTokenId, RevocationReason, TokenFamilyId};
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "valkey"))]
-    pub use axess_core::session::{CryptoError, LegacyBlobs, SessionCrypto};
+    pub use axess_core::session::{CryptoError, SessionCrypto};
     pub use axess_core::session::{
-        CycleOutcome, RefreshToken, RefreshTokenConfig, RefreshTokenStore, RotationOutcome,
+        CycleOutcome, DeviceTokenRevocation, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
+        RotationOutcome,
     };
 }
 
@@ -53,19 +55,22 @@ pub mod blocking {
 
 /// Authentication namespace. Prefer `axess::authn::*` in new code.
 pub mod authn {
+    pub use axess_core::authn::factor_secret::{
+        FactorSecretBinding, FactorSecretCipher, FactorSecretError, OpenedSecret,
+    };
     pub use axess_core::{
-        AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus,
-        AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError, AuthnScope,
-        AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig,
-        EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome,
-        FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
-        IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
-        IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
-        LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
-        PasswordRules, PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor,
-        SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId,
-        TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
-        require_valid_session,
+        Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder,
+        AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError,
+        AuthnScope, AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId,
+        EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind,
+        FactorOutcome, FactorSecret, FactorStep, FactorStore, FactorTemplate, FederatedProvider,
+        Fido2Config, HotpConfig, IdentityAdmin, IdentityAuthnLog, IdentityLookup,
+        IdentityPasswordHistory, IdentityPasswordReset, IdentityStore, IpPolicy,
+        LdapBindFactorConfig, LockoutPolicy, LoginOutcome, NoSessionRegistryError, NoopAuthnLog,
+        OtpAlgorithm, PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError,
+        RequestAuthnService, ResolvedFactor, SealedFactorSecret, SessionValidator, SignupOutcome,
+        StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId, ZeroizedString,
+        create_tenant, default_catalog, require_valid_session,
     };
     pub use axess_factors::{
         GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, PepperTooShort, RECOVERY_CODE_COUNT,
@@ -226,15 +231,17 @@ pub mod backends {
 #[cfg(feature = "device")]
 pub mod device {
     pub use axess_core::{
-        AttestationClass, BindingsUpdate, CachedDeviceStore, DefaultFingerprintExtractor, Device,
-        DeviceBinding, DeviceEventSink, DeviceFingerprintExtractor, DeviceLifecycleService,
-        DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, DeviceResolver,
-        DeviceStore, DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver,
-        MemoryDevicePiiStore, MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError,
-        NoopDeviceEventSink, NoopDeviceResolver, OwnerClaim, PiiToken, REDACTED_PLACEHOLDER,
-        RedactedResolver, SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig,
-        SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
-        cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up_for_user,
+        AttestationClass, BindingsUpdate, CachedDeviceStore, CascadingRefreshStore,
+        DefaultFingerprintExtractor, Device, DeviceBinding, DeviceEventSink,
+        DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory, DevicePiiMapping,
+        DevicePiiResolver, DevicePiiStore, DeviceResolver, DeviceStore, DeviceTrustLevel,
+        FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore, MemoryDevicePiiStoreError,
+        MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink, NoopDeviceResolver,
+        OwnerClaim, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, RevokeDeviceError,
+        SessionUser, StepUpPolicy, StepUpPolicyBuilder, SweepConfig, SweepConfigBuilder,
+        SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
+        cascade_revoke_by_refresh_family, cascade_revoke_devices, decide_step_up_for_optional,
+        decide_step_up_for_user, revoke_device,
     };
 }
 

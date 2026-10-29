@@ -690,6 +690,8 @@ async fn encrypted_store_round_trips_bindings() {
 
 mod family_index;
 mod hardening;
+mod indexes;
 mod own_fingerprint;
 mod reseal;
 mod review;
+mod sweep_batches;

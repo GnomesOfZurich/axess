@@ -293,13 +293,26 @@ impl SessionRegistry for ValkeySessionRegistry {
 
         let Some(watch) = self
             .subscriber
-            .join(&self.client, &self.prefix, [user_channel, session_channel])
+            .join(
+                &self.client,
+                &self.prefix,
+                [user_channel, session_channel],
+                self.clock.now(),
+            )
             .await
         else {
-            // Connection failure: degrade to never-resolving future.
-            // Caller will fall back to next-request validity check.
-            std::future::pending::<()>().await;
-            return;
+            // No subscriber connection: poll the registry until the session
+            // is revoked, rather than waiting on a future that never wakes.
+            tracing::warn!(
+                target: "axess::session::valkey",
+                "revocation subscriber unavailable; polling the registry"
+            );
+            loop {
+                tokio::time::sleep(DEGRADED_POLL).await;
+                if let Ok(false) = self.is_valid(user_id, session_id).await {
+                    return;
+                }
+            }
         };
 
         // Race-free: the watcher's slot exists BEFORE the post-subscribe
@@ -310,28 +323,47 @@ impl SessionRegistry for ValkeySessionRegistry {
             return;
         }
 
+        // After the connection is lost, the watcher polls the registry on a
+        // timer until a replacement flags it for a recheck.
+        let mut degraded = false;
         loop {
-            match watch.slot.next().await {
+            let event = if degraded {
+                tokio::select! {
+                    event = watch.slot.next() => event,
+                    () = tokio::time::sleep(DEGRADED_POLL) => {
+                        if let Ok(false) = self.is_valid(user_id, session_id).await {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                watch.slot.next().await
+            };
+            match event {
                 Event::Revoked => return,
                 // Messages were dropped for a slow receiver: one of them may
                 // have been ours, so the registry decides, after a delay of
                 // its own so a burst does not turn into one instant of
                 // checks from every watcher.
                 Event::Recheck => {
+                    degraded = false;
                     tokio::time::sleep(self.recheck_delay()).await;
                     if let Ok(false) = self.is_valid(user_id, session_id).await {
                         return;
                     }
                 }
-                // The connection is gone: keep waiting. A watcher that joins
-                // later opens a new connection and flags this one for a
-                // recheck; until then the next request's validity check is
-                // the fallback.
-                Event::Closed => {}
+                // The connection is gone: poll the registry until a
+                // replacement connection flags this watcher for a recheck.
+                Event::Closed => degraded = true,
             }
         }
     }
 }
+
+/// How often a watcher without a subscriber connection asks the registry
+/// whether its session is still valid.
+const DEGRADED_POLL: Duration = Duration::from_secs(5);
 
 // ── HealthCheck ──────────────────────────────────────────────────────────────
 

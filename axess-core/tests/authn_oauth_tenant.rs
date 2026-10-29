@@ -59,6 +59,7 @@ fn fake_claims() -> OAuthClaims {
         oidc_sid: None,
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        dpop_key: None,
     }
 }
 
@@ -76,6 +77,7 @@ fn empty_claims(subject: &str) -> OAuthClaims {
         oidc_sid: None,
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        dpop_key: None,
     }
 }
 
@@ -115,6 +117,38 @@ async fn complete_oauth_login_refuses_cross_tenant_when_expected_tenant_set() {
     );
 }
 
+/// The tenant's status gates an OAuth completion as it gates a password or
+/// passkey login: a user of a suspended tenant is refused before the session
+/// flips, whatever the IdP said.
+#[tokio::test]
+async fn complete_oauth_login_refuses_a_suspended_tenant() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let user = test_user_in_tenant("u1", "alice", "t1");
+    let mut tenant = test_tenant();
+    tenant.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: Utc::now(),
+        until: None,
+    });
+    let identity = MockIdentityStore::new()
+        .with_tenant(tenant)
+        .with_user(user.clone());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    stash_claim_lock(&session, "test", "external-sub-123").await;
+
+    let err = svc
+        .complete_oauth_login(&user, &fake_claims(), &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::CrossTenant), "{err:?}");
+    assert!(
+        !session.is_authenticated().await,
+        "a suspended tenant's user must not be authenticated by an IdP"
+    );
+}
+
 #[tokio::test]
 async fn complete_oauth_login_accepts_when_tenant_matches() {
     let user = test_user_in_tenant("u1", "alice", "t1");
@@ -142,10 +176,16 @@ async fn complete_oauth_login_accepts_when_tenant_matches() {
 #[tokio::test]
 async fn complete_oauth_login_unbound_session_unaffected() {
     // Backward compat: if EXPECTED_TENANT is not set (caller used the
-    // unscoped begin_oauth_login), behaviour is unchanged.
+    // unscoped begin_oauth_login), the tenant rail does not apply. The
+    // user's own tenant must still exist and admit logins, as for every
+    // other login path, so the store holds it.
     let user = test_user_in_tenant("u1", "alice", "t2");
+    let mut other = test_tenant();
+    other.id = tid("t2");
+    other.identifier = "other".into();
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
+        .with_tenant(other)
         .with_user(user.clone());
     let svc = AuthnService::new(identity, MockFactorStore::new())
         .with_audit_context(AuditContext::default());

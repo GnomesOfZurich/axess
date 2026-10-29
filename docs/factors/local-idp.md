@@ -8,7 +8,7 @@ this surface in two layers, both built on the same primitives:
 - **Production** [`LocalIdp`](https://docs.rs/axess/latest/axess/local_idp/struct.LocalIdp.html).
   Adopter wires a [`LocalIdpKeyStore`] implementation (file system,
   Vault, KMS, ...) and the [`LocalIdp`] reads the current + historical
-  keys, mints, and rotates atomically on operator request.
+  keys, mints, and rotates on operator request through the store's rotate.
 
 - **Testing** [`LocalIdpFixture`](https://docs.rs/axess/latest/axess/testing/local_idp/struct.LocalIdpFixture.html).
   In-process value that mints JWTs with a generated keypair and
@@ -79,6 +79,8 @@ pub trait LocalIdpKeyStore: Send + Sync + 'static {
 
     async fn rotate(&self, new_current: LocalIdpSigningKey)
         -> Result<(), Self::Error>;
+
+    async fn retire(&self, key_id: &str) -> Result<bool, Self::Error>;
 }
 
 pub struct LoadedKeys {
@@ -94,8 +96,16 @@ historical key continue to verify until the operator removes that
 key from the store.
 
 `rotate` persists a new current key, demoting the previous current
-to historical, atomically. Adopters typically expose this through
-their own admin endpoint or out-of-band tooling.
+to historical. The store makes that step atomic (a pointer flip, a
+transaction); axess does not add atomicity on top of it. Adopters
+typically expose this through their own admin endpoint or out-of-band
+tooling.
+
+`retire` removes a historical key so it leaves the JWKS. Call it through
+`LocalIdp::retire_historical_key` once no token signed under the key can
+still be valid: the time of the rotation plus the longest lifetime the IdP
+mints. The current key is refused. Keep the removed key material (the file
+store moves it aside) so a later audit can still verify what it signed.
 
 ### `MemoryLocalIdpKeyStore` for prototyping
 
@@ -134,6 +144,16 @@ let token = idp
     .await?;
 ```
 
+A new `LocalIdp` is strict by default:
+
+- Tokens are capped at one hour (`DEFAULT_MAX_TTL`). Raise it with
+  `with_max_ttl(...)`, or remove the cap with `without_max_ttl()` when long
+  lived tokens are intended. A mint over the cap returns
+  `IssuanceError::LifetimeExceedsCap`.
+- A mint without an audience returns `IssuanceError::MissingAudience`. A
+  token with no `aud` is accepted by every verifier that does not pin an
+  audience, so minting one is a choice: `allow_no_audience()` makes it.
+
 [`MintClaims`] is a builder: `new(subject, exp)` is the minimum;
 `with_audience`, `with_audiences` (multi-aud), `with_issued_at`,
 `with_not_before`, `with_jwt_id`, and `with_custom_claim` cover the
@@ -152,15 +172,51 @@ let new_key = LocalIdpSigningKey::generate_es256().with_key_id("v2");
 idp.rotate_signing_key(new_key).await?;
 ```
 
-The call atomically:
+The call:
 
-1. Persists the new current via [`LocalIdpKeyStore::rotate`].
-2. Demotes the previous current to historical.
-3. Rebuilds the JWKS snapshot so subsequent `/jwks.json` reads
-   include both keys.
+1. Takes the instance's write lock, so no mint runs against a half-rotated
+   state and two rotations on one instance run one after the other.
+2. Persists the new current via [`LocalIdpKeyStore::rotate`].
+3. Re-reads the key set from the store with `load_all` and rebuilds the JWKS
+   from that snapshot, so a rotation another replica made earlier is not
+   dropped.
 
 In-flight verifications using the old `kid` continue to succeed
 because the historical entry stays in the published JWKS.
+
+#### Several replicas
+
+Each replica holds its own copy of the key set, loaded at startup and
+refreshed by its own `rotate_signing_key`, `retire_historical_key` and
+`reload`. The store is the single source of truth; the replicas converge
+only when they re-read it. To rotate a fleet:
+
+1. Make the store the arbiter: its `rotate` must be atomic and must append to
+   the historical set rather than overwrite it (a pointer flip or one
+   transaction). Two replicas rotating at once then produce two ordered
+   rotations, not a lost one.
+2. Rotate on exactly one replica (an admin call routed to one instance).
+3. Call `reload()` on every other replica. Until a replica reloads, it keeps
+   signing under the previous key, which is still published, so tokens verify
+   throughout; it just has not switched yet.
+4. Retire a historical key only after the longest token lifetime has passed,
+   then `reload()` the others.
+
+`jwks_handle()` returns a snapshot. A handle given to a verifier before a
+rotation, retirement or reload does not see it: build a new handle from
+`jwks()` after the change, or serve the JWKS to verifiers over HTTP from
+`router()`.
+
+### Key algorithms and imported keys
+
+Prefer ES256 (`generate_es256`). RSA signing goes through the `rsa` crate,
+whose private-key operations carry a timing side channel (the Marvin
+advisory, not fixed upstream); use RSA only for a verifier that cannot take
+ES256. Constructors that load a key (`from_rsa_pem`, `from_ec_pem`, the DER
+forms) return `LocalIdpKeyError` instead of panicking: an unsupported
+algorithm is `UnsupportedAlgorithm`, and an RSA key under 2048 bits is
+`WeakKey`. `try_generate_rsa_with_algorithm` is the non-panicking RSA
+generator.
 
 ### Discovery + JWKS endpoints
 
@@ -198,8 +254,9 @@ reference implementation:
 - File-backed `LocalIdpKeyStore` (`FileLocalIdpKeyStore`) with the
   directory layout pattern `historical/{kid}.pem` + atomic
   `current.kid` pointer file.
-- `POST /admin/rotate` operator endpoint.
-- `POST /issue` mint endpoint.
+- `POST /admin/rotate` and `POST /admin/retire` operator endpoints.
+- `POST /issue` mint endpoint; it requires an audience and caps the
+  lifetime at one hour.
 - A curl walkthrough of the full discover-mint-rotate cycle.
 
 ---
@@ -302,17 +359,16 @@ need custom fields.
 use axess::jwt::verifier::JwtVerifier;
 
 let verifier = JwtVerifier::new(idp.jwks_handle())
+    .with_audience("https://api.example.com")
     .with_algorithms(idp.verifier_algorithms());
 
-let claims = verifier
-    .verify::<MyClaims>(&token, "https://api.example.com")
-    .await?;
+let claims = verifier.verify::<MyClaims>(&token).await?;
 ```
 
-`jwks_handle()` returns an `Arc<RwLock<JwkSet>>` that the verifier
-borrows. Calls to `rotate_signing_key` on the fixture update the
-shared JWKS in place, so the verifier sees the rotation without any
-explicit refresh.
+`jwks_handle()` returns an `Arc<RwLock<JwkSet>>` holding a snapshot of the
+JWKS at the time of the call. `rotate_signing_key` on the fixture returns a
+new fixture and does not touch a handle handed out earlier, so after a
+rotation call `jwks_handle()` again and build a new verifier from it.
 
 ### Feeding a cloud STS adapter
 

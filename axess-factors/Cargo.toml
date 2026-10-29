@@ -69,7 +69,13 @@ tower = { version = "0.5.3", features = ["util"], optional = true }
 tracing = { workspace = true }
 url = { workspace = true, optional = true }
 uuid = { workspace = true, features = ["v4"], optional = true }
-webauthn-rs = { version = "0.6.0-dev", features = ["danger-allow-state-serialisation", "conditional-ui"], optional = true }
+# Pinned exactly: 0.6.0-dev is a pre-release, and a pre-release's API and
+# behaviour may change between builds, so a range would let a resolver
+# move it. `danger-allow-state-serialisation` is required to store a
+# ceremony's registration/authentication state between the two requests;
+# keep that state SERVER-SIDE only (never in a cookie or any field the
+# client can read or return), because it is the ceremony's trust anchor.
+webauthn-rs = { version = "=0.6.0-dev", features = ["danger-allow-state-serialisation", "conditional-ui"], optional = true }
 x509-parser = { workspace = true, optional = true }
 zeroize = { workspace = true }
 
@@ -136,8 +142,8 @@ oidc = ["http-body", "jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio"
 http-body = ["dep:reqwest"]
 
 # OAuth ceremony surface
-fapi = ["oauth", "dep:p256", "dep:sha2"]
-oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axum", "dep:dashmap", "dep:axess-identity", "dep:axess-rng", "dep:subtle", "dep:chrono"]
+fapi = ["oauth"]
+oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axum", "dep:dashmap", "dep:axess-identity", "dep:axess-rng", "dep:subtle", "dep:chrono", "dep:p256", "dep:sha2"]
 
 # Bearer + outbound + federation adapters (all sit on `jwt`)
 bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]

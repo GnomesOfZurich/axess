@@ -43,6 +43,8 @@ fn token(suffix: &str) -> RefreshToken {
         family_id: None,
         device_id: None,
         authn_time: None,
+        revoked_reason: None,
+        revoked_at: None,
     }
 }
 
@@ -77,5 +79,62 @@ async fn a_parent_rotates_once_and_a_second_rotation_is_a_lost_race() {
         ids,
         vec![token("a1").id.to_string()],
         "exactly the first child is live: {ids:?}"
+    );
+}
+
+/// Each way of revoking a token records its own reason, and a later sweep
+/// never rewrites it: only a `Rotated` token's reuse is a theft signal.
+#[tokio::test]
+async fn revocation_reasons_are_persisted_and_not_overwritten() {
+    use axess::session::RevocationReason;
+    let store = backend().await;
+    let user = UserId::try_new(ALICE).expect("user id");
+
+    let rotated = token("b0");
+    store.store_token(&rotated).await.expect("store");
+    let mut child = token("b1");
+    child.family_id = rotated.family_id;
+    assert_eq!(
+        store
+            .rotate_token(&rotated.id, &child)
+            .await
+            .expect("rotate"),
+        RotationOutcome::Rotated
+    );
+    let logged_out = token("b2");
+    store.store_token(&logged_out).await.expect("store");
+    store.revoke_token(&logged_out.id).await.expect("revoke");
+
+    let family = axess::session::TokenFamilyId::try_new("00000000-0000-0000-0000-0000000000f1")
+        .expect("family id");
+    let mut swept = token("b3");
+    swept.family_id = Some(family);
+    store.store_token(&swept).await.expect("store");
+    store.revoke_family(&user, &family).await.expect("family");
+    store.revoke_user_tokens(&user).await.expect("all");
+
+    let reason = |hash: &str| {
+        let hash = hash.to_string();
+        let store = &store;
+        async move {
+            store
+                .find_token(&hash)
+                .await
+                .expect("find")
+                .expect("row")
+                .revoked_reason
+        }
+    };
+    assert_eq!(reason("hash-b0").await, Some(RevocationReason::Rotated));
+    assert_eq!(reason("hash-b2").await, Some(RevocationReason::Explicit));
+    assert_eq!(reason("hash-b3").await, Some(RevocationReason::Compromise));
+    assert!(
+        store
+            .find_token("hash-b0")
+            .await
+            .expect("find")
+            .expect("row")
+            .revoked_at
+            .is_some()
     );
 }

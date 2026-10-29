@@ -33,8 +33,12 @@
 //!     PRIMARY KEY (tenant_id, id)
 //! );
 //!
-//! CREATE INDEX IF NOT EXISTS idx_devices_fingerprint
-//!     ON devices (tenant_id, fingerprint_hash);
+//! CREATE INDEX IF NOT EXISTS idx_devices_fingerprint_seen
+//!     ON devices (tenant_id, fingerprint_hash, last_seen_at DESC, id);
+//! CREATE INDEX IF NOT EXISTS idx_devices_sweep
+//!     ON devices (tenant_id, trust_level, last_seen_at);
+//! CREATE INDEX IF NOT EXISTS idx_devices_revoked_at
+//!     ON devices (tenant_id, revoked_at) WHERE trust_level = 'Revoked';
 //! CREATE INDEX IF NOT EXISTS idx_devices_user
 //!     ON devices (tenant_id, user_id, last_seen_at DESC);
 //! CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint
@@ -82,6 +86,11 @@
 //!     ON devices (tenant_id, user_id, fingerprint_hash, last_seen_at DESC);
 //! ```
 //!
+//! `init_schema` also creates `idx_devices_fingerprint_seen` (the lookup by
+//! fingerprint in sorted order, replacing the plain `idx_devices_fingerprint`,
+//! which it drops), and `idx_devices_sweep` and `idx_devices_revoked_at` for
+//! the retention sweep. Run `init_schema` once after upgrading.
+//!
 //! # Encryption
 //!
 //! Only the `bindings` column runs through the optional AES-256-GCM
@@ -114,8 +123,8 @@ use crate::device::storage::sql_common::{
     BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
     SqlDeviceStoreError, SwapPlan, SweepCutoffs, TRANSITION_ATTEMPTS, TrustWrite,
     bindings_update_after_miss, claim_after_miss, decode_all, decode_optional, parse_stored_trust,
-    plan_bindings_swap, push_family_rows, require_row, select_devices, transition_after_miss,
-    utc_to_unix,
+    plan_bindings_swap, push_family_rows, require_row, select_devices, sighting_level,
+    transition_after_miss, utc_to_unix,
 };
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
@@ -125,6 +134,7 @@ use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintH
 use crate::session::crypto::SessionCrypto;
 
 mod reseal;
+mod schema;
 mod sweep;
 
 use reseal::reseal_rows;
@@ -192,74 +202,6 @@ impl SqliteDeviceStore {
     #[doc(hidden)]
     pub fn pool_for_test(&self) -> &SqlitePool {
         &self.pool
-    }
-
-    /// Create the `devices` and `device_bindings_refresh` tables and
-    /// supporting indexes. Idempotent: safe to call on every startup.
-    pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS devices (
-                tenant_id        TEXT    NOT NULL,
-                id               TEXT    NOT NULL,
-                user_id          TEXT,
-                trust_level      TEXT    NOT NULL,
-                fingerprint_hash BLOB    NOT NULL,
-                first_seen_at    INTEGER NOT NULL,
-                last_seen_at     INTEGER NOT NULL,
-                revoked_at       INTEGER,
-                demoted_at       INTEGER,
-                bindings         TEXT    NOT NULL,
-                PRIMARY KEY (tenant_id, id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_fingerprint \
-             ON devices (tenant_id, fingerprint_hash)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_user \
-             ON devices (tenant_id, user_id, last_seen_at DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint \
-             ON devices (tenant_id, user_id, fingerprint_hash, last_seen_at DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS device_bindings_refresh (
-                tenant_id TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                family_id TEXT NOT NULL,
-                PRIMARY KEY (tenant_id, device_id, family_id),
-                FOREIGN KEY (tenant_id, device_id)
-                    REFERENCES devices (tenant_id, id) ON DELETE CASCADE
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_device_bindings_refresh_family \
-             ON device_bindings_refresh (tenant_id, family_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
     }
 }
 
@@ -466,7 +408,7 @@ impl DeviceStore for SqliteDeviceStore {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(stored) = parse_stored_trust(stored)?
-                && blocks_save(stored, device.trust_level)
+                && blocks_save(stored)
             {
                 return Ok(());
             }
@@ -513,13 +455,13 @@ impl DeviceStore for SqliteDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         let pool = self.pool.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
         let ts = utc_to_unix(now);
         async move {
-            let updated = sqlx::query(
+            sqlx::query(
                 "UPDATE devices SET last_seen_at = CASE \
                      WHEN trust_level <> 'Revoked' AND last_seen_at < ?3 THEN ?3 \
                      ELSE last_seen_at END \
@@ -529,9 +471,14 @@ impl DeviceStore for SqliteDeviceStore {
             .bind(&device_id)
             .bind(ts)
             .execute(&pool)
-            .await?
-            .rows_affected();
-            require_row(updated, tenant, device_id)
+            .await?;
+            // The level the row has now: Revoked means the sighting did not
+            // touch it. A missing row is a missing device.
+            sighting_level(
+                fetch_trust_level(&pool, &tenant, &device_id).await?,
+                tenant,
+                device_id,
+            )
         }
     }
 
@@ -550,7 +497,10 @@ impl DeviceStore for SqliteDeviceStore {
             // The CASE reads the row's level from before this statement's
             // assignments.
             let updated = sqlx::query(
-                "UPDATE devices SET trust_level = ?3, revoked_at = ?4, \
+                "UPDATE devices SET trust_level = ?3, \
+                        revoked_at = CASE WHEN ?3 = 'Revoked' AND trust_level = 'Revoked' \
+                                               AND revoked_at IS NOT NULL THEN revoked_at \
+                                          ELSE ?4 END, \
                         demoted_at = CASE WHEN ?5 = 0 THEN NULL \
                                           WHEN trust_level = 'Trusted' THEN ?6 \
                                           ELSE demoted_at END \
@@ -586,7 +536,7 @@ impl DeviceStore for SqliteDeviceStore {
             // and writes in a single statement, so a revocation that lands
             // first makes this match no row instead of being overwritten.
             for _ in 0..TRANSITION_ATTEMPTS {
-                let updated = sqlx::query("UPDATE devices SET trust_level = ?4, revoked_at = ?5, demoted_at = CASE WHEN ?6 = 1 THEN demoted_at ELSE ?7 END WHERE tenant_id = ?1 AND id = ?2 AND trust_level = ?3")
+                let updated = sqlx::query("UPDATE devices SET trust_level = ?4, revoked_at = CASE WHEN ?3 = ?4 THEN revoked_at ELSE ?5 END, demoted_at = CASE WHEN ?6 = 1 THEN demoted_at ELSE ?7 END WHERE tenant_id = ?1 AND id = ?2 AND trust_level = ?3")
             .bind(&tenant)
             .bind(&device_id)
             .bind(w.expected)
@@ -607,7 +557,12 @@ impl DeviceStore for SqliteDeviceStore {
                 // The row is at `expected` again: the write lost a race with
                 // a change that has since been undone. Try it again.
             }
-            Ok(TrustTransition::Refused { current: expected })
+            // Every attempt lost a race: the row was never found at another
+            // level, so the change is neither applied nor refused.
+            Err(SqlDeviceStoreError::Contended {
+                tenant_id: tenant,
+                device_id,
+            })
         }
     }
 

@@ -6,7 +6,7 @@
 
 #![cfg(feature = "memory")]
 
-use axess_core::middleware::csrf::{CsrfConfig, CsrfLayer};
+use axess_core::middleware::csrf::{CsrfConfig, CsrfLayer, CsrfToken};
 use axess_core::session::{
     data::SessionData,
     id::SessionId,
@@ -56,6 +56,16 @@ impl SessionStore for ForgetfulStore {
     ) -> Result<CycleOutcome, Self::Error> {
         Ok(CycleOutcome::Rotated)
     }
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<axess_core::session::store::ConditionalUpdate, Self::Error> {
+        let _ = (id, expected_revision, data, ttl);
+        Ok(axess_core::session::store::ConditionalUpdate::Gone)
+    }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         Ok(0)
     }
@@ -65,7 +75,12 @@ fn router<S: SessionStore>(store: S) -> Router {
     Router::new()
         .route(
             "/form",
-            get(|| async { "form" }).post(|| async { "posted" }),
+            // The form embeds the token, which is what asks for the session
+            // to be stored.
+            get(|axum::Extension(t): axum::Extension<CsrfToken>| async move {
+                t.as_str().to_owned()
+            })
+            .post(|| async { "posted" }),
         )
         .layer(CsrfLayer::new(CsrfConfig::new([42u8; 32])))
         .layer(

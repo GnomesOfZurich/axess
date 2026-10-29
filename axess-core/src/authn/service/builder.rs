@@ -32,8 +32,29 @@ where
     pub(crate) clock: Arc<dyn Clock>,
     /// Where password hashing and verification run.
     pub(crate) kdf: Arc<crate::blocking::KdfExecutor>,
+    /// Where refresh tokens are revoked when a user's credentials change.
+    pub(crate) refresh_revoker: Option<Arc<dyn UserTokenRevoker>>,
+    /// How long a half-finished login may sit before it is dropped.
+    pub(crate) flow_ttl: std::time::Duration,
+    /// Minimum time between password reset requests for one identifier.
+    pub(crate) reset_cooldown: Option<std::time::Duration>,
+    /// Identifiers inside their cooldown, built by `build` from
+    /// [`reset_cooldown`](Self::reset_cooldown) on the service's clock.
+    pub(crate) reset_requests: Option<Arc<super::reset_cooldown::ResetCooldowns>>,
+    /// Whether `begin_signup` answers an identifier that is already taken
+    /// as it answers a free one.
+    pub(crate) hide_signup_conflicts: bool,
+    /// Custom session keys the application asked to carry across the
+    /// transition to `Authenticated`; see
+    /// [`with_preserved_custom_keys`](Self::with_preserved_custom_keys).
+    pub(crate) preserved_custom_keys: Vec<String>,
+    /// The session store, when the application handed it over so that a
+    /// revocation can delete the rows as well as the registry entries.
+    pub(crate) session_rows: Option<Arc<dyn SessionRowRemover>>,
     /// The secret keyed recovery codes are checked under, when configured.
     pub(crate) recovery_pepper: Option<Arc<axess_factors::RecoveryCodePepper>>,
+    /// The cipher OTP secrets are sealed and opened with, when configured.
+    pub(crate) factor_secret_cipher: Option<Arc<crate::authn::factor_secret::FactorSecretCipher>>,
     #[cfg(feature = "fido2")]
     pub(crate) fido2: Option<Arc<dyn axess_factors::fido2::Fido2Provider>>,
     #[cfg(feature = "fido2")]
@@ -60,6 +81,64 @@ where
     /// is dropped.
     #[cfg(feature = "oauth")]
     pub(crate) jwks_refresh_task: Option<super::oauth_service::JwksRefreshTask>,
+}
+
+/// How many identifiers the password reset cooldown remembers.
+pub const RESET_COOLDOWN_CAPACITY: usize = 100_000;
+
+/// How long a login may sit between `begin_login` and its last factor before
+/// the next step answers [`NoFlow`](crate::authn::error::AuthnError::NoFlow):
+/// ten minutes. Change it with [`AuthnServiceBuilder::with_flow_ttl`].
+pub const DEFAULT_FLOW_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Deletes one stored session row, behind a trait object so the service does
+/// not take the session store's type as a parameter.
+pub(crate) trait SessionRowRemover: Send + Sync {
+    /// Delete the row of `id`. The error is its text.
+    fn delete_row<'a>(
+        &'a self,
+        id: &'a crate::session::id::SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+struct RowRemover<S>(S);
+
+impl<S: crate::session::store::SessionStore> SessionRowRemover for RowRemover<S> {
+    fn delete_row<'a>(
+        &'a self,
+        id: &'a crate::session::id::SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.0.delete(id).await.map_err(|e| e.to_string()) })
+    }
+}
+
+/// The one refresh-token operation the credential-change paths need, behind a
+/// trait object so the service does not take the store's type as a parameter.
+pub(crate) trait UserTokenRevoker: Send + Sync {
+    /// Revoke every refresh token of `user_id`. The error is its text.
+    fn revoke_user_tokens<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+struct RefreshStoreRevoker<R>(R);
+
+impl<R> UserTokenRevoker for RefreshStoreRevoker<R>
+where
+    R: crate::session::refresh::RefreshTokenStore + 'static,
+{
+    fn revoke_user_tokens<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.0
+                .revoke_user_tokens(user_id)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
 }
 
 /// Default interval of the JWKS refresh loop the builder starts: one hour.
@@ -90,7 +169,15 @@ where
             rng: Arc::new(SystemRng),
             clock: Arc::new(SystemClock),
             kdf: Arc::new(crate::blocking::KdfExecutor::pool()),
+            refresh_revoker: None,
+            flow_ttl: DEFAULT_FLOW_TTL,
+            reset_cooldown: None,
+            reset_requests: None,
+            hide_signup_conflicts: false,
+            preserved_custom_keys: Vec::new(),
+            session_rows: None,
             recovery_pepper: None,
+            factor_secret_cipher: None,
             #[cfg(feature = "fido2")]
             fido2: None,
             #[cfg(feature = "fido2")]
@@ -145,6 +232,23 @@ where
     /// then fails closed. See [`axess_factors::RecoveryCodePepper`].
     pub fn with_recovery_code_pepper(mut self, pepper: axess_factors::RecoveryCodePepper) -> Self {
         self.recovery_pepper = Some(Arc::new(pepper));
+        self
+    }
+
+    /// Keep TOTP and HOTP secrets encrypted at rest.
+    ///
+    /// With a cipher the service opens a sealed secret to verify a code and
+    /// writes it back sealed, and a plain secret that verifies is sealed in
+    /// the same login while the cipher's plain-secret policy still reads it
+    /// (see [`FactorSecretCipher`](crate::authn::factor_secret::FactorSecretCipher)).
+    /// Seal new enrolments with the same cipher's `seal_config`. Without one
+    /// nothing changes: secrets are read and written as plain text, and a
+    /// sealed secret fails with a clear error.
+    pub fn with_factor_secret_cipher(
+        mut self,
+        cipher: Arc<crate::authn::factor_secret::FactorSecretCipher>,
+    ) -> Self {
+        self.factor_secret_cipher = Some(cipher);
         self
     }
 
@@ -302,6 +406,36 @@ where
         self
     }
 
+    /// Hand the session store to the service, so that ending a user's
+    /// sessions ([`invalidate_user_sessions`](crate::authn::service::RequestAuthnService::invalidate_user_sessions),
+    /// suspension, a password reset) deletes the stored rows as well as the
+    /// registry entries. Pass the store the session layer uses (a clone).
+    ///
+    /// Without it only the registry entries go, and the rows are refused on
+    /// their next request by a layer built with a registry, or expire with
+    /// their TTL.
+    pub fn with_session_store(mut self, store: impl crate::session::store::SessionStore) -> Self {
+        self.session_rows = Some(Arc::new(RowRemover(store)));
+        self
+    }
+
+    /// Carry these custom session keys across the transition to
+    /// `Authenticated`. Names are matched exactly.
+    ///
+    /// Becoming authenticated clears the session's custom data, so state a
+    /// visitor could plant while anonymous does not ride into the signed-in
+    /// session. An application that stashes something deliberately before the
+    /// login (a post-login destination, a chosen locale) lists its keys here;
+    /// nothing is preserved by default. The keys the login itself owns need
+    /// no listing.
+    pub fn with_preserved_custom_keys<K: Into<String>>(
+        mut self,
+        keys: impl IntoIterator<Item = K>,
+    ) -> Self {
+        self.preserved_custom_keys = keys.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Set the maximum number of concurrent sessions per user.
     ///
     /// When a user authenticates and already has this many active sessions,
@@ -311,6 +445,77 @@ where
     /// as 1 without saying so.
     pub fn with_max_sessions_per_user(mut self, max: std::num::NonZeroUsize) -> Self {
         self.max_sessions_per_user = Some(max.get());
+        self
+    }
+
+    /// Attach the refresh token store, so that changing a user's credentials
+    /// also revokes the user's refresh tokens.
+    ///
+    /// Session registry invalidation reaches registered cookie sessions
+    /// only. A refresh token is a separate credential that mints a new
+    /// authenticated session, so without this a refresh token stolen before
+    /// a password reset keeps working after it. With it,
+    /// `complete_password_reset` and the `suspend_user` family call
+    /// [`RefreshTokenStore::revoke_user_tokens`](crate::session::refresh::RefreshTokenStore::revoke_user_tokens)
+    /// and return an error when that fails, after the change itself has been
+    /// made and audited. Pass the same store the application issues tokens
+    /// into (a clone or a shared handle).
+    pub fn with_refresh_store(
+        mut self,
+        store: impl crate::session::refresh::RefreshTokenStore + 'static,
+    ) -> Self {
+        self.refresh_revoker = Some(Arc::new(RefreshStoreRevoker(store)));
+        self
+    }
+
+    /// Set how long a half-finished login may sit before the next step
+    /// answers `NoFlow` and the session is reset.
+    ///
+    /// Measured from `begin_login` with the injected clock. The default is
+    /// [`DEFAULT_FLOW_TTL`](crate::authn::service::DEFAULT_FLOW_TTL), ten minutes.
+    pub fn with_flow_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.flow_ttl = ttl;
+        self
+    }
+
+    /// Refuse a second password reset request for the same identifier inside
+    /// `cooldown`.
+    ///
+    /// `begin_password_reset` then answers `Ok(None)`, as it does for an
+    /// unknown identifier, to a request that follows another for the same
+    /// tenant and identifier within the cooldown. The key is the identifier as
+    /// typed, whether or not an account has it, so the cooldown cannot tell a
+    /// caller which identifiers exist. It stops one inbox being flooded with
+    /// reset mail and one account being kept busy; it is not a rate limit on
+    /// the route, which still belongs in front of the handler.
+    ///
+    /// The record lives in this process, on the injected clock, and holds at
+    /// most [`RESET_COOLDOWN_CAPACITY`] identifiers (the least recently
+    /// requested are forgotten first). A deployment of several instances
+    /// applies the cooldown per instance; put the route behind a shared rate
+    /// limit for a bound across them. The default is no cooldown.
+    pub fn with_password_reset_cooldown(mut self, cooldown: std::time::Duration) -> Self {
+        self.reset_cooldown = Some(cooldown);
+        self
+    }
+
+    /// Answer `begin_signup` for an identifier that is already taken as it
+    /// answers a free one, so the response is not a way to find out who has
+    /// an account.
+    ///
+    /// With this on, an existing identifier gets [`SignupOutcome::Started`](crate::authn::service::SignupOutcome::Started)
+    /// too. Nothing is created and the session is left as it was, anonymous,
+    /// and the refusal is audited with its reason. The application tells the
+    /// two apart where the caller cannot see it: after `Started`, a session
+    /// with no user means the identifier was taken, and the address on file
+    /// gets a "you already have an account" mail where a new signup gets the
+    /// verification link. Answer the client the same either way, and do the
+    /// mail off the request path, since creating an account takes longer than
+    /// declining to. Without this switch the outcome is
+    /// [`SignupOutcome::AlreadyExists`](crate::authn::service::SignupOutcome::AlreadyExists),
+    /// which suits a form that must say so at once.
+    pub fn with_hidden_signup_conflicts(mut self) -> Self {
+        self.hide_signup_conflicts = true;
         self
     }
 
@@ -324,11 +529,28 @@ where
     }
 
     /// Share the collaborators and return the handle.
+    ///
+    /// Logs a warning when no session registry was attached: without one,
+    /// suspending a user, resetting a password and an administrator's kick
+    /// end no existing session, which then lives until its TTL.
     pub fn build(self) -> AuthnService<I, F> {
+        let mut this = self;
+        if this.registry.is_none() {
+            tracing::warn!(
+                "AuthnService built without a session registry: suspending a user, \
+                 resetting a password and kicking a session end no existing session; \
+                 attach one with with_registry"
+            );
+        }
+        this.reset_requests = this.reset_cooldown.map(|cooldown| {
+            Arc::new(super::reset_cooldown::ResetCooldowns::new(
+                RESET_COOLDOWN_CAPACITY,
+                cooldown,
+                this.clock.clone(),
+            ))
+        });
         #[cfg(feature = "oauth")]
-        let this = self.with_jwks_refresh_started();
-        #[cfg(not(feature = "oauth"))]
-        let this = self;
+        let this = this.with_jwks_refresh_started();
         AuthnService {
             inner: Arc::new(this),
         }

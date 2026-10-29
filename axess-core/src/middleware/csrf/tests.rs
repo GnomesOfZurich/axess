@@ -44,6 +44,7 @@ fn session_handle(seed: u64) -> SessionHandle {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     SessionHandle(Arc::new(RwLock::new(inner)))
 }
@@ -237,9 +238,9 @@ fn extract_cookie_token_accepts_value_at_cap() {
 /// pins both `-> ""` and `-> "xyzzy"` body replacements.
 #[test]
 fn csrf_token_as_str_returns_inner_value() {
-    let t = CsrfToken("abc.defg.hij".to_string());
+    let t = CsrfToken::new("abc.defg.hij");
     assert_eq!(t.as_str(), "abc.defg.hij");
-    let empty = CsrfToken(String::new());
+    let empty = CsrfToken::new("");
     assert_eq!(empty.as_str(), "");
 }
 
@@ -995,7 +996,16 @@ async fn csrf_token_for_fresh_guest_survives_session_finalize() {
     let session_layer = SessionLayer::new(MemorySessionStore::new(), [42u8; 32]).with_secure(false);
     let csrf_layer = CsrfLayer::new(CsrfConfig::new([7u8; 32]).secure(false));
     let app = Router::new()
-        .route("/safe", get(|| async { "ok" }))
+        .route(
+            "/safe",
+            get(
+                |axum::Extension(token): axum::Extension<CsrfToken>| async move {
+                    // Using the token is what asks for the session to be stored.
+                    assert!(!token.as_str().is_empty());
+                    "ok"
+                },
+            ),
+        )
         .route("/change", post(|| async { "changed" }))
         .layer(csrf_layer) // inner: sees the SessionHandle
         .layer(session_layer); // outer: injects the handle first
@@ -1069,7 +1079,7 @@ async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
         let token = req
             .extensions()
             .get::<CsrfToken>()
-            .map(|t| t.0.clone())
+            .map(|t| t.as_str().to_owned())
             .unwrap_or_default();
         Ok::<_, Infallible>(
             Response::builder()

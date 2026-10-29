@@ -272,3 +272,74 @@ async fn non_jwt_string_rejects_cleanly() {
     // bypass the resolver.
     let _ = JwtError::InvalidHeader("smoke".into());
 }
+
+#[tokio::test]
+async fn tid_claim_must_match_the_tenant_registered_for_the_spiffe_slug() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(
+        &svid_claims("spiffe://gnomes.local/compute-worker/ekekrantz"),
+        &kid,
+        &der,
+    );
+    let td = TrustDomain::new("gnomes.local").unwrap();
+    let verifier = build_verifier(jwks);
+    let claimed: TenantId = sample_tenant_uuid().parse().expect("uuid");
+    let other = TenantId::from_bytes([9u8; 16]);
+
+    // Slug maps to the tenant the token claims: resolves.
+    let ok = JwtSvidResolver::new(verifier.clone(), td.clone(), token.clone())
+        .with_tenant_lookup(move |slug| (slug == "ekekrantz").then_some(claimed));
+    assert!(ok.resolve().await.is_ok());
+
+    // Slug maps to a different tenant than `tid`: refused.
+    let mismatch = JwtSvidResolver::new(verifier.clone(), td.clone(), token.clone())
+        .with_tenant_lookup(move |_| Some(other));
+    assert!(matches!(
+        mismatch.resolve().await,
+        Err(IdentityError::NotAuthenticated)
+    ));
+
+    // Unknown slug: refused.
+    let unknown = JwtSvidResolver::new(verifier, td, token).with_tenant_lookup(|_| None);
+    assert!(matches!(
+        unknown.resolve().await,
+        Err(IdentityError::NotAuthenticated)
+    ));
+}
+
+/// A JWT-SVID is only valid for the audience it names, and a shared issuer
+/// makes `aud` the only separation between services: a verifier that pins
+/// no audience (or no issuer) is refused even for a token it would verify.
+#[tokio::test]
+async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(
+        &svid_claims("spiffe://gnomes.local/compute-worker/ekekrantz"),
+        &kid,
+        &der,
+    );
+    let handle = || Arc::new(RwLock::new(jwks.clone()));
+    let unpinned: [Arc<JwtVerifier>; 3] = [
+        Arc::new(JwtVerifier::new(handle()).with_issuer("https://idp.gnomes.local")),
+        Arc::new(JwtVerifier::new(handle()).with_audience("axess-platform")),
+        Arc::new(
+            JwtVerifier::new(handle())
+                .with_issuer("https://idp.gnomes.local")
+                .allow_any_audience(),
+        ),
+    ];
+    for verifier in unpinned {
+        let resolver = JwtSvidResolver::new(
+            verifier,
+            TrustDomain::new("gnomes.local").unwrap(),
+            token.clone(),
+        );
+        assert!(
+            matches!(
+                resolver.resolve().await,
+                Err(IdentityError::NotAuthenticated)
+            ),
+            "an unpinned verifier must be refused"
+        );
+    }
+}

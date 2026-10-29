@@ -32,6 +32,7 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
+use crate::session::store::note_revocation;
 use std::ops::ControlFlow;
 
 impl<I, F> RequestAuthnService<I, F>
@@ -59,6 +60,27 @@ where
         Ok(status.effective_at(self.inner.clock.now()))
     }
 
+    /// Revoke every refresh token of `user_id` when a refresh store was
+    /// attached with
+    /// [`with_refresh_store`](crate::authn::service::AuthnServiceBuilder::with_refresh_store);
+    /// a no-op otherwise.
+    pub(crate) async fn revoke_refresh_tokens(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let Some(revoker) = &self.inner.refresh_revoker else {
+            return Ok(());
+        };
+        revoker.revoke_user_tokens(user_id).await.map_err(|e| {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "could not revoke the user's refresh tokens"
+            );
+            AuthnError::ExternalService("refresh token revocation failed".to_string())
+        })
+    }
+
     /// Undo an authentication whose audit row could not be written.
     ///
     /// The flow fails when the audit store is down, but by then the session
@@ -72,22 +94,26 @@ where
     ) {
         let sid = session.session_id().await;
         if let Some(reg) = &self.inner.registry {
-            reg.invalidate_session(user_id, &sid).await;
+            note_revocation(
+                reg.invalidate_session(user_id, &sid).await,
+                "refusing a login step",
+            );
         }
         session.clear().await;
     }
 
-    /// Invalidate up to `count` of `active` (oldest first), never `keep`.
-    async fn evict_oldest(
+    /// Invalidate each of `victims`, oldest first.
+    async fn evict_sessions(
         &self,
         reg: &dyn crate::session::store::SessionRegistryHandle,
         user_id: &crate::authn::ids::UserId,
-        active: &[crate::session::id::SessionId],
-        count: usize,
-        keep: &crate::session::id::SessionId,
+        victims: &[crate::session::id::SessionId],
     ) {
-        for old_sid in active.iter().filter(|s| *s != keep).take(count) {
-            reg.invalidate_session(user_id, old_sid).await;
+        for old_sid in victims {
+            note_revocation(
+                reg.invalidate_session(user_id, old_sid).await,
+                "refusing a login step",
+            );
             tracing::info!(
                 user_id = %user_id,
                 evicted_session = %old_sid,
@@ -107,6 +133,7 @@ where
     async fn register_authenticated_session(
         &self,
         user_id: &crate::authn::ids::UserId,
+        tenant_id: &crate::authn::ids::TenantId,
         sid: &crate::session::id::SessionId,
         session: &AuthSession,
     ) -> Result<ControlFlow<FactorOutcome>, AuthnError<I::Error>> {
@@ -121,9 +148,8 @@ where
             // Enforce concurrent session limit: evict oldest sessions.
             if let Some(max) = self.inner.max_sessions_per_user {
                 let active = reg.active_sessions(user_id).await;
-                let to_evict = (active.len() + 1).saturating_sub(max);
-                self.evict_oldest(reg.as_ref(), user_id, &active, to_evict, sid)
-                    .await;
+                let victims = victims_before_register(&active, sid, max);
+                self.evict_sessions(reg.as_ref(), user_id, &victims).await;
             }
             // Register-failure must clear the session and
             // refuse authentication. Without this, the just-set
@@ -141,14 +167,57 @@ where
 
             // Trim again now that this session is registered. The count above
             // and the register are separate registry calls, so parallel logins
-            // can each see room and together leave the user above the cap;
-            // every one of them trims here, oldest first and never itself, so
-            // the set converges on the cap.
+            // can each see room and together leave the user above the cap.
+            // Every one of them keeps the NEWEST `max` registrations and
+            // evicts the rest, itself included, so they all pick the same
+            // survivors: the set converges on the cap and the logins that
+            // lost the race fail rather than report success with a session
+            // a peer has already revoked. (Evicting "everyone but me" made two
+            // parallel logins at a cap of one revoke each other.)
             if let Some(max) = self.inner.max_sessions_per_user {
                 let active = reg.active_sessions(user_id).await;
-                let surplus = active.len().saturating_sub(max);
-                self.evict_oldest(reg.as_ref(), user_id, &active, surplus, sid)
-                    .await;
+                let victims = victims_after_register(&active, max);
+                self.evict_sessions(reg.as_ref(), user_id, victims).await;
+                if victims.contains(sid) {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        "concurrent session limit: this login lost the race for the \
+                         last slot; clearing session and refusing authentication"
+                    );
+                    session.clear().await;
+                    return Err(AuthnError::NoFlow);
+                }
+            }
+
+            // The credentials the login began against must still be the
+            // credentials now. A password reset that landed after the
+            // password was verified invalidates the user's registered
+            // sessions, but this one was not registered yet, so it would
+            // survive; checked here, after registering, a reset either
+            // sees this session (and invalidates it) or is seen by this check.
+            match self.flow_still_current(session, user_id, tenant_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        "credentials changed while the login was in flight; \
+                         revoking just-registered session and refusing authentication"
+                    );
+                    note_revocation(
+                        reg.invalidate_session(user_id, sid).await,
+                        "refusing a login step",
+                    );
+                    session.clear().await;
+                    return Err(AuthnError::NoFlow);
+                }
+                Err(e) => {
+                    note_revocation(
+                        reg.invalidate_session(user_id, sid).await,
+                        "refusing a login step",
+                    );
+                    session.clear().await;
+                    return Err(e);
+                }
             }
 
             // Re-read account status AFTER registering. Closes the
@@ -165,7 +234,10 @@ where
                         "account status flipped to non-loginable mid-flow; \
                          revoking just-registered session and refusing authentication"
                     );
-                    reg.invalidate_session(user_id, sid).await;
+                    note_revocation(
+                        reg.invalidate_session(user_id, sid).await,
+                        "refusing a login step",
+                    );
                     // Wipe the in-memory session state so the response cookie
                     // does not ship a Set-Cookie for an authenticated session.
                     session.clear().await;
@@ -188,11 +260,19 @@ where
                         error = %e,
                         "post-register status re-check failed; failing closed"
                     );
-                    reg.invalidate_session(user_id, sid).await;
+                    note_revocation(
+                        reg.invalidate_session(user_id, sid).await,
+                        "refusing a login step",
+                    );
                     session.clear().await;
                     return Err(e);
                 }
             }
+        } else if !self.flow_still_current(session, user_id, tenant_id).await? {
+            // No registry: nothing could have invalidated this session, but
+            // the credentials it was verified against still must be current.
+            session.clear().await;
+            return Err(AuthnError::NoFlow);
         }
         Ok(ControlFlow::Continue(()))
     }
@@ -224,7 +304,7 @@ where
             let sid = session.session_id().await;
 
             if let ControlFlow::Break(outcome) = self
-                .register_authenticated_session(user_id, &sid, session)
+                .register_authenticated_session(user_id, tenant_id, &sid, session)
                 .await?
             {
                 return Ok(outcome);
@@ -281,5 +361,62 @@ where
         };
 
         Ok(next_kind.map_or(FactorOutcome::Authenticated, FactorOutcome::FactorRequired))
+    }
+}
+
+/// The sessions to evict to make room for `sid` under a cap of `max`:
+/// the oldest of the OTHERS, enough that the others plus `sid` fit.
+///
+/// `sid` may already be registered (a re-run of the completing step), and
+/// is then not counted twice: counting it as an existing session as well
+/// as the incoming one evicted one session too many.
+pub(super) fn victims_before_register(
+    active: &[crate::session::id::SessionId],
+    sid: &crate::session::id::SessionId,
+    max: usize,
+) -> Vec<crate::session::id::SessionId> {
+    let others: Vec<_> = active.iter().filter(|s| *s != sid).copied().collect();
+    let to_evict = (others.len() + 1).saturating_sub(max).min(others.len());
+    others[..to_evict].to_vec()
+}
+
+/// The sessions to evict once `active` (oldest first) includes the new
+/// login: everything but the newest `max`, the new login itself included
+/// if it is not among them.
+pub(super) fn victims_after_register(
+    active: &[crate::session::id::SessionId],
+    max: usize,
+) -> &[crate::session::id::SessionId] {
+    &active[..active.len().saturating_sub(max)]
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+    use crate::session::id::SessionId;
+
+    fn ids(n: u64) -> Vec<SessionId> {
+        let rng = crate::testing::MockRng::new(n);
+        (0..6).map(|_| SessionId::new(&rng)).collect()
+    }
+
+    #[test]
+    fn an_already_registered_sid_is_not_counted_twice() {
+        let s = ids(3);
+        let (a, b, mine) = (s[0], s[1], s[2]);
+        // a, mine registered; cap 2: nobody needs to go.
+        assert!(victims_before_register(&[a, mine], &mine, 2).is_empty());
+        // a, b, mine registered; cap 2: only the oldest of the others.
+        assert_eq!(victims_before_register(&[a, b, mine], &mine, 2), vec![a]);
+    }
+
+    #[test]
+    fn the_trim_after_register_keeps_the_newest_max_whoever_they_are() {
+        let s = ids(4);
+        let (mine, rival) = (s[0], s[1]);
+        // The rival registered after this login: this login is the surplus.
+        assert_eq!(victims_after_register(&[mine, rival], 1), &[mine]);
+        assert!(victims_after_register(&[rival, mine], 1).contains(&rival));
+        assert!(victims_after_register(&[mine], 1).is_empty());
     }
 }

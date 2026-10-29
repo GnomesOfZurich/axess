@@ -178,8 +178,6 @@ The schema declares the attribute shapes:
 ```cedar,ignore
 entity User {
     tenant_id: String,
-    mfa_completed: Bool,
-    last_authn_at: Long,  // unix seconds
 };
 
 entity Document {
@@ -189,7 +187,8 @@ entity Document {
 
 type Context = {
     ip: String,
-    now: Long,
+    mfa_verified: Bool,
+    authn_age_secs: Long, // seconds since this session authenticated
 };
 ```
 
@@ -206,12 +205,12 @@ permit (
         resource.classification == "public"
         || (
             resource.classification == "internal"
-            && principal.mfa_completed
+            && context.mfa_verified
         )
         || (
             resource.classification == "secret"
-            && principal.mfa_completed
-            && context.now - principal.last_authn_at < 900  // last 15 min
+            && context.mfa_verified
+            && context.authn_age_secs < 900  // last 15 min
         )
     )
 };
@@ -219,8 +218,8 @@ permit (
 
 The rule grants read access in three tiers: public documents to
 anyone in the tenant, internal documents to anyone in the tenant
-with MFA completed, secret documents to anyone in the tenant with
-MFA completed in the last fifteen minutes. The attributes drive
+whose session has completed MFA, secret documents to anyone in the
+tenant whose session completed MFA in the last fifteen minutes. The attributes drive
 the gradations; the policy expresses them in one statement.
 
 ABAC is the right tool for time-sensitive, location-sensitive, and
@@ -272,8 +271,8 @@ forbid (
 ) when {
     resource.classification == "secret"
     && (
-        !principal.mfa_completed
-        || context.now - principal.last_authn_at > 900
+        !context.mfa_verified
+        || context.authn_age_secs > 900
     )
 };
 ```

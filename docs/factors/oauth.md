@@ -267,10 +267,41 @@ in the future at the moment of validation, with a small clock-skew
 allowance. The clock comes from the injected `Clock` trait, so DST
 tests can exercise expiry handling deterministically.
 
-The sixth is `iat` (issued-at) bounds. The token must have been
-issued within the last few minutes; tokens older than that indicate
-replay. The bound is configurable but defaults to five minutes,
-which matches what RFC 7519 implementations typically use.
+`iat` (issued-at) is not given an age bound of its own for ID tokens.
+The `openidconnect` verifier checks `exp` and the nonce but accepts any
+`iat`, and axess does not add a maximum age: how recent a login is comes
+from the single-use authorization code, the nonce bound to the session, the
+ceremony timeout, and `exp`. (Logout tokens are different: their `iat` must be
+within five minutes.) With `with_fapi` it caps `exp - iat`.
+
+The seventh is the `iss` parameter of the authorization response (RFC 9207).
+`finish_oauth_login_with_iss` takes the callback's `iss` and compares it with
+the provider's issuer exactly; a different one is a mix-up and is refused. A
+missing `iss` is refused when the provider's metadata advertises
+`authorization_response_iss_parameter_supported`, and accepted when it does
+not. `finish_oauth_login` does not look at `iss`; prefer the former. Register
+one redirect URI per provider as well.
+
+## Refreshing tokens
+
+`refresh_oauth_token` returns a `RefreshOutcome`. The ID token of a refresh
+response is optional (OIDC Core 12.2), so `id_token_claims` is `None` when the
+IdP sent none; the rotated refresh token is returned either way and is the one
+to store, because a rotating IdP has already spent the token that was sent.
+When an ID token is present its signature, issuer, subject and nonce are
+checked: a nonce, if present, must equal the nonce of the original login
+(pass it as `original_nonce`; it is the `nonce` member of
+`OAuthClaims::additional_claims`), and a missing nonce is accepted.
+
+## Endpoint transport
+
+Every endpoint that receives a client secret, a token or a code (token,
+userinfo, revocation, PAR, device authorization) must be HTTPS, with plain
+HTTP allowed only for `localhost`, `127.0.0.1` and `[::1]`. Discovery refuses
+a remote plain-HTTP endpoint, and the endpoints set by hand are checked where
+they are used, before anything is sent. The optional endpoints
+(`end_session_endpoint`, `revocation_endpoint`, the PAR endpoint) are read
+from the raw discovery document, since the typed metadata drops them.
 
 ## Logging out
 
@@ -291,6 +322,21 @@ the `events` claim verifies the token is a back-channel logout token
 present). Axess implements this through `OAuthProvider::verify_logout_jwt`,
 which returns the claims on success.
 
+The token's `typ` header is checked as well. By default `logout+jwt`, the
+plain `JWT` and `Logout` spellings IdPs in the field send, and no `typ` at
+all are taken, and the types of other tokens the same key signs (`dpop+jwt`,
+`at+jwt`) are refused. For an IdP that sends the explicit type, call
+`OAuthProviderConfig::with_required_logout_typ` and any token whose `typ` is
+not `logout+jwt` is refused too.
+
+A token with a `sid` ends the one session that `sid` maps to; the subject's
+other sessions are ended only when the token has no `sid` or the `sid` maps to
+nothing. Providers that share an issuer are told apart by the client id the
+token's `aud` names. When the replay log of `jti` values is full of live
+entries the endpoint answers 503 (retry later) and forgets none of them.
+Userinfo is bound to the login the same way: `fetch_userinfo` takes the
+expected subject and refuses a response for any other.
+
 The size cap on the logout token is eight kilobytes, the `iat` bound
 is five minutes, and the clock-skew tolerance is sixty seconds. The
 caps protect against denial-of-service through oversize tokens; the
@@ -309,12 +355,14 @@ optional `post_logout_redirect_uri` (where to send the user after
 logout), and an optional state value.
 
 The `post_logout_redirect_uri` must be on an allowlist that the
-application configures. The allowlist exists to defeat open-redirect
-attacks: an attacker who can manipulate the redirect URI could send
-the user to an arbitrary external site after logout, which is the
-shape of a phishing setup. The allowlist is a small explicit list of
-allowed URIs; anything else is rejected at `build_end_session_url`
-time.
+application configures with `with_allowed_post_logout_redirect_uris`. The
+allowlist exists to defeat open-redirect attacks: an attacker who can
+manipulate the redirect URI could send the user to an arbitrary external site
+after logout, which is the shape of a phishing setup. The allowlist is a small
+explicit list of allowed URIs matched exactly. A redirect that is not on the
+list is dropped from the URL at `build_end_session_url` time, and so is every
+redirect when the list is empty (the default): a provider nobody configured
+forwards nothing.
 
 ## Threat model
 

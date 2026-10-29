@@ -45,6 +45,9 @@ async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(store(4).await).await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
+    shared::the_fingerprint_lookup_follows_the_newest_sighting(store(4).await).await;
+    shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
+    shared::a_sighting_reports_the_level_it_found(store(4).await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store(4).await).await;
     shared::sweep_decisions_agree_to_the_second(
         store(4).await.with_sweep_config(shared::tight_config()),

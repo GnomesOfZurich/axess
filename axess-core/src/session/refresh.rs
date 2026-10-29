@@ -15,6 +15,9 @@
 //! - **Per-user cap:** A configurable maximum number of active tokens per user
 //!   prevents unbounded accumulation; the oldest tokens are auto-revoked.
 
+mod device_binding;
+#[cfg(feature = "device")]
+mod device_check;
 mod rotation;
 mod store;
 mod types;
@@ -30,12 +33,15 @@ use rotation::{collect_family_device_targets, generate_token_value, hash_token};
 #[cfg(test)]
 use zeroize::Zeroizing;
 
-pub use rotation::{
-    IssueRequest, issue_refresh_token, refresh_session, refresh_session_with_status_check,
-    revoke_refresh_token,
+#[cfg(feature = "device")]
+pub use device_check::refresh_session_with_device_check;
+// A glob, so re-exporting the deprecated `refresh_session` is not itself a use
+// of it. Every public item of `rotation` is meant to be exported.
+pub use rotation::*;
+pub use store::{DeviceTokenRevocation, RefreshTokenStore, RotationOutcome};
+pub use types::{
+    RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenId, RevocationReason, TokenFamilyId,
 };
-pub use store::{RefreshTokenStore, RotationOutcome};
-pub use types::{RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenId, TokenFamilyId};
 
 #[cfg(test)]
 mod atomic_rotation;
@@ -45,8 +51,16 @@ mod authn_time;
 mod basics;
 #[cfg(test)]
 mod config_tests;
+#[cfg(test)]
+mod device_binding_tests;
 #[cfg(all(test, feature = "device"))]
 mod device_cascade;
+#[cfg(all(test, feature = "device"))]
+mod device_revoke;
+#[cfg(test)]
+mod pepper_rotation;
+#[cfg(test)]
+mod revocation;
 #[cfg(test)]
 mod status_check;
 #[cfg(test)]
@@ -153,6 +167,8 @@ mod refresh_unit_tests {
             (RefreshError::Revoked, "revoked"),
             (RefreshError::DeviceMismatch, "device mismatch"),
             (RefreshError::AccountInactive, "not active"),
+            (RefreshError::DeviceRevoked, "device revoked"),
+            (RefreshError::DeviceStore("down".into()), "device store"),
             (
                 RefreshError::InvalidConfig("max_per_user"),
                 "invalid refresh",

@@ -37,6 +37,7 @@ fn make_session() -> AuthSession {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
@@ -248,4 +249,118 @@ fn oauth_providers_accessor_returns_configured_registry() {
         "registry must contain the registered provider; names={:?}",
         names
     );
+}
+
+/// The registry and the identity store are asked together: with each taking
+/// 100 ms the check takes about 100 ms, not 200, and a failure of either
+/// still fails the session.
+#[tokio::test(start_paused = true)]
+async fn the_registry_and_identity_checks_overlap() {
+    use crate::session::store::SessionRevoker;
+    use std::time::Duration;
+
+    struct Slow(bool);
+    impl SessionRevoker for Slow {
+        fn invalidate_user<'a>(
+            &'a self,
+            _: &'a crate::authn::ids::UserId,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(), crate::session::store::RevocationError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+        fn invalidate_session<'a>(
+            &'a self,
+            _: &'a crate::authn::ids::UserId,
+            _: &'a crate::session::id::SessionId,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(), crate::session::store::RevocationError>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    impl SessionRegistryHandle for Slow {
+        fn is_valid<'a>(
+            &'a self,
+            _: &'a crate::authn::ids::UserId,
+            _: &'a crate::session::id::SessionId,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            let answer = self.0;
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                answer
+            })
+        }
+        fn register<'a>(
+            &'a self,
+            _: &'a crate::authn::ids::UserId,
+            _: &'a crate::session::id::SessionId,
+        ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+            Box::pin(async { true })
+        }
+        fn active_sessions<'a>(
+            &'a self,
+            _: &'a crate::authn::ids::UserId,
+        ) -> Pin<Box<dyn Future<Output = Vec<crate::session::id::SessionId>> + Send + 'a>> {
+            Box::pin(async { Vec::new() })
+        }
+    }
+    struct SlowIdentity;
+    impl IdentityHandle for SlowIdentity {
+        fn get_user_tenant<'a>(
+            &'a self,
+            _: &'a crate::authn::ids::UserId,
+        ) -> Pin<Box<dyn Future<Output = Option<crate::authn::ids::TenantId>> + Send + 'a>>
+        {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Some(fixture_tenant_id())
+            })
+        }
+    }
+
+    let session = authenticated_session().await;
+    let validator = |registry_says: bool| SessionValidator {
+        registry: Some(Arc::new(Slow(registry_says))),
+        identity: Some(Arc::new(SlowIdentity)),
+    };
+
+    let started = tokio::time::Instant::now();
+    assert!(validator(true).is_valid(&session).await);
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+
+    assert!(!validator(false).is_valid(&session).await);
+}
+
+/// The middleware that refuses a revoked session also ends it: the session
+/// is cleared and its id rotated, so the stored row stops saying
+/// `Authenticated` and the cookie stops matching it.
+#[tokio::test]
+async fn require_valid_session_clears_and_rotates_a_revoked_session() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let registry = MemorySessionRegistry::new();
+    let session = authenticated_session().await;
+    let old = session.session_id().await;
+    // Registered nowhere: the registry does not hold the session.
+    let validator = SessionValidator {
+        registry: Some(registry_handle(registry)),
+        identity: None,
+    };
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(|| async { "ok" }))
+        .layer(require_valid_session(validator));
+    let mut req = Request::get("/").body(Body::empty()).unwrap();
+    req.extensions_mut().insert(session.0.clone());
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(!session.is_authenticated().await, "the session is cleared");
+    assert_ne!(session.session_id().await, old, "the id is rotated");
 }

@@ -141,7 +141,10 @@ async fn revoked_token_bypasses_status_check() {
     .unwrap();
 
     // Rotate once (revokes the parent).
-    let _ = refresh_session(&plaintext, &store, &config, &rng, ts, None)
+    let _ =
+        refresh_session_with_status_check(&plaintext, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
         .await
         .unwrap();
 

@@ -50,7 +50,8 @@ pub(crate) fn apply_hotp_failure(
 /// Compute the next Email OTP config state after a failed verification.
 ///
 /// If the prior config has already reached `max_attempts`, burns the pending
-/// code (clears `pending_hash`, `pending_until`, resets `attempt_count`).
+/// code (clears `pending_hash` and resets `attempt_count`; `pending_until` is
+/// kept so the cooldown outlives the burn).
 /// Otherwise increments `attempt_count`.
 ///
 /// Exposed so callers performing compare-and-swap retries can recompute the
@@ -59,8 +60,11 @@ pub(crate) fn apply_hotp_failure(
 pub(crate) fn apply_email_otp_failure(prior: &EmailOtpConfig) -> EmailOtpConfig {
     let mut next = prior.clone();
     if prior.attempt_count >= effective_max_attempts(prior.max_attempts) {
+        // The code is spent, but the cooldown it started is not: keeping
+        // `pending_until` makes `prepare_factor` answer `AlreadySent` until
+        // the original expiry. Clearing it handed out a fresh code, and so a
+        // fresh set of guesses, after every `max_attempts` wrong ones.
         next.pending_hash = None;
-        next.pending_until = None;
         next.attempt_count = 0;
     } else {
         next.attempt_count = prior.attempt_count.saturating_add(1);
@@ -176,8 +180,13 @@ fn verify_totp_factor(
         OtpAlgorithm::Sha256 => axess_factors::TotpAlgorithm::SHA256,
         OtpAlgorithm::Sha512 => axess_factors::TotpAlgorithm::SHA512,
     };
+    // A sealed secret reaches here only if the caller skipped opening it;
+    // refuse rather than treat ciphertext as a key.
+    let Some(secret) = cfg.secret.plain() else {
+        return VerifyOutcome::Fail;
+    };
     let matched = axess_factors::verify_totp(
-        cfg.secret.as_ref(),
+        secret,
         code,
         now,
         axess_factors::TotpVerifyParams {
@@ -226,8 +235,11 @@ fn verify_hotp_factor(code: &str, cfg: &HotpConfig) -> VerifyOutcome {
         OtpAlgorithm::Sha256 => axess_factors::HotpAlgorithm::Sha256,
         OtpAlgorithm::Sha512 => axess_factors::HotpAlgorithm::Sha512,
     };
+    let Some(secret) = cfg.secret.plain() else {
+        return VerifyOutcome::Fail;
+    };
     let matched = axess_factors::verify_hotp(
-        cfg.secret.as_ref(),
+        secret,
         code,
         cfg.counter,
         cfg.digits as usize,
@@ -296,9 +308,9 @@ fn verify_email_otp_factor(
     // failed verifications to prevent brute-force within the TTL window.
     if cfg.attempt_count >= effective_max_attempts(cfg.max_attempts) {
         tracing::warn!("email OTP attempt limit exceeded, burning code");
+        // `pending_until` stays: see `apply_email_otp_failure`.
         let mut burned = cfg.clone();
         burned.pending_hash = None;
-        burned.pending_until = None;
         burned.attempt_count = 0;
         return VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(burned));
     }
@@ -544,7 +556,7 @@ mod tests {
         };
         let next = apply_email_otp_failure(&prior);
         assert!(next.pending_hash.is_none());
-        assert!(next.pending_until.is_none());
+        assert!(next.pending_until.is_some(), "the cooldown survives a burn");
         assert_eq!(next.attempt_count, 0);
     }
 

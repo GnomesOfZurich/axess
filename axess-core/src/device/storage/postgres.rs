@@ -24,8 +24,12 @@
 //!     PRIMARY KEY (tenant_id, id)
 //! );
 //!
-//! CREATE INDEX IF NOT EXISTS idx_devices_fingerprint
-//!     ON devices (tenant_id, fingerprint_hash);
+//! CREATE INDEX IF NOT EXISTS idx_devices_fingerprint_seen
+//!     ON devices (tenant_id, fingerprint_hash, last_seen_at DESC, id);
+//! CREATE INDEX IF NOT EXISTS idx_devices_sweep
+//!     ON devices (tenant_id, trust_level, last_seen_at);
+//! CREATE INDEX IF NOT EXISTS idx_devices_revoked_at
+//!     ON devices (tenant_id, revoked_at) WHERE trust_level = 'Revoked';
 //! CREATE INDEX IF NOT EXISTS idx_devices_user
 //!     ON devices (tenant_id, user_id, last_seen_at DESC);
 //! CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint
@@ -86,8 +90,8 @@ use crate::device::storage::sql_common::{
     BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
     SqlDeviceStoreError, SwapPlan, SweepCutoffs, TRANSITION_ATTEMPTS, TrustWrite,
     bindings_update_after_miss, claim_after_miss, decode_all, decode_optional, parse_stored_trust,
-    plan_bindings_swap, push_family_rows, require_row, select_devices, transition_after_miss,
-    utc_to_unix,
+    plan_bindings_swap, push_family_rows, require_row, select_devices, sighting_level,
+    transition_after_miss, utc_to_unix,
 };
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
@@ -178,9 +182,31 @@ impl PostgresDeviceStore {
         .execute(&self.pool)
         .await?;
 
+        // Serves `find_by_fingerprint` in sorted order, so the newest sighting
+        // is the first entry of the range instead of the winner of a sort over
+        // every device that shares the fingerprint. It replaces the plain
+        // `(tenant_id, fingerprint_hash)` index of earlier releases, which it
+        // covers as a prefix.
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_fingerprint \
-             ON devices (tenant_id, fingerprint_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_devices_fingerprint_seen \
+             ON devices (tenant_id, fingerprint_hash, last_seen_at DESC, id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DROP INDEX IF EXISTS idx_devices_fingerprint")
+            .execute(&self.pool)
+            .await?;
+        // The retention sweep reads by level and age: `Trusted` and `Seen`
+        // rows by `last_seen_at`, `Revoked` rows by `revoked_at`.
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_devices_sweep \
+             ON devices (tenant_id, trust_level, last_seen_at)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_devices_revoked_at \
+             ON devices (tenant_id, revoked_at) WHERE trust_level = 'Revoked'",
         )
         .execute(&self.pool)
         .await?;
@@ -428,7 +454,7 @@ impl DeviceStore for PostgresDeviceStore {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(stored) = parse_stored_trust(stored)?
-                && blocks_save(stored, device.trust_level)
+                && blocks_save(stored)
             {
                 return Ok(());
             }
@@ -475,13 +501,13 @@ impl DeviceStore for PostgresDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         let pool = self.pool.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
         let ts = utc_to_unix(now);
         async move {
-            let updated = sqlx::query(
+            sqlx::query(
                 "UPDATE devices SET last_seen_at = CASE \
                      WHEN trust_level <> 'Revoked' AND last_seen_at < $3 THEN $3 \
                      ELSE last_seen_at END \
@@ -491,9 +517,14 @@ impl DeviceStore for PostgresDeviceStore {
             .bind(&device_id)
             .bind(ts)
             .execute(&pool)
-            .await?
-            .rows_affected();
-            require_row(updated, tenant, device_id)
+            .await?;
+            // The level the row has now: Revoked means the sighting did not
+            // touch it. A missing row is a missing device.
+            sighting_level(
+                fetch_trust_level(&pool, &tenant, &device_id).await?,
+                tenant,
+                device_id,
+            )
         }
     }
 
@@ -512,7 +543,10 @@ impl DeviceStore for PostgresDeviceStore {
             // The CASE reads the row's level from before this statement's
             // assignments.
             let updated = sqlx::query(
-                "UPDATE devices SET trust_level = $3, revoked_at = $4, \
+                "UPDATE devices SET trust_level = $3, \
+                        revoked_at = CASE WHEN $3::text = 'Revoked' AND trust_level = 'Revoked' \
+                                               AND revoked_at IS NOT NULL THEN revoked_at \
+                                          ELSE $4::bigint END, \
                         demoted_at = CASE WHEN $5::bigint = 0 THEN NULL \
                                           WHEN trust_level = 'Trusted' THEN $6::bigint \
                                           ELSE demoted_at END \
@@ -548,7 +582,7 @@ impl DeviceStore for PostgresDeviceStore {
             // and writes in a single statement, so a revocation that lands
             // first makes this match no row instead of being overwritten.
             for _ in 0..TRANSITION_ATTEMPTS {
-                let updated = sqlx::query("UPDATE devices SET trust_level = $4, revoked_at = $5, demoted_at = CASE WHEN $6::bigint = 1 THEN demoted_at ELSE $7::bigint END WHERE tenant_id = $1 AND id = $2 AND trust_level = $3")
+                let updated = sqlx::query("UPDATE devices SET trust_level = $4, revoked_at = CASE WHEN $3::text = $4::text THEN revoked_at ELSE $5::bigint END, demoted_at = CASE WHEN $6::bigint = 1 THEN demoted_at ELSE $7::bigint END WHERE tenant_id = $1 AND id = $2 AND trust_level = $3")
             .bind(&tenant)
             .bind(&device_id)
             .bind(w.expected)
@@ -569,7 +603,12 @@ impl DeviceStore for PostgresDeviceStore {
                 // The row is at `expected` again: the write lost a race with
                 // a change that has since been undone. Try it again.
             }
-            Ok(TrustTransition::Refused { current: expected })
+            // Every attempt lost a race: the row was never found at another
+            // level, so the change is neither applied nor refused.
+            Err(SqlDeviceStoreError::Contended {
+                tenant_id: tenant,
+                device_id,
+            })
         }
     }
 

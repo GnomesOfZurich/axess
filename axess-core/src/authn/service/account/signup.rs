@@ -10,7 +10,7 @@ use crate::authn::service::RequestAuthnService;
 use crate::authn::service::outcomes::SignupOutcome;
 use crate::authn::{
     error::AuthnError,
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     store::{FactorStore, IdentityStore},
 };
 use crate::session::{
@@ -35,6 +35,14 @@ where
     /// `tenant_identifier` is the tenant slug/domain (looked up via
     /// [`IdentityLookup::find_tenant`](crate::authn::IdentityLookup::find_tenant)).
     ///
+    /// An identifier that is already taken answers
+    /// [`SignupOutcome::AlreadyExists`], which tells the caller who has an
+    /// account. [`with_hidden_signup_conflicts`](crate::authn::service::AuthnServiceBuilder::with_hidden_signup_conflicts)
+    /// makes it answer [`SignupOutcome::Started`] instead, creating nothing
+    /// and leaving the session anonymous; see that method for how the
+    /// application tells the two apart privately. Either way the refusal is
+    /// audited with its reason.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthnError::Store`] if the store operation fails.
@@ -55,7 +63,9 @@ where
             || tenant_identifier.len() > MAX_IDENTIFIER_BYTES
             || !is_printable(&user.identifier)
             || !is_printable(&user.display_name)
+            || !crate::validation::is_acceptable_identifier(&user.identifier)
         {
+            self.refuse_signup(None, None, "invalid_input").await?;
             return Err(AuthnError::InvalidAssertion);
         }
 
@@ -69,8 +79,15 @@ where
 
         let tenant = match tenant {
             Some(t) if t.status.is_active() => t,
-            Some(_) => return Ok(SignupOutcome::TenantNotActive),
-            None => return Ok(SignupOutcome::TenantNotActive),
+            Some(t) => {
+                self.refuse_signup(None, Some(&t.id), "tenant_not_active")
+                    .await?;
+                return Ok(SignupOutcome::TenantNotActive);
+            }
+            None => {
+                self.refuse_signup(None, None, "unknown_tenant").await?;
+                return Ok(SignupOutcome::TenantNotActive);
+            }
         };
 
         // 2. Check if user already exists.
@@ -81,32 +98,40 @@ where
             .await
             .map_err(AuthnError::Store)?;
 
-        // Orphan-Candidate recovery. If a previous `begin_signup`
-        // created a `User` row but the application never finished the
-        // workflow (the user closed the tab, the verification email was
-        // dropped, etc.), the user is stuck in `Candidate` state and a
-        // retry would hit `AlreadyExists` indefinitely. Treat an existing
-        // `Candidate` row on the same identifier as a *resumption* of the
-        // signup: re-attach the in-progress workflow state to the same
-        // user_id, skip `create_user`, and let the application continue.
-        // Any other status (`Active`, `Suspended`, etc.) still returns
-        // `AlreadyExists`; those represent real, completed accounts and
-        // must not be silently overwritten.
+        // An existing account is never handed to the caller. An earlier
+        // release resumed any `Candidate` row for whoever typed its
+        // identifier, which let a stranger attach the half-created account
+        // of a person who had not finished signing up (and set its
+        // password, in a flow that saves one). The only resumption left is
+        // the idempotent one: this session is already pending signup for
+        // that very user, so a repeated submit answers `Started` again.
+        // A stale `Candidate` that nobody is resuming is the application's
+        // to purge (`delete_user`), after whatever proof of control its
+        // verification step gives.
         if let Some(existing_user) = existing {
+            let resuming_own = matches!(
+                session.auth_state().await,
+                crate::session::data::AuthState::PendingWorkflow { user_id, workflow, .. }
+                    if user_id == existing_user.id && workflow.kind == WorkflowKind::Signup
+            );
             if matches!(
                 existing_user.status,
                 crate::authn::types::EntityState::Candidate
-            ) {
-                let now = self.inner.clock.now();
-                let workflow = WorkflowState::new(WorkflowKind::Signup, 1, now);
-                session
-                    .set_pending_workflow(existing_user.id, existing_user.tenant_id, workflow)
-                    .await;
-                tracing::info!(
-                    user_id = %existing_user.id,
-                    tenant_id = %existing_user.tenant_id,
-                    "resumed orphan Candidate signup"
-                );
+            ) && resuming_own
+            {
+                return Ok(SignupOutcome::Started);
+            }
+            self.refuse_signup(
+                Some(&existing_user.id),
+                Some(&existing_user.tenant_id),
+                "already_exists",
+            )
+            .await?;
+            // Hidden conflicts answer as a free identifier does, so the
+            // response is not a way to learn who has an account. Nothing is
+            // created and the session stays as it was; the application
+            // reads that from the session (no user) where the caller cannot.
+            if self.inner.hide_signup_conflicts {
                 return Ok(SignupOutcome::Started);
             }
             return Ok(SignupOutcome::AlreadyExists);
@@ -146,6 +171,22 @@ where
         Ok(SignupOutcome::Started)
     }
 
+    /// Leave a failed `SignupStarted` row for a refused signup, with the
+    /// user and tenant it concerns when known.
+    async fn refuse_signup(
+        &self,
+        user_id: Option<&crate::authn::ids::UserId>,
+        tenant_id: Option<&crate::authn::ids::TenantId>,
+        reason: &'static str,
+    ) -> Result<(), AuthnError<I::Error>> {
+        self.emit_audit(
+            AuthEventBuilder::failure(AuthEventType::SignupStarted)
+                .maybe_attributed_to(user_id, tenant_id)
+                .with_error(AuthFailureReason::Other(reason.into())),
+        )
+        .await
+    }
+
     /// Complete a signup flow: activate the user and transition the session
     /// to [`AuthState::Authenticated`](crate::session::data::AuthState::Authenticated).
     ///
@@ -165,6 +206,22 @@ where
             } if workflow.kind == WorkflowKind::Signup => (*user_id, *tenant_id),
             _ => return Err(AuthnError::NoFlow),
         };
+
+        // Only a user still waiting to be activated is activated. The
+        // workflow state in the session is a snapshot; between
+        // `begin_signup` and now an administrator may have suspended the
+        // account, and activating it here would undo that.
+        let status = self.current_account_status(&user_id).await?;
+        if !matches!(
+            status,
+            crate::authn::types::EntityState::Candidate
+                | crate::authn::types::EntityState::Pending(_)
+        ) {
+            session.clear().await;
+            self.refuse_signup(Some(&user_id), Some(&tenant_id), "not_awaiting_activation")
+                .await?;
+            return Err(AuthnError::NotActive(status));
+        }
 
         // Activate the user.
         self.inner

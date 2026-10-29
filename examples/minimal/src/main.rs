@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 5. SessionLayer threads the session through each request.
     let session_layer = SessionLayer::new(session_store, signing_key)
         .with_ttl(Duration::from_secs(86_400))
-        .with_secure(false); // dev only -- see "Cookie security" below.
+        .with_secure(secure_cookies()); // see "Cookie security" below.
 
     let app = Router::new()
         .route("/", get(public_page))
@@ -150,3 +150,13 @@ async fn login(
     }
 }
 // ANCHOR_END: login
+
+/// Cookies are `Secure` unless `AXESS_DEV_INSECURE_COOKIES=1` is set, for a
+/// browser that refuses `Secure` cookies over plain HTTP. Local use only.
+fn secure_cookies() -> bool {
+    let insecure = std::env::var("AXESS_DEV_INSECURE_COOKIES").is_ok_and(|v| v == "1");
+    if insecure {
+        eprintln!("WARNING: AXESS_DEV_INSECURE_COOKIES=1, cookies are sent without Secure");
+    }
+    !insecure
+}

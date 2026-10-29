@@ -10,6 +10,244 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ---
 
+## [0.13.0] - 2026-10-29
+
+The 0.12.0 retest and deep dive: 254 items, 246 fixed with a test that fails
+without the fix, 8 rejected with evidence. `docs/production/migrating.md`
+lists every compile error and storage step by what an adopter sees; this
+entry says what changed.
+
+### Changed (breaking)
+
+Logins and factors:
+
+- Lockout is derived from the store at every gate: `IdentityAuthnLog`
+  requires `failed_attempts`, `reserve_attempt` and `release_attempt`, and a
+  guess is counted before its credential is checked, so parallel guesses
+  cannot pass `LockoutPolicy::max_attempts` (0 means five). The sqlite
+  example gains a `last_failed_at` column.
+- A half-finished login expires (`with_flow_ttl`, ten minutes) and dies with
+  a credential change. `begin_login` answers `InvalidCredentials` for a known
+  inactive account; `begin_signup` answers `AlreadyExists` instead of
+  resuming another session's candidate; signup refuses non-NFC identifiers,
+  invisible format characters and passwords over `MAX_PASSWORD_BYTES`.
+- `finish_discoverable_login` returns `FactorOutcome` and follows the user's
+  method: a passkey alone no longer authenticates a user whose method needs
+  more. Passkey enrolment and deletion need the user's own authenticated or
+  pending-signup session; `delete_fido2_credential` takes the session.
+- `TotpConfig::secret` and `HotpConfig::secret` are a `FactorSecret`, `Plain`
+  or `Sealed`: a struct literal needs `.into()`, reading the text is
+  `secret.plain()`. Stored rows load unchanged.
+- `StepUpPolicy::default()` asks for a factor at every trust level, since a
+  fingerprint is client-controlled. `PrepareOutcome::AlreadySent` carries a
+  masked address; the HOTP attempt limit restarts the count.
+- `begin_impersonation` is the tenant-scoped form and requires an
+  authenticated admin session. `suspend_user`, `activate_user`,
+  `invalidate_user_sessions` and `invalidate_session` take an `Actor` and the
+  expected tenant, with `suspend_user_across_tenants` and
+  `activate_user_across_tenants` for the platform operator; the `_by`,
+  `_in_tenant` and `_as` variants are removed. A registry that fails is
+  `AuthnError::ExternalService`, and no audit row claims the sessions ended.
+- `refresh_session` is deprecated for `refresh_session_with_status_check`; a
+  caller with no status to consult passes `|_| async { true }`.
+
+Sessions and cookies:
+
+- `SessionStore` requires `update_if_revision`; `SessionData` gains
+  `revision` and `touched_at`. `AuthSession::take_custom` is single-use across
+  nodes, `clear` cycles the id, and `user_id` and `tenant_id` answer only for
+  an `Authenticated` session (`pending_user_id` names the login in flight).
+  Becoming authenticated clears the session's `custom` data except the keys
+  named by `with_preserved_custom_keys`.
+- The default cookie is `__Host-axess.sid`. `SessionLayer` and
+  `CsrfLayer::new` panic on a prefixed name without `Secure`, a `__Host-`
+  name off `/`, a zero TTL or `SameSite=None` without `Secure`; a cookie name
+  present twice counts as absent.
+- `CsrfToken` is built with `CsrfToken::new` and read with `as_str`. A request
+  that uses neither the session nor the token stores nothing and sets no
+  cookie; `CsrfConfig::mint_on_every_request(true)` restores the old behaviour.
+- `AuthnService::logout` always clears and rotates, even when the audit write
+  fails; `SessionRevoker` methods return `Result<(), RevocationError>`.
+- `LegacyBlobs` defaults to `Reject`: a session blob with no row binding and
+  the 0.11.0 device formats are refused unless `SessionCrypto` is given
+  `with_legacy_blobs(LegacyBlobs::AcceptUntil(cutoff))`, on the clock set by
+  `with_clock`. `SessionCrypto::encrypt` and `decrypt` are removed; use
+  `encrypt_with_aad` and `decrypt_with_aad`. Bound blobs are sealed under a
+  per-record subkey, so AES-GCM's random-nonce limit no longer applies, and
+  earlier blobs are re-sealed on read. `session::crypto` and `aes-gcm` no
+  longer depend on a storage feature.
+
+Devices and refresh tokens:
+
+- A device is matched by a token in a `__Host-axess_device` cookie, never by
+  its fingerprint; a guest creates no device and a cookieless request writes
+  nothing; devices of earlier releases are not matched again.
+  `DeviceStore::record_sighting` returns the trust level (`Revoked` means the
+  row was not touched); `SqlDeviceStoreError::Contended` replaces a
+  self-contradicting `Refused`; the SQL stores replace
+  `idx_devices_fingerprint` with `idx_devices_fingerprint_seen` and add
+  `idx_devices_sweep` and `idx_devices_revoked_at` (MySQL runs the
+  `ALTER TABLE` in the `MysqlDeviceStore` docs).
+- `RefreshToken` gains `revoked_reason` and `revoked_at`; `RefreshTokenConfig`
+  gains `max_lifetime`, `reuse_grace` and `previous_hash_pepper`;
+  `RefreshError` gains `ConcurrentRefresh`, `DeviceRevoked` and
+  `DeviceStore(String)`. Only the reuse of a token rotated out revokes its
+  family, and a token stores a keyed digest of its device string, not the
+  string.
+- `RateLimitConfig` gains `rng`; `RateLimitLoginIdentifier` is a struct that
+  normalises with NFKC; `x-ratelimit-remaining` is no longer sent for
+  login-identifier, tenant or shared buckets. `KdfError::Busy`: the KDF
+  executor refuses past `with_max_queue` or `with_acquire_timeout`.
+
+Federation, workload identity and network:
+
+- `refresh_oauth_token` takes `original_nonce` and returns `RefreshOutcome`
+  (the ID token is optional and the rotated refresh token is never lost with
+  the error); `fetch_userinfo` takes `expected_subject`.
+  `OAuthProviderConfig::with_fapi` works and no longer needs the `fapi`
+  feature; `FapiConfig` gains `allowed_id_token_algs`; `OAuthClaims` gains
+  `dpop_key`; DPoP proofs take a `DpopKey`. An empty `post_logout_redirect_uri`
+  allowlist forwards nothing. A back-channel logout token with both `sid` and
+  `sub` ends only the `sid` session; `iss` is pinned, `typ` checked, and a
+  full `jti` log answers 503.
+- `JwtVerifier::verify` fails without an audience pin unless
+  `allow_any_audience()` was called; `JwtSvidResolver` and `WorkloadResolver`
+  refuse a verifier that pins no `iss` or `aud`; `verify_jwt` refuses
+  `HS256/384/512` and a JWK whose `use` is not `sig`; `JwtError::TooLarge`
+  refuses a token over `MAX_JWT_BYTES` before decoding. `MtlsResolver` refuses
+  a leaf with more than one SPIFFE SAN, a CA leaf, or one that may sign.
+- Every credential-bearing outbound client refuses a non-HTTPS, non-loopback
+  endpoint before sending, follows no redirects and has timeouts
+  (`OutboundOAuthClient::new` now returns `Result`; `TokenExchangeClient`,
+  `AwsStsClient`, `GcpStsClient`, `GcpServiceAccountImpersonator`,
+  `AzureFicClient`); a client passed to `with_http_client` drops those
+  protections. `LdapProviderConfig` refuses a cleartext bind to a remote host
+  (`allow_cleartext()` opts in).
+- `LocalIdp` caps tokens at one hour and requires an audience
+  (`without_max_ttl()` and `allow_no_audience()` opt out);
+  `LocalIdpKeyStore::retire` is required; `rotate_signing_key` refuses a
+  duplicate `kid` (`IssuanceError::DuplicateKeyId`), and generated keys carry
+  an RFC 7638 thumbprint `kid`.
+- Signed service requests are addressed: `SignedRequests` needs an
+  `audience`, `ServiceSecretLayer::signed` returns `Result`, a signature made
+  for another recipient no longer verifies, `ServiceSigner::sign` is removed
+  for `sign_for`, and `accept_unaddressed_until(instant)` keeps `v1` callers
+  through a window.
+- `EncryptedDelegatedCredentialStore` writes envelope `v2` and re-seals a row
+  on load through the new `DelegatedCredentialStore::save_if_unchanged`
+  (`without_reseal_on_load` opts out; `v1` rows follow
+  `with_legacy_envelopes`); `complete_grant` takes a `&dyn Clock`.
+- `ClientIp`, `TrustedProxies` and `DefaultFingerprintExtractor` canonicalise
+  IPv4-mapped IPv6 addresses; the bearer layer's 401 body is
+  `{"error":"invalid_token"}`; the filesystem audit archiver records
+  `{batch id} {content digest}` in its sidecars.
+
+Authorization:
+
+- `PolicyStore` adds the schema's action entities to every evaluation, and
+  principal attributes cannot shadow the built-in Cedar attributes. Entity
+  cache keys carry the provider's `cache_discriminator` and an invalidation
+  generation, so existing entries are not found after the upgrade.
+  `require_authz!` refuses a resource id with more than one path placeholder
+  at compile time.
+
+Dependencies and test doubles: `axess-core` depends on `unicode-normalization`
+and, unconditionally, on `aes-gcm`; `webauthn-rs` is pinned `=0.6.0-dev`;
+`MockLdapProvider` and `MockFido2Provider` exist only under `cfg(test)` or the
+`testing` feature.
+
+### Added
+
+- A guess is reserved before its credential is checked, so parallel guesses
+  cannot pass the lockout; one Argon2id verification runs on every password
+  path, and a hash made under older parameters is replaced at the next login.
+- OTP secrets sealed at rest: `FactorSecretCipher` seals a TOTP or HOTP secret
+  into a `SealedFactorSecret` bound to its row, and the login that verifies a
+  plain secret seals it, inside a dated window.
+- Pepper rotation for refresh tokens (`previous_hash_pepper`) and recovery
+  codes (`verify_recovery_code_rotating`).
+- Signup can hide a taken identifier and password resets can cool down per
+  identifier; the documented step-up flow is `begin_step_up`.
+- The session layer consults the registry for every authenticated session and
+  caps authenticated age; a read-only request keeps a session alive; the layer
+  finalizes in a task of its own, so a dropped request cannot leave a
+  logged-out session `Authenticated`; `require_authn!(validator = v)` ends a
+  revoked session.
+- Device revocation reaches refresh tokens, a password reset or suspension
+  revokes the user's refresh tokens, and the Valkey device store reads one
+  user's devices rather than every one that shares a fingerprint.
+- A per-prefix rate-limit budget, a bounded KDF queue, and revocation-aware
+  WebSockets with a periodic poll and a maximum lifetime.
+- FAPI 2.0: DPoP on the token request with the nonce retry and key-bound
+  refresh and userinfo calls, mTLS client authentication through the endpoint
+  aliases, JARM, the RFC 9207 `iss` check, and back-channel logout audit.
+- Workload identity: a bearer issuer requires an audience, the JWT-SVID
+  resolver can cross-check the tenant claim, service signatures bind to a
+  named recipient, and the local IdP can retire and reload keys.
+- Authorization: entity providers declare a cache discriminator, invalidation
+  by resource, the `{$tenant}` and `{$user}` placeholders in `require_authz!`,
+  and decision events for denials made before Cedar is asked.
+- The example crates gain a pinned Kubernetes mapper, the local IdP's key
+  retirement route, a logout route and a sealing key for TOTP enrolments.
+
+### Fixed
+
+- Logins: parallel logins at a session cap no longer revoke each other; the
+  failure counter moves before the audit await; a known barred user makes the
+  same store calls as an unknown one; an email OTP burn keeps its cooldown; a
+  password reset installs, invalidates, clears, revokes and audits in that
+  order and re-checks the status before spending the token; FIDO2 clears its
+  ceremony stamp on every failure path and audits a failed registration; an
+  LDAP outage is audited and names the user.
+- Sessions: a fingerprint matched under the previous key no longer ends the
+  session on the next request; the custom-data cap applies to every write; a
+  cookieless `AuditContext` extraction stores nothing; Valkey `cycle` with a
+  zero TTL reports `SessionGone`.
+- Devices and refresh: `ensure_device` never reuses a `Revoked` device,
+  prefers the caller's own device and settles two racing first sightings on
+  one; `save` leaves a `Revoked` row untouched; a family-less token's child is
+  revoked with its parent; the retention sweep runs in batches of 1,000 rows;
+  a legacy blob is refused when the tenant and id inside it differ from its
+  key, and a nonce that happens to begin with a format marker still opens.
+- OAuth and federation: a refused login restores the `(iss, sid)` mapping it
+  displaced; discovery reads `end_session_endpoint`, `revocation_endpoint` and
+  the PAR endpoint from the raw document (`build_end_session_url` had always
+  answered `None`); DPoP proofs at zero skew could replay within their second;
+  a cancelled delegated refresh no longer loses the rotated token; the outbound
+  client caches a token for half its life and shares one fetch across callers;
+  `TokenExchangeRequest`, `AuthUrl` and `DeviceAuthResponse` no longer print
+  tokens through `Debug`; the AWS STS client zeroes the response body;
+  `UnknownKid` carries at most 128 bytes of the `kid`.
+- Infrastructure: the audit archiver marks a batch only after every file and
+  directory is durable; the rate limiter survives a backwards clock step and
+  HMACs its log fingerprints; the service-secret replay cache keeps sweeping
+  after a clock step; Valkey watchers recheck after a lost connection, with
+  2 s setup timeouts and a 5 s poll without a subscriber; `spawn_jwks_refresh`
+  no longer bursts missed ticks; the request-id layer no longer panics on a
+  non-ASCII custom id; an authz invalidation racing a cache load no longer
+  loses; `DEFAULT_FLOW_TTL` is exported without the `oauth` feature.
+- Reference examples: cookies are `Secure` unless
+  `AXESS_DEV_INSECURE_COOKIES=1`; the sqlite example wires a session registry,
+  derives its CSRF key from the session key, rate-limits on `ClientIp`, makes
+  tenant- and system-scope factor rows unique (migration `20261028000100`,
+  re-embedded by a `build.rs`), no longer replaces an enrolled TOTP factor and
+  logs no reset token; the FAPI example runs under the profile, reuses the
+  login's DPoP key and logs out through `logout`; the local IdP prints its
+  admin token once, requires an audience and survives a huge `ttl_secs`.
+
+### Documentation
+
+- `docs/production/migrating.md` gains the 0.12.0 to 0.13.0 section.
+  `SECURITY.md` and the password and TOTP guide state where an OTP secret
+  sits at rest and how to seal it; the mTLS docs state that the root store
+  holds only the pinned trust domain's bundle; the AES-GCM nonce bound, the
+  `jwks_handle` snapshot, the multi-replica rotation procedure and
+  `AuditRetentionLoop`'s one-process rule are documented; `require_authz!`'s
+  principal needs no tenant-qualified form; the cargo-audit rationale matches
+  `deny.toml`, and the preflight fails if the two advisory lists differ.
+
+---
+
 ## [0.12.0] - 2026-10-28
 
 ### Changed (breaking)

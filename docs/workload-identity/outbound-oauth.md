@@ -55,9 +55,17 @@ let client = OutboundOAuthClient::new(
         client_id: "billing-api-prod".into(),
         client_secret: ZeroizedString::new(secret),
     },
-)
+)?
 .with_scopes(["https://api.downstream.example/.default"]);
 ```
+
+`new` returns an error for a token URL that is not HTTPS (plain HTTP is
+allowed for `localhost`, `127.0.0.1` and `[::1]` only), since the request
+carries the client secret. The default HTTP client follows no redirects and has
+connect and request timeouts; a client passed to `with_http_client` should be
+configured the same way. A token fetch is bounded by `with_request_timeout`
+(30 seconds), holds no lock on the cache, and is shared between callers that
+arrive together.
 
 The first argument is the OAuth server's token endpoint. It typically
 comes from the server's discovery document; the configuration is the

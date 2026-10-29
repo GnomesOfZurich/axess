@@ -10,12 +10,38 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::claims::{OAuthClaims, UserInfoClaims};
+use super::claims::{OAuthClaims, RefreshOutcome, UserInfoClaims};
 use super::client_credentials::ClientCredentialsToken;
 use super::device_flow::{DeviceAuthResponse, DeviceTokenOutcome};
+use super::dpop_key::DpopKey;
 use super::error::OAuthError;
-use super::fapi::{DpopProof, FapiConfig, ParResponse};
+use super::fapi::{DpopProof, DpopSigner, FapiConfig, JarmResponse, ParResponse};
 use super::login_options::OAuthLoginOptions;
+
+/// The refusal for a DPoP request to a provider that cannot sign a proof.
+fn dpop_unsupported() -> OAuthError {
+    OAuthError::Config(
+        "this provider does not support DPoP-bound token requests; \
+         sending the request without a proof would drop the binding"
+            .to_string(),
+    )
+}
+
+/// OIDC Core 12.2: the ID token of a refresh response, when there is one,
+/// names the subject of the session.
+fn refresh_subject_check(
+    outcome: RefreshOutcome,
+    expected_subject: &str,
+) -> Result<RefreshOutcome, OAuthError> {
+    if let Some(claims) = &outcome.id_token_claims
+        && claims.subject != expected_subject
+    {
+        return Err(OAuthError::IdTokenValidation(
+            "refresh-response `sub` does not match the subject of the session".to_string(),
+        ));
+    }
+    Ok(outcome)
+}
 
 /// Session-bag keys reserved by the OAuth ceremony. The `axess.`
 /// prefix is reserved for library-internal use; adopter session-bag
@@ -99,17 +125,33 @@ pub trait OAuthProvider: Send + Sync + 'static {
         None
     }
 
+    /// Whether the IdP advertises `authorization_response_iss_parameter_supported`
+    /// (RFC 9207): its authorization responses carry an `iss` parameter, and
+    /// a callback without one must be refused. Defaults to `false`.
+    fn authorization_response_iss_required(&self) -> bool {
+        false
+    }
+
     /// Scopes to request in the authorization URL.
     fn scopes(&self) -> &[String];
 
     /// Ceremony timeout for the OAuth redirect flow.
     fn ceremony_timeout(&self) -> std::time::Duration;
 
-    /// Exchange a refresh token for new claims.
+    /// Exchange a refresh token at the IdP's token endpoint.
+    ///
+    /// Returns a [`RefreshOutcome`]: the rotated tokens always, and the
+    /// verified ID-token claims when the response carried an ID token (OIDC
+    /// Core 12.2 makes it optional). `original_nonce` is the `nonce` of the
+    /// login that produced the refresh token; a refresh ID token that
+    /// carries a nonce must equal it, one without a nonce is accepted, and
+    /// a nonce with no original to compare it to is refused. The original
+    /// nonce is the `nonce` member of `OAuthClaims::additional_claims`.
     fn refresh_token<'a>(
         &'a self,
         refresh_token: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>>;
+        original_nonce: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>>;
 
     /// [`refresh_token`](Self::refresh_token), refusing a response whose
     /// subject is not `expected_subject`.
@@ -117,21 +159,55 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// OIDC Core 12.2 requires the ID token of a refresh response to carry the
     /// same `sub` as the original one: a token for another subject must never
     /// be taken as a refresh of this session's identity. Callers pass the
-    /// subject the login recorded (`OAuthClaims::subject`). Providers need not
+    /// subject the login recorded (`OAuthClaims::subject`). A response with no
+    /// ID token has no subject to compare and passes. Providers need not
     /// override this; it checks whatever `refresh_token` returns.
     fn refresh_token_for_subject<'a>(
         &'a self,
         refresh_token: &'a str,
         expected_subject: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
+        original_nonce: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
-            let claims = self.refresh_token(refresh_token).await?;
-            if claims.subject != expected_subject {
-                return Err(OAuthError::IdTokenValidation(
-                    "refresh-response `sub` does not match the subject of the session".to_string(),
-                ));
-            }
-            Ok(claims)
+            let outcome = self.refresh_token(refresh_token, original_nonce).await?;
+            refresh_subject_check(outcome, expected_subject)
+        })
+    }
+
+    /// [`refresh_token`](Self::refresh_token) for a token bound to a DPoP key:
+    /// the token request carries a proof signed by `dpop.key`, and the
+    /// response must say `token_type` `DPoP`.
+    ///
+    /// The default passes `None` to `refresh_token` and refuses a `Some`,
+    /// since a provider that does not override this cannot sign a proof, and
+    /// sending the refresh token bare would defeat the binding.
+    fn refresh_token_with<'a>(
+        &'a self,
+        refresh_token: &'a str,
+        original_nonce: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
+        if dpop.is_some() {
+            return Box::pin(async { Err(dpop_unsupported()) });
+        }
+        self.refresh_token(refresh_token, original_nonce)
+    }
+
+    /// [`refresh_token_with`](Self::refresh_token_with), refusing a response
+    /// whose subject is not `expected_subject` (see
+    /// [`refresh_token_for_subject`](Self::refresh_token_for_subject)).
+    fn refresh_token_for_subject_with<'a>(
+        &'a self,
+        refresh_token: &'a str,
+        expected_subject: &'a str,
+        original_nonce: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            let outcome = self
+                .refresh_token_with(refresh_token, original_nonce, dpop)
+                .await?;
+            refresh_subject_check(outcome, expected_subject)
         })
     }
 
@@ -143,11 +219,98 @@ pub trait OAuthProvider: Send + Sync + 'static {
         nonce: String,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>>;
 
+    /// [`exchange_code`](Self::exchange_code) for a provider that binds the
+    /// tokens to a DPoP key: the token request carries a proof signed by
+    /// `dpop.key`, the response must say `token_type` `DPoP`, and the
+    /// returned claims hold the key.
+    ///
+    /// The default passes nothing to `exchange_code` and refuses a `Some`,
+    /// for the reason given at [`refresh_token_with`](Self::refresh_token_with).
+    fn exchange_code_with<'a>(
+        &'a self,
+        code: &'a str,
+        pkce_verifier: String,
+        nonce: String,
+        dpop: Option<DpopSigner<'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
+        if dpop.is_some() {
+            return Box::pin(async { Err(dpop_unsupported()) });
+        }
+        self.exchange_code(code, pkce_verifier, nonce)
+    }
+
     /// Fetch additional user claims from the OIDC UserInfo endpoint.
     fn fetch_userinfo<'a>(
         &'a self,
         access_token: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>>;
+
+    /// [`fetch_userinfo`](Self::fetch_userinfo), refusing a response whose
+    /// `sub` is not `expected_subject` (OIDC Core 5.3.2).
+    ///
+    /// A UserInfo response is only about the user the ID token named when its
+    /// `sub` equals that token's `sub`. A substituted access token or a
+    /// mis-routed proxy returns another user's profile otherwise, which the
+    /// caller would merge or link on. The error carries neither subject.
+    fn fetch_userinfo_for_subject<'a>(
+        &'a self,
+        access_token: &'a str,
+        expected_subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            let claims = self.fetch_userinfo(access_token).await?;
+            if claims.sub != expected_subject {
+                return Err(OAuthError::SubjectMismatch);
+            }
+            Ok(claims)
+        })
+    }
+
+    /// [`fetch_userinfo_for_subject`](Self::fetch_userinfo_for_subject) for a
+    /// DPoP-bound access token: the request is sent with the `DPoP`
+    /// authorization scheme and a proof signed by `dpop.key` that carries the
+    /// token's hash. The default refuses a `Some`.
+    fn fetch_userinfo_for_subject_with<'a>(
+        &'a self,
+        access_token: &'a str,
+        expected_subject: &'a str,
+        dpop: Option<DpopSigner<'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
+        if dpop.is_some() {
+            return Box::pin(async { Err(dpop_unsupported()) });
+        }
+        self.fetch_userinfo_for_subject(access_token, expected_subject)
+    }
+
+    /// Whether this provider requires JWT Secured Authorization Response Mode
+    /// (JARM): its authorization requests ask for `response_mode=jwt`, the
+    /// callback is finished from the response JWT, and a plain callback is
+    /// refused. Defaults to `false`.
+    fn authorization_response_jwt_required(&self) -> bool {
+        false
+    }
+
+    /// Verify a JARM authorization response and return its members.
+    ///
+    /// The implementation checks the JWT's signature against the provider's
+    /// key set (never `none`, never a symmetric algorithm), that `iss` is the
+    /// provider's issuer, that `aud` names the client, and that it has not
+    /// expired. Like [`verify_logout_jwt`](Self::verify_logout_jwt) it
+    /// answers [`OAuthError::UnknownKid`] or [`OAuthError::JwksExpired`] when
+    /// a key set refresh may help, and the caller refreshes and retries once.
+    ///
+    /// The default refuses: a provider that does not override it takes no
+    /// signed responses.
+    fn verify_authorization_response_jwt(
+        &self,
+        response: &str,
+    ) -> Result<JarmResponse, OAuthError> {
+        Err(OAuthError::Config(format!(
+            "verify_authorization_response_jwt not implemented for this provider \
+             (rejected response of {} bytes)",
+            response.len()
+        )))
+    }
 
     /// Build an authorization URL for the OAuth flow.
     ///
@@ -317,11 +480,13 @@ pub trait OAuthProvider: Send + Sync + 'static {
 
     /// Generate a DPoP proof JWT (RFC 9449) for the given HTTP method and URL.
     ///
-    /// The proof binds the request to an ephemeral key pair. Include the
+    /// The proof is signed with `key`. RFC 9449 requires every proof
+    /// presented with a bound token to use the key the token is bound to
+    /// (`cnf.jkt`), so the key is the caller's: make one per session with
+    /// [`DpopKey::generate`] and keep it for the token's life. Include the
     /// returned JWT in the `DPoP` header of the HTTP request.
     ///
-    /// `key_seed` supplies 32 bytes of entropy used to derive the ephemeral
-    /// ES256 key, `jti_bytes` the 16 random bytes behind the proof's `jti`
+    /// `jti_bytes` are the 16 random bytes behind the proof's `jti`
     /// (rendered as a version-4 UUID), and `iat` is the Unix second the
     /// proof claims to be issued at. Production callers fill the bytes
     /// from the application's [`SecureRng`](axess_rng::SecureRng) and take
@@ -330,10 +495,10 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// arguments give the same proof.
     fn generate_dpop_proof(
         &self,
+        _key: &DpopKey,
         _http_method: &str,
         _http_url: &str,
         _access_token: Option<&str>,
-        _key_seed: [u8; 32],
         _iat: i64,
         _jti_bytes: [u8; 16],
     ) -> Result<DpopProof, OAuthError> {
@@ -387,7 +552,8 @@ mod provider_default_methods_tests {
         fn refresh_token<'a>(
             &'a self,
             _refresh_token: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
+            _original_nonce: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
         fn exchange_code<'a>(

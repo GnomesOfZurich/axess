@@ -35,6 +35,7 @@ fn session() -> AuthSession {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
@@ -190,4 +191,64 @@ async fn logout_ends_this_session_and_leaves_the_users_others() {
         registry.is_valid(&uid(), &elsewhere_sid).await.unwrap(),
         "logging out here must not sign the user out of their other devices"
     );
+}
+
+/// A failing audit write must not leave the session authenticated: logout
+/// reports the store error and the session is cleared and its id rotated.
+#[tokio::test]
+async fn logout_clears_the_session_even_when_the_audit_write_fails() {
+    let registry = MemorySessionRegistry::new();
+    let here = session();
+    here.set_authenticated(uid(), tid(), chrono::Utc::now())
+        .await;
+    registry
+        .register(&uid(), &here.session_id().await)
+        .await
+        .unwrap();
+    let id = identity(EntityState::Active, EntityState::Active);
+    id.arm_record_event_failure();
+    let svc = AuthnService::builder(id, MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let before = here.session_id().await;
+    let result = svc.logout(&here).await;
+
+    assert!(
+        matches!(result, Err(crate::authn::error::AuthnError::Store(_))),
+        "the audit failure is still reported: {result:?}"
+    );
+    assert!(
+        !here.is_authenticated().await,
+        "the session must be signed out whatever the audit store did"
+    );
+    assert_ne!(here.session_id().await, before, "the id is rotated");
+    assert!(!registry.is_valid(&uid(), &before).await.unwrap());
+}
+
+/// An app-level rotation keeps the registry entry in step with the id.
+#[tokio::test]
+async fn rotate_session_moves_the_registry_entry_to_the_new_id() {
+    let registry = MemorySessionRegistry::new();
+    let here = session();
+    here.set_authenticated(uid(), tid(), chrono::Utc::now())
+        .await;
+    let old = here.session_id().await;
+    registry.register(&uid(), &old).await.unwrap();
+    let svc = AuthnService::builder(
+        identity(EntityState::Active, EntityState::Active),
+        MockFactorStore::new(),
+    )
+    .with_registry(registry.clone())
+    .build()
+    .with_audit_context(AuditContext::default());
+
+    svc.rotate_session(&here).await.unwrap();
+
+    let new = here.session_id().await;
+    assert_ne!(old, new);
+    assert!(registry.is_valid(&uid(), &new).await.unwrap());
+    assert!(!registry.is_valid(&uid(), &old).await.unwrap());
+    assert!(here.is_authenticated().await);
 }

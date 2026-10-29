@@ -596,6 +596,37 @@ where
         self.inner.record_failed_attempt(user_id)
     }
 
+    fn reserve_attempt(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        policy: &crate::authn::types::LockoutPolicy,
+    ) -> impl std::future::Future<
+        Output = Result<Option<u32>, <L as crate::authn::store::IdentityLookup>::Error>,
+    > + Send {
+        self.inner.reserve_attempt(user_id, policy)
+    }
+
+    fn release_attempt(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+    ) -> impl std::future::Future<
+        Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
+    > + Send {
+        self.inner.release_attempt(user_id)
+    }
+
+    fn failed_attempts(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (u32, Option<chrono::DateTime<chrono::Utc>>),
+            <L as crate::authn::store::IdentityLookup>::Error,
+        >,
+    > + Send {
+        self.inner.failed_attempts(user_id)
+    }
+
     fn reset_failed_attempts(
         &self,
         user_id: &crate::authn::ids::UserId,

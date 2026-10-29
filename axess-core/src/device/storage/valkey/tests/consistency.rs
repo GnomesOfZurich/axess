@@ -49,6 +49,9 @@ async fn valkey_device_shared_contract() {
         .await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store("sight").await).await;
     shared::a_save_never_un_revokes(store("unrevoke").await).await;
+    shared::the_fingerprint_lookup_follows_the_newest_sighting(store("newest").await).await;
+    shared::a_revoked_row_keeps_its_revocation_time(store("twice").await).await;
+    shared::a_sighting_reports_the_level_it_found(store("reports").await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store("stamp").await).await;
     shared::sweep_decisions_agree_to_the_second(
         store("second")

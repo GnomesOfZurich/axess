@@ -35,6 +35,9 @@
 //!   drop every entry whose `tenant` field matches. Use when a
 //!   tenant's policy bundle is reloaded, membership shifts, or the
 //!   tenant is suspended.
+//! - [`invalidate_resource`](CacheInvalidator::invalidate_resource):
+//!   drop every entry built for one resource, for every principal. Use
+//!   when a resource's owner, classification or sharing changes.
 //! - [`invalidate_all`](CacheInvalidator::invalidate_all): drop
 //!   every entry. Use for global policy reloads only: a multi-tenant
 //!   deployment paying this hammer on every change negates the cache.
@@ -85,4 +88,19 @@ pub trait CacheInvalidator: Send + Sync + 'static {
     /// Drop every cache entry. Last-resort for global policy reloads
     /// or cache-corruption recovery.
     fn invalidate_all(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Drop every cache entry built for `resource`, for every principal.
+    ///
+    /// Call when a resource's authorization-relevant attributes change
+    /// (owner, classification, sharing) and the principals that read it
+    /// cannot be enumerated. The default drops everything, which is always
+    /// correct and costs more; the three caches in this crate override it
+    /// with a scoped drop.
+    fn invalidate_resource(
+        &self,
+        resource: &EntityUid,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let _ = resource;
+        self.invalidate_all()
+    }
 }

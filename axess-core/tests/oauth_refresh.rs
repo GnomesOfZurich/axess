@@ -31,9 +31,10 @@ async fn oauth_refresh_roundtrip() {
         .with_audit_context(AuditContext::default());
 
     let claims = authn
-        .refresh_oauth_token("refresh-idp", "stored-refresh-token", "user-99")
+        .refresh_oauth_token("refresh-idp", "stored-refresh-token", "user-99", None)
         .await
         .expect("refresh should succeed");
+    let claims = claims.id_token_claims.expect("the mock sends an ID token");
 
     assert_eq!(claims.subject, "user-99");
     assert_eq!(claims.email.as_deref(), Some("carol@example.com"));
@@ -60,7 +61,9 @@ async fn oauth_refresh_empty_token_rejected() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let result = authn.refresh_oauth_token("test-idp2", "", "user-1").await;
+    let result = authn
+        .refresh_oauth_token("test-idp2", "", "user-1", None)
+        .await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::NoRefreshToken
@@ -87,7 +90,7 @@ async fn oauth_refresh_unknown_provider_rejected() {
         .with_audit_context(AuditContext::default());
 
     let result = authn
-        .refresh_oauth_token("nonexistent", "some-token", "user-1")
+        .refresh_oauth_token("nonexistent", "some-token", "user-1", None)
         .await;
     assert!(matches!(
         result.unwrap_err(),
@@ -116,7 +119,7 @@ async fn oauth_userinfo_empty_token_rejected() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let result = authn.fetch_userinfo("ui-idp", "").await;
+    let result = authn.fetch_userinfo("ui-idp", "", "u1").await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::NoAccessToken
@@ -130,7 +133,7 @@ async fn oauth_userinfo_unknown_provider_rejected() {
     let authn = AuthnService::new(identity, MockFactorStore::new())
         .with_audit_context(AuditContext::default());
 
-    let result = authn.fetch_userinfo("nope", "some-token").await;
+    let result = authn.fetch_userinfo("nope", "some-token", "u1").await;
     assert!(matches!(
         result.unwrap_err(),
         axess_factors::oauth::OAuthError::UnknownProvider(_)
@@ -154,7 +157,7 @@ async fn oauth_refresh_refuses_a_response_for_another_subject() {
         .with_audit_context(AuditContext::default());
 
     let err = authn
-        .refresh_oauth_token("sub-idp", "stored-refresh-token", "someone-else")
+        .refresh_oauth_token("sub-idp", "stored-refresh-token", "someone-else", None)
         .await
         .expect_err("a different subject must be refused");
     assert!(
@@ -171,7 +174,7 @@ async fn oauth_refresh_refuses_a_response_for_another_subject() {
     );
 
     authn
-        .refresh_oauth_token("sub-idp", "stored-refresh-token", "user-99")
+        .refresh_oauth_token("sub-idp", "stored-refresh-token", "user-99", None)
         .await
         .expect("the recorded subject is accepted");
 }

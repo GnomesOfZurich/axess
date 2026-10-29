@@ -227,12 +227,12 @@ fn every_row_is_examined_wherever_the_match_sits() {
     for hit in [0usize, 4, 9] {
         let canonical = set.display[hit].replace('-', "");
         let mac = p.mac(&canonical);
-        let (found, examined) = find_match(&set.config, &canonical, Some(&mac));
+        let (found, examined, _) = find_match(&set.config, &canonical, Some(&mac), None);
         assert_eq!(found, Some(hit));
         assert_eq!(examined, 10, "no early exit for a match at {hit}");
     }
     let miss = p.mac("AAAAAAAAAA");
-    let (found, examined) = find_match(&set.config, "AAAAAAAAAA", Some(&miss));
+    let (found, examined, _) = find_match(&set.config, "AAAAAAAAAA", Some(&miss), None);
     assert_eq!((found, examined), (None, 10));
 }
 
@@ -246,6 +246,30 @@ fn a_spent_keyed_row_does_not_match_and_a_malformed_one_is_inert() {
     let mac = p.mac(&canonical);
     // FixedRng makes all three codes identical; row 0 is spent and row 1 is
     // corrupt, so only row 2 can match, and it is the one chosen.
-    let (found, examined) = find_match(&set.config, &canonical, Some(&mac));
+    let (found, examined, _) = find_match(&set.config, &canonical, Some(&mac), None);
     assert_eq!((found, examined), (Some(2), 3));
+}
+
+#[test]
+fn a_set_keyed_under_the_retired_pepper_verifies_through_the_rotating_entry_point() {
+    let old = pepper();
+    let new = RecoveryCodePepper::new(vec![9u8; 32]).unwrap();
+    let rng = CountingRng(std::sync::atomic::AtomicU8::new(1));
+    let set = generate_recovery_codes_peppered(&rng, 3, &old);
+    let shown: &str = set.display[0].as_ref();
+
+    // The plain entry point, given only the new pepper, no longer matches.
+    assert!(verify_recovery_code(&set.config, shown, at(1), Some(&new)).is_none());
+
+    let hit = verify_recovery_code_rotating(&set.config, shown, at(1), Some(&new), Some(&old))
+        .expect("the previous pepper still opens the row");
+    assert!(hit.matched_previous_pepper);
+    assert_eq!(hit.config.remaining(), 2);
+
+    // A set made under the new pepper matches without the flag.
+    let fresh = generate_recovery_codes_peppered(&rng, 3, &new);
+    let shown: &str = fresh.display[1].as_ref();
+    let hit = verify_recovery_code_rotating(&fresh.config, shown, at(1), Some(&new), Some(&old))
+        .expect("current pepper matches");
+    assert!(!hit.matched_previous_pepper);
 }

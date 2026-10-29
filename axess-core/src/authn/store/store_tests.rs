@@ -107,3 +107,17 @@ fn auth_method_factors_picks_first_anyof_choice() {
     let kinds = method.factors();
     assert_eq!(kinds, vec![FactorKind::Totp]);
 }
+
+#[test]
+fn an_empty_any_of_step_is_not_reported_as_a_password() {
+    use crate::authn::factor::FactorStep;
+    let method = AuthMethod {
+        name: "odd".into(),
+        steps: vec![
+            FactorStep::AnyOf(vec![]),
+            FactorStep::Required(FactorKind::Totp),
+        ],
+        scope: AuthnScope::System,
+    };
+    assert_eq!(method.factors(), vec![FactorKind::Totp]);
+}

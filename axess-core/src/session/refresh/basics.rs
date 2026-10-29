@@ -82,7 +82,10 @@ async fn issue_and_refresh_roundtrip() {
     assert!(!record.revoked);
 
     // Use the plaintext to refresh; should produce a new session.
-    let (session, new_token) = refresh_session(&plaintext, &store, &config, &rng, ts, None)
+    let (session, new_token) =
+        refresh_session_with_status_check(&plaintext, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
         .await
         .unwrap();
 
@@ -120,7 +123,16 @@ async fn expired_token_rejected() {
 
     // Advance time past expiry.
     let future = ts + Duration::seconds(2);
-    let result = refresh_session(&plaintext, &store, &config, &rng, future, None).await;
+    let result = refresh_session_with_status_check(
+        &plaintext,
+        &store,
+        &config,
+        &rng,
+        future,
+        None,
+        |_| async { true },
+    )
+    .await;
 
     assert!(matches!(result, Err(RefreshError::Expired)));
 }
@@ -156,7 +168,11 @@ async fn revoked_token_rejected() {
         .await
         .unwrap();
 
-    let result = refresh_session(&plaintext, &store, &config, &rng, ts, None).await;
+    let result =
+        refresh_session_with_status_check(&plaintext, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
 }
 
@@ -187,18 +203,44 @@ async fn rotation_invalidates_old_token() {
     .unwrap();
 
     // First refresh: v1 is consumed, v2 is issued.
-    let (_, new_token) = refresh_session(&plaintext_v1, &store, &config, &rng, ts, None)
-        .await
-        .unwrap();
+    let (_, new_token) = refresh_session_with_status_check(
+        &plaintext_v1,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await
+    .unwrap();
     let (plaintext_v2, _) = new_token.unwrap();
 
     // v1 should now be revoked.
-    let result = refresh_session(&plaintext_v1, &store, &config, &rng, ts, None).await;
+    let result = refresh_session_with_status_check(
+        &plaintext_v1,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
 
     // v1 reuse triggered family revocation; v2 is also revoked (correct
     // security behavior: token theft detected → entire family invalidated).
-    let result = refresh_session(&plaintext_v2, &store, &config, &rng, ts, None).await;
+    let result = refresh_session_with_status_check(
+        &plaintext_v2,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
 }
 
@@ -322,13 +364,20 @@ async fn replayed_rotated_token_revokes_entire_family() {
     .unwrap();
 
     // Step 1 (cont.): Alice's browser rotates v1 → v2.
-    let (_, alice_rotation) = refresh_session(&alice_v1, &store, &config, &rng, ts, None)
+    let (_, alice_rotation) =
+        refresh_session_with_status_check(&alice_v1, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
         .await
         .unwrap();
     let (alice_v2, _) = alice_rotation.expect("rotation must mint v2 when rotation=true");
 
     // Step 2 + 3: Eve replays the rotated-out v1. Must fail.
-    let eve_replay = refresh_session(&alice_v1, &store, &config, &rng, ts, None).await;
+    let eve_replay =
+        refresh_session_with_status_check(&alice_v1, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
     assert!(
         matches!(eve_replay, Err(RefreshError::Revoked)),
         "Eve's replay of rotated-out v1 must fail with Revoked, got {eve_replay:?}",
@@ -337,7 +386,11 @@ async fn replayed_rotated_token_revokes_entire_family() {
     // Step 4: Alice's still-current v2 must ALSO fail; the family
     // is now revoked. This is the contract that distinguishes axess
     // from naive "revoke just the replayed token" implementations.
-    let alice_followup = refresh_session(&alice_v2, &store, &config, &rng, ts, None).await;
+    let alice_followup =
+        refresh_session_with_status_check(&alice_v2, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
     assert!(
         matches!(alice_followup, Err(RefreshError::Revoked)),
         "Alice's v2 must be invalidated by family-revoke after Eve's replay, got {alice_followup:?}",
@@ -408,7 +461,11 @@ async fn max_per_user_enforced() {
     .unwrap();
 
     // The first token should have been auto-revoked.
-    let result = refresh_session(&pt1, &store, &config, &rng, ts, None).await;
+    let result =
+        refresh_session_with_status_check(&pt1, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
 
     // Should have exactly 2 active tokens.
@@ -460,8 +517,16 @@ async fn revoke_user_tokens_clears_all() {
     // Revoke all.
     store.revoke_user_tokens(&fixture_user()).await.unwrap();
 
-    let result1 = refresh_session(&pt1, &store, &config, &rng, ts, None).await;
-    let result2 = refresh_session(&pt2, &store, &config, &rng, ts, None).await;
+    let result1 =
+        refresh_session_with_status_check(&pt1, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
+    let result2 =
+        refresh_session_with_status_check(&pt2, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
 
     assert!(matches!(result1, Err(RefreshError::Revoked)));
     assert!(matches!(result2, Err(RefreshError::Revoked)));
@@ -497,12 +562,29 @@ async fn device_binding_mismatch_rejected() {
     .unwrap();
 
     // Refresh from a different device.
-    let result = refresh_session(&plaintext, &store, &config, &rng, ts, Some("Android/15")).await;
+    let result = refresh_session_with_status_check(
+        &plaintext,
+        &store,
+        &config,
+        &rng,
+        ts,
+        Some("Android/15"),
+        |_| async { true },
+    )
+    .await;
     assert!(matches!(result, Err(RefreshError::DeviceMismatch)));
 
     // Correct device works.
-    let (session, _) = refresh_session(&plaintext, &store, &config, &rng, ts, Some("iPhone/16"))
-        .await
-        .unwrap();
+    let (session, _) = refresh_session_with_status_check(
+        &plaintext,
+        &store,
+        &config,
+        &rng,
+        ts,
+        Some("iPhone/16"),
+        |_| async { true },
+    )
+    .await
+    .unwrap();
     assert!(session.auth_state.is_authenticated());
 }

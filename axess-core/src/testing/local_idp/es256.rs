@@ -136,10 +136,17 @@ async fn es256_from_sec1_pem_roundtrips() {
 }
 
 #[test]
-#[should_panic(expected = "EC constructors only support")]
 fn signing_key_rejects_non_es256_algorithm_at_ec_pem_load() {
     let pem = fresh_es256_pkcs8_pem();
-    let _ = LocalIdpSigningKey::from_ec_pem(&pem, "kid", Algorithm::RS256);
+    let err = LocalIdpSigningKey::from_ec_pem(&pem, "kid", Algorithm::RS256)
+        .expect_err("RS256 is not an EC algorithm");
+    assert!(
+        matches!(
+            err,
+            crate::local_idp::primitives::LocalIdpKeyError::UnsupportedAlgorithm(_)
+        ),
+        "{err:?}"
+    );
 }
 
 #[test]

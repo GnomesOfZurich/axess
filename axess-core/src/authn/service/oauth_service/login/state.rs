@@ -58,8 +58,8 @@ where
         // Use whatever attribution the session carries; a pre-auth failure
         // legitimately has `None` for both ids, and the event_type +
         // error field carry the diagnostic information.
-        let user_id = session.user_id().await;
-        let tenant_id = session.tenant_id().await;
+        let user_id = session.pending_user_id().await;
+        let tenant_id = session.pending_tenant_id().await;
 
         self.emit_audit(
             AuthEventBuilder::failure(AuthEventType::LoginAttempt)

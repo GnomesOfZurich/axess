@@ -40,8 +40,16 @@ async fn an_empty_pepper_is_refused_before_anything_is_stored() {
     );
     assert!(store.active_tokens(&user).await.unwrap().is_empty());
 
-    let refreshed =
-        refresh_session("anything", &store, &config, &MockRng::new(2), now(), None).await;
+    let refreshed = refresh_session_with_status_check(
+        "anything",
+        &store,
+        &config,
+        &MockRng::new(2),
+        now(),
+        None,
+        |_| async { true },
+    )
+    .await;
     assert!(matches!(refreshed, Err(RefreshError::InvalidConfig(_))));
     let checked = refresh_session_with_status_check(
         "anything",

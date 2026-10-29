@@ -195,9 +195,16 @@ async fn an_empty_state_is_refused_even_when_the_callback_state_is_empty_too() {
     let (_url, mut ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
     ctx.state = String::new();
 
-    let err = complete_grant(&provider, &ctx, "code", "", &reqwest::Client::new())
-        .await
-        .expect_err("an empty state checks nothing");
+    let err = complete_grant(
+        &provider,
+        &ctx,
+        "code",
+        "",
+        &reqwest::Client::new(),
+        &axess_clock::SystemClock,
+    )
+    .await
+    .expect_err("an empty state checks nothing");
 
     assert!(matches!(err, DelegatedError::StateMismatch), "got {err:?}");
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -315,4 +322,54 @@ async fn a_success_body_at_the_cap_is_read() {
     grant(&server)
         .await
         .expect("a body of exactly the cap is read");
+}
+
+// ── what counts as a rejected refresh ────────────────────────────────────────
+
+async fn refresh_against(server: &MockServer) -> Result<super::grant::TokenGrant, DelegatedError> {
+    let clock = MockClock::at(t0());
+    super::grant::refresh_token_grant(&provider(server), "rt", &reqwest::Client::new(), &clock)
+        .await
+}
+
+/// `invalid_grant` on the refresh grant is a rejected refresh.
+#[tokio::test]
+async fn invalid_grant_on_a_refresh_is_a_rejected_refresh() {
+    let server = MockServer::start().await;
+    respond(&server, 400, br#"{"error":"invalid_grant"}"#.to_vec()).await;
+    assert!(matches!(
+        refresh_against(&server).await,
+        Err(DelegatedError::RefreshRejected)
+    ));
+}
+
+/// The same body on the authorization-code exchange is a bad or used code, not
+/// a refresh token to reconnect: it is an ordinary token-endpoint error.
+#[tokio::test]
+async fn invalid_grant_on_a_code_exchange_is_not_a_rejected_refresh() {
+    let server = MockServer::start().await;
+    respond(&server, 400, br#"{"error":"invalid_grant"}"#.to_vec()).await;
+    let err = grant(&server).await.expect_err("the code was refused");
+    assert!(
+        matches!(err, DelegatedError::TokenEndpoint { status: 400, .. }),
+        "got {err:?}"
+    );
+}
+
+/// The text `invalid_grant` inside another error's description is not the
+/// error: only the `error` member decides.
+#[tokio::test]
+async fn invalid_grant_in_a_description_is_not_a_rejected_refresh() {
+    let server = MockServer::start().await;
+    respond(
+        &server,
+        400,
+        br#"{"error":"invalid_request","error_description":"not an invalid_grant case"}"#.to_vec(),
+    )
+    .await;
+    let err = refresh_against(&server).await.err().expect("refused");
+    assert!(
+        matches!(err, DelegatedError::TokenEndpoint { status: 400, .. }),
+        "got {err:?}"
+    );
 }

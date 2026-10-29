@@ -233,3 +233,50 @@ async fn valkey_watch_replaces_a_dead_subscriber_connection() {
         .expect("the first watcher is served by the replacement connection")
         .unwrap();
 }
+
+/// A revocation published while the subscriber connection was dead is not
+/// lost: the dispatcher forgets the dead connection on `Closed`, and the next
+/// join that reconnects still flags the waiting watcher for a recheck. The
+/// wait is shorter than the degraded poll interval, so the poll cannot be
+/// what wakes it.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_watch_rechecks_waiting_watchers_after_a_closed_connection() {
+    let _serial = ONE_AT_A_TIME.lock().await;
+    let admin = connect().await;
+    let registry = ValkeySessionRegistry::with_options(
+        connect().await,
+        format!("axt_watch_d_{}", user()),
+        Duration::from_secs(60),
+    );
+    let before = subscriber_connections(&admin).await;
+    let (u1, u2) = (user(), user());
+    let (s1, s2) = (
+        registered(&registry, &u1).await,
+        registered(&registry, &u2).await,
+    );
+    let w1 = watch(&registry, u1, s1);
+    eventually("first watcher joined", || async {
+        registry.subscriber.watcher_count() == 1
+    })
+    .await;
+
+    let kill = CustomCommand::new_static("CLIENT", ClusterHash::FirstKey, false);
+    let _: i64 = admin
+        .custom(kill, vec!["KILL", "TYPE", "pubsub"])
+        .await
+        .expect("CLIENT KILL");
+    eventually("the subscriber connection is gone", || async {
+        subscriber_connections(&admin).await == before
+    })
+    .await;
+
+    // Published while there is no connection: no watcher can hear it.
+    registry.invalidate_session(&u1, &s1).await.unwrap();
+
+    let _w2 = watch(&registry, u2, s2);
+    tokio::time::timeout(Duration::from_secs(3), w1)
+        .await
+        .expect("the waiting watcher rechecks after the reconnect")
+        .unwrap();
+}

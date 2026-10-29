@@ -231,6 +231,8 @@ fn session_data_json_round_trip() {
         fingerprint: Some("fp-abc".to_string()),
         device_id: Some(axess_identity::testing::device("dev-1")),
         custom: serde_json::json!({"key": "value"}),
+        revision: 7,
+        touched_at: Some(chrono::Utc::now()),
     };
     let json = serde_json::to_value(&data).unwrap();
     let restored: SessionData = serde_json::from_value(json).unwrap();

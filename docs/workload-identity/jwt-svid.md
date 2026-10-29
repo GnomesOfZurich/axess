@@ -312,3 +312,13 @@ mTLS-SVID* covers the X.509 variant for deployments where mTLS is
 practical. *Inbound: federation* covers the cross-trust-domain
 patterns. *Cedar policy fundamentals* covers how policies match on
 the workload's claims through `principal.attributes`.
+
+## Cross-checking the tenant claim
+
+The SPIFFE path carries the tenant slug and the `tid` claim carries the
+tenant UUID. Both are written by the issuer, and nothing ties them together
+unless you do. If you have a tenant registry, give the resolver a lookup with
+`JwtSvidResolver::with_tenant_lookup`: it maps the slug to the tenant you
+registered for it, and the token is refused when the slug is unknown or maps
+to a different tenant than `tid`. Without a lookup, the resolver trusts the
+issuer to have kept the two consistent.

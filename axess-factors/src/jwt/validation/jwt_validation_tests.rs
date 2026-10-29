@@ -241,6 +241,47 @@ fn unknown_kid_rejected() {
     );
 }
 
+/// A token over the size limit is refused before its header is decoded, and
+/// one at the limit gets as far as the header.
+#[test]
+fn oversized_token_is_refused_before_any_decoding() {
+    let (_, jwks, _) = rsa_keypair();
+    let over = "a".repeat(crate::jwt::claims::MAX_JWT_BYTES + 1);
+    let result = verify_jwt_signature(&over, &jwks, None, ALLOWED_ALGORITHMS);
+    assert!(
+        matches!(result, Err(JwtError::TooLarge { len, max })
+            if len == over.len() && max == crate::jwt::claims::MAX_JWT_BYTES),
+        "{result:?}"
+    );
+    let at_limit = "a".repeat(crate::jwt::claims::MAX_JWT_BYTES);
+    let result = verify_jwt_signature(&at_limit, &jwks, None, ALLOWED_ALGORITHMS);
+    assert!(
+        matches!(result, Err(JwtError::InvalidHeader(_))),
+        "{result:?}"
+    );
+}
+
+/// The `kid` an error carries is cut, whatever the header held.
+#[test]
+fn unknown_kid_in_the_error_is_truncated() {
+    let (der, jwks, _) = rsa_keypair();
+    let long_kid = "k".repeat(2000);
+    let token = sign_jwt(&sample_claims(), &long_kid, &der);
+
+    let result = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS);
+    match result {
+        Err(JwtError::UnknownKid(k)) => {
+            assert!(k.len() <= MAX_KID_ECHO_BYTES + 3, "{} bytes", k.len());
+            assert!(k.starts_with("kkkk") && k.ends_with("..."));
+        }
+        other => panic!("expected UnknownKid, got {other:?}"),
+    }
+    assert_eq!(truncate_kid("short"), "short");
+    // A multi-byte character is never split.
+    let wide = "é".repeat(100);
+    assert!(truncate_kid(&wide).is_char_boundary(truncate_kid(&wide).len() - 3));
+}
+
 // ── Algorithm mismatch ─────────────────────────────────────────────
 
 /// JWK declares `alg: RS256` but JWT header says RS384 → rejected.
@@ -422,4 +463,62 @@ fn tampered_signature_rejected() {
         matches!(result, Err(JwtError::VerificationFailed(_))),
         "tampered signature must be rejected: {result:?}"
     );
+}
+
+// ── Symmetric algorithms and key use ───────────────────────────────
+
+/// A symmetric algorithm in the caller's allowlist still does not verify: an
+/// HMAC key published in a JWKS lets anyone who can read the set forge tokens.
+#[test]
+fn an_hmac_token_is_refused_even_when_the_allowlist_lists_it() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let secret = b"a-shared-secret-published-in-the-jwks";
+    let jwks: JwkSet = serde_json::from_value(serde_json::json!({
+        "keys": [{
+            "kty": "oct",
+            "kid": "hmac-1",
+            "k": URL_SAFE_NO_PAD.encode(secret),
+        }]
+    }))
+    .expect("JwkSet parse");
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("hmac-1".to_string());
+    let token =
+        encode(&header, &sample_claims(), &EncodingKey::from_secret(secret)).expect("encode");
+
+    let result = verify_jwt_signature(
+        &token,
+        &jwks,
+        None,
+        &[Algorithm::HS256, Algorithm::RS256, Algorithm::ES256],
+    );
+    assert!(
+        matches!(result, Err(JwtError::DisallowedAlgorithm(Algorithm::HS256))),
+        "an HS256 token must not verify, however the allowlist is built: {result:?}"
+    );
+}
+
+/// A key published for encryption is not a signature key.
+#[test]
+fn a_jwk_marked_for_encryption_is_not_a_signature_key() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut value = serde_json::to_value(&jwks).expect("serialise");
+    value["keys"][0]["use"] = serde_json::json!("enc");
+    let jwks: JwkSet = serde_json::from_value(value).expect("JwkSet parse");
+    let token = sign_jwt(&sample_claims(), &kid, &der);
+
+    let result = verify_jwt_signature(&token, &jwks, None, ALLOWED_ALGORITHMS);
+    assert!(
+        matches!(&result, Err(JwtError::KeyConstruction(m)) if m.contains("use")),
+        "a `use: enc` key must not verify signatures: {result:?}"
+    );
+
+    // And `use: sig`, or no `use` at all, still verifies.
+    let (der, jwks, kid) = rsa_keypair();
+    let mut value = serde_json::to_value(&jwks).expect("serialise");
+    value["keys"][0].as_object_mut().unwrap().remove("use");
+    let jwks: JwkSet = serde_json::from_value(value).expect("JwkSet parse");
+    let token_no_use = sign_jwt(&sample_claims(), &kid, &der);
+    assert!(verify_jwt_signature(&token_no_use, &jwks, None, ALLOWED_ALGORITHMS).is_ok());
+    let _ = token;
 }

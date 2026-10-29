@@ -22,10 +22,107 @@ mod custom_bag_tests {
             rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
+            consume: None,
         };
         AuthSession(crate::session::layer::SessionHandle(Arc::new(RwLock::new(
             inner,
         ))))
+    }
+
+    /// Becoming authenticated drops what the visitor put in the session
+    /// before the login, except the key the login owns for the flow in
+    /// flight.
+    #[tokio::test]
+    async fn becoming_authenticated_clears_pre_login_custom_data() {
+        let session = make_session();
+        session
+            .set_custom("planted", serde_json::json!("by the visitor"))
+            .await;
+        session
+            .set_custom(
+                crate::session::data::LOGIN_FLOW_KEY,
+                serde_json::json!({"started": true}),
+            )
+            .await;
+
+        session
+            .set_authenticated(
+                axess_identity::testing::user("alice"),
+                axess_identity::testing::tenant("acme"),
+                chrono::Utc::now(),
+            )
+            .await;
+
+        assert!(session.get_custom("planted").await.is_none());
+        assert!(
+            session
+                .get_custom(crate::session::data::LOGIN_FLOW_KEY)
+                .await
+                .is_some(),
+            "the key the login owns survives its own transition"
+        );
+    }
+
+    /// The keys an application registered ride across; nothing else does.
+    #[tokio::test]
+    async fn registered_custom_keys_survive_the_login() {
+        let session = make_session();
+        session.set_custom("locale", serde_json::json!("sv")).await;
+        session.set_custom("cart", serde_json::json!([1])).await;
+
+        session
+            .set_authenticated_keeping(
+                axess_identity::testing::user("alice"),
+                axess_identity::testing::tenant("acme"),
+                chrono::Utc::now(),
+                &["locale".to_owned()],
+            )
+            .await;
+
+        assert_eq!(
+            session.get_custom("locale").await,
+            Some(serde_json::json!("sv"))
+        );
+        assert!(session.get_custom("cart").await.is_none());
+    }
+
+    /// A multi-factor login completes through the same clearing.
+    #[tokio::test]
+    async fn completing_a_factor_chain_clears_pre_login_custom_data() {
+        use crate::authn::factor::{FactorKind, FactorStep};
+        let session = make_session();
+        session.set_custom("planted", serde_json::json!(1)).await;
+        session
+            .begin_authenticating(
+                axess_identity::testing::user("alice"),
+                axess_identity::testing::tenant("acme"),
+                "password".into(),
+                vec![FactorStep::Required(FactorKind::Password)],
+            )
+            .await;
+        session
+            .advance_factor(&FactorKind::Password, chrono::Utc::now(), &[])
+            .await;
+
+        assert!(session.is_authenticated().await);
+        assert!(session.get_custom("planted").await.is_none());
+    }
+
+    /// `clear` retires the identifier that carried the authenticated session.
+    #[tokio::test]
+    async fn clear_rotates_the_session_id() {
+        let session = make_session();
+        session
+            .set_authenticated(
+                axess_identity::testing::user("alice"),
+                axess_identity::testing::tenant("acme"),
+                chrono::Utc::now(),
+            )
+            .await;
+        let before = session.session_id().await;
+        session.clear().await;
+        assert!(session.auth_state().await.is_guest());
+        assert_ne!(session.session_id().await, before);
     }
 
     /// A bag stored as a non-object (an array here) is replaced by an object
@@ -185,6 +282,7 @@ mod extractor_tests {
             rng: std::sync::Arc::new(axess_rng::SystemRng),
             pending_fingerprint: None,
             max_custom_bytes: 64 * 1024,
+            consume: None,
         };
         AuthSession(crate::session::layer::SessionHandle(Arc::new(RwLock::new(
             inner,

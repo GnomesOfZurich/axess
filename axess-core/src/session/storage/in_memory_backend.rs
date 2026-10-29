@@ -235,6 +235,25 @@ impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
         self.identity.record_failed_attempt(user_id).await
     }
 
+    async fn reserve_attempt(
+        &self,
+        user_id: &UserId,
+        policy: &crate::authn::types::LockoutPolicy,
+    ) -> Result<Option<u32>, Self::Error> {
+        self.identity.reserve_attempt(user_id, policy).await
+    }
+
+    async fn release_attempt(&self, user_id: &UserId) -> Result<(), Self::Error> {
+        self.identity.release_attempt(user_id).await
+    }
+
+    async fn failed_attempts(
+        &self,
+        user_id: &UserId,
+    ) -> Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error> {
+        self.identity.failed_attempts(user_id).await
+    }
+
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
         self.identity.reset_failed_attempts(user_id).await
     }

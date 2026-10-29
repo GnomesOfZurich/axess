@@ -86,7 +86,7 @@ async fn hotp_burns_counter_after_max_attempts() {
         .with_factor(
             user_scope(),
             FactorConfig::Hotp(HotpConfig {
-                secret: ZeroizedString::new(secret),
+                secret: ZeroizedString::new(secret).into(),
                 counter: 0,
                 lookahead_window: 10,
                 max_attempts: 3,

@@ -45,7 +45,7 @@
 //! authz_session.require("ViewLedger", &ledger_id).await?;
 //!
 //! // With ABAC context (MFA status, IP address):
-//! let ctx = StandardRequestContext::new(session.is_mfa_complete(), ip_address);
+//! let ctx = StandardRequestContext::new(mfa_complete, ip_address);
 //! let authz_session = state.authz.for_user_id_with_context(&user_id, ctx)?;
 //! authz_session.require("PostJournalEntry", &ledger_id).await?;
 //! ```

@@ -523,6 +523,25 @@ where
     /// so a single transient DB / archive blip does not silently
     /// halt retention forever. Persistent failures should surface
     /// via the warn-log volume + external alerting.
+    ///
+    /// # One runner
+    ///
+    /// Run this loop in one process at a time. The loop takes no lock and
+    /// has no leader election, so every replica that spawns it selects the
+    /// same unarchived rows, writes the same batches and purges the same
+    /// rows. Nothing is lost or corrupted: a batch id is derived from the
+    /// ids of its events, so a sink that records applied ids (as
+    /// [`FilesystemAuditArchiver`] does) treats the repeat as done, marking
+    /// and purging are idempotent, and the cutoffs come from each replica's
+    /// own clock. But the work is repeated on every replica, and a sink that
+    /// does not deduplicate stores each batch once per replica. Spawn it on
+    /// one designated instance (a singleton job, or a replica chosen by
+    /// your orchestrator), or make the source's selection exclusive across
+    /// replicas (a Postgres advisory lock held across the tick, or
+    /// `SELECT ... FOR UPDATE SKIP LOCKED` in
+    /// [`select_unarchived_before`](AuditRetentionSource::select_unarchived_before)).
+    /// [`tick`](Self::tick) and [`drain`](Self::drain) let you drive the same
+    /// cycle from a scheduler that already guarantees a single runner.
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
         let interval_dur = self.tick_interval;
         tokio::spawn(async move {

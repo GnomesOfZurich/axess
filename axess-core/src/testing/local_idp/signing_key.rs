@@ -144,8 +144,15 @@ fn signing_key_debug_redacts_private_material() {
 }
 
 #[test]
-#[should_panic(expected = "RSA constructors only support")]
 fn signing_key_rejects_non_rsa_algorithm_at_pem_load() {
     let pem = fresh_rsa_pkcs1_pem();
-    let _ = LocalIdpSigningKey::from_rsa_pem(&pem, "kid", Algorithm::ES256);
+    let err = LocalIdpSigningKey::from_rsa_pem(&pem, "kid", Algorithm::ES256)
+        .expect_err("ES256 is not an RSA algorithm");
+    assert!(
+        matches!(
+            err,
+            crate::local_idp::primitives::LocalIdpKeyError::UnsupportedAlgorithm(_)
+        ),
+        "{err:?}"
+    );
 }

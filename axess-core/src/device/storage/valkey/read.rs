@@ -24,6 +24,18 @@ pub(super) struct StoredRow {
     pub(super) stale: bool,
 }
 
+/// What a write finds stored under a row key: nothing, a row it can decode,
+/// or bytes it cannot (a damaged row, one sealed under a key that is no
+/// longer configured, or an unbound blob under `LegacyBlobs::Reject`).
+pub(super) enum StoredRowState {
+    /// No row.
+    Absent,
+    /// A decoded row with the bytes it was read as.
+    Decoded(Device, Vec<u8>),
+    /// Bytes that do not decode, with the reason.
+    Undecodable(Vec<u8>, ValkeyDeviceStoreError),
+}
+
 /// The result of reading the rows behind a list of index members.
 #[derive(Default)]
 pub(super) struct RowsRead {
@@ -47,6 +59,28 @@ impl ValkeyDeviceStore {
             .get_row_checked(tenant, id)
             .await?
             .map(|(device, raw, _)| (device, raw)))
+    }
+
+    /// Read the row `(tenant, id)` for a write that replaces it: bytes that
+    /// do not decode are reported with their raw form instead of failing the
+    /// read, because the write is a compare-and-swap against those exact
+    /// bytes and a row nobody can read would otherwise never be overwritten.
+    pub(super) async fn get_row_for_write(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<StoredRowState, ValkeyDeviceStoreError> {
+        let raw: Option<Vec<u8>> = self
+            .client
+            .get(device_key(&self.prefix, tenant, id))
+            .await?;
+        Ok(match raw {
+            None => StoredRowState::Absent,
+            Some(raw) => match self.decode_row_checked(tenant, id, &raw) {
+                Ok((device, _)) => StoredRowState::Decoded(device, raw),
+                Err(error) => StoredRowState::Undecodable(raw, error),
+            },
+        })
     }
 
     /// [`get_row`](Self::get_row), and whether the bytes are stale.

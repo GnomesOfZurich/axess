@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::Actor;
 use axess_core::authn::factor::{FactorCredential, ZeroizedString};
 use axess_core::authn::types::{EntityState, StatusDetail};
 use axess_core::authn::{
@@ -46,9 +47,18 @@ async fn impersonation_refuses_a_suspended_target_and_leaves_the_session_alone()
             .with_user(target.clone()),
     );
     let session = test_session();
-    let res = svc.begin_impersonation(&admin.id, &target, &session).await;
+    session
+        .set_authenticated(admin.id, admin.tenant_id, Utc::now())
+        .await;
+    let res = svc
+        .begin_impersonation_across_tenants(&admin.id, &target, &session)
+        .await;
     assert!(matches!(res, Err(AuthnError::NotActive(_))), "{res:?}");
-    assert!(!session.is_authenticated().await);
+    assert_eq!(
+        session.user_id().await,
+        Some(admin.id),
+        "the session is left as the admin's"
+    );
 }
 
 #[tokio::test]
@@ -62,7 +72,12 @@ async fn impersonation_whose_audit_row_cannot_be_written_leaves_no_session() {
     identity.arm_record_event_failure();
     let svc = service(identity);
     let session = test_session();
-    let res = svc.begin_impersonation(&admin.id, &target, &session).await;
+    session
+        .set_authenticated(admin.id, admin.tenant_id, Utc::now())
+        .await;
+    let res = svc
+        .begin_impersonation_across_tenants(&admin.id, &target, &session)
+        .await;
     assert!(res.is_err(), "the audit outage must fail the flow");
     assert!(
         !session.is_authenticated().await,
@@ -84,7 +99,8 @@ async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
         .unwrap()
         .expect("token for an active user");
 
-    svc.suspend_user(
+    svc.suspend_user_across_tenants(
+        Actor::System,
         &uid("u1"),
         StatusDetail {
             reason: "hold".into(),
@@ -100,7 +116,9 @@ async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
         .unwrap();
     assert!(!refused, "a suspended account's password must not change");
 
-    svc.activate_user(&uid("u1")).await.unwrap();
+    svc.activate_user_across_tenants(Actor::System, &uid("u1"))
+        .await
+        .unwrap();
     let accepted = svc
         .complete_password_reset(&uid("u1"), &token, "A-long-new-passphrase-9!")
         .await

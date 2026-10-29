@@ -164,6 +164,28 @@ pub trait AuthzEntityProvider: Send + Sync {
         action: &EntityUid,
     ) -> impl std::future::Future<Output = Result<Entities, Self::Error>> + Send;
 
+    /// [`entities_for`](Self::entities_for) for a check made in a known
+    /// tenant.
+    ///
+    /// [`AuthzSession`][super::session::AuthzSession] calls this with the
+    /// tenant its session was opened for (see
+    /// [`AuthzStore::for_user_in_tenant`][super::session::AuthzStore::for_user_in_tenant]
+    /// and [`AuthzStore::for_session`][super::session::AuthzStore::for_session]),
+    /// `None` when it was opened without one. Override it to load the
+    /// principal's roles and the resource for that tenant only. The default
+    /// ignores the tenant and calls `entities_for`, so existing providers
+    /// are unchanged.
+    fn entities_for_tenant(
+        &self,
+        principal: &EntityUid,
+        tenant: Option<&str>,
+        resource_id: &Self::ResourceId,
+        action: &EntityUid,
+    ) -> impl std::future::Future<Output = Result<Entities, Self::Error>> + Send {
+        let _ = tenant;
+        self.entities_for(principal, resource_id, action)
+    }
+
     /// Build the Cedar [`EntityUid`] for a resource instance.
     ///
     /// Must produce a UID whose type matches the Cedar schema. The namespace
@@ -241,6 +263,22 @@ pub trait AuthzEntityProvider: Send + Sync {
 /// axess forbids `_`-prefixed parameter names in trait impls, since
 /// the prefix hides the contract from readers and tooling.
 ///
+/// # Caching contract
+///
+/// The cache decorators key an entry on `(principal, tenant, resource,
+/// action)` and nothing else from the session. Entities that vary with
+/// other session state would be served across sessions of the same user and
+/// tenant for the whole TTL: a password-only session would read the
+/// entities built for a session that completed MFA.
+///
+/// Therefore keep the entities to durable facts (roles, group membership,
+/// ownership, tenant) and carry per-session facts (MFA status, step-up
+/// recency, impersonation) in the Cedar context, which is built per request
+/// and never cached (see
+/// [`RequestContextProvider`][super::context::RequestContextProvider]).
+/// A provider that must put session state into the entities declares it
+/// through [`cache_discriminator`](Self::cache_discriminator).
+///
 /// # Async return shape
 ///
 /// Returns `Pin<Box<dyn Future + Send + 'a>>`: the standard object-safe
@@ -275,6 +313,29 @@ pub trait RequestEntityProvider: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
     >;
+
+    /// A string naming the session state this provider's entities depend on
+    /// beyond the principal, the tenant, the resource and the action.
+    ///
+    /// The caching decorators in [`crate::authz::cache`] key their entries on
+    /// `(principal, tenant, resource, action)` only. A provider that reads
+    /// anything else from the session (a step-up level, an impersonation
+    /// flag) and writes it into the entities would otherwise serve one
+    /// session's entities to another session of the same user and tenant.
+    /// Return that state here and the decorators add it to the key (hashed
+    /// for Valkey). The default, `None`, declares that the entities depend on
+    /// nothing else, which is the supported shape: put per-request facts in
+    /// the Cedar context instead (see the module docs on caching).
+    ///
+    /// Decorators forward this to the provider they wrap, so a stack of
+    /// caches sees the inner provider's value.
+    fn cache_discriminator<'a>(
+        &'a self,
+        session: &'a crate::session::AuthSession,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        let _ = session;
+        Box::pin(async { None })
+    }
 
     /// [`entities_for`](Self::entities_for), returning the entity set
     /// behind an [`Arc`](std::sync::Arc).

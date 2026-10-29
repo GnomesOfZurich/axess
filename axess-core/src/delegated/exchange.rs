@@ -46,7 +46,7 @@ const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-
 ///     .with_actor_token(axess_workload_jwt, token_types::JWT);
 /// let resp = exchanger.exchange(&req).await?;
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TokenExchangeRequest {
     /// The user's current token; proves who the exchange is "on
     /// behalf of". Required.
@@ -75,6 +75,27 @@ pub struct TokenExchangeRequest {
     /// to access_token; some AS use this to issue ID tokens or
     /// refresh tokens via exchange.
     pub requested_token_type: Option<String>,
+}
+
+/// Prints the token types and the exchange parameters but not the tokens:
+/// `{:?}` of a request ends up in logs and panic messages, and both tokens
+/// are bearer credentials.
+impl std::fmt::Debug for TokenExchangeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenExchangeRequest")
+            .field("subject_token", &"[redacted]")
+            .field("subject_token_type", &self.subject_token_type)
+            .field(
+                "actor_token",
+                &self.actor_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("actor_token_type", &self.actor_token_type)
+            .field("audience", &self.audience)
+            .field("resource", &self.resource)
+            .field("scopes", &self.scopes)
+            .field("requested_token_type", &self.requested_token_type)
+            .finish()
+    }
 }
 
 impl TokenExchangeRequest {
@@ -177,6 +198,11 @@ impl TokenExchangeClient {
     /// configure the [`reqwest::Client`] via
     /// [`with_http_client`](Self::with_http_client) to present the
     /// client cert.
+    ///
+    /// The endpoint must be HTTPS (plain HTTP only to a loopback host); any
+    /// other endpoint is refused by [`exchange`](Self::exchange) before a
+    /// request is sent. The default client follows no redirects and has a
+    /// connect timeout of 10 seconds and a request timeout of 30 seconds.
     pub fn new(
         token_endpoint: Url,
         client_id: impl Into<String>,
@@ -186,12 +212,18 @@ impl TokenExchangeClient {
             token_endpoint,
             client_id: client_id.into(),
             client_secret: client_secret.map(Arc::new),
-            http: reqwest::Client::new(),
+            http: crate::outbound_http::hardened_client(),
         }
     }
 
     /// Override the HTTP client; used for outbound mTLS / proxy /
     /// timeout config.
+    ///
+    /// A replacement client drops the default client's protections: it must
+    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
+    /// connect and request timeout, or a redirect re-sends the subject token
+    /// and client credentials to wherever it points. The endpoint check
+    /// (HTTPS, or HTTP to a loopback host) still applies.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
@@ -204,6 +236,10 @@ impl TokenExchangeClient {
         &self,
         request: &TokenExchangeRequest,
     ) -> Result<TokenExchangeResponse, DelegatedError> {
+        // Before any request: the subject token and client credentials go
+        // in this POST.
+        crate::outbound_http::require_https_or_loopback(&self.token_endpoint)
+            .map_err(|reason| DelegatedError::Transport(reason.to_string()))?;
         let mut form: Vec<(&str, String)> = vec![
             ("grant_type", GRANT_TYPE_TOKEN_EXCHANGE.to_string()),
             ("subject_token", request.subject_token.clone()),

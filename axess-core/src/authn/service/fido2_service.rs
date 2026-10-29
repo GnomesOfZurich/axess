@@ -16,6 +16,8 @@ const MAX_PASSKEY_UPDATE_ATTEMPTS: usize = 8;
 
 // ── FIDO2 ceremony session keys ──────────────────────────────────────────────
 
+mod discoverable;
+
 pub(crate) mod fido2_keys {
     pub const AUTH_STATE: &str = "axess.fido2.auth_state";
     pub const REG_STATE: &str = "axess.fido2.reg_state";
@@ -24,6 +26,9 @@ pub(crate) mod fido2_keys {
     pub const AUTH_STARTED: &str = "axess.fido2.auth_started";
     /// When the registration ceremony began; paired with [`REG_STATE`].
     pub const REG_STARTED: &str = "axess.fido2.reg_started";
+    /// The tenant a discoverable ceremony was begun for, when it was begun
+    /// with the tenant rail.
+    pub const DISC_TENANT: &str = "axess.fido2.disc_tenant";
     /// When the discoverable ceremony began; paired with [`DISC_STATE`].
     pub const DISC_STARTED: &str = "axess.fido2.disc_started";
 
@@ -68,7 +73,16 @@ where
                 .map_err(AuthnError::Store)?;
             let mut credentials = match &prior {
                 Some(FactorConfig::Fido2(cfg)) => cfg.credentials.clone(),
-                _ => Vec::new(),
+                // A row stored under the Fido2 kind that is not a Fido2
+                // config cannot be swapped (the insert below only creates
+                // an absent row), so every attempt would lose and end as
+                // "kept changing". Say what is wrong instead.
+                Some(_) => {
+                    return Err(AuthnError::Internal(
+                        "the stored FIDO2 factor row is not a FIDO2 config".to_string(),
+                    ));
+                }
+                None => Vec::new(),
             };
             let Some(outcome) = mutate(&mut credentials) else {
                 return Ok(None);
@@ -192,6 +206,8 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
+        // A tenant left by an earlier ceremony must not bind this one.
+        session.remove_custom(fido2_keys::DISC_TENANT).await;
         let (challenge, auth_state) =
             webauthn.start_discoverable_authentication().map_err(|e| {
                 tracing::warn!("FIDO2 start_discoverable_authentication failed: {e:?}");
@@ -204,6 +220,31 @@ where
             .await;
 
         serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
+    }
+
+    /// Begin a passwordless/discoverable FIDO2 authentication that may only
+    /// finish for a user of `tenant_id`.
+    ///
+    /// Same as [`begin_discoverable_login`](Self::begin_discoverable_login),
+    /// and the tenant is remembered with the ceremony:
+    /// [`finish_discoverable_login`](RequestAuthnService::finish_discoverable_login)
+    /// refuses a user of any other tenant with [`AuthnError::CrossTenant`].
+    /// Use it on any login page that belongs to one tenant, since a
+    /// discoverable credential names a user and says nothing of tenants.
+    #[tracing::instrument(skip(self, session))]
+    pub async fn begin_discoverable_login_in_tenant(
+        &self,
+        tenant_id: &TenantId,
+        session: &AuthSession,
+    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
+        let challenge = self.begin_discoverable_login(session).await?;
+        session
+            .set_custom(
+                fido2_keys::DISC_TENANT,
+                serde_json::Value::String(tenant_id.to_string()),
+            )
+            .await;
+        Ok(challenge)
     }
 
     // ── Credential management ────────────────────────────────────────────────
@@ -273,29 +314,49 @@ where
         AuthnError::NotActive(status)
     }
 
-    /// Retire a failed discoverable ceremony and name the failure.
+    /// Require that `session` may enrol or remove passkeys for `user`.
     ///
-    /// The ceremony state is cleared BEFORE the failure is recorded, so a
-    /// store error while recording cannot leave it behind. The failure goes
-    /// through the canonical helper so counter-store errors are muted (no
-    /// lockout-evading side channel) and the audit row precedes the counter.
-    /// A lockout passes its `until` to the caller; every other verdict is
-    /// `InvalidAssertion`. A store error from the helper is returned as is.
-    async fn discoverable_failure(
+    /// The session must be [`Authenticated`](crate::session::data::AuthState::Authenticated)
+    /// as that very user (same id and tenant), or pending signup for that
+    /// user so a signup can enrol its first passkey. A `User` the caller
+    /// built or fetched is never trusted on its own: a handler that looks a
+    /// user up by a request parameter cannot enrol a passkey on someone
+    /// else's account. A refusal writes a failed audit row and answers
+    /// [`AuthnError::NoFlow`].
+    async fn require_enrolment_context(
         &self,
         user: &crate::authn::types::User,
         session: &AuthSession,
-    ) -> AuthnError<I::Error> {
-        self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-            .await;
-        match self
-            .record_factor_failure(&user.id, &user.tenant_id, &FactorKind::Fido2, session)
-            .await
-        {
-            Ok(FactorOutcome::Locked { until }) => AuthnError::Locked { until },
-            Ok(_) => AuthnError::InvalidAssertion,
-            Err(e) => e,
+        event: AuthEventType,
+    ) -> Result<(), AuthnError<I::Error>> {
+        use crate::session::data::{AuthState, WorkflowKind};
+        let allowed = match session.auth_state().await {
+            AuthState::Authenticated {
+                user_id, tenant_id, ..
+            } => user_id == user.id && tenant_id == user.tenant_id,
+            AuthState::PendingWorkflow {
+                user_id,
+                tenant_id,
+                workflow,
+            } => {
+                workflow.kind == WorkflowKind::Signup
+                    && user_id == user.id
+                    && tenant_id == user.tenant_id
+            }
+            _ => false,
+        };
+        if allowed {
+            return Ok(());
         }
+        self.emit_audit(
+            AuthEventBuilder::failure(event)
+                .attributed_to(&user.id, &user.tenant_id)
+                .with_factor(FactorKind::Fido2)
+                .with_session(session.session_id().await)
+                .with_error(AuthFailureReason::Other("enrolment_context".into())),
+        )
+        .await?;
+        Err(AuthnError::NoFlow)
     }
 
     /// Verify a FIDO2/WebAuthn authentication assertion.
@@ -331,7 +392,12 @@ where
         // assertion and a successful re-use.
         let state_json = match session.take_custom(fido2_keys::AUTH_STATE).await {
             Some(v) if !v.is_null() => v,
-            _ => return Ok(FactorOutcome::InvalidCredential),
+            _ => {
+                // No state to consume, but a timestamp may still be there.
+                self.clear_ceremony_timestamp(session, fido2_keys::AUTH_STATE)
+                    .await;
+                return Ok(FactorOutcome::InvalidCredential);
+            }
         };
 
         if self
@@ -389,25 +455,30 @@ where
                 .await;
         }
 
+        let now = self.inner.clock.now();
+        session
+            .advance_factor(&FactorKind::Fido2, now, &self.inner.preserved_custom_keys)
+            .await;
+
+        let outcome = self
+            .complete_factor_step(user_id, tenant_id, session)
+            .await?;
+
         // Device-binding hook: when the `device` subsystem is wired in
         // via a custom `Fido2Provider`, this updates
         // `DeviceBinding::WebAuthn.last_used_at` and (if the credential
-        // is not yet bound to this device) creates the binding row. The
-        // hook must fire on EVERY successful FIDO2 ceremony; including
-        // this standard MFA path; so a stolen credential authenticating
-        // from a fresh device produces a `DeviceBinding::WebAuthn` row
-        // tying that credential to a new `DeviceId`, defeating the
-        // cross-check the device subsystem exists to perform. Mirrors
-        // the same call in `finish_discoverable_login` and the
-        // registration path.
+        // is not yet bound to this device) creates the binding row. It
+        // fires on every FIDO2 ceremony that SUCCEEDED, including this
+        // standard MFA path, so a stolen credential authenticating from a
+        // fresh device produces a `DeviceBinding::WebAuthn` row tying that
+        // credential to a new `DeviceId`. It runs after the step completes:
+        // `complete_factor_step` can still refuse (the account was
+        // suspended meanwhile, the registry would not take the session),
+        // and a binding row must not record a login that did not happen.
         if let Some(device_id) = session.device_id().await {
             webauthn.on_credential_used(auth_result.cred_id(), &device_id);
         }
-
-        let now = self.inner.clock.now();
-        session.advance_factor(&FactorKind::Fido2, now).await;
-
-        self.complete_factor_step(user_id, tenant_id, session).await
+        Ok(outcome)
     }
 
     /// Begin FIDO2 passkey registration.
@@ -422,6 +493,8 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
+        self.require_enrolment_context(user, session, AuthEventType::FactorEnabled)
+            .await?;
         let status = self.current_account_status(&user.id).await?;
         if !status.allows_login() {
             return Err(self
@@ -493,6 +566,11 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
+        // A session that is not this user's cannot finish a ceremony it did
+        // not begin, and a refusal here leaves any state it holds in place.
+        self.require_enrolment_context(user, session, AuthEventType::FactorSetup)
+            .await?;
+
         // Take the state first so two parallel finishes cannot both consume
         // one challenge, and so a failed finish leaves nothing to replay.
         let state_json = session.take_custom(fido2_keys::REG_STATE).await;
@@ -523,12 +601,22 @@ where
                 .await);
         }
 
-        let passkey = webauthn
-            .finish_registration(response, &reg_state)
-            .map_err(|e| {
+        let passkey = match webauthn.finish_registration(response, &reg_state) {
+            Ok(passkey) => passkey,
+            Err(e) => {
                 tracing::warn!("FIDO2 finish_passkey_registration failed: {e:?}");
-                AuthnError::NoFlow
-            })?;
+                // A rejected attestation is a security-relevant event, and
+                // the success and inactive-account paths both leave a row.
+                self.emit_audit(
+                    AuthEventBuilder::failure(AuthEventType::FactorSetup)
+                        .attributed_to(&user.id, &user.tenant_id)
+                        .with_factor(FactorKind::Fido2)
+                        .with_error(AuthFailureReason::Other("registration_rejected".into())),
+                )
+                .await?;
+                return Err(AuthnError::NoFlow);
+            }
+        };
 
         // Capture the credential id before `passkey` moves into the
         // factor config below; needed for the post-save device-binding
@@ -585,150 +673,21 @@ where
         Ok(())
     }
 
-    /// Complete a passwordless/discoverable FIDO2 authentication.
-    #[tracing::instrument(skip(self, assertion, user, credentials, session))]
-    pub async fn finish_discoverable_login(
-        &self,
-        assertion: &webauthn_rs::prelude::PublicKeyCredential,
-        user: &crate::authn::types::User,
-        credentials: &[crate::authn::factor::Fido2Credential],
-        session: &AuthSession,
-    ) -> Result<(), AuthnError<I::Error>> {
-        let webauthn = match &self.inner.fido2 {
-            Some(w) => w,
-            None => return Err(AuthnError::NoFlow),
-        };
-
-        let status = self.current_account_status(&user.id).await?;
-        if !status.allows_login() {
-            self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                .await;
-            return Err(self
-                .refuse_inactive_account(user, status, AuthEventType::FactorVerified, Some(session))
-                .await);
-        }
-
-        if self
-            .is_ceremony_expired(session, fido2_keys::DISC_STATE)
-            .await
-        {
-            self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                .await;
-            return Err(AuthnError::NoFlow);
-        }
-
-        // Take the discoverable auth state atomically. Same threat
-        // model as the regular `verify_fido2_factor` path; two parallel
-        // submissions of the same valid assertion must not both consume
-        // the same ceremony state.
-        let state_json = match session.take_custom(fido2_keys::DISC_STATE).await {
-            Some(v) if !v.is_null() => v,
-            _ => return Err(AuthnError::NoFlow),
-        };
-
-        let Ok(auth_state) =
-            serde_json::from_value::<webauthn_rs::prelude::DiscoverableAuthentication>(state_json)
-        else {
-            // The state is already taken; retire the timestamp too.
-            self.clear_ceremony_timestamp(session, fido2_keys::DISC_STATE)
-                .await;
-            return Err(AuthnError::NoFlow);
-        };
-
-        let discoverable_keys: Vec<webauthn_rs::prelude::DiscoverableKey> =
-            credentials.iter().map(|c| (&c.passkey).into()).collect();
-
-        let auth_result = match webauthn.finish_discoverable_authentication(
-            assertion,
-            auth_state,
-            &discoverable_keys,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("FIDO2 finish_discoverable_authentication failed: {e:?}");
-                return Err(self.discoverable_failure(user, session).await);
-            }
-        };
-
-        let user_scope = AuthnScope::User {
-            tenant_id: user.tenant_id,
-            user_id: user.id,
-        };
-        // A passkey deleted after the ceremony began is no longer a
-        // credential of this user, however valid the assertion was against
-        // the caller's list.
-        if !self
-            .save_fido2_credentials(&user_scope, &auth_result)
-            .await?
-        {
-            return Err(self.discoverable_failure(user, session).await);
-        }
-
-        // Auto-invoke the device-binding hook for the credential that
-        // just satisfied this assertion. Mirrors the call in
-        // `finish_fido2_registration`: adopters that wire the `device`
-        // subsystem override `Fido2Provider::on_credential_used` to
-        // update `last_used_at` on the corresponding
-        // `DeviceBinding::WebAuthn` row (or insert one on first sighting);
-        // the default impl is a no-op so deployments without the
-        // subsystem are unaffected.
-        if let Some(device_id) = session.device_id().await {
-            webauthn.on_credential_used(auth_result.cred_id(), &device_id);
-        }
-
-        // Clear the ceremony timestamp BEFORE flipping the session
-        // to Authenticated. The state JSON itself was already taken by the
-        // atomic-take above. Doing it now (rather than after
-        // `complete_factor_step`) means an early return on the
-        // status-recheck or registry-error path inside complete_factor_step
-        // does not leave a stale ceremony timestamp
-        // that the next request would interpret as "ceremony in progress".
-        self.clear_ceremony_timestamp(session, fido2_keys::DISC_STATE)
-            .await;
-
-        // Reset the failed-attempt counter BEFORE flipping the session to
-        // Authenticated. Same reasoning as the standard
-        // verify_factor path: if the counter reset errors after the
-        // session is already authenticated, we'd hold an Authenticated
-        // session that the registry never saw. Reset first → register-
-        // through-complete-step → handle errors before set_authenticated.
-        self.inner
-            .identity
-            .reset_failed_attempts(&user.id)
-            .await
-            .map_err(AuthnError::Store)?;
-
-        let now = self.inner.clock.now();
-        session
-            .set_authenticated(user.id, user.tenant_id, now)
-            .await;
-
-        // complete_factor_step here both registers in the SessionRegistry
-        // and re-checks account status; propagate any error so
-        // a failed registration / mid-flow suspension reaches the caller.
-        match self
-            .complete_factor_step(&user.id, &user.tenant_id, session)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                // Roll the session back to Guest on failure so the user
-                // does not hold an Authenticated cookie outside the
-                // registry's view (fail-closed contract).
-                session.clear().await;
-                Err(e)
-            }
-        }
-    }
-
     /// Delete a FIDO2 credential by its credential ID.
-    #[tracing::instrument(skip(self, user, credential_id))]
+    ///
+    /// `session` must be authenticated as `user` (or pending signup for
+    /// them); any other session is refused with [`AuthnError::NoFlow`] and a
+    /// failed audit row, and nothing is deleted.
+    #[tracing::instrument(skip(self, user, session, credential_id))]
     pub async fn delete_fido2_credential(
         &self,
         user: &crate::authn::types::User,
+        session: &AuthSession,
         credential_id: &webauthn_rs::prelude::CredentialID,
         min_remaining: usize,
     ) -> Result<bool, AuthnError<I::Error>> {
+        self.require_enrolment_context(user, session, AuthEventType::FactorDisabled)
+            .await?;
         let user_scope = AuthnScope::User {
             tenant_id: user.tenant_id,
             user_id: user.id,

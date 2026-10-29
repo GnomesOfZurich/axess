@@ -8,8 +8,8 @@
 //! that hold the algorithm enum on a config struct don't need a direct
 //! dependency on the upstream crate.
 
+use crate::factor_secret::FactorSecret;
 use crate::otp_algorithm::OtpAlgorithm;
-use crate::secret::ZeroizedString;
 use crate::{MAX_TOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
@@ -23,8 +23,12 @@ pub use totp_rs::{Algorithm as TotpAlgorithm, Builder as TotpBuilder, Totp};
 /// TOTP factor configuration (RFC 6238).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TotpConfig {
-    /// Shared secret (raw bytes, base32-encoded for provisioning URIs). Zeroized on drop.
-    pub secret: ZeroizedString,
+    /// Shared secret (raw bytes, base32-encoded for provisioning URIs). Plain
+    /// text is zeroized in memory on drop, redacted in `Debug`, and written to
+    /// the store as it stands; seal it with a `FactorSecretCipher` to keep it
+    /// encrypted at rest. See the OTP secret section of the password and TOTP
+    /// guide.
+    pub secret: FactorSecret,
     /// Number of digits in the generated code (typically 6).
     pub digits: u8,
     /// Length of one TOTP step in seconds (RFC 6238 default is 30).
@@ -42,7 +46,7 @@ pub struct TotpConfig {
 impl Default for TotpConfig {
     fn default() -> Self {
         Self {
-            secret: ZeroizedString::new(""),
+            secret: FactorSecret::Plain(crate::secret::ZeroizedString::new("")),
             digits: 6,
             period_secs: 30,
             algorithm: OtpAlgorithm::Sha1,

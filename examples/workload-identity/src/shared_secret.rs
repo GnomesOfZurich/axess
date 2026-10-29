@@ -39,6 +39,11 @@ pub const SECRET_VAR: &str = "INTAKE_WEBHOOK_SECRET";
 /// The route the caller posts to.
 pub const BOUNCE_PATH: &str = "/webhooks/bounce";
 
+/// The name the bounce route is addressed as: the caller signs for it with
+/// `sign_for`, and a signature made for any other service that shares the
+/// secret is refused here.
+pub const BOUNCE_AUDIENCE: &str = "intake";
+
 /// What the caller reports: one address whose mail bounced.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BounceReport {
@@ -64,13 +69,13 @@ pub fn secrets_from_env() -> Result<ServiceSecrets, ServiceSecretError> {
 
 /// The bounce route, admitting only requests signed with one of
 /// `secrets`. With no secret configured the route answers `404`.
-pub fn bounce_routes(secrets: ServiceSecrets) -> Router {
-    Router::new()
+pub fn bounce_routes(secrets: ServiceSecrets) -> Result<Router, ServiceSecretError> {
+    Ok(Router::new()
         .route(BOUNCE_PATH, post(receive_bounce))
         .layer(ServiceSecretLayer::signed(
             secrets,
-            SignedRequests::default(),
-        ))
+            SignedRequests::default().audience(BOUNCE_AUDIENCE),
+        )?))
 }
 
 async fn receive_bounce(caller: ServiceCaller, Json(report): Json<BounceReport>) -> StatusCode {
@@ -96,7 +101,13 @@ pub fn signed_bounce(
     report: &BounceReport,
 ) -> Request<Body> {
     let body = serde_json::to_vec(report).expect("a BounceReport always serializes");
-    let signature = signer.sign(now_unix_seconds, &Method::POST, BOUNCE_PATH, &body);
+    let signature = signer.sign_for(
+        BOUNCE_AUDIENCE,
+        now_unix_seconds,
+        &Method::POST,
+        BOUNCE_PATH,
+        &body,
+    );
     Request::builder()
         .method(Method::POST)
         .uri(BOUNCE_PATH)

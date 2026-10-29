@@ -23,6 +23,7 @@ fn handle(seed: u64) -> SessionHandle {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     })))
 }
 
@@ -51,9 +52,14 @@ fn rotate_then_render()
         if req.method() != Method::GET {
             return Ok(Response::builder().status(200).body(Body::empty()).unwrap());
         }
-        let stale = req.extensions().get::<CsrfToken>().unwrap().0.clone();
+        let stale = req
+            .extensions()
+            .get::<CsrfToken>()
+            .unwrap()
+            .as_str()
+            .to_owned();
         let issuer = req.extensions().get::<CsrfIssuer>().unwrap().clone();
-        let before = issuer.token().await.0;
+        let before = issuer.token().await.as_str().to_owned();
         req.extensions()
             .get::<SessionHandle>()
             .unwrap()
@@ -61,8 +67,8 @@ fn rotate_then_render()
             .write()
             .await
             .rotate_id();
-        let after = issuer.token().await.0;
-        let again = issuer.token().await.0;
+        let after = issuer.token().await.as_str().to_owned();
+        let again = issuer.token().await.as_str().to_owned();
         let body = format!("{stale}\n{before}\n{after}\n{again}");
         Ok(Response::builder()
             .status(200)

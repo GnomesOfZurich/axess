@@ -275,7 +275,7 @@ operation to suspend one.** `IdentityStore` has `suspend_user` and
 invalidates by user and by session and not by tenant, and there is no
 tenant lifecycle event in the audit vocabulary.
 
-What exists today is per-user: `suspend_user_in_tenant` sets the
+What exists today is per-user: `suspend_user` sets the
 status, invalidates that user's sessions through the registry, and
 emits `AccountSuspended` attributed to the actor who did it.
 

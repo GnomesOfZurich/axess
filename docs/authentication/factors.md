@@ -291,30 +291,42 @@ change; the verifier is doing one job, behind a fixed contract.
 ### Step-up authentication
 
 Step-up is the pattern where an already-`Authenticated` session is
-asked to re-prove identity (or to prove with a stronger factor) before
-performing a sensitive action. Axess models this by transitioning the
-state from `Authenticated` back to `Authenticating` with a non-empty
-`remaining` list. There is no `require_step_up` orchestrator method.
-What axess ships is the decision, not the transition:
-`decide_step_up_for_user` is a free function over a `Device`, the user
-logging in and a `StepUpPolicy`, returning `Some(factors)` when the
-device's trust level calls for them and `None` when it does not.
-`StepUpPolicy` is a factor list per `DeviceTrustLevel`: `unknown` and
-`seen` demand factors by default, `trusted` and `revoked` demand none.
-A device owned by a different user counts as `Unknown`, so trust earned
-by one person never carries over to another. `begin_login` surfaces the
-answer as `LoginOutcome::StepUpRequired { device_id, allowed_factors }`.
+asked to prove identity again (or with a stronger factor) before a
+sensitive action. Axess drives it with one call:
+`begin_step_up(session, factors)` on the request-scoped service. The
+session must be `Authenticated`; it becomes `Authenticating` with a single
+remaining step offering `factors` as alternatives, and the factors it had
+already completed are remembered. From there `prepare_factor` and
+`verify_factor` work exactly as they did during the original login: a wrong
+code is counted, audited and subject to the lockout, and the right one
+returns `FactorOutcome::Authenticated`. The resulting session holds the
+earlier factors plus the new one in `factors_completed`, carries a fresh
+`authn_time`, and has a rotated id. Until the step is finished the session
+is not authenticated, so show the prompt on a page of its own.
 
-Driving the session back into `Authenticating` with that list is the
-caller's step.
+Two small gates decide when to ask. `AuthSession::authenticated_within`
+(a maximum age against the service's clock) and
+`AuthSession::has_completed_factor` (a factor kind among the completed
+ones) both answer from the session; when one says no, call
+`begin_step_up`.
 
-The state-machine view is uniform. The session is `Authenticating`
-again; the factor list contains the stepped-up factors; the session
-remembers (in `completed`) which factors it already cleared.
-`verify_factor` works the same way it did during the original login,
-and on the final `Completed` outcome the session transitions back to
-`Authenticated` with a fresh `authn_time` and an updated
-`factors_completed`.
+There is no `require_step_up` orchestrator that decides for you, and the
+device decision is separate: `decide_step_up_for_user` is a free function
+over a `Device`, the user logging in and a `StepUpPolicy`, returning
+`Some(factors)` when the device's trust level calls for them and `None`
+when it does not. `StepUpPolicy` is a factor list per `DeviceTrustLevel`,
+and every list demands a factor by default. A device is matched by a
+fingerprint the client controls, so a `Trusted` device does not skip
+step-up unless you set `trusted` to an empty list, and a `Revoked` device
+is never judged more leniently than an `Unknown` one (an empty `revoked`
+list means the `unknown` list applies). A request with no resolved device
+is judged as `Unknown` by `decide_step_up_for_optional`. A device owned by
+a different user counts as `Unknown`, so trust earned by one person never
+carries over to another.
+`LoginOutcome::StepUpRequired { device_id, allowed_factors }` is the shape
+the application builds from that answer (`begin_login` never returns it
+itself); acting on it means calling `begin_step_up` with those factors once
+the session is authenticated.
 
 The application controls when step-up is required. The Cedar policy
 engine can express "this action requires `Fido2` in

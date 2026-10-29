@@ -4,7 +4,8 @@
 //! # Architecture
 //!
 //! [`LdapProvider`] is the abstraction. Production code uses
-//! [`LdapProviderConfig`] (wraps `ldap3`). Tests use [`MockLdapProvider`].
+//! [`LdapProviderConfig`] (wraps `ldap3`). Tests use `MockLdapProvider`, which is
+//! compiled under `cfg(test)` or the `testing` feature only.
 //!
 //! The provider is attached to the orchestrator's `AuthnService` via
 //! `with_ldap` and triggered when the current factor is the orchestrator's
@@ -79,7 +80,7 @@ pub struct LdapBindResult {
 /// Abstraction over LDAP bind operations.
 ///
 /// Production: [`LdapProviderConfig`].
-/// Tests: [`MockLdapProvider`].
+/// Tests: `MockLdapProvider` (`testing` feature).
 pub trait LdapProvider: Send + Sync + 'static {
     /// Attempt a simple bind with the given DN and password.
     ///
@@ -134,8 +135,10 @@ pub struct LdapGroupSearch {
 /// certificate in the OS trust store or use the `SSL_CERT_FILE` /
 /// `SSL_CERT_DIR` environment variables.
 ///
-/// Plain `ldap://` without STARTTLS sends credentials in cleartext and must
-/// not be used outside localhost development.
+/// Plain `ldap://` without STARTTLS sends credentials in cleartext. It is
+/// refused at bind time unless the host is exactly `localhost`, `127.0.0.1`
+/// or `[::1]`, or the operator has said so with
+/// [`allow_cleartext`](Self::allow_cleartext).
 pub struct LdapProviderConfig {
     /// LDAP server URL (e.g. `"ldap://ad.example.com:389"` or
     /// `"ldaps://ad.example.com:636"`).
@@ -155,6 +158,33 @@ pub struct LdapProviderConfig {
     pub connection_timeout: Duration,
     /// Optional group membership search after successful bind.
     pub group_search: Option<LdapGroupSearch>,
+    /// Explicit opt-in to send the password over a non-loopback `ldap://`
+    /// connection without STARTTLS. Default: false (such a bind is refused
+    /// with [`LdapError::Config`] before any connection is opened).
+    pub allow_cleartext: bool,
+}
+
+/// Extract the host of an LDAP URL: strips the scheme, any userinfo, the
+/// path and the port, and keeps IPv6 brackets. `None` when the URL has no
+/// authority.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let hostport = authority.rsplit('@').next()?;
+    let host = if let Some(stripped) = hostport.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        &hostport[..end + 2]
+    } else {
+        hostport.split(':').next()?
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// True when the URL's host is exactly a loopback name or address. A
+/// substring test would accept `ldap://localhost.evil.example`.
+fn is_loopback_url(url: &str) -> bool {
+    url_host(url)
+        .is_some_and(|h| h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "[::1]")
 }
 
 impl LdapProviderConfig {
@@ -166,24 +196,32 @@ impl LdapProviderConfig {
     /// * `bind_dn_template`: template with `{user}` placeholder
     pub fn new(url: impl Into<String>, bind_dn_template: impl Into<String>) -> Self {
         let url = url.into();
-        let is_ldaps = url.starts_with("ldaps://");
-        let is_localhost = url.contains("://localhost")
-            || url.contains("://127.0.0.1")
-            || url.contains("://[::1]");
-        if !is_ldaps && !is_localhost {
-            tracing::warn!(
-                "LdapProviderConfig: using plain ldap:// without STARTTLS. \
-                 Call .with_starttls() to encrypt credentials on the wire. \
-                 Plain LDAP is only safe for localhost development."
-            );
-        }
         Self {
             url,
             bind_dn_template: bind_dn_template.into(),
             starttls: false,
             connection_timeout: Duration::from_secs(5),
             group_search: None,
+            allow_cleartext: false,
         }
+    }
+
+    /// Permit a cleartext simple bind to a non-loopback `ldap://` host. The
+    /// password then crosses the network unencrypted; use only on a trusted
+    /// segment you have accepted that for.
+    pub fn allow_cleartext(mut self) -> Self {
+        self.allow_cleartext = true;
+        self
+    }
+
+    /// True when a bind would send the password in cleartext to a host that
+    /// is not loopback, and the operator has not opted in.
+    fn refuses_cleartext(&self) -> bool {
+        let scheme_ldaps = self
+            .url
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("ldaps://"));
+        !scheme_ldaps && !self.starttls && !self.allow_cleartext && !is_loopback_url(&self.url)
     }
 
     /// Enable STARTTLS on plain LDAP connections.
@@ -265,6 +303,13 @@ impl LdapProvider for LdapProviderConfig {
             if password.is_empty() {
                 return Err(LdapError::InvalidCredentials);
             }
+            if self.refuses_cleartext() {
+                return Err(LdapError::Config(
+                    "plain ldap:// to a non-loopback host would send the password in \
+                     cleartext; use ldaps://, with_starttls(), or allow_cleartext()"
+                        .into(),
+                ));
+            }
             let settings = ldap3::LdapConnSettings::new()
                 .set_conn_timeout(self.connection_timeout)
                 .set_starttls(self.starttls);
@@ -324,6 +369,7 @@ impl LdapProvider for LdapProviderConfig {
 
 // ── MockLdapProvider ─────────────────────────────────────────────────────────
 
+#[cfg(any(test, feature = "testing"))]
 /// Test double for [`LdapProvider`]. Configure accepted credentials via
 /// [`with_user`](MockLdapProvider::with_user); unconfigured users and
 /// wrong passwords are rejected.
@@ -332,11 +378,13 @@ pub struct MockLdapProvider {
     users: std::collections::HashMap<String, MockLdapUser>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 struct MockLdapUser {
     password: String,
     groups: Vec<String>,
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl MockLdapProvider {
     /// Create a new mock with the given bind DN template.
     pub fn new(bind_dn_template: impl Into<String>) -> Self {
@@ -366,6 +414,7 @@ impl MockLdapProvider {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 impl LdapProvider for MockLdapProvider {
     fn verify_bind<'a>(
         &'a self,
@@ -468,180 +517,4 @@ fn ldap_filter_escape(input: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn mock_accepts_correct_password() {
-        let provider = MockLdapProvider::new("uid={user},ou=people,dc=example,dc=com").with_user(
-            "alice",
-            "Gnomes2+",
-            vec!["engineers", "admins"],
-        );
-
-        let dn = provider.build_bind_dn("alice");
-        assert_eq!(dn, "uid=alice,ou=people,dc=example,dc=com");
-
-        let result = provider
-            .verify_bind("alice", &dn, "Gnomes2+")
-            .await
-            .unwrap();
-        assert_eq!(result.bind_dn, dn);
-        assert_eq!(result.groups, vec!["engineers", "admins"]);
-    }
-
-    #[tokio::test]
-    async fn mock_rejects_wrong_password() {
-        let provider =
-            MockLdapProvider::new("{user}@corp.example.com").with_user("bob", "correct", vec![]);
-
-        let dn = provider.build_bind_dn("bob");
-        let err = provider.verify_bind("bob", &dn, "wrong").await.unwrap_err();
-        assert!(matches!(err, LdapError::InvalidCredentials));
-    }
-
-    /// An empty password is an unauthenticated bind (RFC 4513 §5.1.2), which a
-    /// permissive directory answers with rc=0 for any known DN; the provider
-    /// refuses it before connecting, and so does the mock.
-    #[tokio::test]
-    async fn empty_password_is_refused_as_an_unauthenticated_bind() {
-        let provider =
-            MockLdapProvider::new("{user}@corp.example.com").with_user("alice", "", vec![]);
-        let dn = provider.build_bind_dn("alice");
-        let err = provider.verify_bind("alice", &dn, "").await.unwrap_err();
-        assert!(matches!(err, LdapError::InvalidCredentials));
-    }
-
-    /// A directory that accepts the socket and then never answers the bind
-    /// ends in `Timeout` after the configured bound; it used to hold the
-    /// login open for as long as the peer cared to stay silent.
-    #[tokio::test]
-    async fn a_directory_that_goes_quiet_after_connecting_times_out() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ldap://{}", listener.local_addr().unwrap());
-        // Accept and hold the socket open without ever replying.
-        let _quiet = tokio::spawn(async move {
-            let held = listener.accept().await;
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            drop(held);
-        });
-        let provider = LdapProviderConfig::new(url, "uid={user},dc=example")
-            .with_timeout(Duration::from_millis(300));
-
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            provider.verify_bind("alice", "uid=alice,dc=example", "secret"),
-        )
-        .await
-        .expect("verify_bind must give up by itself, not hang");
-        assert!(matches!(outcome, Err(LdapError::Timeout)), "{outcome:?}");
-    }
-
-    #[tokio::test]
-    async fn mock_rejects_unknown_user() {
-        let provider = MockLdapProvider::new("{user}@corp.example.com");
-
-        let dn = provider.build_bind_dn("nobody");
-        let err = provider
-            .verify_bind("nobody", &dn, "anything")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, LdapError::InvalidCredentials));
-    }
-
-    #[test]
-    fn ad_upn_template() {
-        let provider = MockLdapProvider::new("{user}@corp.example.com");
-        assert_eq!(provider.build_bind_dn("alice"), "alice@corp.example.com");
-    }
-
-    #[test]
-    fn openldap_dn_template() {
-        let provider = MockLdapProvider::new("uid={user},ou=people,dc=example,dc=com");
-        assert_eq!(
-            provider.build_bind_dn("bob"),
-            "uid=bob,ou=people,dc=example,dc=com"
-        );
-    }
-
-    #[test]
-    fn ldap_dn_escape_passes_through_plain_ascii() {
-        assert_eq!(ldap_dn_escape("alice"), "alice");
-        assert_eq!(ldap_dn_escape("user.name_99"), "user.name_99");
-    }
-
-    #[test]
-    fn ldap_dn_escape_handles_null_byte() {
-        assert_eq!(ldap_dn_escape("a\0b"), "a\\00b");
-    }
-
-    #[test]
-    fn ldap_dn_escape_handles_dn_special_chars() {
-        for (input, expected) in [
-            ("a\"b", "a\\\"b"),
-            ("a+b", "a\\+b"),
-            ("a,b", "a\\,b"),
-            ("a;b", "a\\;b"),
-            ("a<b", "a\\<b"),
-            ("a>b", "a\\>b"),
-            ("a\\b", "a\\\\b"),
-        ] {
-            assert_eq!(ldap_dn_escape(input), expected, "input={input:?}");
-        }
-    }
-
-    #[test]
-    fn ldap_dn_escape_hash_only_at_start_of_dn() {
-        assert_eq!(ldap_dn_escape("#alice"), "\\#alice");
-        assert_eq!(ldap_dn_escape("a#b"), "a#b");
-        assert_eq!(ldap_dn_escape("alice#"), "alice#");
-    }
-
-    #[test]
-    fn ldap_dn_escape_space_at_dn_boundary() {
-        // Leading/trailing spaces use the `\ ` form (line 437 match arm).
-        assert_eq!(ldap_dn_escape(" alice"), "\\ alice");
-        assert_eq!(ldap_dn_escape("alice "), "alice\\ ");
-        assert_eq!(ldap_dn_escape(" "), "\\ ");
-        // Interior spaces don't hit the boundary arm; 0x20 is below the
-        // 0x21..=0x7E printable range, so they hex-escape via the fallback.
-        assert_eq!(ldap_dn_escape("a b"), "a\\20b");
-    }
-
-    #[test]
-    fn ldap_dn_escape_non_ascii_hex_escapes() {
-        assert_eq!(ldap_dn_escape("ü"), "\\c3\\bc");
-    }
-
-    #[test]
-    fn ldap_provider_config_build_bind_dn_substitutes_user() {
-        let cfg = LdapProviderConfig::new(
-            "ldap://localhost:389",
-            "uid={user},ou=people,dc=example,dc=com",
-        );
-        assert_eq!(
-            cfg.build_bind_dn("alice"),
-            "uid=alice,ou=people,dc=example,dc=com"
-        );
-    }
-
-    #[test]
-    fn ldap_provider_config_build_bind_dn_escapes_user() {
-        let cfg = LdapProviderConfig::new("ldap://localhost:389", "uid={user},ou=people");
-        assert_eq!(cfg.build_bind_dn("a,b"), "uid=a\\,b,ou=people");
-    }
-
-    #[test]
-    fn ldap_filter_escape_special_chars() {
-        assert_eq!(ldap_filter_escape("alice"), "alice");
-        assert_eq!(ldap_filter_escape("*)(|(*)"), "\\2a\\29\\28|\\28\\2a\\29");
-        assert_eq!(ldap_filter_escape("user\\name"), "user\\5cname");
-        assert_eq!(ldap_filter_escape("a\0b"), "a\\00b");
-        // Control characters must be escaped.
-        assert_eq!(ldap_filter_escape("a\tb"), "a\\09b");
-        assert_eq!(ldap_filter_escape("a\nb"), "a\\0ab");
-        assert_eq!(ldap_filter_escape("a\rb"), "a\\0db");
-        // High-bit bytes (UTF-8 multi-byte) must be escaped.
-        assert_eq!(ldap_filter_escape("ü"), "\\c3\\bc");
-    }
-}
+mod tests;

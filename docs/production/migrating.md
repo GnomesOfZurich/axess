@@ -9,6 +9,274 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.12.0 to 0.13.0
+
+A security release. Compile errors first, then storage, then behaviour.
+
+- **`IdentityAuthnLog` requires `failed_attempts(&UserId) -> (u32,
+  Option<DateTime<Utc>>)`** (`not all trait items implemented`). Return the
+  failure count and the time of the last failure; `record_failed_attempt` must
+  now store that time and `reset_failed_attempts` clear it. The lockout is
+  derived from it at every gate, so a log that forgets the time locks nobody.
+- **`LocalIdpKeyStore` requires `retire(&self, key_id) -> Result<bool, _>`.**
+  Remove the historical key and answer whether one was there.
+- **`DeviceStore::record_sighting` returns `Result<DeviceTrustLevel, _>`**
+  (`mismatched types` in an implementor). Return the row's level; `Revoked`
+  means the row was left as it was.
+- **`RefreshToken` has `revoked_reason: Option<RevocationReason>` and
+  `revoked_at`; `RefreshTokenConfig` has `max_lifetime` and `reuse_grace`**
+  (`missing fields` in a struct literal: add `..Default::default()` or the two
+  `None`s). A third-party `RefreshTokenStore` persists both new fields; the
+  sqlite example ships the migration. A row without them reads as a rotated
+  token, so reuse still revokes the family.
+- **`RefreshTokenStore::revoke_device_tokens`** has a default body answering
+  `DeviceTokenRevocation::Unsupported`; implement it to let
+  `revoke_device` and `CascadingRefreshStore` reach your tokens.
+- **`RateLimitConfig` has `rng`; `RateLimitLoginIdentifier` is a struct**
+  (`RateLimitLoginIdentifier(x)` no longer compiles: use `new` or
+  `new_in_tenant`).
+- **`CsrfToken` is no longer a tuple struct**: build one with `CsrfToken::new`
+  and read it with `as_str` or `Display`.
+- **`refresh_oauth_token(provider, token, expected_subject, original_nonce)`
+  returns `RefreshOutcome`**; read `id_token_claims` as an `Option`. An
+  `OAuthProvider` implementor changes `refresh_token` and
+  `refresh_token_for_subject` the same way.
+- **`fetch_userinfo(provider, access_token, expected_subject)`.**
+- **`generate_dpop_proof(provider, &DpopKey, ..)`** under `fapi`: make one key
+  with `AuthnService::new_dpop_key` (or `DpopKey::from_seed`) and keep it for
+  the session; the thumbprint must stay the same across the proofs.
+- **`OutboundOAuthClient::new` returns `Result`**; so does `SessionLayer::try_new`
+  and `SessionCrypto::try_new` if you move to them (the infallible
+  constructors stay and log a constant key).
+- **`JtiLog::new(capacity)`**; **`BearerIssuerConfig::new(issuer, audience)`**
+  requires the audience (`with_extra_claims` for the rest).
+- **`require_authz!` refuses a resource id with two path placeholders** at
+  compile time. Use one placeholder, or `{$tenant}` / `{$user}` from the
+  session for the qualifying part.
+- **Exhaustive matches** add `RefreshError::{ConcurrentRefresh, DeviceRevoked,
+  DeviceStore}`, `SqlDeviceStoreError::Contended`, `KdfError::Busy`,
+  `IssuanceError::{MissingAudience, RetireCurrentKey, DuplicateKeyId}`,
+  `LocalIdpKeyError::{UnsupportedAlgorithm, WeakKey}`,
+  `OAuthError::SubjectMismatch`, `OAuthClientError::{InsecureEndpoint,
+  ClientBuild}`.
+
+- **`TotpConfig::secret` and `HotpConfig::secret` are a `FactorSecret`**
+  (`mismatched types: expected FactorSecret, found ZeroizedString` in a struct
+  literal). Add `.into()`: `secret: ZeroizedString::new(text).into()`. Code that
+  read the field as a string uses `secret.plain()` (`Option<&str>`). Stored rows
+  need no change: a plain secret still serialises as the bare string.
+
+- **`begin_fido2_registration`, `finish_fido2_registration` and
+  `delete_fido2_credential` answer `NoFlow` unless the session is
+  `Authenticated` as the user passed in** (or pending signup for them). A
+  handler that enrolled a passkey from a guest or another user's session now
+  fails; pass the signed-in user's own session. `delete_fido2_credential`
+  gains a `session: &AuthSession` second parameter
+  (`this method takes 3 arguments but 4 were supplied`).
+- **`IdentityAuthnLog` requires `reserve_attempt(&UserId, &LockoutPolicy) ->
+  Result<Option<u32>, _>` and `release_attempt(&UserId)`** (`not all trait items
+  implemented`). `reserve_attempt` must test and increment in one atomic step
+  (`UPDATE ... SET n = n + 1 WHERE ... RETURNING n`) and store the time of the
+  attempt as `record_failed_attempt` does. The count is fresh (replaced by one)
+  when there is no failure, the last is older than `attempt_window`, or a timed
+  lockout (`duration`) has run out; otherwise the guess is granted while the
+  count is below `effective_max_attempts()` and refused with `None`, changing
+  nothing, once it is not. `release_attempt` decrements without going below zero
+  and clears the failure time at zero. The sqlite example and the testing mock
+  show both. A store that wraps another forwards both.
+- **`refresh_session` is deprecated** (a warning, an error under
+  `-D warnings`): call `refresh_session_with_status_check`, passing a predicate
+  that reads the account's status.
+
+- **`OAuthClaims` has a `dpop_key` field.** A struct literal adds `dpop_key: None`; claims from `finish_oauth_login` on a DPoP provider carry the key to keep with the tokens.
+- **`FapiConfig` has `allowed_id_token_algs`.** Construct it with `..FapiConfig::default()`. A FAPI provider now accepts ID tokens signed with `PS256`, `ES256` or `EdDSA` only; an IdP that signs with `RS256` needs the list widened on purpose.
+
+
+
+- **`SessionStore` requires `update_if_revision`** (`not all trait items
+  implemented`), and **`SessionData` has `revision` and `touched_at`**
+  (`missing fields` in a struct literal: add `..Default::default()`). Replace
+  the row only while the stored data still carries the expected revision, and
+  answer `ConditionalUpdate::Conflict` when it does not and `Gone` when
+  there is no live row. Compare and write in one atomic step; an
+  `UPDATE ... WHERE` naming the bytes you compared does it in SQL.
+- **`SessionRevoker` methods return `Result<(), RevocationError>`.** An
+  implementor returns `Ok(())` where it returned nothing; a caller that
+  ignored the result handles it (`must_use`).
+- **`invalidate_user_sessions` and `invalidate_session` live on
+  `RequestAuthnService` and take an `Actor`.** `invalidate_user_sessions_as(id,
+  Some(&admin))` becomes `invalidate_user_sessions(id, Actor::Admin(&admin))`,
+  and `None` becomes `Actor::System`; the unattributed `AuthnService` methods
+  are gone, so derive a request-scoped handle with `with_audit_context`.
+  A registry that fails is now an `Err` instead of a logged warning.
+- **`suspend_user` and `activate_user` take an `Actor` and the expected
+  tenant.** `suspend_user_by_in_tenant(a, u, t, d)` is
+  `suspend_user(Actor::Admin(a), u, t, d)`; a platform operator that meant "any
+  tenant" calls `suspend_user_across_tenants`. `begin_impersonation_in_tenant`
+  is `begin_impersonation`, and the old unscoped `begin_impersonation` is
+  `begin_impersonation_across_tenants`.
+
+- **`ServiceSecretLayer::signed` returns a `Result` and needs an audience**
+  (`mismatched types` at the call, then `ServiceSecretError::MissingAudience` at
+  run time). Name each route as its recipient,
+  `SignedRequests::default().audience("billing")`, and have callers sign for
+  that name with `ServiceSigner::sign_for("billing", ..)`; `ServiceSigner::sign`
+  is gone. Callers that cannot move at once keep working through
+  `.accept_unaddressed_until(instant)` on the route, checked against its clock;
+  a `v1` signature names no recipient, so inside the window it still replays
+  against another service sharing the secret, so give each recipient its own
+  secret as well.
+
+Storage.
+
+- **Refresh tokens**: two nullable columns, `revoked_reason` and `revoked_at`
+  (the sqlite example's migration shows the shape). No backfill.
+- **Devices**: `idx_devices_fingerprint` is replaced by
+  `idx_devices_fingerprint_seen`, plus `idx_devices_sweep` and
+  `idx_devices_revoked_at`. `init_schema` does it on SQLite and Postgres; on
+  MySQL run the `ALTER TABLE` in the `MysqlDeviceStore` docs.
+- **Device rows and the envelope key**: a row sealed under the previous key
+  is re-sealed by the read that finds it, and a row nobody reads keeps the old
+  key, so keep the previous key for the longest device retention you
+  configured (see the operations guide), not for one session TTL.
+- **Delegated credentials** are written in envelope `v2`; `v1` rows are still
+  read. A release that reads only `v1` needs every row re-saved first.
+- **Entity caches**: every key changes (the Valkey key gains a segment), so
+  cached authz entities are missed once after the upgrade and reloaded.
+- **Audit archive sidecars** carry `{batch id} {digest}`; old lines still match.
+
+Behaviour. Read these.
+
+- **The session cookie is `__Host-axess.sid`** when `Secure` is on and the path
+  is `/`. Every client with a cookie named `axess.sid` signs in again once.
+  Name the cookie yourself to keep the old name. The layer now **panics at
+  `Layer::layer`** on a `__Host-` or `__Secure-` name without `Secure`, a
+  `__Host-` name off `/`, a zero TTL, an invalid name or `SameSite=None`
+  without `Secure`; so does `CsrfLayer::new`.
+- **A request without a session cookie stores nothing** and gets no cookie
+  until a handler uses the CSRF token or the session. A single-page app that
+  reads the CSRF cookie before any handler touches the token needs
+  `CsrfConfig::mint_on_every_request(true)`.
+- **Lockout is enforced from the stored counter**: an account at
+  `max_attempts` answers `Locked` to a correct credential until `duration`
+  after the last failure. `max_attempts == 0` means five (was: lock on the
+  first failure). A `NoopAuthnLog` locks nobody.
+- **A login flow expires**: `verify_factor` and `prepare_factor` answer
+  `NoFlow` for a flow older than `flow_ttl` (ten minutes), one begun against a
+  password or method that has since changed, or one begun under 0.12.0. A
+  session mid-login at the upgrade signs in again.
+- **`begin_login` answers `InvalidCredentials`** for a known account that is
+  not active and not locked (was `Err(NotActive)`); the audit row keeps the
+  reason. **`finish_discoverable_login` returns `FactorOutcome`** and follows
+  the user's method, so a passkey alone no longer signs in a user whose method
+  needs more.
+- **`StepUpPolicy::default()` asks for a factor on every trust level**,
+  `Trusted` included; set `trusted` to an empty list to keep the old
+  behaviour. A request with no resolved device is judged as `Unknown`.
+- **A token revoked by a logout, a user-wide revocation, a cap eviction or an
+  earlier family revocation no longer revokes its family on reuse**; only a
+  token rotated out does. `reuse_grace` is zero, so parallel refreshes by one
+  client are still treated as theft until you set a window.
+- **IPv4-mapped IPv6 clients** (`::ffff:10.0.0.1`) are seen as IPv4: they
+  match IPv4 proxy entries, and each registers as a new device once.
+- **`LocalIdp` mints tokens for at most one hour and refuses a mint without an
+  audience**; `without_max_ttl()` and `allow_no_audience()` opt out. Generated
+  keys carry a thumbprint `kid`, so two generated keys rotate without renaming.
+- **LDAP over plain `ldap://` to a non-loopback host is refused** unless
+  `allow_cleartext()` is called.
+- **`JwtSvidResolver` refuses a verifier that pins no `iss` or no `aud`**, and
+  `verify_jwt` refuses `HS*` even when allowlisted.
+- **An empty post-logout redirect allowlist forwards nothing.** Configure
+  `with_allowed_post_logout_redirect_uris`.
+- **A back-channel logout token with `sid` and `sub` ends only the `sid`
+  session**; a full `jti` log answers 503 and the IdP retries.
+- **The bearer 401 body is fixed** at `{"error":"invalid_token"}`; the reason
+  moved to the debug log.
+- **`x-ratelimit-remaining` is sent only for per-user buckets**, and a /24 or
+  /48 holds at most 1,024 buckets before clients share one.
+- **The KDF executor answers 500 (`KdfError::Busy`)** past `with_max_queue`
+  or `with_acquire_timeout`; there is no 503 variant yet.
+- **The session layer, given a registry (`with_registry`), treats a session
+  the registry no longer holds as revoked**: its row is deleted and the
+  request runs as a guest. Any path that authenticates a session without
+  registering it is caught by this; register, or leave the registry off.
+- **Rotating the refresh-token pepper no longer logs everyone out.** Move the
+  old `RefreshTokenConfig::hash_pepper` to `previous_hash_pepper` and set the
+  new one as `hash_pepper`. Tokens still stored under the old pepper are found
+  by the retry and replaced under the new one on their next refresh (even with
+  `rotation: false`). Clear `previous_hash_pepper` after one `ttl`. Moving from
+  no pepper to a pepper still invalidates the tokens. The struct has a new
+  public field, so a literal without `..Default::default()` needs
+  `previous_hash_pepper: None`.
+- **`WorkloadResolver` needs a verifier with `with_issuer` and `with_audience`.**
+  A verifier that pins either loosely now resolves to `NotAuthenticated`.
+  Add the missing pin; `allow_any_audience` does not satisfy the resolver.
+- **Sealing OTP secrets at rest is opt in, and turning it on needs a plan for the
+  rows you already have.** Build a `FactorSecretCipher` from a 32-byte random
+  key, pass it to `AuthnServiceBuilder::with_factor_secret_cipher`, and seal new
+  enrolments with `FactorSecretCipher::seal_config` before `save_factor`.
+  Without a cipher nothing changes. With one, the default policy refuses a
+  secret still stored in plain text (the login fails with an internal error that
+  names the cause), so set `with_plain_secrets(LegacyBlobs::AcceptUntil(cutoff))`
+  for as long as plain rows remain: each is sealed by its owner's next
+  successful login, with no change to your `FactorStore`. A sealed secret read by
+  a service with no cipher fails the same way, so deploy the cipher to every
+  replica before the first row is sealed. Keep the key outside the database and
+  see "Where the OTP secret sits" in the password and TOTP guide for rotation.
+- **`axess_core::session::LegacyBlobs` and the core crate's `aes-gcm` dependency no
+  longer depend on a storage feature.** Nothing to change unless you named
+  `aes-gcm` through a core-crate feature.
+- **A password hash made under older Argon2 parameters is replaced at the next
+  successful login.** Nothing to do; the row's `hash` changes once. A store that
+  keeps a history of hashes or audits factor writes will see the update.
+- **Opt in** to the new protections: `with_hidden_signup_conflicts` (signup
+  answers `Started` for a taken identifier; read `session.user_id()` after it to
+  tell the cases apart, and answer the client the same either way),
+  `with_password_reset_cooldown` and `OAuthProviderConfig::with_required_logout_typ`.
+- **`with_fapi` returns a working provider** (it returned an error in the first 0.13.0 pass). Against a DPoP provider, refresh with `refresh_oauth_token_with_key(.., Some(&key))` and call userinfo with `fetch_userinfo_with_key`, passing `claims.dpop_key`; the plain forms refuse. For a provider that requires JARM, finish the callback with `finish_oauth_login_jarm(response, &session)`.
+- **`JwtVerifier::verify` needs an audience decision.** Add `.with_audience("...")`, or `.allow_any_audience()` where the issuer is yours alone; without either every `verify` fails.
+- **Back-channel logout is audited only when you ask.** `BackChannelLogoutHandler::new(..).with_audit(authn.backchannel_logout_audit())`.
+- **`AuthSession::user_id` and `tenant_id` are `None` until the login
+  completes.** A handler that used them to read the user of a signup or a
+  factor step in flight calls `pending_user_id` and `pending_tenant_id`
+  instead. A handler that authorizes on them needs no change; it no longer
+  sees a half-logged-in user.
+- **Devices are recognised by a cookie.** Browsers get a `__Host-axess_device`
+  cookie at their first authenticated request after the upgrade, and a new
+  `Unknown` device with it; trust earned on a device row of 0.12 or earlier
+  has to be earned once more, and the old rows age out in the sweep. The
+  cookie needs HTTPS; on plain HTTP in development pass
+  `DeviceCookieConfig::insecure_for_local_development()` to
+  `LifecycleDeviceResolver::with_cookie`. A `DeviceResolver` of your own is
+  unchanged; to issue the cookie, leave its `Set-Cookie` value in the
+  `DeviceCookieSlot` the session layer puts in the request extensions.
+- **A guest has no device**, so step-up for a login in flight sees `Unknown`
+  unless the browser presents a valid device cookie.
+- **Sealed rows are re-sealed once.** Every live session and device row is
+  rewritten the first time it is read after the upgrade (one extra write
+  each). Keep the previous key configured as before.
+- **Refresh tokens bind a digest of `device_info`.** Pass the keyed
+  fingerprint hex as before; nothing to change. Set `hash_pepper` so the
+  digest is keyed.
+- **`with_reseal_on_load` is gone from `EncryptedDelegatedCredentialStore`**;
+  re-sealing is on, and needs `save_if_unchanged` on the inner store. A
+  custom `DelegatedCredentialStore` that wants its rows re-sealed implements
+  it with a conditional write; one that does not is left as it is.
+- **MySQL**: no schema change. The sweep and the Valkey set are code only.
+- **Becoming authenticated clears `custom`.** A cart, a locale or a
+  post-login destination stashed before the login is gone after it. List the
+  keys that must survive with
+  `AuthnServiceBuilder::with_preserved_custom_keys(["post_login_to"])`;
+  names match exactly.
+- **`AuthSession::clear` rotates the session id.** Code that called `clear`
+  and then `regenerate` can drop the second call.
+- **`take_custom` can return `None` where it returned a value**, when another
+  request took it first or the store cannot be reached. Start the ceremony
+  again.
+- **A read-only request past half the TTL writes the session once** and
+  re-issues the cookie. A deployment that counted session writes sees one per
+  half TTL per active session.
+
 ## 0.11.0 to 0.12.0
 
 A security release. Compile errors first, then storage, then behaviour.
@@ -47,14 +315,24 @@ A security release. Compile errors first, then storage, then behaviour.
 
 Storage. No `ALTER` is needed in any backend.
 
-- Session and device rows written by 0.11.0 read as before and are re-sealed
-  to their row the first time they are read. Device blobs use a new format
-  (`AXD\x02`, `AXR\x02`) that 0.11.0 cannot open, so roll back only with a
-  backup taken before the upgrade.
-- To refuse legacy blobs, first let every row be read or written once, then
-  set `SessionCrypto::with_legacy_blobs(LegacyBlobs::Reject)` (and the same
-  method on `ValkeySessionStore` and `ValkeyDeviceStore`). An unbound blob
-  then fails to open instead of opening under any row id.
+- Rows written before row binding (no marker) and device rows written by
+  0.11.0 (`AXD\x01`, `AXR\x01`) are refused by default: a session or device
+  that was last written by such a release reads as missing, and the user signs
+  in again. To keep them readable while they age out, set
+  `SessionCrypto::with_legacy_blobs(LegacyBlobs::AcceptUntil(cutoff))` (and the
+  same method on `ValkeySessionStore` and `ValkeyDeviceStore`), with a cutoff
+  one session lifetime away for sessions and as far as you want to keep old
+  devices for devices. Within the window a stale row is re-sealed to its row the
+  first time it is read; after the cutoff it is refused. `LegacyBlobs::Accept`
+  has no cutoff and is best avoided: an unbound blob opens under any row id.
+  Inject the clock the cutoff is checked against with
+  `SessionCrypto::with_clock`.
+- A Valkey device row read through a legacy blob is also refused when the ids
+  inside it differ from the key it was stored under. Session data and SQL
+  device bindings carry no ids of their own, so the cutoff is their only
+  protection.
+- Device blobs use a format (`AXD\x02`, `AXR\x02`) that 0.11.0 cannot open,
+  so roll back only with a backup taken before the upgrade.
 - Valkey: the device fingerprint index moves from the `dev:fp` string key to
   the `dev:fps` set, one device at a time, on the device's next write. Until
   then the old key is still read. Re-sealing needs `SET ... KEEPTTL` (Redis
@@ -166,7 +444,8 @@ Compile errors first, then schema, then behaviour.
   subject-registry entries of your sessions are forgotten only on logout.
 - **`decide_step_up` is gone.** Call `decide_step_up_for_user(device, user,
   policy)`.
-- **`SessionCrypto::encrypt` and `decrypt` warn as deprecated.** Use
+- **`SessionCrypto::encrypt` and `decrypt` are gone.** They sealed with an
+  empty AAD, so the ciphertext was not bound to its row. Use
   `encrypt_with_aad(aad, plaintext)` and `decrypt_with_aad(aad, data)` with
   the row's identity as the AAD.
 
@@ -574,7 +853,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.12", features = ["request-id"] }
+axess = { version = "0.13", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

@@ -163,13 +163,14 @@ impl FactorStore for OurBackend {
         let tenant_str = cols.tenant_id.to_string();
         let user_str = cols.user_id.map(|u| u.to_string());
 
-        sqlx::query(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO factor_configs (id, user_id, tenant_id, kind, config_json, enabled, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'))
-             ON CONFLICT(user_id, tenant_id, kind) DO UPDATE SET
+             ON CONFLICT {} DO UPDATE SET
                  config_json = excluded.config_json,
                  updated_at  = excluded.updated_at",
-        )
+            factor_conflict_target(user_str.is_some())
+        )))
         .bind(&id)
         .bind(&user_str)
         .bind(&tenant_str)
@@ -243,13 +244,14 @@ impl FactorStore for OurBackend {
         let tenant_str = cols.tenant_id.to_string();
         let user_str = cols.user_id.map(|u| u.to_string());
 
-        // One statement, atomic: the UNIQUE(user_id, tenant_id, kind)
-        // constraint decides the winner of two concurrent first writes.
-        let res = sqlx::query(
+        // One statement, atomic: the unique index for the scope
+        // decides the winner of two concurrent first writes.
+        let res = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO factor_configs (id, user_id, tenant_id, kind, config_json, enabled, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'))
-             ON CONFLICT(user_id, tenant_id, kind) DO NOTHING",
-        )
+             ON CONFLICT {} DO NOTHING",
+            factor_conflict_target(user_str.is_some())
+        )))
         .bind(&id)
         .bind(&user_str)
         .bind(&tenant_str)
@@ -332,13 +334,18 @@ impl FactorStore for OurBackend {
 
         // Idempotent on (user_id, tenant_id, name): re-saving a method
         // with the same scope + name updates steps / re-enables the row.
-        sqlx::query(
+        let target = if user_id.is_some() {
+            "(user_id, tenant_id, name)"
+        } else {
+            "(tenant_id, name) WHERE user_id IS NULL"
+        };
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO auth_methods (id, name, steps_json, user_id, tenant_id, enabled)
              VALUES (?1, ?2, ?3, ?4, ?5, 1)
-             ON CONFLICT(user_id, tenant_id, name) DO UPDATE SET
+             ON CONFLICT {target} DO UPDATE SET
                  steps_json = excluded.steps_json,
-                 enabled    = 1",
-        )
+                 enabled    = 1"
+        )))
         .bind(&id)
         .bind(method.name.as_ref())
         .bind(&steps_json)
@@ -424,5 +431,17 @@ fn decode_scope(tenant_id: &str, user_id: Option<&str>) -> Result<AuthnScope, Ba
         }
         None if tenant.is_system() => Ok(AuthnScope::System),
         None => Ok(AuthnScope::Tenant(tenant)),
+    }
+}
+
+/// The `ON CONFLICT` target that names the unique index covering `scope`.
+/// Tenant and system rows store `user_id` NULL, which the table-level
+/// `UNIQUE(user_id, tenant_id, kind)` never matches (SQLite treats NULLs as
+/// distinct), so they conflict on a partial index instead.
+fn factor_conflict_target(has_user: bool) -> &'static str {
+    if has_user {
+        "(user_id, tenant_id, kind)"
+    } else {
+        "(tenant_id, kind) WHERE user_id IS NULL"
     }
 }

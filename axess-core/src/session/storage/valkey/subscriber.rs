@@ -16,9 +16,12 @@
 //! registry draws it from its injected random source), so the checks do not
 //! land on the server in one instant.
 //!
-//! A connection that has died is not reused: the next watcher to join finds
-//! it disconnected, opens a new one and flags the watchers already waiting for
-//! a recheck, because they missed whatever was published meanwhile.
+//! A connection that has died is not reused. Losing a connection, whether the
+//! dispatcher saw it close or a join found it dead, tells every waiting
+//! watcher at once and records that publications may have been missed. The
+//! next join that subscribes a new connection flags the waiting watchers for
+//! a recheck and clears the record, so a loss is never forgotten between the
+//! dispatcher noticing it and a successful reconnect.
 
 use fred::prelude::*;
 use fred::types::Message;
@@ -104,6 +107,34 @@ impl Slot {
 struct Connection {
     client: Client,
     dispatcher: JoinHandle<()>,
+    /// Which connection this is, so a joiner that saw one fail can tell a
+    /// replacement made meanwhile from the one it probed.
+    generation: u64,
+}
+
+/// How long opening and subscribing a connection may each take.
+const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Spacing of reconnection attempts after failures: it doubles from the
+/// first interval up to the last.
+const BACKOFF_FIRST_SECS: i64 = 1;
+const BACKOFF_MAX_SECS: i64 = 30;
+
+/// Failure backoff on the injected clock.
+#[derive(Default, Debug, Clone, Copy)]
+struct Backoff {
+    failures: u32,
+    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Backoff {
+    /// Record a failed attempt at `now` and set the earliest next attempt.
+    fn failed(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.failures = self.failures.saturating_add(1);
+        let shift = self.failures.saturating_sub(1).min(16);
+        let secs = (BACKOFF_FIRST_SECS << shift).min(BACKOFF_MAX_SECS);
+        self.retry_at = Some(now + chrono::Duration::seconds(secs));
+    }
 }
 
 /// How long a subscriber connection gets to answer a `PING` before it is
@@ -137,6 +168,14 @@ struct State {
     connection: Option<Connection>,
     /// Every watcher's slot, under the user and session channel it watches.
     routes: HashMap<String, Vec<Arc<Slot>>>,
+    /// Publications may have been missed since the last connection ended:
+    /// set when a connection is lost, cleared when a new one is subscribed
+    /// and the waiting watchers have been flagged for a recheck.
+    lost: bool,
+    /// Generation of the current connection.
+    generation: u64,
+    /// Holds off reconnection after failures.
+    backoff: Backoff,
 }
 
 /// The shared subscriber of one registry and its clones.
@@ -277,9 +316,7 @@ impl SharedSubscriber {
         if let Some(connection) = dead {
             quit_in_background(connection.client);
         }
-        for slot in self.all_slots() {
-            slot.wake(&slot.closed);
-        }
+        self.connection_lost();
     }
 
     /// Join the shared connection, opening and subscribing it first if no
@@ -287,62 +324,136 @@ impl SharedSubscriber {
     /// is the registry's client, cloned for the new connection; `prefix` is
     /// the registry prefix whose `revoked-session:` and `revoked-user:`
     /// channels are subscribed; `channels` are this watcher's user and
-    /// session channels.
+    /// session channels; `now` is the registry's injected clock reading, used
+    /// only to space reconnection attempts after a failure.
     ///
-    /// `None` when the connection cannot be opened or subscribed; the caller
-    /// then falls back to the next request's validity check.
+    /// The health probe of an existing connection runs outside the setup
+    /// mutex, so joins onto a healthy connection do not queue behind each
+    /// other. `None` when the connection cannot be opened or subscribed (each
+    /// step is bounded by [`SETUP_TIMEOUT`], and a failure holds off the next
+    /// attempt for a growing interval); the waiting watchers have then been
+    /// told the connection is gone, and the caller falls back to polling the
+    /// registry.
     pub(super) async fn join(
         self: &Arc<Self>,
         base: &Client,
         prefix: &str,
         channels: [String; 2],
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Option<Watch> {
-        let _connecting = self.connecting.lock().await;
         let hold = self.register(channels);
         let slot = hold.slot.clone();
 
         // The existing connection is reused only if its dispatcher still runs
         // and the connection answers.
-        let existing = self
-            .lock()
-            .connection
-            .as_ref()
-            .filter(|c| !c.dispatcher.is_finished())
-            .map(|c| c.client.clone());
-        if let Some(client) = existing
-            && answers_ping(&client).await
+        let existing = self.current_connection();
+        if let Some((client, _)) = &existing
+            && answers_ping(client).await
         {
             return Some(Watch { _hold: hold, slot });
         }
-        let replaced = self.lock().connection.take();
-        let had_dead_connection = replaced.is_some();
-        if let Some(dead) = replaced {
-            dead.shut_down();
+
+        let _connecting = self.connecting.lock().await;
+        // Another joiner may have replaced the connection while this one was
+        // probing or waiting; trust a connection that is not the one that
+        // failed the probe.
+        if let Some((_, generation)) = self.current_connection()
+            && existing
+                .as_ref()
+                .is_none_or(|(_, seen)| *seen != generation)
+        {
+            return Some(Watch { _hold: hold, slot });
+        }
+        if let Some(until) = self.lock().backoff.retry_at
+            && now < until
+        {
+            return None;
         }
 
+        let replaced = self.lock().connection.take();
+        if let Some(dead) = replaced {
+            dead.shut_down();
+            self.connection_lost();
+        }
+
+        match self.open(base, prefix).await {
+            Some(connection) => {
+                let generation = {
+                    let mut state = self.lock();
+                    state.generation += 1;
+                    state.backoff = Backoff::default();
+                    state.generation
+                };
+                self.lock().connection = Some(Connection {
+                    generation,
+                    ..connection
+                });
+                self.finish_reconnect();
+                Some(Watch { _hold: hold, slot })
+            }
+            None => {
+                self.lock().backoff.failed(now);
+                // Whatever was published while there is no connection is
+                // missed, so the next successful connection rechecks.
+                self.connection_lost();
+                None
+            }
+        }
+    }
+
+    /// The live connection's client and generation, if its dispatcher runs.
+    fn current_connection(&self) -> Option<(Client, u64)> {
+        self.lock()
+            .connection
+            .as_ref()
+            .filter(|c| !c.dispatcher.is_finished())
+            .map(|c| (c.client.clone(), c.generation))
+    }
+
+    /// Open a subscriber connection and subscribe it, each step bounded.
+    async fn open(self: &Arc<Self>, base: &Client, prefix: &str) -> Option<Connection> {
         let subscriber = base.clone_new();
         let mut pending = QuitOnDrop(Some(subscriber.clone()));
-        subscriber.init().await.ok()?;
+        tokio::time::timeout(SETUP_TIMEOUT, subscriber.init())
+            .await
+            .ok()?
+            .ok()?;
         let messages = subscriber.message_rx();
         let escaped = escape_glob(prefix);
         let patterns = vec![
             format!("{escaped}:revoked-session:*"),
             format!("{escaped}:revoked-user:*"),
         ];
-        subscriber.psubscribe(patterns).await.ok()?;
-
+        tokio::time::timeout(SETUP_TIMEOUT, subscriber.psubscribe(patterns))
+            .await
+            .ok()?
+            .ok()?;
         let dispatcher = tokio::spawn(dispatch(messages, Arc::downgrade(self)));
         pending.0 = None;
-        self.lock().connection = Some(Connection {
+        Some(Connection {
             client: subscriber,
             dispatcher,
-        });
-        if had_dead_connection {
-            // The watchers already waiting missed what was published while
-            // there was no connection.
+            generation: 0,
+        })
+    }
+
+    /// A connection existed and is gone, or could not be replaced: remember
+    /// that publications were missed, and tell every watcher now so none
+    /// stays blocked on a connection that will not come back.
+    fn connection_lost(&self) {
+        self.lock().lost = true;
+        for slot in self.all_slots() {
+            slot.wake(&slot.closed);
+        }
+    }
+
+    /// A connection is subscribed again. If publications were missed while
+    /// there was none, every waiting watcher is flagged for a recheck, once.
+    fn finish_reconnect(&self) {
+        let lost = std::mem::take(&mut self.lock().lost);
+        if lost {
             self.dispatch_lag();
         }
-        Some(Watch { _hold: hold, slot })
     }
 }
 

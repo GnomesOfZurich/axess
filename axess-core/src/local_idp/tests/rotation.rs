@@ -39,6 +39,10 @@ impl LocalIdpKeyStore for RotateFailingKeyStore {
         drop(new_current);
         Err(RotateFailure)
     }
+
+    async fn retire(&self, _key_id: &str) -> Result<bool, Self::Error> {
+        Err(RotateFailure)
+    }
 }
 
 #[tokio::test]
@@ -116,7 +120,11 @@ async fn rotate_signing_key_propagates_key_store_error_without_mutating_state() 
 
     let now = Utc::now();
     let token = idp
-        .mint(&MintClaims::new("worker-1", now + Duration::hours(1)).with_issued_at(now))
+        .mint(
+            &MintClaims::new("worker-1", now + Duration::hours(1))
+                .with_audience("https://api")
+                .with_issued_at(now),
+        )
         .await
         .expect("mint after failed rotate still works under original key");
     let header = jsonwebtoken::decode_header(&token).expect("decode");
@@ -137,7 +145,9 @@ async fn mint_after_successful_rotation_uses_new_kid() {
     .with_issuance_listener(recorder.clone());
 
     let now = Utc::now();
-    let claims = MintClaims::new("worker-1", now + Duration::hours(1)).with_issued_at(now);
+    let claims = MintClaims::new("worker-1", now + Duration::hours(1))
+        .with_audience("https://api")
+        .with_issued_at(now);
     idp.mint(&claims).await.expect("pre-rotation mint");
     idp.rotate_signing_key(k2).await.expect("rotate");
     idp.mint(&claims).await.expect("post-rotation mint");
@@ -226,7 +236,11 @@ async fn clone_after_rotation_sees_new_state_through_both_handles() {
 
     let now = Utc::now();
     let token = idp_b
-        .mint(&MintClaims::new("worker-1", now + Duration::hours(1)).with_issued_at(now))
+        .mint(
+            &MintClaims::new("worker-1", now + Duration::hours(1))
+                .with_audience("https://api")
+                .with_issued_at(now),
+        )
         .await
         .expect("mint via B");
     let header = jsonwebtoken::decode_header(&token).expect("decode");
@@ -283,4 +297,95 @@ async fn jwks_handle_taken_before_rotation_is_a_snapshot() {
         vec!["rsa-2", "rsa-1"],
         "handle taken after rotation reflects current + historical"
     );
+}
+
+fn es(kid: &str) -> LocalIdpSigningKey {
+    LocalIdpSigningKey::generate_es256().with_key_id(kid)
+}
+
+fn kids(set: &jsonwebtoken::jwk::JwkSet) -> Vec<String> {
+    set.keys
+        .iter()
+        .filter_map(|k| k.common.key_id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn retiring_a_historical_key_removes_it_from_the_jwks_and_the_store() {
+    let store = MemoryLocalIdpKeyStore::with_current(es("k1"));
+    let idp = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load");
+    idp.rotate_signing_key(es("k2")).await.expect("rotate");
+    assert_eq!(kids(&idp.jwks().await), vec!["k2", "k1"]);
+
+    assert!(idp.retire_historical_key("k1").await.expect("retire"));
+    assert_eq!(kids(&idp.jwks().await), vec!["k2"]);
+    assert!(store.load_all().await.expect("load").historical.is_empty());
+
+    // Unknown kid: nothing removed.
+    assert!(!idp.retire_historical_key("k1").await.expect("retire again"));
+}
+
+#[tokio::test]
+async fn the_current_key_cannot_be_retired() {
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(es("k1")),
+    )
+    .await
+    .expect("load");
+    assert!(matches!(
+        idp.retire_historical_key("k1").await,
+        Err(IssuanceError::RetireCurrentKey)
+    ));
+    assert_eq!(kids(&idp.jwks().await), vec!["k1"]);
+}
+
+/// Two replicas over one store, each rotating in turn: the second rotation
+/// is rebuilt from the store, so it keeps the first replica's key in the
+/// JWKS instead of dropping it, and `reload` brings the first replica level.
+#[tokio::test]
+async fn replicas_rotating_in_turn_converge_on_the_stores_key_set() {
+    let store = MemoryLocalIdpKeyStore::with_current(es("k1"));
+    let a = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load a");
+    let b = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load b");
+
+    a.rotate_signing_key(es("ka")).await.expect("a rotates");
+    b.rotate_signing_key(es("kb")).await.expect("b rotates");
+
+    // Without the re-read, b would publish [kb, k1] and lose ka, so tokens
+    // minted by a (kid ka) would not verify against b's JWKS.
+    assert_eq!(kids(&b.jwks().await), vec!["kb", "k1", "ka"]);
+    assert_eq!(kids(&a.jwks().await), vec!["ka", "k1"], "a is behind");
+    a.reload().await.expect("reload");
+    assert_eq!(kids(&a.jwks().await), vec!["kb", "k1", "ka"]);
+}
+
+#[tokio::test]
+async fn rotating_to_a_kid_already_in_the_jwks_is_refused() {
+    let k1 = LocalIdpSigningKey::generate_rsa().with_key_id("same");
+    let k2 = LocalIdpSigningKey::generate_rsa().with_key_id("same");
+    let store = MemoryLocalIdpKeyStore::with_current(k1);
+    let idp = LocalIdp::from_key_store("https://idp.local", store)
+        .await
+        .expect("load");
+
+    let err = idp.rotate_signing_key(k2).await.expect_err("duplicate kid");
+    assert!(matches!(err, IssuanceError::DuplicateKeyId { ref kid } if kid == "same"));
+    assert_eq!(idp.jwks().await.keys.len(), 1, "state is unchanged");
+}
+
+#[test]
+fn generated_keys_get_distinct_kids() {
+    let a = LocalIdpSigningKey::generate_es256();
+    let b = LocalIdpSigningKey::generate_es256();
+    assert_ne!(a.key_id(), b.key_id());
+    let r = LocalIdpSigningKey::generate_rsa();
+    let s = LocalIdpSigningKey::generate_rsa();
+    assert_ne!(r.key_id(), s.key_id());
 }

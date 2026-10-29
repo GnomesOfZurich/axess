@@ -3,7 +3,9 @@
 //! Public surface for adopters that need to verify a JWT against an
 //! externally supplied JWKS (workload identity, federated OIDC, custom
 //! logout flows). Algorithm allowlist excludes symmetric (`HS*`) and
-//! `none` by design.
+//! `none` by design, and [`verify_jwt`] refuses `HS*` even when a caller
+//! puts one in the allowlist. A JWK marked `use: enc` is not a signature key
+//! and is refused.
 //!
 //! # DST
 //!
@@ -46,12 +48,44 @@ pub const ALLOWED_ALGORITHMS: &[Algorithm] = &[
     Algorithm::ES384,
 ];
 
+/// Whether `alg` is an HMAC algorithm (`HS256`, `HS384`, `HS512`).
+fn is_symmetric(alg: Algorithm) -> bool {
+    matches!(alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512)
+}
+
+/// Most bytes of a `kid` that [`JwtError::UnknownKid`] carries.
+pub const MAX_KID_ECHO_BYTES: usize = 128;
+
+/// `kid` cut to [`MAX_KID_ECHO_BYTES`] bytes at a character boundary, with an
+/// ellipsis when anything was dropped.
+fn truncate_kid(kid: &str) -> String {
+    if kid.len() <= MAX_KID_ECHO_BYTES {
+        return kid.to_string();
+    }
+    let mut end = MAX_KID_ECHO_BYTES;
+    while !kid.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &kid[..end])
+}
+
 /// Errors from JWT signature verification.
 ///
 /// Deliberately free of any OAuth types so this module stays reusable
 /// outside the OAuth feature path.
 #[derive(Debug, thiserror::Error)]
 pub enum JwtError {
+    /// The token is longer than [`MAX_JWT_BYTES`](super::claims::MAX_JWT_BYTES).
+    /// Refused before any decoding, so a crafted multi-megabyte token costs
+    /// nothing but its length check.
+    #[error("JWT too large ({len} bytes, max {max})")]
+    TooLarge {
+        /// Length of the token in bytes.
+        len: usize,
+        /// The limit it exceeded.
+        max: usize,
+    },
+
     /// The JWT header could not be decoded.
     #[error("invalid JWT header: {0}")]
     InvalidHeader(String),
@@ -64,7 +98,9 @@ pub enum JwtError {
     #[error("JWT has no `kid` header")]
     MissingKid,
 
-    /// No key in the JWKS matches the JWT's `kid`.
+    /// No key in the JWKS matches the JWT's `kid`. The `kid` is cut to
+    /// [`MAX_KID_ECHO_BYTES`] bytes: it is attacker-supplied and ends up in
+    /// logs and error responses.
     #[error("no key in JWKS matching kid `{0}`")]
     UnknownKid(String),
 
@@ -182,11 +218,24 @@ pub fn verify_jwt(
     // `crate::jwt::ensure_crypto_provider`.
     crate::jwt::ensure_crypto_provider();
 
+    // The size bound comes first: every later step allocates in proportion
+    // to the token.
+    if token.len() > super::claims::MAX_JWT_BYTES {
+        return Err(JwtError::TooLarge {
+            len: token.len(),
+            max: super::claims::MAX_JWT_BYTES,
+        });
+    }
+
     // 1. Decode header (no signature check).
     let header = decode_header(token).map_err(|e| JwtError::InvalidHeader(format!("{e}")))?;
 
-    // 2. Check algorithm against allowlist.
-    if !allowed_algorithms.contains(&header.alg) {
+    // 2. Check algorithm against allowlist. A symmetric algorithm is refused
+    // whatever the allowlist says: a JWKS is public, so an HMAC key in it
+    // verifies for anyone who can read the set and forge for anyone who can
+    // write it, and the key-confusion attacks all start from an HS* token
+    // verified with a key meant for RS*/ES*.
+    if !allowed_algorithms.contains(&header.alg) || is_symmetric(header.alg) {
         return Err(JwtError::DisallowedAlgorithm(header.alg));
     }
 
@@ -195,7 +244,17 @@ pub fn verify_jwt(
 
     let jwk = jwks
         .find(kid)
-        .ok_or_else(|| JwtError::UnknownKid(kid.to_string()))?;
+        .ok_or_else(|| JwtError::UnknownKid(truncate_kid(kid)))?;
+
+    // A key published for another use (`enc`) is not a signature key
+    // (RFC 7517 §4.2). An absent `use` is unrestricted and passes.
+    if let Some(key_use) = &jwk.common.public_key_use
+        && !matches!(key_use, jsonwebtoken::jwk::PublicKeyUse::Signature)
+    {
+        return Err(JwtError::KeyConstruction(
+            "the JWK is not marked for signature use (`use` is not `sig`)".to_string(),
+        ));
+    }
 
     // Defense in depth: if the JWK itself declares an algorithm (RFC 7517
     // `alg` member), require the header's alg to match it. Prevents key
@@ -261,10 +320,21 @@ pub fn verify_jwt(
     let token_data = decode::<serde_json::Value>(token, &decoding_key, &validation)
         .map_err(|e| JwtError::VerificationFailed(format!("{e}")))?;
 
-    // 6. manual exp/nbf validation against the injected clock.
-    //    `leeway_secs` is `u64` and `exp` / `nbf` are `i64` Unix seconds.
-    //    Cast saturating to avoid the pathological-large-leeway overflow
-    //    where `u64::MAX as i64` would be negative.
+    check_time_claims(&token_data.claims, config, clock)?;
+
+    Ok(token_data.claims)
+}
+
+/// Manual `exp` / `nbf` validation against the injected clock.
+///
+/// `leeway_secs` is `u64` and `exp` / `nbf` are `i64` Unix seconds. The cast
+/// saturates to avoid the pathological-large-leeway overflow where
+/// `u64::MAX as i64` would be negative.
+fn check_time_claims(
+    claims: &serde_json::Value,
+    config: &ValidationConfig,
+    clock: &dyn Clock,
+) -> Result<(), JwtError> {
     let now = clock.now().timestamp();
     let leeway: i64 = i64::try_from(config.leeway_secs).unwrap_or(i64::MAX);
 
@@ -272,7 +342,7 @@ pub fn verify_jwt(
     // not "no exp": it is a claim this verifier cannot read, and a token it
     // cannot bound is refused. A missing `exp` is refused unless the caller
     // turned `require_exp` off.
-    match token_data.claims.get("exp") {
+    match claims.get("exp") {
         Some(v) => {
             let exp = v.as_i64().ok_or_else(|| {
                 JwtError::VerificationFailed("exp claim is not an integer".to_string())
@@ -291,7 +361,7 @@ pub fn verify_jwt(
         None => {}
     }
 
-    match token_data.claims.get("nbf") {
+    match claims.get("nbf") {
         Some(v) => {
             let nbf = v.as_i64().ok_or_else(|| {
                 JwtError::VerificationFailed("nbf claim is not an integer".to_string())
@@ -309,8 +379,7 @@ pub fn verify_jwt(
         }
         None => {}
     }
-
-    Ok(token_data.claims)
+    Ok(())
 }
 
 #[cfg(test)]

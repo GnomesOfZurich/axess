@@ -350,3 +350,36 @@ async fn a_silent_iam_credentials_endpoint_times_out() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_plain_http_remote_sts_endpoint_is_refused_before_any_request() {
+    let client =
+        GcpStsClient::new().with_endpoint(Url::parse("http://192.0.2.1:9/v1/token").unwrap());
+    let err = client
+        .exchange_token("jwt", &sample_audience(), &["scope"])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, GcpError::Transport(m) if m.contains("must be https")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_http_remote_impersonation_base_is_refused_before_any_request() {
+    let client = GcpServiceAccountImpersonator::new()
+        .with_endpoint_base(Url::parse("http://192.0.2.1:9/").unwrap());
+    let err = client
+        .generate_access_token(
+            "federated",
+            "sa@p.iam.gserviceaccount.com",
+            &["scope"],
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, GcpError::Transport(m) if m.contains("must be https")),
+        "{err}"
+    );
+}

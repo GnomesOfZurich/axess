@@ -22,7 +22,7 @@ pub const MAX_IAT_AGE_SECS: i64 = 300;
 pub fn decode_jwt_payload(token: &str) -> Result<serde_json::Value, String> {
     if token.len() > MAX_JWT_BYTES {
         return Err(format!(
-            "logout token too large ({} bytes, max {MAX_JWT_BYTES})",
+            "JWT too large ({} bytes, max {MAX_JWT_BYTES})",
             token.len()
         ));
     }

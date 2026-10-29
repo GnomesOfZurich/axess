@@ -138,7 +138,6 @@ pub struct SocialClaims {
 /// pre-auth session, then redirects to `url`. On callback both values
 /// come back out of the session and feed
 /// [`SocialProvider::exchange_code`].
-#[derive(Debug)]
 pub struct AuthUrl {
     /// Redirect URL to send the user to.
     pub url: String,
@@ -146,6 +145,17 @@ pub struct AuthUrl {
     /// [`SocialProvider::exchange_code`]. Empty string when PKCE is
     /// disabled via [`SocialProvider::without_pkce`].
     pub pkce_verifier: String,
+}
+
+/// Prints the URL but not the PKCE verifier, which is the secret half of the
+/// code challenge in that URL.
+impl std::fmt::Debug for AuthUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthUrl")
+            .field("url", &self.url)
+            .field("pkce_verifier", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Static provider configuration for a plain-OAuth-2.0 social-login

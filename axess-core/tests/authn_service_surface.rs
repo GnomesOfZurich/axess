@@ -7,6 +7,7 @@
 
 mod common;
 
+use axess_core::authn::Actor;
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, ZeroizedString},
@@ -113,7 +114,9 @@ async fn invalidate_user_sessions_no_registry_returns_err() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let svc = AuthnService::new(identity, MockFactorStore::new())
         .with_audit_context(AuditContext::default());
-    let result = svc.invalidate_user_sessions(&uid("u1")).await;
+    let result = svc
+        .invalidate_user_sessions(&uid("u1"), Actor::System)
+        .await;
     assert!(result.is_err());
 }
 
@@ -138,7 +141,9 @@ async fn invalidate_user_sessions_with_registry_invalidates() {
         vec![sid]
     );
 
-    svc.invalidate_user_sessions(&uid("u1")).await.unwrap();
+    svc.invalidate_user_sessions(&uid("u1"), Actor::System)
+        .await
+        .unwrap();
     assert!(
         registry
             .active_sessions(&uid("u1"))
@@ -159,7 +164,9 @@ async fn invalidate_session_no_registry_returns_err() {
         .set_authenticated(uid("u1"), tid("default"), Utc::now())
         .await;
     let sid = session.session_id().await;
-    let result = svc.invalidate_session(&uid("u1"), &sid).await;
+    let result = svc
+        .invalidate_session(&uid("u1"), &sid, Actor::System)
+        .await;
     assert!(result.is_err());
 }
 
@@ -184,7 +191,9 @@ async fn invalidate_session_with_registry_removes_target_only() {
     registry.register(&uid("u1"), &sid1).await.unwrap();
     registry.register(&uid("u1"), &sid2).await.unwrap();
 
-    svc.invalidate_session(&uid("u1"), &sid1).await.unwrap();
+    svc.invalidate_session(&uid("u1"), &sid1, Actor::System)
+        .await
+        .unwrap();
     let remaining = registry.active_sessions(&uid("u1")).await.unwrap();
     assert_eq!(
         remaining,

@@ -245,3 +245,57 @@ async fn exchange_bounds_the_response_bodies() {
         "got {err:?}"
     );
 }
+
+/// `{:?}` of a request is read in logs and panic messages, and both tokens
+/// are bearer credentials.
+#[test]
+fn debug_output_redacts_both_tokens() {
+    let req = TokenExchangeRequest::new("subject-secret-abc", token_types::JWT)
+        .with_audience("https://compute.example")
+        .with_actor_token("actor-secret-xyz", token_types::JWT);
+    let shown = format!("{req:?} {req:#?}");
+    assert!(!shown.contains("subject-secret-abc"), "{shown}");
+    assert!(!shown.contains("actor-secret-xyz"), "{shown}");
+    assert!(
+        shown.contains("https://compute.example"),
+        "the rest is kept"
+    );
+}
+
+#[tokio::test]
+async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
+    let client = TokenExchangeClient::new(
+        Url::parse("http://192.0.2.1:9/token").unwrap(),
+        "gnomes-api",
+        Some("shh".into()),
+    );
+    let err = client
+        .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DelegatedError::Transport(m) if m.contains("must be https")),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn the_default_client_does_not_follow_a_redirect() {
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"access_token": "x"})))
+        .expect(0)
+        .mount(&target)
+        .await;
+    let first = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(307).insert_header("location", target.uri().as_str()))
+        .expect(1)
+        .mount(&first)
+        .await;
+    let client = TokenExchangeClient::new(token_url(&first), "gnomes-api", Some("shh".into()));
+    let result = client
+        .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
+        .await;
+    assert!(result.is_err());
+}

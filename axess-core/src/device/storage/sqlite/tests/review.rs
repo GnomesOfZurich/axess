@@ -12,6 +12,9 @@ async fn shared_contract() {
         .await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(fresh_store().await).await;
     shared::a_save_never_un_revokes(fresh_store().await).await;
+    shared::the_fingerprint_lookup_follows_the_newest_sighting(fresh_store().await).await;
+    shared::a_revoked_row_keeps_its_revocation_time(fresh_store().await).await;
+    shared::a_sighting_reports_the_level_it_found(fresh_store().await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(fresh_store().await).await;
     shared::sweep_decisions_agree_to_the_second(
         fresh_store()

@@ -31,6 +31,7 @@ pub mod audit;
 pub mod error;
 pub mod event;
 pub mod factor;
+pub mod factor_secret;
 pub mod ids;
 pub mod provisioning;
 pub mod service;
@@ -52,14 +53,14 @@ pub use event::{
     AuditContext, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason,
 };
 pub use factor::{
-    EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FactorStep, FactorTemplate,
-    FederatedProvider, Fido2Config, HotpConfig, LdapBindFactorConfig, OtpAlgorithm, PasswordConfig,
-    PasswordRules, TotpConfig, ZeroizedString, default_catalog,
+    EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FactorSecret, FactorStep,
+    FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, LdapBindFactorConfig, OtpAlgorithm,
+    PasswordConfig, PasswordRules, SealedFactorSecret, TotpConfig, ZeroizedString, default_catalog,
 };
 pub use ids::{DeviceId, IdError, TenantId, UserId};
 pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
 pub use service::{
-    AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome, NoSessionRegistryError,
+    Actor, AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome, NoSessionRegistryError,
     PrepareOutcome, RequestAuthnService, SessionValidator, SignupOutcome, require_valid_session,
 };
 #[cfg(feature = "oauth")]

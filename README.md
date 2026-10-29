@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.12.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.13.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -49,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_user_password("alice", "default", "Gnomes2+");
     let _service = Arc::new(AuthnService::new(backend.clone(), backend));
 
-    let signing_key: [u8; 32] = [/* load from your secret store */ 0; 32];
+    // 32 random bytes from your secret store; a constant key is logged at error.
+    let signing_key: [u8; 32] = std::fs::read("/run/secrets/axess-signing-key")?
+        .try_into()
+        .map_err(|_| "signing key must be exactly 32 bytes")?;
     let session_layer = SessionLayer::new(session_store, signing_key)
         .with_ttl(Duration::from_secs(86400));
 
@@ -170,7 +173,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.12.0", features = ["sqlite", "authz"] }
+axess = { version = "0.13.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:
@@ -204,7 +207,7 @@ Names are kebab-case throughout. The `axess` facade's default features are `["au
 | `fido2` | FIDO2/WebAuthn passkey authentication | no |
 | `ldap` | LDAP bind authentication (Active Directory, OpenLDAP) | no |
 | `oauth` | OAuth 2.0 / OIDC (AuthCode+PKCE, Client Credentials, Device Code) | no |
-| `fapi` | FAPI 2.0 Security Profile (PAR, DPoP, JARM). Implies `oauth`. | no |
+| `fapi` | FAPI 2.0 resource-server side: `verify_dpop_proof`. Implies `oauth`, which carries the client side (PAR, DPoP, mTLS, JARM through `with_fapi`). | no |
 | `social` | Plain OAuth 2.0 user login (GitHub user / Twitter / Discord / Reddit / Spotify / …). **Weaker security model than OIDC**: claims come from a TLS-trusted userinfo endpoint, not from a signed assertion. See `axess::social` module docs for the delta. | no |
 
 #### Workload identity

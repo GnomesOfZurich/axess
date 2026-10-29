@@ -27,7 +27,9 @@
 //!     demoted_at       BIGINT,
 //!     bindings         MEDIUMTEXT     NOT NULL,
 //!     PRIMARY KEY (tenant_id, id),
-//!     INDEX idx_devices_fingerprint (tenant_id, fingerprint_hash),
+//!     INDEX idx_devices_fingerprint_seen (tenant_id, fingerprint_hash, last_seen_at, id),
+//!     INDEX idx_devices_sweep (tenant_id, trust_level, last_seen_at),
+//!     INDEX idx_devices_revoked_at (tenant_id, trust_level, revoked_at),
 //!     INDEX idx_devices_user (tenant_id, user_id, last_seen_at),
 //!     INDEX idx_devices_user_fingerprint (tenant_id, user_id, fingerprint_hash, last_seen_at)
 //! );
@@ -121,6 +123,20 @@
 //!     (tenant_id, user_id, fingerprint_hash, last_seen_at);
 //! ```
 //!
+//! A deployment created before the fingerprint and retention indexes were
+//! tuned replaces the plain fingerprint index with one that serves
+//! `find_by_fingerprint` in order, and adds the two the sweep reads through
+//! (`CREATE TABLE IF NOT EXISTS` does not touch an existing table):
+//!
+//! ```sql
+//! ALTER TABLE devices
+//!     DROP INDEX idx_devices_fingerprint,
+//!     ADD INDEX idx_devices_fingerprint_seen
+//!         (tenant_id, fingerprint_hash, last_seen_at, id),
+//!     ADD INDEX idx_devices_sweep (tenant_id, trust_level, last_seen_at),
+//!     ADD INDEX idx_devices_revoked_at (tenant_id, trust_level, revoked_at);
+//! ```
+//!
 //! MySQL `CREATE INDEX` is not idempotent (no `IF NOT EXISTS` for
 //! indexes pre-MySQL 8.0.29 / MariaDB 10.5.4), so indexes are
 //! declared inline in `CREATE TABLE`. Mirrors the dialect strategy
@@ -143,8 +159,8 @@ use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::storage::sql_common::{
     BindingsCodec, DeviceRow, DeviceWrite, GuardedTrustWrite, SqlDeviceStoreError, SwapPlan,
     SweepCutoffs, TRANSITION_ATTEMPTS, TrustWrite, bindings_update_after_miss, claim_after_miss,
-    decode_all, decode_optional, parse_stored_trust, plan_bindings_swap, require_row,
-    select_devices, transition_after_miss, utc_to_unix,
+    decode_all, decode_optional, index_follows_write, parse_stored_trust, plan_bindings_swap,
+    require_row, select_devices, sighting_level, transition_after_miss, utc_to_unix,
 };
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
@@ -155,6 +171,7 @@ use crate::session::crypto::SessionCrypto;
 
 mod family;
 mod reseal;
+mod schema;
 mod sweep;
 
 use reseal::reseal_rows;
@@ -222,57 +239,7 @@ impl MysqlDeviceStore {
         self.sweep_config = config;
         self
     }
-
-    /// Create tables + indexes. Idempotent.
-    pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(DEVICES_DDL).execute(&self.pool).await?;
-        sqlx::query(DEVICE_BINDINGS_REFRESH_DDL)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
-    }
 }
-
-/// `devices` table. The id columns (`tenant_id`, `id`, `user_id`) compare
-/// byte for byte (`utf8mb4_bin`): they are case-sensitive opaque ids, and
-/// the server's default case-insensitive collation would resolve device `Ab`
-/// as device `aB`, find another tenant's or user's row by a differently
-/// cased id, and make two distinct ids collide on the primary key.
-const DEVICES_DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS devices (
-    tenant_id        VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    id               VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    user_id          VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
-    trust_level      VARCHAR(16)    NOT NULL,
-    fingerprint_hash VARBINARY(32)  NOT NULL,
-    first_seen_at    BIGINT         NOT NULL,
-    last_seen_at     BIGINT         NOT NULL,
-    revoked_at       BIGINT,
-    demoted_at       BIGINT,
-    bindings         MEDIUMTEXT     NOT NULL,
-    PRIMARY KEY (tenant_id, id),
-    INDEX idx_devices_fingerprint (tenant_id, fingerprint_hash),
-    INDEX idx_devices_user (tenant_id, user_id, last_seen_at),
-    INDEX idx_devices_user_fingerprint (tenant_id, user_id, fingerprint_hash, last_seen_at)
-)
-"#;
-
-/// Refresh-family index table. `tenant_id` and `device_id` carry the same
-/// binary collation as the `devices` columns they reference, which a
-/// foreign key requires.
-const DEVICE_BINDINGS_REFRESH_DDL: &str = r#"
-CREATE TABLE IF NOT EXISTS device_bindings_refresh (
-    tenant_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    device_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    family_id VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-    PRIMARY KEY (tenant_id, device_id, family_id),
-    INDEX idx_device_bindings_refresh_family (tenant_id, family_id),
-    CONSTRAINT fk_device_bindings_refresh_device
-        FOREIGN KEY (tenant_id, device_id)
-        REFERENCES devices (tenant_id, id) ON DELETE CASCADE
-)
-"#;
 
 #[cfg(test)]
 mod schema_tests;
@@ -450,7 +417,7 @@ impl DeviceStore for MysqlDeviceStore {
             .fetch_optional(&mut *tx)
             .await?;
             if let Some(stored) = parse_stored_trust(stored)?
-                && blocks_save(stored, device.trust_level)
+                && blocks_save(stored)
             {
                 return Ok(());
             }
@@ -462,14 +429,14 @@ impl DeviceStore for MysqlDeviceStore {
                      first_seen_at, last_seen_at, revoked_at, demoted_at, bindings)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE
-                    user_id          = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', user_id, VALUES(user_id)),
-                    fingerprint_hash = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', fingerprint_hash, VALUES(fingerprint_hash)),
-                    first_seen_at    = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', first_seen_at, VALUES(first_seen_at)),
-                    last_seen_at     = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', last_seen_at, VALUES(last_seen_at)),
-                    revoked_at       = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', revoked_at, VALUES(revoked_at)),
-                    demoted_at       = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', demoted_at, VALUES(demoted_at)),
-                    bindings         = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', bindings, VALUES(bindings)),
-                    trust_level      = IF(trust_level = 'Revoked' AND VALUES(trust_level) <> 'Revoked', trust_level, VALUES(trust_level))
+                    user_id          = IF(trust_level = 'Revoked', user_id, VALUES(user_id)),
+                    fingerprint_hash = IF(trust_level = 'Revoked', fingerprint_hash, VALUES(fingerprint_hash)),
+                    first_seen_at    = IF(trust_level = 'Revoked', first_seen_at, VALUES(first_seen_at)),
+                    last_seen_at     = IF(trust_level = 'Revoked', last_seen_at, VALUES(last_seen_at)),
+                    revoked_at       = IF(trust_level = 'Revoked', revoked_at, VALUES(revoked_at)),
+                    demoted_at       = IF(trust_level = 'Revoked', demoted_at, VALUES(demoted_at)),
+                    bindings         = IF(trust_level = 'Revoked', bindings, VALUES(bindings)),
+                    trust_level      = IF(trust_level = 'Revoked', trust_level, VALUES(trust_level))
                 "#,
             )
             .bind(&w.tenant)
@@ -485,7 +452,20 @@ impl DeviceStore for MysqlDeviceStore {
             .execute(&mut *tx)
             .await?;
 
-            rewrite_family_index(&mut tx, &w.tenant, &w.id, &w.family_ids).await?;
+            // The upsert leaves a row that was revoked meanwhile exactly as
+            // it was, so the refresh-family index follows the bindings the
+            // row holds now, not the ones this save carried. Ciphertext
+            // differs on every encode, so the stored bytes are this save's
+            // own only when the upsert wrote them.
+            let stored: Option<String> =
+                sqlx::query_scalar("SELECT bindings FROM devices WHERE tenant_id = ? AND id = ?")
+                    .bind(&w.tenant)
+                    .bind(&w.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if index_follows_write(stored.as_deref(), &w.bindings) {
+                rewrite_family_index(&mut tx, &w.tenant, &w.id, &w.family_ids).await?;
+            }
 
             tx.commit().await?;
             Ok(())
@@ -497,13 +477,13 @@ impl DeviceStore for MysqlDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         let pool = self.pool.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
         let ts = utc_to_unix(now);
         async move {
-            let updated = sqlx::query(
+            sqlx::query(
                 "UPDATE devices SET last_seen_at = CASE \
                      WHEN trust_level <> 'Revoked' AND last_seen_at < ? THEN ? \
                      ELSE last_seen_at END \
@@ -514,9 +494,14 @@ impl DeviceStore for MysqlDeviceStore {
             .bind(&tenant)
             .bind(&device_id)
             .execute(&pool)
-            .await?
-            .rows_affected();
-            require_row(updated, tenant, device_id)
+            .await?;
+            // The level the row has now: Revoked means the sighting did not
+            // touch it. A missing row is a missing device.
+            sighting_level(
+                fetch_trust_level(&pool, &tenant, &device_id).await?,
+                tenant,
+                device_id,
+            )
         }
     }
 
@@ -541,13 +526,17 @@ impl DeviceStore for MysqlDeviceStore {
                         demoted_at = CASE WHEN ? = 0 THEN NULL \
                                           WHEN trust_level = 'Trusted' THEN ? \
                                           ELSE demoted_at END, \
-                        trust_level = ?, revoked_at = ? \
+                        revoked_at = CASE WHEN ? = 'Revoked' AND trust_level = 'Revoked' \
+                                               AND revoked_at IS NOT NULL THEN revoked_at \
+                                          ELSE ? END, \
+                        trust_level = ? \
                  WHERE tenant_id = ? AND id = ?",
             )
             .bind(w.to_seen)
             .bind(w.now)
             .bind(w.trust)
             .bind(w.revoked_at)
+            .bind(w.trust)
             .bind(&tenant)
             .bind(&device_id)
             .execute(&pool)
@@ -574,11 +563,13 @@ impl DeviceStore for MysqlDeviceStore {
             // and writes in a single statement, so a revocation that lands
             // first makes this match no row instead of being overwritten.
             for _ in 0..TRANSITION_ATTEMPTS {
-                let updated = sqlx::query("UPDATE devices SET demoted_at = CASE WHEN ? = 1 THEN demoted_at ELSE ? END, trust_level = ?, revoked_at = ? WHERE tenant_id = ? AND id = ? AND trust_level = ?")
+                let updated = sqlx::query("UPDATE devices SET demoted_at = CASE WHEN ? = 1 THEN demoted_at ELSE ? END, revoked_at = CASE WHEN ? = ? THEN revoked_at ELSE ? END, trust_level = ? WHERE tenant_id = ? AND id = ? AND trust_level = ?")
             .bind(w.keep_demoted)
             .bind(w.demoted_at)
+            .bind(w.expected)
             .bind(w.new)
             .bind(w.revoked_at)
+            .bind(w.new)
             .bind(&tenant)
             .bind(&device_id)
             .bind(w.expected)
@@ -595,7 +586,12 @@ impl DeviceStore for MysqlDeviceStore {
                 // The row is at `expected` again: the write lost a race with
                 // a change that has since been undone. Try it again.
             }
-            Ok(TrustTransition::Refused { current: expected })
+            // Every attempt lost a race: the row was never found at another
+            // level, so the change is neither applied nor refused.
+            Err(SqlDeviceStoreError::Contended {
+                tenant_id: tenant,
+                device_id,
+            })
         }
     }
 

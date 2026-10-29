@@ -17,7 +17,15 @@ pub enum ResponseMode {
     Fragment,
     /// Parameters in an auto-submitting HTML form POST to the redirect URI.
     /// Prevents code leakage in browser history, Referer headers, and server
-    /// access logs. Required by FAPI 2.0.
+    /// access logs.
+    ///
+    /// The callback is a cross-site POST, and a browser withholds a
+    /// `SameSite=Lax` cookie (the session layer's default) from it, so the
+    /// callback finds no session unless the IdP is on the same site or the
+    /// session cookie is `SameSite=None; Secure`. A separate ceremony cookie
+    /// or a re-POST shim that redirects to a same-site GET also works. This
+    /// mode is not required by the FAPI 2.0 profile, which asks for PAR and
+    /// leaves JARM optional.
     FormPost,
 }
 

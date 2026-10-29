@@ -100,45 +100,61 @@ pub enum MemoryDeviceStoreError {
 }
 
 impl MemoryDeviceStore {
-    /// After the index entry for `(tenant, hash)` was removed, point it at
-    /// another device that still carries that fingerprint, if there is one,
-    /// so deleting one of two devices that share a fingerprint does not make
-    /// the other unfindable. Never overwrites an entry another writer made.
-    fn repoint_fingerprint(&self, tenant_id: &TenantId, hash: &FingerprintHash) {
-        let heir = self
-            .devices
-            .iter()
-            .filter(|e| e.tenant_id == *tenant_id && e.fingerprint_hash == *hash)
-            .map(|e| e.value().clone())
-            .min_by(order_newest_first);
-        if let Some(heir) = heir {
-            // The entry is written while the heir's row is held, so a save
-            // that re-keys it meanwhile (which updates the index under the
-            // same lock) cannot leave this entry behind for a fingerprint
-            // the row no longer has.
-            if let Some(row) = self.devices.get(&Self::key(tenant_id, &heir.id))
-                && row.fingerprint_hash == *hash
-            {
-                self.fingerprint_index
-                    .entry((*tenant_id, *hash))
-                    .or_insert(heir.id);
+    /// Point the fingerprint index entry for `(tenant, hash)` at the device
+    /// that sorts first among those carrying the fingerprint under
+    /// [`order_newest_first`] (newest sighting, then the smaller id), the
+    /// same device the SQL backends return for the lookup, or remove the
+    /// entry when none carries it.
+    ///
+    /// Called after every change that can alter which device that is (a
+    /// save, a sighting, a delete or purge), and never while a row guard is
+    /// held: the scan takes read guards on other rows. The entry is replaced
+    /// only while it still holds the value this call started from, so two
+    /// settles cannot overwrite each other with a stale answer; the later
+    /// one re-reads and decides again.
+    fn settle_fingerprint(&self, tenant_id: &TenantId, hash: &FingerprintHash) {
+        let key = (*tenant_id, *hash);
+        for _ in 0..SETTLE_ATTEMPTS {
+            let current = self.fingerprint_index.get(&key).map(|v| *v);
+            let best = self
+                .devices
+                .iter()
+                .filter(|e| e.tenant_id == *tenant_id && e.fingerprint_hash == *hash)
+                .map(|e| e.value().clone())
+                .min_by(order_newest_first)
+                .map(|d| d.id);
+            if current == best {
+                return;
+            }
+            // Whether this call or a concurrent one moved the entry, the loop
+            // reads again: an answer computed from a scan can be stale by the
+            // time it is stored (the device may have re-keyed meanwhile), and
+            // only a read that finds entry and table in agreement ends it.
+            match (current, best) {
+                (Some(old), Some(new)) => {
+                    if let Some(mut slot) = self.fingerprint_index.get_mut(&key)
+                        && *slot == old
+                    {
+                        *slot = new;
+                    }
+                }
+                (Some(old), None) => {
+                    self.fingerprint_index.remove_if(&key, |_, v| *v == old);
+                }
+                (None, Some(new)) => {
+                    if let Entry::Vacant(slot) = self.fingerprint_index.entry(key) {
+                        slot.insert(new);
+                    }
+                }
+                (None, None) => {}
             }
         }
     }
-
-    /// Drop the index entry of a device that left the table, then let a
-    /// device sharing its fingerprint inherit it.
-    fn release_fingerprint(&self, gone: &Device) {
-        let fp_key = (gone.tenant_id, gone.fingerprint_hash);
-        let removed = self
-            .fingerprint_index
-            .remove_if(&fp_key, |_, v| *v == gone.id)
-            .is_some();
-        if removed {
-            self.repoint_fingerprint(&gone.tenant_id, &gone.fingerprint_hash);
-        }
-    }
 }
+
+/// How often [`MemoryDeviceStore::settle_fingerprint`] re-reads after losing
+/// a swap to a concurrent settle.
+const SETTLE_ATTEMPTS: usize = 16;
 
 impl DeviceStore for MemoryDeviceStore {
     type Error = MemoryDeviceStoreError;
@@ -238,39 +254,30 @@ impl DeviceStore for MemoryDeviceStore {
     async fn save(&self, device: &Device, now: DateTime<Utc>) -> Result<(), Self::Error> {
         let device = for_save(device, now);
         let key = Self::key(&device.tenant_id, &device.id);
-        let fp_key = (device.tenant_id, device.fingerprint_hash);
-        // The row and its fingerprint index entry change under the row's
-        // shard lock, so two saves of one device cannot interleave their
-        // index updates and leave an entry for a fingerprint the row no
-        // longer has.
+        // The row changes under its shard lock; the fingerprint index is
+        // settled afterwards, from the table as it is then.
         let mut vacated = None;
         match self.devices.entry(key) {
             Entry::Occupied(mut slot) => {
-                if blocks_save(slot.get().trust_level, device.trust_level) {
+                if blocks_save(slot.get().trust_level) {
                     return Ok(());
                 }
                 let old = slot.insert(device.clone());
-                // A device re-saved under a new fingerprint must stop
-                // answering to the old one, unless the old entry already
-                // belongs to another device.
-                if old.fingerprint_hash != device.fingerprint_hash
-                    && self
-                        .fingerprint_index
-                        .remove_if(&(old.tenant_id, old.fingerprint_hash), |_, v| *v == old.id)
-                        .is_some()
-                {
+                if old.fingerprint_hash != device.fingerprint_hash {
                     vacated = Some(old.fingerprint_hash);
                 }
-                self.fingerprint_index.insert(fp_key, device.id);
             }
             Entry::Vacant(slot) => {
                 slot.insert(device.clone());
-                self.fingerprint_index.insert(fp_key, device.id);
             }
         }
+        // A device re-saved under a new fingerprint stops answering to the
+        // old one, and a save takes over the new fingerprint's entry only
+        // when the device sorts first among those carrying it.
         if let Some(hash) = vacated {
-            self.repoint_fingerprint(&device.tenant_id, &hash);
+            self.settle_fingerprint(&device.tenant_id, &hash);
         }
+        self.settle_fingerprint(&device.tenant_id, &device.fingerprint_hash);
         self.write_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -280,20 +287,29 @@ impl DeviceStore for MemoryDeviceStore {
         tenant_id: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<DeviceTrustLevel, Self::Error> {
         let key = Self::key(tenant_id, id);
-        if let Some(mut entry) = self.devices.get_mut(&key) {
+        let outcome = self.devices.get_mut(&key).map(|mut entry| {
             // A sighting never rewinds the clock and never touches a
             // revoked row.
-            if entry.trust_level != DeviceTrustLevel::Revoked {
-                entry.last_seen_at = entry.last_seen_at.max(now);
+            let moved = entry.trust_level != DeviceTrustLevel::Revoked && now > entry.last_seen_at;
+            if moved {
+                entry.last_seen_at = now;
             }
-            return Ok(());
+            (entry.trust_level, entry.fingerprint_hash, moved)
+        });
+        let Some((level, hash, moved)) = outcome else {
+            return Err(MemoryDeviceStoreError::NotFound {
+                tenant_id: tenant_id.to_string(),
+                device_id: id.to_string(),
+            });
+        };
+        // The row guard is released: a newer sighting can make this device
+        // the one the fingerprint lookup returns.
+        if moved {
+            self.settle_fingerprint(tenant_id, &hash);
         }
-        Err(MemoryDeviceStoreError::NotFound {
-            tenant_id: tenant_id.to_string(),
-            device_id: id.to_string(),
-        })
+        Ok(level)
     }
 
     async fn set_trust_level(
@@ -305,9 +321,7 @@ impl DeviceStore for MemoryDeviceStore {
     ) -> Result<(), Self::Error> {
         let key = Self::key(tenant_id, id);
         if let Some(mut entry) = self.devices.get_mut(&key) {
-            entry.demoted_at = demotion_stamp(entry.trust_level, level, entry.demoted_at, now);
-            entry.trust_level = level;
-            entry.revoked_at = matches!(level, DeviceTrustLevel::Revoked).then_some(now);
+            apply_trust_level(&mut entry, level, now);
             return Ok(());
         }
         Err(MemoryDeviceStoreError::NotFound {
@@ -334,9 +348,7 @@ impl DeviceStore for MemoryDeviceStore {
                 current: entry.trust_level,
             });
         }
-        entry.demoted_at = demotion_stamp(entry.trust_level, level, entry.demoted_at, now);
-        entry.trust_level = level;
-        entry.revoked_at = matches!(level, DeviceTrustLevel::Revoked).then_some(now);
+        apply_trust_level(&mut entry, level, now);
         Ok(TrustTransition::Applied)
     }
 
@@ -385,7 +397,7 @@ impl DeviceStore for MemoryDeviceStore {
 
     async fn delete(&self, tenant_id: &TenantId, id: &DeviceId) -> Result<(), Self::Error> {
         if let Some((_, device)) = self.devices.remove(&Self::key(tenant_id, id)) {
-            self.release_fingerprint(&device);
+            self.settle_fingerprint(&device.tenant_id, &device.fingerprint_hash);
         }
         Ok(())
     }
@@ -454,7 +466,7 @@ impl DeviceStore for MemoryDeviceStore {
                         && d.revoked_at == snapshot.revoked_at
                 });
                 if let Some((_, device)) = removed {
-                    self.release_fingerprint(&device);
+                    self.settle_fingerprint(&device.tenant_id, &device.fingerprint_hash);
                     counts.revoked_purged += 1;
                 }
             }
@@ -462,6 +474,21 @@ impl DeviceStore for MemoryDeviceStore {
 
         Ok(counts)
     }
+}
+
+/// Move a stored row to `level` at `now`: the `demoted_at` rule of every
+/// backend, and `revoked_at` stamped on a move into `Revoked` but kept on a
+/// row that already is, so repeating a revocation does not restart the purge
+/// grace clock; a move out of `Revoked` clears it.
+fn apply_trust_level(row: &mut Device, level: DeviceTrustLevel, now: DateTime<Utc>) {
+    let was_revoked = row.trust_level == DeviceTrustLevel::Revoked;
+    row.demoted_at = demotion_stamp(row.trust_level, level, row.demoted_at, now);
+    row.trust_level = level;
+    row.revoked_at = match (level, was_revoked) {
+        (DeviceTrustLevel::Revoked, true) => row.revoked_at.or(Some(now)),
+        (DeviceTrustLevel::Revoked, false) => Some(now),
+        _ => None,
+    };
 }
 
 impl HealthCheck for MemoryDeviceStore {

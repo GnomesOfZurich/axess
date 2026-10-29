@@ -99,3 +99,21 @@ pub(super) fn plan_sweep(device: &Device, cfg: &SweepConfig, now: DateTime<Utc>)
         _ => SweepStep::Keep,
     }
 }
+
+/// The `revoked_at` a row takes when it moves to `level`: the time of its
+/// first revocation if it is already revoked (repeating a revocation must not
+/// restart the purge grace), `now` when it becomes revoked, and none
+/// otherwise.
+pub(super) fn revocation_stamp(
+    current: &Device,
+    level: DeviceTrustLevel,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if level != DeviceTrustLevel::Revoked {
+        return None;
+    }
+    match current.trust_level {
+        DeviceTrustLevel::Revoked => current.revoked_at.or(Some(now)),
+        _ => Some(now),
+    }
+}

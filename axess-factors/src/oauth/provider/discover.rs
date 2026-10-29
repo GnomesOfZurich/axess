@@ -73,23 +73,45 @@ impl OAuthProviderConfig {
             .await
             .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
 
-        // Extract optional endpoints from discovery metadata.
-        // These are standard OIDC fields but not exposed by CoreProviderMetadata
-        // (which uses EmptyAdditionalProviderMetadata). Parse from the raw JSON
-        // serialization of the metadata instead.
-        let metadata_json = serde_json::to_value(&metadata).unwrap_or_default();
-        let end_session_endpoint = metadata_json
-            .get("end_session_endpoint")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let revocation_endpoint = metadata_json
-            .get("revocation_endpoint")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let par_endpoint = metadata_json
-            .get("pushed_authorization_request_endpoint")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        // The optional endpoints are not part of the typed metadata:
+        // `CoreProviderMetadata` carries an empty "additional metadata" type,
+        // so every field outside the standard set is dropped when the
+        // document is parsed (and so when it is serialised again). Read them
+        // from the raw document, which the discovery primitive keeps.
+        let extras = crate::oidc::discovery::DiscoveryDocument::fetch(issuer_url, &http_client)
+            .await
+            .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
+        let end_session_endpoint = extras.end_session_endpoint.clone();
+        let revocation_endpoint = extras.revocation_endpoint.clone();
+        let par_endpoint = extras.pushed_authorization_request_endpoint.clone();
+        let iss_parameter_supported = extras
+            .raw
+            .get("authorization_response_iss_parameter_supported")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mtls_aliases = super::fapi_profile::MtlsAliases::from_document(&extras.raw);
+
+        // Every endpoint that receives a secret, a token or a code travels
+        // over HTTPS (loopback http allowed for development).
+        super::endpoint::require_secure(
+            metadata.token_endpoint().map(|e| e.url().as_str()),
+            "token_endpoint",
+        )?;
+        super::endpoint::require_secure(
+            metadata.userinfo_endpoint().map(|e| e.url().as_str()),
+            "userinfo_endpoint",
+        )?;
+        super::endpoint::require_secure(
+            Some(metadata.authorization_endpoint().url().as_str()),
+            "authorization_endpoint",
+        )?;
+        super::endpoint::require_secure(end_session_endpoint.as_deref(), "end_session_endpoint")?;
+        super::endpoint::require_secure(revocation_endpoint.as_deref(), "revocation_endpoint")?;
+        super::endpoint::require_secure(
+            par_endpoint.as_deref(),
+            "pushed_authorization_request_endpoint",
+        )?;
 
         Ok(Self {
             name: name.into(),
@@ -103,9 +125,13 @@ impl OAuthProviderConfig {
             end_session_endpoint,
             revocation_endpoint,
             par_endpoint,
+            iss_parameter_supported,
+            mtls_aliases,
             fapi: None,
+            id_token_algs: None,
             clock: std::sync::Arc::new(axess_clock::SystemClock),
             allowed_post_logout_redirect_uris: Vec::new(),
+            require_logout_typ: false,
             scopes: vec![
                 "openid".to_string(),
                 "email".to_string(),

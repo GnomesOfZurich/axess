@@ -34,6 +34,13 @@
 //! `user_id` is the id the login is for, which the application holds from
 //! its own identifier lookup; `begin_login` does not return it.
 //!
+//! The relabelled outcome enforces nothing by itself: the remaining steps
+//! are still the original method's. To make the session actually prove one
+//! of `allowed_factors`, call
+//! [`begin_step_up`](crate::authn::service::RequestAuthnService::begin_step_up)
+//! once the session is authenticated, then drive `prepare_factor` and
+//! `verify_factor` as for any login.
+//!
 //! axess does **not** reach into the device subsystem from
 //! `begin_login`. `Device` resolution is a middleware concern
 //! ([`SessionLayer::with_device_resolver`](crate::session::SessionLayer::with_device_resolver))
@@ -57,13 +64,31 @@ use crate::device::types::{Device, DeviceTrustLevel};
 /// |-------------|--------------------------|
 /// | `Unknown` | `[Totp]` (a possession factor) |
 /// | `Seen` | `[Totp]` |
-/// | `Trusted` | _none_; Trusted devices skip step-up |
-/// | `Revoked` | _none_; login should already be rejected upstream |
+/// | `Trusted` | `[Totp]` |
+/// | `Revoked` | `[Totp]`, and never less than the `Unknown` list |
 ///
 /// The default lists TOTP only, so it does not change with compile-time
 /// features. Override via [`StepUpPolicy::builder`] to add
 /// `FactorKind::Fido2`, or when your tenant's policy otherwise differs (e.g.
 /// tighter for high-value users, looser for known internal-network ranges, …).
+///
+/// # A device is recognised by a hint, not proven
+///
+/// A device is matched by a fingerprint of request headers and the client
+/// address, all of which the client chooses. Someone who has a user's
+/// password can send the same headers from the same network range and be
+/// matched to that user's `Trusted` device. That is why the default asks
+/// for a factor on a `Trusted` device too: skipping step-up there trusts
+/// the fingerprint to be unforgeable. Set `trusted` to an empty list
+/// ([`StepUpPolicyBuilder::trusted`]) only where a second signal that the
+/// client cannot copy, such as a device certificate or an app-held key,
+/// backs the match.
+///
+/// # A `Revoked` device never steps up less than an `Unknown` one
+///
+/// An empty `revoked` list does not mean "no step-up": a revoked device is
+/// judged with the `Unknown` list, so a policy that sets `revoked` to
+/// nothing cannot let a revoked device through more easily than a stranger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepUpPolicy {
     /// Factor kinds accepted for an `Unknown` device. Empty = no
@@ -72,13 +97,14 @@ pub struct StepUpPolicy {
     /// Factor kinds accepted for a `Seen` device. Empty = no
     /// step-up required.
     pub seen: Vec<FactorKind>,
-    /// Factor kinds accepted for a `Trusted` device. Almost always
-    /// empty; the whole point of `Trusted` is "we don't need to
-    /// step up." Non-empty is a tighter-than-baseline override.
+    /// Factor kinds accepted for a `Trusted` device. Empty = no step-up
+    /// on a trusted device, which is only as safe as the device match is
+    /// unforgeable (see the type docs); the default is non-empty.
     pub trusted: Vec<FactorKind>,
-    /// Factor kinds accepted for a `Revoked` device. Almost always
-    /// empty; login on a Revoked device should already be rejected
-    /// before this helper runs.
+    /// Factor kinds accepted for a `Revoked` device. Empty means the
+    /// `unknown` list applies, never "no step-up": a revoked device is
+    /// not trusted, and login on one should be rejected before this helper
+    /// runs.
     pub revoked: Vec<FactorKind>,
 }
 
@@ -87,8 +113,8 @@ impl Default for StepUpPolicy {
         Self {
             unknown: default_step_up_factors(),
             seen: default_step_up_factors(),
-            trusted: Vec::new(),
-            revoked: Vec::new(),
+            trusted: default_step_up_factors(),
+            revoked: default_step_up_factors(),
         }
     }
 }
@@ -107,12 +133,14 @@ impl StepUpPolicy {
     }
 
     /// Borrow the factor list for a given trust level. Used by
-    /// [`decide_step_up_for_user`].
+    /// [`decide_step_up_for_user`]. An empty `revoked` list answers with the
+    /// `unknown` list: a revoked device never steps up less than a stranger.
     pub fn for_level(&self, level: DeviceTrustLevel) -> &[FactorKind] {
         match level {
             DeviceTrustLevel::Unknown => &self.unknown,
             DeviceTrustLevel::Seen => &self.seen,
             DeviceTrustLevel::Trusted => &self.trusted,
+            DeviceTrustLevel::Revoked if self.revoked.is_empty() => &self.unknown,
             DeviceTrustLevel::Revoked => &self.revoked,
         }
     }
@@ -149,17 +177,18 @@ impl StepUpPolicyBuilder {
         self.seen = Some(factors);
         self
     }
-    /// Override the factor list for `Trusted` devices. Almost always
-    /// empty; set this only when your tenant runs tighter-than-
-    /// baseline policy that requires step-up even on trusted
-    /// hardware.
+    /// Override the factor list for `Trusted` devices. The default asks for
+    /// a factor; an empty list lets a trusted device skip step-up, which
+    /// trusts the device match (a hint that the client controls) to be
+    /// unforgeable. Do that only with a second signal the client cannot
+    /// copy.
     pub fn trusted(mut self, factors: Vec<FactorKind>) -> Self {
         self.trusted = Some(factors);
         self
     }
-    /// Override the factor list for `Revoked` devices. Almost always
-    /// empty; login on a revoked device should be rejected before
-    /// step-up policy evaluates.
+    /// Override the factor list for `Revoked` devices. An empty list means
+    /// the `unknown` list applies; login on a revoked device should be
+    /// rejected before step-up policy evaluates.
     pub fn revoked(mut self, factors: Vec<FactorKind>) -> Self {
         self.revoked = Some(factors);
         self
@@ -198,7 +227,29 @@ pub fn decide_step_up_for_user(
     } else {
         device.trust_level
     };
-    let factors = policy.for_level(level);
+    factors_or_none(policy.for_level(level))
+}
+
+/// [`decide_step_up_for_user`] for a request that may have no device at all.
+///
+/// A request the device layer could not fingerprint (it sent no
+/// `User-Agent`, or the device store was unavailable) resolves to no device.
+/// That is not a reason to skip step-up: a client chooses whether to send
+/// the header, so "no device" is judged as an `Unknown` one, with the
+/// policy's `unknown` factors.
+pub fn decide_step_up_for_optional(
+    device: Option<&Device>,
+    user: &UserId,
+    policy: &StepUpPolicy,
+) -> Option<Vec<FactorKind>> {
+    match device {
+        Some(device) => decide_step_up_for_user(device, user, policy),
+        None => factors_or_none(policy.for_level(DeviceTrustLevel::Unknown)),
+    }
+}
+
+/// `Some(factors)` for a non-empty list, `None` for "no step-up".
+fn factors_or_none(factors: &[FactorKind]) -> Option<Vec<FactorKind>> {
     if factors.is_empty() {
         None
     } else {
@@ -232,26 +283,76 @@ mod tests {
         crate::authn::ids::testing::user("u")
     }
 
-    /// Pin: default policy demands step-up on `Unknown` and `Seen`,
-    /// passes through silently on `Trusted` and `Revoked`.
+    /// Pin: the default policy demands a factor at every trust level. A
+    /// `Trusted` device is matched by a fingerprint the client controls, so
+    /// copying the headers must not skip step-up; a `Revoked` device never
+    /// steps up less than a stranger.
     #[test]
     fn default_policy_step_up_matrix() {
         let p = StepUpPolicy::default();
-        assert!(
-            decide_step_up_for_user(&build_device(DeviceTrustLevel::Unknown), &owner(), &p)
-                .is_some()
-        );
-        assert!(
-            decide_step_up_for_user(&build_device(DeviceTrustLevel::Seen), &owner(), &p).is_some()
-        );
+        for level in [
+            DeviceTrustLevel::Unknown,
+            DeviceTrustLevel::Seen,
+            DeviceTrustLevel::Trusted,
+            DeviceTrustLevel::Revoked,
+        ] {
+            assert_eq!(
+                decide_step_up_for_user(&build_device(level), &owner(), &p),
+                Some(vec![FactorKind::Totp]),
+                "{level:?}"
+            );
+        }
+    }
+
+    /// Skipping step-up on a trusted device is an explicit choice.
+    #[test]
+    fn an_empty_trusted_list_skips_step_up_only_when_asked_for() {
+        let p = StepUpPolicy::builder().trusted(Vec::new()).build();
         assert!(
             decide_step_up_for_user(&build_device(DeviceTrustLevel::Trusted), &owner(), &p)
                 .is_none()
         );
         assert!(
-            decide_step_up_for_user(&build_device(DeviceTrustLevel::Revoked), &owner(), &p)
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Unknown), &owner(), &p)
+                .is_some()
+        );
+    }
+
+    /// An empty `revoked` list does not wave a revoked device through: it
+    /// is judged with the `unknown` list.
+    #[test]
+    fn an_empty_revoked_list_falls_back_to_the_unknown_list() {
+        let p = StepUpPolicy::builder()
+            .unknown(vec![FactorKind::EmailOtp])
+            .revoked(Vec::new())
+            .build();
+        assert_eq!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Revoked), &owner(), &p),
+            Some(vec![FactorKind::EmailOtp])
+        );
+        // With nothing required of strangers either, nothing is required.
+        let open = StepUpPolicy::builder()
+            .unknown(Vec::new())
+            .revoked(Vec::new())
+            .build();
+        assert!(
+            decide_step_up_for_user(&build_device(DeviceTrustLevel::Revoked), &owner(), &open)
                 .is_none()
         );
+    }
+
+    /// A request with no resolved device is judged as an unknown one.
+    #[test]
+    fn no_device_is_judged_as_unknown() {
+        let p = StepUpPolicy::default();
+        assert_eq!(
+            decide_step_up_for_optional(None, &owner(), &p),
+            Some(vec![FactorKind::Totp])
+        );
+        let device = build_device(DeviceTrustLevel::Trusted);
+        let relaxed = StepUpPolicy::builder().trusted(Vec::new()).build();
+        assert!(decide_step_up_for_optional(Some(&device), &owner(), &relaxed).is_none());
+        assert!(decide_step_up_for_optional(None, &owner(), &relaxed).is_some());
     }
 
     /// Pin: builder overrides. A tenant tightening policy on Trusted
@@ -259,11 +360,11 @@ mod tests {
     #[test]
     fn builder_overrides_trusted_to_require_step_up() {
         let p = StepUpPolicy::builder()
-            .trusted(vec![FactorKind::Totp])
+            .trusted(vec![FactorKind::EmailOtp])
             .build();
         let factors =
             decide_step_up_for_user(&build_device(DeviceTrustLevel::Trusted), &owner(), &p);
-        assert_eq!(factors, Some(vec![FactorKind::Totp]));
+        assert_eq!(factors, Some(vec![FactorKind::EmailOtp]));
     }
 
     /// Pin: empty factor lists translate to `None` even if explicitly
@@ -312,17 +413,19 @@ mod tests {
         // change those too.
         assert_eq!(p.unknown, default_step_up_factors());
         assert_eq!(p.seen, default_step_up_factors());
-        assert!(p.trusted.is_empty());
+        assert_eq!(p.trusted, default_step_up_factors());
     }
 
     /// A device owned by someone else is Unknown to the user logging in,
     /// whatever trust it earned for its owner.
     #[test]
     fn foreign_trusted_device_is_treated_as_unknown() {
-        let p = StepUpPolicy::default();
         let device = build_device(DeviceTrustLevel::Trusted);
         let owner = crate::authn::ids::testing::user("u");
         let other = crate::authn::ids::testing::user("someone-else");
+        // Under a policy that lets a trusted device skip step-up, the owner
+        // skips it and the other user does not.
+        let p = StepUpPolicy::builder().trusted(Vec::new()).build();
         assert!(decide_step_up_for_user(&device, &owner, &p).is_none());
         assert_eq!(
             decide_step_up_for_user(&device, &other, &p),

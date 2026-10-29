@@ -29,6 +29,10 @@ pub struct MockFactorStore {
     /// exercise the retry/reload path inside
     /// `persist_fail_with_update`.
     cas_failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of `compare_and_save_factor` calls that go through normally
+    /// before the armed losses begin; see
+    /// [`arm_cas_failures_after`](Self::arm_cas_failures_after).
+    cas_skip_remaining: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of upcoming `load_factor` calls that report no row even
     /// when one exists: a read that happened before a concurrent first
     /// write landed. Unit-test only.
@@ -99,6 +103,16 @@ impl MockFactorStore {
         self.cas_failures_remaining
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// Like [`arm_cas_failures`](Self::arm_cas_failures), but the first
+    /// `skip` calls to `compare_and_save_factor` behave normally. Lets a
+    /// test lose the second swap of a two-swap flow.
+    pub fn arm_cas_failures_after(&self, skip: usize, n: usize) {
+        self.cas_skip_remaining
+            .store(skip, std::sync::atomic::Ordering::SeqCst);
+        self.cas_failures_remaining
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl FactorStore for MockFactorStore {
@@ -157,9 +171,19 @@ impl FactorStore for MockFactorStore {
     ) -> Result<bool, Self::Error> {
         // Tests can pre-arm a sequence of CAS losses to drive the
         // retry/reload path without a real concurrent writer.
-        let remaining = self
-            .cas_failures_remaining
+        let skip = self
+            .cas_skip_remaining
             .load(std::sync::atomic::Ordering::SeqCst);
+        if skip > 0 {
+            self.cas_skip_remaining
+                .store(skip - 1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let remaining = if skip > 0 {
+            0
+        } else {
+            self.cas_failures_remaining
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
         if remaining > 0 {
             self.cas_failures_remaining
                 .store(remaining - 1, std::sync::atomic::Ordering::SeqCst);

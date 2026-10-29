@@ -22,6 +22,8 @@ mod service;
 mod signing;
 
 pub(crate) use handle::SessionHandle;
+pub(crate) use lifecycle::mark_cookie_response;
+pub(crate) use service::FreshSession;
 // `SessionInner` is `pub(crate)` only so test modules and the
 // `testing::*` fixture helpers can construct sessions directly.
 // Production callers go through `SessionHandle`, so gate the
@@ -34,11 +36,26 @@ pub use service::SessionService;
 use crate::device::resolver::{DeviceResolver, ErasedDeviceResolver};
 use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
-use crate::session::store::SessionStore;
+use crate::session::store::{SessionRegistryHandle, SessionStore};
+use axess_clock::{Clock, SystemClock};
 use axess_rng::{SecureRng, SystemRng};
 use signing::SigningKeyRing;
 use std::{sync::Arc, time::Duration};
 use tower_cookies::cookie::SameSite;
+
+/// What the session layer does with an authenticated session when the
+/// registry set by [`SessionLayer::with_registry`] cannot answer (it errored).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnknownLiveness {
+    /// Treat the request as a guest for now, leave the stored row alone and
+    /// do not replace the client's cookie, so the session works again once
+    /// the registry answers. The default, and the fail-closed choice.
+    #[default]
+    Reject,
+    /// Trust the stored session. A registry outage then does not log anyone
+    /// out, and does not enforce revocation either.
+    Accept,
+}
 
 /// Tower layer that provides signed session cookies and typed [`crate::session::SessionData`].
 ///
@@ -61,6 +78,18 @@ use tower_cookies::cookie::SameSite;
 ///     .with_secure(false)
 ///     .with_same_site(SameSite::Strict);
 /// ```
+///
+/// # Panics
+///
+/// The setters do not check anything, because their order varies. The whole
+/// configuration is checked once, when the layer is turned into a service
+/// (`Router::layer`, `ServiceBuilder::layer`), with the same rules as
+/// [`SessionConfigBuilder::build`](crate::session::SessionConfigBuilder::build):
+/// the TTL must be non-zero, the cookie name non-empty and made of valid
+/// characters, a `__Host-` or `__Secure-` name needs `Secure`, a `__Host-`
+/// name needs `Path=/`, and `SameSite=None` needs `Secure`. A violation
+/// panics at startup with a message naming the setting, rather than
+/// shipping a cookie browsers drop.
 #[derive(Clone)]
 pub struct SessionLayer<S> {
     pub(super) store: S,
@@ -77,6 +106,12 @@ pub struct SessionLayer<S> {
     /// Source of every session id the layer mints (new sessions and
     /// rotations). Defaults to [`SystemRng`]; see [`with_rng`](Self::with_rng).
     pub(super) rng: Arc<dyn SecureRng>,
+    /// Clock for the absolute session age cap; defaults to [`SystemClock`].
+    pub(super) clock: Arc<dyn Clock>,
+    /// Registry consulted for every authenticated record, when set; see
+    /// [`with_registry`](Self::with_registry).
+    pub(super) registry: Option<Arc<dyn SessionRegistryHandle>>,
+    pub(super) unknown_liveness: UnknownLiveness,
     /// Optional device resolver invoked once per request between
     /// session-data load and the inner handler. Stamps
     /// [`SessionData::device_id`](crate::session::SessionData::device_id)
@@ -102,9 +137,12 @@ impl<S: SessionStore> SessionLayer<S> {
     /// use axess_core::{MemorySessionStore, session::SessionLayer};
     /// use std::time::Duration;
     ///
-    /// // Production: load the master key from a secret store (KMS, Vault, …).
-    /// // Below uses a fixed value purely for the construction example.
-    /// let signing_key: [u8; 32] = [0u8; 32];
+    /// // Production: load 32 random bytes from a secret store (KMS, Vault, a
+    /// // mounted secret). A constant key such as all zeros is logged at error.
+    /// let signing_key: [u8; 32] = std::fs::read("/run/secrets/axess-signing-key")
+    ///     .expect("signing key file")
+    ///     .try_into()
+    ///     .expect("exactly 32 bytes");
     /// let store = MemorySessionStore::default();
     ///
     /// let layer = SessionLayer::new(store, signing_key)
@@ -116,6 +154,7 @@ impl<S: SessionStore> SessionLayer<S> {
     /// # let _ = layer;
     /// ```
     pub fn new(store: S, signing_key: [u8; 32]) -> Self {
+        super::weak_key::warn_if_constant_key("session signing key", &signing_key);
         Self {
             store,
             // Derive distinct cookie / fingerprint HMAC sub-keys
@@ -128,9 +167,25 @@ impl<S: SessionStore> SessionLayer<S> {
             binding: None,
             metrics: None,
             rng: Arc::new(SystemRng),
+            clock: Arc::new(SystemClock),
+            registry: None,
+            unknown_liveness: UnknownLiveness::default(),
             #[cfg(feature = "device")]
             device_resolver: None,
         }
+    }
+
+    /// Like [`new`](Self::new), refusing a signing key that is a single
+    /// repeated byte.
+    ///
+    /// # Errors
+    ///
+    /// [`WeakKeyError`](super::weak_key::WeakKeyError) for such a key.
+    pub fn try_new(store: S, signing_key: [u8; 32]) -> Result<Self, super::weak_key::WeakKeyError> {
+        if super::weak_key::is_constant_key(&signing_key) {
+            return Err(super::weak_key::WeakKeyError);
+        }
+        Ok(Self::new(store, signing_key))
     }
 
     /// Configure a previous signing master key for zero-downtime
@@ -168,6 +223,7 @@ impl<S: SessionStore> SessionLayer<S> {
         // means the master key bytes exist in two places briefly.
         // The debug_assert catches this in dev; release builds allow
         // it (matches SessionConfig setter behavior).
+        super::weak_key::warn_if_constant_key("previous session signing key", &previous_master);
         debug_assert!(
             Arc::strong_count(&self.signing_keys) == 1,
             "SessionLayer::with_previous_signing_key called after the layer was cloned \
@@ -265,15 +321,77 @@ impl<S: SessionStore> SessionLayer<S> {
         zeroize::Zeroizing::new(self.signing_keys.derive_subkey(info))
     }
 
+    /// Replace the layer's cookie and TTL settings with a [`SessionConfig`],
+    /// typically one from
+    /// [`SessionConfigBuilder::build`](crate::session::SessionConfigBuilder::build),
+    /// which has already checked it.
+    ///
+    /// Settings made by earlier `with_*` calls are overwritten; call this
+    /// first. The layer re-checks the whole configuration when it becomes a
+    /// service, whichever way it was built.
+    ///
+    /// See the `# Panics` section of [`SessionLayer`].
+    pub fn with_config(mut self, config: SessionConfig) -> Self {
+        self.config = Arc::new(config);
+        self
+    }
+
+    /// Consult a session registry for every authenticated session, so that a
+    /// revocation (suspension, password reset, administrator kick,
+    /// log-out-everywhere, the per-user session cap) takes effect on the
+    /// next request whatever guards the route.
+    ///
+    /// Without this, revocation removes the session only from the registry;
+    /// the stored row stays valid and only handlers behind the validator
+    /// middleware notice. With it, an authenticated session the registry no
+    /// longer holds is deleted from the store and the request runs as a new
+    /// guest, with the client's cookie replaced. Guests and part-way logins
+    /// are not checked. The cost is one registry call per authenticated
+    /// request. What happens when the registry cannot answer is set by
+    /// [`with_unknown_liveness`](Self::with_unknown_liveness).
+    ///
+    /// Pass the registry the authentication service was built with.
+    pub fn with_registry(mut self, registry: Arc<dyn SessionRegistryHandle>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Choose what to do with an authenticated session when the registry
+    /// cannot answer (default: [`UnknownLiveness::Reject`]).
+    pub fn with_unknown_liveness(mut self, policy: UnknownLiveness) -> Self {
+        self.unknown_liveness = policy;
+        self
+    }
+
+    /// End an authenticated session once it is older than `max_age`
+    /// measured from when it authenticated, however recently it was used
+    /// (default: no cap, so only the sliding TTL bounds a session). The age
+    /// is read from the layer's clock; see [`with_clock`](Self::with_clock).
+    pub fn with_max_session_age(mut self, max_age: Duration) -> Self {
+        self.config_mut().max_authenticated_age = Some(max_age);
+        self
+    }
+
+    /// Replace the clock the layer reads (default: [`SystemClock`]). Only the
+    /// absolute age cap reads it, so a simulated clock makes that cap
+    /// deterministic.
+    pub fn with_clock(mut self, clock: impl Clock) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
     /// Override the session TTL (default: 24 hours).
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.config_mut().ttl = ttl;
         self
     }
 
-    /// Override the cookie name (default: `"axess.sid"`).
+    /// Override the cookie name (default: `"__Host-axess.sid"`, or
+    /// `"axess.sid"` when `Secure` is off or the path is not `/`).
     pub fn with_cookie_name(mut self, name: impl Into<Arc<str>>) -> Self {
-        self.config_mut().cookie_name = name.into();
+        let config = self.config_mut();
+        config.cookie_name = name.into();
+        config.cookie_name_explicit = true;
         self
     }
 

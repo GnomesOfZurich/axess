@@ -23,11 +23,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
 /// What a refused-before-user request is expected to do, in order.
-const PRE_USER_SEQUENCE: [&str; 6] = [
+const PRE_USER_SEQUENCE: [&str; 7] = [
     "find_tenant",
     "ip_policy_for_tenant",
     "find_user",
     "account_status",
+    "failed_attempts",
     "available_methods",
     "record_event",
 ];
@@ -43,6 +44,7 @@ fn session() -> AuthSession {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }

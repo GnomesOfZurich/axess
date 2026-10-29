@@ -89,3 +89,59 @@ fn dropping_a_hold_removes_its_routes() {
     drop(keep);
     assert!(shared.lock().routes.is_empty());
 }
+
+fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("in range")
+}
+
+/// After the dispatcher sees `Closed`, the connection is already forgotten, so
+/// the next join sees none to replace. The loss is still remembered, and the
+/// reconnect flags every waiting watcher for a recheck.
+#[tokio::test]
+async fn a_closed_connection_is_rechecked_after_the_reconnect() {
+    let shared = SharedSubscriber::new();
+    let a = shared.register(channels(1));
+    let b = shared.register(channels(2));
+
+    shared.dispatch_closed();
+    assert_eq!(a.slot.next().await, Event::Closed);
+    assert_eq!(b.slot.next().await, Event::Closed);
+    assert!(shared.lock().lost);
+
+    shared.finish_reconnect();
+    assert_eq!(a.slot.next().await, Event::Recheck);
+    assert_eq!(b.slot.next().await, Event::Recheck);
+    assert!(!shared.lock().lost);
+
+    // A reconnect with nothing lost flags nobody.
+    shared.finish_reconnect();
+    assert_eq!(wakeups(&a), 2);
+}
+
+/// A dead connection that is replaced and whose replacement cannot be opened
+/// tells the waiting watchers, and the loss survives to the next success.
+#[tokio::test]
+async fn a_failed_replacement_tells_the_waiting_watchers() {
+    let shared = SharedSubscriber::new();
+    let waiting = shared.register(channels(1));
+    shared.connection_lost();
+    assert_eq!(waiting.slot.next().await, Event::Closed);
+    assert!(shared.lock().lost);
+    shared.finish_reconnect();
+    assert_eq!(waiting.slot.next().await, Event::Recheck);
+}
+
+/// Reconnection attempts are spaced on the injected clock, doubling to a cap.
+#[test]
+fn failed_attempts_back_off_on_the_injected_clock() {
+    let mut backoff = Backoff::default();
+    assert!(backoff.retry_at.is_none());
+    backoff.failed(at(0));
+    assert_eq!(backoff.retry_at, Some(at(1)));
+    backoff.failed(at(1));
+    assert_eq!(backoff.retry_at, Some(at(3)));
+    for _ in 0..40 {
+        backoff.failed(at(100));
+    }
+    assert_eq!(backoff.retry_at, Some(at(100 + BACKOFF_MAX_SECS)));
+}

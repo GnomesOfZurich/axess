@@ -13,7 +13,10 @@ const KEY: [u8; 32] = [3u8; 32];
 const TTL: Duration = Duration::from_secs(60);
 
 async fn store() -> MysqlSessionStore {
-    let store = MysqlSessionStore::new(sql_live::mysql_pool(4).await, SessionCrypto::new(KEY));
+    let store = MysqlSessionStore::new(
+        sql_live::mysql_pool(4).await,
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     store.init_schema().await.expect("init_schema");
     store
 }
@@ -359,7 +362,10 @@ async fn racing_rotations_leave_the_data_under_one_id() {
 async fn the_documented_upgrade_step_makes_an_old_table_work() {
     let pool = sql_live::mysql_pool(2).await;
     sqlx::query("CREATE TABLE sessions (id VARCHAR(64) PRIMARY KEY, data TEXT NOT NULL, expires_at BIGINT NOT NULL, INDEX idx_sessions_expires_at (expires_at))").execute(&pool).await.unwrap();
-    let store = MysqlSessionStore::new(pool.clone(), SessionCrypto::new(KEY));
+    let store = MysqlSessionStore::new(
+        pool.clone(),
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     let id = new_id();
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?, ?, ?)")
         .bind(id.to_string())
@@ -393,4 +399,10 @@ async fn the_documented_upgrade_step_makes_an_old_table_work() {
     let fresh = new_id();
     store.save(&fresh, &admin(), TTL).await.unwrap();
     assert!(store.load(&fresh).await.unwrap().is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn update_if_revision_keeps_the_contract() {
+    crate::testing::store_contract::assert_update_if_revision_contract(&store().await).await;
 }

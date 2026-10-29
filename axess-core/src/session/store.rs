@@ -28,6 +28,19 @@ pub enum CycleOutcome {
     SessionGone,
 }
 
+/// What [`SessionStore::update_if_revision`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ConditionalUpdate {
+    /// The stored data carried the expected revision and was replaced.
+    Written,
+    /// A live row exists but holds another revision: a concurrent request
+    /// wrote it since the caller loaded. Nothing was written.
+    Conflict,
+    /// No live row: the session was deleted or expired. Nothing was written.
+    Gone,
+}
+
 /// Typed, async session storage backend.
 ///
 /// Implementors: [`MemorySessionStore`], `SqliteSessionStore`, `ValkeySessionStore`.
@@ -77,6 +90,28 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         data: &SessionData,
         ttl: Duration,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+
+    /// Replace the data of a live session only while the stored data still
+    /// carries `expected_revision` ([`SessionData::revision`]).
+    ///
+    /// The compare-and-swap behind single-use session state: two requests
+    /// that loaded the same revision cannot both write, so only one of them
+    /// consumes a one-shot value. The loser gets
+    /// [`ConditionalUpdate::Conflict`] and nothing is written; a row that no
+    /// longer exists is [`ConditionalUpdate::Gone`].
+    ///
+    /// The comparison and the write are one atomic step in every shipped
+    /// backend: the SQL stores replace the row only while it still holds the
+    /// bytes that were compared, Valkey runs a script (so a deployment
+    /// without scripting gets an error, never a weaker compare), and the
+    /// memory store holds the entry's lock.
+    fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> impl std::future::Future<Output = Result<ConditionalUpdate, Self::Error>> + Send;
 
     /// Atomically delete the old session row and store the data under the
     /// caller-supplied new id.
@@ -271,218 +306,11 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     }
 }
 
-// Dyn-safe adapters over `SessionRegistry`. The trait uses RPITIT + an
-// associated `Error` so it is not dyn-safe; `SessionRevoker` narrows to
-// the logout surface (`invalidate_*`) and `SessionRegistryHandle` adds
-// the full registry surface used by `AuthnService`. Error handling is
-// baked in: `is_valid` fails closed, `invalidate_*` log-and-swallow,
-// `register` returns `bool`, `active_sessions` fails open with `vec![]`
-// so registry outages don't lock users out.
-
-/// Dyn-safe narrow handle for session revocation. Implemented by
-/// [`SessionRegistryAdapter`]; consumers (logout handlers) take
-/// `Arc<dyn SessionRevoker>` so they can't accidentally call broader
-/// registry operations.
-pub trait SessionRevoker: Send + Sync + 'static {
-    /// Invalidate every session belonging to the user.
-    fn invalidate_user<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-
-    /// Invalidate a single session for the user.
-    fn invalidate_session<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-}
-
-/// What the registry can say about one session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionLiveness {
-    /// The registry holds the session as valid.
-    Valid,
-    /// The registry answered and does not hold the session as valid.
-    Gone,
-    /// The registry could not answer (an error), so nothing is known.
-    Unknown,
-}
-
-/// Dyn-safe full handle for the session registry. Adds session
-/// registration + validity-check + active-session listing on top of
-/// [`SessionRevoker`].
-pub trait SessionRegistryHandle: SessionRevoker {
-    /// Return `true` if the named session is still valid for the user.
-    /// Fails closed on registry error.
-    fn is_valid<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
-
-    /// Three-way liveness of a session: [`SessionLiveness::Gone`] only when
-    /// the registry answered that the session is not valid, and
-    /// [`SessionLiveness::Unknown`] when it could not answer. Bookkeeping
-    /// that drops state for ended sessions acts on `Gone` alone.
-    ///
-    /// The default cannot tell an error from a negative answer, because
-    /// [`is_valid`](Self::is_valid) fails closed with `false`; it reports
-    /// `Unknown` for `false`. [`SessionRegistryAdapter`] overrides it with the
-    /// exact answer.
-    fn liveness<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>> {
-        Box::pin(async move {
-            if self.is_valid(user_id, session_id).await {
-                SessionLiveness::Valid
-            } else {
-                SessionLiveness::Unknown
-            }
-        })
-    }
-
-    /// Register a session under the user. Returns `true` on success,
-    /// `false` on registry error. Callers that *require* the registry
-    /// to track the session (signup, factor completion) should react to
-    /// `false` by clearing the session and refusing authentication.
-    fn register<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
-
-    /// Return all active session IDs for the user, oldest first.
-    /// Fails open with an empty vec on registry error so the
-    /// concurrent-session limit doesn't lock users out during outage.
-    fn active_sessions<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>>;
-}
-
-/// Type-erasing adapter that turns any concrete [`SessionRegistry`] into
-/// `dyn SessionRevoker` *and* `dyn SessionRegistryHandle`. One wrapper
-/// for both shapes; pick the trait that matches the call site's needs.
-pub struct SessionRegistryAdapter<T: SessionRegistry>(pub T);
-
-impl<T: SessionRegistry + 'static> SessionRevoker for SessionRegistryAdapter<T> {
-    fn invalidate_user<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            if let Err(e) = self.0.invalidate_user(user_id).await {
-                tracing::warn!(
-                    user_id = %user_id,
-                    error = %e,
-                    "session registry invalidate_user failed; user sessions may remain active"
-                );
-            }
-        })
-    }
-
-    fn invalidate_session<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            if let Err(e) = self.0.invalidate_session(user_id, session_id).await {
-                tracing::warn!(
-                    user_id = %user_id,
-                    error = %e,
-                    "session registry invalidate_session failed"
-                );
-            }
-        })
-    }
-}
-
-impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdapter<T> {
-    fn liveness<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>> {
-        Box::pin(async move {
-            match self.0.is_valid(user_id, session_id).await {
-                Ok(true) => SessionLiveness::Valid,
-                Ok(false) => SessionLiveness::Gone,
-                Err(e) => {
-                    tracing::warn!(
-                        user_id = %user_id,
-                        error = %e,
-                        "session registry liveness check failed; treating as unknown"
-                    );
-                    SessionLiveness::Unknown
-                }
-            }
-        })
-    }
-
-    fn is_valid<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move {
-            match self.0.is_valid(user_id, session_id).await {
-                Ok(valid) => valid,
-                Err(e) => {
-                    tracing::warn!(
-                        user_id = %user_id,
-                        error = %e,
-                        "session registry is_valid check failed; failing closed"
-                    );
-                    false
-                }
-            }
-        })
-    }
-
-    fn register<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-        session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move {
-            match self.0.register(user_id, session_id).await {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(
-                        user_id = %user_id,
-                        error = %e,
-                        "session registry register failed; caller must clear the session \
-                         to avoid an Authenticated-but-untracked outcome"
-                    );
-                    false
-                }
-            }
-        })
-    }
-
-    fn active_sessions<'a>(
-        &'a self,
-        user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>> {
-        Box::pin(async move {
-            match self.0.active_sessions(user_id).await {
-                Ok(sessions) => sessions,
-                Err(e) => {
-                    tracing::error!(
-                        user_id = %user_id,
-                        error = %e,
-                        "session registry active_sessions failed; concurrent session limit disabled for this request"
-                    );
-                    Vec::new()
-                }
-            }
-        })
-    }
-}
+mod handles;
+pub(crate) use handles::note_revocation;
+pub use handles::{
+    RevocationError, SessionLiveness, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker,
+};
 
 // ── MemorySessionStore ────────────────────────────────────────────────────────
 //
@@ -613,6 +441,27 @@ impl SessionStore for MemorySessionStore {
             self.maybe_auto_purge();
         }
         Ok(replaced)
+    }
+
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<ConditionalUpdate, Self::Error> {
+        let outcome = match self
+            .inner
+            .replace_live_if(id, data, ttl, |stored| stored.revision == expected_revision)
+        {
+            None => ConditionalUpdate::Gone,
+            Some(false) => ConditionalUpdate::Conflict,
+            Some(true) => {
+                self.maybe_auto_purge();
+                ConditionalUpdate::Written
+            }
+        };
+        Ok(outcome)
     }
 
     async fn cycle(

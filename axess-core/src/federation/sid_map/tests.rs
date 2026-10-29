@@ -184,10 +184,10 @@ fn reinserting_a_key_at_the_same_instant_does_not_grow_the_queue() {
     assert!(map.is_empty());
 }
 
-/// Stale queue items (a replaced or removed entry's old insertion) do not
-/// use up the eviction budget: a pass of `max` removes `max` live entries.
+/// A replaced or removed entry leaves nothing in the time order, so a pass of
+/// `max` removes `max` live entries.
 #[test]
-fn stale_queue_items_do_not_count_toward_the_eviction_budget() {
+fn replaced_and_removed_entries_do_not_count_toward_the_eviction_budget() {
     let map = SidMap::new();
     let s = Sessions::new();
     let u = user("u");
@@ -423,4 +423,82 @@ fn the_sweep_queue_stays_bounded_when_sessions_are_forgotten() {
         queued <= 2 * map.subject_len() + QUEUE_SLACK + 1,
         "queue held {queued}"
     );
+}
+
+/// An entry stamped before its predecessors, as happens after the clock
+/// steps back, still ages out on schedule. The order is by the time an entry
+/// carries, not by when it arrived, so the older stamp is not stuck behind a
+/// newer one at the front.
+#[test]
+fn an_entry_stamped_before_its_predecessors_ages_out_on_schedule() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let u = user("u");
+    // Arrives first and is recent; the clock then steps back an hour and the
+    // next login is stamped long before it.
+    put(&map, key(ISS, "recent"), u, s.next(), at(10_000));
+    put(&map, key(ISS, "stepped-back"), u, s.next(), at(0));
+
+    let aged = map.evict_inserted_before(at(5_000), 10);
+
+    let sids: Vec<_> = aged.iter().map(|(k, _)| k.1.clone()).collect();
+    assert_eq!(
+        sids,
+        ["stepped-back"],
+        "the old stamp is due, the recent one is not"
+    );
+    assert!(map.contains_key(&key(ISS, "recent")));
+    assert_consistent(&map);
+}
+
+/// The fan-out order of a subject logout is the same on every run: the
+/// registry is a hash set, and its iteration order is not.
+#[test]
+fn a_subject_logout_returns_its_sessions_in_a_fixed_order() {
+    let u = user("u");
+    let s = Sessions::new();
+    let sessions: Vec<_> = (0..16).map(|_| s.next()).collect();
+    let mut expected: Vec<(UserId, SessionId)> = sessions.iter().map(|x| (u, *x)).collect();
+    expected.sort_unstable();
+    // Fresh maps get fresh hasher keys; the output must not depend on them.
+    for _ in 0..8 {
+        let map = SidMap::new();
+        for session in &sessions {
+            reg(&map, ISS, u, *session);
+        }
+        let taken = map.take_subject_sessions(ISS, &u.to_string());
+        assert_eq!(taken, expected);
+    }
+}
+
+/// A mapping the displacing login took out can be put back, with its
+/// original insertion time, while the key is still vacant and its session
+/// still lives; not over a newer mapping, and not for a session that ended.
+#[test]
+fn a_displaced_mapping_is_restored_only_into_a_vacant_key_for_a_live_session() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let (a, b) = (user("a"), user("b"));
+    let (sa, sb) = (s.next(), s.next());
+    reg(&map, ISS, a, sa);
+    map.insert(key(ISS, "x"), &a.to_string(), a, sa, at(5));
+
+    let displaced = map
+        .insert_displacing(key(ISS, "x"), &b.to_string(), b, sb, at(9))
+        .expect("a's mapping is displaced");
+    assert_eq!((displaced.user, displaced.session), (a, sa));
+    assert_eq!(displaced.inserted_at, at(5));
+
+    // The key is taken, so nothing is restored over it.
+    assert!(!map.restore_if_vacant(key(ISS, "x"), displaced.clone()));
+    assert_eq!(map.get(&key(ISS, "x")).map(|e| e.0), Some(b));
+
+    map.remove_session(&sb);
+    assert!(map.restore_if_vacant(key(ISS, "x"), displaced.clone()));
+    assert_eq!(map.get(&key(ISS, "x")), Some((a, sa, at(5))));
+    assert_consistent(&map);
+
+    // An ended session is not resurrected.
+    map.remove(&key(ISS, "x"));
+    assert!(!map.restore_if_vacant(key(ISS, "x"), displaced));
 }

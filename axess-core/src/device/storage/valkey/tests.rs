@@ -7,9 +7,9 @@ use fred::bytes::Bytes;
 
 use super::policy::{SweepStep, plan_sweep, ttl_seconds};
 use super::scripts::{
-    DROP_STALE_FINGERPRINT, PRUNE_ABSENT, PRUNE_MISMATCH, REMOVE_DEVICE, ScriptStatus, WRITE_ROW,
-    pair_replies, parse_status, prune_args, prune_mismatch_args, remove_args, row_keys,
-    write_row_args,
+    DROP_ABSENT_FINGERPRINT, DROP_STALE_FINGERPRINT, PRUNE_ABSENT, PRUNE_MISMATCH, REMOVE_DEVICE,
+    ScriptStatus, WRITE_ROW, pair_replies, parse_status, prune_args, prune_mismatch_args,
+    remove_args, row_keys, write_row_args,
 };
 use super::*;
 
@@ -255,7 +255,7 @@ fn a_sealed_row_does_not_open_under_another_device_id() {
     let s = offline_store();
     let a = device(DeviceTrustLevel::Trusted, t0());
     let sealed = s.encode_row(&a).unwrap();
-    assert!(sealed.starts_with(b"AXR\x02"));
+    assert!(sealed.starts_with(b"AXR\x82"));
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     assert_eq!(s.decode_row(&tenant, &id, &sealed).unwrap(), a);
     assert!(s.decode_row(&tenant, "dev-2", &sealed).is_err());
@@ -266,7 +266,7 @@ fn a_sealed_row_does_not_open_under_another_device_id() {
 /// the next encode seals it in the bound form.
 #[test]
 fn a_legacy_row_reads_and_is_resealed_bound() {
-    let s = offline_store();
+    let s = offline_store().with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept);
     let a = device(DeviceTrustLevel::Seen, t0());
     let legacy = s
         .crypto
@@ -274,12 +274,12 @@ fn a_legacy_row_reads_and_is_resealed_bound() {
         .unwrap()
         .encrypt_unbound(&rmp_serde::to_vec_named(&a).unwrap())
         .unwrap();
-    assert!(!legacy.starts_with(b"AXR\x02"));
+    assert!(!legacy.starts_with(b"AXR\x82"));
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     let read = s.decode_row(&tenant, &id, &legacy).unwrap();
     assert_eq!(read, a);
     let resealed = s.encode_row(&read).unwrap();
-    assert!(resealed.starts_with(b"AXR\x02"));
+    assert!(resealed.starts_with(b"AXR\x82"));
     assert!(s.decode_row(&tenant, "dev-2", &resealed).is_err());
 }
 
@@ -288,8 +288,8 @@ fn a_legacy_row_reads_and_is_resealed_bound() {
 /// the current format.
 #[test]
 fn a_row_of_the_previous_sealed_format_reads_and_is_resealed() {
-    use crate::session::crypto::{BoundFormat, device_row_id_v1};
-    let s = offline_store();
+    use crate::session::crypto::{BoundFormat, LegacyBlobs, device_row_id_v1};
+    let s = offline_store().with_legacy_blobs(LegacyBlobs::Accept);
     let a = device(DeviceTrustLevel::Seen, t0());
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     let body = s
@@ -306,7 +306,72 @@ fn a_row_of_the_previous_sealed_format_reads_and_is_resealed() {
 
     assert_eq!(s.decode_row(&tenant, &id, &old).unwrap(), a);
     assert!(s.decode_row(&tenant, "dev-2", &old).is_err());
-    assert!(s.encode_row(&a).unwrap().starts_with(b"AXR\x02"));
+    assert!(s.encode_row(&a).unwrap().starts_with(b"AXR\x82"));
+
+    // Under the default policy (and under Reject) the 0.11.0 format is
+    // refused too, ambiguous zero-joined ids and all.
+    let strict = offline_store();
+    assert!(strict.decode_row(&tenant, &id, &old).is_err());
+}
+
+/// A legacy row sealed for one device and stored under another device's key
+/// is refused whatever the policy, and nothing seals it under the new key.
+#[test]
+fn a_legacy_row_moved_to_another_key_is_refused_and_not_resealed() {
+    use crate::session::crypto::LegacyBlobs;
+    let a = device(DeviceTrustLevel::Trusted, t0());
+    let legacy = offline_store()
+        .crypto
+        .as_ref()
+        .unwrap()
+        .encrypt_unbound(&rmp_serde::to_vec_named(&a).unwrap())
+        .unwrap();
+    let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
+
+    // The default refuses every legacy blob.
+    assert!(
+        offline_store()
+            .decode_row_checked("tenant-2", "dev-2", &legacy)
+            .is_err()
+    );
+
+    // Accepting legacy blobs still checks the row's own ids against the key.
+    let accepting = offline_store().with_legacy_blobs(LegacyBlobs::Accept);
+    assert!(
+        accepting
+            .decode_row_checked("tenant-2", "dev-2", &legacy)
+            .is_err()
+    );
+    assert!(
+        accepting
+            .decode_row_checked(&tenant, "dev-2", &legacy)
+            .is_err()
+    );
+    let (read, stale) = accepting.decode_row_checked(&tenant, &id, &legacy).unwrap();
+    assert_eq!(read, a);
+    assert!(stale, "the row under its own key is still re-sealed");
+}
+
+/// A cutoff on the injected clock ends the acceptance of legacy rows.
+#[test]
+fn legacy_rows_are_accepted_only_until_the_cutoff() {
+    use crate::session::crypto::{LegacyBlobs, SessionCrypto};
+    use axess_clock::testing::MockClock;
+    let a = device(DeviceTrustLevel::Seen, t0());
+    let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
+    let clock = std::sync::Arc::new(MockClock::at(t0()));
+    let crypto = SessionCrypto::new([7u8; 32])
+        .with_legacy_blobs(LegacyBlobs::AcceptUntil(t0() + Duration::days(1)))
+        .with_clock(clock.clone());
+    let legacy = crypto
+        .encrypt_unbound(&rmp_serde::to_vec_named(&a).unwrap())
+        .unwrap();
+    let s =
+        ValkeyDeviceStore::with_crypto(Client::new(Config::default(), None, None, None), crypto);
+
+    assert!(s.decode_row_checked(&tenant, &id, &legacy).is_ok());
+    clock.set(t0() + Duration::days(1));
+    assert!(s.decode_row_checked(&tenant, &id, &legacy).is_err());
 }
 
 /// With legacy blobs rejected, an unmarked row is refused and a marked one
@@ -358,6 +423,37 @@ fn a_row_without_demoted_at_reads_as_never_trusted() {
     let bytes = rmp_serde::to_vec_named(&old).unwrap();
     let got: Device = rmp_serde::from_slice(&bytes).unwrap();
     assert_eq!(got.demoted_at, None);
+}
+
+/// Tenant, device, user and family components of every key are ids that are
+/// UUIDs (or, for the family, sit under a fixed segment after a UUID), so a
+/// row key `dev:{tenant}:{id}` can never equal an index key such as
+/// `dev:tenant:{tenant}` or `dev:user:{tenant}:{user}`: a tenant named like
+/// an index segment is refused by the id type before any key is built.
+#[test]
+fn ids_cannot_alias_an_index_segment_in_a_key() {
+    use crate::authn::ids::{DeviceId, TenantId};
+    for segment in ["tenant", "user", "fam", "fp", "fps", "a:b", ""] {
+        assert!(TenantId::try_new(segment).is_err(), "tenant {segment:?}");
+        assert!(DeviceId::try_new(segment).is_err(), "device {segment:?}");
+    }
+    let (tenant, id) = (
+        axess_identity::testing::tenant("tenant-1").to_string(),
+        axess_identity::testing::device("dev-1").to_string(),
+    );
+    let row = device_key("axess", &tenant, &id);
+    assert_ne!(row, tenant_index_key("axess", &id));
+    assert_ne!(row, user_index_key("axess", &tenant, &id));
+    assert!(!tenant.contains(':') && !id.contains(':'));
+}
+
+/// The cleanup of a single-id fingerprint key of an earlier release removes
+/// it only while its row is gone.
+#[test]
+fn the_absent_row_cleanup_checks_the_row_before_deleting() {
+    assert!(DROP_ABSENT_FINGERPRINT.contains("EXISTS"));
+    assert!(DROP_ABSENT_FINGERPRINT.contains("== 0"));
+    assert!(DROP_ABSENT_FINGERPRINT.contains("DEL"));
 }
 
 // ── live-server tests (ignored by default) ──────────────────────────────
@@ -748,6 +844,7 @@ fn pruning_rechecks_absence_inside_the_script() {
 }
 
 mod consistency;
+mod owner_index;
 mod reseal;
 mod twins;
 

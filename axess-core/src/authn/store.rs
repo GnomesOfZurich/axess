@@ -354,6 +354,82 @@ pub trait IdentityAuthnLog: IdentityLookup {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<u32, Self::Error>> + Send;
 
+    /// The failed attempt counter for a user and when the last failure was
+    /// recorded: `(count, last_failure_at)`.
+    ///
+    /// This is what makes a lockout enforceable. The library derives the
+    /// lockout from it with the tenant's
+    /// [`LockoutPolicy`], so a store need
+    /// not (and a conforming one does not have to) flip
+    /// [`account_status`](IdentityLookup::account_status) to suspended. Return
+    /// `(0, None)` for a user with no failures. Failures older than the
+    /// policy's `attempt_window` should be reported as zero, the same expiry
+    /// [`record_failed_attempt`](Self::record_failed_attempt) applies when it
+    /// counts.
+    ///
+    /// [`record_failed_attempt`](Self::record_failed_attempt) must store the
+    /// time of the failure it counts, and
+    /// [`reset_failed_attempts`](Self::reset_failed_attempts) must clear it.
+    /// There is deliberately no default body: a store that silently reported
+    /// zero would leave every account unlockable.
+    fn failed_attempts(
+        &self,
+        user_id: &UserId,
+    ) -> impl std::future::Future<
+        Output = Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error>,
+    > + Send;
+
+    /// Reserve one guess against the failure counter **before** the
+    /// credential is checked.
+    ///
+    /// Returns `Some(count)` with the counter already incremented (and the
+    /// time of the attempt stored, as
+    /// [`record_failed_attempt`](Self::record_failed_attempt) does) while the
+    /// account is under its limit, and `None`, changing nothing, when it is
+    /// at it. The test and the increment **MUST** be one atomic step
+    /// (`UPDATE ... SET n = n + 1 WHERE ... RETURNING n`, a Lua script, a
+    /// locked entry): with a read followed by a write, N parallel guesses all
+    /// read a count below the limit and all run their verifier, so an
+    /// attacker gets N guesses past `max_attempts`, and a read replica
+    /// widens the window further.
+    ///
+    /// The rule, in terms of the stored `(count, last_failure_at)` and the
+    /// `policy` of the user's tenant, at the store's `now`:
+    ///
+    /// 1. The count is **fresh**, that is zero, when there is no failure,
+    ///    when the last one is older than `policy.attempt_window`, or when the
+    ///    count has reached `policy.effective_max_attempts()` and a timed
+    ///    lockout (`policy.duration` is `Some`) has run out. A lockout that
+    ///    has ended starts the account over rather than relocking it on the
+    ///    next guess.
+    /// 2. A fresh count is replaced by one. Otherwise the guess is granted
+    ///    (count plus one) while the count is below
+    ///    `policy.effective_max_attempts()`, and refused with `None` once it
+    ///    is not.
+    ///
+    /// The library calls this once per credential check. A wrong credential
+    /// keeps the reservation, and the library does not call
+    /// [`record_failed_attempt`](Self::record_failed_attempt) for it; a right
+    /// one gives it back with [`release_attempt`](Self::release_attempt). A
+    /// request cancelled between the two therefore still counts as a guess.
+    fn reserve_attempt(
+        &self,
+        user_id: &UserId,
+        policy: &crate::authn::types::LockoutPolicy,
+    ) -> impl std::future::Future<Output = Result<Option<u32>, Self::Error>> + Send;
+
+    /// Give back one reservation made by
+    /// [`reserve_attempt`](Self::reserve_attempt), after the credential
+    /// verified. Never takes the counter below zero, and clears the stored
+    /// failure time when the counter reaches zero. Failures that preceded the
+    /// reservation stay counted until
+    /// [`reset_failed_attempts`](Self::reset_failed_attempts) runs at the end
+    /// of a successful login.
+    fn release_attempt(
+        &self,
+        user_id: &UserId,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
     /// Reset the failed attempt counter (call after successful authentication).
     fn reset_failed_attempts(
         &self,
@@ -565,150 +641,8 @@ pub trait IdentityPasswordHistory: IdentityLookup {
     ) -> impl std::future::Future<Output = Result<Vec<String>, Self::Error>> + Send;
 }
 
-// ── NoopAuthnLog adopter helper ──────────────────────────────────────────────
-
-/// Wraps an [`IdentityLookup`] backend with a no-op [`IdentityAuthnLog`]
-/// impl on top, so it satisfies the `AuthnService::new` bound without
-/// the adopter writing audit + lockout impls.
-///
-/// **Semantics, read carefully before reaching for this:**
-///
-/// - `record_event` silently discards every audit event. No SOC trail.
-/// - `record_failed_attempt` always returns `Ok(1)`. Lockout policy is
-///   effectively disabled; the counter never accumulates beyond 1, so
-///   `max_attempts` thresholds are never crossed regardless of how
-///   many failures occur.
-/// - `reset_failed_attempts` is a no-op.
-/// - `record_last_login` inherits the trait default no-op.
-///
-/// Appropriate uses:
-///
-/// - Integration tests / fixtures that don't exercise the lockout or
-///   audit paths.
-/// - Read-replica integrations where audit goes through a separate
-///   pipeline (e.g. database CDC, a sidecar log forwarder).
-/// - Prototypes that want login working before the audit table is
-///   designed.
-///
-/// **Production deployments must override `IdentityAuthnLog` directly.**
-/// Routing failed attempts to `Ok(1)` is a security regression on any
-/// surface accepting untrusted input.
-pub struct NoopAuthnLog<L>(pub L);
-
-impl<L: IdentityLookup + Clone> Clone for NoopAuthnLog<L> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<L: IdentityLookup> IdentityLookup for NoopAuthnLog<L> {
-    type Error = L::Error;
-
-    fn find_user(
-        &self,
-        identifier: &str,
-        tenant_id: &TenantId,
-    ) -> impl std::future::Future<Output = Result<Option<User>, Self::Error>> + Send {
-        self.0.find_user(identifier, tenant_id)
-    }
-
-    fn get_user(
-        &self,
-        user_id: &UserId,
-    ) -> impl std::future::Future<Output = Result<Option<User>, Self::Error>> + Send {
-        self.0.get_user(user_id)
-    }
-
-    fn get_user_tenant(
-        &self,
-        user_id: &UserId,
-    ) -> impl std::future::Future<Output = Result<Option<TenantId>, Self::Error>> + Send {
-        self.0.get_user_tenant(user_id)
-    }
-
-    fn get_tenant(
-        &self,
-        tenant_id: &TenantId,
-    ) -> impl std::future::Future<Output = Result<Option<Tenant>, Self::Error>> + Send {
-        self.0.get_tenant(tenant_id)
-    }
-
-    fn find_tenant(
-        &self,
-        identifier: &str,
-    ) -> impl std::future::Future<Output = Result<Option<Tenant>, Self::Error>> + Send {
-        self.0.find_tenant(identifier)
-    }
-
-    fn default_tenant(
-        &self,
-    ) -> impl std::future::Future<Output = Result<Tenant, Self::Error>> + Send {
-        self.0.default_tenant()
-    }
-
-    fn account_status(
-        &self,
-        user_id: &UserId,
-    ) -> impl std::future::Future<Output = Result<EntityState, Self::Error>> + Send {
-        self.0.account_status(user_id)
-    }
-
-    fn lockout_policy(&self) -> LockoutPolicy {
-        self.0.lockout_policy()
-    }
-
-    fn lockout_policy_for_tenant(&self, tenant_id: &TenantId) -> LockoutPolicy {
-        self.0.lockout_policy_for_tenant(tenant_id)
-    }
-
-    fn password_rules_for_tenant(
-        &self,
-        tenant_id: &TenantId,
-    ) -> impl std::future::Future<Output = Result<PasswordRules, Self::Error>> + Send {
-        self.0.password_rules_for_tenant(tenant_id)
-    }
-
-    fn ip_policy_for_tenant(
-        &self,
-        tenant_id: &TenantId,
-    ) -> impl std::future::Future<Output = Result<crate::authn::types::IpPolicy, Self::Error>> + Send
-    {
-        self.0.ip_policy_for_tenant(tenant_id)
-    }
-}
-
-impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
-    async fn record_event(&self, event: AuthEvent) -> Result<AuditOutcome, Self::Error> {
-        tracing::trace!(
-            target: "axess::authn::noop_log",
-            event_type = ?event.event_type,
-            user_id = ?event.user_id,
-            "NoopAuthnLog: event discarded (no SOC trail wired up)",
-        );
-        // Honest rather than convenient: this sink drops every event, so
-        // it reports every event as shed. `Recorded` would claim a write
-        // that never happens.
-        Ok(AuditOutcome::Shed)
-    }
-
-    async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
-        tracing::trace!(
-            target: "axess::authn::noop_log",
-            %user_id,
-            "NoopAuthnLog: failed attempt not persisted; lockout policy disabled",
-        );
-        Ok(1)
-    }
-
-    async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        tracing::trace!(
-            target: "axess::authn::noop_log",
-            %user_id,
-            "NoopAuthnLog: reset_failed_attempts is a no-op",
-        );
-        Ok(())
-    }
-}
+mod noop;
+pub use noop::NoopAuthnLog;
 
 // ── ResolvedFactor ────────────────────────────────────────────────────────────
 
@@ -970,16 +904,15 @@ impl AuthMethod {
     /// Return the flat list of factor kinds for simple sequential methods.
     ///
     /// For methods using `AnyOf` steps, this returns the first choice of
-    /// each `AnyOf` step; use `steps` directly for full fidelity.
+    /// each `AnyOf` step, and nothing for an `AnyOf` with no choices; use
+    /// `steps` directly for full fidelity.
     pub fn factors(&self) -> Vec<FactorKind> {
+        // A step with no factor to offer (an empty `AnyOf`) contributes
+        // nothing. It used to be reported as `Password`, a factor the method
+        // never listed.
         self.steps
             .iter()
-            .map(|step| match step {
-                crate::authn::factor::FactorStep::Required(k) => k.clone(),
-                crate::authn::factor::FactorStep::AnyOf(choices) => {
-                    choices.first().cloned().unwrap_or(FactorKind::Password)
-                }
-            })
+            .filter_map(|step| step.primary().cloned())
             .collect()
     }
 }

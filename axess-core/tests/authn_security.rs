@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::authn::Actor;
 use axess_core::authn::AuditContext;
 use axess_core::authn::{
     factor::{FactorCredential, ZeroizedString},
@@ -115,7 +116,8 @@ async fn suspend_invalidates_registry_sessions() {
 
     // Suspend the user: session should be invalidated via registry.
     service
-        .suspend_user(
+        .suspend_user_across_tenants(
+            Actor::System,
             &uid("u1"),
             StatusDetail {
                 reason: "admin action".into(),
@@ -164,15 +166,31 @@ async fn refresh_token_reuse_after_rotation_rejected() {
     .unwrap();
 
     // First refresh: should succeed and rotate.
-    let (_, new_token) = refresh_session(&plaintext, &store, &config, &rng, now, None)
-        .await
-        .unwrap();
+    let (_, new_token) = refresh_session_with_status_check(
+        &plaintext,
+        &store,
+        &config,
+        &rng,
+        now,
+        None,
+        |_| async { true },
+    )
+    .await
+    .unwrap();
     assert!(new_token.is_some(), "rotation should issue a new token");
 
     // Reuse the OLD plaintext: should be rejected (revoked by rotation).
-    let err = refresh_session(&plaintext, &store, &config, &rng, now, None)
-        .await
-        .unwrap_err();
+    let err = refresh_session_with_status_check(
+        &plaintext,
+        &store,
+        &config,
+        &rng,
+        now,
+        None,
+        |_| async { true },
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(err, RefreshError::Revoked),
         "reused token should be Revoked, got {err:?}"

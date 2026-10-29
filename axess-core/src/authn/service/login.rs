@@ -1,16 +1,20 @@
 //! Login flow: begin_login, prepare_factor, verify_factor, check_session, logout.
 
+use super::factor_pipeline::GuessSlot;
 use super::outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome};
 use super::verification::{VerifyOutcome, verify_credential_blocking};
+#[cfg(feature = "fido2")]
+use crate::authn::factor::FactorConfig;
 use crate::authn::types::{Tenant, User};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
-    factor::{FactorConfig, FactorCredential, FactorKind, FactorStep},
+    factor::{FactorCredential, FactorKind, FactorStep},
     store::{FactorStore, IdentityStore},
     types::{AuthnScope, EntityState},
 };
 use crate::session::extractor::AuthSession;
+use crate::session::store::note_revocation;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -32,7 +36,7 @@ where
     /// Updates the session to `Authenticating`.
     ///
     /// Returns a [`LoginOutcome`] describing what the UI should do next.
-    #[tracing::instrument(skip(self, session), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(skip(self, identifier, session), fields(tenant = %tenant_identifier))]
     pub async fn begin_login(
         &self,
         identifier: &str,
@@ -66,18 +70,27 @@ where
             ControlFlow::Break(outcome) => return Ok(outcome),
         };
 
-        // 5. Begin the authentication flow in the session.
-        session
-            .begin_authenticating(user.id, tenant.id, first.method_name, first.steps)
-            .await;
+        // The epoch the flow is begun against, read before anything moves.
+        let epoch = self
+            .credential_epoch(&user.id, &tenant.id, &first.method_name)
+            .await?;
 
-        // Record login attempt event.
+        // 5. Record the login attempt BEFORE the session moves: a failed
+        // audit write fails the call with the session untouched, where the
+        // other order left it in `Authenticating` and the flow could carry
+        // on with no audit row.
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LoginAttempt)
                 .attributed_to(&user.id, &tenant.id)
                 .with_factor(first.first_kind.clone()),
         )
         .await?;
+
+        // 6. Begin the authentication flow in the session.
+        self.stamp_flow(session, &first.method_name, epoch).await;
+        session
+            .begin_authenticating(user.id, tenant.id, first.method_name, first.steps)
+            .await;
 
         Ok(LoginOutcome::FactorRequired(first.first_kind))
     }
@@ -129,6 +142,45 @@ where
             }
         };
 
+        self.admit_resolved_tenant(identifier, tenant).await
+    }
+
+    /// Admit a login for the tenant with this id, for the entry points that
+    /// do not start at [`begin_login`](Self::begin_login) (the passkey
+    /// login, an OAuth callback): the same tenant row check, status check
+    /// and IP policy, with the same refusals and audit rows.
+    ///
+    /// `identifier` is the user's identifier, only used to run the dummy
+    /// lookups a refusal makes. Breaks with
+    /// [`LoginOutcome::InvalidCredentials`] on any refusal, a tenant that
+    /// cannot be loaded included (fail closed).
+    #[cfg(any(feature = "fido2", feature = "oauth"))]
+    pub(crate) async fn admit_tenant_by_id(
+        &self,
+        identifier: &str,
+        tenant_id: &crate::authn::ids::TenantId,
+    ) -> Result<ControlFlow<LoginOutcome, Tenant>, AuthnError<I::Error>> {
+        let tenant = self
+            .inner
+            .identity
+            .get_tenant(tenant_id)
+            .await
+            .map_err(AuthnError::Store)?;
+        let Some(tenant) = tenant else {
+            return self
+                .reject_pre_user(identifier, None, AuthFailureReason::UnknownTenant, false)
+                .await
+                .map(ControlFlow::Break);
+        };
+        self.admit_resolved_tenant(identifier, tenant).await
+    }
+
+    /// The checks every login runs against a tenant once it is loaded.
+    async fn admit_resolved_tenant(
+        &self,
+        identifier: &str,
+        tenant: Tenant,
+    ) -> Result<ControlFlow<LoginOutcome, Tenant>, AuthnError<I::Error>> {
         if let Err(e) = tenant.validate() {
             tracing::error!(error = %e, "IdentityStore returned invalid Tenant");
             return self
@@ -257,9 +309,11 @@ where
     /// Look the user up and require an account status that allows login.
     ///
     /// Breaks with the outcome for an unknown identifier
-    /// ([`LoginOutcome::InvalidCredentials`]) and for a locked account
-    /// ([`LoginOutcome::Locked`]); a non-active, non-locked account is an
-    /// [`AuthnError::NotActive`] error. Each refusal emits its audit row.
+    /// ([`LoginOutcome::InvalidCredentials`]), for a non-active account
+    /// (the same outcome, so the account's state is not observable) and for
+    /// a locked account ([`LoginOutcome::Locked`]), whether the lock is a
+    /// suspension the store reports or one derived from the failure
+    /// counter. Each refusal emits its audit row.
     async fn find_loginnable_user(
         &self,
         identifier: &str,
@@ -291,21 +345,35 @@ where
             }
         };
 
-        // 3. Check account status.
+        // 3. Check account status, then the lockout the failure counter
+        // imposes. Both are read for every known user, in the order the
+        // unknown-identifier path reads its dummies, so a barred account
+        // costs the same store calls as a permitted one.
         let status = self.current_account_status(&user.id).await?;
+        let derived = if status.allows_login() {
+            self.derived_lockout(&user.id, &tenant.id).await?
+        } else {
+            let _ = self.inner.identity.failed_attempts(&user.id).await;
+            None
+        };
 
-        if !status.allows_login() {
+        if !status.allows_login() || derived.is_some() {
+            // Same fourth call the unknown path makes.
+            let _ = self
+                .inner
+                .factors
+                .available_methods(&user.id, &tenant.id)
+                .await;
             self.inner.metrics.auth_failure();
             // Emit a `Failure(LoginAttempt)` audit row before returning so
             // a fresh session probing a known-locked account leaves a SOC
-            // trail. `begin_login` does not go through
-            // `enforce_account_status`, so the audit emit must happen
-            // here explicitly. A lockout carries `Locked` rather than
-            // `Failure`, so a dashboard separates brute-force probes from
+            // trail. A lockout carries `Locked` rather than `Failure`, so a
+            // dashboard separates brute-force probes from
             // administrative-state mismatches on the status column instead
             // of on a free-text tag. The other non-active states keep the
             // tag, having no status of their own.
-            let builder = if status.is_locked() {
+            let locked = status.is_locked() || derived.is_some();
+            let builder = if locked {
                 AuthEventBuilder::locked(AuthEventType::LoginAttempt)
             } else {
                 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
@@ -313,21 +381,22 @@ where
             };
             self.emit_audit(builder.attributed_to(&user.id, &tenant.id))
                 .await?;
-            if status.is_locked() {
+            if locked {
                 self.inner.metrics.account_locked();
                 // Surface the lockout expiry so UIs can render
-                // "locked until X" on the begin path. Mirrors
-                // `prepare_factor`: read `until` off
-                // `Suspended(StatusDetail{until,..})` when the store
-                // carries it.
-                let until = if let EntityState::Suspended(detail) = &status {
-                    detail.until
-                } else {
-                    None
+                // "locked until X" on the begin path.
+                let until = match (&status, derived) {
+                    (EntityState::Suspended(detail), _) => detail.until,
+                    (_, Some(lock)) => lock.until,
+                    _ => None,
                 };
                 return Ok(ControlFlow::Break(LoginOutcome::Locked { until }));
             }
-            return Err(AuthnError::NotActive(status));
+            // A suspended-for-other-reasons, pending or terminated account
+            // answers like an unknown identifier: a distinct 403 here made
+            // account existence and state observable from the first
+            // request. The audit row above carries the real reason.
+            return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
         }
         Ok(ControlFlow::Continue(user))
     }
@@ -349,14 +418,27 @@ where
             .await
             .map_err(AuthnError::Store)?;
 
-        // Both of the next two rejections have to emit, for the same
+        // The first method with a step that has a primary factor. A
+        // method without one (an empty `AnyOf`, say) is skipped rather than
+        // ending the login while a later method is usable.
+        let usable = methods.into_iter().find_map(|method| {
+            let steps: Vec<FactorStep> = method
+                .steps
+                .iter()
+                .filter(|step| step.primary().is_some())
+                .cloned()
+                .collect();
+            (!steps.is_empty()).then(|| (method.name.clone(), steps))
+        });
+
+        // No method, or none with a usable step, has to emit, for the same
         // reason every other branch here does. A known account with no
         // usable method would otherwise be the one outcome that leaves no
         // audit row, and during an audit-store outage the one that still
         // succeeds while every other path fails, which is an enumeration
         // signal, narrow but of exactly the shape this flow was rewritten
         // to remove.
-        let Some(method) = methods.into_iter().next() else {
+        let Some((method_name, steps)) = usable else {
             self.inner.metrics.auth_failure();
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
@@ -369,28 +451,9 @@ where
             return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
         };
 
-        // The method's own steps, choices included: a step offering
-        // `AnyOf([Totp, RecoveryCode])` stays a choice for the whole flow.
-        let steps: Vec<FactorStep> = method
-            .steps
-            .iter()
-            .filter(|step| step.primary().is_some())
-            .cloned()
-            .collect();
-        if steps.is_empty() {
-            self.inner.metrics.auth_failure();
-            self.emit_audit(
-                AuthEventBuilder::failure(AuthEventType::LoginAttempt)
-                    .attributed_to(&user.id, &tenant.id)
-                    .with_error(AuthFailureReason::NoFactorsConfigured),
-            )
-            .await?;
-            return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
-        }
-
         let first_kind = steps[0].primary().cloned().ok_or(AuthnError::NoFlow)?;
         Ok(ControlFlow::Continue(FirstFactor {
-            method_name: method.name.clone(),
+            method_name,
             steps,
             first_kind,
         }))
@@ -473,6 +536,8 @@ where
             .authenticating_state()
             .await
             .ok_or(AuthnError::NoFlow)?;
+        self.require_current_flow(session, &user_id, &tenant_id)
+            .await?;
 
         // A locked/suspended (or otherwise non-Active) account must not
         // trigger challenge delivery (e.g. OTP email sends). The
@@ -608,52 +673,26 @@ where
         credential: &FactorCredential,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        use super::factor_pipeline::AccountStatusEnforcement;
-
         let (user_id, tenant_id, remaining) = session
             .authenticating_state()
             .await
             .ok_or(AuthnError::NoFlow)?;
+        self.require_current_flow(session, &user_id, &tenant_id)
+            .await?;
 
-        match self
-            .enforce_account_status(
-                &user_id,
-                &tenant_id,
-                remaining.first().and_then(FactorStep::primary).cloned(),
-                session,
-            )
+        let prepared = match self
+            .prepare_factor_step(credential, &user_id, &tenant_id, &remaining, session)
             .await?
         {
-            AccountStatusEnforcement::Ok => {}
-            AccountStatusEnforcement::Locked { until, .. } => {
-                return Ok(FactorOutcome::Locked { until });
-            }
-            AccountStatusEnforcement::NotActive(status) => {
-                return Err(AuthnError::NotActive(status));
-            }
-        }
-
-        // The step's factor the credential is for: the required one, or the
-        // choice its shape fits (a recovery code at an `AnyOf([Totp,
-        // RecoveryCode])` step). A credential no choice fits is wrong for
-        // this step, and fails like a wrong code.
-        let step = remaining.first().ok_or(AuthnError::NoFlow)?;
-        let current_kind = match step.kind_for(credential) {
-            Some(kind) => kind,
-            None => step.primary().cloned().ok_or(AuthnError::NoFlow)?,
+            Ok(prepared) => prepared,
+            Err(outcome) => return Ok(outcome),
         };
-
-        // Runtime resolution: User → Tenant → System, single-query in the store.
-        let user_scope = AuthnScope::User { tenant_id, user_id };
-        let resolved = self
-            .inner
-            .factors
-            .resolve_factor(&user_scope, current_kind.clone())
-            .await
-            .map_err(AuthnError::Store)?
-            .ok_or(AuthnError::NoFlow)?;
-        let resolved_from = resolved.resolved_from;
-        let config = resolved.config;
+        let PreparedFactorStep {
+            current_kind,
+            user_scope,
+            resolved_from,
+            config,
+        } = prepared;
 
         // FIDO2 + LDAP have their own verification methods (different
         // ceremony shape, network call) and short-circuit with their
@@ -671,26 +710,59 @@ where
                 )
                 .await;
         }
+        // The guess is counted before the verifier runs, so parallel guesses
+        // cannot all pass the limit (a passkey assertion is not a guess and
+        // is not metered).
+        let reserved = match self
+            .reserve_guess(&user_id, &tenant_id, &current_kind, session)
+            .await?
+        {
+            GuessSlot::Reserved(count) => Some(count),
+            GuessSlot::Unmetered => None,
+            GuessSlot::Refused(outcome) => return Ok(outcome),
+        };
         #[cfg(feature = "ldap")]
         if current_kind == FactorKind::LdapBind {
             return self
-                .verify_ldap_factor(credential, &config, &user_id, &tenant_id, session)
+                .verify_ldap_factor(credential, &config, &user_id, &tenant_id, session, reserved)
                 .await;
         }
+
+        let cipher = self.inner.factor_secret_cipher.as_deref();
+        let opened = super::factor_secrets::open(
+            cipher,
+            &config,
+            &resolved_from,
+            &user_scope,
+            &current_kind,
+        )
+        .map_err(|e| {
+            tracing::error!(error = %e, factor = %current_kind, "factor secret cannot be opened");
+            AuthnError::Internal(e.to_string())
+        })?;
 
         self.inner.metrics.factor_attempt();
         let outcome = verify_credential_blocking(
             &self.inner.kdf,
             credential,
-            &config,
+            &opened.verify,
             &current_kind,
             self.inner.clock.now(),
             self.inner.recovery_pepper.as_ref(),
         )
         .await?;
 
+        let close = |updated: crate::authn::factor::FactorConfig| -> Result<crate::authn::factor::FactorConfig, AuthnError<I::Error>> {
+            super::factor_secrets::close(cipher, &opened, updated, &user_scope, &current_kind)
+                .map_err(|e| {
+                    tracing::error!(error = %e, factor = %current_kind, "factor secret cannot be sealed");
+                    AuthnError::Internal(e.to_string())
+                })
+        };
+
         if let VerifyOutcome::FailWithUpdate(updated_config) = &outcome {
-            self.persist_fail_with_update(&user_scope, current_kind.clone(), updated_config)
+            let updated_config = close(updated_config.clone())?;
+            self.persist_fail_with_update(&user_scope, current_kind.clone(), &updated_config)
                 .await?;
         }
 
@@ -699,13 +771,14 @@ where
             VerifyOutcome::Fail | VerifyOutcome::FailWithUpdate(_)
         ) {
             return self
-                .record_factor_failure(&user_id, &tenant_id, &current_kind, session)
+                .record_factor_failure_after(reserved, &user_id, &tenant_id, &current_kind, session)
                 .await;
         }
 
         self.inner.metrics.factor_success();
 
         if let VerifyOutcome::PassWithUpdate(updated_config) = outcome {
+            let updated_config = close(updated_config)?;
             let swapped = self
                 .persist_pass_with_update(&user_scope, &config, &resolved_from, updated_config)
                 .await?;
@@ -717,8 +790,23 @@ where
             }
         }
 
+        self.release_guess(reserved, &user_id).await;
+        self.rehash_outdated_password(
+            session,
+            credential,
+            &config,
+            &resolved_from,
+            &user_id,
+            &tenant_id,
+        )
+        .await;
+
         session
-            .advance_factor(&current_kind, self.inner.clock.now())
+            .advance_factor(
+                &current_kind,
+                self.inner.clock.now(),
+                &self.inner.preserved_custom_keys,
+            )
             .await;
         self.complete_factor_step(&user_id, &tenant_id, session)
             .await
@@ -728,38 +816,97 @@ where
     ///
     /// Only this session ends. The user's other sessions (another browser, a
     /// phone) stay signed in; use
-    /// [`invalidate_user_sessions`](crate::authn::service::AuthnService::invalidate_user_sessions)
+    /// [`invalidate_user_sessions`](crate::authn::service::RequestAuthnService::invalidate_user_sessions)
     /// to end all of them.
+    ///
+    /// The session is cleared and its id rotated **whatever the audit store
+    /// does**: the registry entry is dropped first, the audit event is
+    /// attempted, and the session is cleared before the audit result is
+    /// returned. When the audit write fails the call returns the store error
+    /// so the failure is not hidden, but the user is logged out: a degraded
+    /// audit store never leaves a session authenticated.
     #[tracing::instrument(skip(self, session))]
     pub async fn logout(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
-        if let Some(user_id) = session.user_id().await {
-            self.inner.metrics.session_invalidated();
-            let sid = session.session_id().await;
-            if let Some(reg) = &self.inner.registry {
-                reg.invalidate_session(&user_id, &sid).await;
+        let audit = match session.pending_user_id().await {
+            Some(user_id) => {
+                self.inner.metrics.session_invalidated();
+                let sid = session.session_id().await;
+                if let Some(reg) = &self.inner.registry {
+                    note_revocation(
+                        reg.invalidate_session(&user_id, &sid).await,
+                        "logout or a refused login",
+                    );
+                }
+                // When the session is authenticated (user_id exists) but the
+                // tenant is somehow missing, record the logout event with
+                // `tenant_id = None` rather than inventing an attribution.
+                // Logged at WARN because it should never happen in practice:
+                // authenticated sessions always carry a tenant_id.
+                let tenant_id = session.pending_tenant_id().await;
+                if tenant_id.is_none() {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        "logout: authenticated session missing tenant_id; audit event will have no tenant attribution",
+                    );
+                }
+                self.emit_audit(
+                    AuthEventBuilder::success(AuthEventType::LogoutAttempt)
+                        .maybe_attributed_to(Some(&user_id), tenant_id.as_ref())
+                        .with_session(sid),
+                )
+                .await
             }
-            // When the session is authenticated (user_id exists) but the
-            // tenant is somehow missing, record the logout event with
-            // `tenant_id = None` rather than inventing an attribution.
-            // Logged at WARN because it should never happen in practice:
-            // authenticated sessions always carry a tenant_id.
-            let tenant_id = session.tenant_id().await;
-            if tenant_id.is_none() {
-                tracing::warn!(
-                    user_id = %user_id,
-                    "logout: authenticated session missing tenant_id; audit event will have no tenant attribution",
-                );
-            }
-            self.emit_audit(
-                AuthEventBuilder::success(AuthEventType::LogoutAttempt)
-                    .maybe_attributed_to(Some(&user_id), tenant_id.as_ref())
-                    .with_session(sid),
-            )
-            .await?;
-        }
+            None => Ok(()),
+        };
+        // `clear` also cycles the session id, which prevents session fixation
+        // after logout.
         session.clear().await;
-        // Cycle the session ID to prevent session fixation after logout.
+        audit
+    }
+
+    /// Rotate the session id of an authenticated session and keep the
+    /// registry in step.
+    ///
+    /// [`AuthSession::regenerate`] alone changes the id the client carries
+    /// but leaves the registry holding the old one, so a registry check would
+    /// then find the session revoked. This registers the new id, drops the
+    /// old one, and fails closed: when the registry cannot register the new
+    /// id the session is cleared and the call returns
+    /// [`AuthnError::NoFlow`]. Without a registry it is just a rotation. Use
+    /// it at the privilege boundaries `regenerate` documents (factor added,
+    /// password changed, tenant switched).
+    ///
+    /// A session layer built with a registry moves the entry itself when a
+    /// handler calls `regenerate`; this method does it without relying on
+    /// that, and works with the validator middleware alone.
+    #[tracing::instrument(skip(self, session))]
+    pub async fn rotate_session(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
+        let user = if session.is_authenticated().await {
+            session.user_id().await
+        } else {
+            None
+        };
+        let old = session.session_id().await;
         session.regenerate().await;
+        if let (Some(user_id), Some(reg)) = (user, &self.inner.registry) {
+            let new = session.session_id().await;
+            if !reg.register(&user_id, &new).await {
+                tracing::error!(
+                    user_id = %user_id,
+                    "rotate_session: registering the new session id failed; clearing the session"
+                );
+                note_revocation(
+                    reg.invalidate_session(&user_id, &old).await,
+                    "logout or a refused login",
+                );
+                session.clear().await;
+                return Err(AuthnError::NoFlow);
+            }
+            note_revocation(
+                reg.invalidate_session(&user_id, &old).await,
+                "logout or a refused login",
+            );
+        }
         Ok(())
     }
 }
@@ -771,109 +918,14 @@ pub(crate) use super::fido2_service::fido2_keys;
 mod email_otp;
 #[cfg(test)]
 mod equalization_tests;
+pub(crate) mod flow;
 #[cfg(test)]
 mod login_tests;
+mod password_entry;
+mod prepare;
+use prepare::PreparedFactorStep;
+mod reauth;
+mod rehash;
 #[cfg(test)]
 mod security_tests;
-
-impl<I, F> super::AuthnService<I, F>
-where
-    I: IdentityStore,
-    F: FactorStore<Error = I::Error>,
-{
-    /// Check whether the current session is valid (consults the registry if installed).
-    #[tracing::instrument(skip(self, session))]
-    pub async fn check_session(&self, session: &AuthSession) -> bool {
-        if !session.is_authenticated().await {
-            return false;
-        }
-        let user_id = match session.user_id().await {
-            Some(id) => id,
-            None => return false,
-        };
-        let sid = session.session_id().await;
-        if let Some(reg) = &self.inner.registry {
-            reg.is_valid(&user_id, &sid).await
-        } else {
-            true
-        }
-    }
-
-    /// A random v4 UUID drawn from the service's RNG, so a deterministic
-    /// RNG pins the throwaway ids the equalization lookups run against.
-    fn dummy_uuid(&self) -> uuid::Uuid {
-        let mut bytes = [0u8; 16];
-        self.inner.rng.fill_bytes(&mut bytes);
-        uuid::Builder::from_random_bytes(bytes).into_uuid()
-    }
-
-    fn dummy_tenant_id(&self) -> crate::authn::ids::TenantId {
-        crate::authn::ids::TenantId::try_new(self.dummy_uuid().to_string())
-            .expect("a UUID is a valid TenantId")
-    }
-
-    /// Look up a user by identifier with timing-equalization on miss.
-    ///
-    /// Returns `Ok(Some(user))` on a clean find + `validate()`,
-    /// `Ok(None)` when the identifier is unknown OR the returned
-    /// `User` failed validation. The caller maps `None` to
-    /// `LoginOutcome::InvalidCredentials`.
-    ///
-    /// **Security invariant, do not change this without thinking
-    /// carefully:** the `None` paths MUST run the same store queries
-    /// the found-user path would (against a fresh-UUID dummy id) so
-    /// the response time does not leak whether the identifier
-    /// exists. Two-step MFA flows (identify → verify) inherently
-    /// reveal whether an identifier maps to a valid account through
-    /// the response *shape*, but timing must not be a second
-    /// side-channel on top of that. This is the same trade-off
-    /// Gmail, Microsoft, and most banks accept.
-    ///
-    /// The dummy UUID is drawn from the service's RNG per request so it cannot collide
-    /// with any real user (including the reserved
-    /// [`UserId::system()`](crate::authn::ids::UserId::system)),
-    /// preserving timing-equalization semantics regardless of which
-    /// principals the application has installed.
-    ///
-    /// **Scope of equalisation:** DB queries only. LDAP network
-    /// latency is NOT equalised because LDAP bind only happens in
-    /// `verify_factor` (after the user is already known to exist);
-    /// user enumeration via LDAP timing is not reachable from
-    /// `begin_login`. Re-evaluate this comment if any LDAP call
-    /// migrates earlier in the flow.
-    async fn find_user_with_timing_equalization(
-        &self,
-        identifier: &str,
-        tenant_id: &crate::authn::ids::TenantId,
-    ) -> Result<Option<crate::authn::types::User>, AuthnError<I::Error>> {
-        let user_opt = self
-            .inner
-            .identity
-            .find_user(identifier, tenant_id)
-            .await
-            .map_err(AuthnError::Store)?;
-
-        if let Some(u) = user_opt {
-            match u.validate() {
-                Ok(()) => return Ok(Some(u)),
-                // A stored row that fails validation is answered like an
-                // unknown identifier, including the dummy queries below, so
-                // it costs the same store calls as one.
-                Err(e) => tracing::error!(error = %e, "IdentityStore returned invalid User"),
-            }
-        }
-
-        // Unknown identifier, or a row that failed validation; run the same
-        // store queries the happy path would, against a fresh-UUID dummy, to
-        // keep response time independent of identifier existence.
-        let dummy_id = crate::authn::ids::UserId::try_new(self.dummy_uuid().to_string())
-            .expect("a UUID is a valid UserId");
-        let _ = self.inner.identity.account_status(&dummy_id).await;
-        let _ = self
-            .inner
-            .factors
-            .available_methods(&dummy_id, tenant_id)
-            .await;
-        Ok(None)
-    }
-}
+mod timing;

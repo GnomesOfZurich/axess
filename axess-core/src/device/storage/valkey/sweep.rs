@@ -94,6 +94,16 @@ impl ValkeyDeviceStore {
                     // A row that stays contended is retried by the next
                     // sweep; it must not abort the rest of the walk.
                     Err(ValkeyDeviceStoreError::Contended { .. }) => {}
+                    // The row was readable in the chunk read and is not when
+                    // the swap reads it again (it was rewritten under another
+                    // key, or damaged): skip it like an undecodable row of
+                    // the chunk read, so one row cannot stop the tenant.
+                    Err(
+                        error @ (ValkeyDeviceStoreError::Crypto(_)
+                        | ValkeyDeviceStoreError::Decode(_)),
+                    ) => {
+                        tracing::warn!(device = %member, %error, "device row skipped by the sweep: it cannot be decoded");
+                    }
                     Err(e) => return Err(e),
                 }
             }

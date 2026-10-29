@@ -83,7 +83,7 @@ pub fn password_config(password: &str) -> FactorConfig {
 /// Build a [`FactorConfig::Totp`] backed by the supplied base32 secret.
 pub fn totp_config(secret: &str) -> FactorConfig {
     FactorConfig::Totp(TotpConfig {
-        secret: ZeroizedString::new(secret),
+        secret: ZeroizedString::new(secret).into(),
         ..TotpConfig::default()
     })
 }
@@ -147,4 +147,38 @@ pub fn generate_hotp_code(secret: &str, counter: u64) -> String {
         | (result[offset + 2] as u32) << 8
         | (result[offset + 3] as u32);
     format!("{:06}", binary % 1_000_000)
+}
+
+// ── Session fixtures ─────────────────────────────────────────────────────────
+
+/// A session authenticated as `user`, for the calls that act on the
+/// caller's own account (passkey enrolment and deletion).
+#[cfg(feature = "testing")]
+pub async fn session_for(user: &User) -> axess_core::session::extractor::AuthSession {
+    let session = axess_core::testing::test_session();
+    // The extension trait's setter, named by path: the inherent method of the
+    // same name is crate-private.
+    axess_core::testing::AuthSessionTestExt::set_authenticated(
+        &session,
+        user.id,
+        user.tenant_id,
+        Utc::now(),
+    )
+    .await;
+    session
+}
+
+/// A session pending signup for `user`, as `begin_signup` leaves it.
+#[cfg(feature = "testing")]
+pub async fn signup_session_for(user: &User) -> axess_core::session::extractor::AuthSession {
+    use axess_core::session::data::{WorkflowKind, WorkflowState};
+    let session = axess_core::testing::test_session();
+    session
+        .set_pending_workflow(
+            user.id,
+            user.tenant_id,
+            WorkflowState::new(WorkflowKind::Signup, 1, Utc::now()),
+        )
+        .await;
+    session
 }

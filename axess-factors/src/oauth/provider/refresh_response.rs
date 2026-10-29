@@ -1,12 +1,86 @@
-//! The claims of a refresh-token response: its ID token verified against a
-//! client whose verifier holds the provider's current key set.
+//! The result of a refresh-token response: the rotated tokens, and the claims
+//! of its ID token (verified against a client whose verifier holds the
+//! provider's current key set) when it carries one.
 
 use super::OAuthProviderConfig;
 use super::OidcClient;
 use crate::oauth::extract_string_array;
 use crate::oauth::types::*;
+use crate::secret::ZeroizedString;
+
+/// The check an ID token's `nonce` must pass on a refresh (OIDC Core 12.2):
+/// absent is fine, present must equal the nonce of the original login. A
+/// nonce with no original to compare it with is refused, since accepting it
+/// would let any value through.
+pub(super) fn refresh_nonce_check(
+    token_nonce: Option<&openidconnect::Nonce>,
+    original: Option<&str>,
+) -> Result<(), String> {
+    use subtle::ConstantTimeEq;
+    match (token_nonce, original) {
+        (None, _) => Ok(()),
+        (Some(got), Some(want)) if bool::from(got.secret().as_bytes().ct_eq(want.as_bytes())) => {
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err("refresh ID token nonce does not match the original".to_string()),
+        (Some(_), None) => Err(
+            "refresh ID token carries a nonce and no original nonce was supplied to compare"
+                .to_string(),
+        ),
+    }
+}
 
 impl OAuthProviderConfig {
+    /// Turn a refresh response into a [`RefreshOutcome`]: verify the ID token
+    /// when there is one, and take the rotated tokens either way.
+    pub(super) async fn refresh_outcome(
+        &self,
+        token_response: &openidconnect::core::CoreTokenResponse,
+        refresh_token: &str,
+        original_nonce: Option<&str>,
+    ) -> Result<RefreshOutcome, OAuthError> {
+        use openidconnect::{OAuth2TokenResponse, TokenResponse};
+
+        let id_token_claims = if token_response.id_token().is_some() {
+            Some(
+                self.with_fresh_keys(|client| {
+                    self.claims_from_refresh_response(
+                        client,
+                        token_response,
+                        refresh_token,
+                        original_nonce,
+                    )
+                })
+                .await?,
+            )
+        } else {
+            // OIDC Core 12.2: the ID token of a refresh response is optional.
+            // The exchange succeeded and the IdP may have rotated the token,
+            // so the tokens are returned and nothing is claimed about the
+            // subject.
+            None
+        };
+
+        let access_token = ZeroizedString::new(
+            OAuth2TokenResponse::access_token(token_response)
+                .secret()
+                .to_string(),
+        );
+        // A response without a refresh token leaves the one that was sent
+        // valid (RFC 6749 §6).
+        let new_refresh = ZeroizedString::new(
+            OAuth2TokenResponse::refresh_token(token_response)
+                .map(|t| t.secret().to_string())
+                .unwrap_or_else(|| refresh_token.to_string()),
+        );
+        Ok(RefreshOutcome {
+            id_token_claims,
+            access_token,
+            refresh_token: new_refresh,
+            expires_in: OAuth2TokenResponse::expires_in(token_response).map(|d| d.as_secs()),
+        })
+    }
+
     /// Verify the ID token of a refresh response against `client`'s verifier
     /// and return the claims, with the rotated tokens.
     pub(super) fn claims_from_refresh_response(
@@ -14,21 +88,15 @@ impl OAuthProviderConfig {
         client: &OidcClient,
         token_response: &openidconnect::core::CoreTokenResponse,
         refresh_token: &str,
+        original_nonce: Option<&str>,
     ) -> Result<OAuthClaims, OAuthError> {
-        // Refresh token responses may include a new ID token. If they do,
-        // we validate it (but without nonce verification since the refresh
-        // flow has no nonce). If no ID token is returned, the refresh only
-        // renewed the access token; we cannot extract OIDC claims.
         use openidconnect::{OAuth2TokenResponse, TokenResponse};
 
         let id_token = token_response.id_token().ok_or_else(|| {
-            OAuthError::IdTokenValidation(
-                "no ID token in refresh response; IdP may not return ID tokens on refresh"
-                    .to_string(),
-            )
+            OAuthError::IdTokenValidation("no ID token in refresh response".to_string())
         })?;
 
-        let verifier = client.id_token_verifier().set_time_fn(self.time_fn());
+        let verifier = self.id_token_verifier(client);
 
         // Preserve raw JWT for RP-Initiated Logout.
         // See `extract_claims_from_response`; call IdToken's
@@ -36,13 +104,12 @@ impl OAuthProviderConfig {
         // serde_json round-trip.
         let raw_id_token: Option<String> = Some(id_token.to_string());
 
-        // Skip nonce verification for refresh: the nonce was validated
-        // during the original login. Refresh responses typically don't
-        // include a nonce, or include the same one from the original flow.
-        // Passing a closure that accepts any nonce (or none) satisfies the
-        // NonceVerifier trait.
+        // OIDC Core 12.2: a nonce in a refresh ID token, if present, must
+        // equal the original one. A missing nonce is accepted.
         let claims = id_token
-            .claims(&verifier, |_: Option<&openidconnect::Nonce>| Ok(()))
+            .claims(&verifier, |nonce: Option<&openidconnect::Nonce>| {
+                refresh_nonce_check(nonce, original_nonce)
+            })
             .map_err(super::fresh_keys::claims_error)?;
 
         // Re-bind `iss` to the originally-configured issuer.
@@ -83,7 +150,6 @@ impl OAuthProviderConfig {
             .map(|s| s.to_string());
 
         // Zeroize bearer-class tokens.
-        use crate::secret::ZeroizedString;
         let new_access_token = Some(ZeroizedString::new(
             OAuth2TokenResponse::access_token(token_response)
                 .secret()
@@ -106,6 +172,7 @@ impl OAuthProviderConfig {
             oidc_sid,
             id_token_hint: raw_id_token.map(ZeroizedString::new),
             additional_claims,
+            dpop_key: None,
         })
     }
 }

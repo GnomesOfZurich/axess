@@ -43,25 +43,52 @@ pub struct AuthSnapshot {
 }
 
 impl AuthSession {
-    /// Return the authenticated user ID, if any.
+    /// Return the user ID of an authenticated session, `None` for every other
+    /// state.
+    ///
+    /// A session in the middle of a login (identified, awaiting a factor, or
+    /// blocked on a workflow) answers `None`, so the value is safe to use as
+    /// an authorization principal. The login pipeline reads the user of a
+    /// partly logged-in session with
+    /// [`pending_user_id`](Self::pending_user_id).
     ///
     /// **Prefer [`snapshot`](Self::snapshot)** when the handler needs more
     /// than one identity field; a single `snapshot().await` acquires the
     /// read lock once and returns `user_id` + `tenant_id` + `session_id` +
-    /// `authn_time` together. Calling `user_id().await` followed by
-    /// `tenant_id().await` costs two lock acquisitions and two `clone()`s
-    /// for the same information.
+    /// `authn_time` together.
     #[doc(hidden)]
     pub async fn user_id(&self) -> Option<UserId> {
+        let guard = self.0.0.read().await;
+        match &guard.data.auth_state {
+            AuthState::Authenticated { user_id, .. } => Some(*user_id),
+            _ => None,
+        }
+    }
+
+    /// Return the tenant ID of an authenticated session, `None` for every
+    /// other state. See [`user_id`](Self::user_id).
+    #[doc(hidden)]
+    pub async fn tenant_id(&self) -> Option<TenantId> {
+        let guard = self.0.0.read().await;
+        match &guard.data.auth_state {
+            AuthState::Authenticated { tenant_id, .. } => Some(*tenant_id),
+            _ => None,
+        }
+    }
+
+    /// Return the user ID the session is in the middle of logging in as, if
+    /// any (identified, authenticating, pending a workflow or authenticated).
+    ///
+    /// The value is a claim until the login completes: use it for audit
+    /// attribution and for driving the login pipeline, never as an
+    /// authorization principal.
+    pub async fn pending_user_id(&self) -> Option<UserId> {
         self.0.0.read().await.data.auth_state.user_id().cloned()
     }
 
-    /// Return the tenant ID, if any.
-    ///
-    /// See [`user_id`](Self::user_id) for why [`snapshot`](Self::snapshot)
-    /// is the recommended way to read identity fields on the hot path.
-    #[doc(hidden)]
-    pub async fn tenant_id(&self) -> Option<TenantId> {
+    /// Return the tenant ID of the login in flight, if any. See
+    /// [`pending_user_id`](Self::pending_user_id).
+    pub async fn pending_tenant_id(&self) -> Option<TenantId> {
         self.0.0.read().await.data.auth_state.tenant_id().cloned()
     }
 
@@ -116,6 +143,15 @@ impl AuthSession {
         let mut guard = self.0.0.write().await;
         guard.needs_persist = true;
         guard.id
+    }
+
+    /// Read the session id without marking the session as needed beyond
+    /// this request. For observers (audit context, logging) that record the
+    /// id but key nothing durable on it: calling
+    /// [`session_id`](Self::session_id) there would make every cookieless
+    /// request that merely passes through them store a session.
+    pub(crate) async fn peek_session_id(&self) -> SessionId {
+        self.0.0.read().await.id
     }
 
     /// Return the resolved [`crate::authn::ids::DeviceId`] for this session, if the device
@@ -199,11 +235,31 @@ impl AuthSession {
     /// `session.session_id().await` (e.g. to register against a
     /// `SessionRegistry`) reads the post-rotation id, the same id the
     /// cookie will carry on the next request.
+    ///
+    /// Clears the custom data the session held before the login, so state an
+    /// anonymous visitor could plant does not ride into the authenticated
+    /// session. Only the key the login service owns for the flow in flight
+    /// survives; the keys an application registered with
+    /// `AuthnServiceBuilder::with_preserved_custom_keys` survive when the
+    /// transition goes through the authentication service.
     pub async fn set_authenticated(
         &self,
         user_id: UserId,
         tenant_id: TenantId,
         authn_time: DateTime<Utc>,
+    ) {
+        self.set_authenticated_keeping(user_id, tenant_id, authn_time, &[])
+            .await;
+    }
+
+    /// [`set_authenticated`](Self::set_authenticated) that also carries the
+    /// custom keys in `preserved` across the transition.
+    pub(crate) async fn set_authenticated_keeping(
+        &self,
+        user_id: UserId,
+        tenant_id: TenantId,
+        authn_time: DateTime<Utc>,
+        preserved: &[String],
     ) {
         let mut guard = self.0.0.write().await;
         // Pure state mutation lives on AuthState. Direct
@@ -213,6 +269,7 @@ impl AuthSession {
             .data
             .auth_state
             .set_authenticated(user_id, tenant_id, authn_time);
+        crate::session::data::retain_across_login(&mut guard.data.custom, preserved);
         // Bind the session fingerprint immediately so it's set before the
         // response leaves the server (prevents hijack-before-binding window).
         if guard.data.fingerprint.is_none()
@@ -254,13 +311,19 @@ impl AuthSession {
     ///
     /// If `remaining` becomes empty after removal, transitions to
     /// [`AuthState::Authenticated`] automatically.
-    pub(crate) async fn advance_factor(&self, kind: &FactorKind, authn_time: DateTime<Utc>) {
+    pub(crate) async fn advance_factor(
+        &self,
+        kind: &FactorKind,
+        authn_time: DateTime<Utc>,
+        preserved: &[String],
+    ) {
         let mut guard = self.0.0.write().await;
         // Pure state transition lives on AuthState; session-level
         // orchestration (fingerprint binding, id rotation, dirty flag) is
         // dispatched on the outcome.
         match guard.data.auth_state.advance_factor(kind, authn_time) {
             AdvanceOutcome::Completed => {
+                crate::session::data::retain_across_login(&mut guard.data.custom, preserved);
                 // Bind fingerprint immediately on auth completion.
                 if guard.data.fingerprint.is_none()
                     && let Some(fp) = guard.pending_fingerprint.take()
@@ -358,13 +421,15 @@ impl AuthSession {
         guard.modified = true;
     }
 
-    /// Clear the session (logout). Resets state to `Guest` and marks as modified.
-    ///
-    /// The caller should regenerate the session ID separately to prevent session fixation.
+    /// Clear the session (logout). Resets state to `Guest`, marks it as
+    /// modified and cycles the session id, so the identifier that carried the
+    /// authenticated session is retired with it and cannot be replayed or
+    /// fixed by an attacker who knew it.
     pub async fn clear(&self) {
         let mut guard = self.0.0.write().await;
         guard.data = SessionData::default();
         guard.modified = true;
+        guard.rotate_id();
     }
 
     /// Cycle the session ID immediately.
@@ -483,23 +548,25 @@ impl AuthSession {
 
     /// Atomically read **and remove** a key from the custom JSON bag.
     ///
-    /// Returns the removed value, or `None` if the key was absent. The
-    /// read and the remove run under a single write lock; use this in
+    /// Returns the removed value, or `None` if the key was absent. Of any
+    /// number of requests, in this process or on other nodes, that hold the
+    /// same stored session, exactly one gets the value: the removal is first
+    /// written to the session store as a compare-and-swap on the session's
+    /// revision, and a request that loses it gets `None`. Use this in
     /// preference to `get_custom(k).await` followed by `remove_custom(k)`
     /// for any one-shot ceremony state (FIDO2 `auth_state`, OAuth PKCE
-    /// verifier, password-reset token, etc.) where two parallel
-    /// requests must not both observe the same value.
+    /// verifier, password-reset token, etc.).
+    ///
+    /// A store that cannot answer, or a session that was ended meanwhile,
+    /// also gives `None`: the ceremony has to be started again, it never
+    /// runs twice. The guarantee covers requests that take the value. An
+    /// ordinary write is last-writer-wins, so an unrelated request that
+    /// loaded the session before the value was taken and saves it afterwards
+    /// puts the value back; bind a ceremony's value to something the
+    /// completing request must also present (a nonce inside the value) when
+    /// a replay of the stale copy would matter.
     pub async fn take_custom(&self, key: &str) -> Option<serde_json::Value> {
-        let mut guard = self.0.0.write().await;
-        let value = guard
-            .data
-            .custom
-            .as_object_mut()
-            .and_then(|obj| obj.remove(key));
-        if value.is_some() {
-            guard.modified = true;
-        }
-        value
+        self.0.0.write().await.consume_custom(key).await
     }
 
     /// Store a value in the custom JSON bag.

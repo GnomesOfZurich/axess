@@ -17,6 +17,27 @@ use std::{fmt, net::IpAddr, str::FromStr};
 
 // ── AuditContext ──────────────────────────────────────────────────────────────
 
+/// The most bytes of a `User-Agent` an audit row keeps. The header is set
+/// by the client and reaches a database column, so it is bounded.
+pub const MAX_USER_AGENT_BYTES: usize = 512;
+
+/// `user_agent` limited to [`MAX_USER_AGENT_BYTES`] bytes, cut on a character
+/// boundary, with `...` appended when anything was cut so a reader can tell a
+/// truncated value from a short one.
+pub(crate) fn cap_user_agent(user_agent: String) -> String {
+    if user_agent.len() <= MAX_USER_AGENT_BYTES {
+        return user_agent;
+    }
+    let mut end = MAX_USER_AGENT_BYTES;
+    while !user_agent.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut capped = user_agent;
+    capped.truncate(end);
+    capped.push_str("...");
+    capped
+}
+
 /// Enriched context for audit events (compliance: MiFID II record-keeping, GDPR).
 ///
 /// Extracted from HTTP request headers via [`AuditContext`]. Passed to
@@ -36,7 +57,8 @@ pub struct AuditContext {
     /// axess cannot check. A row that says `supplied` where the rest say
     /// `forwarded` is worth a question.
     pub ip_source: crate::client_ip::Source,
-    /// `User-Agent` header value.
+    /// `User-Agent` header value, capped at [`MAX_USER_AGENT_BYTES`] bytes
+    /// when read from a request.
     pub user_agent: Option<String>,
     /// Request ID for log correlation.
     ///
@@ -110,7 +132,7 @@ where
             .get::<crate::client_ip::ClientIp>()
             .copied()
             .unwrap_or_default();
-        let user_agent = header("user-agent");
+        let user_agent = header("user-agent").map(cap_user_agent);
 
         // The typed value the request-id layer left behind, and nothing
         // else. `X-Request-Id` is an ordinary request header: any caller
@@ -139,7 +161,7 @@ where
         // `None` rather than a rejection.
         let session_id =
             match crate::session::extractor::AuthSession::from_request_parts(parts, state).await {
-                Ok(session) => Some(session.session_id().await.to_string()),
+                Ok(session) => Some(session.peek_session_id().await.to_string()),
                 Err(_) => None,
             };
 
@@ -162,10 +184,9 @@ where
 /// The enum is shared vocabulary, not a list of what axess emits. Axess
 /// emits from its service layer, which is the part holding an
 /// [`IdentityAuthnLog`](super::store::IdentityAuthnLog) to write through.
-/// Seven names are for glue the adopter implements and axess is not on the
+/// Six names are for glue the adopter implements and axess is not on the
 /// call path for: `MethodEnabled`, `MethodDisabled`, `SessionExpired`,
-/// `SessionInvalidated`, `DeviceTrustGranted`, `DevicePurged` and
-/// `DeviceFingerprintMismatch`. They are declared here so every deployment
+/// `DeviceTrustGranted`, `DevicePurged` and `DeviceFingerprintMismatch`. They are declared here so every deployment
 /// spells them the same way and a shared SIEM rule matches across adopters;
 /// each is marked below. See `docs/production/audit-events.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -202,8 +223,11 @@ pub enum AuthEventType {
     /// expiry is decided by the session store, and `refresh_session` takes
     /// no audit sink.
     SessionExpired,
-    /// Session was explicitly invalidated (e.g., admin logout).
-    /// **Adopter-emitted**, as [`SessionExpired`](Self::SessionExpired).
+    /// Session was explicitly invalidated (e.g., admin logout). Emitted by
+    /// the `invalidate_session_as` and `invalidate_user_sessions_as` methods
+    /// of the request-scoped authentication service, with the acting
+    /// administrator as the actor. The plain `invalidate_*` methods write no
+    /// row, and a session ended by other means is the adopter's to record.
     SessionInvalidated,
     /// A new user account was created (signup started).
     SignupStarted,

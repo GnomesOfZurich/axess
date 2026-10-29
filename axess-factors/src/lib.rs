@@ -46,6 +46,8 @@ pub use fido2_stub as fido2;
 /// axum request extensions (`bearer` feature).
 #[cfg(feature = "bearer")]
 pub mod bearer;
+/// [`FactorSecret`](factor_secret::FactorSecret): an OTP secret, plain or sealed.
+pub mod factor_secret;
 /// Workload-identity federation. The generic
 /// [`federation::workload::WorkloadResolver`] verifies any JWT-bearer
 /// workload token (GitHub Actions OIDC, Kubernetes SA, GitLab CI OIDC,
@@ -68,8 +70,8 @@ pub mod http_body;
 pub mod jwt;
 /// LDAP simple-bind verifier: [`LdapProvider`](ldap::LdapProvider)
 /// trait + [`LdapProviderConfig`](ldap::LdapProviderConfig) production
-/// impl (`ldap3`-backed) + [`MockLdapProvider`](ldap::MockLdapProvider)
-/// (`ldap` feature). HealthCheck integration lives in axess-core as
+/// impl (`ldap3`-backed) + `MockLdapProvider` (under `cfg(test)` or the
+/// `testing` feature). HealthCheck integration lives in axess-core as
 /// an extension impl.
 #[cfg(feature = "ldap")]
 pub mod ldap;
@@ -132,7 +134,7 @@ pub mod totp;
 pub use password::{
     PasswordConfig, PasswordRules, PasswordVerifyError, generate_password_hash,
     generate_password_hash_with_rng, generate_password_salt, hash_password_with_salt,
-    verify_password,
+    password_needs_rehash, verify_password,
 };
 
 #[cfg(feature = "hotp")]
@@ -149,22 +151,24 @@ pub use email_otp::EmailOtpConfig;
 #[cfg(feature = "recovery_code")]
 pub use recovery_code::{
     GeneratedRecoveryCodes, PepperTooShort, RECOVERY_CODE_ALPHABET, RECOVERY_CODE_COUNT,
-    RECOVERY_CODE_LENGTH, RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode,
-    generate_recovery_codes, generate_recovery_codes_peppered, normalize_recovery_code,
-    verify_recovery_code,
+    RECOVERY_CODE_LENGTH, RecoveryCodePepper, RecoveryCodesConfig, RecoveryMatch,
+    StoredRecoveryCode, generate_recovery_codes, generate_recovery_codes_peppered,
+    normalize_recovery_code, verify_recovery_code, verify_recovery_code_rotating,
 };
 
 pub use fido2::Fido2Config;
+#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
+pub use fido2::MockFido2Provider;
 #[cfg(feature = "fido2")]
 pub use fido2::{
     AuthenticationResult, AuthenticatorAttachment, CredentialID, DefaultFido2Provider,
-    Fido2Credential, Fido2Options, Fido2Provider, MockFido2Provider,
+    Fido2Credential, Fido2Options, Fido2Provider,
 };
 
+#[cfg(all(feature = "ldap", any(test, feature = "testing")))]
+pub use ldap::MockLdapProvider;
 #[cfg(feature = "ldap")]
-pub use ldap::{
-    LdapBindResult, LdapError, LdapGroupSearch, LdapProvider, LdapProviderConfig, MockLdapProvider,
-};
+pub use ldap::{LdapBindResult, LdapError, LdapGroupSearch, LdapProvider, LdapProviderConfig};
 
 #[cfg(feature = "mtls")]
 pub use mtls::{MtlsError, MtlsResolver, PeerCertChain, SpiffeIdComponents, peek_spiffe};
@@ -189,6 +193,7 @@ pub use outbound_oauth_client::{
 #[cfg(any(feature = "totp", feature = "hotp"))]
 pub use otp_algorithm::OtpAlgorithm;
 
+pub use factor_secret::{FactorSecret, SealedFactorSecret};
 pub use secret::ZeroizedString;
 
 // ── Shared constants ────────────────────────────────────────────────────────

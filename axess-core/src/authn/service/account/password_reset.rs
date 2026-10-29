@@ -17,7 +17,7 @@
 use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
     error::AuthnError,
-    event::{AuthEventBuilder, AuthEventType},
+    event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::{FactorConfig, FactorKind},
     store::{FactorStore, IdentityPasswordHistory, IdentityPasswordReset, IdentityStore},
     types::AuthnScope,
@@ -57,7 +57,7 @@ where
     /// * `identifier`: the user's login identifier (email, username).
     /// * `tenant_identifier`: the tenant slug/domain.
     /// * `ttl`: how long the token is valid.
-    #[tracing::instrument(skip(self, ttl), fields(tenant = %tenant_identifier))]
+    #[tracing::instrument(skip(self, identifier, ttl), fields(tenant = %tenant_identifier))]
     pub async fn begin_password_reset(
         &self,
         identifier: &str,
@@ -74,6 +74,39 @@ where
                     "password reset ttl must be positive and at most seven days".to_string(),
                 )
             })?;
+
+        // The same input limits `begin_login` applies. An identifier or
+        // tenant outside them is looked up as the empty string, which no
+        // store matches, so the call makes the same round trips as any
+        // unknown identifier and answers the same way.
+        use crate::validation::MAX_IDENTIFIER_BYTES;
+        let in_limits = !identifier.is_empty()
+            && identifier.len() <= MAX_IDENTIFIER_BYTES
+            && !tenant_identifier.is_empty()
+            && tenant_identifier.len() <= MAX_IDENTIFIER_BYTES;
+        let (identifier, tenant_identifier) = if in_limits {
+            (identifier, tenant_identifier)
+        } else {
+            ("", "")
+        };
+
+        // The cooldown is keyed on the identifier as typed, for a registered
+        // one and an unregistered one alike, so being inside it says nothing
+        // about whether an account exists. It runs after the input limits,
+        // which map an over-long identifier to the empty string.
+        if self
+            .inner
+            .reset_requests
+            .as_ref()
+            .is_some_and(|r| r.already_asked(tenant_identifier, identifier))
+        {
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
+                    .with_error(AuthFailureReason::Other("cooldown".into())),
+            )
+            .await?;
+            return Ok(None);
+        }
 
         // Look up the user. If not found, return Ok(None) to avoid
         // leaking whether the identifier exists.
@@ -126,11 +159,30 @@ where
             return Ok(None);
         };
 
-        self.inner
+        // A store that cannot write the token answers like an unknown
+        // identifier: the caller gets `None`, as the unknown path does when
+        // its write fails, so a store fault is not a way to tell a
+        // registered identifier from an unregistered one. The fault is
+        // logged for the operator, and the audit row records the failure.
+        if let Err(e) = self
+            .inner
             .identity
             .store_reset_token(&user.id, &hash, expires_at)
             .await
-            .map_err(AuthnError::Store)?;
+        {
+            tracing::error!(
+                user_id = %user.id,
+                error = %e,
+                "could not store a password reset token; answering as for an unknown identifier"
+            );
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
+                    .attributed_to(&user.id, &user.tenant_id)
+                    .with_error(AuthFailureReason::Other("token_store_error".into())),
+            )
+            .await?;
+            return Ok(None);
+        }
 
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::PasswordResetRequested)
@@ -144,12 +196,12 @@ where
     /// Tenant-scoped password-reset variant.
     ///
     /// Same as [`complete_password_reset`](Self::complete_password_reset) but
-    /// refuses with [`AuthnError::CrossTenant`] if the resolved user's
-    /// `tenant_id` does not match `expected_tenant`. Use this from any
-    /// password-reset handler whose authorisation scope is a single
-    /// tenant. It closes the gap where parameter tampering on a
-    /// reset-link callback could otherwise reset a user in tenant B
-    /// while authenticated as an admin (or just a visitor) of tenant A.
+    /// the user is resolved within `expected_tenant` only. A user id that
+    /// belongs to another tenant answers exactly as an unknown id does,
+    /// `Ok(false)`: refusing it with a distinct error told a caller holding a
+    /// reset link which user ids exist in other tenants. The attempt is
+    /// logged at warn level and audited as a failure. Use this from any
+    /// password-reset handler whose authorisation scope is a single tenant.
     pub async fn complete_password_reset_in_tenant(
         &self,
         user_id: &crate::authn::ids::UserId,
@@ -157,31 +209,7 @@ where
         token: &str,
         new_password: &str,
     ) -> Result<bool, AuthnError<I::Error>> {
-        // Resolve the user and check tenant before doing the (much more
-        // expensive) Argon2id-flavoured rest of the flow. The resolution
-        // re-runs inside `complete_password_reset`, but the cost is tiny
-        // compared to history hashing and we get a fast-path tenant
-        // refusal here.
-        let Some(user) = self
-            .inner
-            .identity
-            .get_user(user_id)
-            .await
-            .map_err(AuthnError::Store)?
-        else {
-            // Same answer as a known user with a bad token.
-            return Ok(false);
-        };
-        if &user.tenant_id != expected_tenant {
-            tracing::warn!(
-                user_id = %user_id,
-                user_tenant = %user.tenant_id,
-                expected_tenant = %expected_tenant,
-                "cross-tenant password reset refused"
-            );
-            return Err(AuthnError::CrossTenant);
-        }
-        self.complete_password_reset(user_id, token, new_password)
+        self.complete_password_reset_inner(user_id, Some(expected_tenant), token, new_password)
             .await
     }
 
@@ -195,7 +223,19 @@ where
     /// password refused for either reason leaves the token unspent, so the
     /// person can pick another with the same link. A tenant that is missing
     /// or not active refuses the reset the same way. An unknown `user_id`
-    /// answers `Ok(false)` as a bad token does.
+    /// answers `Ok(false)` as a bad token does. Every refusal writes a
+    /// failed `PasswordReset` audit row naming the reason.
+    ///
+    /// A lockout the failure counter imposes does not block a reset (the
+    /// account is still active and the reset is how its owner recovers);
+    /// the counter is cleared when the reset succeeds.
+    ///
+    /// On success the password is replaced, every registered session of the
+    /// user is invalidated and, when the service was given a refresh token
+    /// store with
+    /// [`with_refresh_store`](crate::authn::service::AuthnServiceBuilder::with_refresh_store),
+    /// every refresh token of the user is revoked, so a stolen refresh token
+    /// does not outlive the reset.
     ///
     /// # Arguments
     ///
@@ -212,37 +252,41 @@ where
         token: &str,
         new_password: &str,
     ) -> Result<bool, AuthnError<I::Error>> {
-        // A suspended or terminated account cannot have its password
-        // replaced by a reset link: the reset would hand its credentials to
-        // whoever holds the link while the account is barred. Refused before
-        // the token is read, so the token is not spent and works once the
-        // account is active again. The answer is the same `Ok(false)` as a
-        // bad token.
-        let status = self.current_account_status(user_id).await?;
-        if !status.allows_login() {
-            tracing::warn!(
-                user_id = %user_id,
-                status = ?status,
-                "password reset refused: account is not active"
-            );
-            return Ok(false);
-        }
-
-        let Some(user) = self
-            .inner
-            .identity
-            .get_user(user_id)
+        self.complete_password_reset_inner(user_id, None, token, new_password)
             .await
-            .map_err(AuthnError::Store)?
-        else {
-            // Same answer as a known user with a bad token, so the route
-            // is not an oracle for which user ids exist.
-            return Ok(false);
-        };
-        // A token issued before the tenant was suspended must not reset a
-        // password afterwards, as `begin_password_reset` refuses an inactive
-        // tenant. Refused before the token is read, so it is not spent; the
-        // answer is the same `Ok(false)` as a bad token.
+    }
+
+    /// Audit a refused reset and answer `Ok(false)`.
+    ///
+    /// The row is attributed to the user and the tenant the user resolved
+    /// to when there is one, and carries `reason`. A caller cannot tell the
+    /// reasons apart: they all return the same value.
+    async fn refuse_password_reset(
+        &self,
+        user: Option<&crate::authn::types::User>,
+        reason: &'static str,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        let builder = AuthEventBuilder::failure(AuthEventType::PasswordReset)
+            .maybe_attributed_to(user.map(|u| &u.id), user.map(|u| &u.tenant_id))
+            .with_error(AuthFailureReason::Other(reason.into()));
+        self.emit_audit(builder).await?;
+        Ok(false)
+    }
+
+    /// Why a reset for this user must be refused before the token is read,
+    /// if it must: the account is not active, or the tenant is missing or
+    /// not active (a token issued before a suspension must not outlive it).
+    /// Refused before the token is read, so the token is not spent and works
+    /// once the account is active again.
+    async fn reset_refusal_reason(
+        &self,
+        user: &crate::authn::types::User,
+    ) -> Result<Option<&'static str>, AuthnError<I::Error>> {
+        let status = self.current_account_status(&user.id).await?;
+        if !status.allows_login() {
+            tracing::warn!(user_id = %user.id, status = ?status, "password reset refused: account is not active");
+            return Ok(Some("not_active"));
+        }
         let tenant_active = self
             .inner
             .identity
@@ -251,12 +295,57 @@ where
             .map_err(AuthnError::Store)?
             .is_some_and(|t| t.status.is_active());
         if !tenant_active {
-            tracing::warn!(
-                user_id = %user_id,
-                tenant = %user.tenant_id,
-                "password reset refused: tenant is missing or not active"
-            );
-            return Ok(false);
+            tracing::warn!(user_id = %user.id, tenant = %user.tenant_id, "password reset refused: tenant is missing or not active");
+            return Ok(Some("tenant_not_active"));
+        }
+        Ok(None)
+    }
+
+    async fn complete_password_reset_inner(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        expected_tenant: Option<&crate::authn::ids::TenantId>,
+        token: &str,
+        new_password: &str,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        // Resolve the user FIRST. A backend whose `account_status` errors
+        // for an unknown user would otherwise turn an unknown id into an
+        // error, where the contract is `Ok(false)` like a bad token. With a
+        // tenant named, the lookup is scoped to it, so another tenant's user
+        // is indistinguishable from none.
+        let user = match expected_tenant {
+            Some(tenant) => {
+                self.inner
+                    .identity
+                    .get_user_in_tenant(user_id, tenant)
+                    .await
+            }
+            None => self.inner.identity.get_user(user_id).await,
+        }
+        .map_err(AuthnError::Store)?;
+        let Some(user) = user else {
+            if let Some(tenant) = expected_tenant {
+                tracing::warn!(
+                    user_id = %user_id,
+                    expected_tenant = %tenant,
+                    "password reset refused: no such user in the expected tenant"
+                );
+            }
+            return self.refuse_password_reset(None, "unknown_user").await;
+        };
+
+        // A stored row that fails validation cannot log in
+        // (`begin_login` answers it as unknown), and `begin_password_reset`
+        // refuses it, so a token issued earlier cannot finish the reset.
+        if user.validate().is_err() {
+            tracing::error!(user_id = %user_id, "password reset refused: stored user failed validation");
+            return self
+                .refuse_password_reset(Some(&user), "invalid_user")
+                .await;
+        }
+
+        if let Some(reason) = self.reset_refusal_reason(&user).await? {
+            return self.refuse_password_reset(Some(&user), reason).await;
         }
         let rules = self
             .inner
@@ -268,14 +357,15 @@ where
         // The new password must satisfy the tenant's rules, the same ones
         // the factor is stored with. Checked before the token is read so a
         // refused password does not spend the single-use token: the person
-        // can pick another and use the same link. The answer is the same
-        // `Ok(false)` as a bad token or a reused password.
+        // can pick another and use the same link.
         if !crate::validation::meets_password_rules(new_password, &rules) {
             tracing::warn!(
                 user_id = %user_id,
                 "password reset refused: new password does not meet the tenant's password rules"
             );
-            return Ok(false);
+            return self
+                .refuse_password_reset(Some(&user), "password_rules")
+                .await;
         }
 
         // Look at the token without spending it: a token that does not
@@ -283,7 +373,9 @@ where
         // spent only after the new password has passed the history check, so
         // a refused password leaves the link usable.
         if !self.reset_token_matches(user_id, token, false).await? {
-            return Ok(false);
+            return self
+                .refuse_password_reset(Some(&user), "token_mismatch")
+                .await;
         }
 
         let user_scope = AuthnScope::User {
@@ -302,38 +394,81 @@ where
             .check_history_and_hash(user_id, new_password, &rules)
             .await?
         else {
-            return Ok(false); // Password was used before; the token is kept.
+            // Password was used before; the token is kept.
+            return self
+                .refuse_password_reset(Some(&user), "password_reused")
+                .await;
         };
+
+        // The hashing above took tens of milliseconds, and the status was
+        // read before it. Read it again at the commit, before the token is
+        // spent and the password installed, so a suspension that landed in
+        // between is honoured and the unspent token works once the account
+        // is active again.
+        let status = self.current_account_status(user_id).await?;
+        if !status.allows_login() {
+            tracing::warn!(
+                user_id = %user_id,
+                status = ?status,
+                "password reset refused at commit: account is no longer active"
+            );
+            return self.refuse_password_reset(Some(&user), "not_active").await;
+        }
 
         // Spend the token. Of two requests that both got this far, exactly
         // one wins; the other changes nothing.
         if !self.reset_token_matches(user_id, token, true).await? {
-            return Ok(false);
+            return self
+                .refuse_password_reset(Some(&user), "token_mismatch")
+                .await;
         }
 
         self.install_new_password(user_id, &user_scope, new_password_hash, rules)
             .await?;
 
-        // Reset failed attempts.
-        self.inner
-            .identity
-            .reset_failed_attempts(user_id)
-            .await
-            .map_err(AuthnError::Store)?;
+        self.finish_password_reset(&user).await
+    }
 
-        // Invalidate all other live sessions for this user. A stolen session
-        // cookie must not survive a password change; anyone authenticated as
-        // this user prior to the reset is forced to re-authenticate. Best
-        // effort: failures are logged but do not block the reset (the
-        // password change has already succeeded and is more important than
-        // session-registry hygiene).
-        if let Some(reg) = &self.inner.registry {
-            reg.invalidate_user(user_id).await;
+    /// Everything after the new password is installed: sessions,
+    /// counter, refresh tokens, audit.
+    async fn finish_password_reset(
+        &self,
+        user: &crate::authn::types::User,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        let user_id = &user.id;
+        // Everything below runs because the password is already replaced:
+        // each step is attempted, in order of how much a skipped one costs.
+        //
+        // Invalidate all live sessions for this user FIRST. A stolen session
+        // cookie must not survive a password change, and the longer the
+        // window between the install and this call (a failing store write
+        // below, a cancelled request) the longer it does.
+        // A registry that fails is returned after the audit row below, like
+        // a refresh-token revocation that fails.
+        let sessions_ended = self.end_user_sessions(user_id).await;
+        if sessions_ended.is_ok() && self.inner.registry.is_some() {
             tracing::info!(
                 user_id = %user_id,
                 "password reset: invalidated all sessions for user"
             );
         }
+
+        // The reset succeeded, so the failure counter (and any lockout
+        // derived from it) is cleared. A counter store that is down must not
+        // fail a reset that has already happened: log and carry on.
+        if let Err(e) = self.inner.identity.reset_failed_attempts(user_id).await {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "password reset: could not clear the failed-attempt counter; \
+                 it clears on the next successful login"
+            );
+        }
+
+        // Revoke refresh tokens: they are not sessions, and `invalidate_user`
+        // does not reach them. A failure is returned to the caller, but only
+        // after the audit row is written.
+        let revoked = self.revoke_refresh_tokens(user_id).await;
 
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::PasswordReset)
@@ -341,6 +476,8 @@ where
         )
         .await?;
 
+        sessions_ended?;
+        revoked?;
         Ok(true)
     }
 }

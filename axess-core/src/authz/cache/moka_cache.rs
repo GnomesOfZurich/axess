@@ -10,6 +10,7 @@ use std::time::Duration;
 use cedar_policy::{Entities, EntityUid};
 use moka::future::Cache;
 
+use super::generation::{Generation, Generations};
 use crate::authz::error::AuthzError;
 use crate::authz::provider::RequestEntityProvider;
 use crate::session::AuthSession;
@@ -30,6 +31,8 @@ struct EntityCacheKey {
     tenant: Option<String>,
     resource: EntityUid,
     action: EntityUid,
+    discriminator: Option<String>,
+    generation: Generation,
 }
 
 /// In-process cache decorator over a [`RequestEntityProvider`].
@@ -55,7 +58,20 @@ struct EntityCacheKey {
 /// let provider: Arc<dyn axess_core::authz::RequestEntityProvider> = Arc::new(cached);
 /// ```
 ///
+/// # Caching contract
+///
+/// An entry is keyed on the principal, the session's tenant, the resource,
+/// the action and the inner provider's
+/// [`cache_discriminator`](RequestEntityProvider::cache_discriminator).
+/// Entities that depend on any other session state are shared across
+/// sessions of the same user and tenant for the TTL, so keep per-session
+/// facts in the Cedar context, or return them from the discriminator.
+///
 /// # Invalidation
+///
+/// An invalidation takes effect at once for later lookups, and also
+/// discards a load that was in flight when it ran: that load's result is
+/// returned to its caller but never served to anyone else.
 ///
 /// Call [`invalidate`](Self::invalidate) from any code path that mutates a
 /// principal's role membership or a resource's authorization-relevant
@@ -73,6 +89,7 @@ where
 {
     inner: P,
     cache: Cache<EntityCacheKey, Arc<Entities>>,
+    generations: Generations,
 }
 
 impl<P> MokaEntityCache<P>
@@ -93,6 +110,7 @@ where
                 // authorizing until the TTL expires.
                 .support_invalidation_closures()
                 .build(),
+            generations: Generations::new(),
         }
     }
 
@@ -105,6 +123,7 @@ where
                 .time_to_live(ttl)
                 .support_invalidation_closures()
                 .build(),
+            generations: Generations::new(),
         }
     }
 
@@ -128,12 +147,17 @@ where
         Self::with_options(self.inner, capacity, ttl)
     }
 
-    /// Invalidate cached entries for `(principal, tenant, resource, action)`.
+    /// Invalidate cached entries for `(principal, tenant, resource, action)`,
+    /// whatever their cache discriminator.
     ///
     /// Call from any code path that mutates the principal's roles, the
     /// resource's attributes, or anything else the inner provider would
     /// load differently next time. Pass `tenant=None` for guest sessions;
     /// otherwise pass the same tenant_id the session would report.
+    ///
+    /// Because a load already in flight must not repopulate the entry, this
+    /// also drops every other cached entry of `principal`; they are rebuilt
+    /// on their next use.
     pub async fn invalidate(
         &self,
         principal: &EntityUid,
@@ -141,13 +165,14 @@ where
         resource: &EntityUid,
         action: &EntityUid,
     ) {
-        let key = EntityCacheKey {
-            principal: principal.clone(),
-            tenant: tenant.map(str::to_string),
-            resource: resource.clone(),
-            action: action.clone(),
-        };
-        self.cache.invalidate(&key).await;
+        let _ = (tenant, resource, action);
+        self.generations.bump_principal(principal);
+        let principal = principal.clone();
+        // Lookups already miss (the generation is part of the key); this
+        // frees the memory. A predicate error only delays that.
+        let _ = self
+            .cache
+            .invalidate_entries_if(move |k, _v| k.principal == principal);
     }
 
     /// Drop every entry from the cache.
@@ -155,23 +180,22 @@ where
     /// Use as a last-resort invalidation when you can't enumerate the
     /// affected keys (e.g. global Cedar policy reload).
     pub fn invalidate_all(&self) {
+        self.generations.bump_all();
         self.cache.invalidate_all();
     }
 
     /// Drop every entry whose `principal` matches.
     ///
-    /// Eviction is **deferred**: moka's `invalidate_entries_if`
-    /// registers the predicate and matching entries are removed on
-    /// the next maintenance tick (typically sub-second) or the next
-    /// read of a matching key. The next authorization request for
-    /// this principal will still see the cached entry if it lands
-    /// before the tick; call `cache.run_pending_tasks().await` if
-    /// you need hard-sync semantics.
+    /// Lookups miss from the moment this returns, because the invalidation
+    /// generation is part of every key. Freeing the memory is **deferred**:
+    /// moka's `invalidate_entries_if` registers the predicate and matching
+    /// entries are removed on the next maintenance tick.
     ///
     /// Call from role-change, account-suspension, and token-revoke
     /// paths so the new authorization state takes effect promptly
     /// without waiting for the TTL.
     pub fn invalidate_principal(&self, principal: &EntityUid) -> Result<(), moka::PredicateError> {
+        self.generations.bump_principal(principal);
         let principal = principal.clone();
         self.cache
             .invalidate_entries_if(move |k, _v| k.principal == principal)?;
@@ -186,9 +210,25 @@ where
     /// are not matched; use [`invalidate_all`](Self::invalidate_all)
     /// to drop guest entries alongside tenant ones.
     pub fn invalidate_tenant(&self, tenant: &str) -> Result<(), moka::PredicateError> {
+        self.generations.bump_tenant(tenant);
         let tenant = tenant.to_string();
         self.cache
             .invalidate_entries_if(move |k, _v| k.tenant.as_deref() == Some(tenant.as_str()))?;
+        Ok(())
+    }
+
+    /// Drop every entry built for `resource`, for every principal.
+    ///
+    /// Lookups miss from the moment this returns (see
+    /// [`invalidate_principal`](Self::invalidate_principal) for the timing
+    /// of freeing the memory). Call from code that changes a resource's
+    /// authorization-relevant attributes when you cannot enumerate the
+    /// principals that read it.
+    pub fn invalidate_resource(&self, resource: &EntityUid) -> Result<(), moka::PredicateError> {
+        self.generations.bump_resource(resource);
+        let resource = resource.clone();
+        self.cache
+            .invalidate_entries_if(move |k, _v| k.resource == resource)?;
         Ok(())
     }
 
@@ -216,12 +256,23 @@ where
         MokaEntityCache::invalidate_all(self);
         Ok(())
     }
+
+    async fn invalidate_resource(&self, resource: &EntityUid) -> Result<(), Self::Error> {
+        MokaEntityCache::invalidate_resource(self, resource)
+    }
 }
 
 impl<P> RequestEntityProvider for MokaEntityCache<P>
 where
     P: RequestEntityProvider,
 {
+    fn cache_discriminator<'a>(
+        &'a self,
+        session: &'a AuthSession,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.inner.cache_discriminator(session)
+    }
+
     fn entities_for<'a>(
         &'a self,
         session: &'a AuthSession,
@@ -258,11 +309,19 @@ where
     > {
         Box::pin(async move {
             let tenant = session.tenant_id().await.map(|t| t.to_string().to_string());
+            let discriminator = self.inner.cache_discriminator(session).await;
+            // Taken before the provider is read: an invalidation that runs
+            // during the load changes the key the result is stored under.
+            let generation = self
+                .generations
+                .snapshot(principal, tenant.as_deref(), resource);
             let key = EntityCacheKey {
                 principal: principal.clone(),
                 tenant,
                 resource: resource.clone(),
                 action: action.clone(),
+                discriminator,
+                generation,
             };
 
             self.cache
@@ -282,207 +341,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::str::FromStr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Counts inner-provider calls so the test can verify cache hits/misses.
-    struct CountingProvider {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl RequestEntityProvider for CountingProvider {
-        fn entities_for<'a>(
-            &'a self,
-            session: &'a AuthSession,
-            principal: &'a EntityUid,
-            resource: &'a EntityUid,
-            action: &'a EntityUid,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
-        > {
-            // Synthetic counting fixture; doesn't need session/action; explicit
-            // acknowledgment per the axess no-`_`-prefix convention.
-            let _ = (session, action);
-            let calls = self.calls.clone();
-            let principal = principal.clone();
-            let resource = resource.clone();
-            Box::pin(async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                let p = cedar_policy::Entity::new(
-                    principal,
-                    std::collections::HashMap::new(),
-                    HashSet::new(),
-                )
-                .unwrap();
-                let r = cedar_policy::Entity::new(
-                    resource,
-                    std::collections::HashMap::new(),
-                    HashSet::new(),
-                )
-                .unwrap();
-                Ok(Entities::from_entities(vec![p, r], None).unwrap())
-            })
-        }
-    }
-
-    /// Construct a guest (unauthenticated) `AuthSession` for unit tests,
-    /// through the `pub(crate)` `SessionInner` / `SessionHandle`.
-    fn guest_session() -> AuthSession {
-        use crate::session::SessionData;
-        use crate::session::id::SessionId;
-        use crate::session::layer::{SessionHandle, SessionInner};
-        use tokio::sync::RwLock;
-
-        let inner = SessionInner {
-            id: SessionId::new(&axess_rng::SystemRng),
-            data: SessionData::default(),
-            modified: false,
-            needs_persist: false,
-            regenerate: false,
-            pre_cycle_id: None,
-            rng: std::sync::Arc::new(axess_rng::SystemRng),
-            pending_fingerprint: None,
-            max_custom_bytes: 64 * 1024,
-        };
-        AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
-    }
-
-    fn principal() -> EntityUid {
-        EntityUid::from_str("App::User::\"alice\"").unwrap()
-    }
-    fn action() -> EntityUid {
-        EntityUid::from_str("App::Action::\"View\"").unwrap()
-    }
-    fn doc(id: &str) -> EntityUid {
-        EntityUid::from_str(&format!("App::Doc::\"{id}\"")).unwrap()
-    }
-
-    #[tokio::test]
-    async fn first_call_misses_then_caches() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let cached = MokaEntityCache::new(CountingProvider {
-            calls: calls.clone(),
-        });
-        let s = guest_session();
-        let p = principal();
-        let a = action();
-        let r1 = doc("doc-1");
-
-        let _ = cached.entities_for(&s, &p, &r1, &a).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let _ = cached.entities_for(&s, &p, &r1, &a).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "cache hit should not invoke inner"
-        );
-
-        let r2 = doc("doc-2");
-        let _ = cached.entities_for(&s, &p, &r2, &a).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    /// `invalidate_principal` must evict; without invalidation closures
-    /// enabled on the builder, moka answers `InvalidationClosuresDisabled`
-    /// and a revoked role keeps authorizing until the TTL.
-    #[tokio::test]
-    async fn invalidate_principal_evicts_that_principals_entries() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let cached = MokaEntityCache::new(CountingProvider {
-            calls: calls.clone(),
-        });
-        let s = guest_session();
-        let p = principal();
-        let a = action();
-        let r = doc("doc-1");
-
-        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
-        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        cached
-            .invalidate_principal(&p)
-            .expect("invalidation closures are enabled on the builder");
-        // moka applies closure invalidation on its housekeeping pass.
-        cached.cache.run_pending_tasks().await;
-
-        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "after invalidate_principal the next call must re-invoke inner"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalidate_evicts_cached_entry() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let cached = MokaEntityCache::new(CountingProvider {
-            calls: calls.clone(),
-        });
-        let s = guest_session();
-        let p = principal();
-        let a = action();
-        let r = doc("doc-1");
-
-        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
-        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        // Guest session has no tenant_id, so invalidation key uses tenant=None.
-        cached.invalidate(&p, None, &r, &a).await;
-
-        let _ = cached.entities_for(&s, &p, &r, &a).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "after invalidate, next call should re-invoke inner"
-        );
-    }
-
-    #[tokio::test]
-    async fn invalidate_all_evicts_every_entry() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let cached = MokaEntityCache::new(CountingProvider {
-            calls: calls.clone(),
-        });
-        let s = guest_session();
-        let p = principal();
-        let a = action();
-        let r1 = doc("doc-1");
-        let r2 = doc("doc-2");
-
-        let _ = cached.entities_for(&s, &p, &r1, &a).await.unwrap();
-        let _ = cached.entities_for(&s, &p, &r2, &a).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        let _ = cached.entities_for(&s, &p, &r1, &a).await.unwrap();
-        let _ = cached.entities_for(&s, &p, &r2, &a).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "warmed entries must hit cache"
-        );
-
-        cached.invalidate_all();
-        // moka's `invalidate_all` is best-effort/lazy; pending invalidations
-        // are flushed by `run_pending_tasks` so the assertion is deterministic.
-        cached.cache.run_pending_tasks().await;
-
-        let _ = cached.entities_for(&s, &p, &r1, &a).await.unwrap();
-        let _ = cached.entities_for(&s, &p, &r2, &a).await.unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            4,
-            "after invalidate_all, every entry must re-invoke inner; \
-             killing the `()` no-op mutation on invalidate_all"
-        );
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod setter_tests {

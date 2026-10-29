@@ -85,6 +85,7 @@ fn claims(subject: &str, sid: Option<&str>) -> OAuthClaims {
         oidc_sid: sid.map(str::to_string),
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        dpop_key: None,
     }
 }
 

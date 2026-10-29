@@ -46,14 +46,28 @@
 //! - `events` must contain the back-channel logout event URI
 //! - At least one of `sub` or `sid` must be present
 //! - `jti` must be present, and is single-use within the `iat` window
+//! - A token with a `sid` ends the one session that `sid` maps to; the
+//!   sessions of its `sub` are ended only when the token has no `sid`, or the
+//!   `sid` maps to no session (OIDC Back-Channel Logout 1.0 §2.4)
 //! - A `sub` only ends the sessions that the same issuer established
+//! - Several providers may share an issuer: the one whose client id the
+//!   token's `aud` names verifies it
+//! - A log line carries at most a short escaped prefix of the issuer, `sub`
+//!   or `sid`, since all three arrive unauthenticated
 //!
 //! **Signature verification:** `OAuthProviderConfig` fetches and caches the
 //! IdP's JWKS keys at discovery time, and `verify_logout_jwt` validates the
 //! JWT signature before processing claims. `MockOAuthProvider` skips signature
 //! verification for unsigned test tokens.
 
-use crate::session::store::SessionRevoker;
+mod audit;
+
+pub use audit::{IdpSessionEnded, LogoutAudit};
+
+use super::log_field::loggable;
+use crate::authn::ids::UserId;
+use crate::session::id::SessionId;
+use crate::session::store::{SessionRevoker, note_revocation};
 use axess_clock::Clock;
 use axess_factors::oauth::OAuthProvider;
 use axess_factors::oidc::logout_token::{
@@ -78,8 +92,10 @@ use std::sync::Arc;
 /// unless at least one provider advertises both an issuer and a client id.
 #[derive(Clone)]
 pub struct BackChannelLogoutHandler {
-    /// Registered providers, keyed by issuer URL for O(1) lookup.
-    providers_by_issuer: Arc<HashMap<String, ProviderEntry>>,
+    /// Registered providers, keyed by issuer URL for O(1) lookup. Several
+    /// providers can share an issuer (one IdP, a client per application); the
+    /// token's `aud` picks the one that verifies it.
+    providers_by_issuer: Arc<HashMap<String, Vec<ProviderEntry>>>,
     /// Session registry for invalidating sessions.
     registry: Arc<dyn SessionRevoker>,
     /// OIDC `(issuer, sid)` → local session mapping for `sid`-based logout,
@@ -95,6 +111,8 @@ pub struct BackChannelLogoutHandler {
     /// Production wires `SystemClock`; tests inject `MockClock` so the
     /// 5-minute acceptance window can be exercised deterministically.
     clock: Arc<dyn Clock>,
+    /// Told about each session the handler ends, once per session.
+    audit: Option<Arc<dyn LogoutAudit>>,
 }
 
 /// Maximum entries kept in the per-handler `jti` replay cache. Sized so that
@@ -102,11 +120,6 @@ pub struct BackChannelLogoutHandler {
 /// above any legitimate IdP traffic, the cache cannot itself become a
 /// memory-DoS vector.
 const JTI_CACHE_MAX: usize = 16 * 1024;
-
-/// Number of entries evicted in one capacity pass. Evicting a batch rather
-/// than one entry keeps a log sitting at capacity from evicting on every
-/// call. Mirrors `EVICT_BATCH` in `maintain_oidc_sid_map`.
-const JTI_EVICT_BATCH: usize = 128;
 
 pub use super::sid_map::{SidEntry, SidKey, SidMap};
 
@@ -156,18 +169,28 @@ impl BackChannelLogoutHandler {
         sid_map: SidMap,
         clock: Arc<dyn Clock>,
     ) -> Option<Self> {
-        let mut by_issuer = HashMap::new();
+        let mut by_issuer: HashMap<String, Vec<ProviderEntry>> = HashMap::new();
 
         for provider in providers {
             if let (Some(issuer), Some(client_id)) = (provider.issuer(), provider.client_id()) {
-                by_issuer.insert(
-                    issuer.to_string(),
-                    ProviderEntry {
-                        client_id: client_id.to_string(),
-                        name: provider.name().clone(),
-                        provider: provider.clone(),
-                    },
-                );
+                let entries = by_issuer.entry(issuer.to_string()).or_default();
+                // The same issuer AND client id twice cannot be told apart by
+                // any token, so the second is ignored rather than allowed to
+                // replace the first.
+                if let Some(first) = entries.iter().find(|e| e.client_id == client_id) {
+                    tracing::warn!(
+                        first = %first.name,
+                        duplicate = %provider.name(),
+                        "back-channel logout: two providers share an issuer and a client id; \
+                         the first one verifies, the duplicate is ignored"
+                    );
+                    continue;
+                }
+                entries.push(ProviderEntry {
+                    client_id: client_id.to_string(),
+                    name: provider.name().clone(),
+                    provider: provider.clone(),
+                });
             }
         }
 
@@ -179,9 +202,42 @@ impl BackChannelLogoutHandler {
             providers_by_issuer: Arc::new(by_issuer),
             registry,
             sid_map,
-            seen_jtis: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX, JTI_EVICT_BATCH)),
+            seen_jtis: Arc::new(jti_log::JtiLog::new(JTI_CACHE_MAX)),
             clock,
+            audit: None,
         })
+    }
+
+    /// Report every session this handler ends to `audit`.
+    ///
+    /// Without it an IdP-initiated logout leaves no audit row: the sessions
+    /// end in the registry and nothing else hears of it. Pass
+    /// [`AuthnService::backchannel_logout_audit`](crate::authn::service::AuthnService::backchannel_logout_audit)
+    /// for the `SessionInvalidated` rows the rest of the audit trail uses.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn LogoutAudit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Tell the audit hook, if any, that a session ended. A failure is
+    /// logged: the session is already gone and the token already spent.
+    async fn report_ended(&self, iss: &str, user_id: &UserId, session_id: &SessionId) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        let ended = IdpSessionEnded {
+            iss: iss.to_string(),
+            user_id: *user_id,
+            session_id: *session_id,
+        };
+        if let Err(e) = audit.session_ended(&ended).await {
+            tracing::error!(
+                iss = %loggable(iss),
+                error = %e,
+                "back-channel logout: the audit write failed; the session is ended"
+            );
+        }
     }
 
     /// POST /auth/backchannel-logout
@@ -203,81 +259,105 @@ impl BackChannelLogoutHandler {
         let Some(ref jti) = claims.jti else {
             return Err(StatusCode::BAD_REQUEST);
         };
-        if !handler.record_jti(&claims.iss, jti, handler.clock.now()) {
-            tracing::warn!(
-                iss = %claims.iss,
-                jti = %jti,
-                "back-channel logout: jti replay rejected"
-            );
-            return Err(StatusCode::BAD_REQUEST);
+        match handler.record_jti(&claims.iss, jti, handler.clock.now()) {
+            Recorded::New => {}
+            Recorded::Replay => {
+                tracing::warn!(
+                    iss = %loggable(&claims.iss),
+                    "back-channel logout: jti replay rejected"
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Recorded::Full => {
+                // The log is full of live entries and forgets none of them.
+                // The token was not recorded, so the IdP's retry is accepted
+                // once entries age out.
+                tracing::warn!(
+                    capacity = JTI_CACHE_MAX,
+                    "back-channel logout jti log is full of live entries; refusing the token \
+                     (retryable) rather than forgetting a live one"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
         }
 
-        let provider_name = handler
-            .providers_by_issuer
-            .get(&claims.iss)
-            .map(|p| p.name.as_ref())
-            .unwrap_or("unknown");
         tracing::info!(
-            provider = %provider_name,
-            iss = %claims.iss,
-            sub = ?claims.sub,
-            sid = ?claims.sid,
+            iss = %loggable(&claims.iss),
+            has_sub = claims.sub.is_some(),
+            has_sid = claims.sid.is_some(),
             "back-channel logout: invalidating session(s)"
         );
 
         // If `sid` is present, invalidate the specific session mapped to this
         // OIDC session ID. Look up by `(issuer, sid)`; `sid` alone is not
-        // unique across providers. This runs first so a `sub` that this
-        // application cannot use never prevents the `sid` logout.
+        // unique across providers. When the `sid` maps to a session, that
+        // session alone ends: the token is a statement about one IdP
+        // session, and its `sub` (OIDC Back-Channel Logout 1.0 §2.4 asks for
+        // every session of the subject only when there is no `sid`) must not
+        // widen it to the user's other sessions.
+        let mut ended_by_sid = false;
         if let Some(ref sid) = claims.sid {
             let key: SidKey = (claims.iss.clone(), sid.clone());
             if let Some((user_id, session_id, _inserted_at)) = handler.sid_map.remove(&key) {
                 tracing::info!(
-                    iss = %claims.iss,
-                    oidc_sid = %sid,
+                    iss = %loggable(&claims.iss),
                     user_id = %user_id,
                     "back-channel logout: invalidating session by OIDC sid"
                 );
+                note_revocation(
+                    handler
+                        .registry
+                        .invalidate_session(&user_id, &session_id)
+                        .await,
+                    "back-channel logout by sid",
+                );
+
                 handler
-                    .registry
-                    .invalidate_session(&user_id, &session_id)
+                    .report_ended(&claims.iss, &user_id, &session_id)
                     .await;
+                ended_by_sid = true;
             } else if claims.sub.is_none() {
                 tracing::warn!(
-                    iss = %claims.iss,
-                    sid = %sid,
+                    iss = %loggable(&claims.iss),
                     "back-channel logout: sid not found in sid map and no sub to fall back to"
                 );
             }
         }
 
-        // If `sub` is present, end the sessions of that IdP subject that THIS
-        // issuer established. The sid map records `(issuer, sid)` and its
-        // subject registry records `(issuer, sub) -> (local user, session)`,
-        // the latter for every OAuth login including one whose ID token had
-        // no `sid` or whose `sid` mapping was dropped at capacity. `sub` is
-        // the IdP's own identifier and is looked up as such: after account
-        // linking it differs from the local user id the session is
-        // registered under, so each hit carries that id for the registry
-        // call. A subject with no entry under `claims.iss` was not
-        // authenticated by it, and an IdP must not be able to log out users
-        // it never authenticated, nor end sessions that came from another
-        // issuer or from a password or passkey login. Both lookups are by
-        // exact value; `sid` handling above has already run.
-        if let Some(ref sub) = claims.sub {
+        // End the sessions of the IdP subject that THIS issuer established
+        // when the token has no `sid`, or its `sid` maps to nothing (the
+        // mapping was dropped at capacity: the session may be live, and a
+        // logout that ends nothing is the worse failure). The sid map records
+        // `(issuer, sid)` and its subject registry records
+        // `(issuer, sub) -> (local user, session)`, the latter for every OAuth
+        // login including one whose ID token had no `sid`. `sub` is the IdP's
+        // own identifier and is looked up as such: after account linking it
+        // differs from the local user id the session is registered under, so
+        // each hit carries that id for the registry call. A subject with no
+        // entry under `claims.iss` was not authenticated by it, and an IdP
+        // must not be able to log out users it never authenticated, nor end
+        // sessions that came from another issuer or from a password or
+        // passkey login.
+        if !ended_by_sid && let Some(ref sub) = claims.sub {
             let owned = handler.sid_map.take_subject_sessions(&claims.iss, sub);
             if owned.is_empty() {
                 tracing::warn!(
-                    iss = %claims.iss,
-                    sub = %sub,
+                    iss = %loggable(&claims.iss),
                     "back-channel logout: no session of this subject was established \
                      through this issuer; ignoring sub"
                 );
             }
             for (user_id, session_id) in owned {
+                note_revocation(
+                    handler
+                        .registry
+                        .invalidate_session(&user_id, &session_id)
+                        .await,
+                    "back-channel logout by sub",
+                );
+
                 handler
-                    .registry
-                    .invalidate_session(&user_id, &session_id)
+                    .report_ended(&claims.iss, &user_id, &session_id)
                     .await;
             }
         }
@@ -305,10 +385,29 @@ impl BackChannelLogoutHandler {
                 StatusCode::BAD_REQUEST
             })?;
 
-        let entry = self.providers_by_issuer.get(iss).ok_or_else(|| {
-            tracing::warn!(iss = %iss, "back-channel logout: unknown issuer");
+        let entries = self.providers_by_issuer.get(iss).ok_or_else(|| {
+            // The issuer is the sender's own claim on an endpoint anyone can
+            // reach; it is not a reason to write a stranger's string to the
+            // warn log.
+            tracing::debug!(iss = %loggable(iss), "back-channel logout: unknown issuer");
             StatusCode::BAD_REQUEST
         })?;
+
+        // Providers can share an issuer; the one whose client id the token
+        // is addressed to verifies it. Read from the unverified payload only
+        // to choose whose keys to verify with: the verified payload is
+        // checked for `aud` again below.
+        let entry = entries
+            .iter()
+            .find(|e| aud_contains(&unverified, &e.client_id))
+            .ok_or_else(|| {
+                tracing::warn!(
+                    iss = %loggable(iss),
+                    "back-channel logout: aud does not contain the client_id of any provider \
+                     of this issuer"
+                );
+                StatusCode::BAD_REQUEST
+            })?;
 
         // 1. Verify JWT signature using the provider's JWKS.
         //    On unknown `kid`, refresh the JWKS and retry once (key rotation).
@@ -320,17 +419,17 @@ impl BackChannelLogoutHandler {
                 e @ (axess_factors::oauth::OAuthError::UnknownKid(_)
                 | axess_factors::oauth::OAuthError::JwksExpired),
             ) => {
-                tracing::info!(iss = %iss, reason = %e, "back-channel logout: JWKS unusable; refreshing");
+                tracing::info!(iss = %loggable(iss), reason = %e, "back-channel logout: JWKS unusable; refreshing");
                 if let Err(refresh_err) = entry.provider.refresh_jwks().await {
-                    tracing::warn!(iss = %iss, error = %refresh_err, "JWKS refresh failed");
+                    tracing::warn!(iss = %loggable(iss), error = %refresh_err, "JWKS refresh failed");
                 }
                 entry.provider.verify_logout_jwt(token).map_err(|e| {
-                    tracing::warn!(iss = %iss, error = %e, "back-channel logout: JWT verification failed after JWKS refresh");
+                    tracing::warn!(iss = %loggable(iss), error = %e, "back-channel logout: JWT verification failed after JWKS refresh");
                     StatusCode::BAD_REQUEST
                 })?
             }
             Err(e) => {
-                tracing::warn!(iss = %iss, error = %e, "back-channel logout: JWT verification failed");
+                tracing::warn!(iss = %loggable(iss), error = %e, "back-channel logout: JWT verification failed");
                 return Err(StatusCode::BAD_REQUEST);
             }
         };
@@ -339,7 +438,7 @@ impl BackChannelLogoutHandler {
 
         // 2. Check `aud` contains the client ID.
         if !aud_contains(&payload, &provider.client_id) {
-            tracing::warn!(iss = %iss, "back-channel logout: aud does not contain client_id");
+            tracing::warn!(iss = %loggable(iss), "back-channel logout: aud does not contain client_id");
             return Err(StatusCode::BAD_REQUEST);
         }
 
@@ -349,7 +448,7 @@ impl BackChannelLogoutHandler {
         // would be wrongly accepted.
         if !azp_satisfied(&payload, &provider.client_id) {
             tracing::warn!(
-                iss = %iss,
+                iss = %loggable(iss),
                 "back-channel logout: aud is multi-valued and azp does not match client_id"
             );
             return Err(StatusCode::BAD_REQUEST);
@@ -419,25 +518,29 @@ impl BackChannelLogoutHandler {
         })
     }
 
-    /// Record this `(issuer, jti)` as seen. Returns `true` if this is the
-    /// first time we have seen the pair (caller may proceed). Returns
-    /// `false` if the pair was already in the cache (caller should reject
-    /// as a replay). Tokens without a `jti` never reach this point:
+    /// Record this `(issuer, jti)` as seen: [`Recorded::New`] the first time,
+    /// [`Recorded::Replay`] when the log still holds the pair, and
+    /// [`Recorded::Full`] when the pair is new but the log has no room.
+    /// Tokens without a `jti` never reach this point:
     /// `validate_logout_token` refuses them.
     ///
     /// Entries older than [`JTI_RETENTION_SECS`] (the full span over which
-    /// one token's `iat` is accepted) are dropped on each call. If
-    /// the log is at [`JTI_CACHE_MAX`] capacity after that, the oldest
-    /// [`JTI_EVICT_BATCH`] entries are dropped to make room. Both come off
-    /// the front of an arrival-ordered queue, so the work is the number of
-    /// entries removed.
-    fn record_jti(&self, issuer: &str, jti: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    /// one token's `iat` is accepted) are dropped on each call, off the front
+    /// of an arrival-ordered queue, so the work is the number of entries
+    /// removed. A log at [`JTI_CACHE_MAX`] after that refuses the new pair;
+    /// it never forgets a live one to make room.
+    fn record_jti(&self, issuer: &str, jti: &str, now: chrono::DateTime<chrono::Utc>) -> Recorded {
         let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
         self.seen_jtis.record(issuer, jti, now, cutoff)
     }
 }
 
 mod jti_log;
+use jti_log::Recorded;
 
+#[cfg(test)]
+mod audit_tests;
+#[cfg(test)]
+mod scoping_tests;
 #[cfg(test)]
 mod tests;

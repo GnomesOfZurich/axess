@@ -130,7 +130,7 @@ use webauthn_rs::prelude::*;
 /// Abstraction over WebAuthn ceremony operations.
 ///
 /// Production: [`DefaultFido2Provider`] (wraps `webauthn_rs::Webauthn`).
-/// Tests: [`MockFido2Provider`] (configurable outcomes without crypto).
+/// Tests: `MockFido2Provider` (`testing` feature; configurable outcomes without crypto).
 ///
 /// # Timeouts
 ///
@@ -148,7 +148,7 @@ use webauthn_rs::prelude::*;
 /// itself decides around a ceremony (its timeout, timestamps, the credential
 /// list) uses the service's injected `Clock`. A test
 /// that needs a reproducible ceremony substitutes the provider:
-/// [`MockFido2Provider`] returns configured outcomes with no randomness and
+/// `MockFido2Provider` returns configured outcomes with no randomness and
 /// no clock.
 ///
 /// # Limitations (webauthn-rs 0.6)
@@ -320,10 +320,10 @@ impl Fido2Provider for DefaultFido2Provider {
 /// caller can exercise error paths without real WebAuthn crypto; for
 /// end-to-end FIDO2 tests, use [`DefaultFido2Provider`] against a
 /// `WebauthnBuilder` configured for a test origin.
-#[cfg(feature = "fido2")]
+#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 pub struct MockFido2Provider;
 
-#[cfg(feature = "fido2")]
+#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 impl MockFido2Provider {
     /// Construct a new mock provider that always fails ceremony calls.
     pub fn new() -> Self {
@@ -331,14 +331,14 @@ impl MockFido2Provider {
     }
 }
 
-#[cfg(feature = "fido2")]
+#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 impl Default for MockFido2Provider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(feature = "fido2")]
+#[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 impl Fido2Provider for MockFido2Provider {
     fn start_authentication(
         &self,

@@ -105,7 +105,7 @@ async fn complete_grant_rejects_a_state_of_the_same_length_and_a_prefix() {
     flipped[0] = if flipped[0] == b'A' { b'B' } else { b'A' };
     let flipped = String::from_utf8(flipped).unwrap();
     for bad in [flipped.as_str(), &ctx.state[..ctx.state.len() - 1], ""] {
-        let err = complete_grant(&provider, &ctx, "c", bad, &http)
+        let err = complete_grant(&provider, &ctx, "c", bad, &http, &axess_clock::SystemClock)
             .await
             .expect_err("state must match exactly");
         assert!(matches!(err, DelegatedError::StateMismatch), "{bad}");

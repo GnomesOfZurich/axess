@@ -22,6 +22,7 @@ fn fresh_inner(id: SessionId) -> SessionInner {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     }
 }
 
@@ -89,6 +90,18 @@ impl crate::session::store::SessionStore for CallCountingStore {
         self.update_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.update(id, data, ttl).await
     }
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<crate::session::store::ConditionalUpdate, Self::Error> {
+        self.update_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .update_if_revision(id, expected_revision, data, ttl)
+            .await
+    }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         self.inner.prune_expired().await
     }
@@ -143,7 +156,16 @@ async fn finalize_session_cap_disabled_when_max_custom_bytes_is_zero() {
     inner.max_custom_bytes = 0;
     let handle = handle_from(inner);
 
-    let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+    let _ = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
     let guard = handle.0.read().await;
     assert_eq!(
         guard.data.custom, big,
@@ -166,11 +188,22 @@ async fn finalize_session_cap_skipped_when_session_not_modified() {
     let big = serde_json::json!({"k": "v".repeat(5_000)});
     let mut inner = fresh_inner(id);
     inner.data.custom = big.clone();
+    // Recently refreshed, so the idle-expiry refresh does not write it either.
+    inner.data.touched_at = Some(chrono::Utc::now());
     inner.modified = false;
     inner.regenerate = false;
     let handle = handle_from(inner);
 
-    let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+    let _ = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
     let guard = handle.0.read().await;
     assert_eq!(
         guard.data.custom, big,
@@ -213,7 +246,16 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         inner.data.custom = payload.clone();
         inner.modified = true;
         let handle = handle_from(inner);
-        let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+        let _ = finalize_session(
+            &store,
+            &cfg,
+            None,
+            &axess_clock::SystemClock,
+            &handle,
+            Some(id),
+            &MockRng::new(1),
+        )
+        .await;
         let guard = handle.0.read().await;
         assert_eq!(
             guard.data.custom, payload,
@@ -234,7 +276,16 @@ async fn finalize_session_cap_uses_strict_greater_at_exact_boundary() {
         inner.data.custom = over.clone();
         inner.modified = true;
         let handle = handle_from(inner);
-        let _ = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+        let _ = finalize_session(
+            &store,
+            &cfg,
+            None,
+            &axess_clock::SystemClock,
+            &handle,
+            Some(id),
+            &MockRng::new(1),
+        )
+        .await;
         let guard = handle.0.read().await;
         assert_eq!(
             guard.data.custom,
@@ -269,7 +320,16 @@ async fn finalize_session_session_changed_or_over_modified_alone() {
     inner.modified = true;
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
     assert!(
         outcome.session_changed,
         "modified=true alone must mark session_changed (kills `||→&&` on line 764)"
@@ -336,6 +396,19 @@ impl crate::session::store::SessionStore for FailingCycleStore {
     ) -> Result<bool, Self::Error> {
         Ok(self.inner.update(id, data, ttl).await.unwrap())
     }
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<crate::session::store::ConditionalUpdate, Self::Error> {
+        Ok(self
+            .inner
+            .update_if_revision(id, expected_revision, data, ttl)
+            .await
+            .unwrap())
+    }
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         Ok(0)
     }
@@ -362,7 +435,16 @@ async fn finalize_session_failed_cycle_deletes_old_id_and_does_not_reissue_it() 
         .expect("seed");
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
     assert_ne!(
         outcome.final_id, id,
         "the old id must never be re-issued after a failed cycle"
@@ -403,7 +485,16 @@ async fn finalize_session_session_changed_or_over_regenerate_alone() {
         .expect("seed");
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
     assert!(
         outcome.session_changed,
         "regenerate=true alone must mark session_changed (kills 764:62 `||→&&` on second OR)"
@@ -454,6 +545,7 @@ async fn finalize_session_emits_session_created_on_regenerate() {
         &store,
         &cfg,
         Some(&metrics),
+        &axess_clock::SystemClock,
         &handle,
         Some(id),
         &MockRng::new(1),
@@ -485,7 +577,16 @@ async fn finalize_session_fresh_guest_saves_under_load_minted_id() {
     inner.regenerate = false;
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, None, &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        None,
+        &MockRng::new(1),
+    )
+    .await;
     assert_eq!(
         store.save_calls.load(Ordering::SeqCst),
         1,
@@ -540,13 +641,13 @@ async fn load_session_keeps_session_when_fingerprint_matches() {
         &store,
         &keys,
         &cfg,
-        None,
         &headers,
         Fingerprints {
             current: Some(stored_fp.as_str()),
             previous: None,
         },
         &MockRng::new(1),
+        &LoadPolicy::bare(),
     )
     .await;
 
@@ -596,10 +697,10 @@ async fn load_session_invalidates_a_bound_session_presented_without_a_fingerprin
         &store,
         &keys,
         &cfg,
-        None,
         &headers,
         Fingerprints::default(),
         &MockRng::new(1),
+        &LoadPolicy::bare(),
     )
     .await;
     assert!(
@@ -627,10 +728,10 @@ async fn load_session_mints_the_fresh_id_from_the_supplied_rng() {
         &store,
         &keys,
         &cfg,
-        None,
         &headers,
         Fingerprints::default(),
         &MockRng::new(77),
+        &LoadPolicy::bare(),
     )
     .await;
 
@@ -649,7 +750,16 @@ async fn finalize_session_replacement_id_comes_from_the_supplied_rng() {
     inner.regenerate = true;
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(78)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(78),
+    )
+    .await;
 
     assert_eq!(outcome.final_id, SessionId::new(&MockRng::new(78)));
 }
@@ -685,7 +795,16 @@ async fn finalize_session_does_not_revive_a_session_deleted_mid_request() {
     let handle = handle_from(inner);
 
     store.delete(&id).await.unwrap();
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(id), &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(1),
+    )
+    .await;
 
     assert!(
         store.load(&id).await.unwrap().is_none(),
@@ -720,7 +839,16 @@ async fn finalize_session_rotation_of_a_deleted_session_yields_a_guest() {
     let handle = handle_from(inner);
 
     store.delete(&old).await.unwrap();
-    let outcome = finalize_session(&store, &cfg, None, &handle, Some(old), &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(old),
+        &MockRng::new(1),
+    )
+    .await;
 
     assert_eq!(outcome.final_id, new);
     assert!(
@@ -747,7 +875,16 @@ async fn finalize_session_rotation_without_a_stored_session_still_writes() {
     inner.data.custom = serde_json::json!({"authenticated": true});
     let handle = handle_from(inner);
 
-    let outcome = finalize_session(&store, &cfg, None, &handle, None, &MockRng::new(1)).await;
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        None,
+        &MockRng::new(1),
+    )
+    .await;
 
     assert_eq!(outcome.final_id, new);
     assert!(store.load(&new).await.unwrap().is_some());

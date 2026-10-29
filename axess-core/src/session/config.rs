@@ -21,7 +21,13 @@ use std::time::Duration;
 // Re-export SameSite so callers don't need tower_cookies in their Cargo.toml.
 pub use tower_cookies::cookie::SameSite;
 
-const DEFAULT_COOKIE_NAME: &str = "axess.sid";
+/// Default cookie name when the cookie is `Secure` and scoped to `/`.
+const DEFAULT_COOKIE_NAME: &str = "__Host-axess.sid";
+/// Cookie name used instead of [`DEFAULT_COOKIE_NAME`] when the config does
+/// not name a cookie and the `__Host-` prefix cannot hold (`Secure` off, or a
+/// `Path` other than `/`): browsers drop a prefixed cookie that breaks those
+/// rules, so the unprefixed name is the one that still works.
+const FALLBACK_COOKIE_NAME: &str = "axess.sid";
 const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
 /// Default maximum size of serialized custom session data (64 KiB).
 const DEFAULT_MAX_CUSTOM_BYTES: usize = 64 * 1024;
@@ -32,16 +38,22 @@ const DEFAULT_MAX_CUSTOM_BYTES: usize = 64 * 1024;
 /// [`SessionConfig::default()`] for production-safe defaults): fields
 /// are crate-private so struct-literal construction cannot bypass the
 /// validation `SessionConfigBuilder::build` performs (`__Host-` prefix
-/// requires `secure=true`, non-zero TTL, non-empty cookie name).
+/// requires `secure=true`, non-zero TTL, non-empty cookie name). The same
+/// checks run when the layer is built from a config, so the layer's
+/// own `with_*` setters cannot bypass them either.
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub(crate) ttl: Duration,
     pub(crate) cookie_name: Arc<str>,
+    /// `true` when the name was chosen by the caller. A name nobody chose is
+    /// resolved by [`finalize`](Self::finalize) against `secure` and `path`.
+    pub(crate) cookie_name_explicit: bool,
     pub(crate) secure: bool,
     pub(crate) same_site: SameSite,
     pub(crate) http_only: bool,
     pub(crate) path: Arc<str>,
     pub(crate) max_custom_bytes: usize,
+    pub(crate) max_authenticated_age: Option<Duration>,
 }
 
 impl SessionConfig {
@@ -50,10 +62,11 @@ impl SessionConfig {
         self.ttl
     }
 
-    /// Cookie name (default: `"axess.sid"`).
+    /// Cookie name (default: `"__Host-axess.sid"`, or `"axess.sid"` when the
+    /// cookie is not `Secure` or its `Path` is not `/`, where the prefix
+    /// could not hold).
     ///
-    /// Prefer the `__Host-` prefix in production (e.g.,
-    /// `"__Host-axess.sid"`). Browsers refuse to set a `__Host-` cookie
+    /// The default carries the `__Host-` prefix. Browsers refuse to set a `__Host-` cookie
     /// unless `Secure=true`, `Path="/"`, and the cookie has no `Domain`
     /// attribute: together these prevent subdomain-scoped overwrites and
     /// cross-host injection that the bare name does not. The
@@ -98,6 +111,15 @@ impl SessionConfig {
     pub fn max_custom_bytes(&self) -> usize {
         self.max_custom_bytes
     }
+
+    /// Absolute cap on how long an authenticated session may live, measured
+    /// from the moment it authenticated (default: none, so the sliding
+    /// [`ttl`](Self::ttl) is the only bound). When set, a session whose
+    /// authentication is older than this is ended on its next request,
+    /// however recently it was used.
+    pub fn max_authenticated_age(&self) -> Option<Duration> {
+        self.max_authenticated_age
+    }
 }
 
 impl Default for SessionConfig {
@@ -105,11 +127,13 @@ impl Default for SessionConfig {
         Self {
             ttl: DEFAULT_TTL,
             cookie_name: DEFAULT_COOKIE_NAME.into(),
+            cookie_name_explicit: false,
             secure: true,
             same_site: SameSite::Lax,
             http_only: true,
             path: "/".into(),
             max_custom_bytes: DEFAULT_MAX_CUSTOM_BYTES,
+            max_authenticated_age: None,
         }
     }
 }
@@ -119,6 +143,93 @@ impl SessionConfig {
     pub fn builder() -> SessionConfigBuilder {
         SessionConfigBuilder(SessionConfig::default())
     }
+
+    /// Resolve a cookie name nobody chose against `secure` and `path`, then
+    /// check the invariants every config must satisfy.
+    ///
+    /// Returns the resolved config. Runs from the builder's `build` and from
+    /// the layer when it is turned into a service, after every setter, so the
+    /// order the setters were called in does not matter.
+    ///
+    /// # Panics
+    ///
+    /// Panics (with a message naming the setting) if `ttl` is zero, the
+    /// cookie name is empty or not a valid cookie token, a `__Host-` or
+    /// `__Secure-` name is used without `Secure`, a `__Host-` name is used
+    /// with a `Path` other than `/`, or `SameSite=None` is used without
+    /// `Secure` (browsers reject that combination).
+    pub(crate) fn finalize(mut self) -> Self {
+        if !self.cookie_name_explicit {
+            self.cookie_name = if self.secure && self.path.as_ref() == "/" {
+                DEFAULT_COOKIE_NAME.into()
+            } else {
+                FALLBACK_COOKIE_NAME.into()
+            };
+        }
+        self.validate();
+        self
+    }
+
+    fn validate(&self) {
+        assert!(
+            !self.ttl.is_zero(),
+            "SessionConfig: ttl must be > 0 (sessions would expire immediately)"
+        );
+        let name: &str = &self.cookie_name;
+        assert!(
+            !name.is_empty(),
+            "SessionConfig: cookie_name must not be empty"
+        );
+        assert!(
+            name.bytes().all(is_cookie_token_byte),
+            "SessionConfig: cookie name `{name}` contains characters that are not valid in a cookie name"
+        );
+        if name.starts_with("__Host-") {
+            assert!(
+                self.secure,
+                "SessionConfig: cookie name `{name}` requires `secure = true`"
+            );
+            assert!(
+                self.path.as_ref() == "/",
+                "SessionConfig: cookie name `{name}` requires `path = \"/\"`"
+            );
+        } else if name.starts_with("__Secure-") {
+            assert!(
+                self.secure,
+                "SessionConfig: cookie name `{name}` requires `secure = true`"
+            );
+        }
+        assert!(
+            self.max_authenticated_age.is_none_or(|a| !a.is_zero()),
+            "SessionConfig: max_authenticated_age must be > 0 (every session would end at once)"
+        );
+        assert!(
+            self.same_site != SameSite::None || self.secure,
+            "SessionConfig: `SameSite=None` requires `secure = true` (browsers reject the cookie otherwise)"
+        );
+    }
+}
+
+/// RFC 6265 `token` characters: what a cookie name may contain.
+fn is_cookie_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// Whether the builder should emit the "insecure cookie" warning.
@@ -151,9 +262,11 @@ impl SessionConfigBuilder {
         self
     }
 
-    /// Set the cookie name (default: `"axess.sid"`).
+    /// Set the cookie name (default: `"__Host-axess.sid"`, or `"axess.sid"`
+    /// when `secure` is off or the path is not `/`).
     pub fn cookie_name(mut self, name: impl Into<Arc<str>>) -> Self {
         self.0.cookie_name = name.into();
+        self.0.cookie_name_explicit = true;
         self
     }
 
@@ -197,41 +310,26 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// Cap how long an authenticated session may live, however active it is
+    /// (default: no cap). Must be non-zero.
+    pub fn max_authenticated_age(mut self, max_age: Duration) -> Self {
+        self.0.max_authenticated_age = Some(max_age);
+        self
+    }
+
     /// Consume the builder and return the finished [`SessionConfig`].
     ///
     /// # Panics
     ///
     /// Panics if `ttl` is zero (sessions would expire immediately), if
-    /// `cookie_name` is empty, or if a `__Host-` / `__Secure-` cookie name
-    /// prefix is used without `Secure=true` (the prefix would be silently
-    /// dropped by browsers and the security promise lost; better to fail
-    /// fast at construction time than to ship a misconfigured cookie).
+    /// `cookie_name` is empty or not a valid cookie name, if a `__Host-` /
+    /// `__Secure-` cookie name prefix is used without `Secure=true` (the
+    /// prefix would be silently dropped by browsers and the security promise
+    /// lost; better to fail fast at construction time than to ship a
+    /// misconfigured cookie), if a `__Host-` name is used with a `Path`
+    /// other than `/`, or if `SameSite=None` is used without `Secure=true`.
     pub fn build(self) -> SessionConfig {
-        assert!(
-            !self.0.ttl.is_zero(),
-            "SessionConfig: ttl must be > 0 (sessions would expire immediately)"
-        );
-        assert!(
-            !self.0.cookie_name.is_empty(),
-            "SessionConfig: cookie_name must not be empty"
-        );
-        let name: &str = &self.0.cookie_name;
-        if name.starts_with("__Host-") {
-            assert!(
-                self.0.secure,
-                "SessionConfig: cookie name `{name}` requires `secure = true`"
-            );
-            assert!(
-                self.0.path.as_ref() == "/",
-                "SessionConfig: cookie name `{name}` requires `path = \"/\"`"
-            );
-        } else if name.starts_with("__Secure-") {
-            assert!(
-                self.0.secure,
-                "SessionConfig: cookie name `{name}` requires `secure = true`"
-            );
-        }
-        self.0
+        self.0.finalize()
     }
 }
 
@@ -243,7 +341,7 @@ mod tests {
     fn default_config_has_production_safe_values() {
         let config = SessionConfig::default();
         assert_eq!(config.ttl, Duration::from_secs(86400));
-        assert_eq!(config.cookie_name.as_ref(), "axess.sid");
+        assert_eq!(config.cookie_name.as_ref(), "__Host-axess.sid");
         assert!(config.secure);
         assert_eq!(config.same_site, SameSite::Lax);
         assert!(config.http_only);
@@ -292,5 +390,51 @@ mod tests {
         assert!(config.secure);
         assert_eq!(config.same_site, SameSite::Lax);
         assert!(config.http_only);
+    }
+
+    #[test]
+    fn unnamed_cookie_is_host_prefixed_only_when_the_prefix_can_hold() {
+        assert_eq!(
+            SessionConfig::builder().build().cookie_name(),
+            "__Host-axess.sid"
+        );
+        assert_eq!(
+            SessionConfig::builder().secure(false).build().cookie_name(),
+            "axess.sid"
+        );
+        assert_eq!(
+            SessionConfig::builder().path("/app").build().cookie_name(),
+            "axess.sid"
+        );
+    }
+
+    #[test]
+    fn a_chosen_name_is_kept_whatever_secure_says() {
+        let c = SessionConfig::builder()
+            .cookie_name("axess.sid")
+            .secure(true)
+            .build();
+        assert_eq!(c.cookie_name(), "axess.sid");
+    }
+
+    #[test]
+    #[should_panic(expected = "SameSite=None")]
+    fn same_site_none_needs_secure() {
+        let _ = SessionConfig::builder()
+            .same_site(SameSite::None)
+            .secure(false)
+            .build();
+    }
+
+    #[test]
+    fn same_site_none_with_secure_is_accepted() {
+        let c = SessionConfig::builder().same_site(SameSite::None).build();
+        assert_eq!(c.same_site(), SameSite::None);
+    }
+
+    #[test]
+    #[should_panic(expected = "not valid in a cookie name")]
+    fn cookie_name_must_be_a_token() {
+        let _ = SessionConfig::builder().cookie_name("a b").build();
     }
 }

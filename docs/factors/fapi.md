@@ -8,7 +8,15 @@ Requests (PAR), mandatory sender-constrained tokens through DPoP or
 mTLS, optional JWT Authorization Response Mode (JARM), and stricter
 ID token lifetime bounds.
 
-The feature flag is `fapi` (off by default), which implies `oauth`.
+> **Scope.** Axess is the relying party. `OAuthProviderConfig::with_fapi`
+> switches the profile on for a provider: the token request is
+> sender-constrained (a DPoP proof, or a client certificate), the ID token is
+> held to the profile's lifetime, `nbf` and algorithm rules, and the
+> authorization response can be required to arrive as a signed JWT (JARM).
+
+The `oauth` feature carries the whole client side of the profile. The `fapi`
+feature (off by default, implies `oauth`) adds the resource-server side,
+`verify_dpop_proof`.
 The base OAuth chapter (*OAuth 2.0 and OIDC*) covers everything that
 remains true under FAPI; this chapter covers only what changes.
 
@@ -109,47 +117,77 @@ The four things FAPI adds over ordinary OAuth.
 
 ### Configuration
 
-FAPI is enabled per-provider by attaching a `FapiConfig` to an
-`OAuthProviderConfig`:
+`FapiConfig` describes the profile and `OAuthProviderConfig::with_fapi`
+attaches it. `with_fapi` is the only way to turn the profile on, and it
+either returns a provider that keeps all of it or an `OAuthError::Config`
+naming what is missing.
 
 ```rust,ignore
-use axess::federation::oauth::{FapiConfig, SenderConstraint, OAuthProviderConfig};
+use axess::federation::oauth::{FapiConfig, SenderConstraint};
 
-let fapi_config = FapiConfig {
-    sender_constraint: SenderConstraint::DPoP,
-    require_jarm: false,
-    max_id_token_lifetime_secs: 300,
-};
-
-let provider = OAuthProviderConfig::discover(
-    "https://idp.example.com/.well-known/openid-configuration",
-    client_id,
-    client_secret,
-    redirect_uri,
-)
-.await?
-.with_fapi(fapi_config);
+let provider = provider
+    .with_par_endpoint("https://idp.example.com/par") // if discovery did not find it
+    .with_fapi(FapiConfig {
+        sender_constraint: SenderConstraint::DPoP,
+        require_jarm: true,
+        ..FapiConfig::default()
+    })?;
 ```
 
-`sender_constraint` chooses between DPoP and mTLS for the
-sender-constrained-tokens requirement. DPoP is the right choice for
-applications that already manage HTTPS in software; mTLS is the
-right choice for applications that already manage X.509 certificates
-for service-to-service authentication. The two cannot be combined
-on a single provider, but different providers in the same
-application can use different constraints.
+* `sender_constraint` chooses DPoP or mTLS, below.
+* `require_jarm` makes the authorization request ask for `response_mode=jwt`
+  and the callback finish through `finish_oauth_login_jarm`, below. A plain
+  `finish_oauth_login` for such a provider is refused and ends the ceremony.
+* `max_id_token_lifetime_secs` bounds `exp - iat` of the ID token (300 by
+  default), and `nbf` must be present and not in the future.
+* `allowed_id_token_algs` lists the JOSE names an ID token may be signed
+  with: `PS256`, `ES256` and `EdDSA` by default, whatever the IdP advertises
+  in `id_token_signing_alg_values_supported`. An IdP that cannot sign with
+  those is a deployment decision to widen this list, knowingly: the profile
+  does not accept `RS256`. Symmetric names and `none` are refused, and so is an
+  empty list.
+* A PAR endpoint is required. `begin_oauth_login` then pushes the
+  authorization request there.
 
-`require_jarm` toggles JARM enforcement. When true, the authorization
-response from the IdP must arrive as a signed JWT; the
-configuration's `oidc.discovery.jwks_uri` is used to verify the
-signature. When false, the IdP may return the response as query
-parameters as in baseline OAuth.
+### Sender-constrained token requests
 
-`max_id_token_lifetime_secs` is the upper bound on ID token validity.
-The FAPI default is three hundred seconds (five minutes), which is
-short enough that a captured token expires before most replay attacks
-can succeed and long enough that clock skew does not cause spurious
-rejections.
+**DPoP.** For each login the service makes a `DpopKey` from its `SecureRng` and
+the token request carries a `DPoP` header: a proof with `htm` POST, `htu` the
+token endpoint, a fresh `jti` and `iat` from the provider's clock. When the
+server answers `use_dpop_nonce` with a `DPoP-Nonce` header the request is sent
+once more with a proof that echoes the nonce. The response must say
+`token_type` `DPoP`; a `Bearer` answer is refused, and so is an access token
+that is a JWT with a `cnf.jkt` other than the key's thumbprint. The key comes
+back as `OAuthClaims::dpop_key`.
+
+Refresh and userinfo calls are bound to the same key:
+`refresh_oauth_token_with_key` and `fetch_userinfo_with_key` take it, sign
+their requests with it, and send the access token under the `DPoP`
+authorization scheme with a proof that carries the token's hash. A provider
+configured for DPoP refuses the plain forms, since they would send the token
+unbound.
+
+**mTLS.** `with_fapi` reads the certificate and key (PEM) from the configured
+paths into the HTTP client every request goes through, so a TLS server that
+asks for a client certificate gets one. The client authenticates with the
+certificate (`tls_client_auth`), so the configured client secret is no longer
+sent. When the discovery document has `mtls_endpoint_aliases`, the token,
+userinfo, revocation and PAR requests go to the aliases it lists. Missing or
+unreadable files, a bad PEM, or an alias that is not an HTTPS URL fail
+`with_fapi`, not the first login. The tokens are certificate-bound but say
+`Bearer`, as RFC 8705 has it.
+
+### JARM
+
+With `require_jarm` the authorization response is a signed JWT in the
+`response` parameter of the callback. Finish the login with
+`finish_oauth_login_jarm(response, &session)`. The JWT is verified against the
+provider's key set with the profile's algorithms (never `none`, never a
+symmetric one): `iss` must be the provider's issuer, `aud` this client, and
+`exp` is required and enforced. A stale key set is refreshed once. The `code`,
+`state` and `iss` inside then go through the same checks as
+`finish_oauth_login_with_iss`, with `iss` required; a response carrying
+`error` ends the ceremony.
 
 ### The PAR flow
 
@@ -184,24 +222,34 @@ state; axess performs the token exchange and ID token validation.
 
 ### DPoP key management
 
-DPoP binds each access token to a public key the client controls.
-The application generates a key pair at session start (or at
-application start, for some deployments), uses the private key to
-sign a DPoP proof JWT on each request to a protected resource, and
-the resource server verifies the proof and matches the JWK
-thumbprint against the access token's binding.
+DPoP binds each access token to a public key the client controls
+(`cnf.jkt` in the token). RFC 9449 requires every proof presented with that
+token to be signed by that one key: a proof from any other key does not match
+the binding.
 
-`AuthnService::generate_dpop_proof` builds a proof. It mints a fresh
-ephemeral key for every proof, draws the key bytes and the `jti` from the
-service's `SecureRng`, and stamps `iat` from the service's `Clock`, so a
-seeded RNG and a mock clock reproduce the proof exactly. The provider
-trait method it calls, `OAuthProvider::generate_dpop_proof`, takes those
-values as arguments (`key_seed`, `iat`, `jti_bytes`) and reads neither a
-clock nor a random source itself.
+`DpopKey` is that key. A login against a DPoP provider makes it for you and
+returns it in `OAuthClaims::dpop_key`; keep it for as long as the token lives
+(`to_seed_bytes` exports the scalar for storage next to the token, and
+`from_seed` restores it), and pass it by reference to every proof and to the
+refresh and userinfo calls. `AuthnService::new_dpop_key` draws one from the
+service's `SecureRng` for the cases where you make the key yourself.
+`thumbprint` returns the RFC 7638 thumbprint, which is the `jkt` the
+authorization server binds the token to. `Debug` prints the thumbprint only,
+never the scalar.
+
+`AuthnService::generate_dpop_proof` builds a proof with the key. It draws the
+`jti` from the service's `SecureRng` and stamps `iat` from the service's
+`Clock`, so a seeded RNG and a mock clock reproduce the proof exactly. The
+provider trait method it calls, `OAuthProvider::generate_dpop_proof`, takes the
+key, `iat` and `jti_bytes` as arguments and reads neither a clock nor a random
+source itself.
 
 ```rust,ignore
+let key = claims.dpop_key.expect("a DPoP login returns its key"); // kept for the token's life
+
 let proof: DpopProof = authn.generate_dpop_proof(
     "bank",                                        // provider name
+    &key,                                          // the token's key
     "GET",                                         // HTTP method
     "https://resource.example.com/data",           // target URL
     Some(&access_token),                           // bind to this access token
@@ -216,18 +264,15 @@ let response = http_client
 ```
 
 The proof JWT contains the HTTP method, the target URL, a unique `jti`, an
-`iat` timestamp, and the thumbprint of the binding key. The resource
-server checks all of these against the access token's `cnf`
-(confirmation) claim, which carries the thumbprint at token
-issuance.
+`iat` timestamp, the hash of the access token (`ath`) when one is passed, and
+the public key in its header. Two proofs from one key for different URLs
+carry the same thumbprint. The resource server checks all of these against the
+access token's `cnf` (confirmation) claim.
 
-Key lifecycle is the operational concern. A DPoP key pair generated
-per session is the safest choice (a compromised session is bounded
-to one key); a key pair generated per application instance is the
-easiest choice (one key to manage). The trade-off is between blast
-radius and operational complexity. Most deployments choose
-per-session keys for high-sensitivity flows and per-instance keys
-for routine flows.
+Key lifecycle is the operational concern. A key per session bounds a
+compromised session to one key; a key per application instance is easier to
+manage but makes one key the binding of every token. Keep the exported scalar
+with the same care as the refresh token.
 
 ### Token revocation
 

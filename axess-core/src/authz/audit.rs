@@ -43,6 +43,14 @@
 //! | `latency_us` | u64 | Cedar evaluation latency in microseconds |
 //! | `reason` (optional) | string | Set when the decision is forced by a non-policy condition (e.g. `"request_validation_failed"`) |
 //!
+//! A denial that happens before Cedar is asked also emits the event, with
+//! `decision = "deny"`, no `reasons` or `latency_us`, and one of these
+//! `reason` values: `invalid_action`, `invalid_resource`,
+//! `entity_provider_error` (the provider failed or timed out),
+//! `context_error` (the request context could not be built). A request
+//! rejected for having no authenticated session (401) is not an
+//! authorization decision and emits nothing here.
+//!
 //! # Example: route audit to a file via tracing-subscriber
 //!
 //! ```ignore
@@ -72,6 +80,27 @@
 /// Prefer `DECISION_TARGET` over re-typing the literal so consumers stay
 /// aligned with future axess naming.
 pub const DECISION_TARGET: &str = "axess::authz::decision";
+
+/// Emit the decision event for a request that was denied before Cedar was
+/// asked, so the audit trail has a denial for it.
+///
+/// A malformed action or resource, an entity provider that failed and a
+/// request context that could not be built all end in a denial that never
+/// reaches the policy evaluator, which is where the ordinary decision event
+/// is emitted. Each of those sites calls this helper so the event has the
+/// same target and the same `decision = "deny"` field, with `reason` naming
+/// the early exit. Strings that are not known at the exit (no resource UID
+/// could be built yet) are passed as an empty string.
+pub fn emit_early_deny(principal: &str, action: &str, resource: &str, reason: &str) {
+    tracing::info!(
+        target: DECISION_TARGET,
+        principal = %principal,
+        action = %action,
+        resource = %resource,
+        decision = "deny",
+        reason = %reason,
+    );
+}
 
 /// Returns true if `metadata` describes an axess authorization-decision
 /// event. Use as a custom filter:
@@ -145,5 +174,24 @@ mod tests {
             tracing::event!(target: "some::other::target", tracing::Level::INFO, "other");
         });
         assert_eq!(recorded.lock().unwrap().as_slice(), &[false]);
+    }
+
+    /// An early denial reaches a subscriber on the decision target.
+    #[test]
+    fn an_early_deny_is_a_decision_event() {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            recorded: recorded.clone(),
+        };
+        let subscriber = Registry::default().with(layer);
+        with_default(subscriber, || {
+            emit_early_deny(
+                "App::User::\"u\"",
+                "App::Action::\"A\"",
+                "",
+                "invalid_resource",
+            );
+        });
+        assert_eq!(recorded.lock().unwrap().as_slice(), &[true]);
     }
 }

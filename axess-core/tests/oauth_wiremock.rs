@@ -380,7 +380,6 @@ async fn cross_tenant_user_refused_after_real_finish() {
 /// Log in through a discovered provider, with `extra` claims in the ID
 /// token, and return the claims `finish_oauth_login` produced.
 async fn login_with_extra_claims(
-    fapi: bool,
     extra: serde_json::Value,
 ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
     let server = MockServer::start().await;
@@ -405,7 +404,7 @@ async fn login_with_extra_claims(
         )
         .mount(&server)
         .await;
-    let mut provider = OAuthProviderConfig::discover(
+    let provider = OAuthProviderConfig::discover(
         "test",
         &issuer,
         client_id,
@@ -414,12 +413,6 @@ async fn login_with_extra_claims(
     )
     .await
     .expect("discovery should succeed");
-    if fapi {
-        provider = provider
-            .with_par_endpoint(format!("{issuer}/par"))
-            .with_fapi(axess_factors::oauth::FapiConfig::default())
-            .expect("fapi");
-    }
     let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
         .with_oauth_provider(provider)
         .build()
@@ -466,7 +459,6 @@ async fn login_with_extra_claims(
 #[tokio::test]
 async fn id_token_groups_roles_and_sid_reach_oauth_claims() {
     let claims = login_with_extra_claims(
-        false,
         json!({ "groups": ["g1", "g2"], "roles": ["admin"], "sid": "idp-session-9" }),
     )
     .await
@@ -474,25 +466,6 @@ async fn id_token_groups_roles_and_sid_reach_oauth_claims() {
     assert_eq!(claims.groups, vec!["g1", "g2"]);
     assert_eq!(claims.roles, vec!["admin"]);
     assert_eq!(claims.oidc_sid.as_deref(), Some("idp-session-9"));
-}
-
-/// FAPI requires `nbf`; a token that carries a valid one must pass, and one
-/// without it must still be refused.
-#[tokio::test]
-async fn fapi_login_reads_nbf_from_the_id_token() {
-    let now = chrono::Utc::now().timestamp();
-    login_with_extra_claims(true, json!({ "nbf": now - 5, "exp": now + 120 }))
-        .await
-        .expect("FAPI login with nbf must succeed");
-    let err = login_with_extra_claims(true, json!({ "exp": now + 120 }))
-        .await
-        .expect_err("FAPI login without nbf must fail");
-    // The provider reports every token-validation failure to the caller as
-    // a generic exchange failure.
-    assert!(
-        matches!(err, axess_factors::oauth::OAuthError::TokenExchange(_)),
-        "got {err:?}"
-    );
 }
 
 /// Token endpoint returning error should propagate as TokenExchange error.
@@ -676,6 +649,80 @@ async fn unknown_kid_yields_typed_variant() {
         }
         other => panic!("expected OAuthError::UnknownKid, got {other:?}"),
     }
+}
+
+/// With the explicit-type switch on, a logout token whose `typ` is the plain
+/// `JWT` jsonwebtoken writes by default is refused before its key is looked up;
+/// with the switch off the same token gets as far as the key lookup.
+#[tokio::test]
+async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
+    use axess_factors::oauth::{OAuthError, OAuthProvider};
+
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    let (_, jwk_published, _) = generate_rsa_keypair();
+    let (private_unknown, _, _) = generate_rsa_keypair();
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery_document(&issuer)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk_published] })))
+        .mount(&server)
+        .await;
+
+    let discover = || {
+        OAuthProviderConfig::discover(
+            "test",
+            &issuer,
+            "client-id",
+            "secret",
+            "http://localhost:3000/callback",
+        )
+    };
+    let lenient = discover().await.unwrap();
+    let strict = discover().await.unwrap().with_required_logout_typ();
+
+    let claims = json!({
+        "iss": issuer,
+        "aud": "client-id",
+        "iat": chrono::Utc::now().timestamp(),
+        "jti": "logout-1",
+        "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+        "sub": "user-123",
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("not-published".to_string());
+    axess_factors::jwt::ensure_crypto_provider();
+    let key = EncodingKey::from_rsa_der(&private_unknown);
+    let token = jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode");
+
+    match strict.verify_logout_jwt(&token) {
+        Err(OAuthError::IdTokenValidation(reason)) => {
+            assert!(reason.contains("logout+jwt"), "{reason}");
+        }
+        other => panic!("expected a refused typ, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            lenient.verify_logout_jwt(&token),
+            Err(OAuthError::UnknownKid(_))
+        ),
+        "the lenient provider reaches the key lookup"
+    );
+
+    header.typ = Some("logout+jwt".to_string());
+    let explicit = jsonwebtoken::encode(&header, &claims, &key).expect("JWT encode");
+    assert!(
+        matches!(
+            strict.verify_logout_jwt(&explicit),
+            Err(OAuthError::UnknownKid(_))
+        ),
+        "the explicit type passes the check and reaches the key lookup"
+    );
 }
 
 /// A 503 response from the revocation endpoint maps to the

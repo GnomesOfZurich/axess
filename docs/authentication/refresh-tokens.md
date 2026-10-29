@@ -50,10 +50,12 @@ pub struct RefreshToken {
     pub family_id: Option<TokenFamilyId>,
     pub device_id: Option<DeviceId>,
     pub authn_time: Option<DateTime<Utc>>,
+    pub revoked_reason: Option<RevocationReason>,
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 ```
 
-Four fields are worth dwelling on.
+Six fields are worth dwelling on.
 
 `authn_time` is when the user last proved who they are. Rotation mints
 a new token on every refresh, so `issued_at` keeps moving forward while
@@ -62,6 +64,28 @@ carries `authn_time` (or `issued_at` when it is `None`, as it is for a
 token issued at login), so a 29-day-old refresh chain does not pass a
 "recent login" or step-up freshness check. Rotation copies the value from
 parent to child; a store must persist it.
+
+`revoked_reason` and `revoked_at` record why and when a token was
+revoked. Only the reuse of a token that was rotated out is a theft
+signal; a token the user logged out, one the per-user cap evicted and
+one a family revocation already killed were revoked on purpose, and a
+stale client presenting one of them is not an attacker. The reasons are
+`Rotated` (replaced by its child), `Explicit` (a logout or a user-wide
+revocation), `Evicted` (made room under `max_per_user`) and `Compromise`
+(swept by a family revocation). A store persists both fields next to
+`revoked`; a revocation never overwrites the reason of a token that is
+already revoked. The SQL adapters add them as two nullable columns
+(`revoked_reason`, `revoked_at`), which is an additive migration: a row
+revoked before the columns existed reads as `Rotated`, the strictest
+reading, so reuse of such a token still revokes the family.
+
+`device_info` is a keyed digest of the device string the caller passed at
+issue, together with `device_id` (`hb1:` and the base64url of an
+HMAC-SHA256 under the pepper). The client string itself is not stored.
+Refresh recomputes the digest from the string presented and compares in
+constant time, and the child token inherits the stored value. A token of an
+earlier release stores the raw string; it is still honoured and its child
+carries the digest. *Device identity* has the detail.
 
 `token_hash` is the SHA-256 hash of the token string (HMAC-SHA256
 under the configured pepper when there is one), not the string
@@ -121,13 +145,32 @@ fails. The user has to log in again, but during the brief window
 between detection and re-login the attacker has no access either.
 
 The detection-and-revoke pattern is implemented in the
-`refresh_session` function: when a revoked token is presented, the
-function calls `revoke_family(user_id, family_id)` and emits an
-audit event noting the suspected compromise. The application can
-also wire an `on_token_compromise` callback to receive the event
-synchronously and take application-specific action (logging Alice
-out of related sessions, alerting her by email, escalating to
-fraud review).
+`refresh_session` function: when a token that was rotated out is
+presented, the function calls `revoke_family(user_id, family_id)` and then
+`on_token_compromise` on the store. The hook runs even when the family
+revocation itself failed (the failure is logged and the caller still sees
+`Revoked`), so a store fault cannot skip the device cascade. The refresh path
+writes no audit event of its own; override `on_token_compromise` to record
+one (an auth event with status `Suspicious`, carrying the user and family) and to take
+application-specific action (logging Alice out of related sessions, alerting
+her by email, escalating to fraud review).
+
+A token that was revoked for another reason is refused as `Revoked` and
+nothing else happens: a client that logs out and then replays its old token,
+or one whose token the per-user cap evicted, does not take the user's other
+sessions with it.
+
+Two refreshes by one client can race: the browser retries, or two tabs
+refresh at once. The second presentation of the rotated-out token looks like
+reuse. `reuse_grace` (default zero, so every reuse is treated as theft) names a
+short window after a rotation in which the second presentation answers
+`ConcurrentRefresh` instead, revokes nothing, and lets the client retry with
+the token the first refresh returned. Keep it to a few seconds: a thief who
+replays the token just after the victim used it gets the same grace.
+
+A token stored without a family (a row from before families existed) gives
+its child a family named after the token's own id, so reuse of that token can
+still find and revoke what descends from it.
 
 What a long-lived session cannot do is notice. An attacker who avoids
 every other alert still cannot avoid this one, because it is the
@@ -180,11 +223,15 @@ pub struct RefreshTokenConfig {
     pub max_per_user: usize,
     pub rotation: bool,
     pub hash_pepper: Option<Zeroizing<Vec<u8>>>,
+    pub previous_hash_pepper: Option<Zeroizing<Vec<u8>>>,
+    pub max_lifetime: Option<Duration>,
+    pub reuse_grace: Duration,
 }
 ```
 
 The defaults are conservative for most applications: a thirty-day TTL,
-ten concurrent tokens per user, rotation enabled, and no pepper.
+ten concurrent tokens per user, rotation enabled, no pepper, no absolute
+lifetime and no reuse grace.
 
 `ttl` is how long a refresh token is valid before it expires without
 being used. Thirty days is enough that most users do not feel the
@@ -192,6 +239,20 @@ expiry in normal use, and short enough that an abandoned device's
 tokens become unusable in a bounded time. Applications with stricter
 posture set this lower; applications with weak step-up at re-login
 set this higher.
+
+`max_lifetime` is the absolute lifetime of a family, counted from the
+authentication it descends from (the `authn_time` carried through rotation).
+Without it expiry is sliding: a token refreshed at least once per `ttl` never
+expires, so a stolen family that is rotated faster than the owner can notice
+lives for ever. With it, a refresh at or after `authn_time + max_lifetime`
+returns `Expired` on both refresh paths, and every token's `expires_at` is
+clamped to that instant at issue and at rotation, so the stored expiry is the
+truth. It must be positive and at least `ttl`; `validate` refuses anything
+else. Ninety days is a reasonable hardening value. The default is `None`
+because forcing re-authentication is a product decision.
+
+`reuse_grace` is the window described above for racing refreshes. It must not
+be negative.
 
 `max_per_user` is the cap on how many refresh tokens a user can have
 active at once. The cap exists to prevent a runaway "log in from
@@ -214,8 +275,26 @@ hash, held in `zeroize::Zeroizing` so each copy of the config wipes it
 when dropped. Adding a pepper is a defence-in-depth measure that helps when
 the database is breached but the secrets manager is not. The pepper
 must be stable across the deployment (otherwise existing tokens
-become unverifiable); rotation is supported through the same pattern
-as the session signing key, covered in *Operations runbook*.
+become unverifiable).
+
+To rotate it, set `hash_pepper` to the new secret and move the old one to
+`previous_hash_pepper`. A presented token that is not found under the
+current hash is looked up under the previous pepper; one found there is
+refreshed by force, even when `rotation` is off, so the token the client
+receives is stored under the new pepper. Reuse detection is unchanged: the
+rotated-out record keeps its old hash and is still found by the retry. After
+one `ttl` (or `max_lifetime`, for tokens nobody uses) set
+`previous_hash_pepper` back to `None`. Only a keyed previous pepper can be
+named, so moving from no pepper to a pepper still invalidates the tokens.
+
+## Refreshing for one tenant
+
+`refresh_session` finds a token by its hash alone, so a token issued for one
+tenant can be presented to an endpoint that serves another. When the tenant
+comes from the request (a host name, a path segment), use
+`refresh_session_in_tenant` or `refresh_session_with_status_check_in_tenant`:
+a token of any other tenant answers `NotFound`, exactly as an unknown token
+does, and is not rotated, revoked or checked against the status predicate.
 
 ## Atomicity contracts
 
@@ -225,6 +304,11 @@ the family-based theft detection sound; a non-atomic implementation
 opens a time-of-check-to-time-of-use window, where an attacker could
 race the legitimate user past the detection between the moment the
 token is checked and the moment it is spent.
+
+Each of these records the revocation reason described above: `Rotated`
+(stamped with the child's issue time) for the parent in `rotate_token`,
+`Evicted` for the tokens `issue_capped` removes, `Compromise` for
+`revoke_family`, `Explicit` for the single-token and user-wide revocations.
 
 `rotate_token` must atomically mark the current token revoked and
 issue a new token in the same family. Two requests racing each other

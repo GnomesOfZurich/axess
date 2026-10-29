@@ -25,6 +25,7 @@ fn claims(sid: &str) -> OAuthClaims {
         oidc_sid: Some(sid.to_string()),
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        dpop_key: None,
     }
 }
 

@@ -74,10 +74,17 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
     .unwrap();
 
     // Rotate v1 → v2; v2 must inherit the device link.
-    let (session, new_token) =
-        refresh_session(&plaintext_v1, &refresh_store, &config, &rng, ts, None)
-            .await
-            .unwrap();
+    let (session, new_token) = refresh_session_with_status_check(
+        &plaintext_v1,
+        &refresh_store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         session.device_id,
         Some(device_id),
@@ -94,7 +101,16 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
     // on_token_compromise just logs; we replicate the cascade
     // step a production override would perform by collecting
     // family targets and driving the primitive directly.
-    let err = refresh_session(&plaintext_v1, &refresh_store, &config, &rng, ts, None).await;
+    let err = refresh_session_with_status_check(
+        &plaintext_v1,
+        &refresh_store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await;
     assert!(matches!(err, Err(RefreshError::Revoked)));
 
     // Drive the cascade with the same target set the trait hook
@@ -150,9 +166,17 @@ async fn collect_family_targets_deduplicates_same_device_across_family() {
     )
     .await
     .unwrap();
-    let (_session, _) = refresh_session(&plaintext_v1, &store, &config, &rng, ts, None)
-        .await
-        .unwrap();
+    let (_session, _) = refresh_session_with_status_check(
+        &plaintext_v1,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await
+    .unwrap();
 
     // Reload the (now-revoked) v1 record so we can call the
     // private collector directly with it.

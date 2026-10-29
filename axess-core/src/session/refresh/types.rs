@@ -21,6 +21,52 @@ define_id! {
     pub TokenFamilyId
 }
 
+/// Why a refresh token was revoked.
+///
+/// Only a token that was rotated out ([`Rotated`](Self::Rotated)) and then
+/// presented again is evidence of theft. A token a user logged out, one the
+/// per-user cap evicted, and one a family revocation already killed are all
+/// revoked on purpose, and presenting them again is a stale client rather
+/// than an attacker. Stores persist the reason next to `revoked`; a row
+/// revoked before the reason existed reads as `None` and is handled as
+/// [`Rotated`](Self::Rotated), the strictest reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationReason {
+    /// Replaced by its child in a rotation. Reuse is a compromise signal.
+    Rotated,
+    /// Revoked by an explicit call: a logout, or a user-wide revocation.
+    Explicit,
+    /// Revoked to make room under `RefreshTokenConfig::max_per_user`.
+    Evicted,
+    /// Revoked as part of a family revocation after a reuse was detected.
+    Compromise,
+}
+
+impl RevocationReason {
+    /// The stable lower-case spelling stores persist.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotated => "rotated",
+            Self::Explicit => "explicit",
+            Self::Evicted => "evicted",
+            Self::Compromise => "compromise",
+        }
+    }
+
+    /// Parse the spelling [`as_str`](Self::as_str) produced. An unknown
+    /// spelling reads as `None`, which the refresh path treats as a
+    /// rotation (the strictest reading).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "rotated" => Some(Self::Rotated),
+            "explicit" => Some(Self::Explicit),
+            "evicted" => Some(Self::Evicted),
+            "compromise" => Some(Self::Compromise),
+            _ => None,
+        }
+    }
+}
+
 /// A refresh token record. Long-lived, stored server-side, used to
 /// obtain new access/session tokens.
 #[derive(Debug, Clone)]
@@ -79,6 +125,12 @@ pub struct RefreshToken {
     /// later `authn_time`, never an earlier one than the last rotation, so
     /// persist it.
     pub authn_time: Option<DateTime<Utc>>,
+    /// Why the token was revoked, when it was. `None` while live, and for
+    /// rows revoked before the reason was recorded (read as a rotation).
+    pub revoked_reason: Option<RevocationReason>,
+    /// When the token was revoked. For a rotation this is the instant the
+    /// child was issued, which the reuse grace window is measured from.
+    pub revoked_at: Option<DateTime<Utc>>,
 }
 
 impl RefreshToken {
@@ -118,13 +170,50 @@ pub struct RefreshTokenConfig {
     /// ([`RefreshError::InvalidConfig`]): `Some` always means keyed hashing,
     /// never a silent fall back to the unkeyed hash.
     ///
-    /// **Migration:** changing the pepper (including switching from
-    /// `None` to `Some`) invalidates every existing refresh token. Plan
-    /// the rollout accordingly. Default `None` for backward compat.
+    /// **Migration:** changing the pepper invalidates every existing refresh
+    /// token unless the old pepper is moved to
+    /// [`previous_hash_pepper`](Self::previous_hash_pepper) for the rotation
+    /// window. Switching from `None` to `Some` always invalidates them.
+    /// Default `None` for backward compat.
     ///
     /// Held in [`Zeroizing`] so every copy of the config wipes its pepper
     /// when it drops.
     pub hash_pepper: Option<Zeroizing<Vec<u8>>>,
+    /// The pepper `hash_pepper` replaced, kept for the rotation window.
+    ///
+    /// When a presented token is not found under the current hash, the
+    /// lookup retries under `HMAC-SHA256(previous_hash_pepper, plaintext)`.
+    /// A token found that way is moved to the current pepper by force: the
+    /// refresh rotates it even when `rotation` is off, so the token the
+    /// client receives is stored under `hash_pepper`. Reuse detection is
+    /// unchanged, because the rotated-out record keeps its old hash and is
+    /// still found by the retry. Once every live token has been refreshed
+    /// (one `ttl`, at most `max_lifetime` for tokens that are never used),
+    /// set this back to `None`.
+    ///
+    /// Only a keyed previous pepper is expressible: a rollout from the
+    /// unkeyed hash still invalidates the tokens it replaces. An empty
+    /// value is a configuration error, like an empty `hash_pepper`. Held in
+    /// [`Zeroizing`] for the same reason.
+    pub previous_hash_pepper: Option<Zeroizing<Vec<u8>>>,
+    /// Absolute lifetime of a token family, counted from the authentication
+    /// the family descends from. Default `None` (sliding expiry only: a
+    /// token refreshed at least once per `ttl` never expires). When set, a
+    /// refresh at or after `authenticated_at + max_lifetime` returns
+    /// [`RefreshError::Expired`] and every token's `expires_at` is clamped
+    /// to that instant, so a stolen family cannot be rotated for ever. Must
+    /// be at least `ttl`. A value such as 90 days is a sensible hardening
+    /// choice.
+    pub max_lifetime: Option<Duration>,
+    /// How long after a rotation a second presentation of the rotated-out
+    /// token is read as two parallel refreshes by one client rather than as
+    /// theft. Default zero: any reuse of a rotated-out token revokes the
+    /// family. Within the window the second caller gets
+    /// [`RefreshError::ConcurrentRefresh`] and nothing is revoked, so the
+    /// client can retry with the token the first refresh returned. Keep it
+    /// to a few seconds: the window is also open to a thief who replays the
+    /// token just after the victim used it.
+    pub reuse_grace: Duration,
 }
 
 impl RefreshTokenConfig {
@@ -140,7 +229,33 @@ impl RefreshTokenConfig {
         if self.hash_pepper.as_ref().is_some_and(|p| p.is_empty()) {
             return Err("hash_pepper must not be empty; use None for the unkeyed hash");
         }
+        if self
+            .previous_hash_pepper
+            .as_ref()
+            .is_some_and(|p| p.is_empty())
+        {
+            return Err("previous_hash_pepper must not be empty; use None to stop accepting it");
+        }
+        if self.reuse_grace < Duration::zero() {
+            return Err("reuse_grace must not be negative");
+        }
+        if let Some(max) = self.max_lifetime {
+            if max <= Duration::zero() {
+                return Err("max_lifetime must be positive");
+            }
+            if max < self.ttl {
+                return Err("max_lifetime must be at least ttl");
+            }
+        }
         Ok(())
+    }
+
+    /// The instant a token descending from `authenticated_at` can no longer
+    /// be refreshed: `authenticated_at + max_lifetime`, or `None` without a
+    /// cap (or when the sum is out of range, which reads as no cap).
+    pub fn lifetime_end(&self, authenticated_at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.max_lifetime
+            .and_then(|max| authenticated_at.checked_add_signed(max))
     }
 
     /// [`validate`](Self::validate) as the error the refresh functions return.
@@ -153,6 +268,11 @@ impl RefreshTokenConfig {
     /// The pepper bytes, when one is configured.
     pub fn pepper(&self) -> Option<&[u8]> {
         self.hash_pepper.as_deref().map(Vec::as_slice)
+    }
+
+    /// The pepper `hash_pepper` replaced, when the rotation window is open.
+    pub fn previous_pepper(&self) -> Option<&[u8]> {
+        self.previous_hash_pepper.as_deref().map(Vec::as_slice)
     }
 }
 
@@ -175,6 +295,12 @@ impl std::fmt::Debug for RefreshTokenConfig {
             .field("max_per_user", &self.max_per_user)
             .field("rotation", &self.rotation)
             .field("hash_pepper", &RedactedPepper(&self.hash_pepper))
+            .field(
+                "previous_hash_pepper",
+                &RedactedPepper(&self.previous_hash_pepper),
+            )
+            .field("max_lifetime", &self.max_lifetime)
+            .field("reuse_grace", &self.reuse_grace)
             .finish()
     }
 }
@@ -186,6 +312,9 @@ impl Default for RefreshTokenConfig {
             max_per_user: 10,
             rotation: true,
             hash_pepper: None,
+            previous_hash_pepper: None,
+            max_lifetime: None,
+            reuse_grace: Duration::zero(),
         }
     }
 }
@@ -205,6 +334,13 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
     #[error("refresh token revoked")]
     Revoked,
 
+    /// The token was rotated a moment ago and presented again inside
+    /// [`RefreshTokenConfig::reuse_grace`]: two parallel refreshes by one
+    /// client. Nothing was revoked; retry with the token the first refresh
+    /// returned.
+    #[error("refresh token was just rotated by a concurrent refresh")]
+    ConcurrentRefresh,
+
     /// The device fingerprint does not match.
     #[error("device mismatch")]
     DeviceMismatch,
@@ -221,6 +357,20 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
     /// [`RefreshTokenConfig::validate`]); nothing was read or written.
     #[error("invalid refresh token configuration: {0}")]
     InvalidConfig(&'static str),
+
+    /// The device the token was issued to is revoked or no longer exists.
+    /// Returned only by
+    /// [`refresh_session_with_device_check`](super::refresh_session_with_device_check),
+    /// before anything is rotated; the token is left as it is.
+    #[error("device revoked")]
+    DeviceRevoked,
+
+    /// The device store could not answer the device check, so the refresh
+    /// was refused rather than allowed unchecked. Carries the store's
+    /// message. Returned only by
+    /// [`refresh_session_with_device_check`](super::refresh_session_with_device_check).
+    #[error("device store error: {0}")]
+    DeviceStore(String),
 
     /// An error from the underlying store.
     #[error("store error: {0}")]

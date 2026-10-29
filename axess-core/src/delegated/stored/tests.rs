@@ -115,9 +115,15 @@ async fn complete_grant_exchanges_code_for_credential() {
     let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     let http = reqwest::Client::new();
-    let cred = complete_grant(&provider, &ctx, "auth-code-42", &ctx.state, &http)
+    let clock = MockClock::at(t0());
+    let cred = complete_grant(&provider, &ctx, "auth-code-42", &ctx.state, &http, &clock)
         .await
         .expect("complete_grant");
+    // Measured from the injected clock, not the system clock.
+    assert_eq!(
+        cred.expires_at,
+        Some(t0() + chrono::Duration::seconds(3600))
+    );
     assert_eq!(cred.provider, "test-provider");
     assert_eq!(&*cred.access_token, "tok-access");
     assert_eq!(cred.refresh_token.as_deref(), Some("tok-refresh"));
@@ -134,9 +140,16 @@ async fn complete_grant_rejects_state_mismatch() {
     let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     let http = reqwest::Client::new();
-    let err = complete_grant(&provider, &ctx, "code", "WRONG-STATE", &http)
-        .await
-        .expect_err("state mismatch must reject");
+    let err = complete_grant(
+        &provider,
+        &ctx,
+        "code",
+        "WRONG-STATE",
+        &http,
+        &axess_clock::SystemClock,
+    )
+    .await
+    .expect_err("state mismatch must reject");
     assert!(
         matches!(err, crate::delegated::error::DelegatedError::StateMismatch),
         "expected StateMismatch, got {err:?}"
@@ -161,9 +174,16 @@ async fn complete_grant_surfaces_token_endpoint_error() {
     let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
 
     let http = reqwest::Client::new();
-    let err = complete_grant(&provider, &ctx, "code", &ctx.state, &http)
-        .await
-        .expect_err("400 must propagate");
+    let err = complete_grant(
+        &provider,
+        &ctx,
+        "code",
+        &ctx.state,
+        &http,
+        &axess_clock::SystemClock,
+    )
+    .await
+    .expect_err("400 must propagate");
     match err {
         crate::delegated::error::DelegatedError::TokenEndpoint { status, .. } => {
             assert_eq!(status, 400);
@@ -408,9 +428,16 @@ async fn complete_grant_form_encodes_basic_credentials() {
         Url::parse("https://gnomes.local/callback").unwrap(),
     );
     let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
-    complete_grant(&provider, &ctx, "c", &ctx.state, &reqwest::Client::new())
-        .await
-        .expect("secret with reserved characters reaches the IdP intact");
+    complete_grant(
+        &provider,
+        &ctx,
+        "c",
+        &ctx.state,
+        &reqwest::Client::new(),
+        &axess_clock::SystemClock,
+    )
+    .await
+    .expect("secret with reserved characters reaches the IdP intact");
 }
 
 #[tokio::test]
@@ -427,9 +454,16 @@ async fn complete_grant_refuses_out_of_range_expires_in() {
             .await;
         let provider = build_provider(&server.uri());
         let (_url, ctx) = begin_grant(&provider, &[], &MockRng::new(1)).expect("begin_grant");
-        let err = complete_grant(&provider, &ctx, "c", &ctx.state, &reqwest::Client::new())
-            .await
-            .expect_err("out-of-range lifetime is refused, not a panic or an expired token");
+        let err = complete_grant(
+            &provider,
+            &ctx,
+            "c",
+            &ctx.state,
+            &reqwest::Client::new(),
+            &axess_clock::SystemClock,
+        )
+        .await
+        .expect_err("out-of-range lifetime is refused, not a panic or an expired token");
         assert!(
             matches!(
                 err,

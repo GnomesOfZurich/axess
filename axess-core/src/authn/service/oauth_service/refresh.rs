@@ -22,8 +22,8 @@ where
     /// Refresh an OAuth token using a stored refresh token.
     ///
     /// Exchanges the refresh token at the IdP's token endpoint for new
-    /// access/ID tokens. Validates the new ID token and returns updated
-    /// claims (groups, roles, expiry, etc.).
+    /// access/ID tokens. Validates the new ID token, when the IdP sent one,
+    /// and returns it with the rotated tokens.
     ///
     /// # Arguments
     ///
@@ -34,19 +34,55 @@ where
     ///   ([`OAuthClaims::subject`](axess_factors::oauth::OAuthClaims::subject)).
     ///   A response for any other subject is refused (OIDC Core 12.2) and
     ///   audited as a provider rejection.
+    /// * `original_nonce`: The `nonce` of the login that produced the refresh
+    ///   token (the `nonce` member of
+    ///   [`OAuthClaims::additional_claims`](axess_factors::oauth::OAuthClaims::additional_claims)).
+    ///   A refresh ID token that carries a nonce must equal it (OIDC Core
+    ///   12.2); one without a nonce is accepted, and one with a nonce when
+    ///   this is `None` is refused.
     ///
     /// # Returns
     ///
-    /// Updated [`OAuthClaims`](axess_factors::oauth::OAuthClaims) with fresh groups, roles, and (if the IdP
-    /// rotates refresh tokens) a new refresh token in
-    /// [`OAuthClaims::refresh_token`](axess_factors::oauth::OAuthClaims::refresh_token).
-    #[tracing::instrument(skip(self, refresh_token))]
+    /// A [`RefreshOutcome`](axess_factors::oauth::RefreshOutcome). Store its
+    /// `refresh_token` in place of the one you sent: a rotating IdP has spent
+    /// the old one even when the response carries no ID token, in which case
+    /// `id_token_claims` is `None` and the claims you already hold stand.
+    #[tracing::instrument(skip(self, refresh_token, expected_subject, original_nonce))]
     pub async fn refresh_oauth_token(
         &self,
         provider_name: &str,
         refresh_token: &str,
         expected_subject: &str,
-    ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
+        original_nonce: Option<&str>,
+    ) -> Result<axess_factors::oauth::RefreshOutcome, axess_factors::oauth::OAuthError> {
+        self.refresh_oauth_token_with_key(
+            provider_name,
+            refresh_token,
+            expected_subject,
+            original_nonce,
+            None,
+        )
+        .await
+    }
+
+    /// [`refresh_oauth_token`](Self::refresh_oauth_token) for a login whose
+    /// tokens are bound to a DPoP key.
+    ///
+    /// Pass the key the login returned in
+    /// [`OAuthClaims::dpop_key`](axess_factors::oauth::OAuthClaims::dpop_key)
+    /// (or restored with `DpopKey::from_seed`). The refresh request then
+    /// carries a proof signed by it, and the rotated access token is bound to
+    /// the same key. A provider configured for DPoP refuses the call without
+    /// one, since sending the refresh token unbound would drop the binding.
+    #[tracing::instrument(skip(self, refresh_token, expected_subject, original_nonce, dpop_key))]
+    pub async fn refresh_oauth_token_with_key(
+        &self,
+        provider_name: &str,
+        refresh_token: &str,
+        expected_subject: &str,
+        original_nonce: Option<&str>,
+        dpop_key: Option<&axess_factors::oauth::DpopKey>,
+    ) -> Result<axess_factors::oauth::RefreshOutcome, axess_factors::oauth::OAuthError> {
         use axess_factors::oauth::OAuthError;
 
         // Every early-return below records a Failure event with a
@@ -79,8 +115,12 @@ where
         };
         let provider = provider.clone();
 
-        let claims = match provider
-            .refresh_token_for_subject(refresh_token, expected_subject)
+        let signer = dpop_key.map(|key| axess_factors::oauth::DpopSigner {
+            key,
+            rng: &*self.inner.rng,
+        });
+        let outcome = match provider
+            .refresh_token_for_subject_with(refresh_token, expected_subject, original_nonce, signer)
             .await
         {
             Ok(c) => c,
@@ -94,7 +134,7 @@ where
             }
         };
 
-        let subject_user = UserId::try_new(claims.subject.as_str()).ok();
+        let subject_user = UserId::try_new(expected_subject).ok();
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LoginAttempt)
                 .maybe_attributed_to(subject_user.as_ref(), None)
@@ -106,7 +146,7 @@ where
         .await
         .map_err(|e| OAuthError::AuditStore(e.to_string()))?;
 
-        Ok(claims)
+        Ok(outcome)
     }
 
     /// Record an OAuth refresh-token failure audit event.

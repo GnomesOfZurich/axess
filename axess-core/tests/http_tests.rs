@@ -666,11 +666,11 @@ mod device_resolver_wiring {
     }
 
     #[tokio::test]
-    async fn resolver_runs_on_every_request_and_persists_first_stamp() {
-        // First request: resolver stamps Some(id), session is created
-        // (existing_id was None), so the layer saves the SessionData
-        // including the new device_id. The Set-Cookie response header
-        // confirms persistence happened.
+    async fn a_device_stamp_alone_does_not_persist_a_fresh_session() {
+        // First request: the resolver stamps Some(id) on a session that has
+        // no stored row yet. The stamp is carried in memory and saved only
+        // when something else changes the session, so a cookieless request
+        // stores nothing and issues no cookie.
         let id = axess_core::authn::ids::testing::device("dev-persist-test");
         let app = router_with_resolver(StaticResolver(id));
 
@@ -681,8 +681,8 @@ mod device_resolver_wiring {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(
-            resp.headers().get(header::SET_COOKIE).is_some(),
-            "first request must mint+persist a session; Set-Cookie expected"
+            resp.headers().get(header::SET_COOKIE).is_none(),
+            "a device stamp must not by itself create a stored session"
         );
     }
 }

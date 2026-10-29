@@ -16,6 +16,8 @@ use cedar_policy::{Entities, EntityUid};
 use axess_cache::ClockTtlCache;
 use axess_clock::{Clock, SystemClock};
 
+use super::generation::{Generation, Generations};
+
 use crate::authz::error::AuthzError;
 use crate::authz::provider::RequestEntityProvider;
 use crate::session::AuthSession;
@@ -25,7 +27,9 @@ const DEFAULT_CAPACITY: usize = 10_000;
 /// Default TTL if the caller doesn't override it.
 const DEFAULT_TTL_SECS: u64 = 60;
 
-/// Cache key for the (principal, tenant, resource, action) tuple.
+/// Cache key for the (principal, tenant, resource, action) tuple, the
+/// provider's cache discriminator and the invalidation generation the load
+/// started under.
 ///
 /// `tenant` is read from `AuthSession::tenant_id()` so cache entries for
 /// the same physical user acting in different tenants stay distinct (a
@@ -41,6 +45,8 @@ struct EntityCacheKey {
     tenant: Option<String>,
     resource: EntityUid,
     action: EntityUid,
+    discriminator: Option<String>,
+    generation: Generation,
 }
 
 /// In-process cache decorator over a [`RequestEntityProvider`].
@@ -72,7 +78,20 @@ struct EntityCacheKey {
 /// let provider: Arc<dyn axess_core::authz::RequestEntityProvider> = Arc::new(cached);
 /// ```
 ///
+/// # Caching contract
+///
+/// An entry is keyed on the principal, the session's tenant, the resource,
+/// the action and the inner provider's
+/// [`cache_discriminator`](RequestEntityProvider::cache_discriminator).
+/// Entities that depend on any other session state are shared across
+/// sessions of the same user and tenant for the TTL, so keep per-session
+/// facts in the Cedar context, or return them from the discriminator.
+///
 /// # Invalidation
+///
+/// An invalidation also discards a load that was in flight when it ran: the
+/// result of that load is returned to its caller but never served to anyone
+/// else.
 ///
 /// Call [`invalidate`](Self::invalidate) from any code path that mutates a
 /// principal's role membership or a resource's authorization-relevant
@@ -95,6 +114,7 @@ where
     capacity: usize,
     ttl: Duration,
     clock: Arc<dyn Clock>,
+    generations: Generations,
 }
 
 impl<P> EntityCache<P>
@@ -126,6 +146,7 @@ where
             capacity,
             ttl,
             clock,
+            generations: Generations::new(),
         }
     }
 
@@ -146,12 +167,17 @@ where
         Self::with_options(self.inner, self.capacity, self.ttl, clock)
     }
 
-    /// Invalidate cached entries for `(principal, tenant, resource, action)`.
+    /// Invalidate cached entries for `(principal, tenant, resource, action)`,
+    /// whatever their cache discriminator.
     ///
     /// Call from any code path that mutates the principal's roles, the
     /// resource's attributes, or anything else the inner provider would
     /// load differently next time. Pass `tenant=None` for guest sessions;
     /// otherwise pass the same tenant_id the session would report.
+    ///
+    /// Because a load already in flight must not repopulate the entry, this
+    /// also drops every other cached entry of `principal`; they are rebuilt
+    /// on their next use.
     pub fn invalidate(
         &self,
         principal: &EntityUid,
@@ -159,13 +185,9 @@ where
         resource: &EntityUid,
         action: &EntityUid,
     ) {
-        let key = EntityCacheKey {
-            principal: principal.clone(),
-            tenant: tenant.map(str::to_string),
-            resource: resource.clone(),
-            action: action.clone(),
-        };
-        self.cache.invalidate(&key);
+        let _ = (tenant, resource, action);
+        self.generations.bump_principal(principal);
+        self.cache.invalidate_by(|k| &k.principal == principal);
     }
 
     /// Drop every entry from the cache.
@@ -173,6 +195,7 @@ where
     /// Use as a last-resort invalidation when you can't enumerate the
     /// affected keys (e.g. global Cedar policy reload).
     pub fn invalidate_all(&self) {
+        self.generations.bump_all();
         self.cache.invalidate_all();
     }
 
@@ -183,6 +206,7 @@ where
     /// request sees the new authorization state without waiting for
     /// the TTL.
     pub fn invalidate_principal(&self, principal: &EntityUid) -> usize {
+        self.generations.bump_principal(principal);
         self.cache.invalidate_by(|k| &k.principal == principal)
     }
 
@@ -193,8 +217,19 @@ where
     /// [`invalidate_all`](Self::invalidate_all) to drop guest entries
     /// alongside tenant ones.
     pub fn invalidate_tenant(&self, tenant: &str) -> usize {
+        self.generations.bump_tenant(tenant);
         self.cache
             .invalidate_by(|k| k.tenant.as_deref() == Some(tenant))
+    }
+
+    /// Drop every entry built for `resource`, for every principal.
+    ///
+    /// Returns the number of entries dropped. Call from code that changes a
+    /// resource's authorization-relevant attributes (owner, classification,
+    /// sharing) when you cannot enumerate the principals that read it.
+    pub fn invalidate_resource(&self, resource: &EntityUid) -> usize {
+        self.generations.bump_resource(resource);
+        self.cache.invalidate_by(|k| &k.resource == resource)
     }
 
     /// Borrow the inner provider for read access.
@@ -280,12 +315,24 @@ where
         EntityCache::invalidate_all(self);
         Ok(())
     }
+
+    async fn invalidate_resource(&self, resource: &EntityUid) -> Result<(), Self::Error> {
+        let _ = EntityCache::invalidate_resource(self, resource);
+        Ok(())
+    }
 }
 
 impl<P> RequestEntityProvider for EntityCache<P>
 where
     P: RequestEntityProvider,
 {
+    fn cache_discriminator<'a>(
+        &'a self,
+        session: &'a AuthSession,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        self.inner.cache_discriminator(session)
+    }
+
     fn entities_for<'a>(
         &'a self,
         session: &'a AuthSession,
@@ -314,11 +361,19 @@ where
     > {
         Box::pin(async move {
             let tenant = session.tenant_id().await.map(|t| t.to_string().to_string());
+            let discriminator = self.inner.cache_discriminator(session).await;
+            // Taken before the provider is read: an invalidation that runs
+            // during the load changes the key the result is stored under.
+            let generation = self
+                .generations
+                .snapshot(principal, tenant.as_deref(), resource);
             let key = EntityCacheKey {
                 principal: principal.clone(),
                 tenant,
                 resource: resource.clone(),
                 action: action.clone(),
+                discriminator,
+                generation,
             };
 
             // Single-flight: concurrent cold misses for the same key share

@@ -13,17 +13,22 @@
 pub(crate) mod claims;
 pub(crate) mod client_credentials;
 pub(crate) mod device_flow;
+pub(crate) mod dpop_key;
 pub(crate) mod error;
 pub(crate) mod fapi;
 pub(crate) mod jwks_refresh;
 pub(crate) mod login_options;
 pub(crate) mod provider;
 
-pub use claims::{OAuthClaims, UserInfoClaims};
+pub use claims::{OAuthClaims, RefreshOutcome, UserInfoClaims};
 pub use client_credentials::ClientCredentialsToken;
 pub use device_flow::{DeviceAuthResponse, DeviceTokenOutcome};
+pub use dpop_key::DpopKey;
 pub use error::OAuthError;
-pub use fapi::{DpopProof, FapiConfig, ParResponse, SenderConstraint};
+pub use fapi::{
+    DpopProof, DpopSigner, FAPI_ID_TOKEN_ALGS, FapiConfig, JarmResponse, ParResponse,
+    SenderConstraint,
+};
 pub use jwks_refresh::{refresh_providers_jwks, spawn_jwks_refresh};
 pub use login_options::{OAuthLoginOptions, ResponseMode};
 pub use provider::{AuthUrlResult, OAuthProvider};

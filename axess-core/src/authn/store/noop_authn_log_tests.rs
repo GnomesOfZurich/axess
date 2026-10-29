@@ -23,16 +23,17 @@ async fn record_event_silently_drops() {
 }
 
 #[tokio::test]
-async fn record_failed_attempt_always_returns_one() {
+async fn record_failed_attempt_always_returns_zero() {
     let wrapped = NoopAuthnLog(MockIdentityStore::new());
     let uid = axess_identity::testing::user("noop-victim");
     for _ in 0..50 {
         let count = wrapped.record_failed_attempt(&uid).await.unwrap();
         assert_eq!(
-            count, 1,
-            "NoopAuthnLog must always report 1 so the lockout pipeline \
-             never crosses any max_attempts threshold"
+            count, 0,
+            "NoopAuthnLog must always report 0 so the lockout pipeline \
+             never crosses any max_attempts threshold, a threshold of one included"
         );
+        assert_eq!(wrapped.failed_attempts(&uid).await.unwrap(), (0, None));
     }
 }
 
@@ -95,3 +96,21 @@ async fn lockout_policy_for_tenant_delegates_to_inner_not_trait_default() {
 // "no interest" before the per-thread subscriber is in place, racing the
 // observation. Those three mutants are therefore treated as equivalent
 // (same observable API contract; tracing is diagnostic, not load-bearing).
+
+#[tokio::test]
+async fn get_user_in_tenant_reaches_the_inner_stores_override() {
+    use crate::testing::mock_authn::CallLog;
+    let log = CallLog::new();
+    let wrapped = NoopAuthnLog(MockIdentityStore::new().with_call_log(&log));
+    let _ = wrapped
+        .get_user_in_tenant(
+            &axess_identity::testing::user("u"),
+            &axess_identity::testing::tenant("t"),
+        )
+        .await;
+    assert_eq!(
+        log.calls(),
+        vec!["get_user_in_tenant"],
+        "the wrapper must forward to the inner store's own method, not its default"
+    );
+}

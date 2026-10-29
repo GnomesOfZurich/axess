@@ -50,6 +50,8 @@ ROOT = pathlib.Path(".")
 # *type* had no way through the gate at all and the only recourse was
 # ALLOW, which would have been a false claim about provenance.
 REMOVED = {
+    # 0.13.0: the unaddressed v1 service signature; the migration guide names it.
+    "ServiceSigner::sign",
     # Removed in 0.6.0. `docs/production/migrating.md` names it under
     # "0.5.0 to 0.6.0" to say the call has no replacement.
     "ShortString::prefix",
@@ -62,10 +64,28 @@ REMOVED = {
     # no longer needs a clock of its own. `docs/production/migrating.md`
     # names it under "0.10.0 to 0.11.0" to say what replaces it.
     "MockIdentityStore::with_clock",
+    # Removed in 0.12.0: the public seal and open with an empty AAD, which
+    # bound nothing to the row. `docs/production/migrating.md` names them
+    # under "0.11.0 to 0.12.0" to say what replaces them.
+    "SessionCrypto::encrypt", "encrypt",
     # Removed in 0.12.0: the store counts, evicts and inserts in one step
     # through `issue_capped`. `docs/production/migrating.md` names it under
     # "0.11.0 to 0.12.0" to say what replaces it.
     "RefreshTokenStore::issue_with_eviction", "issue_with_eviction",
+    # Removed in 0.13.0: every administrative call names its actor and
+    # defaults to the tenant rail, so the variants that left the actor out or
+    # the rail off are gone. `docs/production/migrating.md` names them under
+    # "0.12.0 to 0.13.0" to say what replaces them.
+    "invalidate_user_sessions_as", "invalidate_session_as",
+    "RequestAuthnService::invalidate_user_sessions_as",
+    "RequestAuthnService::invalidate_session_as",
+    "suspend_user_by", "suspend_user_in_tenant", "suspend_user_by_in_tenant",
+    "activate_user_by", "activate_user_in_tenant", "activate_user_by_in_tenant",
+    "begin_impersonation_in_tenant",
+    "RequestAuthnService::suspend_user_by", "RequestAuthnService::suspend_user_in_tenant",
+    "RequestAuthnService::suspend_user_by_in_tenant", "RequestAuthnService::activate_user_by",
+    "RequestAuthnService::activate_user_in_tenant", "RequestAuthnService::activate_user_by_in_tenant",
+    "RequestAuthnService::begin_impersonation_in_tenant",
 }
 
 ALLOW = {

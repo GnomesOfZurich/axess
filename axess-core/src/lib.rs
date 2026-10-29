@@ -70,11 +70,20 @@
 /// Custom tower session layer with HMAC-signed cookies and typed session data.
 pub mod session;
 
+#[cfg(any(
+    test,
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "valkey"
+))]
+mod subkey;
+
 pub use session::{
-    AuthSession, AuthState, RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
-    SameSite, SessionBinding, SessionConfig, SessionConfigBuilder, SessionData, SessionId,
-    SessionLayer, SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker,
-    SessionStore, UserAgentBinding,
+    AuthSession, AuthState, ConditionalUpdate, RefreshError, RefreshToken, RefreshTokenConfig,
+    RefreshTokenStore, RevocationError, SameSite, SessionBinding, SessionConfig,
+    SessionConfigBuilder, SessionData, SessionId, SessionLayer, SessionRegistry,
+    SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore, UserAgentBinding,
 };
 #[cfg(any(test, feature = "memory"))]
 pub use session::{MemorySessionRegistry, MemorySessionStore};
@@ -96,17 +105,18 @@ pub mod authn;
 pub mod device;
 
 pub use authn::{
-    AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus,
+    Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus,
     AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError, AuthnScope,
     AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig, EntityState,
-    EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome, FactorStep,
-    FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin,
-    IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory, IdentityPasswordReset,
-    IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy, LoginOutcome,
-    NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig, PasswordRules,
-    PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor, SessionValidator,
-    SignupOutcome, StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId,
-    ZeroizedString, create_tenant, default_catalog, require_valid_session,
+    EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome, FactorSecret,
+    FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
+    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
+    IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
+    LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
+    PasswordRules, PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor,
+    SealedFactorSecret, SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap,
+    TenantId, TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
+    require_valid_session,
 };
 
 // ── Federation; external-IdP adapters ───────────────────────────────────────
@@ -174,14 +184,19 @@ pub use session::storage::valkey::{ValkeySessionRegistry, ValkeySessionStore, Va
 #[cfg(feature = "ldap")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ldap")))]
 pub use axess_factors::ldap::{
-    LdapBindResult, LdapError, LdapGroupSearch, LdapProvider, LdapProviderConfig, MockLdapProvider,
+    LdapBindResult, LdapError, LdapGroupSearch, LdapProvider, LdapProviderConfig,
 };
+
+/// Test double for [`LdapProvider`]; compiled under `cfg(test)` or the
+/// `testing` feature only.
+#[cfg(all(feature = "ldap", any(test, feature = "testing")))]
+pub use axess_factors::ldap::MockLdapProvider;
 
 #[cfg(feature = "oauth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
 pub use axess_factors::oauth::{
-    AuthUrlResult, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProvider, OAuthProviderConfig,
-    ResponseMode, UserInfoClaims, spawn_jwks_refresh,
+    AuthUrlResult, DpopKey, DpopSigner, JarmResponse, OAuthClaims, OAuthError, OAuthLoginOptions,
+    OAuthProvider, OAuthProviderConfig, ResponseMode, UserInfoClaims, spawn_jwks_refresh,
 };
 
 #[cfg(all(feature = "oauth", any(test, feature = "testing")))]
@@ -196,18 +211,26 @@ pub use axess_factors::oauth::{DpopProof, FapiConfig, ParResponse, SenderConstra
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
 pub use device::{
     AttestationClass, BindingsUpdate, CachedDeviceStore, DefaultFingerprintExtractor, Device,
-    DeviceBinding, DeviceEventSink, DeviceFingerprintExtractor, DeviceLifecycleService,
-    DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, DeviceResolver,
-    DeviceStore, DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
+    DeviceBinding, DeviceCookieConfig, DeviceCookieSlot, DeviceEventSink,
+    DeviceFingerprintExtractor, DeviceLifecycleService, DevicePiiCategory, DevicePiiMapping,
+    DevicePiiResolver, DevicePiiStore, DeviceRequest, DeviceResolver, DeviceStore, DeviceToken,
+    DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
-    NoopDeviceResolver, OwnerClaim, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver, SessionUser,
-    SweepConfig, SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver,
-    TrustTransition, cascade_revoke_by_refresh_family, cascade_revoke_devices,
+    NoopDeviceResolver, OwnerClaim, PiiToken, PresentedDevice, REDACTED_PLACEHOLDER,
+    RedactedResolver, ResolvedDevice, SessionDevice, SessionUser, SweepConfig, SweepConfigBuilder,
+    SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
+    cascade_revoke_by_refresh_family, cascade_revoke_devices,
 };
 
 #[cfg(feature = "device")]
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
-pub use authn::service::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_user};
+pub use device::{CascadingRefreshStore, RevokeDeviceError, revoke_device};
+
+#[cfg(feature = "device")]
+#[cfg_attr(docsrs, doc(cfg(feature = "device")))]
+pub use authn::service::{
+    StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_optional, decide_step_up_for_user,
+};
 
 #[cfg(all(
     feature = "device",
@@ -295,6 +318,17 @@ pub mod metrics;
 pub mod testing;
 /// Identifier / e-mail / URL validation helpers.
 pub mod validation;
+
+/// Endpoint and client policy shared by the credential-bearing outbound
+/// HTTP clients.
+#[cfg(any(
+    feature = "delegated-exchange",
+    feature = "delegated-stored",
+    feature = "aws-sts",
+    feature = "azure-fic",
+    feature = "gcp-wif"
+))]
+pub(crate) mod outbound_http;
 
 pub use axess_clock::{Clock, SystemClock};
 pub use axess_rng::{SecureRng, SystemRng};

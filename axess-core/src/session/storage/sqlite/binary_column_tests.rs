@@ -39,7 +39,10 @@ async fn legacy_store() -> SqliteSessionStore {
         .execute(&pool)
         .await
         .unwrap();
-    SqliteSessionStore::new(pool, SessionCrypto::new(KEY))
+    SqliteSessionStore::new(
+        pool,
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    )
 }
 
 async fn columns(store: &SqliteSessionStore, id: &SessionId) -> (Option<Vec<u8>>, String) {

@@ -15,7 +15,10 @@ async fn store() -> SqliteSessionStore {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let store = SqliteSessionStore::new(pool, SessionCrypto::new(KEY));
+    let store = SqliteSessionStore::new(
+        pool,
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     store.init_schema().await.unwrap();
     store
 }

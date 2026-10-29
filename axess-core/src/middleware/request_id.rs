@@ -173,6 +173,9 @@ where
             let existing_id = existing_id.clone();
             if let Ok(id_str) = existing_id.to_str()
                 && id_str.len() == G::ID_LENGTH
+                && id_str
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             {
                 match req.extensions().get::<RequestId>() {
                     Some(ext) if ext.0 == id_str => return existing_id,
@@ -185,15 +188,20 @@ where
             // fallthrough: invalid client id -> generate our own below
         }
 
-        let header_val = self.generator.generate();
+        let mut header_val = self.generator.generate();
+        // A generator is required to emit visible ASCII, but this runs on
+        // every request: a custom one that does not must not panic the
+        // service, so its value is replaced by a UUID.
+        if header_val.to_str().is_err() {
+            tracing::error!(
+                target: "axess::request_id",
+                "RequestIdGenerator produced a non-ASCII value; using a UUID instead"
+            );
+            header_val = UuidGenerator.generate();
+        }
+        let request_id_str = String::from_utf8_lossy(header_val.as_bytes()).into_owned();
         req.headers_mut()
             .insert(&G::HEADER_NAME, header_val.clone());
-        // Generators are required to emit ASCII (see `RequestIdGenerator`
-        // and `UuidGenerator::generate`), so `to_str` cannot fail.
-        let request_id_str = header_val
-            .to_str()
-            .expect("RequestIdGenerator must produce ASCII header values")
-            .to_string();
         req.extensions_mut().insert(RequestId(request_id_str));
         header_val
     }

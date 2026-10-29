@@ -155,3 +155,86 @@ async fn parallel_logins_that_each_saw_room_still_end_at_the_cap() {
     );
     assert!(active.contains(&mine), "a login never evicts itself");
 }
+
+/// A registry on which a rival login lands right after this one registers
+/// (so both are in the list when each trims): the late half of the race.
+#[derive(Clone)]
+struct LateRivalRegistry {
+    inner: MemorySessionRegistry,
+    rival: SessionId,
+}
+
+impl SessionRegistry for LateRivalRegistry {
+    type Error = <MemorySessionRegistry as SessionRegistry>::Error;
+
+    async fn register(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<(), Self::Error> {
+        self.inner.register(user_id, session_id).await?;
+        // The rival registers once, after the login under test.
+        self.inner.register(user_id, &self.rival).await
+    }
+
+    async fn is_valid(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<bool, Self::Error> {
+        self.inner.is_valid(user_id, session_id).await
+    }
+
+    async fn invalidate_user(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+    ) -> Result<(), Self::Error> {
+        self.inner.invalidate_user(user_id).await
+    }
+
+    async fn invalidate_session(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<(), Self::Error> {
+        self.inner.invalidate_session(user_id, session_id).await
+    }
+
+    async fn active_sessions(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+    ) -> Result<Vec<SessionId>, Self::Error> {
+        self.inner.active_sessions(user_id).await
+    }
+}
+
+/// At a cap of one, two logins that interleave must leave exactly one live
+/// session, and only that login may report success. The login that finds a
+/// newer registration behind it loses: it fails and the rival stays valid,
+/// where evicting "everyone but me" revoked the rival and left both
+/// reporting a session.
+#[tokio::test]
+async fn at_a_cap_of_one_the_login_that_loses_the_race_fails_and_the_rival_survives() {
+    let (identity, factors) = identity_and_factors();
+    let inner = MemorySessionRegistry::new();
+    let rival = SessionId::new(&MockRng::new(11));
+    let registry = LateRivalRegistry {
+        inner: inner.clone(),
+        rival,
+    };
+    let svc = AuthnService::builder(identity, factors)
+        .with_registry(registry)
+        .with_max_sessions_per_user(NonZeroUsize::MIN)
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+    let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let outcome = svc.verify_factor(&cred, &session).await;
+    assert!(outcome.is_err(), "the losing login must fail: {outcome:?}");
+    assert!(!session.is_authenticated().await);
+
+    let active = inner.active_sessions(&uid("u1")).await.unwrap();
+    assert_eq!(active, vec![rival], "exactly the rival is live");
+}

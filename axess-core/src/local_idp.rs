@@ -90,11 +90,30 @@ pub enum IssuanceError<KE: std::error::Error + Send + Sync + 'static> {
         /// The configured cap.
         max: Duration,
     },
+    /// The claim set names no audience and the IdP was not told to allow
+    /// that. A token without `aud` is accepted by every verifier that does
+    /// not pin an audience, so minting one is an explicit choice
+    /// ([`LocalIdp::allow_no_audience`]).
+    #[error("refusing to mint a token with no audience")]
+    MissingAudience,
+    /// The key asked to be retired is the current signing key. Rotate to a
+    /// new key first, then retire the old one.
+    #[error("the current signing key cannot be retired")]
+    RetireCurrentKey,
     /// The underlying `LocalIdpKeyStore` surfaced an error during
     /// load or rotation. The original backend error is preserved
     /// as `#[source]`.
     #[error("key store error")]
     KeyStore(#[source] KE),
+    /// A rotation offered a key whose `kid` is already in the JWKS (the
+    /// current key or a historical one). Two keys under one `kid` make
+    /// verifiers pick either, so the rotation is refused and nothing
+    /// changes.
+    #[error("signing key id {kid:?} is already in use")]
+    DuplicateKeyId {
+        /// The `kid` that collided.
+        kid: String,
+    },
     /// JWT encoding failed. In practice this never fires for valid
     /// `LocalIdpSigningKey` material plus a well-formed `MintClaims`,
     /// but the `jsonwebtoken::encode` return type forces the path.
@@ -156,102 +175,19 @@ pub trait LocalIdpKeyStore: Send + Sync + 'static {
         &self,
         new_current: LocalIdpSigningKey,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
-}
 
-/// Default in-memory [`LocalIdpKeyStore`] for prototyping and tests.
-///
-/// Mirrors [`crate::MemorySessionStore`] in shape: `Arc<RwLock<...>>`
-/// interior, `Clone` to share between the `LocalIdp` instance and
-/// any operator-side rotation logic that still needs to inspect
-/// the store. Not for production deployments (the keys live in process
-/// memory only; restart loses them).
-///
-/// Constructors require a current key up front; there is no empty state
-/// to model. Adopters who need a "key-less startup" path should
-/// implement their own [`LocalIdpKeyStore`] with whatever recovery
-/// semantics fit (e.g. blocking on a key-management notification).
-#[derive(Debug, Clone)]
-pub struct MemoryLocalIdpKeyStore {
-    inner: Arc<RwLock<LoadedKeys>>,
-}
-
-/// Error type for [`MemoryLocalIdpKeyStore`]. Has no reachable variants
-/// today (every operation succeeds); the enum exists so the trait's
-/// `type Error` has a concrete type to point at and so future variants
-/// can be added without a breaking signature change.
-#[derive(Debug, thiserror::Error)]
-pub enum MemoryLocalIdpKeyStoreError {
-    /// Placeholder. No variants reachable in L1; future variants
-    /// (e.g. `LockPoisoned` if we drop the `expect`) will land here.
-    #[error("memory key store error (unreachable in L1)")]
-    Infallible,
-}
-
-impl MemoryLocalIdpKeyStore {
-    /// Construct with the supplied key as the initial current key
-    /// and no historical keys. Production stores should prefer this
-    /// constructor; `load_all` is infallible from this entry point.
-    pub fn with_current(current: LocalIdpSigningKey) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(LoadedKeys {
-                current,
-                historical: Vec::new(),
-            })),
-        }
-    }
-
-    /// Construct with explicit current + historical keys (useful when
-    /// rehydrating from a backed-up state).
-    pub fn with_keys(current: LocalIdpSigningKey, historical: Vec<LocalIdpSigningKey>) -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(LoadedKeys {
-                current,
-                historical,
-            })),
-        }
-    }
-}
-
-impl LocalIdpKeyStore for MemoryLocalIdpKeyStore {
-    type Error = MemoryLocalIdpKeyStoreError;
-
-    fn load_all(
+    /// Remove the historical key with this `kid` so it leaves the JWKS.
+    /// Returns whether a historical key was removed; the current key is
+    /// never removed by this call. Used by [`LocalIdp::retire_historical_key`]
+    /// once no token signed under the key can still be valid.
+    fn retire(
         &self,
-    ) -> impl std::future::Future<Output = Result<LoadedKeys, Self::Error>> + Send {
-        let inner = self.inner.clone();
-        async move {
-            let guard = inner
-                .read()
-                .expect("MemoryLocalIdpKeyStore lock never poisoned");
-            // We deliberately clone here; the LoadedKeys snapshot is
-            // owned by the LocalIdp from this point and the store
-            // remains free to be rotated/inspected independently.
-            Ok(LoadedKeys {
-                current: guard.current.clone(),
-                historical: guard.historical.clone(),
-            })
-        }
-    }
-
-    fn rotate(
-        &self,
-        new_current: LocalIdpSigningKey,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        let inner = self.inner.clone();
-        async move {
-            let mut guard = inner
-                .write()
-                .expect("MemoryLocalIdpKeyStore lock never poisoned");
-            // Demote previous current → historical at the back of the
-            // list, matching the fixture's `rotate_signing_key` order so
-            // JWKS layouts (current first, then historical oldest→newest)
-            // match across the two surfaces.
-            let previous = std::mem::replace(&mut guard.current, new_current);
-            guard.historical.push(previous);
-            Ok(())
-        }
-    }
+        key_id: &str,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
 }
+
+mod memory_store;
+pub use memory_store::{MemoryLocalIdpKeyStore, MemoryLocalIdpKeyStoreError};
 
 // ── LocalIdp ─────────────────────────────────────────────────────────────────
 
@@ -270,9 +206,15 @@ pub struct LocalIdp<K: LocalIdpKeyStore> {
     base_url: Option<String>,
     extra_metadata: Vec<(String, serde_json::Value)>,
     max_ttl: Option<Duration>,
+    require_audience: bool,
     issuance_listener: Option<Arc<dyn IssuanceListener>>,
     clock: Arc<dyn Clock>,
 }
+
+/// Lifetime cap a new [`LocalIdp`] applies until
+/// [`with_max_ttl`](LocalIdp::with_max_ttl) or
+/// [`without_max_ttl`](LocalIdp::without_max_ttl) says otherwise.
+pub const DEFAULT_MAX_TTL: Duration = Duration::hours(1);
 
 impl<K: LocalIdpKeyStore> Clone for LocalIdp<K> {
     fn clone(&self) -> Self {
@@ -283,6 +225,7 @@ impl<K: LocalIdpKeyStore> Clone for LocalIdp<K> {
             base_url: self.base_url.clone(),
             extra_metadata: self.extra_metadata.clone(),
             max_ttl: self.max_ttl,
+            require_audience: self.require_audience,
             issuance_listener: self.issuance_listener.clone(),
             clock: self.clock.clone(),
         }
@@ -311,6 +254,23 @@ struct LocalIdpState {
     jwks: JwkSet,
 }
 
+impl LocalIdpState {
+    /// Adopt the store's snapshot and rebuild the JWKS from it.
+    fn replace_keys(&mut self, loaded: LoadedKeys) {
+        self.signing_key = loaded.current;
+        self.historical_keys = loaded.historical;
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        self.jwks = rebuild_jwks(
+            &self.signing_key,
+            &self.historical_keys,
+            &self.extra_public_jwks,
+        );
+    }
+}
+
 impl<K: LocalIdpKeyStore> LocalIdp<K> {
     /// Construct from a key store. Loads the current + historical keys
     /// atomically, builds the initial JWKS, and is ready to mint.
@@ -334,7 +294,8 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
             issuer: issuer.into(),
             base_url: None,
             extra_metadata: Vec::new(),
-            max_ttl: None,
+            max_ttl: Some(DEFAULT_MAX_TTL),
+            require_audience: true,
             issuance_listener: None,
             clock: Arc::new(SystemClock),
         })
@@ -394,6 +355,20 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         self
     }
 
+    /// Remove the [`DEFAULT_MAX_TTL`] cap; only for intended long-lived tokens.
+    pub fn without_max_ttl(mut self) -> Self {
+        self.max_ttl = None;
+        self
+    }
+
+    /// Allow minting tokens that carry no `aud`. By default such a mint is
+    /// refused with [`IssuanceError::MissingAudience`]: a verifier that does
+    /// not pin an audience would accept the token for any service.
+    pub fn allow_no_audience(mut self) -> Self {
+        self.require_audience = false;
+        self
+    }
+
     /// Install an [`IssuanceListener`] fired after every successful
     /// mint. Same trait the fixture uses; production wires this to a
     /// real audit sink, the fixture wires it to assertion-side
@@ -439,6 +414,9 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
                 .map_err(|(observed, max)| IssuanceError::LifetimeExceedsCap { observed, max })?;
         }
 
+        if self.require_audience && claims.audience.is_empty() {
+            return Err(IssuanceError::MissingAudience);
+        }
         header.kid = Some(state.signing_key.key_id().to_string());
         header.alg = state.signing_key.algorithm();
         let claims_json = build_claims_json(&self.issuer, claims);
@@ -473,9 +451,13 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     ///
     /// Persists through the configured [`LocalIdpKeyStore`] *first*;
     /// in-memory state and JWKS are only updated after the store's
-    /// `rotate` call succeeds. A failing key store therefore leaves
-    /// the previous current key in place, so a subsequent `mint`
-    /// continues to produce verifiable tokens.
+    /// `rotate` call succeeds, and are then rebuilt from the store's own
+    /// snapshot, so a rotation another replica made earlier is not lost. A
+    /// failing key store leaves the previous current key in place, so a
+    /// subsequent `mint` continues to produce verifiable tokens. The
+    /// store's rotation is the unit of agreement between replicas, not the
+    /// in-memory swap: see the multi-replica procedure in the local IdP
+    /// guide.
     ///
     /// Concurrency: takes the internal write lock, so in-flight
     /// `mint` calls already past the read-lock acquisition complete
@@ -491,19 +473,76 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         &self,
         new_current: LocalIdpSigningKey,
     ) -> Result<(), IssuanceError<K::Error>> {
+        // The write lock is taken before the store is touched, so a mint
+        // never sees the store ahead of memory, and two rotations on one
+        // instance run one after the other.
+        let mut state = self.state.write().await;
+        {
+            let kid = new_current.key_id();
+            if state.signing_key.key_id() == kid
+                || state.historical_keys.iter().any(|k| k.key_id() == kid)
+            {
+                return Err(IssuanceError::DuplicateKeyId {
+                    kid: kid.to_owned(),
+                });
+            }
+        }
         self.key_store
             .rotate(new_current.clone())
             .await
             .map_err(IssuanceError::KeyStore)?;
+        match self.key_store.load_all().await {
+            Ok(loaded) => state.replace_keys(loaded),
+            Err(e) => {
+                // The rotation is durable; only the re-read failed. Apply it
+                // locally; `reload` picks up anything another replica did.
+                tracing::warn!(error = %e, "LocalIdp: key store re-read after rotation failed");
+                let previous = std::mem::replace(&mut state.signing_key, new_current);
+                state.historical_keys.push(previous);
+                state.rebuild();
+            }
+        }
+        Ok(())
+    }
 
+    /// Remove a historical key from the store and the JWKS. Call it once no
+    /// token signed under the key can still be valid (the rotation time plus
+    /// the longest lifetime this IdP mints). Returns whether a key was
+    /// removed; an unknown `key_id` returns `Ok(false)`. The current signing
+    /// key is refused with [`IssuanceError::RetireCurrentKey`].
+    pub async fn retire_historical_key(
+        &self,
+        key_id: &str,
+    ) -> Result<bool, IssuanceError<K::Error>> {
         let mut state = self.state.write().await;
-        let previous = std::mem::replace(&mut state.signing_key, new_current);
-        state.historical_keys.push(previous);
-        state.jwks = rebuild_jwks(
-            &state.signing_key,
-            &state.historical_keys,
-            &state.extra_public_jwks,
-        );
+        if state.signing_key.key_id() == key_id {
+            return Err(IssuanceError::RetireCurrentKey);
+        }
+        let removed = self
+            .key_store
+            .retire(key_id)
+            .await
+            .map_err(IssuanceError::KeyStore)?;
+        let loaded = self
+            .key_store
+            .load_all()
+            .await
+            .map_err(IssuanceError::KeyStore)?;
+        state.replace_keys(loaded);
+        Ok(removed)
+    }
+
+    /// Re-read the current and historical keys from the store and rebuild
+    /// the JWKS. A replica calls this to pick up a rotation or retirement
+    /// another replica performed; the store is the single source of truth.
+    pub async fn reload(&self) -> Result<(), IssuanceError<K::Error>> {
+        let mut state = self.state.write().await;
+        let loaded = self
+            .key_store
+            .load_all()
+            .await
+            .map_err(IssuanceError::KeyStore)?;
+        state.replace_keys(loaded);
         Ok(())
     }
 
@@ -564,8 +603,10 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
 
     /// Build a shared `Arc<RwLock<JwkSet>>` handle suitable for
     /// `JwtVerifier::new(...)`. The handle is a snapshot at call
-    /// time; a rotation (L2) won't automatically propagate into a
-    /// handle previously handed out.
+    /// time: a rotation, a retirement or a reload does NOT propagate into
+    /// a handle previously handed out. Call this again (and build a new
+    /// verifier, or write the new set into the verifier's own handle) after
+    /// any change to the key set.
     pub async fn jwks_handle(&self) -> Arc<RwLock<JwkSet>> {
         Arc::new(RwLock::new(self.state.read().await.jwks.clone()))
     }

@@ -24,6 +24,7 @@ fn claims() -> OAuthClaims {
         oidc_sid: Some("idp-sid-1".to_string()),
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        dpop_key: None,
     }
 }
 
@@ -154,4 +155,63 @@ async fn a_successful_login_still_ends_the_session_it_displaces() {
 
     assert!(!registry.is_valid(&first.id, &ids[0]).await.unwrap());
     assert!(registry.is_valid(&second.id, &ids[1]).await.unwrap());
+}
+
+/// When the audit write fails, the mapping the refused login displaced is put
+/// back, so a back-channel logout for that `sid` still reaches the first
+/// user's session. Before, the displaced `(issuer, sid)` entry stayed
+/// overwritten by the refused login's mapping, then removed, and the first
+/// session was out of reach of a logout by `sid` alone.
+#[tokio::test]
+async fn a_refused_login_leaves_the_displaced_users_sid_mapping_in_place() {
+    let first = user_record("u1", "t1");
+    let second = user_record("u2", "t1");
+    let identity = MockIdentityStore::new()
+        .with_tenant(tenant_record("t1"))
+        .with_user(first.clone())
+        .with_user(second.clone());
+    let registry = MemorySessionRegistry::new();
+    let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build();
+    let req = svc.with_audit_context(crate::authn::event::AuditContext::default());
+
+    let c = claims();
+    let first_session = test_session();
+    let lock = compute_claim_lock("test", &c.subject, &first_session).await;
+    first_session
+        .set_custom(oauth_keys::CLAIM_LOCK, serde_json::Value::String(lock))
+        .await;
+    req.complete_oauth_login(&first, &c, &first_session)
+        .await
+        .expect("first login");
+    let first_id = first_session.session_id().await;
+    let sid_key = ("test".to_string(), "idp-sid-1".to_string());
+    let before = svc.inner.sid_map.get(&sid_key).expect("mapped after login");
+    assert_eq!((before.0, before.1), (first.id, first_id));
+
+    identity.arm_record_event_failure();
+    let second_session = test_session();
+    let lock = compute_claim_lock("test", &c.subject, &second_session).await;
+    second_session
+        .set_custom(oauth_keys::CLAIM_LOCK, serde_json::Value::String(lock))
+        .await;
+    assert!(
+        req.complete_oauth_login(&second, &c, &second_session)
+            .await
+            .is_err(),
+        "the second login is refused"
+    );
+
+    let after = svc
+        .inner
+        .sid_map
+        .get(&sid_key)
+        .expect("the displaced mapping was put back");
+    assert_eq!(
+        (after.0, after.1, after.2),
+        (before.0, before.1, before.2),
+        "the same user, session and insertion time as before the refused login"
+    );
+    assert!(registry.is_valid(&first.id, &first_id).await.unwrap());
 }

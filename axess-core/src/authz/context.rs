@@ -13,8 +13,10 @@
 //! use axess_core::authz::context::StandardRequestContext;
 //!
 //! // Default: emits `mfa_verified` (+ `ip_address` if Some) only.
+//! // `mfa_complete` is the application's own fact, derived from what it
+//! // recorded when the user finished the factors its policy demands.
 //! let ctx = StandardRequestContext::new(
-//!     session.is_mfa_complete(),
+//!     mfa_complete,
 //!     Some("192.168.1.1".parse().unwrap()),
 //! );
 //!
@@ -22,7 +24,7 @@
 //! // emitted when explicitly provided; Cedar schema must then declare
 //! // `timestamp` as well.
 //! let ctx = StandardRequestContext::at(
-//!     session.is_mfa_complete(),
+//!     mfa_complete,
 //!     client_ip.get(),
 //!     clock.now(),
 //! );

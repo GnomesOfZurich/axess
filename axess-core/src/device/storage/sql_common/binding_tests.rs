@@ -32,6 +32,22 @@ fn tenant_and_device_ids_cannot_be_shifted_across_the_separator() {
     assert!(codec().decode("a", "bc", &blob).is_err());
 }
 
+fn accepting_codec() -> BindingsCodec {
+    use crate::session::crypto::LegacyBlobs;
+    BindingsCodec::encrypted(SessionCrypto::new([6u8; 32]).with_legacy_blobs(LegacyBlobs::Accept))
+}
+
+#[test]
+fn a_legacy_blob_is_refused_by_default_and_read_when_accepted() {
+    let legacy = BASE64.encode(
+        SessionCrypto::new([6u8; 32])
+            .encrypt_unbound(&rmp_serde::to_vec_named(&bindings()).unwrap())
+            .unwrap(),
+    );
+    assert!(codec().decode("t1", "d", &legacy).is_err());
+    assert!(accepting_codec().decode("t1", "d", &legacy).is_ok());
+}
+
 #[test]
 fn legacy_blob_decodes_and_the_next_encode_is_bound() {
     let legacy = BASE64.encode(
@@ -39,7 +55,10 @@ fn legacy_blob_decodes_and_the_next_encode_is_bound() {
             .encrypt_unbound(&rmp_serde::to_vec_named(&bindings()).unwrap())
             .unwrap(),
     );
-    assert_eq!(codec().decode("t1", "d", &legacy).unwrap(), bindings());
+    assert_eq!(
+        accepting_codec().decode("t1", "d", &legacy).unwrap(),
+        bindings()
+    );
 
     let resealed = codec().encode("t1", "d", &bindings()).unwrap();
     assert_ne!(resealed, legacy);
@@ -91,12 +110,19 @@ fn a_blob_of_the_previous_format_decodes_and_is_replaced_on_encode() {
     blob.extend_from_slice(&body);
     let stored = BASE64.encode(blob);
 
-    assert_eq!(codec().decode("t1", "d", &stored).unwrap(), bindings());
-    assert!(codec().decode("t1", "other", &stored).is_err());
+    assert!(
+        codec().decode("t1", "d", &stored).is_err(),
+        "default refuses"
+    );
+    assert_eq!(
+        accepting_codec().decode("t1", "d", &stored).unwrap(),
+        bindings()
+    );
+    assert!(accepting_codec().decode("t1", "other", &stored).is_err());
     let current = BASE64
         .decode(codec().encode("t1", "d", &bindings()).unwrap())
         .unwrap();
-    assert!(current.starts_with(b"AXD\x02"));
+    assert!(current.starts_with(b"AXD\x82"));
 }
 
 /// Ids that differ only in where a zero byte falls do not share a blob.
@@ -120,6 +146,21 @@ fn rejecting_legacy_blobs_refuses_an_unmarked_bindings_blob() {
             .unwrap(),
     );
     assert!(strict.decode("t1", "d", &legacy).is_err());
+    // The 0.11.0 marked format is refused as well, not only the unmarked one.
+    let body = SessionCrypto::new([6u8; 32])
+        .encrypt_with_aad(
+            &BoundFormat::DEVICE_BINDINGS_V1.aad(&device_row_id_v1("t1", "d")),
+            &rmp_serde::to_vec_named(&bindings()).unwrap(),
+        )
+        .unwrap();
+    let mut v1 = b"AXD\x01".to_vec();
+    v1.extend_from_slice(&body);
+    assert!(strict.decode("t1", "d", &BASE64.encode(&v1)).is_err());
+    assert!(
+        accepting_codec()
+            .decode("t1", "d", &BASE64.encode(&v1))
+            .is_ok()
+    );
     let bound = strict.encode("t1", "d", &bindings()).unwrap();
     assert_eq!(strict.decode("t1", "d", &bound).unwrap(), bindings());
 }

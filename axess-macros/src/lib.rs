@@ -208,6 +208,20 @@ macro_rules! predicate_required {
 /// .layer(require_authn!(url = "/auth/login", param = "return_to"))
 /// ```
 ///
+/// ## Also require the session to be live in the registry
+///
+/// A bare `require_authn!` only reads the session record, so a session the
+/// registry ended (a password reset, a suspension, an administrator's kick)
+/// still passes behind a layer built without a registry. Passing the
+/// [`SessionValidator`](axess_core::authn::SessionValidator) of the
+/// authentication service makes the guard consult the registry, and clears and
+/// rotates the stored session when it is no longer live:
+/// ```text
+/// .layer(require_authn!(validator = authn.session_validator()))
+/// .layer(require_authn!(url = "/login", validator = authn.session_validator()))
+/// .layer(require_authn!(url = "/login", param = "return_to", validator = v))
+/// ```
+///
 /// ## Redirect to login page (positional args, legacy)
 /// ```text
 /// .layer(require_authn!("/login"))
@@ -215,6 +229,71 @@ macro_rules! predicate_required {
 /// ```
 #[macro_export]
 macro_rules! require_authn {
+    // With a session validator: the session must also be live in the registry.
+    (url = $login_url:expr, param = $redirect_field:expr, validator = $validator:expr) => {{
+        use $crate::axum::{
+            extract::OriginalUri,
+            middleware::{from_fn, Next},
+            response::{IntoResponse, Redirect},
+        };
+
+        let validator = $validator;
+        from_fn(
+            move |auth_session: $crate::AuthSession,
+                  OriginalUri(original_uri): OriginalUri,
+                  req,
+                  next: Next| {
+                let validator = validator.clone();
+                async move {
+                    if validator.enforce(&auth_session).await {
+                        next.run(req).await
+                    } else {
+                        match $crate::url_with_redirect_query(
+                            $login_url,
+                            $redirect_field,
+                            original_uri
+                        ) {
+                            Ok(login_url) => {
+                                Redirect::temporary(&login_url.to_string()).into_response()
+                            }
+                            Err(err) => {
+                                $crate::tracing::error!(err = %err, "Failed to build login redirect URL");
+                                $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                                    .into_response()
+                            }
+                        }
+                    }
+                }
+            },
+        )
+    }};
+
+    (url = $login_url:expr, validator = $validator:expr) => {
+        $crate::require_authn!(url = $login_url, param = "next", validator = $validator)
+    };
+
+    // With a session validator, answering 401.
+    (validator = $validator:expr) => {{
+        use $crate::axum::{
+            middleware::{from_fn, Next},
+            response::IntoResponse,
+        };
+
+        let validator = $validator;
+        from_fn(
+            move |auth_session: $crate::AuthSession, req, next: Next| {
+                let validator = validator.clone();
+                async move {
+                    if validator.enforce(&auth_session).await {
+                        next.run(req).await
+                    } else {
+                        $crate::axum::http::StatusCode::UNAUTHORIZED.into_response()
+                    }
+                }
+            },
+        )
+    }};
+
     // Named args: URL and custom redirect field
     (url = $login_url:expr, param = $redirect_field:expr) => {
         $crate::require_authn!($login_url, $redirect_field)

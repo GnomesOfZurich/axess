@@ -15,12 +15,16 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 use crate::session::store::SessionLiveness;
+use crate::session::store::note_revocation;
 use subtle::ConstantTimeEq;
 
 mod concurrent;
+mod pending_ends;
 
 #[cfg(test)]
 mod audit_failure;
+#[cfg(test)]
+mod cancellation;
 #[cfg(test)]
 mod concurrency;
 #[cfg(test)]
@@ -163,7 +167,10 @@ where
                     "OAuth completion: account status flipped to non-loginable \
                      mid-flow; revoking just-registered session and refusing"
                 );
-                reg.invalidate_session(&user.id, sid).await;
+                note_revocation(
+                    reg.invalidate_session(&user.id, sid).await,
+                    "refusing an OAuth login",
+                );
                 session.clear().await;
                 self.inner.metrics.account_locked();
                 Err(match status {
@@ -180,7 +187,10 @@ where
                     error = %e,
                     "OAuth post-register status re-check failed; failing closed"
                 );
-                reg.invalidate_session(&user.id, sid).await;
+                note_revocation(
+                    reg.invalidate_session(&user.id, sid).await,
+                    "refusing an OAuth login",
+                );
                 session.clear().await;
                 Err(AuthnError::Store(e))
             }
@@ -199,9 +209,11 @@ where
     /// The subject registry is filled in either case, so back-channel logout
     /// by `sub` still works.
     ///
-    /// Returns the sessions the pruning and the swap took out of the map. The
-    /// caller ends them with `end_displaced_sessions` once the login has
-    /// succeeded, because a refused login must end nobody's session.
+    /// Returns what the pruning and the swap took out of the map, as
+    /// [`PendingEnds`](pending_ends::PendingEnds): the caller settles it once
+    /// the audit row is written (`commit` when the login stands, `refuse`
+    /// when it does not, which puts the displaced mapping back), and a caller
+    /// that is dropped first still gets the sessions ended.
     ///
     /// Strategy when an entry would be inserted:
     /// 1. **TTL prune**: drop entries older than `SID_MAP_TTL` (24h) and
@@ -230,14 +242,20 @@ where
         claims: &axess_factors::oauth::OAuthClaims,
         sid: &crate::session::id::SessionId,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> Vec<SubjectSession> {
+    ) -> pending_ends::PendingEnds {
         use crate::federation::sid_map::SidKey;
+
+        // Holds what the steps below owe an end to from the moment they
+        // take it out of the map, so that dropping this future at any
+        // await loses none of it.
+        let mut pending =
+            pending_ends::PendingEnds::new(self.inner.registry.clone(), self.inner.sid_map.clone());
 
         // Without a session registry no session is registered anywhere a
         // logout could end it, so a mapping or a subject entry would only
         // accumulate: neither is recorded.
         if self.inner.registry.is_none() {
-            return Vec::new();
+            return pending;
         }
 
         // Cap oidc_sid length. A compromised IdP can return
@@ -285,13 +303,10 @@ where
                 true
             }
         }) else {
-            return Vec::new();
+            return pending;
         };
 
         let key: SidKey = (issuer.clone(), oidc_sid.clone());
-        // Sessions this login displaces or ages out. They end only once the
-        // login has succeeded, so they are returned, not ended here.
-        let mut to_end = Vec::new();
 
         // Phase 1: TTL prune, bounded per call.
         let cutoff = now - SID_MAP_TTL;
@@ -305,7 +320,7 @@ where
                 evicted_oidc_sid = %evict_key.1,
                 "sid_map: evicted stale entry (TTL expired)"
             );
-            to_end.push((evict_key.0, evict_user, evict_sid));
+            pending.age_out((evict_key.0, evict_user, evict_sid));
         }
 
         // Phase 2: capacity-based batch eviction. Drops the mapping only;
@@ -332,39 +347,20 @@ where
         }
 
         // Atomic swap with displaced-mapping invalidation.
-        let displaced = self
-            .inner
-            .sid_map
-            .insert(key, &claims.subject, user.id, *sid, now);
-        if let Some((old_user_id, old_session_id, _)) = displaced {
+        let displaced =
+            self.inner
+                .sid_map
+                .insert_displacing(key.clone(), &claims.subject, user.id, *sid, now);
+        if let Some(displaced) = displaced {
             tracing::warn!(
                 iss = %issuer,
                 oidc_sid = %oidc_sid,
-                old_user = %old_user_id,
+                old_user = %displaced.user,
                 "SidMap atomic swap displaced existing mapping; invalidating old session"
             );
-            to_end.push((issuer, old_user_id, old_session_id));
+            pending.displace(key, displaced);
         }
-        to_end
-    }
-
-    /// End the sessions a successful login displaced or aged out of the `sid`
-    /// map, and forget them in the subject registry. The invalidations run
-    /// concurrently.
-    async fn end_displaced_sessions(&self, sessions: Vec<SubjectSession>) {
-        let Some(reg) = &self.inner.registry else {
-            return;
-        };
-        let ended = concurrent::bounded(sessions, |(_, user, session)| {
-            let reg = std::sync::Arc::clone(reg);
-            async move { reg.invalidate_session(&user, &session).await }
-        })
-        .await;
-        for ((issuer, user, session), ()) in ended {
-            self.inner
-                .sid_map
-                .forget_subject_session(&issuer, &user, &session);
-        }
+        pending
     }
 
     /// Ask the registry about each `(issuer, user, session)`, concurrently,
@@ -443,9 +439,30 @@ where
         super::state::remove_expected_tenant(session).await;
         tenant_check?;
 
+        // The tenant's own gates, as `begin_login` runs them: its status and
+        // its IP policy. The OAuth completion used to skip both, so a user
+        // of a suspended tenant still logged in through an IdP.
+        if let std::ops::ControlFlow::Break(_) = self
+            .admit_tenant_by_id(&user.identifier, &user.tenant_id)
+            .await?
+        {
+            tracing::warn!(
+                user_id = %user.id,
+                tenant_id = %user.tenant_id,
+                provider = %claims.provider,
+                "OAuth completion refused; the tenant does not admit logins"
+            );
+            return Err(AuthnError::CrossTenant);
+        }
+
         let now = self.inner.clock.now();
         session
-            .set_authenticated(user.id, user.tenant_id, now)
+            .set_authenticated_keeping(
+                user.id,
+                user.tenant_id,
+                now,
+                &self.inner.preserved_custom_keys,
+            )
             .await;
         let sid = session.session_id().await;
 
@@ -476,7 +493,7 @@ where
         // `sid`. Self-contained; see helper for the TTL-prune /
         // capacity-evict / atomic-swap-with-displaced-invalidation
         // sequence.
-        let displaced = self.maintain_oidc_sid_map(user, claims, &sid, now).await;
+        let pending = self.maintain_oidc_sid_map(user, claims, &sid, now).await;
 
         let emitted = self
             .emit_audit_at(
@@ -496,6 +513,10 @@ where
             // not the registry entry, not the session state, and not the
             // back-channel `sid` mapping installed above.
             self.inner.sid_map.remove_session(&sid);
+            // The mapping this login displaced goes back (its user must stay
+            // reachable by a logout for that `sid`), and only the sessions
+            // that aged out are ended.
+            pending.refuse().await;
             self.end_session_after_audit_failure(&user.id, session)
                 .await;
             return Err(e);
@@ -503,7 +524,7 @@ where
 
         // The login stands, so the sessions it displaced or aged out of the
         // map end now; a refused login would have ended nobody's.
-        self.end_displaced_sessions(displaced).await;
+        pending.commit().await;
 
         Ok(())
     }

@@ -32,7 +32,19 @@
 ///    substituted into the id part only, at runtime; a placeholder in the
 ///    type part is rejected at compile time, so a request can never choose
 ///    the entity type. Combined with namespace into
-///    `Namespace::TypeName::"id"`.
+///    `Namespace::TypeName::"id"`. The id part may also use two
+///    session-derived placeholders, `{$tenant}` and `{$user}`, the
+///    authenticated session's tenant and user ids, to qualify a resource by
+///    tenant (`"Ledger:{$tenant}/{id}"`). Never take a tenant qualifier from
+///    a path segment: the caller chooses the URL. An id may name at most one
+///    path placeholder, checked at compile time, because two caller-supplied
+///    values joined by a literal can be re-split into other pairs.
+///
+/// The principal is always `User:<id>` with the id the authenticated session
+/// carries: user ids are issued by the application and held in the session,
+/// never read from the request, so the principal needs no tenant-qualified
+/// form. A policy that must tell tenants apart does so on the resource id
+/// (above).
 ///
 /// # Required request extensions
 ///
@@ -133,6 +145,9 @@ macro_rules! require_authz {
                 // The entity TYPE comes from the attribute alone: a
                 // placeholder in the type position is a compile error.
                 const _: () = $crate::__macro_support::assert_resource_type_is_literal($resource);
+                // At most one request-supplied value in an id, so two
+                // values cannot be re-split by the caller.
+                const _: () = $crate::__macro_support::assert_one_path_placeholder($resource);
 
                 // Path parameters, if the route has any. A request that
                 // reached this gate without routing (no parameters at all)
@@ -151,8 +166,10 @@ macro_rules! require_authz {
                 //    One read of the session answers both "is it authenticated"
                 //    and "as whom", so the id cannot come from a different
                 //    state than the check.
-                let user_id = match auth_session.snapshot().await {
-                    ::std::option::Option::Some(snapshot) => snapshot.user_id.to_string(),
+                let (user_id, tenant_id) = match auth_session.snapshot().await {
+                    ::std::option::Option::Some(snapshot) => {
+                        (snapshot.user_id.to_string(), snapshot.tenant_id.to_string())
+                    }
                     ::std::option::Option::None => {
                         return $crate::axum::http::StatusCode::UNAUTHORIZED.into_response();
                     }
@@ -194,7 +211,7 @@ macro_rules! require_authz {
                 //    from formatted text, so request data cannot inject syntax.
                 let (principal, action_uid_parsed, resource) =
                     match $crate::__macro_support::build_uids(
-                        $namespace, $action, $resource, &path_params, &user_id,
+                        $namespace, $action, $resource, &path_params, &user_id, &tenant_id,
                     ) {
                         ::std::result::Result::Ok(uids) => uids,
                         ::std::result::Result::Err(e) => {
@@ -225,6 +242,12 @@ macro_rules! require_authz {
                             action = %action_uid_parsed,
                             "entities_for failed; treating as deny"
                         );
+                        $crate::__macro_support::audit_early_deny(
+                            &principal,
+                            &action_uid_parsed,
+                            ::std::option::Option::Some(&resource),
+                            "entity_provider_error",
+                        );
                         return $crate::__authz::AuthzDenied.into_response();
                     }
                 };
@@ -250,6 +273,12 @@ macro_rules! require_authz {
                                     resource = %resource,
                                     action = %action_uid_parsed,
                                     "context_for failed; treating as deny"
+                                );
+                                $crate::__macro_support::audit_early_deny(
+                                    &principal,
+                                    &action_uid_parsed,
+                                    ::std::option::Option::Some(&resource),
+                                    "context_error",
                                 );
                                 return $crate::__authz::AuthzDenied.into_response();
                             }

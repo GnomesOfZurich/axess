@@ -59,6 +59,7 @@
 //! // resp.credentials.{access_key_id, secret_access_key, session_token}
 //! ```
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,6 +67,7 @@ use chrono::{DateTime, Utc};
 use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use url::Url;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Time allowed to establish a connection, on the default HTTP client.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -123,6 +125,15 @@ pub struct AssumeRoleWithWebIdentityRequest {
     /// an IAM-configured identity provider (the common case for K8s
     /// / GitHub Actions / axess), leave as `None`.
     pub provider_id: Option<String>,
+}
+
+impl Drop for AssumeRoleWithWebIdentityRequest {
+    /// Zeroes the web-identity token's buffer. Copies made by `Clone` are
+    /// each zeroed when they drop; the form body reqwest builds from the
+    /// token is beyond this type's reach.
+    fn drop(&mut self) {
+        self.web_identity_token.zeroize();
+    }
 }
 
 impl std::fmt::Debug for AssumeRoleWithWebIdentityRequest {
@@ -283,6 +294,7 @@ impl AwsStsClient {
         Self {
             endpoint: Arc::new(default_endpoint()),
             http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
@@ -292,7 +304,8 @@ impl AwsStsClient {
 
     /// Override the STS endpoint. Use this to pin to a regional
     /// endpoint (`https://sts.us-east-1.amazonaws.com/`) or to point
-    /// at LocalStack for testing.
+    /// at LocalStack for testing. The endpoint must be HTTPS (plain HTTP only to
+    /// a loopback host); any other endpoint is refused before a request is sent.
     pub fn with_endpoint(mut self, endpoint: Url) -> Self {
         self.endpoint = Arc::new(endpoint);
         self
@@ -300,6 +313,12 @@ impl AwsStsClient {
 
     /// Override the HTTP client: useful for proxy or outbound mTLS
     /// configuration. The request timeout applies whichever client is used.
+    ///
+    /// A replacement client drops the default client's protections: it must
+    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
+    /// connect timeout, or a redirect carries the credential-bearing request
+    /// to wherever it points. The endpoint check (HTTPS, or HTTP to a
+    /// loopback host) still applies.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
@@ -324,6 +343,8 @@ impl AwsStsClient {
         &self,
         request: &AssumeRoleWithWebIdentityRequest,
     ) -> Result<AssumeRoleWithWebIdentityResponse, AwsStsError> {
+        crate::outbound_http::require_https_or_loopback(&self.endpoint)
+            .map_err(|reason| AwsStsError::Transport(reason.to_string()))?;
         let form = build_form(request);
 
         let mut response = self
@@ -338,14 +359,18 @@ impl AwsStsClient {
 
         let status = response.status();
         // The STS answer is a small XML document; error bodies are cut to
-        // 1 KiB, which holds the error code and message.
-        let body = axess_factors::http_body::read_for_status(
-            &mut response,
-            axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
-        )
-        .await
-        .map_err(|e| AwsStsError::Transport(e.to_string()))?;
-        let body = String::from_utf8_lossy(&body);
+        // 1 KiB, which holds the error code and message. The success body
+        // carries the secret key and session token, so both the bytes and
+        // the text made from them are zeroed on drop.
+        let body = Zeroizing::new(
+            axess_factors::http_body::read_for_status(
+                &mut response,
+                axess_factors::http_body::MAX_TOKEN_BODY_BYTES,
+            )
+            .await
+            .map_err(|e| AwsStsError::Transport(e.to_string()))?,
+        );
+        let body = Zeroizing::new(String::from_utf8_lossy(&body).into_owned());
 
         if !status.is_success() {
             return Err(parse_error(status.as_u16(), &body));
@@ -355,36 +380,38 @@ impl AwsStsClient {
     }
 }
 
-fn build_form(request: &AssumeRoleWithWebIdentityRequest) -> Vec<(String, String)> {
-    let mut form: Vec<(String, String)> = vec![
+fn build_form(request: &AssumeRoleWithWebIdentityRequest) -> Vec<(Cow<'_, str>, Cow<'_, str>)> {
+    // Borrowed from the request wherever possible, so the token is not
+    // copied into a second buffer this function cannot zero.
+    let mut form: Vec<(Cow<'_, str>, Cow<'_, str>)> = vec![
+        ("Action".into(), "AssumeRoleWithWebIdentity".into()),
+        ("Version".into(), STS_API_VERSION.into()),
+        ("RoleArn".into(), request.role_arn.as_str().into()),
         (
-            "Action".to_string(),
-            "AssumeRoleWithWebIdentity".to_string(),
+            "RoleSessionName".into(),
+            request.role_session_name.as_str().into(),
         ),
-        ("Version".to_string(), STS_API_VERSION.to_string()),
-        ("RoleArn".to_string(), request.role_arn.clone()),
         (
-            "RoleSessionName".to_string(),
-            request.role_session_name.clone(),
-        ),
-        (
-            "WebIdentityToken".to_string(),
-            request.web_identity_token.clone(),
+            "WebIdentityToken".into(),
+            request.web_identity_token.as_str().into(),
         ),
     ];
     if let Some(d) = request.duration_seconds {
-        form.push(("DurationSeconds".to_string(), d.to_string()));
+        form.push(("DurationSeconds".into(), d.to_string().into()));
     }
     if let Some(policy) = &request.policy {
-        form.push(("Policy".to_string(), policy.clone()));
+        form.push(("Policy".into(), policy.as_str().into()));
     }
     for (i, arn) in request.policy_arns.iter().enumerate() {
         // AWS Query API list encoding: PolicyArns.member.1.arn=…,
         // PolicyArns.member.2.arn=…
-        form.push((format!("PolicyArns.member.{}.arn", i + 1), arn.clone()));
+        form.push((
+            format!("PolicyArns.member.{}.arn", i + 1).into(),
+            arn.as_str().into(),
+        ));
     }
     if let Some(pid) = &request.provider_id {
-        form.push(("ProviderId".to_string(), pid.clone()));
+        form.push(("ProviderId".into(), pid.as_str().into()));
     }
     form
 }
@@ -411,14 +438,16 @@ struct StsAssumeRoleResult {
     audience: Option<String>,
 }
 
+/// The credentials block as parsed. The three secrets are
+/// [`ZeroizedString`]s, which zero on drop and print as redacted in `Debug`.
 #[derive(Debug, Deserialize)]
 struct StsCredentialsXml {
     #[serde(rename = "AccessKeyId")]
-    access_key_id: String,
+    access_key_id: ZeroizedString,
     #[serde(rename = "SecretAccessKey")]
-    secret_access_key: String,
+    secret_access_key: ZeroizedString,
     #[serde(rename = "SessionToken")]
-    session_token: String,
+    session_token: ZeroizedString,
     #[serde(rename = "Expiration")]
     expiration: String,
 }
@@ -452,9 +481,9 @@ fn parse_success(body: &str) -> Result<AssumeRoleWithWebIdentityResponse, AwsSts
 
     Ok(AssumeRoleWithWebIdentityResponse {
         credentials: AwsCredentials {
-            access_key_id: ZeroizedString::from(creds.access_key_id),
-            secret_access_key: ZeroizedString::from(creds.secret_access_key),
-            session_token: ZeroizedString::from(creds.session_token),
+            access_key_id: creds.access_key_id,
+            secret_access_key: creds.secret_access_key,
+            session_token: creds.session_token,
             expiration,
         },
         assumed_role_arn: parsed.result.assumed_role_user.arn,

@@ -22,12 +22,15 @@
 //!
 //! # Backend support
 //!
-//! Active revocation requires a `SessionRegistry` backend that implements
+//! Immediate revocation requires a `SessionRegistry` backend that implements
 //! `watch_revocation` with a real push channel. Today that is
 //! `ValkeySessionRegistry` via Redis pub/sub. Other backends fall through
-//! to the trait default (`pending().await`), which means the wrapper is
-//! safe to use everywhere but only delivers proactive close on push-capable
-//! backends.
+//! to the trait default (`pending().await`). The wrapper therefore also asks
+//! the registry whether the session is still valid on a timer
+//! ([`WatchOptions::poll_interval`](crate::middleware::ws::WatchOptions::poll_interval)), so a revocation is noticed within one
+//! interval on every backend, and after a subscriber outage on Valkey. The
+//! poll can fail closed ([`WatchOptions::fail_closed`](crate::middleware::ws::WatchOptions::fail_closed)) and a connection can
+//! be given a maximum lifetime ([`WatchOptions::max_lifetime`](crate::middleware::ws::WatchOptions::max_lifetime)).
 //!
 //! # Example
 //!
@@ -40,8 +43,11 @@
 //!     auth: axess_core::AuthSession,
 //!     Extension(registry): Extension<MyRegistry>,
 //! ) -> impl IntoResponse {
-//!     let user_id = auth.user_id().await.unwrap();
-//!     let session_id = auth.session_id().await.unwrap();
+//!     // `snapshot` is `None` unless the session is fully authenticated.
+//!     let Some(who) = auth.snapshot().await else {
+//!         return StatusCode::UNAUTHORIZED.into_response();
+//!     };
+//!     let (user_id, session_id) = (who.user_id, who.session_id);
 //!     ws.on_upgrade(move |socket| async move {
 //!         let mut socket = RevocationAwareSocket::new(
 //!             socket, registry, user_id, session_id);
@@ -53,6 +59,8 @@
 //!     })
 //! }
 //! ```
+
+use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket};
 use tokio::sync::mpsc;
@@ -68,6 +76,72 @@ pub const SESSION_REVOKED_CLOSE_CODE: u16 = 4001;
 
 /// Standard reason string accompanying a session-revocation close frame.
 pub const SESSION_REVOKED_CLOSE_REASON: &str = "session_revoked";
+
+/// How a [`RevocationAwareSocket`] supervises its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchOptions {
+    /// How often the registry is asked whether the session is still valid,
+    /// in addition to the push channel. Zero is treated as one second.
+    pub poll_interval: Duration,
+    /// Close the socket when the registry cannot be asked (a store error),
+    /// instead of keeping it open until the next successful answer.
+    pub fail_closed: bool,
+    /// Close the socket after this long even if the session stays valid.
+    pub max_lifetime: Option<Duration>,
+}
+
+impl Default for WatchOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(30),
+            fail_closed: false,
+            max_lifetime: None,
+        }
+    }
+}
+
+/// Resolve when the session must be closed: the push channel fired, the
+/// poll found it invalid (or, when failing closed, could not tell), or the
+/// lifetime ran out.
+async fn supervise<R: SessionRegistry>(
+    registry: &R,
+    user_id: &UserId,
+    session_id: &SessionId,
+    options: WatchOptions,
+) {
+    let poll = async {
+        let every = options.poll_interval.max(Duration::from_secs(1));
+        loop {
+            tokio::time::sleep(every).await;
+            match registry.is_valid(user_id, session_id).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "axess::ws",
+                        %err,
+                        fail_closed = options.fail_closed,
+                        "ws revocation poll: registry unavailable",
+                    );
+                    if options.fail_closed {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+    let lifetime = async {
+        match options.max_lifetime {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = registry.watch_revocation(user_id, session_id) => {}
+        () = poll => {}
+        () = lifetime => {}
+    }
+}
 
 /// A [`WebSocket`] wrapper that closes itself when the session is revoked.
 ///
@@ -94,6 +168,18 @@ pub struct RevocationAwareSocket {
     /// Drop side effect.
     watch_task: AbortOnDrop,
 }
+
+/// The error `send` returns after the session was revoked.
+#[derive(Debug)]
+struct RevokedError;
+
+impl std::fmt::Display for RevokedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("websocket closed: session revoked")
+    }
+}
+
+impl std::error::Error for RevokedError {}
 
 /// A task handle that ABORTS its task when dropped. Dropping a bare
 /// `JoinHandle` only detaches the task, so every closed socket left a
@@ -129,9 +215,33 @@ impl RevocationAwareSocket {
     where
         R: SessionRegistry,
     {
+        Self::with_options(
+            socket,
+            registry,
+            user_id,
+            session_id,
+            WatchOptions::default(),
+        )
+    }
+
+    /// Like [`new`](Self::new), with explicit [`WatchOptions`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    pub fn with_options<R>(
+        socket: WebSocket,
+        registry: R,
+        user_id: UserId,
+        session_id: SessionId,
+        options: WatchOptions,
+    ) -> Self
+    where
+        R: SessionRegistry,
+    {
         let (tx, rx) = mpsc::channel(1);
         let watch_task = tokio::spawn(async move {
-            registry.watch_revocation(&user_id, &session_id).await;
+            supervise(&registry, &user_id, &session_id, options).await;
             if let Err(err) = tx.send(()).await {
                 tracing::trace!(
                     target: "axess::ws",
@@ -164,18 +274,7 @@ impl RevocationAwareSocket {
         tokio::select! {
             msg = self.socket.recv() => msg,
             _ = self.revoke_rx.recv() => {
-                self.closed = true;
-                let close = Message::Close(Some(CloseFrame {
-                    code: SESSION_REVOKED_CLOSE_CODE,
-                    reason: Utf8Bytes::from_static(SESSION_REVOKED_CLOSE_REASON),
-                }));
-                if let Err(err) = self.socket.send(close).await {
-                    tracing::warn!(
-                        target: "axess::ws",
-                        %err,
-                        "ws revocation: failed to send Close frame to client",
-                    );
-                }
+                self.close_revoked().await;
                 None
             }
         }
@@ -183,11 +282,45 @@ impl RevocationAwareSocket {
 
     /// Send a message on the socket.
     ///
-    /// Pass-through to `WebSocket::send`. After a revocation-induced
-    /// close, returns the underlying socket's error for the now-closed
-    /// connection.
+    /// If the session has been revoked since the last call, the close frame
+    /// (code 4001) is sent instead and an error is returned, so a handler
+    /// that only ever sends (a push stream) stops delivering to a revoked
+    /// session. After a revocation-induced close, every call returns an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying socket's error, or a closed-connection error
+    /// when the session was revoked.
     pub async fn send(&mut self, msg: Message) -> Result<(), axum::Error> {
+        if !self.closed && self.revoke_rx.try_recv().is_ok() {
+            self.close_revoked().await;
+        }
+        if self.closed {
+            return Err(axum::Error::new(RevokedError));
+        }
         self.socket.send(msg).await
+    }
+
+    /// Whether the session has been revoked and the socket closed.
+    pub fn is_revoked(&self) -> bool {
+        self.closed
+    }
+
+    /// Send the revocation close frame and mark the socket closed.
+    async fn close_revoked(&mut self) {
+        self.closed = true;
+        let close = Message::Close(Some(CloseFrame {
+            code: SESSION_REVOKED_CLOSE_CODE,
+            reason: Utf8Bytes::from_static(SESSION_REVOKED_CLOSE_REASON),
+        }));
+        if let Err(err) = self.socket.send(close).await {
+            tracing::warn!(
+                target: "axess::ws",
+                %err,
+                "ws revocation: failed to send Close frame to client",
+            );
+        }
     }
 
     /// Consume the wrapper and return the underlying `WebSocket`.
@@ -223,5 +356,60 @@ mod abort_on_drop_tests {
             abort.is_finished(),
             "the task must be aborted when its handle is dropped"
         );
+    }
+}
+
+#[cfg(all(test, feature = "memory"))]
+mod supervise_tests {
+    use super::*;
+    use crate::session::store::MemorySessionRegistry;
+
+    fn ids() -> (UserId, SessionId) {
+        (
+            axess_identity::testing::user("ws-user"),
+            SessionId::new(&crate::testing::mock_random::MockRng::new(7)),
+        )
+    }
+
+    /// The memory registry has no push channel, so only the poll can notice
+    /// a revocation; it must, within one interval.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_closes_a_revoked_session_on_a_registry_without_push() {
+        let registry = MemorySessionRegistry::new();
+        let (user, session) = ids();
+        registry.register(&user, &session).await.expect("register");
+        let options = WatchOptions {
+            poll_interval: Duration::from_secs(5),
+            ..WatchOptions::default()
+        };
+        let watcher = {
+            let registry = registry.clone();
+            let (user, session) = (user, session);
+            tokio::spawn(async move { supervise(&registry, &user, &session, options).await })
+        };
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!watcher.is_finished(), "a valid session stays open");
+        registry.invalidate_user(&user).await.expect("revoke");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(watcher.is_finished(), "the poll must notice the revocation");
+    }
+
+    /// A connection with a maximum lifetime ends when it runs out.
+    #[tokio::test(start_paused = true)]
+    async fn the_lifetime_ends_a_valid_session() {
+        let registry = MemorySessionRegistry::new();
+        let (user, session) = ids();
+        registry.register(&user, &session).await.expect("register");
+        let options = WatchOptions {
+            max_lifetime: Some(Duration::from_secs(60)),
+            ..WatchOptions::default()
+        };
+        let watcher = tokio::spawn(async move {
+            supervise(&registry, &user, &session, options).await;
+        });
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert!(!watcher.is_finished());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(watcher.is_finished());
     }
 }

@@ -45,29 +45,35 @@
 
 pub mod cache;
 pub mod cascade;
+pub mod cascade_store;
 pub mod events;
 pub mod fingerprint;
 pub mod lifecycle;
 pub mod lifecycle_resolver;
 pub mod pii;
+pub mod proof;
 pub mod resolver;
 pub mod storage;
 pub mod store;
 pub mod types;
 
 pub use cache::CachedDeviceStore;
-pub use cascade::{cascade_revoke_by_refresh_family, cascade_revoke_devices};
+pub use cascade::{
+    RevokeDeviceError, cascade_revoke_by_refresh_family, cascade_revoke_devices, revoke_device,
+};
+pub use cascade_store::CascadingRefreshStore;
 pub use events::{DeviceEventSink, NoopDeviceEventSink};
 pub use fingerprint::{
     DefaultFingerprintExtractor, DeviceFingerprintExtractor, TenantPepperResolver,
 };
-pub use lifecycle::DeviceLifecycleService;
+pub use lifecycle::{DeviceLifecycleService, DeviceRequest, ResolvedDevice};
 pub use lifecycle_resolver::LifecycleDeviceResolver;
 pub use pii::{
     DevicePiiCategory, DevicePiiMapping, DevicePiiResolver, DevicePiiStore, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver,
 };
-pub use resolver::{DeviceResolver, NoopDeviceResolver, SessionUser};
+pub use proof::{DeviceCookieConfig, DeviceCookieSlot, DeviceToken, PresentedDevice, cookie_value};
+pub use resolver::{DeviceResolver, NoopDeviceResolver, SessionDevice, SessionUser};
 pub use store::{
     BindingsUpdate, DeviceStore, MemoryDeviceStore, MemoryDeviceStoreError, OWN_DEVICE_SCAN_LIMIT,
     OwnerClaim, SweepConfig, SweepConfigBuilder, SweepConfigError, SweepCounts, TrustTransition,

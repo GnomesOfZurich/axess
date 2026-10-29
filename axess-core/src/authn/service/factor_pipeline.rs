@@ -111,7 +111,58 @@ where
         if !status.allows_login() {
             return Ok(AccountStatusEnforcement::NotActive(status));
         }
+        // The counter is the lockout, whatever the store did with the
+        // status. Checked here, before any verifier runs, so a locked
+        // account answers `Locked` to a correct guess as to a wrong one.
+        if let Some(lock) = self.derived_lockout(user_id, tenant_id).await? {
+            self.inner.metrics.account_locked();
+            self.record_locked_attempt_audit(user_id, tenant_id, next_kind, session)
+                .await?;
+            return Ok(AccountStatusEnforcement::Locked { until: lock.until });
+        }
         Ok(AccountStatusEnforcement::Ok)
+    }
+
+    /// The lockout the failure counter and the tenant's policy impose now,
+    /// if any.
+    ///
+    /// The shared helper behind every gate that runs before a verifier:
+    /// reads [`IdentityAuthnLog::failed_attempts`](crate::authn::store::IdentityAuthnLog::failed_attempts)
+    /// and applies [`LockoutPolicy::derived_lockout`](crate::authn::types::LockoutPolicy::derived_lockout)
+    /// at the injected clock's now. It runs the same store read for every
+    /// caller, so a gate that finds no lockout costs what one that does.
+    ///
+    /// A counter that cannot be read follows the policy's
+    /// [`CounterUnavailable`]: `Lock` refuses (the attempt would not have been
+    /// counted either), `Allow` lets the attempt through.
+    pub(super) async fn derived_lockout(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+    ) -> Result<Option<crate::authn::types::DerivedLockout>, AuthnError<I::Error>> {
+        let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
+        let now = self.inner.clock.now();
+        match self.inner.identity.failed_attempts(user_id).await {
+            Ok((count, last)) => Ok(policy.derived_lockout(count, last, now)),
+            Err(e) => {
+                self.inner.metrics.factor_counter_store_outage();
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    outage = "factor_counter_store",
+                    on_counter_unavailable = ?policy.on_counter_unavailable,
+                    "failed_attempts errored; lockout state unknown"
+                );
+                Ok(match policy.on_counter_unavailable {
+                    CounterUnavailable::Lock => Some(crate::authn::types::DerivedLockout {
+                        until: policy
+                            .duration
+                            .and_then(|d| chrono::Duration::from_std(d).ok().map(|d| now + d)),
+                    }),
+                    CounterUnavailable::Allow => None,
+                })
+            }
+        }
     }
 
     /// Emit the `FactorVerified Failure` audit row for an
@@ -132,16 +183,50 @@ where
         self.emit_audit(builder).await
     }
 
-    /// Record a factor-verification failure: audit emit, counter
-    /// increment, lockout-policy verdict.
+    /// Write the `FactorVerified Failure` audit row for a wrong credential.
+    ///
+    /// This is the one intentional bypass of `emit_audit` /
+    /// `emit_audit_at`: a failed write is logged with `user_id` context and
+    /// the flow carries on, because the counter has already moved and
+    /// refusing now would be an answer an attacker can tell apart.
+    async fn record_factor_failure_audit(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        current_kind: &FactorKind,
+    ) {
+        if let Err(e) = self
+            .inner
+            .identity
+            .record_event(
+                AuthEventBuilder::failure(AuthEventType::FactorVerified)
+                    .attributed_to(user_id, tenant_id)
+                    .with_factor(current_kind.clone())
+                    .build_at(self.inner.clock.now()),
+            )
+            .await
+        {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "failed to record FactorVerified Failure audit event; \
+                 SOC dashboards will be missing this attempt; the counter was already updated"
+            );
+        }
+    }
+
+    /// Record a factor-verification failure: counter increment, audit emit,
+    /// lockout-policy verdict.
     ///
     /// Returns the [`FactorOutcome`] to bubble up: `Locked { until: None }`
     /// once the lockout threshold is reached, otherwise `InvalidCredential`.
     ///
-    /// Audit-emit comes BEFORE the counter increment so audit-store
-    /// errors fail loudly instead of letting counter and log diverge
-    /// (otherwise a user could get locked with no explanatory audit
-    /// row, leaving the SOC team correlating inconsistent state).
+    /// The counter moves BEFORE the audit row is written. The audit write
+    /// is an await, and a request cancelled there (a client disconnect, a
+    /// timeout) used to drop the future before the increment, so a guess
+    /// the client abandoned was never counted and an attacker could probe
+    /// without limit by hanging up. A lost audit row is logged; a lost
+    /// count is a brute-force window.
     ///
     /// Store errors on `record_failed_attempt` are NOT
     /// propagated as `Err(AuthnError::Store)`. Doing so would leak a
@@ -160,36 +245,34 @@ where
         current_kind: &FactorKind,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        self.inner.metrics.factor_failure();
-
-        // This is the one intentional bypass of `emit_audit` /
-        // `emit_audit_at`. The audit-ordering fix needs a `tracing::error!` with
-        // `user_id = %user_id` context that the generic emit helpers
-        // don't provide; every other audit emit in the crate goes
-        // through them. Direct `self.inner.identity.record_event(...)` is
-        // load-bearing here, not stylistic.
-        if let Err(e) = self
-            .inner
-            .identity
-            .record_event(
-                AuthEventBuilder::failure(AuthEventType::FactorVerified)
-                    .attributed_to(user_id, tenant_id)
-                    .with_factor(current_kind.clone())
-                    .build_at(self.inner.clock.now()),
-            )
+        self.record_factor_failure_after(None, user_id, tenant_id, current_kind, session)
             .await
-        {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "failed to record FactorVerified Failure audit event; \
-                 SOC dashboards will be missing this attempt; proceeding with counter update"
-            );
-        }
+    }
+
+    /// [`record_factor_failure`](Self::record_factor_failure) for a check
+    /// that reserved its guess first.
+    ///
+    /// `reserved` is the count [`reserve_guess`](Self::reserve_guess) took:
+    /// the counter has already moved, so it is not moved again and the
+    /// lockout verdict is taken from that count. `None` counts the failure
+    /// now, as a check that reserved nothing does.
+    pub(super) async fn record_factor_failure_after(
+        &self,
+        reserved: Option<u32>,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        current_kind: &FactorKind,
+        session: &AuthSession,
+    ) -> Result<FactorOutcome, AuthnError<I::Error>> {
+        self.inner.metrics.factor_failure();
 
         let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
 
-        let count = match self.inner.identity.record_failed_attempt(user_id).await {
+        let counted = match reserved {
+            Some(n) => Ok(n),
+            None => self.inner.identity.record_failed_attempt(user_id).await,
+        };
+        let count = match counted {
             Ok(n) => n,
             Err(e) => {
                 // A counter-store outage is operationally distinct from the
@@ -227,6 +310,8 @@ where
                      monitor counter-store health"
                 );
                 session.record_attempt_at(self.inner.clock.now()).await;
+                self.record_factor_failure_audit(user_id, tenant_id, current_kind)
+                    .await;
                 return Ok(verdict);
             }
         };
@@ -235,7 +320,10 @@ where
         // lockout decisions (those are store-authoritative).
         session.record_attempt_at(self.inner.clock.now()).await;
 
-        if count >= policy.max_attempts {
+        self.record_factor_failure_audit(user_id, tenant_id, current_kind)
+            .await;
+
+        if count >= policy.effective_max_attempts() {
             self.inner.metrics.account_locked();
             // Surface the lockout window to the caller as `now +
             // policy.duration`, computed at the verdict that creates
@@ -253,6 +341,9 @@ where
         Ok(FactorOutcome::InvalidCredential)
     }
 }
+
+mod reserve;
+pub(super) use reserve::GuessSlot;
 
 #[cfg(test)]
 mod tests;

@@ -6,7 +6,7 @@
 use axess::authorization::{AuthzEntityProvider, AuthzError, make_entity_uid};
 use cedar_policy::{Entities, Entity, EntityUid, RestrictedExpression, Schema};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // ── Domain types ─────────────────────────────────────────────────────────────
 
@@ -75,6 +75,12 @@ impl AppData {
 pub struct DocEntityProvider {
     data: AppData,
     namespace: Arc<str>,
+    /// The compiled schema, remembered by `validate_schema` at startup so
+    /// entities are built (and checked) against it. Cedar adds the schema's
+    /// action entities only for entities built with a schema; the policy
+    /// store also adds them itself, so a provider that has no schema yet is
+    /// still evaluated correctly.
+    schema: OnceLock<Schema>,
 }
 
 impl DocEntityProvider {
@@ -82,6 +88,7 @@ impl DocEntityProvider {
         Self {
             data,
             namespace: namespace.into(),
+            schema: OnceLock::new(),
         }
     }
 
@@ -208,7 +215,7 @@ impl AuthzEntityProvider for DocEntityProvider {
             entities.push(owner_entity);
         }
 
-        Ok(Entities::from_entities(entities, None)?)
+        Ok(Entities::from_entities(entities, self.schema.get())?)
     }
 
     /// Build the Cedar entity UID for a document.
@@ -217,8 +224,9 @@ impl AuthzEntityProvider for DocEntityProvider {
     }
 
     fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
-        // Example provider: trusts the loaded schema. Real providers cross-check
-        // entity shapes against the schema here.
+        // Remember the schema so `entities_for` builds against it. Real
+        // providers also cross-check sample entity shapes against it here.
+        let _ = self.schema.set(schema.clone());
         tracing::trace!(
             target: "axess::example::authz",
             ?schema,

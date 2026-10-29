@@ -40,6 +40,39 @@ pub struct OAuthClaims {
     pub id_token_hint: Option<crate::secret::ZeroizedString>,
     /// All additional claims from the ID token as a raw JSON map.
     pub additional_claims: serde_json::Value,
+    /// The DPoP key the tokens of this login are bound to, for a provider
+    /// configured with
+    /// [`SenderConstraint::DPoP`](super::fapi::SenderConstraint::DPoP); `None`
+    /// otherwise.
+    ///
+    /// Keep it for the tokens' life (`DpopKey::to_seed_bytes` exports the
+    /// scalar, `DpopKey::from_seed` restores it) and hand it back on every
+    /// refresh and userinfo call, since the authorization server bound the
+    /// access token to its thumbprint. Never serialised.
+    #[serde(skip)]
+    pub dpop_key: Option<std::sync::Arc<super::dpop_key::DpopKey>>,
+}
+
+/// The result of a successful refresh-token exchange.
+///
+/// OIDC Core 12.2 makes the ID token of a refresh response optional, so the
+/// claims are too. The tokens are not: a refresh that succeeded at the IdP has
+/// spent the refresh token that was sent (a rotating server issues another),
+/// and the caller has to store what came back.
+#[derive(Debug, Clone)]
+pub struct RefreshOutcome {
+    /// The verified claims of the response's ID token, or `None` when the IdP
+    /// sent no ID token. A caller that gets `None` keeps the subject and
+    /// claims it already holds.
+    pub id_token_claims: Option<OAuthClaims>,
+    /// The new access token. Zeroized on drop.
+    pub access_token: crate::secret::ZeroizedString,
+    /// The refresh token to store next: the one the IdP rotated to, or, when
+    /// the response carried none, the one that was sent (it stays valid).
+    /// Zeroized on drop.
+    pub refresh_token: crate::secret::ZeroizedString,
+    /// Lifetime of the new access token in seconds, when the IdP stated one.
+    pub expires_in: Option<u64>,
 }
 
 /// Claims returned by the OIDC UserInfo endpoint.

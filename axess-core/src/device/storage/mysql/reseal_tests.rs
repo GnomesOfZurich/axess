@@ -23,7 +23,10 @@ fn fingerprint() -> FingerprintHash {
 }
 
 async fn encrypted_store() -> MysqlDeviceStore {
-    let store = MysqlDeviceStore::new(sql_live::mysql_pool(4).await, SessionCrypto::new(KEY));
+    let store = MysqlDeviceStore::new(
+        sql_live::mysql_pool(4).await,
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     store.init_schema().await.unwrap();
     store
 }
@@ -67,7 +70,7 @@ async fn overwrite_blob(store: &MysqlDeviceStore, device: &DeviceId, blob: &str)
 }
 
 fn is_current_format(stored: &str) -> bool {
-    BASE64.decode(stored).unwrap().starts_with(b"AXD\x02")
+    BASE64.decode(stored).unwrap().starts_with(b"AXD\x82")
 }
 
 fn unbound(_: &str, _: &str, b: &[DeviceBinding]) -> String {
@@ -209,7 +212,7 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn a_failed_reseal_still_returns_the_device() {
     let (store, t, _, d, bindings) = seeded(unbound).await;
-    // Refuses any blob in the current format (`AXD\x02` in base64).
+    // Refuses any blob in the current format (`AXD\x82` in base64).
     sqlx::query(
         "ALTER TABLE devices ADD CONSTRAINT refuse_current CHECK (bindings NOT LIKE 'QVhE%')",
     )

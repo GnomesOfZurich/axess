@@ -508,3 +508,51 @@ async fn a_client_supplied_request_id_header_is_not_believed() {
         "a header the caller writes must not reach the audit row"
     );
 }
+
+/// A client-set `User-Agent` is bounded on every way into an audit row, on a
+/// character boundary, with a marker so a cut value is recognisable.
+#[tokio::test]
+async fn an_oversized_user_agent_is_capped_on_every_path() {
+    // Two-byte characters, so the byte limit falls inside one when odd.
+    let huge = "é".repeat(10_000);
+    let mut headers = HeaderMap::new();
+    headers.insert("user-agent", "x".repeat(20_000).parse().unwrap());
+    let mut p = parts(headers, None);
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
+    let from_request = ctx.user_agent.clone().expect("present");
+    assert!(
+        from_request.len() <= MAX_USER_AGENT_BYTES + 3,
+        "{}",
+        from_request.len()
+    );
+    assert!(from_request.ends_with("..."));
+
+    let built = AuthEventBuilder::new(
+        None,
+        None,
+        AuthEventType::LoginAttempt,
+        AuthEventStatus::Failure,
+    )
+    .with_user_agent(huge.clone())
+    .build_at(chrono::Utc::now());
+    let ua = built.user_agent.expect("present");
+    assert!(ua.len() <= MAX_USER_AGENT_BYTES + 3 && ua.ends_with("..."));
+    assert!(ua.is_char_boundary(ua.len() - 3));
+
+    let wide = AuditContext {
+        user_agent: Some(huge),
+        ..Default::default()
+    };
+    let via_ctx = AuthEventBuilder::new(
+        None,
+        None,
+        AuthEventType::LoginAttempt,
+        AuthEventStatus::Failure,
+    )
+    .with_audit_context(&wide)
+    .build_at(chrono::Utc::now());
+    assert!(via_ctx.user_agent.expect("present").len() <= MAX_USER_AGENT_BYTES + 3);
+
+    // A short value is untouched.
+    assert_eq!(cap_user_agent("curl/8".to_owned()), "curl/8");
+}

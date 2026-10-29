@@ -56,6 +56,15 @@ use std::pin::Pin;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionUser(pub UserId);
 
+/// The device the session was last bound to, placed in the request
+/// extensions by the session layer for an authenticated session that has one.
+///
+/// A request that presents no device token (a cross-site navigation does not
+/// send the `SameSite=Strict` device cookie) keeps this device instead of
+/// being given a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDevice(pub DeviceId);
+
 /// Resolve (or create) the [`DeviceId`] associated with an inbound HTTP
 /// request.
 ///

@@ -154,6 +154,23 @@ under their scope; the authentication ceremony enumerates them and
 the user's authenticator (or the browser, in the passkey case)
 picks one.
 
+## Who may enrol and delete
+
+`begin_fido2_registration`, `finish_fido2_registration` and
+`delete_fido2_credential` take the `User` the passkey belongs to, and a
+`User` value is only what the caller built or fetched: a handler that
+looks one up by a request parameter has not shown the request is that
+user's. So each of the three also takes the session and requires it to be
+`Authenticated` as that user (same id and tenant), or pending signup for
+that user, so a signup can enrol its first passkey. Any other session is
+refused with `AuthnError::NoFlow` and a failed `FactorSetup`,
+`FactorEnabled` or `FactorDisabled` audit row naming the reason
+`enrolment_context`. Finishing a registration re-checks, so a session that
+was swapped between begin and finish cannot complete a ceremony it did not
+start. For a recent-authentication rule on top (re-enter the password
+before adding a key), use `AuthSession::authenticated_within` and
+`begin_step_up`.
+
 ## Adding passkeys to an existing flow
 
 A common rollout is to keep an existing password-and-TOTP method

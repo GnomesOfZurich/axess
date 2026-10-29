@@ -176,6 +176,8 @@ fn session_data_json_roundtrip() {
         fingerprint: Some("abc123".to_string()),
         device_id: None,
         custom: serde_json::json!({"key": "value"}),
+        revision: 0,
+        touched_at: None,
     };
     let json = serde_json::to_string(&data).unwrap();
     let restored: SessionData = serde_json::from_str(&json).unwrap();
@@ -201,6 +203,23 @@ async fn set_authenticated_marks_regenerate() {
         .await;
     assert!(session.is_authenticated().await);
     assert_eq!(session.user_id().await, Some(uid("u1")));
+}
+
+#[tokio::test]
+async fn a_partly_logged_in_session_has_no_user_to_authorize_as() {
+    let session = test_session();
+    session
+        .begin_authenticating(
+            uid("u1"),
+            tid("t1"),
+            "password".into(),
+            vec![FactorKind::Password, FactorKind::Totp],
+        )
+        .await;
+    assert!(session.user_id().await.is_none());
+    assert!(session.tenant_id().await.is_none());
+    assert_eq!(session.pending_user_id().await, Some(uid("u1")));
+    assert_eq!(session.pending_tenant_id().await, Some(tid("t1")));
 }
 
 #[tokio::test]

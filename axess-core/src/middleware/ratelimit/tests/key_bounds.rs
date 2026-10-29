@@ -3,11 +3,14 @@
 use super::*;
 use keys::{HEADER_SLOTS, bound_key, ip_bucket};
 
-/// A key at exactly the limit passes through unchanged, and a short one too.
+/// A key within the natural limit passes through unchanged. One between that
+/// and `MAX_KEY_LEN` is cut, so no uncut key can equal a cut one.
 #[test]
 fn a_key_within_the_limit_is_unchanged() {
-    let at_limit = "x".repeat(MAX_KEY_LEN);
+    let at_limit = "x".repeat(MAX_KEY_LEN - 70);
     assert_eq!(bound_key(at_limit.clone()), at_limit);
+    let above = "x".repeat(MAX_KEY_LEN);
+    assert_ne!(bound_key(above.clone()), above);
     let short = "y".repeat(100);
     assert_eq!(bound_key(short.clone()), short);
 }
@@ -116,9 +119,11 @@ fn the_client_ip_extractor_buckets_a_slash_64_together() {
 /// The debug log carries a fingerprint, not the raw key.
 #[test]
 fn the_fingerprint_hides_the_key_and_is_stable() {
-    let fp = keys::fingerprint("alice@example.com");
+    let secret = [7u8; 32];
+    let fp = keys::fingerprint(&secret, "alice@example.com");
     assert_eq!(fp.len(), 16);
     assert!(!fp.contains("alice"));
-    assert_eq!(fp, keys::fingerprint("alice@example.com"));
-    assert_ne!(fp, keys::fingerprint("bob@example.com"));
+    assert_eq!(fp, keys::fingerprint(&secret, "alice@example.com"));
+    assert_ne!(fp, keys::fingerprint(&secret, "bob@example.com"));
+    assert_ne!(fp, keys::fingerprint(&[8u8; 32], "alice@example.com"));
 }

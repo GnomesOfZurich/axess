@@ -29,6 +29,8 @@
 //! - `GET /auth/login/:provider`; initiates OAuth flow (redirects to IdP)
 //! - `GET /auth/callback/:provider`; handles IdP callback
 //! - `GET /profile`; shows authenticated user info (requires login)
+//! - `POST /auth/logout`; ends the local session and sends the browser to the
+//!   IdP's logout endpoint, when it has one
 
 use axess::authn::{AuditContext, AuthnService};
 use axess::federation::oauth::OAuthProviderConfig;
@@ -38,7 +40,7 @@ use axum::{
     Router,
     extract::{Path, Query, State},
     response::{Html, IntoResponse, Redirect},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use std::sync::Arc;
@@ -50,7 +52,13 @@ type Service = AuthnService<MockIdentityStore, MockFactorStore>;
 #[derive(Clone)]
 struct AppState {
     authn: Arc<Service>,
+    provider_name: String,
 }
+
+/// Where the IdP sends the browser after its own logout. It is forwarded only
+/// because it is listed with `with_allowed_post_logout_redirect_uris`, and it
+/// must be registered at the IdP as well.
+const POST_LOGOUT_REDIRECT: &str = "http://localhost:3000/";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &client_secret,
         "http://localhost:3000/auth/callback/google",
     )
-    .await?;
+    .await?
+    // Without this list the redirect handed to the IdP's logout endpoint is
+    // dropped: only an exact match is forwarded.
+    .with_allowed_post_logout_redirect_uris([POST_LOGOUT_REDIRECT]);
     info!("OIDC discovery complete");
 
     let identity = MockIdentityStore::new();
@@ -94,15 +105,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // models the same pattern the library uses internally.
     let mut signing_key = [0u8; 32];
     axess::SystemRng.fill_bytes(&mut signing_key);
-    let session_layer = SessionLayer::new(session_store, signing_key).with_secure(false); // HTTP for local dev
+    let session_layer = SessionLayer::new(session_store, signing_key).with_secure(secure_cookies());
 
-    let state = AppState { authn };
+    let state = AppState {
+        authn,
+        provider_name,
+    };
 
     let app = Router::new()
         .route("/", get(home))
         .route("/auth/login/{provider}", get(login))
         .route("/auth/callback/{provider}", get(callback))
         .route("/profile", get(profile))
+        .route("/auth/logout", post(logout))
         .with_state(state)
         .layer(session_layer);
 
@@ -234,6 +249,23 @@ async fn callback(
     }
 }
 
+/// End the local session, then send the browser to the IdP's logout endpoint
+/// so its session ends too. A real application passes the `id_token_hint` it
+/// kept from login (`OAuthClaims::id_token_hint`); this example keeps nothing,
+/// so the IdP may ask the user to confirm.
+async fn logout(State(state): State<AppState>, session: AuthSession) -> impl IntoResponse {
+    session.clear().await;
+    match state.authn.build_end_session_url(
+        &state.provider_name,
+        None,
+        Some(POST_LOGOUT_REDIRECT),
+        None,
+    ) {
+        Some(url) => Redirect::to(url.as_str()),
+        None => Redirect::to("/"),
+    }
+}
+
 /// Protected page; shows session info (or redirects to login).
 async fn profile(session: AuthSession) -> impl IntoResponse {
     if session.is_authenticated().await {
@@ -247,6 +279,7 @@ async fn profile(session: AuthSession) -> impl IntoResponse {
 <html><head><title>Profile</title></head><body>
 <h1>Profile</h1>
 <p>Authenticated as: {user_id}</p>
+<form method="POST" action="/auth/logout"><button type="submit">Log out</button></form>
 <a href="/">Home</a>
 </body></html>"#
         ))
@@ -272,4 +305,14 @@ fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+/// Cookies are `Secure` unless `AXESS_DEV_INSECURE_COOKIES=1` is set, for a
+/// browser that refuses `Secure` cookies over plain HTTP. Local use only.
+fn secure_cookies() -> bool {
+    let insecure = std::env::var("AXESS_DEV_INSECURE_COOKIES").is_ok_and(|v| v == "1");
+    if insecure {
+        eprintln!("WARNING: AXESS_DEV_INSECURE_COOKIES=1, cookies are sent without Secure");
+    }
+    !insecure
 }

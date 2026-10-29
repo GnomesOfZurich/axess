@@ -145,10 +145,11 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// `None`, so a revoked row always has a grace clock and the sweep can
     /// purge it.
     ///
-    /// A save never moves a stored [`DeviceTrustLevel::Revoked`] row to
-    /// another level: a `Device` loaded before a revocation and saved after
-    /// it leaves the revoked row as it is. Reinstating a revoked device is
-    /// an explicit [`set_trust_level`](Self::set_trust_level).
+    /// A save never changes a stored [`DeviceTrustLevel::Revoked`] row: a
+    /// `Device` loaded before a revocation and saved after it leaves the
+    /// revoked row as it is, and a save of a revoked copy does not rewrite
+    /// the row's `revoked_at` or bindings either. Reinstating a revoked
+    /// device is an explicit [`set_trust_level`](Self::set_trust_level).
     fn save(
         &self,
         device: &Device,
@@ -164,16 +165,25 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// it backwards. A [`DeviceTrustLevel::Revoked`] row is not touched (a
     /// sighting cannot extend a revoked device) and the call still succeeds.
     /// A missing device is an error.
+    ///
+    /// Returns the trust level the row had when the sighting was applied (or
+    /// skipped): [`DeviceTrustLevel::Revoked`] means the row is revoked and
+    /// was not touched, including when it was revoked after the caller last
+    /// loaded it. A caller that reports a device's level after a sighting
+    /// reports this value, not the level it read earlier.
     fn record_sighting(
         &self,
         tenant_id: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send;
 
     /// Set the trust level. Drives transitions across the
     /// [`DeviceTrustLevel`] ladder. Setting to
-    /// [`DeviceTrustLevel::Revoked`] also stamps `revoked_at = now`.
+    /// [`DeviceTrustLevel::Revoked`] also stamps `revoked_at = now`, except
+    /// on a row that is already revoked, which keeps its original
+    /// `revoked_at` so repeating a revocation does not restart the purge
+    /// grace clock.
     fn set_trust_level(
         &self,
         tenant_id: &TenantId,
@@ -574,10 +584,11 @@ pub(crate) fn for_save(device: &Device, now: DateTime<Utc>) -> Device {
     row
 }
 
-/// `true` when a save of a row at `new` must leave a stored row at `stored`
-/// alone: a save never un-revokes.
-pub(crate) fn blocks_save(stored: DeviceTrustLevel, new: DeviceTrustLevel) -> bool {
-    stored == DeviceTrustLevel::Revoked && new != DeviceTrustLevel::Revoked
+/// `true` when a save must leave a stored row at `stored` alone: a save never un-revokes, and it never rewrites a revoked row
+/// either, so a stale copy of a revoked device (an older `revoked_at`, older
+/// bindings) cannot restart its purge grace clock or bring old state back.
+pub(crate) fn blocks_save(stored: DeviceTrustLevel) -> bool {
+    stored == DeviceTrustLevel::Revoked
 }
 
 /// The `demoted_at` a row carries after its trust level moves from `from`

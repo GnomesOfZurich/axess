@@ -16,6 +16,8 @@ struct AtomicRotateStore {
     inner: MemoryRefreshTokenStore,
     fail_rotate: AtomicBool,
     fail_revoke_family: AtomicBool,
+    /// `rotate_token` answers `ParentAlreadyRevoked` without touching the row.
+    force_lost_race: AtomicBool,
     compromise_calls: AtomicUsize,
 }
 
@@ -25,6 +27,7 @@ impl AtomicRotateStore {
             inner: store(),
             fail_rotate: AtomicBool::new(false),
             fail_revoke_family: AtomicBool::new(false),
+            force_lost_race: AtomicBool::new(false),
             compromise_calls: AtomicUsize::new(0),
         }
     }
@@ -96,6 +99,9 @@ impl RefreshTokenStore for AtomicRotateStore {
             // that hits a constraint violation and is ROLLBACK'd.
             return Err(std::io::Error::other("simulated commit failure"));
         }
+        if self.force_lost_race.load(Ordering::SeqCst) {
+            return Ok(RotationOutcome::ParentAlreadyRevoked);
+        }
         // Otherwise the production-correct atomic path, delegated to the
         // memory store, whose revoke is conditional on the parent being live.
         self.inner
@@ -151,16 +157,33 @@ async fn atomic_rotate_failure_keeps_parent_usable() {
     // Arm rotate to fail atomically.
     store.arm_rotate_failure();
 
-    let result = refresh_session(&parent_plaintext, &store, &config, &rng, ts, None).await;
+    let result = refresh_session_with_status_check(
+        &parent_plaintext,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await;
     assert!(matches!(result, Err(RefreshError::Store(_))));
 
     // The parent must still be active; atomic failure means the
     // revoke didn't happen either. Disarm and retry to confirm the
     // user can still authenticate from the same token.
     store.fail_rotate.store(false, Ordering::SeqCst);
-    let (session, new_token) = refresh_session(&parent_plaintext, &store, &config, &rng, ts, None)
-        .await
-        .expect("post-failure retry must succeed: silent-logout regression");
+    let (session, new_token) = refresh_session_with_status_check(
+        &parent_plaintext,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await
+    .expect("post-failure retry must succeed: silent-logout regression");
     assert!(session.auth_state.is_authenticated());
     assert!(new_token.is_some());
 }
@@ -192,9 +215,17 @@ async fn rotate_token_on_memory_store_revokes_parent_and_stores_child() {
     .await
     .unwrap();
 
-    let (_, new_token) = refresh_session(&parent_plaintext, &store, &config, &rng, ts, None)
-        .await
-        .unwrap();
+    let (_, new_token) = refresh_session_with_status_check(
+        &parent_plaintext,
+        &store,
+        &config,
+        &rng,
+        ts,
+        None,
+        |_| async { true },
+    )
+    .await
+    .unwrap();
     let (_, new_record) = new_token.unwrap();
 
     // Parent is revoked, child is active.
@@ -266,11 +297,17 @@ async fn second_refresh_with_one_token_is_refused_as_reuse() {
     .await
     .unwrap();
     assert!(
-        refresh_session(&plaintext, &store, &config, &rng, ts, None)
-            .await
-            .is_ok()
+        refresh_session_with_status_check(&plaintext, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await
+        .is_ok()
     );
-    let second = refresh_session(&plaintext, &store, &config, &rng, ts, None).await;
+    let second =
+        refresh_session_with_status_check(&plaintext, &store, &config, &rng, ts, None, |_| async {
+            true
+        })
+        .await;
     assert!(
         matches!(second, Err(RefreshError::Revoked)),
         "the second use of one token is a reuse: {second:?}"
@@ -285,51 +322,67 @@ async fn second_refresh_with_one_token_is_refused_as_reuse() {
     );
 }
 
-/// When revoking the family of a reused token fails, the caller gets the
-/// store's error rather than `Revoked`, and the compromise hook does not run:
-/// the hook's contract is "called after `revoke_family` has revoked the
-/// family", and reporting `Revoked` would tell the caller a compromise was
-/// handled when the family is still live. The reused token itself is refused
-/// either way (an `Err`, never a session).
+/// When revoking the family of a reused token fails, the caller still gets
+/// `Revoked` and the compromise hook still runs once, so the device cascade
+/// is not skipped by a store fault. Both paths that detect a reuse are
+/// covered: a token found revoked, and a rotation that lost the race.
 #[tokio::test]
-async fn failed_family_revoke_on_reuse_is_a_store_error_and_not_a_handled_compromise() {
-    let store = AtomicRotateStore::new();
-    let config = test_config();
-    let rng = MockRng::new(459);
-    let ts = now();
-    let (plaintext, _parent) = issue_refresh_token(
-        IssueRequest {
-            user_id: &fixture_user(),
-            tenant_id: &fixture_tenant(),
-            device_info: None,
-            family_id: None,
-            device_id: None,
-        },
-        &config,
-        &store,
-        &rng,
-        ts,
-    )
-    .await
-    .unwrap();
-    refresh_session(&plaintext, &store, &config, &rng, ts, None)
+async fn failed_family_revoke_on_reuse_still_runs_the_hook_and_answers_revoked() {
+    for lost_race in [false, true] {
+        let store = AtomicRotateStore::new();
+        let config = test_config();
+        let rng = MockRng::new(459);
+        let ts = now();
+        let (plaintext, _parent) = issue_refresh_token(
+            IssueRequest {
+                user_id: &fixture_user(),
+                tenant_id: &fixture_tenant(),
+                device_info: None,
+                family_id: None,
+                device_id: None,
+            },
+            &config,
+            &store,
+            &rng,
+            ts,
+        )
         .await
         .unwrap();
+        if !lost_race {
+            refresh_session_with_status_check(
+                &plaintext,
+                &store,
+                &config,
+                &rng,
+                ts,
+                None,
+                |_| async { true },
+            )
+            .await
+            .unwrap();
+        } else {
+            store.force_lost_race.store(true, Ordering::SeqCst);
+        }
 
-    store.fail_revoke_family.store(true, Ordering::SeqCst);
-    let reuse = refresh_session(&plaintext, &store, &config, &rng, ts, None).await;
-    assert!(
-        matches!(reuse, Err(RefreshError::Store(_))),
-        "a failed revoke is reported as the store error it is: {reuse:?}"
-    );
-    assert_eq!(
-        store.compromise_calls.load(Ordering::SeqCst),
-        0,
-        "the hook runs only after the family was revoked"
-    );
-
-    store.fail_revoke_family.store(false, Ordering::SeqCst);
-    let retry = refresh_session(&plaintext, &store, &config, &rng, ts, None).await;
-    assert!(matches!(retry, Err(RefreshError::Revoked)));
-    assert_eq!(store.compromise_calls.load(Ordering::SeqCst), 1);
+        store.fail_revoke_family.store(true, Ordering::SeqCst);
+        let reuse = refresh_session_with_status_check(
+            &plaintext,
+            &store,
+            &config,
+            &rng,
+            ts,
+            None,
+            |_| async { true },
+        )
+        .await;
+        assert!(
+            matches!(reuse, Err(RefreshError::Revoked)),
+            "lost_race={lost_race}: a failed revoke is still a Revoked answer: {reuse:?}"
+        );
+        assert_eq!(
+            store.compromise_calls.load(Ordering::SeqCst),
+            1,
+            "lost_race={lost_race}: the hook runs even though revoke_family failed"
+        );
+    }
 }

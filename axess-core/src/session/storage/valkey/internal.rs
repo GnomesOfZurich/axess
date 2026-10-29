@@ -94,6 +94,24 @@ end
 return 0
 "#;
 
+/// Replace a stored session blob only while the key still holds exactly the
+/// bytes that were compared, and give it a fresh expiry.
+///
+/// KEYS: `[session]`. ARGV: `[old_blob, new_blob, ttl_seconds]`. Returns `1`
+/// when the blob was replaced, `0` when the key holds other bytes (a
+/// concurrent write), and `-1` when the key is gone.
+pub(super) const COMPARE_SET_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then
+  return -1
+end
+if current == ARGV[1] then
+  redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+  return 1
+end
+return 0
+"#;
+
 // ── TTL helpers ──────────────────────────────────────────────────────────────
 
 use std::time::Duration;
@@ -110,6 +128,22 @@ pub(super) fn ex_seconds(ttl: Duration) -> Option<i64> {
         return None;
     }
     Some(ttl.as_secs().clamp(1, i64::MAX as u64) as i64)
+}
+
+/// Outcome of a rotation whose new session is already expired (zero TTL):
+/// nothing is stored, and the old key was deleted. `removed` is the `DEL`
+/// count for the old key. With `require_old`, a delete that removed nothing
+/// means the session was already gone, which holds when the old and new keys
+/// are the same key as much as when they differ.
+pub(super) fn expired_cycle_outcome(
+    require_old: bool,
+    removed: i64,
+) -> crate::session::store::CycleOutcome {
+    if require_old && removed == 0 {
+        crate::session::store::CycleOutcome::SessionGone
+    } else {
+        crate::session::store::CycleOutcome::Rotated
+    }
 }
 
 /// A registry member's lifetime in milliseconds (its score is the

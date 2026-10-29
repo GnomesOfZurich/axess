@@ -18,8 +18,16 @@ use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::traits::PublicKeyParts;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const DEFAULT_KEY_ID: &str = "local-idp-fixture-key";
 pub(crate) const RSA_KEY_BITS: usize = 2048;
+/// Smallest RSA modulus accepted from imported key material.
+pub(crate) const RSA_MIN_BITS: usize = 2048;
+
+/// RFC 7638 thumbprint of a canonical public-key JWK member string, used as
+/// the `kid` of a generated key so two generated keys never share one.
+fn thumbprint_kid(canonical_jwk: &str) -> String {
+    use sha2::Digest as _;
+    URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(canonical_jwk.as_bytes()))
+}
 
 // ── LocalIdpSigningKey ───────────────────────────────────────────────────────
 
@@ -104,6 +112,12 @@ impl LocalIdpSigningKey {
     /// Generate a fresh RSA-2048 keypair under `RS256` with the
     /// default key id. Key generation takes ~50-200 ms; expensive to
     /// run per-test, so reuse via `Clone` across cases.
+    ///
+    /// Prefer [`Self::generate_es256`]: it is faster, its tokens are smaller,
+    /// and it avoids the `rsa` crate's private-key operations, which carry a
+    /// timing side channel (the Marvin advisory, not fixed upstream). Use RSA
+    /// only when a verifier cannot take ES256, and keep signing off shared
+    /// hosts.
     pub fn generate_rsa() -> Self {
         Self::generate_rsa_with_algorithm(Algorithm::RS256)
     }
@@ -125,7 +139,20 @@ impl LocalIdpSigningKey {
         let mut adapter = SecureRngAdapter(rng);
         let private_key =
             RsaPrivateKey::new(&mut adapter, RSA_KEY_BITS).expect("RSA-2048 key generation");
-        Self::from_rsa_private_key(&private_key, DEFAULT_KEY_ID.to_string(), algorithm)
+        let kid = thumbprint_kid(&format!(
+            r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#,
+            URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
+            URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
+        ));
+        Self::from_rsa_private_key(&private_key, kid, algorithm)
+    }
+
+    /// Like [`Self::generate_rsa_with_algorithm`] but returns
+    /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm that is
+    /// not `RS256`, `RS384` or `RS512` instead of panicking.
+    pub fn try_generate_rsa_with_algorithm(algorithm: Algorithm) -> Result<Self, LocalIdpKeyError> {
+        check_rsa_alg(algorithm)?;
+        Ok(Self::generate_rsa_with_algorithm(algorithm))
     }
 
     /// Load from a PEM-encoded RSA private key. Accepts both
@@ -142,7 +169,7 @@ impl LocalIdpSigningKey {
         key_id: impl Into<String>,
         algorithm: Algorithm,
     ) -> Result<Self, LocalIdpKeyError> {
-        assert_rsa_alg(algorithm);
+        check_rsa_alg(algorithm)?;
         let pem_trimmed = pem.trim_start();
         let private_key = if pem_trimmed.starts_with("-----BEGIN RSA PRIVATE KEY-----") {
             RsaPrivateKey::from_pkcs1_pem(pem)
@@ -151,11 +178,7 @@ impl LocalIdpSigningKey {
             RsaPrivateKey::from_pkcs8_pem(pem)
                 .map_err(|e| LocalIdpKeyError::PemParse(e.to_string()))?
         };
-        Ok(Self::from_rsa_private_key(
-            &private_key,
-            key_id.into(),
-            algorithm,
-        ))
+        Self::from_imported_rsa_key(&private_key, key_id.into(), algorithm)
     }
 
     /// Load from a PKCS#1 DER-encoded RSA private key.
@@ -164,14 +187,10 @@ impl LocalIdpSigningKey {
         key_id: impl Into<String>,
         algorithm: Algorithm,
     ) -> Result<Self, LocalIdpKeyError> {
-        assert_rsa_alg(algorithm);
+        check_rsa_alg(algorithm)?;
         let private_key = RsaPrivateKey::from_pkcs1_der(der)
             .map_err(|e| LocalIdpKeyError::DerParse(e.to_string()))?;
-        Ok(Self::from_rsa_private_key(
-            &private_key,
-            key_id.into(),
-            algorithm,
-        ))
+        Self::from_imported_rsa_key(&private_key, key_id.into(), algorithm)
     }
 
     /// Load from a PKCS#8 DER-encoded RSA private key.
@@ -180,14 +199,27 @@ impl LocalIdpSigningKey {
         key_id: impl Into<String>,
         algorithm: Algorithm,
     ) -> Result<Self, LocalIdpKeyError> {
-        assert_rsa_alg(algorithm);
+        check_rsa_alg(algorithm)?;
         let private_key = RsaPrivateKey::from_pkcs8_der(der)
             .map_err(|e| LocalIdpKeyError::DerParse(e.to_string()))?;
-        Ok(Self::from_rsa_private_key(
-            &private_key,
-            key_id.into(),
-            algorithm,
-        ))
+        Self::from_imported_rsa_key(&private_key, key_id.into(), algorithm)
+    }
+
+    /// Wrap imported RSA key material, refusing a modulus under
+    /// [`RSA_MIN_BITS`]: an imported key is whatever the file held.
+    fn from_imported_rsa_key(
+        private_key: &RsaPrivateKey,
+        key_id: String,
+        algorithm: Algorithm,
+    ) -> Result<Self, LocalIdpKeyError> {
+        let bits = private_key.n().bits();
+        if bits < RSA_MIN_BITS {
+            return Err(LocalIdpKeyError::WeakKey {
+                bits,
+                min: RSA_MIN_BITS,
+            });
+        }
+        Ok(Self::from_rsa_private_key(private_key, key_id, algorithm))
     }
 
     fn from_rsa_private_key(
@@ -228,7 +260,17 @@ impl LocalIdpSigningKey {
     pub fn generate_es256_with_rng(rng: &dyn axess_rng::SecureRng) -> Self {
         let mut adapter = SecureRngAdapter(rng);
         let secret = EcSecretKey::random(&mut adapter);
-        Self::from_ec_secret_key(&secret, DEFAULT_KEY_ID.to_string(), Algorithm::ES256)
+        let point = secret.public_key().to_encoded_point(false);
+        let (x, y) = (
+            point.x().expect("uncompressed P-256 point has x"),
+            point.y().expect("uncompressed P-256 point has y"),
+        );
+        let kid = thumbprint_kid(&format!(
+            r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
+            URL_SAFE_NO_PAD.encode(x.as_slice()),
+            URL_SAFE_NO_PAD.encode(y.as_slice()),
+        ));
+        Self::from_ec_secret_key(&secret, kid, Algorithm::ES256)
     }
 
     /// Load an EC private key from PEM. Accepts PKCS#8
@@ -242,7 +284,7 @@ impl LocalIdpSigningKey {
         key_id: impl Into<String>,
         algorithm: Algorithm,
     ) -> Result<Self, LocalIdpKeyError> {
-        assert_ec_alg(algorithm);
+        check_ec_alg(algorithm)?;
         let pem_trimmed = pem.trim_start();
         let secret = if pem_trimmed.starts_with("-----BEGIN EC PRIVATE KEY-----") {
             // SEC1; `p256::SecretKey` reads it via `from_sec1_pem`.
@@ -263,7 +305,7 @@ impl LocalIdpSigningKey {
         key_id: impl Into<String>,
         algorithm: Algorithm,
     ) -> Result<Self, LocalIdpKeyError> {
-        assert_ec_alg(algorithm);
+        check_ec_alg(algorithm)?;
         let secret = EcSecretKey::from_pkcs8_der(der)
             .map_err(|e| LocalIdpKeyError::DerParse(e.to_string()))?;
         Ok(Self::from_ec_secret_key(&secret, key_id.into(), algorithm))
@@ -275,7 +317,7 @@ impl LocalIdpSigningKey {
         key_id: impl Into<String>,
         algorithm: Algorithm,
     ) -> Result<Self, LocalIdpKeyError> {
-        assert_ec_alg(algorithm);
+        check_ec_alg(algorithm)?;
         let secret = EcSecretKey::from_sec1_der(der)
             .map_err(|e| LocalIdpKeyError::DerParse(e.to_string()))?;
         Ok(Self::from_ec_secret_key(&secret, key_id.into(), algorithm))
@@ -350,18 +392,34 @@ fn assert_rsa_alg(algorithm: Algorithm) {
     );
 }
 
-fn assert_ec_alg(algorithm: Algorithm) {
-    assert!(
-        matches!(algorithm, Algorithm::ES256),
-        "LocalIdpSigningKey EC constructors only support ES256 (P-256); got {algorithm:?}"
-    );
+fn check_rsa_alg(algorithm: Algorithm) -> Result<(), LocalIdpKeyError> {
+    if matches!(
+        algorithm,
+        Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
+    ) {
+        Ok(())
+    } else {
+        Err(LocalIdpKeyError::UnsupportedAlgorithm(format!(
+            "{algorithm:?} (RSA constructors support RS256, RS384, RS512)"
+        )))
+    }
+}
+
+fn check_ec_alg(algorithm: Algorithm) -> Result<(), LocalIdpKeyError> {
+    if matches!(algorithm, Algorithm::ES256) {
+        Ok(())
+    } else {
+        Err(LocalIdpKeyError::UnsupportedAlgorithm(format!(
+            "{algorithm:?} (EC constructors support ES256)"
+        )))
+    }
 }
 
 pub(crate) fn build_rsa_jwk(key_id: &str, algorithm: Algorithm, n: &str, e: &str) -> Jwk {
     let alg_name = alg_jwk_name(algorithm).unwrap_or_else(|| {
         panic!(
             "build_rsa_jwk called with unsupported algorithm {algorithm:?}; \
-             only RS256/RS384/RS512 are supported (assert_rsa_alg upstream)"
+             only RS256/RS384/RS512 are supported (check_rsa_alg upstream)"
         )
     });
     let jwk_json = serde_json::json!({
@@ -379,13 +437,13 @@ pub(crate) fn build_ec_jwk(key_id: &str, algorithm: Algorithm, x: &str, y: &str)
     let alg_name = alg_jwk_name(algorithm).unwrap_or_else(|| {
         panic!(
             "build_ec_jwk called with unsupported algorithm {algorithm:?}; \
-             only ES256 is supported (assert_ec_alg upstream)"
+             only ES256 is supported (check_ec_alg upstream)"
         )
     });
     let crv = ec_curve_name(algorithm).unwrap_or_else(|| {
         panic!(
             "build_ec_jwk called with non-EC algorithm {algorithm:?}; \
-             only ES256 (P-256) is supported (assert_ec_alg upstream)"
+             only ES256 (P-256) is supported (check_ec_alg upstream)"
         )
     });
     let jwk_json = serde_json::json!({
@@ -456,6 +514,17 @@ pub enum LocalIdpKeyError {
     /// DER decode / parse failed.
     #[error("DER parse failed: {0}")]
     DerParse(String),
+    /// The algorithm is not one this key type can sign with.
+    #[error("unsupported algorithm: {0}")]
+    UnsupportedAlgorithm(String),
+    /// The RSA modulus is shorter than the minimum accepted.
+    #[error("RSA key is {bits} bits; at least {min} are required")]
+    WeakKey {
+        /// Modulus length of the rejected key.
+        bits: usize,
+        /// Minimum accepted modulus length.
+        min: usize,
+    },
 }
 
 // ── Issuance audit hook ──────────────────────────────────────────────────────
@@ -708,41 +777,60 @@ pub(crate) fn build_claims_json(issuer: &str, claims: &MintClaims) -> serde_json
     value
 }
 
-/// Bridges [`axess_rng::SecureRng`] to the `rand_core::RngCore +
-/// CryptoRng` trait pair used by `rsa` and `p256`. Lets keygen run
-/// against any DST-injected RNG without depending on `OsRng` directly.
-struct SecureRngAdapter<'a>(&'a dyn axess_rng::SecureRng);
-
-impl rsa::rand_core::RngCore for SecureRngAdapter<'_> {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.0.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.0.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.fill_bytes(dest);
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
-        self.0.fill_bytes(dest);
-        Ok(())
-    }
-}
-
-impl rsa::rand_core::CryptoRng for SecureRngAdapter<'_> {}
+mod rng_adapter;
+use rng_adapter::SecureRngAdapter;
 
 #[cfg(test)]
 mod primitives_tests {
     use super::*;
     use jsonwebtoken::jwk::KeyAlgorithm;
     use rsa::rand_core::RngCore;
+
+    /// An imported RSA key under 2048 bits is refused.
+    #[test]
+    fn imported_rsa_key_below_2048_bits_is_refused() {
+        let mut adapter = SecureRngAdapter(&axess_rng::SystemRng);
+        let weak = RsaPrivateKey::new(&mut adapter, 1024).expect("1024-bit keygen");
+        let der = weak.to_pkcs1_der().expect("encode");
+        let err = LocalIdpSigningKey::from_rsa_pkcs1_der(der.as_bytes(), "weak", Algorithm::RS256)
+            .expect_err("a 1024-bit key must be refused");
+        assert!(
+            matches!(
+                err,
+                LocalIdpKeyError::WeakKey {
+                    bits: 1024,
+                    min: 2048
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// An unsupported algorithm is an error from every constructor that
+    /// already returns a `Result`, and from the `try_` generator; none panics.
+    #[test]
+    fn unsupported_algorithm_is_an_error_not_a_panic() {
+        let es = LocalIdpSigningKey::generate_es256();
+        let _ = es;
+        let err = LocalIdpSigningKey::from_ec_pem("x", "k", Algorithm::RS256)
+            .expect_err("EC constructor with RS256");
+        assert!(
+            matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
+            "{err:?}"
+        );
+        let err = LocalIdpSigningKey::from_rsa_pem("x", "k", Algorithm::ES256)
+            .expect_err("RSA constructor with ES256");
+        assert!(
+            matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
+            "{err:?}"
+        );
+        let err = LocalIdpSigningKey::try_generate_rsa_with_algorithm(Algorithm::HS256)
+            .expect_err("HS256 is not an RSA algorithm");
+        assert!(
+            matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
+            "{err:?}"
+        );
+    }
 
     /// A custom claim never overrides a registered one: a custom `exp` would
     /// outlive the max-TTL check, a custom `sub` or `aud` would swap the

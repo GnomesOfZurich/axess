@@ -50,9 +50,13 @@ pub struct LdapProviderConfig {
 `url` is the directory's URL. The `ldaps://` scheme means TLS is
 established at the transport layer (port 636 by default); the
 `ldap://` scheme means cleartext, possibly upgraded to TLS via
-STARTTLS. Cleartext without STARTTLS is acceptable only on a private
-network where the directory traffic does not leave a trusted segment;
-production deployments use one of the encrypted forms.
+STARTTLS. Cleartext without STARTTLS is refused: a bind to a host
+other than exactly `localhost`, `127.0.0.1` or `[::1]` returns
+`LdapError::Config` before any connection is opened, because a simple bind
+sends the password in the clear. (The check parses the host: `ldap://localhost.example.com`
+is not loopback.) A trusted segment where you accept that risk opts in with
+`LdapProviderConfig::allow_cleartext()`; production deployments use one of
+the encrypted forms.
 
 `bind_dn_template` is the pattern axess uses to construct a user's
 distinguished name from their login identifier. The string `{user}`

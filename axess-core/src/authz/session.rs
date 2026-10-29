@@ -34,8 +34,11 @@
 //! use axess_core::client_ip::ClientIp;   // handler argument,
 //!                                         // filled by `client_ip::layer`
 //!
+//! // `mfa_complete` is the application's own fact, derived from what it
+//! // recorded when the user finished the factors its policy demands (the
+//! // session carries the authentication state, not an MFA flag).
 //! let ctx = StandardRequestContext::new(
-//!     session.is_mfa_complete(),
+//!     mfa_complete,
 //!     client_ip.get(),
 //! );
 //! let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
@@ -143,11 +146,21 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
 
     /// Begin a per-request authz session for the given user ID.
     ///
-    /// The session uses an empty Cedar `Context`: suitable when all access
-    /// control is role-based or relationship-based only.
+    /// The session uses an **empty** Cedar `Context`, and says so only here:
+    /// a policy that reads `context.mfa_verified` (or any other context
+    /// attribute) is evaluated with nothing to read. With a schema that
+    /// declares the attribute required, `PolicyStore` denies every request
+    /// (the request is invalid); a policy that guards the attribute with
+    /// `context has ..` and treats absence as allowed would permit. Use this
+    /// builder only when all access control is role-based or
+    /// relationship-based.
     ///
     /// For ABAC policies (IP checks, MFA requirements, etc.) use
     /// [`for_user_id_with_context`][Self::for_user_id_with_context].
+    ///
+    /// The session has no tenant; use
+    /// [`for_user_in_tenant`][Self::for_user_in_tenant] or
+    /// [`for_session`][Self::for_session] when the provider needs one.
     pub fn for_user_id(
         self: &Arc<Self>,
         user_id: &str,
@@ -156,10 +169,46 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         Ok(AuthzSession {
             store: Arc::clone(self),
             principal,
+            tenant: None,
             context: Context::empty(),
             cache: Mutex::new(HashMap::new()),
             _ctx: std::marker::PhantomData,
         })
+    }
+
+    /// Begin a per-request authz session for a user acting in `tenant`.
+    ///
+    /// The tenant reaches the provider through
+    /// [`AuthzEntityProvider::entities_for_tenant`]. As with
+    /// [`for_user_id`][Self::for_user_id] the Cedar `Context` is empty.
+    pub fn for_user_in_tenant(
+        self: &Arc<Self>,
+        user_id: &str,
+        tenant: &str,
+    ) -> Result<AuthzSession<P, NoContext>, AuthzError> {
+        let mut session = self.for_user_id(user_id)?;
+        session.tenant = Some(tenant.to_string());
+        Ok(session)
+    }
+
+    /// Begin a per-request authz session for the authenticated user and
+    /// tenant of `session`, with an ABAC context.
+    ///
+    /// Reads the user and tenant from one snapshot of the session, so they
+    /// cannot come from different states. Returns
+    /// [`AuthzError::InvalidEntityUid`] when the session is not
+    /// authenticated.
+    pub async fn for_session<Ctx: BuildRequestContext>(
+        self: &Arc<Self>,
+        session: &crate::session::AuthSession,
+        ctx: Ctx,
+    ) -> Result<AuthzSession<P, Ctx>, AuthzError> {
+        let snapshot = session.snapshot().await.ok_or_else(|| {
+            AuthzError::InvalidEntityUid("the session is not authenticated".to_string())
+        })?;
+        let mut authz = self.for_user_id_with_context(&snapshot.user_id.to_string(), ctx)?;
+        authz.tenant = Some(snapshot.tenant_id.to_string());
+        Ok(authz)
     }
 
     /// Begin a per-request authz session with an ABAC context.
@@ -176,6 +225,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         Ok(AuthzSession {
             store: Arc::clone(self),
             principal,
+            tenant: None,
             context,
             cache: Mutex::new(HashMap::new()),
             _ctx: std::marker::PhantomData,
@@ -192,6 +242,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
 pub struct AuthzSession<P: AuthzEntityProvider, Ctx = NoContext> {
     store: Arc<AuthzStore<P>>,
     principal: EntityUid,
+    tenant: Option<String>,
     context: Context,
     // Per-request entity cache: (action_uid_str, resource_uid_str) → entities.
     // Deduplicates repeated identical checks within one request.
@@ -262,6 +313,12 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
             Ok(uid) => uid,
             Err(e) => {
                 warn!("authz: invalid action UID '{}': {e}", action);
+                super::audit::emit_early_deny(
+                    &self.principal.to_string(),
+                    action,
+                    "",
+                    "invalid_action",
+                );
                 return AuthzDecision::Deny;
             }
         };
@@ -271,6 +328,12 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
             Ok(uid) => uid,
             Err(e) => {
                 warn!("authz: invalid resource UID: {e}");
+                super::audit::emit_early_deny(
+                    &self.principal.to_string(),
+                    &action_uid.to_string(),
+                    "",
+                    "invalid_resource",
+                );
                 return AuthzDecision::Deny;
             }
         };
@@ -291,7 +354,12 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                 match self
                     .store
                     .provider
-                    .entities_for(&self.principal, resource, &action_uid)
+                    .entities_for_tenant(
+                        &self.principal,
+                        self.tenant.as_deref(),
+                        resource,
+                        &action_uid,
+                    )
                     .await
                 {
                     Ok(ent) => {
@@ -304,6 +372,12 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
                     }
                     Err(e) => {
                         warn!("authz: entity provider error: {e}");
+                        super::audit::emit_early_deny(
+                            &self.principal.to_string(),
+                            &action_uid.to_string(),
+                            &resource_uid.to_string(),
+                            "entity_provider_error",
+                        );
                         return AuthzDecision::Deny;
                     }
                 }
@@ -402,6 +476,119 @@ mod authz_session_tests {
         assert!(
             matches!(result, Err(AuthzError::SchemaParse(_))),
             "validate() must propagate provider's validate_schema error, got {result:?}"
+        );
+    }
+
+    /// Records the tenant it was asked for; refuses the resource id `bad`.
+    struct TenantRecordingProvider {
+        seen: Mutex<Vec<Option<String>>>,
+    }
+
+    impl AuthzEntityProvider for TenantRecordingProvider {
+        type ResourceId = String;
+        type Error = std::convert::Infallible;
+
+        async fn entities_for(
+            &self,
+            principal: &EntityUid,
+            resource_id: &Self::ResourceId,
+            action: &EntityUid,
+        ) -> Result<Entities, Self::Error> {
+            tracing::trace!(?principal, ?resource_id, ?action, "tenant-less path");
+            self.seen.lock().unwrap().push(None);
+            Ok(Entities::empty())
+        }
+
+        async fn entities_for_tenant(
+            &self,
+            principal: &EntityUid,
+            tenant: Option<&str>,
+            resource_id: &Self::ResourceId,
+            action: &EntityUid,
+        ) -> Result<Entities, Self::Error> {
+            tracing::trace!(?principal, ?resource_id, ?action, "tenant path");
+            self.seen.lock().unwrap().push(tenant.map(str::to_string));
+            Ok(Entities::empty())
+        }
+
+        fn resource_uid(&self, id: &Self::ResourceId) -> Result<EntityUid, AuthzError> {
+            if id == "bad" {
+                return Err(AuthzError::InvalidEntityUid("bad".to_string()));
+            }
+            super::super::store::make_uid("TestApp", "Resource", id)
+        }
+
+        fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
+            tracing::trace!(?schema, "accepted");
+            Ok(())
+        }
+    }
+
+    fn tenant_store() -> Arc<AuthzStore<TenantRecordingProvider>> {
+        let evaluator: Arc<dyn PolicyEvaluator> =
+            Arc::new(PolicyStore::from_text(POLICY_TEXT, SCHEMA_JSON).unwrap());
+        Arc::new(AuthzStore::new(
+            evaluator,
+            Arc::new(TenantRecordingProvider {
+                seen: Mutex::new(Vec::new()),
+            }),
+            "TestApp",
+        ))
+    }
+
+    /// The tenant a session was opened for reaches the provider.
+    #[tokio::test]
+    async fn the_session_tenant_reaches_the_provider() {
+        let store = tenant_store();
+        let authz = store.for_user_in_tenant("alice", "tenant-a").unwrap();
+        assert!(authz.is_permitted("View", &"doc1".to_string()).await);
+        let authz = store.for_user_id("alice").unwrap();
+        assert!(authz.is_permitted("View", &"doc1".to_string()).await);
+        let seen = store.provider.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![Some("tenant-a".to_string()), None]);
+    }
+
+    /// A denial before Cedar is asked still emits the decision event.
+    #[tokio::test]
+    async fn a_denial_before_evaluation_emits_a_decision_event() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().target() == super::super::audit::DECISION_TARGET {
+                    let mut fields = Fields(String::new());
+                    event.record(&mut fields);
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = tenant_store();
+        let authz = store.for_user_id("alice").unwrap();
+        assert!(!authz.is_permitted("View", &"bad".to_string()).await);
+
+        let events = capture.0.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("invalid_resource") && e.contains("deny")),
+            "events: {events:?}"
         );
     }
 }

@@ -1,8 +1,8 @@
 //! Pure decisions behind the Valkey TTL and registry-expiry handling.
 
 use super::internal::{
-    ex_seconds, registry_cutoff_ms, registry_key_ttl_secs, registry_member_live,
-    registry_member_ttl_ms,
+    ex_seconds, expired_cycle_outcome, registry_cutoff_ms, registry_key_ttl_secs,
+    registry_member_live, registry_member_ttl_ms,
 };
 use std::time::Duration;
 
@@ -55,4 +55,12 @@ fn cutoff_agrees_with_liveness() {
     for score in [48_999.0, 49_000.0, 49_001.0, 50_000.0] {
         assert_eq!(score > cutoff, registry_member_live(score, now, ttl_ms));
     }
+}
+
+#[test]
+fn zero_ttl_rotation_reports_a_missing_session_as_gone_for_same_or_different_keys() {
+    use crate::session::store::CycleOutcome;
+    assert_eq!(expired_cycle_outcome(true, 0), CycleOutcome::SessionGone);
+    assert_eq!(expired_cycle_outcome(true, 1), CycleOutcome::Rotated);
+    assert_eq!(expired_cycle_outcome(false, 0), CycleOutcome::Rotated);
 }

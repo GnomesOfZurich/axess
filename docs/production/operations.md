@@ -33,7 +33,20 @@ detection* cover the mechanism.
 
 The session cookie has `Secure=true` set. TLS terminates at the
 edge; your service sees only HTTPS traffic; the cookie is
-only sent on HTTPS.
+only sent on HTTPS. The CSRF cookie is `Secure` too (the default of
+`CsrfConfig`, which only local development turns off).
+
+The CSRF signing key is persistent and stable across restarts and
+instances, and is not the session key used raw. Derive it from the
+session layer with `SessionLayer::derive_subkey`, or load a separate
+key from the secrets manager. `CsrfConfig::require_origin` names the
+deployment's public origins, so a state-changing request from another
+origin is refused even before the token is checked.
+
+A session registry is wired with `AuthnServiceBuilder::with_registry`
+(Valkey for more than one instance), so a password reset or an admin
+action can revoke live sessions. Without one, those calls have nothing
+to revoke and sessions stay valid until they expire.
 
 The trusted-proxy list is configured. The application reads the
 forwarded header (`X-Forwarded-For` or `Forwarded`) only when
@@ -60,8 +73,10 @@ the full pipeline configuration.
 
 The health check is wired. `/healthz` (or whatever the
 deployment chooses) queries the session store, the identity
-store, and the device store; the response is a JSON document
-that aggregates the per-component states. *Operations runbook*
+store, and the device store. The public answer is the aggregate
+(healthy or unhealthy) only; per-component detail and backend error
+text go to the log or to an internal-only listener, because they can
+carry connection strings and host names. *Operations runbook*
 in the canonical SECURITY/OPERATIONS section covers the
 deployment expectations.
 
@@ -86,9 +101,9 @@ sections cover the per-backend cleanup patterns.
 
 ## Key rotation
 
-The deployment has three keys to rotate on a schedule: the
-session signing key, the session envelope key, and the per-tenant
-fingerprint pepper. The mechanism is the same shape for all three:
+The deployment has four secrets to rotate on a schedule: the
+session signing key, the session envelope key, the CSRF key and the
+per-tenant fingerprint pepper. The mechanism is the same shape for all three:
 provide the new key alongside the old one for a transition window,
 let in-flight sessions and devices roll over, then remove the old
 key.
@@ -101,14 +116,15 @@ old key available for verification during the transition.
 
 ```rust,ignore
 let session_layer = SessionLayer::new(store, new_signing_key)
-    .with_previous_key(old_signing_key)
+    .with_previous_signing_key(old_signing_key)
     .with_ttl(session_ttl);
 ```
 
-`with_previous_key` accepts the old key. Cookies signed with the
+`with_previous_signing_key` accepts the old key. Cookies signed with the
 old key continue to validate; new cookies sign with the new key.
 After enough time for all old cookies to expire (one session TTL
-plus a safety margin), the previous key can be removed.
+plus a safety margin), the previous key can be removed: drop the call,
+or call `remove_previous_signing_key` on the freshly built layer.
 
 The rotation sequence:
 
@@ -123,7 +139,7 @@ The rotation sequence:
 4. Wait one session TTL. By the end of this window, every
    existing session has either expired or been refreshed (which
    re-signs the cookie with the fresh key).
-5. Deploy with `previous_key = None` (or absent).
+5. Deploy without `with_previous_signing_key`.
    The old key is now unused.
 6. Remove the old key from the secrets manager.
 
@@ -152,17 +168,77 @@ at least the TTL. Alternative: a background scan that proactively
 rewrites stored sessions with the new key, finishing the
 rotation faster than the TTL would.
 
-### Per-tenant fingerprint pepper
+#### The envelope key has no write budget
 
-The fingerprint pepper rotates per-tenant rather than globally.
-The mechanism is on the tenant record:
+AES-GCM under one key with random 96-bit nonces must stay under about 2^32
+seals (NIST SP 800-38D, section 8.3), which a busy deployment could reach in
+weeks. The stores do not spend that budget: each session, device row and
+device-bindings blob is sealed under a key derived for that one record from
+the envelope key, a fresh 16-byte salt and the record's row identity
+(HMAC-SHA256, see `session::crypto`). Every derived key encrypts one message,
+and a blob costs 16 bytes more than before. Rotate the envelope key on your
+compliance cycle, not to stay inside a count.
+
+A blob written by an earlier release (the key used directly) is still read and
+is re-sealed in the new layout by the read that finds it, as any stale blob
+is: after an upgrade each live row costs one extra write the first time it is
+read. Only a caller that
+seals with `SessionCrypto::encrypt_with_aad` itself draws on the budget;
+`SessionCrypto::seals` counts those calls, per process, so sum it across
+replicas and alert well before 2^32.
+
+#### Device store rows
+
+Device rows outlive sessions: a device lives for its whole retention
+ladder (ninety days trusted, thirty seen, seven revoked by default, and an
+`Unknown` device never expires on its own), and a sighting changes only
+`last_seen_at`, not the encrypted part of the row. One session TTL is
+therefore **not** a safe wait before dropping the previous key from a
+device store.
+
+A row sealed under the previous key is read with it, and the read writes the
+row back under the current key (a conditional write of the exact bytes it
+read, so a save that landed meanwhile is not overwritten). A row that nobody
+reads or writes keeps the old key. The SQL stores (`SqliteDeviceStore`,
+`PostgresDeviceStore`, `MysqlDeviceStore`) take the key in the
+`SessionCrypto` they are built with; `ValkeyDeviceStore` takes it through
+`ValkeyDeviceStore::with_crypto` or `with_previous_key`:
 
 ```rust,ignore
-service.rotate_fingerprint_pepper(
-    &tenant_id,
-    new_pepper,
-).await?;
+let crypto = SessionCrypto::new(new_envelope_key)
+    .with_previous_key(old_envelope_key);
+let devices = ValkeyDeviceStore::with_crypto(client, crypto);
 ```
+
+Drop the previous key only after every row has been read or written since
+the rotation. A tenant sweep (`DeviceStore::sweep`) reads every row of the
+tenant on Valkey, so one full sweep of every tenant after the new key is
+deployed covers the rows still there; the SQL stores re-seal on the reads
+that find them, so run a pass that lists each user's devices, or keep the
+previous key for the longest device retention you configured. Dropping it
+early makes the unread rows fail to decode: lookups return an error for
+them, and (on a SQL store) a save of such a device overwrites its bindings
+blob.
+
+### CSRF key
+
+The CSRF key signs the double-submit token. If it is derived with
+`SessionLayer::derive_subkey`, it follows the current session signing
+key only: after a signing-key rotation the derived key changes at once
+and there is no previous-key fallback, so tokens already rendered into
+open forms fail once and the page must be reloaded. That is a visible
+but harmless cost; schedule the switch outside peak form-filling hours.
+A separately stored CSRF key rotates the same way: deploy the new key
+and accept one round of reloads.
+
+### Per-tenant fingerprint pepper
+
+The fingerprint pepper rotates per-tenant rather than globally. axess
+holds no pepper: the application supplies a `TenantPepperResolver`, a
+function from a tenant id to 32 bytes, when it builds the device
+layer. To rotate one tenant, change what the resolver returns for that
+tenant (new secret in the secrets manager, then redeploy or reload).
+There is no rotation call to make.
 
 The rotation invalidates every device record under the tenant.
 Existing sessions remain valid (they do not depend on the device
@@ -192,12 +268,12 @@ have the cookie validated by a different instance that receives
 the next request. The secrets manager is the source of truth;
 each instance pulls the keys at startup.
 
-Shared rate-limit state. If the rate limiter is keyed by
-`PeerIp` and the buckets live in memory per instance, an
-attacker hitting all instances in parallel evades the limit.
-The fix is `BucketStore::Valkey { client }`, which moves the
-state to a shared Valkey instance; every application instance
-sees the same buckets.
+Rate-limit state is per instance. axess keeps the buckets in process
+memory and provides no distributed limiter, so with N instances an
+attacker who reaches all of them gets up to N times the configured
+limit. Enforce the shared limit at the gateway or load balancer
+(*Rate limiting* covers the layering), or divide the per-instance
+limit by the instance count to keep the total near the target.
 
 Session affinity (sticky sessions). Optional, not required. The
 session is stored server-side; any instance can serve any
@@ -264,6 +340,9 @@ let health = Arc::new(
         .add("identity_store", identity_store.clone())
         .add("device_store", device_store.clone())
 );
+// `identity_store` here must implement `HealthCheck`. axess does not
+// implement it for your identity backend; the sqlite example shows a
+// bounded `SELECT 1`.
 
 async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     let status = state.health.check_all().await;
@@ -272,13 +351,19 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    if !status.is_healthy() {
+        // Detail goes to the log, never to an unauthenticated caller.
+        tracing::warn!(components = ?status.components, "health check failed");
+    }
     let body = serde_json::json!({
         "status": if status.is_healthy() { "healthy" } else { "unhealthy" },
-        "components": status.components,
     });
     (code, axum::Json(body))
 }
 ```
+
+Serve a detailed probe, if operators need one, on an internal-only
+listener. The public route returns the aggregate and nothing else.
 
 Each backend that implements `HealthCheck` provides its own probe
 (typically a bounded `SELECT 1` for SQL backends or a `PING` for

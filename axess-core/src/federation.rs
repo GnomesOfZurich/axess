@@ -24,6 +24,8 @@ pub mod frontchannel_logout;
 #[cfg(feature = "ldap")]
 pub mod ldap;
 #[cfg(feature = "oauth")]
+mod log_field;
+#[cfg(feature = "oauth")]
 pub mod oauth;
 #[cfg(feature = "oauth")]
 pub mod sid_map;

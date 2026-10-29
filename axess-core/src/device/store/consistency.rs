@@ -350,3 +350,144 @@ where
     let counts = store.sweep(&t, base + Duration::seconds(11)).await.unwrap();
     assert_eq!(counts.trusted_to_seen, 1);
 }
+
+/// The fingerprint lookup returns the newest-sighted device among those that
+/// share the fingerprint, on every backend: saving an older sighting later
+/// does not take the lookup over, and a later sighting of that older device
+/// does.
+pub(crate) async fn the_fingerprint_lookup_follows_the_newest_sighting<S>(store: S)
+where
+    S: DeviceStore,
+    S::Error: Debug,
+{
+    let t = tenant();
+    let fp = FingerprintHash::from_bytes([0x81; 32]);
+    let mut newer = device("seen-new", 0x81, DeviceTrustLevel::Seen, at(50_030));
+    let mut older = device("seen-old", 0x81, DeviceTrustLevel::Seen, at(50_010));
+    newer.user_id = None;
+    older.user_id = None;
+    store.save(&newer, at(50_030)).await.unwrap();
+    store.save(&older, at(50_030)).await.unwrap();
+
+    let found = store.find_by_fingerprint(&t, &fp).await.unwrap();
+    assert_eq!(
+        found.map(|d| d.id),
+        Some(newer.id),
+        "the device written last is not the one returned"
+    );
+
+    store
+        .record_sighting(&t, &older.id, at(50_050))
+        .await
+        .unwrap();
+    let found = store.find_by_fingerprint(&t, &fp).await.unwrap();
+    assert_eq!(
+        found.map(|d| d.id),
+        Some(older.id),
+        "a later sighting takes the lookup over"
+    );
+}
+
+/// Revoking a revoked device again keeps the first revocation time, and a
+/// save of a revoked copy rewrites nothing, so neither restarts the purge
+/// grace clock or brings back older bindings.
+pub(crate) async fn a_revoked_row_keeps_its_revocation_time<S>(store: S)
+where
+    S: DeviceStore,
+    S::Error: Debug,
+{
+    use crate::device::store::TrustTransition;
+
+    let (t, id) = (tenant(), dev_id("revoked-twice"));
+    let base = at(60_000);
+    let mut d = device("revoked-twice", 0x91, DeviceTrustLevel::Seen, base);
+    d.bindings = vec![refresh("keep-family", base)];
+    store.save(&d, base).await.unwrap();
+    let first = base + Duration::minutes(5);
+    store
+        .set_trust_level(&t, &id, DeviceTrustLevel::Revoked, first)
+        .await
+        .unwrap();
+
+    let again = base + Duration::minutes(50);
+    store
+        .set_trust_level(&t, &id, DeviceTrustLevel::Revoked, again)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .set_trust_level_if(
+                &t,
+                &id,
+                DeviceTrustLevel::Revoked,
+                DeviceTrustLevel::Revoked,
+                again + Duration::minutes(1)
+            )
+            .await
+            .unwrap(),
+        TrustTransition::Applied
+    );
+    let row = store.load(&t, &id).await.unwrap().unwrap();
+    assert_eq!(
+        row.revoked_at.map(|r| r.timestamp()),
+        Some(first.timestamp()),
+        "repeating a revocation keeps the first revocation time"
+    );
+
+    // A stale revoked copy, with its own time and no bindings.
+    let mut copy = d.clone();
+    copy.trust_level = DeviceTrustLevel::Revoked;
+    copy.revoked_at = Some(base + Duration::hours(3));
+    copy.bindings = Vec::new();
+    store.save(&copy, base + Duration::hours(3)).await.unwrap();
+    let row = store.load(&t, &id).await.unwrap().unwrap();
+    assert_eq!(
+        row.revoked_at.map(|r| r.timestamp()),
+        Some(first.timestamp()),
+        "a save of a revoked copy does not restart the grace clock"
+    );
+    assert_eq!(row.bindings, d.bindings, "nor replace the bindings");
+}
+
+/// A sighting reports the trust level the row has: the level of a live
+/// row, `Revoked` for a revoked one (whose `last_seen_at` it leaves alone).
+pub(crate) async fn a_sighting_reports_the_level_it_found<S>(store: S)
+where
+    S: DeviceStore,
+    S::Error: Debug,
+{
+    let (t, id) = (tenant(), dev_id("reports"));
+    let base = at(70_000);
+    store
+        .save(
+            &device("reports", 0xa1, DeviceTrustLevel::Trusted, base),
+            base,
+        )
+        .await
+        .unwrap();
+    let level = store
+        .record_sighting(&t, &id, base + Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(level, DeviceTrustLevel::Trusted);
+
+    store
+        .set_trust_level(
+            &t,
+            &id,
+            DeviceTrustLevel::Revoked,
+            base + Duration::hours(2),
+        )
+        .await
+        .unwrap();
+    let level = store
+        .record_sighting(&t, &id, base + Duration::hours(3))
+        .await
+        .unwrap();
+    assert_eq!(level, DeviceTrustLevel::Revoked);
+    assert_eq!(
+        last_seen(&store, "reports").await,
+        base + Duration::hours(1),
+        "the revoked row's last_seen_at is unchanged"
+    );
+}

@@ -17,7 +17,6 @@ use axess_core::authn::store::IdentityPasswordHistory;
 use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::{
     authn::{
-        error::AuthnError,
         service::AuthnService,
         types::{EntityState, StatusDetail, User},
     },
@@ -162,7 +161,9 @@ async fn begin_password_reset_expires_at_is_in_the_future() {
 
 // ── complete_password_reset_in_tenant ──────────────────────────────────
 
-/// Cross-tenant attempt returns `Err(CrossTenant)`. Kills line-152
+/// Cross-tenant attempt answers `Ok(false)`, exactly as an unknown user
+/// does (a distinct error told a link holder which ids exist in other
+/// tenants). Kills line-152
 /// `!=` to `==` mutation (which would invert the rail and refuse only
 /// when tenants MATCH) and the line-146 body replacements
 /// (Ok(true)/Ok(false); both would make the cross-tenant attempt
@@ -176,8 +177,8 @@ async fn complete_password_reset_in_tenant_refuses_cross_tenant() {
         .complete_password_reset_in_tenant(&user.id, &unrelated_tenant, "any-token", "any-hash")
         .await;
     assert!(
-        matches!(result, Err(AuthnError::CrossTenant)),
-        "cross-tenant must return Err(CrossTenant), got {result:?}"
+        matches!(result, Ok(false)),
+        "cross-tenant must answer Ok(false) like an unknown user, got {result:?}"
     );
 }
 

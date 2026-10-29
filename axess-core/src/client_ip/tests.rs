@@ -623,3 +623,25 @@ mod provenance {
         assert_eq!(ClientIp::resolved(Some(ip)).source(), Source::Supplied);
     }
 }
+
+/// A dual-stack listener reports an IPv4 peer as an IPv4-mapped IPv6
+/// address. It must match the IPv4 proxy entry, as a peer and as a hop in the
+/// chain, and the client it yields is the IPv4 form.
+#[test]
+fn ipv4_mapped_addresses_match_ipv4_entries_everywhere() {
+    let trusted = TrustedProxies::from_cidrs(["10.0.0.0/8"]).unwrap();
+    let mapped_peer: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
+    assert!(trusted.trusts_peer(mapped_peer));
+    assert!(trusted.trusts_hop(mapped_peer));
+
+    let exact = TrustedProxies::new(["192.0.2.7".parse::<IpAddr>().unwrap()]);
+    assert!(exact.trusts_hop("::ffff:192.0.2.7".parse().unwrap()));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Forwarded-For",
+        "::ffff:203.0.113.9, ::ffff:10.0.0.2".parse().unwrap(),
+    );
+    let client = ip_from_headers_trusted(&headers, mapped_peer, &trusted);
+    assert_eq!(client, "203.0.113.9".parse::<IpAddr>().unwrap());
+}

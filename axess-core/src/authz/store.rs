@@ -7,9 +7,10 @@
 //! in tests to evaluate authz flows without any Cedar policy files.
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, EntityUid, PolicySet, Request, Schema, ValidationMode,
-    Validator,
+    Authorizer, Context, Decision, Entities, Entity, EntityUid, PolicySet, Request, Schema,
+    ValidationMode, Validator,
 };
+use std::borrow::Cow;
 use std::str::FromStr;
 
 use super::error::AuthzError;
@@ -102,10 +103,16 @@ pub trait PolicyEvaluator: Send + Sync {
 /// The namespace is intentionally NOT stored here; it lives on
 /// [`AuthzStore`][super::session::AuthzStore] so that entity UID construction
 /// and policy evaluation use the same configured namespace.
+///
+/// The store owns the schema's action entities (the actions and the action
+/// groups they belong to) and adds them to every evaluation, so a policy
+/// such as `action in Action::"Mutating"` holds whether or not the entity
+/// provider built its entities with the schema.
 pub struct PolicyStore {
     policy_set: PolicySet,
     schema: Schema,
     authorizer: Authorizer,
+    action_entities: Vec<Entity>,
 }
 
 impl PolicyStore {
@@ -122,11 +129,47 @@ impl PolicyStore {
 
         validate_policies(&policy_set, &schema)?;
 
+        let action_entities = schema
+            .action_entities()
+            .map_err(|e| AuthzError::SchemaParse(format!("{e:?}")))?
+            .iter()
+            .cloned()
+            .collect();
+
         Ok(Self {
             policy_set,
             schema,
             authorizer: Authorizer::new(),
+            action_entities,
         })
+    }
+
+    /// The provider's entities plus the schema's action entities.
+    ///
+    /// Cedar adds the action entities (with their `memberOf` groups) only
+    /// when entities are built against the schema; a provider that passes no
+    /// schema leaves them out, and `action in Action::"Group"` is then false
+    /// without any error, which would silently disable a `forbid` written
+    /// over an action group. Only the missing actions are added, so entities
+    /// that already carry them are used as they are.
+    fn with_action_entities<'a>(
+        &self,
+        entities: &'a Entities,
+    ) -> Result<Cow<'a, Entities>, Box<cedar_policy::entities_errors::EntitiesError>> {
+        let missing: Vec<Entity> = self
+            .action_entities
+            .iter()
+            .filter(|action| entities.get(&action.uid()).is_none())
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Ok(Cow::Borrowed(entities));
+        }
+        entities
+            .clone()
+            .add_entities(missing, None)
+            .map(Cow::Owned)
+            .map_err(Box::new)
     }
 
     /// Access the Cedar schema (e.g. for entity provider validation).
@@ -190,9 +233,28 @@ impl PolicyEvaluator for PolicyStore {
             }
         };
 
+        let entities = match self.with_action_entities(entities) {
+            Ok(entities) => entities,
+            Err(e) => {
+                tracing::error!("Cedar action entities could not be merged: denied: {e:?}");
+                if let Some(subject) = &subject {
+                    tracing::info!(
+                        target: "axess::authz::decision",
+                        principal = %subject.principal,
+                        action = %subject.action,
+                        resource = %subject.resource,
+                        decision = "deny",
+                        reason = "action_entities_merge_failed",
+                        latency_us = started.elapsed().as_micros() as u64,
+                    );
+                }
+                return AuthzDecision::Deny;
+            }
+        };
+
         let response = self
             .authorizer
-            .is_authorized(&cedar_req, &self.policy_set, entities);
+            .is_authorized(&cedar_req, &self.policy_set, &entities);
 
         // Log diagnostics server-side for debugging (never in API response)
         let diagnostics = response.diagnostics();
@@ -286,184 +348,4 @@ pub(super) fn make_uid(
 mod decision_log;
 
 #[cfg(test)]
-mod authz_store_tests {
-    use super::*;
-
-    /// An id is data: an escape sequence in it names a different entity from
-    /// the decoded spelling, and a quote or backslash is not an error.
-    #[test]
-    fn make_uid_keeps_the_id_as_data() {
-        let escaped = make_uid("TestApp", "User", r"\u{61}lice").expect("escaped id is an id");
-        let plain = make_uid("TestApp", "User", "alice").expect("plain id");
-        assert_ne!(
-            escaped, plain,
-            "an escape sequence must not decode into another principal"
-        );
-        assert_eq!(escaped.id().unescaped(), r"\u{61}lice");
-        assert!(
-            make_uid("TestApp", "User", "a\"b\\c").is_ok(),
-            "a quote or backslash in an id is data"
-        );
-    }
-
-    const SCHEMA_JSON: &str = r#"{
-        "TestApp": {
-            "entityTypes": {
-                "User": { "memberOfTypes": [] },
-                "Resource": { "memberOfTypes": [] }
-            },
-            "actions": {
-                "View": {
-                    "appliesTo": {
-                        "principalTypes": ["User"],
-                        "resourceTypes": ["Resource"]
-                    }
-                }
-            }
-        }
-    }"#;
-
-    const POLICY_TEXT: &str = r#"permit(
-        principal == TestApp::User::"alice",
-        action == TestApp::Action::"View",
-        resource == TestApp::Resource::"doc1"
-    );"#;
-
-    fn build_store() -> PolicyStore {
-        PolicyStore::from_text(POLICY_TEXT, SCHEMA_JSON).unwrap()
-    }
-
-    /// A schema whose `User` carries a number, so a policy can do arithmetic
-    /// on it that passes strict validation and fails at evaluation.
-    const COUNTING_SCHEMA_JSON: &str = r#"{
-        "TestApp": {
-            "entityTypes": {
-                "User": {
-                    "memberOfTypes": [],
-                    "shape": {
-                        "type": "Record",
-                        "attributes": { "n": { "type": "Long" } }
-                    }
-                },
-                "Resource": { "memberOfTypes": [] }
-            },
-            "actions": {
-                "View": {
-                    "appliesTo": {
-                        "principalTypes": ["User"],
-                        "resourceTypes": ["Resource"]
-                    }
-                }
-            }
-        }
-    }"#;
-
-    fn alice_with(n: i64, store: &PolicyStore) -> Entities {
-        let json = format!(
-            r#"[{{"uid": {{"type": "TestApp::User", "id": "alice"}}, "attrs": {{"n": {n}}}, "parents": []}}]"#
-        );
-        Entities::from_json_str(&json, Some(store.schema())).unwrap()
-    }
-
-    fn view_doc1(store: &PolicyStore, entities: &Entities) -> AuthzDecision {
-        store.is_authorized(
-            entities,
-            r#"TestApp::User::"alice""#.parse().unwrap(),
-            r#"TestApp::Action::"View""#.parse().unwrap(),
-            r#"TestApp::Resource::"doc1""#.parse().unwrap(),
-            Context::empty(),
-        )
-    }
-
-    /// A `forbid` that errors does not stop forbidding.
-    ///
-    /// Cedar skips a policy whose evaluation errors, so a `forbid` that fails
-    /// (here on an overflow; in practice on an attribute an entity lacks)
-    /// would stop applying and let the `permit` beside it allow. The decision
-    /// must fail closed: any evaluation error is a deny.
-    #[test]
-    fn an_erroring_forbid_fails_closed() {
-        let policies = r#"
-            permit(principal, action == TestApp::Action::"View", resource);
-            forbid(principal, action, resource)
-                when { principal.n + 9223372036854775807 > 0 };
-        "#;
-        let store = PolicyStore::from_text(policies, COUNTING_SCHEMA_JSON).unwrap();
-        // The forbid evaluates without error and applies: denied.
-        assert_eq!(
-            view_doc1(&store, &alice_with(0, &store)),
-            AuthzDecision::Deny
-        );
-        // The forbid overflows: Cedar would skip it and allow.
-        assert_eq!(
-            view_doc1(&store, &alice_with(1, &store)),
-            AuthzDecision::Deny
-        );
-    }
-
-    /// An erroring `permit` was already a deny; it stays one.
-    #[test]
-    fn an_erroring_permit_denies() {
-        let policies = r#"
-            permit(principal, action == TestApp::Action::"View", resource)
-                when { principal.n + 9223372036854775807 > 0 };
-        "#;
-        let store = PolicyStore::from_text(policies, COUNTING_SCHEMA_JSON).unwrap();
-        assert_eq!(
-            view_doc1(&store, &alice_with(1, &store)),
-            AuthzDecision::Deny
-        );
-        assert_eq!(
-            view_doc1(&store, &alice_with(-1, &store)),
-            AuthzDecision::Allow
-        );
-    }
-
-    /// Cedar would let the working `permit` allow; any evaluation error denies.
-    #[test]
-    fn a_working_permit_beside_an_erroring_one_denies() {
-        let policies = r#"
-            permit(principal, action == TestApp::Action::"View", resource);
-            permit(principal, action == TestApp::Action::"View", resource)
-                when { principal.n + 9223372036854775807 > 0 };
-        "#;
-        let store = PolicyStore::from_text(policies, COUNTING_SCHEMA_JSON).unwrap();
-        assert_eq!(
-            view_doc1(&store, &alice_with(1, &store)),
-            AuthzDecision::Deny
-        );
-        assert_eq!(
-            view_doc1(&store, &alice_with(-1, &store)),
-            AuthzDecision::Allow
-        );
-    }
-
-    #[test]
-    fn policy_evaluator_schema_returns_some_when_loaded() {
-        // pins `<impl PolicyEvaluator for PolicyStore>::schema
-        // -> None` mutation. The trait default body returns `None`,
-        // but `PolicyStore` overrides with `Some(&self.schema)`. The
-        // mutation collapses the override back to the default; this
-        // would silently disable schema-driven `validate_schema`
-        // checks at startup.
-        let store = build_store();
-        assert!(
-            <PolicyStore as PolicyEvaluator>::schema(&store).is_some(),
-            "PolicyStore::schema must return Some, not None"
-        );
-    }
-
-    #[test]
-    fn policy_store_schema_accessor_is_borrow_of_inner() {
-        // defends the inherent `schema()` accessor against
-        // body replacement. Two consecutive calls must return refs
-        // to the same Schema instance (verified via pointer equality).
-        let store = build_store();
-        let s1 = store.schema() as *const _;
-        let s2 = store.schema() as *const _;
-        assert_eq!(
-            s1, s2,
-            "schema() must borrow the stored Schema, not produce a new one"
-        );
-    }
-}
+mod authz_store_tests;

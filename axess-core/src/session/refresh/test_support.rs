@@ -13,6 +13,7 @@ pub(super) fn test_config() -> RefreshTokenConfig {
         max_per_user: 3,
         rotation: true,
         hash_pepper: None,
+        ..Default::default()
     }
 }
 

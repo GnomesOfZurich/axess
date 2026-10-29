@@ -222,9 +222,10 @@ impl AuthEventBuilder {
         self
     }
 
-    /// Attach the user agent string.
+    /// Attach the user agent string, capped at
+    /// [`MAX_USER_AGENT_BYTES`](super::MAX_USER_AGENT_BYTES) bytes.
     pub fn with_user_agent(mut self, ua: impl Into<String>) -> Self {
-        self.user_agent = Some(ua.into());
+        self.user_agent = Some(super::cap_user_agent(ua.into()));
         self
     }
 
@@ -295,7 +296,7 @@ impl AuthEventBuilder {
             self.ip_source = ctx.ip_source;
         }
         if let Some(ua) = &ctx.user_agent {
-            self.user_agent = Some(ua.clone());
+            self.user_agent = Some(super::cap_user_agent(ua.clone()));
         }
         if let Some(tid) = &ctx.trace_id {
             self.trace_id = Some(tid.clone());

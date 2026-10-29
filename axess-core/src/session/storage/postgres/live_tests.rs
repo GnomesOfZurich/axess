@@ -13,8 +13,10 @@ const KEY: [u8; 32] = [3u8; 32];
 const TTL: Duration = Duration::from_secs(60);
 
 async fn store() -> PostgresSessionStore {
-    let store =
-        PostgresSessionStore::new(sql_live::postgres_pool(4).await, SessionCrypto::new(KEY));
+    let store = PostgresSessionStore::new(
+        sql_live::postgres_pool(4).await,
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     store.init_schema().await.expect("init_schema");
     store
 }
@@ -360,7 +362,10 @@ async fn racing_rotations_leave_the_data_under_one_id() {
 async fn the_documented_upgrade_step_makes_an_old_table_work() {
     let pool = sql_live::postgres_pool(2).await;
     sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, expires_at BIGINT NOT NULL)").execute(&pool).await.unwrap();
-    let store = PostgresSessionStore::new(pool.clone(), SessionCrypto::new(KEY));
+    let store = PostgresSessionStore::new(
+        pool.clone(),
+        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+    );
     let id = new_id();
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES ($1, $2, $3)")
         .bind(id.to_string())
@@ -392,4 +397,10 @@ async fn the_documented_upgrade_step_makes_an_old_table_work() {
     let fresh = new_id();
     store.save(&fresh, &admin(), TTL).await.unwrap();
     assert!(store.load(&fresh).await.unwrap().is_some());
+}
+
+#[tokio::test]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
+async fn update_if_revision_keeps_the_contract() {
+    crate::testing::store_contract::assert_update_if_revision_contract(&store().await).await;
 }

@@ -14,7 +14,7 @@ use axess_core::{
     },
 };
 use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider, MockFido2Provider};
-use common::{test_tenant, test_user};
+use common::{session_for, test_tenant, test_user};
 use url::Url;
 use webauthn_rs::prelude::*;
 
@@ -50,7 +50,7 @@ async fn service_begin_registration_with_mock_returns_error() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let session = test_session();
+    let session = session_for(&test_user("u1", "alice")).await;
     let result = service
         .begin_fido2_registration(&test_user("u1", "alice"), &session)
         .await;
@@ -68,7 +68,7 @@ async fn service_begin_registration_without_provider_returns_no_flow() {
     let factors = MockFactorStore::new();
     let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
 
-    let session = test_session();
+    let session = session_for(&test_user("u1", "alice")).await;
     let result = service
         .begin_fido2_registration(&test_user("u1", "alice"), &session)
         .await;
@@ -111,7 +111,7 @@ async fn real_provider_begin_registration_stores_ceremony_state() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let session = test_session();
+    let session = session_for(&test_user("u1", "alice")).await;
     let result = service
         .begin_fido2_registration(&test_user("u1", "alice"), &session)
         .await;
@@ -207,7 +207,7 @@ async fn finish_registration_without_begin_returns_error() {
         .build()
         .with_audit_context(AuditContext::default());
 
-    let session = test_session();
+    let session = session_for(&test_user("u1", "alice")).await;
 
     // Construct a dummy RegisterPublicKeyCredential: it won't validate,
     // but the service should reject it before crypto validation because

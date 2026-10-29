@@ -87,7 +87,12 @@ pub struct BearerIssuerConfig {
     /// are skipped (tried against the next issuer).
     pub issuer: String,
     /// Expected `aud` value. When `Some`, the token's `aud` must contain
-    /// this value. When `None`, audience validation is skipped.
+    /// this value. When `None`, audience validation is skipped, and a token
+    /// minted for any service of the same issuer is accepted;
+    /// [`BearerConfig::new`](crate::bearer::BearerConfig::new) logs a
+    /// warning for such an issuer. Prefer
+    /// [`BearerIssuerConfig::new`](crate::bearer::BearerIssuerConfig::new),
+    /// which requires one.
     pub audience: Option<String>,
     /// JWKS key set for this issuer. Typically fetched at startup and
     /// refreshed periodically via a background task.
@@ -95,6 +100,30 @@ pub struct BearerIssuerConfig {
     /// Additional claim names to extract into `WorkloadIdentity.claims`.
     /// Only top-level string-valued claims are captured.
     pub extra_claims: Vec<String>,
+}
+
+impl BearerIssuerConfig {
+    /// A trusted issuer whose tokens must name `audience`, verified against
+    /// `jwks`, with no extra claims captured.
+    pub fn new(issuer: impl Into<String>, audience: impl Into<String>, jwks: Arc<JwkSet>) -> Self {
+        Self {
+            issuer: issuer.into(),
+            audience: Some(audience.into()),
+            jwks,
+            extra_claims: Vec::new(),
+        }
+    }
+
+    /// Capture these top-level string claims into
+    /// [`WorkloadIdentity::claims`].
+    #[must_use]
+    pub fn with_extra_claims(
+        mut self,
+        claims: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.extra_claims = claims.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 // ── BearerConfig ─────────────────────────────────────────────────────────────
@@ -115,6 +144,14 @@ impl BearerConfig {
     /// Configuration trusting `issuers`, judging token lifetimes on the
     /// system clock.
     pub fn new(issuers: Vec<BearerIssuerConfig>) -> Self {
+        for issuer in issuers.iter().filter(|i| i.audience.is_none()) {
+            tracing::warn!(
+                target: "axess::factors::bearer",
+                issuer = %issuer.issuer,
+                "bearer issuer has no audience pin: a token minted for any other service \
+                 of this issuer is accepted"
+            );
+        }
         Self {
             issuers,
             clock: Arc::new(SystemClock),
@@ -172,6 +209,11 @@ pub fn validate_bearer_token(
     // Verify signature against the issuer's JWKS.
     let mut validation_config = ValidationConfig::new();
     validation_config.audience = issuer_cfg.audience.clone();
+    // The issuer was chosen by the token's own `iss`, so pinning it adds
+    // nothing against a forged claim, but it makes `iss` a required claim
+    // checked by the same code path as every other verifier, rather than a
+    // string compared once above.
+    validation_config.issuer = Some(issuer_cfg.issuer.clone());
     let claims = validation::verify_jwt(
         token,
         &issuer_cfg.jwks,
@@ -305,6 +347,24 @@ impl<S> tower::Layer<S> for BearerTokenLayer {
     }
 }
 
+/// The `401` for a bearer token that did not validate: a fixed body and the
+/// RFC 6750 challenge, the same whatever the reason.
+fn invalid_token_response() -> axum::response::Response {
+    let mut response =
+        axum::response::Response::new(axum::body::Body::from(r#"{"error":"invalid_token"}"#));
+    *response.status_mut() = axum::http::StatusCode::UNAUTHORIZED;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        axum::http::HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+    );
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
 /// The service produced by [`BearerTokenLayer`].
 #[derive(Clone)]
 pub struct BearerTokenService<S> {
@@ -356,18 +416,11 @@ where
                     inner.call(req).await
                 }
                 Err(e) => {
+                    // The reason stays in the log: a body that says which
+                    // check failed (unknown `kid`, wrong audience, expired)
+                    // is a probe for an attacker.
                     tracing::debug!("Bearer token rejected: {e}");
-                    let response = axum::response::Response::builder()
-                        .status(axum::http::StatusCode::UNAUTHORIZED)
-                        .header("WWW-Authenticate", "Bearer")
-                        // Serialised, not formatted: the error text carries the
-                        // token's unverified `iss`, which could otherwise inject
-                        // keys into the JSON body.
-                        .body(axum::body::Body::from(
-                            serde_json::json!({ "error": e.to_string() }).to_string(),
-                        ))
-                        .unwrap();
-                    Ok(response)
+                    Ok(invalid_token_response())
                 }
             }
         })

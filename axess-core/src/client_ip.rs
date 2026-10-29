@@ -333,8 +333,11 @@ impl TrustedProxies {
     /// Whether `addr` is a proxy of yours appearing in the forwarded
     /// chain, so the walk should step past it and keep going left.
     pub fn trusts_hop(&self, addr: std::net::IpAddr) -> bool {
+        // A dual-stack listener reports an IPv4 peer as `::ffff:a.b.c.d`,
+        // which matches no IPv4 entry; compare the IPv4 form.
+        let addr = addr.to_canonical();
         self.entries.iter().any(|entry| match *entry {
-            TrustedEntry::Exact(address) => address == addr,
+            TrustedEntry::Exact(address) => address.to_canonical() == addr,
             TrustedEntry::Net(net, prefix) => in_network(addr, net, prefix),
         })
     }
@@ -392,6 +395,7 @@ impl TrustedProxies {
         headers: &axum::http::HeaderMap,
         peer: Option<std::net::IpAddr>,
     ) -> ClientIp {
+        let peer = peer.map(|peer| peer.to_canonical());
         let found = |addr, source| ClientIp {
             addr: Some(addr),
             source,
@@ -447,7 +451,11 @@ fn client_from_chain(headers: &axum::http::HeaderMap, trusted: &TrustedProxies) 
             entries.extend(text.split(','));
         }
         for entry in entries.iter().rev() {
-            match entry.trim().parse::<std::net::IpAddr>() {
+            match entry
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .map(|addr| addr.to_canonical())
+            {
                 Ok(addr) if trusted.trusts_hop(addr) => continue,
                 Ok(addr) => return ChainOutcome::Client(addr),
                 Err(_) => return ChainOutcome::NoAnswer,

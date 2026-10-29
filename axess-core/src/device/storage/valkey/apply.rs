@@ -4,6 +4,7 @@
 use chrono::{DateTime, Utc};
 
 use super::index::plan_indexes;
+use super::read::StoredRowState;
 use super::row::{device_key, fingerprint_hex, fingerprint_key, fingerprint_set_key};
 use super::scripts::{
     REMOVE_DEVICE, ScriptStatus, WRITE_ROW, parse_status, remove_args, write_row_args,
@@ -165,9 +166,33 @@ impl ValkeyDeviceStore {
         let payload = self.encode_row(&device)?;
         let ttl = self.ttl_seconds_for(&device, now);
         for _ in 0..MAX_ATTEMPTS {
-            let previous = self.get_row(&tenant, &id).await?;
+            let previous = match self.get_row_for_write(&tenant, &id).await? {
+                StoredRowState::Absent => None,
+                StoredRowState::Decoded(prev, raw) => Some((prev, raw)),
+                StoredRowState::Undecodable(raw, error) => {
+                    // A save replaces the row, so a stored row nobody can
+                    // read is overwritten (against the exact bytes found)
+                    // rather than failing every later save of the device.
+                    // Its old index entries are not known; the readers prune
+                    // them when they find the members stale.
+                    tracing::warn!(
+                        %tenant, device = %id, %error,
+                        "replacing a device row that cannot be decoded"
+                    );
+                    let plan = plan_indexes(&self.prefix, None, Some(&device));
+                    let args = write_row_args(Some(&raw), &payload, ttl, &id, &plan.ops());
+                    let keys = [row_key.clone()]
+                        .into_iter()
+                        .chain(self.fingerprint_keys(&tenant, &device))
+                        .chain(plan.keys());
+                    match self.run_script(WRITE_ROW, keys.collect(), args).await? {
+                        ScriptStatus::Ok => return Ok(()),
+                        ScriptStatus::Missing | ScriptStatus::Conflict => continue,
+                    }
+                }
+            };
             if let Some((prev, _)) = &previous
-                && blocks_save(prev.trust_level, device.trust_level)
+                && blocks_save(prev.trust_level)
             {
                 return Ok(());
             }

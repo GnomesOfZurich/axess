@@ -14,9 +14,45 @@ pub enum RotationOutcome {
     ParentAlreadyRevoked,
 }
 
+/// What [`RefreshTokenStore::revoke_device_tokens`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "an unsupported revocation left every token of the device usable"]
+pub enum DeviceTokenRevocation {
+    /// The store has no revoke-by-device operation: nothing was revoked.
+    Unsupported,
+    /// Every live token issued to the device is now revoked; `tokens` is
+    /// how many this call revoked (tokens already revoked are not counted).
+    Revoked {
+        /// Number of tokens this call revoked.
+        tokens: u64,
+    },
+}
+
 /// Async storage backend for refresh tokens.
 ///
 /// All methods accept `&self`; implementations use interior mutability.
+///
+/// # Revocation reasons
+///
+/// Every revocation records why, in [`RefreshToken::revoked_reason`] and
+/// [`RefreshToken::revoked_at`], because only the reuse of a rotated-out
+/// token is a theft signal:
+///
+/// | Method | Reason | `revoked_at` |
+/// |---|---|---|
+/// | [`rotate_token`](Self::rotate_token) (the parent) | `Rotated` | the new token's `issued_at` |
+/// | [`revoke_token`](Self::revoke_token), [`revoke_user_tokens`](Self::revoke_user_tokens) | `Explicit` | the store's now |
+/// | [`issue_capped`](Self::issue_capped) (the evicted) | `Evicted` | the store's now |
+/// | [`revoke_family`](Self::revoke_family) | `Compromise` | the store's now |
+///
+/// A revocation never overwrites the reason of a token that is already
+/// revoked (a rotated token later swept by a family revocation stays
+/// `Rotated`). A store that cannot persist the fields reads every revoked
+/// token as rotated, which is the strictest behaviour (any reuse revokes the
+/// family).
+///
+/// [`RefreshToken::revoked_reason`]: super::RefreshToken::revoked_reason
+/// [`RefreshToken::revoked_at`]: super::RefreshToken::revoked_at
 pub trait RefreshTokenStore: Send + Sync {
     /// The error type returned by storage operations.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -44,6 +80,31 @@ pub trait RefreshTokenStore: Send + Sync {
         &self,
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Revoke every token issued to `device_id` in `tenant_id`, whatever
+    /// user or family it belongs to. The revoke-by-device counterpart of
+    /// [`revoke_user_tokens`](Self::revoke_user_tokens): what "this device was
+    /// lost" needs, and what
+    /// [`revoke_device`](crate::device::revoke_device) calls after it marks
+    /// the device revoked.
+    ///
+    /// Implementations MUST scope by tenant and perform it as one statement
+    /// (or script), like [`revoke_family`](Self::revoke_family), so a
+    /// rotation racing with it cannot escape: `UPDATE ... SET revoked = 1
+    /// WHERE tenant_id = ? AND device_id = ? AND revoked = 0`.
+    ///
+    /// The provided body returns [`DeviceTokenRevocation::Unsupported`] and
+    /// revokes nothing, so a store written before this method existed
+    /// compiles and says plainly that it cannot do it; the caller must not
+    /// treat that as a revocation.
+    fn revoke_device_tokens(
+        &self,
+        tenant_id: &TenantId,
+        device_id: &DeviceId,
+    ) -> impl std::future::Future<Output = Result<DeviceTokenRevocation, Self::Error>> + Send {
+        let _ = (tenant_id, device_id);
+        async { Ok(DeviceTokenRevocation::Unsupported) }
+    }
 
     /// Return all non-revoked tokens for a user, ordered by `issued_at` ascending.
     fn active_tokens(
@@ -165,8 +226,10 @@ pub trait RefreshTokenStore: Send + Sync {
     /// Override this to alert operators (e.g. send to a SIEM, page on-call,
     /// or log at a higher severity). The default implementation logs a warning.
     ///
-    /// This is called *after* `revoke_family` has already revoked the
-    /// compromised token family.
+    /// This is called after `revoke_family` ran. If that call failed, the
+    /// failure is logged and the hook runs anyway, so a store fault cannot
+    /// skip the device cascade; the family may then still be live, and the
+    /// hook is the place to react to that.
     ///
     /// # Device cascade
     ///

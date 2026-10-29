@@ -206,3 +206,25 @@ fn extract_from_request_matches_extract_on_equivalent_inputs() {
         "extract_from_request must agree with extract on equivalent headers"
     );
 }
+
+/// An IPv4-mapped IPv6 address fingerprints like the IPv4 address it
+/// carries: a dual-stack listener reports IPv4 clients this way, and
+/// truncating the mapped form as IPv6 kept only zero bytes, so every IPv4
+/// client shared one fingerprint input.
+#[test]
+fn ipv4_mapped_addresses_are_told_apart_and_match_plain_ipv4() {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mapped =
+        |a: u8, b: u8, c: u8, d: u8| IpAddr::V6(Ipv4Addr::new(a, b, c, d).to_ipv6_mapped());
+    assert_eq!(
+        truncate_ip(mapped(203, 0, 113, 7)),
+        truncate_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99))),
+        "the same /24 as plain IPv4"
+    );
+    assert_ne!(
+        truncate_ip(mapped(203, 0, 113, 7)),
+        truncate_ip(mapped(198, 51, 100, 7)),
+        "different /24 ranges differ"
+    );
+}

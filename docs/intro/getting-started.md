@@ -28,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.12"             # facade -- depend on this, never on the internal crates
+axess = "0.13"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -41,7 +41,7 @@ turn on `memory` for the in-memory session store and `testing` for
 real database needs neither.
 
 ```toml
-axess = { version = "0.12.0", features = ["memory", "testing"] }
+axess = { version = "0.13.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the

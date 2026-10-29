@@ -46,6 +46,7 @@ pub struct MockOAuthProvider {
     clock: Arc<dyn Clock>,
     /// Logout tokens minted so far; makes each `jti` distinct.
     logout_tokens_minted: AtomicU64,
+    iss_parameter_required: bool,
 }
 
 /// Pre-canned error variants the mock can return on token exchange,
@@ -121,7 +122,17 @@ impl MockOAuthProvider {
             ceremony_timeout: std::time::Duration::from_secs(600),
             clock: Arc::new(SystemClock),
             logout_tokens_minted: AtomicU64::new(0),
+            iss_parameter_required: false,
         }
+    }
+
+    /// Simulate an IdP that advertises
+    /// `authorization_response_iss_parameter_supported` (RFC 9207): a
+    /// callback finished without the `iss` parameter is then refused.
+    #[must_use]
+    pub fn with_iss_parameter_required(mut self) -> Self {
+        self.iss_parameter_required = true;
+        self
     }
 
     /// Stamp logout tokens with `clock` instead of the system clock.
@@ -329,6 +340,7 @@ impl MockOAuthProvider {
             oidc_sid: None,
             id_token_hint: Some(crate::secret::ZeroizedString::new("mock-id-token-jwt")),
             additional_claims: serde_json::Value::Object(additional),
+            dpop_key: None,
         })
     }
 }
@@ -370,6 +382,33 @@ impl OAuthProvider for MockOAuthProvider {
         Some(&self.mock_client_id)
     }
 
+    fn authorization_response_iss_required(&self) -> bool {
+        self.iss_parameter_required
+    }
+
+    /// A synthetic authorization URL whose state, nonce and PKCE verifier come
+    /// from `rng`, so a ceremony can begin and finish against the mock.
+    fn build_auth_url(
+        &self,
+        _options: &OAuthLoginOptions,
+        rng: &dyn axess_rng::SecureRng,
+    ) -> Result<AuthUrlResult, OAuthError> {
+        use base64::Engine as _;
+        let secret = || {
+            let mut raw = [0u8; 32];
+            rng.fill_bytes(&mut raw);
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+        };
+        let (state, nonce, verifier) = (secret(), secret(), secret());
+        let mut url = url::Url::parse(&format!("{}/authorize", self.issuer_url))
+            .map_err(|e| OAuthError::Config(format!("mock issuer is not a URL: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.mock_client_id)
+            .append_pair("state", &state)
+            .append_pair("nonce", &nonce);
+        Ok((url, state, nonce, verifier))
+    }
+
     fn scopes(&self) -> &[String] {
         &self.scopes
     }
@@ -387,9 +426,26 @@ impl OAuthProvider for MockOAuthProvider {
 
     fn refresh_token<'a>(
         &'a self,
-        _refresh_token: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
-        Box::pin(async move { self.build_claims(true) })
+        refresh_token: &'a str,
+        _original_nonce: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
+        Box::pin(async move {
+            let claims = self.build_claims(true)?;
+            let access_token = claims
+                .access_token
+                .clone()
+                .unwrap_or_else(|| crate::secret::ZeroizedString::new(String::new()));
+            let refresh = claims
+                .refresh_token
+                .clone()
+                .unwrap_or_else(|| crate::secret::ZeroizedString::new(refresh_token.to_string()));
+            Ok(RefreshOutcome {
+                access_token,
+                refresh_token: refresh,
+                expires_in: None,
+                id_token_claims: Some(claims),
+            })
+        })
     }
 
     fn exchange_code<'a>(

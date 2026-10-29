@@ -25,7 +25,16 @@ fn csrf_cookie(resp: &Response<Body>) -> String {
 #[tokio::test]
 async fn the_minted_token_is_the_seeded_rngs_nonce_bound_to_the_session() {
     let app = Router::new()
-        .route("/safe", get(|| async { "ok" }))
+        .route(
+            "/safe",
+            get(
+                |axum::Extension(token): axum::Extension<CsrfToken>| async move {
+                    // Using the token is what asks for the session to be stored.
+                    assert!(!token.as_str().is_empty());
+                    "ok"
+                },
+            ),
+        )
         .layer(CsrfLayer::new(
             CsrfConfig::new([7u8; 32])
                 .secure(false)

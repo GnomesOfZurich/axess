@@ -29,6 +29,25 @@ The certificate chain is signed by the trust domain's CA. The
 chain validates the certificate's authenticity; the SAN URI
 identifies the workload within the trust domain.
 
+The resolver reads exactly one SPIFFE URI. A leaf with two `spiffe://` URI
+SANs is refused (taking "the first" would let whoever orders the SAN pick
+the identity), and so is a leaf that may sign certificates: one with
+`basicConstraints` CA set, or with `keyCertSign` or `cRLSign` in its key
+usage. An X.509-SVID is a leaf, not a CA.
+
+#### Root store requirement
+
+The resolver compares the certificate's trust domain with the one you
+pinned; it does not validate the chain. Chain validation is the terminator's,
+and it validates against whatever roots it was given. If the client-certificate
+root store holds the CA bundles of several trust domains, any of those
+authorities can mint a certificate that chains correctly and names a path in
+your trust domain's namespace, and the pinned-domain comparison is then the
+only thing between them and your workloads. Configure the terminator with
+only the bundle of the trust domain the resolver pins, one resolver and one
+root store per trust domain, or verify against a per-domain bundle in the
+terminator.
+
 ### Where the certificate comes from
 
 Axess does not handle the TLS handshake. The handshake happens

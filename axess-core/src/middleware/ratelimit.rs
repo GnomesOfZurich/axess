@@ -48,8 +48,20 @@
 //!     .layer(per_ip);
 //! ```
 //!
-//! The identifier is normalised to lowercase before keying so `Alice`
-//! and `alice` share a bucket.
+//! The identifier is normalised before keying (Unicode NFKC, lowercase,
+//! invisible format characters removed) so `Alice`, `alice` and a spelling
+//! with a zero-width character share a bucket. A store may fold even more than
+//! this (a case-insensitive collation, a dotted local part), so pair the
+//! per-identifier limit with one on the resolved user id where that matters.
+//!
+//! In a multi-tenant application build the extension with
+//! [`RateLimitLoginIdentifier::new_in_tenant`](crate::middleware::ratelimit::RateLimitLoginIdentifier::new_in_tenant), so the same address in two
+//! tenants is two buckets and an attacker cannot exhaust a victim's budget
+//! in another tenant by naming it.
+//!
+//! Every bucket key starts with its kind (`ip:`, `user:`, `login:`), so an
+//! identifier that spells a sentinel such as `anon` or `unknown` gets its own
+//! bucket and cannot share the one unattributable requests land in.
 //!
 //! # Memory bound
 //!
@@ -65,6 +77,22 @@
 //! holds at most 262,144 buckets. A request whose key has no bucket yet is
 //! answered 429 while the table is full; keys that already have a bucket
 //! are unaffected, and no live bucket is evicted to make room.
+//!
+//! Two further bounds keep one source from filling the table. Each IPv4 /24
+//! and IPv6 /48 may hold 1,024 live buckets; a new client of that prefix past
+//! the budget shares the prefix's overflow bucket (limited together), so an
+//! allocation holding millions of /64s cannot starve a client elsewhere.
+//! And once the table is three quarters full, a login identifier with no
+//! bucket yet is folded into an overflow bucket of its origin (the IPv4
+//! address or IPv6 /48), so unauthenticated callers inventing identifiers
+//! cannot take the remaining room. Neither bound uses wall-clock time beyond
+//! the sweep: a bucket whose window starts in the future (the clock stepped
+//! back) is re-anchored at the next sweep and ages out normally.
+//!
+//! The remaining-requests header (`x-ratelimit-remaining`) is sent only for
+//! buckets one caller owns (address, user, header); a login-identifier,
+//! tenant or shared bucket would tell the caller how many attempts others
+//! made.
 //!
 //! # Window
 //!
@@ -86,26 +114,28 @@
 //! with a shared store (Valkey / Redis).
 
 use axess_clock::{Clock, SystemClock};
+use axess_rng::{SecureRng, SystemRng};
 use axum::{
     body::Body,
     http::{Request, Response, StatusCode},
 };
-use chrono::{DateTime, Utc};
-use dashmap::{DashMap, mapref::entry::Entry};
 use std::{
     future::Future,
     pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
+use zeroize::Zeroizing;
+
+#[cfg(test)]
+use chrono::{DateTime, Utc};
 use tower::{Layer, Service};
 
 mod keys;
-use keys::extract_key;
+mod store;
+use keys::resolve_target;
+use store::{Acquire, BucketStore};
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -198,6 +228,9 @@ pub struct RateLimitConfig {
     /// [`SystemClock`]; tests inject a mock clock and advance it past the
     /// window instead of sleeping.
     pub clock: Arc<dyn Clock>,
+    /// Randomness for the per-instance key that fingerprints bucket keys in
+    /// the debug log. Defaults to [`SystemRng`]; tests inject a seeded RNG.
+    pub rng: Arc<dyn SecureRng>,
 }
 
 impl std::fmt::Debug for RateLimitConfig {
@@ -218,6 +251,7 @@ pub struct RateLimitConfigBuilder {
     key_extractor: KeyExtractor,
     retry_after: bool,
     clock: Arc<dyn Clock>,
+    rng: Arc<dyn SecureRng>,
 }
 
 impl RateLimitConfig {
@@ -229,6 +263,7 @@ impl RateLimitConfig {
             key_extractor: KeyExtractor::PeerIp,
             retry_after: true,
             clock: Arc::new(SystemClock),
+            rng: Arc::new(SystemRng),
         }
     }
 }
@@ -261,6 +296,12 @@ impl RateLimitConfigBuilder {
     /// Time source (default: [`SystemClock`]).
     pub fn clock(mut self, clock: impl Clock) -> Self {
         self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Random source for the log-fingerprint key (default: [`SystemRng`]).
+    pub fn rng(mut self, rng: impl SecureRng) -> Self {
+        self.rng = Arc::new(rng);
         self
     }
 
@@ -297,265 +338,8 @@ impl RateLimitConfigBuilder {
             key_extractor: self.key_extractor,
             retry_after: self.retry_after,
             clock: self.clock,
+            rng: self.rng,
         }
-    }
-}
-
-// ── Token bucket ─────────────────────────────────────────────────────────────
-
-/// Number of buckets at which a request for a key with no bucket is refused.
-/// Live buckets are never evicted to make room: a flood of distinct keys
-/// cannot push a real client's bucket out and reset its count, so the
-/// limiter answers the flood with 429 until the next expiry sweep frees room.
-const HARD_BUCKET_CAP: usize = 256 * 1024;
-
-/// Smallest gap between two expiry sweeps.
-const MIN_SWEEP_INTERVAL_MS: u64 = 1_000;
-
-/// Milliseconds since the Unix epoch, floored at zero.
-fn epoch_millis(now: DateTime<Utc>) -> u64 {
-    u64::try_from(now.timestamp_millis()).unwrap_or(0)
-}
-
-/// One key's sliding-window counter: the requests admitted in the current
-/// fixed window and in the one before it.
-///
-/// The estimate of requests in the trailing window is the previous window's
-/// count weighted by how much of it still overlaps, plus the current count,
-/// all in integer arithmetic. It never undercounts a burst that straddles a
-/// window boundary, so about `max_requests` pass in any trailing window and
-/// not twice that.
-#[derive(Debug)]
-struct TokenBucket {
-    /// Requests admitted in the window that began at `window_start_ms`.
-    curr: u32,
-    /// Requests admitted in the window before it.
-    prev: u32,
-    /// When the current window started, in epoch milliseconds from the
-    /// injected clock.
-    window_start_ms: u64,
-}
-
-impl TokenBucket {
-    fn new(now_ms: u64) -> Self {
-        Self {
-            curr: 0,
-            prev: 0,
-            window_start_ms: now_ms,
-        }
-    }
-}
-
-/// Shared bucket store.  [`DashMap`] gives lock-free concurrent reads/writes.
-#[derive(Clone)]
-struct BucketStore {
-    buckets: Arc<DashMap<String, TokenBucket>>,
-    max_requests: u32,
-    window_ms: u64,
-    clock: Arc<dyn Clock>,
-    /// Number of entries in `buckets`, kept beside the map so the per-request
-    /// cap check does not read-lock every shard the way `DashMap::len` does.
-    bucket_count: Arc<AtomicUsize>,
-    /// Clock time (epoch milliseconds) of the last expiry sweep. The caller
-    /// that wins the compare-exchange on it runs the sweep; the rest carry on.
-    last_sweep_ms: Arc<AtomicU64>,
-}
-
-/// Result of trying to acquire a token.
-enum Acquire {
-    /// Token granted; remaining count returned for `X-RateLimit-Remaining` header.
-    Allowed { remaining: u32 },
-    /// Rate limited; seconds until the bucket resets.
-    Limited { retry_after_secs: u64 },
-    /// The bucket table is at its hard cap and this key has no bucket yet;
-    /// refused until a sweep frees room.
-    Saturated { retry_after_secs: u64 },
-}
-
-impl BucketStore {
-    fn new(max_requests: u32, window: Duration, clock: Arc<dyn Clock>) -> Self {
-        let now_ms = epoch_millis(clock.now());
-        Self {
-            buckets: Arc::new(DashMap::new()),
-            max_requests,
-            window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
-            clock,
-            bucket_count: Arc::new(AtomicUsize::new(0)),
-            last_sweep_ms: Arc::new(AtomicU64::new(now_ms)),
-        }
-    }
-
-    /// Gap between sweeps: an eighth of the window, never under a second.
-    fn sweep_interval_ms(&self) -> u64 {
-        (self.window_ms / 8).max(MIN_SWEEP_INTERVAL_MS)
-    }
-
-    fn try_acquire(&self, key: &str) -> Acquire {
-        self.try_acquire_at(key, self.clock.now())
-    }
-
-    /// Take a token for `key` at an explicit `now`.
-    fn try_acquire_at(&self, key: &str, now: DateTime<Utc>) -> Acquire {
-        let now_ms = epoch_millis(now);
-        self.sweep_if_due(now_ms);
-
-        // A key that already has a bucket is never refused for capacity.
-        if let Some(mut bucket) = self.buckets.get_mut(key) {
-            return self.take(&mut bucket, now_ms);
-        }
-
-        // Reserve a slot before inserting so concurrent first requests for
-        // distinct keys cannot overshoot the cap.
-        if self.bucket_count.fetch_add(1, Ordering::AcqRel) >= HARD_BUCKET_CAP {
-            self.bucket_count.fetch_sub(1, Ordering::AcqRel);
-            return Acquire::Saturated {
-                retry_after_secs: (self.sweep_interval_ms() / 1_000).max(1),
-            };
-        }
-        match self.buckets.entry(key.to_owned()) {
-            Entry::Occupied(mut occupied) => {
-                self.bucket_count.fetch_sub(1, Ordering::AcqRel);
-                self.take(occupied.get_mut(), now_ms)
-            }
-            Entry::Vacant(vacant) => {
-                let mut bucket = vacant.insert(TokenBucket::new(now_ms));
-                self.take(&mut bucket, now_ms)
-            }
-        }
-    }
-
-    fn take(&self, bucket: &mut TokenBucket, now_ms: u64) -> Acquire {
-        self.roll(bucket, now_ms);
-        let estimate = self.estimate(bucket, now_ms);
-        if estimate < u128::from(self.max_requests) {
-            bucket.curr += 1;
-            let remaining = u128::from(self.max_requests) - estimate - 1;
-            Acquire::Allowed {
-                remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
-            }
-        } else {
-            Acquire::Limited {
-                retry_after_secs: self.wait_ms(bucket, now_ms).div_ceil(1_000).max(1),
-            }
-        }
-    }
-
-    /// Advance `bucket` to the window containing `now_ms`.
-    ///
-    /// One window on, the current count becomes the previous one; two or
-    /// more on, both are zero. A clock that steps backwards re-anchors the
-    /// window at the earlier time and keeps the counts, so the bucket does
-    /// not stay limited until the clock catches up with a future start.
-    fn roll(&self, bucket: &mut TokenBucket, now_ms: u64) {
-        if now_ms < bucket.window_start_ms {
-            bucket.window_start_ms = now_ms;
-            return;
-        }
-        let windows = (now_ms - bucket.window_start_ms) / self.window_ms;
-        match windows {
-            0 => {}
-            1 => {
-                bucket.prev = bucket.curr;
-                bucket.curr = 0;
-                bucket.window_start_ms += self.window_ms;
-            }
-            _ => {
-                bucket.prev = 0;
-                bucket.curr = 0;
-                bucket.window_start_ms =
-                    now_ms - (now_ms - bucket.window_start_ms) % self.window_ms;
-            }
-        }
-    }
-
-    /// Requests counted in the trailing window ending at `now_ms`.
-    fn estimate(&self, bucket: &TokenBucket, now_ms: u64) -> u128 {
-        let into = u128::from(now_ms.saturating_sub(bucket.window_start_ms));
-        let window = u128::from(self.window_ms);
-        let overlap = window.saturating_sub(into);
-        u128::from(bucket.prev) * overlap / window + u128::from(bucket.curr)
-    }
-
-    /// Milliseconds until a request would be admitted, for a bucket that has
-    /// just refused one.
-    fn wait_ms(&self, bucket: &TokenBucket, now_ms: u64) -> u64 {
-        let window = u128::from(self.window_ms);
-        let max = u128::from(self.max_requests);
-        let into = u128::from(now_ms.saturating_sub(bucket.window_start_ms));
-        // Room left in the current window once the next request is counted.
-        let (prev, headroom, wait_to_window_end) =
-            match max.checked_sub(u128::from(bucket.curr) + 1) {
-                Some(headroom) => (u128::from(bucket.prev), headroom, 0),
-                // The current window is full: wait for it to end, after which its
-                // count is the previous window's.
-                None => (
-                    u128::from(bucket.curr),
-                    max - 1,
-                    window.saturating_sub(into),
-                ),
-            };
-        // The estimate is admitting once `prev * overlap / window <= headroom`
-        // in integer division, that is `overlap <= ((headroom + 1) * window - 1) / prev`.
-        let needed_into = ((headroom + 1) * window - 1)
-            .checked_div(prev)
-            .map_or(0, |largest_overlap| window - largest_overlap.min(window));
-        let wait = if wait_to_window_end > 0 {
-            wait_to_window_end + needed_into
-        } else {
-            needed_into.saturating_sub(into)
-        };
-        u64::try_from(wait).unwrap_or(u64::MAX)
-    }
-
-    /// Run an expiry sweep when one is due, on at most one caller.
-    ///
-    /// Due means a sweep interval has passed on the injected clock since the
-    /// last one. The compare-exchange on the stamp picks the caller that
-    /// sweeps; every other request in the same interval skips straight on,
-    /// so the full-table scan runs once per interval instead of once per
-    /// request.
-    fn sweep_if_due(&self, now_ms: u64) {
-        let last = self.last_sweep_ms.load(Ordering::Acquire);
-        // A clock that stepped back leaves the stamp in the future; that
-        // counts as due, so the stamp re-anchors instead of the sweep
-        // waiting for the clock to catch up while the table fills.
-        if now_ms >= last && now_ms - last < self.sweep_interval_ms() {
-            return;
-        }
-        if self
-            .last_sweep_ms
-            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.evict_expired_ms(now_ms);
-        }
-    }
-
-    /// Remove buckets that no longer weigh on the estimate at the injected clock's time.
-    #[cfg(test)]
-    fn evict_expired(&self) {
-        self.evict_expired_at(self.clock.now());
-    }
-
-    /// Remove buckets that no longer weigh on the estimate at `now`.
-    #[cfg(test)]
-    fn evict_expired_at(&self, now: DateTime<Utc>) {
-        self.evict_expired_ms(epoch_millis(now));
-    }
-
-    fn evict_expired_ms(&self, now_ms: u64) {
-        let mut removed = 0usize;
-        self.buckets.retain(|_, bucket| {
-            // A bucket still weighs on the estimate for one window past the
-            // one it was last rolled into, so it lives for two.
-            let live =
-                now_ms.saturating_sub(bucket.window_start_ms) < self.window_ms.saturating_mul(2);
-            if !live {
-                removed += 1;
-            }
-            live
-        });
-        self.bucket_count.fetch_sub(removed, Ordering::AcqRel);
     }
 }
 
@@ -580,29 +364,99 @@ pub struct RateLimitTenantId(pub axess_identity::TenantId);
 ///
 /// The application is responsible for parsing the login form body and
 /// inserting this extension into the request before the rate-limit layer
-/// runs. The identifier is lowercased on construction so case variation
-/// can't trivially evade the limit.
+/// runs. The identifier is normalised on construction (Unicode NFKC,
+/// lowercase, format characters such as zero-width spaces removed) so case
+/// and look-alike variation can't trivially evade the limit.
+///
+/// A multi-tenant application must use [`new_in_tenant`](Self::new_in_tenant):
+/// [`new`](Self::new) keys on the identifier alone, so the same address in two
+/// tenants shares one bucket.
 ///
 /// See [`KeyExtractor::LoginIdentifier`] and the module-level example
 ///
 #[derive(Clone, Debug)]
-pub struct RateLimitLoginIdentifier(String);
+pub struct RateLimitLoginIdentifier {
+    identifier: String,
+    /// `Some(tenant)` for a tenant-scoped key.
+    tenant: Option<String>,
+}
+
+/// NFKC, lowercase, and without invisible format characters (the `Cf`
+/// category: zero-width spaces and joiners, bidi controls, the soft hyphen,
+/// the byte-order mark). `None` when nothing is left.
+fn normalise_identifier(raw: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let folded: String = raw
+        .nfkc()
+        .filter(|c| !is_format_char(*c))
+        .collect::<String>()
+        .to_lowercase();
+    let trimmed = folded.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Characters of Unicode category `Cf` that render as nothing.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
 
 impl RateLimitLoginIdentifier {
-    /// Build a normalised login-identifier key. Trims whitespace, lowercases
-    /// (Unicode-aware), and rejects empty input by returning `None`; the
-    /// caller should treat that as the anonymous bucket.
+    /// Build a normalised login-identifier key. Trims whitespace, applies
+    /// Unicode NFKC, lowercases, drops invisible format characters, and
+    /// rejects input that is empty after that by returning `None`; the caller
+    /// should treat that as the anonymous bucket.
+    ///
+    /// The key is the identifier alone. In a multi-tenant application use
+    /// [`new_in_tenant`](Self::new_in_tenant).
     pub fn new(identifier: impl AsRef<str>) -> Option<Self> {
-        let trimmed = identifier.as_ref().trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(Self(trimmed.to_lowercase()))
+        Some(Self {
+            identifier: normalise_identifier(identifier.as_ref())?,
+            tenant: None,
+        })
     }
 
-    /// The normalised key value used for bucket lookup.
+    /// Like [`new`](Self::new), scoped to `tenant`: the same identifier in two
+    /// tenants gets two buckets, so repeated logins naming `ceo@victim.com`
+    /// against another tenant cannot exhaust the victim tenant's budget. The
+    /// tenant is length-prefixed in the key, so no tenant and identifier pair
+    /// can spell another's. Does not combine with `RateLimitTenantId`; the
+    /// two extractors are separate layers.
+    pub fn new_in_tenant(
+        tenant: &axess_identity::TenantId,
+        identifier: impl AsRef<str>,
+    ) -> Option<Self> {
+        Some(Self {
+            identifier: normalise_identifier(identifier.as_ref())?,
+            tenant: Some(tenant.to_string()),
+        })
+    }
+
+    /// The normalised identifier (without any tenant scope).
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.identifier
+    }
+
+    /// The key this identifier occupies, kind-tagged so an unscoped
+    /// identifier can never equal a scoped one: `u:{identifier}` or
+    /// `t:{len}:{tenant}:{identifier}`.
+    pub(super) fn bucket_key(&self) -> String {
+        match &self.tenant {
+            None => format!("u:{}", self.identifier),
+            Some(tenant) => format!("t:{}:{tenant}:{}", tenant.len(), self.identifier),
+        }
     }
 }
 
@@ -624,18 +478,29 @@ pub struct RateLimitLayer {
     store: BucketStore,
     key_extractor: KeyExtractor,
     retry_after: bool,
+    /// Key for the debug-log fingerprints: random per layer instance.
+    log_key: Arc<Zeroizing<[u8; 32]>>,
     metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
 }
 
 impl RateLimitLayer {
     /// Create a new rate-limit layer from the given configuration.
     pub fn new(config: RateLimitConfig) -> Self {
+        let mut log_key = Zeroizing::new([0u8; 32]);
+        config.rng.fill_bytes(&mut *log_key);
         Self {
             store: BucketStore::new(config.max_requests, config.window, config.clock),
             key_extractor: config.key_extractor,
             retry_after: config.retry_after,
+            log_key: Arc::new(log_key),
             metrics: None,
         }
+    }
+
+    /// The fingerprint this instance logs for `key` (test hook).
+    #[cfg(test)]
+    fn log_fingerprint(&self, key: &str) -> String {
+        keys::fingerprint(&**self.log_key, key)
     }
 
     /// Attach a metrics hook for rate-limit observability.
@@ -654,6 +519,7 @@ impl<S> Layer<S> for RateLimitLayer {
             store: self.store.clone(),
             key_extractor: self.key_extractor.clone(),
             retry_after: self.retry_after,
+            log_key: self.log_key.clone(),
             metrics: self.metrics.clone(),
         }
     }
@@ -666,6 +532,7 @@ pub struct RateLimitService<S> {
     store: BucketStore,
     key_extractor: KeyExtractor,
     retry_after: bool,
+    log_key: Arc<Zeroizing<[u8; 32]>>,
     metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
 }
 
@@ -685,12 +552,16 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let key = extract_key(&req, &self.key_extractor);
+        let target = resolve_target(&req, &self.key_extractor);
         let retry_after_enabled = self.retry_after;
 
         let metrics = self.metrics.clone();
-        match self.store.try_acquire(&key) {
+        match self.store.try_acquire_target(&target, self.store.now()) {
             Acquire::Allowed { remaining } => {
+                // The count left in a bucket other callers draw on says how
+                // many attempts they made, so only a caller's own bucket
+                // reports it.
+                let report_remaining = !target.shared;
                 if let Some(ref m) = metrics {
                     m.rate_limit_allowed();
                 }
@@ -699,7 +570,9 @@ where
                 std::mem::swap(&mut inner, &mut self.inner);
                 Box::pin(async move {
                     let mut resp = inner.call(req).await?;
-                    if let Ok(val) = axum::http::HeaderValue::from_str(&remaining.to_string()) {
+                    if report_remaining
+                        && let Ok(val) = axum::http::HeaderValue::from_str(&remaining.to_string())
+                    {
                         resp.headers_mut().insert("x-ratelimit-remaining", val);
                     }
                     Ok(resp)
@@ -710,7 +583,7 @@ where
                     m.rate_limit_rejected();
                 }
                 tracing::debug!(
-                    key_fingerprint = %keys::fingerprint(&key),
+                    key_fingerprint = %keys::fingerprint(&**self.log_key, &target.key),
                     retry_after = retry_after_secs,
                     "rate limit exceeded"
                 );

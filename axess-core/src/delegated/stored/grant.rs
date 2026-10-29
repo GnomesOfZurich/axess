@@ -11,7 +11,7 @@
 //! constraints (cookie size limits, SameSite policy, stateless
 //! workers, …).
 
-use axess_clock::{Clock, SystemClock};
+use axess_clock::Clock;
 use axess_rng::SecureRng;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -124,14 +124,16 @@ fn random_token(rng: &dyn SecureRng) -> Zeroizing<String> {
 /// `StoredDelegation` ready to hand to a
 /// [`DelegatedCredentialStore`](super::credential::DelegatedCredentialStore).
 ///
-/// Token expiry is computed from the system clock; use
-/// [`complete_grant_at`] to supply the instant.
+/// Token expiry is measured from `clock`, so a simulated clock gives a
+/// deterministic `expires_at`; use [`complete_grant_at`] to supply the
+/// instant itself.
 pub async fn complete_grant(
     provider: &DelegatedProvider,
     context: &GrantContext,
     code: &str,
     state_from_callback: &str,
     http: &reqwest::Client,
+    clock: &dyn Clock,
 ) -> Result<StoredDelegation, DelegatedError> {
     complete_grant_at(
         provider,
@@ -139,7 +141,7 @@ pub async fn complete_grant(
         code,
         state_from_callback,
         http,
-        SystemClock.now(),
+        clock.now(),
     )
     .await
 }
@@ -185,7 +187,7 @@ pub async fn complete_grant_at(
     ];
 
     let response = post_token_endpoint(http, provider, &form).await?;
-    let grant = parse_token_response(provider, response, now).await?;
+    let grant = parse_token_response(provider, response, now, TokenRequest::CodeExchange).await?;
     // RFC 6749 §5.1: an omitted `scope` means the granted scope is the one
     // requested.
     let scopes = grant
@@ -215,7 +217,28 @@ pub(super) async fn refresh_token_grant(
         ("client_id", &provider.client_id),
     ];
     let response = post_token_endpoint(http, provider, &form).await?;
-    parse_token_response(provider, response, clock.now()).await
+    parse_token_response(provider, response, clock.now(), TokenRequest::Refresh).await
+}
+
+/// Which grant a token response answers. Only a refresh can be "rejected" in
+/// the sense of [`DelegatedError::RefreshRejected`]: on an authorization-code
+/// exchange `invalid_grant` means the code was bad, used or expired, and
+/// sending the user to "reconnect" is the wrong message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenRequest {
+    CodeExchange,
+    Refresh,
+}
+
+/// The RFC 6749 §5.2 `error` member of an error body, when the body is the
+/// JSON object the RFC specifies. Exact: `error_description` text that
+/// mentions `invalid_grant` is not the error.
+fn oauth_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// A parsed token response: the credential it describes, and the scope the
@@ -236,6 +259,10 @@ async fn post_token_endpoint(
     form: &[(&str, &str)],
 ) -> Result<reqwest::Response, DelegatedError> {
     let encoded = axess_factors::basic_credentials(&provider.client_id, &provider.client_secret);
+
+    // Before any request: the client credentials go in this POST.
+    crate::outbound_http::require_https_or_loopback(&provider.token_endpoint)
+        .map_err(|reason| DelegatedError::Transport(reason.to_string()))?;
 
     http.post(provider.token_endpoint.clone())
         .header(AUTHORIZATION, format!("Basic {encoded}"))
@@ -271,14 +298,19 @@ async fn parse_token_response(
     provider: &DelegatedProvider,
     mut response: reqwest::Response,
     now: DateTime<Utc>,
+    request: TokenRequest,
 ) -> Result<TokenGrant, DelegatedError> {
     let status = response.status();
     if !status.is_success() {
         let body = read_error_body(&mut response).await;
-        // 400 + `invalid_grant` body specifically signals refresh-token
-        // rejection; RFC 6749 §5.2. Surface the dedicated variant so
-        // adopter UX can route to "please reconnect".
-        if status.as_u16() == 400 && body.contains("invalid_grant") {
+        // 400 + `error: "invalid_grant"` on a REFRESH specifically signals
+        // refresh-token rejection (RFC 6749 §5.2). Surface the dedicated
+        // variant so adopter UX can route to "please reconnect". The member is
+        // compared exactly, and only on the refresh grant.
+        if request == TokenRequest::Refresh
+            && status.as_u16() == 400
+            && oauth_error_code(&body).as_deref() == Some("invalid_grant")
+        {
             return Err(DelegatedError::RefreshRejected);
         }
         return Err(DelegatedError::TokenEndpoint {

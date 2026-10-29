@@ -59,6 +59,16 @@ pub struct StoredDelegation {
 }
 
 impl StoredDelegation {
+    /// Whether `other` holds the same tokens, expiry, scopes and token type.
+    /// The provider name is the row's key and is compared by the caller.
+    pub fn same_as(&self, other: &StoredDelegation) -> bool {
+        *self.access_token == *other.access_token
+            && self.refresh_token.as_deref() == other.refresh_token.as_deref()
+            && self.expires_at == other.expires_at
+            && self.scopes == other.scopes
+            && self.token_type == other.token_type
+    }
+
     /// Whether this credential's `access_token` is still considered
     /// fresh against `now`. `None` `expires_at` is treated as fresh
     /// (caller decides whether to refresh proactively); a Some
@@ -69,6 +79,18 @@ impl StoredDelegation {
             None => true,
         }
     }
+}
+
+/// Result of [`DelegatedCredentialStore::save_if_unchanged`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSwap {
+    /// The stored credential matched the expected one and was replaced.
+    Saved,
+    /// The stored credential differs from the expected one (another request
+    /// rewrote it, or it is gone). Nothing was written.
+    Changed,
+    /// The store has no compare-and-swap. Nothing was written.
+    Unsupported,
 }
 
 /// Persistence boundary for stored delegated credentials.
@@ -105,6 +127,28 @@ pub trait DelegatedCredentialStore: Send + Sync + 'static {
         user: &UserId,
         credential: StoredDelegation,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+
+    /// Replace the credential for `(tenant, user, provider)` with
+    /// `replacement` only if the stored one still equals `expected`, in one
+    /// atomic step; report which happened.
+    ///
+    /// A caller that rewrites a row it read earlier without changing its
+    /// meaning (re-sealing it under a new key) uses this so it cannot
+    /// overwrite a refresh token another request rotated in between. The
+    /// default answers [`CredentialSwap::Unsupported`] and writes nothing, so
+    /// a store that cannot compare-and-swap is never rewritten by such a
+    /// caller; implement it atomically (a conditional `UPDATE`, a
+    /// transaction, a lock) to take part.
+    fn save_if_unchanged(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        expected: &StoredDelegation,
+        replacement: StoredDelegation,
+    ) -> impl std::future::Future<Output = Result<CredentialSwap, String>> + Send {
+        let _ = (tenant, user, expected, replacement);
+        async { Ok(CredentialSwap::Unsupported) }
+    }
 
     /// Remove the credential for `(tenant, user, provider)`. Idempotent
     /// removing a non-existent record returns `Ok(())`. Adopters
@@ -153,6 +197,24 @@ impl DelegatedCredentialStore for MemoryDelegatedCredentialStore {
         let key = (*tenant, *user, credential.provider.clone());
         guard.insert(key, credential);
         Ok(())
+    }
+
+    async fn save_if_unchanged(
+        &self,
+        tenant: &TenantId,
+        user: &UserId,
+        expected: &StoredDelegation,
+        replacement: StoredDelegation,
+    ) -> Result<CredentialSwap, String> {
+        let mut guard = self.inner.lock().map_err(|e| e.to_string())?;
+        let key = (*tenant, *user, expected.provider.clone());
+        match guard.get(&key) {
+            Some(current) if current.same_as(expected) => {
+                guard.insert(key, replacement);
+                Ok(CredentialSwap::Saved)
+            }
+            _ => Ok(CredentialSwap::Changed),
+        }
     }
 
     async fn revoke(&self, tenant: &TenantId, user: &UserId, provider: &str) -> Result<(), String> {

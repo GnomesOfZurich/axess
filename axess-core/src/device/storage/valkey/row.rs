@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use super::policy::ttl_seconds;
 use super::{ValkeyDeviceStore, ValkeyDeviceStoreError};
 use crate::device::types::{Device, FingerprintHash};
-use crate::session::crypto::{BoundFormat, device_row_id, device_row_id_v1};
+use crate::session::crypto::{BoundFormat, CryptoError, device_row_id, device_row_id_v1};
 
 pub(super) fn device_key(prefix: &str, tenant: &str, id: &str) -> String {
     format!("{prefix}:dev:{tenant}:{id}")
@@ -21,6 +21,18 @@ pub(super) fn fingerprint_key(prefix: &str, tenant: &str, hex_hash: &str) -> Str
 /// The set of ids of the devices that carry a fingerprint.
 pub(super) fn fingerprint_set_key(prefix: &str, tenant: &str, hex_hash: &str) -> String {
     format!("{prefix}:dev:fps:{tenant}:{hex_hash}")
+}
+
+/// The set of ids of the devices of one user that carry a fingerprint: the
+/// per-(tenant, fingerprint, user) index a request from an identified user
+/// reads, so finding that user's device does not read every device they own.
+pub(super) fn fingerprint_user_key(
+    prefix: &str,
+    tenant: &str,
+    hex_hash: &str,
+    user: &str,
+) -> String {
+    format!("{prefix}:dev:fpu:{tenant}:{hex_hash}:{user}")
 }
 
 pub(super) fn user_index_key(prefix: &str, tenant: &str, user: &str) -> String {
@@ -49,8 +61,10 @@ pub(super) fn fingerprint_hex(h: &FingerprintHash) -> String {
 impl ValkeyDeviceStore {
     /// Choose whether sealed rows written before row binding (no format
     /// marker) are read; see [`LegacyBlobs`](crate::session::crypto::LegacyBlobs).
-    /// The default reads them and every write seals the current format. Has
-    /// no effect on a plaintext store.
+    /// The default refuses them; [`LegacyBlobs::AcceptUntil`](crate::session::crypto::LegacyBlobs::AcceptUntil)
+    /// reads them for an upgrade window, re-seals what it reads, and refuses a
+    /// row whose stored ids differ from its key. Has no effect on a plaintext
+    /// store.
     pub fn with_legacy_blobs(mut self, policy: crate::session::crypto::LegacyBlobs) -> Self {
         self.crypto = self.crypto.map(|c| c.with_legacy_blobs(policy));
         self
@@ -70,9 +84,11 @@ impl ValkeyDeviceStore {
     /// len(device_id) || device_id` (each length a big-endian `u32`), so a
     /// row copied under another device's key fails authentication and two
     /// different id pairs can never produce the same AAD. The 0.11.0 form
-    /// (`AXR 0x01`, ids joined by a zero byte) is still read, and a blob
-    /// without any marker predates binding and is read under the empty AAD
-    /// unless the store's crypto was set to reject such blobs; every write
+    /// (`AXR 0x01`, ids joined by a zero byte) and a blob without any marker
+    /// (which predates binding and opens under the empty AAD) are read only
+    /// under a [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) policy
+    /// that reads them, and then only when the ids inside the row match the
+    /// key it was stored under; every write
     /// seals the current form, and so does a read that finds an older form (a
     /// conditional write of the exact bytes it read), so the older forms age
     /// out as devices are written or read. A plaintext store has nothing to bind.
@@ -109,7 +125,7 @@ impl ValkeyDeviceStore {
         id: &str,
         payload: &[u8],
     ) -> Result<(Device, bool), ValkeyDeviceStoreError> {
-        let (plaintext, stale) = match &self.crypto {
+        let (plaintext, stale, legacy) = match &self.crypto {
             Some(c) => {
                 let opened = c.open_bound(
                     BoundFormat::DEVICE_ROW,
@@ -117,10 +133,20 @@ impl ValkeyDeviceStore {
                     &[(BoundFormat::DEVICE_ROW_V1, device_row_id_v1(tenant, id))],
                     payload,
                 )?;
-                (opened.plaintext, opened.stale)
+                (opened.plaintext, opened.stale, opened.legacy)
             }
-            None => (payload.to_vec(), false),
+            None => (payload.to_vec(), false, false),
         };
-        Ok((rmp_serde::from_slice(&plaintext)?, stale))
+        let device: Device = rmp_serde::from_slice(&plaintext)?;
+        // A blob without the current binding opens under any key, so the row
+        // must name the key it is stored under. A copy moved from another
+        // device's key is refused here, before anything re-seals it.
+        if legacy && (device.tenant_id.to_string() != tenant || device.id.to_string() != id) {
+            tracing::warn!(
+                "refusing a device row whose stored identity differs from the key it was read under"
+            );
+            return Err(CryptoError.into());
+        }
+        Ok((device, stale))
     }
 }

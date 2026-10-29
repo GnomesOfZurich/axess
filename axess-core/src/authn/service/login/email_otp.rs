@@ -9,6 +9,12 @@ use crate::authn::{
     types::AuthnScope,
 };
 
+/// How long an unfinished claim holds the cooldown slot, in seconds.
+const CLAIM_LEASE_SECS: i64 = 30;
+
+/// Swaps attempted to store an issued code on its claimed row.
+const STORE_ATTEMPTS: usize = 3;
+
 impl<I, F> super::super::RequestAuthnService<I, F>
 where
     I: IdentityStore,
@@ -55,7 +61,7 @@ where
         // one send per TTL window.
         let now = self.inner.clock.now();
         let already_sent = || PrepareOutcome::AlreadySent {
-            destination: cfg.email.clone(),
+            destination: super::super::outcomes::mask_email(&cfg.email),
         };
         if cfg.pending_until.is_some_and(|until| now < until) {
             return Ok(already_sent());
@@ -75,11 +81,20 @@ where
         // and the timestamp type represent, so neither step can overflow.
         let expires = now + chrono::Duration::seconds(i64::from(cfg.ttl_secs));
 
-        // Claim the slot. The claimed row carries the expiry and no hash, so
-        // a code submitted before the hash lands fails verification.
+        // Claim the slot with a SHORT lease, not the code's full expiry. The
+        // claimed row carries no hash, so a code submitted before the hash
+        // lands fails verification; and if this request is cancelled between
+        // the claim and the store (a dropped connection, a timeout) the lease
+        // lapses in seconds, where a claim for the full TTL blocked the user
+        // from any code for up to that long. The stored code gets the full
+        // expiry.
+        let lease = chrono::Duration::seconds(i64::from(cfg.ttl_secs).min(CLAIM_LEASE_SECS));
         let mut claimed_cfg = cfg.clone();
         claimed_cfg.pending_hash = None;
-        claimed_cfg.pending_until = Some(expires);
+        // A new code starts with a fresh allowance of guesses: the count the
+        // previous code left behind must not burn this one on first use.
+        claimed_cfg.attempt_count = 0;
+        claimed_cfg.pending_until = Some(now + lease);
         let claimed = FactorConfig::EmailOtp(claimed_cfg.clone());
         let won = if resolved.resolved_from == user_scope {
             self.inner
@@ -100,29 +115,22 @@ where
         }
 
         match self.issue_claimed_otp(claimed_cfg, code_length).await {
-            Ok((code, final_cfg)) => {
-                let stored = self
-                    .inner
-                    .factors
-                    .compare_and_save_factor(
-                        &user_scope,
-                        &claimed,
-                        FactorConfig::EmailOtp(final_cfg),
-                    )
-                    .await;
-                match stored {
-                    Ok(true) => Ok(PrepareOutcome::SendOtp {
+            Ok((code, mut final_cfg)) => {
+                final_cfg.pending_until = Some(expires);
+                let final_cfg = FactorConfig::EmailOtp(final_cfg);
+                if self
+                    .store_issued_otp(&user_scope, &claimed, &final_cfg)
+                    .await?
+                {
+                    Ok(PrepareOutcome::SendOtp {
                         code,
                         destination: email,
-                    }),
-                    Ok(false) => Err(AuthnError::ExternalService(
+                    })
+                } else {
+                    Err(AuthnError::ExternalService(
                         "email OTP claim was replaced before the code was stored; retry"
                             .to_string(),
-                    )),
-                    Err(e) => {
-                        self.release_otp_claim(&user_scope, &claimed).await;
-                        Err(AuthnError::Store(e))
-                    }
+                    ))
                 }
             }
             Err(e) => {
@@ -130,6 +138,61 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// Store the hashed code on the claimed row, tolerating a benign change
+    /// to it.
+    ///
+    /// The swap compares the whole row, so any unrelated write to the claim
+    /// (another request bumping `attempt_count`, say) loses it although the
+    /// claim is still ours. A lost swap therefore reloads the row and, when
+    /// it is still this request's claim (no hash, the lease's expiry), swaps
+    /// again against what is there now, a few times. Only a row that is no
+    /// longer this claim is a real loss. Returns `Ok(false)` for that, with
+    /// nothing delivered; the claim is released first when it is still ours
+    /// to release.
+    async fn store_issued_otp(
+        &self,
+        user_scope: &AuthnScope,
+        claimed: &FactorConfig,
+        final_cfg: &FactorConfig,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        let FactorConfig::EmailOtp(claimed_cfg) = claimed else {
+            return Ok(false);
+        };
+        let mut expected = claimed.clone();
+        for _ in 0..STORE_ATTEMPTS {
+            match self
+                .inner
+                .factors
+                .compare_and_save_factor(user_scope, &expected, final_cfg.clone())
+                .await
+            {
+                Ok(true) => return Ok(true),
+                Err(e) => {
+                    self.release_otp_claim(user_scope, &expected).await;
+                    return Err(AuthnError::Store(e));
+                }
+                Ok(false) => {}
+            }
+            let reloaded = self
+                .inner
+                .factors
+                .load_factor(user_scope, FactorKind::EmailOtp)
+                .await
+                .map_err(AuthnError::Store)?;
+            match reloaded {
+                Some(FactorConfig::EmailOtp(now_cfg))
+                    if now_cfg.pending_hash.is_none()
+                        && now_cfg.pending_until == claimed_cfg.pending_until =>
+                {
+                    expected = FactorConfig::EmailOtp(now_cfg);
+                }
+                _ => return Ok(false),
+            }
+        }
+        self.release_otp_claim(user_scope, &expected).await;
+        Ok(false)
     }
 
     /// Draw a code and hash it, off the executor, for a claimed cooldown

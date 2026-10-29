@@ -339,3 +339,14 @@ async fn an_ended_session_is_not_revived_by_update_or_cycle() {
     );
     assert!(store.load(&fresh_new).await.unwrap().is_some());
 }
+
+#[cfg(feature = "testing")]
+#[tokio::test]
+#[ignore] // Requires POSTGRES_URL
+#[serial]
+async fn update_if_revision_keeps_the_contract() {
+    let Some((store, _pool)) = make_store().await else {
+        return;
+    };
+    axess_core::testing::store_contract::assert_update_if_revision_contract(&store).await;
+}

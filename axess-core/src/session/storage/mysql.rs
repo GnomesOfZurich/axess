@@ -53,7 +53,7 @@ use crate::session::storage::sql_helpers::log_cleanup_outcome;
 use crate::session::{
     data::SessionData,
     id::SessionId,
-    store::{CycleOutcome, SessionStore},
+    store::{ConditionalUpdate, CycleOutcome, SessionStore},
 };
 use axess_clock::{Clock, SystemClock};
 use sqlx::MySqlPool;
@@ -314,7 +314,77 @@ impl SessionStore for MysqlSessionStore {
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        // A zero TTL writes an expiry of "now": the row cannot be loaded, so
+        // it is reported as not updated, as the Valkey store does.
+        Ok(result.rows_affected() > 0 && exp > now)
+    }
+
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected_revision: u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<ConditionalUpdate, Self::Error> {
+        let id_str = id.to_string();
+        let now = self.clock.now().timestamp();
+        let exp = expires_at(&*self.clock, ttl);
+
+        let row: Option<(Option<Vec<u8>>, String)> =
+            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ? AND expires_at > ?")
+                .bind(&id_str)
+                .bind(now)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((binary, text)) = row else {
+            return Ok(ConditionalUpdate::Gone);
+        };
+        let (stored, _) = self.codec.decode_row(id, binary.as_deref(), &text)?;
+        if stored.revision != expected_revision {
+            return Ok(ConditionalUpdate::Conflict);
+        }
+        if exp <= now {
+            // A zero TTL stores nothing loadable; as `update` does, report
+            // the row as not replaced.
+            return Ok(ConditionalUpdate::Gone);
+        }
+
+        // The write names the bytes that were compared, so a save that landed
+        // between the read and here leaves this one with no row to replace.
+        let encoded = self.codec.encode_bytes(id, data)?;
+        let result = match binary {
+            Some(old) => {
+                sqlx::query(
+                    "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
+                     WHERE id = ? AND expires_at > ? AND data_bin = ?",
+                )
+                .bind(&encoded)
+                .bind(exp)
+                .bind(&id_str)
+                .bind(now)
+                .bind(old)
+                .execute(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
+                     WHERE id = ? AND expires_at > ? AND data_bin IS NULL AND data = ?",
+                )
+                .bind(&encoded)
+                .bind(exp)
+                .bind(&id_str)
+                .bind(now)
+                .bind(text)
+                .execute(&self.pool)
+                .await?
+            }
+        };
+        Ok(if result.rows_affected() > 0 {
+            ConditionalUpdate::Written
+        } else {
+            ConditionalUpdate::Conflict
+        })
     }
 
     async fn cycle(

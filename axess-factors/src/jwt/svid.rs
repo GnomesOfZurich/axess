@@ -38,6 +38,7 @@
 //! `CliResolver` consults at startup; the two paths produce
 //! byte-identical principals for the same `(service, tenant)` pair.
 
+use crate::jwt::verifier::verifier_is_pinned;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -85,7 +86,12 @@ pub struct JwtSvidResolver<R: JtiReplayStore = NoReplay> {
     verifier: Arc<JwtVerifier<R>>,
     expected_trust_domain: TrustDomain,
     token: String,
+    tenant_lookup: Option<TenantLookup>,
 }
+
+/// Maps a SPIFFE tenant slug to the typed tenant the deployment registered
+/// for it; `None` when the slug is unknown.
+type TenantLookup = Arc<dyn Fn(&str) -> Option<TenantId> + Send + Sync>;
 
 impl<R: JtiReplayStore> JwtSvidResolver<R> {
     /// Construct a resolver. The token must include `sub` carrying a
@@ -102,7 +108,23 @@ impl<R: JtiReplayStore> JwtSvidResolver<R> {
             verifier,
             expected_trust_domain,
             token: token.into(),
+            tenant_lookup: None,
         }
+    }
+
+    /// Cross-check the `tid` claim against the SPIFFE tenant slug. The slug
+    /// in `sub` and the UUID in `tid` are two statements about one tenant,
+    /// both written by the IdP; without a registry nothing ties them
+    /// together, so an IdP bug or a loosely templated claim could put one
+    /// tenant's UUID under another's slug. With a lookup, the token is
+    /// refused when the slug is unknown or maps to a different tenant than
+    /// `tid`. Deployments that have a tenant registry should set this.
+    pub fn with_tenant_lookup(
+        mut self,
+        lookup: impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static,
+    ) -> Self {
+        self.tenant_lookup = Some(Arc::new(lookup));
+        self
     }
 }
 
@@ -115,6 +137,13 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
         //    not surfaced to callers; the trait surface is
         //    intentionally opaque about which check rejected the
         //    token, mirroring the Authn user-enumeration discipline.
+        // 0. A JWT-SVID is only meaningful for the audience it names, and
+        //    a shared issuer makes `aud` the only separation between
+        //    services. A verifier that pins neither would accept a token
+        //    minted for anyone, so it is refused before any token is read.
+        if !verifier_is_pinned(&self.verifier, "JwtSvidResolver") {
+            return Err(IdentityError::NotAuthenticated);
+        }
         let claims = self
             .verifier
             .verify::<SvidCustomClaims>(&self.token)
@@ -158,6 +187,21 @@ impl<R: JtiReplayStore + 'static> PrincipalResolver for JwtSvidResolver<R> {
                 expected = self.expected_trust_domain,
                 presented = token_trust_domain,
             )));
+        }
+
+        // 5. The slug and the `tid` claim must name the same tenant.
+        if let Some(lookup) = &self.tenant_lookup {
+            match lookup(&tenant_slug) {
+                Some(registered) if registered == claims.custom.tid => {}
+                other => {
+                    tracing::warn!(
+                        slug = %tenant_slug,
+                        known = other.is_some(),
+                        "JwtSvidResolver: tid claim disagrees with the SPIFFE tenant slug",
+                    );
+                    return Err(IdentityError::NotAuthenticated);
+                }
+            }
         }
 
         Ok(Principal::Workload(WorkloadPrincipal {

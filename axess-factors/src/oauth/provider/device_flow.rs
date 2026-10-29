@@ -25,6 +25,8 @@ pub(super) async fn request_device_code(
             )
         })?;
 
+    super::endpoint::require_secure(Some(device_url), "device_authorization_endpoint")?;
+
     let mut form = vec![("client_id", cfg.client_id.as_str())];
     let scope_str = scopes.join(" ");
     if !scope_str.is_empty() {
@@ -48,16 +50,15 @@ pub(super) async fn request_device_code(
             .map_err(|e| OAuthError::DeviceAuthorization(format!("response read failed: {e}")))?;
 
     if !status.is_success() {
-        let error_body = String::from_utf8_lossy(&body);
-        tracing::warn!(
-            status = status.as_u16(),
-            body = %error_body,
-            "device authorization endpoint error"
-        );
         let error_code = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
             .and_then(|v| v.get("error")?.as_str().map(String::from))
             .unwrap_or_else(|| format!("HTTP {status}"));
+        tracing::warn!(
+            status = status.as_u16(),
+            error_code = %error_code,
+            "device authorization endpoint error"
+        );
         return Err(OAuthError::DeviceAuthorization(error_code));
     }
 

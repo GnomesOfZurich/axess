@@ -4,12 +4,13 @@ use crate::{
     models::backend::OurBackend,
     web::{auth, protected},
 };
-use axess::authn::AuthnService;
+use axess::authn::{AuthnService, FactorSecretCipher};
 use axess::csrf::{CsrfConfig, CsrfLayer};
-use axess::session::SessionCrypto;
+use axess::session::{LegacyBlobs, SessionCrypto};
 use axess::{
-    AuthSession, AuthnMetrics, CompositeHealthCheck, KeyExtractor, RateLimitConfig, RateLimitLayer,
-    SecureRng, SessionLayer, SystemRng, backends::sqlite::SessionStore as SqliteSessionStore,
+    AuthSession, AuthnMetrics, CompositeHealthCheck, KeyExtractor, MemorySessionRegistry,
+    RateLimitConfig, RateLimitLayer, SecureRng, SessionLayer, SystemRng,
+    backends::sqlite::SessionStore as SqliteSessionStore,
 };
 use axum::response::{IntoResponse, Redirect};
 use axum::{Router, routing::get, routing::post};
@@ -67,6 +68,88 @@ pub struct AppState {
     pub backend: OurBackend,
     pub health: Arc<CompositeHealthCheck>,
     pub metrics: Arc<AppMetrics>,
+    /// Seals TOTP secrets before they are stored; the service holds the same
+    /// cipher to open them when a code is checked.
+    pub factor_cipher: Arc<FactorSecretCipher>,
+}
+
+/// Where the example keeps the key its TOTP secrets are sealed under.
+const FACTOR_KEY_FILE: &str = "db/factor-secret.key";
+
+/// How long a TOTP secret still stored in plain text is read, from the start
+/// of this run. Each such secret is sealed by the login that verifies it, so
+/// the window only has to outlast the users who have not signed in yet. A
+/// real deployment writes a fixed date here, so that a restart does not
+/// extend it.
+const PLAIN_SECRET_WINDOW_DAYS: i64 = 30;
+
+/// The key TOTP secrets are sealed under: 32 bytes, hex encoded, in a file
+/// that is created on first use and read on every later start. Secrets sealed
+/// under a key that is lost cannot be opened, so unlike the session keys this
+/// one must survive a restart. In production, load it from a secrets manager.
+fn factor_secret_key() -> [u8; 32] {
+    let path = std::env::current_dir().map(|dir| dir.join(FACTOR_KEY_FILE));
+    if let Ok(path) = &path
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        let text = text.trim();
+        let bytes: Option<Vec<u8>> = (text.len() == 64)
+            .then(|| {
+                (0..32)
+                    .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
+                    .collect()
+            })
+            .flatten();
+        if let Some(key) = bytes.and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+            return key;
+        }
+        tracing::warn!(path = %path.display(), "factor secret key file is unreadable; making a new key");
+    }
+    let mut key = [0u8; 32];
+    SystemRng.fill_bytes(&mut key);
+    if let Ok(path) = &path {
+        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(path, hex));
+        if let Err(e) = written {
+            tracing::warn!(error = %e, "could not keep the factor secret key; TOTP secrets sealed this run will not open after a restart");
+        }
+    }
+    key
+}
+
+/// The example's cipher: sealed under `factor_secret_key`, and reading a
+/// plain secret for `PLAIN_SECRET_WINDOW_DAYS` so rows written before the
+/// cipher existed (Bob's seeded TOTP) are moved by their owner's next login.
+pub fn factor_secret_cipher() -> Arc<FactorSecretCipher> {
+    let until =
+        axess::Clock::now(&axess::SystemClock) + chrono::Duration::days(PLAIN_SECRET_WINDOW_DAYS);
+    Arc::new(
+        FactorSecretCipher::new(factor_secret_key())
+            .with_plain_secrets(LegacyBlobs::AcceptUntil(until)),
+    )
+}
+
+/// Environment variable that lets the example's cookies travel over plain
+/// HTTP. Cookies are `Secure` unless it is set to `1`, because a session
+/// cookie sent over HTTP can be read by anyone on the path. Browsers treat
+/// `localhost` as a secure context in most cases; set this only for a
+/// browser or host name that refuses `Secure` cookies over HTTP.
+pub const INSECURE_COOKIES_ENV: &str = "AXESS_DEV_INSECURE_COOKIES";
+
+/// Whether the operator asked for cookies without the `Secure` attribute.
+/// Prints a banner when they did, so the setting cannot go unnoticed.
+fn secure_cookies() -> bool {
+    let insecure = std::env::var(INSECURE_COOKIES_ENV).is_ok_and(|v| v == "1");
+    if insecure {
+        tracing::warn!(
+            "{INSECURE_COOKIES_ENV}=1: session and CSRF cookies are sent WITHOUT the Secure \
+             attribute. Local development only; never set this behind a real host name."
+        );
+    }
+    !insecure
 }
 
 /// Build the top-level Axum [`Router`].
@@ -102,39 +185,67 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     let mut signing_key = [0u8; 32];
     SystemRng.fill_bytes(&mut signing_key);
 
-    let health = Arc::new(CompositeHealthCheck::new().add("session_store", session_store.clone()));
+    let health = Arc::new(
+        CompositeHealthCheck::new()
+            .add("session_store", session_store.clone())
+            .add("identity_store", backend.clone()),
+    );
 
+    // The registry is what a password reset, a suspension or an admin kick
+    // revokes against. The layer consults it on every request, so a revoked
+    // session is ended whatever guards the route, and the authentication
+    // service deletes the stored rows of the sessions it revokes.
+    //
+    // The in-memory registry is per process and empty after a restart; use
+    // the Valkey registry for more than one instance.
+    let registry = MemorySessionRegistry::default();
+
+    let secure = secure_cookies();
     let session_layer = SessionLayer::new(session_store.clone(), signing_key)
         .with_ttl(Duration::from_secs(86400))
-        .with_secure(false); // Allow HTTP in local dev; set true behind TLS in prod.
+        .with_secure(secure)
+        .with_registry(Arc::new(axess::SessionRegistryAdapter(registry.clone())));
 
     // CSRF layer: signed double-submit cookie bound to the session id.
-    // Uses a distinct HMAC key from the session layer (a compromise of one
-    // key should not compromise the other). Sits INSIDE the session layer
-    // so its handler runs after `SessionLayer` has injected the session
-    // handle into the request extension. Set `secure(false)` here for
-    // local HTTP dev; leave the default (`true`) behind TLS.
-    let mut csrf_key = [0u8; 32];
-    SystemRng.fill_bytes(&mut csrf_key);
-    let csrf_layer = CsrfLayer::new(CsrfConfig::new(csrf_key).secure(false));
+    // The key is a purpose-bound subkey of the session layer's master key
+    // (HKDF, label `axess.v1.csrf`), so a leak of one derived key does not
+    // give the other, and rotating the session master key rotates this key
+    // with it. Sits INSIDE the session layer so its handler runs after
+    // `SessionLayer` has injected the session handle into the request
+    // extension. In production, load the master key from a secrets
+    // manager so both survive a restart.
+    let csrf_key = session_layer.derive_subkey(b"axess.v1.csrf");
+    let csrf_layer = CsrfLayer::new(CsrfConfig::new(*csrf_key).secure(secure));
 
     let metrics = Arc::new(AppMetrics::new());
 
-    // Rate limiting: 10 requests per minute per IP on authentication endpoints.
-    // This is defense-in-depth alongside the per-user lockout policy.
+    // Rate limiting: 10 requests per minute per client IP on authentication
+    // endpoints, where the client IP is the one the `client_ip` layer below
+    // resolved (the socket peer, or the forwarded address when it came
+    // through a trusted proxy). `PeerIp` would put every client behind one
+    // proxy into a single bucket. Defense-in-depth alongside the per-user
+    // lockout policy.
     let auth_rate_limit = RateLimitLayer::new(
         RateLimitConfig::builder()
             .max_requests(10)
             .window(Duration::from_secs(60))
-            .key(KeyExtractor::PeerIp)
+            .key(KeyExtractor::ClientIp)
             .build(),
     )
     .with_metrics(AppMetricsHandle(metrics.clone()));
 
     let state_backend = backend.clone();
+    let factor_cipher = factor_secret_cipher();
     let service = Arc::new(
         AuthnService::builder(backend.clone(), backend)
+            // TOTP secrets are opened to check a code and kept sealed at rest.
+            .with_factor_secret_cipher(factor_cipher.clone())
             .with_metrics(AppMetricsHandle(metrics.clone()))
+            // Registered sessions are what a password reset or an admin
+            // action can revoke; handing over the session store lets the
+            // revocation delete the rows as well.
+            .with_registry(registry)
+            .with_session_store(session_store.clone())
             .build(),
     );
     let state = AppState {
@@ -142,6 +253,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         backend: state_backend,
         health,
         metrics,
+        factor_cipher,
     };
 
     // Auth routes; rate-limited.
@@ -209,6 +321,9 @@ async fn root(session: AuthSession) -> Redirect {
 
 /// `GET /healthz`; operational readiness probe for auth-related backends.
 ///
+/// The public answer is the aggregate only; per-component detail is logged.
+/// Serve a detailed probe on an internal-only listener if operators need it.
+///
 /// This checks axess components only (session store, etc.). In production,
 /// combine with your application's own health checks (database, message
 /// queues, external APIs) into a single composite endpoint. The route
@@ -218,13 +333,13 @@ async fn healthz(axum::extract::State(state): axum::extract::State<AppState>) ->
     let code = if status.is_healthy() {
         axum::http::StatusCode::OK
     } else {
+        // Backend error text can carry connection strings and paths: it goes
+        // to the log, never to an unauthenticated caller.
+        tracing::warn!(components = ?status.components, "health check failed");
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     };
     let body = serde_json::json!({
         "status": if status.is_healthy() { "healthy" } else { "unhealthy" },
-        "components": status.components.iter().map(|(name, s)| {
-            serde_json::json!({ "name": name, "status": format!("{s:?}") })
-        }).collect::<Vec<_>>(),
     });
     (code, axum::Json(body))
 }

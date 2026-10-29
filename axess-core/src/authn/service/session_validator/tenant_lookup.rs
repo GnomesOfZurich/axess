@@ -57,6 +57,7 @@ async fn session_in(tenant: TenantId) -> AuthSession {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     let session = AuthSession(SessionHandle(Arc::new(RwLock::new(inner))));
     session

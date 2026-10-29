@@ -67,6 +67,7 @@ fn guest_session() -> AuthSession {
         rng: std::sync::Arc::new(axess_rng::SystemRng),
         pending_fingerprint: None,
         max_custom_bytes: 64 * 1024,
+        consume: None,
     };
     AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
 }
@@ -284,4 +285,194 @@ fn per_event_metrics_implementations_receive_batched_totals() {
     let sink = PerEvent::default();
     sink.authz_cache_hits(7);
     assert_eq!(sink.0.load(Ordering::SeqCst), 7);
+}
+
+/// A provider whose entities depend on session state it names in its cache
+/// discriminator, and whose build can be held open to let an invalidation
+/// run while it is in flight.
+struct SessionAwareProvider {
+    calls: Arc<AtomicUsize>,
+    mfa: Arc<std::sync::atomic::AtomicBool>,
+    named: bool,
+    started: Arc<tokio::sync::Notify>,
+    release: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl SessionAwareProvider {
+    fn new(named: bool) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            mfa: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            named,
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: None,
+        }
+    }
+}
+
+impl RequestEntityProvider for SessionAwareProvider {
+    fn entities_for<'a>(
+        &'a self,
+        session: &'a AuthSession,
+        principal: &'a EntityUid,
+        resource: &'a EntityUid,
+        action: &'a EntityUid,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
+    > {
+        let _ = (session, action);
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // The state is read when the build starts, as a provider that
+            // reads the session would.
+            let mfa = self.mfa.load(Ordering::SeqCst);
+            if let Some(release) = &self.release {
+                self.started.notify_one();
+                release.notified().await;
+            }
+            let attrs = std::collections::HashMap::from([(
+                "mfa".to_string(),
+                cedar_policy::RestrictedExpression::new_bool(mfa),
+            )]);
+            let p = cedar_policy::Entity::new(principal.clone(), attrs, HashSet::new()).unwrap();
+            let r = cedar_policy::Entity::new(
+                resource.clone(),
+                std::collections::HashMap::new(),
+                HashSet::new(),
+            )
+            .unwrap();
+            Ok(Entities::from_entities(vec![p, r], None).unwrap())
+        })
+    }
+
+    fn cache_discriminator<'a>(
+        &'a self,
+        session: &'a AuthSession,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 'a>> {
+        let _ = session;
+        let named = self.named;
+        let mfa = self.mfa.load(Ordering::SeqCst);
+        Box::pin(async move { named.then(|| format!("mfa={mfa}")) })
+    }
+}
+
+fn principal_mfa(entities: &Entities, principal: &EntityUid) -> bool {
+    matches!(
+        entities.get(principal).and_then(|e| e.attr("mfa")),
+        Some(Ok(cedar_policy::EvalResult::Bool(true)))
+    )
+}
+
+/// Without a discriminator the key holds nothing of the session, so the
+/// second session is served the first session's entities. This pins the
+/// documented limit, not a goal.
+#[tokio::test]
+async fn session_state_in_entities_is_shared_without_a_discriminator() {
+    let provider = SessionAwareProvider::new(false);
+    let (calls, mfa) = (provider.calls.clone(), provider.mfa.clone());
+    let cached = EntityCache::new(provider);
+    let (s, p, a, r) = (guest_session(), principal(), action(), doc("d"));
+
+    mfa.store(true, Ordering::SeqCst);
+    let first = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+    assert!(principal_mfa(&first, &p));
+
+    mfa.store(false, Ordering::SeqCst);
+    let second = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        principal_mfa(&second, &p),
+        "the password-only session reads the MFA session's entities"
+    );
+}
+
+/// With a discriminator naming the state, the second session gets its own
+/// entities.
+#[tokio::test]
+async fn a_cache_discriminator_separates_sessions_of_one_user() {
+    let provider = SessionAwareProvider::new(true);
+    let (calls, mfa) = (provider.calls.clone(), provider.mfa.clone());
+    let cached = EntityCache::new(provider);
+    let (s, p, a, r) = (guest_session(), principal(), action(), doc("d"));
+
+    mfa.store(true, Ordering::SeqCst);
+    let first = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+    assert!(principal_mfa(&first, &p));
+
+    mfa.store(false, Ordering::SeqCst);
+    let second = cached.entities_for(&s, &p, &r, &a).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        !principal_mfa(&second, &p),
+        "the second session is denied the first one's state"
+    );
+
+    // Each state is cached under its own key.
+    cached.entities_for(&s, &p, &r, &a).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// An invalidation that runs while a load is in flight must not be undone
+/// by that load storing its stale result.
+#[tokio::test]
+async fn a_load_in_flight_during_an_invalidation_is_not_stored() {
+    let mut provider = SessionAwareProvider::new(false);
+    let release = Arc::new(tokio::sync::Notify::new());
+    provider.release = Some(release.clone());
+    let (calls, started) = (provider.calls.clone(), provider.started.clone());
+    let cached = EntityCache::new(provider);
+    let (s, p, a, r) = (guest_session(), principal(), action(), doc("d"));
+
+    let load = cached.entities_for(&s, &p, &r, &a);
+    let invalidate = async {
+        started.notified().await;
+        cached.invalidate_principal(&p);
+        release.notify_one();
+    };
+    let (loaded, ()) = tokio::join!(load, invalidate);
+    loaded.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // The stale result was not stored: the next lookup builds again.
+    let next = cached.entities_for(&s, &p, &r, &a);
+    let release_again = async {
+        // A stale entry served from the cache never reaches the provider,
+        // so bound the wait: a regression fails instead of hanging.
+        let built =
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.notified()).await;
+        assert!(built.is_ok(), "the stale load was served from the cache");
+        release.notify_one();
+    };
+    let (next, ()) = tokio::join!(next, release_again);
+    next.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// A resource-scoped invalidation drops the entries of every principal for
+/// that resource and leaves other resources alone.
+#[tokio::test]
+async fn invalidate_resource_drops_every_principals_entry_for_it() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cached = EntityCache::new(CountingProvider {
+        calls: calls.clone(),
+    });
+    let (s, a) = (guest_session(), action());
+    let alice = principal();
+    let bob = EntityUid::from_str("App::User::\"bob\"").unwrap();
+    let (d1, d2) = (doc("d1"), doc("d2"));
+    for (who, res) in [(&alice, &d1), (&bob, &d1), (&alice, &d2)] {
+        cached.entities_for(&s, who, res, &a).await.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    assert_eq!(cached.invalidate_resource(&d1), 2);
+
+    for (who, res) in [(&alice, &d1), (&bob, &d1), (&alice, &d2)] {
+        cached.entities_for(&s, who, res, &a).await.unwrap();
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "d1 twice rebuilt, d2 still cached"
+    );
 }

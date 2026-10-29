@@ -162,6 +162,31 @@ where
         }
     }
 
+    /// Replace the value and deadline of a live key only while `matches`
+    /// accepts the stored value, in one step under the map's shard lock.
+    /// `None` for an absent or expired key; otherwise whether `matches`
+    /// accepted (and the write happened).
+    pub fn replace_live_if(
+        &self,
+        key: &K,
+        value: &V,
+        ttl: Duration,
+        matches: impl FnOnce(&V) -> bool,
+    ) -> Option<bool> {
+        let now = self.clock.now();
+        match self.inner.get_mut(key) {
+            Some(mut entry) if entry.expires_at > now => {
+                if !matches(&entry.value) {
+                    return Some(false);
+                }
+                entry.value = value.clone();
+                entry.expires_at = self.deadline(now, ttl);
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
     /// Remove a key and report whether a live (unexpired) entry was removed.
     /// An expired entry is removed too but reported as `false`.
     pub fn remove_live(&self, key: &K) -> bool {

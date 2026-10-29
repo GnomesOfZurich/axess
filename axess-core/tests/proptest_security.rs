@@ -66,6 +66,8 @@ fn arb_session_data() -> impl Strategy<Value = SessionData> {
         fingerprint,
         device_id: None,
         custom,
+        revision: 0,
+        touched_at: None,
     })
 }
 

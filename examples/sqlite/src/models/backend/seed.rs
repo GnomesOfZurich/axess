@@ -139,14 +139,18 @@ pub async fn seed(
     let totp_secret = if let Some(json) = existing_totp {
         let config: FactorConfig = serde_json::from_str(&json)?;
         if let FactorConfig::Totp(ref tc) = config {
-            tc.secret.to_string()
+            // Once Bob has signed in the secret is sealed at rest and this
+            // process cannot read it back; he already has it in his app.
+            tc.secret
+                .plain()
+                .map_or_else(|| "(sealed at rest)".to_string(), str::to_string)
         } else {
             axess::generate_totp_secret(&axess::SystemRng)
         }
     } else {
         let secret = axess::generate_totp_secret(&axess::SystemRng);
         let bob_totp_config = FactorConfig::Totp(TotpConfig {
-            secret: ZeroizedString::new(secret.clone()),
+            secret: ZeroizedString::new(secret.clone()).into(),
             ..TotpConfig::default()
         });
         let bob_totp_json = serde_json::to_string(&bob_totp_config)?;

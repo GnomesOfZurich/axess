@@ -52,9 +52,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 /// AAD. The ids are supplied again on every read, so a bindings blob copied
 /// into another device's row fails authentication. A blob with a marker is
 /// never opened under an empty AAD. The 0.11.0 form (`AXD 0x01`, the ids
-/// joined by one zero byte) is still read. A blob without any marker
-/// predates binding and is opened under the empty AAD unless the crypto was
-/// set to reject such blobs ([`LegacyBlobs`](crate::session::crypto::LegacyBlobs)).
+/// joined by one zero byte) and a blob without any marker (which predates
+/// binding and opens under any ids) are read only under a
+/// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) policy that reads
+/// them. The bindings carry no ids of their own, so the policy's cutoff is the
+/// protection against a moved legacy blob.
 /// A bindings write seals the current form, and so does a read that finds an
 /// older form (a conditional write of the exact bytes it read), so the older
 /// forms age out as devices are written or read. Plaintext codecs have
@@ -247,6 +249,20 @@ pub enum SqlDeviceStoreError {
         /// Tenant scope of the missed lookup.
         tenant_id: String,
         /// Opaque device id whose lookup missed.
+        device_id: String,
+    },
+
+    /// A guarded trust-level change kept missing a row that a re-read found
+    /// at the expected level, so concurrent writers changed it on every
+    /// attempt. Nothing was written and the change was not refused: the
+    /// caller may retry.
+    #[error(
+        "device trust level kept changing under concurrent writers: tenant={tenant_id} id={device_id}"
+    )]
+    Contended {
+        /// Tenant scope of the row.
+        tenant_id: String,
+        /// Opaque device id of the row.
         device_id: String,
     },
 
@@ -448,6 +464,27 @@ pub(crate) fn require_row(
         });
     }
     Ok(())
+}
+
+/// `true` when the refresh-family index must be rewritten after an upsert:
+/// the bindings the row holds afterwards are the bytes this save wrote. When
+/// a guard in the upsert kept an already revoked row as it was, the stored
+/// bytes differ and the index keeps matching them.
+pub(crate) fn index_follows_write(stored: Option<&str>, written: &str) -> bool {
+    stored == Some(written)
+}
+
+/// The result of a sighting, given the level a read-back of the row found:
+/// the level, or a missing-device error when the row is absent.
+pub(crate) fn sighting_level(
+    level: Option<DeviceTrustLevel>,
+    tenant: String,
+    device_id: String,
+) -> Result<DeviceTrustLevel, SqlDeviceStoreError> {
+    level.ok_or(SqlDeviceStoreError::NotFound {
+        tenant_id: tenant,
+        device_id,
+    })
 }
 
 /// Every column value of a device row, already converted to what the
@@ -656,9 +693,9 @@ impl SweepCutoffs {
         let now = utc_to_unix(now);
         Self {
             now,
-            trusted: now - cfg.trusted_idle.num_seconds(),
-            seen: now - cfg.seen_idle.num_seconds(),
-            grace: now - cfg.revoked_grace.num_seconds(),
+            trusted: now.saturating_sub(cfg.trusted_idle.num_seconds()),
+            seen: now.saturating_sub(cfg.seen_idle.num_seconds()),
+            grace: now.saturating_sub(cfg.revoked_grace.num_seconds()),
         }
     }
 }
@@ -780,6 +817,35 @@ mod device_sql_common_tests {
         let bindings = vec![refresh("b"), refresh("a"), refresh("b"), refresh("a")];
         assert_eq!(refresh_family_ids(&bindings), vec!["b", "a"]);
         assert!(refresh_family_ids(&[]).is_empty());
+    }
+
+    /// A window of `Duration::MAX`, used to mean "never", yields a cutoff far
+    /// in the past: no row is older than it, so nothing is swept. A
+    /// `chrono::Duration` holds at most `i64::MAX` milliseconds, so its seconds
+    /// can never overflow the subtraction.
+    #[test]
+    fn an_unbounded_window_is_a_cutoff_far_in_the_past() {
+        let cfg = SweepConfig {
+            trusted_idle: chrono::Duration::MAX,
+            seen_idle: chrono::Duration::MAX,
+            revoked_grace: chrono::Duration::MAX,
+        };
+        let cutoffs = SweepCutoffs::new(&cfg, Utc::now());
+        for cutoff in [cutoffs.trusted, cutoffs.seen, cutoffs.grace] {
+            assert!(cutoff < 0 && cutoff < cutoffs.now, "cutoff {cutoff}");
+        }
+    }
+
+    /// The refresh-family index follows the bindings a row holds after the
+    /// upsert, which are this save's only when the upsert wrote them.
+    #[test]
+    fn the_family_index_follows_a_write_only_when_the_row_holds_it() {
+        assert!(index_follows_write(Some("written"), "written"));
+        assert!(
+            !index_follows_write(Some("kept-from-before"), "written"),
+            "a revoked row kept its older bindings"
+        );
+        assert!(!index_follows_write(None, "written"), "the row is gone");
     }
 
     /// Belt-and-suspenders: `to_str` and `from_str` form a

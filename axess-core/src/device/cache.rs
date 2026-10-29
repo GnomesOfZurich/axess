@@ -90,6 +90,36 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// it pins the security boundary explicitly and cheaply.
 type CacheKey = (TenantId, DeviceId);
 
+/// Drops a cached row when it goes out of scope, however the write it
+/// guards ends: it returns, fails, or the future running it is dropped at
+/// an `await` after the store has committed. The row is invalidated after
+/// the write either way (a guard dropped on completion runs after the
+/// write, like an explicit call would), and a cancelled write can no longer
+/// leave the pre-write row cached for a full TTL.
+struct InvalidateOnDrop {
+    cache: Arc<ClockTtlCache<CacheKey, Device>>,
+    key: CacheKey,
+}
+
+impl Drop for InvalidateOnDrop {
+    fn drop(&mut self) {
+        self.cache.invalidate(&self.key);
+    }
+}
+
+/// [`InvalidateOnDrop`] for every cached row of one tenant, for the sweep.
+struct InvalidateTenantOnDrop {
+    cache: Arc<ClockTtlCache<CacheKey, Device>>,
+    tenant: TenantId,
+}
+
+impl Drop for InvalidateTenantOnDrop {
+    fn drop(&mut self) {
+        let tenant = self.tenant;
+        self.cache.invalidate_by(|k| k.0 == tenant);
+    }
+}
+
 /// In-process cache decorator wrapping any [`DeviceStore`].
 ///
 /// Construct with [`CachedDeviceStore::new`] for default settings, or
@@ -301,9 +331,8 @@ where
             // row while the write was in flight is dropped by the
             // invalidation instead of staying cached. The invalidation
             // runs on failure too, since the stored row is then unknown.
-            let result = inner.save(&device, now).await;
-            cache.invalidate(&key);
-            result
+            let _guard = InvalidateOnDrop { cache, key };
+            inner.save(&device, now).await
         }
     }
 
@@ -312,7 +341,7 @@ where
         tenant_id: &TenantId,
         id: &DeviceId,
         now: DateTime<Utc>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
         // Deliberately NOT invalidating on this path. `record_sighting`
         // bumps `last_seen_at` and runs on every authenticated request
         //; invalidating would force a re-load on the very next
@@ -340,9 +369,8 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            let result = inner.set_trust_level(&tenant, &device, level, now).await;
-            cache.invalidate(&key);
-            result
+            let _guard = InvalidateOnDrop { cache, key };
+            inner.set_trust_level(&tenant, &device, level, now).await
         }
     }
 
@@ -360,11 +388,10 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            let result = inner
+            let _guard = InvalidateOnDrop { cache, key };
+            inner
                 .set_trust_level_if(&tenant, &device, expected, level, now)
-                .await;
-            cache.invalidate(&key);
-            result
+                .await
         }
     }
 
@@ -384,11 +411,10 @@ where
         let expected = expected.to_vec();
         let bindings = bindings.to_vec();
         async move {
-            let result = inner
+            let _guard = InvalidateOnDrop { cache, key };
+            inner
                 .replace_bindings(&tenant, &device, &expected, &bindings, now)
-                .await;
-            cache.invalidate(&key);
-            result
+                .await
         }
     }
 
@@ -406,9 +432,8 @@ where
         let device = *id;
         let user = *user;
         async move {
-            let result = inner.claim_owner(&tenant, &device, &user, now).await;
-            cache.invalidate(&key);
-            result
+            let _guard = InvalidateOnDrop { cache, key };
+            inner.claim_owner(&tenant, &device, &user, now).await
         }
     }
 
@@ -423,9 +448,8 @@ where
         let tenant = *tenant_id;
         let device = *id;
         async move {
-            let result = inner.delete(&tenant, &device).await;
-            cache.invalidate(&key);
-            result
+            let _guard = InvalidateOnDrop { cache, key };
+            inner.delete(&tenant, &device).await
         }
     }
 
@@ -441,9 +465,8 @@ where
         let inner = self.inner.clone();
         let tenant = *tenant_id;
         async move {
-            let result = inner.sweep(&tenant, now).await;
-            cache.invalidate_by(|k| k.0 == tenant);
-            result
+            let _guard = InvalidateTenantOnDrop { cache, tenant };
+            inner.sweep(&tenant, now).await
         }
     }
 }

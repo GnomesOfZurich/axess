@@ -15,6 +15,21 @@
 //! [`AuthzStore`](super::session::AuthzStore)) sees a single provider
 //! whose `entities_for` is now multi-tier cached.
 //!
+//! # Caching contract
+//!
+//! An entry is keyed on `(principal, tenant, resource, action)` and the
+//! wrapped provider's
+//! [`cache_discriminator`](super::RequestEntityProvider::cache_discriminator),
+//! nothing more. Entities that depend on other session state (MFA status,
+//! step-up recency, impersonation) are therefore shared between sessions of
+//! the same user and tenant for the whole TTL, unless the provider names
+//! that state in its discriminator. The supported shape is to keep the
+//! entities to durable facts and put per-session facts in the Cedar
+//! context, which is never cached.
+//!
+//! An invalidation also stops a load that was already running from
+//! repopulating the entry it just removed.
+//!
 //! # Why decorators (and not a separate trait)
 //!
 //! `RequestEntityProvider` is the only abstraction needed. A cache is just
@@ -39,6 +54,7 @@
 //! [`moka`]: https://docs.rs/moka
 //! [`fred`]: https://docs.rs/fred
 
+mod generation;
 mod invalidator;
 pub use invalidator::CacheInvalidator;
 

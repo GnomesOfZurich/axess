@@ -80,7 +80,11 @@ Preferred entrypoint:
 ```
 
 That script is the maintainer-facing pass/fail gate for a release cut. It runs
-the same checks below in order and stops on first failure.
+the same checks below in order and stops on first failure. It needs
+`VALKEY_URL`, `POSTGRES_URL` and `MYSQL_URL` set to running servers for the
+live-store step, and refuses rather than skips when one is missing;
+`scripts/check-live-stores.sh` carries the container recipe. 0.13.0 was tagged
+with four Valkey tests red because the preflight did not run that suite.
 
 Underlying checks:
 
@@ -88,6 +92,7 @@ Underlying checks:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features
+cargo test --workspace --all-features -- --ignored   # Valkey, PostgreSQL, MySQL
 cargo doc --no-deps --all-features -p axess -p axess-core
 cargo deny check licenses sources bans
 cargo semver-checks check-release --workspace

@@ -5,6 +5,7 @@
 //! trait methods on [`OAuthProviderConfig`](super::OAuthProviderConfig) are
 //! thin wrappers that delegate here.
 
+use super::super::types::DpopKey;
 use super::super::types::{AuthUrlResult, OAuthError, OAuthLoginOptions, ParResponse};
 use super::OAuthProviderConfig;
 use axess_rng::SecureRng;
@@ -46,7 +47,11 @@ pub(super) async fn build_auth_url_par(
     ];
 
     let response_mode_str;
-    if let Some(ref mode) = options.response_mode {
+    if cfg.fapi.as_ref().is_some_and(|f| f.require_jarm) {
+        // JARM (FAPI 2.0 / JWT Secured Authorization Response Mode): the
+        // response is a signed JWT, whatever mode the caller asked for.
+        params.push(("response_mode", "jwt"));
+    } else if let Some(ref mode) = options.response_mode {
         response_mode_str = mode.as_str().to_string();
         params.push(("response_mode", &response_mode_str));
     }
@@ -95,6 +100,8 @@ pub(super) async fn push_authorization_request(
         )
     })?;
 
+    super::endpoint::require_secure(Some(par_url), "pushed_authorization_request_endpoint")?;
+
     let mut form: Vec<(&str, &str)> = Vec::with_capacity(params.len() + 2);
     form.push(("client_id", cfg.client_id.as_str()));
     if let Some(ref secret) = cfg.client_secret {
@@ -127,90 +134,74 @@ pub(super) async fn push_authorization_request(
         .map_err(|e| OAuthError::TokenExchange(format!("PAR response parse failed: {e}")))
 }
 
-/// Generate a fresh DPoP proof JWT (RFC 9449) for sender-constrained tokens.
+/// Generate a DPoP proof JWT (RFC 9449) with `key`.
 ///
-/// Creates a per-proof ephemeral ES256 key pair, signs the `htm`/`htu`/`iat`
-/// claims plus optional `ath` (access token hash) when binding to a
-/// resource-server request, and returns the JWT together with the RFC 7638
-/// JWK thumbprint (which the IdP echoes back in `cnf.jkt`).
+/// Signs the `htm`/`htu`/`iat`/`jti` claims plus optional `ath` (access token
+/// hash) when binding to a resource-server request, and returns the JWT
+/// together with the RFC 7638 thumbprint of `key` (the value the
+/// authorization server echoes back in `cnf.jkt`).
+///
+/// RFC 9449 requires every proof presented with a bound token to be signed by
+/// the key the token is bound to, so the key is the caller's to create once
+/// per session ([`DpopKey::generate`]) and keep for the token's life. Two
+/// proofs from one key for different URLs report the same thumbprint.
 ///
 /// # Caller-supplied entropy and time
 ///
 /// Nothing here reads a clock or a random source. The caller passes the
-/// 32 bytes that derive the ephemeral key, the 16 bytes that become the
-/// `jti` (as a version-4 UUID) and the `iat` Unix second, so the same
-/// inputs give the same header and payload and a seeded
-/// [`SecureRng`](axess_rng::SecureRng) with a mock clock reproduces the
-/// whole proof. The key bytes are interpreted as a P-256 scalar
-/// (big-endian); on the cosmically unlikely chance that they fall outside
-/// the curve order, the input is hashed once and retried.
-#[cfg(feature = "fapi")]
+/// 16 bytes that become the `jti` (as a version-4 UUID) and the `iat` Unix
+/// second, so the same inputs give the same header and payload and a seeded
+/// [`SecureRng`](axess_rng::SecureRng) with a mock clock reproduces the whole
+/// proof.
 pub(super) fn generate_dpop_proof(
+    key: &DpopKey,
     http_method: &str,
     http_url: &str,
     access_token: Option<&str>,
-    mut key_seed: [u8; 32],
+    iat: i64,
+    jti_bytes: [u8; 16],
+) -> Result<super::super::types::DpopProof, OAuthError> {
+    generate_dpop_proof_with_nonce(
+        key,
+        http_method,
+        http_url,
+        access_token,
+        None,
+        iat,
+        jti_bytes,
+    )
+}
+
+/// [`generate_dpop_proof`] carrying the `nonce` an authorization or resource
+/// server demanded (RFC 9449 §8, §9): the server answers a proof without one
+/// with `use_dpop_nonce` and a `DPoP-Nonce` header, and the request is sent
+/// again with a proof that echoes it.
+pub(super) fn generate_dpop_proof_with_nonce(
+    key: &DpopKey,
+    http_method: &str,
+    http_url: &str,
+    access_token: Option<&str>,
+    server_nonce: Option<&str>,
     iat: i64,
     jti_bytes: [u8; 16],
 ) -> Result<super::super::types::DpopProof, OAuthError> {
     use jsonwebtoken::{Algorithm, EncodingKey};
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::pkcs8::EncodePrivateKey;
     use sha2::Digest;
 
-    // DPoP uses an ephemeral ES256 key pair per proof. Build it from the
-    // injected seed bytes so DST tests are reproducible.
-    let ec_key = loop {
-        let bytes_ref: &[u8; 32] = &key_seed;
-        match p256::SecretKey::from_slice(bytes_ref) {
-            Ok(k) => break k,
-            Err(_) => {
-                // Re-hash and retry: ~2^-128 probability per iteration.
-                key_seed = sha2::Sha256::digest(key_seed).into();
-            }
-        }
-    };
+    let ec_key = key.secret_key()?;
     // jsonwebtoken's `EncodingKey::from_ec_der` expects PKCS#8
-    // PrivateKeyInfo, NOT raw SEC1 ECPrivateKey. The previous
-    // implementation passed `to_sec1_der()`, which silently produced
-    // a `Config("DPoP signing failed: InvalidEcdsaKey")` at sign
-    // time. The bug was masked by zero DPoP test coverage; the
-    // determinism tests surfaced it. Use
-    // `to_pkcs8_der()` for the format jsonwebtoken actually accepts.
-    use p256::pkcs8::EncodePrivateKey;
+    // PrivateKeyInfo, not raw SEC1 ECPrivateKey.
     let ec_key_der = ec_key
         .to_pkcs8_der()
         .map_err(|e| OAuthError::Config(format!("DPoP key generation failed: {e}")))?;
     let encoding_key = EncodingKey::from_ec_der(ec_key_der.as_bytes());
 
-    let public_key = ec_key.public_key();
-    let ec_point = public_key.to_encoded_point(false);
-    let x_bytes = ec_point
-        .x()
-        .ok_or_else(|| OAuthError::Config("DPoP: failed to extract EC x coordinate".to_string()))?;
-    let y_bytes = ec_point
-        .y()
-        .ok_or_else(|| OAuthError::Config("DPoP: failed to extract EC y coordinate".to_string()))?;
+    let (x_b64, y_b64) = key.public_coordinates()?;
+    let thumbprint = key.thumbprint()?;
 
     use base64::Engine as _;
     let b64 = &base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let x_b64 = b64.encode(x_bytes.as_slice());
-    let y_b64 = b64.encode(y_bytes.as_slice());
-
-    // Build the JWK in a `BTreeMap<&str, &str>` and serialise via
-    // `serde_json::to_string`. `BTreeMap`'s ordered iteration produces the
-    // RFC 7638 canonical lex-ordered JSON without ad-hoc string templating
-    //; so adding a new public-key field can never silently break the
-    // thumbprint by ordering it incorrectly.
-    let mut canonical_members: std::collections::BTreeMap<&'static str, &str> =
-        std::collections::BTreeMap::new();
-    canonical_members.insert("crv", "P-256");
-    canonical_members.insert("kty", "EC");
-    canonical_members.insert("x", &x_b64);
-    canonical_members.insert("y", &y_b64);
-    let canonical = serde_json::to_string(&canonical_members)
-        .map_err(|e| OAuthError::Config(format!("DPoP JWK canonicalisation failed: {e}")))?;
-    let thumbprint_bytes = sha2::Sha256::digest(canonical.as_bytes());
-    let thumbprint = b64.encode(thumbprint_bytes);
 
     let jwk_value = serde_json::json!({
         "kty": "EC",
@@ -229,6 +220,10 @@ pub(super) fn generate_dpop_proof(
         "iat": iat,
         "jti": jti,
     });
+
+    if let Some(nonce) = server_nonce {
+        payload["nonce"] = serde_json::Value::String(nonce.to_string());
+    }
 
     // If binding to an access token, include `ath` (access token hash).
     if let Some(at) = access_token {
@@ -255,7 +250,6 @@ pub(super) fn generate_dpop_proof(
             .map_err(|e| OAuthError::Config(format!("DPoP signing failed: {e}")))?;
 
     let proof_jwt = format!("{signing_input}.{signature}");
-    zeroize::Zeroize::zeroize(&mut key_seed);
 
     Ok(super::super::types::DpopProof {
         proof_jwt,
@@ -263,17 +257,20 @@ pub(super) fn generate_dpop_proof(
     })
 }
 
-#[cfg(all(test, feature = "fapi"))]
+#[cfg(test)]
 mod fapi_tests {
     use super::*;
 
     const IAT: i64 = 1_767_225_600;
     const JTI: [u8; 16] = [0xab; 16];
 
-    /// Confirm `BTreeMap`-driven canonical JWK matches the
-    /// hand-crafted lex-ordered JSON the previous implementation used.
-    /// Pure-data check: exercises the canonicalisation independently
-    /// of P-256 key generation.
+    fn key(seed: u8) -> DpopKey {
+        DpopKey::from_seed([seed; 32])
+    }
+
+    /// Confirm `BTreeMap`-driven canonical JWK matches the lex-ordered JSON
+    /// RFC 7638 requires. Pure-data check: exercises the canonicalisation
+    /// independently of P-256 key generation.
     #[test]
     fn canonical_jwk_lex_ordering() {
         use std::collections::BTreeMap;
@@ -289,55 +286,64 @@ mod fapi_tests {
         assert_eq!(canonical, r#"{"crv":"P-256","kty":"EC","x":"ax","y":"ay"}"#);
     }
 
-    /// Identical seed → identical thumbprint. Proves
-    /// the DST contract: a seeded `SecureRng` driving DPoP key
-    /// generation gives reproducible `cnf.jkt` across test runs.
-    /// Different seeds → different thumbprints.
+    /// Identical seed gives an identical thumbprint (the DST contract: a
+    /// seeded `SecureRng` driving key generation gives reproducible
+    /// `cnf.jkt` across runs); different seeds give different ones.
     #[test]
     fn deterministic_thumbprint_from_seed() {
-        let seed_a = [0x11u8; 32];
-        let seed_b = [0x22u8; 32];
+        let proof_a1 = generate_dpop_proof(
+            &key(0x11),
+            "POST",
+            "https://api.example.com/x",
+            None,
+            IAT,
+            JTI,
+        )
+        .unwrap();
+        let proof_a2 = generate_dpop_proof(
+            &key(0x11),
+            "POST",
+            "https://api.example.com/x",
+            None,
+            IAT,
+            JTI,
+        )
+        .unwrap();
+        let proof_b = generate_dpop_proof(
+            &key(0x22),
+            "POST",
+            "https://api.example.com/x",
+            None,
+            IAT,
+            JTI,
+        )
+        .unwrap();
 
-        let proof_a1 =
-            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_a, IAT, JTI)
-                .unwrap();
-        let proof_a2 =
-            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_a, IAT, JTI)
-                .unwrap();
-        let proof_b =
-            generate_dpop_proof("POST", "https://api.example.com/x", None, seed_b, IAT, JTI)
-                .unwrap();
-
-        assert_eq!(
-            proof_a1.thumbprint, proof_a2.thumbprint,
-            "same seed must produce the same JWK thumbprint"
-        );
-        assert_ne!(
-            proof_a1.thumbprint, proof_b.thumbprint,
-            "different seeds must produce different thumbprints"
-        );
-        // Sanity: thumbprint is base64url-no-pad of a 32-byte SHA-256 →
-        // expected length 43 chars.
+        assert_eq!(proof_a1.thumbprint, proof_a2.thumbprint);
+        assert_ne!(proof_a1.thumbprint, proof_b.thumbprint);
+        // base64url-no-pad of a 32-byte SHA-256 is 43 chars.
         assert_eq!(proof_a1.thumbprint.len(), 43);
     }
 
-    /// Regression test for the lex-ordering rail. Hardcodes
-    /// the SHA-256 thumbprint expected for a known seed, so any future
-    /// regression that reorders JWK members (or accidentally adds a
-    /// field) will flip the digest and fail loudly.
+    /// Regression test for the lex-ordering rail. Hardcodes the SHA-256
+    /// thumbprint expected for a known seed, so any future regression that
+    /// reorders JWK members (or accidentally adds a field) flips the digest.
     #[test]
     fn known_seed_yields_known_thumbprint() {
-        // Seed picked once and pinned. If you change this test, change
-        // the expected thumbprint below in lockstep.
         let seed = [
             0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
             0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
             0x1d, 0x1e, 0x1f, 0x20,
         ];
-        let proof =
-            generate_dpop_proof("GET", "https://rs.example.com/", None, seed, IAT, JTI).unwrap();
-        // Pin the digest. If this string ever changes, the canonical
-        // JWK form changed; review carefully before updating.
+        let proof = generate_dpop_proof(
+            &DpopKey::from_seed(seed),
+            "GET",
+            "https://rs.example.com/",
+            None,
+            IAT,
+            JTI,
+        )
+        .unwrap();
         let expected = "6UoWwDCkLjV0J-pQG8c0THxbVhBcpR0AZDift1Yl5DM";
         assert_eq!(
             proof.thumbprint, expected,
@@ -358,17 +364,15 @@ mod fapi_tests {
     /// fresh UUID, and the whole proof (header and payload) repeats.
     #[test]
     fn iat_and_jti_are_exactly_what_the_caller_supplied() {
-        let seed = [0x33u8; 32];
-        let proof =
-            generate_dpop_proof("POST", "https://a.example/t", None, seed, IAT, JTI).unwrap();
+        let k = key(0x33);
+        let proof = generate_dpop_proof(&k, "POST", "https://a.example/t", None, IAT, JTI).unwrap();
         let payload = decode_part(&proof.proof_jwt, 1);
         assert_eq!(payload["iat"], IAT);
         assert_eq!(payload["jti"], "abababab-abab-4bab-abab-abababababab");
         assert_eq!(payload["htm"], "POST");
         assert_eq!(payload["htu"], "https://a.example/t");
 
-        let again =
-            generate_dpop_proof("POST", "https://a.example/t", None, seed, IAT, JTI).unwrap();
+        let again = generate_dpop_proof(&k, "POST", "https://a.example/t", None, IAT, JTI).unwrap();
         assert_eq!(
             decode_part(&again.proof_jwt, 0),
             decode_part(&proof.proof_jwt, 0)
@@ -376,10 +380,75 @@ mod fapi_tests {
         assert_eq!(decode_part(&again.proof_jwt, 1), payload);
 
         let later =
-            generate_dpop_proof("POST", "https://a.example/t", None, seed, IAT + 1, [1; 16])
-                .unwrap();
+            generate_dpop_proof(&k, "POST", "https://a.example/t", None, IAT + 1, [1; 16]).unwrap();
         let later_payload = decode_part(&later.proof_jwt, 1);
         assert_eq!(later_payload["iat"], IAT + 1);
         assert_ne!(later_payload["jti"], payload["jti"]);
+    }
+
+    /// Two proofs from one key for different URLs, one of them bound to an
+    /// access token, report one thumbprint and it is the key's own; a proof
+    /// from another key reports another. This is what a `cnf.jkt` binding
+    /// needs and what a key drawn per proof could never give.
+    #[test]
+    fn one_key_gives_one_thumbprint_across_proofs() {
+        let k = key(0x44);
+        let first =
+            generate_dpop_proof(&k, "POST", "https://as.example/token", None, IAT, JTI).unwrap();
+        let second = generate_dpop_proof(
+            &k,
+            "GET",
+            "https://rs.example/accounts",
+            Some("access-token"),
+            IAT + 5,
+            [2; 16],
+        )
+        .unwrap();
+        assert_eq!(first.thumbprint, second.thumbprint);
+        assert_eq!(first.thumbprint, k.thumbprint().unwrap());
+
+        let other = generate_dpop_proof(
+            &key(0x55),
+            "GET",
+            "https://rs.example/accounts",
+            None,
+            IAT,
+            JTI,
+        )
+        .unwrap();
+        assert_ne!(other.thumbprint, first.thumbprint);
+    }
+
+    /// The proof verifies under the verifier a resource server runs, and the
+    /// thumbprint it reports is the key's.
+    #[test]
+    fn a_generated_proof_verifies_and_reports_the_keys_thumbprint() {
+        use crate::oauth::provider::dpop_verify::{
+            DpopVerifyRequest, MemoryJtiCache, verify_dpop_proof,
+        };
+        let k = key(0x66);
+        let proof = generate_dpop_proof(
+            &k,
+            "POST",
+            "https://as.example/token",
+            Some("tok"),
+            IAT,
+            JTI,
+        )
+        .unwrap();
+        let now = chrono::DateTime::from_timestamp(IAT, 0).unwrap();
+        let verified = verify_dpop_proof(
+            DpopVerifyRequest {
+                proof_jwt: &proof.proof_jwt,
+                htm: "POST",
+                htu: "https://as.example/token",
+                access_token: Some("tok"),
+                max_iat_skew_secs: 60,
+                jti_cache: &MemoryJtiCache::new(),
+            },
+            now,
+        )
+        .expect("verifies");
+        assert_eq!(verified.thumbprint, k.thumbprint().unwrap());
     }
 }

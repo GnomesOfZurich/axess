@@ -39,6 +39,18 @@ operational secret covered in the *Getting started* chapter: a
 32-byte value loaded from a secrets manager, stable across process
 restarts, rotated on a schedule.
 
+The default cookie name is `__Host-axess.sid`. The `__Host-` prefix makes
+browsers refuse the cookie unless it is `Secure`, has `Path=/` and carries
+no `Domain`, which stops a sibling subdomain from planting a cookie of the
+same name ("cookie tossing"). When the layer is built with `Secure` off or
+a path other than `/` and no name was chosen, the default falls back to
+`axess.sid`, because a prefixed cookie would be dropped. A name you choose
+is used as given and checked: a prefix that the other settings cannot honour
+panics at startup. If a request carries the cookie name twice with different
+values, the session layer treats it as no cookie rather than picking one.
+Responses that set the session cookie carry `Cache-Control: no-store`
+(unless the handler set its own) and `Vary: Cookie`.
+
 The cookie attributes are conservative by default: `HttpOnly`
 (client-side JavaScript cannot read it), `SameSite=Lax` (it is sent
 on top-level cross-site navigations but not on cross-site
@@ -231,14 +243,23 @@ async fn call(&self, req: Request) -> Response {
 Three of the eight steps are worth dwelling on.
 
 Step 5 (the fingerprint check) is the gate that catches replay. A
-mismatched fingerprint causes the handler not to run at all; the
-session-layer returns a 401 (or the configured response). The
-choice of response depends on the policy: warn-only deployments
-log and continue; strict deployments deny.
+mismatched fingerprint does not stop the request. The stored session
+is discarded, the `session_binding_mismatch` metric fires, and the
+handler runs as a `Guest` under a freshly minted session id, so the
+attacker-planted id never reaches it. A route that needs a signed-in
+user then refuses the request in the usual way (a redirect to login
+or a 401, whatever the route's guard does).
 
 Step 7 is where the handler actually runs. The handler receives a
 `SessionHandle` via `AuthSession` (the extractor), reads or
 mutates it, and the mutations are tracked via the dirty flag.
+
+A request that arrives without a trusted session cookie runs as a guest
+that exists only in memory. It is stored, and a cookie is set, only when
+something needs it: a handler modified it or read its id, or a handler used
+the CSRF token (`CsrfToken` or `CsrfIssuer`). Set
+`CsrfConfig::mint_on_every_request` for a single-page app that reads the
+CSRF cookie without any handler touching the token.
 
 Step 8 is the write-back. The session is saved only when it is
 dirty, which means a read-only request (the dashboard, a metric
@@ -265,8 +286,10 @@ case is to use the typed accessors (`is_authenticated`,
 borrow. Mutating accessors (`clear`, `set_custom`, the orchestrated
 `begin_login` and `verify_factor` paths) all set the flag.
 
-The cookie is reissued only when the session id rotates, not on
-every write. Identifier rotation happens at two automatic moments
+A `Set-Cookie` header is sent whenever the session was created or
+modified in the request, not only when the id rotates; an unmodified
+request sends none, which keeps responses cacheable. Identifier
+rotation happens at two automatic moments
 (`Guest` → authenticated to defeat fixation; logout so the new
 `Guest` session doesn't share an id with the old) plus explicit
 re-issuance through `AuthSession::regenerate`. The routine
@@ -337,17 +360,96 @@ write. A session that goes idle for the TTL expires; a session
 that gets a single dirty write per TTL window never expires
 (through ordinary use).
 
-Some deployments want a hard cap: a session expires absolutely at a
-fixed time after creation, regardless of activity. Axess has no
-absolute TTL. `with_ttl` sets the sliding one and there is no second
-knob beside it, so a session kept warm by ordinary use does not expire
-on its own.
+A request that only reads keeps the session alive too, without a write on
+every request. Each write stamps the session with the time it re-armed the
+row (`SessionData::touched_at`). A stored session whose stamp is older than
+half the TTL is re-armed by the next request, read-only or not: the row's
+expiry moves out by a full TTL and the response re-issues the cookie with a
+fresh `Max-Age`. A session within half its TTL costs no write and sets no
+cookie. The re-arm is a compare-and-swap on the session's revision, so it
+never overwrites what a concurrent request wrote; when it loses the race the
+other request's write has already re-armed the row. A session stored before
+the stamp existed is re-armed once, on its next request.
 
-Where a hard cap matters, put the creation instant in `custom` and
-check it in a layer of your own above the session layer, or end the
-session from the registry on the schedule you want. Both are a few
-lines, and both keep the decision where the deployment's compliance
-requirement actually lives.
+Some deployments want a hard cap: a session expires absolutely at a
+fixed time after it authenticated, regardless of activity. Set it with
+`SessionLayer::with_max_session_age` (or `max_authenticated_age` on the
+config builder). On the next request after the cap, the session is
+deleted and the request runs as a new guest. The age is measured from the
+authentication time stored in the session, using the layer's clock
+(`with_clock`). There is no cap by default.
+
+### Revocation
+
+Revoking a session (suspending the user, a completed password reset,
+`invalidate_user_sessions`, the per-user session cap, an administrator
+kick, log out everywhere) removes it from the **session registry**. On its
+own that does not touch the stored session row or the cookie. What notices
+depends on what guards the route:
+
+- `require_authn!` and `login_required!` check only the session's own
+  state. A revoked session still passes them.
+- `require_valid_session` consults the registry and answers 401. It also
+  clears the stored session and rotates its id, so the row stops saying
+  `Authenticated`.
+- A `SessionLayer` built with `with_registry` consults the registry for
+  every authenticated session on every request, whatever guards the
+  route. A session the registry no longer holds is deleted from the store
+  and the request runs as a new guest with a replacement cookie. When the
+  registry cannot answer, `with_unknown_liveness` decides: the default
+  treats the request as a guest without touching the row, and `Accept`
+  trusts the stored session. This is the setting to use if revocation must
+  be immediate; it costs one registry call per authenticated request.
+
+When a handler rotates an authenticated session with `regenerate`, a layer
+built with a registry moves the registry entry to the new id by itself.
+Without that, use `RequestAuthnService::rotate_session`, which rotates and
+re-registers (failing closed), so the registry check does not find the
+rotated session revoked.
+
+Becoming authenticated clears the session's `custom` data, whichever way the
+login completes (a password, a factor chain, a passkey, an OAuth callback,
+an impersonation), so state an anonymous visitor could plant does not ride
+into the signed-in session. The key the login service owns for the flow in
+flight survives its own transition. An application that stashes something on
+purpose before the login (a post-login destination, a chosen locale) names
+the keys with `AuthnServiceBuilder::with_preserved_custom_keys`; names match
+exactly and nothing is preserved by default.
+
+Ending sessions through the authentication service
+(`RequestAuthnService::invalidate_user_sessions`, `invalidate_session`,
+suspension, a password reset) removes the registry entries and, when the
+service was given the session store with `with_session_store`, deletes the
+stored rows as well. Every kick names who acted with a `Actor`, and
+a registry that cannot carry the revocation out is an error to the caller;
+no audit row claims otherwise. `AuthnServiceBuilder::build` logs a warning
+when no registry is attached, because without one none of these end an
+existing session.
+
+`require_authn!` takes a validator when the layer has no registry:
+`require_authn!(url = "/login", validator = authn.session_validator())`
+consults the registry and ends a revoked session like `require_valid_session`.
+
+### Single-use values
+
+`AuthSession::take_custom` hands a value to exactly one request. The removal
+is written to the store as a compare-and-swap on the session's revision
+before the value is returned, so of any number of requests (on this node or
+others) holding the same stored session, one gets the value and the rest get
+`None`. A store that cannot answer gives `None` as well: a one-shot ceremony
+is started again, never run twice. Ordinary writes stay last-writer-wins, so
+an unrelated request that loaded the session before the value was taken and
+saves it afterwards puts the value back; put a nonce in the value that the
+completing request must also present when a replay of the stale copy would
+matter.
+
+### Cancelled requests
+
+The layer finalizes the session in a task of its own. A request dropped
+mid-handler (the client went away, a timeout layer fired) still has the
+session state the handler had reached written to the store, so a logout that
+cleared the session and then lost its connection does not leave the stored
+row `Authenticated`.
 
 ### Session cleanup
 

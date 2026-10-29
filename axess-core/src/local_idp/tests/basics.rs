@@ -39,6 +39,10 @@ impl LocalIdpKeyStore for FailingKeyStore {
         drop(new_current);
         Err(LoadFailure)
     }
+
+    async fn retire(&self, _key_id: &str) -> Result<bool, Self::Error> {
+        Err(LoadFailure)
+    }
 }
 
 #[tokio::test]
@@ -122,7 +126,11 @@ async fn mint_exceeding_max_ttl_returns_error_does_not_panic() {
 
     let now = Utc::now();
     let result = idp
-        .mint(&MintClaims::new("worker-1", now + Duration::hours(2)).with_issued_at(now))
+        .mint(
+            &MintClaims::new("worker-1", now + Duration::hours(2))
+                .with_audience("https://api")
+                .with_issued_at(now),
+        )
         .await;
     match result {
         Err(IssuanceError::LifetimeExceedsCap { observed, max }) => {
@@ -145,9 +153,13 @@ async fn mint_within_max_ttl_succeeds() {
     .with_max_ttl(Duration::minutes(10));
 
     let now = Utc::now();
-    idp.mint(&MintClaims::new("worker-1", now + Duration::minutes(5)).with_issued_at(now))
-        .await
-        .expect("mint within cap");
+    idp.mint(
+        &MintClaims::new("worker-1", now + Duration::minutes(5))
+            .with_audience("https://api")
+            .with_issued_at(now),
+    )
+    .await
+    .expect("mint within cap");
 }
 
 #[tokio::test]
@@ -162,9 +174,13 @@ async fn mint_at_exact_max_ttl_boundary_succeeds() {
     .with_max_ttl(Duration::minutes(10));
 
     let now = Utc::now();
-    idp.mint(&MintClaims::new("worker-1", now + Duration::minutes(10)).with_issued_at(now))
-        .await
-        .expect("boundary mint succeeds (<= not <)");
+    idp.mint(
+        &MintClaims::new("worker-1", now + Duration::minutes(10))
+            .with_audience("https://api")
+            .with_issued_at(now),
+    )
+    .await
+    .expect("boundary mint succeeds (<= not <)");
 }
 
 #[tokio::test]
@@ -214,7 +230,11 @@ async fn issuance_listener_does_not_fire_when_max_ttl_violated() {
 
     let now = Utc::now();
     let _ = idp
-        .mint(&MintClaims::new("worker-1", now + Duration::hours(2)).with_issued_at(now))
+        .mint(
+            &MintClaims::new("worker-1", now + Duration::hours(2))
+                .with_audience("https://api")
+                .with_issued_at(now),
+        )
         .await;
     assert_eq!(
         recorder.count(),
@@ -277,9 +297,11 @@ async fn with_clock_drives_max_ttl_reference_when_iat_unset() {
 
     // No iat: the production code uses now-from-clock as reference.
     // exp = anchor + 5 min → lifetime = 5 min ≤ 10 min cap → mint OK.
-    idp.mint(&MintClaims::new("worker-1", anchor + Duration::minutes(5)))
-        .await
-        .expect("mint within injected-clock TTL");
+    idp.mint(
+        &MintClaims::new("worker-1", anchor + Duration::minutes(5)).with_audience("https://api"),
+    )
+    .await
+    .expect("mint within injected-clock TTL");
 
     // exp = anchor + 30 min → lifetime = 30 min > 10 min cap → error.
     let result = idp
@@ -405,7 +427,7 @@ async fn issuer_accessor_returns_configured_string() {
 }
 
 #[tokio::test]
-async fn max_ttl_accessor_returns_none_by_default_and_value_after_set() {
+async fn max_ttl_accessor_returns_the_default_cap_and_value_after_set() {
     let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
     let idp = LocalIdp::from_key_store(
         "https://idp.local",
@@ -413,8 +435,69 @@ async fn max_ttl_accessor_returns_none_by_default_and_value_after_set() {
     )
     .await
     .expect("load");
-    assert_eq!(idp.max_ttl(), None);
+    assert_eq!(idp.max_ttl(), Some(DEFAULT_MAX_TTL));
+    assert_eq!(idp.without_max_ttl().max_ttl(), None);
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(LocalIdpSigningKey::generate_es256()),
+    )
+    .await
+    .expect("load");
 
     let idp = idp.with_max_ttl(Duration::minutes(15));
     assert_eq!(idp.max_ttl(), Some(Duration::minutes(15)));
+}
+
+async fn es256_idp() -> LocalIdp<MemoryLocalIdpKeyStore> {
+    LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(
+            LocalIdpSigningKey::generate_es256().with_key_id("k1"),
+        ),
+    )
+    .await
+    .expect("load")
+}
+
+#[tokio::test]
+async fn a_new_idp_caps_lifetime_at_one_hour_until_told_otherwise() {
+    let now = Utc::now();
+    let claims = MintClaims::new("w", now + Duration::days(30)).with_audience("api");
+    let capped = es256_idp().await;
+    assert!(matches!(
+        capped.mint(&claims).await,
+        Err(IssuanceError::LifetimeExceedsCap { .. })
+    ));
+    assert!(
+        es256_idp()
+            .await
+            .without_max_ttl()
+            .mint(&claims)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn a_mint_without_an_audience_is_refused_unless_allowed() {
+    let claims = MintClaims::new("w", Utc::now() + Duration::minutes(5));
+    let strict = es256_idp().await;
+    assert!(matches!(
+        strict.mint(&claims).await,
+        Err(IssuanceError::MissingAudience)
+    ));
+    assert!(
+        es256_idp()
+            .await
+            .allow_no_audience()
+            .mint(&claims)
+            .await
+            .is_ok()
+    );
+    assert!(
+        strict
+            .mint(&claims.clone().with_audience("api"))
+            .await
+            .is_ok()
+    );
 }

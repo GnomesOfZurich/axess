@@ -88,10 +88,14 @@ group they belong to. A policy that says
 is in that role. The provider populates this from your
 role-and-group store.
 
-The principal's attributes. The user's tenant id, MFA status,
-factors completed, custom attributes the policies use. Many of
-these are already on the `Principal` value; the provider attaches
-them as Cedar attributes on the principal entity.
+The principal's durable attributes. The user's tenant id, department,
+clearance level, custom attributes the policies use: facts that are
+the same for every session of that user. The provider attaches them
+as Cedar attributes on the principal entity. Facts about the current
+session or request (MFA status, how recently the user authenticated,
+an impersonation flag) do not belong here: put them in the Cedar
+context (see *Request context* below), because the entity set is
+cached across sessions.
 
 The resource's parents. The tenant that owns it, the project it
 belongs to, any logical grouping the policies might match against.
@@ -130,6 +134,15 @@ of what follows is identical.
 {{#include ../../examples/authz/src/provider.rs:provider}}
 ```
 
+Build the entities with the schema, as the example does
+(`Entities::from_entities(entities, Some(&schema))`), so Cedar checks
+their shape. The policy store also adds the schema's action entities
+(the actions and the action groups they belong to) to every
+evaluation, so a `forbid` over an action group such as
+`action in Action::"Mutating"` applies even to a provider that builds
+its entities without a schema. You do not build action entities in a
+provider.
+
 The last step is the one that bites. Cedar evaluates against the
 entities you hand it and nothing else, so an entity a policy
 dereferences but the provider did not build is simply absent, and the
@@ -161,9 +174,36 @@ answer. The defence is to not cache decisions at all.
 
 Entity graphs can be cached because they are functions of the
 database state at a known point in time. The cache key is the
-principal UID plus the resource UIDs; the cache value is the
-entity set; the cache TTL is a function of how stale the
-application is willing to tolerate.
+principal UID, the session's tenant, the resource UID and the action;
+the cache value is the entity set; the cache TTL is a function of how
+stale the application is willing to tolerate.
+
+### The caching contract
+
+The key holds nothing else from the session. Every session of the
+same user and tenant that asks for the same resource and action is
+served the same entity set for the TTL, whichever session built it.
+A provider that writes session state into the entities breaks that:
+after MFA in one session, a password-only session of the same user
+would read the entities built for the first and pass a
+`principal.mfa_verified` policy.
+
+So the supported shape is: entities hold durable facts (roles, group
+membership, ownership, tenant), and per-session facts go in the Cedar
+context, where `context.mfa_verified` is built for each request and
+never cached.
+
+A provider that must put session state into the entities declares it
+by overriding `cache_discriminator`, which returns a string naming
+that state (for example `"mfa=1"`). The caches add it to the key
+(hashed in Valkey), so sessions with different state get different
+entries. The default returns `None`: the entities depend on nothing
+beyond the key. The caching decorators forward the call to the
+provider they wrap.
+
+An invalidation also discards a load that was running when it was
+called, so a stale build cannot repopulate the entry that was just
+removed.
 
 Axess provides `EntityCache`, an LRU-plus-TTL decorator around a
 `RequestEntityProvider`, so repeat checks skip the inner provider's
@@ -182,7 +222,12 @@ drive expiry without sleeping.
 Invalidation is yours. Call `EntityCache::invalidate` from whatever
 mutates a principal's roles or a resource's authorization-relevant
 attributes; axess cannot know when your data changed, so it does not
-try.
+try. When a resource changes (owner, classification, sharing) and you
+cannot list the principals that read it, call `invalidate_resource`
+with the resource's UID, which drops every entry built for that
+resource whoever asked for it. `invalidate_principal` and
+`invalidate_tenant` are the equivalents for the other two scopes, and
+all of them are on the `CacheInvalidator` trait.
 
 The TTL is the lever. Sixty seconds is fine for a deployment where
 a role change can take a minute to propagate (most internal admin
@@ -205,8 +250,9 @@ What the evaluator sees beyond the entities.
 ### The standard request context
 
 The context is the third input to a policy evaluation. It carries
-the per-request attributes that are not on the principal or the
-resource: the MFA status, the IP address, the time of the request,
+the per-request and per-session attributes that are not on the
+principal or the resource, and it is the place for every fact that
+differs between two sessions of one user: the MFA status, the IP address, the time of the request,
 the custom keys you want to expose to policies.
 
 `StandardRequestContext` is the built-in implementation:
@@ -230,8 +276,10 @@ impl StandardRequestContext {
 ```
 
 The `from_request` constructor pulls what it can from the request:
-the IP from the trusted-proxy chain, the MFA status from the
-session's `factors_completed`, the time from the clock. The
+the IP from the trusted-proxy chain, the time from the clock. The
+MFA status is a fact your application derives from what it recorded
+when the user completed the factors its policy demands; the session
+itself carries the authentication state, not an MFA flag. The
 `with_custom` builder adds application-specific keys.
 
 Policies can match on any of these:
@@ -305,7 +353,7 @@ restricts certain actions to certain regions reads
 `context.custom.region`, which you populate from the
 load balancer's geo-IP information or from an explicit header.
 
-**A stepped-up factor not in `factors_completed`,** because it was
+**A stepped-up factor your application tracks itself,** for example one
 completed for a different reason. A policy that wants to know "did the
 user complete a fresh password challenge in the last five minutes"
 reads `context.custom.password_challenge_at`, which you populate from

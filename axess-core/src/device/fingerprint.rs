@@ -115,6 +115,22 @@ pub type TenantPepperResolver = Arc<dyn Fn(&TenantId) -> [u8; 32] + Send + Sync>
 /// to family/OS, does NOT include screen-class. Adequate for risk-
 /// scoring use; deployments under strict data-minimisation review
 /// should implement their own extractor.
+///
+/// # The fingerprint is a hint, not an authenticator
+///
+/// Every input is chosen by the client: the `User-Agent` and
+/// `Accept-Language` headers are copied verbatim, and the address is
+/// truncated to a /24 or /48 range an attacker on the same network, or
+/// anywhere when no client address is supplied, can share. Anyone who knows
+/// a user's headers produces the same fingerprint and is matched to the same
+/// device row. A match therefore says "this request looks like that
+/// device", never "this is that device", and nothing that grants access
+/// should rest on it alone. The default
+/// [`StepUpPolicy`](crate::authn::service::StepUpPolicy) asks for a factor
+/// on a `Trusted` device for this reason. A device secret the client holds
+/// and presents (a cookie or an app-held key, compared in constant time
+/// against a stored hash) is the way to turn a match into proof; the
+/// extractor does not provide one.
 pub struct DefaultFingerprintExtractor {
     pepper: TenantPepperResolver,
 }
@@ -188,11 +204,17 @@ fn accept_language_top(headers: &HeaderMap) -> Option<String> {
 /// - IPv4: first 3 octets (drop last), /24.
 /// - IPv6: first 6 bytes (drop last 10), /48.
 ///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, which a dual-stack
+/// listener reports for an IPv4 client) is first reduced to the IPv4
+/// address it carries. Truncated as an IPv6 address it would keep only six
+/// zero bytes, and every IPv4 client behind such a listener would share one
+/// fingerprint input.
+///
 /// Returns the raw bytes (4 or 16) with the trailing portion
 /// zeroed, so a cellular user roaming within their ISP doesn't
 /// generate a new device row on every NAT change.
 fn truncate_ip(ip: IpAddr) -> Vec<u8> {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let o = v4.octets();
             vec![o[0], o[1], o[2], 0]

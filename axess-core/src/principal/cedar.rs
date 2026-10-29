@@ -38,9 +38,11 @@
 //!
 //! When [`HumanPrincipal::attributes`] or [`WorkloadPrincipal::attributes`]
 //! contains a key that collides with a built-in attribute name
-//! (e.g. `tenant_id`), the user-supplied attribute wins. Adopters who
-//! explicitly override an attribute have a reason; a silent built-in
-//! win would surprise them.
+//! (e.g. `tenant_id`), the built-in attribute wins and the colliding key
+//! is dropped with a warning. The built-ins (tenant, user, workload
+//! identity) are what policies pin on, and the extra attributes can come
+//! from token claims the caller influences, so they must never be able to
+//! replace them. Use a different key for application attributes.
 
 use std::collections::{HashMap, HashSet};
 
@@ -166,13 +168,20 @@ impl ToCedarEntity for WorkloadPrincipal {
 
 /// Apply user-supplied attributes onto the built-in attribute map,
 /// converting each `serde_json::Value` per
-/// [`json_to_restricted_expression`]. User keys override built-in
-/// keys on collision (see module-level "Conflict policy").
+/// [`json_to_restricted_expression`]. A user key that collides with a
+/// built-in is dropped with a warning (see module-level "Conflict policy").
 fn merge_attribute_map(
     attrs: &mut HashMap<String, RestrictedExpression>,
     user: &std::collections::BTreeMap<String, serde_json::Value>,
 ) {
     for (k, v) in user {
+        if attrs.contains_key(k) {
+            tracing::warn!(
+                attribute = %k,
+                "principal attribute collides with a built-in Cedar attribute; the built-in value is kept"
+            );
+            continue;
+        }
         attrs.insert(k.clone(), json_to_restricted_expression(v));
     }
 }
@@ -291,15 +300,41 @@ mod tests {
         }
     }
 
+    fn string_attr(entity: &Entity, name: &str) -> Option<String> {
+        match entity.attr(name) {
+            Some(Ok(cedar_policy::EvalResult::String(s))) => Some(s),
+            _ => None,
+        }
+    }
+
     #[test]
-    fn user_supplied_attributes_override_built_ins_on_collision() {
+    fn user_supplied_attributes_cannot_replace_built_ins() {
         let mut h = sample_human();
+        let expected = h.tenant_id.to_string();
         h.attributes.insert(
             "tenant_id".to_string(),
             serde_json::json!("override-tenant"),
         );
+        h.attributes
+            .insert("tier".to_string(), serde_json::json!("gold"));
         let entity = h.to_cedar_entity().unwrap();
-        assert!(entity.attr("tenant_id").is_some());
+        assert_eq!(string_attr(&entity, "tenant_id"), Some(expected));
+        assert_eq!(string_attr(&entity, "tier").as_deref(), Some("gold"));
+
+        let mut w = sample_workload();
+        let workload_id = w.workload_id.as_str().to_string();
+        w.attributes.insert(
+            "workload_id".to_string(),
+            serde_json::json!("spiffe://evil"),
+        );
+        w.attributes
+            .insert("trust_domain".to_string(), serde_json::json!("evil"));
+        let entity = w.to_cedar_entity().unwrap();
+        assert_eq!(string_attr(&entity, "workload_id"), Some(workload_id));
+        assert_eq!(
+            string_attr(&entity, "trust_domain").as_deref(),
+            Some("gnomes.local")
+        );
     }
 
     #[test]

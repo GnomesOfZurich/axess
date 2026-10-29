@@ -31,7 +31,7 @@
 //!
 //! // Verifier reads the fixture's JWKS handle and validates the
 //! // signature + iss + exp.
-//! let verifier = JwtVerifier::new(idp.jwks_handle());
+//! let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
 //! let claims = verifier.verify::<MyClaims>(&token, "https://api.example.com").await?;
 //! ```
 //!
@@ -271,7 +271,7 @@ impl LocalIdpFixture {
     ///     .with_historical_signing_key(k1);
     ///
     /// // Verifier dispatches by token's kid header against the JWKS.
-    /// let verifier = JwtVerifier::new(rotated_idp.jwks_handle());
+    /// let verifier = JwtVerifier::new(rotated_idp.jwks_handle()).with_audience("https://api");
     /// verifier.verify::<()>(&token_old).await?; // hits historical k1
     /// verifier.verify::<()>(&rotated_idp.mint(&claims)).await?; // hits k2
     /// ```
@@ -459,6 +459,7 @@ impl LocalIdpFixture {
     ///
     /// ```rust,ignore
     /// let verifier = JwtVerifier::new(idp.jwks_handle())
+    ///     .with_audience("https://api.example.com")
     ///     .with_algorithms(idp.verifier_algorithms());
     /// ```
     ///

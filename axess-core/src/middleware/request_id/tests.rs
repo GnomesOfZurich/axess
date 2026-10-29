@@ -504,3 +504,53 @@ async fn test_duplicate_layers_not_overriden_with_accept_client_id() {
 
     assert_eq!(id, "mock5555");
 }
+
+/// A custom generator that emits a non-ASCII value must not panic the
+/// service on every request: the value is replaced by a UUID, and the header
+/// and the extension agree.
+#[test]
+fn a_non_ascii_generator_value_falls_back_to_a_uuid_without_panicking() {
+    #[derive(Clone)]
+    struct Latin1;
+    impl RequestIdGenerator for Latin1 {
+        const HEADER_NAME: HeaderName = X_REQUEST_ID;
+        #[cfg(feature = "accept-client-id")]
+        const ID_LENGTH: usize = 36;
+        fn generate(&self) -> HeaderValue {
+            HeaderValue::from_bytes(b"caf\xe9").expect("obs-text is a valid header value")
+        }
+    }
+    let service = RequestIdService::new(MockService, Latin1);
+    let mut req = Request::new(Body::empty());
+    let returned = service.ensure_request_id(&mut req);
+    let id = returned.to_str().expect("replacement is ASCII");
+    assert!(Uuid::parse_str(id).is_ok(), "{id}");
+    assert_eq!(req.request_id(), Some(id));
+}
+
+/// (`accept_client_id` only): a client id of the right length is still
+/// refused when it carries anything beyond letters, digits and hyphens, so a
+/// log-injection or header-smuggling value never becomes the request id.
+#[cfg(feature = "accept-client-id")]
+#[test]
+fn ensure_request_id_rejects_client_ids_with_other_characters() {
+    let service = create_service();
+    for bad in [
+        "ab cd ef",
+        "ab\"cd=ef",
+        "ab;cd,ef",
+        "ab/cd.ef",
+        "a\tb\tc\tde",
+    ] {
+        assert_eq!(bad.len(), 8);
+        let mut req = Request::new(Body::empty());
+        req.headers_mut()
+            .insert(X_REQUEST_ID, HeaderValue::from_str(bad).expect("header"));
+        let returned = service.ensure_request_id(&mut req);
+        assert!(returned.to_str().unwrap().starts_with("mock"), "{bad}");
+    }
+    let mut req = Request::new(Body::empty());
+    req.headers_mut()
+        .insert(X_REQUEST_ID, HeaderValue::from_static("Ab-9Z-x0"));
+    assert_eq!(service.ensure_request_id(&mut req), "Ab-9Z-x0");
+}

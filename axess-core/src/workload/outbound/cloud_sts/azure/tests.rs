@@ -266,3 +266,17 @@ async fn a_silent_token_endpoint_times_out() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
+    let client = AzureFicClient::new("tenant", "app-id")
+        .with_token_endpoint(Url::parse("http://192.0.2.1:9/t/oauth2/v2.0/token").unwrap());
+    let err = client
+        .acquire_token(&AzureFicRequest::new("federated"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AzureFicError::Transport(m) if m.contains("must be https")),
+        "{err}"
+    );
+}

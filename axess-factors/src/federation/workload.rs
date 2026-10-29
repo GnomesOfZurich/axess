@@ -44,7 +44,9 @@ use axess_identity::{
 };
 use serde::de::DeserializeOwned;
 
-use crate::jwt::verifier::{JtiReplayStore, JwtVerifier, NoReplay, VerifiedClaims};
+use crate::jwt::verifier::{
+    JtiReplayStore, JwtVerifier, NoReplay, VerifiedClaims, verifier_is_pinned,
+};
 
 /// Output of the caller-supplied claim-mapping closure.
 ///
@@ -132,7 +134,10 @@ where
 {
     /// Construct a resolver. JWT-level validation (signature, `iss`,
     /// `aud`, `exp`, `nbf`, algorithm allowlist) is delegated to the
-    /// wrapped [`JwtVerifier`]. The claim-mapping closure is invoked
+    /// wrapped [`JwtVerifier`], which must pin both an issuer and an
+    /// audience: resolving through a verifier that pins either of them
+    /// loosely answers `NotAuthenticated`, as
+    /// [`JwtSvidResolver`](crate::jwt::svid::JwtSvidResolver) does. The claim-mapping closure is invoked
     /// on successful verification. The `issuer` parameter is recorded
     /// verbatim on the resulting [`WorkloadPrincipal`] for audit
     /// attribution; use [`Issuer::OAuth`] for generic JWT-bearer flows
@@ -166,6 +171,12 @@ where
     R: JtiReplayStore + 'static,
 {
     async fn resolve(&self) -> Result<Principal, IdentityError> {
+        // A workload token is only meaningful for the audience it names, and
+        // a shared issuer makes `aud` the only separation between services,
+        // so a verifier that pins neither is refused before the token is read.
+        if !verifier_is_pinned(&self.verifier, "WorkloadResolver") {
+            return Err(IdentityError::NotAuthenticated);
+        }
         let claims = self.verifier.verify::<C>(&self.token).await.map_err(|e| {
             tracing::debug!(error = %e, "WorkloadResolver: JWT verification failed");
             IdentityError::NotAuthenticated

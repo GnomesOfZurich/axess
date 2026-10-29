@@ -44,6 +44,19 @@ the cost later is a matter of changing the constants and rehashing on
 next login. Old hashes keep verifying against the parameters they were
 made with.
 
+The rehash is done for you. After a password verifies, the service asks
+`password_needs_rehash` whether the stored hash was made under another
+algorithm, version, memory cost, iteration count or parallelism than the
+pinned ones, and if so hashes the password again (fresh salt from the
+injected RNG, on the KDF executor) and replaces the row with a
+compare-and-swap against the config the password was checked against, so
+a password changed in the meantime is never overwritten with the old
+one. The login that triggered it carries on: the flow's credential
+epoch, which includes the hash, is re-stamped. A hash inherited from a
+tenant or global scope is not the user's to rewrite and is left alone, and
+a failure to hash or store is logged and does not fail the login (the old
+hash still verifies, and the next login tries again).
+
 The service takes the salt from its injected `SecureRng` and runs every
 hash and verification on a blocking pool, so a burst of logins does not
 hold the async runtime's workers. Both are configurable:
@@ -360,6 +373,95 @@ data), the recommendation is to offer FIDO2 as the second factor
 and treat TOTP as a fallback for users who do not yet have a
 passkey. The combination is what most regulators are asking for
 today.
+
+## Where the OTP secret sits
+
+A TOTP or HOTP secret is a shared secret: whoever reads it can generate valid
+codes for that user for as long as it lives. In memory axess keeps it in a
+`ZeroizedString`, which wipes the copy on drop and prints as `***` in `Debug`.
+At rest it is whatever the `FactorStore` you implement writes, and that is the
+secret in plaintext unless you seal it.
+
+`TotpConfig::secret` and `HotpConfig::secret` are a `FactorSecret`: either
+`Plain`, the base32 text, or `Sealed`, a `SealedFactorSecret` holding the same
+text encrypted with AES-256-GCM. A `FactorSecretCipher` makes the second from
+the first and opens it again. The sealed form is bound to the row it belongs
+to (the tenant, the user and the factor are the authenticated additional data),
+so a secret copied from one user's row to another's, or from the TOTP row to
+the HOTP row, does not open.
+
+### Turning it on
+
+Build a cipher from a 32-byte random key and give it to the service:
+
+```rust,ignore
+use axess::authn::FactorSecretCipher;
+use axess::session::LegacyBlobs;
+use std::sync::Arc;
+
+let cipher = Arc::new(
+    FactorSecretCipher::try_new(key)?          // refuses an all-zero or repeated-byte key
+        .with_previous_key(old_key)            // only while rotating
+        .with_plain_secrets(LegacyBlobs::AcceptUntil(cutoff)),
+);
+let authn = AuthnService::builder(identity, factors)
+    .with_factor_secret_cipher(cipher.clone())
+    .build();
+```
+
+From then on the service opens a sealed secret to check a code and writes the
+row back sealed. The `FactorStore` needs no new method and no change: a sealed
+secret is part of the serialised `FactorConfig`, saved and compared through the
+same calls as before. Seal new enrolments with the same cipher before saving:
+
+```rust,ignore
+let config = cipher.seal_config(FactorConfig::Totp(totp), &scope)?;
+factors.save_factor(&scope, config).await?;
+```
+
+`scope` is the scope the row is saved at. A secret that sits in a tenant-scope
+template is sealed for that tenant scope; the first time a user verifies a code
+against it, the user's own row is written with the secret sealed for that user.
+
+Without a cipher nothing changes: secrets are read and written as plain text.
+A sealed secret read by a service with no cipher fails the login with an
+internal error that says so, rather than treating the ciphertext as a key.
+
+### Moving rows that are already plain
+
+Rows written before you configured the cipher hold plain secrets. Whether they
+are still read is the plain-secret policy, the same `LegacyBlobs` the session
+crypto uses:
+
+- `Reject`, the default once a cipher is configured, refuses a plain secret.
+  The login fails with an internal error naming the cause, and the row is left
+  alone. Do not leave the default on while plain rows exist.
+- `AcceptUntil(instant)` reads a plain secret until the instant, checked on the
+  cipher's clock. A plain secret that verifies a code is sealed and saved in
+  that login, so the migration costs each user one login inside the window.
+  Pick an instant that outlasts the users you want to keep without a reset.
+- `Accept` reads plain secrets with no end date. Prefer `AcceptUntil`.
+
+You can also seal ahead of the window: load each row, pass it through
+`seal_config` with the row's scope, and save it.
+
+### Rotating the key
+
+Add the old key as the previous key and deploy. A secret sealed under it is
+read, and is sealed again under the current key by the login that verifies it.
+Drop the previous key once no row names it: each sealed secret carries the id
+of its key, which is a short fingerprint and not secret.
+
+The nonce is drawn at random for each seal. A secret is sealed once at
+enrolment and once more when a rotation or the plain-secret window moves it,
+not once per login, so the count under one key stays far below the bound for
+random 96-bit nonces.
+
+Keep the key in a secrets manager, apart from the database it protects, and
+treat the factor table as credential material in access control, audit and
+retention, as you do for password hashes. Recovery codes are different: they
+are stored as one-way hashes, so a dump of them does not let an attacker use
+them.
 
 ## Troubleshooting
 

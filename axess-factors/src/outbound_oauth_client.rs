@@ -21,17 +21,35 @@
 //!
 //! # Caching + refresh
 //!
-//! - First `get_access_token()` → token request, cache the response
-//!   with `(now + expires_in - refresh_threshold)` as the effective
-//!   expiry.
+//! - First `get_access_token()` → token request, cache the response. The
+//!   refresh is due `refresh_threshold` before expiry, or half the token's
+//!   lifetime before it if that is shorter, so a token whose lifetime does
+//!   not exceed the threshold is cached for half its life instead of being
+//!   fetched anew on every call.
 //! - Subsequent calls inside the validity window → return cached
 //!   value (read-locked, no HTTP).
-//! - Inside `refresh_threshold` of expiry → refresh under a write lock
-//!   (one fetch per concurrent burst).
-//! - After expiry → blocking refresh.
+//! - Inside the refresh window → one caller fetches (single flight); the
+//!   others are served the still-unexpired cached token and do not wait on
+//!   the fetch.
+//! - After expiry → callers wait for the one fetch in flight.
 //!
-//! `force_refresh()` bypasses the cache and unconditionally fetches a
-//! new token (use after a `401` from the upstream resource).
+//! The fetch holds no lock on the cache, only the single-flight gate, and is
+//! bounded by a request timeout (30 s by default, see
+//! [`with_request_timeout`](OutboundOAuthClient::with_request_timeout)).
+//!
+//! `force_refresh()` bypasses the cache and fetches a new token (use after a
+//! `401` from the upstream resource); callers that arrive together share one
+//! fetch.
+//!
+//! # Transport
+//!
+//! The token URL must be HTTPS (plain HTTP only for `localhost`,
+//! `127.0.0.1` and `[::1]`), since the request carries the client secret or
+//! assertion. The default HTTP client follows no redirects (a redirect would
+//! re-send the credentials to wherever it points) and has connect and request
+//! timeouts. A client passed to
+//! [`with_http_client`](OutboundOAuthClient::with_http_client) is the
+//! caller's to configure the same way.
 //!
 //! # DST
 //!
@@ -51,7 +69,8 @@ use chrono::{DateTime, Utc};
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 use uuid::Builder as UuidBuilder;
 
@@ -84,6 +103,16 @@ pub enum OAuthClientError {
     /// signing key is validated at client-construction time.
     #[error("client assertion signing failed: {0}")]
     Signing(String),
+    /// The token URL is not HTTPS (and not loopback), so the client secret or
+    /// assertion would travel in the clear. The URL is not echoed.
+    #[error(
+        "token endpoint must use HTTPS (http is only allowed for localhost, 127.0.0.1 and [::1])"
+    )]
+    InsecureEndpoint,
+    /// The default HTTP client could not be built, which happens when the TLS
+    /// backend fails to initialise.
+    #[error("HTTP client could not be built: {0}")]
+    ClientBuild(String),
 }
 
 /// How axess authenticates itself to the token endpoint.
@@ -190,9 +219,13 @@ struct TokenResponse {
 /// plaintext tokens.
 struct CachedToken {
     access_token: ZeroizedString,
-    /// `now + expires_in` from the token response. The effective
-    /// "refresh due" point is `expires_at - refresh_threshold`.
+    /// `now + expires_in` from the token response: the token is unusable
+    /// from here on.
     expires_at: DateTime<Utc>,
+    /// When a refresh is due: `refresh_threshold` before `expires_at`, or
+    /// half the token's lifetime before it if that is shorter. Fixed when the
+    /// token is fetched, because the lifetime is known only then.
+    refresh_at: DateTime<Utc>,
 }
 
 /// RFC 7523 client-assertion JWT body.
@@ -217,6 +250,13 @@ pub struct OutboundOAuthClient {
     auth_method: ClientAuthMethod,
     scopes: Vec<String>,
     cached_token: Arc<RwLock<Option<CachedToken>>>,
+    /// Single flight: held across a token fetch, never the cache lock.
+    refresh_gate: Mutex<()>,
+    /// Counts stored tokens, so a caller that waited on the gate can tell
+    /// that someone else fetched while it waited.
+    generation: AtomicU64,
+    /// Bound on one token fetch.
+    request_timeout: Duration,
     refresh_threshold: Duration,
     clock: Arc<dyn Clock>,
     /// Entropy source for the `jti` claim of `private_key_jwt` client
@@ -238,6 +278,25 @@ pub fn basic_credentials(client_id: &str, client_secret: &str) -> String {
     B64_STANDARD.encode(format!("{}:{}", enc(client_id), enc(client_secret)))
 }
 
+/// Refuse a token URL that is not HTTPS, other than plain HTTP to a loopback
+/// host. The host decides, parsed, and userinfo is refused outright:
+/// `http://localhost@evil.example` is not loopback.
+fn require_secure_token_url(url: &Url) -> Result<(), OAuthClientError> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(OAuthClientError::InsecureEndpoint);
+    }
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" => match url.host() {
+            Some(url::Host::Domain("localhost")) => Ok(()),
+            Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
+            Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
+            _ => Err(OAuthClientError::InsecureEndpoint),
+        },
+        _ => Err(OAuthClientError::InsecureEndpoint),
+    }
+}
+
 /// `now + secs`, or `None` when the lifetime does not fit a timestamp.
 ///
 /// An IdP-supplied `expires_in` is untrusted: a huge value must be
@@ -254,31 +313,48 @@ pub fn expiry_after(
 impl OutboundOAuthClient {
     /// Construct a new outbound OAuth client.
     ///
-    /// Defaults: empty scope list, 30-second refresh threshold,
-    /// [`SystemClock`], default [`reqwest::Client`]. Override via the
+    /// Defaults: empty scope list, 30-second refresh threshold, 30-second
+    /// request timeout, [`SystemClock`], and an HTTP client that follows no
+    /// redirects and has connect and request timeouts. Override via the
     /// `with_*` builder methods.
     ///
-    /// The default [`reqwest::Client`] sends no `User-Agent` and follows
-    /// redirects. Some token endpoints refuse a request without a
-    /// `User-Agent`; pass a configured client to
-    /// [`with_http_client`](Self::with_http_client) for those, and for
-    /// timeouts or redirect policy.
+    /// The default client sends no `User-Agent`. Some token endpoints refuse a
+    /// request without one; pass a configured client to
+    /// [`with_http_client`](Self::with_http_client) for those, and configure
+    /// it with no redirects and timeouts as well.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the default [`reqwest::Client`] cannot be built, which
-    /// happens when the TLS backend fails to initialise.
-    pub fn new(token_url: Url, auth_method: ClientAuthMethod) -> Self {
-        Self {
+    /// * [`OAuthClientError::InsecureEndpoint`] when `token_url` is not HTTPS
+    ///   and not a loopback host: the request carries the client secret or
+    ///   assertion.
+    /// * [`OAuthClientError::ClientBuild`] when the default HTTP client cannot
+    ///   be built (the TLS backend failed to initialise).
+    pub fn new(token_url: Url, auth_method: ClientAuthMethod) -> Result<Self, OAuthClientError> {
+        require_secure_token_url(&token_url)?;
+        let request_timeout = Duration::from_secs(30);
+        let http_client = reqwest::Client::builder()
+            // A redirect would re-send the credentials wherever it points
+            // (a 307 or 308 re-POSTs the form), and a downgrade to HTTP would
+            // send them in the clear. A 3xx is an error response here.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(request_timeout)
+            .build()
+            .map_err(|e| OAuthClientError::ClientBuild(e.to_string()))?;
+        Ok(Self {
             token_url,
             auth_method,
             scopes: Vec::new(),
             cached_token: Arc::new(RwLock::new(None)),
+            refresh_gate: Mutex::new(()),
+            generation: AtomicU64::new(0),
+            request_timeout,
             refresh_threshold: Duration::from_secs(30),
             clock: Arc::new(SystemClock),
             rng: Arc::new(SystemRng),
-            http_client: reqwest::Client::new(),
-        }
+            http_client,
+        })
     }
 
     /// Set the OAuth scopes requested at the token endpoint.
@@ -293,7 +369,8 @@ impl OutboundOAuthClient {
 
     /// Override the refresh threshold (default: 30 s). Cached tokens
     /// are considered "due for refresh" when they're within this
-    /// window of `expires_at`.
+    /// window of `expires_at`, or within half their lifetime of it if that is
+    /// shorter.
     pub fn with_refresh_threshold(mut self, threshold: Duration) -> Self {
         self.refresh_threshold = threshold;
         self
@@ -316,56 +393,103 @@ impl OutboundOAuthClient {
     /// Inject a pre-configured `reqwest::Client`; for adopters who
     /// want custom TLS roots, connection pooling, proxies, or
     /// per-request timeouts.
+    ///
+    /// The client replaces the default one, and with it the default's
+    /// protections: configure it with
+    /// `redirect(reqwest::redirect::Policy::none())` and a request timeout,
+    /// or a redirect carries the client credentials to wherever it points. The
+    /// bound set by [`with_request_timeout`](Self::with_request_timeout) still
+    /// applies to a whole fetch.
     pub fn with_http_client(mut self, client: reqwest::Client) -> Self {
         self.http_client = client;
         self
     }
 
+    /// Bound one token fetch (default: 30 s). A fetch that takes longer fails
+    /// with [`OAuthClientError::Transport`] and releases the single-flight
+    /// gate, so one hung token endpoint cannot hold every caller.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+
     /// Return a valid access token, refreshing the cache silently if
-    /// needed. Concurrent calls deduplicate the refresh under a write
-    /// lock.
+    /// needed. Concurrent calls share one fetch (single flight); callers that
+    /// find a still-unexpired token while a refresh is in flight use it
+    /// instead of waiting for the fetch.
     pub async fn get_access_token(&self) -> Result<String, OAuthClientError> {
         // Fast path: read-lock, check validity, return.
-        {
-            let cached = self.cached_token.read().await;
-            if let Some(token) = cached.as_ref()
-                && self.token_is_still_fresh(token)
-            {
-                return Ok((*token.access_token).to_string());
+        if let Some(token) = self.cached_if(|t, now| now < t.refresh_at).await {
+            return Ok(token);
+        }
+
+        // Due for refresh, or nothing cached. Someone else may already be
+        // fetching: a token that has not expired yet serves meanwhile.
+        let guard = match self.refresh_gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                if let Some(token) = self.cached_if(|t, now| now < t.expires_at).await {
+                    return Ok(token);
+                }
+                self.refresh_gate.lock().await
             }
+        };
+        // Double-check: the fetch we waited on may have stored a token.
+        if let Some(token) = self.cached_if(|t, now| now < t.refresh_at).await {
+            return Ok(token);
         }
-
-        // Slow path: refresh under write lock with a double-check (a
-        // racing thread may have already refreshed by the time we
-        // acquire the write lock).
-        let mut cached = self.cached_token.write().await;
-        if let Some(token) = cached.as_ref()
-            && self.token_is_still_fresh(token)
-        {
-            return Ok((*token.access_token).to_string());
-        }
-        let fresh = self.fetch_new_token().await?;
-        let token_str = (*fresh.access_token).to_string();
-        *cached = Some(fresh);
-        Ok(token_str)
+        let token = self.fetch_and_store().await;
+        drop(guard);
+        token
     }
 
-    /// Bypass the cache and unconditionally fetch a new token. Useful
-    /// after the upstream resource returned `401`, indicating the
-    /// cached token has been server-side revoked or invalidated.
+    /// Fetch a new token and cache it, unconditionally, unless another caller
+    /// stored one while this one waited for the gate: callers that arrive
+    /// together (a burst of `401`s from the upstream resource) share one
+    /// fetch. Use after the upstream returned `401`, indicating the cached
+    /// token has been server-side revoked or invalidated.
     pub async fn force_refresh(&self) -> Result<String, OAuthClientError> {
-        let mut cached = self.cached_token.write().await;
-        let fresh = self.fetch_new_token().await?;
-        let token_str = (*fresh.access_token).to_string();
-        *cached = Some(fresh);
-        Ok(token_str)
+        let seen = self.generation.load(Ordering::Acquire);
+        let guard = self.refresh_gate.lock().await;
+        if self.generation.load(Ordering::Acquire) != seen
+            && let Some(token) = self.cached_if(|t, now| now < t.expires_at).await
+        {
+            return Ok(token);
+        }
+        let token = self.fetch_and_store().await;
+        drop(guard);
+        token
     }
 
-    fn token_is_still_fresh(&self, token: &CachedToken) -> bool {
+    /// The cached access token, when `usable` holds for it at the clock's
+    /// current time.
+    async fn cached_if(
+        &self,
+        usable: impl FnOnce(&CachedToken, DateTime<Utc>) -> bool,
+    ) -> Option<String> {
         let now = self.clock.now();
-        let refresh_due_at = token.expires_at
-            - chrono::Duration::from_std(self.refresh_threshold).unwrap_or_default();
-        now < refresh_due_at
+        let cached = self.cached_token.read().await;
+        cached
+            .as_ref()
+            .filter(|t| usable(t, now))
+            .map(|t| (*t.access_token).to_string())
+    }
+
+    /// Fetch under the request timeout and store the result. The caller holds
+    /// the single-flight gate; the cache lock is taken only to store.
+    async fn fetch_and_store(&self) -> Result<String, OAuthClientError> {
+        let fresh = tokio::time::timeout(self.request_timeout, self.fetch_new_token())
+            .await
+            .map_err(|_| {
+                OAuthClientError::Transport(format!(
+                    "token request timed out after {}s",
+                    self.request_timeout.as_secs()
+                ))
+            })??;
+        let token_str = (*fresh.access_token).to_string();
+        *self.cached_token.write().await = Some(fresh);
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(token_str)
     }
 
     async fn fetch_new_token(&self) -> Result<CachedToken, OAuthClientError> {
@@ -448,9 +572,18 @@ impl OutboundOAuthClient {
         // purpose (leaves the clone unzeroed).
         let access_token = parsed.access_token;
 
+        // Refresh `refresh_threshold` early, or half way through the token's
+        // life if that is sooner: a lifetime at or under the threshold would
+        // otherwise be due the moment it is fetched.
+        let early = self
+            .refresh_threshold
+            .min(Duration::from_secs(lifetime_secs / 2));
+        let early = chrono::Duration::from_std(early).unwrap_or_default();
+
         Ok(CachedToken {
             access_token,
             expires_at,
+            refresh_at: expires_at - early,
         })
     }
 

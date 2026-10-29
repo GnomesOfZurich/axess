@@ -75,7 +75,7 @@ pub mod trace;
 // workspace's exact internal pin.
 pub use axess_strings::ShortString;
 
-pub use encryption::{AeadAlgorithm, EncryptedBlob, KeyId};
+pub use encryption::{AeadAlgorithm, EncryptedBlob, KeyId, envelope_aad};
 pub use id::{DeviceId, EventId, SessionId, TenantId, UserId};
 pub use kind::{EventPayload, KindTag};
 pub use sink::{EventSink, LogAndSwallow, NoopEventSink, SinkError};

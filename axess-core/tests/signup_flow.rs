@@ -4,6 +4,7 @@
 
 mod common;
 
+use axess_core::authn::Actor;
 use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::{
     authn::{
@@ -72,7 +73,7 @@ async fn begin_signup_creates_user_and_sets_pending_workflow() {
 
     // User ID should be set on the session.
     assert_eq!(
-        session.user_id().await,
+        session.pending_user_id().await,
         Some(axess_core::authn::ids::testing::user("u1"))
     );
 }
@@ -98,7 +99,7 @@ async fn begin_signup_stores_the_user_in_the_tenant_it_validated() {
         .unwrap()
         .expect("the user lands in the tenant the slug resolved to");
     assert_eq!(stored.tenant_id, test_tenant().id);
-    assert_eq!(session.tenant_id().await, Some(test_tenant().id));
+    assert_eq!(session.pending_tenant_id().await, Some(test_tenant().id));
 }
 
 #[tokio::test]
@@ -124,12 +125,13 @@ async fn begin_signup_active_user_returns_already_exists() {
     assert!(session.auth_state().await.is_guest());
 }
 
-/// A duplicate `begin_signup` against an existing *Candidate* row
-/// resumes the orphan signup rather than rejecting with `AlreadyExists`.
-/// This unblocks the common path where a user closes the verification tab
-/// and retries hours later; without recovery, they are wedged forever.
+/// A duplicate `begin_signup` against an existing *Candidate* row is not
+/// resumed for a different session: whoever types an identifier would
+/// otherwise be handed the half-created account of the person it belongs
+/// to. Only the session already pending signup for that user gets `Started`
+/// again (an idempotent resubmit).
 #[tokio::test]
-async fn begin_signup_orphan_candidate_resumes() {
+async fn begin_signup_orphan_candidate_is_not_handed_to_a_stranger() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(candidate_user("u1", "alice@example.com"));
@@ -137,25 +139,42 @@ async fn begin_signup_orphan_candidate_resumes() {
     let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
     let session = test_session();
 
-    // Retry begin_signup with a *different* candidate user_id but same
-    // identifier; this models a fresh attempt that doesn't know about
-    // the prior u1 row.
     let user = candidate_user("u2", "alice@example.com");
     let outcome = service
         .begin_signup(user, "default", &session)
         .await
         .unwrap();
 
-    assert!(matches!(outcome, SignupOutcome::Started));
-    // Session is reattached to the EXISTING Candidate (u1), not
-    // the user_id we just passed in. The application's verification
-    // email link will reference u1 because that's the one the
-    // PendingWorkflow was bound to.
+    assert!(
+        matches!(outcome, SignupOutcome::AlreadyExists),
+        "{outcome:?}"
+    );
     assert_eq!(
         session.user_id().await,
-        Some(axess_core::authn::ids::testing::user("u1")),
-        "orphan Candidate resumption must reuse the existing user_id"
+        None,
+        "nothing of the existing Candidate is attached to the caller"
     );
+}
+
+/// The session that began a signup can submit it again: that is the same
+/// session, already bound to the user, and gets `Started` once more.
+#[tokio::test]
+async fn begin_signup_resubmit_from_the_pending_session_is_idempotent() {
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let service = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    let user = candidate_user("u1", "alice@example.com");
+    let first = service
+        .begin_signup(user.clone(), "default", &session)
+        .await
+        .unwrap();
+    assert!(matches!(first, SignupOutcome::Started));
+    let again = service
+        .begin_signup(user, "default", &session)
+        .await
+        .unwrap();
+    assert!(matches!(again, SignupOutcome::Started), "{again:?}");
 }
 
 #[tokio::test]
@@ -258,7 +277,10 @@ async fn suspend_user_changes_status() {
         since: Utc::now(),
         until: None,
     };
-    service.suspend_user(&uid("u1"), detail).await.unwrap();
+    service
+        .suspend_user_across_tenants(Actor::System, &uid("u1"), detail)
+        .await
+        .unwrap();
 
     // User should now be suspended.
     let status = identity.account_status(&uid("u1")).await.unwrap();
@@ -293,7 +315,10 @@ async fn activate_user_changes_status() {
     let service =
         AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
-    service.activate_user(&uid("u1")).await.unwrap();
+    service
+        .activate_user_across_tenants(Actor::System, &uid("u1"))
+        .await
+        .unwrap();
 
     let status = identity.account_status(&uid("u1")).await.unwrap();
     assert!(status.is_active());
@@ -332,7 +357,10 @@ async fn suspend_then_reactivate() {
         since: Utc::now(),
         until: None,
     };
-    service.suspend_user(&uid("u1"), detail).await.unwrap();
+    service
+        .suspend_user_across_tenants(Actor::System, &uid("u1"), detail)
+        .await
+        .unwrap();
     assert!(
         identity
             .account_status(&uid("u1"))
@@ -342,7 +370,10 @@ async fn suspend_then_reactivate() {
     );
 
     // Reactivate.
-    service.activate_user(&uid("u1")).await.unwrap();
+    service
+        .activate_user_across_tenants(Actor::System, &uid("u1"))
+        .await
+        .unwrap();
     assert!(
         identity
             .account_status(&uid("u1"))

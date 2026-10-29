@@ -78,7 +78,9 @@ pub enum PrepareOutcome {
     /// The application should show a "code already sent" message rather than
     /// sending a new one.
     AlreadySent {
-        /// Where the code was sent (email address for EmailOtp).
+        /// The address the code went to, MASKED (`a***@example.com`), because
+        /// this answer reaches a caller who has only typed a username and
+        /// must not learn the address behind it.
         destination: Arc<str>,
     },
     /// A FIDO2/WebAuthn challenge was generated (placeholder for future use).
@@ -86,6 +88,36 @@ pub enum PrepareOutcome {
         /// Opaque challenge data to forward to the browser's WebAuthn API.
         challenge: serde_json::Value,
     },
+}
+
+impl PrepareOutcome {
+    /// The destination for display to the person logging in, masked
+    /// (`a***@example.com`), or `None` for an outcome that has none.
+    ///
+    /// Show this and never `destination` itself: `SendOtp` carries the full
+    /// address because the application needs it to deliver the code, but a
+    /// login page is shown to someone who has only typed a username.
+    pub fn masked_destination(&self) -> Option<Arc<str>> {
+        match self {
+            Self::SendOtp { destination, .. } => Some(mask_email(destination)),
+            Self::AlreadySent { destination } => Some(mask_email(destination)),
+            _ => None,
+        }
+    }
+}
+
+/// Mask an email address for display: the first character of the local part,
+/// three asterisks, and the whole domain. Anything that is not shaped like
+/// an address is masked entirely. Masking an already masked address leaves
+/// it as it is.
+pub(crate) fn mask_email(address: &str) -> Arc<str> {
+    match address.split_once('@') {
+        Some((local, domain)) if !local.is_empty() && !domain.is_empty() => {
+            let first: String = local.chars().take(1).collect();
+            Arc::from(format!("{first}***@{domain}"))
+        }
+        _ => Arc::from("***"),
+    }
 }
 
 impl std::fmt::Debug for PrepareOutcome {

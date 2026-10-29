@@ -1,8 +1,9 @@
 //! The membership indexes a device row belongs to, and the changes to them
 //! that one row write carries.
 //!
-//! A row is listed in the tenant's index, its owner's index and one index per
-//! refresh family it is bound to. When a row is written, the script that
+//! A row is listed in the tenant's index, its owner's index, the index of its
+//! owner's devices that carry its fingerprint, and one index per refresh
+//! family it is bound to. When a row is written, the script that
 //! writes it also adds the row to the indexes it now belongs to and removes
 //! it from the ones it no longer does (see `WRITE_ROW`), so an index is never
 //! updated by a separate command that could run in the other order.
@@ -10,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use super::row::{
-    family_index_key, fingerprint_hex, fingerprint_key, fingerprint_set_key, tenant_index_key,
-    user_index_key,
+    family_index_key, fingerprint_hex, fingerprint_key, fingerprint_set_key, fingerprint_user_key,
+    tenant_index_key, user_index_key,
 };
 use crate::device::types::{Device, DeviceBinding};
 
@@ -111,6 +112,23 @@ pub(super) fn plan_indexes(
         set(key, IndexOp::Remove);
     }
     if let Some(key) = after.and_then(user_key) {
+        set(key, IndexOp::Add);
+    }
+
+    let owner_fingerprint_key = |d: &Device| {
+        d.user_id.map(|u| {
+            fingerprint_user_key(
+                prefix,
+                &tenant,
+                &fingerprint_hex(&d.fingerprint_hash),
+                &u.to_string(),
+            )
+        })
+    };
+    if let Some(key) = before.and_then(owner_fingerprint_key) {
+        set(key, IndexOp::Remove);
+    }
+    if let Some(key) = after.and_then(owner_fingerprint_key) {
         set(key, IndexOp::Add);
     }
 

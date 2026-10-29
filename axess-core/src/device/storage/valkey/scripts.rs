@@ -153,6 +153,21 @@ end
 return 0
 "#;
 
+/// Delete a single-id fingerprint key (the layout of earlier releases) only
+/// if it still points at the given device and that device's row is gone. The
+/// row's native expiry removes it without touching the key, so nothing else
+/// would ever clean the key up. A device saved again in the meantime keeps
+/// its entry.
+///
+/// KEYS: `[fingerprint_index, row]`. ARGV: `[device_id]`.
+/// Replies `1` if deleted.
+pub(super) const DROP_ABSENT_FINGERPRINT: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] and redis.call('EXISTS', KEYS[2]) == 0 then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"#;
+
 /// Remove members from a membership index, but only those whose row key no
 /// longer exists. The existence check and the removal run as one step, so a
 /// device saved again between a reader noticing its row was gone and the

@@ -23,11 +23,11 @@ cargo feature and will not pick one for you. Anything enabling
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.12.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.13.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.12.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.13.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,
@@ -136,10 +136,18 @@ for the lockout policy.
 Two stores sit behind the login path, and what happens when each one is
 down is a decision rather than an accident.
 
-The lockout counter is the first. `record_failed_attempt` is a write,
-and the read-replica split this library encourages puts reads on a
-replica and writes on the primary, so a primary outage leaves logins
-working and the counter dead. `LockoutPolicy::on_counter_unavailable`
+The lockout counter is the first. A guess is counted before its
+credential is checked: `reserve_attempt` increments the counter and
+refuses, changing nothing, once the count has reached
+`max_attempts`, in one atomic step on the primary, and `release_attempt`
+gives the guess back when the credential verified. That is what stops
+parallel guesses all reading a count below the limit and all running their
+verifier. Both are writes, and the read-replica split this library
+encourages puts reads on a replica and writes on the primary, so a primary
+outage leaves logins working and the counter dead. (A correct login that
+overlaps more simultaneous logins than `max_attempts` can be refused for
+the moment their reservations are held; that is the price of a limit that
+holds.) `LockoutPolicy::on_counter_unavailable`
 decides what happens then. It defaults to `CounterUnavailable::Lock`,
 which treats the attempt as locked and keeps brute force bounded.
 `CounterUnavailable::Allow` keeps those users logging in and leaves

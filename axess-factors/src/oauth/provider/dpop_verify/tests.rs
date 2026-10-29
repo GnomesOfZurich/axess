@@ -107,18 +107,22 @@ fn dpop_replay_window_expiry_is_iat_plus_two_skew() {
     let iat = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
     assert_eq!(
         dpop_replay_window_expiry(iat, 60),
-        Some(iat + chrono::Duration::seconds(120)),
-        "expires_at must be iat + 2 × max_iat_skew_secs"
+        Some(iat + chrono::Duration::seconds(121)),
+        "expires_at must be iat + 2 × max_iat_skew_secs + 1"
     );
     assert_eq!(
         dpop_replay_window_expiry(iat, 30),
-        Some(iat + chrono::Duration::seconds(60)),
+        Some(iat + chrono::Duration::seconds(61)),
     );
     assert_eq!(
         dpop_replay_window_expiry(iat, 1),
-        Some(iat + chrono::Duration::seconds(2)),
-        "skew=1 produces a 2-second window; kills `* → /` (would round to 0) and \
-         `* → +` (would give iat + 1s + ε)"
+        Some(iat + chrono::Duration::seconds(3)),
+        "skew=1 produces a 3-second window; kills `* → /` and `* → +`"
+    );
+    assert_eq!(
+        dpop_replay_window_expiry(iat, 0),
+        Some(iat + chrono::Duration::seconds(1)),
+        "skew=0 still outlives the second in which the proof is accepted"
     );
 }
 
@@ -768,8 +772,10 @@ fn eviction_pops_exactly_the_expired_entries_in_expiry_order() {
     }
     // `b` expires exactly at now (evicted), `c` and `d` survive.
     assert_eq!(store.evict_expired(at(20)), 2);
-    assert!(!store.live.contains_key("a") && !store.live.contains_key("b"));
-    assert!(store.live.contains_key("c") && store.live.contains_key("d"));
+    assert!(
+        !store.live.contains_key(&jti_digest("a")) && !store.live.contains_key(&jti_digest("b"))
+    );
+    assert!(store.live.contains_key(&jti_digest("c")) && store.live.contains_key(&jti_digest("d")));
     assert_eq!(store.live.len(), store.by_expiry.len());
 
     // An evicted jti is fresh again; a surviving one is still a replay.

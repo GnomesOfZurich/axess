@@ -65,12 +65,35 @@ pub trait IdentityAuthnLog: IdentityLookup {
         event: AuthEvent,
     ) -> impl Future<Output = Result<AuditOutcome, Self::Error>> + Send;
 
-    /// Returns the running count *after* this failure, which is what
-    /// the lockout policy compares against its threshold.
+    /// Returns the running count *after* this failure, and stores the time
+    /// of the failure beside it.
     fn record_failed_attempt(
         &self,
         user_id: &UserId,
     ) -> impl Future<Output = Result<u32, Self::Error>> + Send;
+
+    /// The count and the time of the last failure, `(0, None)` for none.
+    /// The library derives the lockout from this and the policy.
+    fn failed_attempts(
+        &self,
+        user_id: &UserId,
+    ) -> impl Future<Output = Result<(u32, Option<DateTime<Utc>>), Self::Error>> + Send;
+
+    /// Atomically count one guess before the credential is checked:
+    /// `Some(count)` while the account is under its limit, `None` (and no
+    /// change) at it. Failures older than the attempt window, and a timed
+    /// lockout that has run out, start the count over.
+    fn reserve_attempt(
+        &self,
+        user_id: &UserId,
+        policy: &LockoutPolicy,
+    ) -> impl Future<Output = Result<Option<u32>, Self::Error>> + Send;
+
+    /// Give a reservation back after the credential verified.
+    fn release_attempt(
+        &self,
+        user_id: &UserId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
     fn reset_failed_attempts(
         &self,
@@ -149,10 +172,10 @@ perfectly good `Self::Error`.
 There is no `AttemptRecord`, `LockoutRecord` or `NewUser`. The audit
 tier writes a single flat `AuthEvent` through `record_event`, and
 failure counting is a pair of numeric verbs rather than a record type.
-`record_failed_attempt` returns the count after the increment, which is
-the number the lockout policy compares against its threshold. Lockout
-state is derived from that count and the policy, not stored as its own
-row. `create_user` takes a fully-formed `User`, so identifier
+`record_failed_attempt` returns the count after the increment and stores
+the time of the failure; `failed_attempts` reads both back. Lockout state
+is derived from that pair and the policy by the library, not stored as its
+own row and not reported through `account_status`. `create_user` takes a fully-formed `User`, so identifier
 generation and defaulting happen in your code, before the call.
 
 Four methods that once had `unimplemented!()` defaults on `IdentityAdmin`
@@ -171,6 +194,24 @@ user-enumeration oracle, in the function that equalizes its own timing
 specifically to avoid leaking that. A silently-succeeding default would
 have been worse, since recovery would appear to work while no token was
 ever stored.
+
+`begin_password_reset` can also hold a per-identifier cooldown:
+`AuthnServiceBuilder::with_password_reset_cooldown` makes a second request
+for the same tenant and identifier inside the window answer `Ok(None)`, as
+an unknown identifier does. The key is the identifier as typed, whether or
+not an account has it, so the cooldown tells a caller nothing about who is
+registered. The record is per process; put the route behind a shared rate
+limit as well when several instances serve it.
+
+A completed reset invalidates the user's registered cookie sessions, which
+does not reach refresh tokens: they are a separate credential that mints a
+new session. Give the service the store the application issues refresh
+tokens into with `AuthnServiceBuilder::with_refresh_store`, and
+`complete_password_reset` and the `suspend_user` family revoke every
+refresh token of the user (through the store's `revoke_user_tokens`) and
+return an error if that fails, after the change itself is made and
+audited. Without it a refresh token stolen before a reset keeps working
+after it.
 
 `IdentityPasswordHistory` holds `record_password_hash` and
 `password_history`, for a plainer reason. `record_password_hash` is
@@ -258,11 +299,20 @@ Shed on something identifier-independent, a global rate or a queue depth
 or a disk watermark. A shed decision derived from *which* identifier was
 tried is observable per identifier, and rebuilds the user-enumeration
 oracle that writing unattributable rejections exists to close. `record_failed_attempt` increments the user's failure
-counter and returns the new count, which is the number the
-`LockoutPolicy` compares against its threshold;
-`reset_failed_attempts` zeroes it on a successful login or an
-administrative clear. Lockout keeps no record of its own: the locked
-state is derived from the counter and the policy.
+counter, stores the time of the failure and returns the new count;
+`failed_attempts` returns the count and that time;
+`reset_failed_attempts` zeroes both on a successful login or an
+administrative clear. Lockout keeps no record of its own, and a store does
+not have to suspend the account: the library reads `failed_attempts` at
+every gate that runs before a verifier (`begin_login`, `prepare_factor`,
+`verify_factor`, the passkey login) and applies the tenant's
+`LockoutPolicy`. An account whose count has reached `max_attempts` (zero
+reads as the default of five) is locked until `duration` after the last
+failure, or until an administrator resets the counter when `duration` is
+`None`. A store that cannot report the time of the last failure stays
+locked rather than guess. A password reset still works for a locked
+account and clears the counter. A store that reports failures older than
+`attempt_window` as zero gets the sliding window for free.
 
 `IdentityAdmin` is the privileged writes. `create_tenant` and
 `create_user` are the provisioning verbs, and `create_user` takes an
@@ -364,8 +414,9 @@ every login attempt, so a slow implementation is the bottleneck of the
 whole authentication flow.
 
 There are three of them, and they divide neatly. `record_event` appends
-one flat `AuthEvent` row. `record_failed_attempt` and
-`reset_failed_attempts` maintain a single counter on the user.
+one flat `AuthEvent` row. `record_failed_attempt`, `failed_attempts` and
+`reset_failed_attempts` maintain a single counter, and the time of its last
+increment, on the user.
 
 ```rust,ignore
 {{#include ../../examples/sqlite/src/models/backend/identity.rs:authn_log}}
@@ -418,8 +469,9 @@ and routes the audit writes through the side channel.
 
 The trade-off is that the lockout policy will not function correctly
 under `NoopAuthnLog`. The policy decides from the count
-`record_failed_attempt` returns, and the noop discards the increment,
-so the count never rises and the threshold is never reached.
+`record_failed_attempt` returns and `failed_attempts` reports; the noop
+discards the increment, returns zero for both, so the count never rises
+and the threshold is never reached (not even a threshold of one).
 Deployments that use `NoopAuthnLog` for the read-replica case must
 accept a degraded lockout policy unless they implement an alternative.
 

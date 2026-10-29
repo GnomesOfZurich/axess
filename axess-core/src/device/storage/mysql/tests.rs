@@ -45,6 +45,9 @@ async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(store(4).await).await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
+    shared::the_fingerprint_lookup_follows_the_newest_sighting(store(4).await).await;
+    shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
+    shared::a_sighting_reports_the_level_it_found(store(4).await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store(4).await).await;
     shared::sweep_decisions_agree_to_the_second(
         store(4).await.with_sweep_config(shared::tight_config()),
@@ -254,4 +257,50 @@ async fn the_family_index_insert_is_idempotent() {
             .len(),
         1
     );
+}
+
+/// A save racing with a revocation never leaves the refresh-family index
+/// pointing at bindings the revoked row does not hold: the index follows the
+/// stored bindings, so the family the save carried is not listed for a device
+/// whose row kept its older bindings.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn a_save_racing_a_revocation_leaves_the_family_index_matching_the_row() {
+    let s = store(8).await;
+    let t = tenant();
+    for round in 0..40u8 {
+        let label = format!("racer-{round}");
+        let mut d = device(&label, round, DeviceTrustLevel::Seen, at(0));
+        d.bindings = vec![refresh("fam-old")];
+        s.save(&d, at(0)).await.unwrap();
+
+        let mut newer = d.clone();
+        newer.bindings = vec![refresh("fam-new")];
+        let (saver, revoker) = (s.clone(), s.clone());
+        let id = d.id;
+        let save = tokio::spawn(async move { saver.save(&newer, at(1)).await.unwrap() });
+        let revoke = tokio::spawn(async move {
+            revoker
+                .set_trust_level(&t, &id, DeviceTrustLevel::Revoked, at(1))
+                .await
+                .unwrap()
+        });
+        save.await.unwrap();
+        revoke.await.unwrap();
+
+        let row = s.load(&t, &d.id).await.unwrap().unwrap();
+        assert_eq!(row.trust_level, DeviceTrustLevel::Revoked);
+        for family in ["fam-old", "fam-new"] {
+            let listed = s
+                .find_by_refresh_family(&t, family)
+                .await
+                .unwrap()
+                .iter()
+                .any(|x| x.id == d.id);
+            let held = row.bindings.iter().any(
+                |b| matches!(b, DeviceBinding::Refresh { family_id, .. } if family_id == family),
+            );
+            assert_eq!(listed, held, "round {round}, family {family}");
+        }
+    }
 }

@@ -38,8 +38,13 @@
 mod account;
 mod builder;
 mod factor_pipeline;
+mod factor_secrets;
 mod login;
+#[cfg(feature = "oauth")]
+mod logout_audit;
 pub mod outcomes;
+mod reset_cooldown;
+mod revocation;
 #[cfg(feature = "device")]
 pub mod step_up;
 mod verification;
@@ -55,13 +60,16 @@ pub(crate) mod oauth_service;
 
 pub mod session_validator;
 
-pub use builder::AuthnServiceBuilder;
+pub use builder::{AuthnServiceBuilder, DEFAULT_FLOW_TTL, RESET_COOLDOWN_CAPACITY};
 #[cfg(feature = "oauth")]
 pub use builder::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
 pub use outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome};
+pub use revocation::Actor;
 pub use session_validator::{NoSessionRegistryError, SessionValidator, require_valid_session};
 #[cfg(feature = "device")]
-pub use step_up::{StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_user};
+pub use step_up::{
+    StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_optional, decide_step_up_for_user,
+};
 
 // ── Imports ──────────────────────────────────────────────────────────────────
 
@@ -298,51 +306,6 @@ where
     /// inside a handler.
     pub fn has_session_registry(&self) -> bool {
         self.inner.registry.is_some()
-    }
-
-    /// Invalidate every active session for a user. Used by admin "kick" and
-    /// by credential-rotation paths that need to force a re-authentication.
-    ///
-    /// Returns `Err(NoSessionRegistryError)` when no registry is wired on
-    /// the service: the caller cannot enforce revocation without one and
-    /// should surface that as a 500 / configuration error rather than
-    /// reporting a misleading 200 OK.
-    ///
-    /// Registry-backend errors (Valkey outage, replication lag) are logged
-    /// at `warn` inside the wrapper and *swallowed*; the method returns
-    /// `Ok(())` so the caller's flow continues. Backends that need
-    /// fail-closed semantics should arrange them at the deployment layer
-    /// (e.g. liveness probe gating on registry health).
-    pub async fn invalidate_user_sessions(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-    ) -> Result<(), NoSessionRegistryError> {
-        match &self.inner.registry {
-            Some(reg) => {
-                reg.invalidate_user(user_id).await;
-                Ok(())
-            }
-            None => Err(NoSessionRegistryError),
-        }
-    }
-
-    /// Invalidate a single session for a user. Used by per-session "end"
-    /// admin actions and by sibling-session-revocation paths (e.g. after
-    /// disabling MFA, kill every other session except the current one).
-    ///
-    /// Same error contract as [`invalidate_user_sessions`](Self::invalidate_user_sessions).
-    pub async fn invalidate_session(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &crate::session::id::SessionId,
-    ) -> Result<(), NoSessionRegistryError> {
-        match &self.inner.registry {
-            Some(reg) => {
-                reg.invalidate_session(user_id, session_id).await;
-                Ok(())
-            }
-            None => Err(NoSessionRegistryError),
-        }
     }
 
     /// Enumerate active sessions for a user. Used by admin session lists,

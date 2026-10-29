@@ -364,3 +364,73 @@ fn layer_clock_replaces_the_configured_clock() {
             .is_some()
     );
 }
+
+// ── layer response ───────────────────────────────────────────────────
+
+async fn through_layer(authorization: &str, config: BearerConfig) -> axum::response::Response {
+    use tower::{Layer, ServiceExt};
+    let inner = tower::service_fn(|_req: axum::http::Request<axum::body::Body>| async {
+        Ok::<_, std::convert::Infallible>(axum::response::Response::new(axum::body::Body::empty()))
+    });
+    let service = BearerTokenLayer::new(config).layer(inner);
+    let req = axum::http::Request::builder()
+        .header(axum::http::header::AUTHORIZATION, authorization)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    service.oneshot(req).await.unwrap()
+}
+
+/// Whatever check failed, the client sees the same fixed body and challenge,
+/// so the response is no probe for which of kid, audience or lifetime was
+/// wrong; the reason is only in the log.
+#[tokio::test]
+async fn every_rejection_answers_with_the_same_fixed_body() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut wrong_aud = valid_claims();
+    wrong_aud["aud"] = serde_json::json!("another-service");
+    let mut expired = valid_claims();
+    expired["exp"] = serde_json::json!(chrono::Utc::now().timestamp() - 3600);
+
+    let mut bodies = Vec::new();
+    for token in [
+        sign_jwt(&der, &kid, &wrong_aud),
+        sign_jwt(&der, &kid, &expired),
+        sign_jwt(&der, "unknown-kid", &valid_claims()),
+        "not.a.jwt".to_owned(),
+    ] {
+        let res = through_layer(&format!("Bearer {token}"), make_config(jwks.clone())).await;
+        assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers()[axum::http::header::WWW_AUTHENTICATE],
+            r#"Bearer error="invalid_token""#
+        );
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        bodies.push(String::from_utf8(body.to_vec()).unwrap());
+    }
+    assert!(
+        bodies.iter().all(|b| b == r#"{"error":"invalid_token"}"#),
+        "{bodies:?}"
+    );
+}
+
+/// The constructor requires an audience and the token must carry it.
+#[test]
+fn the_issuer_constructor_pins_an_audience() {
+    let (der, jwks, kid) = rsa_keypair();
+    let config = BearerConfig::new(vec![
+        BearerIssuerConfig::new("https://accounts.example.com", "my-service", Arc::new(jwks))
+            .with_extra_claims(["namespace"]),
+    ]);
+    let header = format!("Bearer {}", sign_jwt(&der, &kid, &valid_claims()));
+    let identity = validate_bearer_token(Some(&header), &config)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        identity.claims.get("namespace").map(String::as_str),
+        Some("production")
+    );
+    let mut other = valid_claims();
+    other["aud"] = serde_json::json!("elsewhere");
+    let header = format!("Bearer {}", sign_jwt(&der, &kid, &other));
+    assert!(validate_bearer_token(Some(&header), &config).is_err());
+}

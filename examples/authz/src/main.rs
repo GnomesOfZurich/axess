@@ -11,9 +11,10 @@
 //! by the caller, so as written anyone can act as `alice` with MFA. In a
 //! service the principal is the authenticated session's user and the MFA
 //! fact is read from that session, never from the request:
-//! `AuthSession::user_id()` for the first, the session's factor history for
-//! the second. Only the policy and entity-provider parts of this example
-//! are meant to be copied.
+//! `AuthzStore::for_session` for the first (it refuses a session that is not
+//! fully authenticated), the session's factor history for the second. Only
+//! the policy and entity-provider parts of this example are meant to be
+//! copied.
 //!
 //! ## Running
 //!

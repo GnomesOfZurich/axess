@@ -46,6 +46,7 @@ async fn first_call_fetches_and_caches() {
             client_secret: "shh".into(),
         },
     )
+    .expect("an HTTPS or loopback token URL")
     .with_clock(clock.clone());
 
     let token = client.get_access_token().await.expect("must fetch token");
@@ -92,6 +93,7 @@ async fn cached_token_refreshes_when_clock_advances_past_threshold() {
             client_secret: "shh".into(),
         },
     )
+    .expect("an HTTPS or loopback token URL")
     .with_clock(clock.clone())
     .with_refresh_threshold(Duration::from_secs(30));
 
@@ -140,6 +142,7 @@ async fn force_refresh_bypasses_cache() {
             client_secret: "shh".into(),
         },
     )
+    .expect("an HTTPS or loopback token URL")
     .with_clock(clock.clone());
 
     let first = client.get_access_token().await.expect("first");
@@ -181,7 +184,8 @@ async fn client_secret_basic_sends_authorization_header() {
             client_id: "axess-id".into(),
             client_secret: "Gnomes2+".into(),
         },
-    );
+    )
+    .expect("an HTTPS or loopback token URL");
     let _ = client.get_access_token().await.expect("auth header sent");
     // MockServer drop-time check enforces the .expect(1).
 }
@@ -208,7 +212,8 @@ async fn client_secret_post_sends_secret_in_form_body() {
             client_id: "axess-id".into(),
             client_secret: "Gnomes2+".into(),
         },
-    );
+    )
+    .expect("an HTTPS or loopback token URL");
     let _ = client
         .get_access_token()
         .await
@@ -233,7 +238,8 @@ async fn token_endpoint_error_status_propagates() {
             client_id: "axess".into(),
             client_secret: "wrong".into(),
         },
-    );
+    )
+    .expect("an HTTPS or loopback token URL");
     let err = client
         .get_access_token()
         .await
@@ -266,7 +272,8 @@ async fn malformed_token_response_rejected() {
             client_id: "axess".into(),
             client_secret: "shh".into(),
         },
-    );
+    )
+    .expect("an HTTPS or loopback token URL");
     let err = client
         .get_access_token()
         .await
@@ -292,6 +299,7 @@ async fn missing_expires_in_defaults_to_one_hour() {
             client_secret: "shh".into(),
         },
     )
+    .expect("an HTTPS or loopback token URL")
     .with_clock(clock.clone());
 
     let t1 = client.get_access_token().await.expect("first");
@@ -348,7 +356,8 @@ async fn private_key_jwt_sends_signed_client_assertion() {
             audience: format!("{}/oauth2/token", server.uri()),
             assertion_ttl: Duration::from_secs(60),
         },
-    );
+    )
+    .expect("an HTTPS or loopback token URL");
     let token = client.get_access_token().await.expect("jwt assertion sent");
     assert_eq!(token, "tok-jwt");
 
@@ -431,6 +440,7 @@ async fn scopes_are_sent_in_form_body() {
             client_secret: "shh".into(),
         },
     )
+    .expect("an HTTPS or loopback token URL")
     .with_scopes(["read", "write"]);
     let _ = client.get_access_token().await.expect("scope sent");
 }
@@ -453,11 +463,225 @@ async fn out_of_range_expires_in_is_refused() {
                 client_id: "axess".into(),
                 client_secret: "shh".into(),
             },
-        );
+        )
+        .expect("an HTTPS or loopback token URL");
         let err = client.get_access_token().await.expect_err("refused");
         assert!(
             matches!(err, OAuthClientError::MalformedResponse(_)),
             "got {err:?}"
         );
     }
+}
+
+// ── transport rail, timeouts and single flight ───────────────────────────────
+
+fn basic() -> ClientAuthMethod {
+    ClientAuthMethod::ClientSecretBasic {
+        client_id: "axess".into(),
+        client_secret: "shh".into(),
+    }
+}
+
+/// A token URL that is not HTTPS, other than loopback, is refused before the
+/// client secret can be sent anywhere.
+#[test]
+fn a_plain_http_token_url_to_a_remote_host_is_refused() {
+    for url in [
+        "http://idp.example.net/token",
+        "http://localhost.evil.example/token",
+        "http://localhost@evil.example/token",
+        "ftp://idp.example.net/token",
+    ] {
+        let refused = OutboundOAuthClient::new(Url::parse(url).unwrap(), basic());
+        assert!(
+            matches!(refused, Err(OAuthClientError::InsecureEndpoint)),
+            "{url} must be refused"
+        );
+    }
+    for url in [
+        "https://idp.example.net/token",
+        "http://localhost:8080/token",
+        "http://127.0.0.1/token",
+        "http://[::1]:9/token",
+    ] {
+        assert!(
+            OutboundOAuthClient::new(Url::parse(url).unwrap(), basic()).is_ok(),
+            "{url} must be accepted"
+        );
+    }
+}
+
+/// The default client follows no redirect: a 307 from the token endpoint is
+/// an error response, and the credentials are not sent to its `Location`.
+#[tokio::test]
+async fn a_redirecting_token_endpoint_is_an_error_and_the_target_is_never_called() {
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "stolen", "expires_in": 60
+        })))
+        .mount(&target)
+        .await;
+    let origin = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/capture", target.uri())),
+        )
+        .mount(&origin)
+        .await;
+
+    let client = OutboundOAuthClient::new(token_url(&origin), basic()).unwrap();
+    let err = client
+        .get_access_token()
+        .await
+        .expect_err("a redirect is an error");
+    assert!(
+        matches!(err, OAuthClientError::TokenEndpoint { status: 307, .. }),
+        "got {err:?}"
+    );
+    assert!(
+        target.received_requests().await.unwrap().is_empty(),
+        "the redirect target must never be called"
+    );
+}
+
+/// A token endpoint that never answers fails the fetch at the request
+/// timeout and releases the gate, instead of holding every caller forever.
+#[tokio::test]
+async fn a_hung_token_endpoint_times_out_and_releases_the_gate() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "late", "expires_in": 60 }))
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+    let client = OutboundOAuthClient::new(token_url(&server), basic())
+        .unwrap()
+        .with_request_timeout(Duration::from_millis(100));
+
+    let started = std::time::Instant::now();
+    let err = client.get_access_token().await.expect_err("times out");
+    assert!(matches!(err, OAuthClientError::Transport(_)), "got {err:?}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // The gate is free: the next caller is not stuck behind the first.
+    let again = tokio::time::timeout(Duration::from_secs(3), client.get_access_token()).await;
+    assert!(again.expect("the second call must not hang").is_err());
+}
+
+/// A token whose lifetime is at or under the refresh threshold is cached for
+/// half its life, instead of being fetched anew on every call.
+#[tokio::test]
+async fn a_short_lived_token_is_cached_for_half_its_life() {
+    let server = token_server_returning(json!({
+        "access_token": "short", "token_type": "Bearer", "expires_in": 20
+    }))
+    .await;
+    let clock = Arc::new(MockClock::at(t0()));
+    // Threshold 30 s against a 20 s token: previously due at once.
+    let client = OutboundOAuthClient::new(token_url(&server), basic())
+        .unwrap()
+        .with_clock(clock.clone())
+        .with_refresh_threshold(Duration::from_secs(30));
+
+    assert_eq!(client.get_access_token().await.unwrap(), "short");
+    clock.advance_secs(5);
+    assert_eq!(client.get_access_token().await.unwrap(), "short");
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "five seconds into a twenty-second token is still cached"
+    );
+
+    clock.advance_secs(6);
+    client.get_access_token().await.unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        2,
+        "past half its life the refresh is due"
+    );
+}
+
+/// Callers that arrive together after a `401` share one fetch.
+#[tokio::test]
+async fn concurrent_force_refreshes_share_one_fetch() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "fresh", "expires_in": 3600 }))
+                .set_delay(Duration::from_millis(150)),
+        )
+        .mount(&server)
+        .await;
+    let client = Arc::new(OutboundOAuthClient::new(token_url(&server), basic()).unwrap());
+
+    let calls: Vec<_> = (0..8)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.force_refresh().await })
+        })
+        .collect();
+    for call in calls {
+        assert_eq!(call.await.unwrap().unwrap(), "fresh");
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "eight simultaneous force_refresh calls are one fetch"
+    );
+}
+
+/// While one caller refreshes a token that is due but not expired, the others
+/// are served the cached token without waiting for the fetch.
+#[tokio::test]
+async fn callers_are_served_the_unexpired_token_while_a_refresh_is_in_flight() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "first", "expires_in": 100 })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "second", "expires_in": 100 }))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    let clock = Arc::new(MockClock::at(t0()));
+    let client = Arc::new(
+        OutboundOAuthClient::new(token_url(&server), basic())
+            .unwrap()
+            .with_clock(clock.clone())
+            .with_refresh_threshold(Duration::from_secs(30)),
+    );
+    assert_eq!(client.get_access_token().await.unwrap(), "first");
+
+    // Due (t0 + 75 > refresh_at 70) but not expired (< 100).
+    clock.advance_secs(75);
+    let refresher = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get_access_token().await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let started = std::time::Instant::now();
+    let served = client.get_access_token().await.unwrap();
+    assert_eq!(served, "first", "served from the cache");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "must not wait for the fetch in flight ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(refresher.await.unwrap().unwrap(), "second");
 }

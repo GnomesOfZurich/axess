@@ -4,6 +4,17 @@
 //! a `sid`, read and drained by the back-channel and front-channel logout
 //! handlers.
 //!
+//! # Why the key is the issuer and not the client
+//!
+//! A `sid` names a session at the IdP, not a session of one client of it, and
+//! it is unique within the issuer's namespace only. The map is keyed by
+//! `(issuer, sid)` because that is the whole identity a logout token carries
+//! once it has verified; adding the client id to the key would add a part the
+//! lookup cannot supply. Several providers sharing an issuer are told apart
+//! where it matters, at verification: the token's `aud` picks the client whose
+//! keys and pins check it, and a duplicate issuer and client id pair is
+//! refused when the handler is built.
+//!
 //! # Shape
 //!
 //! One lock guards the structures below:
@@ -12,8 +23,11 @@
 //! - an index from `(issuer, subject)` to the `sid`s of that IdP subject under
 //!   the issuer, so a logout by `sub` finds a subject's sessions without a
 //!   scan of the map;
-//! - a queue of entries in insertion order, so ageing out the oldest costs
-//!   the number of entries aged out, not the size of the map.
+//! - the entries ordered by insertion time, so ageing out the oldest costs
+//!   the number of entries aged out, not the size of the map. The order is by
+//!   the TIME each entry carries and not by arrival: after the clock steps
+//!   back, an entry stamped before its predecessors still sorts to the front
+//!   and ages out on schedule, instead of waiting behind a newer one.
 //!
 //! Subjects are the IdP's own `sub` values, as the verified ID token carried
 //! them, and are never the local user id: after account linking the two
@@ -33,11 +47,9 @@
 //! mapping that capacity evicted finds nothing under its key, and falls
 //! through to the `sub` path when the logout token carries both.
 //!
-//! The queue may hold items whose entry has since been removed or replaced.
-//! Such an item is recognised when it reaches the front (its entry is gone,
-//! or carries another insertion time) and dropped; when stale items outnumber
-//! live entries the queue is compacted, so it never grows past a small
-//! multiple of the map.
+//! The ordered set holds exactly one item per entry: an entry that is removed
+//! or replaced takes its item with it, so the set is never larger than the
+//! map.
 //!
 //! No registry call happens under the lock. Eviction returns what it removed
 //! and the caller decides what to do with the sessions.
@@ -45,7 +57,7 @@
 use crate::authn::ids::UserId;
 use crate::session::id::SessionId;
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Key of the `sid` map: `(issuer, sid)`.
@@ -59,6 +71,21 @@ pub type SidKey = (String, String);
 /// What a `sid` maps to: the local user, their session, and when the mapping
 /// was inserted.
 pub type SidEntry = (UserId, SessionId, DateTime<Utc>);
+
+/// What an [`insert`](SidMap::insert_displacing) took out of the map: a `sid`
+/// mapping in full, so the caller can put it back if the login that displaced
+/// it is refused.
+#[derive(Debug, Clone)]
+pub struct DisplacedSid {
+    /// The IdP subject the displaced mapping belonged to.
+    pub subject: String,
+    /// The local user of the displaced session.
+    pub user: UserId,
+    /// The displaced session.
+    pub session: SessionId,
+    /// When the displaced mapping was inserted.
+    pub inserted_at: DateTime<Utc>,
+}
 
 /// Shared map from `(issuer, sid)` to the local session.
 ///
@@ -98,8 +125,9 @@ struct SidState {
     keys_of_session: HashMap<SessionId, HashSet<SidKey>>,
     /// `(issuer, subject)` -> the `sid`s of that subject under that issuer.
     by_subject: HashMap<(String, String), HashSet<String>>,
-    /// Insertion order, oldest first. May hold stale items.
-    order: VecDeque<(DateTime<Utc>, SidKey)>,
+    /// One item per entry, ordered by the entry's insertion time, oldest
+    /// first (ties by key).
+    order: BTreeSet<(DateTime<Utc>, SidKey)>,
     /// `(issuer, subject)` -> sessions their OAuth logins established, each
     /// with the local user it belongs to.
     subjects: HashMap<(String, String), HashSet<(UserId, SessionId)>>,
@@ -111,12 +139,12 @@ struct SidState {
     subject_order: VecDeque<(String, UserId, SessionId)>,
 }
 
-/// Compact the queue once it exceeds this many items beyond twice the
-/// number of live entries.
+/// Compact the subject sweep queue once it exceeds this many items beyond
+/// twice the number of live sessions.
 const QUEUE_SLACK: usize = 64;
 
 impl SidState {
-    fn insert(&mut self, key: SidKey, stored: Stored) -> Option<SidEntry> {
+    fn insert(&mut self, key: SidKey, stored: Stored) -> Option<Stored> {
         let at = stored.at;
         let slot = (key.0.clone(), stored.subject.clone());
         let session = stored.session;
@@ -126,6 +154,7 @@ impl SidState {
                 self.unindex(&key.0, &old.subject, &key.1);
             }
             self.unlink_session(&old.session, &key);
+            self.order.remove(&(old.at, key.clone()));
         }
         self.keys_of_session
             .entry(session)
@@ -135,18 +164,8 @@ impl SidState {
             .entry(slot)
             .or_default()
             .insert(key.1.clone());
-        // Re-inserting the same key at the same time (a frozen clock) leaves
-        // the queue item already there; a second copy would only ever be
-        // stale.
-        if !displaced.as_ref().is_some_and(|old| old.at == at) {
-            self.order.push_back((at, key));
-        }
-        if self.order.len() > 2 * self.entries.len() + QUEUE_SLACK {
-            let entries = &self.entries;
-            self.order
-                .retain(|(at, key)| entries.get(key).is_some_and(|e| e.at == *at));
-        }
-        displaced.map(|old| old.entry())
+        self.order.insert((at, key));
+        displaced
     }
 
     fn register_subject(&mut self, issuer: &str, subject: &str, user: UserId, session: SessionId) {
@@ -227,15 +246,15 @@ impl SidState {
 
     fn remove(&mut self, key: &SidKey) -> Option<Stored> {
         let stored = self.entries.remove(key)?;
+        self.order.remove(&(stored.at, key.clone()));
         self.unindex(&key.0, &stored.subject, &key.1);
         self.unlink_session(&stored.session, key);
         Some(stored)
     }
 
-    /// Remove up to `max` live entries from the front of the queue while
-    /// `due` holds for the item's insertion time. Stale items met on the way
-    /// are dropped without counting toward `max`; each item is popped once,
-    /// so the walk costs the items passed, amortised over the inserts.
+    /// Remove up to `max` entries from the front of the time order while
+    /// `due` holds for the entry's insertion time. Each removal costs a
+    /// logarithm of the map's size, and a call costs the entries it removes.
     fn evict_front(
         &mut self,
         max: usize,
@@ -243,16 +262,14 @@ impl SidState {
     ) -> Vec<(SidKey, SidEntry)> {
         let mut evicted = Vec::new();
         while evicted.len() < max {
-            match self.order.front() {
+            match self.order.first() {
                 Some((at, _)) if due(*at) => {}
                 _ => break,
             }
-            let Some((at, key)) = self.order.pop_front() else {
+            let Some((_, key)) = self.order.pop_first() else {
                 break;
             };
-            if self.entries.get(&key).is_some_and(|e| e.at == at)
-                && let Some(stored) = self.remove(&key)
-            {
+            if let Some(stored) = self.remove(&key) {
                 evicted.push((key, stored.entry()));
             }
         }
@@ -283,15 +300,60 @@ impl SidMap {
         session: SessionId,
         inserted_at: DateTime<Utc>,
     ) -> Option<SidEntry> {
-        self.lock().insert(
+        self.insert_displacing(key, subject, user, session, inserted_at)
+            .map(|old| (old.user, old.session, old.inserted_at))
+    }
+
+    /// [`insert`](Self::insert), returning the displaced mapping in full
+    /// (with its subject), so [`restore_if_vacant`](Self::restore_if_vacant)
+    /// can put it back.
+    pub fn insert_displacing(
+        &self,
+        key: SidKey,
+        subject: &str,
+        user: UserId,
+        session: SessionId,
+        inserted_at: DateTime<Utc>,
+    ) -> Option<DisplacedSid> {
+        self.lock()
+            .insert(
+                key,
+                Stored {
+                    subject: subject.to_string(),
+                    user,
+                    session,
+                    at: inserted_at,
+                },
+            )
+            .map(|old| DisplacedSid {
+                subject: old.subject,
+                user: old.user,
+                session: old.session,
+                inserted_at: old.at,
+            })
+    }
+
+    /// Put back a mapping that [`insert_displacing`](Self::insert_displacing)
+    /// took out, with its original insertion time, because the login that
+    /// displaced it was refused. Does nothing, and returns `false`, when the
+    /// key has been mapped again since (the newer mapping wins) or when the
+    /// displaced session has left the subject registry (it has ended, and a
+    /// mapping for a dead session would only accumulate).
+    pub fn restore_if_vacant(&self, key: SidKey, displaced: DisplacedSid) -> bool {
+        let mut state = self.lock();
+        if state.entries.contains_key(&key) || !state.subject_of.contains_key(&displaced.session) {
+            return false;
+        }
+        state.insert(
             key,
             Stored {
-                subject: subject.to_string(),
-                user,
-                session,
-                at: inserted_at,
+                subject: displaced.subject,
+                user: displaced.user,
+                session: displaced.session,
+                at: displaced.inserted_at,
             },
-        )
+        );
+        true
     }
 
     /// The entry for `key`, if any.
@@ -359,6 +421,9 @@ impl SidMap {
                 }
             }
         }
+        // The registry is a hash set, whose iteration order differs between
+        // runs; the fan-out order of a logout is the sorted order.
+        out.sort_unstable();
         out
     }
 

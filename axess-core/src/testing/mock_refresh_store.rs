@@ -16,9 +16,10 @@
 //! rest. Matches the positioning of the other `mock_*` doubles in
 //! this module.
 
-use crate::authn::ids::UserId;
+use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::session::refresh::{
-    RefreshToken, RefreshTokenId, RefreshTokenStore, RotationOutcome, TokenFamilyId,
+    DeviceTokenRevocation, RefreshToken, RefreshTokenId, RefreshTokenStore, RevocationReason,
+    RotationOutcome, TokenFamilyId,
 };
 use crate::store::{MemoryStore, Store};
 use axess_clock::Clock;
@@ -53,6 +54,26 @@ impl MemoryRefreshTokenStore {
     }
 }
 
+impl MemoryRefreshTokenStore {
+    /// Revoke `id` for `reason`, keeping the reason of a token that was
+    /// already revoked.
+    fn revoke_as(
+        &self,
+        id: &RefreshTokenId,
+        reason: RevocationReason,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let now = at.unwrap_or_else(|| self.inner.clock().now());
+        self.inner.update(id, |t| {
+            if !t.revoked {
+                t.revoked = true;
+                t.revoked_reason = Some(reason);
+                t.revoked_at = Some(now);
+            }
+        });
+    }
+}
+
 impl RefreshTokenStore for MemoryRefreshTokenStore {
     type Error = MemoryRefreshStoreError;
 
@@ -80,14 +101,14 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
     }
 
     async fn revoke_token(&self, token_id: &RefreshTokenId) -> Result<(), Self::Error> {
-        self.inner.update(token_id, |t| t.revoked = true);
+        self.revoke_as(token_id, RevocationReason::Explicit, None);
         Ok(())
     }
 
     async fn revoke_user_tokens(&self, user_id: &UserId) -> Result<(), Self::Error> {
         for (id, token) in self.inner.snapshot() {
             if &token.user_id == user_id {
-                self.inner.update(&id, |t| t.revoked = true);
+                self.revoke_as(&id, RevocationReason::Explicit, None);
             }
         }
         Ok(())
@@ -100,10 +121,28 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
     ) -> Result<(), Self::Error> {
         for (id, token) in self.inner.snapshot() {
             if &token.user_id == user_id && token.family_id.as_ref() == Some(family_id) {
-                self.inner.update(&id, |t| t.revoked = true);
+                self.revoke_as(&id, RevocationReason::Compromise, None);
             }
         }
         Ok(())
+    }
+
+    async fn revoke_device_tokens(
+        &self,
+        tenant_id: &TenantId,
+        device_id: &DeviceId,
+    ) -> Result<DeviceTokenRevocation, Self::Error> {
+        let mut tokens = 0;
+        for (id, token) in self.inner.snapshot() {
+            if &token.tenant_id == tenant_id
+                && token.device_id.as_ref() == Some(device_id)
+                && !token.revoked
+            {
+                self.inner.update(&id, |t| t.revoked = true);
+                tokens += 1;
+            }
+        }
+        Ok(DeviceTokenRevocation::Revoked { tokens })
     }
 
     async fn active_tokens(&self, user_id: &UserId) -> Result<Vec<RefreshToken>, Self::Error> {
@@ -136,7 +175,7 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
         let active = self.active_tokens(&new_token.user_id).await?;
         let surplus = (active.len() + 1).saturating_sub(max_per_user);
         for token in active.iter().take(surplus) {
-            self.revoke_token(&token.id).await?;
+            self.revoke_as(&token.id, RevocationReason::Evicted, None);
         }
         self.store_token(new_token).await
     }
@@ -154,6 +193,8 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
         let existed = self.inner.update(parent_id, |t| {
             if !t.revoked {
                 t.revoked = true;
+                t.revoked_reason = Some(RevocationReason::Rotated);
+                t.revoked_at = Some(new_token.issued_at);
                 won = true;
             }
         });
@@ -187,6 +228,8 @@ mod tests {
             family_id: None,
             device_id: None,
             authn_time: None,
+            revoked_reason: None,
+            revoked_at: None,
         }
     }
 

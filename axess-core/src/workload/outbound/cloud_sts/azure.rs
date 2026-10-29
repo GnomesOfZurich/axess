@@ -222,6 +222,7 @@ impl AzureFicClient {
             token_endpoint: Arc::new(token_endpoint_for_tenant(tenant.as_ref())),
             client_id: client_id.into(),
             http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
@@ -240,13 +241,21 @@ impl AzureFicClient {
     /// clouds (`login.microsoftonline.us`,
     /// `login.partner.microsoftonline.cn`,
     /// `login.microsoftonline.de`) or for tests pointing at
-    /// wiremock.
+    /// wiremock. The endpoint must be HTTPS (plain HTTP only to a loopback
+    /// host); any other is refused before a request is sent.
     pub fn with_token_endpoint(mut self, endpoint: Url) -> Self {
         self.token_endpoint = Arc::new(endpoint);
         self
     }
 
-    /// Override the HTTP client.
+    /// Override the HTTP client: useful for proxy or outbound mTLS
+    /// configuration. The request timeout applies whichever client is used.
+    ///
+    /// A replacement client drops the default client's protections: it must
+    /// be built with `redirect(reqwest::redirect::Policy::none())` and a
+    /// connect timeout, or a redirect carries the credential-bearing request
+    /// to wherever it points. The endpoint check (HTTPS, or HTTP to a
+    /// loopback host) still applies.
     pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
         self.http = http;
         self
@@ -267,6 +276,8 @@ impl AzureFicClient {
         &self,
         request: &AzureFicRequest,
     ) -> Result<AzureFicResponse, AzureFicError> {
+        crate::outbound_http::require_https_or_loopback(&self.token_endpoint)
+            .map_err(|reason| AzureFicError::Transport(reason.to_string()))?;
         let scope = request.scopes.join(" ");
         let form: Vec<(&str, &str)> = vec![
             ("grant_type", "client_credentials"),

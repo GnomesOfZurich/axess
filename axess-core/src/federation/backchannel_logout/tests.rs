@@ -75,7 +75,11 @@ async fn valid_logout_token_invalidates_user_sessions() {
     // Simulate what the handler does.
     if let Some(ref sub) = claims.sub {
         let parsed = crate::authn::ids::UserId::try_new(sub.as_str()).expect("valid sub");
-        handler.registry.invalidate_user(&parsed).await;
+        handler
+            .registry
+            .invalidate_user(&parsed)
+            .await
+            .expect("revoke");
     }
 
     // Session should now be invalidated.
@@ -347,7 +351,11 @@ async fn sid_only_logout_invalidates_session() {
 
     // Simulate the handler's sid-based invalidation.
     if let Some((uid, sid, _)) = handler.sid_map.remove(&key) {
-        handler.registry.invalidate_session(&uid, &sid).await;
+        handler
+            .registry
+            .invalidate_session(&uid, &sid)
+            .await
+            .expect("revoke");
     }
 
     // Session should be invalidated.

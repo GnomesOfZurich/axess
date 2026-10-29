@@ -73,16 +73,21 @@
 //!
 //! let app: Router = Router::new()
 //!     .route("/webhooks/bounce", post(bounce))
-//!     .layer(ServiceSecretLayer::signed(secrets, SignedRequests::default()));
+//!     .layer(ServiceSecretLayer::signed(
+//!         secrets,
+//!         SignedRequests::default().audience("intake"),
+//!     )?);
 //! # let _ = app;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! The caller signs with the same secret through [`ServiceSigner`](crate::middleware::service_secret::ServiceSigner);
+//! The caller signs with the same secret, naming the audience, through
+//! [`ServiceSigner`](crate::middleware::service_secret::ServiceSigner);
 //! [`SIGNATURE_HEADER`](crate::middleware::service_secret::SIGNATURE_HEADER) documents the scheme for a caller
 //! not written in Rust.
 
+mod rejection;
 mod signature;
 
 pub use signature::{SIGNATURE_HEADER, ServiceSigner, SignedRequests};
@@ -138,6 +143,12 @@ pub enum ServiceSecretError {
         /// Its length in bytes after trimming.
         len: usize,
     },
+    /// A signed-request route was configured with neither an audience nor an
+    /// unaddressed window, so it would accept nothing.
+    #[error(
+        "signed requests need an `audience` (the name this route is addressed as) or an `accept_unaddressed_until` window"
+    )]
+    MissingAudience,
 }
 
 /// One caller's secret, kept only as values derived from it.
@@ -394,8 +405,25 @@ impl ServiceSecretLayer {
     ///
     /// The body is read in full to verify it, up to
     /// [`SignedRequests::max_body_bytes`], and handed on unchanged.
-    pub fn signed(secrets: ServiceSecrets, config: SignedRequests) -> Self {
-        Self::with_mode(secrets, Mode::Signed(Arc::new(Verifier::new(config))))
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceSecretError::MissingAudience`] when `config` names no
+    /// [`audience`](SignedRequests::audience) and no
+    /// [`accept_unaddressed_until`](SignedRequests::accept_unaddressed_until)
+    /// window: a route that is not addressed would accept nothing, or only a
+    /// signature that can be replayed against any other recipient.
+    pub fn signed(
+        secrets: ServiceSecrets,
+        config: SignedRequests,
+    ) -> Result<Self, ServiceSecretError> {
+        if !config.is_addressed() {
+            return Err(ServiceSecretError::MissingAudience);
+        }
+        Ok(Self::with_mode(
+            secrets,
+            Mode::Signed(Arc::new(Verifier::new(config))),
+        ))
     }
 
     fn with_mode(secrets: ServiceSecrets, mode: Mode) -> Self {
@@ -477,11 +505,17 @@ where
             });
         }
 
-        let caller = self
-            .mode
-            .presented(req.headers())
-            .and_then(|presented| secrets.identify(presented));
+        let presented = self.mode.presented(req.headers());
+        let caller = presented.and_then(|presented| secrets.identify(presented));
         let Some(caller) = caller else {
+            if secrets.is_configured() {
+                let why = if presented.is_some() {
+                    rejection::Rejection::BadSecret
+                } else {
+                    rejection::Rejection::NoCredential
+                };
+                why.log(rejection::peer_of(&req), false);
+            }
             let refused = refusal(&secrets, &self.mode);
             return Box::pin(async move { Ok(refused) });
         };

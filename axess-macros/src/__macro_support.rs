@@ -8,6 +8,22 @@ use std::collections::HashMap;
 use axess_core::authz::{AuthzError, make_entity_uid};
 use cedar_policy::EntityUid;
 
+/// Emit the authorization decision event for a gate that denied before the
+/// policy evaluator ran (see `axess_core::authz::audit`).
+pub fn audit_early_deny(
+    principal: &EntityUid,
+    action: &EntityUid,
+    resource: Option<&EntityUid>,
+    reason: &str,
+) {
+    axess_core::authz::audit::emit_early_deny(
+        &principal.to_string(),
+        &action.to_string(),
+        &resource.map(ToString::to_string).unwrap_or_default(),
+        reason,
+    );
+}
+
 /// A path parameter was not valid UTF-8 once percent-decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPathParam;
@@ -69,7 +85,44 @@ pub const fn assert_resource_type_is_literal(template: &str) {
     }
 }
 
+/// Compile-time check used by `require_authz!`: the id part of the resource
+/// template may name at most one path placeholder.
+///
+/// Two request-supplied values in one id, joined by literal characters,
+/// can be re-split by the caller: `Doc:{a}/{b}` gives the same id for
+/// `a = "x/y", b = "z"` and `a = "x", b = "y/z"`. Session-derived
+/// placeholders (`{$tenant}`, `{$user}`) are not counted, because their
+/// values come from the authenticated session and not from the request.
+pub const fn assert_one_path_placeholder(template: &str) {
+    let bytes = template.as_bytes();
+    let start = match type_id_separator(template) {
+        Some(sep) => sep + 1,
+        None => 0,
+    };
+    let mut count = 0;
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'{' && !(i + 1 < bytes.len() && bytes[i + 1] == b'$') {
+            count += 1;
+        }
+        i += 1;
+    }
+    assert!(
+        count <= 1,
+        "require_authz! resource id may use at most one path placeholder; use the dollar-prefixed tenant or user placeholder for session values"
+    );
+}
+
 /// Build the principal, action and resource UIDs for `require_authz!`.
+///
+/// Besides the route's path parameters the id part may use two
+/// session-derived placeholders: `{$tenant}`, the authenticated session's
+/// tenant id, and `{$user}`, its user id. They let a resource be qualified
+/// by tenant without trusting a tenant segment in the URL. Use them for
+/// tenant-qualified ids; never take the qualifier from a path segment.
+///
+/// The id part holds at most one path placeholder (see
+/// [`assert_one_path_placeholder`]); a template with two is refused.
 ///
 /// The resource template is split into `Type:id` *before* path parameters are
 /// substituted, at the first `:` that is not half of a `::` (so a namespaced
@@ -85,6 +138,7 @@ pub fn build_uids(
     resource_template: &str,
     params: &HashMap<String, String>,
     user_id: &str,
+    tenant_id: &str,
 ) -> Result<(EntityUid, EntityUid, EntityUid), AuthzError> {
     let split = type_id_separator(resource_template).ok_or_else(|| {
         AuthzError::InvalidEntityUid(format!(
@@ -98,6 +152,21 @@ pub fn build_uids(
             "resource template `{resource_template}` has a placeholder in its type; only the id may come from the request"
         )));
     }
+    let path_placeholders = id_template
+        .match_indices('{')
+        .filter(|(at, _)| !id_template[at + 1..].starts_with('$'))
+        .count();
+    if path_placeholders > 1 {
+        return Err(AuthzError::InvalidEntityUid(format!(
+            "resource template `{resource_template}` has more than one path placeholder; the values would be ambiguous"
+        )));
+    }
+    // Session values are inserted last so a route parameter can never shadow
+    // them.
+    let mut values = params.clone();
+    values.insert("$tenant".to_string(), tenant_id.to_string());
+    values.insert("$user".to_string(), user_id.to_string());
+    let params = &values;
     if let Some(name) = unknown_placeholder(id_template, params) {
         return Err(AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` names path parameter `{name}`, which the route does not have"
@@ -189,7 +258,8 @@ mod tests {
     #[test]
     fn unicode_escape_in_user_id_stays_data() {
         let p = params(&[("id", "x")]);
-        let (principal, _, _) = build_uids("App", "Read", "Doc:{id}", &p, r"al\u{69}ce").unwrap();
+        let (principal, _, _) =
+            build_uids("App", "Read", "Doc:{id}", &p, r"al\u{69}ce", "t1").unwrap();
         assert_eq!(principal.id().unescaped(), r"al\u{69}ce");
         assert_ne!(principal.id().unescaped(), "alice");
     }
@@ -197,7 +267,7 @@ mod tests {
     #[test]
     fn quote_and_escape_in_path_param_stay_data() {
         let p = params(&[("id", r#"a" } \u{41}"#)]);
-        let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1").unwrap();
+        let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").unwrap();
         assert_eq!(resource.id().unescaped(), r#"a" } \u{41}"#);
         assert_eq!(resource.type_name().to_string(), "App::Doc");
     }
@@ -205,7 +275,7 @@ mod tests {
     #[test]
     fn colon_in_param_does_not_move_the_split() {
         let p = params(&[("id", "Admin:1")]);
-        let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1").unwrap();
+        let (_, _, resource) = build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").unwrap();
         assert_eq!(resource.type_name().to_string(), "App::Doc");
         assert_eq!(resource.id().unescaped(), "Admin:1");
     }
@@ -213,7 +283,7 @@ mod tests {
     #[test]
     fn namespaced_type_keeps_its_whole_namespace() {
         let p = params(&[("id", "d1")]);
-        let (_, _, r) = build_uids("Gnomes", "Read", "Sub::Document:{id}", &p, "u1").unwrap();
+        let (_, _, r) = build_uids("Gnomes", "Read", "Sub::Document:{id}", &p, "u1", "t1").unwrap();
         assert_eq!(r.type_name().to_string(), "Gnomes::Sub::Document");
         assert_eq!(r.id().unescaped(), "d1");
     }
@@ -222,7 +292,7 @@ mod tests {
     fn two_level_namespace_argument_is_kept() {
         let p = params(&[("id", "d1")]);
         let (principal, action, r) =
-            build_uids("Gnomes::Sub", "Read", "Document:{id}", &p, "u1").unwrap();
+            build_uids("Gnomes::Sub", "Read", "Document:{id}", &p, "u1", "t1").unwrap();
         assert_eq!(r.type_name().to_string(), "Gnomes::Sub::Document");
         assert_eq!(principal.type_name().to_string(), "Gnomes::Sub::User");
         assert_eq!(action.type_name().to_string(), "Gnomes::Sub::Action");
@@ -232,7 +302,7 @@ mod tests {
     fn path_value_with_double_colon_or_quote_cannot_change_the_type() {
         for value in ["Admin::Root", r#"x"::A::"y"#, "A::B:C", "::"] {
             let p = params(&[("id", value)]);
-            let (_, _, r) = build_uids("App", "Read", "Doc:{id}", &p, "u1").unwrap();
+            let (_, _, r) = build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").unwrap();
             assert_eq!(r.type_name().to_string(), "App::Doc", "{value}");
             assert_eq!(r.id().unescaped(), value);
         }
@@ -241,14 +311,15 @@ mod tests {
     #[test]
     fn placeholder_in_the_type_position_is_refused() {
         let p = params(&[("kind", "Admin"), ("id", "1")]);
-        assert!(build_uids("App", "Read", "{kind}:{id}", &p, "u1").is_err());
-        assert!(build_uids("App", "Read", "Pre{kind}:{id}", &p, "u1").is_err());
-        assert!(build_uids("App", "Read", "Doc:{id}", &p, "u1").is_ok());
+        assert!(build_uids("App", "Read", "{kind}:{id}", &p, "u1", "t1").is_err());
+        assert!(build_uids("App", "Read", "Pre{kind}:{id}", &p, "u1", "t1").is_err());
+        assert!(build_uids("App", "Read", "Doc:{id}", &p, "u1", "t1").is_ok());
     }
 
     #[test]
     fn parameterless_template_builds_from_the_attribute_alone() {
-        let (_, _, r) = build_uids("App", "Manage", "Platform:global", &params(&[]), "u1").unwrap();
+        let (_, _, r) =
+            build_uids("App", "Manage", "Platform:global", &params(&[]), "u1", "t1").unwrap();
         assert_eq!(r.type_name().to_string(), "App::Platform");
         assert_eq!(r.id().unescaped(), "global");
     }
@@ -264,12 +335,45 @@ mod tests {
 
     #[test]
     fn unknown_placeholder_is_refused() {
-        assert!(build_uids("App", "Read", "Doc:{id}", &params(&[]), "u1").is_err());
+        assert!(build_uids("App", "Read", "Doc:{id}", &params(&[]), "u1", "t1").is_err());
     }
 
     #[test]
     fn template_without_colon_is_refused() {
-        assert!(build_uids("App", "Read", "Doc", &params(&[]), "u1").is_err());
+        assert!(build_uids("App", "Read", "Doc", &params(&[]), "u1", "t1").is_err());
+    }
+
+    #[test]
+    fn session_placeholders_come_from_the_session_not_the_route() {
+        let p = params(&[("id", "d1"), ("$tenant", "evil")]);
+        let (_, _, r) = build_uids("App", "Read", "Doc:{$tenant}/{id}", &p, "u1", "t1").unwrap();
+        assert_eq!(r.id().unescaped(), "t1/d1");
+        let (_, _, r) = build_uids(
+            "App",
+            "Read",
+            "Doc:{$tenant}:{$user}",
+            &params(&[]),
+            "u1",
+            "t1",
+        )
+        .unwrap();
+        assert_eq!(r.id().unescaped(), "t1:u1");
+    }
+
+    /// Two request values joined by a literal can be re-split by the caller,
+    /// so the template is refused.
+    #[test]
+    fn two_path_placeholders_in_one_id_are_refused() {
+        let p = params(&[("a", "x/y"), ("b", "z")]);
+        assert!(build_uids("App", "Read", "Doc:{a}/{b}", &p, "u1", "t1").is_err());
+        assert!(build_uids("App", "Read", "Doc:{a}", &p, "u1", "t1").is_ok());
+    }
+
+    #[test]
+    fn const_check_counts_only_path_placeholders() {
+        const _: () = assert_one_path_placeholder("Doc:{id}");
+        const _: () = assert_one_path_placeholder("Doc:{$tenant}/{id}");
+        const _: () = assert_one_path_placeholder("Platform:global");
     }
 
     fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {

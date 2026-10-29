@@ -105,17 +105,19 @@ async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResp
     // keep this example focused on the social flow.
     //
     // `Lax` still sends them on the top-level GET the provider redirects
-    // back with, and withholds them from cross-site sub-requests. Add
-    // `set_secure(true)` behind TLS; it is left off only so this works on
-    // http://localhost.
+    // back with, and withholds them from cross-site sub-requests. They are
+    // `Secure` unless `AXESS_DEV_INSECURE_COOKIES=1` is set for plain HTTP.
+    let secure = std::env::var("AXESS_DEV_INSECURE_COOKIES").map_or(true, |v| v != "1");
     let mut state_cookie = Cookie::new("oauth_state", csrf_state);
     state_cookie.set_http_only(true);
     state_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     state_cookie.set_path("/");
+    state_cookie.set_secure(secure);
     let mut pkce_cookie = Cookie::new("oauth_pkce", auth.pkce_verifier);
     pkce_cookie.set_http_only(true);
     pkce_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     pkce_cookie.set_path("/");
+    pkce_cookie.set_secure(secure);
     cookies.add(state_cookie);
     cookies.add(pkce_cookie);
 
@@ -138,7 +140,11 @@ async fn callback(
         .get("oauth_state")
         .map(|c| c.value().to_string())
         .unwrap_or_default();
-    if stored_state.is_empty() || stored_state != q.state {
+    // Constant-time comparison: the state is a secret the attacker must not
+    // be able to guess byte by byte from response timing.
+    let matches: bool =
+        subtle::ConstantTimeEq::ct_eq(stored_state.as_bytes(), q.state.as_bytes()).into();
+    if stored_state.is_empty() || !matches {
         return Html(
             r#"<h1>Auth failed</h1><p>CSRF state mismatch.</p><p><a href="/">Back</a></p>"#
                 .to_string(),

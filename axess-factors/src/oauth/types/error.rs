@@ -110,6 +110,12 @@ pub enum OAuthError {
         /// Body of the failed response (truncated upstream if large).
         body: String,
     },
+
+    /// The UserInfo response names a different subject than the one the
+    /// caller expected (OIDC Core 5.3.2). Neither subject is carried: both
+    /// are an identity the caller should not have to scrub from a log.
+    #[error("userinfo `sub` does not match the expected subject")]
+    SubjectMismatch,
 }
 
 impl OAuthError {
@@ -206,7 +212,8 @@ impl OAuthError {
             | Self::DeviceAuthorization(_)
             | Self::UnknownKid(_)
             | Self::JwksExpired
-            | Self::UnsupportedTokenType => false,
+            | Self::UnsupportedTokenType
+            | Self::SubjectMismatch => false,
         }
     }
 }
@@ -243,6 +250,7 @@ mod oauth_error_is_transient_tests {
             OAuthError::AccessTokenExpired,
             OAuthError::InsufficientScope,
             OAuthError::UnsupportedTokenType,
+            OAuthError::SubjectMismatch,
             OAuthError::UnknownProvider("p".into()),
             OAuthError::Config("c".into()),
             OAuthError::TokenExchange("t".into()),

@@ -3,7 +3,9 @@
 use crate::web::app::AppState;
 use crate::web::{csrf_hidden_input, html_escape};
 use axess::AuthSession;
-use axess::authn::{AuditContext, FactorCredential, FactorKind, FactorOutcome, LoginOutcome};
+use axess::authn::{
+    AuditContext, FactorCredential, FactorKind, FactorOutcome, IdentityLookup, LoginOutcome,
+};
 use axess::csrf::CsrfToken;
 use axum::{
     Extension, Form,
@@ -315,11 +317,11 @@ pub async fn post_signup(
         Ok(SignupOutcome::Started) => {
             // The user is now created (Candidate state). Store their password
             // factor and auth method so they can log in after activation.
-            let user_id = match session.user_id().await {
+            let user_id = match session.pending_user_id().await {
                 Some(id) => id,
                 None => return error_page("Signup session lost.").into_response(),
             };
-            let tenant_id = match session.tenant_id().await {
+            let tenant_id = match session.pending_tenant_id().await {
                 Some(t) => t,
                 None => return error_page("Signup session lost tenant.").into_response(),
             };
@@ -483,13 +485,13 @@ pub async fn post_setup_totp(
 
     // Verify the code against the secret before storing.
     // Use defaults: 6 digits, 30s period, ±1 window.
-    match axess::verify_totp(
+    let verified_step = match axess::verify_totp(
         &form.secret,
         &form.code,
         state.backend.clock().now(),
         axess::TotpVerifyParams::default(),
     ) {
-        Some(_step) => {} // Valid code; proceed.
+        Some(step) => step, // Valid code; proceed.
         None => {
             let csrf_input = csrf_hidden_input(&csrf);
             return Html(format!(
@@ -510,7 +512,7 @@ pub async fn post_setup_totp(
             ))
             .into_response();
         }
-    }
+    };
 
     let user_id = match session.user_id().await {
         Some(id) => id,
@@ -523,11 +525,32 @@ pub async fn post_setup_totp(
 
     let scope = AuthnScope::User { tenant_id, user_id };
 
+    // Fail closed: an enrolled factor is never replaced from here (that
+    // would need step-up first), and a store error is not "not enrolled".
+    match state.backend.load_factor(&scope, FactorKind::Totp).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return Redirect::to("/dashboard").into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to check existing TOTP enrolment");
+            return error_page("Failed to check TOTP configuration.").into_response();
+        }
+    }
+
     // Store the TOTP factor config.
     let totp_config = FactorConfig::Totp(TotpConfig {
-        secret: ZeroizedString::new(form.secret),
+        secret: ZeroizedString::new(form.secret).into(),
+        // The enrolment code is spent: the same code cannot then log in.
+        last_step: Some(verified_step),
         ..TotpConfig::default()
     });
+    // Seal the secret for this user's row before the store sees it.
+    let totp_config = match state.factor_cipher.seal_config(totp_config, &scope) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to seal TOTP secret");
+            return error_page("Failed to save TOTP configuration.").into_response();
+        }
+    };
     if let Err(e) = state.backend.save_factor(&scope, totp_config).await {
         tracing::warn!(error = %e, "failed to store TOTP config");
         return error_page("Failed to save TOTP configuration.").into_response();
@@ -632,17 +655,29 @@ pub async fn post_forgot_password(
         .await
     {
         Ok(Some(token)) => {
-            // In production: send this token via email.
-            // For this example: log it to stdout.
-            tracing::info!(
-                identifier = %form.identifier,
-                token = %token,
-                "PASSWORD RESET TOKEN (would be emailed in production)"
-            );
+            // In production: email the link. This example has no mailer, so a
+            // DEBUG BUILD writes it to the `dev_mail` log target. A release
+            // build writes nothing: the token is a bearer credential and
+            // must not reach an info-level log.
+            if cfg!(debug_assertions)
+                && let Ok(Some(tenant_row)) = state.backend.find_tenant(tenant).await
+                && let Ok(Some(user)) = state
+                    .backend
+                    .find_user(&form.identifier, &tenant_row.id)
+                    .await
+            {
+                tracing::debug!(
+                    target: "dev_mail",
+                    "password reset link: /reset-password?user_id={}&tenant_id={}&token={}",
+                    user.id,
+                    tenant_row.id,
+                    token
+                );
+            }
         }
         Ok(None) => {
-            // User not found; log but show the same response.
-            tracing::debug!(identifier = %form.identifier, "password reset requested for unknown user");
+            // User not found; show the same response.
+            tracing::debug!("password reset requested for an unknown user");
         }
         Err(e) => {
             tracing::warn!(error = %e, "begin_password_reset error");
@@ -653,16 +688,35 @@ pub async fn post_forgot_password(
         r#"<!doctype html><html><head><title>Password Reset</title></head><body>
 <h1>Check Your Email</h1>
 <p>If an account with that identifier exists, a password reset link has been sent.</p>
-<p>For this example, check the <strong>server log</strong> for the reset token.</p>
-<p><a href="/reset-password">Enter reset token</a> | <a href="/login">Back to login</a></p>
+<p>For this example, a debug build prints the reset link to the <strong>server log</strong> (target <code>dev_mail</code>).</p>
+<p><a href="/login">Back to login</a></p>
 </body></html>"#,
     )
 }
 
 // ── GET /reset-password ─────────────────────────────────────────────────────
 
-pub async fn reset_password_page(Extension(csrf): Extension<CsrfToken>) -> Html<String> {
-    render_with_csrf(RESET_PASSWORD_HTML, &csrf)
+#[derive(Deserialize, Default)]
+pub struct ResetLinkQuery {
+    pub user_id: Option<String>,
+    pub tenant_id: Option<String>,
+    pub token: Option<String>,
+}
+
+pub async fn reset_password_page(
+    Extension(csrf): Extension<CsrfToken>,
+    axum::extract::Query(link): axum::extract::Query<ResetLinkQuery>,
+) -> Html<String> {
+    // The emailed link carries the user, tenant and token; the person only
+    // chooses the new password. The values are echoed into hidden inputs.
+    let field = |v: &Option<String>| html_escape(v.as_deref().unwrap_or(""));
+    Html(
+        RESET_PASSWORD_HTML
+            .replace("__USER_ID__", &field(&link.user_id))
+            .replace("__TENANT_ID__", &field(&link.tenant_id))
+            .replace("__TOKEN__", &field(&link.token))
+            .replace("__CSRF_INPUT__", &csrf_hidden_input(&csrf)),
+    )
 }
 
 // ── POST /reset-password ────────────────────────────────────────────────────
@@ -670,6 +724,7 @@ pub async fn reset_password_page(Extension(csrf): Extension<CsrfToken>) -> Html<
 #[derive(Deserialize)]
 pub struct ResetPasswordForm {
     pub user_id: String,
+    pub tenant_id: String,
     pub token: String,
     pub new_password: String,
 }
@@ -679,23 +734,48 @@ pub async fn post_reset_password(
     audit: AuditContext,
     Form(form): Form<ResetPasswordForm>,
 ) -> impl IntoResponse {
-    let user_id = match axess::authn::UserId::try_new(form.user_id.as_str()) {
-        Ok(id) => id,
-        Err(_) => {
+    let ids = (
+        axess::authn::UserId::try_new(form.user_id.as_str()),
+        axess::authn::TenantId::try_new(form.tenant_id.as_str()),
+    );
+    let (user_id, tenant_id) = match ids {
+        (Ok(user_id), Ok(tenant_id)) => (user_id, tenant_id),
+        _ => {
             return Html(
                 r#"<!doctype html><html><head><title>Password Reset</title></head><body>
 <h1>Invalid Request</h1>
-<p>Malformed user id.</p>
+<p>Malformed reset link.</p>
 </body></html>"#,
             )
             .into_response();
         }
     };
 
+    // Check the tenant's password rules first so a weak password is reported
+    // as that, not as an invalid token. The library checks them again, before
+    // it spends the token, so the link still works for a second attempt.
+    match state.backend.password_rules_for_tenant(&tenant_id).await {
+        Ok(rules) if !meets_rules(&form.new_password, &rules) => {
+            return Html(format!(
+                r#"<!doctype html><html><head><title>Password Reset</title></head><body>
+<h1>Password Too Weak</h1>
+<p>The password must be at least {} characters with upper case, lower case and a digit. Your link is still valid: go back and choose another.</p>
+</body></html>"#,
+                rules.min_length
+            ))
+            .into_response();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "password_rules_for_tenant error");
+            return error_page("Password reset failed.").into_response();
+        }
+    }
+
     match state
         .service
         .with_audit_context(audit)
-        .complete_password_reset(&user_id, &form.token, &form.new_password)
+        .complete_password_reset_in_tenant(&user_id, &tenant_id, &form.token, &form.new_password)
         .await
     {
         Ok(true) => Html(
@@ -891,17 +971,14 @@ const FORGOT_PASSWORD_HTML: &str = r#"<!doctype html>
 const RESET_PASSWORD_HTML: &str = r#"<!doctype html>
 <html><head><title>Reset Password</title></head><body>
 <h1>Set New Password</h1>
-<p>Enter the reset token from the server log (or email in production), your user ID, and a new password.</p>
+<p>Open the reset link from your email (in this example, from the server log) and choose a new password.</p>
 <form method="POST" action="/reset-password">
   __CSRF_INPUT__
-  <label>User ID (username):<br>
-    <input type="text" name="user_id" required autofocus>
-  </label><br><br>
-  <label>Reset Token:<br>
-    <input type="text" name="token" required>
-  </label><br><br>
+  <input type="hidden" name="user_id" value="__USER_ID__">
+  <input type="hidden" name="tenant_id" value="__TENANT_ID__">
+  <input type="hidden" name="token" value="__TOKEN__">
   <label>New Password:<br>
-    <input type="password" name="new_password" required minlength="12">
+    <input type="password" name="new_password" required minlength="12" autofocus>
   </label><br><br>
   <button type="submit">Reset Password</button>
 </form>

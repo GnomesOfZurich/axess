@@ -135,6 +135,9 @@ pub struct JwtVerifier<R = NoReplay> {
     /// bound it.
     require_exp: bool,
     replay: Option<R>,
+    /// The caller chose to accept any audience (see
+    /// [`allow_any_audience`](JwtVerifier::allow_any_audience)).
+    audience_waived: bool,
     /// Injected clock; drives `exp` / `nbf` validation and replay-store
     /// TTL computation. Defaults to [`SystemClock`]. Set a
     /// `MockClock`-backed `Arc<dyn Clock>` via `with_clock` for DST tests.
@@ -155,6 +158,7 @@ impl JwtVerifier<NoReplay> {
             require_nbf: false,
             require_exp: true,
             replay: None,
+            audience_waived: false,
             clock: Arc::new(SystemClock),
         }
     }
@@ -177,6 +181,11 @@ impl<R> JwtVerifier<R> {
     /// The allowlist is intersected with each JWK's family at
     /// verification time, so passing a mixed RSA + EC allowlist
     /// against an RSA JWK only exercises the RSA half.
+    ///
+    /// Symmetric algorithms (`HS256`, `HS384`, `HS512`) are never accepted:
+    /// listing one here does not make a token signed with it verify, it fails
+    /// as a disallowed algorithm. A JWKS is public, and a shared-secret key in
+    /// it proves nothing about who signed.
     pub fn with_algorithms(mut self, algs: impl Into<Vec<Algorithm>>) -> Self {
         self.allowed_algorithms = algs.into();
         self
@@ -192,6 +201,31 @@ impl<R> JwtVerifier<R> {
     pub fn with_audience(mut self, aud: impl Into<String>) -> Self {
         self.expected_audience = Some(aud.into());
         self
+    }
+
+    /// Record that accepting a token for any audience is intended.
+    ///
+    /// Without an audience pin ([`with_audience`](Self::with_audience)) a
+    /// token minted for any other service of the same issuer would verify
+    /// here, so `verify` refuses a verifier built with neither. This call
+    /// states the decision, for the verifier whose issuer is the application's
+    /// alone. It does not make
+    /// [`JwtSvidResolver`](crate::jwt::svid::JwtSvidResolver) accept the
+    /// verifier: a JWT-SVID must be validated against an audience.
+    #[must_use]
+    pub fn allow_any_audience(mut self) -> Self {
+        self.audience_waived = true;
+        self
+    }
+
+    /// Whether an `iss` is pinned.
+    pub fn has_issuer(&self) -> bool {
+        self.expected_issuer.is_some()
+    }
+
+    /// Whether an `aud` is pinned.
+    pub fn has_audience(&self) -> bool {
+        self.expected_audience.is_some()
     }
 
     /// Override the clock-skew tolerance applied to `exp` and `nbf`.
@@ -227,6 +261,7 @@ impl<R> JwtVerifier<R> {
             require_nbf: self.require_nbf,
             require_exp: self.require_exp,
             replay: Some(store),
+            audience_waived: self.audience_waived,
             clock: self.clock,
         }
     }
@@ -252,6 +287,14 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
         &self,
         token: &str,
     ) -> Result<VerifiedClaims<C>, JwtError> {
+        if self.expected_audience.is_none() && !self.audience_waived {
+            return Err(JwtError::VerificationFailed(
+                "no audience is pinned: a token minted for any other service of the same \
+                 issuer would verify. Call with_audience, or allow_any_audience to state \
+                 that accepting any audience is intended"
+                    .to_string(),
+            ));
+        }
         let config = ValidationConfig {
             issuer: self.expected_issuer.clone(),
             audience: self.expected_audience.clone(),
@@ -349,3 +392,18 @@ fn compute_replay_ttl(exp: Option<i64>, skew: Duration, clock: &dyn Clock) -> Du
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `verifier` pins both `iss` and `aud`, which every resolver that
+/// turns a JWT into a workload identity requires. Logs the refusal under the
+/// resolver's name, so an operator sees which one rejected its verifier.
+pub(crate) fn verifier_is_pinned<R: JtiReplayStore>(verifier: &JwtVerifier<R>, who: &str) -> bool {
+    if verifier.has_audience() && verifier.has_issuer() {
+        return true;
+    }
+    tracing::error!(
+        has_issuer = verifier.has_issuer(),
+        has_audience = verifier.has_audience(),
+        "{who}: the verifier must pin both `iss` and `aud`; refusing"
+    );
+    false
+}

@@ -20,10 +20,15 @@
 //!    task that does the work (see "One root, one lock" below).
 //! 3. Opens every day file in append mode (creating missing directories) and
 //!    records each file's length.
-//! 4. Writes every day's events in one buffered write per file.
-//! 5. `fsync`s every file, then every directory it created and the parent of
-//!    the topmost one, then the directory of every file, so a crash after
-//!    `Ok(())` cannot lose a day file or the folders leading to it.
+//! 4. Writes every day's events in one buffered write per file, then
+//!    `fsync`s every day file and every directory from each file's folder up
+//!    to the root (also the ones an earlier failed attempt created), so a
+//!    crash after `Ok(())` cannot lose a day file or the folders leading to it.
+//! 5. Only then writes the batch-id markers (see "Retried batches") and
+//!    `fsync`s them and their directories. A marker is never written before
+//!    every event file is durable: otherwise writeback could persist one
+//!    day's marker while another day's events were lost to a crash, and the
+//!    retry would skip a batch whose events are gone.
 //!
 //! If the last step succeeds the call returns `Ok(())`; the adopter then
 //! takes that as the green light to mark hot-table rows as archived.
@@ -53,14 +58,18 @@
 //! The retention loop archives before it marks rows archived, so a
 //! failed mark makes the next tick send the same events again, under the
 //! same [`ArchiveBatchId`]. Next to each day file the archiver keeps
-//! `audit-{YYYY-MM-DD}.jsonl.batches`, one applied batch id per line,
-//! written and `fsync`ed in the same all-or-nothing step as the events. A
-//! batch whose id is already recorded for any of its days is skipped, so
-//! the retry does not duplicate it. Identical events in different batches
-//! have different ids and are both appended.
+//! `audit-{YYYY-MM-DD}.jsonl.batches`, one applied batch per line (the batch
+//! id and a digest of the batch's events), written and `fsync`ed in the same
+//! all-or-nothing step as the events. A batch whose id and digest are already
+//! recorded for any of its days is skipped, so the retry does not duplicate
+//! it. Identical events in different batches have different ids and are both
+//! appended, and so are different events under a reused id (a source that
+//! recycles row ids): the digest tells them apart. The sidecars are read once
+//! and then answered from memory, revalidated against the file's length and
+//! modification time on every call.
 //!
 //! The one remaining window is a crash after the event files are durable
-//! and before the id is: the retry then appends the batch again, which
+//! and before the marker is: the retry then appends the batch again, which
 //! is at-least-once delivery and never loss. Consumers should still
 //! tolerate a repeated line.
 //!
@@ -104,6 +113,9 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod sidecar;
+use sidecar::{SidecarCache, marker_line};
+
 /// Errors from the filesystem archiver.
 #[derive(Debug, thiserror::Error)]
 pub enum FilesystemArchiveError {
@@ -133,6 +145,7 @@ pub enum FilesystemArchiveError {
 pub struct FilesystemAuditArchiver {
     root: PathBuf,
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    sidecars: Arc<std::sync::Mutex<SidecarCache>>,
 }
 
 impl FilesystemAuditArchiver {
@@ -143,6 +156,7 @@ impl FilesystemAuditArchiver {
         Self {
             root: root.into(),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sidecars: Arc::new(std::sync::Mutex::new(SidecarCache::default())),
         }
     }
 
@@ -170,27 +184,6 @@ fn batches_path(day_file: &std::path::Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// True when `batch_id` is one of the lines of the sidecar at `path`. A
-/// missing sidecar records nothing.
-///
-/// The sidecar is read a line at a time and the scan stops at the first
-/// match, so memory does not grow with the file. Each line is one 64-character
-/// id, so a day holding a thousand batches is about 65 KB.
-fn batch_recorded(path: &std::path::Path, batch_id: &str) -> std::io::Result<bool> {
-    use std::io::BufRead as _;
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    for line in std::io::BufReader::new(file).lines() {
-        if line? == batch_id {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Create `dir` and every missing ancestor, returning the directories this
 /// call created, outermost first.
 fn create_dir_all_tracked(dir: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
@@ -204,10 +197,13 @@ fn create_dir_all_tracked(dir: &std::path::Path) -> std::io::Result<Vec<PathBuf>
     Ok(missing)
 }
 
-/// The directories whose entries must be made durable: each directory this
-/// call created, the parent of the outermost one (it gained an entry), and the
-/// directory of every file written.
+/// The directories whose entries must be made durable: `root`, every
+/// directory from each written file's folder up to it (whether or not this
+/// call created it, because an earlier attempt that failed may have created
+/// it and never synced it), each directory this call created, and the parent
+/// of the outermost one (it gained an entry).
 fn dirs_to_sync(
+    root: &std::path::Path,
     created: &[PathBuf],
     files: &[&std::path::Path],
 ) -> std::collections::BTreeSet<PathBuf> {
@@ -219,9 +215,15 @@ fn dirs_to_sync(
         dirs.insert(parent.to_path_buf());
     }
     for file in files {
-        if let Some(parent) = file.parent() {
-            dirs.insert(parent.to_path_buf());
+        for ancestor in file.ancestors().skip(1) {
+            dirs.insert(ancestor.to_path_buf());
+            if ancestor == root {
+                break;
+            }
         }
+    }
+    if !files.is_empty() {
+        dirs.insert(root.to_path_buf());
     }
     dirs
 }
@@ -240,57 +242,56 @@ fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
+/// One durable step of [`append_all_or_none`], reported to [`Faults::trace`]
+/// in the order it happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Step {
+    /// The file at this index of the plan was written.
+    Write(usize),
+    /// The file at this index of the plan was `fsync`ed.
+    SyncFile(usize),
+    /// This directory was `fsync`ed.
+    SyncDir(PathBuf),
+}
+
 /// Test seams: a failure injected before each file's write, and before each
-/// file's rollback. Production passes closures that always succeed.
+/// file's rollback, and an observer of every durable step. Production passes
+/// closures that always succeed and ignore the trace.
 struct Faults<'a> {
     before_write: Box<dyn FnMut(usize) -> std::io::Result<()> + 'a>,
     before_rollback: Box<dyn FnMut(usize) -> std::io::Result<()> + 'a>,
+    trace: Box<dyn FnMut(Step) + 'a>,
 }
 
 /// Append every buffer to its file, or leave every file as it was.
 ///
 /// `data` is written first, then `markers` (the batch-id sidecars); indexes
 /// in [`Faults`] count `data` then `markers`. Each file's length is recorded
-/// before anything is written. All files are opened, written and `fsync`ed,
-/// then the directories holding them are; if any step fails, the files are
-/// truncated back to their recorded lengths, so a failed batch leaves no whole
-/// or partial line behind and the caller's retry cannot duplicate records.
+/// before anything is written to it.
+///
+/// The work is two phases. Phase one writes and `fsync`s every `data` file
+/// and the directories from each file's folder up to `root`. Phase two writes
+/// and `fsync`s the `markers` and their directories. No marker is written
+/// before every data file is durable, so a crash cannot leave a batch id on
+/// disk whose events are not. If any step fails, the files are truncated back
+/// to their recorded lengths, so a failed batch leaves no whole or partial
+/// line behind and the caller's retry cannot duplicate records.
 ///
 /// The markers are restored first, and `data` only if every marker was. A
 /// marker that cannot be restored may still carry the batch id, and the retry
 /// would then skip a batch whose events had been truncated.
 fn append_all_or_none(
+    root: &std::path::Path,
     data: &[(PathBuf, Vec<u8>)],
     markers: &[(PathBuf, Vec<u8>)],
     faults: &mut Faults<'_>,
 ) -> Result<(), FilesystemArchiveError> {
-    let plan: Vec<&(PathBuf, Vec<u8>)> = data.iter().chain(markers).collect();
-    let mut touched: Vec<(std::fs::File, u64)> = Vec::with_capacity(plan.len());
+    let mut touched: Vec<(std::fs::File, u64)> = Vec::with_capacity(data.len() + markers.len());
     let outcome = (|| -> Result<(), FilesystemArchiveError> {
-        let mut created: Vec<PathBuf> = Vec::new();
-        for (path, _) in &plan {
-            if let Some(parent) = path.parent() {
-                created.extend(create_dir_all_tracked(parent)?);
-            }
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)?;
-            let original_len = file.metadata()?.len();
-            touched.push((file, original_len));
-        }
-        for (i, (_, buf)) in plan.iter().enumerate() {
-            (faults.before_write)(i)?;
-            touched[i].0.write_all(buf)?;
-        }
-        for (file, _) in &touched {
-            file.sync_all()?;
-        }
-        let files: Vec<&std::path::Path> = plan.iter().map(|(p, _)| p.as_path()).collect();
-        for dir in dirs_to_sync(&created, &files) {
-            sync_dir(&dir)?;
-        }
-        Ok(())
+        // Phase one: the events.
+        write_phase(root, data, 0, &mut touched, faults)?;
+        // Phase two: only now the markers that make the batch count as done.
+        write_phase(root, markers, data.len(), &mut touched, faults)
     })();
     if outcome.is_err() {
         let mut restore = |i: usize| -> bool {
@@ -323,12 +324,55 @@ fn append_all_or_none(
     outcome
 }
 
+/// Open, write and `fsync` one group of files, then `fsync` the directories
+/// from their folders up to `root`. `first` is the group's index offset in the
+/// whole plan; each file is pushed onto `touched` as soon as it is opened so
+/// the caller can roll it back.
+fn write_phase(
+    root: &std::path::Path,
+    group: &[(PathBuf, Vec<u8>)],
+    first: usize,
+    touched: &mut Vec<(std::fs::File, u64)>,
+    faults: &mut Faults<'_>,
+) -> Result<(), FilesystemArchiveError> {
+    let mut created: Vec<PathBuf> = Vec::new();
+    for (path, _) in group {
+        if let Some(parent) = path.parent() {
+            created.extend(create_dir_all_tracked(parent)?);
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let original_len = file.metadata()?.len();
+        touched.push((file, original_len));
+    }
+    for (offset, (_, buf)) in group.iter().enumerate() {
+        let i = first + offset;
+        (faults.before_write)(i)?;
+        touched[i].0.write_all(buf)?;
+        (faults.trace)(Step::Write(i));
+    }
+    for offset in 0..group.len() {
+        let i = first + offset;
+        touched[i].0.sync_all()?;
+        (faults.trace)(Step::SyncFile(i));
+    }
+    let files: Vec<&std::path::Path> = group.iter().map(|(p, _)| p.as_path()).collect();
+    for dir in dirs_to_sync(root, &created, &files) {
+        sync_dir(&dir)?;
+        (faults.trace)(Step::SyncDir(dir));
+    }
+    Ok(())
+}
+
 /// The blocking half of `archive_batch`: take the root's lock, skip a batch
 /// already recorded, and write the rest all-or-nothing.
 fn archive_blocking(
     root: &std::path::Path,
     by_day: std::collections::BTreeMap<chrono::NaiveDate, Vec<String>>,
     batch_line: &str,
+    sidecars: &std::sync::Mutex<SidecarCache>,
     faults: &mut Faults<'_>,
 ) -> Result<(), FilesystemArchiveError> {
     let _root_lock = lock_root(root)?;
@@ -338,11 +382,14 @@ fn archive_blocking(
             .join(format!("{:02}", day.day()))
             .join(format!("audit-{}.jsonl", day.format("%Y-%m-%d")))
     };
-    // A batch is written to every day file or to none, and its id is
-    // recorded in the same step, so an id recorded for any of its days means
-    // all of its events are already there.
+    let batch_id = batch_line.trim_end();
+    let marker = marker_line(batch_id, &content_digest(&by_day));
+    let mut cache = sidecars.lock().unwrap_or_else(|e| e.into_inner());
+    // A batch is written to every day file or to none, and its marker is
+    // recorded in the same step, so a marker recorded for any of its days
+    // means all of its events are already there.
     for day in by_day.keys() {
-        if batch_recorded(&batches_path(&day_path(*day)), batch_line.trim_end())? {
+        if cache.recorded(&batches_path(&day_path(*day)), batch_id, &marker)? {
             return Ok(());
         }
     }
@@ -360,11 +407,37 @@ fn archive_blocking(
             (path, buf)
         })
         .collect();
+    let marker_bytes = format!("{marker}\n").into_bytes();
     let markers: Vec<(PathBuf, Vec<u8>)> = data
         .iter()
-        .map(|(path, _)| (batches_path(path), batch_line.as_bytes().to_vec()))
+        .map(|(path, _)| (batches_path(path), marker_bytes.clone()))
         .collect();
-    append_all_or_none(&data, &markers, faults)
+    append_all_or_none(root, &data, &markers, faults)?;
+    for (path, _) in &markers {
+        cache.note_appended(path, &marker);
+    }
+    Ok(())
+}
+
+/// A SHA-256 over the batch's events, day by day, as lower-case hex. Part of
+/// the marker, so a reused batch id over different events is not skipped.
+fn content_digest(by_day: &std::collections::BTreeMap<chrono::NaiveDate, Vec<String>>) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let mut h = Sha256::new();
+    for (day, lines) in by_day {
+        h.update(day.to_string().as_bytes());
+        h.update((lines.len() as u64).to_be_bytes());
+        for line in lines {
+            h.update((line.len() as u64).to_be_bytes());
+            h.update(line.as_bytes());
+        }
+    }
+    let mut hex = String::with_capacity(64);
+    for b in h.finalize() {
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// Create `root` if needed and take an exclusive lock on `{root}/.archive.lock`,
@@ -377,7 +450,7 @@ fn lock_root(root: &std::path::Path) -> std::io::Result<std::fs::File> {
         .truncate(false)
         .open(root.join(LOCK_FILE))?;
     lock.lock()?;
-    for dir in dirs_to_sync(&created, &[]) {
+    for dir in dirs_to_sync(root, &created, &[]) {
         sync_dir(&dir)?;
     }
     Ok(lock)
@@ -429,15 +502,18 @@ impl FilesystemAuditArchiver {
         // the root to a retry while its writes are still in progress.
         let _queue = self.write_lock.lock().await;
         let root = self.root.clone();
+        let sidecars = Arc::clone(&self.sidecars);
         let batch_line = format!("{batch}\n");
         tokio::task::spawn_blocking(move || {
             archive_blocking(
                 &root,
                 by_day,
                 &batch_line,
+                &sidecars,
                 &mut Faults {
                     before_write: Box::new(move |i| before_write(i)),
                     before_rollback: Box::new(|_| Ok(())),
+                    trace: Box::new(|_| {}),
                 },
             )
         })
@@ -581,11 +657,13 @@ mod tests {
             }
         };
         let err = append_all_or_none(
+            tmp.path(),
             &data,
             &[],
             &mut Faults {
                 before_write: Box::new(&mut fail_second),
                 before_rollback: Box::new(|_| Ok(())),
+                trace: Box::new(|_| {}),
             },
         )
         .expect_err("injected failure");
@@ -594,7 +672,7 @@ mod tests {
         assert_eq!(std::fs::read(&day2).unwrap(), b"");
 
         // The retry of the same batch lands each record exactly once.
-        append_all_or_none(&data, &[], &mut no_faults()).unwrap();
+        append_all_or_none(tmp.path(), &data, &[], &mut no_faults()).unwrap();
         assert_eq!(
             std::fs::read_to_string(&day1).unwrap(),
             "{\"earlier\":1}\n{\"new\":1}\n{\"new\":2}\n"
@@ -607,6 +685,7 @@ mod tests {
         Faults {
             before_write: Box::new(|_| Ok(())),
             before_rollback: Box::new(|_| Ok(())),
+            trace: Box::new(|_| {}),
         }
     }
 
@@ -644,6 +723,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod durability;
 #[cfg(test)]
 mod locking;
 #[cfg(test)]

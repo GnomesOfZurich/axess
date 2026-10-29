@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::delegated::stored::credential::MemoryDelegatedCredentialStore;
+use crate::session::crypto::LegacyBlobs;
 use chrono::{TimeZone, Utc};
 
 fn sample_tenant() -> TenantId {
@@ -74,13 +75,13 @@ async fn inner_store_holds_ciphertext_not_plaintext() {
         .expect("inner load")
         .expect("present");
     assert!(
-        (*raw.access_token).starts_with("v1.k1."),
+        (*raw.access_token).starts_with("v2.k1."),
         "expected envelope prefix, got: {:?}",
         &*raw.access_token
     );
     assert_ne!(&*raw.access_token, "at-plaintext");
     let rt = raw.refresh_token.as_deref().expect("refresh present");
-    assert!(rt.starts_with("v1.k1."));
+    assert!(rt.starts_with("v2.k1."));
     assert_ne!(rt, "rt-plaintext");
 }
 
@@ -282,7 +283,7 @@ async fn historical_key_decrypts_pre_rotation_rows() {
         .expect("load")
         .expect("present");
     assert!(
-        (*rewritten.access_token).starts_with("v1.k2."),
+        (*rewritten.access_token).starts_with("v2.k2."),
         "after re-save, row should be under new current key, got: {:?}",
         &*rewritten.access_token
     );
@@ -373,4 +374,128 @@ async fn short_envelope_body_rejects_as_malformed() {
     let aad = build_aad("gmail", &sample_tenant(), &sample_user(), FIELD_ACCESS);
     let err = decrypt_envelope(&keys, &short, &aad).unwrap_err();
     assert!(matches!(err, EnvelopeError::Malformed(_)));
+}
+
+/// The v2 AAD covers `scopes` and `token_type`: a store that widens the
+/// granted scopes or changes the token type under the ciphertext makes the
+/// row fail to open.
+#[tokio::test]
+async fn rewriting_scopes_or_token_type_in_the_inner_store_fails_authentication() {
+    let store = store_with_key([5u8; 32]);
+    let (tenant, user) = (sample_tenant(), sample_user());
+    store
+        .save(&tenant, &user, sample_credential())
+        .await
+        .expect("save");
+    let mut raw = store
+        .inner()
+        .load(&tenant, &user, "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut widened = raw.clone();
+    widened.scopes.push("gmail.admin".to_string());
+    store.inner().save(&tenant, &user, widened).await.unwrap();
+    let err = store.load(&tenant, &user, "gmail").await.unwrap_err();
+    assert!(err.contains("decrypt"), "{err}");
+
+    raw.token_type = "MAC".to_string();
+    store.inner().save(&tenant, &user, raw).await.unwrap();
+    assert!(store.load(&tenant, &user, "gmail").await.is_err());
+}
+
+/// Reordering the same scope set does not break authentication.
+#[tokio::test]
+async fn reordering_scopes_does_not_break_authentication() {
+    let store = store_with_key([6u8; 32]);
+    let (tenant, user) = (sample_tenant(), sample_user());
+    let mut cred = sample_credential();
+    cred.scopes = vec!["a".into(), "b".into()];
+    store.save(&tenant, &user, cred).await.unwrap();
+    let mut raw = store
+        .inner()
+        .load(&tenant, &user, "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    raw.scopes = vec!["b".into(), "a".into()];
+    store.inner().save(&tenant, &user, raw).await.unwrap();
+    assert!(store.load(&tenant, &user, "gmail").await.unwrap().is_some());
+}
+
+/// A row written by the previous release (v1, AAD without scopes) still
+/// opens, and the read re-seals it as v2 under the current key.
+#[tokio::test]
+async fn a_v1_row_under_a_retired_key_is_read_and_resealed() {
+    let (tenant, user) = (sample_tenant(), sample_user());
+    let old_key = [1u8; 32];
+    let new_key = [2u8; 32];
+    let cred = sample_credential();
+
+    let old = CurrentKey {
+        key_id: Arc::from("k1"),
+        key: Arc::new(EncryptionKey::from_bytes(old_key)),
+    };
+    let aad_a = build_aad("gmail", &tenant, &user, FIELD_ACCESS);
+    let aad_r = build_aad("gmail", &tenant, &user, FIELD_REFRESH);
+    let rng = axess_rng::SystemRng;
+    let v1 = |env: String| env.replacen("v2.", "v1.", 1);
+    let legacy = StoredDelegation {
+        access_token: ZeroizedString::from(v1(encrypt_envelope(
+            &old,
+            &rng,
+            "at-plaintext",
+            &aad_a,
+        )
+        .unwrap())),
+        refresh_token: Some(ZeroizedString::from(v1(encrypt_envelope(
+            &old,
+            &rng,
+            "rt-plaintext",
+            &aad_r,
+        )
+        .unwrap()))),
+        ..cred
+    };
+    let inner = MemoryDelegatedCredentialStore::new();
+    inner.save(&tenant, &user, legacy).await.unwrap();
+    let keys = MemoryKeyProvider::new("k2", new_key)
+        .unwrap()
+        .with_historical("k1", old_key)
+        .unwrap();
+
+    let store = EncryptedDelegatedCredentialStore::new(inner, keys)
+        .with_legacy_envelopes(LegacyBlobs::Accept);
+    let loaded = store.load(&tenant, &user, "gmail").await.unwrap().unwrap();
+    assert_eq!(&*loaded.access_token, "at-plaintext");
+
+    let raw = store
+        .inner()
+        .load(&tenant, &user, "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        (*raw.access_token).starts_with("v2.k2."),
+        "{:?}",
+        &*raw.access_token
+    );
+    assert!(raw.refresh_token.as_deref().unwrap().starts_with("v2.k2."));
+}
+
+#[tokio::test]
+async fn seals_counts_every_envelope_written() {
+    let store = store_with_key([8u8; 32]);
+    let (tenant, user) = (sample_tenant(), sample_user());
+    assert_eq!(store.seals(), 0);
+    store
+        .save(&tenant, &user, sample_credential())
+        .await
+        .expect("save");
+    assert_eq!(store.seals(), 2, "access + refresh");
+    let mut no_refresh = sample_credential();
+    no_refresh.refresh_token = None;
+    store.save(&tenant, &user, no_refresh).await.expect("save");
+    assert_eq!(store.seals(), 3);
 }

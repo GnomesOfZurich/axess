@@ -18,7 +18,7 @@ use axess_core::{
     },
 };
 use axess_factors::fido2::{DefaultFido2Provider, Fido2Provider};
-use common::{test_tenant, test_user};
+use common::{session_for, test_tenant, test_user};
 use url::Url;
 use webauthn_rs::prelude::*;
 
@@ -195,6 +195,7 @@ struct Fixture {
     service: RequestAuthnService<MockIdentityStore, FlakyFactors>,
     factors: FlakyFactors,
     scope: AuthnScope,
+    identity: MockIdentityStore,
 }
 
 fn fixture() -> Fixture {
@@ -224,7 +225,7 @@ fn fixture() -> Fixture {
     let identity = MockIdentityStore::new()
         .with_default_tenant(test_tenant())
         .with_user(user);
-    let service = AuthnService::builder(identity, factors.clone())
+    let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_fido2(AcceptingProvider(DefaultFido2Provider::new(webauthn)))
         .build()
         .with_audit_context(AuditContext::default());
@@ -232,6 +233,7 @@ fn fixture() -> Fixture {
         service,
         factors,
         scope,
+        identity,
     }
 }
 
@@ -252,7 +254,7 @@ async fn stored_count(f: &Fixture) -> usize {
 async fn registration_adds_to_the_existing_passkeys() {
     let f = fixture();
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -268,7 +270,7 @@ async fn registration_adds_to_the_existing_passkeys() {
 async fn failed_read_during_registration_keeps_the_existing_passkeys() {
     let f = fixture();
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -295,7 +297,7 @@ async fn failed_read_when_beginning_registration_is_an_error() {
     f.factors.fail_next_load.store(true, Ordering::SeqCst);
     let result = f
         .service
-        .begin_fido2_registration(&user, &test_session())
+        .begin_fido2_registration(&user, &session_for(&user).await)
         .await;
     assert!(result.is_err());
 }
@@ -338,7 +340,7 @@ async fn an_ended_suspension_no_longer_blocks_passkey_registration() {
     let past = chrono::Utc::now() - chrono::Duration::hours(1);
     let (service, user) = fixture_with_status(suspended_until(past));
     service
-        .begin_fido2_registration(&user, &test_session())
+        .begin_fido2_registration(&user, &session_for(&user).await)
         .await
         .unwrap();
 }
@@ -349,7 +351,7 @@ async fn a_running_suspension_still_blocks_passkey_registration() {
     let (service, user) = fixture_with_status(suspended_until(future));
     assert!(
         service
-            .begin_fido2_registration(&user, &test_session())
+            .begin_fido2_registration(&user, &session_for(&user).await)
             .await
             .is_err()
     );
@@ -411,7 +413,7 @@ async fn failed_read_during_delete_is_an_error_not_a_refusal() {
     f.factors.fail_next_load.store(true, Ordering::SeqCst);
     let result = f
         .service
-        .delete_fido2_credential(&user, &cred_id(AAAA), 0)
+        .delete_fido2_credential(&user, &session_for(&user).await, &cred_id(AAAA), 0)
         .await;
     assert!(result.is_err(), "got {result:?}");
     assert_eq!(stored_count(&f).await, 1);
@@ -424,7 +426,7 @@ async fn failed_write_during_delete_is_an_error_and_the_credential_stays() {
     f.factors.fail_next_write.store(true, Ordering::SeqCst);
     let result = f
         .service
-        .delete_fido2_credential(&user, &cred_id(AAAA), 0)
+        .delete_fido2_credential(&user, &session_for(&user).await, &cred_id(AAAA), 0)
         .await;
     assert!(result.is_err(), "got {result:?}");
     assert_eq!(stored_ids(&f).await, vec![cred_id(AAAA)]);
@@ -434,7 +436,7 @@ async fn failed_write_during_delete_is_an_error_and_the_credential_stays() {
 async fn registration_racing_another_registration_keeps_both() {
     let f = fixture();
     let user = test_user("u1", "alice");
-    let session = test_session();
+    let session = session_for(&user).await;
     f.service
         .begin_fido2_registration(&user, &session)
         .await
@@ -462,7 +464,7 @@ async fn delete_racing_a_registration_keeps_the_new_passkey() {
     *f.factors.race_after_next_load.lock().unwrap() = Some(config_of(&[AAAA, CCCC, DDDD]));
     let deleted = f
         .service
-        .delete_fido2_credential(&user, &cred_id(AAAA), 1)
+        .delete_fido2_credential(&user, &session_for(&user).await, &cred_id(AAAA), 1)
         .await
         .unwrap();
     assert!(deleted);
@@ -482,9 +484,107 @@ async fn delete_racing_a_delete_respects_the_minimum_on_the_fresh_list() {
     *f.factors.race_after_next_load.lock().unwrap() = Some(config_of(&[AAAA]));
     let deleted = f
         .service
-        .delete_fido2_credential(&user, &cred_id(AAAA), 1)
+        .delete_fido2_credential(&user, &session_for(&user).await, &cred_id(AAAA), 1)
         .await
         .unwrap();
     assert!(!deleted, "the minimum must hold against the fresh list");
     assert_eq!(stored_ids(&f).await, vec![cred_id(AAAA)]);
+}
+
+// ── Who may enrol and delete ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_guest_session_cannot_begin_a_registration() {
+    use axess_core::authn::error::AuthnError;
+    let f = fixture();
+    let user = test_user("u1", "alice");
+    let err = f
+        .service
+        .begin_fido2_registration(&user, &test_session())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+}
+
+#[tokio::test]
+async fn another_users_session_cannot_begin_finish_or_delete() {
+    use axess_core::authn::error::AuthnError;
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let mallory = test_user("u2", "mallory");
+    let session = session_for(&mallory).await;
+    let err = f
+        .service
+        .begin_fido2_registration(&alice, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "begin: {err:?}");
+    let err = f
+        .service
+        .finish_fido2_registration(&alice, &dummy_response(), "evil", &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "finish: {err:?}");
+    let err = f
+        .service
+        .delete_fido2_credential(&alice, &session, &cred_id(AAAA), 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "delete: {err:?}");
+    assert_eq!(stored_count(&f).await, 1, "nothing was added or removed");
+}
+
+#[tokio::test]
+async fn a_session_of_the_same_id_in_another_tenant_is_refused() {
+    use axess_core::authn::error::AuthnError;
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let impostor = common::test_user_in_tenant("u1", "alice", "t2");
+    let err = f
+        .service
+        .begin_fido2_registration(&alice, &session_for(&impostor).await)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_signup_session_can_enrol_its_first_passkey_but_only_its_own() {
+    use axess_core::authn::error::AuthnError;
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let session = common::signup_session_for(&alice).await;
+    f.service
+        .begin_fido2_registration(&alice, &session)
+        .await
+        .unwrap();
+    f.service
+        .finish_fido2_registration(&alice, &dummy_response(), "first", &session)
+        .await
+        .unwrap();
+    let bob = test_user("u3", "bob");
+    let err = f
+        .service
+        .begin_fido2_registration(&bob, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_refused_enrolment_leaves_a_failed_audit_row() {
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let _ = f
+        .service
+        .begin_fido2_registration(&alice, &test_session())
+        .await;
+    let rows = f.identity.events();
+    assert!(
+        rows.iter()
+            .any(|e| e.event_type == AuthEventType::FactorEnabled
+                && e.event_status == AuthEventStatus::Failure),
+        "{rows:?}"
+    );
 }

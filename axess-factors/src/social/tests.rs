@@ -408,3 +408,14 @@ async fn a_userinfo_body_at_the_cap_is_read() {
 
     assert_eq!(claims.subject, "1");
 }
+
+#[test]
+fn auth_url_debug_redacts_the_pkce_verifier() {
+    let auth = AuthUrl {
+        url: "https://idp.example/authorize?code_challenge=abc".to_owned(),
+        pkce_verifier: "verifier-secret-123".to_owned(),
+    };
+    let shown = format!("{auth:?} {auth:#?}");
+    assert!(!shown.contains("verifier-secret-123"), "{shown}");
+    assert!(shown.contains("code_challenge=abc"));
+}

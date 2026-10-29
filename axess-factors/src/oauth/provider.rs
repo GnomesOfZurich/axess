@@ -24,11 +24,14 @@ mod device_flow;
 mod discover;
 #[cfg(feature = "fapi")]
 pub mod dpop_verify;
+mod endpoint;
 mod fapi_flow;
+mod fapi_profile;
 mod fresh_keys;
 mod jwks;
 mod provider_impl;
 mod refresh_response;
+mod sender_constrained;
 
 use super::{extract_string_array, types::*};
 use crate::oidc::JwksCache;
@@ -91,8 +94,19 @@ pub struct OAuthProviderConfig {
     pub(crate) revocation_endpoint: Option<String>,
     /// Pushed Authorization Request endpoint (RFC 9126), from discovery metadata.
     pub(crate) par_endpoint: Option<String>,
-    /// FAPI configuration: when set, enforces FAPI 2.0 Baseline Profile.
+    /// Whether the IdP advertises `authorization_response_iss_parameter_supported`
+    /// (RFC 9207): its authorization responses carry an `iss` parameter that
+    /// the callback must compare with the issuer.
+    pub(crate) iss_parameter_supported: bool,
+    /// The `mtls_endpoint_aliases` of the discovery document, used when
+    /// [`with_fapi`](Self::with_fapi) selects mTLS.
+    pub(crate) mtls_aliases: fapi_profile::MtlsAliases,
+    /// FAPI configuration, set by [`with_fapi`](Self::with_fapi): the
+    /// sender constraint on the token requests and the ID-token limits.
     pub(crate) fapi: Option<FapiConfig>,
+    /// The ID-token signature algorithms of the FAPI profile, parsed from
+    /// the configuration; `None` leaves the IdP's advertised list in force.
+    pub(crate) id_token_algs: Option<fapi_profile::IdTokenAlgs>,
     /// Source of wall-clock time for `exp`/`iat`/`nbf` checks. Defaults
     /// to [`SystemClock`](axess_clock::SystemClock); swap in a
     /// `MockClock` for DST.
@@ -104,6 +118,11 @@ pub struct OAuthProviderConfig {
     /// (back-compat); operators should populate it for any production
     /// deployment that exposes a logout link with a `return_to` parameter.
     pub(crate) allowed_post_logout_redirect_uris: Vec<String>,
+    /// Whether a back-channel logout token must carry the `typ` header
+    /// `logout+jwt`. Off by default, where a token with no `typ` and the
+    /// plain `JWT` and `Logout` spellings IdPs send are taken too; see
+    /// [`with_required_logout_typ`](Self::with_required_logout_typ).
+    pub(crate) require_logout_typ: bool,
     /// Scopes to request. Default: `["openid", "email", "profile"]`.
     pub scopes: Vec<String>,
     /// How long the OAuth ceremony (redirect → callback) is valid.
@@ -149,50 +168,19 @@ impl OAuthProviderConfig {
             .await
     }
 
-    /// FAPI 2.0 §5.2.2 limits on a verified ID token: its lifetime
-    /// (`exp - iat`, in seconds) is within the configured cap and its `nbf`,
-    /// read from the verified payload, is present and not in the future.
-    /// Does nothing when FAPI is not configured.
+    /// FAPI 2.0 §5.2.2 limits on a verified ID token; see
+    /// [`fapi_id_token_violation`]. Does nothing when FAPI is not configured.
     fn enforce_fapi_id_token(
         &self,
         lifetime: i64,
         verified_payload: &serde_json::Value,
     ) -> Result<(), OAuthError> {
-        if let Some(fapi) = &self.fapi {
-            if lifetime <= 0 || lifetime > fapi.max_id_token_lifetime_secs as i64 {
-                return Err(OAuthError::IdTokenValidation(format!(
-                    "ID token lifetime {lifetime}s exceeds FAPI cap of {}s (exp - iat)",
-                    fapi.max_id_token_lifetime_secs
-                )));
+        match &self.fapi {
+            Some(fapi) => {
+                fapi_id_token_violation(fapi, self.clock.now(), lifetime, verified_payload)
             }
-
-            // `IdTokenClaims` is built with `EmptyAdditionalClaims`, which
-            // drops `nbf`; read it from the verified payload instead.
-            let nbf = verified_payload.get("nbf").and_then(|v| v.as_i64());
-            match nbf {
-                None => {
-                    return Err(OAuthError::IdTokenValidation(
-                        "FAPI requires `nbf` claim on ID token; missing".to_string(),
-                    ));
-                }
-                Some(nbf_secs) => {
-                    let now = self.clock.now();
-                    let nbf_time =
-                        chrono::DateTime::from_timestamp(nbf_secs, 0).ok_or_else(|| {
-                            OAuthError::IdTokenValidation(
-                                "FAPI `nbf` claim is not a valid Unix timestamp".to_string(),
-                            )
-                        })?;
-                    // Allow up to 60s of clock skew on the not-before check.
-                    if nbf_time > now + chrono::Duration::seconds(60) {
-                        return Err(OAuthError::IdTokenValidation(format!(
-                            "FAPI `nbf` claim is in the future ({nbf_time}); rejecting",
-                        )));
-                    }
-                }
-            }
+            None => Ok(()),
         }
-        Ok(())
     }
 
     /// [`extract_claims_from_response`](Self::extract_claims_from_response)
@@ -218,7 +206,7 @@ impl OAuthProviderConfig {
         // representation. `ToString::to_string` is infallible.
         let raw_id_token: Option<String> = Some(id_token.to_string());
 
-        let id_token_verifier = client.id_token_verifier().set_time_fn(self.time_fn());
+        let id_token_verifier = self.id_token_verifier(client);
         let claims = id_token
             .claims(&id_token_verifier, &Nonce::new(nonce.to_string()))
             .map_err(fresh_keys::claims_error)?;
@@ -344,6 +332,79 @@ impl OAuthProviderConfig {
             oidc_sid,
             id_token_hint: raw_id_token.map(ZeroizedString::new),
             additional_claims,
+            dpop_key: None,
         })
+    }
+}
+
+/// FAPI 2.0 §5.2.2 limits on a verified ID token: its lifetime
+/// (`exp - iat`, in seconds) is within `fapi`'s cap and its `nbf`, read from
+/// the verified payload, is present and not in the future (60 seconds of
+/// skew allowed).
+pub(crate) fn fapi_id_token_violation(
+    fapi: &FapiConfig,
+    now: chrono::DateTime<chrono::Utc>,
+    lifetime: i64,
+    verified_payload: &serde_json::Value,
+) -> Result<(), OAuthError> {
+    let cap = i64::try_from(fapi.max_id_token_lifetime_secs).unwrap_or(i64::MAX);
+    if lifetime <= 0 || lifetime > cap {
+        return Err(OAuthError::IdTokenValidation(format!(
+            "ID token lifetime {lifetime}s exceeds FAPI cap of {}s (exp - iat)",
+            fapi.max_id_token_lifetime_secs
+        )));
+    }
+
+    // `IdTokenClaims` is built with `EmptyAdditionalClaims`, which drops
+    // `nbf`; read it from the verified payload instead.
+    let nbf_secs = verified_payload
+        .get("nbf")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| {
+            OAuthError::IdTokenValidation(
+                "FAPI requires `nbf` claim on ID token; missing".to_string(),
+            )
+        })?;
+    let nbf_time = chrono::DateTime::from_timestamp(nbf_secs, 0).ok_or_else(|| {
+        OAuthError::IdTokenValidation("FAPI `nbf` claim is not a valid Unix timestamp".to_string())
+    })?;
+    if nbf_time > now + chrono::Duration::seconds(60) {
+        return Err(OAuthError::IdTokenValidation(format!(
+            "FAPI `nbf` claim is in the future ({nbf_time}); rejecting",
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fapi_id_token_tests {
+    use super::*;
+
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    #[test]
+    fn nbf_is_required_and_must_not_be_in_the_future() {
+        let fapi = FapiConfig::default();
+        let t = now().timestamp();
+        assert!(
+            fapi_id_token_violation(&fapi, now(), 120, &serde_json::json!({ "nbf": t - 5 }))
+                .is_ok()
+        );
+        assert!(fapi_id_token_violation(&fapi, now(), 120, &serde_json::json!({})).is_err());
+        assert!(
+            fapi_id_token_violation(&fapi, now(), 120, &serde_json::json!({ "nbf": t + 600 }))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn lifetime_is_capped() {
+        let fapi = FapiConfig::default();
+        let payload = serde_json::json!({ "nbf": now().timestamp() });
+        assert!(fapi_id_token_violation(&fapi, now(), 300, &payload).is_ok());
+        assert!(fapi_id_token_violation(&fapi, now(), 301, &payload).is_err());
+        assert!(fapi_id_token_violation(&fapi, now(), 0, &payload).is_err());
     }
 }
