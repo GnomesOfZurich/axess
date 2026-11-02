@@ -1,14 +1,14 @@
 [package]
 name = "axess-example-workload-identity"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
 resolver = "3"
 description = """
 Adopter recipes for axess workload-identity federation. Shows how to wire
-WorkloadResolver against GitHub Actions OIDC and Kubernetes service-account
-projected tokens, and, as the last resort for a caller with no identity of
+WorkloadResolver against GitHub Actions OIDC, GitLab CI ID tokens and
+Kubernetes service-account projected tokens (OpenShift and EKS included), and, as the last resort for a caller with no identity of
 its own, signed requests over a shared secret. Copy whichever recipe matches
 your caller into your own code. `--bin local-idp` runs an in-process IdP
 with a file-backed, rotating key store, for flows without a real IdP.
@@ -29,9 +29,12 @@ categories = ["authentication"]
 # no identity of their own.
 # `local-idp` backs `--bin local-idp`, an in-process IdP that mints the
 # workload JWTs these recipes verify.
-axess = { path = "../../axess", version = "=0.13.0", features = ["jwt-rust-crypto", "service-secret", "local-idp"] }
-axess-factors = { path = "../../axess-factors", version = "=0.13.0", features = ["jwt-rust-crypto"] }
-axess-identity = { path = "../../axess-identity", version = "=0.13.0" }
+# `aws-sts` and `azure-fic` back the cloud walkthroughs in
+# `docs/workload-identity/aws.md` and `azure.md`, whose compiled code is
+# `tests/cloud_aws.rs` and `tests/cloud_azure.rs`.
+axess = { path = "../../axess", version = "=0.14.0", features = ["jwt-rust-crypto", "service-secret", "local-idp", "aws-sts", "azure-fic"] }
+axess-factors = { path = "../../axess-factors", version = "=0.14.0", features = ["jwt-rust-crypto"] }
+axess-identity = { path = "../../axess-identity", version = "=0.14.0" }
 axum = { version = "0.8.9", features = ["json"] }
 chrono = "0.4.45"
 jsonwebtoken = "11.1.0"
@@ -47,13 +50,18 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # `axess_identity::PrincipalResolver` is the trait the integration
 # tests call into; the workspace crate is already a runtime dep
 # above, so the dev-dep just adds nothing extra.
-axess-identity = { path = "../../axess-identity", version = "=0.13.0" }
+axess-identity = { path = "../../axess-identity", version = "=0.14.0" }
 # `MockClock` pins JwtVerifier's notion of "now" so the pinned JWT
 # timestamps validate deterministically under DST.
-axess-clock = { path = "../../axess-clock", version = "=0.13.0", features = ["testing"] }
+axess-clock = { path = "../../axess-clock", version = "=0.14.0", features = ["testing"] }
 base64 = "0.23.1"
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }
 # `pkcs5` matches the workspace pin. The `pkcs1` *module* (used to
 # DER-encode the test signing key) is unconditionally available.
 rsa = { version = "0.9.10", features = ["pkcs5"] }
 tower = { version = "0.5.3", features = ["util"] }
+# The cloud walkthroughs stand a mock STS and a mock Key Vault up with
+# wiremock, and the service under test calls Key Vault with reqwest.
+wiremock = "0.6.5"
+url = "2.5.8"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"] }

@@ -78,6 +78,7 @@ async fn session_over(
     let (tenant, user) = (TenantId::from_bytes([1; 16]), UserId::from_bytes([2; 16]));
     store.save(&tenant, &user, credential).await.expect("save");
     let session = StoredDelegationSession::new(provider, store.clone(), tenant, user)
+        .expect("the default client builds")
         .with_clock(Arc::new(MockClock::at(t0())));
     (session, store, tenant, user)
 }

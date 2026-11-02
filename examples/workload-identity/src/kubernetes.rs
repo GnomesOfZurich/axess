@@ -125,15 +125,31 @@ impl SaUidPins {
         self
     }
 
-    fn admits(&self, namespace: &str, name: &str, uid: Option<&str>) -> bool {
-        let pinned = self.0.get(&(namespace.to_string(), name.to_string()));
-        matches!((pinned, uid), (Some(p), Some(u)) if p == u)
+    /// `Ok` when the account is pinned and the token's UID is the pinned one;
+    /// otherwise the error names the claim that decided the refusal.
+    fn check(&self, namespace: &str, name: &str, uid: Option<&str>) -> Result<(), IdentityError> {
+        let Some(pinned) = self.0.get(&(namespace.to_string(), name.to_string())) else {
+            return Err(IdentityError::InvalidComponent(format!(
+                "Kubernetes claim `kubernetes.io.namespace` ({namespace}) with \
+                 `kubernetes.io.serviceaccount.name` ({name}) is not a pinned service account"
+            )));
+        };
+        match uid {
+            Some(u) if u == pinned => Ok(()),
+            _ => Err(IdentityError::InvalidComponent(format!(
+                "Kubernetes claim `kubernetes.io.serviceaccount.uid` ({}) is not the UID pinned \
+                 for {namespace}/{name}",
+                uid.unwrap_or("absent")
+            ))),
+        }
     }
 }
 
 /// Like [`k8s_sa_mapper`], but refuses a token whose service-account UID is
 /// absent or differs from the one pinned for its `(namespace, name)`, and
-/// every account that is not pinned at all.
+/// every account that is not pinned at all. The error names the claim that
+/// decided it (`kubernetes.io.namespace` and `serviceaccount.name` for an
+/// unpinned account, `kubernetes.io.serviceaccount.uid` for a UID mismatch).
 pub fn k8s_sa_mapper_pinned(
     trust_domain: TrustDomain,
     pins: SaUidPins,
@@ -142,13 +158,11 @@ pub fn k8s_sa_mapper_pinned(
     let inner = k8s_sa_mapper(trust_domain);
     move |claims| {
         let ns = &claims.custom.kubernetes_io;
-        if !pins.admits(
+        pins.check(
             &ns.namespace,
             &ns.serviceaccount.name,
             ns.serviceaccount.uid.as_deref(),
-        ) {
-            return Err(IdentityError::NotAuthenticated);
-        }
+        )?;
         inner(claims)
     }
 }

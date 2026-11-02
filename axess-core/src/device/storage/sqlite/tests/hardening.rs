@@ -3,6 +3,8 @@
 //! against a real in-memory SQLite database.
 
 use super::*;
+use crate::device::storage::sql_common::ops::DeviceSql;
+use crate::device::storage::sqlite::statements::SqliteSql;
 use crate::device::store::{BindingsUpdate, OwnerClaim, TrustTransition};
 
 fn refresh(family: &str) -> DeviceBinding {
@@ -196,7 +198,7 @@ async fn the_family_index_insert_is_idempotent() {
     let store = fresh_store().await;
     let (t, d) = saved(&store, DeviceTrustLevel::Seen).await;
     let mut tx = store.pool.begin().await.unwrap();
-    rewrite_family_index(
+    SqliteSql::rewrite_family_index(
         &mut tx,
         &t.to_string(),
         &d.to_string(),

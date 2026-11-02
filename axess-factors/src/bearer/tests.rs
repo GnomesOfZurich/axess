@@ -84,7 +84,7 @@ fn sign_jwt(private_der: &[u8], kid: &str, claims: &serde_json::Value) -> String
 fn make_config(jwks: JwkSet) -> BearerConfig {
     BearerConfig::new(vec![BearerIssuerConfig {
         issuer: "https://accounts.example.com".to_string(),
-        audience: Some("my-service".to_string()),
+        audience: Audience::Exact("my-service".to_string()),
         jwks: Arc::new(jwks),
         extra_claims: vec!["namespace".to_string()],
     }])
@@ -433,4 +433,46 @@ fn the_issuer_constructor_pins_an_audience() {
     other["aud"] = serde_json::json!("elsewhere");
     let header = format!("Bearer {}", sign_jwt(&der, &kid, &other));
     assert!(validate_bearer_token(Some(&header), &config).is_err());
+}
+
+/// Skipping the audience check is an explicit, loudly named choice. A
+/// token for another audience is refused unless the issuer was configured
+/// with `Audience::AnyDangerous`.
+#[test]
+fn any_audience_is_an_explicit_dangerous_choice() {
+    let (private_der, jwks, kid) = rsa_keypair();
+    let jwks = Arc::new(jwks);
+    let now = chrono::Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": "https://accounts.example.com",
+        "sub": "worker",
+        "aud": "some-other-service",
+        "exp": now + 300,
+        "iat": now,
+    });
+    let header = format!("Bearer {}", sign_jwt(&private_der, &kid, &claims));
+
+    let pinned = BearerConfig::new(vec![BearerIssuerConfig::new(
+        "https://accounts.example.com",
+        "my-service",
+        jwks.clone(),
+    )]);
+    assert!(
+        matches!(
+            validate_bearer_token(Some(&header), &pinned),
+            Err(BearerError::Jwt(_))
+        ),
+        "a token for another audience is refused by default"
+    );
+
+    let any = BearerConfig::new(vec![BearerIssuerConfig {
+        issuer: "https://accounts.example.com".to_string(),
+        audience: Audience::AnyDangerous,
+        jwks,
+        extra_claims: Vec::new(),
+    }]);
+    let identity = validate_bearer_token(Some(&header), &any)
+        .expect("validates")
+        .expect("a bearer token is present");
+    assert_eq!(identity.audiences, vec!["some-other-service"]);
 }

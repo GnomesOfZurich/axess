@@ -113,6 +113,7 @@
 //! in-process buckets; distributed rate limiting belongs at the gateway
 //! with a shared store (Valkey / Redis).
 
+use crate::validation::normalise_identifier;
 use axess_clock::{Clock, SystemClock};
 use axess_rng::{SecureRng, SystemRng};
 use axum::{
@@ -381,38 +382,6 @@ pub struct RateLimitLoginIdentifier {
     tenant: Option<String>,
 }
 
-/// NFKC, lowercase, and without invisible format characters (the `Cf`
-/// category: zero-width spaces and joiners, bidi controls, the soft hyphen,
-/// the byte-order mark). `None` when nothing is left.
-fn normalise_identifier(raw: &str) -> Option<String> {
-    use unicode_normalization::UnicodeNormalization as _;
-    let folded: String = raw
-        .nfkc()
-        .filter(|c| !is_format_char(*c))
-        .collect::<String>()
-        .to_lowercase();
-    let trimmed = folded.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_owned())
-}
-
-/// Characters of Unicode category `Cf` that render as nothing.
-fn is_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-    )
-}
-
 impl RateLimitLoginIdentifier {
     /// Build a normalised login-identifier key. Trims whitespace, applies
     /// Unicode NFKC, lowercases, drops invisible format characters, and
@@ -557,11 +526,12 @@ where
 
         let metrics = self.metrics.clone();
         match self.store.try_acquire_target(&target, self.store.now()) {
-            Acquire::Allowed { remaining } => {
+            Acquire::Allowed { remaining, shared } => {
                 // The count left in a bucket other callers draw on says how
                 // many attempts they made, so only a caller's own bucket
-                // reports it.
-                let report_remaining = !target.shared;
+                // reports it: not the shared anonymous or unknown buckets,
+                // and not the group's overflow bucket this key folded into.
+                let report_remaining = !target.shared && !shared;
                 if let Some(ref m) = metrics {
                     m.rate_limit_allowed();
                 }

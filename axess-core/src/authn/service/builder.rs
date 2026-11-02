@@ -42,8 +42,19 @@ where
     /// [`reset_cooldown`](Self::reset_cooldown) on the service's clock.
     pub(crate) reset_requests: Option<Arc<super::reset_cooldown::ResetCooldowns>>,
     /// Whether `begin_signup` answers an identifier that is already taken
-    /// as it answers a free one.
-    pub(crate) hide_signup_conflicts: bool,
+    /// with `AlreadyExists` rather than as it answers a free one (the
+    /// default); see
+    /// [`with_signup_conflicts_revealed`](Self::with_signup_conflicts_revealed).
+    pub(crate) reveal_signup_conflicts: bool,
+    /// Whether an impersonated session may issue refresh tokens and enrol
+    /// or delete factors; see
+    /// [`with_impersonated_credential_changes_allowed`](Self::with_impersonated_credential_changes_allowed).
+    pub(crate) impersonated_credential_changes: bool,
+    /// Whether `begin_login` answers a locked account with
+    /// [`LoginOutcome::Locked`](crate::authn::service::LoginOutcome::Locked)
+    /// rather than as it answers an unknown identifier (the default); see
+    /// [`with_lockout_revealed_on_begin`](Self::with_lockout_revealed_on_begin).
+    pub(crate) reveal_lockout_on_begin: bool,
     /// Custom session keys the application asked to carry across the
     /// transition to `Authenticated`; see
     /// [`with_preserved_custom_keys`](Self::with_preserved_custom_keys).
@@ -51,8 +62,9 @@ where
     /// The session store, when the application handed it over so that a
     /// revocation can delete the rows as well as the registry entries.
     pub(crate) session_rows: Option<Arc<dyn SessionRowRemover>>,
-    /// The secret keyed recovery codes are checked under, when configured.
-    pub(crate) recovery_pepper: Option<Arc<axess_factors::RecoveryCodePepper>>,
+    /// The secrets keyed recovery codes are checked under, when configured:
+    /// the current pepper and, during a rotation, the previous one.
+    pub(crate) recovery_peppers: super::verification::RecoveryPeppers,
     /// The cipher OTP secrets are sealed and opened with, when configured.
     pub(crate) factor_secret_cipher: Option<Arc<crate::authn::factor_secret::FactorSecretCipher>>,
     #[cfg(feature = "fido2")]
@@ -63,6 +75,11 @@ where
     pub(crate) ldap: Option<Arc<dyn axess_factors::ldap::LdapProvider>>,
     #[cfg(feature = "oauth")]
     pub(crate) oauth_providers: crate::federation::oauth::OAuthProviderRegistry,
+    /// Per-tenant providers resolved at request time, when configured by
+    /// [`with_tenant_oauth_providers`](AuthnServiceBuilder::with_tenant_oauth_providers).
+    #[cfg(feature = "oauth")]
+    pub(crate) tenant_oauth_providers:
+        Option<Arc<dyn crate::federation::oauth_tenant::TenantOAuthProviders>>,
     /// Shared OIDC `sid` → `(user_id, session_id, inserted_at)` map for back-channel logout.
     /// The timestamp enables TTL-based eviction of stale entries.
     #[cfg(feature = "oauth")]
@@ -173,10 +190,12 @@ where
             flow_ttl: DEFAULT_FLOW_TTL,
             reset_cooldown: None,
             reset_requests: None,
-            hide_signup_conflicts: false,
+            reveal_signup_conflicts: false,
+            impersonated_credential_changes: false,
+            reveal_lockout_on_begin: false,
             preserved_custom_keys: Vec::new(),
             session_rows: None,
-            recovery_pepper: None,
+            recovery_peppers: Default::default(),
             factor_secret_cipher: None,
             #[cfg(feature = "fido2")]
             fido2: None,
@@ -186,6 +205,8 @@ where
             ldap: None,
             #[cfg(feature = "oauth")]
             oauth_providers: Default::default(),
+            #[cfg(feature = "oauth")]
+            tenant_oauth_providers: None,
             #[cfg(feature = "oauth")]
             sid_map: Default::default(),
             #[cfg(feature = "oauth")]
@@ -231,7 +252,28 @@ where
     /// under. Without it only Argon2id recovery codes can verify; a keyed row
     /// then fails closed. See [`axess_factors::RecoveryCodePepper`].
     pub fn with_recovery_code_pepper(mut self, pepper: axess_factors::RecoveryCodePepper) -> Self {
-        self.recovery_pepper = Some(Arc::new(pepper));
+        self.recovery_peppers.current = Some(Arc::new(pepper));
+        self
+    }
+
+    /// Keep the pepper a rotation retired, so recovery-code sets generated
+    /// under it still verify while their owners regenerate them.
+    ///
+    /// A keyed row cannot be re-keyed without its plaintext, so after
+    /// [`with_recovery_code_pepper`](Self::with_recovery_code_pepper) moves
+    /// to a new secret every set made under the old one would fail closed.
+    /// With the previous pepper set a code matches under either; a match
+    /// under the previous one still logs the user in, and is reported so the
+    /// application can have them generate a new set: the persisted
+    /// [`RecoveryCodesConfig::under_previous_pepper`](crate::authn::factor::RecoveryCodesConfig::under_previous_pepper)
+    /// is set, a warning is logged and
+    /// [`AuthnMetrics::recovery_codes_under_previous_pepper`](crate::metrics::AuthnMetrics::recovery_codes_under_previous_pepper)
+    /// fires. Drop the previous pepper once no stored set uses it.
+    pub fn with_previous_recovery_code_pepper(
+        mut self,
+        pepper: axess_factors::RecoveryCodePepper,
+    ) -> Self {
+        self.recovery_peppers.previous = Some(Arc::new(pepper));
         self
     }
 
@@ -266,7 +308,9 @@ where
         self
     }
 
-    /// Configure FIDO2 ceremony timeout and other options stored on the service.
+    /// Configure the FIDO2 ceremony timeout and the recency a credential
+    /// change requires of the session
+    /// ([`Fido2Options::max_authn_age`](crate::authn::factor::Fido2Options::max_authn_age)).
     #[cfg(feature = "fido2")]
     pub fn with_fido2_options(mut self, options: crate::authn::factor::Fido2Options) -> Self {
         self.fido2_options = options;
@@ -337,14 +381,40 @@ where
     ///
     /// If you need genuinely dynamic per-tenant IdP configuration
     /// (each tenant admin uploads their own client_secret through a UI,
-    /// changing at runtime), that requires provider hot-swap which
-    /// axess-core does not yet support: see the roadmap.
+    /// changing at runtime), use
+    /// [`with_tenant_oauth_providers`](Self::with_tenant_oauth_providers):
+    /// the provider is resolved by `(tenant, name)` from a store at request
+    /// time and an update is used by the next login.
     #[cfg(feature = "oauth")]
     pub fn with_oauth_provider(
         mut self,
         provider: impl axess_factors::oauth::OAuthProvider,
     ) -> Self {
         self.oauth_providers.add(provider);
+        self
+    }
+
+    /// Resolve per-tenant OAuth providers (bring your own IdP) from
+    /// `providers` at request time.
+    ///
+    /// A login started with
+    /// [`begin_oauth_login_with_tenant_provider`](AuthnService::begin_oauth_login_with_tenant_provider)
+    /// asks `providers` for the provider named `(tenant, name)`; the
+    /// callback asks again for the same tenant, taken from the session. The
+    /// global registrations of
+    /// [`with_oauth_provider`](Self::with_oauth_provider) are unaffected and
+    /// remain the single-tenant form: a name registered there is reached by
+    /// [`begin_oauth_login`](AuthnService::begin_oauth_login), a tenant's by
+    /// the tenant method, and the two never shadow each other.
+    ///
+    /// [`StoredTenantOAuthProviders`](crate::federation::oauth_tenant::StoredTenantOAuthProviders)
+    /// is the implementation over a store.
+    #[cfg(feature = "oauth")]
+    pub fn with_tenant_oauth_providers(
+        mut self,
+        providers: impl crate::federation::oauth_tenant::TenantOAuthProviders,
+    ) -> Self {
+        self.tenant_oauth_providers = Some(Arc::new(providers));
         self
     }
 
@@ -483,11 +553,15 @@ where
     ///
     /// `begin_password_reset` then answers `Ok(None)`, as it does for an
     /// unknown identifier, to a request that follows another for the same
-    /// tenant and identifier within the cooldown. The key is the identifier as
-    /// typed, whether or not an account has it, so the cooldown cannot tell a
-    /// caller which identifiers exist. It stops one inbox being flooded with
-    /// reset mail and one account being kept busy; it is not a rate limit on
-    /// the route, which still belongs in front of the handler.
+    /// tenant and identifier within the cooldown. The key is the identifier
+    /// normalised as the login rate limiter normalises it
+    /// ([`normalise_identifier`](crate::validation::normalise_identifier):
+    /// NFKC, lowercase, invisible format characters dropped, trimmed), so a
+    /// variant spelling of one address does not earn a second token; whether
+    /// or not an account has it, so the cooldown cannot tell a caller which
+    /// identifiers exist. It stops one inbox being flooded with reset mail
+    /// and one account being kept busy; it is not a rate limit on the route,
+    /// which still belongs in front of the handler.
     ///
     /// The record lives in this process, on the injected clock, and holds at
     /// most [`RESET_COOLDOWN_CAPACITY`] identifiers (the least recently
@@ -499,23 +573,61 @@ where
         self
     }
 
-    /// Answer `begin_signup` for an identifier that is already taken as it
-    /// answers a free one, so the response is not a way to find out who has
-    /// an account.
-    ///
-    /// With this on, an existing identifier gets [`SignupOutcome::Started`](crate::authn::service::SignupOutcome::Started)
-    /// too. Nothing is created and the session is left as it was, anonymous,
-    /// and the refusal is audited with its reason. The application tells the
-    /// two apart where the caller cannot see it: after `Started`, a session
-    /// with no user means the identifier was taken, and the address on file
-    /// gets a "you already have an account" mail where a new signup gets the
-    /// verification link. Answer the client the same either way, and do the
-    /// mail off the request path, since creating an account takes longer than
-    /// declining to. Without this switch the outcome is
+    /// Answer `begin_signup` for an identifier that is already taken with
     /// [`SignupOutcome::AlreadyExists`](crate::authn::service::SignupOutcome::AlreadyExists),
-    /// which suits a form that must say so at once.
-    pub fn with_hidden_signup_conflicts(mut self) -> Self {
-        self.hide_signup_conflicts = true;
+    /// for a form that must say so at once.
+    ///
+    /// By default a taken identifier gets
+    /// [`SignupOutcome::Started`](crate::authn::service::SignupOutcome::Started)
+    /// like a free one, so the response is not a way to find out who has an
+    /// account: nothing is created, the session is left as it was,
+    /// anonymous, and the refusal is audited with its reason. The
+    /// application tells the two apart where the caller cannot see it: after
+    /// `Started`, a session with no user means the identifier was taken, and
+    /// the address on file gets a "you already have an account" mail where a
+    /// new signup gets the verification link. Answer the client the same
+    /// either way, and do the mail off the request path, since creating an
+    /// account takes longer than declining to (the hidden answer skips the
+    /// `create_user` write, and that difference is measurable by a caller
+    /// timing the response). Revealing the conflict trades that away for a
+    /// form that can say "taken" on the spot.
+    pub fn with_signup_conflicts_revealed(mut self) -> Self {
+        self.reveal_signup_conflicts = true;
+        self
+    }
+
+    /// Let an impersonated session issue refresh tokens and enrol or delete
+    /// factors.
+    ///
+    /// By default a session `begin_impersonation` made is refused these with
+    /// [`AuthnError::NoFlow`](crate::authn::error::AuthnError::NoFlow) and a
+    /// failed audit row naming the administrator as actor: a refresh token
+    /// would outlive the impersonation as a credential of the user, and a
+    /// factor the administrator enrols is one the user never saw. A support
+    /// desk that enrols a replacement authenticator for a locked-out user on
+    /// purpose, and audits it, opts in here.
+    pub fn with_impersonated_credential_changes_allowed(mut self) -> Self {
+        self.impersonated_credential_changes = true;
+        self
+    }
+
+    /// Let `begin_login` answer a locked account with
+    /// [`LoginOutcome::Locked`](crate::authn::service::LoginOutcome::Locked)
+    /// and the time the lock ends.
+    ///
+    /// By default a locked account, whether the lock is a suspension the
+    /// store reports or one derived from the failure counter, is answered
+    /// [`InvalidCredentials`](crate::authn::service::LoginOutcome::InvalidCredentials),
+    /// the outcome an unknown identifier gets: a caller who has proved
+    /// nothing is otherwise told that the account exists and that it is
+    /// being guessed at, from the first request. The audit row carries
+    /// `Locked` either way, and the metrics count the lockout either way.
+    /// Turn the answer on for a first-party form behind its own abuse
+    /// controls, where "locked until" is worth more than the concealment;
+    /// [`login_with_password`](crate::authn::RequestAuthnService::login_with_password)
+    /// always conceals.
+    pub fn with_lockout_revealed_on_begin(mut self) -> Self {
+        self.reveal_lockout_on_begin = true;
         self
     }
 

@@ -9,7 +9,6 @@ use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
-    ids::UserId,
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
@@ -22,6 +21,16 @@ pub(super) enum IssCheck<'a> {
     Skipped,
     /// The caller passed what the callback carried, possibly nothing.
     Compared(Option<&'a str>),
+}
+
+/// How the callback's `code`, `state` and `iss` arrived.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponseForm {
+    /// As query or form parameters of the callback.
+    Plain,
+    /// Out of a verified JWT Secured Authorization Response (JARM); a
+    /// provider that requires JARM refuses them any other way.
+    Jarm,
 }
 
 /// RFC 9207 §2.4: a present `iss` equals the provider's issuer by simple
@@ -41,6 +50,15 @@ fn iss_parameter_acceptable(
     }
 }
 
+/// What `begin_oauth_login` stashed in the session and the code exchange
+/// presents: the PKCE verifier, the nonce, and the DPoP key the pushed
+/// authorization request named, when the ceremony stashed one.
+struct StashedCeremony {
+    verifier: String,
+    nonce: String,
+    dpop_key: Option<axess_factors::oauth::DpopKey>,
+}
+
 impl<I, F> RequestAuthnService<I, F>
 where
     I: IdentityStore,
@@ -52,7 +70,12 @@ where
     /// response, so the mix-up defence of RFC 9207 rests on the session state
     /// alone. Prefer
     /// [`finish_oauth_login_with_iss`](Self::finish_oauth_login_with_iss),
-    /// which compares it.
+    /// which compares it. A provider that advertises
+    /// `authorization_response_iss_parameter_supported` refuses this form
+    /// with [`OAuthError::Config`](axess_factors::oauth::OAuthError::Config)
+    /// before the code is exchanged, and the ceremony is cleared: its
+    /// responses carry an `iss` this form cannot compare, so a callback that
+    /// drops the parameter would give up the defence the provider offers.
     #[tracing::instrument(skip(self, code, state, session))]
     pub async fn finish_oauth_login(
         &self,
@@ -60,8 +83,15 @@ where
         state: &str,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
-        self.finish_oauth_login_checked(code, state, IssCheck::Skipped, false, session)
-            .await
+        self.finish_oauth_login_checked(
+            code,
+            state,
+            IssCheck::Skipped,
+            ResponseForm::Plain,
+            None,
+            session,
+        )
+        .await
     }
 
     /// Complete an OAuth/OIDC login flow, comparing the `iss` parameter of
@@ -86,23 +116,32 @@ where
         iss: Option<&str>,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
-        self.finish_oauth_login_checked(code, state, IssCheck::Compared(iss), false, session)
-            .await
+        self.finish_oauth_login_checked(
+            code,
+            state,
+            IssCheck::Compared(iss),
+            ResponseForm::Plain,
+            None,
+            session,
+        )
+        .await
     }
 
-    /// The shared body of the finish forms. `jarm` says the `code`, `state`
-    /// and `iss` come out of a verified JWT Secured Authorization Response;
-    /// a provider that requires that refuses them any other way.
+    /// The shared body of the finish forms. `form` says how the `code`,
+    /// `state` and `iss` arrived. `resolved` is the ceremony's provider when
+    /// the caller already resolved it (the JARM form, to verify the response
+    /// with it); otherwise it is resolved here, once.
     pub(super) async fn finish_oauth_login_checked(
         &self,
         code: &str,
         state: &str,
         iss: IssCheck<'_>,
-        jarm: bool,
+        form: ResponseForm,
+        resolved: Option<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>>,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
         use crate::validation::MAX_OAUTH_PARAM_BYTES;
-        use axess_factors::oauth::{OAuthError, keys as oauth_keys};
+        use axess_factors::oauth::OAuthError;
 
         // Reject oversized callback parameters before processing.
         let iss_len = match iss {
@@ -116,52 +155,22 @@ where
             return Err(OAuthError::InvalidParameter);
         }
 
-        let get_str = |v: serde_json::Value| v.as_str().map(|s| s.to_string());
-
-        let stored_csrf = session
-            .get_custom(oauth_keys::CSRF_STATE)
-            .await
-            .and_then(get_str)
-            .ok_or(OAuthError::NoFlow)?;
-        let stored_nonce = session
-            .get_custom(oauth_keys::NONCE)
-            .await
-            .and_then(get_str)
-            .ok_or(OAuthError::NoFlow)?;
-        let stored_verifier = session
-            .get_custom(oauth_keys::PKCE_VERIFIER)
-            .await
-            .and_then(get_str)
-            .ok_or(OAuthError::NoFlow)?;
-        // Extracted before the PKCE validation below so the warn!/record
-        // failure paths can attribute the failure to a provider.
-        let provider_name = session
-            .get_custom(oauth_keys::PROVIDER)
-            .await
-            .and_then(get_str)
-            .ok_or(OAuthError::NoFlow)?;
-        // Validate the stashed PKCE code_verifier locally before
-        // we waste the AS round-trip. RFC 7636 §4.1 fixes the alphabet
-        // (`unreserved` = ALPHA / DIGIT / "-" / "." / "_" / "~") and
-        // length (43..=128). A verifier outside the spec means session
-        // tampering or a bug in `begin_oauth_login`; either way the AS
-        // would reject the exchange anyway.
-        if !is_valid_pkce_verifier(&stored_verifier) {
-            tracing::warn!(
-                provider = %provider_name,
-                verifier_len = stored_verifier.len(),
-                "stashed PKCE code_verifier failed RFC 7636 §4.1 validation"
-            );
-            self.record_oauth_failure_and_clear(
-                AuthFailureReason::PkceVerifierInvalid,
-                &provider_name,
-                session,
-            )
+        let (stored_csrf, stored_nonce, stored_verifier, provider_name) =
+            read_stashed_ceremony(session).await?;
+        // The provider the ceremony began with, resolved once: the expiry
+        // check reads its timeout, the exchange runs against it.
+        let provider = match resolved {
+            Some(provider) => provider,
+            None => self.finish_provider(&provider_name, session).await?,
+        };
+        self.refuse_invalid_pkce_verifier(&stored_verifier, &provider_name, session)
             .await?;
-            return Err(OAuthError::InvalidParameter);
-        }
+        let stashed_dpop_key = self.stashed_dpop_key(&provider_name, session).await?;
 
-        if self.is_oauth_expired(session, &provider_name).await {
+        if self
+            .is_oauth_expired(session, &provider_name, provider.ceremony_timeout())
+            .await
+        {
             self.record_oauth_failure_and_clear(
                 AuthFailureReason::CeremonyExpired,
                 &provider_name,
@@ -185,57 +194,187 @@ where
         // to prevent session fixation during the OAuth callback window.
         session.regenerate().await;
 
-        // Validate that the callback came from the same provider that initiated
-        // the flow. Without this check an attacker who compromises Provider A
-        // could replay a valid state from Provider A at Provider B's callback
-        // (confused-deputy attack).
-        let provider = self
-            .inner
-            .oauth_providers
-            .get(&provider_name)
-            .ok_or_else(|| OAuthError::UnknownProvider(provider_name.clone()))?
-            .clone();
-
         // Anti-confused-deputy rail: the issuer the begin-side stashed
         // must match the issuer of the provider whose callback we're
         // handling. See helper for the full argument.
         self.verify_provider_issuer_matches(&provider, &provider_name, session)
             .await?;
 
-        if provider.authorization_response_jwt_required() && !jarm {
+        self.check_authorization_response_form(&provider, &provider_name, iss, form, session)
+            .await?;
+
+        let mut claims = self
+            .exchange_code_for_login(
+                &provider,
+                &provider_name,
+                code,
+                StashedCeremony {
+                    verifier: stored_verifier,
+                    nonce: stored_nonce.clone(),
+                    dpop_key: stashed_dpop_key,
+                },
+                session,
+            )
+            .await?;
+        // The provider verified the ID token's nonce against this one, so
+        // they are equal; a provider that does not fill the field still
+        // returns the login's nonce for the caller to store.
+        claims.nonce.get_or_insert(stored_nonce);
+
+        self.seal_finished_login(&provider_name, &claims, session)
+            .await?;
+
+        Ok(claims)
+    }
+
+    /// The provider the ceremony named, resolved for its tenant binding when
+    /// it has one. A provider that does not resolve (removed since the
+    /// begin, its tenant's store unreachable, its discovery failed, an
+    /// unreadable binding) is recorded and the ceremony cleared, like every
+    /// other failure of the callback.
+    pub(super) async fn finish_provider(
+        &self,
+        provider_name: &str,
+        session: &AuthSession,
+    ) -> Result<
+        std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>,
+        axess_factors::oauth::OAuthError,
+    > {
+        match self.ceremony_provider(session, provider_name).await {
+            Ok(provider) => Ok(provider),
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_name,
+                    error = %e,
+                    "the ceremony's provider does not resolve at the callback"
+                );
+                self.record_oauth_failure_and_clear(
+                    AuthFailureReason::ProviderUnavailable,
+                    provider_name,
+                    session,
+                )
+                .await?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Refuse a stashed PKCE verifier outside RFC 7636, recording the
+    /// failure and clearing the ceremony.
+    async fn refuse_invalid_pkce_verifier(
+        &self,
+        stored_verifier: &str,
+        provider_name: &str,
+        session: &AuthSession,
+    ) -> Result<(), axess_factors::oauth::OAuthError> {
+        use axess_factors::oauth::OAuthError;
+
+        // Validate the stashed PKCE code_verifier locally before
+        // we waste the AS round-trip. RFC 7636 §4.1 fixes the alphabet
+        // (`unreserved` = ALPHA / DIGIT / "-" / "." / "_" / "~") and
+        // length (43..=128). A verifier outside the spec means session
+        // tampering or a bug in `begin_oauth_login`; either way the AS
+        // would reject the exchange anyway.
+        if !is_valid_pkce_verifier(stored_verifier) {
+            tracing::warn!(
+                provider = %provider_name,
+                verifier_len = stored_verifier.len(),
+                "stashed PKCE code_verifier failed RFC 7636 §4.1 validation"
+            );
+            self.record_oauth_failure_and_clear(
+                AuthFailureReason::PkceVerifierInvalid,
+                provider_name,
+                session,
+            )
+            .await?;
+            return Err(OAuthError::InvalidParameter);
+        }
+        Ok(())
+    }
+
+    /// The DPoP key the ceremony stashed, if it stashed one.
+    async fn stashed_dpop_key(
+        &self,
+        provider_name: &str,
+        session: &AuthSession,
+    ) -> Result<Option<axess_factors::oauth::DpopKey>, axess_factors::oauth::OAuthError> {
+        use axess_factors::oauth::{OAuthError, keys as oauth_keys};
+
+        // The DPoP key the pushed authorization request named, when the
+        // provider binds tokens; the token request must present the same
+        // key. A stash that does not decode is tampering or a bug, like a
+        // malformed verifier, and is refused the same way.
+        match session.get_custom(oauth_keys::DPOP_KEY).await {
+            None => Ok(None),
+            Some(value) => match value.as_str().and_then(super::helpers::decode_dpop_key) {
+                Some(key) => Ok(Some(key)),
+                None => {
+                    tracing::warn!(provider = %provider_name, "stashed DPoP key does not decode");
+                    self.record_oauth_failure_and_clear(
+                        AuthFailureReason::DpopKeyInvalid,
+                        provider_name,
+                        session,
+                    )
+                    .await?;
+                    Err(OAuthError::InvalidParameter)
+                }
+            },
+        }
+    }
+
+    /// Refuse an authorization response in a form the provider does not
+    /// accept: a plain response where it requires JARM, an `iss` that does
+    /// not match, or a form that skips the `iss` the provider sends.
+    async fn check_authorization_response_form(
+        &self,
+        provider: &std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>,
+        provider_name: &str,
+        iss: IssCheck<'_>,
+        form: ResponseForm,
+        session: &AuthSession,
+    ) -> Result<(), axess_factors::oauth::OAuthError> {
+        use axess_factors::oauth::OAuthError;
+
+        if provider.authorization_response_jwt_required() && form != ResponseForm::Jarm {
             tracing::warn!(
                 provider = %provider_name,
                 "plain authorization response for a provider that requires JARM; refusing"
             );
             self.record_oauth_failure_and_clear(
                 AuthFailureReason::ProviderMismatch,
-                &provider_name,
+                provider_name,
                 session,
             )
             .await?;
             return Err(OAuthError::InvalidParameter);
         }
 
-        if let IssCheck::Compared(response_iss) = iss {
-            self.verify_response_iss(&provider, &provider_name, response_iss, session)
+        match iss {
+            IssCheck::Compared(response_iss) => {
+                self.verify_response_iss(provider, provider_name, response_iss, session)
+                    .await?;
+            }
+            IssCheck::Skipped if provider.authorization_response_iss_required() => {
+                tracing::warn!(
+                    provider = %provider_name,
+                    "the provider sends the iss parameter (RFC 9207) and this callback did not \
+                     pass it; use finish_oauth_login_with_iss"
+                );
+                self.record_oauth_failure_and_clear(
+                    AuthFailureReason::MissingIssuer,
+                    provider_name,
+                    session,
+                )
                 .await?;
+                return Err(OAuthError::Config(
+                    "this provider sends the authorization response iss parameter; finish the \
+                     callback with finish_oauth_login_with_iss so it is compared"
+                        .to_string(),
+                ));
+            }
+            IssCheck::Skipped => {}
         }
-
-        let claims = self
-            .exchange_code_for_login(
-                &provider,
-                &provider_name,
-                code,
-                stored_verifier,
-                stored_nonce,
-                session,
-            )
-            .await?;
-
-        self.seal_finished_login(&provider_name, &claims, session)
-            .await?;
-
-        Ok(claims)
+        Ok(())
     }
 
     /// Exchange the code at the provider, recording and clearing the ceremony
@@ -245,23 +384,39 @@ where
         provider: &std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>,
         provider_name: &str,
         code: &str,
-        stored_verifier: String,
-        stored_nonce: String,
+        stashed: StashedCeremony,
         session: &AuthSession,
     ) -> Result<axess_factors::oauth::OAuthClaims, axess_factors::oauth::OAuthError> {
         use axess_factors::oauth::OAuthError;
 
-        // A provider that binds tokens to a DPoP key gets a fresh one per
-        // login, drawn from the service's rng; the claims carry it back.
-        let dpop_key = provider
-            .fapi_config()
-            .filter(|f| {
-                matches!(
-                    f.sender_constraint,
-                    axess_factors::oauth::SenderConstraint::DPoP
+        let StashedCeremony {
+            verifier,
+            nonce,
+            dpop_key: stashed_dpop_key,
+        } = stashed;
+        // A provider that binds tokens to a DPoP key presents the key the
+        // begin stashed (and a pushed request named); the claims carry it
+        // back. A ceremony begun without one (the provider started binding
+        // between begin and callback, after a rediscovery) is refused and
+        // restarts: a key improvised here was never named to the server.
+        let dpop_key = match (provider.binds_to_dpop(), stashed_dpop_key) {
+            (true, Some(key)) => Some(key),
+            (true, None) => {
+                tracing::warn!(
+                    provider = %provider_name,
+                    "the provider binds tokens to a DPoP key and the ceremony has none; \
+                     the login restarts"
+                );
+                self.record_oauth_failure_and_clear(
+                    AuthFailureReason::DpopKeyInvalid,
+                    provider_name,
+                    session,
                 )
-            })
-            .map(|_| axess_factors::oauth::DpopKey::generate(&*self.inner.rng));
+                .await?;
+                return Err(OAuthError::InvalidParameter);
+            }
+            (false, _) => None,
+        };
         let signer = dpop_key
             .as_ref()
             .map(|key| axess_factors::oauth::DpopSigner {
@@ -269,10 +424,7 @@ where
                 rng: &*self.inner.rng,
             });
 
-        match provider
-            .exchange_code_with(code, stored_verifier, stored_nonce, signer)
-            .await
-        {
+        match provider.exchange_code(code, verifier, nonce, signer).await {
             Ok(c) => Ok(c),
             Err(e) => {
                 // Log the original error server-side but return a generic error
@@ -325,14 +477,21 @@ where
             .set_custom(oauth_keys::CLAIM_LOCK, serde_json::Value::String(lock))
             .await;
 
-        // Attribution: the OAuth subject may or may not be a valid UserId,
-        // and the local tenant has not yet been resolved at this stage.
-        // Record whatever attribution we have; `None` for anything that
-        // cannot be turned into a typed id.
-        let subject_user = UserId::try_new(claims.subject.as_str()).ok();
+        // Attribution: the local user is not resolved until
+        // `complete_oauth_login`, whose row names it; the IdP subject is the
+        // IdP's identifier and never a local user id, even when it parses as
+        // one (a row under a foreign subject would attribute the login to
+        // whatever local user shares that id). The tenant is the one the
+        // begin bound the ceremony to, when it did; a row with no tenant is
+        // a platform row that every tenant's `include_unscoped` query sees.
+        let tenant = super::state::ceremony_tenant(session)
+            .await
+            .ok()
+            .flatten()
+            .map(|binding| binding.tenant);
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LoginAttempt)
-                .maybe_attributed_to(subject_user.as_ref(), None)
+                .maybe_attributed_to(None, tenant.as_ref())
                 .with_factor(FactorKind::Federated(
                     crate::authn::factor::FederatedProvider::Custom(provider_name.to_string()),
                 )),
@@ -430,6 +589,41 @@ where
             }
         }
     }
+}
+
+/// The strings `begin_oauth_login` stashed in the session, in this order:
+/// the CSRF state, the nonce, the PKCE verifier and the provider name. Any
+/// one missing means there is no ceremony to finish.
+async fn read_stashed_ceremony(
+    session: &AuthSession,
+) -> Result<(String, String, String, String), axess_factors::oauth::OAuthError> {
+    use axess_factors::oauth::{OAuthError, keys as oauth_keys};
+
+    let get_str = |v: serde_json::Value| v.as_str().map(|s| s.to_string());
+
+    let stored_csrf = session
+        .get_custom(oauth_keys::CSRF_STATE)
+        .await
+        .and_then(get_str)
+        .ok_or(OAuthError::NoFlow)?;
+    let stored_nonce = session
+        .get_custom(oauth_keys::NONCE)
+        .await
+        .and_then(get_str)
+        .ok_or(OAuthError::NoFlow)?;
+    let stored_verifier = session
+        .get_custom(oauth_keys::PKCE_VERIFIER)
+        .await
+        .and_then(get_str)
+        .ok_or(OAuthError::NoFlow)?;
+    // Read before the PKCE validation that follows, so the warn!/record
+    // failure paths can attribute the failure to a provider.
+    let provider_name = session
+        .get_custom(oauth_keys::PROVIDER)
+        .await
+        .and_then(get_str)
+        .ok_or(OAuthError::NoFlow)?;
+    Ok((stored_csrf, stored_nonce, stored_verifier, provider_name))
 }
 
 #[cfg(test)]

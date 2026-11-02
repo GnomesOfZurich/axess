@@ -59,6 +59,7 @@ fn fake_claims() -> OAuthClaims {
         oidc_sid: None,
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        nonce: None,
         dpop_key: None,
     }
 }
@@ -77,6 +78,7 @@ fn empty_claims(subject: &str) -> OAuthClaims {
         oidc_sid: None,
         id_token_hint: None,
         additional_claims: serde_json::Value::Null,
+        nonce: None,
         dpop_key: None,
     }
 }

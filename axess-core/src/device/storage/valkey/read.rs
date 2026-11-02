@@ -213,7 +213,7 @@ impl ValkeyDeviceStore {
         }
     }
 
-    /// The devices listed in `index_key` whose row still satisfies
+    /// The devices listed in the set `index_key` whose row still satisfies
     /// `belongs`. Members whose row is gone, and members whose row no longer
     /// matches, are removed from the index; a row that does not decode fails
     /// the read, since a lookup that skipped it would answer as if the
@@ -225,15 +225,36 @@ impl ValkeyDeviceStore {
         belongs: impl Fn(&Device) -> bool,
     ) -> Result<Vec<Device>, ValkeyDeviceStoreError> {
         let members: Vec<String> = self.client.smembers(index_key).await?;
-        let read = self.read_rows(tenant, &members).await?;
-        self.prune_absent(index_key, tenant, &read.gone).await;
+        self.read_members(&[index_key], tenant, &members, belongs)
+            .await
+    }
+
+    /// The devices among `members` whose row still satisfies `belongs`, as
+    /// [`read_index`](Self::read_index) judges them. Members whose row is
+    /// gone, and members whose row no longer matches, are removed from every
+    /// index in `index_keys` (a key that does not list a member is left as
+    /// it is), so a lookup that gathers its candidates from several indexes
+    /// tidies them all.
+    pub(super) async fn read_members(
+        &self,
+        index_keys: &[&str],
+        tenant: &str,
+        members: &[String],
+        belongs: impl Fn(&Device) -> bool,
+    ) -> Result<Vec<Device>, ValkeyDeviceStoreError> {
+        let read = self.read_rows(tenant, members).await?;
+        for key in index_keys {
+            self.prune_absent(key, tenant, &read.gone).await;
+        }
         if let Some((_, e)) = read.undecodable.into_iter().next() {
             return Err(e);
         }
         let (kept, stale): (Vec<StoredRow>, Vec<StoredRow>) =
             read.live.into_iter().partition(|r| belongs(&r.device));
         let judged: Vec<(String, Vec<u8>)> = stale.into_iter().map(|r| (r.id, r.raw)).collect();
-        self.prune_mismatched(index_key, tenant, &judged).await;
+        for key in index_keys {
+            self.prune_mismatched(key, tenant, &judged).await;
+        }
         for row in kept.iter().filter(|r| r.stale) {
             self.reseal_row(&row.device, &row.raw).await;
         }

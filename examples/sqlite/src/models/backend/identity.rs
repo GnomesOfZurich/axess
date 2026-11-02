@@ -2,8 +2,8 @@
 //! `IdentityAdmin`.
 
 use axess::authn::{
-    AuditOutcome, AuthEvent, EntityState, LockoutPolicy, StatusDetail, Tenant, TenantId, User,
-    UserId,
+    AuditOutcome, AuthEvent, EntityState, IpPolicy, LockoutPolicy, PasswordRules, StatusDetail,
+    Tenant, TenantId, User, UserId,
 };
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -11,6 +11,19 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::{BackendError, OurBackend, entity_state_from_db, tenant_from_row, user_from_row};
+
+impl OurBackend {
+    /// The lockout policy of every tenant: five failures, then fifteen
+    /// minutes. The counter statements below read it too, since a failure
+    /// is counted by user, not by tenant.
+    pub fn lockout_policy(&self) -> LockoutPolicy {
+        LockoutPolicy {
+            max_attempts: 5,
+            duration: Some(std::time::Duration::from_secs(15 * 60)),
+            ..LockoutPolicy::default()
+        }
+    }
+}
 
 impl axess::authn::IdentityLookup for OurBackend {
     type Error = BackendError;
@@ -31,7 +44,7 @@ impl axess::authn::IdentityLookup for OurBackend {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| user_from_row(self.clock(), &r)))
+        row.map(|r| user_from_row(self.clock(), &r)).transpose()
     }
 
     async fn get_user(&self, user_id: &UserId) -> Result<Option<User>, Self::Error> {
@@ -45,7 +58,7 @@ impl axess::authn::IdentityLookup for OurBackend {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| user_from_row(self.clock(), &r)))
+        row.map(|r| user_from_row(self.clock(), &r)).transpose()
     }
 
     async fn get_tenant(&self, tenant_id: &TenantId) -> Result<Option<Tenant>, Self::Error> {
@@ -58,7 +71,7 @@ impl axess::authn::IdentityLookup for OurBackend {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| tenant_from_row(self.clock(), &r)))
+        row.map(|r| tenant_from_row(self.clock(), &r)).transpose()
     }
 
     async fn get_user_tenant(&self, user_id: &UserId) -> Result<Option<TenantId>, Self::Error> {
@@ -88,7 +101,7 @@ impl axess::authn::IdentityLookup for OurBackend {
         .fetch_optional(self.pool())
         .await?;
 
-        Ok(row.map(|r| tenant_from_row(self.clock(), &r)))
+        row.map(|r| tenant_from_row(self.clock(), &r)).transpose()
     }
 
     async fn default_tenant(&self) -> Result<Tenant, Self::Error> {
@@ -100,7 +113,7 @@ impl axess::authn::IdentityLookup for OurBackend {
         .fetch_one(self.pool())
         .await?;
 
-        Ok(tenant_from_row(self.clock(), &row))
+        tenant_from_row(self.clock(), &row)
     }
 
     async fn account_status(&self, user_id: &UserId) -> Result<EntityState, Self::Error> {
@@ -114,16 +127,73 @@ impl axess::authn::IdentityLookup for OurBackend {
             Some(r) => {
                 let status: String = r.get("status");
                 let locked_until: Option<String> = r.get("locked_until");
-                entity_state_from_db(self.clock(), &status, locked_until.as_deref())
+                entity_state_from_db(self.clock(), &status, locked_until.as_deref())?
             }
         })
     }
 
-    fn lockout_policy(&self) -> LockoutPolicy {
-        LockoutPolicy {
-            max_attempts: 5,
-            duration: Some(std::time::Duration::from_secs(15 * 60)),
-            ..LockoutPolicy::default()
+    // One policy for every tenant; a multi-tenant deployment reads its
+    // tenant table here.
+    fn lockout_policy_for_tenant(&self, _tenant_id: &TenantId) -> LockoutPolicy {
+        self.lockout_policy()
+    }
+
+    async fn password_rules_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+    ) -> Result<PasswordRules, Self::Error> {
+        Ok(PasswordRules::default())
+    }
+
+    async fn ip_policy_for_tenant(&self, _tenant_id: &TenantId) -> Result<IpPolicy, Self::Error> {
+        Ok(IpPolicy::default())
+    }
+}
+
+/// The SQL condition under which a stored failure count is fresh, that is
+/// replaced by one on the next failure, in terms of the bind parameters
+/// [`FreshBounds`] supplies: `?3` the start of the attempt window, `?4` the
+/// limit, `?5` the time a timed lockout started by must have ended (NULL when
+/// the policy's lockout is indefinite).
+///
+/// A count under the limit is fresh once its last failure is older than the
+/// window. A count at the limit is fresh only when a timed lockout has run
+/// out: the window bounds how long failures accumulate and must not end a
+/// lockout that is indefinite or longer than the window.
+///
+/// A macro rather than a `const` so the statements that use it stay string
+/// literals, which is what `sqlx::query` accepts without an audit marker.
+macro_rules! fresh_count {
+    () => {
+        "(last_failed_at IS NULL
+          OR (last_failed_at < ?3 AND failed_attempts < ?4)
+          OR (failed_attempts >= ?4 AND ?5 IS NOT NULL AND last_failed_at <= ?5))"
+    };
+}
+
+/// The bind values behind `fresh_count!`, computed once per statement from
+/// the clock and the policy in force.
+struct FreshBounds {
+    now: DateTime<Utc>,
+    /// `?3`: a failure before this is outside the attempt window.
+    window_start: String,
+    /// `?4`: the policy's effective limit.
+    max_attempts: i64,
+    /// `?5`: a lockout whose last failure is at or before this has ended;
+    /// `None` for an indefinite lockout.
+    lock_ended_by: Option<String>,
+}
+
+impl FreshBounds {
+    fn at(now: DateTime<Utc>, policy: &axess::authn::LockoutPolicy) -> Self {
+        let back = |d: std::time::Duration| {
+            failure_time(now - chrono::Duration::from_std(d).unwrap_or(chrono::Duration::hours(1)))
+        };
+        Self {
+            now,
+            window_start: back(policy.attempt_window),
+            max_attempts: i64::from(policy.effective_max_attempts()),
+            lock_ended_by: policy.duration.map(back),
         }
     }
 }
@@ -194,25 +264,24 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
     async fn record_failed_attempt(&self, user_id: &UserId) -> Result<u32, Self::Error> {
         // One statement: the increment and the read cannot be separated by
         // a concurrent failure. A failure older than the policy's window
-        // starts the count again instead of adding to it.
-        let now = self.clock().now();
-        let window = chrono::Duration::from_std(
-            axess::authn::IdentityLookup::lockout_policy(self).attempt_window,
-        )
-        .unwrap_or_else(|_| chrono::Duration::hours(1));
-        let row = sqlx::query(
+        // starts the count again instead of adding to it, unless the count
+        // is at the limit: then only an ended timed lockout starts it over.
+        let policy = self.lockout_policy();
+        let bounds = FreshBounds::at(self.clock().now(), &policy);
+        let row = sqlx::query(concat!(
             "UPDATE users
-             SET failed_attempts = CASE
-                     WHEN last_failed_at IS NULL OR last_failed_at < ?3 THEN 1
-                     ELSE failed_attempts + 1
-                 END,
+             SET failed_attempts = CASE WHEN ",
+            fresh_count!(),
+            " THEN 1 ELSE failed_attempts + 1 END,
                  last_failed_at = ?2
              WHERE id = ?1
-             RETURNING failed_attempts",
-        )
+             RETURNING failed_attempts"
+        ))
         .bind(user_id.to_string())
-        .bind(failure_time(now))
-        .bind(failure_time(now - window))
+        .bind(failure_time(bounds.now))
+        .bind(bounds.window_start)
+        .bind(bounds.max_attempts)
+        .bind(bounds.lock_ended_by)
         .fetch_one(self.pool())
         .await?;
 
@@ -227,36 +296,30 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
     ) -> Result<Option<u32>, Self::Error> {
         // The test and the increment are one statement. The count is fresh
         // (replaced by one) when there is no failure, the last is older than
-        // the attempt window, or a timed lockout has run out; otherwise the
-        // guess is granted while the count is under the limit. When no row is
-        // updated the account is at its limit and the guess is refused, so
-        // parallel guesses cannot pass it.
-        let now = self.clock().now();
-        let back = |d: std::time::Duration| {
-            failure_time(now - chrono::Duration::from_std(d).unwrap_or(chrono::Duration::hours(1)))
-        };
-        let window_start = back(policy.attempt_window);
-        let lock_ended_by = policy.duration.map(back);
-        let row = sqlx::query(
+        // the attempt window and the count is under the limit, or a timed
+        // lockout has run out; otherwise the guess is granted while the
+        // count is under the limit. When no row is updated the account is at
+        // its limit and the guess is refused, so parallel guesses cannot
+        // pass it, and the window alone never frees it: an indefinite
+        // lockout, or one longer than the window, outlives the window.
+        let bounds = FreshBounds::at(self.clock().now(), policy);
+        let row = sqlx::query(concat!(
             "UPDATE users
-             SET failed_attempts = CASE
-                     WHEN last_failed_at IS NULL OR last_failed_at < ?3
-                          OR (failed_attempts >= ?4 AND ?5 IS NOT NULL AND last_failed_at <= ?5)
-                     THEN 1
-                     ELSE failed_attempts + 1
-                 END,
+             SET failed_attempts = CASE WHEN ",
+            fresh_count!(),
+            " THEN 1 ELSE failed_attempts + 1 END,
                  last_failed_at = ?2
              WHERE id = ?1
-               AND (last_failed_at IS NULL OR last_failed_at < ?3
-                    OR failed_attempts < ?4
-                    OR (?5 IS NOT NULL AND last_failed_at <= ?5))
-             RETURNING failed_attempts",
-        )
+               AND (",
+            fresh_count!(),
+            " OR failed_attempts < ?4)
+             RETURNING failed_attempts"
+        ))
         .bind(user_id.to_string())
-        .bind(failure_time(now))
-        .bind(window_start)
-        .bind(i64::from(policy.effective_max_attempts()))
-        .bind(lock_ended_by)
+        .bind(failure_time(bounds.now))
+        .bind(bounds.window_start)
+        .bind(bounds.max_attempts)
+        .bind(bounds.lock_ended_by)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.map(|row| row.get::<i64, _>("failed_attempts") as u32))
@@ -292,15 +355,19 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
             .as_deref()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|t| t.with_timezone(&Utc));
-        // Failures older than the window have expired, as in the increment.
-        let window = chrono::Duration::from_std(
-            axess::authn::IdentityLookup::lockout_policy(self).attempt_window,
-        )
-        .unwrap_or_else(|_| chrono::Duration::hours(1));
-        if last.is_some_and(|t| self.clock().now() - t > window) {
+        // Failures older than the window have expired, as in the increment,
+        // while the count is under the limit. At the limit the raw count and
+        // time are returned so the library derives the lockout's end from
+        // the policy's duration rather than from the window.
+        let policy = self.lockout_policy();
+        let window = chrono::Duration::from_std(policy.attempt_window)
+            .unwrap_or_else(|_| chrono::Duration::hours(1));
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        let under_limit = count < policy.effective_max_attempts();
+        if under_limit && last.is_some_and(|t| self.clock().now() - t > window) {
             return Ok((0, None));
         }
-        Ok((count as u32, last))
+        Ok((count, last))
     }
 
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
@@ -308,6 +375,15 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
             .bind(user_id.to_string())
             .execute(self.pool())
             .await?;
+        Ok(())
+    }
+
+    // The example schema keeps no last-login column.
+    async fn record_last_login(
+        &self,
+        _user_id: &UserId,
+        _at: DateTime<Utc>,
+    ) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -385,10 +461,12 @@ impl axess::authn::IdentityAdmin for OurBackend {
     ///
     /// Sessions are not touched here: the example's session store keeps
     /// them encrypted under a key this backend does not hold, with no user
-    /// column to select on, and the example runs no session registry to ask.
-    /// The user's sessions therefore expire on their own. A deployment that
-    /// tracks sessions per user in a registry invalidates
-    /// that user's sessions through it alongside this call.
+    /// column to select on. They are ended by the caller that owns the
+    /// registry: `RequestAuthnService::delete_user` ends the user's
+    /// registered sessions and revokes their refresh tokens, then calls
+    /// this, then writes the audit row. Call that, not this, to erase an
+    /// account; this method alone leaves a signed-in session valid until
+    /// its TTL.
     async fn delete_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
         let id = user_id.to_string();
         let mut tx = self.pool().begin().await?;

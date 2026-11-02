@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 
 use axess_clock::{Clock, SystemClock};
 use axess_identity::{TenantId, UserId};
@@ -22,12 +21,6 @@ use super::provider::DelegatedProvider;
 /// network latency.
 const DEFAULT_REFRESH_SKEW_SECS: i64 = 60;
 
-/// Connect timeout of the process-wide default HTTP client.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Overall timeout of the process-wide default HTTP client.
-const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Idle entries are pruned from the single-flight registry once it
 /// holds more than this many keys.
 const REFRESH_LOCK_PRUNE_THRESHOLD: usize = 1024;
@@ -35,20 +28,19 @@ const REFRESH_LOCK_PRUNE_THRESHOLD: usize = 1024;
 /// The process-wide default HTTP client: built once, so every session
 /// that does not call [`StoredDelegationSession::with_http_client`]
 /// shares one connection pool. A clone is a reference-count bump.
-fn default_http_client() -> reqwest::Client {
+///
+/// A build failure (the TLS backend failed to initialise) is returned, not
+/// remembered, so the next session tries again. No client stands in for it:
+/// the refresh POST carries the client credentials and the refresh token,
+/// and a stock `reqwest::Client` would follow a 307 or 308 with them and
+/// wait for ever.
+fn default_http_client() -> Result<reqwest::Client, DelegatedError> {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            // No redirects: the refresh POST carries the client credentials
-            // and the refresh token, and a 307 or 308 would repeat it.
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .timeout(DEFAULT_HTTP_TIMEOUT)
-                .build()
-                .unwrap_or_default()
-        })
-        .clone()
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let built = crate::outbound_http::hardened_client()?;
+    Ok(CLIENT.get_or_init(|| built).clone())
 }
 
 /// The access token as a bearer string, for a `Bearer` credential only. A
@@ -115,21 +107,27 @@ where
 {
     /// Build a session. Defaults: [`SystemClock`], the shared default
     /// [`reqwest::Client`], 60-second refresh skew.
+    ///
+    /// # Errors
+    ///
+    /// [`DelegatedError::ClientBuild`] when the default HTTP client cannot be
+    /// built (the TLS backend failed to initialise). No client with the
+    /// protections missing is built in its place.
     pub fn new(
         provider: Arc<DelegatedProvider>,
         store: Arc<S>,
         tenant: TenantId,
         user: UserId,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DelegatedError> {
+        Ok(Self {
             provider,
             store,
             tenant,
             user,
-            http: default_http_client(),
+            http: default_http_client()?,
             clock: Arc::new(SystemClock),
             refresh_skew_secs: DEFAULT_REFRESH_SKEW_SECS,
-        }
+        })
     }
 
     /// Override the HTTP client; useful for adopter-side TLS / proxy

@@ -8,6 +8,9 @@
 //!
 //! - **OAuth provider registry** ([`oauth::OAuthProviderRegistry`](crate::federation::oauth::OAuthProviderRegistry)):
 //!   the per-`AuthnService` map of configured OAuth providers.
+//! - **Per-tenant OAuth providers** ([`oauth_tenant`](crate::federation::oauth_tenant)):
+//!   bring-your-own IdP resolved by `(tenant, name)` from a store at
+//!   request time.
 //! - **LDAP health check** ([`ldap`](crate::federation::ldap)): `HealthCheck` impl for
 //!   `LdapProviderConfig` (the trait lives in axess-core).
 //! - **Back-channel logout** ([`backchannel_logout`](crate::federation::backchannel_logout)) and
@@ -27,5 +30,7 @@ pub mod ldap;
 mod log_field;
 #[cfg(feature = "oauth")]
 pub mod oauth;
+#[cfg(feature = "oauth")]
+pub mod oauth_tenant;
 #[cfg(feature = "oauth")]
 pub mod sid_map;

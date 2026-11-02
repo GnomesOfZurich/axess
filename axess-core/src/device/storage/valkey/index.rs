@@ -3,7 +3,8 @@
 //!
 //! A row is listed in the tenant's index, its owner's index, the index of its
 //! owner's devices that carry its fingerprint, and one index per refresh
-//! family it is bound to. When a row is written, the script that
+//! family it is bound to (its fingerprint index is written by the script
+//! itself, with the sighting as the score). When a row is written, the script that
 //! writes it also adds the row to the indexes it now belongs to and removes
 //! it from the ones it no longer does (see `WRITE_ROW`), so an index is never
 //! updated by a separate command that could run in the other order.
@@ -12,7 +13,7 @@ use std::collections::BTreeMap;
 
 use super::row::{
     family_index_key, fingerprint_hex, fingerprint_key, fingerprint_set_key, fingerprint_user_key,
-    tenant_index_key, user_index_key,
+    fingerprint_zset_key, tenant_index_key, user_index_key,
 };
 use crate::device::types::{Device, DeviceBinding};
 
@@ -21,7 +22,7 @@ use crate::device::types::{Device, DeviceBinding};
 pub(super) enum IndexOp {
     /// Add the device to the set.
     Add,
-    /// Remove the device from the set.
+    /// Remove the device from the set, or from the sorted set.
     Remove,
     /// Delete a stale single-id fingerprint key, only if it still points at
     /// the device.
@@ -143,6 +144,7 @@ pub(super) fn plan_indexes(
         && b.fingerprint_hash != a.fingerprint_hash
     {
         let old = fingerprint_hex(&b.fingerprint_hash);
+        set(fingerprint_zset_key(prefix, &tenant, &old), IndexOp::Remove);
         set(fingerprint_set_key(prefix, &tenant, &old), IndexOp::Remove);
         set(
             fingerprint_key(prefix, &tenant, &old),

@@ -27,8 +27,9 @@ use super::*;
 ///   designed.
 ///
 /// **Production deployments must override `IdentityAuthnLog` directly.**
-/// Routing failed attempts to `Ok(1)` is a security regression on any
-/// surface accepting untrusted input.
+/// A failure counter that never accumulates (every failed attempt answered
+/// `Ok(0)`) is a security regression on any surface accepting untrusted
+/// input.
 pub struct NoopAuthnLog<L>(pub L);
 
 impl<L: IdentityLookup + Clone> Clone for NoopAuthnLog<L> {
@@ -95,10 +96,6 @@ impl<L: IdentityLookup> IdentityLookup for NoopAuthnLog<L> {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<EntityState, Self::Error>> + Send {
         self.0.account_status(user_id)
-    }
-
-    fn lockout_policy(&self) -> LockoutPolicy {
-        self.0.lockout_policy()
     }
 
     fn lockout_policy_for_tenant(&self, tenant_id: &TenantId) -> LockoutPolicy {
@@ -171,6 +168,16 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
             %user_id,
             "NoopAuthnLog: reset_failed_attempts is a no-op",
         );
+        Ok(())
+    }
+
+    async fn record_last_login(
+        &self,
+        _user_id: &UserId,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Self::Error> {
+        // The inner store is an `IdentityLookup` only: there is no
+        // last-login column to forward to.
         Ok(())
     }
 }

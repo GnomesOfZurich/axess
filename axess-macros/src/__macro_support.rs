@@ -24,6 +24,43 @@ pub fn audit_early_deny(
     );
 }
 
+/// Emit the authorization decision event for a gate that denied because a
+/// UID could not be built, so the audit trail has a denial for it. The
+/// principal, action and resource are the strings the UIDs would have been
+/// built from (the user id, the action name, the resource template), since
+/// no UID exists to render.
+pub fn audit_unbuilt_deny(user_id: &str, action: &str, resource_template: &str, reason: &str) {
+    axess_core::authz::audit::emit_early_deny(user_id, action, resource_template, reason);
+}
+
+/// A UID of the request could not be built; `reason` names which one, in
+/// the words of the decision event (`invalid_resource`, `invalid_action`,
+/// `invalid_principal`).
+#[derive(Debug)]
+pub struct InvalidUid {
+    /// The decision-event `reason` for this failure.
+    pub reason: &'static str,
+    /// What went wrong.
+    pub error: AuthzError,
+}
+
+impl InvalidUid {
+    const fn resource(error: AuthzError) -> Self {
+        Self {
+            reason: "invalid_resource",
+            error,
+        }
+    }
+}
+
+impl std::fmt::Display for InvalidUid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.error)
+    }
+}
+
+impl std::error::Error for InvalidUid {}
+
 /// A path parameter was not valid UTF-8 once percent-decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidPathParam;
@@ -132,6 +169,11 @@ pub const fn assert_one_path_placeholder(template: &str) {
 /// [`make_entity_uid`], which stores the id as an opaque string: quotes,
 /// backslashes and `\u{..}` escapes in a user id or path parameter stay data
 /// and cannot become another principal or resource.
+///
+/// # Errors
+///
+/// [`InvalidUid`] naming the UID that could not be built, so the caller can
+/// record the denial under the right reason.
 pub fn build_uids(
     namespace: &str,
     action: &str,
@@ -139,27 +181,27 @@ pub fn build_uids(
     params: &HashMap<String, String>,
     user_id: &str,
     tenant_id: &str,
-) -> Result<(EntityUid, EntityUid, EntityUid), AuthzError> {
+) -> Result<(EntityUid, EntityUid, EntityUid), InvalidUid> {
     let split = type_id_separator(resource_template).ok_or_else(|| {
-        AuthzError::InvalidEntityUid(format!(
+        InvalidUid::resource(AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` must be 'TypeName:id' shape"
-        ))
+        )))
     })?;
     let (resource_type, id_template) =
         (&resource_template[..split], &resource_template[split + 1..]);
     if resource_type.contains(['{', '}']) {
-        return Err(AuthzError::InvalidEntityUid(format!(
+        return Err(InvalidUid::resource(AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` has a placeholder in its type; only the id may come from the request"
-        )));
+        ))));
     }
     let path_placeholders = id_template
         .match_indices('{')
         .filter(|(at, _)| !id_template[at + 1..].starts_with('$'))
         .count();
     if path_placeholders > 1 {
-        return Err(AuthzError::InvalidEntityUid(format!(
+        return Err(InvalidUid::resource(AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` has more than one path placeholder; the values would be ambiguous"
-        )));
+        ))));
     }
     // Session values are inserted last so a route parameter can never shadow
     // them.
@@ -168,14 +210,21 @@ pub fn build_uids(
     values.insert("$user".to_string(), user_id.to_string());
     let params = &values;
     if let Some(name) = unknown_placeholder(id_template, params) {
-        return Err(AuthzError::InvalidEntityUid(format!(
+        return Err(InvalidUid::resource(AuthzError::InvalidEntityUid(format!(
             "resource template `{resource_template}` names path parameter `{name}`, which the route does not have"
-        )));
+        ))));
     }
     let resource_id = interpolate_path_params(id_template, params);
-    let principal = make_entity_uid(namespace, "User", user_id)?;
-    let action = make_entity_uid(namespace, "Action", action)?;
-    let resource = make_entity_uid(namespace, resource_type, &resource_id)?;
+    let principal = make_entity_uid(namespace, "User", user_id).map_err(|error| InvalidUid {
+        reason: "invalid_principal",
+        error,
+    })?;
+    let action = make_entity_uid(namespace, "Action", action).map_err(|error| InvalidUid {
+        reason: "invalid_action",
+        error,
+    })?;
+    let resource =
+        make_entity_uid(namespace, resource_type, &resource_id).map_err(InvalidUid::resource)?;
     Ok((principal, action, resource))
 }
 

@@ -31,10 +31,21 @@ struct Entry {
 /// time it had when the index was built or last extended by this archiver, so
 /// an append, a truncation or a replacement by another process (the root lock
 /// lets several share a root) is noticed and the file is read again.
-#[derive(Default)]
 pub(super) struct SidecarCache {
     days: HashMap<PathBuf, Entry>,
     loads: usize,
+    /// The most day sidecars kept; see [`MAX_CACHED_DAYS`].
+    max_days: usize,
+}
+
+impl Default for SidecarCache {
+    fn default() -> Self {
+        Self {
+            days: HashMap::new(),
+            loads: 0,
+            max_days: MAX_CACHED_DAYS,
+        }
+    }
 }
 
 /// The line recorded for a batch: its id and the digest of its events.
@@ -43,6 +54,16 @@ pub(super) fn marker_line(batch_id: &str, content_digest: &str) -> String {
 }
 
 impl SidecarCache {
+    /// A cache that keeps at most `max_days` day sidecars, so a test reaches
+    /// the clearing of the table with two days instead of four hundred.
+    #[cfg(test)]
+    pub(super) fn with_max_days(max_days: usize) -> Self {
+        Self {
+            max_days,
+            ..Self::default()
+        }
+    }
+
     /// How many times a sidecar has been read from disk.
     #[cfg(test)]
     pub(super) fn loads(&self) -> usize {
@@ -87,7 +108,7 @@ impl SidecarCache {
             lines.insert(line?);
         }
         self.loads += 1;
-        if self.days.len() >= MAX_CACHED_DAYS {
+        if self.days.len() >= self.max_days {
             self.days.clear();
         }
         self.days.insert(
@@ -104,31 +125,33 @@ impl SidecarCache {
     /// Record that `marker` was appended to the sidecar at `path`, so the next
     /// check is answered from memory. Called with the root lock held, after
     /// the append is durable.
+    ///
+    /// A sidecar the table does not hold (it did not exist before this
+    /// append, or the table was cleared since the check) is read from disk
+    /// in full: an entry built from this one marker would be trusted as the
+    /// file's whole content, and the batches recorded before it would be
+    /// archived again. A read that fails leaves the sidecar out of the
+    /// table, so the next check reads it.
     pub(super) fn note_appended(&mut self, path: &Path, marker: &str) {
         let Ok(meta) = std::fs::metadata(path) else {
             self.days.remove(path);
             return;
         };
-        let known = self.days.get_mut(path);
-        match known {
+        match self.days.get_mut(path) {
             Some(entry) => {
                 entry.lines.insert(marker.to_string());
                 entry.len = meta.len();
                 entry.modified = meta.modified().ok();
             }
             None => {
-                // Only reached for a sidecar that did not exist before this
-                // append (the check ran first and found nothing).
-                let mut lines = HashSet::new();
-                lines.insert(marker.to_string());
-                self.days.insert(
-                    path.to_path_buf(),
-                    Entry {
-                        lines,
-                        len: meta.len(),
-                        modified: meta.modified().ok(),
-                    },
-                );
+                if let Err(e) = self.load(path, &meta) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "audit archive: the batch sidecar could not be re-read after an append"
+                    );
+                    self.days.remove(path);
+                }
             }
         }
     }

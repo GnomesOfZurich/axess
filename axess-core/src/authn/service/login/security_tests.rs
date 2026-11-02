@@ -4,8 +4,9 @@
 
 use super::super::AuthnService;
 use super::*;
-use crate::authn::event::AuthFailureReason;
+use crate::authn::event::{AuthEventStatus, AuthEventType, AuthFailureReason};
 use crate::authn::ids::{TenantId, UserId};
+use crate::authn::store::IdentityAuthnLog as _;
 use crate::authn::types::{EntityState, LockoutPolicy, StatusDetail, Tenant, User};
 use crate::authn::{AuditContext, RequestAuthnService};
 use crate::session::data::SessionData;
@@ -150,16 +151,81 @@ async fn an_ended_suspension_no_longer_blocks_login() {
     );
 }
 
+/// The audit rows of a locked login attempt: status `Locked`, which the
+/// store enforces and a SOC query can filter on.
+fn locked_rows(store: &MockIdentityStore) -> usize {
+    store
+        .events()
+        .iter()
+        .filter(|e| {
+            matches!(e.event_type, AuthEventType::LoginAttempt)
+                && matches!(e.event_status, AuthEventStatus::Locked)
+        })
+        .count()
+}
+
 #[tokio::test]
-async fn a_running_suspension_still_blocks_login() {
+async fn a_running_suspension_still_blocks_login_and_answers_like_an_unknown_identifier() {
+    // Answering `Locked` to a caller who has proved nothing tells them the
+    // account exists and that someone, perhaps they, has been guessing at
+    // it. By default `begin_login` conceals the lockout behind the answer an
+    // unknown identifier gets; the audit row still says `Locked`.
     let future = chrono::Utc::now() + chrono::Duration::hours(1);
-    let outcome = service(identity(EntityState::Active, suspended(Some(future))))
+    let id = identity(EntityState::Active, suspended(Some(future)));
+    let observer = id.clone();
+    let outcome = service(id).begin_login("alice", "acme", &session()).await;
+    let unknown = service(identity(EntityState::Active, EntityState::Active))
+        .begin_login("nobody", "acme", &session())
+        .await;
+    assert!(
+        matches!(outcome, Ok(LoginOutcome::InvalidCredentials)),
+        "a locked account must answer as an unknown identifier does: {outcome:?}"
+    );
+    assert!(matches!(unknown, Ok(LoginOutcome::InvalidCredentials)));
+    assert_eq!(locked_rows(&observer), 1, "the audit row keeps the lockout");
+}
+
+#[tokio::test]
+async fn a_counter_lockout_is_concealed_on_begin_by_default() {
+    let id =
+        identity(EntityState::Active, EntityState::Active).with_lockout_policy(LockoutPolicy {
+            max_attempts: 3,
+            duration: None,
+            ..LockoutPolicy::default()
+        });
+    let observer = id.clone();
+    for _ in 0..3 {
+        id.record_failed_attempt(&uid()).await.unwrap();
+    }
+    assert_eq!(
+        observer.failed_attempts_for("u-sec"),
+        3,
+        "the account is locked"
+    );
+    let outcome = service(id).begin_login("alice", "acme", &session()).await;
+    assert!(
+        matches!(outcome, Ok(LoginOutcome::InvalidCredentials)),
+        "{outcome:?}"
+    );
+    assert_eq!(locked_rows(&observer), 1);
+}
+
+#[tokio::test]
+async fn a_revealed_lockout_names_its_end() {
+    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let id = identity(EntityState::Active, suspended(Some(future)));
+    let observer = id.clone();
+    let outcome = AuthnService::builder(id, MockFactorStore::new())
+        .with_lockout_revealed_on_begin()
+        .build()
+        .with_audit_context(AuditContext::default())
         .begin_login("alice", "acme", &session())
         .await;
     assert!(
-        matches!(outcome, Ok(LoginOutcome::Locked { .. })),
+        matches!(outcome, Ok(LoginOutcome::Locked { until: Some(u) }) if u == future),
         "{outcome:?}"
     );
+    assert_eq!(locked_rows(&observer), 1);
 }
 
 #[tokio::test]

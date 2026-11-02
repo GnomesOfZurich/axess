@@ -3,18 +3,19 @@
 //! loopback host), and the default client follows no redirects and has
 //! connect and request timeouts. A redirect would re-send the credentials
 //! (a 307 or 308 repeats the POST body) to wherever the response points.
-
-use std::time::Duration;
+//!
+//! The module is compiled only with one of the features that bring such a
+//! client (see its declaration in the crate root), so nothing in it repeats
+//! that gate.
 
 use url::Url;
 
 /// Connect timeout of the default client.
-#[cfg(feature = "delegated-exchange")]
-pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Request timeout of the default client.
-#[cfg(feature = "delegated-exchange")]
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Request timeout of the default client. A request that sets its own
+/// timeout replaces it for that request.
+pub(crate) const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Why an endpoint was refused. Carries no URL: a configured endpoint can
 /// embed userinfo.
@@ -40,15 +41,41 @@ pub(crate) fn require_https_or_loopback(url: &Url) -> Result<(), &'static str> {
     }
 }
 
+/// The default HTTP client of a credential-bearing outbound client (token
+/// exchange, stored delegation, the cloud STS adapters) could not be built,
+/// which happens when the TLS backend fails to initialise. Nothing is sent:
+/// the alternative, a stock `reqwest::Client`, follows redirects and has no
+/// timeouts, so it would carry the credentials wherever a redirect points and
+/// hang on a stalled endpoint. The builder's error is the source.
+#[derive(Debug, thiserror::Error)]
+#[error("HTTP client could not be built: {0}")]
+pub struct ClientBuildError(#[source] reqwest::Error);
+
 /// A client that follows no redirects and has a connect and a request timeout.
-#[cfg(feature = "delegated-exchange")]
-pub(crate) fn hardened_client() -> reqwest::Client {
-    reqwest::Client::builder()
+///
+/// # Errors
+///
+/// [`ClientBuildError`] when the client cannot be built; it is never
+/// swallowed.
+#[cfg(any(feature = "delegated-exchange", feature = "delegated-stored"))]
+pub(crate) fn hardened_client() -> Result<reqwest::Client, ClientBuildError> {
+    harden(reqwest::Client::builder())
+}
+
+/// [`hardened_client`] on a builder the caller started: the policy applied,
+/// the build error surfaced. The cloud STS adapters build their default
+/// client here too.
+///
+/// # Errors
+///
+/// [`ClientBuildError`] when the client cannot be built.
+pub(crate) fn harden(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, ClientBuildError> {
+    builder
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .unwrap_or_default()
+        .map_err(ClientBuildError)
 }
 
 #[cfg(test)]
@@ -75,5 +102,24 @@ mod tests {
         assert!(!ok("https://user:pw@sts.example.com/t"));
         assert!(!ok("http://localhost@evil.com/t"));
         assert!(!ok("ftp://localhost/t"));
+    }
+
+    /// A client that cannot be built is an error, never `reqwest::Client::default()`
+    /// (redirects followed, no timeouts) in its place. A TLS configuration of
+    /// a type no backend recognises is the one build failure a test can
+    /// arrange whatever TLS backend the feature set resolves to.
+    #[cfg(any(feature = "delegated-exchange", feature = "delegated-stored"))]
+    #[test]
+    fn a_client_that_cannot_be_built_is_an_error_not_a_default_client() {
+        let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
+        let result = harden(unbuildable);
+        assert!(
+            result.is_err(),
+            "a failed build must surface, not fall back to an unhardened client"
+        );
+        assert!(
+            hardened_client().is_ok(),
+            "the default build still succeeds"
+        );
     }
 }

@@ -1,10 +1,11 @@
 # Axess Example: Machine Callers
 
-Recipes for machine callers. Two wire JWT-bearer workload-identity flows
+Recipes for machine callers. Three wire JWT-bearer workload-identity flows
 into axess's generic `WorkloadResolver` for common issuer schemas:
 
 - **GitHub Actions OIDC**; tokens from `https://token.actions.githubusercontent.com`.
-- **Kubernetes service-account projected tokens**; `kubernetes.io.{namespace,serviceaccount.name}` claims.
+- **GitLab CI ID tokens**; `src/gitlab.rs`, keyed on `project_id` and `namespace_id` with `ref_protected` and `environment` allowlists.
+- **Kubernetes service-account projected tokens**; `kubernetes.io.{namespace,serviceaccount.name}` claims. OpenShift and EKS use the same recipe; `src/openshift.rs` and `src/eks.rs` hold each platform's issuer and audience.
 
 The third is the last resort, for a caller no identity provider vouches
 for (an intake worker, a relay, a cron job):
@@ -12,7 +13,7 @@ for (an intake worker, a relay, a cron job):
 - **Shared secret** (`src/shared_secret.rs`); the caller signs each request
   with a secret both ends hold, through the `service-secret` feature, and
   the route verifies it and refuses altered, stale and replayed requests.
-  This is the weakest machine credential axess offers: prefer the two
+  This is the weakest machine credential axess offers: prefer the
   recipes above whenever the caller can use them. The book chapter
   *Shared secrets: the last resort* sets the options side by side.
 
@@ -33,7 +34,7 @@ reuse benefit.
 Instead: one generic [`WorkloadResolver<C, F, R>`][resolver] in the library
 handles JWT verification + trust-domain pinning + `Principal` construction.
 This crate provides ready-made `C` (claim struct) + `F` (mapper closure)
-implementations for two common IdPs as **copy-paste starting points**.
+implementations for common IdPs as **copy-paste starting points**.
 
 ## Using a recipe
 
@@ -44,7 +45,7 @@ Three options:
 2. **Depend on the crate** and use the public functions directly. Useful
    for prototypes and tests.
 3. **Read the source** as documentation for how to write your own recipe
-   (GitLab CI OIDC, CircleCI OIDC, Buildkite OIDC, custom internal JWT
+   (CircleCI OIDC, Buildkite OIDC, custom internal JWT
    format, …). Each recipe is ~100 lines and follows the same pattern:
    `#[derive(Deserialize)] struct Claims { ... }` plus a mapper function
    that turns verified claims into a `WorkloadMapping`.
@@ -95,10 +96,10 @@ is what stops a deleted and recreated account from inheriting the old name.
 
 ## Writing your own recipe
 
-For a new IdP (e.g. GitLab CI):
+For a new IdP (e.g. CircleCI):
 
 1. Decode a sample JWT from your IdP, identify which claims carry the
-   workload identity (`project_path`? `namespace_id`? `user_login`?).
+   workload identity (a project id? a tenant id? a user login?).
 2. Define a `#[derive(Deserialize)] struct YourClaims { ... }` with only
    the fields you care about (axess's `JwtVerifier` ignores unknown claims).
 3. Write a mapper closure: `Fn(&VerifiedClaims<YourClaims>) ->
@@ -113,6 +114,12 @@ the claim-shape translation.
 
 ## See also
 
+- The cloud walkthroughs, which chain a recipe to an STS adapter and run
+  against mock Azure AD, Key Vault and STS servers:
+  [`tests/cloud_azure.rs`](tests/cloud_azure.rs) and
+  [`tests/cloud_aws.rs`](tests/cloud_aws.rs), explained in
+  [`docs/workload-identity/azure.md`](../../docs/workload-identity/azure.md) and
+  [`docs/workload-identity/aws.md`](../../docs/workload-identity/aws.md).
 - [`axess_factors::federation::workload`][resolver]; the generic resolver this crate's recipes plug into.
 - [`axess_factors::jwt::svid::JwtSvidResolver`][svid]; the one *exception* to the
   "no per-IdP adapter" rule: SPIFFE JWT-SVID is a spec (mandatory `spiffe://` URI

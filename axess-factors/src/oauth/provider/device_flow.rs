@@ -5,12 +5,15 @@
 //! trait methods on [`OAuthProviderConfig`](super::OAuthProviderConfig)
 //! are thin wrappers that delegate here.
 
-use super::super::types::{DeviceAuthResponse, DeviceTokenOutcome, OAuthError};
+use super::super::types::{
+    DeviceAuthResponse, DeviceTokenOutcome, DpopKey, DpopSigner, OAuthError,
+};
 use super::OAuthProviderConfig;
+use std::sync::Arc;
 
 /// Request a device + user code pair from the IdP's device authorization
 /// endpoint. Requires the endpoint to have been configured via
-/// [`OAuthProviderConfig::with_device_authorization_endpoint`]; it is not
+/// [`OAuthProviderBuilder::with_device_authorization_endpoint`](super::OAuthProviderBuilder::with_device_authorization_endpoint); it is not
 /// part of standard OIDC discovery.
 pub(super) async fn request_device_code(
     cfg: &OAuthProviderConfig,
@@ -24,8 +27,6 @@ pub(super) async fn request_device_code(
                 "no device_authorization_endpoint configured; call with_device_authorization_endpoint()".to_string(),
             )
         })?;
-
-    super::endpoint::require_secure(Some(device_url), "device_authorization_endpoint")?;
 
     let mut form = vec![("client_id", cfg.client_id.as_str())];
     let scope_str = scopes.join(" ");
@@ -83,36 +84,23 @@ pub(super) async fn poll_device_token(
     device_code: &str,
     current_interval: u64,
     nonce: Option<&str>,
+    dpop: Option<DpopSigner<'_>>,
 ) -> Result<DeviceTokenOutcome, OAuthError> {
-    let token_url = cfg
-        .metadata
-        .token_endpoint()
-        .ok_or_else(|| OAuthError::Config("no token endpoint in metadata".to_string()))?
-        .url()
-        .to_string();
+    let dpop = cfg.require_signer(dpop)?;
+    let token_url = cfg.token_endpoint_url()?;
 
-    let mut form = vec![
-        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ("device_code", device_code),
-        ("client_id", cfg.client_id.as_str()),
+    let mut form: Vec<(String, String)> = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:device_code".to_string(),
+        ),
+        ("device_code".to_string(), device_code.to_string()),
     ];
-    if let Some(ref secret) = cfg.client_secret {
-        form.push(("client_secret", secret.secret()));
-    }
+    cfg.add_client_auth(&mut form, &token_url)?;
 
-    let mut response = cfg
-        .http_client
-        .post(&token_url)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| OAuthError::TokenExchange(format!("device token poll failed: {e}")))?;
-
-    let status = response.status();
-    let body =
-        crate::http_body::read_for_status(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
-            .await
-            .map_err(|e| OAuthError::TokenExchange(format!("response read failed: {e}")))?;
+    let (status, body) = cfg
+        .post_form_constrained(&token_url, &form, None, dpop, "device token poll")
+        .await?;
 
     if status.is_success() {
         // Token granted; extract claims from the ID token.
@@ -120,6 +108,9 @@ pub(super) async fn poll_device_token(
             .map_err(|e| {
                 OAuthError::TokenExchange(format!("failed to parse token response: {e}"))
             })?;
+        if let Some(signer) = dpop {
+            OAuthProviderConfig::check_bound_response(&token_response, signer.key)?;
+        }
 
         // Nonce IS allowed in device flows. When the caller
         // generated one in `request_device_authorization` and stashed it,
@@ -129,7 +120,7 @@ pub(super) async fn poll_device_token(
         // a quirk of openidconnect 4.x; passing `""` is interpreted as
         // "no nonce expected"; any non-empty string activates the check.
         let nonce_for_verify = nonce.unwrap_or("");
-        let claims = cfg
+        let mut claims = cfg
             .extract_claims_from_response(&token_response, nonce_for_verify)
             .await
             .map_err(|e| {
@@ -137,6 +128,7 @@ pub(super) async fn poll_device_token(
                     "device code flow: ID token extraction failed: {e}"
                 ))
             })?;
+        claims.dpop_key = dpop.map(|s| Arc::new(DpopKey::from_seed(*s.key.to_seed_bytes())));
 
         return Ok(DeviceTokenOutcome::Authorized(Box::new(claims)));
     }

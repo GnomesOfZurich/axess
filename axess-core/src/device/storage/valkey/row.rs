@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use super::policy::ttl_seconds;
 use super::{ValkeyDeviceStore, ValkeyDeviceStoreError};
 use crate::device::types::{Device, FingerprintHash};
-use crate::session::crypto::{BoundFormat, CryptoError, device_row_id, device_row_id_v1};
+use crate::session::crypto::{Binding, BoundFormat, CryptoError, device_row_id, device_row_id_v1};
 
 pub(super) fn device_key(prefix: &str, tenant: &str, id: &str) -> String {
     format!("{prefix}:dev:{tenant}:{id}")
@@ -18,9 +18,20 @@ pub(super) fn fingerprint_key(prefix: &str, tenant: &str, hex_hash: &str) -> Str
     format!("{prefix}:dev:fp:{tenant}:{hex_hash}")
 }
 
-/// The set of ids of the devices that carry a fingerprint.
+/// The set of ids of the devices that carry a fingerprint, as the release
+/// before the sorted set kept it. It is read when the store is told to read
+/// the earlier layouts and emptied by the next write of each device it
+/// lists; nothing adds to it any more.
 pub(super) fn fingerprint_set_key(prefix: &str, tenant: &str, hex_hash: &str) -> String {
     format!("{prefix}:dev:fps:{tenant}:{hex_hash}")
+}
+
+/// The sorted set of ids of the devices that carry a fingerprint, scored by
+/// each device's `last_seen_at` (Unix seconds) as of its last write, so the
+/// newest sightings are read first and a lookup reads a bounded number of
+/// rows however many devices share the fingerprint.
+pub(super) fn fingerprint_zset_key(prefix: &str, tenant: &str, hex_hash: &str) -> String {
+    format!("{prefix}:dev:fpz:{tenant}:{hex_hash}")
 }
 
 /// The set of ids of the devices of one user that carry a fingerprint: the
@@ -33,6 +44,23 @@ pub(super) fn fingerprint_user_key(
     user: &str,
 ) -> String {
     format!("{prefix}:dev:fpu:{tenant}:{hex_hash}:{user}")
+}
+
+/// The create guard of `create_or_find` for one `(tenant, fingerprint,
+/// owner)`: the device the last create of that key inserted, after the
+/// generation of that insert (`generation:device_id`), so a
+/// concurrent create of the key conflicts instead of inserting a second row.
+/// `user` is `None` for an unowned device.
+pub(super) fn create_guard_key(
+    prefix: &str,
+    tenant: &str,
+    hex_hash: &str,
+    user: Option<&str>,
+) -> String {
+    format!(
+        "{prefix}:dev:new:{tenant}:{hex_hash}:{}",
+        user.unwrap_or("-")
+    )
 }
 
 pub(super) fn user_index_key(prefix: &str, tenant: &str, user: &str) -> String {
@@ -133,7 +161,11 @@ impl ValkeyDeviceStore {
                     &[(BoundFormat::DEVICE_ROW_V1, device_row_id_v1(tenant, id))],
                     payload,
                 )?;
-                (opened.plaintext, opened.stale, opened.legacy)
+                (
+                    opened.plaintext,
+                    opened.stale,
+                    opened.binding != Binding::Current,
+                )
             }
             None => (payload.to_vec(), false, false),
         };

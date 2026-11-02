@@ -641,6 +641,44 @@ async fn a_tenant_bound_ceremony_refuses_a_user_of_another_tenant() {
     assert!(!session.is_authenticated().await);
 }
 
+/// The caller resolved `user` from the credential's user handle and may
+/// carry the wrong tenant on it. The tenant of record is the store's, and it
+/// must be settled before any gate runs: a gate evaluated against the
+/// supplied tenant would answer for, and write audit rows against, a tenant
+/// the user is not in.
+#[tokio::test]
+async fn a_user_supplied_with_the_wrong_tenant_is_refused_before_any_gate_runs() {
+    let f = fixture(true);
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let wrong_tenant = common::test_user_in_tenant("u1", "alice", "t2");
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &wrong_tenant, &list, &session)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, AuthnError::CrossTenant),
+        "the store's tenant decides, before the tenant and lockout gates: {err:?}"
+    );
+    assert!(!session.is_authenticated().await);
+    let rows_for_t2: Vec<_> = f
+        .identity
+        .events()
+        .into_iter()
+        .filter(|e| e.tenant_id == Some(axess_identity::testing::tenant("t2")))
+        .collect();
+    assert!(
+        rows_for_t2.is_empty(),
+        "no audit row may attribute the user to the supplied tenant: {rows_for_t2:?}"
+    );
+    let left = session.get_custom("axess.fido2.disc_started").await;
+    assert!(
+        left.as_ref().is_none_or(|v| v.is_null()),
+        "the ceremony stamp is cleared on this refusal too: {left:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_missing_ceremony_state_does_not_leave_its_timestamp_behind() {
     let f = fixture(true);
@@ -661,5 +699,166 @@ async fn a_missing_ceremony_state_does_not_leave_its_timestamp_behind() {
     assert!(
         left.as_ref().is_none_or(|v| v.is_null()),
         "stamp left behind: {left:?}"
+    );
+}
+
+// ── The cross-tenant refusals and the ceremony's tenant ─────────────────────
+
+/// Counts the login failures the service reports.
+#[derive(Default, Clone)]
+struct FailureCount(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl axess_core::metrics::AuthnMetrics for FailureCount {
+    fn auth_failure(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A ceremony begun for one tenant refusing a user of another is a login
+/// refusal like any other: it leaves a failed row naming the user and the
+/// reason, and counts as a failure. It used to be answered silently.
+#[tokio::test]
+async fn a_cross_tenant_refusal_is_audited_and_counted() {
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let f = fixture(true);
+    let counter = FailureCount::default();
+    let service = AuthnService::builder(f.identity.clone(), f.factors.clone())
+        .with_fido2(AcceptingProvider(DefaultFido2Provider::new(
+            WebauthnBuilder::new("localhost", &Url::parse("https://localhost:8443").unwrap())
+                .unwrap()
+                .build()
+                .unwrap(),
+        )))
+        .with_clock(f.clock.clone())
+        .with_metrics(counter.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    service
+        .begin_discoverable_login_in_tenant(&axess_identity::testing::tenant("t2"), &session)
+        .await
+        .unwrap();
+    let list = stored(&f).await.unwrap_or_default();
+
+    let err = service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::CrossTenant), "{err:?}");
+    let rows: Vec<_> = f
+        .identity
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.event_type == AuthEventType::FactorVerified
+                && e.event_status == AuthEventStatus::Failure
+                && e.error
+                    .as_ref()
+                    .is_some_and(|r| r.to_string() == "cross_tenant")
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "one failed row names the refusal: {rows:?}");
+    assert_eq!(rows[0].user_id, Some(uid("u1")));
+    assert_eq!(
+        rows[0].tenant_id,
+        Some(test_user("u1", "alice").tenant_id),
+        "attributed to the user's tenant of record"
+    );
+    assert_eq!(rows[0].session_id, Some(session.session_id().await));
+    assert_eq!(
+        counter.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "and counted as a login failure"
+    );
+}
+
+/// A user whose supplied record carries the wrong tenant is refused with a
+/// row attributed to the tenant of record, never to the supplied one.
+#[tokio::test]
+async fn a_wrong_tenant_on_the_record_is_audited_against_the_tenant_of_record() {
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let f = fixture(true);
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let wrong_tenant = common::test_user_in_tenant("u1", "alice", "t2");
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &wrong_tenant, &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::CrossTenant), "{err:?}");
+    let rows: Vec<_> = f
+        .identity
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.event_type == AuthEventType::FactorVerified
+                && e.event_status == AuthEventStatus::Failure
+                && e.error
+                    .as_ref()
+                    .is_some_and(|r| r.to_string() == "cross_tenant")
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].user_id, Some(uid("u1")));
+    assert_eq!(rows[0].tenant_id, Some(test_user("u1", "alice").tenant_id));
+}
+
+/// The tenant a ceremony began for is retired with the ceremony on every
+/// way out, so it cannot bind a later ceremony begun without one. The
+/// tenant-gate exit (a suspended tenant) used to leave it behind.
+#[tokio::test]
+async fn the_ceremony_tenant_is_cleared_on_the_tenant_gate_exit() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let f = fixture_with(
+        true,
+        vec![vec![FactorKind::Fido2]],
+        EntityState::Suspended(StatusDetail {
+            reason: "hold".into(),
+            since: chrono::Utc::now(),
+            until: None,
+        }),
+    );
+    let session = test_session();
+    f.service
+        .begin_discoverable_login_in_tenant(&test_user("u1", "alice").tenant_id, &session)
+        .await
+        .unwrap();
+    let list = stored(&f).await.unwrap_or_default();
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::InvalidAssertion), "{err:?}");
+    let left = session.get_custom("axess.fido2.disc_tenant").await;
+    assert!(
+        left.as_ref().is_none_or(|v| v.is_null()),
+        "the ceremony tenant is cleared with the ceremony: {left:?}"
+    );
+}
+
+/// The same on the expiry exit.
+#[tokio::test]
+async fn the_ceremony_tenant_is_cleared_on_the_expiry_exit() {
+    let f = fixture(true);
+    let session = test_session();
+    f.service
+        .begin_discoverable_login_in_tenant(&test_user("u1", "alice").tenant_id, &session)
+        .await
+        .unwrap();
+    let list = stored(&f).await.unwrap_or_default();
+    f.clock.advance(chrono::Duration::hours(1));
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
+    let left = session.get_custom("axess.fido2.disc_tenant").await;
+    assert!(
+        left.as_ref().is_none_or(|v| v.is_null()),
+        "the ceremony tenant is cleared with the ceremony: {left:?}"
     );
 }

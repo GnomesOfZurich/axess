@@ -39,7 +39,8 @@ async fn exchange_happy_path_returns_downstream_token() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("shh".into()));
+    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("shh".into()))
+        .expect("client");
     let req = TokenExchangeRequest::new("user-jwt-here", token_types::JWT)
         .with_audience("https://compute-worker.gnomes")
         .with_scopes(["compute.read", "compute.write"]);
@@ -73,7 +74,8 @@ async fn exchange_passes_actor_token_for_azure_obo_shape() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "axess-tenant", Some("shh".into()));
+    let client = TokenExchangeClient::new(token_url(&server), "axess-tenant", Some("shh".into()))
+        .expect("client");
     let req = TokenExchangeRequest::new("user-jwt", token_types::JWT)
         .with_actor_token("axess-workload-jwt", token_types::JWT)
         .with_audience("https://graph.microsoft.com");
@@ -99,7 +101,7 @@ async fn exchange_works_without_client_secret_for_mtls_auth() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "axess", None);
+    let client = TokenExchangeClient::new(token_url(&server), "axess", None).expect("client");
     let req = TokenExchangeRequest::new("user-token", token_types::JWT);
     let resp = client.exchange(&req).await.expect("exchange");
     assert_eq!(&*resp.access_token, "downstream");
@@ -124,7 +126,8 @@ async fn exchange_propagates_token_endpoint_error() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into()));
+    let client =
+        TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
     let req = TokenExchangeRequest::new("token", token_types::JWT)
         .with_audience("https://forbidden.example");
     let err = client.exchange(&req).await.expect_err("400 must propagate");
@@ -149,7 +152,8 @@ async fn exchange_rejects_empty_access_token_in_response() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into()));
+    let client =
+        TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
     let req = TokenExchangeRequest::new("token", token_types::JWT);
     let err = client
         .exchange(&req)
@@ -180,7 +184,8 @@ async fn exchange_carries_resource_when_set() {
         .mount(&server)
         .await;
 
-    let client = TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into()));
+    let client =
+        TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
     let req = TokenExchangeRequest::new("token", token_types::JWT)
         .with_resource(Url::parse("https://api.gnomes/v1/market").unwrap());
     let _ = client.exchange(&req).await.expect("resource carried");
@@ -201,7 +206,8 @@ async fn exchange_form_encodes_basic_credentials() {
         .expect(1)
         .mount(&server)
         .await;
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("a:b%c+d".into()));
+    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("a:b%c+d".into()))
+        .expect("client");
     let req = TokenExchangeRequest::new("user-jwt", token_types::JWT);
     client.exchange(&req).await.expect("exchange");
 }
@@ -219,7 +225,7 @@ async fn exchange_bounds_the_response_bodies() {
         .up_to_n_times(1)
         .mount(&server)
         .await;
-    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", None);
+    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", None).expect("client");
     let req = TokenExchangeRequest::new("t", token_types::JWT);
     let err = client.exchange(&req).await.expect_err("500");
     let DelegatedError::TokenEndpoint { body, .. } = err else {
@@ -268,7 +274,8 @@ async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
         Url::parse("http://192.0.2.1:9/token").unwrap(),
         "gnomes-api",
         Some("shh".into()),
-    );
+    )
+    .expect("client");
     let err = client
         .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
         .await
@@ -293,9 +300,36 @@ async fn the_default_client_does_not_follow_a_redirect() {
         .expect(1)
         .mount(&first)
         .await;
-    let client = TokenExchangeClient::new(token_url(&first), "gnomes-api", Some("shh".into()));
+    let client = TokenExchangeClient::new(token_url(&first), "gnomes-api", Some("shh".into()))
+        .expect("client");
     let result = client
         .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
         .await;
     assert!(result.is_err());
+}
+
+/// A transport error names no URL: the endpoint can carry a tenant path or
+/// a key in its query, and the error reaches adopter logs.
+#[tokio::test]
+async fn a_transport_error_names_no_url() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/tenant-7f3a9c/token")).unwrap();
+    let client = TokenExchangeClient::new(url, "gnomes-api", Some("shh".into())).expect("client");
+    let err = client
+        .exchange(&TokenExchangeRequest::new("jwt", token_types::JWT))
+        .await
+        .expect_err("nothing listens");
+    let shown = format!("{err} / {err:?}");
+    assert!(
+        matches!(err, DelegatedError::Transport(_)),
+        "a connection refused is a transport error: {err:?}"
+    );
+    assert!(
+        !shown.contains("tenant-7f3a9c") && !shown.contains(&port.to_string()),
+        "the error names the URL: {shown}"
+    );
 }

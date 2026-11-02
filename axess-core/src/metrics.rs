@@ -117,6 +117,13 @@ pub trait AuthnMetrics: Send + Sync + 'static {
     /// An account was locked due to too many failed attempts.
     fn account_locked(&self) {}
 
+    /// A recovery code matched only under the previous pepper of a rotation.
+    ///
+    /// The login succeeded, and the set it came from stays sealed under the
+    /// retired secret: it should be regenerated, and the previous pepper
+    /// dropped once this stops firing.
+    fn recovery_codes_under_previous_pepper(&self) {}
+
     // ── Sessions ────────────────────────────────────────────────────────
 
     /// A new session was created (ID cycled after auth or first visit).

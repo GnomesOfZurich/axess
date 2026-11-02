@@ -1,9 +1,10 @@
 //! Shared ceremony-state helpers used across the OAuth login submodules.
 //!
 //! `is_oauth_expired`, `record_oauth_failure`, `record_oauth_failure_and_clear`,
-//! and `clear_oauth_state` are needed by multiple ceremony steps (begin clears
-//! stale state, finish records failures and checks expiry). They live here so
-//! the per-step modules can stay focused on their own happy path.
+//! `clear_oauth_state` and the ceremony's tenant binding are needed by
+//! multiple ceremony steps (begin clears stale state, finish records failures
+//! and checks expiry, complete checks the tenant). They live here so the
+//! per-step modules can stay focused on their own happy path.
 
 use crate::authn::service::{AuthnService, RequestAuthnService};
 use crate::authn::{
@@ -12,7 +13,7 @@ use crate::authn::{
     store::{FactorStore, IdentityStore},
 };
 use crate::session::extractor::AuthSession;
-use axess_factors::oauth::OAuthError;
+use axess_factors::oauth::{OAuthError, keys as oauth_keys};
 
 impl<I, F> RequestAuthnService<I, F>
 where
@@ -79,7 +80,8 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// Check if the OAuth ceremony has exceeded the provider's timeout.
+    /// Check if the OAuth ceremony has exceeded `configured`, the timeout
+    /// of the provider the ceremony runs against.
     ///
     /// Caps the effective ceremony timeout at the RFC 6749 §4.1.2
     /// RECOMMENDED authorization-code lifetime of **10 minutes** (600s).
@@ -93,6 +95,7 @@ where
         &self,
         session: &AuthSession,
         provider_name: &str,
+        configured: std::time::Duration,
     ) -> bool {
         use axess_factors::oauth::types::keys as oauth_keys;
         const RFC_6749_AUTH_CODE_MAX: std::time::Duration = std::time::Duration::from_secs(600);
@@ -109,12 +112,6 @@ where
         let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(ts) else {
             return true;
         };
-        let configured = self
-            .inner
-            .oauth_providers
-            .get(provider_name)
-            .map(|p| p.ceremony_timeout())
-            .unwrap_or(RFC_6749_AUTH_CODE_MAX);
         let timeout = configured.min(RFC_6749_AUTH_CODE_MAX);
         if configured > RFC_6749_AUTH_CODE_MAX {
             tracing::warn!(
@@ -135,51 +132,126 @@ where
     /// every flow; repeated logins under the size cap would otherwise
     /// eventually trip the `max_custom_bytes` guard and wipe the entire bag.
     ///
-    /// All eight removals run inside one
+    /// Every removal, the tenant binding included, runs inside one
     /// [`AuthSession::mutate_custom`] closure (a single write-lock
-    /// acquisition). The previous implementation issued the removals
-    /// serially via `remove_custom`; a concurrent `begin_oauth_login`
-    /// (or any caller of `set_custom`) could re-insert one of these
-    /// keys mid-clear, leaving the session with partial ceremony state
-    /// that downstream calls would treat as "active flow".
+    /// acquisition): a concurrent `begin_oauth_login` (or any caller of
+    /// `set_custom`) cannot re-insert one of these keys mid-clear and leave
+    /// the session with partial ceremony state that downstream calls would
+    /// treat as an active flow.
     pub(super) async fn clear_oauth_state(&self, session: &AuthSession) {
-        self.clear_oauth_state_except_tenant(session).await;
-        remove_expected_tenant(session).await;
+        remove_ceremony_keys(session, true).await;
     }
 
-    /// Clear the ceremony state but keep the expected-tenant binding.
+    /// Clear the ceremony state but keep the tenant binding.
     ///
     /// `finish_oauth_login` uses this: the binding must survive until
     /// `complete_oauth_login` has compared it with the resolved user's
-    /// tenant, and `complete` removes it afterwards.
+    /// tenant, and `complete` removes it afterwards
+    /// ([`take_ceremony_tenant`]).
     pub(super) async fn clear_oauth_state_except_tenant(&self, session: &AuthSession) {
-        use axess_factors::oauth::types::keys as oauth_keys;
-        const KEYS: &[&str] = &[
-            oauth_keys::PKCE_VERIFIER,
-            oauth_keys::CSRF_STATE,
-            oauth_keys::NONCE,
-            oauth_keys::PROVIDER,
-            oauth_keys::PROVIDER_ISSUER,
-            oauth_keys::STARTED,
-            // Cleared after the OIDC callback completes.
-            oauth_keys::PAR_INFLIGHT,
-        ];
-        session
-            .mutate_custom(|obj| {
-                for key in KEYS {
-                    obj.remove(*key);
-                }
-            })
-            .await;
+        remove_ceremony_keys(session, false).await;
     }
 }
 
-/// Remove the begin-side expected-tenant binding.
-pub(super) async fn remove_expected_tenant(session: &AuthSession) {
-    use axess_factors::oauth::types::keys as oauth_keys;
+/// The keys of an in-flight ceremony, in one place: what
+/// `stash_oauth_ceremony` writes (and the PAR marker) is what is cleared.
+const CEREMONY_KEYS: &[&str] = &[
+    oauth_keys::PKCE_VERIFIER,
+    oauth_keys::CSRF_STATE,
+    oauth_keys::NONCE,
+    oauth_keys::PROVIDER,
+    oauth_keys::PROVIDER_ISSUER,
+    oauth_keys::STARTED,
+    oauth_keys::DPOP_KEY,
+    oauth_keys::PAR_INFLIGHT,
+];
+
+async fn remove_ceremony_keys(session: &AuthSession, with_tenant: bool) {
     session
         .mutate_custom(|obj| {
-            obj.remove(oauth_keys::EXPECTED_TENANT);
+            for key in CEREMONY_KEYS {
+                obj.remove(*key);
+            }
+            if with_tenant {
+                obj.remove(oauth_keys::CEREMONY_TENANT);
+            }
         })
         .await;
+}
+
+/// A stored tenant binding that does not read: tampering, or a session
+/// written by something else. Refused, never taken for no binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UnreadableBinding;
+
+/// The tenant a ceremony is bound to: `complete_oauth_login` refuses a
+/// resolved user of another tenant, and, when `provider_from_tenant`, the
+/// callback resolves the provider from this tenant's configuration instead
+/// of the global registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::authn::service::oauth_service) struct CeremonyTenant {
+    pub(in crate::authn::service::oauth_service) tenant: crate::authn::ids::TenantId,
+    pub(in crate::authn::service::oauth_service) provider_from_tenant: bool,
+}
+
+impl CeremonyTenant {
+    /// The session-bag form: `{"tenant": <id>, "provider_from_tenant": bool}`.
+    pub(super) fn to_value(self) -> serde_json::Value {
+        serde_json::json!({
+            "tenant": self.tenant.to_string(),
+            "provider_from_tenant": self.provider_from_tenant,
+        })
+    }
+
+    /// Read the session-bag form. A plain string is the binding a 0.13
+    /// `begin_oauth_login_in_tenant` wrote under the same key (a tenant
+    /// with the global provider). [`UnreadableBinding`] for anything else.
+    fn from_value(value: &serde_json::Value) -> Result<Self, UnreadableBinding> {
+        let parse = |v: &serde_json::Value| {
+            v.as_str()
+                .and_then(|t| t.parse().ok())
+                .ok_or(UnreadableBinding)
+        };
+        match value {
+            serde_json::Value::String(_) => Ok(Self {
+                tenant: parse(value)?,
+                provider_from_tenant: false,
+            }),
+            serde_json::Value::Object(map) => Ok(Self {
+                tenant: map.get("tenant").map(parse).ok_or(UnreadableBinding)??,
+                provider_from_tenant: map
+                    .get("provider_from_tenant")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or(UnreadableBinding)?,
+            }),
+            _ => Err(UnreadableBinding),
+        }
+    }
+}
+
+/// The ceremony's tenant binding, if it has one; `Err` when the stored
+/// binding does not read.
+pub(super) async fn ceremony_tenant(
+    session: &AuthSession,
+) -> Result<Option<CeremonyTenant>, UnreadableBinding> {
+    session
+        .get_custom(oauth_keys::CEREMONY_TENANT)
+        .await
+        .map(|v| CeremonyTenant::from_value(&v))
+        .transpose()
+}
+
+/// Remove the ceremony's tenant binding and return what it was: the binding
+/// is single-use, gone whether the check that reads it passes or not.
+pub(super) async fn take_ceremony_tenant(
+    session: &AuthSession,
+) -> Result<Option<CeremonyTenant>, UnreadableBinding> {
+    // Removed under the session's own lock, not `take_custom`: that one
+    // answers `None` when the store cannot confirm the removal, and `None`
+    // here would read as "no binding" and skip the tenant check.
+    session
+        .mutate_custom(|obj| obj.remove(oauth_keys::CEREMONY_TENANT))
+        .await
+        .map(|v| CeremonyTenant::from_value(&v))
+        .transpose()
 }

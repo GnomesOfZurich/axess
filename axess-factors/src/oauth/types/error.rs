@@ -116,6 +116,39 @@ pub enum OAuthError {
     /// are an identity the caller should not have to scrub from a log.
     #[error("userinfo `sub` does not match the expected subject")]
     SubjectMismatch,
+
+    /// The provider binds its tokens to a DPoP key (RFC 9449) and the call
+    /// passed none: the `dpop` argument of the [`OAuthProvider`] methods,
+    /// or the `dpop_key` argument of the service's `refresh_oauth_token`,
+    /// `fetch_userinfo` and `revoke_oauth_token`. Refused before anything
+    /// is sent: a bound token presented as `Bearer` is refused by a
+    /// resource server that checks the binding and taken by one that does
+    /// not. A caller fault, not an IdP refusal; pass the key the login
+    /// returned in `OAuthClaims::dpop_key`.
+    ///
+    /// [`OAuthProvider`]: crate::oauth::OAuthProvider
+    #[error(
+        "this provider binds tokens to a DPoP key and the call passed none: pass the key \
+         the login returned (`dpop` on the provider methods, `dpop_key` on the service)"
+    )]
+    DpopKeyRequired,
+
+    /// The `private_key_jwt` signer could not sign the client assertion of
+    /// a request. The signer signs one when it is built, so this is a
+    /// runtime fault of the signing backend, not a configuration the
+    /// caller can correct.
+    #[error("client assertion: {0}")]
+    ClientAssertion(#[from] crate::client_assertion::ClientAssertionError),
+
+    /// A store or cipher the OAuth surface reads failed: the per-tenant
+    /// provider store is unreachable, or a sealed credential could not be
+    /// sealed or opened. The cause is kept as the
+    /// [`source`](std::error::Error::source). Distinct from
+    /// [`Discovery`](Self::Discovery), which is the IdP's document or key
+    /// set, and from [`Config`](Self::Config), which is a setting the caller
+    /// can correct.
+    #[error("OAuth store failed: {0}")]
+    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl OAuthError {
@@ -194,6 +227,11 @@ impl OAuthError {
             // stays down.
             Self::AuditStore(_) => true,
 
+            // An unreachable store answers again once it recovers; a cipher
+            // fault does not, but the two share the variant and a capped
+            // retry costs little.
+            Self::Store(_) => true,
+
             // Permanent / semantic rejections; retrying the same input
             // produces the same outcome.
             Self::Config(_)
@@ -213,7 +251,9 @@ impl OAuthError {
             | Self::UnknownKid(_)
             | Self::JwksExpired
             | Self::UnsupportedTokenType
-            | Self::SubjectMismatch => false,
+            | Self::SubjectMismatch
+            | Self::DpopKeyRequired
+            | Self::ClientAssertion(_) => false,
         }
     }
 }
@@ -251,6 +291,7 @@ mod oauth_error_is_transient_tests {
             OAuthError::InsufficientScope,
             OAuthError::UnsupportedTokenType,
             OAuthError::SubjectMismatch,
+            OAuthError::DpopKeyRequired,
             OAuthError::UnknownProvider("p".into()),
             OAuthError::Config("c".into()),
             OAuthError::TokenExchange("t".into()),

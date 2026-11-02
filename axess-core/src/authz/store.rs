@@ -7,10 +7,11 @@
 //! in tests to evaluate authz flows without any Cedar policy files.
 
 use cedar_policy::{
-    Authorizer, Context, Decision, Entities, Entity, EntityUid, PolicySet, Request, Schema,
-    ValidationMode, Validator,
+    Authorizer, Context, Decision, Entities, Entity, EntityTypeName, EntityUid, PolicySet, Request,
+    Schema, ValidationMode, Validator,
 };
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 use super::error::AuthzError;
@@ -107,12 +108,30 @@ pub trait PolicyEvaluator: Send + Sync {
 /// The store owns the schema's action entities (the actions and the action
 /// groups they belong to) and adds them to every evaluation, so a policy
 /// such as `action in Action::"Mutating"` holds whether or not the entity
-/// provider built its entities with the schema.
+/// provider built its entities with the schema. The schema is authoritative:
+/// a provider entity of an action type that differs from the schema's (or
+/// that the schema does not declare) denies the request, see
+/// [`PolicyEvaluator::is_authorized`].
 pub struct PolicyStore {
     policy_set: PolicySet,
     schema: Schema,
     authorizer: Authorizer,
-    action_entities: Vec<Entity>,
+    /// The schema's action entities with their group membership.
+    action_entities: Entities,
+    /// The entity types of the schema's actions. A provider entity of one
+    /// of these types is an action entity and is checked against the schema.
+    action_types: HashSet<EntityTypeName>,
+}
+
+/// Why the provider's entities could not be evaluated with the schema's
+/// action entities.
+enum ActionEntitiesError {
+    /// The provider supplied an action entity that is not the schema's:
+    /// different parents or attributes, or an action the schema does not
+    /// declare.
+    Conflict(EntityUid),
+    /// Cedar refused the merged entity set.
+    Merge(Box<cedar_policy::entities_errors::EntitiesError>),
 }
 
 impl PolicyStore {
@@ -131,9 +150,10 @@ impl PolicyStore {
 
         let action_entities = schema
             .action_entities()
-            .map_err(|e| AuthzError::SchemaParse(format!("{e:?}")))?
+            .map_err(|e| AuthzError::SchemaParse(format!("{e:?}")))?;
+        let action_types = action_entities
             .iter()
-            .cloned()
+            .map(|action| action.uid().type_name().clone())
             .collect();
 
         Ok(Self {
@@ -141,6 +161,7 @@ impl PolicyStore {
             schema,
             authorizer: Authorizer::new(),
             action_entities,
+            action_types,
         })
     }
 
@@ -150,12 +171,30 @@ impl PolicyStore {
     /// when entities are built against the schema; a provider that passes no
     /// schema leaves them out, and `action in Action::"Group"` is then false
     /// without any error, which would silently disable a `forbid` written
-    /// over an action group. Only the missing actions are added, so entities
-    /// that already carry them are used as they are.
+    /// over an action group. The missing actions are added. An action entity
+    /// the provider did supply must be the schema's: a parentless
+    /// `Action::"Delete"` from a provider would otherwise stand in for the
+    /// schema's and take the action out of its groups. Such a conflict is a
+    /// provider (or cache writer) fault, so it is reported rather than
+    /// repaired: the caller denies. Cedar applies the same rule when entities
+    /// are built with the schema; this extends it to entities built without.
     fn with_action_entities<'a>(
         &self,
         entities: &'a Entities,
-    ) -> Result<Cow<'a, Entities>, Box<cedar_policy::entities_errors::EntitiesError>> {
+    ) -> Result<Cow<'a, Entities>, ActionEntitiesError> {
+        for supplied in entities
+            .iter()
+            .filter(|entity| self.action_types.contains(entity.uid().type_name()))
+        {
+            let uid = supplied.uid();
+            let matches_schema = self
+                .action_entities
+                .get(&uid)
+                .is_some_and(|schema_action| schema_action.deep_eq(supplied));
+            if !matches_schema {
+                return Err(ActionEntitiesError::Conflict(uid));
+            }
+        }
         let missing: Vec<Entity> = self
             .action_entities
             .iter()
@@ -169,7 +208,7 @@ impl PolicyStore {
             .clone()
             .add_entities(missing, None)
             .map(Cow::Owned)
-            .map_err(Box::new)
+            .map_err(|e| ActionEntitiesError::Merge(Box::new(e)))
     }
 
     /// Access the Cedar schema (e.g. for entity provider validation).
@@ -236,7 +275,19 @@ impl PolicyEvaluator for PolicyStore {
         let entities = match self.with_action_entities(entities) {
             Ok(entities) => entities,
             Err(e) => {
-                tracing::error!("Cedar action entities could not be merged: denied: {e:?}");
+                let reason = match &e {
+                    ActionEntitiesError::Conflict(uid) => {
+                        tracing::error!(
+                            action_entity = %uid,
+                            "entity provider supplied an action entity that is not the schema's: denied"
+                        );
+                        "action_entities_conflict"
+                    }
+                    ActionEntitiesError::Merge(e) => {
+                        tracing::error!("Cedar action entities could not be merged: denied: {e:?}");
+                        "action_entities_merge_failed"
+                    }
+                };
                 if let Some(subject) = &subject {
                     tracing::info!(
                         target: "axess::authz::decision",
@@ -244,7 +295,7 @@ impl PolicyEvaluator for PolicyStore {
                         action = %subject.action,
                         resource = %subject.resource,
                         decision = "deny",
-                        reason = "action_entities_merge_failed",
+                        reason = reason,
                         latency_us = started.elapsed().as_micros() as u64,
                     );
                 }

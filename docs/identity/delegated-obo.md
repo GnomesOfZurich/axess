@@ -183,7 +183,7 @@ let client = TokenExchangeClient::new(
     token_endpoint,
     client_id,
     Some(ZeroizedString::new(client_secret)),
-);
+)?;
 
 let downstream_token = client
     .exchange(

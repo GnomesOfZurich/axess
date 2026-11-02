@@ -117,23 +117,31 @@ const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Spacing of reconnection attempts after failures: it doubles from the
 /// first interval up to the last.
-const BACKOFF_FIRST_SECS: i64 = 1;
-const BACKOFF_MAX_SECS: i64 = 30;
+const BACKOFF_FIRST_SECS: u64 = 1;
+const BACKOFF_MAX_SECS: u64 = 30;
 
-/// Failure backoff on the injected clock.
+/// Failure backoff, measured on the monotonic clock: the spacing is an
+/// amount of time to wait, and the wall clock (the registry's injected
+/// clock) can be stepped or frozen without the next attempt ever being due.
 #[derive(Default, Debug, Clone, Copy)]
 struct Backoff {
     failures: u32,
-    retry_at: Option<chrono::DateTime<chrono::Utc>>,
+    retry_at: Option<tokio::time::Instant>,
 }
 
 impl Backoff {
-    /// Record a failed attempt at `now` and set the earliest next attempt.
-    fn failed(&mut self, now: chrono::DateTime<chrono::Utc>) {
+    /// Record a failed attempt now and set the earliest next attempt.
+    fn failed(&mut self) {
         self.failures = self.failures.saturating_add(1);
         let shift = self.failures.saturating_sub(1).min(16);
         let secs = (BACKOFF_FIRST_SECS << shift).min(BACKOFF_MAX_SECS);
-        self.retry_at = Some(now + chrono::Duration::seconds(secs));
+        self.retry_at = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+    }
+
+    /// Whether an attempt may be made now.
+    fn ready(&self) -> bool {
+        self.retry_at
+            .is_none_or(|until| tokio::time::Instant::now() >= until)
     }
 }
 
@@ -324,8 +332,7 @@ impl SharedSubscriber {
     /// is the registry's client, cloned for the new connection; `prefix` is
     /// the registry prefix whose `revoked-session:` and `revoked-user:`
     /// channels are subscribed; `channels` are this watcher's user and
-    /// session channels; `now` is the registry's injected clock reading, used
-    /// only to space reconnection attempts after a failure.
+    /// session channels.
     ///
     /// The health probe of an existing connection runs outside the setup
     /// mutex, so joins onto a healthy connection do not queue behind each
@@ -339,7 +346,6 @@ impl SharedSubscriber {
         base: &Client,
         prefix: &str,
         channels: [String; 2],
-        now: chrono::DateTime<chrono::Utc>,
     ) -> Option<Watch> {
         let hold = self.register(channels);
         let slot = hold.slot.clone();
@@ -364,9 +370,7 @@ impl SharedSubscriber {
         {
             return Some(Watch { _hold: hold, slot });
         }
-        if let Some(until) = self.lock().backoff.retry_at
-            && now < until
-        {
+        if !self.lock().backoff.ready() {
             return None;
         }
 
@@ -392,7 +396,7 @@ impl SharedSubscriber {
                 Some(Watch { _hold: hold, slot })
             }
             None => {
-                self.lock().backoff.failed(now);
+                self.lock().backoff.failed();
                 // Whatever was published while there is no connection is
                 // missed, so the next successful connection rechecks.
                 self.connection_lost();

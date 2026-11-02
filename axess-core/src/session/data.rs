@@ -91,8 +91,8 @@ pub struct SessionData {
 pub(crate) const LOGIN_FLOW_KEY: &str = "axess.login.flow";
 
 /// Drop the pre-login contents of the custom bag when a session becomes
-/// authenticated, keeping the key the login service owns for the flow in
-/// flight and the keys the application registered to be carried across.
+/// authenticated, keeping the key the login service owns (the flow in
+/// flight) and the keys the application registered to be carried across.
 ///
 /// State an anonymous visitor could put in a session (a cart, a locale, a
 /// planted value) must not ride into the authenticated session, so the
@@ -126,6 +126,24 @@ pub(crate) fn json_byte_len(value: &serde_json::Value) -> usize {
         return 0;
     }
     count.0
+}
+
+/// Clear a custom bag that exceeds `max_bytes` serialized (zero is no cap).
+/// Every write of a session applies it, so data loaded, migrated or merged
+/// from a concurrent write cannot be stored oversized.
+pub(crate) fn cap_custom(custom: &mut serde_json::Value, max_bytes: usize) {
+    if max_bytes == 0 {
+        return;
+    }
+    let custom_size = json_byte_len(custom);
+    if custom_size > max_bytes {
+        tracing::warn!(
+            custom_size,
+            max = max_bytes,
+            "session custom data exceeds size limit; clearing custom data"
+        );
+        *custom = serde_json::Value::default();
+    }
 }
 
 fn default_version() -> u8 {
@@ -251,6 +269,11 @@ pub enum AuthState {
         attempt_count: u32,
         /// Timestamp of last attempt (for rate limiting / lockout).
         last_attempt: Option<DateTime<Utc>>,
+        /// The groups the directory returned when an LDAP bind step of this
+        /// login verified, carried into
+        /// [`AuthState::Authenticated::ldap_groups`]; `None` until then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ldap_groups: Option<Vec<String>>,
     },
 
     /// All factors verified: user is fully authenticated.
@@ -271,6 +294,24 @@ pub enum AuthState {
         /// sessions readable.
         #[serde(default)]
         factors_completed: Vec<FactorKind>,
+        /// The administrator acting in `user_id`'s name and when the
+        /// impersonation began, for a session `begin_impersonation` made;
+        /// `None` for the user's own session. Part of the authenticated
+        /// state, so nothing done to the custom data can remove it; it
+        /// ends with the state (`end_impersonation`, logout, a new login).
+        /// Stored as an object (`{"admin": .., "since": ..}`). Sessions
+        /// written before this field read as `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        impersonator: Option<Impersonation>,
+        /// The groups the directory returned when this login's LDAP bind
+        /// factor verified (empty when the provider searches no groups);
+        /// `None` for a login without an LDAP bind. Part of the
+        /// authenticated state for the same reasons as `impersonator`: a
+        /// handler cannot overwrite them, the custom-data cap cannot drop
+        /// them, and they end with the state. Read with
+        /// `AuthSession::ldap_groups`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ldap_groups: Option<Vec<String>>,
     },
 
     /// Authenticated but blocked on a post-auth workflow (e.g. signup, KYC, password reset).
@@ -282,6 +323,17 @@ pub enum AuthState {
         /// Workflow currently blocking full authentication (e.g. signup, KYC).
         workflow: WorkflowState,
     },
+}
+
+/// An administrator acting in a user's name: who, and since when. Carried by
+/// [`AuthState::Authenticated::impersonator`] and returned by
+/// [`AuthSession::impersonation`](super::extractor::AuthSession::impersonation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Impersonation {
+    /// The administrator.
+    pub admin: UserId,
+    /// When `begin_impersonation` made the session.
+    pub since: DateTime<Utc>,
 }
 
 impl AuthState {
@@ -310,6 +362,24 @@ impl AuthState {
     /// Return `true` if this state represents a fully authenticated session.
     pub fn is_authenticated(&self) -> bool {
         matches!(self, AuthState::Authenticated { .. })
+    }
+
+    /// The administrator impersonating the authenticated user and when the
+    /// impersonation began, or `None` for every other session.
+    pub fn impersonation(&self) -> Option<Impersonation> {
+        match self {
+            AuthState::Authenticated { impersonator, .. } => *impersonator,
+            _ => None,
+        }
+    }
+
+    /// The groups the directory returned for the LDAP bind of an
+    /// authenticated session, or `None` for every other session.
+    pub fn ldap_groups(&self) -> Option<&[String]> {
+        match self {
+            AuthState::Authenticated { ldap_groups, .. } => ldap_groups.as_deref(),
+            _ => None,
+        }
     }
 
     /// Return `true` if this is an unauthenticated guest session.
@@ -360,6 +430,7 @@ impl AuthState {
             completed: Vec::new(),
             attempt_count: 0,
             last_attempt: None,
+            ldap_groups: None,
         };
     }
 
@@ -374,6 +445,7 @@ impl AuthState {
             user_id,
             tenant_id,
             factors_completed,
+            ldap_groups,
             ..
         } = self
         else {
@@ -387,6 +459,9 @@ impl AuthState {
             completed: std::mem::take(factors_completed),
             attempt_count: 0,
             last_attempt: None,
+            // The groups of the login stay with the session; an LDAP bind
+            // in the step-up replaces them.
+            ldap_groups: ldap_groups.take(),
         };
         true
     }
@@ -409,7 +484,31 @@ impl AuthState {
             tenant_id,
             authn_time,
             factors_completed: Vec::new(),
+            impersonator: None,
+            ldap_groups: None,
         };
+    }
+
+    /// Mark an `Authenticated` state as an impersonation by `admin` begun
+    /// at `since`. Returns `false`, changing nothing, from any other state.
+    pub(crate) fn set_impersonator(&mut self, admin: UserId, since: DateTime<Utc>) -> bool {
+        let AuthState::Authenticated { impersonator, .. } = self else {
+            return false;
+        };
+        *impersonator = Some(Impersonation { admin, since });
+        true
+    }
+
+    /// Record the groups the directory returned for an LDAP bind step of
+    /// the login in flight; the transition to `Authenticated` carries them.
+    /// Each bind replaces the list, so a login after a group change sees
+    /// the new one. Does nothing outside `Authenticating`, as
+    /// [`advance_factor`](Self::advance_factor) does.
+    #[cfg(feature = "ldap")]
+    pub(crate) fn set_ldap_groups(&mut self, groups: Vec<String>) {
+        if let AuthState::Authenticating { ldap_groups, .. } = self {
+            *ldap_groups = Some(groups);
+        }
     }
 
     /// Replace the state with `PendingWorkflow { … }`.
@@ -451,6 +550,7 @@ impl AuthState {
                 tenant_id,
                 remaining,
                 completed,
+                ldap_groups,
                 ..
             } => {
                 // The step this factor satisfies is done; the factor itself
@@ -463,11 +563,14 @@ impl AuthState {
                     let uid = *user_id;
                     let tid = *tenant_id;
                     let factors = std::mem::take(completed);
+                    let ldap_groups = ldap_groups.take();
                     *self = AuthState::Authenticated {
                         user_id: uid,
                         tenant_id: tid,
                         authn_time,
                         factors_completed: factors,
+                        impersonator: None,
+                        ldap_groups,
                     };
                     AdvanceOutcome::Completed
                 } else {
@@ -580,6 +683,9 @@ pub enum WorkflowKind {
     /// Application-defined workflow with a custom name.
     Custom(Arc<str>),
 }
+
+mod merge;
+pub(crate) use merge::merge_concurrent;
 
 #[cfg(test)]
 mod tests;

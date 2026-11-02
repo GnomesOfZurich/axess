@@ -115,9 +115,12 @@ async fn lockout_is_enforced_before_the_verifier_and_expires() {
     assert_eq!(r.identity.failed_attempts_for("u1"), 3);
 
     // The store never changed account_status, yet the correct password no
-    // longer gets in, at either gate, and the verifier does not run.
+    // longer gets in, at either gate, and the verifier does not run. The
+    // begin gate conceals the lock behind the unknown-identifier answer by
+    // default; the verify gate, reached only by a flow begun before the
+    // lock, names it.
     let jobs = r.kdf.jobs_started();
-    assert_eq!(attempt(&r, "Gnomes2+").await, "begin-locked:true");
+    assert_eq!(attempt(&r, "Gnomes2+").await, "begin:InvalidCredentials");
     let outcome = r.svc.verify_factor(&pw("Gnomes2+"), &early).await.unwrap();
     assert!(
         matches!(outcome, FactorOutcome::Locked { until: Some(_) }),
@@ -367,16 +370,9 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
             .unwrap()
     );
 
-    let refreshed = refresh_session_with_status_check(
-        &plaintext,
-        &store,
-        &config,
-        &rng,
-        clock.now(),
-        None,
-        |_| async { true },
-    )
-    .await;
+    let refreshed = Refresh::new(&plaintext, |_| async { true })
+        .run(&store, &config, &rng, clock.now())
+        .await;
     assert!(
         refreshed.is_err(),
         "the old refresh token must not mint a session"
@@ -549,6 +545,88 @@ async fn step_up_asks_an_authenticated_session_for_another_factor() {
     );
 }
 
+/// A step-up for a factor the user has not enrolled used to move the
+/// session into `Authenticating` with a step nothing could ever satisfy:
+/// the session lost its access and had no way to finish.
+#[tokio::test]
+async fn step_up_refuses_a_factor_the_user_has_not_enrolled() {
+    let r = rig_with(EntityState::Active, false);
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
+        .await;
+
+    let res = r.svc.begin_step_up(&session, vec![FactorKind::Totp]).await;
+
+    assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
+    assert!(
+        session.is_authenticated().await,
+        "a refused step-up leaves the session as it was"
+    );
+    let stamp = session.get_custom("axess.login.flow").await;
+    assert!(stamp.is_none(), "no flow stamp is left behind: {stamp:?}");
+}
+
+/// Among several alternatives only the enrolled ones are asked for; the
+/// first enrolled one is the answer.
+#[tokio::test]
+async fn step_up_keeps_only_the_enrolled_alternatives() {
+    let r = rig_with(EntityState::Active, true);
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
+        .await;
+
+    let first = r
+        .svc
+        .begin_step_up(&session, vec![FactorKind::Hotp, FactorKind::Totp])
+        .await
+        .unwrap();
+    assert_eq!(first, FactorKind::Totp, "HOTP is not enrolled");
+
+    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let done = r
+        .svc
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+    assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
+}
+
+/// A step-up is stamped like a login: a password replaced while the step
+/// is open drops it, as it drops a half-finished login.
+#[tokio::test]
+async fn step_up_is_dropped_by_a_password_change() {
+    let r = rig_with(EntityState::Active, true);
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
+        .await;
+    r.svc
+        .begin_step_up(&session, vec![FactorKind::Totp])
+        .await
+        .unwrap();
+    let token = r
+        .svc
+        .begin_password_reset("alice", "default", Duration::from_secs(300))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        r.svc
+            .complete_password_reset(&uid("u1"), &token, "A-long-new-passphrase-9!")
+            .await
+            .unwrap()
+    );
+
+    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let res = r
+        .svc
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await;
+    assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
+}
+
 #[tokio::test]
 async fn step_up_requires_an_authenticated_session() {
     let r = rig();
@@ -627,7 +705,9 @@ async fn a_candidate_is_not_resumed_by_a_different_session() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(candidate.clone());
-    let svc = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_signup_conflicts_revealed()
+        .build()
         .with_audit_context(AuditContext::default());
     let stranger = test_session();
     let outcome = svc
@@ -683,4 +763,40 @@ async fn an_oversized_reset_identifier_is_answered_as_unknown() {
         .begin_password_reset(&huge, "default", Duration::from_secs(300))
         .await;
     assert!(matches!(res, Ok(None)), "{res:?}");
+}
+
+// ── logout under a hanging audit store ──────────────────────────────────────
+
+/// A logout the caller gives up on during the audit write has already ended
+/// the session: the cookie is a guest and the registry entry is gone.
+#[tokio::test]
+async fn a_logout_cancelled_during_the_audit_write_leaves_a_guest() {
+    use axess_core::session::store::{MemorySessionRegistry, SessionRegistry};
+
+    let registry = MemorySessionRegistry::new();
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .with_registry(registry.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), chrono::Utc::now())
+        .await;
+    let sid = session.session_id().await;
+    registry.register(&uid("u1"), &sid).await.unwrap();
+    assert!(session.is_authenticated().await);
+
+    identity.arm_record_event_hang();
+    let gave_up = tokio::time::timeout(Duration::from_millis(50), svc.logout(&session)).await;
+    assert!(gave_up.is_err(), "the audit write never completes");
+
+    assert!(
+        !session.is_authenticated().await,
+        "the session must be cleared before the audit write is awaited"
+    );
+    assert_ne!(session.session_id().await, sid, "and its id rotated");
+    assert!(!registry.is_valid(&uid("u1"), &sid).await.unwrap());
 }

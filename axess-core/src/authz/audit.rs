@@ -46,6 +46,8 @@
 //! A denial that happens before Cedar is asked also emits the event, with
 //! `decision = "deny"`, no `reasons` or `latency_us`, and one of these
 //! `reason` values: `invalid_action`, `invalid_resource`,
+//! `invalid_principal` (a UID could not be built; `principal`, `action` and
+//! `resource` are then the strings it would have been built from),
 //! `entity_provider_error` (the provider failed or timed out),
 //! `context_error` (the request context could not be built). A request
 //! rejected for having no authenticated session (401) is not an

@@ -1,4 +1,8 @@
 //! The record behind the password reset cooldown.
+//!
+//! The record lives in this process: a deployment of several instances
+//! applies the cooldown per instance, and a shared rate limit in front of
+//! the route is the bound across them.
 
 use axess_cache::ClockTtlCache;
 use axess_clock::Clock;
@@ -28,9 +32,17 @@ impl ResetCooldowns {
     /// Whether this tenant and identifier asked within the cooldown. When
     /// they did not, the request is noted (and starts the cooldown) before
     /// returning `false`.
+    ///
+    /// Both parts are keyed in their normalised form
+    /// ([`normalise_identifier`](crate::validation::normalise_identifier):
+    /// NFKC, lowercase, invisible format characters dropped, trimmed), so
+    /// `alice@x.com` and `ALICE@x.com\u{200B}` are one request. A part that
+    /// normalises to nothing is keyed as the empty string, as an over-long
+    /// one already is by the caller.
     pub(crate) fn already_asked(&self, tenant_identifier: &str, identifier: &str) -> bool {
         let mut hasher = sha2::Sha256::new();
         for part in [tenant_identifier, identifier] {
+            let part = crate::validation::normalise_identifier(part).unwrap_or_default();
             hasher.update((part.len() as u64).to_be_bytes());
             hasher.update(part.as_bytes());
         }

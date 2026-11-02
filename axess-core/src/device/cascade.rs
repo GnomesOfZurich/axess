@@ -36,7 +36,7 @@ where
     /// [`RefreshTokenStore::revoke_device_tokens`]); the device is marked
     /// revoked and its tokens are untouched. Check the device on refresh
     /// with
-    /// [`refresh_session_with_device_check`](crate::session::refresh::refresh_session_with_device_check)
+    /// [`Refresh::device_store`](crate::session::refresh::Refresh::device_store)
     /// or implement the method.
     #[error("the refresh-token store cannot revoke tokens by device")]
     TokensUnsupported,
@@ -90,7 +90,7 @@ where
 /// [`DeviceStore::set_trust_level`] call; per-target failures are logged
 /// at `warn` level and do not abort the overall cascade. The
 /// compromise signal is treated as critical-but-best-effort, mirroring
-/// how [`refresh_session`](crate::session::refresh::refresh_session)
+/// how [`Refresh::run`](crate::session::refresh::Refresh::run)
 /// proceeds with the family revocation even if device-side gathering
 /// hit an error.
 ///
@@ -173,7 +173,7 @@ mod tests {
     }
 
     fn d(id: &str, fp: u8, tenant: &TenantId) -> Device {
-        let now = Utc::now();
+        let now = crate::device::store::whole_second(Utc::now());
         Device {
             id: axess_identity::testing::device(id),
             tenant_id: *tenant,
@@ -198,7 +198,7 @@ mod tests {
         store.save(&dev_b, crate::device::test_now()).await.unwrap();
 
         let targets = vec![(tenant, dev_a.id), (tenant, dev_b.id)];
-        let now = Utc::now();
+        let now = crate::device::store::whole_second(Utc::now());
         let count = cascade_revoke_devices(&store, &targets, now).await;
         assert_eq!(count, 2);
 

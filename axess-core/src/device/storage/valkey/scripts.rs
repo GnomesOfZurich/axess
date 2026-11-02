@@ -19,29 +19,38 @@ use fred::types::Value;
 
 /// Write the row only if it still holds the bytes the caller read (or, for
 /// an empty expectation, only if it does not exist), set or clear its
-/// expiry, add the device to its fingerprint set, and apply the membership
-/// changes that belong to the new row, all in one step.
+/// expiry, list the device in its fingerprint index with its sighting as the
+/// score, and apply the membership changes that belong to the new row, all
+/// in one step.
 ///
 /// The membership changes ride in the same script as the row write so the
 /// row and its indexes cannot disagree, whatever order two writers' scripts
 /// run in: a script that lands second sees the row the first one wrote and
 /// conflicts instead of applying its own index changes to it.
 ///
-/// The fingerprint index is a set of device ids, so devices that share a
-/// fingerprint are all listed. A write also migrates the single-id string key
-/// an earlier release used: when it points at this device it is deleted,
-/// because the device is now listed in the set.
+/// The fingerprint index is a sorted set of device ids scored by
+/// `last_seen_at`, so devices that share a fingerprint are all listed and
+/// the newest sightings come first. A write also migrates the two layouts
+/// earlier releases used: the device is removed from the plain set, and the
+/// single-id string key is deleted when it points at this device, because
+/// the device is now listed in the sorted set.
 ///
-/// KEYS: `[row, fingerprint_set, legacy_fingerprint_key, member_index_1 ..
-/// member_index_n]`.
+/// KEYS: `[row, fingerprint_zset, fingerprint_set, legacy_fingerprint_key,
+/// member_index_1 .. member_index_n]`.
 /// ARGV: `[expected_row ("" = must not exist), new_row, ttl_seconds (0 = no
-/// expiry), device_id, op_1 .. op_n]`.
-/// `op_i` is `A` (add the device to set `i`), `R` (remove it) or `F` (delete
-/// key `i`, a stale single-id fingerprint key, only if it points at this
-/// device).
+/// expiry), device_id, sighting_score, op_1 .. op_n]`.
+/// `op_i` is `A` (add the device to set `i`), `R` (remove it, from a set or
+/// a sorted set) or `F` (delete key `i`, a stale single-id fingerprint key,
+/// only if it points at this device).
 /// Replies `ok`, `missing` (a row was expected and there is none) or
 /// `conflict` (the row is not what the caller read).
 pub(super) const WRITE_ROW: &str = r#"
+local function unlist(key, member)
+  if redis.call('TYPE', key).ok == 'zset' then
+    return redis.call('ZREM', key, member)
+  end
+  return redis.call('SREM', key, member)
+end
 local current = redis.call('GET', KEYS[1])
 if ARGV[1] == '' then
   if current then
@@ -61,22 +70,61 @@ if ttl > 0 then
 else
   redis.call('SET', KEYS[1], ARGV[2])
 end
-redis.call('SADD', KEYS[2], ARGV[4])
-if redis.call('GET', KEYS[3]) == ARGV[4] then
-  redis.call('DEL', KEYS[3])
+redis.call('ZADD', KEYS[2], ARGV[5], ARGV[4])
+redis.call('SREM', KEYS[3], ARGV[4])
+if redis.call('GET', KEYS[4]) == ARGV[4] then
+  redis.call('DEL', KEYS[4])
 end
-for i = 4, #KEYS do
+for i = 5, #KEYS do
   local op = ARGV[i + 1]
   if op == 'A' then
     redis.call('SADD', KEYS[i], ARGV[4])
   elseif op == 'R' then
-    redis.call('SREM', KEYS[i], ARGV[4])
+    unlist(KEYS[i], ARGV[4])
   elseif op == 'F' then
     if redis.call('GET', KEYS[i]) == ARGV[4] then
       redis.call('DEL', KEYS[i])
     end
   end
 end
+return 'ok'
+"#;
+
+/// Insert a new row with its fingerprint entry and membership indexes, only
+/// while the create guard holds exactly what the caller read from it (or is
+/// absent, for an empty expectation) and the row does not exist, and point
+/// the guard at the new device, all in one step. This is the insert of
+/// `create_or_find`: the caller found no live device of the guard's key
+/// after reading the guard, so a guard that changed since means another
+/// create of the key inserted in between, and the caller looks again.
+///
+/// The guard holds `generation:device_id`, and every insert raises the
+/// generation, so a guard never comes back to a value a caller read while
+/// it lives, even when a device id is used again after its row was deleted.
+///
+/// KEYS: `[guard, row, fingerprint_zset, member_index_1 .. member_index_n]`.
+/// ARGV: `[expected_guard ("" = absent), guard_ttl_seconds, new_row,
+/// ttl_seconds (0 = no expiry), device_id, sighting_score]`. The device is
+/// added to every member index.
+/// Replies `ok` or `conflict` (the guard is not what the caller read, or the
+/// row exists; nothing is written).
+pub(super) const CREATE_ROW: &str = r#"
+local held = redis.call('GET', KEYS[1]) or ''
+if held ~= ARGV[1] or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 'conflict'
+end
+local ttl = tonumber(ARGV[4])
+if ttl > 0 then
+  redis.call('SET', KEYS[2], ARGV[3], 'EX', ttl)
+else
+  redis.call('SET', KEYS[2], ARGV[3])
+end
+redis.call('ZADD', KEYS[3], ARGV[6], ARGV[5])
+for i = 4, #KEYS do
+  redis.call('SADD', KEYS[i], ARGV[5])
+end
+local generation = (tonumber(string.match(held, '^(%d+):')) or 0) + 1
+redis.call('SET', KEYS[1], generation .. ':' .. ARGV[5], 'EX', tonumber(ARGV[2]))
 return 'ok'
 "#;
 
@@ -100,18 +148,25 @@ return 'ok'
 "#;
 
 /// Delete the row (only if it still holds the expected bytes, when an
-/// expectation is given), remove the device from its fingerprint set (other
-/// devices sharing the fingerprint stay listed), delete the single-id
-/// fingerprint key of an earlier release only if it still points at this
-/// device, and apply the membership removals, in one step.
+/// expectation is given), remove the device from its fingerprint index and
+/// from the plain set of the earlier layout (other devices sharing the
+/// fingerprint stay listed), delete the single-id fingerprint key of an
+/// earlier release only if it still points at this device, and apply the
+/// membership removals, in one step.
 ///
-/// KEYS: `[row, fingerprint_set, legacy_fingerprint_key, member_index_1 ..
-/// member_index_n]`.
+/// KEYS: `[row, fingerprint_zset, fingerprint_set, legacy_fingerprint_key,
+/// member_index_1 .. member_index_n]`.
 /// ARGV: `[expected_row or empty for unconditional, device_id, op_1 .. op_n]`
 /// with `op_i` as in [`WRITE_ROW`].
 /// Replies `ok`, `missing` (no row; the indexes are still cleaned) or
 /// `conflict` (row changed since read; nothing is deleted).
 pub(super) const REMOVE_DEVICE: &str = r#"
+local function unlist(key, member)
+  if redis.call('TYPE', key).ok == 'zset' then
+    return redis.call('ZREM', key, member)
+  end
+  return redis.call('SREM', key, member)
+end
 local current = redis.call('GET', KEYS[1])
 local status = 'ok'
 if not current then
@@ -121,14 +176,15 @@ elseif ARGV[1] ~= '' and current ~= ARGV[1] then
 else
   redis.call('DEL', KEYS[1])
 end
-redis.call('SREM', KEYS[2], ARGV[2])
-if redis.call('GET', KEYS[3]) == ARGV[2] then
-  redis.call('DEL', KEYS[3])
+unlist(KEYS[2], ARGV[2])
+redis.call('SREM', KEYS[3], ARGV[2])
+if redis.call('GET', KEYS[4]) == ARGV[2] then
+  redis.call('DEL', KEYS[4])
 end
-for i = 4, #KEYS do
-  local op = ARGV[i - 1]
+for i = 5, #KEYS do
+  local op = ARGV[i - 2]
   if op == 'R' then
-    redis.call('SREM', KEYS[i], ARGV[2])
+    unlist(KEYS[i], ARGV[2])
   elseif op == 'F' then
     if redis.call('GET', KEYS[i]) == ARGV[2] then
       redis.call('DEL', KEYS[i])
@@ -174,13 +230,19 @@ return 0
 /// cleanup keeps its index entry.
 ///
 /// KEYS: `[index, row_1 .. row_n]`. ARGV: `[member_1 .. member_n]`, where
-/// `row_i` is the row key of `member_i`. Replies the number of members
-/// removed.
+/// `row_i` is the row key of `member_i`. The index may be a set or a sorted
+/// set. Replies the number of members removed.
 pub(super) const PRUNE_ABSENT: &str = r#"
+local function unlist(key, member)
+  if redis.call('TYPE', key).ok == 'zset' then
+    return redis.call('ZREM', key, member)
+  end
+  return redis.call('SREM', key, member)
+end
 local removed = 0
 for i = 2, #KEYS do
   if redis.call('EXISTS', KEYS[i]) == 0 then
-    removed = removed + redis.call('SREM', KEYS[1], ARGV[i - 1])
+    removed = removed + unlist(KEYS[1], ARGV[i - 1])
   end
 end
 return removed
@@ -194,13 +256,20 @@ return removed
 ///
 /// KEYS: `[index, row_1 .. row_n]`. ARGV: `[member_1 .. member_n, bytes_1 ..
 /// bytes_n]`, where `bytes_i` is the row `row_i` held when it was judged.
-/// Replies the number of members removed.
+/// The index may be a set or a sorted set. Replies the number of members
+/// removed.
 pub(super) const PRUNE_MISMATCH: &str = r#"
+local function unlist(key, member)
+  if redis.call('TYPE', key).ok == 'zset' then
+    return redis.call('ZREM', key, member)
+  end
+  return redis.call('SREM', key, member)
+end
 local n = #KEYS - 1
 local removed = 0
 for i = 1, n do
   if redis.call('GET', KEYS[i + 1]) == ARGV[n + i] then
-    removed = removed + redis.call('SREM', KEYS[1], ARGV[i])
+    removed = removed + unlist(KEYS[1], ARGV[i])
   end
 end
 return removed
@@ -249,7 +318,7 @@ pub(super) fn prune_args(members: &[String]) -> Vec<Value> {
     members.iter().map(|m| bytes(m.as_bytes())).collect()
 }
 
-/// Reply of [`WRITE_ROW`] and [`REMOVE_DEVICE`].
+/// Reply of [`WRITE_ROW`], [`CREATE_ROW`] and [`REMOVE_DEVICE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScriptStatus {
     Ok,
@@ -272,13 +341,16 @@ fn bytes(b: &[u8]) -> Value {
 }
 
 /// ARGV for [`WRITE_ROW`]. `expected = None` requires the row to be absent;
-/// `ttl_seconds = None` writes the row without expiry; `ops` has one entry
-/// per membership key after the first three.
+/// `ttl_seconds = None` writes the row without expiry; `sighting` is the
+/// row's `last_seen_at` in Unix seconds, the score it is listed under in its
+/// fingerprint index; `ops` has one entry per membership key after the first
+/// four.
 pub(super) fn write_row_args(
     expected: Option<&[u8]>,
     new_row: &[u8],
     ttl_seconds: Option<i64>,
     device_id: &str,
+    sighting: i64,
     ops: &[&'static str],
 ) -> Vec<Value> {
     let mut args = vec![
@@ -286,9 +358,31 @@ pub(super) fn write_row_args(
         bytes(new_row),
         Value::Integer(ttl_seconds.unwrap_or(0)),
         bytes(device_id.as_bytes()),
+        Value::Integer(sighting),
     ];
     args.extend(ops.iter().map(|op| bytes(op.as_bytes())));
     args
+}
+
+/// ARGV for [`CREATE_ROW`]. `expected_guard` is the guard exactly as read
+/// (`None` requires it to be absent); `ttl_seconds = None` writes the row
+/// without expiry.
+pub(super) fn create_row_args(
+    expected_guard: Option<&str>,
+    guard_ttl_seconds: u64,
+    new_row: &[u8],
+    ttl_seconds: Option<i64>,
+    device_id: &str,
+    sighting: i64,
+) -> Vec<Value> {
+    vec![
+        bytes(expected_guard.unwrap_or("").as_bytes()),
+        Value::Integer(i64::try_from(guard_ttl_seconds).unwrap_or(i64::MAX)),
+        bytes(new_row),
+        Value::Integer(ttl_seconds.unwrap_or(0)),
+        bytes(device_id.as_bytes()),
+        Value::Integer(sighting),
+    ]
 }
 
 /// ARGV for [`RESEAL_ROW`].
@@ -314,4 +408,10 @@ pub(super) fn prune_mismatch_args(judged: &[(String, Vec<u8>)]) -> Vec<Value> {
         .map(|(m, _)| bytes(m.as_bytes()))
         .chain(judged.iter().map(|(_, raw)| bytes(raw)))
         .collect()
+}
+
+/// The device a create guard value (`generation:device_id`, see
+/// [`CREATE_ROW`]) names.
+pub(super) fn guarded_device(guard: &str) -> Option<&str> {
+    guard.split_once(':').map(|(_, id)| id)
 }

@@ -22,7 +22,9 @@
 //!
 //! After a successful bind, the provider can optionally search for group
 //! memberships. Configure [`LdapGroupSearch`] to extract groups from the
-//! directory. The groups are returned in [`LdapBindResult`] for the
+//! directory. The groups are returned in [`LdapBindResult`]; the
+//! orchestrator's LDAP factor stores them on the session that logged in,
+//! where `AuthSession::ldap_groups` (axess-core) reads them for the
 //! application to map to roles or Cedar entities.
 //!
 //! # Health checks
@@ -50,6 +52,22 @@ pub enum LdapError {
     /// Bind operation rejected by the directory due to invalid credentials.
     #[error("LDAP bind failed (invalid credentials)")]
     InvalidCredentials,
+
+    /// The directory answered the bind with a result code that is not a
+    /// verdict on the credential: `busy` (51), `unavailable` (52),
+    /// `unwillingToPerform` (53), `operationsError` (1), or any other code
+    /// outside the credential set listed on
+    /// [`LdapProvider::verify_bind`]. `text` is the directory's diagnostic
+    /// message, which may name the server; log it, do not show it. The
+    /// orchestrator answers an external-service error and counts no failed
+    /// attempt, where `InvalidCredentials` feeds the lockout.
+    #[error("LDAP directory could not perform the bind: rc={rc} {text}")]
+    Directory {
+        /// The LDAP result code (RFC 4511 appendix A).
+        rc: u32,
+        /// The directory's diagnostic message, possibly empty.
+        text: String,
+    },
 
     /// Directory search failed (e.g. invalid filter or insufficient privileges).
     #[error("LDAP search failed: {0}")]
@@ -88,7 +106,11 @@ pub trait LdapProvider: Send + Sync + 'static {
     /// used for group search filters. `bind_dn` is the fully-constructed DN.
     ///
     /// Returns the bind result (including group memberships if configured)
-    /// on success, or [`LdapError::InvalidCredentials`] on wrong password.
+    /// on success, or [`LdapError::InvalidCredentials`] on a wrong password
+    /// (or an unknown or unbindable DN). A directory that could not judge
+    /// the password (busy, unavailable, unwilling, a server error) answers
+    /// [`LdapError::Directory`]; an implementation that cannot tell must not
+    /// answer `InvalidCredentials`, since that counts against the user.
     fn verify_bind<'a>(
         &'a self,
         identifier: &'a str,
@@ -138,7 +160,20 @@ pub struct LdapGroupSearch {
 /// Plain `ldap://` without STARTTLS sends credentials in cleartext. It is
 /// refused at bind time unless the host is exactly `localhost`, `127.0.0.1`
 /// or `[::1]`, or the operator has said so with
-/// [`allow_cleartext`](Self::allow_cleartext).
+/// [`allow_cleartext`](Self::allow_cleartext). An `ldapi://` URL (a Unix
+/// domain socket, `ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi`) never leaves the
+/// host and is not refused.
+///
+/// # Result codes
+///
+/// A bind the directory answers with `invalidCredentials` (49),
+/// `inappropriateAuthentication` (48) or `noSuchObject` (32) is
+/// [`LdapError::InvalidCredentials`]: a verdict on what the user typed,
+/// which the orchestrator counts towards the lockout. Any other non-zero
+/// code (`busy`, `unavailable`, `unwillingToPerform`, `operationsError`, a
+/// server error) is [`LdapError::Directory`], which the orchestrator
+/// answers as an external-service error without counting an attempt, so a
+/// directory outage locks nobody out.
 pub struct LdapProviderConfig {
     /// LDAP server URL (e.g. `"ldap://ad.example.com:389"` or
     /// `"ldaps://ad.example.com:636"`).
@@ -180,6 +215,24 @@ fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
+/// True when the URL's scheme is `scheme` (given with its `://`), compared
+/// without regard to case.
+fn has_scheme(url: &str, scheme: &str) -> bool {
+    url.get(..scheme.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(scheme))
+}
+
+/// Whether a bind result code is the directory's verdict on the DN and
+/// password the user gave (RFC 4511 appendix A): `invalidCredentials` (49),
+/// `inappropriateAuthentication` (48, the entry cannot bind this way) and
+/// `noSuchObject` (32, no entry at the DN). Every other non-zero code
+/// (`busy`, `unavailable`, `unwillingToPerform`, `operationsError`, a
+/// protocol or server error) says nothing about the credential and must
+/// not count against the user.
+fn is_credential_verdict(rc: u32) -> bool {
+    matches!(rc, 32 | 48 | 49)
+}
+
 /// True when the URL's host is exactly a loopback name or address. A
 /// substring test would accept `ldap://localhost.evil.example`.
 fn is_loopback_url(url: &str) -> bool {
@@ -215,13 +268,12 @@ impl LdapProviderConfig {
     }
 
     /// True when a bind would send the password in cleartext to a host that
-    /// is not loopback, and the operator has not opted in.
+    /// is not loopback, and the operator has not opted in. An `ldapi://`
+    /// URL is a Unix domain socket on this host: nothing crosses a network,
+    /// so it is local like loopback.
     fn refuses_cleartext(&self) -> bool {
-        let scheme_ldaps = self
-            .url
-            .get(..8)
-            .is_some_and(|p| p.eq_ignore_ascii_case("ldaps://"));
-        !scheme_ldaps && !self.starttls && !self.allow_cleartext && !is_loopback_url(&self.url)
+        let local = has_scheme(&self.url, "ldapi://") || is_loopback_url(&self.url);
+        !has_scheme(&self.url, "ldaps://") && !self.starttls && !self.allow_cleartext && !local
     }
 
     /// Enable STARTTLS on plain LDAP connections.
@@ -338,9 +390,14 @@ impl LdapProvider for LdapProviderConfig {
                     .map_err(|e| LdapError::Connection(e.to_string()))?;
 
             if result.rc != 0 {
-                // RC 49 = invalid credentials (standard LDAP result code).
                 let _ = ldap.unbind().await;
-                return Err(LdapError::InvalidCredentials);
+                if is_credential_verdict(result.rc) {
+                    return Err(LdapError::InvalidCredentials);
+                }
+                return Err(LdapError::Directory {
+                    rc: result.rc,
+                    text: result.text,
+                });
             }
 
             // Optionally search for group memberships using the original

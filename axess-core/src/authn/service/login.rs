@@ -2,17 +2,16 @@
 
 use super::factor_pipeline::GuessSlot;
 use super::outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome};
-use super::verification::{VerifyOutcome, verify_credential_blocking};
-#[cfg(feature = "fido2")]
-use crate::authn::factor::FactorConfig;
 use crate::authn::types::{Tenant, User};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::{FactorCredential, FactorKind, FactorStep},
     store::{FactorStore, IdentityStore},
-    types::{AuthnScope, EntityState},
+    types::EntityState,
 };
+#[cfg(feature = "fido2")]
+use crate::authn::{factor::FactorConfig, types::AuthnScope};
 use crate::session::extractor::AuthSession;
 use crate::session::store::note_revocation;
 use std::ops::ControlFlow;
@@ -311,9 +310,12 @@ where
     /// Breaks with the outcome for an unknown identifier
     /// ([`LoginOutcome::InvalidCredentials`]), for a non-active account
     /// (the same outcome, so the account's state is not observable) and for
-    /// a locked account ([`LoginOutcome::Locked`]), whether the lock is a
-    /// suspension the store reports or one derived from the failure
-    /// counter. Each refusal emits its audit row.
+    /// a locked account, whether the lock is a suspension the store reports
+    /// or one derived from the failure counter: the same outcome again by
+    /// default, so the lock is not observable either, or
+    /// [`LoginOutcome::Locked`] when the service was built with
+    /// [`with_lockout_revealed_on_begin`](super::AuthnServiceBuilder::with_lockout_revealed_on_begin).
+    /// Each refusal emits its audit row, a lockout's with status `Locked`.
     async fn find_loginnable_user(
         &self,
         identifier: &str,
@@ -383,6 +385,12 @@ where
                 .await?;
             if locked {
                 self.inner.metrics.account_locked();
+                if !self.inner.reveal_lockout_on_begin {
+                    // The caller has proved nothing yet; `Locked` would tell
+                    // them the account exists and is being guessed at. The
+                    // audit row above carries the lockout.
+                    return Ok(ControlFlow::Break(LoginOutcome::InvalidCredentials));
+                }
                 // Surface the lockout expiry so UIs can render
                 // "locked until X" on the begin path.
                 let until = match (&status, derived) {
@@ -687,23 +695,17 @@ where
             Ok(prepared) => prepared,
             Err(outcome) => return Ok(outcome),
         };
-        let PreparedFactorStep {
-            current_kind,
-            user_scope,
-            resolved_from,
-            config,
-        } = prepared;
 
         // FIDO2 + LDAP have their own verification methods (different
         // ceremony shape, network call) and short-circuit with their
         // own FactorOutcome. The local-hash factors continue below.
         #[cfg(feature = "fido2")]
-        if current_kind == FactorKind::Fido2 {
+        if prepared.current_kind == FactorKind::Fido2 {
             return self
                 .verify_fido2_factor(
                     credential,
-                    &config,
-                    &user_scope,
+                    &prepared.config,
+                    &prepared.user_scope,
                     &user_id,
                     &tenant_id,
                     session,
@@ -714,7 +716,7 @@ where
         // cannot all pass the limit (a passkey assertion is not a guess and
         // is not metered).
         let reserved = match self
-            .reserve_guess(&user_id, &tenant_id, &current_kind, session)
+            .reserve_guess(&user_id, &tenant_id, &prepared.current_kind, session)
             .await?
         {
             GuessSlot::Reserved(count) => Some(count),
@@ -722,94 +724,23 @@ where
             GuessSlot::Refused(outcome) => return Ok(outcome),
         };
         #[cfg(feature = "ldap")]
-        if current_kind == FactorKind::LdapBind {
+        if prepared.current_kind == FactorKind::LdapBind {
             return self
-                .verify_ldap_factor(credential, &config, &user_id, &tenant_id, session, reserved)
+                .verify_ldap_factor(
+                    credential,
+                    &prepared.config,
+                    &user_id,
+                    &tenant_id,
+                    session,
+                    reserved,
+                )
                 .await;
         }
 
-        let cipher = self.inner.factor_secret_cipher.as_deref();
-        let opened = super::factor_secrets::open(
-            cipher,
-            &config,
-            &resolved_from,
-            &user_scope,
-            &current_kind,
+        self.verify_local_factor(
+            credential, session, &user_id, &tenant_id, prepared, reserved,
         )
-        .map_err(|e| {
-            tracing::error!(error = %e, factor = %current_kind, "factor secret cannot be opened");
-            AuthnError::Internal(e.to_string())
-        })?;
-
-        self.inner.metrics.factor_attempt();
-        let outcome = verify_credential_blocking(
-            &self.inner.kdf,
-            credential,
-            &opened.verify,
-            &current_kind,
-            self.inner.clock.now(),
-            self.inner.recovery_pepper.as_ref(),
-        )
-        .await?;
-
-        let close = |updated: crate::authn::factor::FactorConfig| -> Result<crate::authn::factor::FactorConfig, AuthnError<I::Error>> {
-            super::factor_secrets::close(cipher, &opened, updated, &user_scope, &current_kind)
-                .map_err(|e| {
-                    tracing::error!(error = %e, factor = %current_kind, "factor secret cannot be sealed");
-                    AuthnError::Internal(e.to_string())
-                })
-        };
-
-        if let VerifyOutcome::FailWithUpdate(updated_config) = &outcome {
-            let updated_config = close(updated_config.clone())?;
-            self.persist_fail_with_update(&user_scope, current_kind.clone(), &updated_config)
-                .await?;
-        }
-
-        if matches!(
-            outcome,
-            VerifyOutcome::Fail | VerifyOutcome::FailWithUpdate(_)
-        ) {
-            return self
-                .record_factor_failure_after(reserved, &user_id, &tenant_id, &current_kind, session)
-                .await;
-        }
-
-        self.inner.metrics.factor_success();
-
-        if let VerifyOutcome::PassWithUpdate(updated_config) = outcome {
-            let updated_config = close(updated_config)?;
-            let swapped = self
-                .persist_pass_with_update(&user_scope, &config, &resolved_from, updated_config)
-                .await?;
-            if !swapped {
-                // Concurrent verification spent the same step/counter
-                // first; treat as a replay and reject.
-                self.inner.metrics.factor_failure();
-                return Ok(FactorOutcome::InvalidCredential);
-            }
-        }
-
-        self.release_guess(reserved, &user_id).await;
-        self.rehash_outdated_password(
-            session,
-            credential,
-            &config,
-            &resolved_from,
-            &user_id,
-            &tenant_id,
-        )
-        .await;
-
-        session
-            .advance_factor(
-                &current_kind,
-                self.inner.clock.now(),
-                &self.inner.preserved_custom_keys,
-            )
-            .await;
-        self.complete_factor_step(&user_id, &tenant_id, session)
-            .await
+        .await
     }
 
     /// Log out the current session: clear it and invalidate it in the registry.
@@ -820,48 +751,51 @@ where
     /// to end all of them.
     ///
     /// The session is cleared and its id rotated **whatever the audit store
-    /// does**: the registry entry is dropped first, the audit event is
-    /// attempted, and the session is cleared before the audit result is
-    /// returned. When the audit write fails the call returns the store error
-    /// so the failure is not hidden, but the user is logged out: a degraded
-    /// audit store never leaves a session authenticated.
+    /// does**: the registry entry is dropped, the session is cleared, and
+    /// only then is the audit event written, so a caller that gives up on a
+    /// slow audit store (a timeout, a client that hangs up) has still logged
+    /// the user out. When the audit write fails the call returns the store
+    /// error so the failure is not hidden, but the user is logged out: a
+    /// degraded audit store never leaves a session authenticated.
     #[tracing::instrument(skip(self, session))]
     pub async fn logout(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
-        let audit = match session.pending_user_id().await {
-            Some(user_id) => {
-                self.inner.metrics.session_invalidated();
-                let sid = session.session_id().await;
-                if let Some(reg) = &self.inner.registry {
-                    note_revocation(
-                        reg.invalidate_session(&user_id, &sid).await,
-                        "logout or a refused login",
-                    );
-                }
-                // When the session is authenticated (user_id exists) but the
-                // tenant is somehow missing, record the logout event with
-                // `tenant_id = None` rather than inventing an attribution.
-                // Logged at WARN because it should never happen in practice:
-                // authenticated sessions always carry a tenant_id.
-                let tenant_id = session.pending_tenant_id().await;
-                if tenant_id.is_none() {
-                    tracing::warn!(
-                        user_id = %user_id,
-                        "logout: authenticated session missing tenant_id; audit event will have no tenant attribution",
-                    );
-                }
-                self.emit_audit(
-                    AuthEventBuilder::success(AuthEventType::LogoutAttempt)
-                        .maybe_attributed_to(Some(&user_id), tenant_id.as_ref())
-                        .with_session(sid),
-                )
-                .await
-            }
-            None => Ok(()),
+        let Some(user_id) = session.pending_user_id().await else {
+            // `clear` also cycles the session id, which prevents session
+            // fixation after logout.
+            session.clear().await;
+            return Ok(());
         };
-        // `clear` also cycles the session id, which prevents session fixation
-        // after logout.
+        self.inner.metrics.session_invalidated();
+        let sid = session.session_id().await;
+        let tenant_id = session.pending_tenant_id().await;
+        if let Some(reg) = &self.inner.registry {
+            note_revocation(
+                reg.invalidate_session(&user_id, &sid).await,
+                "logout or a refused login",
+            );
+        }
+        // Cleared before the audit write is awaited: everything the row needs
+        // was captured above, and nothing that can wait on a store stands
+        // between the user and being logged out.
         session.clear().await;
-        audit
+
+        // When the session is authenticated (user_id exists) but the tenant
+        // is somehow missing, record the logout event with `tenant_id = None`
+        // rather than inventing an attribution. Logged at WARN because it
+        // should never happen in practice: authenticated sessions always
+        // carry a tenant_id.
+        if tenant_id.is_none() {
+            tracing::warn!(
+                user_id = %user_id,
+                "logout: authenticated session missing tenant_id; audit event will have no tenant attribution",
+            );
+        }
+        self.emit_audit(
+            AuthEventBuilder::success(AuthEventType::LogoutAttempt)
+                .maybe_attributed_to(Some(&user_id), tenant_id.as_ref())
+                .with_session(sid),
+        )
+        .await
     }
 
     /// Rotate the session id of an authenticated session and keep the
@@ -919,13 +853,14 @@ mod email_otp;
 #[cfg(test)]
 mod equalization_tests;
 pub(crate) mod flow;
+mod local_factor;
 #[cfg(test)]
 mod login_tests;
 mod password_entry;
 mod prepare;
 use prepare::PreparedFactorStep;
 mod reauth;
-mod rehash;
+pub(crate) mod rehash;
 #[cfg(test)]
 mod security_tests;
 mod timing;

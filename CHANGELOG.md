@@ -8,6 +8,253 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-02
+
+`docs/production/migrating.md` lists every break by what an adopter sees.
+
+### Changed (breaking)
+
+Types and traits:
+
+- **`AuthState` carries the impersonation marker and the LDAP groups**:
+  `impersonator` holds an `Impersonation { admin, since }` (capped by
+  `max_impersonation_age`, kept by custom-data changes, carried by
+  `AuthSnapshot`) and `ldap_groups` replaces the custom key
+  `axess.ldap.groups`. **Migrating:** add `impersonator: None`,
+  `ldap_groups: None` and `impersonation: None` to literals; sessions load.
+- **`AuditContext` has `impersonator`**, and an event built with it names the
+  administrator as `actor_id`. **Migrating:** add `..Default::default()`.
+- **New fields**: `OAuthClaims::nonce` (pass it as `original_nonce` on
+  refresh); `PasswordConfig::password_id`, the identity a rehash keeps;
+  `HotpConfig::throttle`, whose lock (a minute, doubling to an hour) never
+  moves the counter, so a password holder cannot desynchronise the token.
+  **Migrating:** add the field, `password_id: None` and
+  `throttle: Default::default()` to literals; stored rows read as unlocked.
+- **New variants**: `AuthEventType::{AccountDeleted, SignupResumed}`,
+  `RevocationReason::Device`, `AuthnError::{Busy, Impersonated}`, typed
+  `AuthFailureReason` refusals, `LdapError::Directory`,
+  `KeyProviderError::WeakKey`, `SqlDeviceStoreError::CreateLockTimeout`,
+  `OAuthError::{DpopKeyRequired, Store, ClientAssertion}`,
+  `OAuthClientError::RequestBuild`, `DelegatedError::ClientCredentials`, the
+  `ClientBuild` errors, `MemoryLocalIdpKeyStoreError::DuplicateKeyId` and
+  `MockStoreError::Unavailable`. **Migrating:** add the arms.
+- **`BearerIssuerConfig.audience` is the `Audience` enum**; only
+  `Audience::AnyDangerous` skips the check. **Migrating:** write
+  `Audience::Exact(aud)` for `Some(aud)`.
+- **Fallible constructors return their cause**: `TokenExchangeClient::new`,
+  the STS constructors, `StoredDelegationSession::new` and
+  `SocialProvider::new` return `Result` (`ClientBuild` keeps the
+  `reqwest::Error` as its source) instead of a client that follows redirects
+  or a panic; the STS `Default` impls are gone. **Migrating:** add `?`.
+- **`basic_credentials` returns `ZeroizedString`.** **Migrating:** build the
+  header with the new `basic_authorization`, which marks it sensitive.
+- **`handle_backchannel_logout` returns an axum `Response`**, always with
+  `Cache-Control: no-store`. **Migrating:** a mounted route is unchanged; a
+  direct caller reads the status.
+- **`with_hidden_signup_conflicts` is removed** (hiding a taken identifier is
+  the default) and **`LocalIdpFixture::new` signs ES256**. **Migrating:**
+  `with_signup_conflicts_revealed` restores `AlreadyExists`; `new_rsa`.
+- **A single-repeated-byte key is refused** by `MemoryKeyProvider::new` and
+  `CsrfConfig::try_new` (`WeakKeyError`), and logged by `CsrfConfig::new` and
+  `EncryptionKey::from_bytes`. **Migrating:** generate the key.
+- **Required trait methods**: `DeviceStore::create_or_find`,
+  `SessionRegistryHandle::held_sessions` (`active_sessions` is provided),
+  `OAuthProvider::binds_to_dpop`, and the tenant policies and
+  `record_last_login`, whose permissive defaults let a decorator switch a
+  policy off; `IdentityLookup::lockout_policy` is gone. **Migrating:**
+  implement them; a store with one policy returns it for every tenant.
+- **Trait contracts**: every revoking `RefreshTokenStore` method records a
+  reason and time; `LocalIdpKeyStore::rotate` refuses a duplicate `kid`;
+  `LdapProvider` answers `Directory` for a result that does not judge the
+  password; `SessionStore` keeps nothing under a zero TTL. **Migrating:**
+  bring a custom store to the documented contract.
+- **One refresh entry point, `Refresh`**: `new(plaintext, status_check)`, then
+  `in_tenant`, `device_info` and `device_store` as needed, then `run`, over one
+  pipeline (an expired token is `Expired` before the device check; a device
+  another user owns is `DeviceMismatch`). The `refresh_session*` forms are
+  deprecated wrappers. **Migrating:** build a `Refresh`.
+
+OAuth and federation:
+
+- **`discover` and `discover_with_private_key_jwt` return an
+  `OAuthProviderBuilder`** whose `build()` checks every setting together (FAPI
+  client authentication and PAR, DPoP, ID-token algorithms, each endpoint's
+  transport), whatever the call order. **Migrating:** drop the `?` after
+  `with_fapi`; end the chain with `.build()?`.
+- **A FAPI provider that would send a client secret is refused**
+  (`OAuthError::Config`): FAPI 2.0 permits only `private_key_jwt` and mTLS.
+  **Migrating:** use `discover_with_private_key_jwt` or `with_private_key_jwt`,
+  or `SenderConstraint::Mtls`; a secret client keeps DPoP without the profile.
+- **One method per DPoP-capable operation**: the `_with` and `_with_key`
+  forms are gone; the bare names take the key (`dpop: Option<DpopSigner>`,
+  `dpop_key: Option<&DpopKey>`), and a binding provider given `None` answers
+  `DpopKeyRequired` before sending. **Migrating:** pass the key or `None`.
+- **`private_key_jwt` has one representation, `ClientAssertionSigner`**:
+  `ClientAuthMethod::PrivateKeyJwt` takes a boxed signer (with Entra's `x5t`
+  headers), which refuses a key unfit for its algorithm at startup;
+  `mint_client_assertion` is gone. **Migrating:**
+  `ClientAuthMethod::PrivateKeyJwt(Box::new(signer))`.
+- **`keys::EXPECTED_TENANT` is `keys::CEREMONY_TENANT`**, the same session
+  key now holding `{"tenant", "provider_from_tenant"}`; a 0.13 value reads.
+  **Migrating:** name the new constant.
+- **`with_session_match_required` returns a `BoundFrontChannelLogoutHandler`**,
+  whose only route takes the caller's `AuthSession`;
+  `handle_frontchannel_logout_bound` is gone. **Migrating:** route its
+  `handle_frontchannel_logout` behind the session layer.
+- **`SidMap::take_subject_sessions` and `SidMap::remove` are removed**; the
+  first dropped mappings before the registry confirmed. **Migrating:**
+  `subject_sessions`, then `remove_session` for each session ended.
+
+Storage:
+
+- **The Valkey device fingerprint index is a sorted set** (`dev:fpz`); the
+  layouts of earlier releases are read only under
+  `with_legacy_fingerprint_keys`. **Migrating:** set it until every device has
+  been sighted since the upgrade.
+- **MySQL device indexes are `last_seen_at DESC, id ASC`.** **Migrating:** run
+  the `ALTER TABLE` from the `DeviceStore` module docs once.
+- **Delegated credentials are sealed in envelope `v3`**, binding `expires_at`;
+  a `v2` row is re-sealed by the read that finds it.
+- **`LegacyBlobs::AcceptUntil` is a deadline for the row's next write**: a read
+  no longer re-seals a blob with no row binding. **Migrating:** set the cutoff
+  after every wanted row is next written.
+- **Half-finished logins are dropped once at the upgrade**; the user starts
+  again. **Device timestamps are whole seconds**; a tie goes to the smaller id.
+
+Behaviour:
+
+- **`begin_login` answers a locked account `InvalidCredentials`**, as an
+  unknown one, and a lockout at the limit outlives the attempt window.
+  **Migrating:** `with_lockout_revealed_on_begin` restores `Locked { until }`.
+- **`User::validate` refuses an identifier signup would refuse**, against all
+  of Unicode 16.0 Cf less the joiners. **Migrating:** find such rows with
+  `normalise_identifier` and have the users rename.
+- **The KDF queue is bounded** (16 per permit); a saturated executor answers
+  `503` with `Retry-After` (`AuthnError::Busy`). **Migrating:**
+  `with_max_queue(usize::MAX)` restores the unbounded queue.
+- **The CSRF cookie is `__Host-axess.csrf`** under `Secure`, and `CsrfLayer`
+  panics for `SameSite::None` without `Secure`. **Migrating:** read the new
+  name in front-end code (a first request after the upgrade fails once).
+- **A WebSocket upgrade must come from the request's own `Host`** without a
+  CSRF allow-list, and `RevocationAwareSocket` fails closed and lives a day.
+  **Migrating:** list the origin; set `fail_closed`, `max_lifetime` knowingly.
+- **A non-rotating client keeps its token across a pepper rotation**; it is
+  re-stored under the current pepper instead of rotated.
+- **`finish_oauth_login` is refused** by a provider that advertises the
+  RFC 9207 `iss` parameter. **Migrating:** call `finish_oauth_login_with_iss`.
+- **A provider binds its tokens to a DPoP key when the IdP advertises DPoP**:
+  the login makes its key at `begin_oauth_login`, and a ceremony or refresh
+  without it is refused (`dpop_key_invalid`, `token_refresh_dpop_key_missing`).
+  **Migrating:** keep `OAuthClaims::dpop_key` beside the refresh token, or
+  `without_dpop()` (`TenantDpop::Off`) where resource servers want Bearer.
+- **An impersonated session cannot change passkeys or get a refresh token**
+  (`AuthnError::Impersonated`, 403), and `Fido2Options::max_authn_age` refuses
+  an old authentication. **Migrating:**
+  `with_impersonated_credential_changes_allowed` opts in.
+- **Audit reasons are typed**: the refresh path's `impersonated_session` is
+  `impersonated`, and a signup resubmit is a `SignupResumed` row, not a success
+  row with the reason `resumed`. **Migrating:** query the new names.
+- **`invalidate_session` refuses a session the registry does not hold for that
+  user**; `begin_impersonation` answers an unknown target `CrossTenant`; a
+  rotated session the registry fails to register follows `UnknownLiveness`.
+- **A back-channel logout the registry could not complete answers 503** so the
+  IdP retries; the `jti` log is bounded per issuer, dropped with its last entry.
+- **`begin_password_reset` answers `Ok(None)` for an account that may not log
+  in**, and **`begin_step_up` asks only for enrolled factors** (none is
+  `NoFlow`). **Migrating:** show the factor it returns.
+
+### Added
+
+- **Per-tenant identity providers**: `TenantOAuthProviders` (by issuer, the
+  built providers and the broken records), `StoredTenantOAuthProviders` (one
+  build per record revision, credentials sealed, issuer indexed in SQLite)
+  and `begin_oauth_login_with_tenant_provider`.
+- **`oauth_for_session` and `oauth_in_tenant`** return a `ScopedOAuth` whose
+  refresh, userinfo, revocation and logout helpers use the login's provider;
+  `as_user` names the user for a background refresh.
+- **`BackChannelLogoutHandler::for_tenants`** verifies tenants' logout tokens:
+  an issuer and client id two providers share is `Ambiguous`, and a token only
+  a broken record could verify answers 503 while the others verify.
+- **`private_key_jwt` on the user login** (`ClientAssertionSigner`, RFC 7523;
+  `SignerSpec` for a stored record) and **`with_id_token_signing_algs`**, which
+  pins ID and logout token algorithms and narrows FAPI's list, never widens it.
+- **DPoP without FAPI**: `with_dpop`, `without_dpop`,
+  `TenantOAuthProviderRecord::dpop`; DPoP and `verify_dpop_proof` need only
+  `oauth`, of which `fapi` is now an alias.
+- **`RequestAuthnService::delete_user`** ends sessions and refresh tokens, then
+  deletes the user; **`issue_refresh_token`** and
+  `revoke_refresh_token_in_tenant`, exported by `axess::session`.
+- **`with_previous_recovery_code_pepper`** keeps recovery codes valid across a
+  pepper rotation and flags the set for regeneration.
+- **`force_refresh_of(token)`**, `normalise_identifier`, `SidMap::remove_if`
+  and `subject_sessions`; the facade exports both logout handlers and DPoP.
+- **The oauth example ends with a session** (identities keyed by
+  `(issuer, subject)`, provisioning, logout from both ends, `private_key_jwt`);
+  **the fapi example completes a real Keycloak login** (`ES256`, DPoP).
+- **Workload identity**: a `gitlab` recipe on numeric ids, `openshift` and
+  `eks` issuer modules; Kubernetes refusals name the claim.
+- **Testing**: `AuthSessionTestExt::set_impersonator`, `CallLog::on`,
+  `arm_record_event_hang`, `arm_get_user_failure`.
+
+### Fixed
+
+- **A one-shot session value cannot be handed out twice or written back**:
+  every stored-session write is a compare-and-swap whose merge base moves
+  forward with each write, so a value consumed meanwhile is not restored.
+- **Nested impersonation is refused, as is a suspended administrator's**, and
+  refused rows no longer carry ids the caller chose.
+- **Password reset**: the cooldown keys on the normalised identifier, the
+  commit re-checks the tenant, a dropped request cannot leave sessions valid,
+  and a refused reset writes no password history.
+- **The discoverable passkey login takes the tenant from the store** before its
+  gates; `delete_fido2_credential` re-checks account status.
+- **An LDAP outage no longer counts towards lockout**, `ldapi://` is not
+  refused as a remote cleartext bind, and a password rehash keeps the
+  password's identity, so it drops no login in progress on any instance.
+- **`AuditLogWithAnalytics` and `InMemoryBackend` forward every trait
+  method**, keeping a store's IP allowlists, password rules and lockout policy.
+- **A revocation during rotation is not lost**, no cookie is set for a session
+  the store did not keep, and a re-seal no longer fails a conditional write.
+- **A failing device resolver no longer unbinds the session**, and the
+  resolver sees a tenant held in the session (`SessionTenant`).
+- **Devices**: a device revoked mid-request is not served; two first sightings
+  make one device on every store; a SQLite save racing another write no longer
+  fails with `database is locked`; the Valkey store no longer reads a user's
+  every device on a miss.
+- **A device-bound refresh token survives a pepper rotation**, a lost device's
+  token is refused as `Revoked`, and a store blip during a concurrent refresh
+  no longer revokes the family.
+- **A callback whose provider no longer resolves is audited**
+  (`provider_unavailable`) and clears the ceremony; a JARM response that is not
+  the ceremony's leaves it in place.
+- **A FAPI ID token without `nbf` is accepted** (Keycloak logins were refused);
+  discovery is fetched once; federated audit rows carry the tenant, never a
+  user read from the IdP; a displaced `sid` stays reachable by a `sub` logout.
+- **`SocialProvider` checks all three endpoints for HTTPS at construction**,
+  and the `social` feature compiles on its own.
+- **The outbound OAuth client never serves a token a `401` condemned**, shares
+  one fetch outcome with its waiters and keeps a valid token through a failed
+  refresh; its timeout error names the timeout as set.
+- **Client secrets stay in zeroized buffers**, transport errors no longer print
+  the URL, and the assertion signer pins the crypto provider.
+- **`LocalIdp` refuses an empty `aud`**, and a retired key leaves memory even
+  when the re-read fails; a delegated credential loads when the key provider
+  cannot name its current key.
+- **The Cedar schema is authoritative for action entities**; `require_authz!`
+  audits a UID it cannot build; an IPv4-mapped trusted-proxy CIDR trusts the
+  proxies it names; the overflow bucket withholds `x-ratelimit-remaining`.
+- **Clock steps and stalls**: the service-secret warn throttle re-arms, the
+  Valkey revocation subscriber reconnects, the JWKS refresh and session
+  cleanup tickers run once, and the audit archiver archives no batch twice.
+- **`logout` clears the session before awaiting the audit write**; the sqlite
+  example costs the same for an unknown identifier and its decoders return an
+  error for a malformed row; `TracingCapture` sees a sibling test's events.
+
+### Documentation
+
+- OpenID Foundation runs in `docs/factors/conformance.md`, Azure and AWS
+  workload identity walkthroughs, and guides that match the code.
+
 ---
 
 ## [0.13.0] - 2026-10-29

@@ -187,9 +187,6 @@ fn an_out_of_range_skew_refuses_verification_without_panicking() {
 }
 
 /// Direct unit tests on `verify_dpop_proof` using ES256-signed proofs.
-/// Gated behind `fapi` because the ES256 keypair generation pulls in the
-/// `p256` crate which is only present under that feature.
-#[cfg(feature = "fapi")]
 mod verify_dpop_proof_tests {
     use super::*;
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};

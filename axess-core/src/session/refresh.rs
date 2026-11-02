@@ -28,15 +28,17 @@ use crate::authn::ids::{TenantId, UserId};
 use crate::session::data::{AuthState, SessionData};
 #[cfg(test)]
 use chrono::{DateTime, Duration, Utc};
+#[cfg(all(test, feature = "device"))]
+use rotation::collect_family_device_targets;
 #[cfg(test)]
-use rotation::{collect_family_device_targets, generate_token_value, hash_token};
+use rotation::{generate_token_value, hash_token};
 #[cfg(test)]
 use zeroize::Zeroizing;
 
+// Globs, so re-exporting the deprecated entry points is not itself a use of
+// them. Every public item of both modules is meant to be exported.
 #[cfg(feature = "device")]
-pub use device_check::refresh_session_with_device_check;
-// A glob, so re-exporting the deprecated `refresh_session` is not itself a use
-// of it. Every public item of `rotation` is meant to be exported.
+pub use device_check::*;
 pub use rotation::*;
 pub use store::{DeviceTokenRevocation, RefreshTokenStore, RotationOutcome};
 pub use types::{
@@ -44,25 +46,25 @@ pub use types::{
 };
 
 #[cfg(test)]
-mod atomic_rotation;
+mod atomic_rotation_tests;
 #[cfg(test)]
-mod authn_time;
+mod authn_time_tests;
 #[cfg(test)]
-mod basics;
+mod basics_tests;
 #[cfg(test)]
 mod config_tests;
 #[cfg(test)]
 mod device_binding_tests;
 #[cfg(all(test, feature = "device"))]
-mod device_cascade;
+mod device_cascade_tests;
 #[cfg(all(test, feature = "device"))]
-mod device_revoke;
+mod device_revoke_tests;
 #[cfg(test)]
-mod pepper_rotation;
+mod pepper_rotation_tests;
 #[cfg(test)]
-mod revocation;
+mod revocation_tests;
 #[cfg(test)]
-mod status_check;
+mod status_check_tests;
 #[cfg(test)]
 mod test_support;
 

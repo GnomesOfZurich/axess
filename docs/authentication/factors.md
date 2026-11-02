@@ -232,7 +232,12 @@ is in progress).
    nothing returns `LoginOutcome::InvalidCredentials`, the same outcome a
    wrong password gives, and runs the same store queries against a dummy
    id so the latency matches too. There is deliberately no "no such
-   user" to branch on.
+   user" to branch on. A locked account gets the same outcome by default,
+   with an audit row that says `Locked`; `LoginOutcome::Locked { until }`
+   is answered only when the service is built with
+   `AuthnServiceBuilder::with_lockout_revealed_on_begin`, for a
+   first-party form where "locked until" is worth more than concealing
+   that the account exists and is being guessed at.
 2. **Loads the method** that applies under the scope hierarchy (see
    *Scope hierarchy*): the sequence of steps this user will walk.
 3. **Transitions the session** to `Authenticating`, with `remaining` set

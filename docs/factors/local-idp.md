@@ -97,15 +97,21 @@ key from the store.
 
 `rotate` persists a new current key, demoting the previous current
 to historical. The store makes that step atomic (a pointer flip, a
-transaction); axess does not add atomicity on top of it. Adopters
-typically expose this through their own admin endpoint or out-of-band
-tooling.
+transaction); axess does not add atomicity on top of it. The store also
+refuses a key whose `kid` it already holds, current or historical, and
+leaves the set as it was: `LocalIdp` checks the `kid` against its own
+snapshot first, but only the store sees a rotation another replica made
+since that snapshot was read. Adopters typically expose rotation through
+their own admin endpoint or out-of-band tooling.
 
 `retire` removes a historical key so it leaves the JWKS. Call it through
 `LocalIdp::retire_historical_key` once no token signed under the key can
 still be valid: the time of the rotation plus the longest lifetime the IdP
-mints. The current key is refused. Keep the removed key material (the file
-store moves it aside) so a later audit can still verify what it signed.
+mints. The current key is refused. The key leaves this replica's JWKS even
+when the re-read of the store that follows fails (the failure is logged); the
+other replicas drop it at their next `reload`. Keep the removed key material
+(the file store moves it aside) so a later audit can still verify what it
+signed.
 
 ### `MemoryLocalIdpKeyStore` for prototyping
 
@@ -301,12 +307,16 @@ use axess::testing::local_idp::LocalIdpFixture;
 let idp = LocalIdpFixture::new("https://test.idp.local");
 ```
 
-`new(issuer)` generates a fresh RSA-2048 keypair per call. Other
-constructors:
+`new(issuer)` generates a fresh P-256 keypair per call and signs with
+ES256 (see the key material notes above for why RSA is not the default).
+Other constructors:
 
-- `LocalIdpFixture::with_algorithm(issuer, Algorithm::ES256)`:
+- `LocalIdpFixture::new_rsa(issuer)`: a fresh RSA-2048 keypair under
+  RS256, for a verifier that cannot take ES256.
+- `LocalIdpFixture::with_algorithm(issuer, Algorithm::RS384)`:
   generate with a specific signing algorithm. Supported: RS256,
-  RS384, RS512, ES256.
+  RS384, RS512, ES256; `try_with_algorithm` returns
+  `UnsupportedAlgorithm` for any other instead of panicking.
 - `LocalIdpFixture::with_signing_key(issuer, key)`: explicit key
   (use when the test needs a stable signature across runs).
 

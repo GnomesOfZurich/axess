@@ -1,5 +1,7 @@
-//! A read that finds a bindings blob in an older format writes it back in
-//! the current one, conditional on the bytes it read.
+//! A read that finds a bindings blob in an earlier bound format, or under the
+//! previous key, writes it back in the current one, conditional on the bytes it
+//! read. A blob without any binding is read under the legacy window but left as
+//! it is: a read cannot tell whether it belongs to the row it was found under.
 
 use super::*;
 use crate::session::crypto::{BoundFormat, device_row_id_v1};
@@ -102,11 +104,14 @@ fn unbound(_: &str, _: &str, b: &[DeviceBinding]) -> String {
 }
 
 #[tokio::test]
-async fn load_reseals_an_unbound_blob() {
+async fn load_reads_an_unbound_blob_without_resealing_it() {
     let (store, t, _, d, bindings) = seeded(unbound).await;
     let loaded = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(loaded.bindings, bindings);
-    assert!(is_current_format(&stored_blob(&store, &d).await));
+    assert!(
+        !is_current_format(&stored_blob(&store, &d).await),
+        "a blob that proves nothing about its row is not bound to it by a read"
+    );
     assert_eq!(
         store.load(&t, &d).await.unwrap().unwrap().bindings,
         bindings
@@ -119,6 +124,57 @@ async fn load_reseals_a_blob_of_the_previous_format() {
     let loaded = store.load(&t, &d).await.unwrap().unwrap();
     assert_eq!(loaded.bindings, bindings);
     assert!(is_current_format(&stored_blob(&store, &d).await));
+}
+
+/// Under an `AcceptUntil` window, a bindings blob without any binding that
+/// sits under a row it may not belong to (a copy from another device) reads,
+/// but the read does not bind it to that row; the next write of the row's
+/// bindings seals what the application holds.
+#[tokio::test]
+async fn an_unbound_blob_under_another_row_is_not_bound_to_it_by_a_read() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let store = SqliteDeviceStore::new(
+        pool,
+        SessionCrypto::new(KEY).with_legacy_blobs(
+            crate::session::crypto::LegacyBlobs::AcceptUntil(
+                Utc::now() + chrono::Duration::hours(1),
+            ),
+        ),
+    );
+    store.init_schema().await.unwrap();
+    let (t, u, d) = ids();
+    let own = vec![refresh("own")];
+    store
+        .save(
+            &build_device(&t, Some(&u), &d, 7, own.clone()),
+            now_at(10, 0),
+        )
+        .await
+        .unwrap();
+    let copied = unbound_blob(&[refresh("copied-from-another-device")]);
+    overwrite_blob(&store, &d, &copied).await;
+
+    let loaded = store.load(&t, &d).await.unwrap().unwrap();
+    assert_eq!(loaded.bindings, vec![refresh("copied-from-another-device")]);
+    assert_eq!(
+        stored_blob(&store, &d).await,
+        copied,
+        "the read leaves the blob as it found it"
+    );
+
+    store
+        .save(
+            &build_device(&t, Some(&u), &d, 7, own.clone()),
+            now_at(10, 1),
+        )
+        .await
+        .unwrap();
+    assert!(is_current_format(&stored_blob(&store, &d).await));
+    assert_eq!(store.load(&t, &d).await.unwrap().unwrap().bindings, own);
 }
 
 #[tokio::test]
@@ -139,7 +195,7 @@ async fn a_current_blob_is_left_alone_by_a_read() {
 
 #[tokio::test]
 async fn find_by_fingerprint_reseals() {
-    let (store, t, _, d, bindings) = seeded(unbound).await;
+    let (store, t, _, d, bindings) = seeded(v1_blob).await;
     let found = store
         .find_by_fingerprint(&t, &fingerprint(7))
         .await
@@ -156,7 +212,12 @@ async fn find_for_user_and_refresh_family_reseal() {
     assert_eq!(found[0].bindings, bindings);
     assert!(is_current_format(&stored_blob(&store, &d).await));
 
-    overwrite_blob(&store, &d, &unbound_blob(&bindings)).await;
+    overwrite_blob(
+        &store,
+        &d,
+        &v1_blob(&t.to_string(), &d.to_string(), &bindings),
+    )
+    .await;
     let found = store.find_by_refresh_family(&t, "fam-1").await.unwrap();
     assert_eq!(found[0].bindings, bindings);
     assert!(is_current_format(&stored_blob(&store, &d).await));
@@ -174,7 +235,7 @@ async fn find_for_user_and_refresh_family_reseal() {
 
 #[tokio::test]
 async fn find_by_fingerprint_for_user_reseals() {
-    let (store, t, u, d, bindings) = seeded(unbound).await;
+    let (store, t, u, d, bindings) = seeded(v1_blob).await;
     let found = store
         .find_by_fingerprint_for_user(&t, &u, &fingerprint(7))
         .await
@@ -189,7 +250,7 @@ async fn find_by_fingerprint_for_user_reseals() {
 /// halves of what `load` does.
 #[tokio::test]
 async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
-    let (store, t, u, d, _) = seeded(unbound).await;
+    let (store, t, u, d, _) = seeded(v1_blob).await;
     let row: DeviceRow = sqlx::query_as(select_devices!("WHERE tenant_id = ?1 AND id = ?2"))
         .bind(t.to_string())
         .bind(d.to_string())
@@ -197,7 +258,10 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
         .await
         .unwrap();
     let (read, reseal) = row.into_device(&store.codec).unwrap();
-    assert!(reseal.is_some(), "the unbound blob must be reported stale");
+    assert!(
+        reseal.is_some(),
+        "the blob of the previous format must be reported stale"
+    );
 
     let newer = vec![refresh("fam-2")];
     store
@@ -209,7 +273,7 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
         .unwrap();
     let saved = stored_blob(&store, &d).await;
 
-    reseal_rows(&store.pool, reseal).await;
+    crate::device::storage::sql_common::ops::reseal_rows::<Sql>(&store.pool, reseal).await;
     assert_eq!(stored_blob(&store, &d).await, saved);
     assert_ne!(read.bindings, newer);
     assert_eq!(store.load(&t, &d).await.unwrap().unwrap().bindings, newer);
@@ -218,7 +282,7 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
 /// A failing re-seal does not fail the read.
 #[tokio::test]
 async fn a_failed_reseal_still_returns_the_device() {
-    let (store, t, _, d, bindings) = seeded(unbound).await;
+    let (store, t, _, d, bindings) = seeded(v1_blob).await;
     sqlx::query(
         "CREATE TRIGGER refuse_update BEFORE UPDATE ON devices \
          BEGIN SELECT RAISE(ABORT, 'no'); END",

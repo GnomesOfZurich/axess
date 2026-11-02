@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 /// Attempt limit applied when a config carries `max_attempts = 0`.
 ///
-/// Zero used to switch the limit off. A zero reaches a config through a
-/// missing field in stored JSON, a partial migration or a careless admin
-/// form, and "no limit" is the worst thing any of those should silently
-/// mean, so zero now means the default.
+/// Zero is never "no limit": a zero reaches a config through a missing
+/// field in stored JSON, a partial migration or a careless admin form, and
+/// "no limit" is the worst thing any of those should silently mean, so zero
+/// means the default.
 pub(crate) const DEFAULT_MAX_OTP_ATTEMPTS: u8 = 5;
 
 /// The attempt limit in force for a configured `max_attempts`.
@@ -26,23 +26,27 @@ pub(crate) fn effective_max_attempts(configured: u8) -> u8 {
     }
 }
 
-/// Compute the next HOTP config state after a failed verification.
+/// Compute the next HOTP config state after a failed verification at `now`.
 ///
-/// Mirror of [`apply_email_otp_failure`] for HOTP. If the prior
-/// config has reached `max_attempts`, advance `counter` past the
-/// lookahead window (burning the current window) and reset
-/// `attempt_count`. Otherwise increment `attempt_count`.
+/// Mirror of [`apply_email_otp_failure`] for HOTP. A config that is locked
+/// at `now` is returned unchanged: no code was checked, so the token's
+/// attempt count does not move. Otherwise `attempt_count` goes up by one,
+/// and when it reaches `max_attempts` the factor is locked for its backoff
+/// (RFC 4226 §7.3) with the count started over. The counter never moves on
+/// a failure: advancing it past the lookahead window would put the token
+/// out of sync, so anyone who knew the password could lock the user out of
+/// their own token for good.
 pub(crate) fn apply_hotp_failure(
     prior: &crate::authn::factor::HotpConfig,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> crate::authn::factor::HotpConfig {
     let mut next = prior.clone();
-    if prior.attempt_count >= effective_max_attempts(prior.max_attempts) {
-        next.counter = prior
-            .counter
-            .saturating_add(prior.lookahead_window as u64 + 1);
-        next.attempt_count = 0;
-    } else {
-        next.attempt_count = prior.attempt_count.saturating_add(1);
+    if prior.is_locked_at(now) {
+        return next;
+    }
+    next.attempt_count = prior.attempt_count.saturating_add(1);
+    if next.attempt_count >= effective_max_attempts(prior.max_attempts) {
+        next.lock_at(now);
     }
     next
 }
@@ -72,6 +76,21 @@ pub(crate) fn apply_email_otp_failure(prior: &EmailOtpConfig) -> EmailOtpConfig 
     next
 }
 
+/// The secrets keyed recovery codes are checked under: the current pepper
+/// and, while a rotation is in flight, the previous one.
+///
+/// Set through
+/// [`with_recovery_code_pepper`](crate::authn::AuthnServiceBuilder::with_recovery_code_pepper)
+/// and
+/// [`with_previous_recovery_code_pepper`](crate::authn::AuthnServiceBuilder::with_previous_recovery_code_pepper).
+/// A set generated under the previous pepper stays usable; a match under it
+/// is reported so the application can have the user regenerate the set.
+#[derive(Clone, Default)]
+pub(crate) struct RecoveryPeppers {
+    pub(crate) current: Option<Arc<axess_factors::RecoveryCodePepper>>,
+    pub(crate) previous: Option<Arc<axess_factors::RecoveryCodePepper>>,
+}
+
 /// Result of verifying a single factor credential.
 pub(crate) enum VerifyOutcome {
     /// Verification failed: wrong credential or replay detected.
@@ -96,8 +115,8 @@ pub(crate) enum VerifyOutcome {
 /// testable under DST. Converted to `SystemTime` only for the TOTP path
 /// which requires it.
 ///
-/// `pepper` is the secret keyed recovery codes are checked under; without it
-/// a keyed row cannot match. Password, email-OTP and (for Argon2id rows)
+/// `peppers` are the secrets keyed recovery codes are checked under; with
+/// neither set a keyed row cannot match and only Argon2id rows verify. Password, email-OTP and (for Argon2id rows)
 /// recovery-code checks run Argon2id: reach them through
 /// [`verify_credential_blocking`] from async code.
 pub(crate) fn verify_credential(
@@ -105,7 +124,7 @@ pub(crate) fn verify_credential(
     config: &FactorConfig,
     kind: &FactorKind,
     now: chrono::DateTime<chrono::Utc>,
-    pepper: Option<&axess_factors::RecoveryCodePepper>,
+    peppers: &RecoveryPeppers,
 ) -> VerifyOutcome {
     match (credential, config, kind) {
         (FactorCredential::Password(pwd), FactorConfig::Password(cfg), FactorKind::Password) => {
@@ -115,7 +134,7 @@ pub(crate) fn verify_credential(
             verify_totp_factor(code.as_ref(), cfg, now)
         }
         (FactorCredential::OtpCode(code), FactorConfig::Hotp(cfg), FactorKind::Hotp) => {
-            verify_hotp_factor(code.as_ref(), cfg)
+            verify_hotp_factor(code.as_ref(), cfg, now)
         }
         (FactorCredential::OtpCode(code), FactorConfig::EmailOtp(cfg), FactorKind::EmailOtp) => {
             verify_email_otp_factor(code.as_ref(), cfg, now)
@@ -124,7 +143,7 @@ pub(crate) fn verify_credential(
             FactorCredential::RecoveryCode(code),
             FactorConfig::RecoveryCodes(cfg),
             FactorKind::RecoveryCode,
-        ) => verify_recovery_code_factor(code.as_ref(), cfg, now, pepper),
+        ) => verify_recovery_code_factor(code.as_ref(), cfg, now, peppers),
         (FactorCredential::Fido2Assertion(_), FactorConfig::Fido2(_), FactorKind::Fido2) => {
             // Defensive fail-closed for `#[cfg(not(feature = "fido2"))]` builds.
             //
@@ -214,21 +233,29 @@ fn verify_totp_factor(
 }
 
 /// Check an HOTP code inside the lookahead window, throttled per counter.
-fn verify_hotp_factor(code: &str, cfg: &HotpConfig) -> VerifyOutcome {
+fn verify_hotp_factor(
+    code: &str,
+    cfg: &HotpConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> VerifyOutcome {
     if code.len() > MAX_OTP_CODE_BYTES {
         return VerifyOutcome::Fail;
     }
-    // RFC 4226 §7.4: enforce per-counter throttling. If
-    // attempts have already maxed out, burn the lookahead window
-    // (advance the counter past it) and fail. The user must
-    // re-sync their token (typically by pressing it once and
-    // re-enrolling, or by an admin counter reset).
+    // RFC 4226 §7.3 and §7.4: a run of `max_attempts` wrong codes locks the
+    // factor for a while; while locked no code is checked and the factor is
+    // not changed, so the token's attempt count and counter stay where they
+    // are. The refusal is still a failed credential to the account: the
+    // guess reserved against the account's failure counter before the check
+    // is kept, as for every refused credential, so hammering a locked token
+    // leads to the account lockout.
+    if cfg.is_locked_at(now) {
+        return VerifyOutcome::Fail;
+    }
+    // A stored count at the limit with no lock (a row written before the
+    // lock existed): lock it now rather than check the code.
     if cfg.attempt_count >= effective_max_attempts(cfg.max_attempts) {
-        let mut burned = cfg.clone();
-        burned.counter = cfg.counter.saturating_add(cfg.lookahead_window as u64 + 1);
-        burned.attempt_count = 0;
-        tracing::warn!("HOTP attempt limit reached; burning lookahead window");
-        return VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(burned));
+        tracing::warn!("HOTP attempt limit reached; factor locked");
+        return VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(apply_hotp_failure(cfg, now)));
     }
     let hotp_algo = match cfg.algorithm {
         OtpAlgorithm::Sha1 => axess_factors::HotpAlgorithm::Sha1,
@@ -248,21 +275,22 @@ fn verify_hotp_factor(code: &str, cfg: &HotpConfig) -> VerifyOutcome {
     );
     match matched {
         None => {
-            // Increment per-counter attempt count on failure.
-            let mut failed = cfg.clone();
-            failed.attempt_count = cfg.attempt_count.saturating_add(1);
+            // Count the guess; the limit locks the factor.
+            let failed = apply_hotp_failure(cfg, now);
+            if failed.locked_until().is_some() {
+                tracing::warn!("HOTP attempt limit reached; factor locked");
+            }
             VerifyOutcome::FailWithUpdate(FactorConfig::Hotp(failed))
         }
         Some(counter) => {
-            // Advance counter past the matched value to prevent reuse.
-            // Reset attempt_count for the new counter window.
-            // `saturating_add` matches the failure path above; a
-            // counter at `u64::MAX` (18e18 verifications) sticks
-            // rather than wraps back to zero, keeping the
-            // never-decreases invariant that anti-reuse relies on.
+            // Advance counter past the matched value to prevent reuse and
+            // forget the throttle state. A counter at `u64::MAX` (18e18
+            // verifications) sticks rather than wraps back to zero,
+            // keeping the never-decreases invariant that anti-reuse
+            // relies on.
             let mut updated = cfg.clone();
             updated.counter = counter.saturating_add(1);
-            updated.attempt_count = 0;
+            updated.clear_lock();
             VerifyOutcome::PassWithUpdate(FactorConfig::Hotp(updated))
         }
     }
@@ -336,17 +364,25 @@ fn verify_recovery_code_factor(
     code: &str,
     cfg: &RecoveryCodesConfig,
     now: chrono::DateTime<chrono::Utc>,
-    pepper: Option<&axess_factors::RecoveryCodePepper>,
+    peppers: &RecoveryPeppers,
 ) -> VerifyOutcome {
     if code.len() > MAX_OTP_CODE_BYTES {
         return VerifyOutcome::Fail;
     }
+    let current = peppers.current.as_deref();
+    let previous = peppers.previous.as_deref();
     // A match returns the set with that code spent; persisting it by
     // compare-and-swap is what makes the code single-use: a second
     // login racing on the same code loses the swap and is rejected
-    // as a replay.
-    match axess_factors::verify_recovery_code(cfg, code, now, pepper) {
-        Some(updated) => VerifyOutcome::PassWithUpdate(FactorConfig::RecoveryCodes(updated)),
+    // as a replay. A match under the previous pepper of a rotation is
+    // recorded on the set, which cannot be re-keyed and should be
+    // regenerated; the mark stays until a new set replaces it.
+    match axess_factors::verify_recovery_code_rotating(cfg, code, now, current, previous) {
+        Some(matched) => {
+            let mut updated = matched.config;
+            updated.under_previous_pepper |= matched.matched_previous_pepper;
+            VerifyOutcome::PassWithUpdate(FactorConfig::RecoveryCodes(updated))
+        }
         None => VerifyOutcome::Fail,
     }
 }
@@ -372,24 +408,18 @@ pub(crate) async fn verify_credential_blocking(
     config: &FactorConfig,
     kind: &FactorKind,
     now: chrono::DateTime<chrono::Utc>,
-    pepper: Option<&Arc<axess_factors::RecoveryCodePepper>>,
+    peppers: &RecoveryPeppers,
 ) -> Result<VerifyOutcome, KdfError> {
     if !runs_kdf(credential, config) {
-        return Ok(verify_credential(
-            credential,
-            config,
-            kind,
-            now,
-            pepper.map(|p| &**p),
-        ));
+        return Ok(verify_credential(credential, config, kind, now, peppers));
     }
-    let (credential, config, kind, pepper) = (
+    let (credential, config, kind, peppers) = (
         credential.clone(),
         config.clone(),
         kind.clone(),
-        pepper.cloned(),
+        peppers.clone(),
     );
-    kdf.run(move || verify_credential(&credential, &config, &kind, now, pepper.as_deref()))
+    kdf.run(move || verify_credential(&credential, &config, &kind, now, &peppers))
         .await
 }
 
@@ -428,198 +458,7 @@ fn random_digits(rng: &impl SecureRng, width: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::authn::factor::{EmailOtpConfig, PasswordConfig, ZeroizedString};
-    use crate::testing::mock_random::MockRng;
-    use chrono::Utc;
-    use std::sync::Arc;
-
-    // ── Password ─────────────────────────────────────────────────────
-
-    #[test]
-    fn password_correct() {
-        let hash = axess_factors::generate_password_hash("Gnomes2+");
-        let cfg = FactorConfig::Password(PasswordConfig {
-            hash: ZeroizedString::new(&hash),
-            rules: Default::default(),
-        });
-        let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::Password, Utc::now(), None);
-        assert!(matches!(outcome, VerifyOutcome::Pass));
-    }
-
-    #[test]
-    fn password_wrong() {
-        let hash = axess_factors::generate_password_hash("Gnomes2+");
-        let cfg = FactorConfig::Password(PasswordConfig {
-            hash: ZeroizedString::new(&hash),
-            rules: Default::default(),
-        });
-        let cred = FactorCredential::Password(ZeroizedString::new("wrong"));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::Password, Utc::now(), None);
-        assert!(matches!(outcome, VerifyOutcome::Fail));
-    }
-
-    #[test]
-    fn password_oversized_rejected() {
-        let hash = axess_factors::generate_password_hash("x");
-        let cfg = FactorConfig::Password(PasswordConfig {
-            hash: ZeroizedString::new(&hash),
-            rules: Default::default(),
-        });
-        let oversized = "x".repeat(crate::validation::MAX_PASSWORD_BYTES + 1);
-        let cred = FactorCredential::Password(ZeroizedString::new(&oversized));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::Password, Utc::now(), None);
-        assert!(matches!(outcome, VerifyOutcome::Fail));
-    }
-
-    // ── Email OTP ────────────────────────────────────────────────────
-
-    #[test]
-    fn email_otp_expired_rejected() {
-        let code = "12345678";
-        let hash = axess_factors::generate_password_hash(code);
-        let expired = Utc::now() - chrono::Duration::seconds(10);
-        let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
-            email: "test@example.com".into(),
-            pending_hash: Some(ZeroizedString::new(&hash)),
-            pending_until: Some(expired),
-            ..Default::default()
-        });
-        let cred = FactorCredential::OtpCode(Arc::from(code));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None);
-        assert!(matches!(outcome, VerifyOutcome::Fail));
-    }
-
-    #[test]
-    fn email_otp_no_pending_hash_rejected() {
-        let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
-            email: "test@example.com".into(),
-            pending_hash: None,
-            pending_until: None,
-            ..Default::default()
-        });
-        let cred = FactorCredential::OtpCode(Arc::from("12345678"));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None);
-        assert!(matches!(outcome, VerifyOutcome::Fail));
-    }
-
-    #[test]
-    fn email_otp_attempt_limit_burns_code() {
-        let code = "12345678";
-        let hash = axess_factors::generate_password_hash(code);
-        let future = Utc::now() + chrono::Duration::seconds(300);
-        let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
-            email: "test@example.com".into(),
-            pending_hash: Some(ZeroizedString::new(&hash)),
-            pending_until: Some(future),
-            attempt_count: 5,
-            max_attempts: 5,
-            ..Default::default()
-        });
-        let cred = FactorCredential::OtpCode(Arc::from(code));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None);
-        match outcome {
-            VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(updated)) => {
-                assert!(updated.pending_hash.is_none());
-                assert_eq!(updated.attempt_count, 0);
-            }
-            _ => panic!("expected FailWithUpdate with burned code"),
-        }
-    }
-
-    #[test]
-    fn apply_email_otp_failure_increments_below_limit() {
-        let prior = EmailOtpConfig {
-            email: "test@example.com".into(),
-            pending_hash: Some(ZeroizedString::new("hash")),
-            pending_until: Some(Utc::now()),
-            attempt_count: 2,
-            max_attempts: 5,
-            ..Default::default()
-        };
-        let next = apply_email_otp_failure(&prior);
-        assert_eq!(next.attempt_count, 3);
-        assert!(next.pending_hash.is_some());
-    }
-
-    #[test]
-    fn apply_email_otp_failure_burns_at_limit() {
-        let prior = EmailOtpConfig {
-            email: "test@example.com".into(),
-            pending_hash: Some(ZeroizedString::new("hash")),
-            pending_until: Some(Utc::now()),
-            attempt_count: 5,
-            max_attempts: 5,
-            ..Default::default()
-        };
-        let next = apply_email_otp_failure(&prior);
-        assert!(next.pending_hash.is_none());
-        assert!(next.pending_until.is_some(), "the cooldown survives a burn");
-        assert_eq!(next.attempt_count, 0);
-    }
-
-    #[test]
-    fn email_otp_wrong_code_increments_counter() {
-        let hash = axess_factors::generate_password_hash("12345678");
-        let future = Utc::now() + chrono::Duration::seconds(300);
-        let cfg = FactorConfig::EmailOtp(EmailOtpConfig {
-            email: "test@example.com".into(),
-            pending_hash: Some(ZeroizedString::new(&hash)),
-            pending_until: Some(future),
-            attempt_count: 2,
-            max_attempts: 5,
-            ..Default::default()
-        });
-        let cred = FactorCredential::OtpCode(Arc::from("00000000"));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::EmailOtp, Utc::now(), None);
-        match outcome {
-            VerifyOutcome::FailWithUpdate(FactorConfig::EmailOtp(updated)) => {
-                assert_eq!(updated.attempt_count, 3);
-                assert!(updated.pending_hash.is_some());
-            }
-            _ => panic!("expected FailWithUpdate with incremented counter"),
-        }
-    }
-
-    // ── Mismatched credential/config ────────────────────────────────
-
-    #[test]
-    fn mismatched_credential_config_rejected() {
-        let cfg = FactorConfig::Password(PasswordConfig {
-            hash: ZeroizedString::new("$argon2id$v=19$m=19456,t=2,p=1$fake$fake"),
-            rules: Default::default(),
-        });
-        let cred = FactorCredential::OtpCode(Arc::from("123456"));
-        let outcome = verify_credential(&cred, &cfg, &FactorKind::Totp, Utc::now(), None);
-        assert!(matches!(outcome, VerifyOutcome::Fail));
-    }
-
-    // ── generate_otp_code ────────────────────────────────────────────
-
-    #[test]
-    fn otp_code_correct_length() {
-        let rng = MockRng::new(42);
-        let code = generate_otp_code(&rng, 8);
-        assert_eq!(code.len(), 8);
-        assert!(code.chars().all(|c| c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn otp_code_deterministic_with_same_seed() {
-        let code1 = generate_otp_code(&MockRng::new(99), 6);
-        let code2 = generate_otp_code(&MockRng::new(99), 6);
-        assert_eq!(code1, code2);
-    }
-
-    #[test]
-    fn otp_code_different_seeds_differ() {
-        let code1 = generate_otp_code(&MockRng::new(1), 6);
-        let code2 = generate_otp_code(&MockRng::new(2), 6);
-        assert_ne!(code1, code2);
-    }
-}
+mod tests;
 
 #[cfg(test)]
 mod verification_tests;

@@ -6,10 +6,8 @@
 
 #![cfg(feature = "testing-oauth")]
 
-use axess_core::testing::oauth_wiremock::{
-    oauth_discovery_document, oauth_generate_rsa_keypair, oauth_setup_provider,
-};
-use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderConfig};
+use axess_core::testing::oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair};
+use axess_factors::oauth::{OAuthError, OAuthProvider, OAuthProviderBuilder, OAuthProviderConfig};
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -37,7 +35,7 @@ async fn idp_with(extra: serde_json::Value) -> MockServer {
     server
 }
 
-async fn discover(server: &MockServer) -> Result<OAuthProviderConfig, OAuthError> {
+async fn discover(server: &MockServer) -> Result<OAuthProviderBuilder, OAuthError> {
     OAuthProviderConfig::discover(
         "test",
         &server.uri(),
@@ -64,7 +62,9 @@ async fn discovery_reads_the_optional_endpoints_from_the_raw_document() {
     let provider = discover(&server)
         .await
         .unwrap()
-        .with_allowed_post_logout_redirect_uris(["https://app.example/after"]);
+        .with_allowed_post_logout_redirect_uris(["https://app.example/after"])
+        .build()
+        .unwrap();
 
     let url = provider
         .build_end_session_url(Some("hint"), Some("https://app.example/after"), None)
@@ -78,7 +78,7 @@ async fn discovery_reads_the_optional_endpoints_from_the_raw_document() {
 #[tokio::test]
 async fn iss_parameter_is_required_only_when_advertised() {
     let server = idp_with(json!({})).await;
-    let provider = discover(&server).await.unwrap();
+    let provider = discover(&server).await.unwrap().build().unwrap();
     assert!(!provider.authorization_response_iss_required());
 }
 
@@ -87,7 +87,7 @@ async fn iss_parameter_is_required_only_when_advertised() {
 #[tokio::test]
 async fn an_empty_post_logout_allowlist_forwards_no_redirect() {
     let server = idp_with(json!({ "end_session_endpoint": "http://localhost:9/logout" })).await;
-    let bare = discover(&server).await.unwrap();
+    let bare = discover(&server).await.unwrap().build().unwrap();
 
     let url = bare
         .build_end_session_url(None, Some("https://evil.example"), None)
@@ -101,7 +101,9 @@ async fn an_empty_post_logout_allowlist_forwards_no_redirect() {
     let listed = discover(&server)
         .await
         .unwrap()
-        .with_allowed_post_logout_redirect_uris(["https://app/after"]);
+        .with_allowed_post_logout_redirect_uris(["https://app/after"])
+        .build()
+        .unwrap();
     let forwarded = |redirect: &str| {
         listed
             .build_end_session_url(None, Some(redirect), None)
@@ -115,9 +117,9 @@ async fn an_empty_post_logout_allowlist_forwards_no_redirect() {
 }
 
 /// An endpoint that receives a secret or a token is HTTPS, or loopback HTTP.
-/// Discovery refuses a remote plain-HTTP endpoint it is told about, and the
-/// setters' endpoints are checked where they are used, before anything is
-/// sent.
+/// Discovery refuses a remote plain-HTTP endpoint it is told about, and
+/// `build` refuses one a setter named, naming the setting, before the
+/// provider exists to send anything.
 #[tokio::test]
 async fn plain_http_endpoints_to_remote_hosts_are_refused() {
     // Discovery: a plain-HTTP token endpoint on a remote host.
@@ -131,33 +133,45 @@ async fn plain_http_endpoints_to_remote_hosts_are_refused() {
         "got {err:?}"
     );
 
-    // Setters: used, they refuse before sending the secret.
+    // Setters: `build` refuses each, naming it.
     let server = idp_with(json!({})).await;
-    let provider = oauth_setup_provider(&server)
-        .await
-        .with_revocation_endpoint("http://idp.example.net/revoke")
-        .with_par_endpoint("http://idp.example.net/par")
-        .with_device_authorization_endpoint("http://idp.example.net/device")
-        .with_end_session_endpoint("http://idp.example.net/logout");
-    let err = provider.revoke_token("tok", None).await.unwrap_err();
+    type Setter = fn(OAuthProviderBuilder) -> OAuthProviderBuilder;
+    let cases: [(Setter, &str); 4] = [
+        (
+            |b| b.with_revocation_endpoint("http://idp.example.net/revoke"),
+            "revocation_endpoint",
+        ),
+        (
+            |b| b.with_par_endpoint("http://idp.example.net/par"),
+            "pushed_authorization_request_endpoint",
+        ),
+        (
+            |b| b.with_device_authorization_endpoint("http://idp.example.net/device"),
+            "device_authorization_endpoint",
+        ),
+        (
+            |b| b.with_end_session_endpoint("http://idp.example.net/logout"),
+            "end_session_endpoint",
+        ),
+    ];
+    for (set, what) in cases {
+        let insecure = set(discover(&server).await.unwrap());
+        let err = insecure.build().err().expect(what);
+        assert!(
+            matches!(&err, OAuthError::Config(m) if m.contains(what)),
+            "{what}: {err:?}"
+        );
+    }
+    // The same settings over loopback HTTP build.
     assert!(
-        matches!(&err, OAuthError::Config(m) if m.contains("revocation_endpoint")),
-        "{err:?}"
-    );
-    let err = provider.push_authorization_request(&[]).await.unwrap_err();
-    assert!(
-        matches!(&err, OAuthError::Config(m) if m.contains("pushed_authorization_request_endpoint")),
-        "{err:?}"
-    );
-    let err = provider.request_device_code(&["openid"]).await.unwrap_err();
-    assert!(
-        matches!(&err, OAuthError::Config(m) if m.contains("device_authorization_endpoint")),
-        "{err:?}"
-    );
-    assert!(
-        provider
-            .build_end_session_url(Some("hint"), None, None)
-            .is_none(),
-        "an id_token_hint is not put in a plain-HTTP URL"
+        discover(&server)
+            .await
+            .unwrap()
+            .with_revocation_endpoint("http://localhost:9/revoke")
+            .with_par_endpoint("http://127.0.0.1:9/par")
+            .with_device_authorization_endpoint("http://localhost:9/device")
+            .with_end_session_endpoint("http://localhost:9/logout")
+            .build()
+            .is_ok()
     );
 }

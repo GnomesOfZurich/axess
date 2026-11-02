@@ -8,15 +8,16 @@ Requests (PAR), mandatory sender-constrained tokens through DPoP or
 mTLS, optional JWT Authorization Response Mode (JARM), and stricter
 ID token lifetime bounds.
 
-> **Scope.** Axess is the relying party. `OAuthProviderConfig::with_fapi`
+> **Scope.** Axess is the relying party. `OAuthProviderBuilder::with_fapi`
 > switches the profile on for a provider: the token request is
-> sender-constrained (a DPoP proof, or a client certificate), the ID token is
-> held to the profile's lifetime, `nbf` and algorithm rules, and the
+> sender-constrained (a DPoP proof, or a client certificate), the client
+> authenticates by `private_key_jwt` or mTLS and never by a secret, the ID
+> token is held to the profile's lifetime, `nbf` and algorithm rules, and the
 > authorization response can be required to arrive as a signed JWT (JARM).
 
-The `oauth` feature carries the whole client side of the profile. The `fapi`
-feature (off by default, implies `oauth`) adds the resource-server side,
-`verify_dpop_proof`.
+The `oauth` feature carries the whole client side of the profile and the
+resource-server side of DPoP, `verify_dpop_proof`. The `fapi` feature is an
+alias for it.
 The base OAuth chapter (*OAuth 2.0 and OIDC*) covers everything that
 remains true under FAPI; this chapter covers only what changes.
 
@@ -78,6 +79,13 @@ That defeats bearer-token theft. An attacker who lifts the token from
 logs, a misconfigured proxy or a debugging surface cannot use it without
 the private key, which never leaves the client.
 
+DPoP is not FAPI-only. Outside the profile a provider binds its tokens to
+a DPoP key by default whenever the IdP advertises DPoP, whatever the client
+authenticates with; [OAuth 2.0 and OIDC](oauth.md#binding-tokens-to-a-key-dpop)
+covers that. FAPI builds on the same binding and makes it unconditional: on
+whether or not the IdP advertises it, with the code bound too through PAR,
+and with no way to switch it off.
+
 #### JARM: signed authorization responses
 
 The IdP returns the authorization response as a signed JWT rather than
@@ -86,10 +94,12 @@ in FAPI 2.0; some implementations use it, some do not.
 
 #### Short ID token windows
 
-FAPI 2.0 requires `nbf` to be enforced and the lifetime kept short.
-Axess defaults to five minutes and refuses an ID token whose `nbf` is in
-the future or whose `exp` is more than five minutes out. That closes
-replay through stale tokens.
+Axess refuses an ID token whose `exp` is more than five minutes after its
+`iat` (the default of `max_id_token_lifetime_secs`), which narrows replay
+through stale tokens, and one whose `nbf` is more than 60 seconds in the
+future, the rule FAPI 2.0 (section 5.3.2.1) sets for every JWT. `nbf` is
+optional: neither OpenID Connect nor FAPI 2.0 requires it in an ID token,
+and Keycloak issues none.
 
 [RFC 9126]: https://www.rfc-editor.org/rfc/rfc9126
 [RFC 9449]: https://www.rfc-editor.org/rfc/rfc9449
@@ -117,21 +127,23 @@ The four things FAPI adds over ordinary OAuth.
 
 ### Configuration
 
-`FapiConfig` describes the profile and `OAuthProviderConfig::with_fapi`
-attaches it. `with_fapi` is the only way to turn the profile on, and it
-either returns a provider that keeps all of it or an `OAuthError::Config`
-naming what is missing.
+`FapiConfig` describes the profile and `OAuthProviderBuilder::with_fapi`
+attaches it to the builder `discover` returns. It is the only way to turn the
+profile on, and `build` either returns a provider that keeps all of it or an
+`OAuthError::Config` naming what is missing, whatever order the settings
+came in.
 
 ```rust,ignore
 use axess::federation::oauth::{FapiConfig, SenderConstraint};
 
-let provider = provider
+let provider = builder
     .with_par_endpoint("https://idp.example.com/par") // if discovery did not find it
     .with_fapi(FapiConfig {
         sender_constraint: SenderConstraint::DPoP,
         require_jarm: true,
         ..FapiConfig::default()
-    })?;
+    })
+    .build()?;
 ```
 
 * `sender_constraint` chooses DPoP or mTLS, below.
@@ -139,19 +151,74 @@ let provider = provider
   and the callback finish through `finish_oauth_login_jarm`, below. A plain
   `finish_oauth_login` for such a provider is refused and ends the ceremony.
 * `max_id_token_lifetime_secs` bounds `exp - iat` of the ID token (300 by
-  default), and `nbf` must be present and not in the future.
+  default), and an `nbf`, when present, must not be more than 60 seconds in
+  the future.
 * `allowed_id_token_algs` lists the JOSE names an ID token may be signed
   with: `PS256`, `ES256` and `EdDSA` by default, whatever the IdP advertises
   in `id_token_signing_alg_values_supported`. An IdP that cannot sign with
   those is a deployment decision to widen this list, knowingly: the profile
   does not accept `RS256`. Symmetric names and `none` are refused, and so is an
-  empty list.
+  empty list. With `with_id_token_signing_algs` as well, the provider accepts
+  the algorithms both lists name, and `build` refuses a pin the profile shares
+  nothing with.
 * A PAR endpoint is required. `begin_oauth_login` then pushes the
   authorization request there.
+* The client authenticates by `private_key_jwt` or mTLS, never by a
+  client secret, below.
+
+### Client authentication
+
+FAPI 2.0 (Security Profile section 5.3.1.1) allows two ways for the
+client to prove its identity to the authorization server:
+`private_key_jwt` (RFC 7523) and mTLS (`tls_client_auth` or
+`self_signed_tls_client_auth`, RFC 8705). A shared secret, sent in the
+form or in a Basic header, is not one of them. `build` therefore
+refuses, with an `OAuthError::Config` naming both methods, a provider
+that holds neither a `private_key_jwt` signer nor an mTLS sender
+constraint, and drops any secret the provider was discovered with. No
+request a FAPI provider makes (the pushed authorization request, the
+code exchange, the refresh, `client_credentials`, the device grant,
+revocation) carries a secret; userinfo never did.
+
+**`private_key_jwt`.** Give the provider its signer: discover it with
+`discover_with_private_key_jwt`, or call `with_private_key_jwt` on the
+builder `discover` returns, before or after `with_fapi`. Each
+request then carries a fresh `client_assertion` signed for the issuer as
+audience (section 5.3.2.1), unless the signer fixed another with
+`ClientAssertionSigner::with_audience`. Sign with `PS256`, `ES256` or
+`EdDSA`. The [OAuth chapter](oauth.md) covers the signer, its key
+formats and the `kid` and thumbprint headers.
+
+```rust,ignore
+use axess::federation::oauth::{ClientAssertionSigner, FapiConfig, OAuthProviderConfig};
+
+let signer = ClientAssertionSigner::from_pem(client_id, &private_key_pem, jsonwebtoken::Algorithm::ES256)?
+    .with_key_id("2026-11");
+let provider = OAuthProviderConfig::discover_with_private_key_jwt(
+    "bank", issuer, signer, "https://app.example.com/auth/callback",
+)
+.await?
+.with_fapi(FapiConfig::default()) // DPoP-bound tokens, assertion-authenticated client
+.build()?;
+```
+
+**mTLS.** Choose `SenderConstraint::Mtls` with the certificate and key
+paths. The certificate both authenticates the client and binds its
+tokens, so no signer is needed; the requests carry `client_id` and the
+handshake carries the proof. A signer added as well authenticates by
+assertion over the same TLS connection.
+
+The order of the builder calls never matters: nothing brings a secret back
+under the profile, and a provider that would authenticate by its secret is
+refused by `build`.
 
 ### Sender-constrained token requests
 
-**DPoP.** For each login the service makes a `DpopKey` from its `SecureRng` and
+**DPoP.** The profile turns on the provider's one DPoP switch, the one
+discovery turns on for an IdP that advertises DPoP, so everything below is
+also what a provider outside the profile does when it binds its tokens.
+Under the profile it is on whatever the discovery document says, and
+`build` refuses `without_dpop()`. For each login the service makes a `DpopKey` from its `SecureRng` and
 the token request carries a `DPoP` header: a proof with `htm` POST, `htu` the
 token endpoint, a fresh `jti` and `iat` from the provider's clock. When the
 server answers `use_dpop_nonce` with a `DPoP-Nonce` header the request is sent
@@ -161,21 +228,28 @@ that is a JWT with a `cnf.jkt` other than the key's thumbprint. The key comes
 back as `OAuthClaims::dpop_key`.
 
 Refresh and userinfo calls are bound to the same key:
-`refresh_oauth_token_with_key` and `fetch_userinfo_with_key` take it, sign
-their requests with it, and send the access token under the `DPoP`
-authorization scheme with a proof that carries the token's hash. A provider
-configured for DPoP refuses the plain forms, since they would send the token
-unbound.
+`refresh_oauth_token` and `fetch_userinfo` take it as `dpop_key`, sign their
+requests with it, and send the access token under the `DPoP` authorization
+scheme with a proof that carries the token's hash. A provider configured for
+DPoP refuses them given no key (`OAuthError::DpopKeyRequired`), since they
+would send the token unbound.
 
-**mTLS.** `with_fapi` reads the certificate and key (PEM) from the configured
+The key is the caller's to keep: axess does not store it. Store
+`DpopKey::to_seed_bytes` beside the refresh token and restore it with
+`DpopKey::from_seed` in the process that refreshes; see
+[DPoP key management](#dpop-key-management).
+
+**mTLS.** `build` reads the certificate and key (PEM) from the configured
 paths into the HTTP client every request goes through, so a TLS server that
 asks for a client certificate gets one. The client authenticates with the
 certificate (`tls_client_auth`), so the configured client secret is no longer
 sent. When the discovery document has `mtls_endpoint_aliases`, the token,
-userinfo, revocation and PAR requests go to the aliases it lists. Missing or
-unreadable files, a bad PEM, or an alias that is not an HTTPS URL fail
-`with_fapi`, not the first login. The tokens are certificate-bound but say
-`Bearer`, as RFC 8705 has it.
+userinfo, revocation and PAR requests go to the aliases it lists, including
+an endpoint named with `with_par_endpoint` or `with_revocation_endpoint`.
+Missing or unreadable files, a bad PEM, or an alias that is not an HTTPS URL
+fail `build`, not the first login. The tokens are certificate-bound but say
+`Bearer`, as RFC 8705 has it. Under mTLS DPoP is off, even where the IdP
+advertises it, and `build` refuses `with_dpop()`: the certificate is the binding.
 
 ### JARM
 
@@ -209,11 +283,22 @@ redirect URI, scopes, PKCE challenge, CSRF state, nonce), receives
 the `request_uri` and its `expires_in`, and constructs the
 shorter authorize URL the user is redirected to.
 
-The PAR exchange happens server-to-server and is authenticated. The
-authentication is whatever the IdP requires (client secret POST,
-client secret basic, mTLS, or signed JWT assertion); axess passes
-through the credential that `OAuthProviderConfig` was constructed
-with.
+With DPoP as the sender constraint, the login's key is made at begin:
+the pushed request names it in `dpop_jkt` and carries a DPoP proof
+signed by it (RFC 9449 sections 10 and 10.1), so the authorization
+server binds the code to the key before the token request presents it,
+and a PAR endpoint that answers `use_dpop_nonce` is retried once with
+its nonce. The key travels in the session's ceremony state, beside the
+PKCE verifier, and the token request at `finish_oauth_login` presents
+it; `OAuthClaims::dpop_key` carries it back as before. On the trait,
+`build_auth_url_par` and `push_authorization_request` take the signer in
+their `dpop` argument; without one they push no `dpop_jkt` and no proof,
+which the RFC leaves optional since the token request binds the code.
+
+The PAR exchange happens server-to-server and is authenticated the way
+every request of a FAPI provider is: by a `private_key_jwt` assertion
+(audience the issuer) or by the mTLS client certificate, never by a
+client secret (see Client authentication above).
 
 The callback flow on your side is unchanged. The IdP
 redirects the user back to your callback URL with a
@@ -327,13 +412,16 @@ For an end-to-end browser walkthrough, the [`examples/fapi/`](https://github.com
 crate ships with a pre-configured Keycloak realm under
 `examples/fapi/keycloak/`. One `podman compose up -d` brings up
 Keycloak with PAR required, PKCE S256 required, DPoP-bound tokens
-enabled, the `axess-fapi-client` client registered, and a seeded
-user (`alice`/`alice`) ready to log in. The example's
-`OAuthProviderConfig::discover(...)` call points at the local
-Keycloak issuer through env vars, and the same code talks to a real
-production IdP when those env vars point elsewhere. Docker users can
-substitute `docker compose` for `podman compose`; podman is the
-documented path.
+enabled, ID tokens signed `ES256` (Keycloak's default `RS256` is outside
+the profile), the `axess-fapi-client` client registered for
+`private_key_jwt` with a development key, and a seeded user
+(`alice`/`alice`) ready to log in. The example's
+`OAuthProviderConfig::discover_with_private_key_jwt(...)` call points
+at the local Keycloak issuer through env vars and signs with that
+development key unless `FAPI_PRIVATE_KEY_FILE` names another; the same
+code talks to a real production IdP when those env vars point
+elsewhere. Docker users can substitute `docker compose` for
+`podman compose`; podman is the documented path.
 
 For compliance certification, the OpenID Foundation runs a free
 hosted conformance suite at <https://www.certification.openid.net/>.
@@ -365,10 +453,17 @@ else.
 
 ## Troubleshooting
 
-If the PAR exchange fails with `invalid_client`, your
-PAR endpoint authentication does not match what the IdP expects.
-Some IdPs require mTLS authentication on PAR even when the rest of
-the flow uses client secrets; check the IdP's PAR documentation.
+If `build` fails with "FAPI 2.0 does not allow a client secret",
+the provider has no `private_key_jwt` signer and no mTLS constraint:
+call `with_private_key_jwt` on the builder (or discover with
+`discover_with_private_key_jwt`), or choose `SenderConstraint::Mtls`.
+
+If the PAR exchange fails with `invalid_client`, your client
+authentication does not match what the IdP registered for the client:
+the method (`private_key_jwt` or `tls_client_auth`), the public key or
+certificate, the `kid`, or the assertion's audience. Some IdPs accept
+only the token endpoint as audience; fix it with
+`ClientAssertionSigner::with_audience`.
 
 If DPoP verification fails at the resource server, the most common
 cause is a clock-skew issue between the client and the resource

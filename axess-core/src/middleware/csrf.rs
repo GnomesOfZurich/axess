@@ -24,9 +24,15 @@
 //! (native mobile, server-to-server) that hit the same routes without
 //! an `Origin` header.
 //!
-//! With an allow-list configured, a WebSocket upgrade (a `GET` with
-//! `Upgrade: websocket`, which the token check never sees) must present an
-//! allowed `Origin` too, and is refused with `403` otherwise.
+//! A WebSocket upgrade (a `GET` with `Upgrade: websocket`, which the token
+//! check never sees) gets its own `Origin` gate, since a cross-site page can
+//! open a socket with the user's cookies: with an allow-list configured it
+//! must present an allowed `Origin`; without one it must come from the
+//! request's own `Host` under the scheme the deployment serves (`https`
+//! while `secure` is on). Either way it is refused with `403` otherwise.
+//! An upgrade with no `Origin` is not a browser's and passes the host rule.
+//! [`CsrfConfig::websocket_origin_check`](crate::middleware::csrf::CsrfConfig::websocket_origin_check)
+//! turns the host rule off.
 //!
 //! The token is `HMAC(signing_key, nonce || session_id)`, so it is bound to
 //! the session that was current when it was minted: a token minted under one
@@ -106,15 +112,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use subtle::ConstantTimeEq;
 use tower::{Layer, Service};
 use zeroize::Zeroizing;
 
 use crate::session::id::SessionId;
 use crate::session::layer::SessionHandle;
 
-/// Default cookie name for the CSRF token.
-pub const DEFAULT_CSRF_COOKIE: &str = "axess.csrf";
+/// Default cookie name for the CSRF token when the cookie is `Secure`. The
+/// `__Host-` prefix makes the browser refuse the cookie from any other host
+/// or path, so a sibling subdomain cannot plant a CSRF cookie of its own.
+pub const DEFAULT_CSRF_COOKIE: &str = "__Host-axess.csrf";
+
+/// Cookie name used instead of [`DEFAULT_CSRF_COOKIE`] when the config does
+/// not name a cookie and `Secure` is off: browsers drop a `__Host-` cookie
+/// that is not `Secure`, so the unprefixed name is the one that still works.
+pub const FALLBACK_CSRF_COOKIE: &str = "axess.csrf";
 
 /// Default header name for the CSRF token on AJAX requests.
 pub const DEFAULT_CSRF_HEADER: &str = "x-csrf-token";
@@ -140,7 +152,9 @@ pub struct CsrfConfig {
     signing_key: Arc<Zeroizing<[u8; 32]>>,
     /// Source of every token nonce.
     rng: Arc<dyn SecureRng>,
-    cookie_name: Arc<str>,
+    /// The name the adopter set; `None` takes the default that follows the
+    /// `Secure` flag (see [`effective_cookie_name`](Self::effective_cookie_name)).
+    cookie_name: Option<Arc<str>>,
     header_name: Arc<str>,
     form_field_name: Arc<str>,
     form_body_limit: usize,
@@ -154,6 +168,9 @@ pub struct CsrfConfig {
     /// Issue a token (and so store a session) on every request that arrives
     /// without one, whether or not a handler uses it.
     mint_on_every_request: bool,
+    /// Without an allow-list, refuse a WebSocket upgrade whose `Origin` is
+    /// not the request's own host and scheme.
+    websocket_origin_check: bool,
 }
 
 /// Whether [`CsrfConfig::require_origin`] should warn about entries it dropped.
@@ -178,11 +195,14 @@ impl CsrfConfig {
     /// master itself, so a leak of one use does not hand over the other.
     /// There is no previous-key fallback: changing this key invalidates the
     /// tokens already rendered into open forms, and those pages reload.
+    /// A key that is a single repeated byte is logged at `error`; use
+    /// [`try_new`](Self::try_new) to refuse it.
     pub fn new(signing_key: [u8; 32]) -> Self {
+        crate::session::weak_key::warn_if_constant_key("CSRF signing key", &signing_key);
         Self {
             signing_key: Arc::new(Zeroizing::new(signing_key)),
             rng: Arc::new(axess_rng::SystemRng),
-            cookie_name: DEFAULT_CSRF_COOKIE.into(),
+            cookie_name: None,
             header_name: DEFAULT_CSRF_HEADER.into(),
             form_field_name: DEFAULT_CSRF_FORM_FIELD.into(),
             form_body_limit: DEFAULT_CSRF_FORM_BODY_LIMIT,
@@ -191,7 +211,21 @@ impl CsrfConfig {
             path: "/".into(),
             allowed_origins: Arc::from(Vec::new()),
             mint_on_every_request: false,
+            websocket_origin_check: true,
         }
+    }
+
+    /// Like [`new`](Self::new), refusing a signing key that is a single
+    /// repeated byte.
+    ///
+    /// # Errors
+    ///
+    /// [`WeakKeyError`](crate::session::WeakKeyError) for such a key.
+    pub fn try_new(signing_key: [u8; 32]) -> Result<Self, crate::session::WeakKeyError> {
+        if crate::session::is_constant_key(&signing_key) {
+            return Err(crate::session::WeakKeyError);
+        }
+        Ok(Self::new(signing_key))
     }
 
     /// Issue a CSRF token, and store a session to bind it to, on every
@@ -209,6 +243,20 @@ impl CsrfConfig {
         self
     }
 
+    /// Without an allow-list ([`require_origin`](Self::require_origin)),
+    /// refuse a WebSocket upgrade whose `Origin` is not the request's own
+    /// `Host` under the scheme the deployment serves (`https` while
+    /// [`secure`](Self::secure) is on, `http` or `https` otherwise); on by
+    /// default. A cross-site page can open a socket with the user's
+    /// cookies, and the token check never sees an upgrade. An upgrade with
+    /// no `Origin` at all is not a browser's and passes. Turn this off only
+    /// for a deployment that terminates WebSockets on another host than the
+    /// one the browser addresses, and then set an allow-list instead.
+    pub fn websocket_origin_check(mut self, check: bool) -> Self {
+        self.websocket_origin_check = check;
+        self
+    }
+
     /// Draw token nonces from `rng` (default: `SystemRng`), so a seeded RNG
     /// makes the issued tokens reproducible.
     pub fn rng(mut self, rng: impl SecureRng) -> Self {
@@ -216,9 +264,10 @@ impl CsrfConfig {
         self
     }
 
-    /// Override the cookie name.
+    /// Override the cookie name (default [`DEFAULT_CSRF_COOKIE`], or
+    /// [`FALLBACK_CSRF_COOKIE`] when `Secure` is off).
     pub fn cookie_name(mut self, name: impl Into<Arc<str>>) -> Self {
-        self.cookie_name = name.into();
+        self.cookie_name = Some(name.into());
         self
     }
 
@@ -245,7 +294,10 @@ impl CsrfConfig {
     }
 
     /// Set the cookie `Secure` attribute (default: true). Set to `false`
-    /// only in local development over HTTP.
+    /// only in local development over HTTP. A default cookie name follows
+    /// the flag: [`DEFAULT_CSRF_COOKIE`] when `Secure`, else
+    /// [`FALLBACK_CSRF_COOKIE`], since browsers drop a `__Host-` cookie
+    /// that is not `Secure`.
     pub fn secure(mut self, secure: bool) -> Self {
         if !secure {
             tracing::warn!(
@@ -255,6 +307,19 @@ impl CsrfConfig {
         }
         self.secure = secure;
         self
+    }
+
+    /// The cookie name in use: the one set with
+    /// [`cookie_name`](Self::cookie_name), else [`DEFAULT_CSRF_COOKIE`] while
+    /// `Secure` is on and [`FALLBACK_CSRF_COOKIE`] otherwise. Derived from
+    /// the settings on every read, so the order of the setters never
+    /// matters.
+    pub(crate) fn effective_cookie_name(&self) -> &str {
+        match &self.cookie_name {
+            Some(name) => name,
+            None if self.secure => DEFAULT_CSRF_COOKIE,
+            None => FALLBACK_CSRF_COOKIE,
+        }
     }
 
     /// Set the cookie `SameSite` attribute. Default `Lax`.
@@ -350,9 +415,15 @@ impl CsrfLayer {
     ///
     /// Panics when the cookie name carries a `__Host-` or `__Secure-` prefix
     /// the configuration cannot honour (no `Secure`, or for `__Host-` a path
-    /// other than `/`): browsers drop such a cookie silently.
+    /// other than `/`), or when `SameSite=None` is set without `Secure`:
+    /// browsers drop such a cookie silently.
     pub fn new(config: CsrfConfig) -> Self {
-        check_cookie_rules(&config.cookie_name, config.secure, &config.path);
+        check_cookie_rules(
+            config.effective_cookie_name(),
+            config.secure,
+            &config.path,
+            config.same_site,
+        );
         Self { config }
     }
 }
@@ -395,7 +466,7 @@ where
         std::mem::swap(&mut inner, &mut self.inner);
 
         Box::pin(async move {
-            let cookie_token = extract_cookie_token(&req, &config.cookie_name);
+            let cookie_token = extract_cookie_token(&req, config.effective_cookie_name());
 
             // Read the current session id from the handle the session layer
             // injects. The token is HMAC-bound to this id, so the session
@@ -410,16 +481,24 @@ where
 
             // A WebSocket upgrade is a GET the browser sends with cookies
             // from any origin, and the CSRF token never applies to it. With
-            // an allow-list configured it gets the same Origin gate.
-            if !config.allowed_origins.is_empty()
-                && is_websocket_upgrade(&req)
-                && !origin_matches_allowed(&req, &config.allowed_origins)
-            {
-                tracing::warn!(
-                    path = %req.uri().path(),
-                    "csrf: WebSocket upgrade refused, Origin not in the allow-list"
-                );
-                return Ok(forbidden());
+            // an allow-list configured it gets the same Origin gate; without
+            // one the request's own host is the one origin it may come from.
+            if is_websocket_upgrade(&req) {
+                let admitted = if !config.allowed_origins.is_empty() {
+                    origin_matches_allowed(&req, &config.allowed_origins)
+                } else if config.websocket_origin_check {
+                    origin_is_own_host(&req, config.secure)
+                } else {
+                    true
+                };
+                if !admitted {
+                    tracing::warn!(
+                        path = %req.uri().path(),
+                        "csrf: WebSocket upgrade refused, Origin is not an allowed origin or the \
+                         request's own host"
+                    );
+                    return Ok(forbidden());
+                }
             }
 
             // Validate on state-changing methods. GET/HEAD/OPTIONS pass through
@@ -793,29 +872,13 @@ async fn extract_presented_token(
     Ok((field, restored))
 }
 
-fn validate_pair(
-    cookie_token: Option<&str>,
-    presented: Option<&str>,
-    session_id: &[u8],
-    signing_key: &[u8; 32],
-) -> bool {
-    let (Some(c), Some(p)) = (cookie_token, presented) else {
-        return false;
-    };
-    if c.is_empty() || p.is_empty() {
-        return false;
-    }
-    // Cookie and presented must match exactly (double-submit) AND the token
-    // must verify against the signing key *and* the current session id (so an
-    // attacker who can set cookies cannot inject a self-chosen value, and a
-    // token stolen from another session cannot be replayed here).
-    bool::from(c.as_bytes().ct_eq(p.as_bytes())) && validate_token(c, session_id, signing_key)
-}
-
 fn build_cookie(config: &CsrfConfig, token: &str) -> String {
     use tower_cookies::Cookie;
 
-    let mut cookie = Cookie::new(config.cookie_name.as_ref().to_string(), token.to_string());
+    let mut cookie = Cookie::new(
+        config.effective_cookie_name().to_string(),
+        token.to_string(),
+    );
     // Intentionally NOT HttpOnly; JavaScript needs to read the token to
     // include it in headers (the double-submit pattern requires this).
     cookie.set_http_only(false);
@@ -826,9 +889,12 @@ fn build_cookie(config: &CsrfConfig, token: &str) -> String {
 }
 
 mod guards;
-use guards::{check_cookie_rules, is_websocket_upgrade, normalize_origin, origin_matches_allowed};
+use guards::{
+    check_cookie_rules, is_websocket_upgrade, normalize_origin, origin_is_own_host,
+    origin_matches_allowed,
+};
 mod token;
-use token::{mint_token, validate_token};
+use token::{mint_token, validate_pair, validate_token};
 
 #[cfg(test)]
 mod tests;

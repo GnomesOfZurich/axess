@@ -42,7 +42,7 @@
 //! let client = AzureFicClient::new(
 //!     "tenant-guid",
 //!     "azure-app-client-id",
-//! );
+//! )?;
 //! let req = AzureFicRequest::new(federated_token)
 //!     .with_scope("https://graph.microsoft.com/.default");
 //! let resp = client.acquire_token(&req).await?;
@@ -59,9 +59,6 @@ use url::Url;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::authn::factor::ZeroizedString;
-
-/// Time allowed to establish a connection, on the default HTTP client.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time allowed for one token request from send to last response byte,
 /// unless [`AzureFicClient::with_timeout`] says otherwise.
@@ -189,6 +186,10 @@ pub enum AzureFicError {
     /// 2xx response that did not parse as the expected shape.
     #[error("malformed Azure AD response: {0}")]
     MalformedResponse(String),
+    /// The default HTTP client could not be built; nothing is sent. See
+    /// [`ClientBuildError`](crate::ClientBuildError).
+    #[error(transparent)]
+    ClientBuild(#[from] crate::ClientBuildError),
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -200,8 +201,9 @@ pub enum AzureFicError {
 /// reuse: `clone()` is cheap (`Arc`-backed reqwest client).
 ///
 /// Every token request is bounded by a timeout (30 seconds by default,
-/// [`with_timeout`](Self::with_timeout)), whichever HTTP client is used,
-/// and the default client also bounds connection setup to 10 seconds.
+/// [`with_timeout`](Self::with_timeout)), whichever HTTP client is used; it
+/// replaces the default client's own 30-second request bound, and the
+/// default client also bounds connection setup to 10 seconds.
 #[derive(Clone)]
 pub struct AzureFicClient {
     token_endpoint: Arc<Url>,
@@ -217,17 +219,32 @@ impl AzureFicClient {
     /// override with [`with_token_endpoint`](Self::with_token_endpoint)
     /// for Azure clouds other than the public cloud (US Gov, China
     /// 21Vianet, Germany) or for testing.
-    pub fn new(tenant: impl AsRef<str>, client_id: impl Into<String>) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`AzureFicError::ClientBuild`] when the default HTTP client cannot be built (the
+    /// TLS backend failed to initialise). No client with the protections
+    /// missing is built in its place.
+    pub fn new(
+        tenant: impl AsRef<str>,
+        client_id: impl Into<String>,
+    ) -> Result<Self, AzureFicError> {
+        Self::from_builder(tenant, client_id, reqwest::Client::builder())
+    }
+
+    /// [`new`](Self::new) on a builder the caller started.
+    fn from_builder(
+        tenant: impl AsRef<str>,
+        client_id: impl Into<String>,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self, AzureFicError> {
+        let http = crate::outbound_http::harden(builder)?;
+        Ok(Self {
             token_endpoint: Arc::new(token_endpoint_for_tenant(tenant.as_ref())),
             client_id: client_id.into(),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http,
             timeout: DEFAULT_REQUEST_TIMEOUT,
-        }
+        })
     }
 
     /// Bound each token request to `timeout` (default 30 seconds). The

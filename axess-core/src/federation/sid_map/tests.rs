@@ -32,6 +32,17 @@ fn reg(map: &SidMap, issuer: &str, user: UserId, session: SessionId) {
     map.register_subject_session(issuer, &user.to_string(), user, session);
 }
 
+/// End every session of `subject` under `issuer` the way the back-channel
+/// handler does once the registry has ended them: read the sessions, then
+/// drop each one's mappings.
+fn end_subject(map: &SidMap, issuer: &str, subject: &str) -> Vec<(UserId, SessionId)> {
+    let sessions = map.subject_sessions(issuer, subject);
+    for (_, session) in &sessions {
+        map.remove_session(session);
+    }
+    sessions
+}
+
 /// A deterministic stream of session ids.
 struct Sessions(MockRng);
 
@@ -98,13 +109,13 @@ fn user_index_agrees_with_entries_across_inserts_displacements_and_removals() {
     assert_eq!(displaced.map(|e| e.0), Some(alice));
     assert_consistent(&map);
 
-    map.remove(&key(ISS, "b"));
+    map.remove_if(&key(ISS, "b"), |_| true);
     assert_consistent(&map);
     assert_eq!(map.len(), 3);
 }
 
 #[test]
-fn take_subject_sessions_takes_only_that_subject_under_that_issuer() {
+fn ending_a_subject_ends_only_that_subject_under_that_issuer() {
     let map = SidMap::new();
     let s = Sessions::new();
     let (alice, bob) = (user("alice"), user("bob"));
@@ -114,8 +125,7 @@ fn take_subject_sessions_takes_only_that_subject_under_that_issuer() {
     put(&map, key(OTHER, "1"), alice, a_other, at(2));
     put(&map, key(ISS, "3"), bob, b1, at(3));
 
-    let mut taken: Vec<SessionId> = map
-        .take_subject_sessions(ISS, &alice.to_string())
+    let mut taken: Vec<SessionId> = end_subject(&map, ISS, &alice.to_string())
         .into_iter()
         .map(|(_, session)| session)
         .collect();
@@ -127,10 +137,7 @@ fn take_subject_sessions_takes_only_that_subject_under_that_issuer() {
     assert_eq!(map.len(), 2);
     assert!(map.contains_key(&key(OTHER, "1")), "other issuer untouched");
     assert!(map.contains_key(&key(ISS, "3")), "other subject untouched");
-    assert!(
-        map.take_subject_sessions(ISS, &alice.to_string())
-            .is_empty()
-    );
+    assert!(end_subject(&map, ISS, &alice.to_string()).is_empty());
     assert_consistent(&map);
 }
 
@@ -148,13 +155,10 @@ fn a_linked_subject_finds_its_sessions_under_the_local_user() {
     map.register_subject_session(ISS, "google-oauth2|1234", local, without_sid);
 
     // The local id names nobody to the IdP.
-    assert!(
-        map.take_subject_sessions(ISS, &local.to_string())
-            .is_empty()
-    );
+    assert!(end_subject(&map, ISS, &local.to_string()).is_empty());
     assert_eq!(map.len(), 1);
 
-    let mut taken = map.take_subject_sessions(ISS, "google-oauth2|1234");
+    let mut taken = end_subject(&map, ISS, "google-oauth2|1234");
     taken.sort_by_key(|(_, session)| session.to_string());
     let mut expected = vec![(local, with_sid), (local, without_sid)];
     expected.sort_by_key(|(_, session)| session.to_string());
@@ -196,7 +200,7 @@ fn replaced_and_removed_entries_do_not_count_toward_the_eviction_budget() {
     put(&map, key(ISS, "a"), u, s.next(), at(0));
     put(&map, key(ISS, "a"), u, s.next(), at(1));
     put(&map, key(ISS, "gone"), u, s.next(), at(2));
-    map.remove(&key(ISS, "gone"));
+    map.remove_if(&key(ISS, "gone"), |_| true);
     put(&map, key(ISS, "b"), u, s.next(), at(3));
 
     let evicted = map.evict_oldest(2);
@@ -271,7 +275,7 @@ fn the_queue_stays_a_small_multiple_of_the_map_under_churn() {
     for n in 0..5_000 {
         put(&map, key(ISS, &n.to_string()), u, s.next(), at(n));
         if n > 0 {
-            map.remove(&key(ISS, &(n - 1).to_string()));
+            map.remove_if(&key(ISS, &(n - 1).to_string()), |_| true);
         }
     }
     assert_eq!(map.len(), 1);
@@ -296,7 +300,7 @@ fn remove_session_unwinds_one_login() {
 // ── subject registry ─────────────────────────────────────────────────────────
 
 #[test]
-fn subject_sessions_are_taken_per_issuer_and_user() {
+fn subject_sessions_are_per_issuer_and_user() {
     let map = SidMap::new();
     let s = Sessions::new();
     let (alice, bob) = (user("alice"), user("bob"));
@@ -309,8 +313,7 @@ fn subject_sessions_are_taken_per_issuer_and_user() {
     assert_eq!(map.subject_len(), 4, "a repeated registration counts once");
 
     let sub = |u: &UserId| u.to_string();
-    let mut taken: Vec<SessionId> = map
-        .take_subject_sessions(ISS, &sub(&alice))
+    let mut taken: Vec<SessionId> = end_subject(&map, ISS, &sub(&alice))
         .into_iter()
         .map(|(_, session)| session)
         .collect();
@@ -319,16 +322,13 @@ fn subject_sessions_are_taken_per_issuer_and_user() {
     expected.sort_by_key(|id| id.to_string());
     assert_eq!(taken, expected);
     assert_eq!(map.subject_len(), 2);
-    assert!(map.take_subject_sessions(ISS, &sub(&alice)).is_empty());
-    assert_eq!(
-        map.take_subject_sessions(OTHER, &sub(&alice)),
-        vec![(alice, other)]
-    );
-    assert_eq!(map.take_subject_sessions(ISS, &sub(&bob)), vec![(bob, b1)]);
+    assert!(end_subject(&map, ISS, &sub(&alice)).is_empty());
+    assert_eq!(end_subject(&map, OTHER, &sub(&alice)), vec![(alice, other)]);
+    assert_eq!(end_subject(&map, ISS, &sub(&bob)), vec![(bob, b1)]);
 }
 
 #[test]
-fn taking_subject_sessions_also_takes_the_sid_entries() {
+fn ending_a_subject_also_drops_its_sid_entries() {
     let map = SidMap::new();
     let s = Sessions::new();
     let alice = user("alice");
@@ -337,7 +337,7 @@ fn taking_subject_sessions_also_takes_the_sid_entries() {
     reg(&map, ISS, alice, with_sid);
     reg(&map, ISS, alice, without);
 
-    let taken = map.take_subject_sessions(ISS, &alice.to_string());
+    let taken = end_subject(&map, ISS, &alice.to_string());
 
     assert_eq!(taken.len(), 2, "the shared session is reported once");
     assert!(map.is_empty());
@@ -356,12 +356,12 @@ fn ending_a_session_through_the_sid_paths_forgets_its_subject_entry() {
     }
     assert_eq!(map.subject_len(), 3);
 
-    map.remove(&key(ISS, "r")).expect("mapped");
+    map.remove_if(&key(ISS, "r"), |_| true).expect("mapped");
     assert_eq!(map.subject_len(), 2);
     assert_eq!(map.remove_session(&by_session), 1);
     assert_eq!(map.subject_len(), 1);
     assert_eq!(
-        map.take_subject_sessions(ISS, &alice.to_string()),
+        end_subject(&map, ISS, &alice.to_string()),
         vec![(alice, by_user)]
     );
     assert_eq!(map.subject_len(), 0);
@@ -466,7 +466,7 @@ fn a_subject_logout_returns_its_sessions_in_a_fixed_order() {
         for session in &sessions {
             reg(&map, ISS, u, *session);
         }
-        let taken = map.take_subject_sessions(ISS, &u.to_string());
+        let taken = end_subject(&map, ISS, &u.to_string());
         assert_eq!(taken, expected);
     }
 }
@@ -499,6 +499,6 @@ fn a_displaced_mapping_is_restored_only_into_a_vacant_key_for_a_live_session() {
     assert_consistent(&map);
 
     // An ended session is not resurrected.
-    map.remove(&key(ISS, "x"));
+    map.remove_if(&key(ISS, "x"), |_| true);
     assert!(!map.restore_if_vacant(key(ISS, "x"), displaced));
 }

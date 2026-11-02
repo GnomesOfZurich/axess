@@ -8,7 +8,9 @@
 use crate::factor_secret::FactorSecret;
 use crate::otp_algorithm::OtpAlgorithm;
 use crate::{MAX_HOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -50,26 +52,111 @@ pub struct HotpConfig {
     /// Number of future counter values accepted to handle hardware-token drift.
     pub lookahead_window: u32,
     /// Number of failed verification attempts made against the current
-    /// counter window. Incremented on each failed verify; reset to 0 on
-    /// successful verify. When `attempt_count >= max_attempts`, the
-    /// counter is advanced past the lookahead window so the current set
-    /// of codes can never be presented again, and the user must re-sync
-    /// from a fresh hardware-token press.
+    /// counter window. Incremented on each failed verify; reset to 0 on a
+    /// successful verify and when a lock is set. When it reaches
+    /// `max_attempts` the factor is locked for a while (see
+    /// [`locked_until`](Self::locked_until)); the counter itself does not
+    /// move, so the token stays in sync and its next code verifies once
+    /// the lock has run out.
     ///
     /// Required by RFC 4226 §7.4 ("the server MUST set a throttling
     /// parameter T"). Without this counter, an attacker has unlimited
     /// guesses against the lookahead window.
     #[serde(default)]
     pub attempt_count: u8,
-    /// Maximum failed attempts before the counter is burned. RFC 4226
+    /// Maximum failed attempts before the factor is locked. RFC 4226
     /// §7.4 RECOMMENDS T ≤ 10. Default: 5. A value of 0 is
     /// treated as the default, never as "no limit".
     #[serde(default = "default_max_hotp_attempts")]
     pub max_attempts: u8,
+    /// The lock a run of `max_attempts` wrong codes sets, and how many
+    /// locks came before it. Set and cleared only by
+    /// [`lock_at`](Self::lock_at) and [`clear_lock`](Self::clear_lock), so a
+    /// lock always starts the attempt count over; read it with
+    /// [`locked_until`](Self::locked_until) and [`lockouts`](Self::lockouts).
+    /// Stored as the two top-level fields `locked_until` and `lockouts`.
+    #[serde(flatten, default)]
+    pub throttle: HotpThrottle,
+}
+
+/// The lock state of an HOTP factor (RFC 4226 §7.3's delay scheme): the
+/// first lock lasts [`HOTP_LOCK_BASE`], each consecutive lock doubles it up
+/// to [`HOTP_LOCK_MAX`], and a successful verification clears it. The
+/// counter is never advanced to end a run of guesses; doing so would put the
+/// token out of sync, so anyone who knew the password could lock the user
+/// out of their own token for good.
+///
+/// The fields are private: a lock is set only through
+/// [`HotpConfig::lock_at`], which also starts the attempt count over.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotpThrottle {
+    /// Until when verification is refused; `None` when not locked.
+    #[serde(default)]
+    locked_until: Option<DateTime<Utc>>,
+    /// How many locks have been set since the last successful
+    /// verification; drives the backoff of the next one.
+    #[serde(default)]
+    lockouts: u8,
 }
 
 fn default_max_hotp_attempts() -> u8 {
     5
+}
+
+/// How long the first HOTP lock lasts: one minute.
+pub const HOTP_LOCK_BASE: Duration = Duration::from_secs(60);
+
+/// The longest an HOTP lock lasts, however many came before it: one hour.
+pub const HOTP_LOCK_MAX: Duration = Duration::from_secs(60 * 60);
+
+impl HotpConfig {
+    /// How long the lock set after `lockouts` earlier ones lasts:
+    /// [`HOTP_LOCK_BASE`] doubled per earlier lock, capped at
+    /// [`HOTP_LOCK_MAX`].
+    pub fn lock_duration_after(lockouts: u8) -> Duration {
+        let doublings = u32::from(lockouts.min(31));
+        HOTP_LOCK_BASE
+            .checked_mul(1u32 << doublings)
+            .map_or(HOTP_LOCK_MAX, |d| d.min(HOTP_LOCK_MAX))
+    }
+
+    /// Whether verification is refused at `now` because of an earlier run
+    /// of wrong codes.
+    pub fn is_locked_at(&self, now: DateTime<Utc>) -> bool {
+        self.throttle.locked_until.is_some_and(|until| now < until)
+    }
+
+    /// Until when verification is refused, after `max_attempts` wrong codes
+    /// against the current counter; `None` when the factor is not locked.
+    pub fn locked_until(&self) -> Option<DateTime<Utc>> {
+        self.throttle.locked_until
+    }
+
+    /// How many locks have been set since the last successful verification.
+    pub fn lockouts(&self) -> u8 {
+        self.throttle.lockouts
+    }
+
+    /// Lock the factor at `now` for the backoff its history earns, start
+    /// the attempt count over for the period after it and count the lock.
+    /// The counter is left where it is.
+    pub fn lock_at(&mut self, now: DateTime<Utc>) {
+        // The backoff is at most an hour, which always converts; the
+        // fallback, a lock that never ends, fails closed.
+        let for_ = chrono::Duration::from_std(Self::lock_duration_after(self.throttle.lockouts))
+            .unwrap_or(chrono::Duration::MAX);
+        self.throttle.locked_until = now
+            .checked_add_signed(for_)
+            .or(Some(DateTime::<Utc>::MAX_UTC));
+        self.throttle.lockouts = self.throttle.lockouts.saturating_add(1);
+        self.attempt_count = 0;
+    }
+
+    /// Forget the throttle state after a successful verification.
+    pub fn clear_lock(&mut self) {
+        self.throttle = HotpThrottle::default();
+        self.attempt_count = 0;
+    }
 }
 
 impl Default for HotpConfig {
@@ -82,6 +169,7 @@ impl Default for HotpConfig {
             lookahead_window: 10,
             attempt_count: 0,
             max_attempts: 5,
+            throttle: HotpThrottle::default(),
         }
     }
 }
@@ -100,6 +188,56 @@ mod hotp_config_defaults {
     fn hotp_default_max_attempts_is_five() {
         assert_eq!(default_max_hotp_attempts(), 5);
         assert_eq!(HotpConfig::default().max_attempts, 5);
+    }
+
+    #[test]
+    fn a_stored_config_without_the_throttle_fields_reads_as_unlocked() {
+        // A row written before the lock existed has neither field.
+        let mut json = serde_json::to_value(HotpConfig::default()).expect("serialises");
+        let row = json.as_object_mut().expect("an object");
+        assert!(row.remove("locked_until").is_some());
+        assert!(row.remove("lockouts").is_some());
+        let cfg: HotpConfig = serde_json::from_value(json).expect("older rows still read");
+        assert_eq!(cfg.locked_until(), None);
+        assert_eq!(cfg.lockouts(), 0);
+        assert!(!cfg.is_locked_at(chrono::Utc::now()));
+    }
+}
+
+#[cfg(test)]
+mod hotp_lock_backoff {
+    use super::{HOTP_LOCK_BASE, HOTP_LOCK_MAX, HotpConfig};
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn each_consecutive_lock_doubles_up_to_the_cap() {
+        assert_eq!(HotpConfig::lock_duration_after(0), HOTP_LOCK_BASE);
+        assert_eq!(HotpConfig::lock_duration_after(1), HOTP_LOCK_BASE * 2);
+        assert_eq!(HotpConfig::lock_duration_after(5), HOTP_LOCK_BASE * 32);
+        assert_eq!(HotpConfig::lock_duration_after(6), HOTP_LOCK_MAX);
+        assert_eq!(HotpConfig::lock_duration_after(u8::MAX), HOTP_LOCK_MAX);
+    }
+
+    #[test]
+    fn a_lock_holds_until_its_end_and_leaves_the_counter_alone() {
+        let t0 = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let mut cfg = HotpConfig {
+            counter: 41,
+            attempt_count: 5,
+            ..HotpConfig::default()
+        };
+        cfg.lock_at(t0);
+        assert_eq!(cfg.counter, 41);
+        assert_eq!(cfg.attempt_count, 0);
+        assert_eq!(cfg.lockouts(), 1);
+        assert!(cfg.is_locked_at(t0));
+        assert!(cfg.is_locked_at(t0 + chrono::Duration::seconds(59)));
+        assert!(!cfg.is_locked_at(t0 + chrono::Duration::seconds(60)));
+        cfg.lock_at(t0);
+        assert!(cfg.is_locked_at(t0 + chrono::Duration::seconds(119)));
+        assert!(!cfg.is_locked_at(t0 + chrono::Duration::seconds(120)));
+        cfg.clear_lock();
+        assert_eq!((cfg.locked_until(), cfg.lockouts()), (None, 0));
     }
 }
 

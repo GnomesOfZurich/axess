@@ -161,6 +161,36 @@ fn user_validate_rejects_invalid_inputs() {
     );
 }
 
+/// A user row is refused on the same terms as a signup: an identifier with
+/// an invisible format character, or not in NFC, looks like another one on
+/// screen while comparing different, whichever path created the row.
+#[test]
+fn user_validate_refuses_confusable_identifiers() {
+    assert!(
+        make_user_with_identifier("admin\u{200B}", "Display")
+            .validate()
+            .is_err(),
+        "a zero width space must fail validation"
+    );
+    assert!(
+        make_user_with_identifier("ad\u{1BCA0}min", "Display")
+            .validate()
+            .is_err(),
+        "a shorthand format control (U+1BCA0) must fail validation"
+    );
+    assert!(
+        make_user_with_identifier("cafe\u{0301}", "Display")
+            .validate()
+            .is_err(),
+        "a decomposed identifier must fail validation"
+    );
+    assert!(
+        make_user_with_identifier("caf\u{00E9}", "Caf\u{00E9}")
+            .validate()
+            .is_ok()
+    );
+}
+
 /// Kill the `Tenant::validate -> Ok(())` body replacement.
 #[test]
 fn tenant_validate_rejects_invalid_inputs() {

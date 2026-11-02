@@ -105,6 +105,13 @@ pub struct Fido2Options {
     /// Maximum lifetime of a registration or authentication ceremony before
     /// the in-flight state is discarded.
     pub ceremony_timeout: std::time::Duration,
+    /// How recently the session must have authenticated for a credential
+    /// change (beginning or finishing a registration, deleting a passkey).
+    /// A session whose authentication is older is refused the change and
+    /// must step up first, so a session left open on a shared machine
+    /// cannot enrol an attacker's passkey hours later. `None`, the
+    /// default, applies no age limit; a few minutes is the usual choice.
+    pub max_authn_age: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "fido2")]
@@ -112,6 +119,7 @@ impl Default for Fido2Options {
     fn default() -> Self {
         Self {
             ceremony_timeout: std::time::Duration::from_secs(300),
+            max_authn_age: None,
         }
     }
 }

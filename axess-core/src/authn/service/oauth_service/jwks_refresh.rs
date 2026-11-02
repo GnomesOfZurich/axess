@@ -108,6 +108,11 @@ fn spawn_refresh_loop(
     };
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // A stall (a suspended host, a slow refresh) makes ticks late; the
+        // default Burst then fires every missed tick back to back at an
+        // endpoint that rate-limits. Delay fires once and resumes the normal
+        // spacing, as the axess-factors loop does.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await; // Skip the immediate first tick.
         loop {
             ticker.tick().await;
@@ -115,6 +120,9 @@ fn spawn_refresh_loop(
         }
     })
 }
+
+#[cfg(test)]
+mod tests;
 
 /// A refresh loop owned by a built service: it is aborted when the last
 /// clone of the service is dropped, so it never outlives the service that

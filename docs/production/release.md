@@ -81,8 +81,10 @@ Preferred entrypoint:
 
 That script is the maintainer-facing pass/fail gate for a release cut. It runs
 the same checks below in order and stops on first failure. It needs
-`VALKEY_URL`, `POSTGRES_URL` and `MYSQL_URL` set to running servers for the
-live-store step, and refuses rather than skips when one is missing;
+`VALKEY_URL`, `POSTGRES_URL`, `MYSQL_URL` and `KEYCLOAK_URL` set to running
+servers for the live-store step (Keycloak serves the `private_key_jwt` login
+test against the FAPI example's realm), and refuses rather than skips when
+one is missing;
 `scripts/check-live-stores.sh` carries the container recipe. 0.13.0 was tagged
 with four Valkey tests red because the preflight did not run that suite.
 

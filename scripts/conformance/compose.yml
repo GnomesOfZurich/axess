@@ -1,0 +1,35 @@
+# The OpenID Foundation conformance suite, as the RP tests need it: the suite
+# server and its MongoDB, no TLS front end. The suite's own origin is plain
+# http on loopback because the relying party under test (axess) trusts only
+# the public web PKI for https and accepts http only for loopback issuers.
+#
+# The front is nginx, set up in nginx.conf. Images are pinned by digest; the digests are the ones docs/factors/conformance.md
+# records. Everything is named axess-conformance-* and bound to 127.0.0.1.
+name: axess-conformance
+services:
+  mongodb:
+    image: docker.io/library/mongo@sha256:b415b12f638e2685d06c58ab7fb5943577c50fadec6d9340ef67d21aeac72070
+    container_name: axess-conformance-mongodb
+  server:
+    image: registry.gitlab.com/openid/conformance-suite@sha256:ad39ddfcab955805327f3a4c75fc4f2999dfe6b740ca5cc87a96b2690ea98009
+    container_name: axess-conformance-server
+    environment:
+      BASE_URL: http://localhost:9080
+      BASE_MTLS_URL: http://localhost:9080
+      MONGODB_HOST: mongodb
+      SPRING_PROFILES_ACTIVE: dev
+      OIDC_GOOGLE_CLIENTID: google-client
+      OIDC_GOOGLE_SECRET: google-secret
+      OIDC_GITLAB_CLIENTID: gitlab-client
+      OIDC_GITLAB_SECRET: gitlab-secret
+    depends_on:
+      - mongodb
+  front:
+    image: docker.io/library/nginx:1.27.3
+    container_name: axess-conformance-front
+    ports:
+      - "127.0.0.1:9080:8080"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - server

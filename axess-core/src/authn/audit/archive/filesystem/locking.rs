@@ -277,3 +277,38 @@ fn recorded_finds_an_id_in_a_large_sidecar_with_one_read() {
     );
     assert_eq!(cache.loads(), 1, "one read for four questions");
 }
+
+/// A cache whose day table is cleared between the check and the record of
+/// one batch (a batch over two days, the second day's read at the cap) still
+/// knows the sidecar's earlier lines afterwards: the record rebuilds the
+/// entry from the file, not from the one marker it just wrote.
+#[test]
+fn a_marker_noted_after_a_cache_clear_keeps_the_sidecars_earlier_lines() {
+    let tmp = tempdir();
+    let first = tmp.path().join("audit-2026-05-19.jsonl.batches");
+    let second = tmp.path().join("audit-2026-05-20.jsonl.batches");
+    std::fs::write(&first, "old digest-old\n").unwrap();
+    std::fs::write(&second, "other digest-other\n").unwrap();
+    let mut cache = sidecar::SidecarCache::with_max_days(1);
+    assert!(cache.recorded(&first, "old", "old digest-old").unwrap());
+    assert!(!cache.recorded(&first, "new", "new digest-new").unwrap());
+    // The second day's read is at the cap and clears the table.
+    assert!(!cache.recorded(&second, "new", "new digest-new").unwrap());
+    // The batch is appended to both sidecars and recorded.
+    for path in [&first, &second] {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(b"new digest-new\n").unwrap();
+        cache.note_appended(path, "new digest-new");
+    }
+    assert!(
+        cache.recorded(&first, "old", "old digest-old").unwrap(),
+        "the first day's earlier batch is forgotten, so it would be archived again"
+    );
+    assert!(cache.recorded(&first, "new", "new digest-new").unwrap());
+    assert!(
+        cache
+            .recorded(&second, "other", "other digest-other")
+            .unwrap()
+    );
+}

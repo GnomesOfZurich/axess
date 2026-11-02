@@ -145,6 +145,8 @@ fn user_id_returns_none_only_for_guest() {
             tenant_id: tenant,
             authn_time: chrono::Utc::now(),
             factors_completed: vec![],
+            impersonator: None,
+            ldap_groups: None,
         }
         .user_id(),
         Some(&user)
@@ -164,6 +166,8 @@ fn tenant_id_returns_none_only_for_guest() {
             tenant_id: tenant,
             authn_time: chrono::Utc::now(),
             factors_completed: vec![],
+            impersonator: None,
+            ldap_groups: None,
         }
         .tenant_id(),
         Some(&tenant)
@@ -183,6 +187,8 @@ fn is_authenticated_only_for_authenticated_variant() {
             tenant_id: tenant,
             authn_time: chrono::Utc::now(),
             factors_completed: vec![],
+            impersonator: None,
+            ldap_groups: None,
         }
         .is_authenticated()
     );
@@ -201,6 +207,8 @@ fn is_guest_only_for_guest_variant() {
             tenant_id: tenant,
             authn_time: chrono::Utc::now(),
             factors_completed: vec![],
+            impersonator: None,
+            ldap_groups: None,
         }
         .is_guest()
     );
@@ -227,6 +235,8 @@ fn session_data_json_round_trip() {
             tenant_id: axess_identity::testing::tenant("acme"),
             authn_time: chrono::Utc::now(),
             factors_completed: vec![FactorKind::Password, FactorKind::Totp],
+            impersonator: None,
+            ldap_groups: None,
         },
         fingerprint: Some("fp-abc".to_string()),
         device_id: Some(axess_identity::testing::device("dev-1")),
@@ -267,6 +277,7 @@ fn is_authenticating_only_true_for_authenticating_variant() {
             completed: vec![],
             attempt_count: 0,
             last_attempt: None,
+            ldap_groups: None,
         }
         .is_authenticating()
     );
@@ -276,6 +287,8 @@ fn is_authenticating_only_true_for_authenticating_variant() {
             tenant_id: tenant,
             authn_time: chrono::Utc::now(),
             factors_completed: vec![],
+            impersonator: None,
+            ldap_groups: None,
         }
         .is_authenticating()
     );
@@ -334,10 +347,12 @@ fn begin_authenticating_constructs_authenticating_with_factors_in_order() {
             completed,
             attempt_count,
             last_attempt,
+            ldap_groups,
         } => {
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(&*method_name, "password+totp");
+            assert_eq!(ldap_groups, None);
             assert_eq!(
                 remaining,
                 required(vec![FactorKind::Password, FactorKind::Totp])
@@ -363,10 +378,14 @@ fn set_authenticated_constructs_authenticated_with_empty_factors() {
             tenant_id,
             authn_time,
             factors_completed,
+            impersonator,
+            ldap_groups,
         } => {
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(authn_time, t);
+            assert_eq!(impersonator, None, "a login is nobody's impersonation");
+            assert_eq!(ldap_groups, None, "no LDAP bind in this login");
             assert!(
                 factors_completed.is_empty(),
                 "direct transition: no factor sequence"
@@ -388,6 +407,7 @@ fn advance_factor_still_authenticating_when_factors_remain() {
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
+        ldap_groups: None,
     };
     let outcome = state.advance_factor(&FactorKind::Password, now());
     assert_eq!(outcome, AdvanceOutcome::StillAuthenticating);
@@ -417,6 +437,7 @@ fn advance_factor_completes_when_last_factor_verified() {
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
+        ldap_groups: None,
     };
     let outcome = state.advance_factor(&FactorKind::Password, t);
     assert_eq!(outcome, AdvanceOutcome::Completed);
@@ -426,10 +447,14 @@ fn advance_factor_completes_when_last_factor_verified() {
             tenant_id,
             authn_time,
             factors_completed,
+            impersonator,
+            ldap_groups,
         } => {
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(authn_time, t);
+            assert_eq!(impersonator, None, "a login is nobody's impersonation");
+            assert_eq!(ldap_groups, None, "no LDAP bind in this login");
             assert_eq!(factors_completed, vec![FactorKind::Password]);
         }
         other => panic!("expected Authenticated, got {other:?}"),
@@ -453,6 +478,7 @@ fn advance_factor_carries_completed_factors_into_authenticated() {
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
+        ldap_groups: None,
     };
     assert_eq!(
         state.advance_factor(&FactorKind::Password, t),
@@ -491,6 +517,7 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
+        ldap_groups: None,
     };
     let outcome = state.advance_factor(&FactorKind::Totp, now());
     assert_eq!(outcome, AdvanceOutcome::StillAuthenticating);
@@ -534,6 +561,7 @@ fn record_attempt_at_increments_counter_and_captures_timestamp() {
         completed: vec![],
         attempt_count: 0,
         last_attempt: None,
+        ldap_groups: None,
     };
     state.record_attempt_at(t);
     state.record_attempt_at(t);
@@ -656,4 +684,61 @@ fn a_mid_login_session_from_an_earlier_release_still_loads() {
     let again: AuthState =
         rmp_serde::from_slice(&rmp_serde::to_vec_named(&state).unwrap()).unwrap();
     assert_eq!(again, state);
+}
+
+/// The impersonation is stored as an object with named fields, so a field
+/// added later is a new key, not a new tuple arity.
+#[test]
+fn an_impersonation_is_stored_as_an_object() {
+    let admin = axess_identity::testing::user("admin");
+    let since = now();
+    let mut state = AuthState::Guest;
+    state.set_authenticated(
+        axess_identity::testing::user("u1"),
+        axess_identity::testing::tenant("t1"),
+        since,
+    );
+    assert!(state.set_impersonator(admin, since));
+
+    let json = serde_json::to_value(&state).unwrap();
+    assert_eq!(json["impersonator"]["admin"], serde_json::json!(admin));
+    assert_eq!(json["impersonator"]["since"], serde_json::json!(since));
+    let back: AuthState = serde_json::from_value(json).unwrap();
+    assert_eq!(back.impersonation(), Some(Impersonation { admin, since }));
+}
+
+/// The groups an LDAP bind step recorded ride the login into the
+/// authenticated state, stay through a step-up, and end with a new login.
+#[test]
+fn ldap_groups_ride_the_login_into_the_authenticated_state() {
+    let staff = vec!["staff".to_string()];
+    let mut state = AuthState::Authenticating {
+        user_id: axess_identity::testing::user("u1"),
+        tenant_id: axess_identity::testing::tenant("t1"),
+        method_name: Arc::from("ldap"),
+        remaining: required(vec![FactorKind::LdapBind]),
+        completed: vec![],
+        attempt_count: 0,
+        last_attempt: None,
+        ldap_groups: Some(staff.clone()),
+    };
+    assert_eq!(state.ldap_groups(), None, "not before the login completes");
+
+    state.advance_factor(&FactorKind::LdapBind, now());
+    assert_eq!(state.ldap_groups(), Some(staff.as_slice()));
+
+    assert!(state.begin_step_up(required(vec![FactorKind::Totp])));
+    state.advance_factor(&FactorKind::Totp, now());
+    assert_eq!(
+        state.ldap_groups(),
+        Some(staff.as_slice()),
+        "a step-up keeps the login's groups"
+    );
+
+    state.set_authenticated(
+        axess_identity::testing::user("u1"),
+        axess_identity::testing::tenant("t1"),
+        now(),
+    );
+    assert_eq!(state.ldap_groups(), None, "a new login starts without them");
 }

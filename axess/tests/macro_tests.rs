@@ -394,6 +394,53 @@ mod authz_tests {
         );
     }
 
+    /// A resource template that names a path parameter the route does not
+    /// have cannot be turned into a UID. The gate answers 500 (a
+    /// configuration error the operator must see) and the audit trail
+    /// still records the denial, with the principal and action as strings.
+    #[tokio::test]
+    async fn require_authz_audits_the_denial_when_the_resource_uid_cannot_be_built() {
+        let app = Router::new()
+            .route(
+                "/docs/{id}",
+                get(|| async { "doc body" }).layer(require_authz!("App", "View", "Doc:{slug}")),
+            )
+            .route(
+                "/login",
+                axum::routing::post(|session: axess::AuthSession| async move {
+                    session
+                        .set_authenticated(
+                            axess::testing::user("alice"),
+                            axess::testing::tenant("t1"),
+                            chrono::Utc::now(),
+                        )
+                        .await;
+                    StatusCode::NO_CONTENT
+                }),
+            )
+            .layer(Extension(policy_store()))
+            .layer(Extension(provider()))
+            .layer(session_layer());
+        let capture = axess_core::testing::mock_tracing::TracingCapture::install();
+        let (status, _) = call_protected(app, "/docs/doc-1").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let decisions: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|e| e.target == "axess::authz::decision")
+            .collect();
+        assert_eq!(decisions.len(), 1, "one decision event: {decisions:?}");
+        let event = &decisions[0].message;
+        for needle in [
+            "decision=deny",
+            "reason=invalid_resource",
+            &format!("principal={}", axess::testing::user("alice")),
+            "action=View",
+        ] {
+            assert!(event.contains(needle), "{needle} not in {event}");
+        }
+    }
+
     #[tokio::test]
     async fn require_authz_route_without_path_params_authorizes() {
         let (status, body) = call_protected(build_app("alice"), "/admin").await;

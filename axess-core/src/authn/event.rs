@@ -88,6 +88,14 @@ pub struct AuditContext {
     pub geo_country: Option<String>,
     /// Session ID for session-scoped audit trail.
     pub session_id: Option<String>,
+    /// The administrator impersonating the session's user, when the request
+    /// carries an impersonated session
+    /// ([`AuthSession::impersonator`](crate::session::extractor::AuthSession::impersonator)).
+    ///
+    /// Every event built with this context names them as `actor_id` unless
+    /// the event set an actor itself, so nothing done under impersonation
+    /// is recorded as the user's own act.
+    pub impersonator: Option<UserId>,
 }
 
 impl<S> axum::extract::FromRequestParts<S> for AuditContext
@@ -158,11 +166,16 @@ where
 
         // A request without a session is ordinary on a login route, which
         // is the one place this context matters most, so its absence is a
-        // `None` rather than a rejection.
-        let session_id =
+        // `None` rather than a rejection. The impersonator is read from the
+        // same session: an administrator acting in a user's name is the
+        // actor of every row the request writes.
+        let (session_id, impersonator) =
             match crate::session::extractor::AuthSession::from_request_parts(parts, state).await {
-                Ok(session) => Some(session.peek_session_id().await.to_string()),
-                Err(_) => None,
+                Ok(session) => (
+                    Some(session.peek_session_id().await.to_string()),
+                    session.impersonator().await,
+                ),
+                Err(_) => (None, None),
             };
 
         Ok(Self {
@@ -173,6 +186,7 @@ where
             trace_id,
             geo_country: None,
             session_id,
+            impersonator,
         })
     }
 }
@@ -220,8 +234,8 @@ pub enum AuthEventType {
     /// A password reset was completed (new password set).
     PasswordReset,
     /// Session expired due to inactivity or policy. **Adopter-emitted:**
-    /// expiry is decided by the session store, and `refresh_session` takes
-    /// no audit sink.
+    /// expiry is decided by the session store, and `Refresh::run` takes no
+    /// audit sink.
     SessionExpired,
     /// Session was explicitly invalidated (e.g., admin logout). Emitted by
     /// the `invalidate_session_as` and `invalidate_user_sessions_as` methods
@@ -231,12 +245,19 @@ pub enum AuthEventType {
     SessionInvalidated,
     /// A new user account was created (signup started).
     SignupStarted,
+    /// A signup was submitted again from the session that started it, for
+    /// an account still waiting for verification; nothing was created.
+    SignupResumed,
     /// A signup workflow was completed (user activated).
     SignupCompleted,
     /// A user account was suspended by an admin or the system.
     AccountSuspended,
     /// A user account was activated (e.g., after suspension or signup verification).
     AccountActivated,
+    /// A user account was erased by an administrator
+    /// (`RequestAuthnService::delete_user`): the sessions and refresh tokens
+    /// ended first, then the user and every row naming them.
+    AccountDeleted,
     /// An admin assumed the identity of another user (impersonation).
     Impersonation,
     /// A request's fingerprint+cookie pair did not resolve to
@@ -284,9 +305,11 @@ impl AuthEventType {
             AuthEventType::SessionExpired => "session_expired",
             AuthEventType::SessionInvalidated => "session_invalidated",
             AuthEventType::SignupStarted => "signup_started",
+            AuthEventType::SignupResumed => "signup_resumed",
             AuthEventType::SignupCompleted => "signup_completed",
             AuthEventType::AccountSuspended => "account_suspended",
             AuthEventType::AccountActivated => "account_activated",
+            AuthEventType::AccountDeleted => "account_deleted",
             AuthEventType::Impersonation => "impersonation",
             AuthEventType::DeviceFirstSeen => "device_first_seen",
             AuthEventType::DeviceTrustGranted => "device_trust_granted",
@@ -317,9 +340,11 @@ impl FromStr for AuthEventType {
             "session_expired" => Ok(AuthEventType::SessionExpired),
             "session_invalidated" => Ok(AuthEventType::SessionInvalidated),
             "signup_started" => Ok(AuthEventType::SignupStarted),
+            "signup_resumed" => Ok(AuthEventType::SignupResumed),
             "signup_completed" => Ok(AuthEventType::SignupCompleted),
             "account_suspended" => Ok(AuthEventType::AccountSuspended),
             "account_activated" => Ok(AuthEventType::AccountActivated),
+            "account_deleted" => Ok(AuthEventType::AccountDeleted),
             "impersonation" => Ok(AuthEventType::Impersonation),
             "device_first_seen" => Ok(AuthEventType::DeviceFirstSeen),
             "device_trust_granted" => Ok(AuthEventType::DeviceTrustGranted),
@@ -354,8 +379,8 @@ pub enum AuthEventStatus {
     /// Blocked due to lockout.
     Locked,
     /// Failed due to expiry. **Adopter-set:** the paths where it applies,
-    /// such as `refresh_session`, are free functions with no audit sink in
-    /// their signature, so axess never writes this.
+    /// such as `Refresh::run`, take no audit sink, so axess never writes
+    /// this.
     Expired,
     /// Flagged as suspicious (e.g., anomaly detected). **Adopter-set:** its
     /// canonical producer is
@@ -445,11 +470,17 @@ pub enum AuthFailureReason {
     TokenRefreshUnknownProvider,
     /// The identity provider rejected the refresh token.
     TokenRefreshProviderRejected,
+    /// A refresh for a provider that binds tokens to a DPoP key was asked
+    /// without the key, and refused before anything was sent: a caller
+    /// fault, not an identity provider's verdict on the token.
+    TokenRefreshDpopKeyMissing,
     /// The OAuth ceremony outlived its timeout before the callback.
     CeremonyExpired,
     /// The `state` returned by the identity provider did not match.
     CsrfMismatch,
-    /// The stored ceremony carried no issuer to compare against.
+    /// The stored ceremony carried no issuer to compare against, or the
+    /// callback was finished without the `iss` parameter a provider that
+    /// advertises it sends.
     MissingIssuer,
     /// The stored PKCE verifier was absent or unusable.
     PkceVerifierInvalid,
@@ -457,6 +488,44 @@ pub enum AuthFailureReason {
     TokenExchange,
     /// The callback's provider did not match the one the flow began with.
     ProviderMismatch,
+    /// An impersonated session asked to change the user's credentials (issue a
+    /// refresh token, enrol or delete a factor), or to impersonate again, and
+    /// the deployment does not allow it.
+    Impersonated,
+    /// A credential of one tenant was presented in another (a discoverable
+    /// passkey whose user belongs to another tenant).
+    CrossTenant,
+    /// An impersonated session tried to begin another impersonation.
+    NestedImpersonation,
+    /// The session asking to impersonate is not authenticated.
+    AdminNotAuthenticated,
+    /// The session asking to impersonate belongs to another user than the
+    /// administrator named.
+    SessionIsNotAdmin,
+    /// The administrator named for an impersonation does not exist.
+    UnknownAdmin,
+    /// The administrator asking to impersonate is not active.
+    AdminNotActive,
+    /// The user to impersonate does not exist.
+    UnknownTarget,
+    /// The user to impersonate could not be read from the store.
+    TargetLookupFailed,
+    /// The impersonating session could not be registered with the session
+    /// registry, so it could not be ended with the user's other sessions.
+    SessionNotRegistered,
+    /// A credential change came from a session that is neither authenticated
+    /// as the user nor the user's own signup.
+    EnrolmentContext,
+    /// A credential change came from a session whose authentication is older
+    /// than the deployment allows; the user must authenticate again.
+    AuthnTooOld,
+    /// The provider a ceremony began with could not be resolved at the
+    /// callback: removed since, its tenant's store unreachable, or its
+    /// discovery failed.
+    ProviderUnavailable,
+    /// The ceremony's DPoP key is unusable: the stashed key does not decode,
+    /// or the provider binds tokens and the ceremony stashed none.
+    DpopKeyInvalid,
     /// Anything axess has no tag for, including adopter-supplied detail.
     ///
     /// Prefer a variant where one fits: `Other` is not queryable as a
@@ -483,12 +552,27 @@ impl AuthFailureReason {
             Self::TokenRefreshNoToken => "token_refresh_no_token",
             Self::TokenRefreshUnknownProvider => "token_refresh_unknown_provider",
             Self::TokenRefreshProviderRejected => "token_refresh_provider_rejected",
+            Self::TokenRefreshDpopKeyMissing => "token_refresh_dpop_key_missing",
             Self::CeremonyExpired => "ceremony_expired",
             Self::CsrfMismatch => "csrf_mismatch",
             Self::MissingIssuer => "missing_issuer",
             Self::PkceVerifierInvalid => "pkce_verifier_invalid",
             Self::TokenExchange => "token_exchange",
             Self::ProviderMismatch => "provider_mismatch",
+            Self::Impersonated => "impersonated",
+            Self::CrossTenant => "cross_tenant",
+            Self::NestedImpersonation => "nested_impersonation",
+            Self::AdminNotAuthenticated => "admin_not_authenticated",
+            Self::SessionIsNotAdmin => "session_is_not_admin",
+            Self::UnknownAdmin => "unknown_admin",
+            Self::AdminNotActive => "admin_not_active",
+            Self::UnknownTarget => "unknown_target",
+            Self::TargetLookupFailed => "target_lookup_failed",
+            Self::SessionNotRegistered => "session_not_registered",
+            Self::EnrolmentContext => "enrolment_context",
+            Self::AuthnTooOld => "authn_too_old",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::DpopKeyInvalid => "dpop_key_invalid",
             Self::Other(s) => s,
         }
     }
@@ -508,12 +592,27 @@ impl From<&str> for AuthFailureReason {
             "token_refresh_no_token" => Self::TokenRefreshNoToken,
             "token_refresh_unknown_provider" => Self::TokenRefreshUnknownProvider,
             "token_refresh_provider_rejected" => Self::TokenRefreshProviderRejected,
+            "token_refresh_dpop_key_missing" => Self::TokenRefreshDpopKeyMissing,
             "ceremony_expired" => Self::CeremonyExpired,
             "csrf_mismatch" => Self::CsrfMismatch,
             "missing_issuer" => Self::MissingIssuer,
             "pkce_verifier_invalid" => Self::PkceVerifierInvalid,
             "token_exchange" => Self::TokenExchange,
             "provider_mismatch" => Self::ProviderMismatch,
+            "impersonated" => Self::Impersonated,
+            "cross_tenant" => Self::CrossTenant,
+            "nested_impersonation" => Self::NestedImpersonation,
+            "admin_not_authenticated" => Self::AdminNotAuthenticated,
+            "session_is_not_admin" => Self::SessionIsNotAdmin,
+            "unknown_admin" => Self::UnknownAdmin,
+            "admin_not_active" => Self::AdminNotActive,
+            "unknown_target" => Self::UnknownTarget,
+            "target_lookup_failed" => Self::TargetLookupFailed,
+            "session_not_registered" => Self::SessionNotRegistered,
+            "enrolment_context" => Self::EnrolmentContext,
+            "authn_too_old" => Self::AuthnTooOld,
+            "provider_unavailable" => Self::ProviderUnavailable,
+            "dpop_key_invalid" => Self::DpopKeyInvalid,
             other => Self::Other(other.to_owned()),
         }
     }

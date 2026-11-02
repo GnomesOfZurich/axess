@@ -118,7 +118,8 @@ The remaining-requests header (`x-ratelimit-remaining`) is sent only when the
 bucket belongs to the caller (an address, a user, a header slot). A
 login-identifier, tenant or shared bucket is drawn on by other people, and its
 remaining count would tell the caller how many attempts they made, so it is
-left out.
+left out; so is the count of a group's overflow bucket, which an address draws
+on once its /24 or /48 holds its budget of buckets.
 
 A clock that steps backwards does not strand buckets: a bucket whose window
 starts in the future is re-anchored at the next sweep and ages out two windows

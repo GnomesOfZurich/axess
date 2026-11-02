@@ -21,8 +21,15 @@ pub enum LegacyBlobs {
     #[default]
     Reject,
     /// Read such a blob until this instant on the crypto's clock, and refuse
-    /// it from then on. The stores re-seal what they read in the current
-    /// format.
+    /// it from then on. The stores re-seal a blob in a 0.11.0 device format
+    /// in the current format when they read it. A blob without any binding
+    /// opens under any row id, so a read cannot tell whether it belongs to
+    /// the row it sits under and leaves it as it is; the row's next write
+    /// seals it (a session on its next save, a device on its next bindings
+    /// write; the Valkey device store checks the identity inside the row and
+    /// re-seals on read). Set the cutoff so that every row still wanted is
+    /// written before it: a row not written by then is refused from the
+    /// cutoff on.
     AcceptUntil(DateTime<Utc>),
     /// Read such a blob with no end date. A blob without a binding opens
     /// under any row id, so prefer [`AcceptUntil`](Self::AcceptUntil).

@@ -11,9 +11,13 @@ use crate::authn::{
     error::AuthnError,
     factor::{FactorKind, FactorStep},
     store::{FactorStore, IdentityStore},
+    types::AuthnScope,
 };
 use crate::session::extractor::AuthSession;
 use chrono::{DateTime, Utc};
+
+/// The method name a step-up runs under; it names no stored method.
+const STEP_UP_METHOD: &str = "step-up";
 
 impl AuthSession {
     /// Whether the session is authenticated and its authentication (or last
@@ -53,17 +57,22 @@ where
     /// Ask an authenticated session for another factor before a sensitive
     /// action.
     ///
-    /// `factors` are alternatives: the user completes any one of them. The
-    /// session must be `Authenticated`; any other state is
-    /// [`AuthnError::NoFlow`], as is an empty `factors`. It becomes
-    /// `Authenticating` with that single step remaining and every factor
-    /// completed so far remembered. Drive it with
+    /// `factors` are alternatives: the user completes any one of them. Only
+    /// the factors the user has enrolled are asked for (a factor nobody can
+    /// satisfy would leave the session unable to finish); when none of them
+    /// is enrolled the call is [`AuthnError::NoFlow`] and the session is
+    /// left as it was. The session must be `Authenticated`; any other state
+    /// is `NoFlow`, as is an empty `factors`. It becomes `Authenticating`
+    /// with that single step remaining and every factor completed so far
+    /// remembered, and the step is stamped like a login: a password
+    /// replaced while it is open drops it. Drive it with
     /// [`prepare_factor`](Self::prepare_factor) and
     /// [`verify_factor`](Self::verify_factor): a wrong code is an ordinary
     /// failure (counted, audited, lockout applies), and the right one
     /// returns [`FactorOutcome::Authenticated`](crate::authn::service::FactorOutcome::Authenticated)
     /// with `factors_completed` holding the earlier factors and the new one,
-    /// a later authentication time, and a rotated session id.
+    /// a later authentication time, and a rotated session id. The answer
+    /// is the first enrolled factor of `factors`, the one to prompt for.
     ///
     /// Until the step is finished the session is not authenticated, so an
     /// abandoned step-up ends the session's access: the caller shows the
@@ -82,36 +91,54 @@ where
         if factors.is_empty() {
             return Err(AuthnError::NoFlow);
         }
-        let first = factors[0].clone();
-        let step = if factors.len() == 1 {
+        let Some(snapshot) = session.snapshot().await else {
+            return Err(AuthnError::NoFlow);
+        };
+        let (user_id, tenant_id) = (snapshot.user_id, snapshot.tenant_id);
+
+        // Only a factor the user can complete is asked for.
+        let scope = AuthnScope::User { tenant_id, user_id };
+        let mut enrolled = Vec::with_capacity(factors.len());
+        for kind in factors {
+            let present = self
+                .inner
+                .factors
+                .resolve_factor(&scope, kind.clone())
+                .await
+                .map_err(AuthnError::Store)?
+                .is_some();
+            if present {
+                enrolled.push(kind);
+            } else {
+                tracing::debug!(user_id = %user_id, factor = %kind, "step-up: factor not enrolled");
+            }
+        }
+        let Some(first) = enrolled.first().cloned() else {
+            tracing::warn!(user_id = %user_id, "step-up refused: none of the factors is enrolled");
+            return Err(AuthnError::NoFlow);
+        };
+        let step = if enrolled.len() == 1 {
             FactorStep::Required(first.clone())
         } else {
-            FactorStep::AnyOf(factors)
+            FactorStep::AnyOf(enrolled)
         };
+        let steps = vec![step];
 
-        let (user_id, tenant_id) = {
-            let guard = session.0.0.write().await;
-            let ids = match guard
-                .data
-                .auth_state
-                .user_id()
-                .zip(guard.data.auth_state.tenant_id())
-            {
-                Some((u, t)) if guard.data.auth_state.is_authenticated() => (*u, *t),
-                _ => return Err(AuthnError::NoFlow),
-            };
-            // The stamp is computed from the store before the state moves.
-            ids
-        };
-        let epoch = self
-            .credential_epoch(&user_id, &tenant_id, "step-up")
+        // The stamp is computed from the store before the state moves, and
+        // written in the same critical section as the move: a session
+        // logged out or cleared meanwhile is refused there, and a refusal
+        // leaves no stamp behind.
+        let stamp = self
+            .stamp_for_steps(&user_id, &tenant_id, STEP_UP_METHOD, &steps)
             .await?;
-        self.stamp_flow(session, "step-up", epoch).await;
         {
             let mut guard = session.0.0.write().await;
-            if !guard.data.auth_state.begin_step_up(vec![step]) {
+            let same_user = guard.data.auth_state.user_id() == Some(&user_id)
+                && guard.data.auth_state.tenant_id() == Some(&tenant_id);
+            if !same_user || !guard.data.auth_state.begin_step_up(steps) {
                 return Err(AuthnError::NoFlow);
             }
+            guard.set_custom_value(super::flow::FLOW_KEY.to_owned(), stamp);
             guard.modified = true;
         }
         Ok(first)

@@ -388,6 +388,67 @@ where
     );
 }
 
+/// Sub-second instants compare as whole seconds on every backend: two
+/// sightings within one second tie and the smaller id wins, a sighting within
+/// the stored second moves nothing, and the stored time is the whole second.
+pub(crate) async fn sub_second_instants_compare_as_whole_seconds<S>(store: S)
+where
+    S: DeviceStore,
+    S::Error: Debug,
+{
+    let t = tenant();
+    let fp = FingerprintHash::from_bytes([0x91; 32]);
+    let (first, second) = if dev_id("frac-a") < dev_id("frac-b") {
+        ("frac-a", "frac-b")
+    } else {
+        ("frac-b", "frac-a")
+    };
+    let tenth = Duration::milliseconds(100);
+    let mut smaller = device(first, 0x91, DeviceTrustLevel::Seen, at(60_010) + tenth * 2);
+    let mut larger = device(second, 0x91, DeviceTrustLevel::Seen, at(60_010) + tenth * 7);
+    smaller.user_id = None;
+    larger.user_id = None;
+    store.save(&smaller, at(60_010) + tenth * 2).await.unwrap();
+    store.save(&larger, at(60_010) + tenth * 7).await.unwrap();
+
+    assert_eq!(
+        last_seen(&store, first).await,
+        at(60_010),
+        "the stored sighting is the whole second"
+    );
+    let found = store.find_by_fingerprint(&t, &fp).await.unwrap();
+    assert_eq!(
+        found.map(|d| d.id),
+        Some(smaller.id),
+        "sightings within one second tie, and the smaller id wins"
+    );
+
+    let level = store
+        .record_sighting(&t, &larger.id, at(60_010) + tenth * 9)
+        .await
+        .unwrap();
+    assert_eq!(level, DeviceTrustLevel::Seen);
+    assert_eq!(
+        last_seen(&store, second).await,
+        at(60_010),
+        "a sighting within the stored second moves nothing"
+    );
+    let found = store.find_by_fingerprint(&t, &fp).await.unwrap();
+    assert_eq!(found.map(|d| d.id), Some(smaller.id));
+
+    store
+        .record_sighting(&t, &larger.id, at(60_011) + tenth)
+        .await
+        .unwrap();
+    assert_eq!(last_seen(&store, second).await, at(60_011));
+    let found = store.find_by_fingerprint(&t, &fp).await.unwrap();
+    assert_eq!(
+        found.map(|d| d.id),
+        Some(larger.id),
+        "a sighting in a later second takes the lookup over"
+    );
+}
+
 /// Revoking a revoked device again keeps the first revocation time, and a
 /// save of a revoked copy rewrites nothing, so neither restarts the purge
 /// grace clock or brings back older bindings.

@@ -203,17 +203,24 @@ impl TokenExchangeClient {
     /// other endpoint is refused by [`exchange`](Self::exchange) before a
     /// request is sent. The default client follows no redirects and has a
     /// connect timeout of 10 seconds and a request timeout of 30 seconds.
+    ///
+    /// # Errors
+    ///
+    /// [`DelegatedError::ClientBuild`] when the default HTTP client cannot be
+    /// built (the TLS backend failed to initialise). No client with the
+    /// protections missing is built in its place.
     pub fn new(
         token_endpoint: Url,
         client_id: impl Into<String>,
         client_secret: Option<ZeroizedString>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DelegatedError> {
+        let http = crate::outbound_http::hardened_client()?;
+        Ok(Self {
             token_endpoint,
             client_id: client_id.into(),
             client_secret: client_secret.map(Arc::new),
-            http: crate::outbound_http::hardened_client(),
-        }
+            http,
+        })
     }
 
     /// Override the HTTP client; used for outbound mTLS / proxy /
@@ -267,15 +274,17 @@ impl TokenExchangeClient {
 
         let mut req = self.http.post(self.token_endpoint.clone());
         if let Some(secret) = &self.client_secret {
-            let encoded = axess_factors::basic_credentials(&self.client_id, secret);
-            req = req.header(AUTHORIZATION, format!("Basic {encoded}"));
+            let header = axess_factors::basic_authorization(&self.client_id, secret)
+                .map_err(DelegatedError::ClientCredentials)?;
+            req = req.header(AUTHORIZATION, header);
         }
 
+        // `without_url`: reqwest's message names the URL it was sent to.
         let mut response = req
             .form(&form)
             .send()
             .await
-            .map_err(|e| DelegatedError::Transport(e.to_string()))?;
+            .map_err(|e| DelegatedError::Transport(e.without_url().to_string()))?;
 
         let status = response.status();
         if !status.is_success() {

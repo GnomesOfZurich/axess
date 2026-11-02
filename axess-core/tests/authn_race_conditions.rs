@@ -1,20 +1,22 @@
 #![cfg(feature = "testing")]
-//! Race-window and store-outage rails: suspend-during-auth, HOTP counter-burn
+//! Race-window and store-outage rails: suspend-during-auth, HOTP lock
 //! after max attempts, and counter-store outage MUST NOT propagate as
 //! `Err(Store)`.
 
 mod common;
 
+use axess_core::Clock as _;
 use axess_core::authn::AuditContext;
 use axess_core::authn::event::AuthFailureReason;
 use axess_core::authn::{
     factor::{FactorConfig, FactorCredential, FactorKind, HotpConfig, ZeroizedString},
     service::{AuthnService, FactorOutcome, LoginOutcome},
-    store::{AuthMethod, IdentityAdmin},
+    store::{AuthMethod, FactorStore as _, IdentityAdmin},
     types::{CounterUnavailable, LockoutPolicy, StatusDetail},
 };
 use axess_core::session::store::MemorySessionRegistry;
 use axess_core::testing::{
+    MockClock,
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
 };
@@ -71,15 +73,19 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
     assert!(!session.is_authenticated().await);
 }
 
-/// Regression: after `max_attempts` failed HOTP attempts, the counter
-/// advances past the lookahead window so the current set of codes can never
-/// be presented again.
+/// After `max_attempts` wrong HOTP codes the factor is locked for a while
+/// and the counter stays where the token is: the genuine code is refused
+/// while the lock holds and verifies, at the original counter, once it has
+/// run out. The earlier throttle advanced the counter past the lookahead
+/// window instead, which desynchronised the token for good.
 #[tokio::test]
-async fn hotp_burns_counter_after_max_attempts() {
+async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    let clock = MockClock::now();
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
-        .with_user(test_user("u1", "carol"));
+        .with_user(test_user("u1", "carol"))
+        .with_clock(clock.clone());
 
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
@@ -101,61 +107,85 @@ async fn hotp_burns_counter_after_max_attempts() {
                 user_scope(),
             ),
         );
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let inspector = factors.clone();
+    let service = AuthnService::builder(identity, factors)
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
 
-    // Three wrong attempts.
-    for _ in 0..3 {
+    /// A whole attempt: begin, password, then `code` at the HOTP step.
+    async fn try_code(
+        service: &axess_core::authn::RequestAuthnService<MockIdentityStore, MockFactorStore>,
+        code: &str,
+    ) -> FactorOutcome {
         let session = test_session();
         service
             .begin_login("carol", "default", &session)
             .await
             .unwrap();
-        service
+        let r = service
             .verify_factor(
                 &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
                 &session,
             )
             .await
             .unwrap();
-        let r = service
+        assert!(
+            matches!(r, FactorOutcome::FactorRequired(FactorKind::Hotp)),
+            "{r:?}"
+        );
+        service
             .verify_factor(
-                &FactorCredential::OtpCode("000000".to_string().into()),
+                &FactorCredential::OtpCode(code.to_string().into()),
                 &session,
             )
             .await
-            .unwrap();
-        assert!(matches!(
-            r,
-            FactorOutcome::InvalidCredential | FactorOutcome::Locked { .. }
-        ));
+            .unwrap()
     }
 
-    // Now: even the genuine code at counter 0 must NOT verify, because the
-    // counter was burned past the lookahead window.
-    let code_0 = generate_hotp_code(secret, 0);
-    let session = test_session();
-    service
-        .begin_login("carol", "default", &session)
-        .await
-        .unwrap();
-    let r = service
-        .verify_factor(
-            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
-            &session,
-        )
-        .await;
-    // Account may be locked from the wrong-attempt counter; either way the
-    // genuine code cannot succeed.
-    if let Ok(FactorOutcome::FactorRequired(FactorKind::Hotp)) = r {
-        let r = service
-            .verify_factor(&FactorCredential::OtpCode(code_0.into()), &session)
-            .await
-            .unwrap();
-        assert!(
-            !matches!(r, FactorOutcome::Authenticated),
-            "burned counter must NOT accept the previously valid code"
-        );
+    // Three wrong codes: the limit.
+    for _ in 0..3 {
+        assert!(matches!(
+            try_code(&service, "000000").await,
+            FactorOutcome::InvalidCredential
+        ));
     }
+    let stored = inspector
+        .load_factor(&user_scope(), FactorKind::Hotp)
+        .await
+        .unwrap()
+        .expect("hotp row");
+    let FactorConfig::Hotp(hotp) = stored else {
+        panic!("expected Hotp")
+    };
+    assert_eq!(hotp.counter, 0, "the counter must not move on failures");
+    assert!(hotp.is_locked_at(clock.now()), "the factor is locked");
+
+    // While the lock holds, the genuine code is refused and nothing moves.
+    let code_0 = generate_hotp_code(secret, 0);
+    assert!(matches!(
+        try_code(&service, &code_0).await,
+        FactorOutcome::InvalidCredential
+    ));
+
+    // Once it has run out, the same code at the same counter gets in.
+    clock.advance(chrono::Duration::seconds(61));
+    assert!(matches!(
+        try_code(&service, &code_0).await,
+        FactorOutcome::Authenticated
+    ));
+    let FactorConfig::Hotp(after) = inspector
+        .load_factor(&user_scope(), FactorKind::Hotp)
+        .await
+        .unwrap()
+        .expect("hotp row")
+    else {
+        panic!("expected Hotp")
+    };
+    assert_eq!(
+        (after.counter, after.locked_until(), after.lockouts()),
+        (1, None, 0)
+    );
 }
 
 /// A wrong password while the counter store is down must never come back as

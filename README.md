@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.13.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.14.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -152,9 +152,11 @@ axess covers a long list of concerns; the table below points at the cookbook doc
 | Device identity (`device` feature, default-on) | [`docs/identity/device.md`](docs/identity/device.md) |
 | OAuth 2.0 / OIDC | `examples/oauth/` |
 | FAPI 2.0 (PAR / DPoP / JARM) | `examples/fapi/` |
+| OpenID Foundation RP conformance run | [`docs/factors/conformance.md`](docs/factors/conformance.md) |
 | FIDO2 / WebAuthn (passkeys) | [`docs/factors/fido2.md`](docs/factors/fido2.md) |
 | Workload identity (SPIFFE, K8s SA, GitHub OIDC) | [`docs/workload-identity/README.md`](docs/workload-identity/README.md) |
 | Cloud STS exchange (AWS / GCP / Azure) | [`docs/workload-identity/cloud-sts.md`](docs/workload-identity/cloud-sts.md) |
+| Cloud walkthroughs: pipeline to service to secret store | [`docs/workload-identity/azure.md`](docs/workload-identity/azure.md), [`docs/workload-identity/aws.md`](docs/workload-identity/aws.md) |
 | On-behalf-of (OBO) downstream access | [`docs/identity/delegated-obo.md`](docs/identity/delegated-obo.md) |
 | Local IdP for testing and on-host issuance | [`docs/factors/local-idp.md`](docs/factors/local-idp.md) |
 | Audit events + SOC/SIEM integration | [`docs/production/audit-events.md`](docs/production/audit-events.md) |
@@ -173,7 +175,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.13.0", features = ["sqlite", "authz"] }
+axess = { version = "0.14.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:
@@ -207,7 +209,7 @@ Names are kebab-case throughout. The `axess` facade's default features are `["au
 | `fido2` | FIDO2/WebAuthn passkey authentication | no |
 | `ldap` | LDAP bind authentication (Active Directory, OpenLDAP) | no |
 | `oauth` | OAuth 2.0 / OIDC (AuthCode+PKCE, Client Credentials, Device Code) | no |
-| `fapi` | FAPI 2.0 resource-server side: `verify_dpop_proof`. Implies `oauth`, which carries the client side (PAR, DPoP, mTLS, JARM through `with_fapi`). | no |
+| `fapi` | An alias for `oauth`, which carries both halves of DPoP (`verify_dpop_proof` for a resource server, the client's proofs) and the FAPI 2.0 client profile (PAR, mTLS, JARM through `with_fapi`). | no |
 | `social` | Plain OAuth 2.0 user login (GitHub user / Twitter / Discord / Reddit / Spotify / …). **Weaker security model than OIDC**: claims come from a TLS-trusted userinfo endpoint, not from a signed assertion. See `axess::social` module docs for the delta. | no |
 
 #### Workload identity

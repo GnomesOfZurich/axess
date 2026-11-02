@@ -85,7 +85,7 @@ async fn run(fail: bool) -> (Vec<IdpSessionEnded>, bool, StatusCode) {
     }
 
     // No `sid`: both sessions of the subject end, and both are reported.
-    let status = BackChannelLogoutHandler::handle_backchannel_logout(
+    let status = BackChannelLogoutHandler::handle_outcome(
         State(handler),
         Form(LogoutParams {
             logout_token: token(serde_json::json!({ "sub": "idp-sub", "jti": "j1" })),

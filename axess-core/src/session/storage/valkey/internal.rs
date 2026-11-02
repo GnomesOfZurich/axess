@@ -112,6 +112,24 @@ end
 return 0
 "#;
 
+/// Remove a stored session blob only while the key still holds exactly the
+/// bytes that were compared: the zero-TTL form of a conditional write, where
+/// the data to store is already expired.
+///
+/// Returns `1` when the key was removed, `0` when it holds other bytes, and
+/// `-1` when there is no key.
+pub(super) const COMPARE_DEL_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then
+  return -1
+end
+if current == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+"#;
+
 // ── TTL helpers ──────────────────────────────────────────────────────────────
 
 use std::time::Duration;
@@ -124,25 +142,49 @@ use std::time::Duration;
 /// to one second. A zero TTL means the session is already expired: the caller
 /// must not store it.
 pub(super) fn ex_seconds(ttl: Duration) -> Option<i64> {
-    if ttl.is_zero() {
-        return None;
-    }
-    Some(ttl.as_secs().clamp(1, i64::MAX as u64) as i64)
+    (!ttl.is_zero()).then(|| live_ex_seconds(ttl))
 }
 
-/// Outcome of a rotation whose new session is already expired (zero TTL):
-/// nothing is stored, and the old key was deleted. `removed` is the `DEL`
-/// count for the old key. With `require_old`, a delete that removed nothing
-/// means the session was already gone, which holds when the old and new keys
-/// are the same key as much as when they differ.
-pub(super) fn expired_cycle_outcome(
-    require_old: bool,
-    removed: i64,
-) -> crate::session::store::CycleOutcome {
-    if require_old && removed == 0 {
-        crate::session::store::CycleOutcome::SessionGone
-    } else {
-        crate::session::store::CycleOutcome::Rotated
+/// Seconds for a Valkey `EX` argument of a TTL the caller knows is not zero:
+/// whole seconds, clamped up to one.
+pub(super) fn live_ex_seconds(ttl: Duration) -> i64 {
+    ttl.as_secs().clamp(1, i64::MAX as u64) as i64
+}
+
+/// How often a watcher without a subscriber connection asks the registry
+/// whether its session is still valid, before backoff and spread.
+pub(super) const DEGRADED_POLL: Duration = Duration::from_secs(5);
+
+/// The longest the degraded poll backs off to while the registry does not
+/// answer.
+pub(super) const DEGRADED_POLL_MAX: Duration = Duration::from_secs(60);
+
+/// The wait before a degraded watcher's next poll of the registry. The
+/// interval doubles from [`DEGRADED_POLL`] for each consecutive poll the
+/// registry failed to answer, up to [`DEGRADED_POLL_MAX`], so the watchers
+/// do not hammer a Valkey that is down; and `draw`, a random number, spreads
+/// it uniformly over the quarter interval on either side, so the watchers
+/// that lost one connection together do not poll in lockstep while it
+/// recovers.
+pub(super) fn degraded_poll_delay(failed_polls: u32, draw: u64) -> Duration {
+    let interval = DEGRADED_POLL
+        .saturating_mul(1u32 << failed_polls.min(16))
+        .min(DEGRADED_POLL_MAX);
+    let quarter = interval / 4;
+    // The spread is `[0, 2 * quarter]` in whole milliseconds.
+    let spread_ms = u64::try_from((quarter * 2).as_millis()).unwrap_or(u64::MAX);
+    interval - quarter + Duration::from_millis(draw % spread_ms.saturating_add(1))
+}
+
+/// What a degraded watcher does with the registry's answer to a poll:
+/// `None` when the session is revoked (the watch ends), otherwise the count
+/// of consecutive polls the registry failed to answer, which the next wait
+/// backs off on.
+pub(super) fn after_degraded_poll<E>(answer: Result<bool, E>, failed_polls: u32) -> Option<u32> {
+    match answer {
+        Ok(false) => None,
+        Ok(true) => Some(0),
+        Err(_) => Some(failed_polls.saturating_add(1)),
     }
 }
 

@@ -41,19 +41,24 @@
 //! `data_bin` holds the session as raw bytes (MessagePack, sealed with
 //! AES-256-GCM when encryption is on). `data` is the base64 text column of
 //! earlier releases: rows written by them keep working because a load reads
-//! `data_bin` first and falls back to `data`, and every save writes
-//! `data_bin` and empties `data`, so a legacy row is rewritten when it is
-//! loaded (the store re-seals it) or saved. `data` stays `NOT NULL`, so new rows carry an
-//! empty string there. Rolling back to the earlier release afterwards cannot
+//! `data_bin` first and falls back to `data`, and every write stores
+//! `data_bin` and empties `data`. A legacy row moves to `data_bin` with its
+//! next write; a load moves it only when its blob is bound to the row, since
+//! a blob without a binding proves nothing about the row it sits under (see
+//! `LegacyBlobs`). `data` stays `NOT NULL`, so new rows carry an empty string
+//! there. Rolling back to the earlier release afterwards cannot
 //! read a row this release saved (the text column is empty): that user signs
 //! in again.
 
-use crate::session::storage::session_codec::{SessionCodec, SqlStoreError, expires_at};
+use crate::session::storage::session_codec::{Decoded, SessionCodec, SqlStoreError, expires_at};
 use crate::session::storage::sql_helpers::log_cleanup_outcome;
 use crate::session::{
     data::SessionData,
     id::SessionId,
-    store::{ConditionalUpdate, CycleOutcome, SessionStore},
+    store::{
+        ConditionalUpdate, CycleOutcome, SessionStore,
+        cas::{CasRow, CasWrite, cas_by_revision},
+    },
 };
 use axess_clock::{Clock, SystemClock};
 use sqlx::MySqlPool;
@@ -216,6 +221,10 @@ impl MysqlSessionStore {
         let store = self.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // A stall (a suspended host, a slow pass) makes ticks late; the
+            // default Burst then fires every missed tick back to back. Delay
+            // fires once and resumes the normal spacing.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
@@ -241,8 +250,9 @@ impl SessionStore for MysqlSessionStore {
 
         match row {
             Some((binary, text)) => {
-                let (data, stale) = self.codec.decode_row(id, binary.as_deref(), &text)?;
-                if stale {
+                let Decoded { data, reseal } =
+                    self.codec.decode_row(id, binary.as_deref(), &text)?;
+                if reseal {
                     self.reseal(id, &data, binary.as_deref(), &text, now).await;
                 }
                 Ok(Some(data))
@@ -257,6 +267,11 @@ impl SessionStore for MysqlSessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
+        if ttl.is_zero() {
+            // Already expired: nothing may be stored, and a previous row under
+            // this id must not outlive the expiry it was just given.
+            return SessionStore::delete(self, id).await;
+        }
         let id_str = id.to_string();
         let encoded = self.codec.encode_bytes(id, data)?;
         let exp = expires_at(&*self.clock, ttl);
@@ -298,6 +313,12 @@ impl SessionStore for MysqlSessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
+        if ttl.is_zero() {
+            // Already expired: nothing may stay stored under this id, and
+            // the session is reported as not kept.
+            SessionStore::delete(self, id).await?;
+            return Ok(false);
+        }
         let id_str = id.to_string();
         let encoded = self.codec.encode_bytes(id, data)?;
         let exp = expires_at(&*self.clock, ttl);
@@ -314,9 +335,7 @@ impl SessionStore for MysqlSessionStore {
         .execute(&self.pool)
         .await?;
 
-        // A zero TTL writes an expiry of "now": the row cannot be loaded, so
-        // it is reported as not updated, as the Valkey store does.
-        Ok(result.rows_affected() > 0 && exp > now)
+        Ok(result.rows_affected() > 0)
     }
 
     async fn update_if_revision(
@@ -326,65 +345,7 @@ impl SessionStore for MysqlSessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<ConditionalUpdate, Self::Error> {
-        let id_str = id.to_string();
-        let now = self.clock.now().timestamp();
-        let exp = expires_at(&*self.clock, ttl);
-
-        let row: Option<(Option<Vec<u8>>, String)> =
-            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ? AND expires_at > ?")
-                .bind(&id_str)
-                .bind(now)
-                .fetch_optional(&self.pool)
-                .await?;
-        let Some((binary, text)) = row else {
-            return Ok(ConditionalUpdate::Gone);
-        };
-        let (stored, _) = self.codec.decode_row(id, binary.as_deref(), &text)?;
-        if stored.revision != expected_revision {
-            return Ok(ConditionalUpdate::Conflict);
-        }
-        if exp <= now {
-            // A zero TTL stores nothing loadable; as `update` does, report
-            // the row as not replaced.
-            return Ok(ConditionalUpdate::Gone);
-        }
-
-        // The write names the bytes that were compared, so a save that landed
-        // between the read and here leaves this one with no row to replace.
-        let encoded = self.codec.encode_bytes(id, data)?;
-        let result = match binary {
-            Some(old) => {
-                sqlx::query(
-                    "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
-                     WHERE id = ? AND expires_at > ? AND data_bin = ?",
-                )
-                .bind(&encoded)
-                .bind(exp)
-                .bind(&id_str)
-                .bind(now)
-                .bind(old)
-                .execute(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(
-                    "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
-                     WHERE id = ? AND expires_at > ? AND data_bin IS NULL AND data = ?",
-                )
-                .bind(&encoded)
-                .bind(exp)
-                .bind(&id_str)
-                .bind(now)
-                .bind(text)
-                .execute(&self.pool)
-                .await?
-            }
-        };
-        Ok(if result.rows_affected() > 0 {
-            ConditionalUpdate::Written
-        } else {
-            ConditionalUpdate::Conflict
-        })
+        cas_by_revision(self, id, expected_revision, data, ttl).await
     }
 
     async fn cycle(
@@ -395,11 +356,21 @@ impl SessionStore for MysqlSessionStore {
         ttl: Duration,
         require_old: bool,
     ) -> Result<CycleOutcome, Self::Error> {
+        let old_str = old_id.to_string();
+        let new_str = new_id.to_string();
+        if ttl.is_zero() {
+            // Already expired: the rotated session is stored nowhere, so both
+            // rows go and the session is reported gone, never as rotated.
+            sqlx::query("DELETE FROM sessions WHERE id IN (?, ?)")
+                .bind(&old_str)
+                .bind(&new_str)
+                .execute(&self.pool)
+                .await?;
+            return Ok(CycleOutcome::SessionGone);
+        }
         let encoded = self.codec.encode_bytes(new_id, data)?;
         let exp = expires_at(&*self.clock, ttl);
         let now = self.clock.now().timestamp();
-        let old_str = old_id.to_string();
-        let new_str = new_id.to_string();
 
         let mut tx = self.pool.begin().await?;
 
@@ -465,6 +436,75 @@ impl SessionStore for MysqlSessionStore {
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         Ok(self.cleanup_expired().await?)
+    }
+}
+
+/// The SQL store compares the stored columns: a write names the bytes it
+/// read, the only thing a statement can match on.
+impl CasRow for MysqlSessionStore {
+    type Seen = (Option<Vec<u8>>, String);
+    type Error = SqlStoreError;
+
+    async fn read(&self, id: &SessionId) -> Result<Option<(u64, Self::Seen)>, Self::Error> {
+        let row: Option<(Option<Vec<u8>>, String)> =
+            sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = ? AND expires_at > ?")
+                .bind(id.to_string())
+                .bind(self.clock.now().timestamp())
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((binary, text)) = row else {
+            return Ok(None);
+        };
+        let stored = self.codec.decode_row(id, binary.as_deref(), &text)?.data;
+        Ok(Some((stored.revision, (binary, text))))
+    }
+
+    async fn delete_if(
+        &self,
+        id: &SessionId,
+        (binary, text): &Self::Seen,
+    ) -> Result<CasWrite, Self::Error> {
+        let removed =
+            sqlx::query("DELETE FROM sessions WHERE id = ? AND data_bin <=> ? AND data = ?")
+                .bind(id.to_string())
+                .bind(binary)
+                .bind(text)
+                .execute(&self.pool)
+                .await?;
+        Ok(if removed.rows_affected() > 0 {
+            CasWrite::Done
+        } else {
+            CasWrite::Missed
+        })
+    }
+
+    async fn replace_if(
+        &self,
+        id: &SessionId,
+        (binary, text): &Self::Seen,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<CasWrite, Self::Error> {
+        // Sealed once the row is known to be live: a session that is gone or
+        // moved on costs no seal.
+        let encoded = self.codec.encode_bytes(id, data)?;
+        let replaced = sqlx::query(
+            "UPDATE sessions SET data = '', data_bin = ?, expires_at = ? \
+             WHERE id = ? AND expires_at > ? AND data_bin <=> ? AND data = ?",
+        )
+        .bind(&encoded)
+        .bind(expires_at(&*self.clock, ttl))
+        .bind(id.to_string())
+        .bind(self.clock.now().timestamp())
+        .bind(binary)
+        .bind(text)
+        .execute(&self.pool)
+        .await?;
+        Ok(if replaced.rows_affected() > 0 {
+            CasWrite::Done
+        } else {
+            CasWrite::Missed
+        })
     }
 }
 

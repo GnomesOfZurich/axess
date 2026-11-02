@@ -9,6 +9,236 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.13.0 to 0.14.0
+
+A security release. Compile errors first, then storage, then behaviour.
+
+Compile errors.
+
+- **`AuthState::Authenticated` has `impersonator` and `ldap_groups`,
+  `AuthState::Authenticating` has `ldap_groups`, and `AuthSnapshot` has
+  `impersonation`** (`missing field` in a struct literal). Add
+  `impersonator: None`, `ldap_groups: None` and `impersonation: None`; stored
+  sessions read as before. Read the marker with `AuthSession::impersonator`
+  or `impersonation`, which returns `Impersonation { admin, since }`; the
+  custom key `axess.impersonation` is gone. The LDAP groups no longer sit in
+  the custom key `axess.ldap.groups`; read them with `AuthSession::ldap_groups`.
+- **`AuditContext` has `impersonator`** (`missing field`). Add it or
+  `..Default::default()`. An event built with the context names the
+  administrator as `actor_id` unless the event set one.
+- **`OAuthClaims` has `nonce`** (`missing field` in a literal outside the
+  crate). Store it beside the refresh token and pass it as `original_nonce`.
+- **`PasswordConfig` has `password_id`** (`missing field`). Add
+  `password_id: None`. A rehash fills it with the identity of the password it
+  re-hashes; never copy it from an old config into a new password's.
+- **`HotpConfig` has `throttle: HotpThrottle`** (`missing field`). Add
+  `throttle: Default::default()`; read the lock with `locked_until()` and
+  `lockouts()`, set it with `lock_at`. Rows written before read as unlocked.
+- **`BearerIssuerConfig.audience` is `Audience`** (`expected Audience, found
+  Option<String>`). Write `Audience::Exact(aud)` for `Some(aud)`; skipping the
+  check is `Audience::AnyDangerous`, spelled out.
+- **`OAuthProviderConfig::discover` and `discover_with_private_key_jwt` return
+  an `OAuthProviderBuilder`**, and `with_fapi`, `with_required_logout_typ` and
+  the other settings are builder methods that return the builder, not a
+  `Result`. Drop the `?` after `with_fapi` and end the chain with
+  `.build()?`, which checks every setting together, whatever the call order.
+- **The `_with` twins are gone** (`no method named exchange_code_with`):
+  `exchange_code_with`, `refresh_token_with`, `refresh_oauth_token_with_key`
+  and `fetch_userinfo_with_key`. The bare names take the key:
+  `dpop: Option<DpopSigner>` on `OAuthProvider`, `dpop_key: Option<&DpopKey>`
+  on the service and `ScopedOAuth` (`refresh_oauth_token`, `fetch_userinfo`,
+  `revoke_oauth_token`). Call the bare name and pass the key, or `None`.
+- **`ClientAuthMethod::PrivateKeyJwt` takes a `Box<ClientAssertionSigner>`,
+  and `mint_client_assertion` is gone.** Build the signer with
+  `ClientAssertionSigner::new` or `from_pem` (both `Result`: a key that does
+  not suit its algorithm fails here, at startup) and write
+  `ClientAuthMethod::PrivateKeyJwt(Box::new(signer))`; `mint` signs one
+  assertion. Its audience defaults to the token URL.
+- **`keys::EXPECTED_TENANT` is `keys::CEREMONY_TENANT`** (`cannot find value`).
+  The session key keeps its name and now holds
+  `{"tenant", "provider_from_tenant"}`; a 0.13 value (a plain tenant id) still
+  reads.
+- **`with_session_match_required` returns a `BoundFrontChannelLogoutHandler`,
+  and `handle_frontchannel_logout_bound` is gone.** Route
+  `BoundFrontChannelLogoutHandler::handle_frontchannel_logout` behind the
+  session layer; it takes the caller's `AuthSession`, so the plain route can
+  no longer be mounted with a bound handler.
+- **`SidMap::take_subject_sessions` and `SidMap::remove` are gone**
+  (`no method named`). Read `subject_sessions`, then call `remove_session` for
+  each session the registry ended; `remove_if(key, |_| true)` for `remove`.
+- **`with_hidden_signup_conflicts` is gone** (`no method named`). Hiding a
+  taken identifier is the default; `with_signup_conflicts_revealed` restores
+  `AlreadyExists` for a form that must say so.
+- **`TokenExchangeClient::new`, `AwsStsClient::new`, `AzureFicClient::new`,
+  `GcpStsClient::new`, `GcpServiceAccountImpersonator::new`,
+  `StoredDelegationSession::new` and `SocialProvider::new` return `Result`**
+  (`expected AwsStsClient, found Result`), and the STS `Default` impls are
+  gone. Add `?`, or call `new()?` for `default()`. The `ClientBuild` error
+  keeps the `reqwest::Error` as its `source()` (inside a `ClientBuildError`
+  on the delegated and STS errors).
+- **`basic_credentials` returns `ZeroizedString`** (`expected String`). It
+  derefs to `str`; build the header with `basic_authorization`.
+- **`handle_backchannel_logout` returns `Response`**, not
+  `Result<StatusCode, StatusCode>`. A route that mounts it compiles unchanged;
+  a direct caller reads `status()`.
+- **Required trait methods** (`not all trait items implemented`):
+  `DeviceStore::create_or_find` (the check and the insert as one step per
+  tenant, fingerprint and owner, so two first sightings make one device);
+  `SessionRegistryHandle::held_sessions` (move a custom handle's listing there
+  and return the registry's error on an outage; `active_sessions` is now
+  provided over it, so drop its override); `OAuthProvider::binds_to_dpop`
+  (answer `true` only when the token requests sign the proofs they are given),
+  with the `dpop` argument of `exchange_code`, `refresh_token` and
+  `fetch_userinfo`; and `IdentityLookup::lockout_policy_for_tenant`,
+  `password_rules_for_tenant`, `ip_policy_for_tenant` and
+  `IdentityAuthnLog::record_last_login`, which lost their permissive defaults
+  (a store with one policy returns it for every tenant; a decorator forwards
+  each). `IdentityLookup::lockout_policy` is gone.
+- **The `refresh_session*` functions are deprecated** (a warning, an error
+  under `-D warnings`). Refresh through the builder, which checks tenant,
+  status, device and binding together:
+  `Refresh::new(&plaintext, status_check).in_tenant(&tenant).device_info(fp).device_store(&devices).run(&store, &config, &rng, now)`.
+  Leave out the checks a route does not need; a caller with no status to
+  consult passes `|_| async { true }`.
+- **Exhaustive matches** add `AuthEventType::AccountDeleted` and
+  `SignupResumed`, `RevocationReason::Device`, `AuthnError::Busy` and
+  `Impersonated`, the `AuthFailureReason` refusals (`Impersonated`,
+  `CrossTenant`, `NestedImpersonation`, `AdminNotAuthenticated`,
+  `SessionIsNotAdmin`, `UnknownAdmin`, `AdminNotActive`, `UnknownTarget`,
+  `TargetLookupFailed`, `SessionNotRegistered`, `EnrolmentContext`,
+  `AuthnTooOld`, `ProviderUnavailable`, `DpopKeyInvalid`,
+  `TokenRefreshDpopKeyMissing`), `LdapError::Directory`,
+  `KeyProviderError::WeakKey(WeakKeyError)`,
+  `SqlDeviceStoreError::CreateLockTimeout`, `OAuthError::DpopKeyRequired`,
+  `Store` and `ClientAssertion`, `OAuthClientError::RequestBuild`,
+  `MemoryLocalIdpKeyStoreError::DuplicateKeyId`, `SocialError::ClientBuild`,
+  `DelegatedError::ClientCredentials`, `ClientBuild` on `DelegatedError`,
+  `AwsStsError`, `AzureFicError` and `GcpError`, and
+  `MockStoreError::Unavailable`.
+- **Custom implementations** keep compiling but owe new behaviour: a
+  `RefreshTokenStore` that records a reason and `revoked_at` from every
+  revoking method (a `None` reason reads as `Rotated`, and a lost device's
+  token would then revoke its family), a `LocalIdpKeyStore` whose `rotate`
+  refuses a `kid` it holds, an `LdapProvider` that answers `Directory` for a
+  bind result that does not judge the password, and a `SessionStore` that
+  keeps nothing under a zero TTL (`save` and `update` remove the row,
+  `update_if_revision` removes it and reports `Gone`, `cycle` removes both and
+  reports `SessionGone`).
+- **Tests**: `MemoryKeyProvider::new` refuses a single-repeated-byte key
+  (`[0u8; 32]`) with `KeyProviderError::WeakKey(_)` (`CsrfConfig::try_new`
+  with `WeakKeyError`), and `CsrfLayer::new` panics for `SameSite::None`
+  without `secure`; generate the key, set `secure`. `LocalIdpFixture::new`
+  signs ES256; a test that reads `kty: RSA` uses `new_rsa` or
+  `with_algorithm`.
+
+Storage.
+
+- **MySQL device indexes.** Run the `ALTER TABLE` block from the `DeviceStore`
+  module docs once, so `idx_devices_fingerprint_seen`, `idx_devices_user` and
+  `idx_devices_user_fingerprint` are `last_seen_at DESC, id ASC`. Nothing fails
+  without it; the newest-sighting lookups filesort.
+- **Valkey device fingerprint index.** `find_by_fingerprint` reads the sorted
+  set `dev:fpz`; a device not written since the upgrade is found by
+  fingerprint, or on a per-user miss, only while the store is built with
+  `with_legacy_fingerprint_keys`. Set it until every wanted device has been
+  sighted, then drop it. A first sighting holds a create guard
+  (`{prefix}:dev:new:...`) for up to 60 seconds.
+- **Delegated credentials** are sealed in envelope `v3`; `v2` rows are
+  re-sealed on read. A deployment still holding `v1` rows (before 0.13.0) sets
+  `with_legacy_envelopes(LegacyBlobs::AcceptUntil(cutoff))`, since `v1` is
+  refused by default.
+- **`LegacyBlobs::AcceptUntil` bounds the row's next write.** A blob with no row
+  binding (an old session blob, a SQL device bindings blob) is sealed by the
+  row's next write, not its next read; set the cutoff so every wanted row is
+  written before it.
+- **Half-finished logins are dropped once at the upgrade** (`NoFlow` at the
+  next step); the user starts again.
+- **A `tenant_oauth_providers` table made by a pre-release 0.14.0 build** lacks
+  the indexed `issuer` column; drop it before `init_schema`. A table made by
+  0.14.0 itself needs nothing.
+
+Behaviour.
+
+- **`build()` fails with `OAuthError::Config` for a FAPI provider that would
+  send a client secret.** FAPI 2.0 permits only `private_key_jwt` and mTLS.
+  Build with `discover_with_private_key_jwt`, or call `with_private_key_jwt`
+  on the builder (in any order with `with_fapi`), and register the public key
+  at the IdP; or use `SenderConstraint::Mtls`. The fapi
+  example reads `FAPI_PRIVATE_KEY_FILE` in place of `FAPI_CLIENT_SECRET`. A
+  client that has only a secret keeps DPoP without the profile (next entry).
+- **A provider whose IdP advertises DPoP binds its tokens to a DPoP key**
+  (`ES256` in `dpop_signing_alg_values_supported`), whatever the client
+  authenticates with. You see `OAuthError::DpopKeyRequired` from
+  `refresh_oauth_token`, `fetch_userinfo` and the other calls given no key, and
+  resource servers receive `Authorization: DPoP` with a proof. Keep
+  `OAuthClaims::dpop_key` beside the refresh token (`DpopKey::to_seed_bytes`;
+  `DpopKey::from_seed` in the process that refreshes) and pass it as their
+  `dpop_key`; sessions signed in before the upgrade hold no key and sign in
+  again. Where the resource servers accept only Bearer tokens,
+  call `without_dpop()` on the builder, or set a tenant record's `dpop` to
+  `TenantDpop::Off`. `binds_to_dpop()` says which a
+  provider does; an IdP that does not advertise DPoP changes nothing.
+- **A DPoP provider refuses `client_credentials`, `poll_device_token` and
+  `fetch_userinfo` given no key** before sending
+  (`OAuthError::DpopKeyRequired`). Pass the key in their `dpop` argument.
+- **`begin_login` answers a locked account `InvalidCredentials`**, as an
+  unknown one. A form that rendered `Locked { until }` shows its
+  invalid-credentials page; `with_lockout_revealed_on_begin` restores it. The
+  attempt that locks still answers `Locked`.
+- **A lockout at the limit outlives the attempt window.** An
+  `IdentityAuthnLog` reports the raw count and time from `failed_attempts` at
+  the limit.
+- **`User::validate` refuses an identifier signup would refuse**, now against
+  all of Unicode 16.0 Cf less the joiners. Find such rows with
+  `normalise_identifier` before the upgrade and have the users rename.
+- **A saturated KDF executor answers 503 with `Retry-After: 1`**, and the queue
+  holds 16 jobs per permit. `with_max_queue(usize::MAX)` restores the unbounded
+  queue.
+- **The CSRF cookie is `__Host-axess.csrf`** under `Secure` (`axess.csrf`
+  without). Each browser's first state-changing request after the upgrade
+  fails once; front-end code reads the new name. An explicit `cookie_name` is
+  kept.
+- **A WebSocket upgrade from a foreign `Origin` is refused with 403** when no
+  CSRF allow-list is set; one with no `Origin` passes. Add the origin, or
+  `CsrfConfig::websocket_origin_check(false)`.
+- **`RevocationAwareSocket` fails closed and closes after a day**
+  (`4001 session_revoked`). Set `fail_closed: false` or `max_lifetime: None`
+  to keep the old behaviour.
+- **A device-checked refresh of an expired token answers `Expired`**, not
+  `DeviceRevoked`, and a device now owned by another user is
+  `DeviceMismatch`.
+- **A non-rotating client keeps its token across a pepper rotation**; it is
+  re-stored, and the client is handed nothing new.
+- **`finish_oauth_login` is refused with `OAuthError::Config`** by a provider
+  that advertises `authorization_response_iss_parameter_supported`. Call
+  `finish_oauth_login_with_iss`.
+- **An impersonated session is refused passkey changes, `issue_refresh_token`
+  and a second impersonation** with `AuthnError::Impersonated` (403) unless
+  the service is built with `with_impersonated_credential_changes_allowed`;
+  `Fido2Options::max_authn_age`, when set, refuses an old authentication too.
+- **Audit rows name refusals by typed reasons.** The refresh path's
+  `impersonated_session` is now `impersonated`, as on the passkey path, and a
+  signup resubmit is a `SignupResumed` event (`signup_resumed`), not a success
+  row with the failure reason `resumed`. Update queries and dashboards that
+  read the old strings.
+- **`invalidate_session` refuses a `(user, sid)` pair the registry does not
+  hold** (`NoFlow`, or `ExternalService` when it cannot say).
+  `begin_impersonation` answers an unknown target `CrossTenant`.
+- **A rotated session the registry fails to register follows
+  `UnknownLiveness` in every case**: `Accept` keeps it untracked after a valid
+  liveness answer too, as it did when the registry could not answer; `Reject`
+  ends it.
+- **A back-channel logout the registry could not carry out answers 503**, and
+  the IdP retries; an issuer that fills its own `jti` log share (16384 live
+  entries) is answered 503 too.
+- **`begin_password_reset` answers `Ok(None)` for an account that may not log
+  in**, as for an unknown identifier.
+- **`begin_step_up` asks only for enrolled factors** and answers the first
+  enrolled one; none enrolled is `NoFlow`. Show the factor it returns.
+- **The sqlite example's `delete_user`** goes through
+  `RequestAuthnService::delete_user`, which ends sessions and tokens first; an
+  application that erases accounts does the same.
+
 ## 0.12.0 to 0.13.0
 
 A security release. Compile errors first, then storage, then behaviour.
@@ -78,10 +308,14 @@ A security release. Compile errors first, then storage, then behaviour.
   implemented`). `reserve_attempt` must test and increment in one atomic step
   (`UPDATE ... SET n = n + 1 WHERE ... RETURNING n`) and store the time of the
   attempt as `record_failed_attempt` does. The count is fresh (replaced by one)
-  when there is no failure, the last is older than `attempt_window`, or a timed
-  lockout (`duration`) has run out; otherwise the guess is granted while the
-  count is below `effective_max_attempts()` and refused with `None`, changing
-  nothing, once it is not. `release_attempt` decrements without going below zero
+  when there is no failure, the last is older than `attempt_window` and the
+  count is below `effective_max_attempts()`, or a timed lockout (`duration`)
+  has run out; otherwise the guess is granted while the count is below
+  `effective_max_attempts()` and refused with `None`, changing nothing, once it
+  is not. The window alone never frees a count at the limit, so a lockout with
+  `duration` `None`, or longer than the window, outlives the window; and
+  `failed_attempts` reports the raw count and time at the limit for the same
+  reason. `release_attempt` decrements without going below zero
   and clears the failure time at zero. The sqlite example and the testing mock
   show both. A store that wraps another forwards both.
 - **`refresh_session` is deprecated** (a warning, an error under
@@ -203,8 +437,10 @@ Behaviour. Read these.
 - **Rotating the refresh-token pepper no longer logs everyone out.** Move the
   old `RefreshTokenConfig::hash_pepper` to `previous_hash_pepper` and set the
   new one as `hash_pepper`. Tokens still stored under the old pepper are found
-  by the retry and replaced under the new one on their next refresh (even with
-  `rotation: false`). Clear `previous_hash_pepper` after one `ttl`. Moving from
+  by the retry and replaced under the new one on their next refresh (in
+  0.13.0 even with `rotation: false`; from 0.14.0 a non-rotating client keeps
+  its token and only the stored hash moves). Clear `previous_hash_pepper`
+  after one `ttl`. Moving from
   no pepper to a pepper still invalidates the tokens. The struct has a new
   public field, so a literal without `..Default::default()` needs
   `previous_hash_pepper: None`.
@@ -231,8 +467,10 @@ Behaviour. Read these.
   keeps a history of hashes or audits factor writes will see the update.
 - **Opt in** to the new protections: `with_hidden_signup_conflicts` (signup
   answers `Started` for a taken identifier; read `session.user_id()` after it to
-  tell the cases apart, and answer the client the same either way),
-  `with_password_reset_cooldown` and `OAuthProviderConfig::with_required_logout_typ`.
+  tell the cases apart, and answer the client the same either way; from 0.14.0
+  this is the default and the method is gone, `with_signup_conflicts_revealed`
+  being the opt-out), `with_password_reset_cooldown` and
+  `OAuthProviderConfig::with_required_logout_typ`.
 - **`with_fapi` returns a working provider** (it returned an error in the first 0.13.0 pass). Against a DPoP provider, refresh with `refresh_oauth_token_with_key(.., Some(&key))` and call userinfo with `fetch_userinfo_with_key`, passing `claims.dpop_key`; the plain forms refuse. For a provider that requires JARM, finish the callback with `finish_oauth_login_jarm(response, &session)`.
 - **`JwtVerifier::verify` needs an audience decision.** Add `.with_audience("...")`, or `.allow_any_audience()` where the issuer is yours alone; without either every `verify` fails.
 - **Back-channel logout is audited only when you ask.** `BackChannelLogoutHandler::new(..).with_audit(authn.backchannel_logout_audit())`.
@@ -853,7 +1091,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.13", features = ["request-id"] }
+axess = { version = "0.14", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

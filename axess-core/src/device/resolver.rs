@@ -37,12 +37,13 @@
 //! marking the session modified iff the value changed (so the new id is
 //! persisted on response).
 //!
-//! Errors returned by `resolve` are logged and treated as `None`; device
-//! resolution is best-effort and never causes the request to fail.
+//! Errors returned by `resolve` are logged and leave the session's
+//! `device_id` as it was; device resolution is best-effort and never causes
+//! the request to fail.
 //!
 //! [`DeviceStore`]: super::store::DeviceStore
 
-use crate::authn::ids::{DeviceId, UserId};
+use crate::authn::ids::{DeviceId, TenantId, UserId};
 use axum::http::request::Parts;
 use std::future::Future;
 use std::pin::Pin;
@@ -55,6 +56,21 @@ use std::pin::Pin;
 /// not proved who they are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionUser(pub UserId);
+
+/// The tenant the session authenticated into, placed in the request
+/// extensions by the session layer before a [`DeviceResolver`] runs.
+///
+/// It is the tenant [`AuthSession::set_authenticated`] stored at login, so an
+/// adopter whose tenant is a property of the signed-in user needs no
+/// `TenantId` request extension for device tracking: the default `tenant_fn`
+/// of [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
+/// falls back to it. A `TenantId` extension, when the adopter sets one, is
+/// read first. Absent for a guest and for a session part-way through a login,
+/// like [`SessionUser`].
+///
+/// [`AuthSession::set_authenticated`]: crate::session::extractor::AuthSession::set_authenticated
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTenant(pub TenantId);
 
 /// The device the session was last bound to, placed in the request
 /// extensions by the session layer for an authenticated session that has one.
@@ -75,10 +91,11 @@ pub struct SessionDevice(pub DeviceId);
 ///
 /// `Ok(None)` means "no device could be associated with this request",
 /// not an error. Reserve `Self::Error` for genuine storage / configuration
-/// faults the caller should propagate. The session layer treats `Ok(None)`
-/// as a no-op (leaves
-/// [`SessionData::device_id`](crate::session::SessionData::device_id) at
-/// `None`); it logs `Err(_)` and continues with `None`.
+/// faults the caller should propagate. The session layer stores `Ok(_)` as
+/// [`SessionData::device_id`](crate::session::SessionData::device_id)
+/// (so `Ok(None)` unbinds a session that had a device); it logs `Err(_)`
+/// and leaves the session's `device_id` as it was, so a transient fault in
+/// the device store does not strip a session of its device binding.
 ///
 /// # Tenant context
 ///
@@ -97,7 +114,7 @@ pub trait DeviceResolver: Send + Sync + 'static {
 
     /// Resolve the device for `parts`. Always best-effort: returning
     /// `Ok(None)` is the documented "no device" outcome; the layer never
-    /// fails the request on `Err(_)`.
+    /// fails the request on `Err(_)`, it keeps the session's device.
     ///
     /// Takes [`axum::http::request::Parts`] rather than the full
     /// `Request<Body>` because `axum::body::Body` is `!Sync`; borrowing
@@ -146,29 +163,41 @@ impl DeviceResolver for NoopDeviceResolver {
 /// would ripple through every `SessionLayer::new` call site.
 ///
 /// This trait closes the gap: a blanket impl for every `R: DeviceResolver`
-/// boxes the future and swallows the error to a `tracing::warn!` log,
-/// honouring the documented best-effort contract.
+/// boxes the future and erases the error to a `tracing::warn!` log and
+/// [`DeviceResolution::Failed`], honouring the documented best-effort
+/// contract.
 pub(crate) trait ErasedDeviceResolver: Send + Sync + 'static {
     fn resolve_erased<'a>(
         &'a self,
         parts: &'a Parts,
-    ) -> Pin<Box<dyn Future<Output = Option<DeviceId>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = DeviceResolution> + Send + 'a>>;
+}
+
+/// What a [`DeviceResolver`] told the session layer, with the error erased.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceResolution {
+    /// The resolver answered: the request's device, or none.
+    Resolved(Option<DeviceId>),
+    /// The resolver failed, so nothing is known about the request's device.
+    /// The layer keeps the session's device as it was: a fault in the device
+    /// store must not read as "no device" and strip the session's binding.
+    Failed,
 }
 
 impl<R: DeviceResolver> ErasedDeviceResolver for R {
     fn resolve_erased<'a>(
         &'a self,
         parts: &'a Parts,
-    ) -> Pin<Box<dyn Future<Output = Option<DeviceId>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = DeviceResolution> + Send + 'a>> {
         Box::pin(async move {
             match self.resolve(parts).await {
-                Ok(id) => id,
+                Ok(id) => DeviceResolution::Resolved(id),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "DeviceResolver failed; continuing with device_id = None"
+                        "DeviceResolver failed; the session keeps its device"
                     );
-                    None
+                    DeviceResolution::Failed
                 }
             }
         })
@@ -195,9 +224,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn erased_resolver_swallows_errors_to_none() {
-        // A resolver that always errors should appear as `None` to
-        // dyn-trait callers; the warn log is fire-and-forget.
+    async fn erased_resolver_reports_an_error_as_a_failure() {
+        // A resolver that always errors is reported as failed to dyn-trait
+        // callers, never as "no device"; the warn log is fire-and-forget.
         #[derive(Debug, thiserror::Error)]
         #[error("synthetic resolver failure")]
         struct BoomError;
@@ -215,7 +244,7 @@ mod tests {
         let resolver = BoomResolver;
         let parts = empty_parts();
         let outcome = resolver.resolve_erased(&parts).await;
-        assert_eq!(outcome, None);
+        assert_eq!(outcome, DeviceResolution::Failed);
     }
 
     #[tokio::test]
@@ -233,6 +262,6 @@ mod tests {
         let resolver = StaticResolver(id);
         let parts = empty_parts();
         let outcome = resolver.resolve_erased(&parts).await;
-        assert_eq!(outcome, Some(id));
+        assert_eq!(outcome, DeviceResolution::Resolved(Some(id)));
     }
 }

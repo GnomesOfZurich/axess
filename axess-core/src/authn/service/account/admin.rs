@@ -144,6 +144,81 @@ where
         self.activate_user_inner(actor, None, user_id).await
     }
 
+    /// Erase a user account of `expected_tenant` on behalf of `actor`: the
+    /// GDPR right-to-erasure verb, done in the order the store alone cannot
+    /// manage.
+    ///
+    /// The user's registered sessions are ended first (registry entries and,
+    /// with [`with_session_store`](crate::authn::service::AuthnServiceBuilder::with_session_store),
+    /// the stored rows), then every refresh token is revoked (with
+    /// [`with_refresh_store`](crate::authn::service::AuthnServiceBuilder::with_refresh_store)),
+    /// then [`IdentityAdmin::delete_user`](crate::authn::store::IdentityAdmin::delete_user)
+    /// erases the user and every row naming them, and an `AccountDeleted`
+    /// row records `actor`. A session or token that could not be ended stops
+    /// the erasure before the user is deleted, so no live credential is left
+    /// pointing at a user that no longer exists; the administrator retries.
+    ///
+    /// **Tenant boundary**: refuses with [`AuthnError::CrossTenant`] when the
+    /// target user does not belong to `expected_tenant`, and a user that does
+    /// not exist gets the same refusal. Use
+    /// [`delete_user_across_tenants`](Self::delete_user_across_tenants) only
+    /// for a platform-operator console.
+    #[tracing::instrument(skip(self))]
+    pub async fn delete_user(
+        &self,
+        actor: Actor<'_>,
+        user_id: &crate::authn::ids::UserId,
+        expected_tenant: &crate::authn::ids::TenantId,
+    ) -> Result<(), AuthnError<I::Error>> {
+        self.delete_user_inner(actor, Some(*expected_tenant), user_id)
+            .await
+    }
+
+    /// Erase a user account in any tenant, on behalf of `actor`.
+    ///
+    /// Like [`delete_user`](Self::delete_user) without the tenant rail: for
+    /// system-tenant administrative paths only. A user that does not exist is
+    /// [`AuthnError::NoFlow`].
+    #[tracing::instrument(skip(self))]
+    pub async fn delete_user_across_tenants(
+        &self,
+        actor: Actor<'_>,
+        user_id: &crate::authn::ids::UserId,
+    ) -> Result<(), AuthnError<I::Error>> {
+        self.delete_user_inner(actor, None, user_id).await
+    }
+
+    async fn delete_user_inner(
+        &self,
+        actor: Actor<'_>,
+        expected_tenant: Option<crate::authn::ids::TenantId>,
+        user_id: &crate::authn::ids::UserId,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let user = self
+            .verify_admin_target_in_tenant(user_id, actor.id(), expected_tenant.as_ref(), "delete")
+            .await?;
+
+        // Credentials first, user last: a registry or token store that
+        // cannot be reached stops the erasure here, before anything is
+        // gone, rather than leaving a live session or token for a user the
+        // store no longer knows.
+        self.end_user_sessions(user_id).await?;
+        self.revoke_refresh_tokens(user_id).await?;
+
+        self.inner
+            .identity
+            .delete_user(user_id)
+            .await
+            .map_err(AuthnError::Store)?;
+
+        let mut builder = AuthEventBuilder::success(AuthEventType::AccountDeleted)
+            .attributed_to(&user.id, &user.tenant_id);
+        if let Some(actor_id) = actor.id() {
+            builder = builder.with_actor(*actor_id);
+        }
+        self.emit_audit(builder).await
+    }
+
     async fn activate_user_inner(
         &self,
         actor: Actor<'_>,
@@ -197,10 +272,10 @@ where
     /// short literal strings.
     ///
     /// This converged helper replaced duplicated bodies in
-    /// `suspend_user_inner` and `activate_user_inner`. A future
-    /// admin action (e.g. `delete_user_inner`,
-    /// `force_password_reset_inner`) can adopt the same fail-closed
-    /// rail with a single call rather than re-implementing it.
+    /// `suspend_user_inner` and `activate_user_inner`; `delete_user_inner`
+    /// uses it too. A future admin action (e.g.
+    /// `force_password_reset_inner`) can adopt the same fail-closed rail
+    /// with a single call rather than re-implementing it.
     async fn verify_admin_target_in_tenant(
         &self,
         user_id: &crate::authn::ids::UserId,
@@ -232,6 +307,7 @@ where
                         );
                         let event_type = match action_label {
                             "suspend" => AuthEventType::AccountSuspended,
+                            "delete" => AuthEventType::AccountDeleted,
                             _ => AuthEventType::AccountActivated,
                         };
                         let mut builder = AuthEventBuilder::failure(event_type)

@@ -341,10 +341,13 @@ impl Verifier {
 
     /// Whether this caller won the right to emit a warning: at most one per
     /// second, so a flood of replays does not become a flood of log lines.
-    fn claim_warn(&self, now: i64) -> bool {
+    /// A clock that reads earlier than the stamp (it stepped back) re-arms
+    /// the throttle, as [`claim_sweep`](Self::claim_sweep) does: waiting for
+    /// it to catch up would silence every warning until then.
+    pub(super) fn claim_warn(&self, now: i64) -> bool {
         let now = u64::try_from(now).unwrap_or(0);
         let last = self.last_warn.load(Ordering::Acquire);
-        (last == 0 || now > last)
+        (last == 0 || now != last)
             && self
                 .last_warn
                 .compare_exchange(last, now.max(1), Ordering::AcqRel, Ordering::Acquire)

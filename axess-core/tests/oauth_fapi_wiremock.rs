@@ -1,7 +1,7 @@
 //! The FAPI 2.0 profile against a wiremock IdP: the DPoP proof on the token
 //! request, the nonce retry, the `token_type` check, the refresh and userinfo
-//! calls bound to the same key, JARM, the ID-token algorithm allow-list and
-//! mTLS client authentication.
+//! calls bound to the same key, JARM, the ID-token algorithm allow-list, and
+//! client authentication by `private_key_jwt` or mTLS, never a client secret.
 //!
 //! Run with: `cargo test -p axess-core --features testing-oauth --test oauth_fapi_wiremock`
 
@@ -14,9 +14,10 @@ use axess_core::testing::{
     oauth_wiremock::{oauth_discovery_document, oauth_generate_rsa_keypair},
     test_session,
 };
+use axess_factors::client_assertion::{CLIENT_ASSERTION_TYPE_JWT_BEARER, ClientAssertionSigner};
 use axess_factors::oauth::{
-    DpopKey, FapiConfig, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProviderConfig,
-    SenderConstraint,
+    DpopKey, FapiConfig, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProviderBuilder,
+    OAuthProviderConfig, SenderConstraint,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -91,12 +92,29 @@ struct Idp {
     private_der: Vec<u8>,
     kid: String,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// The client's `private_key_jwt` key: a P-256 key in PKCS#8 DER and
+    /// its public point, as the IdP holds it for the client.
+    client_der: Vec<u8>,
+    client_public: Vec<u8>,
 }
 
 impl Idp {
     /// An IdP signing with `PS256`, whose discovery document advertises
-    /// `extra` members and which has a PAR endpoint at `/par`.
+    /// `extra` members (with `{issuer}` in a string replaced by the issuer)
+    /// and which has a PAR endpoint at `/par` that accepts every push.
     async fn start(extra: Value) -> Self {
+        Self::start_with_par(extra, |_, _| {
+            ResponseTemplate::new(201)
+                .set_body_json(json!({ "request_uri": "urn:par:1", "expires_in": 60 }))
+        })
+        .await
+    }
+
+    /// [`start`](Self::start) with the PAR endpoint answering as `par` says.
+    async fn start_with_par(
+        extra: Value,
+        par: impl Fn(&Seen, usize) -> ResponseTemplate + Send + Sync + 'static,
+    ) -> Self {
         let server = MockServer::start().await;
         let issuer = server.uri();
         let (private_der, mut jwk, kid) = oauth_generate_rsa_keypair();
@@ -105,6 +123,8 @@ impl Idp {
         doc["id_token_signing_alg_values_supported"] = json!(["PS256"]);
         doc["pushed_authorization_request_endpoint"] = json!(format!("{issuer}/par"));
         doc["mtls_endpoint_aliases"] = json!({ "token_endpoint": format!("{issuer}/mtls/token") });
+        let extra: Value =
+            serde_json::from_str(&extra.to_string().replace("{issuer}", &issuer)).unwrap();
         doc.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
@@ -118,18 +138,17 @@ impl Idp {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
             .mount(&server)
             .await;
+        let client_key = rcgen::KeyPair::generate().unwrap();
         let idp = Self {
             server,
             issuer,
             private_der,
             kid,
             seen: Arc::default(),
+            client_der: client_key.serialize_der(),
+            client_public: client_key.public_key_raw().to_vec(),
         };
-        idp.mount("POST", "/par", |_, _| {
-            ResponseTemplate::new(201)
-                .set_body_json(json!({ "request_uri": "urn:par:1", "expires_in": 60 }))
-        })
-        .await;
+        idp.mount("POST", "/par", par).await;
         idp
     }
 
@@ -190,7 +209,7 @@ impl Idp {
         .expect("sign")
     }
 
-    async fn provider(&self) -> OAuthProviderConfig {
+    async fn provider(&self) -> OAuthProviderBuilder {
         OAuthProviderConfig::discover(
             "test",
             &self.issuer,
@@ -201,6 +220,59 @@ impl Idp {
         .await
         .expect("discovery")
     }
+
+    /// The client's `private_key_jwt` signer.
+    fn signer(&self) -> ClientAssertionSigner {
+        axess_factors::jwt::ensure_crypto_provider();
+        ClientAssertionSigner::new(
+            CLIENT_ID,
+            EncodingKey::from_ec_der(&self.client_der),
+            Algorithm::ES256,
+        )
+        .expect("the key signs under its algorithm")
+    }
+
+    /// A provider that can carry the FAPI profile: discovered with a secret,
+    /// as [`provider`](Self::provider) is, then switched to
+    /// `private_key_jwt`, which drops the secret.
+    async fn fapi_provider(&self) -> OAuthProviderBuilder {
+        self.provider().await.with_private_key_jwt(self.signer())
+    }
+
+    /// The claims of the client assertion `seen` carries, after its
+    /// signature verified under the client's public key.
+    fn assertion_claims(&self, seen: &Seen) -> Value {
+        assert_eq!(
+            seen.form("client_assertion_type"),
+            Some(CLIENT_ASSERTION_TYPE_JWT_BEARER),
+            "{} carries the assertion type",
+            seen.path
+        );
+        let assertion = seen.form("client_assertion").expect("a client assertion");
+        let (x, y) = self.client_public[1..].split_at(32);
+        let key = jsonwebtoken::DecodingKey::from_ec_components(&B64.encode(x), &B64.encode(y))
+            .expect("key");
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.set_audience(&[self.issuer.as_str()]);
+        jsonwebtoken::decode::<Value>(assertion, &key, &validation)
+            .expect("the assertion verifies under the client's key, for the issuer")
+            .claims
+    }
+}
+
+/// `seen` carries no client secret, in the form or in a Basic header.
+fn assert_no_secret(seen: &Seen) {
+    assert_eq!(
+        seen.form("client_secret"),
+        None,
+        "{} sent the secret",
+        seen.path
+    );
+    assert_eq!(
+        seen.authorization, None,
+        "{} sent an Authorization header",
+        seen.path
+    );
 }
 
 fn service(provider: OAuthProviderConfig) -> Authn {
@@ -295,9 +367,10 @@ fn dpop_provider_config() -> FapiConfig {
 }
 
 async fn dpop_provider(idp: &Idp) -> OAuthProviderConfig {
-    idp.provider()
+    idp.fapi_provider()
         .await
         .with_fapi(dpop_provider_config())
+        .build()
         .expect("with_fapi")
 }
 
@@ -403,10 +476,10 @@ async fn a_provider_configured_for_dpop_refuses_a_request_without_a_key() {
     let provider = dpop_provider(&idp).await;
     use axess_factors::oauth::OAuthProvider as _;
     let err = provider
-        .exchange_code("code", "v".repeat(43), "n".to_string())
+        .exchange_code("code", "v".repeat(43), "n".to_string(), None)
         .await
         .expect_err("the bare form must not send a bearer request");
-    assert!(matches!(err, OAuthError::Config(_)), "{err:?}");
+    assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
     assert!(idp.requests_to("/token").is_empty(), "nothing was sent");
 }
 
@@ -426,7 +499,7 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
     .await;
 
     let outcome = authn
-        .refresh_oauth_token_with_key("test", "rt1", "alice-subject", None, Some(&key))
+        .refresh_oauth_token("test", "rt1", "alice-subject", None, Some(&key))
         .await
         .expect("refresh");
     assert_eq!(&*outcome.refresh_token, "rt2");
@@ -440,7 +513,7 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
     assert_eq!(payload["htm"], "POST");
 
     authn
-        .fetch_userinfo_with_key("test", "access-2", "alice-subject", Some(&key))
+        .fetch_userinfo("test", "access-2", "alice-subject", Some(&key))
         .await
         .expect("userinfo");
     let userinfo = &idp.requests_to("/userinfo")[0];
@@ -457,10 +530,10 @@ async fn refresh_and_userinfo_use_the_key_the_login_returned() {
     // Without the key the call is refused before anything is sent.
     let before = idp.requests_to("/token").len();
     let err = authn
-        .refresh_oauth_token("test", "rt2", "alice-subject", None)
+        .refresh_oauth_token("test", "rt2", "alice-subject", None, None)
         .await
         .expect_err("a bound token is not refreshed bare");
-    assert!(matches!(err, OAuthError::Config(_)), "{err:?}");
+    assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
     assert_eq!(idp.requests_to("/token").len(), before);
 }
 
@@ -475,22 +548,28 @@ async fn a_restored_key_is_the_same_key() {
 
 // ── ID-token rules of the profile ────────────────────────────────────────────
 
-/// FAPI requires `nbf`; a token that carries a valid one passes, and one
-/// without it is refused.
+/// The profile asks nothing of an ID token's `nbf` beyond the rule for any
+/// JWT (FAPI 2.0 section 5.3.2.1): one more than 60 seconds in the future is
+/// refused. A token without `nbf`, as Keycloak issues them, is accepted, and
+/// so is one whose `nbf` has passed.
 #[tokio::test]
-async fn fapi_login_reads_nbf_from_the_id_token() {
-    for accepted in [true, false] {
+async fn fapi_login_refuses_only_an_nbf_in_the_future() {
+    let now = chrono::Utc::now().timestamp();
+    for (nbf, accepted) in [
+        (None, true),
+        (Some(now - 5), true),
+        (Some(now + 600), false),
+    ] {
         let idp = Idp::start(json!({})).await;
         let authn = service(dpop_provider(&idp).await);
         let session = test_session();
         let (nonce, csrf) = begin(&authn, &session).await;
         let mut id_claims = json!({
             "iss": idp.issuer, "sub": "alice-subject", "aud": CLIENT_ID,
-            "exp": chrono::Utc::now().timestamp() + 120,
-            "iat": chrono::Utc::now().timestamp(), "nonce": nonce,
+            "exp": now + 120, "iat": now, "nonce": nonce,
         });
-        if accepted {
-            id_claims["nbf"] = json!(chrono::Utc::now().timestamp() - 5);
+        if let Some(nbf) = nbf {
+            id_claims["nbf"] = json!(nbf);
         }
         let id = idp.sign(Algorithm::PS256, &id_claims);
         idp.mount("POST", "/token", move |_, _| {
@@ -498,7 +577,7 @@ async fn fapi_login_reads_nbf_from_the_id_token() {
         })
         .await;
         let result = authn.finish_oauth_login("code", &csrf, &session).await;
-        assert_eq!(result.is_ok(), accepted, "{result:?}");
+        assert_eq!(result.is_ok(), accepted, "nbf {nbf:?}: {result:?}");
         if !accepted {
             // The provider reports every token-validation failure to the
             // caller as a generic exchange failure.
@@ -521,7 +600,13 @@ async fn the_profile_refuses_an_rs256_id_token_unless_the_list_is_widened() {
         if let Some(algs) = algs {
             config.allowed_id_token_algs = algs;
         }
-        let authn = service(idp.provider().await.with_fapi(config).expect("with_fapi"));
+        let authn = service(
+            idp.fapi_provider()
+                .await
+                .with_fapi(config)
+                .build()
+                .expect("with_fapi"),
+        );
         let session = test_session();
         let (nonce, csrf) = begin(&authn, &session).await;
         let id = idp.id_token(Algorithm::RS256, &nonce, json!({}));
@@ -546,7 +631,12 @@ async fn with_fapi_refuses_what_the_profile_cannot_keep() {
 
     // No PAR endpoint at the IdP, none configured.
     let bare = Idp::start(json!({ "pushed_authorization_request_endpoint": null })).await;
-    let msg = config_err(bare.provider().await.with_fapi(FapiConfig::default()));
+    let msg = config_err(
+        bare.fapi_provider()
+            .await
+            .with_fapi(FapiConfig::default())
+            .build(),
+    );
     assert!(
         msg.contains("pushed_authorization_request_endpoint"),
         "{msg}"
@@ -554,20 +644,434 @@ async fn with_fapi_refuses_what_the_profile_cannot_keep() {
 
     // An empty list accepts no ID token; a symmetric name never verifies one.
     for algs in [vec![], vec!["HS256".to_string()], vec!["none".to_string()]] {
-        let msg = config_err(idp.provider().await.with_fapi(FapiConfig {
-            allowed_id_token_algs: algs,
-            ..Default::default()
-        }));
+        let msg = config_err(
+            idp.fapi_provider()
+                .await
+                .with_fapi(FapiConfig {
+                    allowed_id_token_algs: algs,
+                    ..Default::default()
+                })
+                .build(),
+        );
         assert!(msg.contains("allowed_id_token_algs"), "{msg}");
     }
 
     // The default profile is available.
     assert!(
-        idp.provider()
+        idp.fapi_provider()
             .await
             .with_fapi(FapiConfig::default())
+            .build()
             .is_ok()
     );
+}
+
+/// A setting of the builder, applied by [`both_orders`].
+type Setting<'a> = Box<dyn Fn(OAuthProviderBuilder) -> OAuthProviderBuilder + 'a>;
+
+/// `first` then `second`, and `second` then `first`, each built from
+/// `base`.
+async fn both_orders<F, Fut>(
+    base: F,
+    first: &Setting<'_>,
+    second: &Setting<'_>,
+) -> [Result<OAuthProviderConfig, OAuthError>; 2]
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = OAuthProviderBuilder>,
+{
+    [
+        second(first(base().await)).build(),
+        first(second(base().await)).build(),
+    ]
+}
+
+/// `outcomes` are the same verdict: both built, or both refused with a
+/// `Config` error that contains `refusal`.
+fn same_verdict(outcomes: &[Result<OAuthProviderConfig, OAuthError>; 2], refusal: Option<&str>) {
+    for outcome in outcomes {
+        match (outcome, refusal) {
+            (Ok(_), None) => {}
+            (Err(OAuthError::Config(m)), Some(want)) => assert!(m.contains(want), "{m}"),
+            (other, _) => panic!(
+                "expected {refusal:?}, got {:?}",
+                other.as_ref().map(|_| ()).map_err(ToString::to_string)
+            ),
+        }
+    }
+}
+
+/// Every builder setting gives one verdict whatever the order of the
+/// calls: each pair that used to depend on it builds, or is refused, the
+/// same way both ways round. The refusals the profile makes still happen.
+#[tokio::test]
+async fn every_setting_gives_one_verdict_in_either_order() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({})).await;
+    let fapi: Setting = Box::new(|b| b.with_fapi(FapiConfig::default()));
+
+    // The signer before or after the profile: built.
+    let signer: Setting = Box::new(|b| b.with_private_key_jwt(idp.signer()));
+    same_verdict(&both_orders(|| idp.provider(), &signer, &fapi).await, None);
+    // No signer at all: refused, as before.
+    assert!(matches!(
+        idp.provider().await.with_fapi(FapiConfig::default()).build(),
+        Err(OAuthError::Config(m)) if m.contains("private_key_jwt")
+    ));
+
+    // A PAR endpoint named before or after the profile, at an IdP that
+    // advertises none: built. With none named: refused.
+    let bare = Idp::start(json!({ "pushed_authorization_request_endpoint": null })).await;
+    let par: Setting = Box::new(|b| b.with_par_endpoint(format!("{}/par", bare.issuer)));
+    same_verdict(
+        &both_orders(|| bare.fapi_provider(), &par, &fapi).await,
+        None,
+    );
+    same_verdict(
+        &[
+            bare.fapi_provider()
+                .await
+                .with_fapi(FapiConfig::default())
+                .build(),
+            bare.fapi_provider()
+                .await
+                .with_fapi(FapiConfig::default())
+                .build(),
+        ],
+        Some("pushed_authorization_request_endpoint"),
+    );
+
+    // A pin the profile shares nothing with: refused both ways. One inside
+    // it: built both ways.
+    let rs256: Setting = Box::new(|b| b.with_id_token_signing_algs(["RS256"]));
+    same_verdict(
+        &both_orders(|| idp.fapi_provider(), &rs256, &fapi).await,
+        Some("shares no algorithm"),
+    );
+    let es256: Setting = Box::new(|b| b.with_id_token_signing_algs(["ES256"]));
+    same_verdict(
+        &both_orders(|| idp.fapi_provider(), &es256, &fapi).await,
+        None,
+    );
+    // A bad list on its own names the pin, not the profile.
+    match idp
+        .provider()
+        .await
+        .with_id_token_signing_algs(["HS256"])
+        .build()
+    {
+        Err(OAuthError::Config(m)) => assert!(m.contains("ID token algorithm list"), "{m}"),
+        other => panic!("expected Config, got {:?}", other.map(|_| ())),
+    }
+
+    // `without_dpop` against the DPoP profile: refused both ways.
+    let off: Setting = Box::new(OAuthProviderBuilder::without_dpop);
+    same_verdict(
+        &both_orders(|| idp.fapi_provider(), &off, &fapi).await,
+        Some("requires DPoP"),
+    );
+    // `with_dpop` with the DPoP profile at an IdP that does not advertise
+    // DPoP: built and bound both ways, since the profile binds anyway.
+    let on: Setting = Box::new(OAuthProviderBuilder::with_dpop);
+    let outcomes = both_orders(|| idp.fapi_provider(), &on, &fapi).await;
+    same_verdict(&outcomes, None);
+    for provider in outcomes.iter().flatten() {
+        assert!(provider.binds_to_dpop());
+    }
+    // `with_dpop` against the mTLS profile: refused both ways.
+    let cert = ClientCert::new("order");
+    let mtls: Setting = Box::new(|b| {
+        b.with_fapi(FapiConfig {
+            sender_constraint: cert.constraint(),
+            ..Default::default()
+        })
+    });
+    same_verdict(
+        &both_orders(|| idp.provider(), &on, &mtls).await,
+        Some("mTLS"),
+    );
+}
+
+/// Under mTLS the advertised aliases are put in place last: an endpoint a
+/// setter named, before or after the profile, does not move the pushed
+/// authorization request or the revocation off the certificate-bound
+/// endpoint.
+#[tokio::test]
+async fn the_mtls_aliases_win_over_a_named_endpoint_in_either_order() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({ "mtls_endpoint_aliases": {
+        "token_endpoint": "{issuer}/mtls/token",
+        "pushed_authorization_request_endpoint": "{issuer}/mtls/par",
+        "revocation_endpoint": "{issuer}/mtls/revoke",
+    }}))
+    .await;
+    idp.mount("POST", "/mtls/par", |_, _| {
+        ResponseTemplate::new(201)
+            .set_body_json(json!({ "request_uri": "urn:par:mtls", "expires_in": 60 }))
+    })
+    .await;
+    idp.mount("POST", "/mtls/revoke", |_, _| ResponseTemplate::new(200))
+        .await;
+    let cert = ClientCert::new("aliases");
+    let mtls: Setting = Box::new(|b| {
+        b.with_fapi(FapiConfig {
+            sender_constraint: cert.constraint(),
+            ..Default::default()
+        })
+    });
+    let named: Setting = Box::new(|b| {
+        b.with_par_endpoint(format!("{}/par", idp.issuer))
+            .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
+    });
+    for provider in both_orders(|| idp.provider(), &named, &mtls).await {
+        let provider = provider.expect("build");
+        let rng = axess_rng::SystemRng;
+        provider
+            .build_auth_url_par(&OAuthLoginOptions::default(), &rng, None)
+            .await
+            .expect("PAR");
+        provider
+            .revoke_token("rt", Some("refresh_token"), None)
+            .await
+            .expect("revocation");
+    }
+    assert_eq!(idp.requests_to("/mtls/par").len(), 2);
+    assert_eq!(idp.requests_to("/mtls/revoke").len(), 2);
+    assert!(
+        idp.requests_to("/par").is_empty(),
+        "the named PAR endpoint is not used"
+    );
+    assert!(idp.requests_to("/revoke").is_empty());
+}
+
+/// A pin narrows the profile and never widens it, whichever comes first:
+/// with the profile widened to `RS256` and `PS256` and the client pinned
+/// to `PS256`, an `RS256` ID token is refused both ways, and a `PS256` one
+/// from the same IdP is accepted.
+#[tokio::test]
+async fn a_pin_narrows_the_profile_in_either_order() {
+    let widened: Setting = Box::new(|b| {
+        b.with_fapi(FapiConfig {
+            allowed_id_token_algs: vec!["RS256".into(), "PS256".into()],
+            ..FapiConfig::default()
+        })
+    });
+    let ps256: Setting = Box::new(|b| b.with_id_token_signing_algs(["PS256"]));
+    for pin_first in [true, false] {
+        for (alg, accepted) in [(Algorithm::PS256, true), (Algorithm::RS256, false)] {
+            let idp =
+                Idp::start(json!({ "id_token_signing_alg_values_supported": ["RS256", "PS256"] }))
+                    .await;
+            let builder = idp.fapi_provider().await;
+            let builder = if pin_first {
+                widened(ps256(builder))
+            } else {
+                ps256(widened(builder))
+            };
+            let authn = service(builder.build().expect("build"));
+            let session = test_session();
+            let (nonce, csrf) = begin(&authn, &session).await;
+            let id = idp.id_token(alg, &nonce, json!({}));
+            idp.mount("POST", "/token", move |_, _| {
+                ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
+            })
+            .await;
+            let result = authn.finish_oauth_login("code", &csrf, &session).await;
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{alg:?}, pin first: {pin_first}: {result:?}"
+            );
+        }
+    }
+}
+
+// ── Client authentication under the profile ──────────────────────────────────
+
+/// FAPI 2.0 Security Profile section 5.3.1.1 lets a client authenticate by
+/// `private_key_jwt` or mTLS only. A provider that holds nothing but a client
+/// secret is refused at `with_fapi`, before any login, whatever else the
+/// profile asks for, and the refusal names both methods. Switched to
+/// `private_key_jwt` first, the same provider carries the profile.
+#[tokio::test]
+async fn a_fapi_provider_with_only_a_client_secret_is_refused() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({})).await;
+    grant_any(&idp, "Bearer").await;
+
+    // The case: this provider authenticates with its secret.
+    idp.provider()
+        .await
+        .build()
+        .expect("build")
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect("a grant without the profile");
+    assert_eq!(
+        idp.requests_to("/token")[0].form("client_secret"),
+        Some("test-secret"),
+        "the provider holds a secret and sends it"
+    );
+
+    for config in [FapiConfig::default(), jarm_provider_config()] {
+        match idp.provider().await.with_fapi(config).build() {
+            Err(OAuthError::Config(m)) => assert!(
+                m.contains("private_key_jwt") && m.contains("mTLS"),
+                "the refusal names the allowed methods: {m}"
+            ),
+            other => panic!("expected Config, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    assert!(
+        idp.provider()
+            .await
+            .with_private_key_jwt(idp.signer())
+            .with_fapi(FapiConfig::default())
+            .build()
+            .is_ok()
+    );
+}
+
+/// Under the profile with `private_key_jwt`, every request that proves the
+/// client's identity (the pushed authorization request, the code exchange,
+/// the refresh, `client_credentials` and revocation) carries a fresh
+/// assertion for the issuer and no secret, though the provider was
+/// discovered with one.
+#[tokio::test]
+async fn a_fapi_provider_with_private_key_jwt_sends_an_assertion_and_no_secret() {
+    use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let idp = Idp::start(json!({})).await;
+    idp.mount("POST", "/revoke", |_, _| ResponseTemplate::new(200))
+        .await;
+    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let key = claims.expect("login").dpop_key.expect("key");
+    authn
+        .refresh_oauth_token("test", "rt1", "alice-subject", None, Some(&key))
+        .await
+        .expect("refresh");
+    let provider = idp
+        .fapi_provider()
+        .await
+        .with_fapi(dpop_provider_config())
+        .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
+        .build()
+        .expect("build");
+    let rng = axess_rng::SystemRng;
+    provider
+        .client_credentials(
+            &["scope-a"],
+            Some(DpopSigner {
+                key: &key,
+                rng: &rng,
+            }),
+        )
+        .await
+        .expect("client_credentials");
+    provider
+        .revoke_token("rt2", Some("refresh_token"), None)
+        .await
+        .expect("revocation");
+
+    let par = idp.requests_to("/par");
+    let token = idp.requests_to("/token");
+    let revoke = idp.requests_to("/revoke");
+    let grants: Vec<_> = token.iter().filter_map(|s| s.form("grant_type")).collect();
+    assert_eq!(
+        grants,
+        ["authorization_code", "refresh_token", "client_credentials"]
+    );
+    let mut jtis = std::collections::HashSet::new();
+    for seen in par.iter().chain(&token).chain(&revoke) {
+        assert_no_secret(seen);
+        let claims = idp.assertion_claims(seen);
+        assert_eq!(claims["iss"], CLIENT_ID);
+        assert_eq!(claims["sub"], CLIENT_ID);
+        assert!(
+            jtis.insert(claims["jti"].as_str().expect("jti").to_string()),
+            "every request signs a new assertion"
+        );
+    }
+    assert_eq!(jtis.len(), 5, "PAR, three token requests and revocation");
+}
+
+/// Under the profile with mTLS the certificate authenticates the client
+/// (`tls_client_auth`): the pushed authorization request, the code exchange,
+/// the refresh, `client_credentials` and revocation carry the client id and
+/// neither the secret the provider was discovered with nor an assertion.
+/// `with_private_key_jwt` with it adds an assertion and still no secret.
+#[tokio::test]
+async fn a_fapi_provider_with_mtls_sends_no_secret() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({})).await;
+    let cert = ClientCert::new("nosecret");
+    let mtls_provider = || async {
+        idp.provider()
+            .await
+            .with_fapi(FapiConfig {
+                sender_constraint: cert.constraint(),
+                ..Default::default()
+            })
+            .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
+    };
+    let authn = service(mtls_provider().await.build().expect("with_fapi"));
+    let session = test_session();
+    let (nonce, csrf) = begin(&authn, &session).await;
+    let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
+    idp.mount("POST", "/mtls/token", move |seen, _| {
+        let id = (seen.form("grant_type") == Some("authorization_code")).then(|| id.clone());
+        ResponseTemplate::new(200).set_body_json(token_json("Bearer", id))
+    })
+    .await;
+    idp.mount("POST", "/revoke", |_, _| ResponseTemplate::new(200))
+        .await;
+
+    authn
+        .finish_oauth_login("code", &csrf, &session)
+        .await
+        .expect("login");
+    authn
+        .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
+        .await
+        .expect("refresh");
+    authn
+        .revoke_oauth_token("test", "rt1", Some("refresh_token"), None)
+        .await
+        .expect("revocation");
+    mtls_provider()
+        .await
+        .build()
+        .expect("with_fapi")
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect("client_credentials");
+
+    let par = idp.requests_to("/par");
+    let token = idp.requests_to("/mtls/token");
+    let revoke = idp.requests_to("/revoke");
+    let grants: Vec<_> = token.iter().filter_map(|s| s.form("grant_type")).collect();
+    assert_eq!(
+        grants,
+        ["authorization_code", "refresh_token", "client_credentials"]
+    );
+    assert_eq!((par.len(), revoke.len()), (1, 1));
+    for seen in par.iter().chain(&token).chain(&revoke) {
+        assert_no_secret(seen);
+        assert_eq!(seen.form("client_id"), Some(CLIENT_ID));
+        assert_eq!(seen.form("client_assertion"), None);
+    }
+
+    mtls_provider()
+        .await
+        .with_private_key_jwt(idp.signer())
+        .build()
+        .expect("with_fapi")
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect("client_credentials");
+    let last = idp.requests_to("/mtls/token").pop().expect("a request");
+    assert_no_secret(&last);
+    idp.assertion_claims(&last);
 }
 
 // ── JARM ─────────────────────────────────────────────────────────────────────
@@ -587,9 +1091,10 @@ async fn jarm_login(
     finish: impl FnOnce(String, String) -> (String, bool),
 ) -> (Result<OAuthClaims, OAuthError>, Authn) {
     let provider = idp
-        .provider()
+        .fapi_provider()
         .await
         .with_fapi(jarm_provider_config())
+        .build()
         .expect("with_fapi");
     let authn = service(provider);
     let session = test_session();
@@ -739,6 +1244,124 @@ async fn an_error_response_ends_the_ceremony() {
     );
 }
 
+/// A response that is not this ceremony's cannot end it. Garbage, and a
+/// signed error response an attacker obtained for their own flow, are
+/// refused and leave the victim's ceremony in place; the real response then
+/// finishes. Only an error response carrying this ceremony's own `state`
+/// ends it.
+#[tokio::test]
+async fn a_response_that_is_not_the_ceremonys_leaves_the_flow_in_place() {
+    let idp = Idp::start(json!({})).await;
+    let provider = idp
+        .fapi_provider()
+        .await
+        .with_fapi(jarm_provider_config())
+        .build()
+        .expect("with_fapi");
+    let authn = service(provider);
+    let session = test_session();
+    let (nonce, csrf) = begin(&authn, &session).await;
+    let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
+    idp.mount("POST", "/token", move |_, _| {
+        ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
+    })
+    .await;
+    let now = chrono::Utc::now().timestamp();
+    let response = |extra: Value| {
+        let mut claims = json!({ "iss": idp.issuer, "aud": CLIENT_ID, "exp": now + 60 });
+        claims
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        idp.sign(Algorithm::PS256, &claims)
+    };
+
+    let err = authn
+        .finish_oauth_login_jarm("not-a-jwt", &session)
+        .await
+        .expect_err("garbage is refused");
+    assert!(matches!(err, OAuthError::IdTokenValidation(_)), "{err:?}");
+
+    let foreign_error = response(json!({ "error": "access_denied", "state": "someone-elses" }));
+    let err = authn
+        .finish_oauth_login_jarm(&foreign_error, &session)
+        .await
+        .expect_err("another flow's error response is refused");
+    assert!(matches!(err, OAuthError::CsrfMismatch), "{err:?}");
+
+    let real = response(json!({ "code": "the-code", "state": csrf }));
+    authn
+        .finish_oauth_login_jarm(&real, &session)
+        .await
+        .expect("the victim's ceremony survived both");
+
+    // The ceremony's own error response ends it.
+    let session = test_session();
+    let (_nonce, csrf) = begin(&authn, &session).await;
+    let own_error = response(json!({ "error": "access_denied", "state": csrf }));
+    let err = authn
+        .finish_oauth_login_jarm(&own_error, &session)
+        .await
+        .expect_err("the IdP refused this flow");
+    assert!(matches!(err, OAuthError::TokenExchange(_)), "{err:?}");
+    let real = response(json!({ "code": "the-code", "state": csrf }));
+    let err = authn
+        .finish_oauth_login_jarm(&real, &session)
+        .await
+        .expect_err("the ceremony is over");
+    assert!(matches!(err, OAuthError::NoFlow), "{err:?}");
+}
+
+// ── The login's nonce on a refresh ───────────────────────────────────────────
+
+/// The login returns its nonce as a typed field, and passing it back as the
+/// original nonce accepts a refresh ID token that repeats it; without it the
+/// same refresh response is refused.
+#[tokio::test]
+async fn the_login_returns_its_nonce_and_a_refresh_id_token_that_repeats_it_is_accepted() {
+    let idp = Idp::start(json!({})).await;
+    let authn = service(idp.provider().await.build().expect("build"));
+    let session = test_session();
+    let (nonce, csrf) = begin(&authn, &session).await;
+    let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
+    idp.mount("POST", "/token", move |_, _| {
+        // Both the code exchange and the refresh answer with an ID token
+        // carrying the login's nonce, as Keycloak does.
+        ResponseTemplate::new(200).set_body_json(token_json("Bearer", Some(id.clone())))
+    })
+    .await;
+    let claims = authn
+        .finish_oauth_login("code", &csrf, &session)
+        .await
+        .expect("login");
+    assert_eq!(
+        claims.nonce.as_deref(),
+        Some(nonce.as_str()),
+        "the typed nonce is the login's"
+    );
+    assert_eq!(
+        claims.additional_claims["nonce"].as_str(),
+        Some(nonce.as_str()),
+        "and the raw claim still carries it"
+    );
+
+    authn
+        .refresh_oauth_token(
+            "test",
+            "rt1",
+            "alice-subject",
+            claims.nonce.as_deref(),
+            None,
+        )
+        .await
+        .expect("a refresh ID token that repeats the login nonce is accepted");
+    let err = authn
+        .refresh_oauth_token("test", "rt1", "alice-subject", None, None)
+        .await
+        .expect_err("a nonce with no original to compare it with is refused");
+    assert!(matches!(err, OAuthError::IdTokenValidation(_)), "{err:?}");
+}
+
 // ── mTLS ─────────────────────────────────────────────────────────────────────
 
 /// A self-signed client certificate and key written under a temp directory
@@ -787,6 +1410,7 @@ async fn mtls_uses_the_advertised_alias_and_authenticates_with_the_certificate()
             sender_constraint: cert.constraint(),
             ..Default::default()
         })
+        .build()
         .expect("with_fapi");
     let authn = service(provider);
     let session = test_session();
@@ -838,6 +1462,7 @@ async fn mtls_with_unusable_files_is_a_config_error() {
                 sender_constraint: constraint,
                 ..Default::default()
             })
+            .build()
             .map(|_| ())
     };
     // A path that does not exist.
@@ -853,4 +1478,320 @@ async fn mtls_with_unusable_files_is_a_config_error() {
         client_key_path,
     };
     assert!(matches!(attempt(garbage).await, Err(OAuthError::Config(_))));
+}
+
+// ── Client credentials, the device grant and revocation on a DPoP provider ──
+
+/// A token endpoint that grants `token_type` to any grant and records what
+/// it saw.
+async fn grant_any(idp: &Idp, token_type: &'static str) {
+    idp.mount("POST", "/token", move |_, _| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "cc-1",
+            "token_type": token_type,
+            "expires_in": 300,
+        }))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn client_credentials_on_a_dpop_provider_is_refused_bare() {
+    let idp = Idp::start(json!({})).await;
+    grant_any(&idp, "Bearer").await;
+    let provider = dpop_provider(&idp).await;
+    use axess_factors::oauth::OAuthProvider as _;
+    let err = provider
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect_err("the bare form must not fetch a bearer token from a DPoP provider");
+    assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
+    assert!(idp.requests_to("/token").is_empty(), "nothing was sent");
+}
+
+#[tokio::test]
+async fn the_device_grant_on_a_dpop_provider_is_refused_bare() {
+    let idp = Idp::start(json!({})).await;
+    grant_any(&idp, "Bearer").await;
+    let provider = dpop_provider(&idp).await;
+    use axess_factors::oauth::OAuthProvider as _;
+    let err = provider
+        .poll_device_token("device-code-1", 5, None, None)
+        .await
+        .expect_err("the bare poll must not fetch a bearer token from a DPoP provider");
+    assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
+    assert!(idp.requests_to("/token").is_empty(), "nothing was sent");
+}
+
+#[tokio::test]
+async fn client_credentials_with_a_key_carries_a_proof_and_wants_a_bound_answer() {
+    use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let idp = Idp::start(json!({})).await;
+    grant_any(&idp, "DPoP").await;
+    let provider = dpop_provider(&idp).await;
+    let rng = axess_rng::SystemRng;
+    let key = DpopKey::generate(&rng);
+    let signer = DpopSigner {
+        key: &key,
+        rng: &rng,
+    };
+
+    let token = provider
+        .client_credentials(&["scope-a"], Some(signer))
+        .await
+        .expect("a bound client_credentials grant");
+    assert_eq!(token.token_type, "DPoP");
+    let seen = &idp.requests_to("/token")[0];
+    assert_eq!(seen.form("grant_type"), Some("client_credentials"));
+    let (header, payload) = proof_of(seen);
+    assert_eq!(header_thumbprint(&header), key.thumbprint().unwrap());
+    assert_eq!(payload["htm"], "POST");
+    assert_eq!(payload["htu"], format!("{}/token", idp.issuer));
+
+    // A bearer answer to a bound request is refused.
+    let bearer = Idp::start(json!({})).await;
+    grant_any(&bearer, "Bearer").await;
+    let provider = dpop_provider(&bearer).await;
+    let err = provider
+        .client_credentials(&["scope-a"], Some(signer))
+        .await
+        .expect_err("a bearer token is not what was asked for");
+    assert!(matches!(err, OAuthError::TokenExchange(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn the_device_grant_with_a_key_carries_a_proof_and_returns_the_key() {
+    use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let idp = Idp::start(json!({})).await;
+    let id = idp.id_token(Algorithm::PS256, "", json!({}));
+    idp.mount("POST", "/token", move |_, _| {
+        ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
+    })
+    .await;
+    let provider = dpop_provider(&idp).await;
+    let rng = axess_rng::SystemRng;
+    let key = DpopKey::generate(&rng);
+    let signer = DpopSigner {
+        key: &key,
+        rng: &rng,
+    };
+
+    let outcome = provider
+        .poll_device_token("device-code-1", 5, None, Some(signer))
+        .await
+        .expect("a bound device grant");
+    let axess_factors::oauth::DeviceTokenOutcome::Authorized(claims) = outcome else {
+        panic!("authorized, got {outcome:?}");
+    };
+    assert_eq!(
+        claims
+            .dpop_key
+            .expect("the claims carry the key")
+            .thumbprint()
+            .unwrap(),
+        key.thumbprint().unwrap()
+    );
+    let seen = &idp.requests_to("/token")[0];
+    assert_eq!(
+        seen.form("grant_type"),
+        Some("urn:ietf:params:oauth:grant-type:device_code")
+    );
+    let (header, _) = proof_of(seen);
+    assert_eq!(header_thumbprint(&header), key.thumbprint().unwrap());
+}
+
+#[tokio::test]
+async fn revocation_sends_bare_and_carries_a_proof_when_given_the_key() {
+    use axess_factors::oauth::{DpopSigner, OAuthProvider as _};
+    let idp = Idp::start(json!({})).await;
+    idp.mount("POST", "/revoke", |_, _| ResponseTemplate::new(200))
+        .await;
+    let provider = idp
+        .fapi_provider()
+        .await
+        .with_fapi(dpop_provider_config())
+        .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
+        .build()
+        .expect("build");
+
+    provider
+        .revoke_token("rt1", Some("refresh_token"), None)
+        .await
+        .expect("a bare revocation is sent: it issues no token");
+    assert!(idp.requests_to("/revoke")[0].dpop.is_none());
+
+    let rng = axess_rng::SystemRng;
+    let key = DpopKey::generate(&rng);
+    provider
+        .revoke_token(
+            "rt1",
+            Some("refresh_token"),
+            Some(DpopSigner {
+                key: &key,
+                rng: &rng,
+            }),
+        )
+        .await
+        .expect("revocation with a proof");
+    let (header, payload) = proof_of(&idp.requests_to("/revoke")[1]);
+    assert_eq!(header_thumbprint(&header), key.thumbprint().unwrap());
+    assert_eq!(payload["htm"], "POST");
+}
+
+// ── Userinfo on a DPoP provider ──────────────────────────────────────────────
+
+/// A DPoP provider's access tokens are bound: the bare userinfo forms send
+/// nothing, as the bare token-request forms do, instead of presenting the
+/// bound token as `Bearer`.
+#[tokio::test]
+async fn userinfo_on_a_dpop_provider_is_refused_bare() {
+    let idp = Idp::start(json!({})).await;
+    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let access = claims
+        .expect("login")
+        .access_token
+        .expect("an access token");
+    idp.mount("GET", "/userinfo", |_, _| {
+        ResponseTemplate::new(200).set_body_json(json!({ "sub": "alice-subject" }))
+    })
+    .await;
+
+    let err = authn
+        .fetch_userinfo("test", &access, "alice-subject", None)
+        .await
+        .expect_err("a bound token is not sent as Bearer");
+    assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
+
+    let provider = dpop_provider(&idp).await;
+    use axess_factors::oauth::OAuthProvider as _;
+    let err = provider
+        .fetch_userinfo(&access, None)
+        .await
+        .expect_err("the provider's bare form is refused too");
+    assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
+    assert!(idp.requests_to("/userinfo").is_empty(), "nothing was sent");
+}
+
+/// A `401` from the userinfo endpoint is retried with a nonce only when it
+/// is the `use_dpop_nonce` challenge of RFC 9449 section 9; a `401` that
+/// says `invalid_token` is the refusal it says it is, whatever headers it
+/// carries.
+#[tokio::test]
+async fn userinfo_retries_with_a_nonce_only_on_a_use_dpop_nonce_challenge() {
+    let idp = Idp::start(json!({})).await;
+    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let claims = claims.expect("login");
+    let key = claims.dpop_key.clone().expect("key");
+    let access = claims.access_token.clone().expect("an access token");
+    // First call: a refusal that happens to carry a nonce. Second call: the
+    // challenge. Third: accepted when the proof echoes the nonce.
+    idp.mount("GET", "/userinfo", |seen, count| match count {
+        0 => ResponseTemplate::new(401)
+            .insert_header("WWW-Authenticate", "DPoP error=\"invalid_token\"")
+            .insert_header("DPoP-Nonce", "unasked-nonce"),
+        1 => ResponseTemplate::new(401)
+            .insert_header("WWW-Authenticate", "DPoP error=\"use_dpop_nonce\"")
+            .insert_header("DPoP-Nonce", "rs-nonce-1"),
+        _ => {
+            let (_, payload) = proof_of(seen);
+            if payload["nonce"] == "rs-nonce-1" {
+                ResponseTemplate::new(200).set_body_json(json!({ "sub": "alice-subject" }))
+            } else {
+                ResponseTemplate::new(401)
+                    .insert_header("WWW-Authenticate", "DPoP error=\"use_dpop_nonce\"")
+                    .insert_header("DPoP-Nonce", "rs-nonce-1")
+            }
+        }
+    })
+    .await;
+
+    let err = authn
+        .fetch_userinfo("test", &access, "alice-subject", Some(&key))
+        .await
+        .expect_err("invalid_token is a refusal");
+    assert!(matches!(err, OAuthError::AccessTokenExpired), "{err:?}");
+    assert_eq!(
+        idp.requests_to("/userinfo").len(),
+        1,
+        "a 401 that is not the nonce challenge is not retried"
+    );
+
+    authn
+        .fetch_userinfo("test", &access, "alice-subject", Some(&key))
+        .await
+        .expect("the challenge is answered with the nonce");
+    let calls = idp.requests_to("/userinfo");
+    assert_eq!(calls.len(), 3, "one challenge, one retry");
+    let (_, first) = proof_of(&calls[1]);
+    assert!(
+        first.get("nonce").is_none(),
+        "the first proof carries no nonce"
+    );
+    let (_, retry) = proof_of(&calls[2]);
+    assert_eq!(retry["nonce"], "rs-nonce-1");
+}
+
+// ── The DPoP key at the pushed authorization request ─────────────────────────
+
+/// A DPoP login makes its key at begin: the pushed authorization request
+/// names it in `dpop_jkt` and carries a proof signed by it (RFC 9449
+/// sections 10 and 10.1), and the token request presents the same key, so
+/// the code the authorization server issued bound to the key is redeemed
+/// with it.
+#[tokio::test]
+async fn par_names_the_key_the_token_request_presents() {
+    let idp = Idp::start(json!({})).await;
+    let (_authn, claims) = dpop_login(&idp, "DPoP").await;
+    let key = claims.expect("login").dpop_key.expect("key");
+    let jkt = key.thumbprint().unwrap();
+
+    let pushes = idp.requests_to("/par");
+    assert_eq!(pushes.len(), 1);
+    assert_eq!(
+        pushes[0].form("dpop_jkt"),
+        Some(jkt.as_str()),
+        "the push names the login's key"
+    );
+    let (header, payload) = proof_of(&pushes[0]);
+    assert_eq!(header_thumbprint(&header), jkt, "the push is signed by it");
+    assert_eq!(payload["htm"], "POST");
+    assert_eq!(payload["htu"], format!("{}/par", idp.issuer));
+
+    let token = &idp.requests_to("/token")[0];
+    let (header, _) = proof_of(token);
+    assert_eq!(
+        header_thumbprint(&header),
+        jkt,
+        "the token request presents the key the push named"
+    );
+}
+
+/// A PAR endpoint that wants a nonce refuses the first push with
+/// `use_dpop_nonce` and is answered once with a proof that echoes it, as the
+/// token endpoint is.
+#[tokio::test]
+async fn a_par_use_dpop_nonce_refusal_is_answered_with_the_nonce() {
+    let idp = Idp::start_with_par(json!({}), |seen, _| {
+        let (_, payload) = proof_of(seen);
+        if payload["nonce"] == "par-nonce-1" {
+            ResponseTemplate::new(201)
+                .set_body_json(json!({ "request_uri": "urn:par:2", "expires_in": 60 }))
+        } else {
+            ResponseTemplate::new(400)
+                .insert_header("DPoP-Nonce", "par-nonce-1")
+                .set_body_json(json!({ "error": "use_dpop_nonce" }))
+        }
+    })
+    .await;
+    let authn = service(dpop_provider(&idp).await);
+    let session = test_session();
+    let (_nonce, _csrf) = begin(&authn, &session).await;
+
+    let pushes = idp.requests_to("/par");
+    assert_eq!(pushes.len(), 2, "one refusal, one retry");
+    let (_, first) = proof_of(&pushes[0]);
+    assert!(first.get("nonce").is_none());
+    let (_, retry) = proof_of(&pushes[1]);
+    assert_eq!(retry["nonce"], "par-nonce-1");
+    assert_eq!(pushes[0].form("dpop_jkt"), pushes[1].form("dpop_jkt"));
 }

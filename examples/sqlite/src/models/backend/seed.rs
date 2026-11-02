@@ -76,6 +76,7 @@ pub async fn seed(
     let alice_pw_config = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(password_hash.clone()),
         rules: PasswordRules::default(),
+        password_id: None,
     });
     let alice_pw_json = serde_json::to_string(&alice_pw_config)?;
     let alice_pw_fc_id = Uuid::new_v4().to_string();
@@ -108,6 +109,7 @@ pub async fn seed(
     let bob_pw_config = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(password_hash),
         rules: PasswordRules::default(),
+        password_id: None,
     });
     let bob_pw_json = serde_json::to_string(&bob_pw_config)?;
     let bob_pw_fc_id = Uuid::new_v4().to_string();

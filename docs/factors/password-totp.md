@@ -27,6 +27,8 @@ pub struct PasswordConfig {
     pub hash: ZeroizedString,
     /// Strength rules applied when setting a new password.
     pub rules: PasswordRules,
+    /// Which password this is, kept across a rehash; `None` for a new one.
+    pub password_id: Option<String>,
 }
 ```
 
@@ -51,8 +53,12 @@ pinned ones, and if so hashes the password again (fresh salt from the
 injected RNG, on the KDF executor) and replaces the row with a
 compare-and-swap against the config the password was checked against, so
 a password changed in the meantime is never overwritten with the old
-one. The login that triggered it carries on: the flow's credential
-epoch, which includes the hash, is re-stamped. A hash inherited from a
+one. The new config carries the password's identity in `password_id`
+(for a row without one, a digest of the hash it replaced), and the login
+flow's credential epoch covers that identity rather than the hash, so
+every half-finished login of the user, on every instance, carries on. A
+new password is written with `password_id: None` and so is a change. A
+hash inherited from a
 tenant or global scope is not the user's to rewrite and is left alone, and
 a failure to hash or store is logged and does not fail the login (the old
 hash still verifies, and the next login tries again).
@@ -289,6 +295,17 @@ row never verifies on a service with no pepper. Rows without the
 `hmac-sha256:` prefix are Argon2id rows and verify as they always did,
 so existing sets keep working and a set may mix both forms.
 
+To rotate the pepper, hand the new secret to `with_recovery_code_pepper`
+and the retired one to `with_previous_recovery_code_pepper`. A keyed row
+cannot be re-keyed without its plaintext, so a set made under the old
+pepper verifies under the previous one instead and still logs the user
+in; the match sets `RecoveryCodesConfig::under_previous_pepper` on the
+stored set, logs a warning and fires
+`AuthnMetrics::recovery_codes_under_previous_pepper`, which is the
+application's cue to have the user generate a new set (made under the
+current pepper, where the flag starts clear). Drop the previous pepper
+once no stored set uses it; from then on those sets fail closed.
+
 Offer the codes beside the factor they back up, in one step:
 
 ```rust,ignore
@@ -336,7 +353,14 @@ it from a monotonically-increasing counter that advances on every
 successful verification. HOTP is the right choice for hardware tokens
 that have no clock (some YubiKey configurations, for instance). The
 configuration mirrors `TotpConfig` with a counter field instead of a
-period.
+period. Guesses are throttled per counter as RFC 4226 §7.3 asks:
+`max_attempts` wrong codes (default five) lock the factor for a
+minute, each consecutive lock doubles that up to an hour, and a
+successful code clears the lock. The counter never moves on a
+failure, so the token stays in sync and the code it shows next
+verifies once the lock has run out; an earlier throttle advanced the
+counter past the lookahead window instead, which let anyone who knew
+the password desynchronise the user's token.
 
 The email OTP factor verifies a six-digit code delivered to the user
 out of band, typically by email. The configuration carries the code

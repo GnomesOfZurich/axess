@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The tests behind `--ignored`: every store that needs a running server
-# (Valkey, PostgreSQL, MySQL), run the way CI's "Test Suite" job runs them.
+# (Valkey, PostgreSQL, MySQL, Keycloak), run the way CI's "Test Suite" job runs them.
 #
 # A release preflight that skips them certifies nothing about the live
 # stores: 0.13.0 shipped with four Valkey device tests red because the
@@ -14,16 +14,27 @@
 #   export VALKEY_URL=redis://127.0.0.1:6390
 #   export POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5490/postgres
 #   export MYSQL_URL=mysql://root:mysql@127.0.0.1:3390/axess_test
+#   podman run -d --name axess-keycloak-test -p 127.0.0.1:8090:8080 \
+#     -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+#     -e KC_HTTP_ENABLED=true -e KC_HOSTNAME_STRICT=false -e JAVA_OPTS_APPEND=-XX:UseSVE=0 \
+#     -v "$PWD/examples/fapi/keycloak/fapi-realm.json:/opt/keycloak/data/import/fapi-realm.json:Z" \
+#     quay.io/keycloak/keycloak:26.0 start-dev --import-realm
+#   export KEYCLOAK_URL=http://127.0.0.1:8090
+#
+# Keycloak joined the list with the private_key_jwt login test
+# (axess-core/tests/oauth_keycloak_live.rs, realm `fapi`); the JVM flag is
+# what keeps Keycloak alive under podman's VM on Apple silicon (SIGILL
+# without it). Wait for `/realms/fapi` to answer before running.
 set -euo pipefail
 AXESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 missing=()
-for v in VALKEY_URL POSTGRES_URL MYSQL_URL; do
+for v in VALKEY_URL POSTGRES_URL MYSQL_URL KEYCLOAK_URL; do
   [ -n "${!v:-}" ] || missing+=("$v")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "ERROR: live-store tests NOT run: ${missing[*]} unset. This is a refusal, not a pass;" >&2
-  echo "       start the three servers (recipe at the top of $0) and export every URL." >&2
+  echo "       start the four servers (recipe at the top of $0) and export every URL." >&2
   exit 1
 fi
 
@@ -44,4 +55,4 @@ if [ "$passed" -eq 0 ]; then
   echo "ERROR: live-store tests measured nothing: 0 passed over $lines result lines." >&2
   exit 1
 fi
-echo "OK: live-store tests: $passed passed, 0 failed, over $lines result lines (Valkey, PostgreSQL, MySQL)."
+echo "OK: live-store tests: $passed passed, 0 failed, over $lines result lines (Valkey, PostgreSQL, MySQL, Keycloak)."

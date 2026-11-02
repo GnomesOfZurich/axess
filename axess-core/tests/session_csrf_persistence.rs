@@ -107,7 +107,7 @@ async fn get_then_post<S: SessionStore>(store: S) -> StatusCode {
         .collect();
     let token = cookies
         .iter()
-        .find_map(|c| c.strip_prefix("axess.csrf="))
+        .find_map(|c| c.strip_prefix("__Host-axess.csrf="))
         .expect("the GET sets the CSRF cookie")
         .to_string();
     let second = app

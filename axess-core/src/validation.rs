@@ -152,12 +152,19 @@ pub fn is_printable(s: &str) -> bool {
         .all(|c| c == ' ' || (!c.is_control() && c != '\u{FEFF}'))
 }
 
-/// Whether `c` is an invisible format character (Unicode category Cf: zero
-/// width space and joiners, bidirectional controls, soft hyphen, word joiner
-/// and the like) or a noncharacter. None of them has any business in a
-/// login identifier (the zero width non-joiner and joiner, U+200C and U+200D,
-/// are spelled into ordinary words in several scripts and are allowed), and each makes two identifiers look the same on screen
-/// while comparing different.
+/// Whether `c` is an invisible format character (Unicode general category
+/// Cf: zero width space, bidirectional controls, soft hyphen, word joiner,
+/// the Arabic and Syriac number and end-of-ayah marks, the Kaithi number
+/// signs, the Egyptian hieroglyph and shorthand format controls, the
+/// musical beam and tie controls, the language and tag characters) or a
+/// noncharacter. None of them has any business in a login identifier (the
+/// zero width non-joiner and joiner, U+200C and U+200D, are spelled into
+/// ordinary words in several scripts and are allowed), and each makes two
+/// identifiers look the same on screen while comparing different.
+///
+/// The list is the whole of Cf in Unicode 16.0 (170 code points) less the
+/// two joiners; `validation_tests` checks it against the category's ranges,
+/// so a Unicode release that adds a format character is a test change here.
 fn is_invisible_format_char(c: char) -> bool {
     matches!(c,
         '\u{00AD}'
@@ -165,6 +172,8 @@ fn is_invisible_format_char(c: char) -> bool {
         | '\u{061C}'
         | '\u{06DD}'
         | '\u{070F}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08E2}'
         | '\u{180E}'
         | '\u{200B}'
         | '\u{200E}'..='\u{200F}'
@@ -173,15 +182,44 @@ fn is_invisible_format_char(c: char) -> bool {
         | '\u{2066}'..='\u{206F}'
         | '\u{FEFF}'
         | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}'
+        | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}'
+        | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}'
         | '\u{E0001}'
         | '\u{E0020}'..='\u{E007F}'
         | '\u{FDD0}'..='\u{FDEF}'
     ) || (u32::from(c) & 0xFFFE) == 0xFFFE
 }
 
-/// Whether a login identifier is acceptable at signup: printable, free of
-/// invisible format characters and noncharacters, and already in Unicode
-/// normalisation form C.
+/// The identifier as a person reads it, for keying things by it: Unicode
+/// NFKC, without invisible format characters and noncharacters (see
+/// [`is_acceptable_identifier`]) or the zero width joiners, lowercased and
+/// trimmed. `None` when nothing is left.
+///
+/// `alice@x.com`, `ALICE@x.com\u{200B}` and ` Alice@X.COM ` are one key.
+/// Used by the login rate limiter and the password reset cooldown, so a
+/// variant spelling cannot evade a limit or earn a second token; never for
+/// storing or matching an identifier, where the typed form stands (signup
+/// refuses the forms this folds away).
+pub fn normalise_identifier(raw: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    let folded: String = raw
+        .nfkc()
+        .filter(|c| !is_invisible_format_char(*c) && !matches!(c, '\u{200C}' | '\u{200D}'))
+        .collect::<String>()
+        .to_lowercase();
+    let trimmed = folded.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Whether a login identifier is acceptable: printable, free of invisible
+/// format characters and noncharacters, and already in Unicode
+/// normalisation form C. Checked at signup and by
+/// [`User::validate`](crate::authn::types::User::validate), so a row
+/// created by any path, or read back from a store, is held to the same
+/// terms.
 ///
 /// `admin` and `admin\u{200B}` are different strings to a store and the
 /// same name to a person; so are a composed `\u{00E9}` and an `e` followed

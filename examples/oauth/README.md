@@ -9,26 +9,35 @@ Signing in through someone else's identity provider, two ways:
 
 ## OpenID Connect
 
-Demonstrates the OAuth 2.0 Authorization Code + PKCE flow using a real OIDC provider. The application redirects the user to an external identity provider (Google, Keycloak, or similar), handles the callback, exchanges the authorization code for tokens, validates the ID token signature, and displays the resulting claims.
+The OAuth 2.0 Authorization Code + PKCE flow against an OIDC provider (Google, Entra, Keycloak, or similar), carried through to a session: the application redirects the user to the provider, handles the callback, verifies the ID token, finds or creates the local user the identity belongs to, and makes the session `Authenticated`. `/profile` then reads that session.
 
-This example uses `MockIdentityStore` and `MockFactorStore` because the focus is on the OAuth integration, not local credential storage. In a real application you would combine this with a database-backed store like the SQLite example.
+The example uses `MockIdentityStore` and `MockFactorStore` because the focus is on the federation, not local credential storage. A real application combines this with a database-backed store like the SQLite example; the federated-identity table in `src/identities.rs` is one unique key, and its SQL is in the module docs.
 
 ### What it demonstrates
 
-- OIDC discovery (fetching `.well-known/openid-configuration` and JWKS)
-- Authorization URL generation with PKCE and state (CSRF) protection
-- Token exchange and ID token signature verification
-- Claim extraction (subject, email, name, groups, roles)
-- Session establishment after federated login
+- OIDC discovery (fetching `.well-known/openid-configuration` and JWKS), in one place: `ProviderSettings` in `src/app.rs`
+- Authorization URL generation with PKCE and state (CSRF) protection, begun for a tenant (`begin_oauth_login_in_tenant`)
+- Token exchange, ID token verification and the RFC 9207 `iss` check (`finish_oauth_login_with_iss`)
+- A federated-identity table: `(issuer, subject)` to local user id. The e-mail address is never the link, so the same address from a second issuer is a second user
+- Just-in-time provisioning under a tenant policy (`Provisioning::JustInTime` creates the user on first login; `LinkedOnly` refuses an identity nobody linked, and `Provisioner::invite` links one beforehand)
+- The claim lock: `complete_oauth_login` refuses claims that did not come out of this session's `finish_oauth_login_with_iss`
+- Logout from both ends: `POST /auth/logout` (local, then the provider's end-session endpoint with the ID token as hint) and `POST /auth/backchannel-logout` (the provider ends a session)
+- A `/profile` that reads the axess session and the user store, not the claims
+- Refresh on demand: `POST /auth/refresh` exchanges the stored refresh token (`refresh_oauth_token` with the stored DPoP key), keeps the rotated one and asks userinfo about the same subject
+- DPoP-bound tokens wherever the IdP advertises DPoP: the login's key (`OAuthClaims::dpop_key`) is kept beside the refresh token and signs the refresh and userinfo calls
+- `private_key_jwt` instead of a secret: set `OAUTH_PRIVATE_KEY_FILE` to a PEM key (`OAUTH_PRIVATE_KEY_ALG`, default `RS256`; `OAUTH_PRIVATE_KEY_KID` optional)
 
 ### Endpoints
 
 | Route | Purpose |
 |-------|---------|
-| `GET /` | Home page with "Login with Google" link |
-| `GET /auth/login/:provider` | Initiates the OAuth flow (redirects to IdP) |
-| `GET /auth/callback/:provider` | Handles the IdP callback, exchanges code, shows claims |
-| `GET /profile` | Displays authenticated user info |
+| `GET /` | Home page with a sign-in link per provider |
+| `GET /auth/login/:provider` | Starts the flow (redirects to the IdP) |
+| `GET /auth/callback/:provider` | The IdP's answer: verifies it, finds or creates the user, signs in, redirects to `/profile` |
+| `GET /profile` | The signed-in user, read from the axess session |
+| `POST /auth/refresh` | Refreshes the IdP's tokens for the signed-in session |
+| `POST /auth/logout` | Ends the session and goes to the IdP's logout endpoint |
+| `POST /auth/backchannel-logout` | The IdP's signed logout token ends the session it names |
 
 ### Running with Google
 
@@ -42,32 +51,34 @@ OAUTH_CLIENT_SECRET=your-secret \
 cargo run -p axess-example-oauth
 ```
 
-The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000).
+The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000). Set `OAUTH_PROVISIONING=linked-only` to turn first-login creation off.
 
 ### Running with other providers
 
-Any OIDC-compliant provider works. Set the issuer URL, client ID, and client secret as environment variables. The example calls `OAuthProviderConfig::discover()` which fetches the discovery document and JWKS automatically.
+Any OIDC-compliant provider works. Set `OAUTH_ISSUER`, `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` and `OAUTH_PROVIDER_NAME` (the name in the routes; the redirect URI to register is `http://localhost:3000/auth/callback/<name>`). The example calls `OAuthProviderConfig::discover()`, which fetches the discovery document and JWKS, and builds the provider with `build()`.
 
-For local testing without an external IdP, see the `wiremock`-based integration tests in `axess-core/tests/oauth_wiremock.rs`. They spin up an in-process OIDC mock server with RSA-signed JWTs.
+### Testing without an IdP
+
+`cargo test -p axess-example-oauth` drives the application as a browser does, against an in-process OIDC provider (wiremock, RSA-signed tokens): the first login creates the user, the second finds it, the same address from a second issuer creates a second user, a tenant that creates no one refuses an unlinked identity, and both logouts end the session.
 
 ### Project structure
 
 ```
 src/
-  main.rs    Startup, OAuth provider registration, routes, callback handler
+  main.rs          Reads the environment, serves app::build
+  lib.rs           Module map
+  app.rs           ProviderSettings, build(), the router and its handlers
+  identities.rs    The (issuer, subject) to user table
+  provisioning.rs  Claims to a local user: find, or create under the tenant policy
+tests/
+  federated_login.rs  The browser-driven tests
 ```
-
-Single-file example. The handler logic is inline to keep things readable.
 
 ### What this example does not cover
 
-- Mapping OAuth claims to a local user (the callback just displays claims)
-- Calling `complete_oauth_login()` to establish a full Axess session
-- Refresh token handling: the library supports `refresh_oauth_token()`, just not shown here
-- RP-Initiated Logout and token revocation: supported via `build_end_session_url()` and `revoke_oauth_token()`, demonstrated in the [`fapi/`](../fapi/) example
-- FAPI 2.0 (PAR, DPoP, form_post): see the [`fapi/`](../fapi/) example
-
-For a production-like integration that ties OAuth to local sessions, combine the patterns from this example with the SQLite example's backend.
+- Token revocation at logout: supported via `revoke_oauth_token()`
+- A database: the stores are in memory, so users and links are gone on restart
+- FAPI 2.0 (PAR, DPoP under the profile, form_post): see the [`fapi/`](../fapi/) example
 
 ### License
 

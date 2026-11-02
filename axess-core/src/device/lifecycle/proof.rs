@@ -57,7 +57,9 @@ where
     ///
     /// A device that matches the fingerprint but cannot prove itself is never
     /// returned, whoever it belongs to. A `Revoked` device is never
-    /// returned either.
+    /// returned either, including one revoked between the load and the
+    /// sighting: the store reports the level it found when it applied the
+    /// sighting, and a `Revoked` answer sends the request on to a new device.
     pub fn resolve_proven(
         &self,
         request: DeviceRequest<'_>,
@@ -92,8 +94,9 @@ where
                     )
                 {
                     // Another user claimed it first: it is theirs now.
-                } else {
-                    self.note_sighting(&tenant, &device, now).await?;
+                } else if self.note_sighting(&tenant, &device, now).await?
+                    != DeviceTrustLevel::Revoked
+                {
                     return Ok(Some(ResolvedDevice {
                         id: device.id,
                         issued: None,
@@ -108,8 +111,8 @@ where
                 && let Some(device) = self.store.load(&tenant, &id).await?
                 && device.trust_level != DeviceTrustLevel::Revoked
                 && device.user_id.as_ref() == Some(&user)
+                && self.note_sighting(&tenant, &device, now).await? != DeviceTrustLevel::Revoked
             {
-                self.note_sighting(&tenant, &device, now).await?;
                 return Ok(Some(ResolvedDevice {
                     id: device.id,
                     issued: None,

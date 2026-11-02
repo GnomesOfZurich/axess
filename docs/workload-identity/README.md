@@ -205,7 +205,9 @@ Identity Federation, Azure Federated Identity Credentials), and
 axess provides adapters that bridge a validated workload identity
 to each of them.
 
-The chapter *Cloud STS exchange* covers the configuration and the
+The walkthroughs *Azure* and *AWS* follow one request from a pipeline job
+through a service to a cloud secret store, step by step. The chapter *Cloud
+STS exchange* covers the configuration and the
 credential lifecycle. The benefit is that no long-lived cloud keys
 ever live on the workload's filesystem; the credentials are minted
 on demand from the workload identity, used briefly, and discarded.

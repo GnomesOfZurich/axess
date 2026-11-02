@@ -19,7 +19,7 @@
 //!
 //! | Hook | Default | When to override |
 //! |------|---------|------------------|
-//! | `tenant_fn` | `parts.extensions.get::<TenantId>()` | when tenant lives elsewhere (subdomain, JWT claim, …) |
+//! | `tenant_fn` | a `TenantId` in the request extensions, else the tenant the session authenticated into ([`SessionTenant`](crate::device::SessionTenant)) | when tenant lives elsewhere (subdomain, JWT claim, …) |
 //! | `client_ip_fn` | the address [`client_ip::layer`](crate::client_ip::layer) resolved, or `None` without it (logged once at `warn`, because the address then leaves the fingerprint) | override only where the address comes from somewhere axess cannot see, such as a platform's own header |
 //! | `user_fn` | the user the session layer authenticated ([`SessionUser`](crate::device::SessionUser)), `None` for a guest | when an upstream auth layer has already injected a `UserId` extension |
 //! | `new_id_fn` | a UUID v4 drawn from the resolver's RNG (`with_rng`, default `SystemRng`) | when you have an id scheme of your own; for a deterministic UUID scheme under test, seed the RNG instead |
@@ -59,7 +59,8 @@ use crate::device::resolver::DeviceResolver;
 use crate::device::store::DeviceStore;
 
 /// Function shape: pull a [`TenantId`] from request [`Parts`]. Default
-/// reads `parts.extensions.get::<TenantId>()`.
+/// reads a `TenantId` request extension, then the
+/// [`SessionTenant`](crate::device::SessionTenant) the session layer supplied.
 type TenantFn = Arc<dyn Fn(&Parts) -> Option<TenantId> + Send + Sync>;
 
 /// Function shape: pull the client IP from request [`Parts`]. Default
@@ -296,7 +297,17 @@ where
 // ── Defaults ─────────────────────────────────────────────────────────
 
 fn default_tenant_fn() -> TenantFn {
-    Arc::new(|parts: &Parts| parts.extensions.get::<TenantId>().cloned())
+    // The extension an adopter sets is the first choice; the tenant the
+    // session authenticated into is the fallback, so an adopter whose tenant
+    // is a property of the signed-in user needs no extension at all.
+    Arc::new(|parts: &Parts| {
+        parts.extensions.get::<TenantId>().cloned().or_else(|| {
+            parts
+                .extensions
+                .get::<crate::device::SessionTenant>()
+                .map(|t| t.0)
+        })
+    })
 }
 
 fn default_client_ip_fn(warned: Arc<AtomicBool>) -> ClientIpFn {

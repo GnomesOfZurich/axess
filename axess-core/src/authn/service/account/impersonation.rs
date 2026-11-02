@@ -14,6 +14,15 @@
 //! `user_id` and the admin as `actor_id`, so forensic queries like
 //! `SELECT * FROM auth_events WHERE actor_id = ? AND event_type = 'impersonation'`
 //! reconstruct the admin's full session-take history.
+//!
+//! The impersonated session carries the administrator and the start time in
+//! its authenticated state (`AuthSession::impersonation`). While it is set
+//! the service refuses refresh token issuance and factor enrolment or
+//! deletion unless built with
+//! `AuthnServiceBuilder::with_impersonated_credential_changes_allowed`, the
+//! audit context of a request under impersonation names the administrator
+//! as actor on every row, and `SessionLayer::with_max_impersonation_age`
+//! ends the session once the impersonation is older than the cap.
 
 use crate::authn::service::RequestAuthnService;
 use crate::authn::{
@@ -54,8 +63,16 @@ where
     /// share a tenant, so it is for a platform operator whose reach is every
     /// tenant. A handler scoped to one tenant uses
     /// [`begin_impersonation`](Self::begin_impersonation), which refuses with
-    /// [`AuthnError::CrossTenant`] if `admin_user.tenant_id` and
-    /// `target_user.tenant_id` differ.
+    /// [`AuthnError::CrossTenant`] unless the stored target is a user of the
+    /// admin's stored tenant. Here a target id that does not exist is
+    /// refused with [`AuthnError::NoFlow`]; a session that is already an
+    /// impersonation is refused with [`AuthnError::Impersonated`]. An
+    /// administrator whose own
+    /// account is not active is refused with [`AuthnError::NotActive`],
+    /// as a target that is not active is. Every refusal, and a target
+    /// lookup the store could not make, leaves a failed `Impersonation`
+    /// row naming the administrator as actor; the row names the target
+    /// only once it was read from the store.
     #[tracing::instrument(skip(self, target_user, session))]
     pub async fn begin_impersonation_across_tenants(
         &self,
@@ -68,19 +85,23 @@ where
     }
 
     /// Refuse an impersonation and leave the failed audit row naming the
-    /// admin as actor.
+    /// admin as actor. `target` is the stored target when it was read and
+    /// is inside the rail, and `None` otherwise: a refusal made before, or
+    /// without, a stored target names none, since the caller's `User`
+    /// value is whatever the caller built and a row carrying its ids would
+    /// put a chosen user and tenant on the trail.
     async fn refuse_impersonation(
         &self,
         admin: &crate::authn::ids::UserId,
         target: Option<&crate::authn::types::User>,
-        reason: &'static str,
+        reason: AuthFailureReason,
         error: AuthnError<I::Error>,
     ) -> AuthnError<I::Error> {
-        tracing::warn!(admin = %admin, reason, "impersonation refused");
+        tracing::warn!(admin = %admin, reason = reason.as_str(), "impersonation refused");
         let builder = AuthEventBuilder::failure(AuthEventType::Impersonation)
             .maybe_attributed_to(target.map(|t| &t.id), target.map(|t| &t.tenant_id))
             .with_actor(*admin)
-            .with_error(AuthFailureReason::Other(reason.into()));
+            .with_error(reason);
         match self.emit_audit(builder).await {
             Ok(()) => error,
             Err(audit_error) => audit_error,
@@ -88,8 +109,18 @@ where
     }
 
     /// The checks that come before the admin's session is touched: it is
-    /// the admin's, and the target (reloaded from the store) is inside the
-    /// tenant rail. Returns the admin's snapshot and the stored target.
+    /// the admin's own (not already an impersonation), and the target
+    /// (reloaded from the store) is inside the tenant rail. Returns the
+    /// admin's snapshot and the stored target.
+    ///
+    /// `expected_tenant` is the rail. `Some(tenant)` is the tenant-scoped
+    /// form: the target must be a stored user of that tenant, and so must
+    /// the admin's session. A target that is missing and one that exists in
+    /// another tenant are refused with the same error after the same work
+    /// (one read, one audit write), so the answer does not say which ids
+    /// exist elsewhere; the audit row names which it was. `None` is the
+    /// across-tenants form: no rail is applied here, the caller's policy
+    /// is the rail, and only a target that does not exist at all is refused.
     async fn admit_impersonation(
         &self,
         admin_user_id: &crate::authn::ids::UserId,
@@ -111,8 +142,8 @@ where
             return Err(self
                 .refuse_impersonation(
                     admin_user_id,
-                    Some(target_user),
-                    "admin_not_authenticated",
+                    None,
+                    AuthFailureReason::AdminNotAuthenticated,
                     AuthnError::NoFlow,
                 )
                 .await);
@@ -121,9 +152,25 @@ where
             return Err(self
                 .refuse_impersonation(
                     admin_user_id,
-                    Some(target_user),
-                    "session_is_not_admin",
+                    None,
+                    AuthFailureReason::SessionIsNotAdmin,
                     AuthnError::NoFlow,
+                )
+                .await);
+        }
+        // A session that is already an impersonation is the administrator's
+        // in the impersonated user's name: letting it impersonate again
+        // would record the second take, and everything after it, as the
+        // first target's act. The row names the administrator who really
+        // holds the session and, like every refusal made before the target
+        // is read, no target. `end_impersonation` is the way back.
+        if let Some(holder) = session.impersonator().await {
+            return Err(self
+                .refuse_impersonation(
+                    &holder,
+                    None,
+                    AuthFailureReason::NestedImpersonation,
+                    AuthnError::Impersonated,
                 )
                 .await);
         }
@@ -132,20 +179,33 @@ where
         // `User` struct is whatever the caller built, and its `tenant_id`
         // is what the tenant rail compares. Reloaded by id; the tenant
         // rail uses the stored tenants of both principals.
-        let target = self
-            .inner
-            .identity
-            .get_user(&target_user.id)
-            .await
-            .map_err(AuthnError::Store)?;
+        // A lookup the store cannot make fails the impersonation with a row
+        // saying so; it names no target, since none was read.
+        let target = match self.inner.identity.get_user(&target_user.id).await {
+            Ok(target) => target,
+            Err(e) => {
+                return Err(self
+                    .refuse_impersonation(
+                        admin_user_id,
+                        None,
+                        AuthFailureReason::TargetLookupFailed,
+                        AuthnError::Store(e),
+                    )
+                    .await);
+            }
+        };
+        // Inside the rail, or why not. The two refusals the rail can give
+        // share one error and one audit write, so a tenant administrator
+        // learns nothing about ids outside the tenant from either. The row
+        // of a missing target names none: there is no stored user to name,
+        // and the caller's record is not one.
         let Some(target) = target else {
+            let error = match expected_tenant {
+                None => AuthnError::NoFlow,
+                Some(_) => AuthnError::CrossTenant,
+            };
             return Err(self
-                .refuse_impersonation(
-                    admin_user_id,
-                    Some(target_user),
-                    "unknown_target",
-                    AuthnError::NoFlow,
-                )
+                .refuse_impersonation(admin_user_id, None, AuthFailureReason::UnknownTarget, error)
                 .await);
         };
         if let Some(expected) = expected_tenant
@@ -155,7 +215,7 @@ where
                 .refuse_impersonation(
                     admin_user_id,
                     Some(&target),
-                    "cross_tenant_impersonation",
+                    AuthFailureReason::CrossTenantImpersonation,
                     AuthnError::CrossTenant,
                 )
                 .await);
@@ -176,6 +236,26 @@ where
             .admit_impersonation(admin_user_id, expected_tenant, target_user, session)
             .await?;
         let target_user = &target;
+
+        // A suspended administrator with a session still open cannot take
+        // another identity through it: the session outlived the account's
+        // standing, and the impersonation would hand it a fresh one.
+        let admin_status = self.current_account_status(admin_user_id).await?;
+        if !admin_status.allows_login() {
+            tracing::warn!(
+                admin = %admin_user_id,
+                status = ?admin_status,
+                "impersonation refused: the administrator's account is not active"
+            );
+            return Err(self
+                .refuse_impersonation(
+                    admin_user_id,
+                    Some(target_user),
+                    AuthFailureReason::AdminNotActive,
+                    AuthnError::NotActive(admin_status),
+                )
+                .await);
+        }
 
         // A suspended, terminated or otherwise non-active target cannot be
         // assumed: impersonation would hand the admin a session the account's
@@ -224,17 +304,10 @@ where
                 admin_snapshot.authn_time,
             )
             .await;
-        // The marker `AuthSession::impersonator` reads. It lives in the
-        // session's custom data, which only server code writes.
-        session
-            .set_custom(
-                IMPERSONATOR_KEY,
-                serde_json::json!({
-                    "actor": admin_user_id.to_string(),
-                    "since": now.to_rfc3339(),
-                }),
-            )
-            .await;
+        // The marker `AuthSession::impersonator` reads, part of the
+        // authenticated state: the custom-data cap and `clear_custom` cannot
+        // reach it, and it ends with the state.
+        session.set_impersonator(*admin_user_id, now).await;
 
         // Force a session-ID rotation so the impersonating session never
         // shares its ID with the prior admin session; relevant for any
@@ -252,7 +325,14 @@ where
                     "begin_impersonation register failed; clearing session and refusing"
                 );
                 session.clear().await;
-                return Err(AuthnError::NoFlow);
+                return Err(self
+                    .refuse_impersonation(
+                        admin_user_id,
+                        Some(target_user),
+                        AuthFailureReason::SessionNotRegistered,
+                        AuthnError::NoFlow,
+                    )
+                    .await);
             }
             note_revocation(
                 reg.invalidate_session(admin_user_id, &admin_sid).await,
@@ -324,9 +404,16 @@ where
     /// The same operation as
     /// [`begin_impersonation_across_tenants`](Self::begin_impersonation_across_tenants),
     /// which it is the safe default for: it refuses with
-    /// [`AuthnError::CrossTenant`] when `admin_user.tenant_id` does not equal
-    /// `target_user.tenant_id`, closing the cross-tenant pivot vector that the
-    /// other form leaves to the application's Cedar policy.
+    /// [`AuthnError::CrossTenant`] when the stored target is not a user of
+    /// the admin's stored tenant, closing the cross-tenant pivot vector that
+    /// the other form leaves to the application's Cedar policy. A target id
+    /// that does not exist is refused with the same error after the same
+    /// work, so the answer does not say which ids exist in other tenants;
+    /// the audit row names which it was.
+    ///
+    /// A session that is already an impersonation is refused with
+    /// [`AuthnError::NoFlow`] and a failed row naming the administrator who
+    /// holds it; [`end_impersonation`](Self::end_impersonation) first.
     ///
     /// Pass `admin_user` (not just the id) so the rail can be enforced
     /// without an extra `get_user` round-trip in the common case where the
@@ -345,35 +432,20 @@ where
             .get_user_tenant(&admin_user.id)
             .await
             .map_err(AuthnError::Store)?;
+        // An administrator the store does not hold is refused before the
+        // target is read; the row names no target, as every refusal made
+        // before that read does.
         let Some(admin_tenant) = stored_admin_tenant else {
             return Err(self
                 .refuse_impersonation(
                     &admin_user.id,
-                    Some(target_user),
-                    "unknown_admin",
+                    None,
+                    AuthFailureReason::UnknownAdmin,
                     AuthnError::NoFlow,
                 )
                 .await);
         };
         self.impersonate(&admin_user.id, Some(&admin_tenant), target_user, session)
             .await
-    }
-}
-
-/// Session custom key that marks an impersonated session.
-pub(crate) const IMPERSONATOR_KEY: &str = "axess.impersonation";
-
-impl AuthSession {
-    /// The administrator who is impersonating the user this session is
-    /// authenticated as, or `None` for an ordinary session.
-    ///
-    /// Set by `begin_impersonation`. Check it before allowing anything an
-    /// administrator should not do in a user's name: changing credentials,
-    /// enrolling factors, issuing refresh tokens. The session's
-    /// authentication time is the administrator's, not a fresh login's.
-    pub async fn impersonator(&self) -> Option<crate::authn::ids::UserId> {
-        let marker = self.get_custom(IMPERSONATOR_KEY).await?;
-        let actor = marker.get("actor")?.as_str()?;
-        crate::authn::ids::UserId::try_new(actor).ok()
     }
 }

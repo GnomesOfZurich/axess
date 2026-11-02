@@ -266,3 +266,31 @@ fn with_algorithm_dispatches_rsa_family_to_rsa_keygen() {
         assert_eq!(jwk_json["kty"], "RSA");
     }
 }
+
+/// The fixture's default key is ES256: faster, smaller tokens, and no
+/// `rsa` private-key operation (the Marvin timing advisory). RSA stays
+/// available by name.
+#[test]
+fn the_default_signing_key_is_es256() {
+    let idp = LocalIdpFixture::new("https://idp");
+    assert_eq!(idp.signing_key().algorithm(), Algorithm::ES256);
+    assert_eq!(idp.algorithm(), Algorithm::ES256);
+    let rsa = LocalIdpFixture::new_rsa("https://idp");
+    assert_eq!(rsa.algorithm(), Algorithm::RS256);
+}
+
+/// `try_with_algorithm` refuses an algorithm the fixture cannot generate a
+/// key for without panicking; `with_algorithm` keeps its documented panic.
+#[test]
+fn try_with_algorithm_refuses_an_unsupported_algorithm() {
+    let err = LocalIdpFixture::try_with_algorithm("https://idp", Algorithm::HS256)
+        .expect_err("HS256 has no key to generate");
+    assert!(
+        matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
+        "{err:?}"
+    );
+    let es = LocalIdpFixture::try_with_algorithm("https://idp", Algorithm::ES256).expect("ES256");
+    assert_eq!(es.algorithm(), Algorithm::ES256);
+    let rs = LocalIdpFixture::try_with_algorithm("https://idp", Algorithm::RS384).expect("RS384");
+    assert_eq!(rs.algorithm(), Algorithm::RS384);
+}

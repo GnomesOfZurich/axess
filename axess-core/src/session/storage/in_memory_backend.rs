@@ -162,6 +162,7 @@ impl InMemoryBackend {
         let config = FactorConfig::Password(PasswordConfig {
             hash: ZeroizedString::new(hash),
             rules: PasswordRules::default(),
+            password_id: None,
         });
         let scope = AuthnScope::User { user_id, tenant_id };
         self.factors = self.factors.with_factor(scope, config);
@@ -221,6 +222,27 @@ impl crate::authn::store::IdentityLookup for InMemoryBackend {
     async fn account_status(&self, user_id: &UserId) -> Result<EntityState, Self::Error> {
         self.identity.account_status(user_id).await
     }
+
+    fn lockout_policy_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> crate::authn::types::LockoutPolicy {
+        self.identity.lockout_policy_for_tenant(tenant_id)
+    }
+
+    async fn password_rules_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<crate::authn::factor::PasswordRules, Self::Error> {
+        self.identity.password_rules_for_tenant(tenant_id).await
+    }
+
+    async fn ip_policy_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<crate::authn::types::IpPolicy, Self::Error> {
+        self.identity.ip_policy_for_tenant(tenant_id).await
+    }
 }
 
 impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
@@ -256,6 +278,14 @@ impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
 
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
         self.identity.reset_failed_attempts(user_id).await
+    }
+
+    async fn record_last_login(
+        &self,
+        user_id: &UserId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Self::Error> {
+        self.identity.record_last_login(user_id, at).await
     }
 }
 

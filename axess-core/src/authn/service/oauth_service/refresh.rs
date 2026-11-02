@@ -6,11 +6,11 @@
 //! tokens against axess sessions; this path delegates to the upstream
 //! IdP's `/token` endpoint with the IdP's refresh token.
 
+use super::scoped::Scope;
 use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
     factor::FactorKind,
-    ids::UserId,
     store::{FactorStore, IdentityStore},
 };
 
@@ -35,11 +35,17 @@ where
     ///   A response for any other subject is refused (OIDC Core 12.2) and
     ///   audited as a provider rejection.
     /// * `original_nonce`: The `nonce` of the login that produced the refresh
-    ///   token (the `nonce` member of
-    ///   [`OAuthClaims::additional_claims`](axess_factors::oauth::OAuthClaims::additional_claims)).
+    ///   token ([`OAuthClaims::nonce`](axess_factors::oauth::OAuthClaims::nonce),
+    ///   stored beside the refresh token).
     ///   A refresh ID token that carries a nonce must equal it (OIDC Core
     ///   12.2); one without a nonce is accepted, and one with a nonce when
     ///   this is `None` is refused.
+    /// * `dpop_key`: The key the login's tokens are bound to, for a provider
+    ///   that binds them to a DPoP key: the one the login returned in
+    ///   [`OAuthClaims::dpop_key`](axess_factors::oauth::OAuthClaims::dpop_key),
+    ///   or restored with `DpopKey::from_seed`. The refresh request carries a
+    ///   proof signed by it, and the rotated access token is bound to the
+    ///   same key. `None` for a provider that does not bind.
     ///
     /// # Returns
     ///
@@ -47,36 +53,38 @@ where
     /// `refresh_token` in place of the one you sent: a rotating IdP has spent
     /// the old one even when the response carries no ID token, in which case
     /// `id_token_claims` is `None` and the claims you already hold stand.
-    #[tracing::instrument(skip(self, refresh_token, expected_subject, original_nonce))]
+    ///
+    /// # Errors
+    ///
+    /// [`OAuthError::DpopKeyRequired`](axess_factors::oauth::OAuthError::DpopKeyRequired)
+    /// when the provider binds tokens and `dpop_key` is `None`, refused
+    /// before anything is sent and audited as `token_refresh_dpop_key_missing`;
+    /// the provider's own errors otherwise.
+    #[tracing::instrument(skip(self, refresh_token, expected_subject, original_nonce, dpop_key))]
     pub async fn refresh_oauth_token(
         &self,
         provider_name: &str,
         refresh_token: &str,
         expected_subject: &str,
         original_nonce: Option<&str>,
+        dpop_key: Option<&axess_factors::oauth::DpopKey>,
     ) -> Result<axess_factors::oauth::RefreshOutcome, axess_factors::oauth::OAuthError> {
-        self.refresh_oauth_token_with_key(
+        self.refresh_scoped(
+            &Scope::global(),
             provider_name,
             refresh_token,
             expected_subject,
             original_nonce,
-            None,
+            dpop_key,
         )
         .await
     }
 
-    /// [`refresh_oauth_token`](Self::refresh_oauth_token) for a login whose
-    /// tokens are bound to a DPoP key.
-    ///
-    /// Pass the key the login returned in
-    /// [`OAuthClaims::dpop_key`](axess_factors::oauth::OAuthClaims::dpop_key)
-    /// (or restored with `DpopKey::from_seed`). The refresh request then
-    /// carries a proof signed by it, and the rotated access token is bound to
-    /// the same key. A provider configured for DPoP refuses the call without
-    /// one, since sending the refresh token unbound would drop the binding.
-    #[tracing::instrument(skip(self, refresh_token, expected_subject, original_nonce, dpop_key))]
-    pub async fn refresh_oauth_token_with_key(
+    /// The refresh both the by-name methods and [`ScopedOAuth`](super::ScopedOAuth)
+    /// run; `scope` says whose provider `provider_name` names.
+    pub(super) async fn refresh_scoped(
         &self,
+        scope: &Scope,
         provider_name: &str,
         refresh_token: &str,
         expected_subject: &str,
@@ -93,6 +101,7 @@ where
         //   * `token_refresh_no_token`       ; empty refresh_token
         //   * `token_refresh_unknown_provider`; provider_name not registered
         //   * `token_refresh_provider_rejected`; IdP rejected the token
+        //   * `token_refresh_dpop_key_missing`; a binding provider, no key
         // Success continues to record `token_refresh` so the two are
         // distinguishable in the audit stream.
 
@@ -100,44 +109,57 @@ where
             self.record_oauth_refresh_failure(
                 AuthFailureReason::TokenRefreshNoToken,
                 provider_name,
+                scope,
             )
             .await?;
             return Err(OAuthError::NoRefreshToken);
         }
 
-        let Some(provider) = self.inner.oauth_providers.get(provider_name) else {
-            self.record_oauth_refresh_failure(
-                AuthFailureReason::TokenRefreshUnknownProvider,
-                provider_name,
-            )
-            .await?;
-            return Err(OAuthError::UnknownProvider(provider_name.to_string()));
+        let provider = match self.scoped_provider(scope, provider_name).await {
+            Ok(provider) => provider,
+            Err(e) => {
+                let reason = if matches!(e, OAuthError::UnknownProvider(_)) {
+                    AuthFailureReason::TokenRefreshUnknownProvider
+                } else {
+                    AuthFailureReason::TokenRefreshProviderRejected
+                };
+                self.record_oauth_refresh_failure(reason, provider_name, scope)
+                    .await?;
+                return Err(e);
+            }
         };
-        let provider = provider.clone();
 
         let signer = dpop_key.map(|key| axess_factors::oauth::DpopSigner {
             key,
             rng: &*self.inner.rng,
         });
         let outcome = match provider
-            .refresh_token_for_subject_with(refresh_token, expected_subject, original_nonce, signer)
+            .refresh_token_for_subject(refresh_token, expected_subject, original_nonce, signer)
             .await
         {
             Ok(c) => c,
             Err(e) => {
-                self.record_oauth_refresh_failure(
-                    AuthFailureReason::TokenRefreshProviderRejected,
-                    provider_name,
-                )
-                .await?;
+                // A refusal before anything was sent is the caller's fault,
+                // not the IdP's verdict on the token: a SOC reading
+                // "provider rejected" would chase a stolen token.
+                let reason = if matches!(e, OAuthError::DpopKeyRequired) {
+                    AuthFailureReason::TokenRefreshDpopKeyMissing
+                } else {
+                    AuthFailureReason::TokenRefreshProviderRejected
+                };
+                self.record_oauth_refresh_failure(reason, provider_name, scope)
+                    .await?;
                 return Err(e);
             }
         };
 
-        let subject_user = UserId::try_new(expected_subject).ok();
+        // The IdP subject is never a local user id; the row names the user
+        // and tenant the scope was given (`as_user`, `oauth_in_tenant`, or
+        // the authenticated session behind `oauth_for_session`).
+        let (user, tenant) = scope.attribution();
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::LoginAttempt)
-                .maybe_attributed_to(subject_user.as_ref(), None)
+                .maybe_attributed_to(user, tenant)
                 .with_factor(FactorKind::Federated(
                     crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
                 ))
@@ -152,19 +174,19 @@ where
     /// Record an OAuth refresh-token failure audit event.
     ///
     /// Mirrors [`record_oauth_failure`](super::login::RequestAuthnService::record_oauth_failure)
-    /// but session-free: the refresh path is called with just a provider
-    /// name and a token, with no `AuthSession` to source attribution from.
+    /// but session-free: the refresh path is called with a provider name and
+    /// a token, and the user and tenant the scope was given.
     async fn record_oauth_refresh_failure(
         &self,
         reason: AuthFailureReason,
         provider_name: &str,
+        scope: &Scope,
     ) -> Result<(), axess_factors::oauth::OAuthError> {
         use axess_factors::oauth::OAuthError;
-        // No session in this path → no attribution. `failure(type)`
-        // already builds an unattributed shape; `maybe_attributed_to`
-        // is unnecessary.
+        let (user, tenant) = scope.attribution();
         self.emit_audit(
             AuthEventBuilder::failure(AuthEventType::LoginAttempt)
+                .maybe_attributed_to(user, tenant)
                 .with_factor(FactorKind::Federated(
                     crate::authn::factor::FederatedProvider::Custom(provider_name.into()),
                 ))

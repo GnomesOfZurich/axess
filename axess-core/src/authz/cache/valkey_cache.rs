@@ -421,7 +421,11 @@ where
             // does NOT defend against Valkey being written to by anything
             // other than axess: that's a distinct trust boundary
             // (network segmentation, Valkey ACLs) and MUST NOT be relied
-            // on cache-side. Note also the mutation-invalidation contract
+            // on cache-side. One exception is held by the evaluator rather
+            // than here: `PolicyStore` checks every action-typed entity it
+            // is handed against the schema and denies on a difference, so a
+            // cached action entity stripped of its groups cannot take an
+            // action out of a `forbid`. Note also the mutation-invalidation contract
             // documented on the struct: semantic staleness (a revoked
             // role still cached) is invisible to schema validation
             // regardless.

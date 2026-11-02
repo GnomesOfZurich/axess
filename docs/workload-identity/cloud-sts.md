@@ -56,16 +56,17 @@ use axess_core::workload::outbound::cloud_sts::aws::{
 
 // Defaults to the global endpoint; `with_endpoint` pins a regional one
 // (or LocalStack), `with_http_client` supplies a proxy or outbound mTLS.
-// Every call times out after 30 s; `with_timeout` adjusts that.
-let client = AwsStsClient::new();
+// Every call times out after 30 s; `with_timeout` adjusts that. The
+// constructor fails when the default HTTP client cannot be built, rather
+// than fall back to one that follows redirects.
+let client = AwsStsClient::new()?;
 
-let request = AssumeRoleWithWebIdentityRequest {
-    role_arn: "arn:aws:iam::123456789012:role/billing-api-prod".into(),
-    role_session_name: "billing-api".into(),
-    web_identity_token: token,          // the workload's own JWT
-    duration_seconds: Some(900),        // 15 minutes
-    ..Default::default()
-};
+let request = AssumeRoleWithWebIdentityRequest::new(
+    "arn:aws:iam::123456789012:role/billing-api-prod",
+    "billing-api",   // the session name CloudTrail records
+    token,           // the workload's own JWT
+)
+.with_duration_seconds(900); // 15 minutes
 ```
 
 The `role_arn` is the AWS role the credential will assume. The
@@ -122,7 +123,7 @@ let provider = WorkloadIdentityPoolProvider::new(
     "axess",                // pool id
     "external-oidc",        // provider id
 );
-let client = GcpStsClient::new();
+let client = GcpStsClient::new()?;
 let federated = client.exchange_token(&provider, token).await?;
 ```
 
@@ -155,10 +156,10 @@ use axess_core::workload::outbound::cloud_sts::azure::{
 let client = AzureFicClient::new(
     "00000000-0000-0000-0000-000000000000",   // Azure AD tenant
     "11111111-1111-1111-1111-111111111111",   // managed identity / app id
-);
+)?;
 
 let request = AzureFicRequest::new(token)
-    .scopes(["https://storage.azure.com/.default"]);
+    .with_scope("https://storage.azure.com/.default");
 let response = client.acquire_token(&request).await?;
 ```
 
@@ -261,10 +262,11 @@ against future compliance review of cross-cloud actions.
 ## Troubleshooting
 
 If the exchange returns `AccessDenied` from AWS STS, the role's
-trust policy does not admit the token. Check the policy's
-`Principal.Federated` and `Condition` blocks; the most common
-issues are a wrong issuer URL, a wrong audience, or a missing
-required claim.
+trust policy does not admit the token: check the policy's
+`Principal.Federated` and its `aud` and `sub` conditions. If it returns
+`InvalidIdentityToken`, the failure is earlier: the issuer is not a
+registered IAM provider, or the token's audience is not in the provider's
+client ID list. The [AWS walkthrough](aws.md) reproduces each.
 
 If the exchange returns `INVALID_ARGUMENT` from GCP, the
 workload identity pool or provider name is wrong, or the token's
@@ -275,7 +277,8 @@ providers describe`.
 If the exchange returns `AADSTS70021` from Azure, the FIC binding
 on the managed identity does not match the token's subject claim.
 Update the FIC configuration to match what the workload identity
-emits.
+emits. The [Azure walkthrough](azure.md) reproduces this and its
+neighbours (`AADSTS700211` for the issuer, `AADSTS700212` for the audience).
 
 ## Further reading
 

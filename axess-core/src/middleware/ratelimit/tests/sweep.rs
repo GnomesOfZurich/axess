@@ -163,7 +163,10 @@ fn at_the_hard_cap_a_new_key_is_refused_and_a_known_key_is_not_evicted() {
     // refusal.
     assert!(matches!(
         store.try_acquire_at("flood-0", millis(t0, 2)),
-        Acquire::Allowed { remaining: 0 }
+        Acquire::Allowed {
+            remaining: 0,
+            shared: false
+        }
     ));
     assert!(matches!(
         store.try_acquire_at("flood-0", millis(t0, 3)),

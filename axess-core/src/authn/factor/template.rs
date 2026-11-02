@@ -103,6 +103,7 @@ pub fn default_catalog() -> Vec<FactorTemplate> {
             FactorConfig::Password(PasswordConfig {
                 hash: ZeroizedString::new(""),
                 rules: PasswordRules::default(),
+                password_id: None,
             }),
         ),
         FactorTemplate::new(

@@ -48,7 +48,7 @@
 //!     AssumeRoleWithWebIdentityRequest, AwsStsClient,
 //! };
 //!
-//! let client = AwsStsClient::new();
+//! let client = AwsStsClient::new()?;
 //! let req = AssumeRoleWithWebIdentityRequest::new(
 //!     "arn:aws:iam::123456789012:role/axess-worker",
 //!     "axess-session-001",
@@ -68,9 +68,6 @@ use reqwest::header::CONTENT_TYPE;
 use serde::Deserialize;
 use url::Url;
 use zeroize::{Zeroize, Zeroizing};
-
-/// Time allowed to establish a connection, on the default HTTP client.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time allowed for one request from send to last response byte, unless
 /// `with_timeout` on the client says otherwise.
@@ -263,6 +260,10 @@ pub enum AwsStsError {
     /// XML shape.
     #[error("malformed AWS STS response: {0}")]
     MalformedResponse(String),
+    /// The default HTTP client could not be built; nothing is sent. See
+    /// [`ClientBuildError`](crate::ClientBuildError).
+    #[error(transparent)]
+    ClientBuild(#[from] crate::ClientBuildError),
 }
 
 // ── Client ───────────────────────────────────────────────────────────────────
@@ -281,25 +282,31 @@ pub struct AwsStsClient {
     timeout: Duration,
 }
 
-impl Default for AwsStsClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl AwsStsClient {
     /// Construct a client pointed at the default global AWS STS
-    /// endpoint (`https://sts.amazonaws.com/`).
-    pub fn new() -> Self {
-        Self {
+    /// endpoint (`https://sts.amazonaws.com/`). The default HTTP client
+    /// follows no redirects and bounds connection setup to 10 seconds; each
+    /// request carries this client's own timeout
+    /// ([`with_timeout`](Self::with_timeout)), which replaces the default
+    /// client's 30-second request bound.
+    ///
+    /// # Errors
+    ///
+    /// [`AwsStsError::ClientBuild`] when the default HTTP client cannot be built (the
+    /// TLS backend failed to initialise). No client with the protections
+    /// missing is built in its place.
+    pub fn new() -> Result<Self, AwsStsError> {
+        Self::from_builder(reqwest::Client::builder())
+    }
+
+    /// [`new`](Self::new) on a builder the caller started.
+    fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, AwsStsError> {
+        let http = crate::outbound_http::harden(builder)?;
+        Ok(Self {
             endpoint: Arc::new(default_endpoint()),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http,
             timeout: DEFAULT_REQUEST_TIMEOUT,
-        }
+        })
     }
 
     /// Override the STS endpoint. Use this to pin to a regional

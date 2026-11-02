@@ -665,6 +665,89 @@ mod device_resolver_wiring {
         assert_eq!(std::str::from_utf8(&body).unwrap(), "device=none");
     }
 
+    /// A resolver that binds a device on its first call and fails on every
+    /// later one, as a device store does during an outage.
+    struct FailingLaterResolver {
+        id: DeviceId,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("device store unavailable")]
+    struct StoreDown;
+
+    impl DeviceResolver for FailingLaterResolver {
+        type Error = StoreDown;
+        async fn resolve(&self, _: &Parts) -> Result<Option<DeviceId>, Self::Error> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Ok(Some(self.id))
+            } else {
+                Err(StoreDown)
+            }
+        }
+    }
+
+    /// Stamps the session with the stored device and, by asking for its id,
+    /// has the session persisted so the device binding is saved.
+    async fn persist_and_reflect_handler(session: AuthSession) -> impl IntoResponse {
+        session.session_id().await;
+        reflect_device_handler(session).await
+    }
+
+    /// A resolver failure leaves the session's device binding as it was: a
+    /// transient fault in the device store must not strip the device from a
+    /// session that had one, and the untouched session is not rewritten.
+    #[tokio::test]
+    async fn a_resolver_failure_keeps_the_stored_device_binding() {
+        let id = axess_core::authn::ids::testing::device("dev-kept-on-fault");
+        let store = MemorySessionStore::new();
+        let session_layer = SessionLayer::new(store, [42u8; 32])
+            .with_secure(false)
+            .with_device_resolver(FailingLaterResolver {
+                id,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+        let app = Router::new()
+            .route("/reflect", get(persist_and_reflect_handler))
+            .layer(session_layer);
+
+        let first = app
+            .clone()
+            .oneshot(Request::get("/reflect").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let cookie = first
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("the persisted session sets a cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let body = axum::body::to_bytes(first.into_body(), 64).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), format!("device={id}"));
+
+        let second = app
+            .oneshot(
+                Request::get("/reflect")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(second.into_body(), 64).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            format!("device={id}"),
+            "a resolver error must keep the session's stored device"
+        );
+    }
+
     #[tokio::test]
     async fn a_device_stamp_alone_does_not_persist_a_fresh_session() {
         // First request: the resolver stamps Some(id) on a session that has

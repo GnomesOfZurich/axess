@@ -231,6 +231,90 @@ fn a_forbid_over_an_action_group_denies_without_schema_built_entities() {
     assert_eq!(delete_doc(&store, &with_schema, true), AuthzDecision::Allow);
 }
 
+/// The schema is authoritative for action entities. A provider that supplies
+/// `Action::"DeleteDocument"` with no parents would otherwise replace the
+/// schema's entity, `action in Action::"Mutating"` would be false, the
+/// `forbid` would not fire and the `permit` beside it would allow.
+#[test]
+fn a_provider_action_entity_that_differs_from_the_schema_denies() {
+    let store = PolicyStore::from_text(GROUP_POLICIES, GROUP_SCHEMA_JSON).unwrap();
+    let delete: EntityUid = r#"TestApp::Action::"DeleteDocument""#.parse().unwrap();
+    let parentless = Entities::from_entities(
+        [
+            Entity::new_no_attrs(
+                r#"TestApp::User::"alice""#.parse().unwrap(),
+                Default::default(),
+            ),
+            Entity::new_no_attrs(delete.clone(), Default::default()),
+        ],
+        None,
+    )
+    .unwrap();
+    // The seeded case: the provider's Delete stands without the group.
+    assert!(
+        parentless
+            .ancestors(&delete)
+            .is_some_and(|mut a| a.next().is_none()),
+        "the provider's action entity has no parents"
+    );
+    assert_eq!(
+        delete_doc(&store, &parentless, false),
+        AuthzDecision::Deny,
+        "a provider action entity that differs from the schema must deny"
+    );
+    // Not an allow in the other direction either: the conflict is a
+    // configuration error, not a reason to skip the policy.
+    assert_eq!(delete_doc(&store, &parentless, true), AuthzDecision::Deny);
+}
+
+/// An action-typed entity the schema does not declare is a conflict too.
+#[test]
+fn a_provider_action_entity_unknown_to_the_schema_denies() {
+    let store = PolicyStore::from_text(GROUP_POLICIES, GROUP_SCHEMA_JSON).unwrap();
+    let entities = Entities::from_entities(
+        [
+            Entity::new_no_attrs(
+                r#"TestApp::User::"alice""#.parse().unwrap(),
+                Default::default(),
+            ),
+            Entity::new_no_attrs(
+                r#"TestApp::Action::"Undeclared""#.parse().unwrap(),
+                Default::default(),
+            ),
+        ],
+        None,
+    )
+    .unwrap();
+    assert_eq!(delete_doc(&store, &entities, true), AuthzDecision::Deny);
+}
+
+/// Provider entities that carry the schema's action entities as the schema
+/// defines them (the shape a cache round trip without a schema produces)
+/// are used as they are and decide the same way.
+#[test]
+fn schema_shaped_action_entities_round_tripped_without_schema_are_accepted() {
+    let store = PolicyStore::from_text(GROUP_POLICIES, GROUP_SCHEMA_JSON).unwrap();
+    let with_schema = Entities::empty()
+        .add_entities(
+            [Entity::new_no_attrs(
+                r#"TestApp::User::"alice""#.parse().unwrap(),
+                Default::default(),
+            )],
+            Some(store.schema()),
+        )
+        .unwrap();
+    let json = with_schema.to_json_value().unwrap();
+    let round_tripped = Entities::from_json_value(json, None).unwrap();
+    assert_eq!(
+        delete_doc(&store, &round_tripped, false),
+        AuthzDecision::Deny
+    );
+    assert_eq!(
+        delete_doc(&store, &round_tripped, true),
+        AuthzDecision::Allow
+    );
+}
+
 #[test]
 fn policy_evaluator_schema_returns_some_when_loaded() {
     // pins `<impl PolicyEvaluator for PolicyStore>::schema

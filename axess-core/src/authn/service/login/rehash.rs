@@ -4,15 +4,19 @@
 //! verifying under the parameters written into it. A successful password
 //! check is the one moment the plaintext is in hand, so it is the moment to
 //! hash it again under the current set.
+//!
+//! The new config carries the password's identity over (see
+//! [`password_identity`]), so the credential epoch every half-finished login
+//! of the user is stamped with does not move: the password did not change.
 
 use super::super::RequestAuthnService;
+use super::flow::password_identity;
 use crate::authn::{
     factor::{FactorConfig, FactorCredential, ZeroizedString},
     ids::{TenantId, UserId},
     store::{FactorStore, IdentityStore},
     types::AuthnScope,
 };
-use crate::session::extractor::AuthSession;
 
 impl<I, F> RequestAuthnService<I, F>
 where
@@ -28,16 +32,15 @@ where
     /// to rewrite). The write is a compare-and-swap against `verified`, so a
     /// password changed meanwhile is never overwritten with the old one.
     ///
-    /// The password hash feeds the login flow's credential epoch, so after a
-    /// successful swap the flow in `session` is re-stamped; otherwise the
-    /// very login that caused the rehash would be dropped at its next step.
+    /// The new config keeps the password's identity, which is what the login
+    /// flow's credential epoch covers, so this login and any other
+    /// half-finished one of the user go on unchanged.
     ///
     /// Best effort: a failure to hash or to store is logged and the login
     /// goes on, since the old hash is still valid and the next login tries
     /// again.
     pub(super) async fn rehash_outdated_password(
         &self,
-        session: &AuthSession,
         credential: &FactorCredential,
         verified: &FactorConfig,
         resolved_from: &AuthnScope,
@@ -75,6 +78,7 @@ where
             }
         };
         let mut next = cfg.clone();
+        next.password_id = Some(password_identity(Some(cfg)));
         next.hash = ZeroizedString::new(hash);
         match self
             .inner
@@ -82,9 +86,7 @@ where
             .compare_and_save_factor(&user_scope, verified, FactorConfig::Password(next))
             .await
         {
-            Ok(true) => {
-                self.restamp_flow_epoch(session, user_id, tenant_id).await;
-            }
+            Ok(true) => {}
             Ok(false) => {
                 tracing::debug!(user_id = %user_id, "password changed during the login; not rehashing");
             }

@@ -72,17 +72,23 @@ use crate::device::types::{Device, DeviceTrustLevel};
 /// `FactorKind::Fido2`, or when your tenant's policy otherwise differs (e.g.
 /// tighter for high-value users, looser for known internal-network ranges, …).
 ///
-/// # A device is recognised by a hint, not proven
+/// # A device is proven by its token, and the token is a bearer secret
 ///
-/// A device is matched by a fingerprint of request headers and the client
-/// address, all of which the client chooses. Someone who has a user's
-/// password can send the same headers from the same network range and be
-/// matched to that user's `Trusted` device. That is why the default asks
-/// for a factor on a `Trusted` device too: skipping step-up there trusts
-/// the fingerprint to be unforgeable. Set `trusted` to an empty list
-/// ([`StepUpPolicyBuilder::trusted`]) only where a second signal that the
-/// client cannot copy, such as a device certificate or an app-held key,
-/// backs the match.
+/// A device is recognised by the token its `__Host-axess_device` cookie
+/// presents, a 32-byte random value minted when the device row was created
+/// ([`proof`](crate::device::proof)); only the token's digest is stored, and
+/// a request is that device only when the digest it presents is on the row
+/// ([`resolve_proven`](crate::device::DeviceLifecycleService::resolve_proven)).
+/// The fingerprint of request headers and client address is kept on the row
+/// but selects nothing: someone who copies a user's headers and network
+/// range gets a new `Unknown` device, not the user's `Trusted` one. What the
+/// token does not prove is who holds the browser: it is a bearer secret
+/// that leaves with the cookie jar, so a stolen profile presents it as the
+/// owner would. That is why the default asks for a factor on a `Trusted`
+/// device too. Set `trusted` to an empty list
+/// ([`StepUpPolicyBuilder::trusted`]) where a trusted device is meant to
+/// stand in for a possession factor, or where a signal the client cannot
+/// copy, such as a device certificate or an app-held key, backs it.
 ///
 /// # A `Revoked` device never steps up less than an `Unknown` one
 ///
@@ -98,8 +104,8 @@ pub struct StepUpPolicy {
     /// step-up required.
     pub seen: Vec<FactorKind>,
     /// Factor kinds accepted for a `Trusted` device. Empty = no step-up
-    /// on a trusted device, which is only as safe as the device match is
-    /// unforgeable (see the type docs); the default is non-empty.
+    /// on a trusted device, which is only as safe as the device token's
+    /// cookie is (see the type docs); the default is non-empty.
     pub trusted: Vec<FactorKind>,
     /// Factor kinds accepted for a `Revoked` device. Empty means the
     /// `unknown` list applies, never "no step-up": a revoked device is
@@ -232,11 +238,11 @@ pub fn decide_step_up_for_user(
 
 /// [`decide_step_up_for_user`] for a request that may have no device at all.
 ///
-/// A request the device layer could not fingerprint (it sent no
-/// `User-Agent`, or the device store was unavailable) resolves to no device.
-/// That is not a reason to skip step-up: a client chooses whether to send
-/// the header, so "no device" is judged as an `Unknown` one, with the
-/// policy's `unknown` factors.
+/// A request the device layer could not resolve (a guest without a device
+/// cookie, a request it could not fingerprint for a new row, or a device
+/// store that was unavailable) resolves to no device. That is not a reason
+/// to skip step-up: a client chooses what it sends, so "no device" is
+/// judged as an `Unknown` one, with the policy's `unknown` factors.
 pub fn decide_step_up_for_optional(
     device: Option<&Device>,
     user: &UserId,
@@ -284,9 +290,9 @@ mod tests {
     }
 
     /// Pin: the default policy demands a factor at every trust level. A
-    /// `Trusted` device is matched by a fingerprint the client controls, so
-    /// copying the headers must not skip step-up; a `Revoked` device never
-    /// steps up less than a stranger.
+    /// `Trusted` device is proven by a bearer cookie, so a stolen browser
+    /// profile must not skip step-up; a `Revoked` device never steps up less
+    /// than a stranger.
     #[test]
     fn default_policy_step_up_matrix() {
         let p = StepUpPolicy::default();

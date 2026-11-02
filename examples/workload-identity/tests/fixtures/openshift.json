@@ -1,0 +1,20 @@
+{
+  "source": "https://kubernetes.io/docs/reference/access-authn-authz/service-accounts-admin/#bound-service-account-tokens; OpenShift 4 default serviceAccountIssuer, https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/authentication_and_authorization/bound-service-account-tokens",
+  "recorded": "2026-10-30",
+  "kind": "constructed",
+  "issuer": "https://kubernetes.default.svc",
+  "audience": "axess-platform",
+  "jwks": {
+    "keys": [
+      {
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "fixture-1",
+        "kty": "RSA",
+        "n": "5dliD3poy0Bwb42u-NSGlzw2ZtRsu2ljTLBcWMAkEOulGDbBiQQaNOHnOgSofgRtEjO7iVkg4k_8DFBkx4U7TCJtoHYmkChBUZJsnGimYmWe-qIPvY8C915DMCpjEuZ90VixRHueh9z-Y6eJ_PR6PNejfyvERiAv-DDlir9ugITvYcBbJLyikKawhHeV_vbfqNtngqULv-ANkbCF8QewUHyCpweYx7f7ETcjl9Z_0fsJZdN6UwaPkomb0-E3kEkuyX3UdeB0Y7wGsbGlt6lDDfo5FUW3qfAtxNr5QhyztdxV9iz8HHZHV2dlWp7zO0lZREz1ScFMqqusLlxJqPNyuQ",
+        "e": "AQAB"
+      }
+    ]
+  },
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUtMSJ9.eyJpc3MiOiJodHRwczovL2t1YmVybmV0ZXMuZGVmYXVsdC5zdmMiLCJzdWIiOiJzeXN0ZW06c2VydmljZWFjY291bnQ6dGVuYW50LWFjbWU6YmlsbGluZy1hcGkiLCJhdWQiOlsiYXhlc3MtcGxhdGZvcm0iXSwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDAsImV4cCI6MTc2NzIyOTIwMCwia3ViZXJuZXRlcy5pbyI6eyJuYW1lc3BhY2UiOiJ0ZW5hbnQtYWNtZSIsInBvZCI6eyJuYW1lIjoiYmlsbGluZy1hcGktN2Q5YmM2ZjVkOC14Mms0cSIsInVpZCI6ImFhYWFhYWFhLWJiYmItY2NjYy1kZGRkLWVlZWVlZWVlZWVlZSJ9LCJzZXJ2aWNlYWNjb3VudCI6eyJuYW1lIjoiYmlsbGluZy1hcGkiLCJ1aWQiOiIxMTExMTExMS0yMjIyLTMzMzMtNDQ0NC01NTU1NTU1NTU1NTUifX19.v3C3jDNUJPxeEQgPaKhKTyE1vA_aTBlcFVQU2jxiIi29VdaiNCnoa-S6WgsgEAdQp1jir06ij5biadC2ROVf61qKu_HKxVTWDgMw_5r2FBbOhsMNEXNDkDDQcMkL750mcryi-BipnAVq1sIs54BzLKssZaJag9oIWFVFone6395s85vDit2coUC5_v3CBInL7Z5e1GJNoqaONFxXxbMcRLi229VPEbBBd_icRYyCF-aR0WdHu7_0vjcvKNC9Cvx0JTU_0ub2Lj95Lnbp3kB4Y6J1Z1SQZCHye_hsHX7ECXCBVaDU8ZS4bV8AMS7WeKAd9TQKmns7ru4wiIwgkNfWSQ"
+}

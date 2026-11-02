@@ -129,6 +129,8 @@ sha1 = { workspace = true }
 # needs TLS (or an RSA exchange); the live MySQL tests connect over TLS.
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres", "tls-rustls-aws-lc-rs"] }
 subtle = { workspace = true }
+# Test directories that are removed on drop, also when an assertion fails.
+tempfile = "3.27.0"
 # Satisfies `#[cfg(test)] mod tests` in authz/audit.rs and the doc-test
 # examples, which need a subscriber without the `testing` feature on.
 tracing-subscriber = { workspace = true }
@@ -181,7 +183,9 @@ trace-id = []
 ws = ["axum/ws"]
 
 # Federated authn / OIDC
-fapi = ["oauth", "dep:p256", "axess-factors/fapi"]
+# An alias for `oauth`, which carries the FAPI 2.0 client profile and both
+# halves of DPoP.
+fapi = ["oauth", "axess-factors/fapi"]
 fido2 = ["dep:webauthn-rs", "axess-factors/fido2"]
 # Generic JWT primitives + `WorkloadResolver` for non-SPIFFE
 # workload-identity flows. Adopters reach for this when wiring

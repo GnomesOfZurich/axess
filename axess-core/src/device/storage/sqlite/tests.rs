@@ -695,3 +695,85 @@ mod own_fingerprint;
 mod reseal;
 mod review;
 mod sweep_batches;
+
+/// A file database in WAL mode with a pool of several connections, the
+/// shape a deployment runs, removed when dropped.
+struct FileDb {
+    store: SqliteDeviceStore,
+    path: std::path::PathBuf,
+}
+
+impl Drop for FileDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = self.path.clone().into_os_string();
+            p.push(suffix);
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+async fn file_store() -> FileDb {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+    let path = std::env::temp_dir().join(format!("axess-device-{}.db", uuid::Uuid::new_v4()));
+    let options = SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(10));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(options)
+        .await
+        .expect("file sqlite connect");
+    let store = SqliteDeviceStore::plaintext(pool);
+    store.init_schema().await.expect("init_schema");
+    FileDb { store, path }
+}
+
+/// A save that races other writes (a revocation of the same device, saves
+/// of other devices) never fails with a busy database: it either lands or,
+/// on a row revoked first, leaves the row as it is. A revoked row stays
+/// revoked whichever order the two land in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_save_racing_other_writes_lands_or_is_a_no_op() {
+    let db = file_store().await;
+    let store = db.store.clone();
+    let (t, u, _) = ids();
+    for round in 0..40u32 {
+        let id = crate::authn::ids::testing::device(&format!("race-{round}"));
+        let mut d = build_device(&t, Some(&u), &id, 7, vec![]);
+        d.trust_level = DeviceTrustLevel::Trusted;
+        store.save(&d, now_at(10, 0)).await.expect("seed save");
+        assert!(store.load(&t, &id).await.unwrap().is_some(), "seeded");
+
+        let mut tasks = Vec::new();
+        for writer in 0..6u32 {
+            let store = store.clone();
+            let mut copy = d.clone();
+            tasks.push(tokio::spawn(async move {
+                if writer == 0 {
+                    store
+                        .set_trust_level(
+                            &copy.tenant_id,
+                            &copy.id,
+                            DeviceTrustLevel::Revoked,
+                            now_at(11, 0),
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    copy.last_seen_at = now_at(10, writer);
+                    store.save(&copy, now_at(10, writer)).await
+                }
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("join")
+                .unwrap_or_else(|e| panic!("round {round}: a racing write failed: {e}"));
+        }
+        let row = store.load(&t, &id).await.unwrap().unwrap();
+        assert_eq!(row.trust_level, DeviceTrustLevel::Revoked, "round {round}");
+    }
+}

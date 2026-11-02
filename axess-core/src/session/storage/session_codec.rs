@@ -12,7 +12,7 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::session::{
-    crypto::{BoundFormat, SessionCrypto},
+    crypto::{Binding, BoundFormat, SessionCrypto},
     data::SessionData,
     id::SessionId,
 };
@@ -97,21 +97,28 @@ impl SessionCodec {
     /// base64 text column otherwise. A row an earlier release wrote has only
     /// the text; every save writes the binary column and empties the text.
     ///
-    /// The flag says the row is stale: its blob lacks the current row
-    /// binding, or it still lives in the legacy text column. The SQL stores
-    /// re-seal a stale row on load.
+    /// [`Decoded::reseal`] says the row is to be re-sealed: its blob is bound
+    /// but not in the current form, or it still lives in the legacy text
+    /// column (see [`decode_bytes_checked`](Self::decode_bytes_checked) for
+    /// the blob without any binding, which a read leaves as it is). The SQL
+    /// stores re-seal such a row on load.
     #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
     pub fn decode_row(
         &self,
         id: &SessionId,
         binary: Option<&[u8]>,
         text: &str,
-    ) -> Result<(SessionData, bool), SqlStoreError> {
+    ) -> Result<Decoded, SqlStoreError> {
         match binary {
             Some(bytes) => self.decode_bytes_checked(id, bytes),
             None => {
-                let (data, _) = self.decode_text(id, text)?;
-                Ok((data, true))
+                // A bound blob moves to the binary column; one without any
+                // binding stays where it is until the next save.
+                let (data, state) = self.decode_text(id, text)?;
+                Ok(Decoded {
+                    data,
+                    reseal: state.bound(),
+                })
             }
         }
     }
@@ -121,19 +128,19 @@ impl SessionCodec {
         &self,
         id: &SessionId,
         stored: &str,
-    ) -> Result<(SessionData, bool), SqlStoreError> {
+    ) -> Result<(SessionData, BlobState), SqlStoreError> {
         // Plaintext-legacy fast path: a JSON object always starts with
         // `{`, which is never a valid base64 character. If we see one,
         // we know we are reading a pre-MessagePack plaintext row; decode
         // it as JSON and return.
         if self.crypto.is_none() && stored.starts_with('{') {
-            return Ok((serde_json::from_str(stored)?, true));
+            return Ok((serde_json::from_str(stored)?, BlobState::plaintext()));
         }
 
         let payload = BASE64
             .decode(stored)
             .map_err(|_| SqlStoreError::Crypto(crate::session::crypto::CryptoError))?;
-        self.decode_bytes_checked(id, &payload)
+        self.decode_payload(id, &payload)
     }
 
     /// Serialize (and optionally encrypt) session data for binary
@@ -168,24 +175,48 @@ impl SessionCodec {
         id: &SessionId,
         payload: &[u8],
     ) -> Result<SessionData, SqlStoreError> {
-        Ok(self.decode_bytes_checked(id, payload)?.0)
+        Ok(self.decode_bytes_checked(id, payload)?.data)
     }
 
-    /// [`decode_bytes`](Self::decode_bytes) plus whether the blob is stale:
-    /// sealed without the row binding of the current format. A stale blob is
-    /// re-sealed by the store that read it ([`encode_bytes`](Self::encode_bytes)
-    /// writes the current format).
+    /// [`decode_bytes`](Self::decode_bytes) plus whether the store that read
+    /// the blob should re-seal it ([`encode_bytes`](Self::encode_bytes) writes
+    /// the current format): the blob is bound to its row but not in the
+    /// current form (the direct layout, or a blob that only the previous key
+    /// opened). A blob without any binding, read under the [`LegacyBlobs`]
+    /// window, is not re-sealed by a read: it proves nothing about the row it
+    /// sits under, so a re-seal would bind a blob copied from another row to
+    /// this one for good. The next save of the session writes the bound form,
+    /// and a session that is never saved again expires with its TTL.
+    ///
+    /// [`LegacyBlobs`]: crate::session::crypto::LegacyBlobs
     pub fn decode_bytes_checked(
         &self,
         id: &SessionId,
         payload: &[u8],
-    ) -> Result<(SessionData, bool), SqlStoreError> {
+    ) -> Result<Decoded, SqlStoreError> {
+        let (data, state) = self.decode_payload(id, payload)?;
+        Ok(Decoded {
+            data,
+            reseal: state.stale && state.bound(),
+        })
+    }
+
+    /// Decrypt (when the codec encrypts) and deserialize a blob, reporting
+    /// its state at rest.
+    fn decode_payload(
+        &self,
+        id: &SessionId,
+        payload: &[u8],
+    ) -> Result<(SessionData, BlobState), SqlStoreError> {
         let opened;
-        let mut stale = false;
+        let mut state = BlobState::plaintext();
         let plaintext: &[u8] = match &self.crypto {
             Some(crypto) => {
                 opened = crypto.open_bound(BoundFormat::SESSION, id.as_bytes(), &[], payload)?;
-                stale = opened.stale;
+                state = BlobState {
+                    stale: opened.stale,
+                    binding: opened.binding,
+                };
                 &opened.plaintext
             }
             None => payload,
@@ -194,7 +225,41 @@ impl SessionCodec {
             Ok(data) => data,
             Err(_) => serde_json::from_slice(plaintext)?,
         };
-        Ok((data, stale))
+        Ok((data, state))
+    }
+}
+
+/// A stored session as a store read it.
+pub(crate) struct Decoded {
+    /// The session.
+    pub data: SessionData,
+    /// The store that read it should write it back in the current form
+    /// ([`SessionCodec::encode_bytes`]) under the same revision, on the
+    /// condition that the row still holds what was read.
+    pub reseal: bool,
+}
+
+/// What a decode found out about a blob besides its data.
+struct BlobState {
+    /// Not at rest in the current form.
+    stale: bool,
+    /// How the blob was bound to its row.
+    binding: Binding,
+}
+
+impl BlobState {
+    /// A blob of a plaintext codec: in the current form, with nothing to
+    /// bind.
+    fn plaintext() -> Self {
+        Self {
+            stale: false,
+            binding: Binding::Current,
+        }
+    }
+
+    /// Whether the blob carries a row binding, so a read may re-seal it.
+    fn bound(&self) -> bool {
+        self.binding != Binding::Unbound
     }
 }
 
@@ -204,8 +269,11 @@ impl SessionCodec {
 /// The expiry is whole seconds, and a sub-second TTL is raised to one second
 /// (as the Valkey store does), so any positive TTL leaves the row loadable
 /// for at least a second (a row loads only while `expires_at` is after now).
-/// A zero TTL gives `now`, a row that can never be loaded; the write paths
-/// report that as an ended session.
+/// A zero TTL gives `now`, a row that can never be loaded, and the write
+/// paths store nothing for it: `save` and `update` remove the row,
+/// `update_if_revision` removes the row whose revision matched, and `cycle`
+/// removes both rows; each reports the session gone or not kept (see the
+/// trait's "Zero TTL" section).
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub(crate) fn expires_at(clock: &dyn axess_clock::Clock, ttl: Duration) -> i64 {
     let secs = if ttl.is_zero() {

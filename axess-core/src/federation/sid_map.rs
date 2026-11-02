@@ -1,8 +1,8 @@
 //! The OIDC `sid` map: which local session a logout from the IdP ends.
 //!
 //! Populated by `complete_oauth_login` for every login whose ID token carries
-//! a `sid`, read and drained by the back-channel and front-channel logout
-//! handlers.
+//! a `sid`, read by the back-channel and front-channel logout handlers, which
+//! drop a session's mappings once the session registry has ended it.
 //!
 //! # Why the key is the issuer and not the client
 //!
@@ -367,9 +367,20 @@ impl SidMap {
     }
 
     /// Remove and return the entry for `key`, and forget its session in the
-    /// subject registry: the caller is about to end that session.
-    pub fn remove(&self, key: &SidKey) -> Option<SidEntry> {
+    /// subject registry, only when `expected` holds for the entry the key
+    /// maps to now, under the one lock: a caller that looked the key up and
+    /// then ended its session removes that mapping and not one a later login
+    /// put in its place. Returns `None` when the key is unmapped or maps to
+    /// something else; nothing moves then.
+    pub fn remove_if(
+        &self,
+        key: &SidKey,
+        expected: impl FnOnce(&SidEntry) -> bool,
+    ) -> Option<SidEntry> {
         let mut state = self.lock();
+        if !state.entries.get(key).is_some_and(|s| expected(&s.entry())) {
+            return None;
+        }
         let stored = state.remove(key)?;
         state.forget_subject(&key.0, &stored.user, &stored.session);
         Some(stored.entry())
@@ -378,7 +389,7 @@ impl SidMap {
     /// Record that `session` was established for the local `user`, who logged
     /// in under `issuer` as the IdP subject `subject`, whether or not the
     /// login has a `sid` mapping. A `sub`-only logout reaches the session
-    /// through [`take_subject_sessions`](Self::take_subject_sessions).
+    /// through [`subject_sessions`](Self::subject_sessions).
     pub fn register_subject_session(
         &self,
         issuer: &str,
@@ -395,34 +406,31 @@ impl SidMap {
         self.lock().forget_subject(issuer, user, session)
     }
 
-    /// Remove every session of the IdP subject `subject` under `issuer` from
-    /// the subject registry and return each with its local user, together
-    /// with the sessions of the `sid` entries that map to the same subject and
-    /// issuer. Other issuers and other subjects stay.
-    pub fn take_subject_sessions(&self, issuer: &str, subject: &str) -> Vec<(UserId, SessionId)> {
-        let mut state = self.lock();
+    /// Every session of the IdP subject `subject` under `issuer`, each with
+    /// its local user, sorted: those in the subject registry and those of
+    /// the `sid` entries that map to the same subject and issuer. Other
+    /// issuers and other subjects are not included, and nothing is removed.
+    /// A caller ends each session in the session registry first and then
+    /// calls [`remove_session`](Self::remove_session) for it, so a session
+    /// the registry could not end stays reachable for a retry.
+    pub fn subject_sessions(&self, issuer: &str, subject: &str) -> Vec<(UserId, SessionId)> {
+        let state = self.lock();
         let slot = (issuer.to_string(), subject.to_string());
         let mut out: Vec<(UserId, SessionId)> = state
             .subjects
-            .remove(&slot)
-            .map(|set| set.into_iter().collect())
+            .get(&slot)
+            .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
-        for (_, session) in &out {
-            state.subject_of.remove(session);
-        }
-        if let Some(sids) = state.by_subject.get(&slot).cloned() {
+        if let Some(sids) = state.by_subject.get(&slot) {
             for sid in sids {
-                if let Some(stored) = state.remove(&(issuer.to_string(), sid)) {
+                if let Some(stored) = state.entries.get(&(issuer.to_string(), sid.clone())) {
                     let pair = (stored.user, stored.session);
                     if !out.contains(&pair) {
-                        state.forget_subject(issuer, &stored.user, &stored.session);
                         out.push(pair);
                     }
                 }
             }
         }
-        // The registry is a hash set, whose iteration order differs between
-        // runs; the fan-out order of a logout is the sorted order.
         out.sort_unstable();
         out
     }

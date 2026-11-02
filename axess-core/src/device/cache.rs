@@ -336,6 +336,23 @@ where
         }
     }
 
+    fn create_or_find(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
+        let key = (device.tenant_id, device.id);
+        let cache = self.cache.clone();
+        let inner = self.inner.clone();
+        let device = device.clone();
+        async move {
+            // As for `save`: the new row's key is invalidated after the
+            // write, whether or not it was the one inserted.
+            let _guard = InvalidateOnDrop { cache, key };
+            inner.create_or_find(&device, now).await
+        }
+    }
+
     fn record_sighting(
         &self,
         tenant_id: &TenantId,
@@ -473,6 +490,3 @@ where
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod races;

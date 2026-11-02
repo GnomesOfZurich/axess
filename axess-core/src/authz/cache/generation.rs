@@ -78,6 +78,7 @@ impl Generations {
 
     /// Whether an invalidation that applies to the snapshot's key has run
     /// since the snapshot was taken.
+    #[cfg(any(test, feature = "valkey-cache"))]
     pub(crate) fn is_current(
         &self,
         taken: Generation,

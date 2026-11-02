@@ -153,14 +153,28 @@ ends at its own expiry or through the session store, and carries
 `device_id` for an application that wants to check the device on each
 request.
 
-**Checking the device on refresh.** `refresh_session_with_device_check`
-is `refresh_session` that first loads the token's device and refuses with
+**Checking the device on refresh.** `Refresh::device_store` makes a
+refresh first load the token's device and refuse with
 `RefreshError::DeviceRevoked` when it is `Revoked` or no longer exists,
 before anything is rotated. A token without a device id is refreshed as
 usual, and a device store that cannot answer refuses with
 `RefreshError::DeviceStore` instead of letting the refresh through. Use it
 as the second line behind `revoke_device`, and as the only line for a
-refresh store without revoke-by-device.
+refresh store without revoke-by-device. It composes with the other checks
+of the one refresh entry point:
+
+```rust,ignore
+let (session, rotated) = Refresh::new(&plaintext, status_check)
+    .in_tenant(&tenant)
+    .device_info(Some(fingerprint))
+    .device_store(&devices)
+    .run(&refresh_store, &config, &rng, now)
+    .await?;
+```
+
+The checks run in the order tenant, revoked, expired, account status,
+device, device binding, rotation; a token of another tenant answers
+`RefreshError::NotFound` before the device is loaded.
 
 **A compromised family.** When a rotated-out token is reused, the family
 is revoked and `RefreshTokenStore::on_token_compromise` is called with the
@@ -176,14 +190,29 @@ of it together with the token's device id (`hb1:` and the base64url of an
 HMAC-SHA256 under the refresh pepper), so a database dump holds no client
 strings, and the stored value matches only the device id on the same row.
 Refresh recomputes the digest from the string the caller presents and
-compares in constant time; the replacement token inherits the stored value.
-Pass the keyed fingerprint (the hex of the `FingerprintHash` the extractor
-computed) rather than a raw `User-Agent`: the string is still whatever the
-client's request yields, and the device id link above is the strong binding.
-Configure `RefreshTokenConfig::hash_pepper` so the digest is keyed; without
-one it is an unkeyed hash. A token issued by an earlier release stores the
-raw string; it is still honoured, and the token that replaces it carries the
-digest.
+compares in constant time, under the pepper the token was found under, and
+the replacement token carries the digest under the current pepper, so a
+bound token survives a pepper rotation (`previous_hash_pepper`) and keeps
+working once the previous pepper is dropped. Pass the keyed fingerprint (the
+hex of the `FingerprintHash` the extractor computed) rather than a raw
+`User-Agent`: the string is still whatever the client's request yields, and
+the device id link above is the strong binding. Configure
+`RefreshTokenConfig::hash_pepper` so the digest is keyed; without one it is
+an unkeyed hash, which a reader of the store can confirm a guessed device
+string against (it never lets a caller pass with the wrong string). A token
+issued by an earlier release stores the raw string; it is still honoured, and
+the token that replaces it on its first refresh carries the digest. With
+rotation off nothing replaces the token, so the raw string stays until the
+token expires; turn rotation on or revoke the user's tokens to retire it
+sooner.
+
+The device-checked refreshes also match the owner: a token whose device now
+belongs to another user (a guest device claimed by someone else first) is
+refused with `RefreshError::DeviceMismatch` and nothing is rotated; an
+unowned device passes. The check and the rotation are two store operations,
+so a device revoked between them is rotated once more; `revoke_device`
+catches the child when its insert landed first, and the next device-checked
+refresh refuses it otherwise.
 
 ### Step-up policies
 
@@ -341,7 +370,9 @@ features and either matching an existing device or minting one with
 `LifecycleDeviceResolver` has four hooks, because those are the four
 things that differ between deployments:
 
-- `tenant_fn`, defaulting to a `TenantId` in the request extensions.
+- `tenant_fn`, defaulting to a `TenantId` in the request extensions and,
+  when there is none, to the tenant the session authenticated into
+  (`SessionTenant` in the request extensions, filled by the session layer).
 - `client_ip_fn`, defaulting to the address `client_ip::layer` resolved,
   and to `None` (with a one-time warning) when that layer is not installed,
   because reading the address yourself means either `ConnectInfo` or a
@@ -359,6 +390,30 @@ If `tenant_fn` yields `None` the resolver short-circuits to `Ok(None)`:
 there is no meaningful device without a tenant scope, for the
 cross-tenant-correlation reason this chapter covers below. A
 fingerprint the extractor cannot compute short-circuits the same way.
+
+Where the tenant comes from decides whether a device is ever issued, so
+pick the form that matches the application:
+
+```rust,ignore
+// One tenant for the whole deployment: a constant.
+let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock)
+    .with_tenant_fn(|_parts| Some(tenant));
+
+// The tenant is a property of the signed-in user: set nothing. The tenant
+// stored by `AuthSession::set_authenticated` at login reaches the resolver
+// as `SessionTenant`, and the first authenticated request gets a device
+// cookie.
+let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock);
+
+// The tenant comes from the host name: an outer layer inserts a `TenantId`
+// extension, which is read before the session's.
+```
+
+A guest, and a session part-way through a login, carry no `SessionTenant`,
+so they still get no device. Without a `TenantId` extension and without a
+tenant in the session the resolver returns `Ok(None)` and no device is ever
+issued, so a deployment that sees every device as `Unknown` should check
+this first.
 
 Applications with a stronger device signal (a long-lived hardware key,
 a mobile app's installation id, a device certificate) implement
@@ -412,24 +467,35 @@ up to the granularity, which the retention sweep's windows (days) absorb.
 
 `DeviceStore::record_sighting` returns the trust level the row had when the
 sighting was applied. `DeviceLifecycleService::promote_on_authn` reports that
-level, so a device revoked between its load and its sighting comes back as
-`Revoked`, with `last_seen_at` unchanged. `ensure_device` never reuses or
-touches a revoked device (a request that matches one gets a new `Unknown`
-device), and two first sightings of one fingerprint that race settle on one
-device: the one that sorts later removes itself.
+level, and `ensure_device` and `resolve_proven` act on it: a device revoked
+between its load and its sighting is never served (the request gets a new
+`Unknown` device) and its `last_seen_at` is unchanged. `ensure_device` never
+reuses or touches a revoked device, and two first sightings of one
+fingerprint that race end on one device: the create goes through
+`DeviceStore::create_or_find`, which inserts the new row only while no live
+device of the same tenant, fingerprint and owner exists and otherwise returns
+the one that does. The memory store serialises creates of one key on a
+per-key lock, SQLite runs the read and the insert in an immediate
+transaction, Postgres under a transaction-scoped advisory lock and MySQL
+under a named lock (`GET_LOCK`, released on every path). The trait's
+provided implementation, which the Valkey store uses, saves and re-reads
+and deletes its own row when another sorts first; it can leave a second
+row when both re-reads precede the other's write.
 
 For an identified user `ensure_device` looks for the caller's own device
 first, with `DeviceStore::find_by_fingerprint_for_user`, and only then at the
 newest device that carries the fingerprint, which may belong to another user
 (two people behind one office address with the same browser). The
 SQL stores answer it from the `idx_devices_user_fingerprint` index on
-`(tenant_id, user_id, fingerprint_hash, last_seen_at)`, so a user with
-any number of devices finds the right one. SQLite and Postgres create the
+`(tenant_id, user_id, fingerprint_hash, last_seen_at DESC, id ASC)`, so a user
+with any number of devices finds the right one (MySQL 8 reads the newest
+sighting from the descending key parts; MariaDB before 10.8 ignores the
+direction and sorts). SQLite and Postgres create the
 index in `init_schema`. A MySQL deployment created earlier adds it once:
 
 ```sql
 ALTER TABLE devices ADD INDEX idx_devices_user_fingerprint
-    (tenant_id, user_id, fingerprint_hash, last_seen_at);
+    (tenant_id, user_id, fingerprint_hash, last_seen_at DESC, id ASC);
 ```
 
 A store that does not override the method falls back to scanning the

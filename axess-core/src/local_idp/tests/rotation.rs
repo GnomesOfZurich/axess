@@ -389,3 +389,117 @@ fn generated_keys_get_distinct_kids() {
     let s = LocalIdpSigningKey::generate_rsa();
     assert_ne!(r.key_id(), s.key_id());
 }
+
+/// A store whose `retire` is durable but whose next `load_all` fails: the
+/// re-read a replica makes after it retires a key.
+#[derive(Clone)]
+struct ReloadFailsAfterRetire {
+    inner: MemoryLocalIdpKeyStore,
+    fail_loads: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("intentional load failure after retire")]
+struct ReloadFailure;
+
+impl LocalIdpKeyStore for ReloadFailsAfterRetire {
+    type Error = ReloadFailure;
+
+    async fn load_all(&self) -> Result<LoadedKeys, Self::Error> {
+        if self.fail_loads.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ReloadFailure);
+        }
+        self.inner.load_all().await.map_err(|_| ReloadFailure)
+    }
+
+    async fn rotate(&self, new_current: LocalIdpSigningKey) -> Result<(), Self::Error> {
+        self.inner
+            .rotate(new_current)
+            .await
+            .map_err(|_| ReloadFailure)
+    }
+
+    async fn retire(&self, key_id: &str) -> Result<bool, Self::Error> {
+        let removed = self.inner.retire(key_id).await.map_err(|_| ReloadFailure)?;
+        self.fail_loads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(removed)
+    }
+}
+
+/// The store retired the key, so the JWKS must not carry it whether or not
+/// the re-read that follows succeeds: a key the store no longer holds is
+/// never served from memory.
+#[tokio::test]
+async fn a_key_retired_in_the_store_leaves_the_jwks_even_when_the_reread_fails() {
+    let store = ReloadFailsAfterRetire {
+        inner: MemoryLocalIdpKeyStore::with_current(es("k1")),
+        fail_loads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let idp = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load");
+    idp.rotate_signing_key(es("k2")).await.expect("rotate");
+    assert_eq!(kids(&idp.jwks().await), vec!["k2", "k1"]);
+
+    let outcome = idp.retire_historical_key("k1").await;
+    assert!(
+        store
+            .inner
+            .load_all()
+            .await
+            .expect("store")
+            .historical
+            .is_empty(),
+        "the store retired the key"
+    );
+    assert_eq!(
+        kids(&idp.jwks().await),
+        vec!["k2"],
+        "a key the store retired is still served (outcome {outcome:?})"
+    );
+    assert!(
+        !idp.verifier_algorithms().await.is_empty(),
+        "the current key is still there"
+    );
+    assert!(
+        matches!(outcome, Ok(true)),
+        "the retirement is durable: {outcome:?}"
+    );
+}
+
+/// Two replicas over one store: the first rotates to a kid, the second,
+/// which has not reloaded, rotates to the same kid. The in-memory check on
+/// the second replica cannot see the first's key, so the store itself must
+/// refuse, or the JWKS carries two keys under one kid.
+#[tokio::test]
+async fn a_kid_another_replica_rotated_to_is_refused_by_the_store() {
+    let store = MemoryLocalIdpKeyStore::with_current(es("k1"));
+    let a = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load a");
+    let b = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load b");
+
+    a.rotate_signing_key(es("dup")).await.expect("a rotates");
+    let outcome = b.rotate_signing_key(es("dup")).await;
+    assert!(
+        outcome.is_err(),
+        "a kid the store already holds must be refused: {outcome:?}"
+    );
+    let loaded = store.load_all().await.expect("store");
+    let mut all: Vec<&str> = std::iter::once(loaded.current.key_id())
+        .chain(loaded.historical.iter().map(|k| k.key_id()))
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    assert_eq!(all, vec!["dup", "k1"], "one key per kid in the store");
+    assert_eq!(kids(&b.jwks().await), vec!["k1"], "b is unchanged");
+    b.reload().await.expect("reload");
+    assert_eq!(
+        kids(&b.jwks().await),
+        vec!["dup", "k1"],
+        "one key under the kid once b has caught up"
+    );
+}

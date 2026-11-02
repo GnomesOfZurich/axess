@@ -258,3 +258,30 @@ async fn the_remaining_header_is_sent_only_for_a_callers_own_bucket() {
         Some("9".to_owned())
     );
 }
+
+/// An address whose group is at its bucket cap draws on the group's shared
+/// overflow bucket, so its answer carries no remaining count: that count
+/// would say how much the other folded callers have used.
+#[tokio::test]
+async fn an_address_folded_into_the_overflow_bucket_gets_no_remaining_header() {
+    let mut svc = make_service(10, Duration::from_secs(60));
+    svc.store = test_store(10, Duration::from_secs(60)).with_caps(100, 2);
+    assert_eq!(
+        remaining_header(svc.clone(), make_request_with_ip("10.0.0.1")).await,
+        Some("9".to_owned())
+    );
+    assert_eq!(
+        remaining_header(svc.clone(), make_request_with_ip("10.0.0.2")).await,
+        Some("9".to_owned())
+    );
+    assert_eq!(
+        remaining_header(svc.clone(), make_request_with_ip("10.0.0.3")).await,
+        None,
+        "the third address of the /24 folds into the shared overflow bucket"
+    );
+    assert_eq!(
+        remaining_header(svc, make_request_with_ip("10.0.0.4")).await,
+        None,
+        "and so does the fourth, which shares that bucket with the third"
+    );
+}

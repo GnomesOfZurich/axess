@@ -11,7 +11,8 @@ use axess_core::{
         MockClock,
         mock_authn::{MockFactorStore, MockIdentityStore},
         oauth_wiremock::{
-            oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints, oauth_setup_provider,
+            oauth_discover_provider, oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
+            oauth_setup_provider,
         },
         test_session,
     },
@@ -103,9 +104,11 @@ async fn oauth_ceremony_capped_at_rfc_600s_even_when_provider_overrides() {
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     // Provider advertises a 30-min ceremony_timeout. The AS would happily
     // honour it; the axess-side cap clamps the *axess* expiry check at 600 s.
-    let provider = oauth_setup_provider(&server)
+    let provider = oauth_discover_provider(&server)
         .await
-        .with_ceremony_timeout(std::time::Duration::from_secs(1800));
+        .with_ceremony_timeout(std::time::Duration::from_secs(1800))
+        .build()
+        .expect("build");
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let clock = MockClock::now();
@@ -180,7 +183,7 @@ async fn mock_oauth_provider_returns_configured_user() {
         .with_audit_context(AuditContext::default());
 
     let claims = authn
-        .refresh_oauth_token("mock-idp", "any-refresh-token", "user-42", None)
+        .refresh_oauth_token("mock-idp", "any-refresh-token", "user-42", None, None)
         .await
         .expect("mock refresh should succeed")
         .id_token_claims
@@ -211,7 +214,7 @@ async fn mock_oauth_provider_simulates_failure() {
         .with_audit_context(AuditContext::default());
 
     let result = authn
-        .refresh_oauth_token("failing-idp", "some-token", "user-1", None)
+        .refresh_oauth_token("failing-idp", "some-token", "user-1", None, None)
         .await;
     assert!(result.is_err());
 

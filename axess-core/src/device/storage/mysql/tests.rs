@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::authn::ids::testing;
+use crate::device::storage::mysql::statements::MysqlSql;
 use crate::device::storage::sql_common::FAMILY_INSERT_CHUNK;
+use crate::device::storage::sql_common::ops::DeviceSql;
 use crate::device::store::consistency::{self as shared, at, dev_id, device, tenant, user};
 use crate::device::store::sql_contract as contract;
 use crate::testing::sql_live;
@@ -46,6 +48,7 @@ async fn shared_contract() {
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(store(4).await).await;
+    shared::sub_second_instants_compare_as_whole_seconds(store(4).await).await;
     shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
     shared::a_sighting_reports_the_level_it_found(store(4).await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store(4).await).await;
@@ -240,7 +243,7 @@ async fn the_family_index_insert_is_idempotent() {
     let d = device("idem", 1, DeviceTrustLevel::Seen, at(10));
     store.save(&d, at(10)).await.unwrap();
     let mut tx = store.pool.begin().await.unwrap();
-    rewrite_family_index(
+    MysqlSql::rewrite_family_index(
         &mut tx,
         &tenant().to_string(),
         &d.id.to_string(),
@@ -304,3 +307,91 @@ async fn a_save_racing_a_revocation_leaves_the_family_index_matching_the_row() {
         }
     }
 }
+
+/// Each lookup ordered `last_seen_at DESC, id ASC` reads its index in that
+/// order: the plan names the index and holds no sort, in the tabular `EXPLAIN`
+/// (no `Using filesort`) and in the tree (no `Sort:` step). The table holds
+/// 6000 rows (three tenants, 200 owners of ten devices each per tenant, each
+/// fingerprint on four devices), enough that the optimizer reads an index
+/// rather than the table. The queries are the ones the store issues, with the
+/// same parameters bound.
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn the_sighting_lookups_read_their_index_without_a_sort() {
+    use sqlx::Row as _;
+
+    // One connection: the recursion limit below is a session setting.
+    let store = store(1).await;
+    sqlx::query("SET SESSION cte_max_recursion_depth = 10000")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO devices (tenant_id, id, user_id, trust_level, fingerprint_hash, \
+                              first_seen_at, last_seen_at, bindings) \
+         WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 5999) \
+         SELECT CONCAT('tenant-', i % 3), CONCAT('dev-', LPAD(i, 6, '0')), \
+                CONCAT('user-', (i DIV 3) % 200), ELT(1 + i % 3, 'Seen', 'Trusted', 'Revoked'), \
+                UNHEX(SHA2(CONCAT('fp-', (i DIV 3) % 500), 256)), \
+                1700000000 + i, 1700000000 + ((i * 7919) % 100000), '[]' \
+         FROM n",
+    )
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE TABLE devices")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM devices")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 6000);
+    let fingerprint: Vec<u8> = sqlx::query_scalar(
+        "SELECT fingerprint_hash FROM devices WHERE tenant_id = 'tenant-1' AND id = 'dev-000022'",
+    )
+    .fetch_one(&store.pool)
+    .await
+    .unwrap();
+    let owner = "user-7";
+
+    for (query, index) in [
+        (FIND_BY_FINGERPRINT, "idx_devices_fingerprint_seen"),
+        (FIND_BY_FINGERPRINT_FOR_USER, "idx_devices_user_fingerprint"),
+        (FIND_FOR_USER, "idx_devices_user"),
+    ] {
+        let explain = |format: &str| {
+            let sql = format!("EXPLAIN {format}{query}");
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind("tenant-1");
+            if query != FIND_BY_FINGERPRINT {
+                q = q.bind(owner);
+            }
+            if query == FIND_FOR_USER {
+                q = q.bind(10_i64);
+            } else {
+                q = q.bind(fingerprint.clone());
+            }
+            q.fetch_all(&store.pool)
+        };
+
+        let table = explain("").await.unwrap();
+        assert_eq!(table.len(), 1, "{index}: one table, one row");
+        let key: Option<String> = table[0].try_get("key").unwrap();
+        let extra: Option<String> = table[0].try_get("Extra").unwrap();
+        assert_eq!(key.as_deref(), Some(index), "{query}: extra {extra:?}");
+        assert!(
+            !extra.as_deref().unwrap_or("").contains("filesort"),
+            "{index}: {extra:?}"
+        );
+
+        let tree: String = explain("FORMAT=TREE ").await.unwrap()[0]
+            .try_get(0)
+            .unwrap();
+        assert!(tree.contains(&format!("using {index} ")), "{tree}");
+        assert!(!tree.contains("Sort"), "{index} sorts:\n{tree}");
+    }
+}
+
+mod reseal;
+mod schema;

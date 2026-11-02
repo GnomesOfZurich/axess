@@ -100,6 +100,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let store = session_store.clone();
         async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            // A stall makes ticks late; Delay runs one cleanup then, not one
+            // per missed tick.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await; // first tick completes immediately; skip it
             loop {
                 interval.tick().await;

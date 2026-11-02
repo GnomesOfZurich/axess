@@ -7,7 +7,8 @@
 //! back to the runtime. The inner store sees only opaque ciphertext
 //! envelopes in those string fields; the non-secret metadata
 //! (`provider`, `expires_at`, `scopes`, `token_type`) passes through
-//! unchanged so adopters can still run operational queries over it.
+//! in clear so adopters can still run operational queries over it, and
+//! is authenticated by the envelopes so a rewrite of it is noticed.
 //!
 //! # Threat model
 //!
@@ -31,16 +32,21 @@
 //! Each encrypted string is encoded as
 //!
 //! ```text
-//! v2.{key_id}.{base64url-no-pad(nonce ‖ ciphertext‖tag)}
+//! v3.{key_id}.{base64url-no-pad(nonce ‖ ciphertext‖tag)}
 //! ```
 //!
-//! - `v2`: format version. New versions get a new tag and explicit
-//!   decode dispatch; the decoder rejects unknown versions. `v1` (whose
-//!   AAD lacks `scopes` and `token_type`) is still read; every save
-//!   writes `v2`. In `v2` the AAD also covers the row's `scopes` and
-//!   `token_type`, so a store that rewrites those metadata fields
-//!   (widening the granted scopes, say) fails authentication on load
-//!   instead of changing what the runtime believes it holds.
+//! - `v3`: format version. New versions get a new tag and explicit
+//!   decode dispatch; the decoder rejects unknown versions. Every save
+//!   writes `v3`, whose AAD covers the row's `scopes`, `token_type` and
+//!   `expires_at` (eight big-endian bytes of Unix seconds, or an empty
+//!   value for `None`) as well as the identity fields, so a store that
+//!   rewrites any of that metadata (widening the granted scopes, or
+//!   moving the expiry so a stale token looks fresh and is never
+//!   refreshed) fails authentication on load instead of changing what
+//!   the runtime believes it holds. `v2` (whose AAD lacks `expires_at`)
+//!   is still read and re-sealed as `v3` by the read that found it; `v1`
+//!   (whose AAD also lacks `scopes` and `token_type`) is read only under
+//!   the legacy policy below.
 //! - `key_id`: opaque adopter-chosen identifier (e.g. `"2026-05"`,
 //!   a KMS key ARN, an HSM label). Must not contain `.`; the
 //!   [`KeyProvider`] is responsible for storing and resolving the
@@ -54,7 +60,8 @@
 //! `key_id` (read during decrypt). Rotation is therefore lazy: rows
 //! re-encrypt under the new key whenever they're saved (each refresh
 //! cycle, every `complete_grant`), and a row read under a retired key or in
-//! the `v1` format is re-sealed by the read that found it. That rewrite is a
+//! an older format (a `v2` row, or a `v1` row inside the legacy window) is
+//! re-sealed by the read that found it. That rewrite is a
 //! compare-and-swap ([`DelegatedCredentialStore::save_if_unchanged`]), so it
 //! cannot overwrite a refresh token another request rotated in between; a
 //! store that does not implement the swap is left as it is.
@@ -64,12 +71,16 @@
 //! # Envelopes from before scope binding
 //!
 //! `v1` envelopes authenticate no `scopes` or `token_type`, so a store that
-//! rewrites those fields is not noticed. They are read by default and
-//! re-sealed as `v2` on load.
+//! rewrites those fields is not noticed. They are refused by default: the
+//! policy is [`LegacyBlobs::Reject`], and a `v1` row then reads as a
+//! decryption failure (`a v1 envelope is refused`), which fails the load
+//! without exposing anything. A deployment upgrading from a release that
+//! wrote `v1` opens a migration window with
 //! [`with_legacy_envelopes`](EncryptedDelegatedCredentialStore::with_legacy_envelopes)
-//! takes the same [`LegacyBlobs`] choice as the session crypto: set
-//! [`Reject`](LegacyBlobs::Reject) once the rows have been re-sealed, and a
-//! `v1` row then reads as a decryption failure.
+//! and [`LegacyBlobs::AcceptUntil`]`(cutoff)`, the same choice the session
+//! crypto takes: inside the window a `v1` row is read and re-sealed in the
+//! current format by the read that found it. Drop back to `Reject` once
+//! the rows have been re-sealed, or let the cutoff pass.
 //!
 //! # Usage bound
 //!
@@ -91,17 +102,10 @@
 //!   from (env var, file, KMS, HSM); that's the [`KeyProvider`]
 //!   impl's job. A poor key custody story defeats the whole feature.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, Payload},
-};
 use axess_identity::{TenantId, UserId};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::delegated::stored::credential::{
     CredentialSwap, DelegatedCredentialStore, StoredDelegation,
@@ -111,171 +115,25 @@ use axess_clock::{Clock, SystemClock};
 use axess_factors::ZeroizedString;
 use axess_rng::SecureRng;
 
-/// Version written by this release. `v2` binds the row's `scopes` and
-/// `token_type` into the AAD as well; `v1` rows are still read.
-const ENVELOPE_VERSION: &str = "v2";
+mod envelope;
+mod keys;
+
+pub use keys::{CurrentKey, EncryptionKey, KeyProvider, KeyProviderError, MemoryKeyProvider};
+
+use envelope::{
+    EnvelopeError, Opened, build_aad, build_aad_v2, build_aad_v3, encrypt_envelope, open_envelope,
+};
+
+/// Version written by this release. `v3` binds the row's `expires_at` into
+/// the AAD as well as its `scopes` and `token_type`; `v2` rows (no expiry
+/// bound) are read and re-sealed on load, `v1` rows follow [`LegacyBlobs`].
+const ENVELOPE_VERSION: &str = "v3";
+const SCOPED_ENVELOPE_VERSION: &str = "v2";
 const LEGACY_ENVELOPE_VERSION: &str = "v1";
 const NONCE_LEN: usize = 12;
 const FIELD_ACCESS: &[u8] = b"access_token";
 const FIELD_REFRESH: &[u8] = b"refresh_token";
 const AAD_SEP: u8 = 0x1f; // ASCII unit separator
-
-// ── EncryptionKey ────────────────────────────────────────────────────────────
-
-/// A 32-byte AES-256 key. Held inside an `Arc` by [`KeyProvider`]
-/// implementations so cloning the key handle is cheap; the underlying
-/// bytes are zeroized when the last `Arc` drops.
-pub struct EncryptionKey([u8; 32]);
-
-impl EncryptionKey {
-    /// Construct from a 32-byte slice.
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    fn as_array(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl Drop for EncryptionKey {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.0);
-    }
-}
-
-impl core::fmt::Debug for EncryptionKey {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("EncryptionKey(***)")
-    }
-}
-
-// ── KeyProvider ──────────────────────────────────────────────────────────────
-
-/// Resolves encryption keys for the [`EncryptedDelegatedCredentialStore`].
-///
-/// Two access patterns:
-///
-/// - [`current`](Self::current): supplies the key used to encrypt
-///   *new* writes. Called once per save.
-/// - [`resolve`](Self::resolve): looks up a historical key by its
-///   id, used when decrypting an envelope that was written under a
-///   prior key.
-///
-/// Lazy rotation: rows re-encrypt under the new current key whenever
-/// they're saved. To force rotation across the whole dataset,
-/// adopters can run a maintenance pass that loads then saves each
-/// row.
-///
-/// Implementors must keep historical keys available for as long as
-/// any envelope encrypted under them is still in the store.
-pub trait KeyProvider: Send + Sync + 'static {
-    /// Key used for new encryptions. Returns the `(key_id, key)` pair
-    /// embedded in the resulting envelope.
-    fn current(&self) -> Result<CurrentKey, KeyProviderError>;
-
-    /// Resolve a historical `key_id` to its key material.
-    ///
-    /// `Ok(None)` means "this id is not known to me" and surfaces as
-    /// a decrypt failure. `Err(_)` is reserved for provider-level
-    /// failures (KMS unreachable, etc.) so adopters can distinguish
-    /// "unknown id" from "transient infrastructure failure".
-    fn resolve(&self, key_id: &str) -> Result<Option<Arc<EncryptionKey>>, KeyProviderError>;
-}
-
-/// Pair returned by [`KeyProvider::current`].
-#[derive(Clone)]
-pub struct CurrentKey {
-    /// Opaque identifier embedded in the envelope so future loads
-    /// can route back to the right key. Must not contain `.`
-    /// (envelope-format delimiter).
-    pub key_id: Arc<str>,
-    /// Key material.
-    pub key: Arc<EncryptionKey>,
-}
-
-/// Error from a [`KeyProvider`] operation.
-#[derive(Debug, thiserror::Error)]
-pub enum KeyProviderError {
-    /// Underlying key-resolution failed (e.g. KMS error, missing
-    /// environment variable).
-    #[error("key provider failed: {0}")]
-    Failed(String),
-    /// `key_id` contains a `.`, which would collide with the envelope
-    /// delimiter.
-    #[error("key id contains '.', which is reserved by the envelope format: {0:?}")]
-    InvalidKeyId(String),
-}
-
-// ── MemoryKeyProvider ────────────────────────────────────────────────────────
-
-/// In-memory [`KeyProvider`] for dev, test, and small single-node
-/// deployments where keys are loaded from configuration at startup.
-///
-/// Holds one current key plus zero or more historical keys for
-/// rotation. **Key material is not encrypted at rest in this
-/// provider**; it lives in process memory in plaintext (zeroized on
-/// drop via [`EncryptionKey`]). Production deployments at scale
-/// should plug in a KMS / HSM-backed provider instead.
-#[derive(Clone, Debug)]
-pub struct MemoryKeyProvider {
-    current_id: Arc<str>,
-    current_key: Arc<EncryptionKey>,
-    historical: HashMap<String, Arc<EncryptionKey>>,
-}
-
-impl MemoryKeyProvider {
-    /// Construct with a current `(key_id, key)`. Returns an error if
-    /// `key_id` contains the envelope delimiter `.`.
-    pub fn new(key_id: impl Into<String>, key: [u8; 32]) -> Result<Self, KeyProviderError> {
-        let id = key_id.into();
-        validate_key_id(&id)?;
-        Ok(Self {
-            current_id: Arc::from(id),
-            current_key: Arc::new(EncryptionKey::from_bytes(key)),
-            historical: HashMap::new(),
-        })
-    }
-
-    /// Register an additional historical key. Calls to
-    /// [`KeyProvider::resolve`] for `key_id` will return this key,
-    /// allowing decrypt of envelopes written before rotation.
-    /// Returns an error if `key_id` contains `.`.
-    pub fn with_historical(
-        mut self,
-        key_id: impl Into<String>,
-        key: [u8; 32],
-    ) -> Result<Self, KeyProviderError> {
-        let id = key_id.into();
-        validate_key_id(&id)?;
-        self.historical
-            .insert(id, Arc::new(EncryptionKey::from_bytes(key)));
-        Ok(self)
-    }
-}
-
-impl KeyProvider for MemoryKeyProvider {
-    fn current(&self) -> Result<CurrentKey, KeyProviderError> {
-        Ok(CurrentKey {
-            key_id: self.current_id.clone(),
-            key: self.current_key.clone(),
-        })
-    }
-
-    fn resolve(&self, key_id: &str) -> Result<Option<Arc<EncryptionKey>>, KeyProviderError> {
-        if key_id == &*self.current_id {
-            return Ok(Some(self.current_key.clone()));
-        }
-        Ok(self.historical.get(key_id).cloned())
-    }
-}
-
-fn validate_key_id(id: &str) -> Result<(), KeyProviderError> {
-    if id.is_empty() || id.contains('.') {
-        return Err(KeyProviderError::InvalidKeyId(id.to_string()));
-    }
-    Ok(())
-}
 
 // ── EncryptedDelegatedCredentialStore ────────────────────────────────────────
 
@@ -293,7 +151,10 @@ fn validate_key_id(id: &str) -> Result<(), KeyProviderError> {
 /// };
 /// use axess::delegated::stored::MemoryDelegatedCredentialStore;
 ///
-/// let keys = MemoryKeyProvider::new("2026-05", [0u8; 32])?;
+/// // 32 random bytes from your secret store; a placeholder such as
+/// // `[0u8; 32]` is refused with `KeyProviderError::WeakKey`.
+/// let key: [u8; 32] = load_delegation_key()?;
+/// let keys = MemoryKeyProvider::new("2026-05", key)?;
 /// let inner = MemoryDelegatedCredentialStore::new();
 /// let store = EncryptedDelegatedCredentialStore::new(inner, keys);
 /// ```
@@ -339,9 +200,12 @@ where
         self.seals.load(Ordering::Relaxed)
     }
 
-    /// Leave a row as it is when it is read under a retired key or in the
-    /// `v1` format. By default such a row is re-sealed by the read that found
-    /// it, through [`DelegatedCredentialStore::save_if_unchanged`].
+    /// Leave a row as it is when it is read under a retired key or in an
+    /// older format. By default such a row is re-sealed by the read that
+    /// found it, through [`DelegatedCredentialStore::save_if_unchanged`].
+    /// The re-seal needs [`KeyProvider::current`]; when that fails the load
+    /// is still served under the key the row names, the failure is logged
+    /// and the re-seal is left to a later load.
     pub fn without_reseal_on_load(mut self) -> Self {
         self.reseal_on_load = false;
         self
@@ -415,14 +279,29 @@ where
         self.seals
             .fetch_add(1 + u64::from(refresh_token.is_some()), Ordering::Relaxed);
 
-        let aad_access = build_aad_v2(&provider, tenant, user, FIELD_ACCESS, &scopes, &token_type);
+        let aad_access = build_aad_v3(
+            &provider,
+            tenant,
+            user,
+            FIELD_ACCESS,
+            &scopes,
+            &token_type,
+            expires_at,
+        );
         let access_env = encrypt_envelope(&current, &*self.rng, &access_token, &aad_access)
             .map_err(|e| format!("encrypt access_token: {e}"))?;
 
         let refresh_env = match refresh_token.as_deref() {
             Some(rt) => {
-                let aad_refresh =
-                    build_aad_v2(&provider, tenant, user, FIELD_REFRESH, &scopes, &token_type);
+                let aad_refresh = build_aad_v3(
+                    &provider,
+                    tenant,
+                    user,
+                    FIELD_REFRESH,
+                    &scopes,
+                    &token_type,
+                    expires_at,
+                );
                 Some(ZeroizedString::from(
                     encrypt_envelope(&current, &*self.rng, rt, &aad_refresh)
                         .map_err(|e| format!("encrypt refresh_token: {e}"))?,
@@ -490,10 +369,21 @@ where
             return Ok(None);
         };
 
-        let current_id = if self.reseal_on_load {
-            Some(self.keys.current().map_err(|e| e.to_string())?.key_id)
-        } else {
-            None
+        // The row is opened under the key it names; the current key is
+        // wanted only to tell whether the row is due a re-seal. A provider
+        // that cannot name one (a KMS that answers reads and refuses the
+        // write-key call) still serves the load; the re-seal waits.
+        let current_id = match self.reseal_on_load.then(|| self.keys.current()) {
+            Some(Ok(current)) => Some(current.key_id),
+            Some(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "delegated credential load: no current key; read under the stored key, \
+                     re-seal skipped"
+                );
+                None
+            }
+            None => None,
         };
         let mut stale = false;
 
@@ -550,66 +440,6 @@ where
     }
 }
 
-// ── AAD ──────────────────────────────────────────────────────────────────────
-
-fn build_aad(provider: &str, tenant: &TenantId, user: &UserId, field: &[u8]) -> Vec<u8> {
-    let provider_bytes = provider.as_bytes();
-    let tenant_bytes = tenant.as_bytes();
-    let user_bytes = user.as_bytes();
-    let mut buf = Vec::with_capacity(provider_bytes.len() + 16 + 16 + field.len() + 3);
-    buf.extend_from_slice(provider_bytes);
-    buf.push(AAD_SEP);
-    buf.extend_from_slice(tenant_bytes);
-    buf.push(AAD_SEP);
-    buf.extend_from_slice(user_bytes);
-    buf.push(AAD_SEP);
-    buf.extend_from_slice(field);
-    buf
-}
-
-/// `v2` AAD: the `v1` fields, then the token type and the scope set, each
-/// length-prefixed so no value can bleed into its neighbour. Scopes are
-/// sorted and de-duplicated so a store that reorders a set does not break
-/// authentication; changing the set does.
-fn build_aad_v2(
-    provider: &str,
-    tenant: &TenantId,
-    user: &UserId,
-    field: &[u8],
-    scopes: &[String],
-    token_type: &str,
-) -> Vec<u8> {
-    fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
-        buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        buf.extend_from_slice(bytes);
-    }
-    let mut buf = build_aad(provider, tenant, user, field);
-    buf.push(AAD_SEP);
-    put(&mut buf, b"v2");
-    put(&mut buf, token_type.as_bytes());
-    let mut sorted: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    buf.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
-    for scope in sorted {
-        put(&mut buf, scope.as_bytes());
-    }
-    buf
-}
-
-/// One decrypted field and what it was sealed under.
-struct Opened {
-    plain: String,
-    version: String,
-    key_id: String,
-}
-
-impl Opened {
-    fn is_stale(&self, current_key_id: Option<&str>) -> bool {
-        current_key_id.is_some_and(|c| self.version != ENVELOPE_VERSION || self.key_id != c)
-    }
-}
-
 impl<S, K> EncryptedDelegatedCredentialStore<S, K>
 where
     S: DelegatedCredentialStore,
@@ -628,7 +458,16 @@ where
             return Err(EnvelopeError::LegacyRefused);
         }
         let aad_for = |version: &str| match version {
-            ENVELOPE_VERSION => Some(build_aad_v2(
+            ENVELOPE_VERSION => Some(build_aad_v3(
+                provider,
+                tenant,
+                user,
+                field,
+                &row.scopes,
+                &row.token_type,
+                row.expires_at,
+            )),
+            SCOPED_ENVELOPE_VERSION => Some(build_aad_v2(
                 provider,
                 tenant,
                 user,
@@ -643,122 +482,10 @@ where
     }
 }
 
-// ── Envelope codec ───────────────────────────────────────────────────────────
-
-#[derive(Debug, thiserror::Error)]
-enum EnvelopeError {
-    #[error("malformed envelope: {0}")]
-    Malformed(&'static str),
-    #[error("unknown envelope version {0:?}; store written by a newer axess?")]
-    UnknownVersion(String),
-    #[error("a v1 envelope is refused (legacy envelopes are rejected)")]
-    LegacyRefused,
-    #[error("unknown key id {0:?}")]
-    UnknownKeyId(String),
-    #[error("key provider error: {0}")]
-    KeyProvider(#[from] KeyProviderError),
-    #[error("decryption failed (wrong key, corrupted ciphertext, or AAD mismatch)")]
-    Decrypt,
-    #[error("base64 decode failed")]
-    Base64,
-    #[error("encryption failed")]
-    Encrypt,
-}
-
-fn encrypt_envelope(
-    current: &CurrentKey,
-    rng: &dyn SecureRng,
-    plaintext: &str,
-    aad: &[u8],
-) -> Result<String, EnvelopeError> {
-    let cipher =
-        Aes256Gcm::new_from_slice(current.key.as_array()).map_err(|_| EnvelopeError::Encrypt)?;
-
-    let mut nonce_bytes = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| EnvelopeError::Encrypt)?;
-
-    let ct = cipher
-        .encrypt(
-            &nonce,
-            Payload {
-                msg: plaintext.as_bytes(),
-                aad,
-            },
-        )
-        .map_err(|_| EnvelopeError::Encrypt)?;
-
-    let mut body = Vec::with_capacity(NONCE_LEN + ct.len());
-    body.extend_from_slice(&nonce_bytes);
-    body.extend_from_slice(&ct);
-
-    let b64 = URL_SAFE_NO_PAD.encode(&body);
-    Ok(format!("{ENVELOPE_VERSION}.{}.{}", &*current.key_id, b64))
-}
-
-/// Open a `v1` envelope under the given AAD. Kept as the narrow entry the
-/// codec tests drive; the store reads through [`open_envelope`].
+/// A non-constant 32-byte key for tests, distinct per `seed`.
 #[cfg(test)]
-fn decrypt_envelope<K: KeyProvider>(
-    keys: &K,
-    envelope: &str,
-    aad: &[u8],
-) -> Result<String, EnvelopeError> {
-    let aad_for = |version: &str| (version == LEGACY_ENVELOPE_VERSION).then(|| aad.to_vec());
-    open_envelope(keys, envelope, &aad_for).map(|o| o.plain)
-}
-
-fn open_envelope<K: KeyProvider>(
-    keys: &K,
-    envelope: &str,
-    aad_for_version: &dyn Fn(&str) -> Option<Vec<u8>>,
-) -> Result<Opened, EnvelopeError> {
-    // Strictly three parts: version, key_id, body. key_id is
-    // adopter-chosen but we forbid `.` at construction, so two splits
-    // from the left is sufficient.
-    let mut parts = envelope.splitn(3, '.');
-    let version = parts.next().ok_or(EnvelopeError::Malformed("no version"))?;
-    let key_id = parts.next().ok_or(EnvelopeError::Malformed("no key id"))?;
-    let body_b64 = parts.next().ok_or(EnvelopeError::Malformed("no body"))?;
-
-    let aad = aad_for_version(version)
-        .ok_or_else(|| EnvelopeError::UnknownVersion(version.to_string()))?;
-    if key_id.is_empty() {
-        return Err(EnvelopeError::Malformed("empty key id"));
-    }
-
-    let body = URL_SAFE_NO_PAD
-        .decode(body_b64)
-        .map_err(|_| EnvelopeError::Base64)?;
-    if body.len() <= NONCE_LEN {
-        return Err(EnvelopeError::Malformed("body shorter than nonce"));
-    }
-    let (nonce_bytes, ciphertext) = body.split_at(NONCE_LEN);
-
-    let key = keys
-        .resolve(key_id)?
-        .ok_or_else(|| EnvelopeError::UnknownKeyId(key_id.to_string()))?;
-
-    let cipher = Aes256Gcm::new_from_slice(key.as_array()).map_err(|_| EnvelopeError::Decrypt)?;
-    let nonce = Nonce::try_from(nonce_bytes).map_err(|_| EnvelopeError::Decrypt)?;
-
-    let plaintext = cipher
-        .decrypt(
-            &nonce,
-            Payload {
-                msg: ciphertext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| EnvelopeError::Decrypt)?;
-
-    let plain = String::from_utf8(plaintext)
-        .map_err(|_| EnvelopeError::Malformed("plaintext not utf-8"))?;
-    Ok(Opened {
-        plain,
-        version: version.to_string(),
-        key_id: key_id.to_string(),
-    })
+fn test_key(seed: u8) -> [u8; 32] {
+    std::array::from_fn(|i| seed.wrapping_add(i as u8))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

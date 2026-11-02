@@ -346,6 +346,7 @@ pub fn make_password_service(
     let pw_config = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(axess_factors::generate_password_hash(password)),
         rules: PasswordRules::default(),
+        password_id: None,
     });
 
     let user_id = user.id;

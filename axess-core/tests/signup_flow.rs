@@ -112,7 +112,10 @@ async fn begin_signup_active_user_returns_already_exists() {
         .with_tenant(test_tenant())
         .with_user(active_user);
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_signup_conflicts_revealed()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u2", "alice@example.com");
@@ -136,7 +139,10 @@ async fn begin_signup_orphan_candidate_is_not_handed_to_a_stranger() {
         .with_tenant(test_tenant())
         .with_user(candidate_user("u1", "alice@example.com"));
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .with_signup_conflicts_revealed()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let user = candidate_user("u2", "alice@example.com");

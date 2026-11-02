@@ -42,7 +42,7 @@ pub use config::{SameSite, SessionConfig, SessionConfigBuilder};
     feature = "delegated-stored-encrypted"
 ))]
 pub use crypto::{CryptoError, SessionCrypto};
-pub use data::{AuthState, SessionData, WorkflowKind, WorkflowState};
+pub use data::{AuthState, Impersonation, SessionData, WorkflowKind, WorkflowState};
 pub use extractor::{AuthSession, SessionMissing};
 pub use id::SessionId;
 pub use layer::{SessionLayer, UnknownLiveness};

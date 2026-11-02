@@ -23,5 +23,7 @@ mod jwks_refresh;
 pub(crate) use jwks_refresh::JwksRefreshTask;
 mod login;
 mod refresh;
+mod scoped;
+pub use scoped::ScopedOAuth;
 mod tokens;
 mod userinfo;

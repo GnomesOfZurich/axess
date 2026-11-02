@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::session::data::SessionData;
-use crate::session::layer::handle::SessionInner;
-use crate::session::store::MemorySessionStore;
+use crate::session::layer::handle::{SessionHandle, SessionInner};
+use crate::session::store::{CycleOutcome, MemorySessionStore};
 use crate::testing::mock_random::MockRng;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

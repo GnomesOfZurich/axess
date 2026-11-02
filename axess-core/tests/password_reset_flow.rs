@@ -13,6 +13,7 @@
 
 mod common;
 
+use axess_core::authn::event::{AuthEventStatus, AuthEventType};
 use axess_core::authn::store::IdentityPasswordHistory;
 use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::{
@@ -108,6 +109,43 @@ async fn begin_password_reset_inactive_tenant_returns_none() {
 /// line-74 match guard `u.validate().is_ok()` to `true` (which would
 /// continue with a Some) and to `false` (which would always force None
 /// even for valid users; paired with the happy-path test above).
+/// A suspended account is answered like an unknown identifier: no token.
+/// It used to be issued one, which `complete_password_reset` then refused,
+/// so the mail went out for nothing.
+#[tokio::test]
+async fn begin_password_reset_suspended_account_returns_none() {
+    let mut suspended = fixture_user("u1", "alice", "t1");
+    suspended.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: Utc::now(),
+        until: None,
+    });
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(suspended);
+    let inspector = identity.clone();
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+
+    let token = svc
+        .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
+        .await
+        .unwrap();
+
+    assert!(
+        token.is_none(),
+        "a suspended account gets no token, got {token:?}"
+    );
+    let rows: Vec<_> = inspector
+        .events()
+        .into_iter()
+        .filter(|e| e.event_type == AuthEventType::PasswordResetRequested)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].event_status, AuthEventStatus::Failure);
+    assert_eq!(rows[0].user_id, Some(uid("u1")));
+}
+
 #[tokio::test]
 async fn begin_password_reset_unknown_user_returns_none() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
@@ -362,6 +400,68 @@ async fn password_history_records_each_hash_once() {
     assert_eq!(history.len(), 3, "one entry per password: {history:?}");
 }
 
+/// A reset refused after the token check (here: the new password is the
+/// current one, on an account with no history yet) writes no history row:
+/// the replaced hash is recorded only when the new password is installed.
+/// The current password still counts as a reuse.
+#[tokio::test]
+async fn a_refused_reset_writes_no_password_history() {
+    use axess_core::authn::factor::{FactorConfig, PasswordConfig, PasswordRules};
+    use axess_core::authn::types::AuthnScope;
+
+    let user = fixture_user("u1", "alice", "t1");
+    let current = "Current-password-1";
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(user.clone())
+        .with_password_rules(
+            &user.tenant_id,
+            PasswordRules {
+                history_count: 5,
+                ..PasswordRules::default()
+            },
+        );
+    let factors = MockFactorStore::new().with_factor(
+        AuthnScope::User {
+            tenant_id: user.tenant_id,
+            user_id: user.id,
+        },
+        FactorConfig::Password(PasswordConfig {
+            hash: axess_core::authn::factor::ZeroizedString::new(
+                axess_factors::generate_password_hash(current),
+            ),
+            rules: PasswordRules::default(),
+            password_id: None,
+        }),
+    );
+    let inspector = identity.clone();
+    let svc = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    assert!(
+        inspector
+            .password_history(&user.id, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the account starts with no history"
+    );
+    let token = svc
+        .begin_password_reset("alice", "default", std::time::Duration::from_secs(300))
+        .await
+        .unwrap()
+        .expect("token");
+
+    let result = svc
+        .complete_password_reset(&user.id, &token, current)
+        .await
+        .unwrap();
+    assert!(!result, "the current password is a reuse");
+    let history = inspector.password_history(&user.id, 10).await.unwrap();
+    assert!(
+        history.is_empty(),
+        "a refused reset wrote history: {history:?}"
+    );
+}
+
 // ── the tenant's password rules ────────────────────────────────────────
 
 /// A password the tenant's rules refuse never replaces the old one, and it
@@ -394,6 +494,7 @@ async fn a_reset_to_a_password_that_breaks_the_rules_is_refused_and_keeps_the_ol
         FactorConfig::Password(PasswordConfig {
             hash: ZeroizedString::new(axess_factors::generate_password_hash(old_password)),
             rules,
+            password_id: None,
         }),
     );
     let inspector = factors.clone();

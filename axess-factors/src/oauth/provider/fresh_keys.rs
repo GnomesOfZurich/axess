@@ -15,12 +15,17 @@ const ID_TOKEN_KID: &str = "(ID token header)";
 
 /// Map a claims verification failure: a signing key missing from the key set
 /// is [`OAuthError::UnknownKid`], which callers answer by refreshing; anything
-/// else is a validation failure.
+/// else is a validation failure. A signature failure keeps its reason (an
+/// algorithm outside the allowed list, a bad signature): the outer error
+/// alone reads only "Signature verification failed".
 pub(super) fn claims_error(e: ClaimsVerificationError) -> OAuthError {
     match e {
         ClaimsVerificationError::SignatureVerification(
             SignatureVerificationError::NoMatchingKey,
         ) => OAuthError::UnknownKid(ID_TOKEN_KID.to_string()),
+        ClaimsVerificationError::SignatureVerification(reason) => {
+            OAuthError::IdTokenValidation(format!("signature verification failed: {reason}"))
+        }
         other => OAuthError::IdTokenValidation(format!("{other}")),
     }
 }
@@ -31,10 +36,7 @@ impl OAuthProviderConfig {
     /// Fails with [`OAuthError::JwksExpired`] when that key set is older than
     /// the cache's maximum age.
     fn client_with_cached_keys(&self) -> Result<OidcClient, OAuthError> {
-        let handle = self.jwks_cache.fresh_handle().map_err(|e| match e {
-            crate::oidc::OidcError::JwksExpired { .. } => OAuthError::JwksExpired,
-            other => OAuthError::Discovery(other.to_string()),
-        })?;
+        let handle = self.cached_jwks()?;
         let value = {
             let guard = handle.read().unwrap_or_else(|p| p.into_inner());
             serde_json::to_value(&*guard)
@@ -76,5 +78,22 @@ impl OAuthProviderConfig {
                 )),
                 other => other,
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An ID token signed with an algorithm the profile refuses says so,
+    /// rather than reporting a bare signature failure.
+    #[test]
+    fn a_refused_algorithm_is_named() {
+        let err = claims_error(ClaimsVerificationError::SignatureVerification(
+            SignatureVerificationError::DisallowedAlg("RS256".to_string()),
+        ));
+        let message = err.to_string();
+        assert!(matches!(err, OAuthError::IdTokenValidation(_)), "{err:?}");
+        assert!(message.contains("RS256"), "{message}");
     }
 }

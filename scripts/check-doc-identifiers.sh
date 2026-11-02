@@ -52,6 +52,17 @@ ROOT = pathlib.Path(".")
 REMOVED = {
     # 0.13.0: the unaddressed v1 service signature; the migration guide names it.
     "ServiceSigner::sign",
+    # 0.14.0: the provider settings moved from `OAuthProviderConfig` to
+    # `OAuthProviderBuilder`; the "0.12.0 to 0.13.0" section names the
+    # method where 0.13.0 had it.
+    "OAuthProviderConfig::with_required_logout_typ",
+    # Removed in 0.14.0: `SidMap::take_subject_sessions` dropped mappings
+    # before the registry confirmed, and `SidMap::remove` and
+    # `IdentityLookup::lockout_policy` (the fallback of a provided policy
+    # method that is now required) had no caller. The "0.13.0 to 0.14.0"
+    # section names them to say what replaces them.
+    "SidMap::take_subject_sessions", "take_subject_sessions", "SidMap::remove",
+    "IdentityLookup::lockout_policy",
     # Removed in 0.6.0. `docs/production/migrating.md` names it under
     # "0.5.0 to 0.6.0" to say the call has no replacement.
     "ShortString::prefix",
@@ -86,6 +97,10 @@ REMOVED = {
     "RequestAuthnService::suspend_user_by_in_tenant", "RequestAuthnService::activate_user_by",
     "RequestAuthnService::activate_user_in_tenant", "RequestAuthnService::activate_user_by_in_tenant",
     "RequestAuthnService::begin_impersonation_in_tenant",
+    # Removed in 0.14.0: hiding a taken identifier at signup is the default,
+    # and `with_signup_conflicts_revealed` is the opt-out.
+    # `docs/production/migrating.md` names it under "0.13.0 to 0.14.0".
+    "with_hidden_signup_conflicts", "AuthnServiceBuilder::with_hidden_signup_conflicts",
 }
 
 ALLOW = {
@@ -115,6 +130,9 @@ ALLOW = {
     "EntitySet",
     # AWS STS action name, and the Kubernetes API that mints pod tokens
     "AssumeRoleWithWebIdentity", "TokenRequest",
+    # AWS: an IAM condition operator, the AWS SDK's config type, and the
+    # error Secrets Manager returns; named in workload-identity/aws.md.
+    "StringLike", "BehaviorVersion", "AccessDeniedException",
     # Named precisely to say it does NOT exist; the prose depends on it.
     # A chapter that could not write the name a reader is looking for
     # could not tell them it is not there.

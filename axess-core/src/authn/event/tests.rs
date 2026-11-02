@@ -88,6 +88,7 @@ fn event_carries_ip_and_user_agent_from_audit_context() {
         request_id: Some("req-xyz".to_string()),
         geo_country: Some("CH".to_string()),
         session_id: None,
+        impersonator: None,
     };
 
     let event = AuthEventBuilder::attributed(
@@ -169,9 +170,11 @@ fn auth_event_type_as_str_pins_wire_strings() {
         (AuthEventType::SessionExpired, "session_expired"),
         (AuthEventType::SessionInvalidated, "session_invalidated"),
         (AuthEventType::SignupStarted, "signup_started"),
+        (AuthEventType::SignupResumed, "signup_resumed"),
         (AuthEventType::SignupCompleted, "signup_completed"),
         (AuthEventType::AccountSuspended, "account_suspended"),
         (AuthEventType::AccountActivated, "account_activated"),
+        (AuthEventType::AccountDeleted, "account_deleted"),
         (AuthEventType::Impersonation, "impersonation"),
         // Device-event variants. Wire strings ARE the
         // contract with `docs/production/audit-events.md`; changing them
@@ -323,6 +326,52 @@ async fn audit_context_carries_session_id() {
         Some("10.1.2.3")
     );
     assert_eq!(ctx.user_agent.as_deref(), Some("AuditUA/1"));
+    assert_eq!(
+        ctx.impersonator, None,
+        "an ordinary session has no impersonator"
+    );
+}
+
+/// A request carrying an impersonated session yields a context naming the
+/// administrator, and an event built with it names them as actor unless it
+/// set one itself.
+#[tokio::test]
+async fn audit_context_names_the_impersonator_as_actor() {
+    let admin = crate::authn::ids::testing::user("admin");
+    let target = crate::authn::ids::testing::user("target");
+    let tenant = crate::authn::ids::testing::tenant("t");
+    let session = crate::testing::test_session();
+    session
+        .set_authenticated(target, tenant, chrono::Utc::now())
+        .await;
+    assert!(session.set_impersonator(admin, chrono::Utc::now()).await);
+
+    let mut p = parts(HeaderMap::new(), None);
+    p.extensions.insert(session.0.clone());
+    let ctx = AuditContext::from_request_parts(&mut p, &()).await.unwrap();
+    assert_eq!(ctx.impersonator, Some(admin));
+
+    let event = AuthEventBuilder::success(AuthEventType::LogoutAttempt)
+        .attributed_to(&target, &tenant)
+        .with_audit_context(&ctx)
+        .build();
+    assert_eq!(
+        event.actor_id,
+        Some(admin),
+        "the row names the administrator"
+    );
+
+    let explicit = crate::authn::ids::testing::user("other-admin");
+    let event = AuthEventBuilder::success(AuthEventType::Impersonation)
+        .attributed_to(&target, &tenant)
+        .with_actor(explicit)
+        .with_audit_context(&ctx)
+        .build();
+    assert_eq!(
+        event.actor_id,
+        Some(explicit),
+        "an actor the event named stands"
+    );
 }
 
 #[tokio::test]
@@ -361,12 +410,11 @@ async fn audit_context_records_no_ip_rather_than_a_forged_one() {
     );
 }
 
-#[test]
-fn failure_reason_round_trips_through_its_wire_string() {
-    // Every variant must survive as_str -> from_str, or a reason written
-    // by one version reads back as something else in the next.
-    let all = [
+/// Every tagged reason (all but `Other`).
+fn tagged_reasons() -> Vec<AuthFailureReason> {
+    vec![
         AuthFailureReason::NotActive,
+        AuthFailureReason::NoFactorsConfigured,
         AuthFailureReason::UnknownTenant,
         AuthFailureReason::InvalidTenantRow,
         AuthFailureReason::IpPolicy,
@@ -376,14 +424,36 @@ fn failure_reason_round_trips_through_its_wire_string() {
         AuthFailureReason::TokenRefreshNoToken,
         AuthFailureReason::TokenRefreshUnknownProvider,
         AuthFailureReason::TokenRefreshProviderRejected,
+        AuthFailureReason::TokenRefreshDpopKeyMissing,
         AuthFailureReason::CeremonyExpired,
         AuthFailureReason::CsrfMismatch,
         AuthFailureReason::MissingIssuer,
         AuthFailureReason::PkceVerifierInvalid,
         AuthFailureReason::TokenExchange,
         AuthFailureReason::ProviderMismatch,
-        AuthFailureReason::Other("anything else".to_owned()),
-    ];
+        AuthFailureReason::Impersonated,
+        AuthFailureReason::CrossTenant,
+        AuthFailureReason::NestedImpersonation,
+        AuthFailureReason::AdminNotAuthenticated,
+        AuthFailureReason::SessionIsNotAdmin,
+        AuthFailureReason::UnknownAdmin,
+        AuthFailureReason::AdminNotActive,
+        AuthFailureReason::UnknownTarget,
+        AuthFailureReason::TargetLookupFailed,
+        AuthFailureReason::SessionNotRegistered,
+        AuthFailureReason::EnrolmentContext,
+        AuthFailureReason::AuthnTooOld,
+        AuthFailureReason::ProviderUnavailable,
+        AuthFailureReason::DpopKeyInvalid,
+    ]
+}
+
+#[test]
+fn failure_reason_round_trips_through_its_wire_string() {
+    // Every variant must survive as_str -> from_str, or a reason written
+    // by one version reads back as something else in the next.
+    let mut all = tagged_reasons();
+    all.push(AuthFailureReason::Other("anything else".to_owned()));
     for reason in all {
         let wire = reason.as_str().to_owned();
         assert_eq!(
@@ -397,25 +467,10 @@ fn failure_reason_round_trips_through_its_wire_string() {
 #[test]
 fn failure_reason_tags_are_distinct() {
     // Two variants sharing a tag would silently merge on read-back.
-    let tags = [
-        AuthFailureReason::NotActive,
-        AuthFailureReason::UnknownTenant,
-        AuthFailureReason::InvalidTenantRow,
-        AuthFailureReason::IpPolicy,
-        AuthFailureReason::UnknownIdentifier,
-        AuthFailureReason::CrossTenantImpersonation,
-        AuthFailureReason::TokenRefresh,
-        AuthFailureReason::TokenRefreshNoToken,
-        AuthFailureReason::TokenRefreshUnknownProvider,
-        AuthFailureReason::TokenRefreshProviderRejected,
-        AuthFailureReason::CeremonyExpired,
-        AuthFailureReason::CsrfMismatch,
-        AuthFailureReason::MissingIssuer,
-        AuthFailureReason::PkceVerifierInvalid,
-        AuthFailureReason::TokenExchange,
-        AuthFailureReason::ProviderMismatch,
-    ]
-    .map(|r| r.as_str().to_owned());
+    let tags: Vec<String> = tagged_reasons()
+        .iter()
+        .map(|r| r.as_str().to_owned())
+        .collect();
     let unique: std::collections::BTreeSet<_> = tags.iter().collect();
     assert_eq!(
         unique.len(),

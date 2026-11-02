@@ -11,8 +11,9 @@ use std::pin::Pin;
 // the full registry surface used by `AuthnService`. Error handling is
 // baked in: `is_valid` fails closed, `invalidate_*` report a failed
 // revocation as a [`RevocationError`], `register` returns `bool`,
-// `active_sessions` fails open with `vec![]` so registry outages don't
-// lock users out.
+// `held_sessions` returns the registry's error, and `active_sessions`, built
+// on it, fails open with `vec![]` so registry outages don't lock users out
+// of the concurrent-session limit.
 
 /// A revocation the registry could not carry out.
 ///
@@ -120,13 +121,40 @@ pub trait SessionRegistryHandle: SessionRevoker {
         session_id: &'a SessionId,
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
-    /// Return all active session IDs for the user, oldest first.
-    /// Fails open with an empty vec on registry error so the
-    /// concurrent-session limit doesn't lock users out during outage.
+    /// The sessions the registry holds for the user, oldest first, or the
+    /// error when it could not answer. The paths that must know whose a
+    /// session is before acting on it (an administrator's kick of one
+    /// session) read this, so an outage refuses rather than passes as
+    /// "none".
+    ///
+    /// Required: a registry that cannot list sessions returns the error,
+    /// and the callers that may go on without the list say so themselves
+    /// (see [`active_sessions`](Self::active_sessions)).
+    fn held_sessions<'a>(
+        &'a self,
+        user_id: &'a crate::authn::ids::UserId,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>>;
+
+    /// [`held_sessions`](Self::held_sessions) for the callers that go on
+    /// without the list when the registry cannot answer: an outage is
+    /// logged and answered with an empty list, so the concurrent-session
+    /// limit does not lock users out while the registry is down.
     fn active_sessions<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>> {
+        Box::pin(async move {
+            self.held_sessions(user_id).await.unwrap_or_else(|e| {
+                tracing::error!(
+                    user_id = %user_id,
+                    error = %e,
+                    "session registry could not list the user's sessions; \
+                     concurrent session limit disabled for this request"
+                );
+                Vec::new()
+            })
+        })
+    }
 }
 
 /// Type-erasing adapter that turns any concrete [`SessionRegistry`] into
@@ -235,22 +263,15 @@ impl<T: SessionRegistry + 'static> SessionRegistryHandle for SessionRegistryAdap
         })
     }
 
-    fn active_sessions<'a>(
+    fn held_sessions<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>> {
         Box::pin(async move {
-            match self.0.active_sessions(user_id).await {
-                Ok(sessions) => sessions,
-                Err(e) => {
-                    tracing::error!(
-                        user_id = %user_id,
-                        error = %e,
-                        "session registry active_sessions failed; concurrent session limit disabled for this request"
-                    );
-                    Vec::new()
-                }
-            }
+            self.0
+                .active_sessions(user_id)
+                .await
+                .map_err(|e| RevocationError(e.to_string()))
         })
     }
 }

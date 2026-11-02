@@ -7,7 +7,9 @@ use crate::session::{data::SessionData, id::SessionId};
 use crate::store::{MemoryStore, Store};
 #[cfg(any(test, feature = "memory"))]
 use dashmap::DashMap;
+#[cfg(any(test, feature = "memory"))]
 use std::future::Future;
+#[cfg(any(test, feature = "memory"))]
 use std::pin::Pin;
 #[cfg(any(test, feature = "memory"))]
 use std::sync::Arc;
@@ -48,6 +50,19 @@ pub enum ConditionalUpdate {
 /// All methods accept `&self`; implementations are expected to use
 /// interior mutability (`Arc<DashMap<...>>` for memory, connection
 /// pool for SQL/Valkey).
+///
+/// # Zero TTL
+///
+/// A zero `ttl` means the data is already expired, and no shipped store
+/// keeps anything for it: [`save`](Self::save) removes the row under the id,
+/// [`update`](Self::update) removes it and reports `false`,
+/// [`update_if_revision`](Self::update_if_revision) removes the row whose
+/// revision matched and reports [`ConditionalUpdate::Gone`] (another
+/// revision is still a [`ConditionalUpdate::Conflict`], and removes
+/// nothing), and [`cycle`](Self::cycle) removes both rows and reports
+/// [`CycleOutcome::SessionGone`], whether or not the old row was required.
+/// An adopter's store should do the same: a session the layer meant to end
+/// at once must not stay loadable until an older, longer expiry runs out.
 pub trait SessionStore: Send + Sync + Clone + 'static {
     /// The error type returned by storage operations.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -104,7 +119,10 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// backend: the SQL stores replace the row only while it still holds the
     /// bytes that were compared, Valkey runs a script (so a deployment
     /// without scripting gets an error, never a weaker compare), and the
-    /// memory store holds the entry's lock.
+    /// memory store holds the entry's lock. The revision is what decides: a
+    /// concurrent load's re-seal of the row changes its bytes and keeps its
+    /// revision, so a write that found other bytes reads the row again and
+    /// is retried while the revision still matches.
     fn update_if_revision(
         &self,
         id: &SessionId,
@@ -306,6 +324,15 @@ pub trait SessionRegistry: Send + Sync + Clone + 'static {
     }
 }
 
+#[cfg(any(
+    test,
+    feature = "memory",
+    feature = "sqlite",
+    feature = "postgres",
+    feature = "mysql",
+    feature = "valkey"
+))]
+pub(crate) mod cas;
 mod handles;
 pub(crate) use handles::note_revocation;
 pub use handles::{
@@ -421,6 +448,11 @@ impl SessionStore for MemorySessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<(), Self::Error> {
+        if ttl.is_zero() {
+            // Already expired: nothing may be stored, and a previous entry
+            // under this id must not outlive the expiry it was just given.
+            return self.inner.delete(id).await;
+        }
         self.inner.put(id, data, ttl).await?;
         self.maybe_auto_purge();
         Ok(())
@@ -436,6 +468,11 @@ impl SessionStore for MemorySessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<bool, Self::Error> {
+        if ttl.is_zero() {
+            // Already expired: nothing may stay stored under this id.
+            self.inner.remove_live(id);
+            return Ok(false);
+        }
         let replaced = self.inner.replace_live(id, data, ttl);
         if replaced {
             self.maybe_auto_purge();
@@ -450,18 +487,7 @@ impl SessionStore for MemorySessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<ConditionalUpdate, Self::Error> {
-        let outcome = match self
-            .inner
-            .replace_live_if(id, data, ttl, |stored| stored.revision == expected_revision)
-        {
-            None => ConditionalUpdate::Gone,
-            Some(false) => ConditionalUpdate::Conflict,
-            Some(true) => {
-                self.maybe_auto_purge();
-                ConditionalUpdate::Written
-            }
-        };
-        Ok(outcome)
+        cas::cas_by_revision(self, id, expected_revision, data, ttl).await
     }
 
     async fn cycle(
@@ -472,6 +498,13 @@ impl SessionStore for MemorySessionStore {
         ttl: Duration,
         require_old: bool,
     ) -> Result<CycleOutcome, Self::Error> {
+        if ttl.is_zero() {
+            // Already expired: the rotated session is stored nowhere, so both
+            // entries go and the session is reported gone, never as rotated.
+            self.inner.remove_live(old_id);
+            self.inner.remove_live(new_id);
+            return Ok(CycleOutcome::SessionGone);
+        }
         // The removal of the old row decides: `remove_live` takes the entry
         // out of the map in one step, so of two racing rotations (or a
         // rotation and a logout) exactly one sees a live row. Same id: the
@@ -497,6 +530,52 @@ impl SessionStore for MemorySessionStore {
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         self.inner.prune_expired().await
+    }
+}
+
+/// The in-memory store compares the stored revision: its entries are values,
+/// replaced in one step under the map's shard lock.
+#[cfg(any(test, feature = "memory"))]
+impl cas::CasRow for MemorySessionStore {
+    type Seen = u64;
+    type Error = MemoryStoreError;
+
+    async fn read(&self, id: &SessionId) -> Result<Option<(u64, u64)>, Self::Error> {
+        Ok(self.inner.get(id).await?.map(|d| (d.revision, d.revision)))
+    }
+
+    async fn delete_if(&self, id: &SessionId, seen: &u64) -> Result<cas::CasWrite, Self::Error> {
+        Ok(cas_outcome(
+            self.inner.remove_live_if(id, |d| d.revision == *seen),
+        ))
+    }
+
+    async fn replace_if(
+        &self,
+        id: &SessionId,
+        seen: &u64,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<cas::CasWrite, Self::Error> {
+        let written = cas_outcome(
+            self.inner
+                .replace_live_if(id, data, ttl, |d| d.revision == *seen),
+        );
+        if matches!(written, cas::CasWrite::Done) {
+            self.maybe_auto_purge();
+        }
+        Ok(written)
+    }
+}
+
+/// A conditional step of the in-memory store: `None` for no live entry,
+/// otherwise whether the entry matched and the step ran.
+#[cfg(any(test, feature = "memory"))]
+fn cas_outcome(step: Option<bool>) -> cas::CasWrite {
+    match step {
+        None => cas::CasWrite::Gone,
+        Some(true) => cas::CasWrite::Done,
+        Some(false) => cas::CasWrite::Missed,
     }
 }
 

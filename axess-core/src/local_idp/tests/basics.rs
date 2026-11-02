@@ -501,3 +501,32 @@ async fn a_mint_without_an_audience_is_refused_unless_allowed() {
             .is_ok()
     );
 }
+
+/// An audience entry that is the empty string names nobody; under the
+/// default audience requirement it is refused like a missing `aud`.
+#[tokio::test]
+async fn an_empty_string_audience_is_refused_as_no_audience() {
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(LocalIdpSigningKey::generate_es256()),
+    )
+    .await
+    .expect("load");
+    let now = Utc::now();
+    for audiences in [
+        vec![String::new()],
+        vec!["https://api".to_owned(), String::new()],
+    ] {
+        let outcome = idp
+            .mint(
+                &MintClaims::new("worker-1", now + Duration::hours(1))
+                    .with_audiences(audiences.clone())
+                    .with_issued_at(now),
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(IssuanceError::MissingAudience)),
+            "aud {audiences:?} minted: {outcome:?}"
+        );
+    }
+}

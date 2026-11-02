@@ -58,7 +58,6 @@ use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, Header, encode};
 
-#[cfg(test)]
 use crate::local_idp::primitives::LocalIdpKeyError;
 use crate::local_idp::primitives::{
     IssuanceEvent, IssuanceListener, LocalIdpSigningKey, MintClaims, build_claims_json,
@@ -202,15 +201,26 @@ struct LocalIdpInner {
 }
 
 impl LocalIdpFixture {
-    /// Generate a fresh RSA-2048 keypair and configure the fixture
-    /// to issue tokens with `iss = issuer` and `alg = RS256`.
+    /// Generate a fresh P-256 keypair and configure the fixture to issue
+    /// tokens with `iss = issuer` and `alg = ES256`.
     ///
-    /// Key generation takes ~50-200ms; fixture instances are
-    /// intended to be constructed once per test (or once per test
-    /// module) and shared via `Clone`. Adopters wanting a stable
-    /// keypair across runs reach for
+    /// ES256 is the default because it is fast (about a millisecond), its
+    /// tokens are small, and it avoids the `rsa` crate's private-key
+    /// operations and their timing side channel (the Marvin advisory).
+    /// A verifier that cannot take ES256 gets RSA from
+    /// [`new_rsa`](Self::new_rsa) or [`with_algorithm`](Self::with_algorithm).
+    /// Adopters wanting a stable keypair across runs reach for
     /// [`with_signing_key`](Self::with_signing_key) instead.
     pub fn new(issuer: impl Into<String>) -> Self {
+        Self::with_signing_key(issuer, LocalIdpSigningKey::generate_es256())
+    }
+
+    /// Generate a fresh RSA-2048 keypair and configure the fixture to issue
+    /// tokens with `iss = issuer` and `alg = RS256`, for a verifier that
+    /// cannot take ES256. Key generation takes ~50-200ms; construct once
+    /// and share via `Clone`. See [`new`](Self::new) for why RSA is not the
+    /// default.
+    pub fn new_rsa(issuer: impl Into<String>) -> Self {
         Self::with_signing_key(issuer, LocalIdpSigningKey::generate_rsa())
     }
 
@@ -218,18 +228,43 @@ impl LocalIdpFixture {
     /// algorithm family: `RS256` / `RS384` / `RS512` produce a fresh
     /// RSA-2048 keypair (per [`LocalIdpSigningKey::generate_rsa_with_algorithm`]);
     /// `ES256` produces a fresh P-256 keypair (per
-    /// [`LocalIdpSigningKey::generate_es256`]). Other algorithms panic.
+    /// [`LocalIdpSigningKey::generate_es256`]).
+    ///
+    /// # Panics
+    ///
+    /// On any other algorithm; [`try_with_algorithm`](Self::try_with_algorithm)
+    /// returns the error instead.
     pub fn with_algorithm(issuer: impl Into<String>, algorithm: Algorithm) -> Self {
+        Self::try_with_algorithm(issuer, algorithm).unwrap_or_else(|e| {
+            panic!("LocalIdpFixture::with_algorithm supports RS256/RS384/RS512 and ES256: {e}")
+        })
+    }
+
+    /// Like [`with_algorithm`](Self::with_algorithm), returning an error
+    /// instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm other
+    /// than `RS256`, `RS384`, `RS512` or `ES256`;
+    /// [`LocalIdpKeyError::KeyGeneration`] if an RSA keypair could not be
+    /// generated.
+    pub fn try_with_algorithm(
+        issuer: impl Into<String>,
+        algorithm: Algorithm,
+    ) -> Result<Self, LocalIdpKeyError> {
         let signing_key = match algorithm {
-            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-                LocalIdpSigningKey::generate_rsa_with_algorithm(algorithm)
-            }
             Algorithm::ES256 => LocalIdpSigningKey::generate_es256(),
-            other => panic!(
-                "LocalIdpFixture::with_algorithm supports RS256/RS384/RS512 and ES256; got {other:?}"
-            ),
+            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
+                LocalIdpSigningKey::try_generate_rsa_with_algorithm(algorithm)?
+            }
+            other => {
+                return Err(LocalIdpKeyError::UnsupportedAlgorithm(format!(
+                    "{other:?} (the fixture generates RS256, RS384, RS512 and ES256 keys)"
+                )));
+            }
         };
-        Self::with_signing_key(issuer, signing_key)
+        Ok(Self::with_signing_key(issuer, signing_key))
     }
 
     /// Construct with an adopter-supplied [`LocalIdpSigningKey`]. Use

@@ -32,14 +32,23 @@
 //!   others are served the still-unexpired cached token and do not wait on
 //!   the fetch.
 //! - After expiry → callers wait for the one fetch in flight.
+//! - A fetch that fails does not fail every caller: the callers that waited
+//!   for it share its outcome instead of each fetching in turn, and a token
+//!   that is still unexpired keeps being served until `expires_at`, with
+//!   the next call trying the endpoint again. Only when nothing usable is
+//!   cached does the failure reach the caller.
 //!
 //! The fetch holds no lock on the cache, only the single-flight gate, and is
 //! bounded by a request timeout (30 s by default, see
 //! [`with_request_timeout`](OutboundOAuthClient::with_request_timeout)).
 //!
-//! `force_refresh()` bypasses the cache and fetches a new token (use after a
-//! `401` from the upstream resource); callers that arrive together share one
-//! fetch.
+//! `force_refresh()` condemns the cached token and fetches a new one (use
+//! after a `401` from the upstream resource): from the moment it is called
+//! the condemned token is served to nobody, during the fetch or after one
+//! that fails. Callers that arrive together share one fetch.
+//! `force_refresh_of(token)` condemns only that token, so a `401` reported
+//! late, after another caller already replaced the token, keeps the
+//! replacement.
 //!
 //! # Transport
 //!
@@ -66,32 +75,35 @@ use axess_rng::{SecureRng, SystemRng};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64_STANDARD;
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::header::AUTHORIZATION;
-use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
-use uuid::Builder as UuidBuilder;
 
 use crate::secret::ZeroizedString;
 
 /// Errors surfaced by [`OutboundOAuthClient`].
-#[derive(Debug, thiserror::Error)]
+///
+/// `Clone`, because the outcome of one fetch is answered to every caller
+/// that waited for it.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum OAuthClientError {
     /// Transport-level failure: connection refused, TLS error, DNS,
     /// timeout. Distinct from [`Self::TokenEndpoint`] (which is the
-    /// IdP returning an error response).
+    /// IdP returning an error response). The token URL is not echoed: a
+    /// configured endpoint can carry a tenant path or a key in its query.
     #[error("HTTP transport error: {0}")]
     Transport(String),
     /// Token endpoint returned a non-2xx response. Carries the HTTP
-    /// status and (best-effort) body for adopter logging.
+    /// status and a bounded snippet of the body for adopter logging.
     #[error("token endpoint returned {status}: {body}")]
     TokenEndpoint {
         /// HTTP status code returned by the token endpoint.
         status: u16,
-        /// Best-effort response body, captured as text for adopter
-        /// logging. Empty if the body could not be read.
+        /// The first [`ERROR_BODY_BYTES`](crate::http_body::ERROR_BODY_BYTES)
+        /// of the response body as text, with
+        /// [`TRUNCATED_SUFFIX`](crate::http_body::TRUNCATED_SUFFIX) when more
+        /// followed; empty if the body could not be read.
         body: String,
     },
     /// 2xx response but the body didn't deserialise as a valid
@@ -99,8 +111,8 @@ pub enum OAuthClientError {
     #[error("malformed token response: {0}")]
     MalformedResponse(String),
     /// JWT signing failed when constructing a `private_key_jwt`
-    /// client assertion. Should not happen in production; the
-    /// signing key is validated at client-construction time.
+    /// client assertion. Should not happen in production: the signer signs
+    /// one assertion when it is built.
     #[error("client assertion signing failed: {0}")]
     Signing(String),
     /// The token URL is not HTTPS (and not loopback), so the client secret or
@@ -109,6 +121,11 @@ pub enum OAuthClientError {
         "token endpoint must use HTTPS (http is only allowed for localhost, 127.0.0.1 and [::1])"
     )]
     InsecureEndpoint,
+    /// The token request could not be built from the configuration: the
+    /// client credentials do not form an `Authorization` header. A
+    /// configuration fault, not a transport one; retrying does not help.
+    #[error("token request could not be built: {0}")]
+    RequestBuild(String),
     /// The default HTTP client could not be built, which happens when the TLS
     /// backend fails to initialise.
     #[error("HTTP client could not be built: {0}")]
@@ -134,32 +151,15 @@ pub enum ClientAuthMethod {
         /// Shared secret. Zeroized on drop.
         client_secret: ZeroizedString,
     },
-    /// RFC 7523 `private_key_jwt`. axess signs a short-lived JWT
-    /// asserting its identity; the IdP validates against axess's
-    /// published JWKS. No shared secret to rotate.
-    PrivateKeyJwt {
-        /// Public client identifier; used as both `iss` and `sub`
-        /// in the assertion JWT per RFC 7523 §3.
-        client_id: String,
-        /// PEM-encoded private key for the chosen algorithm.
-        /// Validated at client-construction time.
-        signing_key: EncodingKey,
-        /// JWA algorithm. Typical values: `RS256` (legacy IdPs),
-        /// `ES256` (modern / FAPI 2.0), `PS256` (Microsoft Entra +
-        /// FAPI 2.0 strict).
-        algorithm: Algorithm,
-        /// `kid` header for the assertion JWT. The IdP uses this to
-        /// pick the right public key from axess's JWKS.
-        key_id: Option<String>,
-        /// `aud` claim of the assertion JWT. Per RFC 7523 §3 this
-        /// must be a value the IdP recognises as identifying itself
-        /// typically the token endpoint URL. Some IdPs require
-        /// their `issuer` URL instead; consult the IdP's docs.
-        audience: String,
-        /// Lifetime of each minted assertion JWT. Per RFC 7523 §3
-        /// must be short; default is 60 s.
-        assertion_ttl: Duration,
-    },
+    /// RFC 7523 `private_key_jwt`: the signer makes a short-lived JWT
+    /// asserting the client's identity, which the IdP checks against the key
+    /// or certificate it holds for the client. No shared secret to rotate.
+    /// The assertion's audience is the token URL unless the signer fixes one
+    /// ([`ClientAssertionSigner::with_audience`](crate::client_assertion::ClientAssertionSigner::with_audience)),
+    /// and its headers (`kid`, `x5t`, `x5t#S256`) are the signer's, so the
+    /// certificate thumbprint Microsoft Entra looks for can be set.
+    /// Boxed: the signer is several times the size of the other variants.
+    PrivateKeyJwt(Box<crate::client_assertion::ClientAssertionSigner>),
 }
 
 impl std::fmt::Debug for ClientAuthMethod {
@@ -175,22 +175,7 @@ impl std::fmt::Debug for ClientAuthMethod {
                 .field("client_id", client_id)
                 .field("client_secret", &"<redacted>")
                 .finish(),
-            Self::PrivateKeyJwt {
-                client_id,
-                algorithm,
-                key_id,
-                audience,
-                assertion_ttl,
-                ..
-            } => f
-                .debug_struct("PrivateKeyJwt")
-                .field("client_id", client_id)
-                .field("algorithm", algorithm)
-                .field("key_id", key_id)
-                .field("audience", audience)
-                .field("assertion_ttl", assertion_ttl)
-                .field("signing_key", &"<redacted>")
-                .finish(),
+            Self::PrivateKeyJwt(signer) => f.debug_tuple("PrivateKeyJwt").field(signer).finish(),
         }
     }
 }
@@ -228,15 +213,34 @@ struct CachedToken {
     refresh_at: DateTime<Utc>,
 }
 
-/// RFC 7523 client-assertion JWT body.
-#[derive(Serialize)]
-struct ClientAssertionClaims<'a> {
-    iss: &'a str,
-    sub: &'a str,
-    aud: &'a str,
-    exp: i64,
-    iat: i64,
-    jti: String,
+/// The cache and the record of the fetches that filled it, under one lock.
+///
+/// The states a caller can find: no token (before the first fetch, after a
+/// fetch failed with nothing usable left, or from the moment
+/// [`OutboundOAuthClient::force_refresh`] condemned the token until a fetch
+/// replaces it); a token not yet due; a token due but unexpired; a token
+/// expired. A condemned token is removed, never flagged, so no path can
+/// serve it.
+struct Cache {
+    token: Option<CachedToken>,
+    /// How many fetches have completed, successful or not. A caller that
+    /// waited for the gate compares it with the count it saw before: a
+    /// change means a fetch completed meanwhile, and that fetch's outcome
+    /// is the waiter's too.
+    fetches: u64,
+    /// The error of the last completed fetch; `None` again once one
+    /// succeeds.
+    last_error: Option<OAuthClientError>,
+}
+
+impl Cache {
+    /// The cached access token when `usable` holds for it.
+    fn token_if(&self, usable: impl FnOnce(&CachedToken) -> bool) -> Option<String> {
+        self.token
+            .as_ref()
+            .filter(|t| usable(t))
+            .map(|t| (*t.access_token).to_string())
+    }
 }
 
 /// Outbound OAuth client.
@@ -249,12 +253,9 @@ pub struct OutboundOAuthClient {
     token_url: Url,
     auth_method: ClientAuthMethod,
     scopes: Vec<String>,
-    cached_token: Arc<RwLock<Option<CachedToken>>>,
+    cache: RwLock<Cache>,
     /// Single flight: held across a token fetch, never the cache lock.
     refresh_gate: Mutex<()>,
-    /// Counts stored tokens, so a caller that waited on the gate can tell
-    /// that someone else fetched while it waited.
-    generation: AtomicU64,
     /// Bound on one token fetch.
     request_timeout: Duration,
     refresh_threshold: Duration,
@@ -270,12 +271,49 @@ pub struct OutboundOAuthClient {
 ///
 /// RFC 6749 §2.3.1: the client id and secret are form-urlencoded before
 /// they are joined with `:` and base64-encoded, so a secret carrying
-/// `:`, `+` or `%` reaches a strict IdP intact. Use as
-/// `format!("Basic {}", basic_credentials(id, secret))`.
+/// `:`, `+` or `%` reaches a strict IdP intact. The value is the secret in
+/// another spelling, so it is a [`ZeroizedString`], as is every buffer on
+/// the way to it; [`basic_authorization`] builds the header from it.
 #[must_use]
-pub fn basic_credentials(client_id: &str, client_secret: &str) -> String {
-    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-    B64_STANDARD.encode(format!("{}:{}", enc(client_id), enc(client_secret)))
+pub fn basic_credentials(client_id: &str, client_secret: &str) -> ZeroizedString {
+    let enc = |s: &str| {
+        ZeroizedString::new(url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>())
+    };
+    let id = enc(client_id);
+    let secret = enc(client_secret);
+    // Sized up front: a buffer that grows leaves its earlier allocations
+    // behind unzeroed.
+    let mut joined = String::with_capacity(id.len() + 1 + secret.len());
+    joined.push_str(&id);
+    joined.push(':');
+    joined.push_str(&secret);
+    let joined = ZeroizedString::new(joined);
+    ZeroizedString::new(B64_STANDARD.encode(&*joined))
+}
+
+/// The `Authorization` header for `client_secret_basic`: `Basic` and
+/// [`basic_credentials`], marked sensitive so the header is redacted
+/// wherever the request's headers are printed. The buffers it is built from
+/// are zeroized; the header value itself is the HTTP layer's copy.
+///
+/// # Errors
+///
+/// [`InvalidHeaderValue`](reqwest::header::InvalidHeaderValue) when the
+/// value is not a header value, which base64 never is; the `Result` keeps
+/// the construction free of a panic path.
+pub fn basic_authorization(
+    client_id: &str,
+    client_secret: &str,
+) -> Result<reqwest::header::HeaderValue, reqwest::header::InvalidHeaderValue> {
+    const SCHEME: &str = "Basic ";
+    let credentials = basic_credentials(client_id, client_secret);
+    let mut value = String::with_capacity(SCHEME.len() + credentials.len());
+    value.push_str(SCHEME);
+    value.push_str(&credentials);
+    let value = ZeroizedString::new(value);
+    let mut header = reqwest::header::HeaderValue::from_str(&value)?;
+    header.set_sensitive(true);
+    Ok(header)
 }
 
 /// Refuse a token URL that is not HTTPS, other than plain HTTP to a loopback
@@ -346,9 +384,12 @@ impl OutboundOAuthClient {
             token_url,
             auth_method,
             scopes: Vec::new(),
-            cached_token: Arc::new(RwLock::new(None)),
+            cache: RwLock::new(Cache {
+                token: None,
+                fetches: 0,
+                last_error: None,
+            }),
             refresh_gate: Mutex::new(()),
-            generation: AtomicU64::new(0),
             request_timeout,
             refresh_threshold: Duration::from_secs(30),
             clock: Arc::new(SystemClock),
@@ -416,86 +457,178 @@ impl OutboundOAuthClient {
     /// Return a valid access token, refreshing the cache silently if
     /// needed. Concurrent calls share one fetch (single flight); callers that
     /// find a still-unexpired token while a refresh is in flight use it
-    /// instead of waiting for the fetch.
+    /// instead of waiting for the fetch, and callers that waited for a fetch
+    /// take its outcome rather than fetching again.
+    ///
+    /// # Errors
+    ///
+    /// The fetch's error when it failed and no unexpired token is cached. A
+    /// failed refresh of a token that is still unexpired is not an error: the
+    /// token is returned, and the next call tries the endpoint again.
     pub async fn get_access_token(&self) -> Result<String, OAuthClientError> {
+        let now = self.clock.now();
         // Fast path: read-lock, check validity, return.
-        if let Some(token) = self.cached_if(|t, now| now < t.refresh_at).await {
-            return Ok(token);
-        }
+        let seen = {
+            let cache = self.cache.read().await;
+            if let Some(token) = cache.token_if(|t| now < t.refresh_at) {
+                return Ok(token);
+            }
+            cache.fetches
+        };
 
         // Due for refresh, or nothing cached. Someone else may already be
         // fetching: a token that has not expired yet serves meanwhile.
         let guard = match self.refresh_gate.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                if let Some(token) = self.cached_if(|t, now| now < t.expires_at).await {
+                if let Some(token) = self.cache.read().await.token_if(|t| now < t.expires_at) {
                     return Ok(token);
                 }
                 self.refresh_gate.lock().await
             }
         };
-        // Double-check: the fetch we waited on may have stored a token.
-        if let Some(token) = self.cached_if(|t, now| now < t.refresh_at).await {
-            return Ok(token);
-        }
-        let token = self.fetch_and_store().await;
-        drop(guard);
-        token
+        self.settle_holding(guard, seen).await
     }
 
-    /// Fetch a new token and cache it, unconditionally, unless another caller
-    /// stored one while this one waited for the gate: callers that arrive
-    /// together (a burst of `401`s from the upstream resource) share one
-    /// fetch. Use after the upstream returned `401`, indicating the cached
-    /// token has been server-side revoked or invalidated.
+    /// Condemn the cached token and fetch a new one. Use after the upstream
+    /// returned `401`, indicating the cached token has been server-side
+    /// revoked or invalidated. The condemned token is served to nobody from
+    /// here on: not to callers that arrive during the fetch, and not after
+    /// a fetch that fails. Callers that arrive together (a burst of `401`s
+    /// from the upstream resource) share one fetch.
+    ///
+    /// When the `401` names the token it was about, prefer
+    /// [`force_refresh_of`](Self::force_refresh_of), which leaves a
+    /// replacement another caller already fetched in place.
+    ///
+    /// # Errors
+    ///
+    /// The fetch's error. Nothing is cached then; the next call fetches.
     pub async fn force_refresh(&self) -> Result<String, OAuthClientError> {
-        let seen = self.generation.load(Ordering::Acquire);
-        let guard = self.refresh_gate.lock().await;
-        if self.generation.load(Ordering::Acquire) != seen
-            && let Some(token) = self.cached_if(|t, now| now < t.expires_at).await
-        {
-            return Ok(token);
-        }
-        let token = self.fetch_and_store().await;
-        drop(guard);
-        token
+        self.refresh_condemning(|_| true).await
     }
 
-    /// The cached access token, when `usable` holds for it at the clock's
-    /// current time.
-    async fn cached_if(
+    /// [`force_refresh`](Self::force_refresh) for a `401` about `condemned`:
+    /// that token is condemned when it is the cached one. When the cache
+    /// already holds another token (a concurrent caller replaced it), the
+    /// replacement is returned without a fetch unless it is due.
+    ///
+    /// # Errors
+    ///
+    /// As [`force_refresh`](Self::force_refresh).
+    pub async fn force_refresh_of(&self, condemned: &str) -> Result<String, OAuthClientError> {
+        self.refresh_condemning(|t| *t.access_token == *condemned)
+            .await
+    }
+
+    /// The body of both forced refreshes: condemn the cached token when
+    /// `is_condemned` holds for it, take the gate, settle.
+    async fn refresh_condemning(
         &self,
-        usable: impl FnOnce(&CachedToken, DateTime<Utc>) -> bool,
-    ) -> Option<String> {
-        let now = self.clock.now();
-        let cached = self.cached_token.read().await;
-        cached
-            .as_ref()
-            .filter(|t| usable(t, now))
-            .map(|t| (*t.access_token).to_string())
+        is_condemned: impl FnOnce(&CachedToken) -> bool,
+    ) -> Result<String, OAuthClientError> {
+        let seen = self.condemn(is_condemned).await;
+        let guard = self.refresh_gate.lock().await;
+        self.settle_holding(guard, seen).await
     }
 
-    /// Fetch under the request timeout and store the result. The caller holds
-    /// the single-flight gate; the cache lock is taken only to store.
+    /// [`settle`](Self::settle) while holding the single-flight `guard`,
+    /// released once the outcome is known.
+    async fn settle_holding(
+        &self,
+        guard: tokio::sync::MutexGuard<'_, ()>,
+        seen: u64,
+    ) -> Result<String, OAuthClientError> {
+        let outcome = self.settle(seen).await;
+        drop(guard);
+        outcome
+    }
+
+    /// Remove the cached token when `is_condemned` holds for it, before
+    /// taking the gate, so that no caller is served it while the fetch that
+    /// replaces it waits or runs. Returns the fetch count for [`settle`].
+    ///
+    /// [`settle`]: Self::settle
+    async fn condemn(&self, is_condemned: impl FnOnce(&CachedToken) -> bool) -> u64 {
+        let mut cache = self.cache.write().await;
+        if cache.token.as_ref().is_some_and(is_condemned) {
+            cache.token = None;
+        }
+        cache.fetches
+    }
+
+    /// Holding the gate: fetch, unless a fetch completed since the caller
+    /// read the count `seen`, in which case that fetch's outcome is this
+    /// caller's too (a token it stored, a still-unexpired token after it
+    /// failed, or its error), and no second fetch is made.
+    async fn settle(&self, seen: u64) -> Result<String, OAuthClientError> {
+        let now = self.clock.now();
+        {
+            let cache = self.cache.read().await;
+            if cache.fetches == seen {
+                // Nobody fetched meanwhile. A token not yet due is the
+                // replacement `force_refresh_of` found in place of the
+                // condemned one.
+                if let Some(token) = cache.token_if(|t| now < t.refresh_at) {
+                    return Ok(token);
+                }
+            } else {
+                if let Some(token) = cache.token_if(|t| now < t.expires_at) {
+                    return Ok(token);
+                }
+                if let Some(err) = &cache.last_error {
+                    return Err(err.clone());
+                }
+            }
+        }
+        self.fetch_and_store().await
+    }
+
+    /// Fetch under the request timeout and record the outcome. The caller
+    /// holds the single-flight gate; the cache lock is taken only to store.
+    /// A failure leaves a still-unexpired token in place and returns it;
+    /// an expired one is dropped and the error returned.
     async fn fetch_and_store(&self) -> Result<String, OAuthClientError> {
-        let fresh = tokio::time::timeout(self.request_timeout, self.fetch_new_token())
+        let fetched = tokio::time::timeout(self.request_timeout, self.fetch_new_token())
             .await
             .map_err(|_| {
                 OAuthClientError::Transport(format!(
-                    "token request timed out after {}s",
-                    self.request_timeout.as_secs()
+                    "token request timed out after {:?}",
+                    self.request_timeout
                 ))
-            })??;
-        let token_str = (*fresh.access_token).to_string();
-        *self.cached_token.write().await = Some(fresh);
-        self.generation.fetch_add(1, Ordering::Release);
-        Ok(token_str)
+            })
+            .and_then(|fetched| fetched);
+        let now = self.clock.now();
+        let mut cache = self.cache.write().await;
+        cache.fetches += 1;
+        match fetched {
+            Ok(fresh) => {
+                let token = (*fresh.access_token).to_string();
+                cache.token = Some(fresh);
+                cache.last_error = None;
+                Ok(token)
+            }
+            Err(err) => {
+                cache.last_error = Some(err.clone());
+                match cache.token_if(|t| now < t.expires_at) {
+                    Some(token) => Ok(token),
+                    None => {
+                        cache.token = None;
+                        Err(err)
+                    }
+                }
+            }
+        }
     }
 
     async fn fetch_new_token(&self) -> Result<CachedToken, OAuthClientError> {
-        let mut form: Vec<(&str, String)> = vec![("grant_type", "client_credentials".to_string())];
+        // The form carries the client secret or the assertion, so every
+        // value is zeroized with the form; the body the HTTP layer encodes
+        // from it is its own copy.
+        let mut form: Vec<(&str, ZeroizedString)> =
+            vec![("grant_type", "client_credentials".into())];
         if !self.scopes.is_empty() {
-            form.push(("scope", self.scopes.join(" ")));
+            form.push(("scope", self.scopes.join(" ").into()));
         }
 
         let mut request = self.http_client.post(self.token_url.clone());
@@ -505,34 +638,37 @@ impl OutboundOAuthClient {
                 client_id,
                 client_secret,
             } => {
-                let encoded = basic_credentials(client_id, client_secret);
-                request = request.header(AUTHORIZATION, format!("Basic {encoded}"));
+                let header = basic_authorization(client_id, client_secret).map_err(|e| {
+                    OAuthClientError::RequestBuild(format!("authorization header: {e}"))
+                })?;
+                request = request.header(AUTHORIZATION, header);
             }
             ClientAuthMethod::ClientSecretPost {
                 client_id,
                 client_secret,
             } => {
-                form.push(("client_id", client_id.clone()));
-                form.push(("client_secret", (**client_secret).to_string()));
+                form.push(("client_id", client_id.as_str().into()));
+                form.push(("client_secret", (**client_secret).into()));
             }
-            ClientAuthMethod::PrivateKeyJwt { .. } => {
-                let assertion = self.mint_client_assertion()?;
+            ClientAuthMethod::PrivateKeyJwt(signer) => {
+                let assertion = signer
+                    .mint(self.token_url.as_str(), &*self.clock, &*self.rng)
+                    .map_err(|e| OAuthClientError::Signing(e.to_string()))?;
                 form.push((
                     "client_assertion_type",
-                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+                    crate::client_assertion::CLIENT_ASSERTION_TYPE_JWT_BEARER.into(),
                 ));
-                form.push(("client_assertion", assertion));
-                if let ClientAuthMethod::PrivateKeyJwt { client_id, .. } = &self.auth_method {
-                    form.push(("client_id", client_id.clone()));
-                }
+                form.push(("client_assertion", ZeroizedString::new(assertion)));
+                form.push(("client_id", signer.client_id().into()));
             }
         }
 
+        // `without_url`: reqwest's message names the URL it was sent to.
         let mut response = request
             .form(&form)
             .send()
             .await
-            .map_err(|e| OAuthClientError::Transport(e.to_string()))?;
+            .map_err(|e| OAuthClientError::Transport(e.without_url().to_string()))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -585,50 +721,6 @@ impl OutboundOAuthClient {
             expires_at,
             refresh_at: expires_at - early,
         })
-    }
-
-    fn mint_client_assertion(&self) -> Result<String, OAuthClientError> {
-        let ClientAuthMethod::PrivateKeyJwt {
-            client_id,
-            signing_key,
-            algorithm,
-            key_id,
-            audience,
-            assertion_ttl,
-        } = &self.auth_method
-        else {
-            // Type-system guarantees we only reach this from a
-            // PrivateKeyJwt branch; the early return makes that
-            // explicit instead of `unreachable!`.
-            return Err(OAuthClientError::Signing(
-                "mint_client_assertion called on non-PrivateKeyJwt auth method".into(),
-            ));
-        };
-
-        let now = self.clock.now();
-        let iat = now.timestamp();
-        let exp = iat + assertion_ttl.as_secs() as i64;
-
-        let mut jti_bytes = [0u8; 16];
-        self.rng.fill_bytes(&mut jti_bytes);
-        // RFC 4122 v4 from random bytes (sets version + variant bits).
-        let jti = UuidBuilder::from_random_bytes(jti_bytes)
-            .into_uuid()
-            .to_string();
-
-        let claims = ClientAssertionClaims {
-            iss: client_id,
-            sub: client_id,
-            aud: audience,
-            exp,
-            iat,
-            jti,
-        };
-
-        let mut header = Header::new(*algorithm);
-        header.kid = key_id.clone();
-
-        encode(&header, &claims, signing_key).map_err(|e| OAuthClientError::Signing(e.to_string()))
     }
 }
 

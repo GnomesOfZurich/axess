@@ -1,34 +1,45 @@
-//! Replay log of the `(issuer, jti)` pairs of recently seen logout tokens.
+//! Replay log of the `jti`s of recently seen logout tokens, one partition
+//! per issuer.
 //!
-//! Entries age out of a queue in the order they arrived, so recording a token
-//! costs the number of entries that expired, not the number the log holds.
-//! Arrival order follows the injected clock, so it can differ from time order
-//! only across a backwards clock step; an entry stuck behind a newer one then
-//! lingers until the newer one expires, which is a delay bounded by the step
-//! and never a premature release.
+//! Entries age out of one queue, over every issuer, in the order they
+//! arrived, so recording a token costs the number of entries that expired,
+//! not the number the log holds. Arrival order follows the injected clock, so
+//! it can differ from time order only across a backwards clock step; an entry
+//! stuck behind a newer one then lingers until the newer one expires, which
+//! is a delay bounded by the step and never a premature release.
 //!
 //! The log never forgets an entry that is still inside the replay window to
-//! make room. When it is full of live entries it refuses the new token
-//! ([`Recorded::Full`]), and the caller answers with a retryable error: the
-//! pair is not recorded, so the same token is accepted once room appears.
+//! make room. The bound is per issuer: when an issuer's partition is full of
+//! live entries it refuses that issuer's new token ([`Recorded::Full`]), and
+//! the caller answers with a retryable error; the pair is not recorded, so the
+//! same token is accepted once room appears. Another issuer's tokens are
+//! unaffected, so one IdP cannot starve the others' logouts.
+//!
+//! Only a verified token reaches the log, and a partition goes with its last
+//! entry, whichever issuer's token the expiry ran for. So the log holds a
+//! partition for each issuer that sent a verified token within the replay
+//! window, and no more: with tenant providers the set of issuers is not fixed
+//! when the handler is built, and an issuer that stops sending leaves nothing
+//! behind.
 
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
-
-type JtiKey = (String, String);
-
-#[derive(Default)]
-struct Inner {
-    seen: HashMap<JtiKey, DateTime<Utc>>,
-    /// Arrival order, oldest first; one item per entry in `seen`.
-    order: VecDeque<(DateTime<Utc>, JtiKey)>,
-}
+use std::sync::{Arc, Mutex};
 
 /// Bounded `(issuer, jti)` replay log. See the [module docs](self).
 pub(super) struct JtiLog {
-    inner: Mutex<Inner>,
+    state: Mutex<State>,
+    /// Live entries one issuer may hold.
     capacity: usize,
+}
+
+#[derive(Default)]
+struct State {
+    /// Issuer -> `jti` -> when it was seen. An issuer with no live entry has
+    /// no partition.
+    issuers: HashMap<Arc<str>, HashMap<String, DateTime<Utc>>>,
+    /// Arrival order over every issuer, oldest first; one item per entry.
+    order: VecDeque<(DateTime<Utc>, Arc<str>, String)>,
 }
 
 /// What recording a pair did.
@@ -38,26 +49,34 @@ pub(super) enum Recorded {
     New,
     /// The log still holds the pair: a replay.
     Replay,
-    /// The pair is new but the log is full of live entries and has no room.
-    /// Nothing was recorded or forgotten.
+    /// The pair is new but the issuer's partition is full of live entries
+    /// and has no room. Nothing was recorded or forgotten.
     Full,
 }
 
 impl JtiLog {
+    /// A log that holds up to `capacity` live entries per issuer.
     pub(super) fn new(capacity: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            state: Mutex::new(State::default()),
             capacity,
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Record the pair as seen at `now`.
     ///
-    /// Entries seen before `cutoff` are dropped first. Then the replay check
-    /// runs, so a token the log holds is a replay however full the log is.
-    /// Only a new pair that finds the log still at capacity is refused: every
-    /// entry left is inside the replay window, and forgetting one to make room
-    /// would let its token replay.
+    /// Every entry seen before `cutoff`, of any issuer, is dropped first.
+    /// Then the replay check runs, so a token the log holds is a replay
+    /// however full the partition is. Only a new pair that finds the issuer's
+    /// partition still at capacity is refused: every entry left is inside the
+    /// replay window, and forgetting one to make room would let its token
+    /// replay.
     pub(super) fn record(
         &self,
         issuer: &str,
@@ -65,48 +84,76 @@ impl JtiLog {
         now: DateTime<Utc>,
         cutoff: DateTime<Utc>,
     ) -> Recorded {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.drop_front_while(|seen_at| seen_at < cutoff, usize::MAX);
-        let key = (issuer.to_string(), jti.to_string());
-        if inner.seen.contains_key(&key) {
+        let mut state = self.lock();
+        state.expire_before(cutoff);
+        let held = state.issuers.get(issuer);
+        if held.is_some_and(|seen| seen.contains_key(jti)) {
             return Recorded::Replay;
         }
-        if inner.seen.len() >= self.capacity {
+        if held.is_some_and(|seen| seen.len() >= self.capacity) {
             return Recorded::Full;
         }
-        inner.seen.insert(key.clone(), now);
-        inner.order.push_back((now, key));
+        let issuer: Arc<str> = match state.issuers.get_key_value(issuer) {
+            Some((held, _)) => held.clone(),
+            None => issuer.into(),
+        };
+        state
+            .issuers
+            .entry(issuer.clone())
+            .or_default()
+            .insert(jti.to_string(), now);
+        state.order.push_back((now, issuer, jti.to_string()));
         Recorded::New
     }
 
+    /// Forget the pair, so the same token is accepted again: the handler
+    /// recorded it before acting and could not carry the logout out, and
+    /// the IdP's retry must not be refused as a replay. Returns whether the
+    /// pair was held.
+    pub(super) fn forget(&self, issuer: &str, jti: &str) -> bool {
+        let mut state = self.lock();
+        let Some(seen_at) = state.take(issuer, jti) else {
+            return false;
+        };
+        state
+            .order
+            .retain(|(at, iss, held)| !(*at == seen_at && **iss == *issuer && held == jti));
+        true
+    }
+
+    /// Live entries over every issuer.
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .seen
-            .len()
+        self.lock().issuers.values().map(HashMap::len).sum()
+    }
+
+    /// Issuers with a partition.
+    #[cfg(test)]
+    fn partitions(&self) -> usize {
+        self.lock().issuers.len()
     }
 }
 
-impl Inner {
-    /// Pop up to `max` items off the front while `due` holds for their
-    /// arrival time, forgetting the pair each one names.
-    fn drop_front_while(&mut self, due: impl Fn(DateTime<Utc>) -> bool, max: usize) {
-        let mut dropped = 0;
-        while dropped < max {
-            match self.order.front() {
-                Some((seen_at, _)) if due(*seen_at) => {}
-                _ => break,
+impl State {
+    /// Pop the items that arrived before `cutoff` off the front, forgetting
+    /// the entry each one names.
+    fn expire_before(&mut self, cutoff: DateTime<Utc>) {
+        while self.order.front().is_some_and(|(at, _, _)| *at < cutoff) {
+            if let Some((_, issuer, jti)) = self.order.pop_front() {
+                self.take(&issuer, &jti);
             }
-            if let Some((_, key)) = self.order.pop_front() {
-                self.seen.remove(&key);
-            }
-            dropped += 1;
         }
+    }
+
+    /// Remove one entry, and its issuer's partition when it was the last;
+    /// returns when the entry was seen.
+    fn take(&mut self, issuer: &str, jti: &str) -> Option<DateTime<Utc>> {
+        let seen = self.issuers.get_mut(issuer)?;
+        let seen_at = seen.remove(jti)?;
+        if seen.is_empty() {
+            self.issuers.remove(issuer);
+        }
+        Some(seen_at)
     }
 }
 
@@ -155,6 +202,20 @@ mod tests {
         );
     }
 
+    /// A forgotten pair is new again at once, and only that pair.
+    #[test]
+    fn a_forgotten_pair_is_accepted_again_and_nothing_else_moves() {
+        let log = JtiLog::new(100);
+        assert_eq!(log.record("iss", "j1", at(0), at(-300)), Recorded::New);
+        assert_eq!(log.record("iss", "j2", at(1), at(-299)), Recorded::New);
+        assert!(log.forget("iss", "j1"));
+        assert!(!log.forget("iss", "j1"), "already forgotten");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.record("iss", "j1", at(2), at(-298)), Recorded::New);
+        assert_eq!(log.record("iss", "j2", at(2), at(-298)), Recorded::Replay);
+        assert_eq!(log.len(), 2, "no stale order item doubles an entry");
+    }
+
     /// A log full of live entries refuses a new token and forgets nothing:
     /// the oldest token still replays, and a refused token is accepted once
     /// room appears.
@@ -179,5 +240,52 @@ mod tests {
         // Once j0..j4 age past the cutoff there is room, and the token that
         // was refused is accepted.
         assert_eq!(log.record("iss", "new", at(20), at(5)), Recorded::New);
+    }
+
+    /// The bound is per issuer: an IdP that fills its own log does not get
+    /// every other IdP's logouts refused.
+    #[test]
+    fn one_issuers_full_log_does_not_refuse_another_issuers_token() {
+        let log = JtiLog::new(10);
+        for n in 0..10 {
+            assert_eq!(
+                log.record("https://noisy", &format!("j{n}"), at(n), at(-300)),
+                Recorded::New
+            );
+        }
+        assert_eq!(
+            log.record("https://noisy", "j10", at(10), at(-300)),
+            Recorded::Full,
+            "the noisy issuer is at its bound"
+        );
+        assert_eq!(
+            log.record("https://quiet", "j1", at(10), at(-300)),
+            Recorded::New,
+            "another issuer's logout is not starved by the noisy one"
+        );
+        assert_eq!(
+            log.record("https://quiet", "j1", at(11), at(-300)),
+            Recorded::Replay
+        );
+        assert_eq!(log.len(), 11);
+    }
+
+    /// An issuer whose every entry expired leaves no partition behind,
+    /// whichever issuer's token ran the expiry: with tenant providers the
+    /// issuers are not a set fixed at build time.
+    #[test]
+    fn an_issuer_whose_entries_all_expired_leaves_no_partition() {
+        let log = JtiLog::new(10);
+        assert_eq!(
+            log.record("https://gone", "j1", at(0), at(-300)),
+            Recorded::New
+        );
+        assert_eq!(log.partitions(), 1, "the case exists");
+        assert_eq!(
+            log.record("https://live", "j1", at(400), at(100)),
+            Recorded::New
+        );
+        assert_eq!(log.len(), 1, "the old entry expired");
+        assert_eq!(log.partitions(), 1, "and its partition went with it");
     }
 }

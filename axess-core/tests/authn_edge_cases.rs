@@ -85,7 +85,8 @@ async fn prepare_factor_without_begin_returns_no_flow() {
     assert!(matches!(result, Err(AuthnError::NoFlow)));
 }
 
-/// Suspended user cannot login.
+/// Suspended user cannot login, and is answered as an unknown identifier
+/// is: the suspension is in the audit row, not in the outcome.
 #[tokio::test]
 async fn suspended_user_cannot_login() {
     let now = Utc::now();
@@ -132,7 +133,11 @@ async fn suspended_user_cannot_login() {
     let session = test_session();
 
     let outcome = service.begin_login("alice", "default", &session).await;
-    assert!(matches!(outcome, Ok(LoginOutcome::Locked { .. })));
+    assert!(
+        matches!(outcome, Ok(LoginOutcome::InvalidCredentials)),
+        "{outcome:?}"
+    );
+    assert!(!session.is_authenticated().await);
 }
 
 /// An unknown tenant must be indistinguishable from a known tenant whose

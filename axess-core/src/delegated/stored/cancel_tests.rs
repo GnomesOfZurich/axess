@@ -63,6 +63,7 @@ async fn a_dropped_refresh_still_saves_the_rotated_token() {
         .expect("save");
 
     let session = StoredDelegationSession::new(provider.clone(), store.clone(), tenant, user)
+        .expect("the default client builds")
         .with_clock(Arc::new(MockClock::at(t0())));
     // The caller gives up long before the IdP answers; its future is dropped.
     let outcome = tokio::time::timeout(Duration::from_millis(50), session.get_access_token()).await;

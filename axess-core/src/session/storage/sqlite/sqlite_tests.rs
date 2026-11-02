@@ -39,9 +39,9 @@ fn payload_with_custom() -> SessionData {
     }
 }
 
-/// A zero TTL writes an already-expired row, so `update` must say the
-/// session was not kept; a sub-second TTL is raised to one second and
-/// the session stays loadable.
+/// A zero TTL stores nothing, so `update` must say the session was not
+/// kept; a sub-second TTL is raised to one second and the session stays
+/// loadable.
 #[tokio::test]
 async fn zero_ttl_update_reports_false_and_sub_second_ttl_stays_loadable() {
     let store = store().await;
@@ -69,6 +69,126 @@ async fn zero_ttl_update_reports_false_and_sub_second_ttl_stays_loadable() {
         store.load(&id2).await.unwrap().is_some(),
         "a sub-second TTL must not produce a row that can never load"
     );
+}
+
+async fn rows_under(store: &SqliteSessionStore, id: &SessionId) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE id = ?1")
+        .bind(id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
+/// A zero TTL stores nothing: `update` removes the row instead of leaving an
+/// unloadable one behind, and reports the session not kept.
+#[tokio::test]
+async fn zero_ttl_update_removes_the_row() {
+    let store = store().await;
+    let id = sample_id();
+    store
+        .save(&id, &payload_with_custom(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let kept = store
+        .update(&id, &payload_with_custom(), Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(!kept);
+    assert_eq!(rows_under(&store, &id).await, 0, "no row is left behind");
+}
+
+/// A zero TTL stores nothing: a conditional write against the stored revision
+/// removes the row and reports the session gone; against another revision it
+/// conflicts and removes nothing.
+#[tokio::test]
+async fn zero_ttl_update_if_revision_removes_the_row_and_reports_gone() {
+    let store = store().await;
+    let id = sample_id();
+    let stored = SessionData {
+        revision: 3,
+        ..payload_with_custom()
+    };
+    store
+        .save(&id, &stored, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_if_revision(&id, 9, &stored, Duration::ZERO)
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict
+    );
+    assert_eq!(
+        rows_under(&store, &id).await,
+        1,
+        "a conflict removes nothing"
+    );
+    assert_eq!(
+        store
+            .update_if_revision(&id, 3, &stored, Duration::ZERO)
+            .await
+            .unwrap(),
+        ConditionalUpdate::Gone
+    );
+    assert_eq!(rows_under(&store, &id).await, 0, "no row is left behind");
+}
+
+/// A zero TTL stores nothing: `save` removes the row it would have expired at
+/// once, instead of upserting it and reporting a success.
+#[tokio::test]
+async fn zero_ttl_save_removes_the_row() {
+    let store = store().await;
+    let id = sample_id();
+    store
+        .save(&id, &payload_with_custom(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    store
+        .save(&id, &payload_with_custom(), Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(store.load(&id).await.unwrap().is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sessions WHERE id = ?1")
+            .bind(id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap(),
+        0,
+        "no row is left behind"
+    );
+}
+
+/// A zero TTL rotation removes both rows and reports the session gone, with
+/// and without the old row being required.
+#[tokio::test]
+async fn zero_ttl_cycle_removes_both_rows_and_reports_the_session_gone() {
+    for require_old in [false, true] {
+        let store = store().await;
+        let (old, new) = (sample_id(), sample_id());
+        store
+            .save(&old, &payload_with_custom(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let outcome = store
+            .cycle(
+                &old,
+                &new,
+                &payload_with_custom(),
+                Duration::ZERO,
+                require_old,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CycleOutcome::SessionGone,
+            "require_old={require_old}: nothing is stored, so nothing rotated"
+        );
+        assert!(store.load(&old).await.unwrap().is_none());
+        assert!(store.load(&new).await.unwrap().is_none());
+    }
 }
 
 #[tokio::test]

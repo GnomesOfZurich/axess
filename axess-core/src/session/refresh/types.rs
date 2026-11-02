@@ -25,11 +25,20 @@ define_id! {
 ///
 /// Only a token that was rotated out ([`Rotated`](Self::Rotated)) and then
 /// presented again is evidence of theft. A token a user logged out, one the
-/// per-user cap evicted, and one a family revocation already killed are all
-/// revoked on purpose, and presenting them again is a stale client rather
-/// than an attacker. Stores persist the reason next to `revoked`; a row
-/// revoked before the reason existed reads as `None` and is handled as
-/// [`Rotated`](Self::Rotated), the strictest reading.
+/// per-user cap evicted, one revoked with its device, and one a family
+/// revocation already killed are all revoked on purpose, and presenting them
+/// again is a stale client rather than an attacker. Every revoking method of
+/// a [`RefreshTokenStore`](super::RefreshTokenStore) persists the reason and
+/// the time next to `revoked`.
+///
+/// A row whose reason reads as `None` (revoked by a release that recorded
+/// none, or by a store that does not persist the column) is handled as
+/// [`Rotated`](Self::Rotated), the strictest reading: its reuse revokes the
+/// family. That is deliberate. Such a row may be a rotated-out token, and
+/// reading it as benign would blind the reuse detection for every token
+/// revoked before the upgrade; the cost is that a stale client presenting a
+/// pre-upgrade logout token once more is answered as a compromise, which
+/// only ends a family that was already revoked or about to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevocationReason {
     /// Replaced by its child in a rotation. Reuse is a compromise signal.
@@ -40,6 +49,9 @@ pub enum RevocationReason {
     Evicted,
     /// Revoked as part of a family revocation after a reuse was detected.
     Compromise,
+    /// Revoked together with the device it was issued to
+    /// ([`RefreshTokenStore::revoke_device_tokens`](super::RefreshTokenStore::revoke_device_tokens)).
+    Device,
 }
 
 impl RevocationReason {
@@ -50,6 +62,7 @@ impl RevocationReason {
             Self::Explicit => "explicit",
             Self::Evicted => "evicted",
             Self::Compromise => "compromise",
+            Self::Device => "device",
         }
     }
 
@@ -62,6 +75,7 @@ impl RevocationReason {
             "explicit" => Some(Self::Explicit),
             "evicted" => Some(Self::Evicted),
             "compromise" => Some(Self::Compromise),
+            "device" => Some(Self::Device),
             _ => None,
         }
     }
@@ -166,6 +180,12 @@ pub struct RefreshTokenConfig {
     /// database); a leaked refresh-token-hash table cannot be pre-image
     /// scanned without it.
     ///
+    /// The pepper also keys the digest a token stores of its `device_info`.
+    /// Without one that digest is unkeyed, so a reader of the store can
+    /// confirm a guessed device string against a row (a `User-Agent` has
+    /// little entropy); it still never lets a caller pass with the wrong
+    /// string. Set a pepper wherever device binding is used.
+    ///
     /// An empty pepper is a configuration error
     /// ([`RefreshError::InvalidConfig`]): `Some` always means keyed hashing,
     /// never a silent fall back to the unkeyed hash.
@@ -183,13 +203,16 @@ pub struct RefreshTokenConfig {
     ///
     /// When a presented token is not found under the current hash, the
     /// lookup retries under `HMAC-SHA256(previous_hash_pepper, plaintext)`.
-    /// A token found that way is moved to the current pepper by force: the
-    /// refresh rotates it even when `rotation` is off, so the token the
-    /// client receives is stored under `hash_pepper`. Reuse detection is
-    /// unchanged, because the rotated-out record keeps its old hash and is
-    /// still found by the retry. Once every live token has been refreshed
-    /// (one `ttl`, at most `max_lifetime` for tokens that are never used),
-    /// set this back to `None`.
+    /// A token found that way is moved to the current pepper on that
+    /// refresh: with `rotation` on, the replacement token is stored under
+    /// `hash_pepper` as any replacement is; with `rotation` off, the same
+    /// token is re-stored under `hash_pepper` (and its device binding keyed
+    /// by it), the client is handed nothing and keeps presenting the token
+    /// it has. Reuse detection is unchanged: the record under the old hash
+    /// is revoked as rotated and is reached only when the current-pepper
+    /// lookup misses, which for a kept token it no longer does. Once every
+    /// live token has been refreshed (one `ttl`, at most `max_lifetime` for
+    /// tokens that are never used), set this back to `None`.
     ///
     /// Only a keyed previous pepper is expressible: a rollout from the
     /// unkeyed hash still invalidates the tokens it replaces. An empty
@@ -210,9 +233,12 @@ pub struct RefreshTokenConfig {
     /// theft. Default zero: any reuse of a rotated-out token revokes the
     /// family. Within the window the second caller gets
     /// [`RefreshError::ConcurrentRefresh`] and nothing is revoked, so the
-    /// client can retry with the token the first refresh returned. Keep it
-    /// to a few seconds: the window is also open to a thief who replays the
-    /// token just after the victim used it.
+    /// client can retry with the token the first refresh returned. The
+    /// window is measured as the distance between the rotation's
+    /// `revoked_at` and this node's clock, in either direction, so a
+    /// rotation stamped by a node whose clock runs ahead is not read as
+    /// theft. Keep it to a few seconds: the window is also open to a thief
+    /// who replays the token just after the victim used it.
     pub reuse_grace: Duration,
 }
 
@@ -336,20 +362,24 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
 
     /// The token was rotated a moment ago and presented again inside
     /// [`RefreshTokenConfig::reuse_grace`]: two parallel refreshes by one
-    /// client. Nothing was revoked; retry with the token the first refresh
-    /// returned.
+    /// client. Also answered when the store refused the rotation because the
+    /// parent was no longer live, yet still reads it as live: a parallel
+    /// refresh this node cannot see yet. Nothing was revoked; retry with the
+    /// token the first refresh returned.
     #[error("refresh token was just rotated by a concurrent refresh")]
     ConcurrentRefresh,
 
-    /// The device fingerprint does not match.
+    /// The device fingerprint presented does not match the token's binding,
+    /// or, on the device-checked refreshes, the token's device now belongs
+    /// to another user. Nothing was rotated.
     #[error("device mismatch")]
     DeviceMismatch,
 
     /// The caller-supplied account-status check returned `false`
     /// for the user the token belongs to (suspended, terminated, etc.).
-    /// Returned only by [`refresh_session_with_status_check`](super::refresh_session_with_status_check);
-    /// the bare [`refresh_session`](super::refresh_session) never produces it because it has no
-    /// [`IdentityStore`](crate::authn::store::IdentityStore) reference.
+    /// Returned by [`Refresh::run`](super::Refresh::run) when the status
+    /// predicate given to [`Refresh::new`](super::Refresh::new) refuses;
+    /// nothing was rotated.
     #[error("account is not active")]
     AccountInactive,
 
@@ -359,16 +389,16 @@ pub enum RefreshError<E: std::error::Error + Send + Sync + 'static> {
     InvalidConfig(&'static str),
 
     /// The device the token was issued to is revoked or no longer exists.
-    /// Returned only by
-    /// [`refresh_session_with_device_check`](super::refresh_session_with_device_check),
-    /// before anything is rotated; the token is left as it is.
+    /// Returned only by a refresh with a device check
+    /// ([`Refresh::device_store`](super::Refresh::device_store)), before
+    /// anything is rotated; the token is left as it is.
     #[error("device revoked")]
     DeviceRevoked,
 
     /// The device store could not answer the device check, so the refresh
     /// was refused rather than allowed unchecked. Carries the store's
-    /// message. Returned only by
-    /// [`refresh_session_with_device_check`](super::refresh_session_with_device_check).
+    /// message. Returned only by a refresh with a device check
+    /// ([`Refresh::device_store`](super::Refresh::device_store)).
     #[error("device store error: {0}")]
     DeviceStore(String),
 

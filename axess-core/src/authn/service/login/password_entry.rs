@@ -29,8 +29,10 @@ where
     /// A locked account is answered `InvalidCredential` here, not `Locked`:
     /// telling a caller who has not yet proved anything that the account
     /// exists and is locked is the enumeration this method exists to avoid.
-    /// The audit row still records the lockout. Use `begin_login` and
-    /// `verify_factor` directly when the lock should be shown.
+    /// The audit row still records the lockout. `begin_login` conceals the
+    /// lock the same way unless the service was built with
+    /// [`with_lockout_revealed_on_begin`](crate::authn::AuthnServiceBuilder::with_lockout_revealed_on_begin);
+    /// use it and `verify_factor` directly when the lock should be shown.
     ///
     /// Otherwise the result is that of `verify_factor` on the password:
     /// [`Authenticated`](FactorOutcome::Authenticated),
@@ -38,6 +40,16 @@ where
     /// or `InvalidCredential`, with the failure counter and audit row of any
     /// wrong password. The session is left `Authenticating` only while a
     /// further factor is required.
+    ///
+    /// What is equalised is the hash: the store round trips of the two
+    /// paths differ. A known user's password check reads the factor,
+    /// writes the failure counter and the audit row, where the paths above
+    /// make `begin_login`'s calls alone; a dummy counter write and audit row
+    /// for a user that does not exist would equalise them at the cost of
+    /// rows in every deployment's stores, and the difference is a few
+    /// store round trips beside an Argon2id run of tens of milliseconds.
+    /// A deployment that must close it puts the same fixed delay on every
+    /// answer in front of the route.
     #[tracing::instrument(skip(self, identifier, password, session), fields(tenant = %tenant_identifier))]
     pub async fn login_with_password(
         &self,

@@ -554,3 +554,66 @@ async fn sweeping_resumes_after_the_clock_steps_back() {
     );
     assert_eq!(v.remembered(), 1);
 }
+
+// ── Warn throttle ─────────────────────────────────────────────────────────
+
+/// One warning per second; a clock that steps back re-arms the throttle
+/// rather than silencing it until the clock passes the old stamp again.
+#[test]
+fn the_warn_throttle_survives_a_clock_step_back() {
+    let (v, _) = verifier(&clock(), addressed());
+    assert!(v.claim_warn(1000), "the first refusal warns");
+    assert!(
+        !v.claim_warn(1000),
+        "a second in the same second is throttled"
+    );
+    assert!(
+        v.claim_warn(900),
+        "after a step back the next refusal must warn, not wait for the clock to reach 1000"
+    );
+    assert!(!v.claim_warn(900));
+    assert!(v.claim_warn(901));
+}
+
+/// The acceptance case through the verifier: a replay warns, the clock
+/// steps back, and the next replay still produces a warn-level line.
+#[tokio::test]
+async fn a_replay_after_a_clock_step_back_is_still_warned_about() {
+    use crate::testing::mock_tracing::TracingCapture;
+    let capture = TracingCapture::install();
+    let clock = MockClock::at(chrono::DateTime::from_timestamp(1000, 0).expect("in range"));
+    let (v, secrets) = verifier(&clock, addressed());
+
+    assert_eq!(verdict(&v, &secrets, 1000, "a").await, StatusCode::OK);
+    assert_eq!(
+        verdict(&v, &secrets, 1000, "a").await,
+        StatusCode::UNAUTHORIZED,
+        "the replay is refused"
+    );
+    let warns_before = capture
+        .events()
+        .iter()
+        .filter(|e| e.level == tracing::Level::WARN && e.target == "axess::service_secret")
+        .count();
+    assert_eq!(warns_before, 1, "the first replay warns");
+
+    clock.set(chrono::DateTime::from_timestamp(900, 0).expect("in range"));
+    assert_eq!(
+        verdict(&v, &secrets, 900, "b").await,
+        StatusCode::OK,
+        "the stamp is inside the tolerance of the stepped-back clock"
+    );
+    assert_eq!(
+        verdict(&v, &secrets, 900, "b").await,
+        StatusCode::UNAUTHORIZED
+    );
+    let warns_after = capture
+        .events()
+        .iter()
+        .filter(|e| e.level == tracing::Level::WARN && e.target == "axess::service_secret")
+        .count();
+    assert_eq!(
+        warns_after, 2,
+        "the replay after the step back must be warned about, not demoted to debug"
+    );
+}

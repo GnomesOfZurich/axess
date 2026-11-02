@@ -114,12 +114,23 @@ fn parse_cidr(spec: &str) -> Result<(std::net::IpAddr, u8), CidrParseError> {
     if !host_bits_clear(addr, prefix) {
         return Err(CidrParseError::HostBitsSet(spec.to_string()));
     }
+    // A block written in IPv4-mapped form (`::ffff:10.0.0.0/104`) names
+    // IPv4 proxies. Addresses are compared in their IPv4 form (see
+    // `trusts_hop`), so the entry is kept in that form too, or it would
+    // match neither an IPv4 peer nor the mapped peer a dual-stack listener
+    // reports. A mapped network address has the `ffff` word set, so its
+    // prefix covers at least the 96 bits before the IPv4 part.
+    if let std::net::IpAddr::V6(v6) = addr
+        && let Some(v4) = v6.to_ipv4_mapped()
+    {
+        let prefix = prefix
+            .checked_sub(96)
+            .ok_or_else(|| CidrParseError::Prefix(spec.to_string()))?;
+        return Ok((std::net::IpAddr::V4(v4), prefix));
+    }
     Ok((addr, prefix))
 }
 
-/// Whether `addr` falls inside `net/prefix`. Mixed families never match:
-/// an IPv4-mapped IPv6 peer is a different address, and silently treating
-/// it as its IPv4 form would let a v6 client claim a v4 allowance.
 /// Whether `addr` has no bits set below `prefix`, i.e. it names a
 /// network rather than a host inside one.
 fn host_bits_clear(addr: std::net::IpAddr, prefix: u8) -> bool {
@@ -131,6 +142,11 @@ fn host_bits_clear(addr: std::net::IpAddr, prefix: u8) -> bool {
     }
 }
 
+/// Whether `addr` falls inside `net/prefix`. Mixed families never match:
+/// an IPv4-mapped IPv6 peer is a different address, and silently treating
+/// it as its IPv4 form would let a v6 client claim a v4 allowance. Both
+/// sides arrive in canonical form: the address through `trusts_hop`, the
+/// network through `parse_cidr`.
 fn in_network(addr: std::net::IpAddr, net: std::net::IpAddr, prefix: u8) -> bool {
     match (addr, net) {
         (std::net::IpAddr::V4(a), std::net::IpAddr::V4(n)) => {
@@ -198,6 +214,8 @@ impl TrustedProxies {
     }
 
     /// Build from CIDR strings such as `"10.0.0.0/8"` or `"2001:db8::/32"`.
+    /// A block in IPv4-mapped form, such as `"::ffff:10.0.0.0/104"`, names
+    /// the IPv4 proxies `10.0.0.0/8` does.
     ///
     /// Ranges matter in practice: a cloud load balancer's egress addresses
     /// change, and an operator who cannot express the range tends to skip

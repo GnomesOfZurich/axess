@@ -9,6 +9,22 @@
   "editUsernameAllowed": false,
   "bruteForceProtected": true,
   "accessTokenLifespan": 300,
+  "defaultSignatureAlgorithm": "ES256",
+  "components": {
+    "org.keycloak.keys.KeyProvider": [
+      {
+        "name": "fapi-es256",
+        "providerId": "ecdsa-generated",
+        "subComponents": {},
+        "config": {
+          "priority": ["200"],
+          "enabled": ["true"],
+          "active": ["true"],
+          "ecdsaEllipticCurveKey": ["P-256"]
+        }
+      }
+    ]
+  },
   "ssoSessionIdleTimeout": 1800,
   "ssoSessionMaxLifespan": 36000,
   "users": [
@@ -26,7 +42,7 @@
           "temporary": false
         }
       ],
-      "realmRoles": ["portfolio-viewer"],
+      "realmRoles": ["default-roles-fapi", "portfolio-viewer"],
       "groups": ["/finance-team"]
     }
   ],
@@ -51,8 +67,7 @@
       "description": "Demo client for the axess FAPI 2.0 example",
       "enabled": true,
       "protocol": "openid-connect",
-      "clientAuthenticatorType": "client-secret",
-      "secret": "axess-fapi-secret",
+      "clientAuthenticatorType": "client-jwt",
       "publicClient": false,
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
@@ -77,8 +92,40 @@
         "client.session.max.lifespan": "36000",
         "id.token.as.detached.signature": "false",
         "tls.client.certificate.bound.access.tokens": "false",
-        "require.signed.request.object": "false"
+        "require.signed.request.object": "false",
+        "token.endpoint.auth.signing.alg": "ES256",
+        "id.token.signed.response.alg": "ES256",
+        "use.jwks.url": "false",
+        "use.jwks.string": "true",
+        "jwks.string": "{\"keys\":[{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"sig\",\"alg\":\"ES256\",\"kid\":\"axess-fapi-dev\",\"x\":\"HiI8V1SnTSnlNMRkv8zqiQSkiaJWKdJkD1CkbT8sw-o\",\"y\":\"KtRmBq3QlSwL1wNqngYMrf9j7cn9I0k-0tgqjt1FS4Y\"}]}"
       },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "realm roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "multivalued": "true",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ],
       "defaultClientScopes": [
         "web-origins",
         "acr",

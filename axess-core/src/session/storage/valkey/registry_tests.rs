@@ -39,6 +39,30 @@ fn recheck_delay_is_drawn_from_the_injected_rng_within_the_window() {
     assert_eq!(delays, replay, "the same seed gives the same delays");
 }
 
+/// Each degraded poll's wait is drawn from the injected random source and
+/// stays within the quarter interval on either side of the base: the draws
+/// differ, so watchers that lost one connection together do not poll in
+/// lockstep.
+#[test]
+fn degraded_poll_delay_is_drawn_from_the_injected_rng_within_the_window() {
+    let registry = offline_registry().with_rng(Arc::new(MockRng::new(7)));
+    let delays: Vec<Duration> = (0..64).map(|_| registry.degraded_poll_delay(0)).collect();
+    assert!(
+        delays
+            .iter()
+            .all(|d| (Duration::from_millis(3_750)..=Duration::from_millis(6_250)).contains(d)),
+        "{delays:?}"
+    );
+    let distinct = delays
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    assert!(
+        distinct > 8,
+        "the delays spread over the window: {distinct} distinct"
+    );
+}
+
 /// A clock that runs a closure once, on its first reading, then reports a
 /// fixed instant. `is_valid` reads the clock between its `ZSCORE` and its
 /// removal of an expired member, so the closure is a write landing exactly

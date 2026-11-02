@@ -50,6 +50,7 @@ async fn valkey_device_shared_contract() {
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store("sight").await).await;
     shared::a_save_never_un_revokes(store("unrevoke").await).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(store("newest").await).await;
+    shared::sub_second_instants_compare_as_whole_seconds(store("fraction").await).await;
     shared::a_revoked_row_keeps_its_revocation_time(store("twice").await).await;
     shared::a_sighting_reports_the_level_it_found(store("reports").await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store("stamp").await).await;
@@ -279,12 +280,13 @@ async fn valkey_device_a_stale_user_entry_does_not_hand_over_a_device() {
     assert_eq!(s.find_for_user(&t, &user(), 10).await.unwrap().len(), 1);
 }
 
-/// A fingerprint entry that points at a device whose row says otherwise
-/// finds nothing and is removed.
+/// A single-id fingerprint key of an earlier release that points at a device
+/// whose row says otherwise finds nothing and is removed, on a store that
+/// reads the earlier layouts.
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_stale_fingerprint_entry_finds_nothing_and_is_removed() {
-    let s = store("stalefp").await;
+    let s = store("stalefp").await.with_legacy_fingerprint_keys();
     let now = at(0);
     let t = tenant();
     let d = shared::device("fp-owner", 0x86, DeviceTrustLevel::Seen, now);

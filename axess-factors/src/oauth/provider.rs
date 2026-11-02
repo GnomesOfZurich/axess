@@ -1,33 +1,39 @@
 //! OAuthProviderConfig: production OIDC provider implementation.
 //!
-//! Split from the previous monolithic `provider/mod.rs` (1114 lines)
-//! into orthogonal sub-files:
+//! This file carries the struct, the openidconnect client it builds per
+//! operation (`make_client`) and the ID-token claim extraction the trait
+//! impl and the grant submodules share. The rest is split by concern:
 //!
-//! - `discover`: async OIDC discovery constructor.
-//! - `builder`: chainable `with_*` configuration setters.
-//! - `jwks`: JWKS refresh with single-flight + min-interval coalescing.
+//! - `discover`: async OIDC discovery, which returns the builder.
+//! - `builder`: [`OAuthProviderBuilder`], its `with_*` settings and the
+//!   one `build` that checks them together.
+//! - `fapi_profile`: the FAPI 2.0 profile's checks, the mTLS client and
+//!   aliases, the ID-token verifier and the JARM response.
 //! - `provider_impl`: `impl OAuthProvider for OAuthProviderConfig`.
-//!
-//! Plus the existing siblings:
-//!
+//! - `sender_constrained`: the token requests and the userinfo call, with a
+//!   DPoP proof and the one nonce retry.
+//! - `client_auth`: the client secret or `private_key_jwt` assertion on a
+//!   request.
+//! - `issuer_jwt`: the logout and JARM tokens the issuer signs.
+//! - `jwks`, `fresh_keys`: the refreshable key set.
 //! - `device_flow`: RFC 8628 Device Authorization Grant.
-//! - `fapi_flow`: FAPI 2.0 Baseline Profile (PAR + DPoP).
-//! - `dpop_verify`: DPoP proof validation (`fapi` feature).
-//!
-//! `mod.rs` itself only carries the struct definition + the two
-//! cross-cutting helpers (`make_client`, `extract_claims_from_response`)
-//! that the trait impl and sibling submodules share.
+//! - `dpop`: DPoP proofs (RFC 9449) and the discovery advertisement.
+//! - `fapi_flow`: Pushed Authorization Requests (RFC 9126).
+//! - `dpop_verify`: DPoP proof validation for a resource server.
 
 mod builder;
+pub use builder::OAuthProviderBuilder;
 mod ceremony;
+mod client_auth;
 mod device_flow;
 mod discover;
-#[cfg(feature = "fapi")]
+mod dpop;
 pub mod dpop_verify;
 mod endpoint;
 mod fapi_flow;
 mod fapi_profile;
 mod fresh_keys;
+mod issuer_jwt;
 mod jwks;
 mod provider_impl;
 mod refresh_response;
@@ -72,8 +78,18 @@ pub struct OAuthProviderConfig {
     pub(crate) metadata: CoreProviderMetadata,
     /// OAuth client ID.
     pub(crate) client_id: ClientId,
-    /// OAuth client secret.
+    /// OAuth client secret. `None` when the client authenticates by
+    /// [`client_assertion`](Self::client_assertion) or by certificate, and
+    /// always under the FAPI profile.
     pub(crate) client_secret: Option<ClientSecret>,
+    /// `private_key_jwt` signer, set by
+    /// [`with_private_key_jwt`](OAuthProviderBuilder::with_private_key_jwt).
+    /// While it is set no request carries a client secret.
+    pub(crate) client_assertion: Option<crate::client_assertion::ClientAssertionSigner>,
+    /// Entropy for the `jti` of client assertions. Defaults to
+    /// [`SystemRng`](axess_rng::SystemRng); see
+    /// [`with_rng`](OAuthProviderBuilder::with_rng).
+    pub(crate) rng: Arc<dyn axess_rng::SecureRng>,
     /// Redirect URL for the callback.
     pub(crate) redirect_url: RedirectUrl,
     /// HTTP client for token exchange (configured not to follow redirects).
@@ -86,7 +102,7 @@ pub struct OAuthProviderConfig {
     /// Device authorization endpoint URL (RFC 8628), if configured.
     ///
     /// Not part of standard OIDC discovery; must be set via
-    /// [`with_device_authorization_endpoint`](Self::with_device_authorization_endpoint).
+    /// [`with_device_authorization_endpoint`](OAuthProviderBuilder::with_device_authorization_endpoint).
     pub(crate) device_authorization_endpoint: Option<String>,
     /// OIDC RP-Initiated Logout endpoint, from discovery metadata.
     pub(crate) end_session_endpoint: Option<String>,
@@ -99,13 +115,28 @@ pub struct OAuthProviderConfig {
     /// the callback must compare with the issuer.
     pub(crate) iss_parameter_supported: bool,
     /// The `mtls_endpoint_aliases` of the discovery document, used when
-    /// [`with_fapi`](Self::with_fapi) selects mTLS.
+    /// the FAPI profile selects mTLS.
     pub(crate) mtls_aliases: fapi_profile::MtlsAliases,
-    /// FAPI configuration, set by [`with_fapi`](Self::with_fapi): the
-    /// sender constraint on the token requests and the ID-token limits.
+    /// FAPI configuration, set by
+    /// [`OAuthProviderBuilder::with_fapi`]: the sender constraint on the
+    /// token requests and the ID-token limits.
     pub(crate) fapi: Option<FapiConfig>,
-    /// The ID-token signature algorithms of the FAPI profile, parsed from
-    /// the configuration; `None` leaves the IdP's advertised list in force.
+    /// Whether tokens are bound to a DPoP key (RFC 9449): every token
+    /// request and userinfo call carries a proof, and a call without the key
+    /// is refused. Resolved by [`OAuthProviderBuilder::build`] from
+    /// [`dpop_advertised`](Self::dpop_advertised),
+    /// [`with_dpop`](OAuthProviderBuilder::with_dpop),
+    /// [`without_dpop`](OAuthProviderBuilder::without_dpop) and the FAPI
+    /// profile.
+    pub(crate) dpop: bool,
+    /// Whether the discovery document advertises DPoP with the algorithm
+    /// the proofs are signed with (`ES256` in
+    /// `dpop_signing_alg_values_supported`).
+    pub(crate) dpop_advertised: bool,
+    /// The ID-token signature algorithms the provider accepts: the pin of
+    /// [`with_id_token_signing_algs`](OAuthProviderBuilder::with_id_token_signing_algs),
+    /// the FAPI profile's list, or the algorithms both name. `None` leaves
+    /// the IdP's advertised list in force.
     pub(crate) id_token_algs: Option<fapi_profile::IdTokenAlgs>,
     /// Source of wall-clock time for `exp`/`iat`/`nbf` checks. Defaults
     /// to [`SystemClock`](axess_clock::SystemClock); swap in a
@@ -121,7 +152,7 @@ pub struct OAuthProviderConfig {
     /// Whether a back-channel logout token must carry the `typ` header
     /// `logout+jwt`. Off by default, where a token with no `typ` and the
     /// plain `JWT` and `Logout` spellings IdPs send are taken too; see
-    /// [`with_required_logout_typ`](Self::with_required_logout_typ).
+    /// [`with_required_logout_typ`](OAuthProviderBuilder::with_required_logout_typ).
     pub(crate) require_logout_typ: bool,
     /// Scopes to request. Default: `["openid", "email", "profile"]`.
     pub scopes: Vec<String>,
@@ -191,7 +222,7 @@ impl OAuthProviderConfig {
         token_response: &openidconnect::core::CoreTokenResponse,
         nonce: &str,
     ) -> Result<OAuthClaims, OAuthError> {
-        use openidconnect::{Nonce, OAuth2TokenResponse, TokenResponse};
+        use openidconnect::{Nonce, TokenResponse};
 
         let id_token = token_response
             .id_token()
@@ -233,33 +264,7 @@ impl OAuthProviderConfig {
         // claims and the access token are present, so a tampered
         // access-token swap is detected even on IdPs that emit the hash.
         if let Some(claim_hash) = claims.access_token_hash() {
-            use openidconnect::OAuth2TokenResponse;
-            let access_token = OAuth2TokenResponse::access_token(token_response).secret();
-            let alg = id_token
-                .signing_alg()
-                .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
-            let signing_key = id_token
-                .signing_key(&id_token_verifier)
-                .map_err(|e| OAuthError::IdTokenValidation(format!("signing key: {e}")))?;
-            let expected = openidconnect::AccessTokenHash::from_token(
-                &openidconnect::AccessToken::new(access_token.to_string()),
-                alg,
-                signing_key,
-            )
-            .map_err(|e| OAuthError::IdTokenValidation(format!("at_hash compute: {e}")))?;
-            use subtle::ConstantTimeEq as _;
-            if !bool::from(
-                expected
-                    .as_str()
-                    .as_bytes()
-                    .ct_eq(claim_hash.as_str().as_bytes()),
-            ) {
-                return Err(OAuthError::IdTokenValidation(
-                    "at_hash claim does not match access_token; IdP-side tampering or \
-                     wrong access token routed"
-                        .to_string(),
-                ));
-            }
+            enforce_at_hash(id_token, &id_token_verifier, claim_hash, token_response)?;
         }
         // c_hash is computed from the authorization code; we don't have
         // the original code at this point in the flow (it was consumed
@@ -268,15 +273,29 @@ impl OAuthProviderConfig {
         // FAPI-mode verifier to be added once the upstream openidconnect
         // crate exposes it.
 
-        // FAPI 2.0 §5.2.2; when FAPI is configured, enforce
-        // strict ID-token lifetime AND require `nbf`. openidconnect's
-        // default verifier honours `exp` (rejects expired tokens) but
-        // does NOT cap `exp - iat` nor require `nbf`. The doc on
-        // FapiConfig advertises both; the enforcement was missing.
+        // When FAPI is configured, cap the ID-token lifetime and refuse an
+        // `nbf` in the future. openidconnect's default verifier honours
+        // `exp` (rejects expired tokens) but neither caps `exp - iat` nor
+        // reads `nbf`.
         self.enforce_fapi_id_token(
             (claims.expiration() - claims.issue_time()).num_seconds(),
             &verified_payload,
         )?;
+
+        Ok(self.oauth_claims(claims, verified_payload, token_response, raw_id_token))
+    }
+
+    /// The [`OAuthClaims`] of a verified ID token: the standard claims, the
+    /// claims the typed view drops (read from the verified payload) and the
+    /// tokens of the response.
+    fn oauth_claims(
+        &self,
+        claims: &openidconnect::core::CoreIdTokenClaims,
+        verified_payload: serde_json::Value,
+        token_response: &openidconnect::core::CoreTokenResponse,
+        raw_id_token: Option<String>,
+    ) -> OAuthClaims {
+        use openidconnect::OAuth2TokenResponse;
 
         let subject = claims.subject().to_string();
         let email = claims.email().map(|e| e.as_str().to_string());
@@ -318,8 +337,12 @@ impl OAuthProviderConfig {
         ));
         let refresh_token = OAuth2TokenResponse::refresh_token(token_response)
             .map(|t| ZeroizedString::new(t.secret().to_string()));
+        let nonce = additional_claims
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
-        Ok(OAuthClaims {
+        OAuthClaims {
             provider: self.name.clone(),
             subject,
             email,
@@ -330,17 +353,57 @@ impl OAuthProviderConfig {
             access_token,
             refresh_token,
             oidc_sid,
+            nonce,
             id_token_hint: raw_id_token.map(ZeroizedString::new),
             additional_claims,
             dpop_key: None,
-        })
+        }
     }
 }
 
-/// FAPI 2.0 §5.2.2 limits on a verified ID token: its lifetime
-/// (`exp - iat`, in seconds) is within `fapi`'s cap and its `nbf`, read from
-/// the verified payload, is present and not in the future (60 seconds of
-/// skew allowed).
+/// OIDC Core `at_hash`: `claim_hash` must be the hash of the response's
+/// access token under the ID token's signing algorithm.
+fn enforce_at_hash(
+    id_token: &openidconnect::core::CoreIdToken,
+    id_token_verifier: &openidconnect::core::CoreIdTokenVerifier<'_>,
+    claim_hash: &openidconnect::AccessTokenHash,
+    token_response: &openidconnect::core::CoreTokenResponse,
+) -> Result<(), OAuthError> {
+    use openidconnect::OAuth2TokenResponse;
+    let access_token = OAuth2TokenResponse::access_token(token_response).secret();
+    let alg = id_token
+        .signing_alg()
+        .map_err(|e| OAuthError::IdTokenValidation(format!("{e}")))?;
+    let signing_key = id_token
+        .signing_key(id_token_verifier)
+        .map_err(|e| OAuthError::IdTokenValidation(format!("signing key: {e}")))?;
+    let expected = openidconnect::AccessTokenHash::from_token(
+        &openidconnect::AccessToken::new(access_token.to_string()),
+        alg,
+        signing_key,
+    )
+    .map_err(|e| OAuthError::IdTokenValidation(format!("at_hash compute: {e}")))?;
+    use subtle::ConstantTimeEq as _;
+    if !bool::from(
+        expected
+            .as_str()
+            .as_bytes()
+            .ct_eq(claim_hash.as_str().as_bytes()),
+    ) {
+        return Err(OAuthError::IdTokenValidation(
+            "at_hash claim does not match access_token; IdP-side tampering or \
+             wrong access token routed"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The FAPI limits on a verified ID token: its lifetime (`exp - iat`, in
+/// seconds) is within `fapi`'s cap, and its `nbf`, read from the verified
+/// payload, is not more than 60 seconds in the future (FAPI 2.0 section
+/// 5.3.2.1, the rule for any JWT). `nbf` is optional: neither OpenID Connect
+/// nor FAPI 2.0 requires it in an ID token, and Keycloak issues none.
 pub(crate) fn fapi_id_token_violation(
     fapi: &FapiConfig,
     now: chrono::DateTime<chrono::Utc>,
@@ -357,14 +420,12 @@ pub(crate) fn fapi_id_token_violation(
 
     // `IdTokenClaims` is built with `EmptyAdditionalClaims`, which drops
     // `nbf`; read it from the verified payload instead.
-    let nbf_secs = verified_payload
-        .get("nbf")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| {
-            OAuthError::IdTokenValidation(
-                "FAPI requires `nbf` claim on ID token; missing".to_string(),
-            )
-        })?;
+    let Some(nbf) = verified_payload.get("nbf") else {
+        return Ok(());
+    };
+    let nbf_secs = nbf.as_i64().ok_or_else(|| {
+        OAuthError::IdTokenValidation("ID token `nbf` claim is not an integer".to_string())
+    })?;
     let nbf_time = chrono::DateTime::from_timestamp(nbf_secs, 0).ok_or_else(|| {
         OAuthError::IdTokenValidation("FAPI `nbf` claim is not a valid Unix timestamp".to_string())
     })?;
@@ -385,18 +446,16 @@ mod fapi_id_token_tests {
     }
 
     #[test]
-    fn nbf_is_required_and_must_not_be_in_the_future() {
+    fn nbf_is_optional_and_must_not_be_in_the_future() {
         let fapi = FapiConfig::default();
         let t = now().timestamp();
-        assert!(
-            fapi_id_token_violation(&fapi, now(), 120, &serde_json::json!({ "nbf": t - 5 }))
-                .is_ok()
-        );
-        assert!(fapi_id_token_violation(&fapi, now(), 120, &serde_json::json!({})).is_err());
-        assert!(
-            fapi_id_token_violation(&fapi, now(), 120, &serde_json::json!({ "nbf": t + 600 }))
-                .is_err()
-        );
+        let check = |payload| fapi_id_token_violation(&fapi, now(), 120, &payload);
+        assert!(check(serde_json::json!({ "nbf": t - 5 })).is_ok());
+        assert!(check(serde_json::json!({})).is_ok());
+        assert!(check(serde_json::json!({ "nbf": t + 60 })).is_ok());
+        assert!(check(serde_json::json!({ "nbf": t + 61 })).is_err());
+        assert!(check(serde_json::json!({ "nbf": t + 600 })).is_err());
+        assert!(check(serde_json::json!({ "nbf": "soon" })).is_err());
     }
 
     #[test]

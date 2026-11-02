@@ -58,8 +58,8 @@ The library handles JWT verification (signature against JWKS,
 
 ## Ready-made recipes
 
-`examples/workload-identity/` ships claim parsers + mappers for two
-common issuers. Adopters copy the recipe that matches their IdP
+`examples/workload-identity/` ships claim parsers + mappers for three
+common issuers (GitHub Actions, GitLab CI, Kubernetes service accounts). Adopters copy the recipe that matches their IdP
 into their codebase (recommended for production) or depend on the
 crate directly (useful for prototypes and tests).
 
@@ -116,6 +116,88 @@ unregistered account, use `k8s_sa_mapper_pinned` with a `SaUidPins` listing the
 UID registered for each `(namespace, name)` you trust; it rejects a token whose
 UID is missing or different.
 
+OpenShift and Amazon EKS issue the same bound service-account token with the
+same `kubernetes.io` claim block, so they use this recipe unchanged; what
+differs is the issuer and the audience, and the example crate's `openshift`
+and `eks` modules hold them. A default OpenShift 4 cluster signs with
+`https://kubernetes.default.svc` (read the cluster's value with
+`oc get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}'`),
+which is the same string on every default cluster, so the issuer does not
+tell clusters apart: the JWKS you trust and the audience do. An EKS cluster
+signs with its own `https://oidc.eks.<region>.amazonaws.com/id/<cluster id>`
+(`eks::issuer` builds it). On both, a pod's default token is for the
+API server (OpenShift) or for AWS STS (`sts.amazonaws.com`, the IRSA token on
+EKS): never accept those audiences. Project a second token with your own
+audience in the pod spec and pin that on the verifier. Both are tested with
+`k8s_sa_mapper_pinned` against a recorded token, and a wrong namespace, wrong
+UID or wrong audience is refused, the first two with an error that names the
+claim.
+
+### GitLab CI
+
+A GitLab job asks for an ID token with the `id_tokens:` keyword, naming the
+audience it wants. Pick the audience to be your service's URL and pin it on
+the verifier; the issuer is the GitLab instance's URL and its keys are at
+`<instance>/oauth/discovery/keys`.
+
+```yaml
+deploy:
+  stage: deploy
+  environment: production
+  id_tokens:
+    AXESS_TOKEN:
+      aud: https://axess.example.com
+  script:
+    - >
+      curl --fail -H "Authorization: Bearer ${AXESS_TOKEN}"
+      https://axess.example.com/deploy-hook
+```
+
+```rust,ignore
+use axess_example_workload_identity::gitlab::{
+    gitlab_mapper, GitLabAllowlist, GitLabClaims,
+};
+use axess_factors::federation::workload::WorkloadResolver;
+use axess_factors::jwt::verifier::JwtVerifier;
+use axess_identity::{Issuer, TrustDomain};
+use std::sync::Arc;
+
+let verifier = Arc::new(
+    JwtVerifier::new(gitlab_jwks_handle)
+        .with_issuer("https://gitlab.example.com")
+        .with_audience("https://axess.example.com"),
+);
+let trust_domain = TrustDomain::new("gitlab.ci").unwrap();
+
+let resolver = WorkloadResolver::<GitLabClaims, _, _>::new(
+    verifier.clone(),
+    trust_domain.clone(),
+    tenant_id,
+    Issuer::custom("gitlab_ci").unwrap(),
+    bearer_token,
+    gitlab_mapper(
+        trust_domain,
+        GitLabAllowlist::new()
+            .namespace_id("1204")
+            .project_id("4711")
+            .environment("production"),
+    ),
+);
+let principal = resolver.resolve().await?;
+```
+
+The recipe synthesises `spiffe://gitlab.ci/<project_id>/<namespace_id>` from
+the numeric `project_id` and `namespace_id` claims and requires both. The
+paths (`project_path`, `namespace_path`) are mutable and reusable, as GitHub's
+names are: a renamed, transferred or deleted project or group frees its old
+path. They are kept as attributes for audit. The mapper also requires
+`ref_protected` to be `true` unless the allowlist calls
+`allow_unprotected_refs`, since a job on an unprotected branch is one any
+developer of the project can start, and with environments listed it requires
+the job's `environment` to be one of them. Every refusal names the claim that
+decided it. If the instance is GitLab running in your own Azure subscription,
+only the issuer URL and the JWKS handle change.
+
 ### GitHub Actions OIDC
 
 GitHub Actions can issue OIDC tokens for workflow runs. The token
@@ -166,12 +248,12 @@ preserves `actor`, `workflow`, `ref`, `sha`, `event_name` as
 Cedar attributes for policy use (allow only deploys from the
 default branch, require a specific workflow file, etc.).
 
-### Other issuers (GitLab CI, Okta, Azure AD, Auth0, …)
+### Other issuers (Okta, Azure AD, Auth0, …)
 
 Write your own recipe. For any new IdP:
 
 1. Decode a sample JWT to identify which claims carry the workload
-   identity (`project_path`? `namespace_id`? a custom `service`?).
+   identity (a project id? a tenant id? a custom `service`?).
 2. Define a `#[derive(Deserialize)] struct YourClaims { ... }` with
    only the fields you care about. `JwtVerifier` ignores unknown
    claims, so you don't have to enumerate everything the issuer
@@ -187,12 +269,12 @@ Write your own recipe. For any new IdP:
 `WorkloadId::build` renders `spiffe://<trust_domain>/<service>/<tenant_slug>`,
 and each of those two segments is one path component: `[A-Za-z0-9._~-]`,
 non-empty, with the whole URI capped at 2048 characters. A claim that is
-already a path does not pass through. GitLab's `project_path` is
-`group/subgroup/project`, and handing it over whole fails on the first
+already a path does not pass through. A path-shaped claim such as
+`group/subgroup/project` fails on the first
 slash, so decide what the segments mean for your issuer and build them
 rather than forwarding a claim verbatim.
 
-The two shipped recipes are the templates; read their source,
+The shipped recipes are the templates; read their source,
 adapt as needed.
 
 ## Where federation fits

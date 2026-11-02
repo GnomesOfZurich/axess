@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id,
         client_secret,
         "http://localhost:3000/auth/callback/github",
-    );
+    )?;
 
     let state = AppState {
         github: Arc::new(github),
@@ -96,6 +96,27 @@ async fn home() -> Html<&'static str> {
     )
 }
 
+/// Whether the pre-auth cookies are `Secure`: yes unless
+/// `AXESS_DEV_INSECURE_COOKIES=1` is set for plain HTTP in development.
+fn secure_cookies() -> bool {
+    std::env::var("AXESS_DEV_INSECURE_COOKIES").map_or(true, |v| v != "1")
+}
+
+/// The name of a pre-auth cookie. Under `Secure` it carries the `__Host-`
+/// prefix (RFC 6265bis), which a browser honours only for a cookie set by
+/// the host itself over HTTPS with `Path=/` and no `Domain`: a cookie of
+/// that name planted by a sibling subdomain, an `http://` page or a
+/// `Domain=` attribute is dropped, so the callback never reads a state or
+/// verifier the attacker chose. Plain HTTP in development cannot carry the
+/// prefix, so there the bare name is used.
+fn pre_auth_cookie(base: &str, secure: bool) -> String {
+    if secure {
+        format!("__Host-{base}")
+    } else {
+        base.to_string()
+    }
+}
+
 async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResponse {
     let csrf_state = state.github.mint_csrf_state();
     let auth = state.github.build_auth_url(&csrf_state);
@@ -106,14 +127,16 @@ async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResp
     //
     // `Lax` still sends them on the top-level GET the provider redirects
     // back with, and withholds them from cross-site sub-requests. They are
-    // `Secure` unless `AXESS_DEV_INSECURE_COOKIES=1` is set for plain HTTP.
-    let secure = std::env::var("AXESS_DEV_INSECURE_COOKIES").map_or(true, |v| v != "1");
-    let mut state_cookie = Cookie::new("oauth_state", csrf_state);
+    // `Secure` and `__Host-` prefixed unless `AXESS_DEV_INSECURE_COOKIES=1`
+    // is set for plain HTTP; `Path=/` and no `Domain` are what the prefix
+    // requires.
+    let secure = secure_cookies();
+    let mut state_cookie = Cookie::new(pre_auth_cookie("oauth_state", secure), csrf_state);
     state_cookie.set_http_only(true);
     state_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     state_cookie.set_path("/");
     state_cookie.set_secure(secure);
-    let mut pkce_cookie = Cookie::new("oauth_pkce", auth.pkce_verifier);
+    let mut pkce_cookie = Cookie::new(pre_auth_cookie("oauth_pkce", secure), auth.pkce_verifier);
     pkce_cookie.set_http_only(true);
     pkce_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
     pkce_cookie.set_path("/");
@@ -135,9 +158,12 @@ async fn callback(
     Query(q): Query<CallbackQuery>,
     cookies: Cookies,
 ) -> impl IntoResponse {
-    // Verify CSRF state matches what we issued at /auth/login/github.
+    // Verify CSRF state matches what we issued at /auth/login/github. Only
+    // the prefixed name is read under `Secure`: a planted bare `oauth_state`
+    // cookie is not the one this app set and does not count.
+    let secure = secure_cookies();
     let stored_state = cookies
-        .get("oauth_state")
+        .get(&pre_auth_cookie("oauth_state", secure))
         .map(|c| c.value().to_string())
         .unwrap_or_default();
     // Constant-time comparison: the state is a secret the attacker must not
@@ -153,15 +179,16 @@ async fn callback(
     }
 
     let pkce_verifier = cookies
-        .get("oauth_pkce")
+        .get(&pre_auth_cookie("oauth_pkce", secure))
         .map(|c| c.value().to_string())
         .unwrap_or_default();
 
     // Clear the pre-auth cookies; they have served their purpose.
     // A removal only matches the cookie it replaces when the path agrees.
     for name in ["oauth_state", "oauth_pkce"] {
-        let mut gone = Cookie::new(name, "");
+        let mut gone = Cookie::new(pre_auth_cookie(name, secure), "");
         gone.set_path("/");
+        gone.set_secure(secure);
         cookies.remove(gone);
     }
 
@@ -250,4 +277,24 @@ fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pre_auth_cookie;
+
+    /// The default (Secure) deployment sets `__Host-` cookies, so a planted
+    /// bare `oauth_state` is a different cookie and is never read; plain
+    /// HTTP development keeps the bare names the browser can store.
+    #[test]
+    fn secure_pre_auth_cookies_carry_the_host_prefix() {
+        assert_eq!(pre_auth_cookie("oauth_state", true), "__Host-oauth_state");
+        assert_eq!(pre_auth_cookie("oauth_pkce", true), "__Host-oauth_pkce");
+        assert_ne!(
+            pre_auth_cookie("oauth_state", true),
+            "oauth_state",
+            "a planted bare cookie is not the one the callback reads"
+        );
+        assert_eq!(pre_auth_cookie("oauth_state", false), "oauth_state");
+    }
 }

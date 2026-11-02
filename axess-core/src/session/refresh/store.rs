@@ -34,9 +34,12 @@ pub enum DeviceTokenRevocation {
 ///
 /// # Revocation reasons
 ///
-/// Every revocation records why, in [`RefreshToken::revoked_reason`] and
-/// [`RefreshToken::revoked_at`], because only the reuse of a rotated-out
-/// token is a theft signal:
+/// Every method that revokes a token MUST record why and when, in
+/// [`RefreshToken::revoked_reason`] and [`RefreshToken::revoked_at`],
+/// because only the reuse of a rotated-out token is a theft signal; a
+/// revoked row with no reason is read as rotated, so a method that sets
+/// `revoked` alone turns every later presentation of its tokens into a
+/// family revocation and a compromise alarm:
 ///
 /// | Method | Reason | `revoked_at` |
 /// |---|---|---|
@@ -44,12 +47,16 @@ pub enum DeviceTokenRevocation {
 /// | [`revoke_token`](Self::revoke_token), [`revoke_user_tokens`](Self::revoke_user_tokens) | `Explicit` | the store's now |
 /// | [`issue_capped`](Self::issue_capped) (the evicted) | `Evicted` | the store's now |
 /// | [`revoke_family`](Self::revoke_family) | `Compromise` | the store's now |
+/// | [`revoke_device_tokens`](Self::revoke_device_tokens) | `Device` | the store's now |
 ///
 /// A revocation never overwrites the reason of a token that is already
 /// revoked (a rotated token later swept by a family revocation stays
-/// `Rotated`). A store that cannot persist the fields reads every revoked
-/// token as rotated, which is the strictest behaviour (any reuse revokes the
-/// family).
+/// `Rotated`). A row revoked by a release that recorded no reason, and
+/// every row of a store that cannot persist the fields, reads as `None`,
+/// which the refresh path handles as `Rotated`: the strictest reading, so
+/// a pre-upgrade rotated-out token still trips the reuse detection, at the
+/// price of a pre-upgrade logout token presented again being answered as a
+/// compromise (see [`RevocationReason`](super::RevocationReason)).
 ///
 /// [`RefreshToken::revoked_reason`]: super::RefreshToken::revoked_reason
 /// [`RefreshToken::revoked_at`]: super::RefreshToken::revoked_at
@@ -90,8 +97,13 @@ pub trait RefreshTokenStore: Send + Sync {
     ///
     /// Implementations MUST scope by tenant and perform it as one statement
     /// (or script), like [`revoke_family`](Self::revoke_family), so a
-    /// rotation racing with it cannot escape: `UPDATE ... SET revoked = 1
-    /// WHERE tenant_id = ? AND device_id = ? AND revoked = 0`.
+    /// rotation racing with it cannot escape, and MUST record the reason
+    /// [`RevocationReason::Device`](super::RevocationReason::Device) and the
+    /// time: `UPDATE ... SET revoked = 1, revoked_reason = 'device',
+    /// revoked_at = ? WHERE tenant_id = ? AND device_id = ? AND revoked = 0`.
+    /// Without the reason, a token of the lost device presented once more
+    /// reads as a rotated-out token reused, revokes its family and raises the
+    /// compromise hook.
     ///
     /// The provided body returns [`DeviceTokenRevocation::Unsupported`] and
     /// revokes nothing, so a store written before this method existed
@@ -137,7 +149,7 @@ pub trait RefreshTokenStore: Send + Sync {
     ///
     /// 1. **Non-atomic load+update**: a backend that lists active tokens
     ///    and then revokes them one-by-one races with a parallel
-    ///    `refresh_session` call from the attacker; the attacker may
+    ///    refresh from the attacker; the attacker may
     ///    succeed in rotating an unrevoked sibling between the list and
     ///    the per-row revoke, escaping the family invalidation.
     /// 2. **Family scope ignored**: delegating to `revoke_user_tokens`

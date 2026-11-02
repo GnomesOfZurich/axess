@@ -238,6 +238,7 @@ where
     /// `InvalidCredential`. Persistent counter outages should be
     /// monitored externally (metrics hook + log levels) and a
     /// circuit-breaker added at the application layer if needed.
+    #[cfg(any(test, feature = "fido2"))]
     pub(super) async fn record_factor_failure(
         &self,
         user_id: &UserId,
@@ -397,6 +398,9 @@ where
     ) -> Result<(), AuthnError<I::Error>> {
         const MAX_FAIL_UPDATE_RETRIES: usize = 8;
 
+        // One reading of the clock for every recompute below, so a CAS retry
+        // sets the same lock the first attempt would have.
+        let now = self.inner.clock.now();
         let initial_user_scope = self
             .inner
             .factors
@@ -411,7 +415,7 @@ where
             // initial verification used.
             let recomputed = match &existing {
                 FactorConfig::EmailOtp(otp) => FactorConfig::EmailOtp(apply_email_otp_failure(otp)),
-                FactorConfig::Hotp(otp) => FactorConfig::Hotp(apply_hotp_failure(otp)),
+                FactorConfig::Hotp(otp) => FactorConfig::Hotp(apply_hotp_failure(otp, now)),
                 _ => updated_config.clone(),
             };
             (existing, recomputed)
@@ -442,7 +446,9 @@ where
                             FactorConfig::EmailOtp(otp) => {
                                 FactorConfig::EmailOtp(apply_email_otp_failure(otp))
                             }
-                            FactorConfig::Hotp(otp) => FactorConfig::Hotp(apply_hotp_failure(otp)),
+                            FactorConfig::Hotp(otp) => {
+                                FactorConfig::Hotp(apply_hotp_failure(otp, now))
+                            }
                             _ => updated_config.clone(),
                         };
                         (existing, next)
@@ -506,7 +512,7 @@ where
                     prior_config = reloaded_config;
                 }
                 FactorConfig::Hotp(otp) => {
-                    next_config = FactorConfig::Hotp(apply_hotp_failure(otp));
+                    next_config = FactorConfig::Hotp(apply_hotp_failure(otp, now));
                     prior_config = reloaded_config;
                 }
                 _ => {

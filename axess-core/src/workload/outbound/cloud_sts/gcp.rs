@@ -49,7 +49,7 @@
 //! let audience = WorkloadIdentityPoolProvider::new(
 //!     123_456_789, "axess-pool", "github-actions",
 //! );
-//! let sts = GcpStsClient::new();
+//! let sts = GcpStsClient::new()?;
 //! let federated = sts
 //!     .exchange_token(
 //!         oidc_token,
@@ -58,7 +58,7 @@
 //!     )
 //!     .await?;
 //!
-//! let imp = GcpServiceAccountImpersonator::new();
+//! let imp = GcpServiceAccountImpersonator::new()?;
 //! let sa_token = imp
 //!     .generate_access_token(
 //!         &federated.access_token,
@@ -76,9 +76,6 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use url::Url;
-
-/// Time allowed to establish a connection, on the default HTTP client.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Time allowed for one request from send to last response byte, unless
 /// `with_timeout` on the client says otherwise.
@@ -167,25 +164,31 @@ pub struct GcpStsClient {
     timeout: Duration,
 }
 
-impl Default for GcpStsClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GcpStsClient {
     /// Construct with the default GCP STS endpoint
-    /// (`https://sts.googleapis.com/v1/token`).
-    pub fn new() -> Self {
-        Self {
+    /// (`https://sts.googleapis.com/v1/token`). The default HTTP client
+    /// follows no redirects and bounds connection setup to 10 seconds; each
+    /// request carries this client's own timeout
+    /// ([`with_timeout`](Self::with_timeout)), which replaces the default
+    /// client's 30-second request bound.
+    ///
+    /// # Errors
+    ///
+    /// [`GcpError::ClientBuild`] when the default HTTP client cannot be built (the
+    /// TLS backend failed to initialise). No client with the protections
+    /// missing is built in its place.
+    pub fn new() -> Result<Self, GcpError> {
+        Self::from_builder(reqwest::Client::builder())
+    }
+
+    /// [`new`](Self::new) on a builder the caller started.
+    fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, GcpError> {
+        let http = crate::outbound_http::harden(builder)?;
+        Ok(Self {
             endpoint: Arc::new(default_sts_endpoint()),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http,
             timeout: DEFAULT_REQUEST_TIMEOUT,
-        }
+        })
     }
 
     /// Override the STS endpoint (for tests or pinned-regional
@@ -325,24 +328,30 @@ pub struct GcpServiceAccountImpersonator {
     timeout: Duration,
 }
 
-impl Default for GcpServiceAccountImpersonator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl GcpServiceAccountImpersonator {
-    /// Construct with the default IAM Credentials endpoint base.
-    pub fn new() -> Self {
-        Self {
+    /// Construct with the default IAM Credentials endpoint base. The default
+    /// HTTP client follows no redirects and bounds connection setup to 10
+    /// seconds; each request carries this client's own timeout
+    /// ([`with_timeout`](Self::with_timeout)), which replaces the default
+    /// client's 30-second request bound.
+    ///
+    /// # Errors
+    ///
+    /// [`GcpError::ClientBuild`] when the default HTTP client cannot be built (the
+    /// TLS backend failed to initialise). No client with the protections
+    /// missing is built in its place.
+    pub fn new() -> Result<Self, GcpError> {
+        Self::from_builder(reqwest::Client::builder())
+    }
+
+    /// [`new`](Self::new) on a builder the caller started.
+    fn from_builder(builder: reqwest::ClientBuilder) -> Result<Self, GcpError> {
+        let http = crate::outbound_http::harden(builder)?;
+        Ok(Self {
             endpoint_base: Arc::new(default_iam_credentials_base()),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http,
             timeout: DEFAULT_REQUEST_TIMEOUT,
-        }
+        })
     }
 
     /// Override the IAM Credentials endpoint base: primarily for
@@ -493,6 +502,10 @@ pub enum GcpError {
     /// 2xx response that did not parse as the expected shape.
     #[error("malformed GCP response: {0}")]
     MalformedResponse(String),
+    /// The default HTTP client could not be built; nothing is sent. See
+    /// [`ClientBuildError`](crate::ClientBuildError).
+    #[error(transparent)]
+    ClientBuild(#[from] crate::ClientBuildError),
 }
 
 #[cfg(test)]

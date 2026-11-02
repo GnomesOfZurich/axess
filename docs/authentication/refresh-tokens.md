@@ -83,7 +83,9 @@ reading, so reuse of such a token still revokes the family.
 issue, together with `device_id` (`hb1:` and the base64url of an
 HMAC-SHA256 under the pepper). The client string itself is not stored.
 Refresh recomputes the digest from the string presented and compares in
-constant time, and the child token inherits the stored value. A token of an
+constant time, under the pepper the token was found under (the previous one
+during a pepper rotation), and the child token carries the digest under the
+current pepper. Without a pepper the digest is unkeyed. A token of an
 earlier release stores the raw string; it is still honoured and its child
 carries the digest. *Device identity* has the detail.
 
@@ -144,8 +146,8 @@ used) is now revoked. The next time Alice's browser refreshes, it
 fails. The user has to log in again, but during the brief window
 between detection and re-login the attacker has no access either.
 
-The detection-and-revoke pattern is implemented in the
-`refresh_session` function: when a token that was rotated out is
+The detection-and-revoke pattern is implemented in
+`Refresh::run`: when a token that was rotated out is
 presented, the function calls `revoke_family(user_id, family_id)` and then
 `on_token_compromise` on the store. The hook runs even when the family
 revocation itself failed (the failure is logged and the caller still sees
@@ -289,11 +291,10 @@ named, so moving from no pepper to a pepper still invalidates the tokens.
 
 ## Refreshing for one tenant
 
-`refresh_session` finds a token by its hash alone, so a token issued for one
-tenant can be presented to an endpoint that serves another. When the tenant
-comes from the request (a host name, a path segment), use
-`refresh_session_in_tenant` or `refresh_session_with_status_check_in_tenant`:
-a token of any other tenant answers `NotFound`, exactly as an unknown token
+A refresh finds a token by its hash alone, so a token issued for one tenant
+can be presented to an endpoint that serves another. When the tenant comes
+from the request (a host name, a path segment), add `Refresh::in_tenant`: a
+token of any other tenant answers `NotFound`, exactly as an unknown token
 does, and is not rotated, revoked or checked against the status predicate.
 
 ## Atomicity contracts

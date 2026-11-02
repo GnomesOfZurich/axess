@@ -10,10 +10,14 @@
 //! The stamp lives in the session's custom data, under [`FLOW_KEY`], which
 //! only server code writes; a session without one (a flow begun by an
 //! earlier release, or one the size cap refused) is treated as stale.
+//!
+//! The password enters the epoch by its identity (see [`password_identity`]),
+//! which a rehash of the same password keeps, so a rehash is no change of
+//! credential and needs no special case.
 
 use crate::authn::{
     error::AuthnError,
-    factor::{FactorConfig, FactorKind},
+    factor::{FactorConfig, FactorKind, FactorStep, PasswordConfig},
     ids::{TenantId, UserId},
     store::{FactorStore, IdentityStore},
     types::AuthnScope,
@@ -26,10 +30,56 @@ use serde::{Deserialize, Serialize};
 pub(crate) const FLOW_KEY: &str = crate::session::data::LOGIN_FLOW_KEY;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct FlowStamp {
+pub(crate) struct FlowStamp {
     started_at: DateTime<Utc>,
     method: String,
     epoch: String,
+    /// The steps the epoch was computed over, for a flow whose steps are
+    /// not those of a stored method (a step-up); `None` reads the method's
+    /// steps from the store at every check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    steps: Option<Vec<FactorStep>>,
+}
+
+/// The identity of a stored password: its `password_id`, or for a config
+/// without one (a new password, or one stored before the field existed) a
+/// digest of its hash. A rehash writes this value into the new config's
+/// `password_id`, so the identity survives a rehash and changes with a new
+/// password. An absent password is the identity of the empty hash.
+pub(crate) fn password_identity(cfg: Option<&PasswordConfig>) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let digest = |hash: &str| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(hash))
+    };
+    match cfg {
+        Some(PasswordConfig {
+            password_id: Some(id),
+            ..
+        }) => id.clone(),
+        Some(cfg) => digest(cfg.hash.as_ref()),
+        None => digest(""),
+    }
+}
+
+/// The canonical form of a method's steps that the epoch digests.
+fn serialise_steps<E: std::error::Error + Send + Sync + 'static>(
+    steps: &[FactorStep],
+) -> Result<String, AuthnError<E>> {
+    serde_json::to_string(steps)
+        .map_err(|e| AuthnError::Internal(format!("factor steps cannot be serialised: {e}")))
+}
+
+/// The epoch digest over the password identity, the method and its steps.
+fn epoch_digest(password: &str, method: &str, steps: &str) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    for part in [password, method, steps] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
 impl<I, F> crate::authn::service::RequestAuthnService<I, F>
@@ -37,52 +87,109 @@ where
     I: IdentityStore,
     F: FactorStore<Error = I::Error>,
 {
-    /// A digest of what a login of `method` for this user depends on: the
-    /// stored password hash and the method's steps. Replacing the password
-    /// (reset, admin set), enrolling or removing a factor, or changing the
-    /// method's policy changes it; using a factor does not.
-    pub(crate) async fn credential_epoch(
+    /// The identity of the user's password as stored now.
+    async fn stored_password_identity(
         &self,
         user_id: &UserId,
         tenant_id: &TenantId,
-        method: &str,
     ) -> Result<String, AuthnError<I::Error>> {
-        use base64::Engine as _;
-        use sha2::Digest as _;
         let scope = AuthnScope::User {
             tenant_id: *tenant_id,
             user_id: *user_id,
         };
-        let password_hash = match self
+        let config = self
             .inner
             .factors
             .resolve_factor(&scope, FactorKind::Password)
             .await
             .map_err(AuthnError::Store)?
-            .map(|r| r.config)
-        {
-            Some(FactorConfig::Password(cfg)) => {
-                let hash: &str = cfg.hash.as_ref();
-                hash.to_owned()
-            }
-            _ => String::new(),
-        };
-        let steps = self
+            .map(|r| r.config);
+        Ok(match &config {
+            Some(FactorConfig::Password(cfg)) => password_identity(Some(cfg)),
+            _ => password_identity(None),
+        })
+    }
+
+    /// The steps of the user's method `method` as stored now, in the form
+    /// the epoch digests, or a marker for a method that is gone.
+    async fn stored_method_steps(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        method: &str,
+    ) -> Result<String, AuthnError<I::Error>> {
+        let found = self
             .inner
             .factors
             .available_methods(user_id, tenant_id)
             .await
             .map_err(AuthnError::Store)?
             .into_iter()
-            .find(|m| &*m.name == method)
-            .and_then(|m| serde_json::to_string(&m.steps).ok())
-            .unwrap_or_else(|| "<method gone>".to_owned());
-        let mut hasher = sha2::Sha256::new();
-        for part in [password_hash.as_str(), method, steps.as_str()] {
-            hasher.update((part.len() as u64).to_be_bytes());
-            hasher.update(part.as_bytes());
+            .find(|m| &*m.name == method);
+        match found {
+            Some(m) => serialise_steps(&m.steps),
+            None => Ok("<method gone>".to_owned()),
         }
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize()))
+    }
+
+    /// A digest of what a login of `method` for this user depends on: the
+    /// stored password's identity and the method's steps. Replacing the
+    /// password (reset, admin set), enrolling or removing a factor, or
+    /// changing the method's policy changes it; using a factor or rehashing
+    /// the password does not.
+    pub(crate) async fn credential_epoch(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        method: &str,
+    ) -> Result<String, AuthnError<I::Error>> {
+        let password = self.stored_password_identity(user_id, tenant_id).await?;
+        let steps = self.stored_method_steps(user_id, tenant_id, method).await?;
+        Ok(epoch_digest(&password, method, &steps))
+    }
+
+    /// The stamp of a flow whose steps are given rather than read from a
+    /// stored method (a step-up): its epoch covers the stored password's
+    /// identity and `steps`, and the stamp carries `steps` so every later check
+    /// computes the same epoch. Returns the stamp as the session value to
+    /// write under [`FLOW_KEY`].
+    pub(crate) async fn stamp_for_steps(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        method: &str,
+        steps: &[FactorStep],
+    ) -> Result<serde_json::Value, AuthnError<I::Error>> {
+        let serialised = serialise_steps(steps)?;
+        let password = self.stored_password_identity(user_id, tenant_id).await?;
+        let stamp = FlowStamp {
+            started_at: self.inner.clock.now(),
+            epoch: epoch_digest(&password, method, &serialised),
+            method: method.to_owned(),
+            steps: Some(steps.to_vec()),
+        };
+        serde_json::to_value(&stamp)
+            .map_err(|e| AuthnError::Internal(format!("flow stamp cannot be serialised: {e}")))
+    }
+
+    /// Whether `stamp` is current: its epoch is the one the credentials give
+    /// now. A stamp carrying its own steps is judged on those; any other on
+    /// the stored method's.
+    async fn stamp_is_current(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        stamp: &FlowStamp,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        let password = self.stored_password_identity(user_id, tenant_id).await?;
+        let steps = match &stamp.steps {
+            Some(steps) => serialise_steps(steps)?,
+            None => {
+                self.stored_method_steps(user_id, tenant_id, &stamp.method)
+                    .await?
+            }
+        };
+        Ok(epoch_digest(&password, &stamp.method, &steps) == stamp.epoch)
     }
 
     /// Stamp the flow just begun. Called with the epoch computed before the
@@ -92,35 +199,8 @@ where
             started_at: self.inner.clock.now(),
             method: method.to_owned(),
             epoch,
+            steps: None,
         };
-        if let Ok(value) = serde_json::to_value(&stamp) {
-            session.set_custom(FLOW_KEY, value).await;
-        }
-    }
-
-    /// Recompute the credential epoch of the flow in `session` and store it,
-    /// keeping the flow's start time and method.
-    ///
-    /// For a change this service made to the credentials in the middle of the
-    /// login itself (a password rehash). A session without a stamp is left
-    /// alone, and a failure to read the store leaves the old epoch, which
-    /// then fails the flow closed.
-    pub(crate) async fn restamp_flow_epoch(
-        &self,
-        session: &AuthSession,
-        user_id: &UserId,
-        tenant_id: &TenantId,
-    ) {
-        let Some(mut stamp) = self.read_flow_stamp(session).await else {
-            return;
-        };
-        match self
-            .credential_epoch(user_id, tenant_id, &stamp.method)
-            .await
-        {
-            Ok(epoch) => stamp.epoch = epoch,
-            Err(_) => return,
-        }
         if let Ok(value) = serde_json::to_value(&stamp) {
             session.set_custom(FLOW_KEY, value).await;
         }
@@ -157,10 +237,7 @@ where
             session.clear().await;
             return Err(AuthnError::NoFlow);
         }
-        let epoch = self
-            .credential_epoch(user_id, tenant_id, &stamp.method)
-            .await?;
-        if epoch != stamp.epoch {
+        if !self.stamp_is_current(user_id, tenant_id, &stamp).await? {
             tracing::info!(
                 user_id = %user_id,
                 "credentials changed since the login began; dropping the flow"
@@ -186,9 +263,52 @@ where
         let Ok(stamp) = serde_json::from_value::<FlowStamp>(value) else {
             return Ok(false);
         };
-        let epoch = self
-            .credential_epoch(user_id, tenant_id, &stamp.method)
-            .await?;
-        Ok(epoch == stamp.epoch)
+        self.stamp_is_current(user_id, tenant_id, &stamp).await
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+    use crate::authn::factor::{PasswordRules, ZeroizedString};
+
+    fn config(hash: &str, password_id: Option<&str>) -> PasswordConfig {
+        PasswordConfig {
+            hash: ZeroizedString::new(hash),
+            rules: PasswordRules::default(),
+            password_id: password_id.map(str::to_owned),
+        }
+    }
+
+    /// A rehash writes the identity of the config it replaces, so the
+    /// identity survives the new hash; a new password (no carried id) is a
+    /// new identity.
+    #[test]
+    fn a_rehash_keeps_the_identity_and_a_new_password_does_not() {
+        let stored = config("$argon2id$old", None);
+        let carried = password_identity(Some(&stored));
+        let rehashed = config("$argon2id$new-params", Some(&carried));
+        assert_eq!(password_identity(Some(&rehashed)), carried);
+        let again = config("$argon2id$newer-params", Some(&carried));
+        assert_eq!(password_identity(Some(&again)), carried);
+        let changed = config("$argon2id$other-password", None);
+        assert_ne!(password_identity(Some(&changed)), carried);
+        assert_ne!(password_identity(None), carried);
+    }
+
+    /// A step-up stamp carries its steps as a list in the stamp itself, not
+    /// as a JSON string inside it.
+    #[test]
+    fn a_step_up_stamp_carries_its_steps_as_a_list() {
+        let stamp = FlowStamp {
+            started_at: chrono::DateTime::UNIX_EPOCH,
+            method: "step-up".into(),
+            epoch: "e".into(),
+            steps: Some(vec![FactorStep::Required(FactorKind::Totp)]),
+        };
+        let value = serde_json::to_value(&stamp).unwrap();
+        assert!(value["steps"].is_array(), "{value}");
+        let back: FlowStamp = serde_json::from_value(value).unwrap();
+        assert_eq!(back.steps, stamp.steps);
     }
 }

@@ -181,25 +181,10 @@ impl Discovery {
 /// transitively secures the JWKS URI: an attacker that can rewrite the
 /// discovery doc can swap `jwks_uri` to a key set they control.
 pub(crate) fn require_https_or_loopback(issuer_url: &str) -> Result<(), OidcError> {
-    // Parsed, not prefix-matched: `http://localhost.attacker.com`,
-    // `http://127.0.0.1.nip.io` and `http://localhost@evil.com` all start with
-    // a loopback spelling and none is loopback. The HOST decides, and a URL
-    // carrying userinfo is refused outright, since `user@host` is how a
-    // prefix test is defeated.
-    let refuse = || OidcError::NonHttpsIssuer(issuer_url.to_string());
-    let parsed = url::Url::parse(issuer_url).map_err(|_| refuse())?;
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(refuse());
-    }
-    match parsed.scheme() {
-        "https" => Ok(()),
-        "http" => match parsed.host() {
-            Some(url::Host::Domain("localhost")) => Ok(()),
-            Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
-            Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
-            _ => Err(refuse()),
-        },
-        _ => Err(refuse()),
+    if crate::endpoint::is_https_or_loopback(issuer_url) {
+        Ok(())
+    } else {
+        Err(OidcError::NonHttpsIssuer(issuer_url.to_string()))
     }
 }
 

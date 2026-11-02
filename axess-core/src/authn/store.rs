@@ -32,11 +32,17 @@ pub struct EventQueryFilter {
     pub from: Option<chrono::DateTime<chrono::Utc>>,
     /// Exclusive upper bound on `event_time`.
     pub until: Option<chrono::DateTime<chrono::Utc>>,
-    /// When `true`, also return events with `tenant_id IS NULL`
-    /// (platform-level rail events, e.g. login attempts for unknown
-    /// users that never resolved a tenant). Default `true` so the trait
-    /// matches the SQL most operators want for tenant audit screens.
-    /// Flip to `false` for views that should hide platform noise.
+    /// When `true`, also return events with `tenant_id IS NULL`: the
+    /// platform-level rail events (a login attempt for an unknown user that
+    /// never resolved a tenant, a global OAuth login whose begin named no
+    /// tenant, a refresh run outside any tenant scope). Those rows are not
+    /// the tenant's: the same rows come back for every tenant that asks,
+    /// so a view that shows them to a tenant's administrators shows
+    /// cross-tenant platform activity. Leave it `false` (the `Default`) for
+    /// a tenant's own audit screen; set it for an operator view. Federated
+    /// rows carry the tenant whenever the ceremony or scope named one
+    /// (`begin_oauth_login_with_tenant_provider`, `oauth_in_tenant`, `oauth_for_session`
+    /// on an authenticated session).
     pub include_unscoped: bool,
     /// Maximum number of rows to return (newest-first). 0 means
     /// "backend default"; implementations should pick a safe cap
@@ -233,46 +239,31 @@ pub trait IdentityLookup: Send + Sync + 'static {
         user_id: &UserId,
     ) -> impl std::future::Future<Output = Result<EntityState, Self::Error>> + Send;
 
-    /// Return the global lockout policy. Default: 5 attempts, 15-minute lockout.
-    fn lockout_policy(&self) -> LockoutPolicy {
-        LockoutPolicy::default()
-    }
-
-    /// Return the lockout policy for a specific tenant.
+    /// Return the lockout policy for a tenant.
     ///
-    /// Override this to support per-tenant lockout configuration (e.g., Tenant A
-    /// allows 3 attempts, Tenant B allows 10). Falls back to the global
-    /// [`lockout_policy`](Self::lockout_policy) by default.
-    fn lockout_policy_for_tenant(&self, tenant_id: &TenantId) -> LockoutPolicy {
-        let _ = tenant_id;
-        self.lockout_policy()
-    }
+    /// Required, like the other policy methods below: a provided default
+    /// would let a decorator that forgets to forward it switch the tenant's
+    /// policy off without a compile error. A store with one policy for every
+    /// tenant returns it whatever `tenant_id` is
+    /// ([`LockoutPolicy::default`] is 5 attempts and a 15-minute lockout).
+    fn lockout_policy_for_tenant(&self, tenant_id: &TenantId) -> LockoutPolicy;
 
-    /// Return the password rules for a specific tenant.
-    ///
-    /// Override this to support per-tenant password policies (e.g., Tenant A
-    /// requires 16-char passwords, Tenant B allows 12). Returns the global
-    /// default `PasswordRules` by default.
+    /// Return the password rules for a tenant (e.g., tenant A requires
+    /// 16-character passwords, tenant B allows 12). A store with one set of
+    /// rules returns it whatever `tenant_id` is; [`PasswordRules::default`]
+    /// is the library's.
     fn password_rules_for_tenant(
         &self,
         tenant_id: &TenantId,
-    ) -> impl std::future::Future<Output = Result<PasswordRules, Self::Error>> + Send {
-        let _ = tenant_id;
-        std::future::ready(Ok(PasswordRules::default()))
-    }
+    ) -> impl std::future::Future<Output = Result<PasswordRules, Self::Error>> + Send;
 
-    /// Return the IP access policy for a tenant.
-    ///
-    /// Override to load per-tenant allowlists/denylists from your database.
-    /// Default: empty policy (all IPs allowed).
+    /// Return the IP access policy for a tenant, from your database or
+    /// configuration. [`IpPolicy::default`](crate::authn::types::IpPolicy)
+    /// (an empty policy) allows every address.
     fn ip_policy_for_tenant(
         &self,
         tenant_id: &TenantId,
-    ) -> impl std::future::Future<Output = Result<crate::authn::types::IpPolicy, Self::Error>> + Send
-    {
-        let _ = tenant_id;
-        std::future::ready(Ok(crate::authn::types::IpPolicy::default()))
-    }
+    ) -> impl std::future::Future<Output = Result<crate::authn::types::IpPolicy, Self::Error>> + Send;
 }
 
 // ── IdentityAuthnLog ─────────────────────────────────────────────────────────
@@ -363,9 +354,15 @@ pub trait IdentityAuthnLog: IdentityLookup {
     /// not (and a conforming one does not have to) flip
     /// [`account_status`](IdentityLookup::account_status) to suspended. Return
     /// `(0, None)` for a user with no failures. Failures older than the
-    /// policy's `attempt_window` should be reported as zero, the same expiry
+    /// policy's `attempt_window` should be reported as zero while the count
+    /// is below `policy.effective_max_attempts()`, the same expiry
     /// [`record_failed_attempt`](Self::record_failed_attempt) applies when it
-    /// counts.
+    /// counts. At or above the limit the raw count and time are returned
+    /// whatever their age: the window bounds how long failures accumulate,
+    /// and the library derives the lockout's end from `policy.duration`, so
+    /// a store that zeroed an at-limit count after the window would end a
+    /// lockout that is indefinite (`duration` is `None`) or longer than the
+    /// window.
     ///
     /// [`record_failed_attempt`](Self::record_failed_attempt) must store the
     /// time of the failure it counts, and
@@ -397,11 +394,15 @@ pub trait IdentityAuthnLog: IdentityLookup {
     /// `policy` of the user's tenant, at the store's `now`:
     ///
     /// 1. The count is **fresh**, that is zero, when there is no failure,
-    ///    when the last one is older than `policy.attempt_window`, or when the
-    ///    count has reached `policy.effective_max_attempts()` and a timed
-    ///    lockout (`policy.duration` is `Some`) has run out. A lockout that
-    ///    has ended starts the account over rather than relocking it on the
-    ///    next guess.
+    ///    when the last one is older than `policy.attempt_window` and the
+    ///    count is below `policy.effective_max_attempts()`, or when the count
+    ///    has reached `policy.effective_max_attempts()` and a timed lockout
+    ///    (`policy.duration` is `Some`) has run out. A lockout that has ended
+    ///    starts the account over rather than relocking it on the next guess.
+    ///    A count at the limit is never freshened by the window alone: with
+    ///    `duration` `None`, or longer than the window, the lockout outlives
+    ///    the window and ends only with the timed lockout or
+    ///    [`reset_failed_attempts`](Self::reset_failed_attempts).
     /// 2. A fresh count is replaced by one. Otherwise the guess is granted
     ///    (count plus one) while the count is below
     ///    `policy.effective_max_attempts()`, and refused with `None` once it
@@ -439,15 +440,13 @@ pub trait IdentityAuthnLog: IdentityLookup {
     /// Record the timestamp of a successful authentication for a user.
     ///
     /// Called automatically by `complete_factor_step` when all factors pass.
-    /// Default: no-op. Override to populate a "last login" column.
+    /// A store without a "last login" column answers `Ok(())`; a decorator
+    /// forwards to the store it wraps.
     fn record_last_login(
         &self,
         user_id: &UserId,
         at: chrono::DateTime<chrono::Utc>,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        let _ = (user_id, at);
-        std::future::ready(Ok(()))
-    }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send;
 }
 
 // ── IdentityAdmin ────────────────────────────────────────────────────────────

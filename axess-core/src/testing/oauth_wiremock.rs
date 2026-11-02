@@ -26,7 +26,7 @@
 //! // ... drive begin_oauth_login(&provider, ...) against the wiremock IdP ...
 //! ```
 
-use axess_factors::oauth::OAuthProviderConfig;
+use axess_factors::oauth::{OAuthProviderBuilder, OAuthProviderConfig};
 
 /// Build an OIDC discovery document for the given issuer. The shape covers
 /// the discovery fields axess actually reads; it is not a complete
@@ -101,11 +101,12 @@ pub async fn oauth_mount_oidc_endpoints(server: &wiremock::MockServer, jwk: &ser
         .await;
 }
 
-/// Run OIDC discovery against the given wiremock server and return a
-/// configured [`OAuthProviderConfig`] pointed at it. Uses stable test
-/// values for the client id (`"test-client-id"`), secret (`"test-secret"`),
-/// and redirect URI (`"http://localhost:3000/callback"`).
-pub async fn oauth_setup_provider(server: &wiremock::MockServer) -> OAuthProviderConfig {
+/// Run OIDC discovery against the given wiremock server and return the
+/// builder of a provider pointed at it, for a test that adds settings
+/// before [`build`](OAuthProviderBuilder::build). Uses stable test values for
+/// the client id (`"test-client-id"`), secret (`"test-secret"`), and
+/// redirect URI (`"http://localhost:3000/callback"`).
+pub async fn oauth_discover_provider(server: &wiremock::MockServer) -> OAuthProviderBuilder {
     OAuthProviderConfig::discover(
         "test",
         &server.uri(),
@@ -115,4 +116,12 @@ pub async fn oauth_setup_provider(server: &wiremock::MockServer) -> OAuthProvide
     )
     .await
     .expect("OIDC discovery should succeed")
+}
+
+/// [`oauth_discover_provider`], built with no further settings.
+pub async fn oauth_setup_provider(server: &wiremock::MockServer) -> OAuthProviderConfig {
+    oauth_discover_provider(server)
+        .await
+        .build()
+        .expect("a provider with no settings builds")
 }

@@ -238,7 +238,7 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `fido2` | WebAuthn passkeys (pulls `axess-factors/fido2`) |
 | `ldap` | LDAP bind (pulls `axess-factors/ldap`) |
 | `oauth` | OAuth 2.0 / OIDC inbound (pulls `axess-factors/oauth`) |
-| `fapi` | FAPI 2.0 (PAR, DPoP, JARM). Implies `oauth`. |
+| `fapi` | An alias for `oauth`, which carries FAPI 2.0 (PAR, DPoP, JARM) |
 | `mtls` | mTLS verifier (pulls `axess-factors/mtls`) |
 | `jwt-svid` | SPIFFE JWT-SVID resolver (spec-bound) |
 | `social` | Plain-OAuth-2.0 user login (`SocialProvider`; weaker than OIDC, off by default) |
@@ -267,7 +267,7 @@ All tests deterministic and reproducible, no flaky timing dependencies.
 | `jwt-rust-crypto` | `jwt` verifying with RustCrypto: pure Rust, builds anywhere |
 | `jwt-svid` | SPIFFE JWT-SVID resolver (pulls `jwt`; spec-bound; mandatory `spiffe://` URI in `sub`) |
 | `oauth` | Inbound OAuth ceremony (pulls `oidc` + `jwt`) |
-| `fapi` | FAPI 2.0 add-ons (pulls `oauth`) |
+| `fapi` | An alias for `oauth` |
 | `social` | Plain-OAuth-2.0 user login (`SocialProvider`; see module docs for the weaker security model vs OIDC) |
 | `bearer` | Bearer-token axum extractor |
 | `outbound-oauth` | Outbound OAuth client (pulls `jwt`) |

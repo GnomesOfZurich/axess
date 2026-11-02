@@ -1,9 +1,10 @@
 //! Account management, split into orthogonal sub-modules per concern:
 //!
 //! - `signup`: `begin_signup` + `complete_signup`.
-//! - `admin`: `suspend_user` / `activate_user` and the four variants
-//!   each (`_by`, `_in_tenant`, `_by_in_tenant`).
-//! - `impersonation`: `begin_impersonation` + `_in_tenant`.
+//! - `admin`: `suspend_user`, `activate_user` and `delete_user`, each with
+//!   an `_across_tenants` form for the platform operator.
+//! - `impersonation`: `begin_impersonation` + `_across_tenants`,
+//!   `end_impersonation`.
 //! - `password_reset`: `begin_password_reset`,
 //!   `complete_password_reset`, and the cross-tenant rail.
 //!

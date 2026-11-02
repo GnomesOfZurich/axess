@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::authn::ids::testing;
+use crate::device::storage::postgres::statements::PostgresSql;
 use crate::device::storage::sql_common::FAMILY_INSERT_CHUNK;
+use crate::device::storage::sql_common::ops::DeviceSql;
 use crate::device::store::consistency::{self as shared, at, dev_id, device, tenant, user};
 use crate::device::store::sql_contract as contract;
 use crate::testing::sql_live;
@@ -46,6 +48,7 @@ async fn shared_contract() {
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(store(4).await).await;
+    shared::sub_second_instants_compare_as_whole_seconds(store(4).await).await;
     shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
     shared::a_sighting_reports_the_level_it_found(store(4).await).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(store(4).await).await;
@@ -238,7 +241,7 @@ async fn the_family_index_insert_is_idempotent() {
     let d = device("idem", 1, DeviceTrustLevel::Seen, at(10));
     store.save(&d, at(10)).await.unwrap();
     let mut tx = store.pool.begin().await.unwrap();
-    rewrite_family_index(
+    PostgresSql::rewrite_family_index(
         &mut tx,
         &tenant().to_string(),
         &d.id.to_string(),
@@ -256,3 +259,5 @@ async fn the_family_index_insert_is_idempotent() {
         1
     );
 }
+
+mod reseal;

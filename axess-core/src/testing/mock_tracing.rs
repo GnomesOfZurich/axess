@@ -59,6 +59,14 @@ impl TracingCapture {
         };
         let subscriber = tracing_subscriber::registry().with(layer);
         let guard = tracing::subscriber::set_default(subscriber);
+        // While this is the only live dispatcher in the process, tracing-core
+        // registers a callsite's first hit through the hitting thread's own
+        // default subscriber. A sibling test with no subscriber that hits a
+        // callsite first caches "never interested" for it, and the macro
+        // then drops the event on this thread without asking the capture.
+        // Rebuild the cache under this subscriber so the callsites already
+        // seen in the process are asked again.
+        tracing::callsite::rebuild_interest_cache();
         Self {
             events,
             _guard: guard,

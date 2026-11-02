@@ -148,6 +148,10 @@ impl OAuthProviderConfig {
             .get("sid")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let nonce = additional_claims
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
 
         // Zeroize bearer-class tokens.
         let new_access_token = Some(ZeroizedString::new(
@@ -170,6 +174,7 @@ impl OAuthProviderConfig {
             refresh_token: new_refresh_token
                 .or_else(|| Some(ZeroizedString::new(refresh_token.to_string()))),
             oidc_sid,
+            nonce,
             id_token_hint: raw_id_token.map(ZeroizedString::new),
             additional_claims,
             dpop_key: None,

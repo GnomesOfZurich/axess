@@ -60,7 +60,8 @@ trace-id = ["axess-core/trace-id"]
 ws = ["axess-core/ws"]
 
 # Federated authn
-fapi = ["axess-core/fapi"]
+# An alias for `oauth`.
+fapi = ["oauth", "axess-core/fapi"]
 fido2 = ["axess-core/fido2"]
 # Generic JWT-bearer workload identity. Pulls the `WorkloadResolver`
 # adopters wire against GitHub Actions OIDC, Kubernetes SA, GitLab CI,
@@ -84,13 +85,18 @@ social = ["axess-core/social"]
 # Outbound + cloud STS
 aws-sts = ["axess-core/aws-sts"]
 azure-fic = ["axess-core/azure-fic"]
-cloud-sts = ["axess-core/cloud-sts"]
+cloud-sts = ["aws-sts", "azure-fic", "gcp-wif", "axess-core/cloud-sts"]
 gcp-wif = ["axess-core/gcp-wif"]
 outbound-mtls = ["axess-core/outbound-mtls"]
 outbound-oauth = ["axess-core/outbound-oauth"]
 
 # OBO
-delegated = ["axess-core/delegated"]
+delegated = [
+    "delegated-exchange",
+    "delegated-stored",
+    "delegated-stored-encrypted",
+    "axess-core/delegated",
+]
 delegated-exchange = ["axess-core/delegated-exchange"]
 delegated-stored = ["axess-core/delegated-stored"]
 delegated-stored-encrypted = ["axess-core/delegated-stored-encrypted"]
@@ -116,4 +122,11 @@ valkey-cache = ["axess-core/valkey-cache", "valkey"]
 # without serving a real adopter shape. Pick one session backend +
 # the federation / middleware / workload features you actually need;
 # use `cargo … --all-features` for CI / docs.rs only.
-workload-id = ["axess-core/workload-id"]
+workload-id = [
+    "jwt",
+    "jwt-svid",
+    "mtls",
+    "outbound-oauth",
+    "outbound-mtls",
+    "axess-core/workload-id",
+]

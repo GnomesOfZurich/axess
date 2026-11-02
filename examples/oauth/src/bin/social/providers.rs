@@ -44,7 +44,7 @@ pub fn github(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
     redirect_uri: impl Into<String>,
-) -> Provider {
+) -> Result<Provider, SocialError> {
     SocialProvider::new(
         SocialProviderConfig {
             name: "github".into(),
@@ -85,7 +85,7 @@ pub fn discord(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
     redirect_uri: impl Into<String>,
-) -> Provider {
+) -> Result<Provider, SocialError> {
     SocialProvider::new(
         SocialProviderConfig {
             name: "discord".into(),
@@ -146,7 +146,7 @@ pub fn twitter_x(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
     redirect_uri: impl Into<String>,
-) -> Provider {
+) -> Result<Provider, SocialError> {
     SocialProvider::new(
         SocialProviderConfig {
             name: "twitter_x".into(),
@@ -189,7 +189,7 @@ pub fn spotify(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
     redirect_uri: impl Into<String>,
-) -> Provider {
+) -> Result<Provider, SocialError> {
     SocialProvider::new(
         SocialProviderConfig {
             name: "spotify".into(),
@@ -236,7 +236,7 @@ pub fn reddit(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
     redirect_uri: impl Into<String>,
-) -> Provider {
+) -> Result<Provider, SocialError> {
     SocialProvider::new(
         SocialProviderConfig {
             name: "reddit".into(),
@@ -270,32 +270,33 @@ mod tests {
     use super::*;
 
     // Smoke tests: each constructor builds a Provider. Catches
-    // accidental URL typos / scope-list breakage at compile time
-    // plus a single resolution check that the type system holds.
+    // accidental URL typos and a cleartext endpoint (the constructor
+    // refuses one) plus a single resolution check that the type system
+    // holds.
 
     #[test]
     fn github_constructor_builds() {
-        let _: Provider = github("id", "secret", "https://app.example/cb");
+        let _: Provider = github("id", "secret", "https://app.example/cb").expect("builds");
     }
 
     #[test]
     fn discord_constructor_builds() {
-        let _: Provider = discord("id", "secret", "https://app.example/cb");
+        let _: Provider = discord("id", "secret", "https://app.example/cb").expect("builds");
     }
 
     #[test]
     fn twitter_x_constructor_builds() {
-        let _: Provider = twitter_x("id", "secret", "https://app.example/cb");
+        let _: Provider = twitter_x("id", "secret", "https://app.example/cb").expect("builds");
     }
 
     #[test]
     fn spotify_constructor_builds() {
-        let _: Provider = spotify("id", "secret", "https://app.example/cb");
+        let _: Provider = spotify("id", "secret", "https://app.example/cb").expect("builds");
     }
 
     #[test]
     fn reddit_constructor_builds() {
-        let _: Provider = reddit("id", "secret", "https://app.example/cb");
+        let _: Provider = reddit("id", "secret", "https://app.example/cb").expect("builds");
     }
 
     #[test]

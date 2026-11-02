@@ -209,6 +209,7 @@ async fn save_factor_overwrites_existing_password_factor() {
     let replacement = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new("REPLACEMENT-HASH"),
         rules: PasswordRules::default(),
+        password_id: None,
     });
     backend
         .save_factor(&user_scope(), replacement.clone())
@@ -231,6 +232,7 @@ async fn save_factor_overwrites_existing_password_factor() {
     let next = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new("CAS-WIN"),
         rules: PasswordRules::default(),
+        password_id: None,
     });
     let cas_ok = backend
         .compare_and_save_factor(&user_scope(), &loaded, next.clone())
@@ -243,6 +245,7 @@ async fn save_factor_overwrites_existing_password_factor() {
     let losing = FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new("CAS-LOSE"),
         rules: PasswordRules::default(),
+        password_id: None,
     });
     let cas_fail = backend
         .compare_and_save_factor(&user_scope(), &original, losing)
@@ -523,4 +526,22 @@ async fn delete_user_erases_every_trace_and_the_session() {
         backend.delete_user(&u()).await,
         Err(MockStoreError::NotFound)
     ));
+}
+
+/// The backend answers the tenant policies of the identity store it wraps.
+/// It used to inherit the trait's permissive defaults for them, so a policy
+/// set on the inner store was dropped; the policy methods are required now.
+#[tokio::test]
+async fn the_tenant_policies_come_from_the_wrapped_store() {
+    let mut backend = InMemoryBackend::new();
+    backend.identity =
+        backend
+            .identity
+            .clone()
+            .with_lockout_policy(crate::authn::types::LockoutPolicy {
+                max_attempts: 3,
+                ..Default::default()
+            });
+    let tenant = axess_identity::testing::tenant("t");
+    assert_eq!(backend.lockout_policy_for_tenant(&tenant).max_attempts, 3);
 }

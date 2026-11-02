@@ -74,7 +74,9 @@ async fn sts_happy_path_returns_federated_token() {
         .mount(&server)
         .await;
 
-    let client = GcpStsClient::new().with_endpoint(sts_endpoint(&server));
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(sts_endpoint(&server));
     let token = client
         .exchange_token(
             "external-jwt",
@@ -99,7 +101,9 @@ async fn sts_invalid_target_audience_surfaces_as_sts_error() {
         })))
         .mount(&server)
         .await;
-    let client = GcpStsClient::new().with_endpoint(sts_endpoint(&server));
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(sts_endpoint(&server));
     let err = client
         .exchange_token("token", &sample_audience(), &["scope"])
         .await
@@ -124,7 +128,9 @@ async fn sts_empty_access_token_rejects_as_malformed() {
         })))
         .mount(&server)
         .await;
-    let client = GcpStsClient::new().with_endpoint(sts_endpoint(&server));
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(sts_endpoint(&server));
     let err = client
         .exchange_token("token", &sample_audience(), &["scope"])
         .await
@@ -152,7 +158,9 @@ async fn impersonation_happy_path_returns_sa_token() {
         .mount(&server)
         .await;
 
-    let imp = GcpServiceAccountImpersonator::new().with_endpoint_base(iam_base(&server));
+    let imp = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_endpoint_base(iam_base(&server));
     let token = imp
         .generate_access_token(
             "federated-token-from-step-1",
@@ -186,7 +194,9 @@ async fn impersonation_carries_lifetime_when_set() {
         .expect(1)
         .mount(&server)
         .await;
-    let imp = GcpServiceAccountImpersonator::new().with_endpoint_base(iam_base(&server));
+    let imp = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_endpoint_base(iam_base(&server));
     imp.generate_access_token(
         "fed",
         "sa@p.iam.gserviceaccount.com",
@@ -213,7 +223,9 @@ async fn impersonation_403_surfaces_as_iam_credentials_error() {
         })))
         .mount(&server)
         .await;
-    let imp = GcpServiceAccountImpersonator::new().with_endpoint_base(iam_base(&server));
+    let imp = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_endpoint_base(iam_base(&server));
     let err = imp
         .generate_access_token("fed", "sa@p.iam.gserviceaccount.com", &["scope"], None)
         .await
@@ -240,7 +252,9 @@ async fn impersonation_malformed_expire_time_rejects() {
         })))
         .mount(&server)
         .await;
-    let imp = GcpServiceAccountImpersonator::new().with_endpoint_base(iam_base(&server));
+    let imp = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_endpoint_base(iam_base(&server));
     let err = imp
         .generate_access_token("fed", "sa@p.iam.gserviceaccount.com", &["scope"], None)
         .await
@@ -250,12 +264,12 @@ async fn impersonation_malformed_expire_time_rejects() {
 
 #[test]
 fn default_endpoints_point_at_production_gcp() {
-    let sts = GcpStsClient::default();
+    let sts = GcpStsClient::new().expect("client");
     assert_eq!(
         sts.endpoint().as_str(),
         "https://sts.googleapis.com/v1/token"
     );
-    let imp = GcpServiceAccountImpersonator::default();
+    let imp = GcpServiceAccountImpersonator::new().expect("client");
     assert_eq!(
         imp.endpoint_base().as_str(),
         "https://iamcredentials.googleapis.com/"
@@ -276,7 +290,9 @@ async fn service_account_is_confined_to_one_path_segment() {
         .expect(1)
         .mount(&server)
         .await;
-    let imp = GcpServiceAccountImpersonator::new().with_endpoint_base(iam_base(&server));
+    let imp = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_endpoint_base(iam_base(&server));
     imp.generate_access_token("fed", "a/../b?x", &["scope"], None)
         .await
         .expect("slash and query characters stay inside the account segment");
@@ -301,6 +317,7 @@ async fn a_silent_sts_endpoint_times_out() {
         .mount(&server)
         .await;
     let client = GcpStsClient::new()
+        .expect("client")
         .with_endpoint(sts_endpoint(&server))
         .with_http_client(reqwest::Client::new())
         .with_timeout(std::time::Duration::from_millis(150));
@@ -334,6 +351,7 @@ async fn a_silent_iam_credentials_endpoint_times_out() {
         .mount(&server)
         .await;
     let client = GcpServiceAccountImpersonator::new()
+        .expect("client")
         .with_endpoint_base(iam_base(&server))
         .with_http_client(reqwest::Client::new())
         .with_timeout(std::time::Duration::from_millis(150));
@@ -353,8 +371,9 @@ async fn a_silent_iam_credentials_endpoint_times_out() {
 
 #[tokio::test]
 async fn a_plain_http_remote_sts_endpoint_is_refused_before_any_request() {
-    let client =
-        GcpStsClient::new().with_endpoint(Url::parse("http://192.0.2.1:9/v1/token").unwrap());
+    let client = GcpStsClient::new()
+        .expect("client")
+        .with_endpoint(Url::parse("http://192.0.2.1:9/v1/token").unwrap());
     let err = client
         .exchange_token("jwt", &sample_audience(), &["scope"])
         .await
@@ -368,6 +387,7 @@ async fn a_plain_http_remote_sts_endpoint_is_refused_before_any_request() {
 #[tokio::test]
 async fn a_plain_http_remote_impersonation_base_is_refused_before_any_request() {
     let client = GcpServiceAccountImpersonator::new()
+        .expect("client")
         .with_endpoint_base(Url::parse("http://192.0.2.1:9/").unwrap());
     let err = client
         .generate_access_token(
@@ -381,5 +401,36 @@ async fn a_plain_http_remote_impersonation_base_is_refused_before_any_request() 
     assert!(
         matches!(&err, GcpError::Transport(m) if m.contains("must be https")),
         "{err}"
+    );
+}
+
+/// A client that cannot be built is an error, never `reqwest::Client::default()`
+/// (redirects followed, no connect timeout) in its place. A TLS configuration
+/// of a type no backend recognises is the one build failure a test can
+/// arrange whatever TLS backend the feature set resolves to.
+#[test]
+fn an_sts_client_that_cannot_be_built_is_an_error_not_a_default_client() {
+    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
+    let err = GcpStsClient::from_builder(unbuildable)
+        .err()
+        .expect("a failed build must surface, not fall back to an unhardened client");
+    assert!(matches!(err, GcpError::ClientBuild(_)), "{err:?}");
+    assert!(
+        GcpStsClient::new().is_ok(),
+        "the default build still succeeds"
+    );
+}
+
+/// The impersonator on the same terms as the STS client.
+#[test]
+fn an_impersonator_that_cannot_be_built_is_an_error_not_a_default_client() {
+    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
+    let err = GcpServiceAccountImpersonator::from_builder(unbuildable)
+        .err()
+        .expect("a failed build must surface, not fall back to an unhardened client");
+    assert!(matches!(err, GcpError::ClientBuild(_)), "{err:?}");
+    assert!(
+        GcpServiceAccountImpersonator::new().is_ok(),
+        "the default build still succeeds"
     );
 }

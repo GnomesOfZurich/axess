@@ -56,7 +56,7 @@ fn handler(registry: &MemorySessionRegistry, sid_map: SidMap) -> BackChannelLogo
 }
 
 async fn post(h: &BackChannelLogoutHandler, t: String) -> Result<StatusCode, StatusCode> {
-    BackChannelLogoutHandler::handle_backchannel_logout(
+    BackChannelLogoutHandler::handle_outcome(
         State(h.clone()),
         Form(LogoutParams { logout_token: t }),
     )

@@ -3,6 +3,7 @@
 
 use axum::{body::Body, extract::Request, http::header};
 use std::sync::Arc;
+use tower_cookies::cookie::SameSite;
 use url::Url;
 
 /// Canonicalize an origin string ("scheme://host[:port]") to a form suitable
@@ -52,6 +53,42 @@ pub(super) fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) 
     allowed.iter().any(|a| a.as_ref() == origin)
 }
 
+/// Whether the request's `Origin`, when it has one, is the request's own
+/// host under an expected scheme: `https` alone when the deployment's
+/// cookies are `Secure`, `http` or `https` otherwise. The host is the `Host`
+/// header, or the request target's authority (HTTP/2 carries it there).
+///
+/// A request with no `Origin` passes: a browser sends one on every
+/// WebSocket upgrade, so its absence means a non-browser client, which has
+/// no ambient cookies a cross-site page could borrow. A malformed `Origin`,
+/// an opaque one (`null`), or a request with no host fails closed.
+pub(super) fn origin_is_own_host(req: &Request<Body>, secure: bool) -> bool {
+    let Some(header) = req.headers().get(header::ORIGIN) else {
+        return true;
+    };
+    let Some(origin) = header.to_str().ok().and_then(normalize_origin) else {
+        return false;
+    };
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()));
+    let Some(host) = host else {
+        return false;
+    };
+    let schemes: &[&str] = if secure {
+        &["https"]
+    } else {
+        &["http", "https"]
+    };
+    schemes
+        .iter()
+        .filter_map(|scheme| normalize_origin(&format!("{scheme}://{host}")))
+        .any(|own| own == origin)
+}
+
 /// Whether `req` asks to upgrade to a WebSocket: `Upgrade: websocket` with
 /// `Connection` listing `upgrade`, both compared case-insensitively.
 pub(super) fn is_websocket_upgrade(req: &Request<Body>) -> bool {
@@ -66,16 +103,21 @@ pub(super) fn is_websocket_upgrade(req: &Request<Body>) -> bool {
     names(header::UPGRADE, "websocket") && names(header::CONNECTION, "upgrade")
 }
 
-/// Refuse a cookie name whose prefix the configuration cannot honour. A
-/// browser drops a `__Host-` or `__Secure-` cookie set without `Secure`
-/// (and a `__Host-` one with a path other than `/`), so the CSRF cookie
-/// would never arrive and every state-changing request would fail.
+/// Refuse cookie attributes no browser stores. A browser drops a `__Host-`
+/// or `__Secure-` cookie set without `Secure` (and a `__Host-` one with a
+/// path other than `/`), and a `SameSite=None` cookie without `Secure`, so
+/// the CSRF cookie would never arrive and every state-changing request
+/// would fail.
 ///
 /// # Panics
 ///
 /// On such a combination, as `SessionConfigBuilder::build` does for the
 /// session cookie.
-pub(super) fn check_cookie_rules(name: &str, secure: bool, path: &str) {
+pub(super) fn check_cookie_rules(name: &str, secure: bool, path: &str, same_site: SameSite) {
+    assert!(
+        same_site != SameSite::None || secure,
+        "CsrfConfig: `SameSite=None` requires `secure = true` (browsers reject the cookie otherwise)"
+    );
     if name.starts_with("__Host-") {
         assert!(
             secure,

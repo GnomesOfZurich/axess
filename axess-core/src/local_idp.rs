@@ -79,10 +79,11 @@ pub use discovery::LocalIdpMetadata;
 /// [`crate::authn::error::AuthnError`].
 #[derive(Debug, thiserror::Error)]
 pub enum IssuanceError<KE: std::error::Error + Send + Sync + 'static> {
-    /// The claim set's lifetime (`exp - iat`, or `exp - now` when
-    /// `iat` is unset) exceeds the configured `max_ttl` cap. Production
-    /// refuses the mint rather than producing a token a downstream
-    /// verifier would honour despite the policy.
+    /// The claim set's lifetime, `exp` less the IdP clock's now, exceeds
+    /// the configured `max_ttl` cap. The lifetime is never measured from
+    /// the claim set's `iat`, so a backdated `iat` cannot stretch it.
+    /// Production refuses the mint rather than producing a token a
+    /// downstream verifier would honour despite the policy.
     #[error("token lifetime {observed} exceeds configured max-TTL {max}")]
     LifetimeExceedsCap {
         /// The computed lifetime of the proposed token.
@@ -93,7 +94,9 @@ pub enum IssuanceError<KE: std::error::Error + Send + Sync + 'static> {
     /// The claim set names no audience and the IdP was not told to allow
     /// that. A token without `aud` is accepted by every verifier that does
     /// not pin an audience, so minting one is an explicit choice
-    /// ([`LocalIdp::allow_no_audience`]).
+    /// ([`LocalIdp::allow_no_audience`]). An `aud` entry that is the empty
+    /// string names nobody and is refused on the same terms, whatever else
+    /// the list holds.
     #[error("refusing to mint a token with no audience")]
     MissingAudience,
     /// The key asked to be retired is the current signing key. Rotate to a
@@ -169,8 +172,15 @@ pub trait LocalIdpKeyStore: Send + Sync + 'static {
     -> impl std::future::Future<Output = Result<LoadedKeys, Self::Error>> + Send;
 
     /// Persist a new current signing key, demoting the previous
-    /// current to historical (atomic). Used by L2's
-    /// `LocalIdp::rotate_signing_key`. Not exercised by L1.
+    /// current to historical (atomic). Used by
+    /// [`LocalIdp::rotate_signing_key`].
+    ///
+    /// Backends MUST refuse a `new_current` whose `kid` the store already
+    /// holds, as the current key or a historical one, and leave the key set
+    /// as it was. `LocalIdp` checks the `kid` against its own snapshot first,
+    /// but that snapshot does not see a rotation another replica made since
+    /// its last read; only the store does. Two keys under one `kid` make a
+    /// verifier pick either.
     fn rotate(
         &self,
         new_current: LocalIdpSigningKey,
@@ -346,7 +356,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
 
     /// Cap the maximum lifetime of minted tokens. When set, [`mint`](Self::mint)
     /// returns [`IssuanceError::LifetimeExceedsCap`] for over-cap
-    /// claim sets. Contrast with
+    /// claim sets; the lifetime is `exp` less the IdP clock's now. Contrast with
     /// [`crate::testing::local_idp::LocalIdpFixture::with_max_ttl`],
     /// which panics at the misuse site (fixture mints have no error
     /// channel because they're test-time).
@@ -414,7 +424,9 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
                 .map_err(|(observed, max)| IssuanceError::LifetimeExceedsCap { observed, max })?;
         }
 
-        if self.require_audience && claims.audience.is_empty() {
+        if self.require_audience
+            && (claims.audience.is_empty() || claims.audience.iter().any(String::is_empty))
+        {
             return Err(IssuanceError::MissingAudience);
         }
         header.kid = Some(state.signing_key.key_id().to_string());
@@ -510,6 +522,13 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     /// the longest lifetime this IdP mints). Returns whether a key was
     /// removed; an unknown `key_id` returns `Ok(false)`. The current signing
     /// key is refused with [`IssuanceError::RetireCurrentKey`].
+    ///
+    /// The store's `retire` is the durable step. The key set is then re-read
+    /// from the store, as [`rotate_signing_key`](Self::rotate_signing_key)
+    /// does; when that re-read fails the key is dropped from memory anyway
+    /// and the failure is logged, so a key the store no longer holds is never
+    /// served from the JWKS. `Ok(removed)` reports the store's answer either
+    /// way; [`reload`](Self::reload) picks up what else the store holds.
     pub async fn retire_historical_key(
         &self,
         key_id: &str,
@@ -523,12 +542,17 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
             .retire(key_id)
             .await
             .map_err(IssuanceError::KeyStore)?;
-        let loaded = self
-            .key_store
-            .load_all()
-            .await
-            .map_err(IssuanceError::KeyStore)?;
-        state.replace_keys(loaded);
+        match self.key_store.load_all().await {
+            Ok(loaded) => state.replace_keys(loaded),
+            Err(e) => {
+                // The retirement is durable; only the re-read failed. Apply
+                // it locally rather than keep serving a key the store has
+                // dropped; `reload` picks up anything another replica did.
+                tracing::warn!(error = %e, "LocalIdp: key store re-read after retirement failed");
+                state.historical_keys.retain(|k| k.key_id() != key_id);
+                state.rebuild();
+            }
+        }
         Ok(removed)
     }
 

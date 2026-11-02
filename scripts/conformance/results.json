@@ -1,0 +1,865 @@
+{
+  "date": "2026-10-30 20:57",
+  "plans": [
+    {
+      "date": "2026-10-30 21:00",
+      "key": "basic",
+      "modules": [
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=0fvSbGXF9VAoY8P3VHtWPJa6iqn27p3t9mtxH9RdzzY&code_challenge=S4XvGYCPRFW_VJyOQMBvD9XCYfdrxaw2QFQOLG6EzDA&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=0IeV1Vn218xwz3GYuqW1STIvOLWcpMW9FDeZO_KVY50 -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=0fvSbGXF9VAoY8P3VHtWPJa6iqn27p3t9mtxH9RdzzY&code=x64wgpYCeSL8aCrxnDNGOnxeAYXnkgQq -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "Cv2Ku4XMpwgm1T6",
+          "module": "oidcc-client-test",
+          "result": "PASSED",
+          "seconds": 1.6,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=TQWRxiHWg9mBvw60vYmKRmHvkyj9b8OIUyWBsZyGbnw&code_challenge=eqpAVbDjZ38A6RtbX-N_bG4x6TBoi1QPEo6Vo37s0Xk&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=CxjDJ2DUopeK7avOs4F7JMugdmzZlL_h5OVm7iS2_4o -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=TQWRxiHWg9mBvw60vYmKRmHvkyj9b8OIUyWBsZyGbnw&code=yxsaW65312Gxktj8eYvCRbhNy59xHAIf -> 400"
+          ],
+          "findings": [],
+          "id": "1Ysva0lhIubhfl1",
+          "module": "oidcc-client-test-invalid-iss",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=QKzt-0eaek9w6i0OsIFahb8E5CYknTwBNAOiCHgH5a8&code_challenge=KilfJH7AVHwSdUeKOvBSoYyILeTLmx0SWCEhqL2Hgg8&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=2mOCKgFS4_zHUn8Kz_DES2HJhg6IC0ulG4fQCc_MWcY -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=QKzt-0eaek9w6i0OsIFahb8E5CYknTwBNAOiCHgH5a8&code=OZFnu5fgl63MtVAmdiHfqghpRul8wZhu -> 400"
+          ],
+          "findings": [],
+          "id": "qbfha9vsE39Rp36",
+          "module": "oidcc-client-test-missing-sub",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=PmJxk9X6Oxj6EUu57gO-1mOhafXzkWirXrZ4GwdpjB0&code_challenge=rbPF9JK45AcDJtWp7L5iKbqQz4laBq-wfX-ca0LmKmg&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=X4UOFqLYEOm8PurVbmp-zcJwUs47dRmALgyAdPEzEBA -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=PmJxk9X6Oxj6EUu57gO-1mOhafXzkWirXrZ4GwdpjB0&code=IsbvHZnH3NdsGdxjEhgHh1jNF07PxecE -> 400"
+          ],
+          "findings": [],
+          "id": "LEPVpJtM6t1e73Z",
+          "module": "oidcc-client-test-invalid-aud",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=ea1cdRUcrWbyF5tKnEe_M_ULuLQlqYPRWXcpdV5vRbY&code_challenge=CmEe7j8pRCaPvPCImBpJHkJHqK1d4Np_VB_3zDXoNp0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=HD_KNKxRM9iCK2WJfUz2pIuW0oklrb9dhFQ-T8Ys_yU -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=ea1cdRUcrWbyF5tKnEe_M_ULuLQlqYPRWXcpdV5vRbY&code=HZKSEOsxpliNVGDvnip0WwbnjxqDCfch -> 400"
+          ],
+          "findings": [],
+          "id": "jx4KRsfUUUb744R",
+          "module": "oidcc-client-test-missing-iat",
+          "result": "PASSED",
+          "seconds": 20.8,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=Rnkh_iivSxOBcReNTMbm31pIbeF67TDdYs4Sr9SaMA0&code_challenge=NgDjkEVZSW_aUSLArMhXeh6AQxGRlsAT1mDtN6xQYic&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=KudKrxPmAKgtJRcUnQjlWJOCi9yTR4AWgcUzFPOwk_E -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=Rnkh_iivSxOBcReNTMbm31pIbeF67TDdYs4Sr9SaMA0&code=YUtzCGyWC2xNciM2ePh8cv3GywmC7Lts -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "bVFkepjNFkse8ny",
+          "module": "oidcc-client-test-kid-absent-single-jwks",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=BgexGb7kZBhIDtFnuuS9IDmHTJNXXPbtqQ1pKOHjCx4&code_challenge=ApJO-s6Zl0eRQZPeGx2PEIBs0FLKo98O9QtIQFldc60&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=6FgUgEpuDBRJzRKlfZLXEgCcsLhTefbRKf1jkAzgAew -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=BgexGb7kZBhIDtFnuuS9IDmHTJNXXPbtqQ1pKOHjCx4&code=0BiWQAzPVdPRDYSt0VjFergQRhWSH6Yq -> 400"
+          ],
+          "findings": [],
+          "id": "Jf7NoqbVZgzrlMf",
+          "module": "oidcc-client-test-kid-absent-multiple-jwks",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=bw-Hi06W9kL8SXRBOd-8Kf_zIx87p15wnK_nw_JQQEI&code_challenge=7pLLEGazAIwAczqp46wYc5d8-qItqF1xUlLKUaE3iU8&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=vyc-sRYl2FlUENZrXrjFHqgqyxWgFInOfNdGQ0qFTKM -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=bw-Hi06W9kL8SXRBOd-8Kf_zIx87p15wnK_nw_JQQEI&code=bHknz9mOx58U4XLfh3MNKpg10hPitAib -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "8k0Chb8QqeB8QHu",
+          "module": "oidcc-client-test-idtoken-sig-rs256",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=WycGTeqXv_-QtU9GYrYU6spiflbEFXYn9gACZWbTaDU&code_challenge=aQ471jEW-d6y2qqpTNVG-G8A02J-kcKh4dgZWF3NLl0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=ttP5x0lX8Bfnq--2Nq68aK1ZV3CRGOHLayHgJnSp3CI -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=WycGTeqXv_-QtU9GYrYU6spiflbEFXYn9gACZWbTaDU&code=R3dZFhOmXy7plIpQnsDwv8pcIJtt22oQ -> 400"
+          ],
+          "findings": [],
+          "id": "8Et7E5oS4XgE8sg",
+          "module": "oidcc-client-test-idtoken-sig-none",
+          "result": "SKIPPED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=NMMhqZxCYdVLsUnjMgZlYj7PAPaQSsJfo7ny05D7RmU&code_challenge=TOb6svBSUk0SDbp7B6hSTafbVGu4qdtepyioGzkTD2E&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=gtgyM2nuJyftr_KB0vcOY9ciHnRa6zv26GNoMGObh_Q -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=NMMhqZxCYdVLsUnjMgZlYj7PAPaQSsJfo7ny05D7RmU&code=EMA1KTTPgB2mFTHWQ8hm0Xwe3cqJHIYt -> 400"
+          ],
+          "findings": [],
+          "id": "0zvzu3PJ2EYOCqh",
+          "module": "oidcc-client-test-invalid-sig-rs256",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=hQIL8tluDs8FKGRag2K3zaswHyyx_rdNKA-iTgjrWX8&code_challenge=dOoFVd0SXwvOSgztiXd_FLdwMMUs_NUrSAdM1TPYvN0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=X4fBwMNXim73IPuVl-Vu5mKUiqXS7imTuLtNhOee9gE -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=hQIL8tluDs8FKGRag2K3zaswHyyx_rdNKA-iTgjrWX8&code=2KaUyaSPCuBuu6KDMuZN46ucgL2jV9O2 -> 400"
+          ],
+          "findings": [],
+          "id": "Ob0PFnzgEbtabJU",
+          "module": "oidcc-client-test-userinfo-invalid-sub",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=5VDNTt9wKaO3khbXOUx88TxEAMK1eD9TrF9-sb5q6H0&code_challenge=8m6JPgQQzFx5yj6fg1Cuz6jnDRdrXmzL8Cdw6zIok9Y&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=VvYtULt8vW9Dh0QV-T2hKYFrIWJnntV0pM6BjV7of0s -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=5VDNTt9wKaO3khbXOUx88TxEAMK1eD9TrF9-sb5q6H0&code=uQJsIRXb3x6ZhxzW8aMeff5mdpN7hyTC -> 400"
+          ],
+          "findings": [],
+          "id": "qFiwvLmY62kLnz1",
+          "module": "oidcc-client-test-nonce-invalid",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=W0uZhllm9_U-hyjGmSIcksjLGJX4_5V5_TYxPvRa3Gk&code_challenge=7PS8gPfTSdoo9o2MqsATlfztN_dRJN9kGOEh6gocecY&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=ouDA92NrENFRXuRtSEJtq1dK-fp-LDsiKalW5-E1Hk0 -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=W0uZhllm9_U-hyjGmSIcksjLGJX4_5V5_TYxPvRa3Gk&code=g2LHWaIc35JNgva3ycAaf1MbUUZQlNGp -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "NF999UoQ063LOHV",
+          "module": "oidcc-client-test-scope-userinfo-claims",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic/authorize?response_type=code&client_id=axess-conformance-rp&state=AxtVXFQYwaaVh85H5-d8z-X-JlxJ1pDeGM1hC0JiF08&code_challenge=ftN8fzyS5siINa4_a3oTpLKpTE2-c6AsPCi032N5uco&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=P3U9CHhgqPzvYH061HhpK2o4LcGYB-ROTBl4AXS0Q3o -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=AxtVXFQYwaaVh85H5-d8z-X-JlxJ1pDeGM1hC0JiF08&code=uTK9n8aahDv1cjlBdrqogM9RFfe4mAfb -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "YY1mW1Iwb1YTsUB",
+          "module": "oidcc-client-test-client-secret-basic",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "client_auth_type": "client_secret_basic",
+            "response_mode": "default",
+            "response_type": "code"
+          }
+        }
+      ],
+      "modules_in_plan": 14,
+      "plan": "oidcc-client-basic-certification-test-plan",
+      "plan_id": "FMiwfJiShcsd6",
+      "variant": {
+        "client_registration": "static_client",
+        "request_type": "plain_http_request"
+      }
+    },
+    {
+      "date": "2026-10-30 21:00",
+      "key": "rpinit",
+      "modules": [
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-rpinit/authorize?response_type=code&client_id=axess-conformance-rp&state=m0Uc2InVEWkgbSoSEwaeEawZPWqPAJFclcJ0ZrUCYbM&code_challenge=6a5yf2WTPMHWmHq5BxbyeQNPifdkXFA7ymHM3VeqDME&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=HFblwGo98SPj8Q1iOelqlNsNbXWS94tfMJQwxfa-TWQ -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=m0Uc2InVEWkgbSoSEwaeEawZPWqPAJFclcJ0ZrUCYbM&code=6GpxlITV3sc2DQfVCIgAZR9cLb4EuPSs&session_state=dQvuLt67H3ydOs_YsNEM1Aev7ElpmdSeIrNwLd3zZF0.NU5ncrHopEEiK22MsKTihJp6CYQgN9meIWlAqyUKgLl5qiBc2T -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-rpinit/end_session_endpoint?id_token_hint=eyJraWQiOiJlZjBiZmY1MS1jNTBmLTQ3NjEtODA0MC01NjFmOWQwZmQ2NTUiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoiNDRNVFQ1YzBtYzB1aEgzcXlKNHJNQSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLXJwaW5pdC8iLCJleHAiOjE3OTMzOTQzNDUsIm5vbmNlIjoiSEZibHdHbzk4U1BqOFExaU9lbHFsTnNOYlhXUzk0dGZNSlF3eGZhLVRXUSIsImlhdCI6MTc5MzM5NDA0NSwic2lkIjoiVFVUSnl5WFJaYU1HQ01IR292Ymc2ODcyMDQyMDkxP3t7Ji8ifQ.JX0e-yXDjPV6qxJOpOZjb_5rbEN8ScgKYgPcy6w69WNGM24xMHMngBBMXbwFjNs1JU2gbFu0Ae7tGud7oMZmEkawRVGrA_7IhFF9KwgTjSI9be_UvBOPPAELAVdBril7YuYXoOURB_HEPsymimh16RYFPnSo0R8d7syC--2HghzJUJA4EgUcQbGaKSj5GWPLoYvzNuQi-UN-dECae-R3MsTTVaTnqilydEHKbTd0yqaxroNgpLGse0MfCUmXkjMoFih79lK1qUaStrIo6_KAkNbXD8j-bMvG3LSMIXmiI1fuWvqceXrKudHsYEynwzERaAhys9b9EehFF3HxoP66vg&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=bad9d8b150a7949c60e1f2beddc4f567 -> 303",
+            "GET http://localhost:9300/?state=bad9d8b150a7949c60e1f2beddc4f567 -> 200"
+          ],
+          "findings": [],
+          "id": "Pw08gzru0dPSDpJ",
+          "module": "oidcc-client-test-rp-init-logout",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-rpinit/authorize?response_type=code&client_id=axess-conformance-rp&state=UaCVhi4JSWH043UdIWcm518Kr3gnif8DryO_7aezKiw&code_challenge=oQZsE8Hw_OVOBzgoo4cxiYTi74Z7NsYlb_x-rV_kGR0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=OGQvfCFkdhLklw9re8rWGeu55YrWYJepn1aWLP5Rxxo -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=UaCVhi4JSWH043UdIWcm518Kr3gnif8DryO_7aezKiw&code=4NOQ3UNWyJilPWI4r32dVmR1uQfgfVyY&session_state=rWq01rY8ZJNVYT6wY7ON-uhqi5x1HFKo38KT3QKJ2AY.KcV73qpMtfirCo9HeafDYqyEryoWApnlcDWWr6CVPOfyWDybr3 -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-rpinit/end_session_endpoint?id_token_hint=eyJraWQiOiI5ODE0ODM0MS1kM2VkLTQ1M2MtOTllOC00NzEyMjQ5YWU2MWUiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoibDhOd1FBcHhKWVFtWGtBVzhSVV9zZyIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLXJwaW5pdC8iLCJleHAiOjE3OTMzOTQzNDYsIm5vbmNlIjoiT0dRdmZDRmtkaExrbHc5cmU4cldHZXU1NVlyV1lKZXBuMWFXTFA1Unh4byIsImlhdCI6MTc5MzM5NDA0Niwic2lkIjoiY2d2UW9vQmJRZHV4dFpQdmZwRUs5OTY3NzU3NjQyLik-PF8ifQ.oJl9nSqzazjc_lFwlZyZdsebyQTcV29pnGMIyCxgsfrBob1DrFFmhvSTonveQUHbLOWD17ekdwilnjHNEWFiywYoumEuxy2zyLO6LRq00Kb6g20JzLDpdMO2JAS6TuWcv-VBOcozLuUKqFSl451DxWcCH35P4JfI4Tt-DNw4V5R97W4wP5bYTgpu2JPyHC2sRgVURMnvXXFqFKclKQ-3orO0T4tvf4l0b82n34t-mxkmpRMbqYIaVd2bawpfC3_m_0qZTMWT_luzGnvupIVNHlh1v5__ykeejT6zyJA48Z8Av_2u-kKKpNdyg2A32azEIKNie-RvJ9o2F7KGMws25A&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=c3fd784225a038425bf80e0a362804be -> 303",
+            "GET http://localhost:9300/?state=c3fd784225a038425bf80e0a362804be_INVALID -> 200"
+          ],
+          "findings": [],
+          "id": "Vzj6vY0IYqAukqG",
+          "module": "oidcc-client-test-rp-init-logout-other-state",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-rpinit/authorize?response_type=code&client_id=axess-conformance-rp&state=F6fo5rhZf1gxRrh2zFoSBFXcnsdclFY5FrNliiac8rw&code_challenge=isKZMwVSwGko8aVdnLGa3jZRIdjF6LWKCdpdZUKax0g&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=11Hw3ADzKZKeP8IJZHOv-bF0qlPCqxWIJF4NGsli_8o -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=F6fo5rhZf1gxRrh2zFoSBFXcnsdclFY5FrNliiac8rw&code=NKDGumsCQDxgdvLuacmMqzt6oHRYywZc&session_state=AEj42HmGdAddpzdMGKKmsBDImC052zNlcWlwubGDlsk.clOZKvlTD3HijoA6l0JnY9JTfvqcstla5skjVPBXLtlaG6j3De -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-rpinit/end_session_endpoint?id_token_hint=eyJraWQiOiJiZWRjZTc1Yi1mOWM1LTRjOTMtYmQwMi03MjZhZDkwMTkzMTAiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoib2phTXlXNXkwV29LOGctQlBBeV84dyIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLXJwaW5pdC8iLCJleHAiOjE3OTMzOTQzNDcsIm5vbmNlIjoiMTFIdzNBRHpLWktlUDhJSlpIT3YtYkYwcWxQQ3F4V0lKRjROR3NsaV84byIsImlhdCI6MTc5MzM5NDA0Nywic2lkIjoiQXdTT2RYTW1sdWNZTEZWZXp0enQxOTEwMzc3NDM3YEBdOyAifQ.mmIItBnskuyqk6mdPhIBMeIrX20ghwxMFwGUAn8UhA9pRP-4jCl9DdausLx2-lxJ2v8PGyF4sR4lqaPuTw8OHUl_QFUW4oll_17cGeSJS0_2T1NHh4C7Jk1mx1tHA-HNiuduGEz1gsIGX5ED-tfpWTN8i7r4hzeXrCIJttU47PPY0ivb29x-L561yMiC33t2hU21pcYW1pi3cuTPlZMZ2rxxQBUwQlUDiZyzvjfvLeFHQgtiAVoBJWyEtcrbD4iGgbyWQTKILSWlDlcJ68pcrgUXse5GHb4yTkpGjVvQhCaYkWeSxrrSinDNHCSGb857Vox3Y9gwp1gcXovj9AIqAg&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=fd3ec59b2aee170dac6c2d31a860fc1f -> 303",
+            "GET http://localhost:9300/ -> 200"
+          ],
+          "findings": [],
+          "id": "3vhWMJ6qWUc2gWs",
+          "module": "oidcc-client-test-rp-init-logout-no-state",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        }
+      ],
+      "modules_in_plan": 3,
+      "plan": "oidcc-client-rp-initiated-logout-rp-basic",
+      "plan_id": "tdAcaxOGfrfDi",
+      "variant": {
+        "client_auth_type": "client_secret_basic",
+        "client_registration": "static_client",
+        "request_type": "plain_http_request",
+        "response_mode": "default"
+      }
+    },
+    {
+      "date": "2026-10-30 21:00",
+      "key": "bcl",
+      "modules": [
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=av3n_iX4F9Rmzz9TA1ewemHSfwzYYH1YjLWElbwf5AI&code_challenge=ElbWSCZtqMmug0sgv-mSrvyj61kfeAQlVbilNBPj6Vo&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=A6GQMqkQZHw-ZjpggI_nh1KUMI8TtrOp_lA28YgxZ_0 -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=av3n_iX4F9Rmzz9TA1ewemHSfwzYYH1YjLWElbwf5AI&code=QyhPs4nLq94T81wg5Eu2DDBwbKhGKjye&session_state=9oxnP7IlOMrBU4arbsesEedMLcXU6m2cHGWwdEtHvnY.rWrNDilSWSVXgXh1qrfzM8KO4nCfxOcw6kJgl5Ff1J5SsSo1AU -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiI0OGE4ZDJlNy04MTcwLTQzOGMtODA4Zi0zODU4ZmFhMGM3YzYiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoiV3p1ekFzQVN6dzVvdFA5elB2anR6dyIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNDgsIm5vbmNlIjoiQTZHUU1xa1FaSHctWmpwZ2dJX25oMUtVTUk4VHRyT3BfbEEyOFlneFpfMCIsImlhdCI6MTc5MzM5NDA0OCwic2lkIjoiSEp6d2JDT1NQSmZxVmNabHJzcGcxMTM0ODc3MzQzXS98JCYifQ.XdYNJ9WTXRUazcumoT_nw8C34D0Nfv7d8xZCdYYX3ppHMQ5U0afXRJUJMsejs8t8gbSp8ev4yUkaaktRrZKIMdgoFffeSvXjt1m0Pb0bcwLC2diiXaZ1YQStGIzl4ez5UYWqo7smpLfQxn1YxW024hB_EMmcG5QYZFBnX1M2yhzv73W8jyq8wZZKl7t2JUyNpY6faHDzyIUXT52YHgsS0_qXfd1fLAs4nCCro8_HEzDznNLr7vFXupGf6dIxwYm9C1QTrKPZQ1kNaQmmXF9JHGzOAtdGa_w8Rj-Ta3g006i_5eqZZELFfKg393M0kFU1r96hD-9RkIln9041Vjkd9w&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=f1f396e21c0cab0ce20e76cf9ae99ede -> 303",
+            "GET http://localhost:9300/?state=f1f396e21c0cab0ce20e76cf9ae99ede -> 200"
+          ],
+          "findings": [],
+          "id": "VcFTdS2VFJXEs3a",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=K4WyKxd5TcD2fYFvLQjDugyNWE-e8IdaIPFC6xWDG-s&code_challenge=Lj-lPMPpgF4MkL9967I5lmLfmUr3JneG5aj8kC2WlUE&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=CEGjiISZUhADQ8dFg7liIs1d0REvtVLKC1XQvV5vL08 -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=K4WyKxd5TcD2fYFvLQjDugyNWE-e8IdaIPFC6xWDG-s&code=XivJoUw7B5LWhfxu84wSOvd2S47DtEfk&session_state=bS36EQYKW3mRPfl1FhMn5FP5iml-YOYxRofBl8bT1I4.WGOu773bD9JffoakRGZVqmHs5e3uZDM9F0zVx94quDTSCaaACf -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiI1ZDZhYzIxNC01YjBlLTQ3NzQtODM1OC1lY2FkZTg3Yjc4ZmMiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoiRkVYdGJxV1FDS1BwODAwRV9XWlhPUSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNDksIm5vbmNlIjoiQ0VHamlJU1pVaEFEUThkRmc3bGlJczFkMFJFdnRWTEtDMVhRdlY1dkwwOCIsImlhdCI6MTc5MzM5NDA0OSwic2lkIjoiUmlYRGZYVGd6WGdaRW1PeW5BSVY3NDE4NTk4NTU5PmAhLSkifQ.YZ4j0Uskl-N40J2n_ohceS0IoZZvGosZHlHqN42sXQXeKvwQIYA_6G0dBSpJGhBlgj274sZolHn71AnILL6ypcQeMClR_mw9UH4Lxu_1z5UYwkkhetQkm48k19DP0R9SkxhKlqjLOKzS3BwVkoGdNvXlj48_-3E5I-NGz6gy1jv0BBtuKxdZTXRvXbFF8j94bdGTgJm3zKEaYCX7geugn_zaLGbZrZvyufIyYe76gbk8f2_4jsqO4QeASYNd1DzOIC_uR-ad3j9xclJnRFqrkyMbYKxmfhFstn9744BnLcUinftwjdBL8em4VXHuD5HVW91VfZeHEZc8o3uZMy0DoA&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=4da84922b30b0ea04164e1d4943ff9a8 -> 303",
+            "GET http://localhost:9300/?state=4da84922b30b0ea04164e1d4943ff9a8 -> 200"
+          ],
+          "findings": [],
+          "id": "TWvj4bGwcSAXktK",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-alg-none",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=GxjzmpTbnvHwZv2j5crVwBOMKA7vk6rnybEUYb8rduk&code_challenge=Q9nRYwGqYORLH6kDZfpI4CUcNqpHnyBycF-gc7Y57cw&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=StNJm-yCC2qHyhGkBVD64LT2qxS4PPT05OJUur7uXBs -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=GxjzmpTbnvHwZv2j5crVwBOMKA7vk6rnybEUYb8rduk&code=2cM4HriIqN0xpTJZkUOoOCePL4CgTm2d&session_state=1IfdgKQB64V4PNYSHK4m5zlzBk1GxWc36FQ2WvVKLPA.bobvuT6RBeEpFMpCtH9zgB8UFgPaepuI2ZZfT9vZjq6NqlHlLr -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiIyY2EzYTA1ZC05ZjFjLTQxZjctYWQ5Zi1mZDU3MGRkMzY0OGYiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoieVgtSEM0NzRqZXBaRFBNcGdNWV9RdyIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNDksIm5vbmNlIjoiU3ROSm0teUNDMnFIeWhHa0JWRDY0TFQycXhTNFBQVDA1T0pVdXI3dVhCcyIsImlhdCI6MTc5MzM5NDA0OSwic2lkIjoiQU5NeUx5QkJQY2FqdVlVcXhaS243MTg5MjE5NjU3fTs_LCYifQ.Yq0UW7goJW1U05XIbWKH8Gtv72WtXrUY-IgVJy6hO6gd4O7WbT0Mn6PPFFu6xndqtCgTOoPYlNffNjGs8ZqS3_Vyyec0HJDCqVdxbd_o_E1x_Gb-aLqvUPhf60Jadtcplsv-NHmRLzQql9VlC20bnAAXWzPxSfs1ccu43vFB6lGHrB2nnzIrqVqnQYGzawlK9q0Mk_mE0LfHbpyoiuWH29D0-QfCks9VQVW43gTaqBsO2b48afx77WHvT96x6PO0M8Ps7wBoeK6phBOARANKZ5epTB9ACvV7JvyyfsnKviMbRmOB9dmyzOTgruWnAHBjw8YWdSnnPJaiUPGmmTKHbA&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=a55dcb80715eef220c8add09a4dbef8f -> 303",
+            "GET http://localhost:9300/?state=a55dcb80715eef220c8add09a4dbef8f -> 200"
+          ],
+          "findings": [],
+          "id": "JuWg8l0Gg9qqxdI",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-no-event",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=_KXOkx5F-Wdwp7Dl7eLJuA_XvBBpMRzy82SVFmNyLow&code_challenge=hmy2fqFclm3B16dDHb93xKBJEOtaxs3ierP4snj0xqU&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=nbxD3kKSQGe69kE6fAsHWU-J6kNSKtNHhlBKm5vMUCQ -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=_KXOkx5F-Wdwp7Dl7eLJuA_XvBBpMRzy82SVFmNyLow&code=hTiOrIb5cgP7NcJVyNsihP9mYrjg1zDO&session_state=Id_dfWW4aqNBkIh3U-km_fA82B0lfLivG7wlnTdHCV4.pHNa5Hl2CQzvDQSBOr93LqYtIWZTZCXv9zaABL7VmpyLARfDSY -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiJiYzVkMjM2OC04MTNjLTQyYjUtYTI5Yy1iM2IyODNiOTc2NDMiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoidW5FSWRHLXhJcHhrWDQ2eGVoZXYyQSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNTAsIm5vbmNlIjoibmJ4RDNrS1NRR2U2OWtFNmZBc0hXVS1KNmtOU0t0TkhobEJLbTV2TVVDUSIsImlhdCI6MTc5MzM5NDA1MCwic2lkIjoiZ3BNeVJhZVpVRFlYd3lHQ2JqQWU1NjQxNDM1NDUzKV1-LD0ifQ.B-aLDf_tiOsX_sZmSOVzW-ZLMh6jiIS7CK7YP121yYahR5v0bYummZQ3dnb-U1R6CelfLijVIGL1cnQiNQiffI5gThIO3upjrGxW7GWK_xuqJDMk_LXSku_eUQvtPnAd4zZ9O9rjhWDPYXAU5hAEFGqKlxWmtFH3hyUnNDTiUZiZF8nKqiPJLpCsM9LdyJgUZMwaevt-jHRsgHf8A7umLLLYdemNCW4rOHpXi5lm3JO3m3lUQVVjcRGKwviAUEG8xdMr8k1PjSMl3VitqAZXgddfxnl04Dl87v0Kfom1x7ypPgwF7noxhn4NUMrraJEHyCq-m2dCrkRmI2kQr7DsKg&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=34117ff1422f3f8323ea42adaa5d3bbc -> 303",
+            "GET http://localhost:9300/?state=34117ff1422f3f8323ea42adaa5d3bbc -> 200"
+          ],
+          "findings": [],
+          "id": "ZJmWS8NLPmoxUh9",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-with-nonce",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=fiRml-ZwU0v_8WLA7UwUG0xQdSFsbM0voGpWd_Tnqio&code_challenge=5xe9hTeGeymIXIODhi4FcQzFO5N_7JzNlICaxdZseF0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=leiWq-qcLg6xYbu_8eJFF2TP9xak3D4YPXcbXRe0vYg -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=fiRml-ZwU0v_8WLA7UwUG0xQdSFsbM0voGpWd_Tnqio&code=tFbuU1FG8Zm4MFYGlhE24kvRXFYjoa6c&session_state=pyspBgzIbg9i_r92RA7KdfVeqg0JYO0HI2zLBFLcS_o.vwP0v4qbi1MnDgGSvcNwaDEXwYMRMggt79fKf89Fy66salnr8K -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiJlZjUzOTA3Ny03MDYwLTQ4MjAtYmZmNy01NmI4MWVjY2UwMTAiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoiTEJzNnE0WnZoX1JaX09UZ2c5VEtZUSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNTEsIm5vbmNlIjoibGVpV3EtcWNMZzZ4WWJ1XzhlSkZGMlRQOXhhazNENFlQWGNiWFJlMHZZZyIsImlhdCI6MTc5MzM5NDA1MSwic2lkIjoiZHB3Q2hHU2JlVEtoUGRZV1ZQam0yOTYyMzM4NzczX1wie348In0.OKzlDhdE6zToqewmLgYHu0pytt62FRLLmL-Vxc_wR2Jhs2BsDcPCRDmEq284nfOIyMgbvGISHd7OmYJSqhDEYS-ndvHbxen3fSaCH8kmaH3sQw5rS9r2XOtI3RYi_m24AB9CUPL7TyTY9jLfDAhZHat1q6UAOhqYesAc8pY3XUoi3Vf_nt7DVPoT5e917zKn7E2No2p5VOQFrKk3Sd_sWVXhJ6PBhjumddQDODsLN2h_Qdc_sqUZPFf1YbrMhfuEFdCbA-vZ9UaOZA9JbFIsK40ci9NonQOma0t4cA2b3rzGeUFgVFfBlf-Zg97Em-QvCB7-zwwKMkkgsr-LlXBPkA&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=69dc5aa3d495badda975c5554144f47c -> 303",
+            "GET http://localhost:9300/?state=69dc5aa3d495badda975c5554144f47c -> 200"
+          ],
+          "findings": [],
+          "id": "asRmSxgVZUYPKYV",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-wrong-alg",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=vBXUNXoCSQZir3aWIeP-b50KVmlANcSWMHum945ZfM4&code_challenge=_olDPPvaQia17vJkVp4BQjcOAT1mmqcAI0DTvAKRV0M&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=b80gUaI7bdo9VIv1Mux_8tOVFDuTmZzTJ4iPLd9sHAc -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=vBXUNXoCSQZir3aWIeP-b50KVmlANcSWMHum945ZfM4&code=ZQhhPADEoyiMWQhM9ywKjejXvtjCvYuc&session_state=9GdxVTmZhjhv3eKFuYevOI7us0IXwao1khBOVIPshLM.QJt6Y6ffn1jeDuKGEhSGqRPkBD0JRG6xxD9PIQqnBxI4xzxlEU -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiJlNDZmNDA1MC0zOWM4LTQ0MjQtODM1NS1kOWFkZmUwYTQ4ZTkiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoialZWcEZFcXBxcTF1OFVzOV9vRmtpUSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNTIsIm5vbmNlIjoiYjgwZ1VhSTdiZG85Vkl2MU11eF84dE9WRkR1VG1aelRKNGlQTGQ5c0hBYyIsImlhdCI6MTc5MzM5NDA1Miwic2lkIjoicHVSTkJWdmlRZmxKU1lZV1l2S1c5NjQ3MTgyMzcyKn18ezoifQ.ZWMdxQ4Oz7Ul3tzfFATicjqvSQjOKvyUQKvvvcmR_e302O-WdVhSo01jnWhRWYB7F_-YELk3ryPyveWTg13wAWwtaOMnAUgA6lLwtqDz9NP9w82s_oqGnTtVq6gH_dAytU_c50jxB2R5rKfpUqRDf_bcQWbG0OBKzintbyfsAYOXF_rGH7xPVTG8eQDgzQb1iYX5yV0unUXv9-5MIEVEh6LKmo_nfrsLYWzvj6tp_TwEnQt8etKY4Ppml6DJbjMo5O5zQtMtZX77zprX3EW6mV11cHd9G3uCB-LUFYaS1_KlR2vyhlKf2Z-aswRRX-lvJeayvqzti0YUFCRc81AA7A&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=abac182829e79cccdb3e621a009576fb -> 303",
+            "GET http://localhost:9300/?state=abac182829e79cccdb3e621a009576fb -> 200"
+          ],
+          "findings": [],
+          "id": "6ibV88GCqXfyecC",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-wrong-aud",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=feeLWiDL_EqyJrZE96O2Ig9WohEkHZXwmShqJ7jxE6U&code_challenge=n7ZML3IpQ3pAx7_LNHUFIq2UaERz9X0TGJhSkfZfr1g&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=A3xrRVDGpseHoCM4YBdiQDT2Sk2-Zshi4RfIzEbicA0 -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=feeLWiDL_EqyJrZE96O2Ig9WohEkHZXwmShqJ7jxE6U&code=Faaq5jvQ6Zh3kglC7w7E9ORu6gMxusPy&session_state=eFaFLql7DuVPl5by5585WjJjmwAsl9KmUoa81fzI7xE.8oHKJ9ZosUIhNvSublKL93F2ZnChJ17VePaIxHOhTXH9PD2GFt -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiJiMGM0NzQ4ZS1mNGNkLTQ2YjMtYWViMy04NGM0MDc5OWFlZTciLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoiVS1kMW9OS3VMSzNSczBYemlYSmY5QSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNTIsIm5vbmNlIjoiQTN4clJWREdwc2VIb0NNNFlCZGlRRFQyU2syLVpzaGk0UmZJekViaWNBMCIsImlhdCI6MTc5MzM5NDA1Miwic2lkIjoidmZSTkVYenF6anFjZnVZa2ZMb1EwMTQ0NzE2Mzc1Li0vficifQ.HIug9ZH1J8HC7FP1hIccJL_r2kWcQxrbdoZXzN42MzZjN-2M5tVmCpz9o3jtzFUhWfy5QQcE9m7GwL6vHFKXuIwBBJ33Sux3GZqt_-kur_XkL2c5UfTHey8R8m657bZVCIKllN2V8YEqn3djwapNiKk5jbTdeArfldJr_K7lwnwIIaXVW1G2d9S7xHXz4TlMlYc6xkINUE3FOux3tFC7cVIWvk4kRhdwlNStOgK0pXKGgauqkDdHzTezOnbS_EjV-lynHmy-2KRLLcZrrINSIVDNiDf9OEuaeGyN-J95eSH7OcMBwL3l_tVRwTQjGi80T1otxZVPeRWi6N4o4QtLXQ&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=d60b694c32db32b727e0a5629d1b23ca -> 303",
+            "GET http://localhost:9300/?state=d60b694c32db32b727e0a5629d1b23ca -> 200"
+          ],
+          "findings": [],
+          "id": "rB7Bk88xqfGXvHh",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-wrong-event",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); logout ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-bcl/authorize?response_type=code&client_id=axess-conformance-rp&state=p1UyFkvK2ffGVEBja0Dq--kWP04bQJ-R3_iflYaQMH8&code_challenge=flgmDuYS9_xSD24s2BTEwoQjl_VLJt36QAbw6j4r9NA&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=i5CjFxLEWErboiFfOQ3oie8hk6N6-CWKgy1lwH7xqAA -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=p1UyFkvK2ffGVEBja0Dq--kWP04bQJ-R3_iflYaQMH8&code=lRWeW2HgeboO7uIp8hEoqPQxA7QTLJZl&session_state=kaiEiDlgQnVX_nrN7hTGP17bjs2g4pyTrpotISZpt_0.ZYhm6AlRQEPTLXdqQnqjmplHBTRQfACEXhOReng1JDgl3MWBmp -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/logout -> 303",
+            "GET http://localhost:9080/test/a/axess-bcl/end_session_endpoint?id_token_hint=eyJraWQiOiI4NGZhODQyYS1mMTRhLTQ3NTAtYTAxNy1iNDgzOWJjN2I5OWEiLCJhbGciOiJSUzI1NiJ9.eyJhdF9oYXNoIjoiVndjd0FrcFBEdWd5UTZ0akZYUGxzQSIsInN1YiI6InVzZXItc3ViamVjdC0xMjM0NTMxIiwiYXVkIjoiYXhlc3MtY29uZm9ybWFuY2UtcnAiLCJpc3MiOiJodHRwOi8vbG9jYWxob3N0OjkwODAvdGVzdC9hL2F4ZXNzLWJjbC8iLCJleHAiOjE3OTMzOTQzNTMsIm5vbmNlIjoiaTVDakZ4TEVXRXJib2lGZk9RM29pZThoazZONi1DV0tneTFsd0g3eHFBQSIsImlhdCI6MTc5MzM5NDA1Mywic2lkIjoiS1lQR1V6WHdXbU92WlhSSXJrRHg3OTA2Njk2NjI3KCYvXTwifQ.dtmNZ0lBU6ehLYxG-5KeW4rlVm2MHzIs8bcV4q_GrCqrG4skiTjP3F1KUyjiskGwi9UQstqXJ10dImq2v_5Po2AEG5xuXVT9V5shSrNza3PnnK3ewAVyVacEoB9sgxD73hCUkLi8GxtK5sNC6B451uYBUguobU3N_dbE2yazObzkcKA6IR-qhLAfm8xEAMS7e_9eD7BwawaOY6BJQcapdmsVAF2TzeVVbzcO_ki2YUuiOrzT3NhdAlcKPSrGJqVzfrE88nR2HM0xiOLOq_fO2RDFfZ4B0egGvjZX6vDAadbrunwBvH-66X9bAz85zrwj-cPTC7ZDut4xIn8Vf_KTOQ&post_logout_redirect_uri=http%3A%2F%2Flocalhost%3A9300%2F&state=891f2dd0acfc62ee2909705ef4568256 -> 303",
+            "GET http://localhost:9300/?state=891f2dd0acfc62ee2909705ef4568256 -> 200"
+          ],
+          "findings": [],
+          "id": "bjBR6w9OChh1wtr",
+          "module": "oidcc-client-test-rp-backchannel-rpinitlogout-wrong-iss",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": {
+            "response_type": "code"
+          }
+        }
+      ],
+      "modules_in_plan": 8,
+      "plan": "oidcc-client-back-channel-logout-rp-basic",
+      "plan_id": "nGpvoHrgPXbhf",
+      "variant": {
+        "client_auth_type": "client_secret_basic",
+        "client_registration": "static_client",
+        "request_type": "plain_http_request",
+        "response_mode": "default"
+      }
+    },
+    {
+      "date": "2026-10-30 21:01",
+      "key": "refresh",
+      "modules": [
+        {
+          "client_note": "login ended with HTTP 200 (signed in); refresh ended with HTTP 200",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-refresh/authorize?response_type=code&client_id=axess-conformance-rp&state=0ch0IoOhsYpdxy2ANPcn8Ny5Gbxs_XEEoaiCL-tSmWQ&code_challenge=BluweP1Ehp8jiIGnqUgTTA3siwmDYu5FptvAPMghHUg&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=0UZMGPekjHdeUFIojN3XbhDyyBLo7acpHsag0ur0lKw -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=0ch0IoOhsYpdxy2ANPcn8Ny5Gbxs_XEEoaiCL-tSmWQ&code=OshjTf6kFhLFMzhjbfVTZdyafMkLeCKo -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/refresh -> 200"
+          ],
+          "findings": [],
+          "id": "iBqOmKmLn7Y1ZRr",
+          "module": "oidcc-client-test-refresh-token",
+          "result": "PASSED",
+          "seconds": 0.7,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); refresh ended with HTTP 502",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-refresh/authorize?response_type=code&client_id=axess-conformance-rp&state=p4CokFRtD9iplmi_9_FL0H_kBjRv8l-JX8GLSRTAYYk&code_challenge=9k6R1nFg2xV16WQqsI-CvHqBMLIL5aqjLRDCHqGmPZM&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=fLvULZ6qJ2DeSoG1inUp1xqC2_SqywKAaGYH_BKLCas -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=p4CokFRtD9iplmi_9_FL0H_kBjRv8l-JX8GLSRTAYYk&code=pNwmvqQrqrlmGQZF4UM9tDOTNk116jtG -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/refresh -> 502"
+          ],
+          "findings": [],
+          "id": "n3zPsJhskzDAK4h",
+          "module": "oidcc-client-test-refresh-token-invalid-issuer",
+          "result": "PASSED",
+          "seconds": 20.8,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in); refresh ended with HTTP 502",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-refresh/authorize?response_type=code&client_id=axess-conformance-rp&state=mcbDxHcIbHbTRMnefwkbqJQR3VMebVP5a6nEXW9_lYE&code_challenge=Mh3n-8C-CcfcH16xGHkkcB6lYXukv8d7ayoDrrByKxk&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=Z-lOqFy5YDaoD73AJVI7vRwBcMloUnT0qpoFXRgjc8w -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=mcbDxHcIbHbTRMnefwkbqJQR3VMebVP5a6nEXW9_lYE&code=bsfuQgbqfYewL4MOQoyIicgRIMatG0Ap -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200",
+            "POST http://localhost:9300/auth/refresh -> 502"
+          ],
+          "findings": [],
+          "id": "BQhfZLi0Vo8pg7W",
+          "module": "oidcc-client-test-refresh-token-invalid-sub",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": null
+        }
+      ],
+      "modules_in_plan": 3,
+      "plan": "oidcc-client-refreshtoken-test-plan",
+      "plan_id": "EYHuS18d2vgVc",
+      "variant": {
+        "client_auth_type": "client_secret_basic",
+        "client_registration": "static_client",
+        "request_type": "plain_http_request",
+        "response_mode": "default",
+        "response_type": "code"
+      }
+    },
+    {
+      "date": "2026-10-30 21:04",
+      "key": "basic-private-key-jwt",
+      "modules": [
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=DYGdcXk-YgtTyD_gsuGMGYcXzVYyzw32pyR2OS91Ef8&code_challenge=r2kAWco3aCFZuAEUXVrGpON_ISAqDIqzdeu9Juw0Qig&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=fxRRMQrnU5sv5Hk0SHWsY365Xnq27ulC9jWVqBQnPXQ -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=DYGdcXk-YgtTyD_gsuGMGYcXzVYyzw32pyR2OS91Ef8&code=nZB1jHmW528bDYyReEuTiabnv2YlYvSL -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "D743K6XZduXnnGY",
+          "module": "oidcc-client-test",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=FDkcY_JOzAqSPDMWOh6h2sqxG7-2oAp8rW3u8YHsSDg&code_challenge=DPGyssfoCvVRtPqxCClu7TjGjMOdAMcH4bUF1mkIKW4&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=8GgokC3074ZiXUJ68fwPZP9N-9t4ul8BHWcJ0UQSrqw -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=FDkcY_JOzAqSPDMWOh6h2sqxG7-2oAp8rW3u8YHsSDg&code=RcFJHfHrYO2hEtNI5zuDf5oK08Cu5kNr -> 400"
+          ],
+          "findings": [],
+          "id": "SZratJmsq53Nf9P",
+          "module": "oidcc-client-test-nonce-invalid",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=KwtFH6KfFVDVk5pi3m3lH-90uSs_TD-GFSvC2tO0Skk&code_challenge=Z7Sk0aowH8-EtBE6zV6rhf5xkAY4n7OzhXeZ8MKwugA&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=-f7-odYDbAK9fhhDRKyUgyWuSpwr4qD3-RHO38tbEqs -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=KwtFH6KfFVDVk5pi3m3lH-90uSs_TD-GFSvC2tO0Skk&code=ihQHrelHXRt7lsw1I5SJeURYd1ziM3Zo -> 400"
+          ],
+          "findings": [
+            {
+              "msg": "This test expected the client to perform client_secret_basic client authorization, but the incoming http request does not contain an authorization header",
+              "requirements": [
+                "OIDCC-9"
+              ],
+              "result": "FAILURE",
+              "src": "ExtractClientCredentialsFromBasicAuthorizationHeader"
+            },
+            {
+              "msg": "Test was interrupted before it could complete. The failure 'ExtractClientCredentialsFromBasicAuthorizationHeader: This test expected the client to perform client_secret_basic client authorization, but the incoming http request does not contain an authorization header' means the test cannot continue.",
+              "requirements": null,
+              "result": "INTERRUPTED",
+              "src": "oidcc-client-test-client-secret-basic"
+            }
+          ],
+          "id": "fEzCnuie4y5fRgE",
+          "module": "oidcc-client-test-client-secret-basic",
+          "result": "FAILED",
+          "seconds": 0.8,
+          "status": "INTERRUPTED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=cOqp9omGYCB70MV5intx720daKAC5bsPlEpI6f4RBds&code_challenge=pMZSAYhbgPRITlYVp0ulv9e1mMSTupoDGU55YZv_Buw&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=7HTYKNA1sXuWbixNKwnTvKTizLvYOSX4W6mCW8_gX4U -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=cOqp9omGYCB70MV5intx720daKAC5bsPlEpI6f4RBds&code=OMU0XV2SZjIVu8hu0ln6Q5VrX5Ch5Fts -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "3yJkfsLHuww4qXa",
+          "module": "oidcc-client-test-scope-userinfo-claims",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=wnvmUUFKraZciSG9hbCJu0JlCQeeEATZI6UJViJffVA&code_challenge=nmHJdNyUMi_yYzXs3aP4uI6IWE-5FZA7xwr5C3QGHNs&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=pTzr3PFNHh59yNSoHucePBSj-hGlxQGlAYL3zuMu-jk -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=wnvmUUFKraZciSG9hbCJu0JlCQeeEATZI6UJViJffVA&code=epRiHY2mtlHCc9ZPps3jelMFb6J4VEn6 -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "wWh5tKt2htZxlmI",
+          "module": "oidcc-client-test-kid-absent-single-jwks",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=BuWmDBnU_femfxsGo52W0xknu8V5eaQYOmK2AiBJtOs&code_challenge=QsQkTUIY8lXbrlm-VTsQ_r49Nn5DXbGORjm0sSSNbjA&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=a5I7D8ojdQ6eAX1nLNdUxQdu4Y_mT41x8BrytizJnGM -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=BuWmDBnU_femfxsGo52W0xknu8V5eaQYOmK2AiBJtOs&code=sBrW6FECGn4AYxAgAnWW2ffCiroH4WUX -> 400"
+          ],
+          "findings": [],
+          "id": "vSNzg98kUcUxnpt",
+          "module": "oidcc-client-test-kid-absent-multiple-jwks",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=5R_kLRxvO6mQJ0-aMopvbO5TjzyVuRpVK0KVzDDY4gI&code_challenge=8UKsuA1c_6uV75cD4lMGqhbN51eLVu3C12WkDVcd4RA&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=SXl59LQP1QnQEI19-eclFRgB4skNkrmR3wW-pyP-T1w -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=5R_kLRxvO6mQJ0-aMopvbO5TjzyVuRpVK0KVzDDY4gI&code=gbjsRLJQZP4Mk6k3u3THPhNxTJplQjyz -> 400"
+          ],
+          "findings": [],
+          "id": "4bzhSxbTwksVwGP",
+          "module": "oidcc-client-test-missing-iat",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=LAmhAoSLY59bCIc9B-riUP3SiwWgiNz3h3Yo3mT8XIo&code_challenge=kF1Gt4CsMdGYymsOyEkXln3my6Zt9dnmMighurte9YM&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=XRq1SLmwzgX9ZQvD48K1MjLuyA5qVoHpIGM4Ecwh-Cc -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=LAmhAoSLY59bCIc9B-riUP3SiwWgiNz3h3Yo3mT8XIo&code=YtHjhOaCc74pX39nB85lbl1SSHMI6vxY -> 400"
+          ],
+          "findings": [],
+          "id": "eBSAZXcAgXOBRBw",
+          "module": "oidcc-client-test-invalid-aud",
+          "result": "PASSED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=Oq2bov0ocbmkZM11U-GrG2q3A7QrJRXgz0k9j4wGWUc&code_challenge=zXj8DPOayvWQFT3OSPSE0d8Dbjn8yY2uGo3rvV9ILVE&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=KeSXy7iGYvF3_1-VFITxA_Vn6LN5sAcoJ3FZL4xAM7I -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=Oq2bov0ocbmkZM11U-GrG2q3A7QrJRXgz0k9j4wGWUc&code=3vLEf4tq1yAU0108bWg2GTS3fsRRz2Ov -> 400"
+          ],
+          "findings": [],
+          "id": "aKTvmcVJ49mDRAs",
+          "module": "oidcc-client-test-idtoken-sig-none",
+          "result": "SKIPPED",
+          "seconds": 20.9,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 200 (signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=gXPr0gnupj0Ff3BW8fAVXjgl_iW7rDEa3SZa9n-Td2M&code_challenge=j1cHWLGSdAjOGxtUr2L2uv3f2nEFvBEGzQSnJtBnqh0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=cAQDRfnTGUfks6xSAYaqU2RPDaqBPiEh9Dl98f-Ynvs -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=gXPr0gnupj0Ff3BW8fAVXjgl_iW7rDEa3SZa9n-Td2M&code=NqQTkmaAFijmXmLJDYNjWHmi6rLuDegO -> 303",
+            "GET http://localhost:9300/profile?welcome=1 -> 200"
+          ],
+          "findings": [],
+          "id": "y10wforrEND5hPB",
+          "module": "oidcc-client-test-idtoken-sig-rs256",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=na_YGwZTnzrFIu4P0WiIH_P_WxOBAp4nK9QsUmTWym8&code_challenge=s0Yut6A1J7DW3teEbVOWQ1zCdU4NcY88Zt5qI5jF0r0&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=SzuIvmJ2tuGgCzqU09YH1NNG7iAx0zeeLN7WlC3OQtw -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=na_YGwZTnzrFIu4P0WiIH_P_WxOBAp4nK9QsUmTWym8&code=GFtQvNxqe7UK4yfNr2EDXjFGuutWDi92 -> 400"
+          ],
+          "findings": [],
+          "id": "UWgnXAFQunMWhd6",
+          "module": "oidcc-client-test-missing-sub",
+          "result": "PASSED",
+          "seconds": 21.0,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=5exTshyI7Ra_HaxaI0feEn382Se3fuaHEMmk4ROTXGE&code_challenge=3BHrw5jsUFT_smdbyvdQQ6bvmPph-vEQmjA51P_-YZs&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=psI2rRTbf05GZuYxANbiIh3fQ8-hkx9a5itYn8wedfw -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=5exTshyI7Ra_HaxaI0feEn382Se3fuaHEMmk4ROTXGE&code=lzGe006tEtsaqNIwTmQfmutAAFG4frxx -> 400"
+          ],
+          "findings": [],
+          "id": "1OjeACcpikt4hWu",
+          "module": "oidcc-client-test-invalid-sig-rs256",
+          "result": "PASSED",
+          "seconds": 21.0,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=MNUnIgIKgkEQ25SWgfj4ZJgbdPLgKzLYiTV4Ls7Iy2c&code_challenge=_8iYOSunHWMt5_vBZCECPb0Py4s1lHLa-nz_U3JCvoM&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=suktftZiRMe1Zy6JmA4t1vpDUYMmJVnsiPUBvThk80I -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=MNUnIgIKgkEQ25SWgfj4ZJgbdPLgKzLYiTV4Ls7Iy2c&code=4YT9wq1Vrow3wyYXpdPnqf2pJ2S9L2cb -> 400"
+          ],
+          "findings": [],
+          "id": "0959rzs8M5WKSB6",
+          "module": "oidcc-client-test-invalid-iss",
+          "result": "PASSED",
+          "seconds": 21.0,
+          "status": "FINISHED",
+          "variant": null
+        },
+        {
+          "client_note": "login ended with HTTP 400 (not signed in)",
+          "client_trail": [
+            "GET http://localhost:9300/auth/login/suite -> 307",
+            "GET http://localhost:9080/test/a/axess-basic-pkjwt/authorize?response_type=code&client_id=axess-conformance-rp&state=ye8OfioSYmyVO4cBoEev-CkQ4TFsSDlmGXp7tJ8TH_4&code_challenge=gNY01VC_v6CMwLanfrbhoqIAUT6Qx-zBfmo0VNNnZrk&code_challenge_method=S256&redirect_uri=http%3A%2F%2Flocalhost%3A9300%2Fauth%2Fcallback%2Fsuite&scope=openid+openid+email+profile&nonce=3iWgjJZxCu1KUOlf3h9yxvvKnKlajC6j6YxDA0uIwrw -> 303",
+            "GET http://localhost:9300/auth/callback/suite?state=ye8OfioSYmyVO4cBoEev-CkQ4TFsSDlmGXp7tJ8TH_4&code=xjdJ7AfgeXVQwCR5HxZZ0VH0CrgKTo77 -> 400"
+          ],
+          "findings": [],
+          "id": "cwDjgS5ERWEKI9e",
+          "module": "oidcc-client-test-userinfo-invalid-sub",
+          "result": "PASSED",
+          "seconds": 0.8,
+          "status": "FINISHED",
+          "variant": null
+        }
+      ],
+      "modules_in_plan": 28,
+      "plan": "oidcc-client-test-plan",
+      "plan_id": "bZaePN8cR8J4Y",
+      "title_suffix": " (client_auth_type `private_key_jwt`)",
+      "variant": {
+        "client_auth_type": "private_key_jwt",
+        "client_registration": "static_client",
+        "request_type": "plain_http_request",
+        "response_mode": "default",
+        "response_type": "code"
+      }
+    }
+  ],
+  "suite_image": "registry.gitlab.com/openid/conformance-suite@sha256:ad39ddfcab955805327f3a4c75fc4f2999dfe6b740ca5cc87a96b2690ea98009",
+  "suite_version": "5.3.4"
+}

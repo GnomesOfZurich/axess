@@ -29,14 +29,34 @@ where
         user: &crate::authn::types::User,
         session: &AuthSession,
     ) -> AuthnError<I::Error> {
-        self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-            .await;
+        self.clear_discoverable_ceremony(session).await;
         match self
             .record_factor_failure(&user.id, &user.tenant_id, &FactorKind::Fido2, session)
             .await
         {
             Ok(FactorOutcome::Locked { until }) => AuthnError::Locked { until },
             Ok(_) => AuthnError::InvalidAssertion,
+            Err(e) => e,
+        }
+    }
+
+    /// Count and record a discoverable login refused on the tenant rail,
+    /// and name the refusal. `known` is the user and the tenant of record
+    /// when the store holds the user; the row is attributed to them, and
+    /// to nobody otherwise. A failed audit write is returned in its place.
+    async fn refuse_cross_tenant(
+        &self,
+        known: Option<(&crate::authn::ids::UserId, &crate::authn::ids::TenantId)>,
+        session: &AuthSession,
+    ) -> AuthnError<I::Error> {
+        self.inner.metrics.auth_failure();
+        let builder = AuthEventBuilder::failure(AuthEventType::FactorVerified)
+            .maybe_attributed_to(known.map(|(u, _)| u), known.map(|(_, t)| t))
+            .with_factor(FactorKind::Fido2)
+            .with_session(session.session_id().await)
+            .with_error(AuthFailureReason::CrossTenant);
+        match self.emit_audit(builder).await {
+            Ok(()) => AuthnError::CrossTenant,
             Err(e) => e,
         }
     }
@@ -59,11 +79,19 @@ where
     ///   [`AuthnError::NoFlow`] and a failed audit row. Their passkey is a
     ///   step-up factor, not a way in.
     ///
-    /// The tenant rail: when the ceremony began with
+    /// The tenant rail: the user's tenant is re-read from the identity store
+    /// before any gate runs, and a record whose tenant differs is refused
+    /// with [`AuthnError::CrossTenant`] without the tenant, lockout or audit
+    /// paths ever seeing the caller-supplied tenant. When the ceremony began
+    /// with
     /// [`begin_discoverable_login_in_tenant`](crate::authn::service::AuthnService::begin_discoverable_login_in_tenant)
-    /// a user of another tenant is refused with [`AuthnError::CrossTenant`].
-    /// The user's tenant is also re-read from the identity store, whatever
-    /// the caller-supplied record says.
+    /// a user of another tenant is refused the same way. Either refusal is
+    /// a login failure like the others: counted, and recorded as a failed
+    /// `FactorVerified` row (`cross_tenant`) against the user's tenant of
+    /// record, never against the tenant the caller supplied.
+    ///
+    /// Whichever way the call ends, the ceremony's state, its stamp and the
+    /// tenant it began for are gone from the session.
     #[tracing::instrument(skip(self, assertion, user, credentials, session))]
     pub async fn finish_discoverable_login(
         &self,
@@ -77,10 +105,29 @@ where
             None => return Err(AuthnError::NoFlow),
         };
 
+        // The tenant rail first. The caller resolved `user` from the
+        // credential's user handle, which names a user and carries no
+        // tenant; the tenant of record is the store's, and every gate below
+        // (the tenant's status and IP policy, the lockout policy, the audit
+        // rows) must run against it rather than against whatever the caller
+        // put on the record. A mismatch ends the ceremony here.
+        let stored_tenant = self
+            .inner
+            .identity
+            .get_user_tenant(&user.id)
+            .await
+            .map_err(AuthnError::Store)?;
+        if stored_tenant.as_ref() != Some(&user.tenant_id) {
+            self.clear_discoverable_ceremony(session).await;
+            // Named only when the store knows the user: an id the store
+            // does not hold is the caller's word alone.
+            let known = stored_tenant.as_ref().map(|tenant| (&user.id, tenant));
+            return Err(self.refuse_cross_tenant(known, session).await);
+        }
+
         let status = self.current_account_status(&user.id).await?;
         if !status.allows_login() {
-            self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                .await;
+            self.clear_discoverable_ceremony(session).await;
             return Err(self
                 .refuse_inactive_account(user, status, AuthEventType::FactorVerified, Some(session))
                 .await);
@@ -92,16 +139,14 @@ where
             .admit_tenant_by_id(&user.identifier, &user.tenant_id)
             .await?
         {
-            self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                .await;
+            self.clear_discoverable_ceremony(session).await;
             return Err(AuthnError::InvalidAssertion);
         }
         // The lockout the failure counter imposes, before any assertion is
         // verified: a locked account answers `Locked` to a valid passkey
         // as to an invalid one.
         if let Some(lock) = self.derived_lockout(&user.id, &user.tenant_id).await? {
-            self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                .await;
+            self.clear_discoverable_ceremony(session).await;
             self.inner.metrics.account_locked();
             self.emit_audit(
                 AuthEventBuilder::locked(AuthEventType::FactorVerified)
@@ -117,8 +162,7 @@ where
             .is_ceremony_expired(session, fido2_keys::DISC_STATE)
             .await
         {
-            self.clear_ceremony_state(session, fido2_keys::DISC_STATE)
-                .await;
+            self.clear_discoverable_ceremony(session).await;
             return Err(AuthnError::NoFlow);
         }
 
@@ -144,18 +188,9 @@ where
             return Err(AuthnError::NoFlow);
         };
 
-        // The tenant rail. The caller resolved `user` from the credential's
-        // user handle, which names a user and carries no tenant; the tenant
-        // of record is the store's.
-        let stored_tenant = self
-            .inner
-            .identity
-            .get_user_tenant(&user.id)
-            .await
-            .map_err(AuthnError::Store)?;
-        if stored_tenant.as_ref() != Some(&user.tenant_id) {
-            return Err(AuthnError::CrossTenant);
-        }
+        // The ceremony's own tenant rail: a ceremony begun for one tenant
+        // does not finish a user of another. The store's tenant was settled
+        // above, before any gate ran.
         if let Some(expected) = expected_tenant.as_ref().and_then(|v| v.as_str())
             && expected != user.tenant_id.to_string()
         {
@@ -163,7 +198,9 @@ where
                 user_id = %user.id,
                 "discoverable login refused: the user is not in the tenant the ceremony began for"
             );
-            return Err(AuthnError::CrossTenant);
+            return Err(self
+                .refuse_cross_tenant(Some((&user.id, &user.tenant_id)), session)
+                .await);
         }
 
         let discoverable_keys: Vec<webauthn_rs::prelude::DiscoverableKey> =

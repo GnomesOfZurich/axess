@@ -3,9 +3,7 @@
 use crate::web::app::AppState;
 use crate::web::{csrf_hidden_input, html_escape};
 use axess::AuthSession;
-use axess::authn::{
-    AuditContext, FactorCredential, FactorKind, FactorOutcome, IdentityLookup, LoginOutcome,
-};
+use axess::authn::{AuditContext, FactorCredential, FactorKind, FactorOutcome, IdentityLookup};
 use axess::csrf::CsrfToken;
 use axum::{
     Extension, Form,
@@ -76,12 +74,9 @@ pub async fn post_login(
     audit: AuditContext,
     Form(form): Form<LoginForm>,
 ) -> impl IntoResponse {
-    // Derive the request-scoped handle. Both calls below go through it
-    // because there is no other way to reach them: `begin_login` and
-    // `verify_factor` live on `RequestAuthnService`, not on the shared service.
-    // Until 0.7.0 they were on both, and routing only the first through it
-    // left the failed-password rows, the ones a brute-force query counts,
-    // with no address on them.
+    // Derive the request-scoped handle: `login_with_password` lives on
+    // `RequestAuthnService`, not on the shared service, so the failed-password
+    // rows, the ones a brute-force query counts, carry the request's address.
     let service = state.service.with_audit_context(audit);
 
     let tenant = form
@@ -90,72 +85,48 @@ pub async fn post_login(
         .filter(|t| !t.trim().is_empty())
         .unwrap_or("default");
 
-    // begin_login finds the user, checks account status, and starts the factor flow.
-    // Since this form submits username + password together, we skip prepare_factor
-    // (it returns Ready for passwords) and call verify_factor immediately.
-    // For EmailOtp or FIDO2 flows, call prepare_factor first to generate the challenge.
-    let outcome = match service
-        .begin_login(&form.identifier, tenant, &session)
+    // The form submits identifier and password together, so the one-call
+    // entry point is the right one: it finds the user, checks the account,
+    // verifies the password, and spends the same Argon2id work on an unknown
+    // identifier, a locked account or a non-password first factor as on a
+    // wrong password, so the response time does not say which it was. For
+    // the same reason a locked account answers `InvalidCredential` here;
+    // `Locked` is only the attempt that locks it.
+    //
+    // The Guest to Authenticated session-id rotation that closes the
+    // login-side session-fixation window happens inside the password check
+    // (see `AuthSession::regenerate` docs), so no explicit
+    // `session.regenerate()` call is required here. Every application-defined
+    // privilege boundary (MFA add, tenant switch, impersonation, etc.) still
+    // needs its own `regenerate()`: the library only auto-cycles at
+    // login-completion and OAuth-callback finish.
+    match service
+        .login_with_password(&form.identifier, tenant, &form.password, &session)
         .await
     {
-        Ok(o) => o,
-        Err(err) => {
-            tracing::warn!(error = %err, "begin_login error");
-            return error_page("An internal error occurred. Please try again.").into_response();
+        Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
+        Ok(FactorOutcome::FactorRequired(FactorKind::Totp)) => {
+            Redirect::to("/totp").into_response()
         }
-    };
-
-    // begin_login returns FactorRequired even for the first factor; call verify_factor
-    // immediately with the password credential.
-    //
-    // The Guest→Authenticated session-id rotation that closes the login-side
-    // session-fixation window is done inside `verify_factor` itself (see
-    // `AuthSession::regenerate` docs), so no explicit `session.regenerate()`
-    // call is required here. Every application-defined privilege boundary
-    // (MFA add, tenant switch, impersonation, etc.) still needs its own
-    // `regenerate()`: the library only auto-cycles at login-completion and
-    // OAuth-callback finish.
-    match outcome {
-        LoginOutcome::FactorRequired(FactorKind::Password) => {
-            let cred = FactorCredential::Password(form.password.into());
-            match service.verify_factor(&cred, &session).await {
-                Ok(FactorOutcome::Authenticated) => Redirect::to("/dashboard").into_response(),
-                Ok(FactorOutcome::FactorRequired(FactorKind::Totp)) => {
-                    Redirect::to("/totp").into_response()
-                }
-                Ok(FactorOutcome::InvalidCredential) => {
-                    Html(login_with_error("Invalid username or password.", &csrf)).into_response()
-                }
-                Ok(FactorOutcome::Locked { .. }) => Html(login_with_error(
-                    "Account locked due to too many failed attempts. Try again later.",
-                    &csrf,
-                ))
-                .into_response(),
-                Ok(FactorOutcome::FactorRequired(other)) => {
-                    tracing::warn!(kind = ?other, "unexpected factor kind after password");
-                    error_page("Unsupported factor type.").into_response()
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "verify_factor error");
-                    error_page("An internal error occurred.").into_response()
-                }
-            }
-        }
-        LoginOutcome::InvalidCredentials => {
+        Ok(FactorOutcome::InvalidCredential) => {
             Html(login_with_error("Invalid username or password.", &csrf)).into_response()
         }
-        LoginOutcome::Locked { .. } => Html(login_with_error(
+        // Only the attempt that locks the account answers `Locked`; a login
+        // against an account already locked answers `InvalidCredential`
+        // above, as an unknown username does, so the form never says that
+        // an account exists and is locked.
+        Ok(FactorOutcome::Locked { .. }) => Html(login_with_error(
             "Account locked due to too many failed attempts. Try again later.",
             &csrf,
         ))
         .into_response(),
-        other => {
-            tracing::warn!(outcome = ?std::mem::discriminant(&other), "unexpected login outcome");
-            Html(login_with_error(
-                "Unexpected error. Please try again.",
-                &csrf,
-            ))
-            .into_response()
+        Ok(FactorOutcome::FactorRequired(other)) => {
+            tracing::warn!(kind = ?other, "unexpected factor kind after password");
+            error_page("Unsupported factor type.").into_response()
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "login_with_password error");
+            error_page("An internal error occurred. Please try again.").into_response()
         }
     }
 }
@@ -315,11 +286,13 @@ pub async fn post_signup(
 
     match service.begin_signup(user, tenant, &session).await {
         Ok(SignupOutcome::Started) => {
-            // The user is now created (Candidate state). Store their password
-            // factor and auth method so they can log in after activation.
-            let user_id = match session.pending_user_id().await {
-                Some(id) => id,
-                None => return error_page("Signup session lost.").into_response(),
+            // `Started` with no user on the session means the username is
+            // taken: the service answers a taken identifier like a free one
+            // so the form cannot be used to learn who has an account. The
+            // visitor gets the same page a signup awaiting its mail would;
+            // a real deployment mails the holder instead of creating anyone.
+            let Some(user_id) = session.pending_user_id().await else {
+                return Html(SIGNUP_CHECK_EMAIL).into_response();
             };
             let tenant_id = match session.pending_tenant_id().await {
                 Some(t) => t,
@@ -332,6 +305,7 @@ pub async fn post_signup(
             let pw_config = FactorConfig::Password(PasswordConfig {
                 hash: ZeroizedString::new(hash),
                 rules: PasswordRules::default(),
+                password_id: None,
             });
             if let Err(e) = state.backend.save_factor(&scope, pw_config).await {
                 tracing::warn!(error = %e, "failed to store password factor");
@@ -365,11 +339,10 @@ pub async fn post_signup(
                 }
             }
         }
-        Ok(SignupOutcome::AlreadyExists) => Html(signup_with_error(
-            "A user with that username already exists.",
-            &csrf,
-        ))
-        .into_response(),
+        // Only a service built with `with_signup_conflicts_revealed` answers
+        // this; the example's service does not, and shows the same page as
+        // above should it ever change.
+        Ok(SignupOutcome::AlreadyExists) => Html(SIGNUP_CHECK_EMAIL).into_response(),
         Ok(SignupOutcome::TenantNotActive) => Html(signup_with_error(
             "That tenant does not exist or is not active.",
             &csrf,
@@ -897,6 +870,15 @@ const LOGIN_HTML: &str = r#"<!doctype html>
 </ul>
 <p><em>Or <a href="/signup">sign up</a> to create your own account, then enroll TOTP from the dashboard.</em></p>
 <p><a href="/forgot-password">Forgot your password?</a></p>
+</body></html>"#;
+
+/// The answer to a signup whose outcome must not be read from the response:
+/// a taken username gets this page, and so would a fresh signup that waits
+/// for its verification mail in a deployment with a mailer.
+const SIGNUP_CHECK_EMAIL: &str = r#"<!doctype html><html><head><title>Sign Up</title></head><body>
+<h1>Check your email</h1>
+<p>If that username was free, your account has been created and a verification link is on its way. If it was not, the account holder has been told.</p>
+<p><a href="/login">Back to login</a></p>
 </body></html>"#;
 
 fn signup_with_error(msg: &str, csrf: &CsrfToken) -> String {

@@ -5,14 +5,18 @@
 
 use super::encryption::{encrypted_codec, encrypted_codec_with_rotation, plaintext_codec};
 use super::internal::{
-    COMPARE_SET_SCRIPT, CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, DEFAULT_PREFIX, RESEAL_SCRIPT,
-    ValkeyStoreError, ex_seconds, expired_cycle_outcome, script_unavailable, session_key,
+    COMPARE_DEL_SCRIPT, COMPARE_SET_SCRIPT, CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES,
+    DEFAULT_PREFIX, RESEAL_SCRIPT, ValkeyStoreError, ex_seconds, live_ex_seconds,
+    script_unavailable, session_key,
 };
 use crate::session::{
     data::SessionData,
     id::SessionId,
-    storage::session_codec::SessionCodec,
-    store::{ConditionalUpdate, CycleOutcome, SessionStore},
+    storage::session_codec::{Decoded, SessionCodec},
+    store::{
+        ConditionalUpdate, CycleOutcome, SessionStore,
+        cas::{CasRow, CasWrite, cas_by_revision},
+    },
 };
 use fred::bytes::Bytes;
 use fred::prelude::*;
@@ -205,8 +209,8 @@ impl SessionStore for ValkeySessionStore {
         let bytes: Option<Vec<u8>> = self.client.get(&key).await?;
         match bytes {
             Some(b) => {
-                let (data, stale) = self.codec.decode_bytes_checked(id, &b)?;
-                if stale {
+                let Decoded { data, reseal } = self.codec.decode_bytes_checked(id, &b)?;
+                if reseal {
                     self.reseal(id, &b, &data).await;
                 }
                 debug!(session_id = %id, "session loaded from valkey");
@@ -282,39 +286,7 @@ impl SessionStore for ValkeySessionStore {
         data: &SessionData,
         ttl: Duration,
     ) -> Result<ConditionalUpdate, Self::Error> {
-        let key = session_key(&self.prefix, id);
-        let Some(old): Option<Vec<u8>> = self.client.get(&key).await? else {
-            return Ok(ConditionalUpdate::Gone);
-        };
-        let (stored, _) = self.codec.decode_bytes_checked(id, &old)?;
-        if stored.revision != expected_revision {
-            return Ok(ConditionalUpdate::Conflict);
-        }
-        let Some(ex) = ex_seconds(ttl) else {
-            // Already expired: nothing loadable may be stored.
-            return Ok(ConditionalUpdate::Gone);
-        };
-        let bytes = self.encode(id, data)?;
-        // The script writes only while the key still holds the bytes that
-        // were compared. A deployment without scripting returns the error
-        // rather than a weaker compare: the caller then fails closed.
-        let swapped: i64 = self
-            .client
-            .eval(
-                COMPARE_SET_SCRIPT,
-                vec![key],
-                vec![
-                    Value::Bytes(Bytes::from(old)),
-                    Value::Bytes(Bytes::from(bytes)),
-                    Value::Integer(ex),
-                ],
-            )
-            .await?;
-        Ok(match swapped {
-            1 => ConditionalUpdate::Written,
-            0 => ConditionalUpdate::Conflict,
-            _ => ConditionalUpdate::Gone,
-        })
+        cas_by_revision(self, id, expected_revision, data, ttl).await
     }
 
     async fn cycle(
@@ -329,10 +301,13 @@ impl SessionStore for ValkeySessionStore {
         let new_key = session_key(&self.prefix, new_id);
         let bytes = self.encode(new_id, data)?;
         let Some(ex) = ex_seconds(ttl) else {
-            // The rotated session is already expired: store nothing and let
-            // the old one go with it.
-            let removed: i64 = self.client.del(&old_key).await?;
-            return Ok(expired_cycle_outcome(require_old, removed));
+            // Already expired: the rotated session is stored nowhere, so both
+            // keys go, in one command, and the session is reported gone,
+            // never as rotated.
+            self.client
+                .del::<(), _>(vec![old_key.clone(), new_key.clone()])
+                .await?;
+            return Ok(CycleOutcome::SessionGone);
         };
 
         // One server-side script removes the old key and writes the new one,
@@ -401,6 +376,68 @@ impl SessionStore for ValkeySessionStore {
     /// the trait once defaulted to.
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         Ok(0)
+    }
+}
+
+/// The Valkey store compares the stored bytes, in a script that writes only
+/// while the key still holds them. A deployment without scripting returns
+/// the error rather than a weaker compare: the caller then fails closed.
+impl CasRow for ValkeySessionStore {
+    type Seen = Vec<u8>;
+    type Error = ValkeyStoreError;
+
+    async fn read(&self, id: &SessionId) -> Result<Option<(u64, Vec<u8>)>, Self::Error> {
+        let key = session_key(&self.prefix, id);
+        let Some(old): Option<Vec<u8>> = self.client.get(&key).await? else {
+            return Ok(None);
+        };
+        let stored = self.codec.decode_bytes_checked(id, &old)?.data;
+        Ok(Some((stored.revision, old)))
+    }
+
+    async fn delete_if(&self, id: &SessionId, seen: &Vec<u8>) -> Result<CasWrite, Self::Error> {
+        let removed: i64 = self
+            .client
+            .eval(
+                COMPARE_DEL_SCRIPT,
+                vec![session_key(&self.prefix, id)],
+                vec![Value::Bytes(Bytes::from(seen.clone()))],
+            )
+            .await?;
+        Ok(script_outcome(removed))
+    }
+
+    async fn replace_if(
+        &self,
+        id: &SessionId,
+        seen: &Vec<u8>,
+        data: &SessionData,
+        ttl: Duration,
+    ) -> Result<CasWrite, Self::Error> {
+        let bytes = self.encode(id, data)?;
+        let swapped: i64 = self
+            .client
+            .eval(
+                COMPARE_SET_SCRIPT,
+                vec![session_key(&self.prefix, id)],
+                vec![
+                    Value::Bytes(Bytes::from(seen.clone())),
+                    Value::Bytes(Bytes::from(bytes)),
+                    Value::Integer(live_ex_seconds(ttl)),
+                ],
+            )
+            .await?;
+        Ok(script_outcome(swapped))
+    }
+}
+
+/// The answer of a compare script: `1` it ran, `0` the key holds other
+/// bytes, anything else the key is gone.
+fn script_outcome(answer: i64) -> CasWrite {
+    match answer {
+        1 => CasWrite::Done,
+        0 => CasWrite::Missed,
+        _ => CasWrite::Gone,
     }
 }
 

@@ -240,8 +240,9 @@ async fn session_returns_fresh_token_from_store() {
     store.save(&tenant, &user, credential).await.expect("save");
 
     let clock = Arc::new(MockClock::at(t0()));
-    let session =
-        StoredDelegationSession::new(provider, store.clone(), tenant, user).with_clock(clock);
+    let session = StoredDelegationSession::new(provider, store.clone(), tenant, user)
+        .expect("the default client builds")
+        .with_clock(clock);
     let token = session.get_access_token().await.expect("token");
     assert_eq!(token, "fresh-token");
     // No HTTP call should have happened; fresh token in store.
@@ -256,7 +257,8 @@ async fn session_not_connected_when_store_empty() {
     let server = MockServer::start().await;
     let provider = build_provider(&server.uri());
     let store = Arc::new(MemoryDelegatedCredentialStore::new());
-    let session = StoredDelegationSession::new(provider, store, sample_tenant(), sample_user());
+    let session = StoredDelegationSession::new(provider, store, sample_tenant(), sample_user())
+        .expect("the default client builds");
     let err = session
         .get_access_token()
         .await
@@ -302,6 +304,7 @@ async fn session_refreshes_expired_access_token() {
 
     let clock = Arc::new(MockClock::at(t0()));
     let session = StoredDelegationSession::new(provider.clone(), store.clone(), tenant, user)
+        .expect("the default client builds")
         .with_clock(clock);
     let token = session
         .get_access_token()
@@ -348,6 +351,7 @@ async fn session_preserves_refresh_token_when_idp_omits_it() {
 
     let clock = Arc::new(MockClock::at(t0()));
     let session = StoredDelegationSession::new(provider.clone(), store.clone(), tenant, user)
+        .expect("the default client builds")
         .with_clock(clock);
     let _ = session.get_access_token().await.expect("refresh");
 
@@ -390,7 +394,9 @@ async fn session_surfaces_refresh_rejected_on_invalid_grant() {
     store.save(&tenant, &user, credential).await.expect("save");
 
     let clock = Arc::new(MockClock::at(t0()));
-    let session = StoredDelegationSession::new(provider, store, tenant, user).with_clock(clock);
+    let session = StoredDelegationSession::new(provider, store, tenant, user)
+        .expect("the default client builds")
+        .with_clock(clock);
     let err = session
         .get_access_token()
         .await

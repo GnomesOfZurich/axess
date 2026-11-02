@@ -146,6 +146,17 @@ pub struct PasswordConfig {
     pub hash: ZeroizedString,
     /// Strength rules applied when setting a new password.
     pub rules: PasswordRules,
+    /// Which password this is, kept when the same password is hashed again
+    /// under newer parameters, so a check that depends on the password (a
+    /// half-finished login's credential epoch) sees a rehash as no change
+    /// while a new password is one.
+    ///
+    /// `None` means the password is identified by its hash. A rehash writes
+    /// that identity here, so the hash can change and the identity not.
+    /// Leave it `None` for a new password; carry the old value over only for
+    /// the same password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_id: Option<String>,
 }
 
 /// Complexity requirements for passwords.

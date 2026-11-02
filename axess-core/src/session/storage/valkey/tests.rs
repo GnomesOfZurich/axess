@@ -693,11 +693,13 @@ async fn valkey_encrypted_store_never_revives_an_ended_session() {
     crate::session::store::revival_tests::run_all(&store).await;
 }
 
-/// A load re-seals a blob that carries no row binding and keeps the key's
-/// expiry; with legacy blobs rejected the same blob is refused instead.
+/// A load reads a blob that carries no row binding and leaves it as it is
+/// (it proves nothing about the key it sits under); the next save writes the
+/// bound form and keeps the key's expiry. With legacy blobs rejected the
+/// unbound blob is refused instead.
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
-async fn valkey_load_reseals_an_unbound_blob_and_reject_refuses_it() {
+async fn valkey_load_reads_an_unbound_blob_without_resealing_it_and_reject_refuses_it() {
     let client = Client::new(
         Config::from_url(&live_client_url()).unwrap(),
         None,
@@ -732,9 +734,19 @@ async fn valkey_load_reseals_an_unbound_blob_and_reject_refuses_it() {
     let untouched: Vec<u8> = client.get(&redis_key).await.unwrap();
     assert_eq!(untouched, unbound, "a refused blob is left as it is");
 
-    assert!(store.load(&id).await.unwrap().is_some());
+    let loaded = store
+        .load(&id)
+        .await
+        .unwrap()
+        .expect("accept reads the blob");
     let after: Vec<u8> = client.get(&redis_key).await.unwrap();
-    assert!(BoundFormat::SESSION.marks(&after), "re-sealed by the load");
+    assert_eq!(after, unbound, "left as it was by the read");
+    store
+        .save(&id, &loaded, Duration::from_secs(600))
+        .await
+        .unwrap();
+    let after: Vec<u8> = client.get(&redis_key).await.unwrap();
+    assert!(BoundFormat::SESSION.marks(&after), "bound by the save");
     let ttl: i64 = client.ttl(&redis_key).await.unwrap();
     assert!((1..=600).contains(&ttl), "the expiry is kept: {ttl}");
     assert!(strict.load(&id).await.unwrap().is_some(), "now bound");
@@ -753,4 +765,78 @@ async fn valkey_update_if_revision_keeps_the_contract() {
     crate::testing::store_contract::assert_update_if_revision_contract(&encrypted).await;
     let plain = ValkeySessionStore::plaintext(client).with_prefix("axess_cas_plain");
     crate::testing::store_contract::assert_update_if_revision_contract(&plain).await;
+}
+
+/// A zero TTL stores nothing, as in every other store: a conditional write
+/// against the stored revision removes the key and reports the session gone
+/// (against another revision it conflicts and removes nothing), and a
+/// rotation removes both keys and reports the session gone whether or not
+/// the old key was required.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_zero_ttl_writes_store_nothing() {
+    let client = Client::new(
+        Config::from_url(&live_client_url()).unwrap(),
+        None,
+        None,
+        None,
+    );
+    client.init().await.expect("connect");
+    let prefix = format!("axt_zero_{}", SessionId::new(&SystemRng));
+    let store = ValkeySessionStore::plaintext(client.clone()).with_prefix(prefix.clone());
+    let exists = |id: SessionId| {
+        let client = client.clone();
+        let prefix = prefix.clone();
+        async move {
+            client
+                .exists::<i64, _>(session_key(&prefix, &id))
+                .await
+                .unwrap()
+                == 1
+        }
+    };
+    let data = SessionData {
+        revision: 3,
+        ..SessionData::default()
+    };
+    let ttl = Duration::from_secs(60);
+
+    let id = SessionId::new(&SystemRng);
+    store.save(&id, &data, ttl).await.unwrap();
+    assert_eq!(
+        store
+            .update_if_revision(&id, 9, &data, Duration::ZERO)
+            .await
+            .unwrap(),
+        crate::session::store::ConditionalUpdate::Conflict
+    );
+    assert!(exists(id).await, "a conflict removes nothing");
+    assert_eq!(
+        store
+            .update_if_revision(&id, 3, &data, Duration::ZERO)
+            .await
+            .unwrap(),
+        crate::session::store::ConditionalUpdate::Gone
+    );
+    assert!(
+        !exists(id).await,
+        "update_if_revision: no key is left behind"
+    );
+
+    for require_old in [false, true] {
+        let (old, new) = (SessionId::new(&SystemRng), SessionId::new(&SystemRng));
+        store.save(&old, &data, ttl).await.unwrap();
+        assert_eq!(
+            store
+                .cycle(&old, &new, &data, Duration::ZERO, require_old)
+                .await
+                .unwrap(),
+            CycleOutcome::SessionGone,
+            "require_old={require_old}: nothing is stored, so nothing rotated"
+        );
+        assert!(
+            !exists(old).await && !exists(new).await,
+            "cycle: no key is left behind"
+        );
+    }
 }

@@ -44,6 +44,21 @@ impl IdentityLookup for TenantOnly {
     async fn account_status(&self, _: &UserId) -> Result<EntityState, Infallible> {
         unreachable!("not used by the validator")
     }
+    fn lockout_policy_for_tenant(&self, _: &TenantId) -> crate::authn::types::LockoutPolicy {
+        unreachable!("not used by the validator")
+    }
+    async fn password_rules_for_tenant(
+        &self,
+        _: &TenantId,
+    ) -> Result<crate::authn::factor::PasswordRules, Infallible> {
+        unreachable!("not used by the validator")
+    }
+    async fn ip_policy_for_tenant(
+        &self,
+        _: &TenantId,
+    ) -> Result<crate::authn::types::IpPolicy, Infallible> {
+        unreachable!("not used by the validator")
+    }
 }
 
 async fn session_in(tenant: TenantId) -> AuthSession {

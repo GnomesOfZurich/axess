@@ -310,6 +310,30 @@ mod extractor_tests {
         assert_eq!(snap.tenant_id, tenant);
         assert_eq!(snap.authn_time, now);
         assert_eq!(snap.session_id, session.session_id().await);
+        assert_eq!(snap.impersonation, None);
+    }
+
+    /// The snapshot carries the impersonation, read under the same lock as
+    /// the user it is an impersonation of.
+    #[tokio::test]
+    async fn snapshot_carries_the_impersonation() {
+        let session = make_session();
+        let now = chrono::Utc::now();
+        session
+            .set_authenticated(
+                axess_identity::testing::user("u-1"),
+                axess_identity::testing::tenant("t-1"),
+                now,
+            )
+            .await;
+        let admin = axess_identity::testing::user("admin");
+        assert!(session.set_impersonator(admin, now).await);
+
+        let snap = session.snapshot().await.expect("authenticated");
+        assert_eq!(
+            snap.impersonation,
+            Some(crate::session::Impersonation { admin, since: now })
+        );
     }
 
     /// `snapshot()` returns `None` for non-Authenticated

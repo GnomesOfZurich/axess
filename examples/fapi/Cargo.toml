@@ -1,17 +1,21 @@
 [package]
 name = "axess-example-fapi"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
 resolver = "3"
-description = "FAPI 2.0 example for the Axess library: PAR, DPoP, form_post."
+description = "FAPI 2.0 example for the Axess library: private_key_jwt, PAR, DPoP, form_post."
 authors = ["Gnomes"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.13.0", features = ["oauth", "fapi", "jwt-rust-crypto", "testing"] }
+axess = { path = "../../axess", version = "=0.14.0", features = ["oauth", "fapi", "jwt-rust-crypto", "testing"] }
+# `Algorithm` names the signing algorithm of the `private_key_jwt` key. No
+# crypto backend here: `axess`'s `jwt-rust-crypto` feature picks the one
+# provider, and a second one makes `jsonwebtoken` refuse to choose.
+jsonwebtoken = { version = "11.1.0", default-features = false }
 axum = { version = "0.8.9", features = ["json", "form"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

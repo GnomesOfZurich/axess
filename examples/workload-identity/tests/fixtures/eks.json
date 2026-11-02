@@ -1,0 +1,20 @@
+{
+  "source": "https://kubernetes.io/docs/reference/access-authn-authz/service-accounts-admin/#bound-service-account-tokens; EKS issuer shape, https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html",
+  "recorded": "2026-10-30",
+  "kind": "constructed",
+  "issuer": "https://oidc.eks.eu-west-1.amazonaws.com/id/A1B2C3D4E5F60718293A4B5C6D7E8F90",
+  "audience": "axess-platform",
+  "jwks": {
+    "keys": [
+      {
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "fixture-1",
+        "kty": "RSA",
+        "n": "w11VH5cHH24iQYOgCZdu3nvOP8xQsHmojkvqxGcyIy904E0cQBlV2dFF08226MDRU55BZysmNW6Prpq8NMJsTTsGEsCNKgj7sVVAXh8s3e4IRJujSKRs-OnDlWw2pY7yEWW51ZtA_Ls-gByH5XCKVAKyoJL2W2nPIY_W7cL8LJysYTnU1FaijY5TBMrIEkrpd7qWFLT7gNmab-4vfBDyCtOV1eXle71aBF2BaoE-oDm-9lgx0H_dOzqV69PAiRAxawZZ5umZpN-jSyfpYT-OBaJg9GHMpLNUSFIqrdjCF4FoIJdwtjhPMnE76-UTVUSP0epB12pd5bmFeJtwqUX6gQ",
+        "e": "AQAB"
+      }
+    ]
+  },
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUtMSJ9.eyJpc3MiOiJodHRwczovL29pZGMuZWtzLmV1LXdlc3QtMS5hbWF6b25hd3MuY29tL2lkL0ExQjJDM0Q0RTVGNjA3MTgyOTNBNEI1QzZEN0U4RjkwIiwic3ViIjoic3lzdGVtOnNlcnZpY2VhY2NvdW50OnRlbmFudC1hY21lOmJpbGxpbmctYXBpIiwiYXVkIjpbImF4ZXNzLXBsYXRmb3JtIl0sImlhdCI6MTc2NzIyNTYwMCwibmJmIjoxNzY3MjI1NjAwLCJleHAiOjE3NjcyMjkyMDAsImt1YmVybmV0ZXMuaW8iOnsibmFtZXNwYWNlIjoidGVuYW50LWFjbWUiLCJwb2QiOnsibmFtZSI6ImJpbGxpbmctYXBpLTdkOWJjNmY1ZDgteDJrNHEiLCJ1aWQiOiJhYWFhYWFhYS1iYmJiLWNjY2MtZGRkZC1lZWVlZWVlZWVlZWUifSwic2VydmljZWFjY291bnQiOnsibmFtZSI6ImJpbGxpbmctYXBpIiwidWlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1In19fQ.R86XyuqzQL067C-Au0jnzjFYsl0H0w8rJjBfBw3_EKrwPzd-rX6ETeaXBym5pEyX-jmH-09Z8fqVn00FFwNjy6aKpzHZgLNoy8hm1RTDC348mTVu_WcONLPR86SgMfYIu6I5GK1w7iMIDxd9AWbVIOunpTKcjWMf5Cg95DH2JcP26naa_5bptnTrZF2KrDXzmmA_duV9hNKZnD3ELeFr9cmEPH2biEwHJcoo1i3Rh8HRyqj5YEAvC_ohg8hpry985AbL-ABzRhEh5_B46svxJtv0-jC2gLWa0bpD014oAJ1a364CeBlF3zLxTEMAMZzXG3EpQCGjVvYQy47jE912vg"
+}

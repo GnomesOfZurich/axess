@@ -11,6 +11,12 @@ pub enum LoginOutcome {
     /// Call `prepare_factor` then present the factor UI.
     FactorRequired(FactorKind),
     /// The account is locked out.
+    ///
+    /// Answered by `begin_login` only when the service was built with
+    /// [`with_lockout_revealed_on_begin`](crate::authn::AuthnServiceBuilder::with_lockout_revealed_on_begin);
+    /// by default a locked account gets [`InvalidCredentials`](Self::InvalidCredentials),
+    /// as an unknown identifier does, so the lock is not observable before
+    /// any proof. The audit row says `Locked` either way.
     Locked {
         /// Wall-clock instant at which the lockout expires, or `None` for an indefinite lockout.
         until: Option<chrono::DateTime<chrono::Utc>>,

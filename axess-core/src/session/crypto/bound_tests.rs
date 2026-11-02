@@ -69,7 +69,7 @@ fn legacy_blob_opens_and_is_flagged() {
         .open_bound(BoundFormat::SESSION, A, &[], &legacy)
         .unwrap();
     assert_eq!(opened.plaintext, b"old row");
-    assert!(opened.stale && opened.legacy);
+    assert!(opened.stale && opened.binding != Binding::Current);
     // Legacy blobs carry no id, so they open under any id: the fallback the
     // next save removes.
     assert!(
@@ -168,7 +168,7 @@ fn a_device_blob_of_the_previous_format_opens_and_is_stale() {
     let old = v1_device_blob(&crypto, "t", "d", b"bindings");
     let opened = open_device(&crypto, "t", "d", &old).unwrap();
     assert_eq!(opened.plaintext, b"bindings");
-    assert!(opened.stale && opened.legacy);
+    assert!(opened.stale && opened.binding != Binding::Current);
     assert!(open_device(&crypto, "t", "other", &old).is_err());
 
     let fresh = crypto
@@ -293,7 +293,7 @@ fn a_legacy_blob_whose_nonce_starts_with_the_marker_still_opens() {
         .open_bound(BoundFormat::SESSION, A, &[], &legacy)
         .unwrap();
     assert_eq!(opened.plaintext, b"old row");
-    assert!(opened.legacy);
+    assert!(opened.binding != Binding::Current);
     assert!(
         SessionCrypto::new(KEY)
             .open_bound(BoundFormat::SESSION, A, &[], &legacy)
@@ -331,4 +331,34 @@ fn a_blob_opened_with_the_previous_key_is_stale() {
     let again = open_device(&new_only, "t", "d", &resealed).unwrap();
     assert!(!again.stale);
     assert!(open_device(&new_only, "t", "d", &sealed).is_err());
+}
+
+/// The same holds for the marker of the per-record-subkey layout: a legacy
+/// blob whose nonce happens to start with it opens under a policy that reads
+/// legacy blobs, and is refused by the default.
+#[test]
+fn a_legacy_blob_whose_nonce_starts_with_the_subkeyed_marker_still_opens() {
+    struct SubkeyedMarkerNonce;
+    impl axess_rng::SecureRng for SubkeyedMarkerNonce {
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            let marker = BoundFormat::SESSION.subkeyed_magic();
+            for (i, byte) in dest.iter_mut().enumerate() {
+                *byte = marker.get(i).copied().unwrap_or(0x5a);
+            }
+        }
+    }
+    let sealer = SessionCrypto::new(KEY).with_rng(Arc::new(SubkeyedMarkerNonce));
+    let legacy = sealer.encrypt_unbound(b"old row").unwrap();
+    assert!(legacy.starts_with(&BoundFormat::SESSION.subkeyed_magic()));
+
+    let opened = accepting()
+        .open_bound(BoundFormat::SESSION, A, &[], &legacy)
+        .expect("a readable legacy blob opens whatever its nonce looks like");
+    assert_eq!(opened.plaintext, b"old row");
+    assert!(opened.binding != Binding::Current);
+    assert!(
+        SessionCrypto::new(KEY)
+            .open_bound(BoundFormat::SESSION, A, &[], &legacy)
+            .is_err()
+    );
 }

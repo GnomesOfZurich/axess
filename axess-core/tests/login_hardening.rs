@@ -8,6 +8,7 @@ mod common;
 
 use axess_clock::{Clock, testing::MockClock};
 use axess_core::authn::AuditContext;
+use axess_core::authn::error::AuthnError;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
 use axess_core::authn::factor::{
     FactorConfig, FactorCredential, FactorKind, PasswordConfig, PasswordRules, ZeroizedString,
@@ -38,6 +39,7 @@ fn config_with(hash: &str) -> FactorConfig {
     FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(hash),
         rules: PasswordRules::default(),
+        password_id: None,
     })
 }
 
@@ -153,6 +155,108 @@ async fn a_rehash_does_not_drop_the_login_that_caused_it() {
         .await
         .unwrap();
     assert!(matches!(second, FactorOutcome::Authenticated), "{second:?}");
+}
+
+/// Two logins of the same user are in flight; the first to verify the
+/// password rehashes it. The second, stamped against the old hash, used to
+/// be dropped at its next step as if the password had been changed.
+#[tokio::test]
+async fn a_rehash_does_not_drop_another_login_of_the_same_user() {
+    let r = rig(OLD_PARAMETERS, true, KdfExecutor::inline(), policy(5));
+    let first = test_session();
+    let second = test_session();
+    r.svc.begin_login("alice", "default", &first).await.unwrap();
+    r.svc
+        .begin_login("alice", "default", &second)
+        .await
+        .unwrap();
+
+    let outcome = r.svc.verify_factor(&pw("Gnomes2+"), &first).await.unwrap();
+    assert!(
+        matches!(outcome, FactorOutcome::FactorRequired(FactorKind::Totp)),
+        "{outcome:?}"
+    );
+    assert_ne!(
+        stored_hash(&r).await,
+        OLD_PARAMETERS,
+        "the first login rehashed"
+    );
+
+    let outcome = r.svc.verify_factor(&pw("Gnomes2+"), &second).await;
+    assert!(
+        matches!(outcome, Ok(FactorOutcome::FactorRequired(FactorKind::Totp))),
+        "the second login goes on under the rehashed password: {outcome:?}"
+    );
+    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let done = r
+        .svc
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &second)
+        .await
+        .unwrap();
+    assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
+}
+
+/// The same, with the two logins on two instances of the service over the
+/// same stores: a rehash is no change of credential whichever instance
+/// carries the other login on.
+#[tokio::test]
+async fn a_rehash_does_not_drop_a_login_on_another_instance() {
+    let r = rig(OLD_PARAMETERS, true, KdfExecutor::inline(), policy(5));
+    let other = AuthnService::builder(r.identity.clone(), r.factors.clone())
+        .with_clock(r.clock.clone())
+        .with_kdf_executor(r.kdf.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let first = test_session();
+    let second = test_session();
+    r.svc.begin_login("alice", "default", &first).await.unwrap();
+    other
+        .begin_login("alice", "default", &second)
+        .await
+        .unwrap();
+    r.svc.verify_factor(&pw("Gnomes2+"), &first).await.unwrap();
+    assert_ne!(
+        stored_hash(&r).await,
+        OLD_PARAMETERS,
+        "the first login rehashed"
+    );
+
+    let outcome = other.verify_factor(&pw("Gnomes2+"), &second).await;
+    assert!(
+        matches!(outcome, Ok(FactorOutcome::FactorRequired(FactorKind::Totp))),
+        "the login on the other instance goes on: {outcome:?}"
+    );
+}
+
+/// The tolerance is for a rehash only: a flow begun before the password
+/// was replaced is still dropped.
+#[tokio::test]
+async fn a_replaced_password_still_drops_a_flow_begun_before_it() {
+    let r = rig(OLD_PARAMETERS, true, KdfExecutor::inline(), policy(5));
+    let first = test_session();
+    let second = test_session();
+    r.svc.begin_login("alice", "default", &first).await.unwrap();
+    r.svc
+        .begin_login("alice", "default", &second)
+        .await
+        .unwrap();
+    r.svc.verify_factor(&pw("Gnomes2+"), &first).await.unwrap();
+    let rehashed = stored_hash(&r).await;
+    assert_ne!(rehashed, OLD_PARAMETERS);
+
+    // A password change by any other path: a fresh hash of another password.
+    r.factors
+        .save_factor(
+            &user_scope(),
+            config_with(&axess_factors::generate_password_hash("Other-password-9")),
+        )
+        .await
+        .unwrap();
+    let outcome = r.svc.verify_factor(&pw("Other-password-9"), &second).await;
+    assert!(
+        matches!(outcome, Err(AuthnError::NoFlow)),
+        "a flow begun before a password change is dropped: {outcome:?}"
+    );
 }
 
 #[tokio::test]
@@ -321,7 +425,7 @@ async fn a_counter_outage_lets_a_guess_through_when_the_policy_allows() {
 // ── Hidden signup conflicts ──────────────────────────────────────────────────
 
 fn signup_service(
-    hide: bool,
+    reveal: bool,
 ) -> (
     RequestAuthnService<MockIdentityStore, MockFactorStore>,
     MockIdentityStore,
@@ -332,8 +436,8 @@ fn signup_service(
         .with_tenant(test_tenant())
         .with_user(existing);
     let mut builder = AuthnService::builder(identity.clone(), MockFactorStore::new());
-    if hide {
-        builder = builder.with_hidden_signup_conflicts();
+    if reveal {
+        builder = builder.with_signup_conflicts_revealed();
     }
     let svc = builder.build().with_audit_context(AuditContext::default());
     (svc, identity)
@@ -346,8 +450,8 @@ fn newcomer() -> axess_core::authn::types::User {
 }
 
 #[tokio::test]
-async fn a_taken_identifier_answers_as_a_free_one_when_conflicts_are_hidden() {
-    let (svc, identity) = signup_service(true);
+async fn a_taken_identifier_answers_as_a_free_one_by_default() {
+    let (svc, identity) = signup_service(false);
     let taken = test_session();
     let outcome = svc
         .begin_signup(newcomer(), "default", &taken)
@@ -360,12 +464,12 @@ async fn a_taken_identifier_answers_as_a_free_one_when_conflicts_are_hidden() {
     // Nothing was created.
     assert!(identity.get_user(&uid("u2")).await.unwrap().is_none());
     assert!(
-        identity
-            .events()
-            .iter()
-            .any(|e| e.event_type == AuthEventType::SignupStarted
-                && e.event_status == AuthEventStatus::Failure),
-        "the refusal is audited"
+        identity.events().iter().any(|e| {
+            e.event_type == AuthEventType::SignupStarted
+                && e.event_status == AuthEventStatus::Failure
+                && e.error.as_ref().map(ToString::to_string).as_deref() == Some("already_exists")
+        }),
+        "the refusal is audited with its reason"
     );
 
     let mut free = newcomer();
@@ -380,8 +484,8 @@ async fn a_taken_identifier_answers_as_a_free_one_when_conflicts_are_hidden() {
 }
 
 #[tokio::test]
-async fn a_taken_identifier_is_reported_by_default() {
-    let (svc, _) = signup_service(false);
+async fn a_taken_identifier_is_reported_only_when_revealed() {
+    let (svc, _) = signup_service(true);
     let outcome = svc
         .begin_signup(newcomer(), "default", &test_session())
         .await
@@ -389,6 +493,45 @@ async fn a_taken_identifier_is_reported_by_default() {
     assert!(
         matches!(outcome, SignupOutcome::AlreadyExists),
         "{outcome:?}"
+    );
+}
+
+/// The session already pending signup for a user may submit again; the
+/// resumption leaves a row saying so, where it used to leave none.
+#[tokio::test]
+async fn resuming_ones_own_signup_is_audited() {
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let svc = AuthnService::new(identity.clone(), MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    let mut user = newcomer();
+    user.identifier = "dave@example.com".into();
+    let first = svc
+        .begin_signup(user.clone(), "default", &session)
+        .await
+        .unwrap();
+    assert!(matches!(first, SignupOutcome::Started), "{first:?}");
+    let again = svc.begin_signup(user, "default", &session).await.unwrap();
+    assert!(matches!(again, SignupOutcome::Started), "{again:?}");
+
+    let rows: Vec<_> = identity
+        .events()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.event_type,
+                AuthEventType::SignupStarted | AuthEventType::SignupResumed
+            )
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "one row per submit: {rows:?}");
+    assert_eq!(rows[0].event_type, AuthEventType::SignupStarted);
+    assert_eq!(rows[1].event_type, AuthEventType::SignupResumed);
+    assert_eq!(rows[1].event_status, AuthEventStatus::Success);
+    assert_eq!(rows[1].user_id, Some(uid("u2")));
+    assert_eq!(
+        rows[1].error, None,
+        "a success row carries no failure reason"
     );
 }
 
@@ -470,6 +613,50 @@ async fn the_cooldown_treats_an_unknown_identifier_like_a_known_one() {
             .await
             .unwrap()
             .is_some()
+    );
+}
+
+/// The cooldown keys on the identifier as a person reads it: case folded,
+/// invisible format characters dropped, surrounding whitespace trimmed.
+#[tokio::test]
+async fn the_cooldown_keys_on_the_normalised_identifier() {
+    use axess_core::testing::mock_authn::CallLog;
+    let log = CallLog::new();
+    let clock = MockClock::now();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice@x.com"))
+        .with_call_log(&log);
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .with_password_reset_cooldown(Duration::from_secs(60))
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    assert!(
+        svc.begin_password_reset("alice@x.com", "default", TTL)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for variant in ["ALICE@x.com\u{200B}", " alice@X.COM ", "Alice@x.com"] {
+        assert!(
+            svc.begin_password_reset(variant, "default", TTL)
+                .await
+                .unwrap()
+                .is_none(),
+            "{variant:?} is the same identifier inside the cooldown"
+        );
+    }
+    assert_eq!(
+        log.calls()
+            .iter()
+            .filter(|c| **c == "store_reset_token")
+            .count(),
+        1,
+        "exactly one token was written: {:?}",
+        log.calls()
     );
 }
 

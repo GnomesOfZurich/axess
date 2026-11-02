@@ -128,6 +128,7 @@ async fn session_refresh_expiry_follows_the_injected_clock() {
         .await
         .unwrap();
     let session = StoredDelegationSession::new(provider.clone(), store.clone(), tenant, user)
+        .expect("the default client builds")
         .with_clock(Arc::new(MockClock::at(t0())));
     assert_eq!(session.get_access_token().await.unwrap(), "fresh");
     let saved = store
@@ -172,6 +173,7 @@ async fn concurrent_refreshes_redeem_a_rotating_token_once() {
     let mut tasks = Vec::new();
     for _ in 0..8 {
         let session = StoredDelegationSession::new(provider.clone(), store.clone(), tenant, user)
+            .expect("the default client builds")
             .with_clock(clock.clone());
         tasks.push(tokio::spawn(
             async move { session.get_access_token().await },
@@ -239,6 +241,7 @@ async fn rejected_refresh_reloads_and_uses_a_credential_another_node_rotated() {
         TenantId::from_bytes([9; 16]),
         UserId::from_bytes([3; 16]),
     )
+    .expect("the default client builds")
     .with_clock(Arc::new(MockClock::at(t0())));
     assert_eq!(session.get_access_token().await.unwrap(), "from-other-node");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);

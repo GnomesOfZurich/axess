@@ -1,10 +1,11 @@
 //! Token-side OAuth operations: revocation (RFC 7009), RP-Initiated
-//! Logout URL construction, and DPoP proof generation (FAPI 2.0).
+//! Logout URL construction, and DPoP proof generation (RFC 9449).
 //!
 //! Each method is a thin pass-through to the configured provider; the
 //! security-relevant logic (allowlist enforcement on logout redirects,
 //! proof signing for DPoP) lives on the provider implementation itself.
 
+use super::scoped::Scope;
 use crate::authn::service::AuthnService;
 use crate::authn::store::{FactorStore, IdentityStore};
 
@@ -53,21 +54,43 @@ where
     /// * `token`: The access or refresh token to revoke.
     /// * `token_type_hint`: `"access_token"` or `"refresh_token"` (optional
     ///   but helps the IdP locate the token faster).
+    /// * `dpop_key`: The key the token is bound to, when the caller still
+    ///   holds it: the request then carries a proof signed by it, for an
+    ///   authorization server that wants one. A revocation issues no token,
+    ///   so it is sent with `None` too, even to a provider that binds.
     pub async fn revoke_oauth_token(
         &self,
         provider_name: &str,
         token: &str,
         token_type_hint: Option<&str>,
+        dpop_key: Option<&axess_factors::oauth::DpopKey>,
     ) -> Result<(), axess_factors::oauth::OAuthError> {
-        use axess_factors::oauth::OAuthError;
+        self.revoke_scoped(
+            &Scope::global(),
+            provider_name,
+            token,
+            token_type_hint,
+            dpop_key,
+        )
+        .await
+    }
 
-        let provider = self
-            .inner
-            .oauth_providers
-            .get(provider_name)
-            .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?;
-
-        provider.revoke_token(token, token_type_hint).await
+    /// The revocation both the by-name method and
+    /// [`ScopedOAuth`](super::ScopedOAuth) run.
+    pub(super) async fn revoke_scoped(
+        &self,
+        scope: &Scope,
+        provider_name: &str,
+        token: &str,
+        token_type_hint: Option<&str>,
+        dpop_key: Option<&axess_factors::oauth::DpopKey>,
+    ) -> Result<(), axess_factors::oauth::OAuthError> {
+        let provider = self.scoped_provider(scope, provider_name).await?;
+        let signer = dpop_key.map(|key| axess_factors::oauth::DpopSigner {
+            key,
+            rng: &*self.inner.rng,
+        });
+        provider.revoke_token(token, token_type_hint, signer).await
     }
 
     /// A fresh DPoP key for one session, drawn from the service's injected
@@ -78,9 +101,6 @@ where
     /// when the session starts, keep it for the token's life (the key exports its
     /// scalar for that), and pass it to every
     /// [`generate_dpop_proof`](Self::generate_dpop_proof) call.
-    ///
-    /// Requires the `fapi` feature.
-    #[cfg(feature = "fapi")]
     pub fn new_dpop_key(&self) -> axess_factors::oauth::DpopKey {
         axess_factors::oauth::DpopKey::generate(&*self.inner.rng)
     }
@@ -96,9 +116,6 @@ where
     /// The 16 bytes behind the `jti` are drawn from the service's injected
     /// [`SecureRng`](axess_rng::SecureRng), and `iat` is read from its
     /// injected clock, so DST tests get reproducible proofs.
-    ///
-    /// Requires the `fapi` feature.
-    #[cfg(feature = "fapi")]
     pub fn generate_dpop_proof(
         &self,
         provider_name: &str,
@@ -113,8 +130,33 @@ where
             .inner
             .oauth_providers
             .get(provider_name)
-            .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?;
+            .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?
+            .clone();
+        self.sign_dpop_proof(&provider, key, http_method, http_url, access_token)
+    }
 
+    /// The DPoP proof of [`ScopedOAuth`](super::ScopedOAuth).
+    pub(super) async fn dpop_proof_scoped(
+        &self,
+        scope: &Scope,
+        provider_name: &str,
+        key: &axess_factors::oauth::DpopKey,
+        http_method: &str,
+        http_url: &str,
+        access_token: Option<&str>,
+    ) -> Result<axess_factors::oauth::DpopProof, axess_factors::oauth::OAuthError> {
+        let provider = self.scoped_provider(scope, provider_name).await?;
+        self.sign_dpop_proof(&provider, key, http_method, http_url, access_token)
+    }
+
+    fn sign_dpop_proof(
+        &self,
+        provider: &std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>,
+        key: &axess_factors::oauth::DpopKey,
+        http_method: &str,
+        http_url: &str,
+        access_token: Option<&str>,
+    ) -> Result<axess_factors::oauth::DpopProof, axess_factors::oauth::OAuthError> {
         let mut jti_bytes = [0u8; 16];
         self.inner.rng.fill_bytes(&mut jti_bytes);
         let iat = self.inner.clock.now().timestamp();

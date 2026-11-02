@@ -302,11 +302,21 @@ async fn the_registry_and_identity_checks_overlap() {
         ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
             Box::pin(async { true })
         }
-        fn active_sessions<'a>(
+        fn held_sessions<'a>(
             &'a self,
             _: &'a crate::authn::ids::UserId,
-        ) -> Pin<Box<dyn Future<Output = Vec<crate::session::id::SessionId>> + Send + 'a>> {
-            Box::pin(async { Vec::new() })
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Vec<crate::session::id::SessionId>,
+                            crate::session::store::RevocationError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
         }
     }
     struct SlowIdentity;

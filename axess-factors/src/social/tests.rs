@@ -36,6 +36,7 @@ fn make_provider(
         },
         github_style_mapper,
     )
+    .expect("a valid configuration")
     // Pin the PKCE verifier so the assertion on the generated URL
     // is reproducible. `MockRng::new(seed)` is the standard DST
     // pattern used elsewhere in the workspace.
@@ -57,6 +58,7 @@ fn build_auth_url_includes_pkce_and_state_by_default() {
         },
         github_style_mapper,
     )
+    .expect("a valid configuration")
     .with_rng(std::sync::Arc::new(MockRng::new(7)));
 
     let result = provider.build_auth_url("csrf-state-xyz");
@@ -92,6 +94,7 @@ fn without_pkce_omits_code_challenge() {
         },
         github_style_mapper,
     )
+    .expect("a valid configuration")
     .without_pkce();
 
     let result = provider.build_auth_url("csrf-1");
@@ -418,4 +421,79 @@ fn auth_url_debug_redacts_the_pkce_verifier() {
     let shown = format!("{auth:?} {auth:#?}");
     assert!(!shown.contains("verifier-secret-123"), "{shown}");
     assert!(shown.contains("code_challenge=abc"));
+}
+
+/// A configuration with a cleartext endpoint to a remote host is refused at
+/// construction, whichever of the three endpoints it is, naming the setting
+/// and not echoing the URL; loopback HTTP and HTTPS are accepted. Nothing is
+/// ever sent.
+#[tokio::test]
+async fn a_cleartext_endpoint_to_a_remote_host_is_refused_at_construction() {
+    let mock = MockServer::start().await;
+    let mut cleartext_auth = cleartext_config(
+        "https://idp.example/token".into(),
+        "https://api.example/user".into(),
+    );
+    cleartext_auth.authorization_endpoint = "http://idp.example/authorize".into();
+    let cases = [
+        (cleartext_auth, "authorization_endpoint"),
+        (
+            cleartext_config(
+                "http://idp.example/token".into(),
+                format!("{}/user", mock.uri()),
+            ),
+            "token_endpoint",
+        ),
+        (
+            cleartext_config(
+                format!("{}/token", mock.uri()),
+                "http://api.example/user".into(),
+            ),
+            "userinfo_endpoint",
+        ),
+    ];
+    for (config, setting) in cases {
+        let err = SocialProvider::new(config, github_style_mapper)
+            .err()
+            .expect("a cleartext endpoint is refused at construction");
+        assert!(matches!(err, SocialError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains(setting), "{err}");
+        assert!(
+            !err.to_string().contains("example/"),
+            "the URL is not echoed: {err}"
+        );
+    }
+    assert!(
+        mock.received_requests().await.unwrap().is_empty(),
+        "nothing was sent anywhere"
+    );
+
+    let mut loopback = cleartext_config(
+        format!("{}/token", mock.uri()),
+        format!("{}/user", mock.uri()),
+    );
+    loopback.authorization_endpoint = format!("{}/authorize", mock.uri());
+    SocialProvider::new(loopback, github_style_mapper)
+        .expect("loopback http is for local development");
+    SocialProvider::new(
+        cleartext_config(
+            "https://idp.example/token".into(),
+            "https://api.example/user".into(),
+        ),
+        github_style_mapper,
+    )
+    .expect("https");
+}
+
+fn cleartext_config(token: String, userinfo: String) -> SocialProviderConfig {
+    SocialProviderConfig {
+        name: "cleartext".into(),
+        authorization_endpoint: "https://idp.example/authorize".into(),
+        token_endpoint: token,
+        userinfo_endpoint: userinfo,
+        client_id: "id".into(),
+        client_secret: "secret".into(),
+        redirect_uri: "https://app.example.com/cb".into(),
+        scopes: vec![],
+    }
 }

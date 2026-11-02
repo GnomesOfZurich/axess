@@ -6,6 +6,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use fred::bytes::Bytes;
 
 use super::policy::{SweepStep, plan_sweep, ttl_seconds};
+use super::row::{fingerprint_hex, fingerprint_key, fingerprint_set_key, fingerprint_zset_key};
 use super::scripts::{
     DROP_ABSENT_FINGERPRINT, DROP_STALE_FINGERPRINT, PRUNE_ABSENT, PRUNE_MISMATCH, REMOVE_DEVICE,
     ScriptStatus, WRITE_ROW, pair_replies, parse_status, prune_args, prune_mismatch_args,
@@ -65,6 +66,34 @@ fn ttl_covers_the_whole_ladder_per_level() {
     for (d, want) in cases {
         assert_eq!(ttl_seconds(&cfg, &d, now), want, "{:?}", d.trust_level);
     }
+}
+
+/// A window near the top of the range cannot be added to a sighting: the row
+/// then simply has no expiry, and the save that computes it does not panic.
+#[test]
+fn a_window_too_long_to_add_means_no_expiry() {
+    let huge = Duration::seconds(i64::MAX / 1000);
+    let cfg = SweepConfig::builder()
+        .trusted_idle(huge)
+        .seen_idle(huge)
+        .revoked_grace(huge)
+        .build()
+        .unwrap();
+    let mut revoked = device(DeviceTrustLevel::Revoked, t0());
+    revoked.revoked_at = Some(t0());
+    for d in [
+        device(DeviceTrustLevel::Trusted, t0()),
+        device(DeviceTrustLevel::Seen, t0()),
+        revoked,
+    ] {
+        assert_eq!(ttl_seconds(&cfg, &d, t0()), None, "{:?}", d.trust_level);
+    }
+    // A long but representable window still yields a TTL.
+    let long = SweepConfig::builder()
+        .trusted_idle(Duration::days(365 * 50))
+        .build()
+        .unwrap();
+    assert!(ttl_seconds(&long, &device(DeviceTrustLevel::Trusted, t0()), t0()).is_some());
 }
 
 #[test]
@@ -166,7 +195,14 @@ fn status_mapping() {
 
 #[test]
 fn write_row_args_are_ordered_and_binary_safe() {
-    let args = write_row_args(Some(&[0, 255, 1]), &[9, 0], Some(42), "dev-1", &["A", "R"]);
+    let args = write_row_args(
+        Some(&[0, 255, 1]),
+        &[9, 0],
+        Some(42),
+        "dev-1",
+        1_700_000_000,
+        &["A", "R"],
+    );
     assert_eq!(
         args,
         vec![
@@ -174,16 +210,17 @@ fn write_row_args_are_ordered_and_binary_safe() {
             Value::Bytes(Bytes::from_static(&[9, 0])),
             Value::Integer(42),
             Value::Bytes(Bytes::from_static(b"dev-1")),
+            Value::Integer(1_700_000_000),
             Value::Bytes(Bytes::from_static(b"A")),
             Value::Bytes(Bytes::from_static(b"R")),
         ]
     );
     // No expiry is encoded as 0, which the script treats as "persist"; no
     // expectation is encoded as empty, which the script reads as "absent".
-    let bare = write_row_args(None, b"b", None, "d", &[]);
+    let bare = write_row_args(None, b"b", None, "d", 0, &[]);
     assert_eq!(bare[0], Value::Bytes(Bytes::new()));
     assert_eq!(bare[2], Value::Integer(0));
-    assert_eq!(bare.len(), 4);
+    assert_eq!(bare.len(), 5);
 }
 
 #[test]
@@ -215,13 +252,17 @@ fn scripts_compare_before_they_write_or_delete() {
     assert!(pos(WRITE_ROW, "current ~= ARGV[1]") < pos(WRITE_ROW, "'SET'"));
     // The index changes ride after the row write, in the same script.
     assert!(pos(WRITE_ROW, "'SET', KEYS[1]") < pos(WRITE_ROW, "'SADD'"));
-    // The fingerprint set is written after the row, and the single-id key of
-    // an earlier release goes only while it points at this device.
-    assert!(pos(WRITE_ROW, "'SET', KEYS[1]") < pos(WRITE_ROW, "'SADD', KEYS[2]"));
-    assert!(pos(WRITE_ROW, "GET', KEYS[3]) == ARGV[4]") < pos(WRITE_ROW, "'DEL', KEYS[3]"));
+    // The fingerprint index is written after the row, with the sighting as
+    // the score, the plain set of the earlier layout is emptied of this
+    // device, and the single-id key of an earlier release goes only while it
+    // points at this device.
+    assert!(pos(WRITE_ROW, "'SET', KEYS[1]") < pos(WRITE_ROW, "'ZADD', KEYS[2], ARGV[5], ARGV[4]"));
+    assert!(pos(WRITE_ROW, "'ZADD', KEYS[2]") < pos(WRITE_ROW, "'SREM', KEYS[3], ARGV[4]"));
+    assert!(pos(WRITE_ROW, "GET', KEYS[4]) == ARGV[4]") < pos(WRITE_ROW, "'DEL', KEYS[4]"));
     assert!(pos(REMOVE_DEVICE, "current ~= ARGV[1]") < pos(REMOVE_DEVICE, "'DEL', KEYS[1]"));
-    assert!(pos(REMOVE_DEVICE, "'SREM', KEYS[2], ARGV[2]") > pos(REMOVE_DEVICE, "'DEL', KEYS[1]"));
-    assert!(pos(REMOVE_DEVICE, "GET', KEYS[3]) == ARGV[2]") < pos(REMOVE_DEVICE, "'DEL', KEYS[3]"));
+    assert!(pos(REMOVE_DEVICE, "unlist(KEYS[2], ARGV[2])") > pos(REMOVE_DEVICE, "'DEL', KEYS[1]"));
+    assert!(pos(REMOVE_DEVICE, "'SREM', KEYS[3], ARGV[2]") > pos(REMOVE_DEVICE, "'DEL', KEYS[1]"));
+    assert!(pos(REMOVE_DEVICE, "GET', KEYS[4]) == ARGV[2]") < pos(REMOVE_DEVICE, "'DEL', KEYS[4]"));
     // A stale fingerprint entry goes only if it points here AND the row is
     // still the bytes that were judged.
     assert!(
@@ -234,7 +275,8 @@ fn scripts_compare_before_they_write_or_delete() {
     );
     // A mismatched member is removed only while its row is the judged bytes.
     assert!(
-        pos(PRUNE_MISMATCH, "GET', KEYS[i + 1]) == ARGV[n + i]") < pos(PRUNE_MISMATCH, "'SREM'")
+        pos(PRUNE_MISMATCH, "GET', KEYS[i + 1]) == ARGV[n + i]")
+            < pos(PRUNE_MISMATCH, "unlist(KEYS[1], ARGV[i])")
     );
     assert_eq!(
         prune_mismatch_args(&[("a".into(), b"ra".to_vec()), ("b".into(), b"rb".to_vec())]).len(),
@@ -433,7 +475,7 @@ fn a_row_without_demoted_at_reads_as_never_trusted() {
 #[test]
 fn ids_cannot_alias_an_index_segment_in_a_key() {
     use crate::authn::ids::{DeviceId, TenantId};
-    for segment in ["tenant", "user", "fam", "fp", "fps", "a:b", ""] {
+    for segment in ["tenant", "user", "fam", "fp", "fps", "fpz", "a:b", ""] {
         assert!(TenantId::try_new(segment).is_err(), "tenant {segment:?}");
         assert!(DeviceId::try_new(segment).is_err(), "device {segment:?}");
     }
@@ -481,12 +523,18 @@ async fn valkey_device_missing_row_is_not_found() {
         axess_identity::testing::device("nope"),
     );
     assert!(matches!(
-        s.record_sighting(&t, &i, Utc::now()).await,
+        s.record_sighting(&t, &i, crate::device::store::whole_second(Utc::now()))
+            .await,
         Err(ValkeyDeviceStoreError::NotFound { .. })
     ));
     assert!(matches!(
-        s.set_trust_level(&t, &i, DeviceTrustLevel::Seen, Utc::now())
-            .await,
+        s.set_trust_level(
+            &t,
+            &i,
+            DeviceTrustLevel::Seen,
+            crate::device::store::whole_second(Utc::now())
+        )
+        .await,
         Err(ValkeyDeviceStoreError::NotFound { .. })
     ));
 }
@@ -495,9 +543,11 @@ async fn valkey_device_missing_row_is_not_found() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
     let s = live_store("axt_cas").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let d = named("dev-1", 0xaa, DeviceTrustLevel::Seen, now);
-    s.save(&d, Utc::now()).await.unwrap();
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let (tenant, id) = (d.tenant_id.to_string(), d.id.to_string());
     let row_key = device_key(&s.prefix, &tenant, &id);
     // A writer read the row ...
@@ -514,13 +564,15 @@ async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
         &s.encode_row(&resurrected).unwrap(),
         Some(600),
         &id,
+        resurrected.last_seen_at.timestamp(),
         &[],
     );
     let hex = fingerprint_hex(&d.fingerprint_hash);
+    let fp_zset = fingerprint_zset_key(&s.prefix, &tenant, &hex);
     let fp_set = fingerprint_set_key(&s.prefix, &tenant, &hex);
     let fp = fingerprint_key(&s.prefix, &tenant, &hex);
     let status = s
-        .run_script(WRITE_ROW, vec![row_key, fp_set, fp], args)
+        .run_script(WRITE_ROW, vec![row_key, fp_zset, fp_set, fp], args)
         .await
         .unwrap();
     assert_eq!(status, ScriptStatus::Conflict);
@@ -538,11 +590,15 @@ async fn valkey_device_stale_swap_conflicts_and_revocation_survives() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_delete_keeps_a_shared_fingerprint_lookup() {
     let s = live_store("axt_fp").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let a = named("dev-a", 0xbb, DeviceTrustLevel::Seen, now);
     let b = named("dev-b", 0xbb, DeviceTrustLevel::Seen, now);
-    s.save(&a, Utc::now()).await.unwrap();
-    s.save(&b, Utc::now()).await.unwrap(); // b saved last: the index points at b
+    s.save(&a, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
+    s.save(&b, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap(); // b saved last: the index points at b
     s.delete(&a.tenant_id, &a.id).await.unwrap();
     let found = s
         .find_by_fingerprint(&b.tenant_id, &b.fingerprint_hash)
@@ -561,12 +617,16 @@ async fn valkey_device_delete_keeps_a_shared_fingerprint_lookup() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_ttls_follow_the_ladder_and_sweep_uses_120_days() {
     let s = live_store("axt_ttl").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let tenant = axess_identity::testing::tenant("tenant-1");
     let trusted = named("dev-t", 1, DeviceTrustLevel::Trusted, now);
     let unknown = named("dev-u", 2, DeviceTrustLevel::Unknown, now);
-    s.save(&trusted, Utc::now()).await.unwrap();
-    s.save(&unknown, Utc::now()).await.unwrap();
+    s.save(&trusted, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
+    s.save(&unknown, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let ttl = |d: &Device| device_key(&s.prefix, &d.tenant_id.to_string(), &d.id.to_string());
     let t: i64 = s.client.ttl(ttl(&trusted)).await.unwrap();
     let u: i64 = s.client.ttl(ttl(&unknown)).await.unwrap();
@@ -579,7 +639,9 @@ async fn valkey_device_ttls_follow_the_ladder_and_sweep_uses_120_days() {
         DeviceTrustLevel::Trusted,
         now - Duration::days(100),
     );
-    s.save(&old, Utc::now()).await.unwrap();
+    s.save(&old, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let counts = s.sweep(&tenant, now).await.unwrap();
     assert_eq!((counts.trusted_to_seen, counts.seen_to_revoked), (1, 0));
     let got = s.load(&tenant, &old.id).await.unwrap().unwrap();
@@ -594,9 +656,11 @@ async fn valkey_device_ttls_follow_the_ladder_and_sweep_uses_120_days() {
 async fn valkey_device_conditional_writes_refuse_a_revoked_row() {
     use crate::device::store::{BindingsUpdate, TrustTransition};
     let s = live_store("axt_cond").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let d = named("dev-1", 0xc1, DeviceTrustLevel::Seen, now);
-    s.save(&d, Utc::now()).await.unwrap();
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     s.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now)
         .await
         .unwrap();
@@ -623,9 +687,15 @@ async fn valkey_device_conditional_writes_refuse_a_revoked_row() {
         last_used_at: now,
     };
     assert_eq!(
-        s.replace_bindings(&d.tenant_id, &d.id, &[], &[binding], Utc::now())
-            .await
-            .unwrap(),
+        s.replace_bindings(
+            &d.tenant_id,
+            &d.id,
+            &[],
+            &[binding],
+            crate::device::store::whole_second(Utc::now())
+        )
+        .await
+        .unwrap(),
         BindingsUpdate::Revoked
     );
     let row = s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
@@ -655,9 +725,11 @@ async fn valkey_device_conditional_writes_refuse_a_revoked_row() {
 async fn valkey_device_a_racing_promotion_never_undoes_a_revocation() {
     let s = live_store("axt_race").await;
     for round in 0..25u8 {
-        let now = Utc::now();
+        let now = crate::device::store::whole_second(Utc::now());
         let d = named("dev-1", 0xc2 ^ round, DeviceTrustLevel::Seen, now);
-        s.save(&d, Utc::now()).await.unwrap();
+        s.save(&d, crate::device::store::whole_second(Utc::now()))
+            .await
+            .unwrap();
         let (a, b) = tokio::join!(
             s.set_trust_level_if(
                 &d.tenant_id,
@@ -681,7 +753,7 @@ async fn valkey_device_a_racing_promotion_never_undoes_a_revocation() {
 async fn valkey_device_replace_bindings_moves_the_family_index() {
     use crate::device::store::BindingsUpdate;
     let s = live_store("axt_fam").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let refresh = |f: &str| DeviceBinding::Refresh {
         family_id: f.into(),
         issued_at: now,
@@ -689,14 +761,16 @@ async fn valkey_device_replace_bindings_moves_the_family_index() {
     };
     let mut d = named("dev-1", 0xc3, DeviceTrustLevel::Seen, now);
     d.bindings = vec![refresh("fam-a")];
-    s.save(&d, Utc::now()).await.unwrap();
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let written = s
         .replace_bindings(
             &d.tenant_id,
             &d.id,
             &[refresh("fam-a")],
             &[refresh("fam-b")],
-            Utc::now(),
+            crate::device::store::whole_second(Utc::now()),
         )
         .await
         .unwrap();
@@ -716,12 +790,14 @@ async fn valkey_device_replace_bindings_moves_the_family_index() {
 async fn valkey_device_sweep_follows_the_ladder_table() {
     use crate::device::store::ladder::LADDER;
     let s = live_store("axt_ladder").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let tenant = axess_identity::testing::tenant("tenant-1");
     for (i, r) in LADDER.iter().enumerate() {
         let mut d = named(&format!("row-{i}"), i as u8, r.level, r.last_seen(now));
         d.demoted_at = r.demoted_at(now);
-        s.save(&d, Utc::now()).await.unwrap();
+        s.save(&d, crate::device::store::whole_second(Utc::now()))
+            .await
+            .unwrap();
     }
     s.sweep(&tenant, now).await.unwrap();
     for (i, r) in LADDER.iter().enumerate() {
@@ -738,18 +814,30 @@ async fn valkey_device_sweep_follows_the_ladder_table() {
 async fn valkey_device_racing_claims_have_one_winner() {
     use crate::device::store::OwnerClaim;
     let s = live_store("axt_claim").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     for round in 0..15u8 {
         let mut d = named("dev-1", 0xd0 ^ round, DeviceTrustLevel::Unknown, now);
         d.user_id = None;
-        s.save(&d, Utc::now()).await.unwrap();
+        s.save(&d, crate::device::store::whole_second(Utc::now()))
+            .await
+            .unwrap();
         let (a, b) = (
             axess_identity::testing::user("a"),
             axess_identity::testing::user("b"),
         );
         let (ra, rb) = tokio::join!(
-            s.claim_owner(&d.tenant_id, &d.id, &a, Utc::now()),
-            s.claim_owner(&d.tenant_id, &d.id, &b, Utc::now())
+            s.claim_owner(
+                &d.tenant_id,
+                &d.id,
+                &a,
+                crate::device::store::whole_second(Utc::now())
+            ),
+            s.claim_owner(
+                &d.tenant_id,
+                &d.id,
+                &b,
+                crate::device::store::whole_second(Utc::now())
+            )
         );
         let (ra, rb) = (ra.unwrap(), rb.unwrap());
         let wins = [ra, rb]
@@ -771,21 +859,35 @@ async fn valkey_device_racing_claims_have_one_winner() {
 async fn valkey_device_a_stale_bindings_write_conflicts() {
     use crate::device::store::BindingsUpdate;
     let s = live_store("axt_bindcas").await;
-    let now = Utc::now();
+    let now = crate::device::store::whole_second(Utc::now());
     let refresh = |f: &str| DeviceBinding::Refresh {
         family_id: f.into(),
         issued_at: now,
         last_used_at: now,
     };
     let d = named("dev-1", 0xd1, DeviceTrustLevel::Seen, now);
-    s.save(&d, Utc::now()).await.unwrap();
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let first = s
-        .replace_bindings(&d.tenant_id, &d.id, &[], &[refresh("fam-1")], Utc::now())
+        .replace_bindings(
+            &d.tenant_id,
+            &d.id,
+            &[],
+            &[refresh("fam-1")],
+            crate::device::store::whole_second(Utc::now()),
+        )
         .await
         .unwrap();
     assert_eq!(first, BindingsUpdate::Written);
     let second = s
-        .replace_bindings(&d.tenant_id, &d.id, &[], &[refresh("fam-2")], Utc::now())
+        .replace_bindings(
+            &d.tenant_id,
+            &d.id,
+            &[],
+            &[refresh("fam-2")],
+            crate::device::store::whole_second(Utc::now()),
+        )
         .await
         .unwrap();
     assert_eq!(second, BindingsUpdate::Conflict);
@@ -834,8 +936,10 @@ fn a_short_or_malformed_batch_reply_is_an_error_not_a_silent_gap() {
 #[test]
 fn pruning_rechecks_absence_inside_the_script() {
     let exists = PRUNE_ABSENT.find("EXISTS").expect("checks existence");
-    let srem = PRUNE_ABSENT.find("SREM").expect("removes members");
-    assert!(exists < srem, "existence is checked before the removal");
+    let unlist = PRUNE_ABSENT
+        .find("unlist(KEYS[1], ARGV[i - 1])")
+        .expect("removes members");
+    assert!(exists < unlist, "existence is checked before the removal");
     let members = ids(3);
     assert_eq!(
         prune_args(&members).len(),
@@ -900,6 +1004,14 @@ fn index_plans_follow_the_row_change() {
         )),
         Some(IndexOp::Remove)
     );
+    assert_eq!(
+        op(row::fingerprint_zset_key(
+            "p",
+            &t,
+            &row::fingerprint_hex(&before.fingerprint_hash)
+        )),
+        Some(IndexOp::Remove)
+    );
 
     let gone = plan_indexes("p", Some(&before), None);
     assert_eq!(
@@ -922,4 +1034,102 @@ fn a_revoked_row_without_a_time_is_planned_for_stamping() {
         plan_sweep(&d, &SweepConfig::default(), t0()),
         SweepStep::StampRevoked
     );
+}
+
+/// Concurrent first sightings of one key end on one device: every creator
+/// returns the same id and exactly one live row of the key is left, for an
+/// owned key and for an unowned one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_device_concurrent_creators_end_on_one_device() {
+    const CREATORS: u8 = 6;
+    let s = live_store("axt_create").await;
+    let now = crate::device::store::whole_second(Utc::now());
+    for owned in [true, false] {
+        for round in 0..20u8 {
+            let fp = round ^ if owned { 0x40 } else { 0x80 };
+            let mut tasks = Vec::new();
+            for i in 0..CREATORS {
+                // Ids that sort against creation order as often as with it.
+                let id = format!("c{owned}-{round}-{}", (i * 7 + round) % CREATORS);
+                let mut d = named(&id, fp, DeviceTrustLevel::Unknown, now);
+                if !owned {
+                    d.user_id = None;
+                }
+                let s = s.clone();
+                tasks.push(tokio::spawn(async move { s.create_or_find(&d, now).await }));
+            }
+            let mut ids = Vec::new();
+            for t in tasks {
+                ids.push(t.await.expect("join").expect("create_or_find").id);
+            }
+            let tenant = axess_identity::testing::tenant("tenant-1");
+            let hex = row::fingerprint_hex(&FingerprintHash::from_bytes([fp; 32]));
+            let listed: Vec<String> = s
+                .client
+                .zrange(
+                    row::fingerprint_zset_key(&s.prefix, &tenant.to_string(), &hex),
+                    0,
+                    -1,
+                    None,
+                    false,
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut rows = 0;
+            for m in &listed {
+                let id: DeviceId = m.parse().expect("device id");
+                if let Some(d) = s.load(&tenant, &id).await.unwrap() {
+                    rows += 1;
+                    s.delete(&tenant, &d.id).await.unwrap();
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                1,
+                "owned={owned} round {round}: creators returned {ids:?}"
+            );
+            assert_eq!(rows, 1, "owned={owned} round {round}: {rows} rows left");
+        }
+    }
+}
+
+/// A new row is in no index yet, so the plan `create_or_find` sends with
+/// `CREATE_ROW` (which adds the device to every key it is given) only adds.
+#[test]
+fn a_new_rows_index_plan_only_adds() {
+    let mut d = device(DeviceTrustLevel::Unknown, t0());
+    d.bindings = vec![DeviceBinding::Refresh {
+        family_id: "fam-1".into(),
+        issued_at: t0(),
+        last_used_at: t0(),
+    }];
+    let plan = super::index::plan_indexes("p", None, Some(&d));
+    let ops = plan.ops();
+    assert!(
+        ops.len() >= 4,
+        "tenant, user, owner-fingerprint, family: {ops:?}"
+    );
+    assert!(ops.iter().all(|op| *op == "A"), "{ops:?}");
+}
+
+#[test]
+fn create_row_checks_the_guard_and_the_row_before_writing() {
+    use super::scripts::CREATE_ROW;
+    let guard_check = CREATE_ROW.find("held ~= ARGV[1]").expect("guard check");
+    let first_write = CREATE_ROW.find("redis.call('SET'").expect("a write");
+    assert!(guard_check < first_write);
+    assert!(CREATE_ROW.contains("EXISTS', KEYS[2]"));
+    assert!(CREATE_ROW.contains("redis.call('SET', KEYS[1], generation .. ':' .. ARGV[5], 'EX'"));
+}
+
+#[test]
+fn a_create_guard_names_the_device_after_its_generation() {
+    use super::scripts::guarded_device;
+    assert_eq!(guarded_device("7:dev-1"), Some("dev-1"));
+    assert_eq!(guarded_device("legacy"), None);
 }

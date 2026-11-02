@@ -172,10 +172,12 @@ async fn expiry(store: &SqliteSessionStore, id: &SessionId) -> i64 {
         .unwrap()
 }
 
-/// A load re-seals a row that carries no row binding, keeps its expiry, and
-/// the next load reads the bound form.
+/// A load reads a row that carries no row binding under the legacy window,
+/// but leaves it as it is: the blob proves nothing about the row it sits
+/// under, so a re-seal would bind a blob moved between rows to the row it was
+/// found under. The next save writes the bound form.
 #[tokio::test]
-async fn load_reseals_an_unbound_row_and_keeps_its_expiry() {
+async fn load_reads_an_unbound_row_without_resealing_it() {
     let store = store().await;
     let id = SessionId::new(&SystemRng);
     let expires = store.clock.now().timestamp() + 600;
@@ -184,23 +186,64 @@ async fn load_reseals_an_unbound_row_and_keeps_its_expiry() {
 
     let loaded = store.load(&id).await.unwrap().expect("unbound row loads");
     assert_eq!(loaded.custom, admin().custom);
+    assert_eq!(
+        raw(&store, &id).await,
+        unbound,
+        "the read leaves the blob as it found it"
+    );
+    assert_eq!(expiry(&store, &id).await, expires);
 
-    let after = raw(&store, &id).await;
-    assert!(BoundFormat::SESSION.marks(&after), "re-sealed by the load");
-    assert_eq!(expiry(&store, &id).await, expires, "the expiry is kept");
-    assert!(store.load(&id).await.unwrap().is_some());
+    store
+        .save(&id, &loaded, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(BoundFormat::SESSION.marks(&raw(&store, &id).await));
 }
 
-/// A legacy text-column row is moved to the binary column by its load.
+/// A bound row that only the previous key opens is re-sealed under the
+/// current key by the load that found it, and keeps its expiry.
+#[tokio::test]
+async fn load_reseals_a_row_sealed_under_the_previous_key_and_keeps_its_expiry() {
+    let store = store().await;
+    let id = SessionId::new(&SystemRng);
+    store
+        .save(&id, &admin(), Duration::from_secs(600))
+        .await
+        .unwrap();
+    let before = raw(&store, &id).await;
+    let expires = expiry(&store, &id).await;
+
+    let rotated = SqliteSessionStore::new(
+        store.pool.clone(),
+        SessionCrypto::new([4u8; 32]).with_previous_key(KEY),
+    );
+    let loaded = rotated
+        .load(&id)
+        .await
+        .unwrap()
+        .expect("the previous key opens the row");
+    assert_eq!(loaded.custom, admin().custom);
+    let after = raw(&store, &id).await;
+    assert_ne!(after, before, "re-sealed by the load");
+    assert!(BoundFormat::SESSION.marks(&after));
+    assert_eq!(expiry(&store, &id).await, expires, "the expiry is kept");
+    assert!(
+        SqliteSessionStore::new(store.pool.clone(), SessionCrypto::new([4u8; 32]))
+            .load(&id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the current key alone opens the re-sealed row"
+    );
+}
+
+/// A bound row in the legacy text column is moved to the binary column by
+/// its load.
 #[tokio::test]
 async fn load_moves_a_text_column_row_to_the_binary_column() {
     let store = store().await;
     let id = SessionId::new(&SystemRng);
-    let text = BASE64.encode(
-        SessionCrypto::new(KEY)
-            .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
-            .unwrap(),
-    );
+    let text = BASE64.encode(store.codec.encode_bytes(&id, &admin()).unwrap());
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?1, ?2, ?3)")
         .bind(id.to_string())
         .bind(&text)

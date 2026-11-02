@@ -35,13 +35,15 @@ where
     /// `tenant_identifier` is the tenant slug/domain (looked up via
     /// [`IdentityLookup::find_tenant`](crate::authn::IdentityLookup::find_tenant)).
     ///
-    /// An identifier that is already taken answers
-    /// [`SignupOutcome::AlreadyExists`], which tells the caller who has an
-    /// account. [`with_hidden_signup_conflicts`](crate::authn::service::AuthnServiceBuilder::with_hidden_signup_conflicts)
-    /// makes it answer [`SignupOutcome::Started`] instead, creating nothing
-    /// and leaving the session anonymous; see that method for how the
-    /// application tells the two apart privately. Either way the refusal is
-    /// audited with its reason.
+    /// An identifier that is already taken answers [`SignupOutcome::Started`]
+    /// like a free one, creating nothing and leaving the session anonymous,
+    /// so the answer does not say who has an account; the refusal is audited
+    /// with reason `already_exists`. A service built with
+    /// [`with_signup_conflicts_revealed`](crate::authn::service::AuthnServiceBuilder::with_signup_conflicts_revealed)
+    /// answers [`SignupOutcome::AlreadyExists`] instead; see that method for
+    /// how the application tells the two apart privately. The session that
+    /// began a signup may submit it again and gets `Started` once more, with
+    /// a success row carrying reason `resumed`.
     ///
     /// # Errors
     ///
@@ -119,6 +121,14 @@ where
                 crate::authn::types::EntityState::Candidate
             ) && resuming_own
             {
+                // A row for the resubmit, so the log shows every submit and
+                // not only the first; its type says nothing was created.
+                self.emit_audit(
+                    AuthEventBuilder::success(AuthEventType::SignupResumed)
+                        .attributed_to(&existing_user.id, &existing_user.tenant_id)
+                        .with_session(session.session_id().await),
+                )
+                .await?;
                 return Ok(SignupOutcome::Started);
             }
             self.refuse_signup(
@@ -127,14 +137,15 @@ where
                 "already_exists",
             )
             .await?;
-            // Hidden conflicts answer as a free identifier does, so the
-            // response is not a way to learn who has an account. Nothing is
-            // created and the session stays as it was; the application
-            // reads that from the session (no user) where the caller cannot.
-            if self.inner.hide_signup_conflicts {
-                return Ok(SignupOutcome::Started);
+            // Hidden conflicts (the default) answer as a free identifier
+            // does, so the response is not a way to learn who has an account.
+            // Nothing is created and the session stays as it was; the
+            // application reads that from the session (no user) where the
+            // caller cannot.
+            if self.inner.reveal_signup_conflicts {
+                return Ok(SignupOutcome::AlreadyExists);
             }
-            return Ok(SignupOutcome::AlreadyExists);
+            return Ok(SignupOutcome::Started);
         }
 
         // 3. Create the user in the tenant that was just validated. The

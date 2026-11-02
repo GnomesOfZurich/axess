@@ -19,6 +19,14 @@ impl MysqlDeviceStore {
 /// the server's default case-insensitive collation would resolve device `Ab`
 /// as device `aB`, find another tenant's or user's row by a differently
 /// cased id, and make two distinct ids collide on the primary key.
+///
+/// The three indexes that serve a lookup ordered `last_seen_at DESC, id
+/// ASC` (by fingerprint, by owner, by owner and fingerprint) are declared in
+/// that order: MySQL 8.0 stores a descending key part and reads the newest
+/// sighting straight from the index, where an all-ascending index would
+/// sort every row of the prefix on each lookup. MariaDB before 10.8 accepts
+/// the `DESC` and builds an ascending index, which still serves the lookup
+/// with a sort.
 pub(super) const DEVICES_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS devices (
     tenant_id        VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
@@ -32,11 +40,11 @@ CREATE TABLE IF NOT EXISTS devices (
     demoted_at       BIGINT,
     bindings         MEDIUMTEXT     NOT NULL,
     PRIMARY KEY (tenant_id, id),
-    INDEX idx_devices_fingerprint_seen (tenant_id, fingerprint_hash, last_seen_at, id),
+    INDEX idx_devices_fingerprint_seen (tenant_id, fingerprint_hash, last_seen_at DESC, id ASC),
     INDEX idx_devices_sweep (tenant_id, trust_level, last_seen_at),
     INDEX idx_devices_revoked_at (tenant_id, trust_level, revoked_at),
-    INDEX idx_devices_user (tenant_id, user_id, last_seen_at),
-    INDEX idx_devices_user_fingerprint (tenant_id, user_id, fingerprint_hash, last_seen_at)
+    INDEX idx_devices_user (tenant_id, user_id, last_seen_at DESC, id ASC),
+    INDEX idx_devices_user_fingerprint (tenant_id, user_id, fingerprint_hash, last_seen_at DESC, id ASC)
 )
 "#;
 

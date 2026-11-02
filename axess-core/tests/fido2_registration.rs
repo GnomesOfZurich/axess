@@ -199,6 +199,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(axess_core::authn::factor::Fido2Options::default())
+}
+
+fn fixture_with(options: axess_core::authn::factor::Fido2Options) -> Fixture {
     let user = test_user("u1", "alice");
     let scope = AuthnScope::User {
         tenant_id: user.tenant_id,
@@ -227,6 +231,7 @@ fn fixture() -> Fixture {
         .with_user(user);
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_fido2(AcceptingProvider(DefaultFido2Provider::new(webauthn)))
+        .with_fido2_options(options)
         .build()
         .with_audit_context(AuditContext::default());
     Fixture {
@@ -587,4 +592,203 @@ async fn a_refused_enrolment_leaves_a_failed_audit_row() {
                 && e.event_status == AuthEventStatus::Failure),
         "{rows:?}"
     );
+}
+
+/// A session authenticated as `user` `age` ago.
+async fn session_aged(
+    user: &axess_core::authn::types::User,
+    age: chrono::Duration,
+) -> axess_core::session::extractor::AuthSession {
+    let session = test_session();
+    axess_core::testing::AuthSessionTestExt::set_authenticated(
+        &session,
+        user.id,
+        user.tenant_id,
+        chrono::Utc::now() - age,
+    )
+    .await;
+    session
+}
+
+#[tokio::test]
+async fn a_session_authenticated_too_long_ago_cannot_change_credentials() {
+    use axess_core::authn::error::AuthnError;
+    use axess_core::authn::factor::Fido2Options;
+    let f = fixture_with(Fido2Options {
+        max_authn_age: Some(std::time::Duration::from_secs(5 * 60)),
+        ..Fido2Options::default()
+    });
+    let alice = test_user("u1", "alice");
+    let fresh = session_aged(&alice, chrono::Duration::minutes(1)).await;
+    f.service
+        .begin_fido2_registration(&alice, &fresh)
+        .await
+        .expect("a minute-old authentication is recent enough");
+
+    let stale = session_aged(&alice, chrono::Duration::minutes(10)).await;
+    let err = f
+        .service
+        .begin_fido2_registration(&alice, &stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "begin: {err:?}");
+    let err = f
+        .service
+        .finish_fido2_registration(&alice, &dummy_response(), "late", &stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "finish: {err:?}");
+    let err = f
+        .service
+        .delete_fido2_credential(&alice, &stale, &cred_id(AAAA), 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "delete: {err:?}");
+    assert_eq!(stored_count(&f).await, 1, "nothing was added or removed");
+}
+
+#[tokio::test]
+async fn an_impersonated_session_cannot_change_credentials() {
+    use axess_core::authn::error::AuthnError;
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let session = session_for(&alice).await;
+    // The marker `begin_impersonation` leaves; only server code writes it.
+    assert!(
+        axess_core::testing::AuthSessionTestExt::set_impersonator(
+            &session,
+            test_user("u9", "admin").id,
+            chrono::Utc::now(),
+        )
+        .await,
+        "the session is impersonated"
+    );
+    let err = f
+        .service
+        .begin_fido2_registration(&alice, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::Impersonated), "begin: {err:?}");
+    let err = f
+        .service
+        .delete_fido2_credential(&alice, &session, &cred_id(AAAA), 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::Impersonated), "delete: {err:?}");
+    assert_eq!(stored_count(&f).await, 1, "nothing was added or removed");
+}
+
+#[tokio::test]
+async fn a_signup_session_cannot_delete_a_passkey() {
+    use axess_core::authn::error::AuthnError;
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let session = common::signup_session_for(&alice).await;
+    let err = f
+        .service
+        .delete_fido2_credential(&alice, &session, &cred_id(AAAA), 0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+    assert_eq!(stored_count(&f).await, 1, "the passkey stays");
+}
+
+// ── Status and audit rows on the management paths ───────────────────────────
+
+/// Deleting checked the session and nothing else: a suspended account
+/// could still remove its passkeys, where it could neither enrol one nor
+/// finish enrolling one.
+#[tokio::test]
+async fn a_suspended_account_cannot_delete_a_passkey() {
+    use axess_core::authn::error::AuthnError;
+    let future = chrono::Utc::now() + chrono::Duration::hours(1);
+    let (service, alice) = fixture_with_status(suspended_until(future));
+    let session = session_for(&alice).await;
+
+    let res = service
+        .delete_fido2_credential(&alice, &session, &cred_id(AAAA), 0)
+        .await;
+
+    assert!(matches!(res, Err(AuthnError::Locked { .. })), "{res:?}");
+}
+
+/// The success rows of a registration and a deletion carry the session
+/// that made the change, as every refusal row does.
+#[tokio::test]
+async fn the_registration_and_deletion_rows_carry_the_session() {
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let session = session_for(&alice).await;
+    let sid = session.session_id().await;
+    f.service
+        .begin_fido2_registration(&alice, &session)
+        .await
+        .unwrap();
+    f.service
+        .finish_fido2_registration(&alice, &dummy_response(), "second", &session)
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .delete_fido2_credential(&alice, &session, &cred_id(AAAA), 0)
+            .await
+            .unwrap()
+    );
+
+    for kind in [AuthEventType::FactorSetup, AuthEventType::FactorDisabled] {
+        let rows: Vec<_> = f
+            .identity
+            .events()
+            .into_iter()
+            .filter(|e| e.event_type == kind && e.event_status == AuthEventStatus::Success)
+            .collect();
+        assert_eq!(rows.len(), 1, "{kind:?}");
+        assert_eq!(rows[0].session_id, Some(sid), "{kind:?}: {rows:?}");
+    }
+}
+
+/// A finish refused for an account suspended since the ceremony began is
+/// recorded under the finish's own kind, `FactorSetup`, which its success
+/// row and its other refusals use; it used to be a `FactorEnabled` row.
+#[tokio::test]
+async fn an_inactive_account_refused_at_finish_is_recorded_as_a_setup() {
+    use axess_core::authn::error::AuthnError;
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    use axess_core::authn::store::IdentityAdmin as _;
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let session = session_for(&alice).await;
+    f.service
+        .begin_fido2_registration(&alice, &session)
+        .await
+        .unwrap();
+    f.identity
+        .suspend_user(
+            &alice.id,
+            axess_core::authn::types::StatusDetail {
+                reason: "test".into(),
+                since: chrono::Utc::now(),
+                until: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let err = f
+        .service
+        .finish_fido2_registration(&alice, &dummy_response(), "late", &session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::Locked { .. }), "{err:?}");
+    let rows: Vec<_> = f
+        .identity
+        .events()
+        .into_iter()
+        .filter(|e| e.event_status == AuthEventStatus::Locked)
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].event_type, AuthEventType::FactorSetup);
+    assert_eq!(rows[0].session_id, Some(session.session_id().await));
 }

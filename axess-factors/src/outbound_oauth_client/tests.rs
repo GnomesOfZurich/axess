@@ -314,7 +314,7 @@ async fn missing_expires_in_defaults_to_one_hour() {
 }
 
 #[tokio::test]
-async fn private_key_jwt_sends_signed_client_assertion() {
+async fn private_key_jwt_sends_the_signers_assertion_for_the_token_url() {
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rsa::RsaPrivateKey;
@@ -348,14 +348,16 @@ async fn private_key_jwt_sends_signed_client_assertion() {
 
     let client = OutboundOAuthClient::new(
         token_url(&server),
-        ClientAuthMethod::PrivateKeyJwt {
-            client_id: "axess-fapi".into(),
-            signing_key: jsonwebtoken::EncodingKey::from_rsa_der(&der),
-            algorithm: jsonwebtoken::Algorithm::RS256,
-            key_id: Some("kid-1".into()),
-            audience: format!("{}/oauth2/token", server.uri()),
-            assertion_ttl: Duration::from_secs(60),
-        },
+        ClientAuthMethod::PrivateKeyJwt(Box::new(
+            crate::client_assertion::ClientAssertionSigner::new(
+                "axess-fapi",
+                jsonwebtoken::EncodingKey::from_rsa_der(&der),
+                jsonwebtoken::Algorithm::RS256,
+            )
+            .expect("an RSA key signs RS256")
+            .with_key_id("kid-1")
+            .with_x5t_s256("cert-thumbprint"),
+        )),
     )
     .expect("an HTTPS or loopback token URL");
     let token = client.get_access_token().await.expect("jwt assertion sent");
@@ -386,6 +388,9 @@ async fn private_key_jwt_sends_signed_client_assertion() {
     let header_val: serde_json::Value = serde_json::from_slice(&header_json).expect("json header");
     assert_eq!(header_val["alg"], "RS256");
     assert_eq!(header_val["kid"], "kid-1");
+    // The signer's certificate thumbprint, which Microsoft Entra finds the
+    // credential by, reaches the outbound client's assertion too.
+    assert_eq!(header_val["x5t#S256"], "cert-thumbprint");
 
     let payload_json = URL_SAFE_NO_PAD.decode(parts[1]).expect("base64 payload");
     let payload: serde_json::Value = serde_json::from_slice(&payload_json).expect("json payload");
@@ -567,6 +572,10 @@ async fn a_hung_token_endpoint_times_out_and_releases_the_gate() {
     let started = std::time::Instant::now();
     let err = client.get_access_token().await.expect_err("times out");
     assert!(matches!(err, OAuthClientError::Transport(_)), "got {err:?}");
+    assert!(
+        err.to_string().contains("100ms"),
+        "the message names the timeout as set: {err}"
+    );
     assert!(started.elapsed() < Duration::from_secs(3));
 
     // The gate is free: the next caller is not stuck behind the first.
@@ -684,4 +693,275 @@ async fn callers_are_served_the_unexpired_token_while_a_refresh_is_in_flight() {
         started.elapsed()
     );
     assert_eq!(refresher.await.unwrap().unwrap(), "second");
+}
+
+/// The token a `401` condemned is served to nobody while `force_refresh`
+/// fetches its replacement: a caller that arrives during the fetch waits for
+/// the fresh token instead of taking the condemned one from the cache.
+#[tokio::test]
+async fn callers_during_a_force_refresh_never_get_the_condemned_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "condemned", "expires_in": 3600 })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "fresh", "expires_in": 3600 }))
+                .set_delay(Duration::from_millis(400)),
+        )
+        .mount(&server)
+        .await;
+    let client = Arc::new(OutboundOAuthClient::new(token_url(&server), basic()).unwrap());
+    assert_eq!(client.get_access_token().await.unwrap(), "condemned");
+
+    let refresher = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.force_refresh().await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let during = client.get_access_token().await.unwrap();
+    assert_eq!(
+        during, "fresh",
+        "a caller during the forced refresh must not get the condemned token"
+    );
+    assert_eq!(refresher.await.unwrap().unwrap(), "fresh");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+/// After a `force_refresh` that failed, the condemned token stays out of
+/// service: the next call fetches instead of serving it from the cache.
+#[tokio::test]
+async fn a_failed_force_refresh_does_not_serve_the_condemned_token_afterwards() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "condemned", "expires_in": 3600 })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "fresh", "expires_in": 3600 })),
+        )
+        .mount(&server)
+        .await;
+    let client = OutboundOAuthClient::new(token_url(&server), basic()).unwrap();
+    assert_eq!(client.get_access_token().await.unwrap(), "condemned");
+
+    let failed = client.force_refresh().await;
+    assert!(
+        matches!(
+            failed,
+            Err(OAuthClientError::TokenEndpoint { status: 503, .. })
+        ),
+        "{failed:?}"
+    );
+    let next = client.get_access_token().await.unwrap();
+    assert_eq!(
+        next, "fresh",
+        "the condemned token must not come back from the cache after a failed refresh"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+/// Callers that waited for a fetch that failed take its failure: one fetch,
+/// one answer for all of them, not one fetch per waiter in turn, each under
+/// the full request timeout.
+#[tokio::test]
+async fn waiters_on_a_failed_fetch_share_its_outcome_instead_of_fetching_in_turn() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503).set_delay(Duration::from_millis(300)))
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        OutboundOAuthClient::new(token_url(&server), basic())
+            .unwrap()
+            .with_request_timeout(Duration::from_secs(2)),
+    );
+
+    let started = std::time::Instant::now();
+    let calls: Vec<_> = (0..6)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get_access_token().await })
+        })
+        .collect();
+    for call in calls {
+        let outcome = call.await.unwrap();
+        assert!(
+            matches!(
+                outcome,
+                Err(OAuthClientError::TokenEndpoint { status: 503, .. })
+            ),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "six callers that arrived together are one fetch, failed or not"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1200),
+        "the waiters did not fetch in turn ({:?})",
+        started.elapsed()
+    );
+}
+
+/// A refresh that fails while the cached token is still unexpired is not an
+/// error: the token serves until `expires_at`, and the next call tries the
+/// endpoint again. Once it has expired, the failure reaches the caller.
+#[tokio::test]
+async fn an_unexpired_token_outlives_a_failed_refresh_until_it_expires() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "first", "expires_in": 100 })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let clock = Arc::new(MockClock::at(t0()));
+    let client = OutboundOAuthClient::new(token_url(&server), basic())
+        .unwrap()
+        .with_clock(clock.clone())
+        .with_refresh_threshold(Duration::from_secs(30));
+    assert_eq!(client.get_access_token().await.unwrap(), "first");
+
+    // Due (t0 + 75 > refresh_at 70), not expired (< 100): the failed
+    // refresh answers the cached token.
+    clock.advance_secs(75);
+    let served = client.get_access_token().await;
+    assert_eq!(
+        served.as_deref().ok(),
+        Some("first"),
+        "a still-unexpired token answers a failed refresh: {served:?}"
+    );
+    // Each call tries again; the endpoint is still down.
+    clock.advance_secs(10);
+    assert_eq!(client.get_access_token().await.unwrap(), "first");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+
+    // Expired: nothing usable is cached, the failure is the answer.
+    clock.advance_secs(20);
+    let expired = client.get_access_token().await;
+    assert!(
+        matches!(
+            expired,
+            Err(OAuthClientError::TokenEndpoint { status: 503, .. })
+        ),
+        "{expired:?}"
+    );
+}
+
+/// A `401` reported late, about a token another caller has already replaced,
+/// condemns nothing: `force_refresh_of` keeps the replacement and makes no
+/// fetch. The same call about the token in the cache condemns it.
+#[tokio::test]
+async fn force_refresh_of_a_replaced_token_keeps_the_replacement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "first", "expires_in": 3600 })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "second", "expires_in": 3600 })),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "access_token": "third", "expires_in": 3600 })),
+        )
+        .mount(&server)
+        .await;
+    let client = OutboundOAuthClient::new(token_url(&server), basic()).unwrap();
+    assert_eq!(client.get_access_token().await.unwrap(), "first");
+    assert_eq!(client.force_refresh_of("first").await.unwrap(), "second");
+
+    // A late 401 about "first": "second" is in place and stays.
+    assert_eq!(client.force_refresh_of("first").await.unwrap(), "second");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+    // A 401 about the token in the cache condemns it.
+    assert_eq!(client.force_refresh_of("second").await.unwrap(), "third");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+/// A transport error names no URL: the token endpoint can carry a tenant
+/// path or a key in its query, and the error reaches adopter logs.
+#[tokio::test]
+async fn a_transport_error_names_no_url() {
+    // A port nothing listens on: bound, read, released.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/tenant-7f3a9c/token")).unwrap();
+    let client = OutboundOAuthClient::new(url, basic()).unwrap();
+    let err = client
+        .get_access_token()
+        .await
+        .expect_err("nothing listens");
+    let OAuthClientError::Transport(message) = &err else {
+        panic!("a connection refused is a transport error: {err:?}");
+    };
+    let shown = format!("{err} / {err:?}");
+    assert!(
+        !shown.contains("tenant-7f3a9c") && !shown.contains(&port.to_string()),
+        "the error names the URL: {message}"
+    );
+}
+
+/// The Basic credential is the secret in another spelling: it is zeroized
+/// on drop and redacted in `Debug`.
+#[test]
+fn basic_credentials_are_redacted_in_debug() {
+    let credentials = basic_credentials("axess-id", "Gnomes2+");
+    assert_eq!(&*credentials, "YXhlc3MtaWQ6R25vbWVzMiUyQg==");
+    assert!(
+        !format!("{credentials:?}").contains("YXhlc3MtaWQ6"),
+        "the credential is in Debug output: {credentials:?}"
+    );
+}
+
+/// The header built from the Basic credential is marked sensitive, so it
+/// is redacted wherever the request's headers are printed.
+#[test]
+fn the_basic_authorization_header_is_sensitive() {
+    let header = basic_authorization("axess-id", "Gnomes2+").unwrap();
+    assert_eq!(
+        header.to_str().unwrap(),
+        "Basic YXhlc3MtaWQ6R25vbWVzMiUyQg=="
+    );
+    assert!(header.is_sensitive(), "the header is marked sensitive");
 }

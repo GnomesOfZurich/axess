@@ -55,3 +55,6 @@ fuzz/Cargo.lock
 docs/book/
 /docs/mermaid.min.js
 /docs/mermaid-init.js
+
+# Conformance runner output: suite exports, example logs and the generated key
+scripts/conformance/out/

@@ -20,6 +20,7 @@
 - [FIDO2 and WebAuthn passkeys](factors/fido2.md)
 - [OAuth 2.0 and OIDC](factors/oauth.md)
 - [FAPI 2.0](factors/fapi.md)
+- [Conformance](factors/conformance.md)
 - [LDAP bind](factors/ldap.md)
 
 # Part IV: Authorization
@@ -49,6 +50,8 @@
   - [Inbound: mTLS-SVID](workload-identity/mtls-svid.md)
   - [Inbound: federation](workload-identity/federation.md)
   - [Cloud STS exchange](workload-identity/cloud-sts.md)
+  - [Walkthrough: Azure](workload-identity/azure.md)
+  - [Walkthrough: AWS](workload-identity/aws.md)
   - [Outbound: OAuth](workload-identity/outbound-oauth.md)
   - [Outbound: mTLS](workload-identity/outbound-mtls.md)
   - [Shared secrets: the last resort](workload-identity/shared-secrets.md)

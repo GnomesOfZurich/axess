@@ -187,6 +187,23 @@ where
         }
     }
 
+    /// Remove a live key only while `matches` accepts the stored value, in
+    /// one step under the map's shard lock. `None` for an absent or expired
+    /// key; otherwise whether `matches` accepted (and the entry was removed).
+    pub fn remove_live_if(&self, key: &K, matches: impl FnOnce(&V) -> bool) -> Option<bool> {
+        let now = self.clock.now();
+        match self.inner.entry(key.clone()) {
+            dashmap::Entry::Occupied(entry) if entry.get().expires_at > now => {
+                if !matches(&entry.get().value) {
+                    return Some(false);
+                }
+                entry.remove();
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
     /// Remove a key and report whether a live (unexpired) entry was removed.
     /// An expired entry is removed too but reported as `false`.
     pub fn remove_live(&self, key: &K) -> bool {

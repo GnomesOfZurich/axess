@@ -77,8 +77,8 @@ substring of `error`.
 `Expired` and `Suspicious` are unset for the same structural reason the
 adopter-emitted event names are. The paths where they would apply sit
 outside the service layer that owns the log: refresh-token expiry is
-`refresh_session`, a free function over a `RefreshTokenStore` with no
-audit sink in its signature, and a fingerprint mismatch comes from your
+`Refresh::run`, which runs over a `RefreshTokenStore` with no audit sink
+in its signature, and a fingerprint mismatch comes from your
 `DeviceResolver`. Use them when you write those rows; a SIEM rule that
 matches on them will not fire on anything axess wrote.
 
@@ -138,14 +138,21 @@ unknown identifier writes a tenant-attributed row with
 | `PasswordResetRequested` | `password_reset_requested` | axess |
 | `PasswordReset` | `password_reset` | axess |
 | `SignupStarted` | `signup_started` | axess |
+| `SignupResumed` | `signup_resumed` | axess |
 | `SignupCompleted` | `signup_completed` | axess |
 | `AccountSuspended` | `account_suspended` | axess |
 | `AccountActivated` | `account_activated` | axess |
+| `AccountDeleted` | `account_deleted` | axess |
 | `Impersonation` | `impersonation` | axess |
+
+`SignupResumed` is a resubmit from the session that started a signup still
+waiting for verification; nothing is created.
 
 `Impersonation` is the administrative act of assuming another
 user's identity, emitted on both the successful and the refused
-path.
+path. A refused credential change of an impersonated session (a refresh
+token, a factor enrolled or deleted) and a refused second impersonation
+carry the reason `impersonated`, whichever operation was refused.
 
 ### Sessions
 

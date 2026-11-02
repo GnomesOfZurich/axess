@@ -1,10 +1,17 @@
-//! Per-request session lifecycle helpers.
+//! Per-request session lifecycle: the stages `SessionService::call`
+//! coordinates, each a `pub(crate)` free function taking narrow inputs
+//! (`HeaderMap`, the request's fingerprints, the service's dependencies by
+//! reference) so it can be tested without axum.
 //!
-//! Three `pub(crate)` free helpers that name the load / finalize /
-//! cookie-write stages of `SessionService::call`, taking narrow inputs
-//! (`HeaderMap`, fingerprint `Option<&str>`, and `&SessionService` deps
-//! by reference) so the `call` body shrinks to a coordinator and each
-//! stage is individually testable without axum.
+//! - Load: [`load_session`], here, verifies the cookie, loads the row and
+//!   applies the fingerprint, age and registry checks.
+//! - Finalize: [`finalize_session`], in `finalize`, saves, swaps or cycles
+//!   the row for the response.
+//! - Registry: [`settle_registry`], in `registry`, moves the registry entry
+//!   of a session whose id rotated.
+//! - Cookie: [`apply_session_cookie`] and [`build_set_cookie`], here, write
+//!   the `Set-Cookie` header, and [`mark_cookie_response`] keeps a response
+//!   that sets a cookie out of shared caches.
 //!
 //! Load invariant: fresh-mint absorbs every failure mode, so the
 //! handler never runs under a client-supplied id we don't trust the
@@ -14,12 +21,8 @@ use crate::cookies::MAX_COOKIE_VALUE_BYTES;
 use crate::session::config::SessionConfig;
 use crate::session::data::SessionData;
 use crate::session::id::SessionId;
-use crate::session::layer::handle::SessionHandle;
 use crate::session::layer::signing::SigningKeyRing;
-use crate::session::store::{
-    ConditionalUpdate, CycleOutcome, SessionLiveness, SessionRegistryHandle, SessionStore,
-    note_revocation,
-};
+use crate::session::store::{SessionLiveness, SessionRegistryHandle, SessionStore};
 use axess_clock::Clock;
 use axess_rng::SecureRng;
 use subtle::ConstantTimeEq;
@@ -90,13 +93,21 @@ pub(crate) struct LoadOutcome {
     /// row has been deleted; the response replaces the client's cookie with
     /// one for the fresh guest.
     pub(crate) session_ended: bool,
+    /// The row as the store held it, when the load was trusted (`Some`
+    /// exactly when `existing_id` is): before migration and re-binding. It
+    /// is the base against which this request's changes are merged when a
+    /// write finds the row changed by a concurrent request.
+    pub(crate) loaded_row: Option<SessionData>,
 }
 
 /// Outcome of [`finalize_session`].
 ///
 /// `final_id` is the id the response cookie should carry.
-/// `session_changed` toggles whether the session is persisted and a
-/// `Set-Cookie` header is emitted.
+/// `session_changed` says whether the response sets the session cookie: the
+/// session was created or changed and its row was written. A write that
+/// failed, found the row gone, or lost to concurrent writes sets no cookie;
+/// the one exception is a failed rotation, whose cookie replaces the retired
+/// id in the client's jar with one no row backs.
 pub(crate) struct FinalizeOutcome {
     pub(crate) final_id: SessionId,
     pub(crate) session_changed: bool,
@@ -160,9 +171,11 @@ where
         .unwrap_or(false);
 
     let mut session_ended = false;
+    let mut loaded_row = None;
     let (mut existing_id, mut session_data) = if let Some(verified) = verified {
         match store.load(&verified.id).await {
             Ok(Some(mut data)) => {
+                let row = data.clone();
                 if data.migrate() {
                     tracing::debug!(
                         new_version = data.version,
@@ -170,7 +183,10 @@ where
                     );
                 }
                 match authenticated_session_verdict(&data, config, policy, &verified.id).await {
-                    SessionVerdict::Keep => (Some(verified.id), data),
+                    SessionVerdict::Keep => {
+                        loaded_row = Some(row);
+                        (Some(verified.id), data)
+                    }
                     SessionVerdict::End => {
                         // Revoked or too old: the row must not stay
                         // Authenticated, so it goes now (best effort), and the
@@ -263,6 +279,8 @@ where
         binding_invalidated,
         rotation_fallback_used,
         session_ended,
+        // A binding mismatch distrusts the row after it loaded.
+        loaded_row: existing_id.and(loaded_row),
     }
 }
 
@@ -289,16 +307,24 @@ async fn authenticated_session_verdict(
     let crate::session::data::AuthState::Authenticated {
         user_id,
         authn_time,
+        impersonator,
         ..
     } = &data.auth_state
     else {
         return SessionVerdict::Keep;
     };
-    if let Some(max_age) = config.max_authenticated_age
-        && let Ok(max_age) = chrono::Duration::from_std(max_age)
-        && policy.clock.now().signed_duration_since(*authn_time) > max_age
-    {
+    let outlived = |cap: Option<std::time::Duration>, since: &chrono::DateTime<chrono::Utc>| {
+        cap.and_then(|cap| chrono::Duration::from_std(cap).ok())
+            .is_some_and(|cap| policy.clock.now().signed_duration_since(*since) > cap)
+    };
+    if outlived(config.max_authenticated_age, authn_time) {
         tracing::info!("authenticated session outlived its absolute age cap; ending it");
+        return SessionVerdict::End;
+    }
+    if let Some(crate::session::data::Impersonation { since, .. }) = impersonator
+        && outlived(config.max_impersonation_age, since)
+    {
+        tracing::info!("impersonated session outlived the impersonation age cap; ending it");
         return SessionVerdict::End;
     }
     let Some(registry) = policy.registry else {
@@ -317,252 +343,11 @@ async fn authenticated_session_verdict(
     }
 }
 
-/// Enforce the custom-data size cap, then decide save vs cycle vs
-/// fail-closed for the response.
-///
-/// `existing_id` is the trusted id from [`load_session`]'s outcome:
-/// `None` means "no trusted prior session", a fresh guest whose id was
-/// already minted safely by `load_session` (never the client's cookie
-/// id). Its data is *saved* under that same id; the response cookie
-/// carries it unchanged. This is deliberate: a CSRF token minted during
-/// the request is HMAC-bound to this id, so minting a *second*, different
-/// id for the response cookie here would invalidate that token and 403
-/// the next state-changing request (the login POST). Only `guard.regenerate`
-/// (handler-side `rotate_id`, or binding invalidation) forces an id change.
-///
-/// Cycle order matters: the handler-side state-transition methods
-/// already minted the new id and stashed the old one in
-/// `pre_cycle_id` (see
-/// [`SessionInner::rotate_id`](super::handle::SessionInner::rotate_id)).
-/// The store's `cycle` then takes `(old, new, data)` so handler code
-/// that registered with the new id keys the registry against the
-/// post-rotation value. Fallback path for `regenerate` without a
-/// stashed `pre_cycle_id` (binding-mismatch reset) mints fresh here.
-///
-/// Cycle failure: fail closed by clearing the session to Guest and
-/// keeping the old id. Keeping the old id + new data would bypass
-/// session fixation prevention.
-pub(crate) async fn finalize_session<S>(
-    store: &S,
-    config: &SessionConfig,
-    metrics: Option<&dyn crate::metrics::AuthnMetrics>,
-    clock: &dyn Clock,
-    handle: &SessionHandle,
-    existing_id: Option<SessionId>,
-    rng: &dyn SecureRng,
-) -> FinalizeOutcome
-where
-    S: SessionStore + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    let mut guard = handle.0.write().await;
+mod finalize;
+mod registry;
 
-    enforce_custom_cap(&mut guard, config, existing_id.is_none());
-
-    // A request without a trusted session persists the fresh guest and sets a
-    // cookie only when something needs it (a modification, a CSRF token bound
-    // to the id, a handler that read the id); an untouched cookieless request
-    // leaves the store empty and the response without `Set-Cookie`.
-    let fresh_needed = existing_id.is_none() && (guard.modified || guard.needs_persist);
-    // A stored session that only read, and whose row has not been re-armed
-    // for half its lifetime, is refreshed so that activity keeps it alive.
-    let now = clock.now();
-    let touch_due = existing_id.is_some()
-        && !guard.modified
-        && !guard.regenerate
-        && touch_is_due(guard.data.touched_at, now, config.ttl);
-    let mut session_changed = guard.modified || guard.regenerate || fresh_needed || touch_due;
-    let loaded_revision = guard.data.revision;
-    if session_changed {
-        // Every write moves the revision and the refresh stamp, so a
-        // compare-and-swap on the revision sees any intervening write.
-        guard.data.revision = guard.data.revision.wrapping_add(1);
-        guard.data.touched_at = Some(now);
-    }
-    if session_changed
-        && (guard.regenerate || existing_id.is_none())
-        && let Some(m) = metrics
-    {
-        m.session_created();
-    }
-
-    let mut rotation = None;
-    let final_id = if session_changed {
-        if guard.regenerate {
-            let (new_id, moved) = cycle_session(store, config, &mut guard, existing_id, rng).await;
-            rotation = moved;
-            new_id
-        } else if existing_id.is_some() {
-            // The request ran under a stored session: replace it only while
-            // it is still stored. A delete that landed while the request ran
-            // (logout, administrator revocation) is final, and the response
-            // does not re-issue a cookie for the ended session.
-            let written = if touch_due {
-                refresh_idle_expiry(store, &guard, loaded_revision, config.ttl).await
-            } else {
-                store.update(&guard.id, &guard.data, config.ttl).await
-            };
-            match written {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::info!("session was ended while its request ran; changes discarded");
-                    guard.data = SessionData::default();
-                    session_changed = false;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "session store update failed; session changes may be lost"
-                    );
-                }
-            }
-            guard.id
-        } else {
-            // A fresh guest: `existing_id` is `None`, so its id was minted
-            // safely by `load_session` (never the client-supplied cookie id:
-            // session fixation is prevented there and, on privilege change, by
-            // the `regenerate` branch above). Keeping it, rather than minting
-            // a second, different id for the response cookie, is what lets a
-            // CSRF token minted *during* this request (bound to the same id)
-            // still validate on the client's next request. Minting a fresh id
-            // here would orphan both the token and any handler-time work keyed
-            // to `guard.id`, and every subsequent state-changing request would
-            // 403 until the cookie expired.
-            if let Err(e) = store.save(&guard.id, &guard.data, config.ttl).await {
-                tracing::warn!(
-                    error = %e,
-                    "session store save failed; session changes may be lost"
-                );
-            }
-            guard.id
-        }
-    } else {
-        guard.id
-    };
-
-    FinalizeOutcome {
-        final_id,
-        session_changed,
-        rotation,
-    }
-}
-
-/// Write a rotated session under its new id and retire the old row, failing
-/// closed. Returns the id the response cookie carries and, for a session
-/// that stayed authenticated, the registry entry to move.
-async fn cycle_session<S>(
-    store: &S,
-    config: &SessionConfig,
-    guard: &mut tokio::sync::RwLockWriteGuard<'_, super::handle::SessionInner>,
-    existing_id: Option<SessionId>,
-    rng: &dyn SecureRng,
-) -> (SessionId, Option<Rotation>)
-where
-    S: SessionStore + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    let mut rotation = None;
-    let old_id = guard.pre_cycle_id.take().unwrap_or_else(|| {
-        let prev = guard.id;
-        guard.id = SessionId::new(rng);
-        prev
-    });
-    let new_id = guard.id;
-    // A request that ran under a stored session requires that row to
-    // still be live: a logout that removed it while the request ran
-    // must not be undone by moving the data to the new id.
-    let require_old = existing_id.is_some();
-    match store
-        .cycle(&old_id, &new_id, &guard.data, config.ttl, require_old)
-        .await
-    {
-        Ok(CycleOutcome::Rotated) => {
-            if guard.data.auth_state.is_authenticated()
-                && let Some(user_id) = guard.data.auth_state.user_id()
-                && old_id != new_id
-            {
-                rotation = Some(Rotation {
-                    user_id: *user_id,
-                    old_id,
-                    new_id,
-                });
-            }
-            (new_id, rotation)
-        }
-        Ok(CycleOutcome::SessionGone) => {
-            tracing::info!(
-                "session was ended while its request ran; \
-                     not carrying it over to the rotated id"
-            );
-            guard.data = SessionData::default();
-            (new_id, None)
-        }
-        Err(e) => {
-            // Fail closed in the STORE as well as in this response: the
-            // row under `old_id` may still say Authenticated, so the old
-            // id is deleted (best effort) and never re-issued; the cookie
-            // carries the new id, which no row backs, so the next request
-            // is a guest.
-            tracing::error!(
-                error = %e,
-                "session store cycle failed; clearing session (fail closed)"
-            );
-            if let Err(e) = store.delete(&old_id).await {
-                tracing::error!(
-                    error = %e,
-                    "session store delete after a failed cycle also failed; \
-                     the old session id may authenticate until its TTL"
-                );
-            }
-            guard.data = SessionData::default();
-            (new_id, None)
-        }
-    }
-}
-
-/// Whether a stored session that only read has gone half its lifetime
-/// without its row being re-armed. A session that carries no stamp (stored
-/// before the stamp existed) is due at once; a stamp in the future (a clock
-/// step) is not.
-fn touch_is_due(
-    touched_at: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-    ttl: std::time::Duration,
-) -> bool {
-    let Some(touched_at) = touched_at else {
-        return true;
-    };
-    let Ok(half) = chrono::Duration::from_std(ttl / 2) else {
-        return false;
-    };
-    now.signed_duration_since(touched_at) >= half
-}
-
-/// Re-arm the row of a session that did not change, without clobbering a
-/// concurrent request's write: the write is a compare-and-swap on the
-/// revision the request loaded, so when another request wrote meanwhile
-/// (and re-armed the row itself) this one writes nothing. `Ok(false)` when
-/// the row is gone.
-async fn refresh_idle_expiry<S>(
-    store: &S,
-    guard: &tokio::sync::RwLockWriteGuard<'_, super::handle::SessionInner>,
-    loaded_revision: u64,
-    ttl: std::time::Duration,
-) -> Result<bool, S::Error>
-where
-    S: SessionStore + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    Ok(
-        match store
-            .update_if_revision(&guard.id, loaded_revision, &guard.data, ttl)
-            .await?
-        {
-            ConditionalUpdate::Written | ConditionalUpdate::Conflict => true,
-            ConditionalUpdate::Gone => false,
-        },
-    )
-}
+pub(crate) use finalize::finalize_session;
+pub(crate) use registry::settle_registry;
 
 /// Keep a response that sets a session or CSRF cookie out of shared caches.
 ///
@@ -584,83 +369,6 @@ pub(crate) fn mark_cookie_response(headers: &mut axum::http::HeaderMap) {
     });
     if !varies_on_cookie {
         headers.append(header::VARY, HeaderValue::from_static("Cookie"));
-    }
-}
-
-/// Enforce the custom-data size cap on every path that writes the session.
-///
-/// Every write path is covered, not only a handler's own modification: data
-/// loaded from the store or migrated can be oversized too, and a session
-/// saved because it was regenerated or must persist writes it back.
-fn enforce_custom_cap(
-    guard: &mut tokio::sync::RwLockWriteGuard<'_, super::handle::SessionInner>,
-    config: &SessionConfig,
-    fresh: bool,
-) {
-    let will_write = guard.modified || guard.regenerate || (fresh && guard.needs_persist);
-    if config.max_custom_bytes > 0 && will_write {
-        let custom_size = crate::session::data::json_byte_len(&guard.data.custom);
-        if custom_size > config.max_custom_bytes {
-            tracing::warn!(
-                custom_size,
-                max = config.max_custom_bytes,
-                "session custom data exceeds size limit; clearing custom data"
-            );
-            guard.data.custom = serde_json::Value::default();
-        }
-    }
-}
-
-/// Move the registry entry of a rotated, still-authenticated session from
-/// its old id to its new one. Returns `false` when the registry could not
-/// track the new id: the session has then been deleted (fail closed) and
-/// must not get a cookie.
-pub(crate) async fn move_registry_entry<S>(
-    store: &S,
-    registry: &dyn SessionRegistryHandle,
-    rotation: &Rotation,
-) -> bool
-where
-    S: SessionStore + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    if registry.liveness(&rotation.user_id, &rotation.old_id).await != SessionLiveness::Valid {
-        return true;
-    }
-    if registry.register(&rotation.user_id, &rotation.new_id).await {
-        note_revocation(
-            registry
-                .invalidate_session(&rotation.user_id, &rotation.old_id)
-                .await,
-            "moving a rotated session's registry entry",
-        );
-        return true;
-    }
-    tracing::error!(
-        "registering the rotated session failed; ending it rather than leaving it untracked"
-    );
-    if let Err(e) = store.delete(&rotation.new_id).await {
-        tracing::error!(error = %e, "deleting the untracked session failed");
-    }
-    false
-}
-
-/// Move the registry entry of a session that stayed authenticated across an
-/// id change, which is still registered under its old id. Returns whether
-/// the session may get a cookie: `false` when the registry could not track
-/// the new id and the session was ended instead.
-pub(crate) async fn settle_registry<S>(
-    store: &S,
-    registry: Option<&dyn SessionRegistryHandle>,
-    outcome: &FinalizeOutcome,
-) -> bool
-where
-    S: SessionStore + Send + Sync + 'static,
-    S::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    match (registry, &outcome.rotation) {
-        (Some(registry), Some(rotation)) => move_registry_entry(store, registry, rotation).await,
-        _ => true,
     }
 }
 
@@ -723,3 +431,6 @@ mod helper_tests;
 
 #[cfg(test)]
 mod policy_tests;
+
+#[cfg(test)]
+mod concurrency_tests;

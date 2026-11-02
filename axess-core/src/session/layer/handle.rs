@@ -6,63 +6,13 @@
 //! `SessionInner` itself stays `pub(crate)` so external code can only
 //! reach it through the typed `AuthSession` extractor surface.
 
+use super::swap::{Swap, SwapStore, Swapped, swap_merging};
 use crate::session::data::SessionData;
 use crate::session::id::SessionId;
-use crate::session::store::{ConditionalUpdate, SessionStore};
 use axess_rng::SecureRng;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-
-/// How often a consumption retries after losing a compare-and-swap to a
-/// concurrent write that left the value in place.
-const CONSUME_ATTEMPTS: usize = 3;
-
-/// The two store operations a handler-time consumption needs, erased so the
-/// per-request state does not carry the store's type.
-pub(crate) trait ErasedSessionStore: Send + Sync {
-    fn load<'a>(
-        &'a self,
-        id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionData>, String>> + Send + 'a>>;
-
-    fn update_if_revision<'a>(
-        &'a self,
-        id: &'a SessionId,
-        expected_revision: u64,
-        data: &'a SessionData,
-        ttl: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<ConditionalUpdate, String>> + Send + 'a>>;
-}
-
-impl<S: SessionStore> ErasedSessionStore for S {
-    fn load<'a>(
-        &'a self,
-        id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionData>, String>> + Send + 'a>> {
-        Box::pin(async move {
-            SessionStore::load(self, id)
-                .await
-                .map_err(|e| e.to_string())
-        })
-    }
-
-    fn update_if_revision<'a>(
-        &'a self,
-        id: &'a SessionId,
-        expected_revision: u64,
-        data: &'a SessionData,
-        ttl: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<ConditionalUpdate, String>> + Send + 'a>> {
-        Box::pin(async move {
-            SessionStore::update_if_revision(self, id, expected_revision, data, ttl)
-                .await
-                .map_err(|e| e.to_string())
-        })
-    }
-}
 
 /// The per-request session handle injected into request extensions.
 ///
@@ -122,13 +72,18 @@ pub(crate) struct SessionInner {
 /// The stored row of a session, as far as a handler-time consumption needs it.
 #[derive(Clone)]
 pub(crate) struct ConsumeTarget {
-    pub(crate) store: Arc<dyn ErasedSessionStore>,
+    pub(crate) store: Arc<dyn SwapStore>,
     /// Lifetime given to a row written by a consumption.
     pub(crate) ttl: Duration,
-    /// `true` when a row for this session is stored (the request arrived
-    /// with a session the layer trusted). It lives under the id the session
-    /// held at request entry, whatever rotation happened since.
-    pub(crate) row_stored: bool,
+    /// The row as this request last saw it stored: as loaded (the request
+    /// arrived with a session the layer trusted), then as each write of this
+    /// request left it; `None` for a fresh guest. The row lives under the id
+    /// the session held at request entry, whatever rotation happened since.
+    /// A write that finds the row changed by a concurrent request merges this
+    /// request's changes onto the stored row with this as the base (see
+    /// [`swap_merging`]), so it must move forward with every write: a value
+    /// a merge brought in from another request is not this request's change.
+    pub(crate) loaded: Option<SessionData>,
 }
 
 impl SessionHandle {
@@ -140,62 +95,62 @@ impl SessionHandle {
 }
 
 impl SessionInner {
-    /// The id the stored row sits under, when there is one.
-    fn row_id(&self) -> Option<SessionId> {
-        self.consume
-            .as_ref()
-            .is_some_and(|c| c.row_stored)
-            .then(|| self.pre_cycle_id.unwrap_or(self.id))
-    }
-
     /// Remove `key` from the custom bag and return its value, so that of any
     /// number of requests holding the same session exactly one gets it.
     ///
     /// A value held in memory only (a guest session nothing has stored yet,
     /// or a handle without a layer) is simply removed. For a stored session
     /// the removal is first written to the store as a compare-and-swap on the
-    /// session's revision: the request that wins gets the value, one that
-    /// loses re-reads the row and gets `None` when the value is already gone
-    /// (or retries when a concurrent write left it in place). A store that
-    /// cannot answer, or a session ended meanwhile, gives `None`: failing
-    /// closed means a one-shot ceremony has to be started again, never that
-    /// it runs twice.
+    /// session's revision: the request that wins gets the value. One that
+    /// loses re-reads the row: when the value is already gone it gets `None`;
+    /// when a concurrent write left it in place, the value handed out is the
+    /// one stored now (never the copy this request loaded, which another
+    /// request may have taken and replaced), and the retry writes the stored
+    /// row with this request's own changes merged on top, so the concurrent
+    /// write is kept. A store that cannot answer, or a session ended
+    /// meanwhile, gives `None`: failing closed means a one-shot ceremony has
+    /// to be started again, never that it runs twice.
     pub(crate) async fn consume_custom(&mut self, key: &str) -> Option<serde_json::Value> {
         let value = self.data.custom.as_object_mut()?.remove(key)?;
         self.modified = true;
-        let (Some(target), Some(row)) = (self.consume.clone(), self.row_id()) else {
+        let Some(ConsumeTarget {
+            store,
+            ttl,
+            loaded: Some(base),
+        }) = self.consume.clone()
+        else {
             return Some(value);
         };
-        let ConsumeTarget { store, ttl, .. } = target;
-        for _ in 0..CONSUME_ATTEMPTS {
-            let mut next = self.data.clone();
-            next.revision = next.revision.wrapping_add(1);
-            let swapped = store
-                .update_if_revision(&row, self.data.revision, &next, ttl)
-                .await;
-            match swapped {
-                Ok(ConditionalUpdate::Written) => {
-                    self.data.revision = next.revision;
-                    return Some(value);
+        let mut taken = Some(value);
+        let swap = Swap {
+            row: &self.pre_cycle_id.unwrap_or(self.id),
+            base: Some(&base),
+            local: &self.data,
+            expected: self.data.revision,
+            ttl,
+            max_custom_bytes: self.max_custom_bytes,
+        };
+        // A conflict reads the row again: the value handed out is the one
+        // stored now, and none at all when a concurrent request took it.
+        let outcome = swap_merging(&*store, swap, |fresh| {
+            taken = fresh.custom.as_object_mut().and_then(|c| c.remove(key));
+            taken.is_some()
+        })
+        .await;
+        match outcome {
+            Ok(Swapped::Written(written)) => {
+                self.data = (*written).clone();
+                if let Some(target) = self.consume.as_mut() {
+                    target.loaded = Some(*written);
                 }
-                Ok(ConditionalUpdate::Gone) => return None,
-                Ok(ConditionalUpdate::Conflict) => match store.load(&row).await {
-                    Ok(Some(fresh)) if fresh.custom.get(key).is_some() => {
-                        self.data.revision = fresh.revision;
-                    }
-                    Ok(_) => return None,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "re-reading a session after a conflict failed; the value is not handed out");
-                        return None;
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "consuming session state failed; the value is not handed out");
-                    return None;
-                }
+                taken
+            }
+            Ok(Swapped::Gone | Swapped::Conflict | Swapped::Declined) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "consuming session state failed; the value is not handed out");
+                None
             }
         }
-        None
     }
 
     /// Mint a new session id, swap it into `self.id`, and stash the old id
@@ -210,4 +165,48 @@ impl SessionInner {
         self.id = new_id;
         self.regenerate = true;
     }
+
+    /// [`AuthSession::set_custom`](crate::session::AuthSession::set_custom)
+    /// for a caller that already holds the session's write lock, so the
+    /// write lands in the same critical section as a state change it belongs
+    /// with.
+    pub(crate) fn set_custom_value(&mut self, key: String, value: serde_json::Value) -> bool {
+        // The bag is an object; one that was stored as another JSON type is
+        // replaced by an empty object, as `mutate_custom` does, rather than
+        // indexed (which panics on an array or a scalar).
+        if !self.data.custom.is_object() {
+            self.data.custom = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let limit = self.max_custom_bytes;
+        if limit > 0 {
+            // Speculatively apply the change, check size, and rollback if over limit.
+            let prev = self.data.custom.get(&key).cloned();
+            self.data.custom[key.clone()] = value;
+            let size = crate::session::data::json_byte_len(&self.data.custom);
+            if size > limit {
+                // Rollback.
+                match prev {
+                    Some(v) => self.data.custom[key] = v,
+                    None => {
+                        if let Some(obj) = self.data.custom.as_object_mut() {
+                            obj.remove(&key);
+                        }
+                    }
+                }
+                tracing::warn!(
+                    size,
+                    max = limit,
+                    "set_custom rejected; would exceed max_custom_bytes"
+                );
+                return false;
+            }
+        } else {
+            self.data.custom[key] = value;
+        }
+        self.modified = true;
+        true
+    }
 }
+
+#[cfg(test)]
+mod consume_tests;

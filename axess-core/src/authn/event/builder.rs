@@ -290,7 +290,14 @@ impl AuthEventBuilder {
     /// This is the preferred way to enrich events: call
     /// [`AuditContext`](super::AuditContext) (or the
     /// async variant) once per request, then pass the result here.
+    ///
+    /// A context carrying an impersonator names them as the actor of an
+    /// event that set none itself, so an action taken under impersonation
+    /// is never recorded as the user's own.
     pub fn with_audit_context(mut self, ctx: &AuditContext) -> Self {
+        if self.actor_id.is_none() {
+            self.actor_id = ctx.impersonator;
+        }
         if let Some(ip) = &ctx.ip_address {
             self.ip_address = Some(*ip);
             self.ip_source = ctx.ip_source;

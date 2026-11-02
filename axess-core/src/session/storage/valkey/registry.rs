@@ -5,9 +5,9 @@
 //! eviction ordering) and the pub/sub revocation channel layout.
 
 use super::internal::{
-    DEFAULT_PREFIX, ValkeyStoreError, registry_cutoff_ms, registry_key, registry_key_ttl_secs,
-    registry_member_live, registry_member_ttl_ms, revocation_session_channel,
-    revocation_user_channel,
+    DEFAULT_PREFIX, ValkeyStoreError, after_degraded_poll, degraded_poll_delay, registry_cutoff_ms,
+    registry_key, registry_key_ttl_secs, registry_member_live, registry_member_ttl_ms,
+    revocation_session_channel, revocation_user_channel,
 };
 use super::subscriber::{Event, SharedSubscriber};
 use crate::session::{id::SessionId, store::SessionRegistry};
@@ -137,10 +137,21 @@ impl ValkeySessionRegistry {
     /// spread their registry reads over that window instead of issuing them
     /// together.
     pub(super) fn recheck_delay(&self) -> Duration {
+        Duration::from_millis(self.draw() % (RECHECK_JITTER_MAX_MS + 1))
+    }
+
+    /// The wait before a degraded watcher's next poll of the registry, after
+    /// `failed_polls` consecutive polls the registry did not answer: see
+    /// [`degraded_poll_delay`].
+    pub(super) fn degraded_poll_delay(&self, failed_polls: u32) -> Duration {
+        degraded_poll_delay(failed_polls, self.draw())
+    }
+
+    /// One draw from the injected random source.
+    fn draw(&self) -> u64 {
         let mut bytes = [0u8; 4];
         self.rng.fill_bytes(&mut bytes);
-        let draw = u64::from(u32::from_le_bytes(bytes));
-        Duration::from_millis(draw % (RECHECK_JITTER_MAX_MS + 1))
+        u64::from(u32::from_le_bytes(bytes))
     }
 }
 
@@ -293,12 +304,7 @@ impl SessionRegistry for ValkeySessionRegistry {
 
         let Some(watch) = self
             .subscriber
-            .join(
-                &self.client,
-                &self.prefix,
-                [user_channel, session_channel],
-                self.clock.now(),
-            )
+            .join(&self.client, &self.prefix, [user_channel, session_channel])
             .await
         else {
             // No subscriber connection: poll the registry until the session
@@ -307,11 +313,14 @@ impl SessionRegistry for ValkeySessionRegistry {
                 target: "axess::session::valkey",
                 "revocation subscriber unavailable; polling the registry"
             );
+            let mut failed_polls = 0;
             loop {
-                tokio::time::sleep(DEGRADED_POLL).await;
-                if let Ok(false) = self.is_valid(user_id, session_id).await {
+                tokio::time::sleep(self.degraded_poll_delay(failed_polls)).await;
+                let answer = self.is_valid(user_id, session_id).await;
+                let Some(next) = after_degraded_poll(answer, failed_polls) else {
                     return;
-                }
+                };
+                failed_polls = next;
             }
         };
 
@@ -324,16 +333,20 @@ impl SessionRegistry for ValkeySessionRegistry {
         }
 
         // After the connection is lost, the watcher polls the registry on a
-        // timer until a replacement flags it for a recheck.
-        let mut degraded = false;
+        // timer until a replacement flags it for a recheck. `degraded` holds
+        // the count of consecutive polls the registry did not answer, which
+        // each wait backs off on.
+        let mut degraded: Option<u32> = None;
         loop {
-            let event = if degraded {
+            let event = if let Some(failed_polls) = degraded {
                 tokio::select! {
                     event = watch.slot.next() => event,
-                    () = tokio::time::sleep(DEGRADED_POLL) => {
-                        if let Ok(false) = self.is_valid(user_id, session_id).await {
+                    () = tokio::time::sleep(self.degraded_poll_delay(failed_polls)) => {
+                        let answer = self.is_valid(user_id, session_id).await;
+                        let Some(next) = after_degraded_poll(answer, failed_polls) else {
                             return;
-                        }
+                        };
+                        degraded = Some(next);
                         continue;
                     }
                 }
@@ -347,7 +360,7 @@ impl SessionRegistry for ValkeySessionRegistry {
                 // its own so a burst does not turn into one instant of
                 // checks from every watcher.
                 Event::Recheck => {
-                    degraded = false;
+                    degraded = None;
                     tokio::time::sleep(self.recheck_delay()).await;
                     if let Ok(false) = self.is_valid(user_id, session_id).await {
                         return;
@@ -355,15 +368,11 @@ impl SessionRegistry for ValkeySessionRegistry {
                 }
                 // The connection is gone: poll the registry until a
                 // replacement connection flags this watcher for a recheck.
-                Event::Closed => degraded = true,
+                Event::Closed => degraded = Some(0),
             }
         }
     }
 }
-
-/// How often a watcher without a subscriber connection asks the registry
-/// whether its session is still valid.
-const DEGRADED_POLL: Duration = Duration::from_secs(5);
 
 // ── HealthCheck ──────────────────────────────────────────────────────────────
 

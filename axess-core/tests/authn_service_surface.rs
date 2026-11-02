@@ -346,6 +346,126 @@ async fn ldap_factor_completes_login_with_valid_bind_dn_override() {
     );
 }
 
+/// LDAP factor: the groups the directory returns for the bind are kept on
+/// the authenticated session, where the application maps them to roles.
+#[cfg(feature = "ldap")]
+#[tokio::test]
+async fn ldap_groups_from_the_bind_are_readable_on_the_authenticated_session() {
+    use axess_core::authn::factor::LdapBindFactorConfig;
+    use axess_factors::ldap::MockLdapProvider;
+
+    let bind_dn = "uid=alice,ou=people,dc=example,dc=com";
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(
+            user_scope(),
+            FactorConfig::LdapBind(LdapBindFactorConfig {
+                bind_dn: Some(bind_dn.to_string()),
+            }),
+        )
+        .with_method(
+            &uid("u1"),
+            AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
+        );
+    let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", vec!["admins"]);
+    let svc = AuthnService::builder(identity, factors)
+        .with_ldap(ldap)
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+    let cred = FactorCredential::Password(ZeroizedString::new("ldap-secret"));
+    let outcome = svc.verify_factor(&cred, &session).await.unwrap();
+    assert!(
+        matches!(outcome, FactorOutcome::Authenticated),
+        "{outcome:?}"
+    );
+    assert!(session.is_authenticated().await);
+    assert_eq!(
+        session.ldap_groups().await,
+        Some(vec!["admins".to_string()]),
+        "the groups the bind returned must reach the application"
+    );
+}
+
+/// A session authenticated through an LDAP bind that returned `groups`.
+#[cfg(feature = "ldap")]
+async fn ldap_login_with_groups(groups: Vec<&str>) -> axess_core::session::AuthSession {
+    use axess_core::authn::factor::LdapBindFactorConfig;
+    use axess_factors::ldap::MockLdapProvider;
+
+    let bind_dn = "uid=alice,ou=people,dc=example,dc=com";
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(
+            user_scope(),
+            FactorConfig::LdapBind(LdapBindFactorConfig {
+                bind_dn: Some(bind_dn.to_string()),
+            }),
+        )
+        .with_method(
+            &uid("u1"),
+            AuthMethod::sequential("ldap", vec![FactorKind::LdapBind], user_scope()),
+        );
+    let ldap = MockLdapProvider::new(bind_dn).with_user("alice", "ldap-secret", groups);
+    let svc = AuthnService::builder(identity, factors)
+        .with_ldap(ldap)
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+    let cred = FactorCredential::Password(ZeroizedString::new("ldap-secret"));
+    let outcome = svc.verify_factor(&cred, &session).await.unwrap();
+    assert!(
+        matches!(outcome, FactorOutcome::Authenticated),
+        "{outcome:?}"
+    );
+    session
+}
+
+/// The groups are part of the authenticated state: a handler writing the
+/// custom data cannot replace them.
+#[cfg(feature = "ldap")]
+#[tokio::test]
+async fn ldap_groups_cannot_be_overwritten_through_the_custom_data() {
+    let session = ldap_login_with_groups(vec!["staff"]).await;
+
+    assert!(
+        session
+            .set_custom("axess.ldap.groups", serde_json::json!(["admins"]))
+            .await
+    );
+    session.clear_custom().await;
+
+    assert_eq!(
+        session.ldap_groups().await,
+        Some(vec!["staff".to_string()]),
+        "the directory's answer stands"
+    );
+}
+
+/// A user in more groups than the custom-data cap holds keeps them: the cap
+/// does not apply to the authenticated state.
+#[cfg(feature = "ldap")]
+#[tokio::test]
+async fn ldap_groups_beyond_the_custom_data_cap_are_kept() {
+    let names: Vec<String> = (0..4000)
+        .map(|n| format!("cn=group-{n:05},ou=groups,dc=example,dc=com"))
+        .collect();
+    assert!(
+        serde_json::to_vec(&names).unwrap().len() > 64 * 1024,
+        "the list exceeds the session's custom-data cap"
+    );
+    let session = ldap_login_with_groups(names.iter().map(String::as_str).collect()).await;
+
+    assert_eq!(session.ldap_groups().await, Some(names));
+}
+
 /// LDAP factor: a `bind_dn` override that is fully DN-safe but missing the
 /// structural `=` separator must be rejected with `InvalidCredential` even
 /// when the mock would otherwise accept the bind.

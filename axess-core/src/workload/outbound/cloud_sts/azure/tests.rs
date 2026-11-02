@@ -17,7 +17,7 @@ fn endpoint(server: &MockServer) -> Url {
 
 #[test]
 fn default_endpoint_uses_public_cloud_login_url() {
-    let client = AzureFicClient::new("my-tenant", "app-id");
+    let client = AzureFicClient::new("my-tenant", "app-id").expect("client");
     assert_eq!(
         client.token_endpoint().as_str(),
         "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/token"
@@ -54,8 +54,9 @@ async fn acquire_token_happy_path_returns_bearer() {
         .mount(&server)
         .await;
 
-    let client =
-        AzureFicClient::new("tenant-guid", "app-id").with_token_endpoint(endpoint(&server));
+    let client = AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server));
     let req = AzureFicRequest::new("eyJraWQ.federated.token")
         .with_scope("https://graph.microsoft.com/.default");
     let resp = client.acquire_token(&req).await.expect("acquire_token");
@@ -80,8 +81,9 @@ async fn invalid_client_assertion_surfaces_structured_error() {
         .mount(&server)
         .await;
 
-    let client =
-        AzureFicClient::new("tenant-guid", "app-id").with_token_endpoint(endpoint(&server));
+    let client = AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server));
     let err = client
         .acquire_token(&AzureFicRequest::new("bad-token").with_scope("https://x/.default"))
         .await
@@ -112,8 +114,9 @@ async fn non_json_error_body_still_surfaces_as_azure_error() {
         .respond_with(ResponseTemplate::new(502).set_body_raw("Bad Gateway", "text/plain"))
         .mount(&server)
         .await;
-    let client =
-        AzureFicClient::new("tenant-guid", "app-id").with_token_endpoint(endpoint(&server));
+    let client = AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server));
     let err = client
         .acquire_token(&AzureFicRequest::new("token"))
         .await
@@ -148,8 +151,9 @@ async fn empty_access_token_in_success_body_rejects() {
         })))
         .mount(&server)
         .await;
-    let client =
-        AzureFicClient::new("tenant-guid", "app-id").with_token_endpoint(endpoint(&server));
+    let client = AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server));
     let err = client
         .acquire_token(&AzureFicRequest::new("token"))
         .await
@@ -172,8 +176,9 @@ async fn multiple_scopes_join_with_spaces() {
         .expect(1)
         .mount(&server)
         .await;
-    let client =
-        AzureFicClient::new("tenant-guid", "app-id").with_token_endpoint(endpoint(&server));
+    let client = AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server));
     let req = AzureFicRequest::new("token").with_scopes(["a/.default", "b/.default"]);
     client.acquire_token(&req).await.expect("multi-scope path");
 }
@@ -186,8 +191,9 @@ async fn malformed_success_body_surfaces_as_malformed_response() {
         .respond_with(ResponseTemplate::new(200).set_body_raw("not json", "application/json"))
         .mount(&server)
         .await;
-    let client =
-        AzureFicClient::new("tenant-guid", "app-id").with_token_endpoint(endpoint(&server));
+    let client = AzureFicClient::new("tenant-guid", "app-id")
+        .expect("client")
+        .with_token_endpoint(endpoint(&server));
     let err = client
         .acquire_token(&AzureFicRequest::new("token"))
         .await
@@ -204,7 +210,7 @@ fn request_debug_redacts_federated_token() {
 
 #[test]
 fn tenant_is_confined_to_one_path_segment() {
-    let client = AzureFicClient::new("evil/../x?y#z@host", "app-id");
+    let client = AzureFicClient::new("evil/../x?y#z@host", "app-id").expect("client");
     assert_eq!(
         client.token_endpoint().host_str(),
         Some("login.microsoftonline.com")
@@ -220,7 +226,7 @@ fn tenant_is_confined_to_one_path_segment() {
         client.token_endpoint()
     );
     for dots in [".", ".."] {
-        let client = AzureFicClient::new(dots, "app-id");
+        let client = AzureFicClient::new(dots, "app-id").expect("client");
         let segments: Vec<_> = client.token_endpoint().path_segments().unwrap().collect();
         assert_eq!(segments.len(), 4, "{}", client.token_endpoint());
         assert!(
@@ -247,6 +253,7 @@ async fn a_silent_token_endpoint_times_out() {
         .mount(&server)
         .await;
     let client = AzureFicClient::new("tenant", "client")
+        .expect("client")
         .with_token_endpoint(endpoint(&server))
         .with_http_client(reqwest::Client::new())
         .with_timeout(std::time::Duration::from_millis(150));
@@ -270,6 +277,7 @@ async fn a_silent_token_endpoint_times_out() {
 #[tokio::test]
 async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
     let client = AzureFicClient::new("tenant", "app-id")
+        .expect("client")
         .with_token_endpoint(Url::parse("http://192.0.2.1:9/t/oauth2/v2.0/token").unwrap());
     let err = client
         .acquire_token(&AzureFicRequest::new("federated"))
@@ -278,5 +286,22 @@ async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
     assert!(
         matches!(&err, AzureFicError::Transport(m) if m.contains("must be https")),
         "{err}"
+    );
+}
+
+/// A client that cannot be built is an error, never `reqwest::Client::default()`
+/// (redirects followed, no connect timeout) in its place. A TLS configuration
+/// of a type no backend recognises is the one build failure a test can
+/// arrange whatever TLS backend the feature set resolves to.
+#[test]
+fn a_client_that_cannot_be_built_is_an_error_not_a_default_client() {
+    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
+    let err = AzureFicClient::from_builder("tenant", "app-id", unbuildable)
+        .err()
+        .expect("a failed build must surface, not fall back to an unhardened client");
+    assert!(matches!(err, AzureFicError::ClientBuild(_)), "{err:?}");
+    assert!(
+        AzureFicClient::new("tenant", "app-id").is_ok(),
+        "the default build still succeeds"
     );
 }

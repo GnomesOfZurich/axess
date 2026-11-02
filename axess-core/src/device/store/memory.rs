@@ -2,7 +2,7 @@
 
 use super::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
-    blocks_save, demotion_stamp, for_save, order_newest_first,
+    blocks_save, demotion_stamp, for_save, order_newest_first, shares_create_key, whole_second,
 };
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
@@ -49,6 +49,11 @@ pub struct MemoryDeviceStore {
     /// in sync by `save` / `delete`; serves the `find_by_fingerprint` fast
     /// path without scanning the primary table.
     fingerprint_index: Arc<DashMap<FingerprintKey, DeviceId>>,
+    /// Serialises [`DeviceStore::create_or_find`]: holding it makes the scan
+    /// for an existing device and the insert one step against every other
+    /// create. One lock for every key, as the scan reads every device
+    /// anyway.
+    create_lock: Arc<std::sync::Mutex<()>>,
     /// Write counter: reserved for future auto-purge scheduling, mirrors
     /// the `MemorySessionStore` pattern even though no auto-purge runs in
     /// this sketch.
@@ -152,6 +157,39 @@ impl MemoryDeviceStore {
     }
 }
 
+impl MemoryDeviceStore {
+    /// Store `device` (already prepared by [`for_save`]) as [`DeviceStore::save`]
+    /// does: the row changes under its shard lock, and the fingerprint index
+    /// is settled afterwards from the table as it is then. A stored revoked
+    /// row is left alone.
+    fn write(&self, device: Device) {
+        let key = Self::key(&device.tenant_id, &device.id);
+        let mut vacated = None;
+        match self.devices.entry(key) {
+            Entry::Occupied(mut slot) => {
+                if blocks_save(slot.get().trust_level) {
+                    return;
+                }
+                let old = slot.insert(device.clone());
+                if old.fingerprint_hash != device.fingerprint_hash {
+                    vacated = Some(old.fingerprint_hash);
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(device.clone());
+            }
+        }
+        // A device re-saved under a new fingerprint stops answering to the
+        // old one, and a save takes over the new fingerprint's entry only
+        // when the device sorts first among those carrying it.
+        if let Some(hash) = vacated {
+            self.settle_fingerprint(&device.tenant_id, &hash);
+        }
+        self.settle_fingerprint(&device.tenant_id, &device.fingerprint_hash);
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// How often [`MemoryDeviceStore::settle_fingerprint`] re-reads after losing
 /// a swap to a concurrent settle.
 const SETTLE_ATTEMPTS: usize = 16;
@@ -252,34 +290,38 @@ impl DeviceStore for MemoryDeviceStore {
     }
 
     async fn save(&self, device: &Device, now: DateTime<Utc>) -> Result<(), Self::Error> {
-        let device = for_save(device, now);
-        let key = Self::key(&device.tenant_id, &device.id);
-        // The row changes under its shard lock; the fingerprint index is
-        // settled afterwards, from the table as it is then.
-        let mut vacated = None;
-        match self.devices.entry(key) {
-            Entry::Occupied(mut slot) => {
-                if blocks_save(slot.get().trust_level) {
-                    return Ok(());
-                }
-                let old = slot.insert(device.clone());
-                if old.fingerprint_hash != device.fingerprint_hash {
-                    vacated = Some(old.fingerprint_hash);
-                }
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(device.clone());
-            }
-        }
-        // A device re-saved under a new fingerprint stops answering to the
-        // old one, and a save takes over the new fingerprint's entry only
-        // when the device sorts first among those carrying it.
-        if let Some(hash) = vacated {
-            self.settle_fingerprint(&device.tenant_id, &hash);
-        }
-        self.settle_fingerprint(&device.tenant_id, &device.fingerprint_hash);
-        self.write_count.fetch_add(1, Ordering::Relaxed);
+        self.write(for_save(device, now));
         Ok(())
+    }
+
+    async fn create_or_find(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> Result<Device, Self::Error> {
+        let device = for_save(device, now);
+        // Held across the scan and the write and across no await, so two
+        // creates run one after the other and the second finds the first
+        // one's row. A poisoned lock guards no data, so it is taken as is.
+        let serial = self
+            .create_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let existing = self
+            .devices
+            .iter()
+            .filter(|entry| shares_create_key(entry.value(), &device))
+            .map(|entry| entry.value().clone())
+            .min_by(order_newest_first);
+        let created = match existing {
+            Some(existing) => existing,
+            None => {
+                self.write(device.clone());
+                device
+            }
+        };
+        drop(serial);
+        Ok(created)
     }
 
     async fn record_sighting(
@@ -289,9 +331,10 @@ impl DeviceStore for MemoryDeviceStore {
         now: DateTime<Utc>,
     ) -> Result<DeviceTrustLevel, Self::Error> {
         let key = Self::key(tenant_id, id);
+        let now = whole_second(now);
         let outcome = self.devices.get_mut(&key).map(|mut entry| {
             // A sighting never rewinds the clock and never touches a
-            // revoked row.
+            // revoked row; whole seconds, as every backend compares.
             let moved = entry.trust_level != DeviceTrustLevel::Revoked && now > entry.last_seen_at;
             if moved {
                 entry.last_seen_at = now;
@@ -408,6 +451,7 @@ impl DeviceStore for MemoryDeviceStore {
         now: DateTime<Utc>,
     ) -> Result<SweepCounts, Self::Error> {
         let cfg = self.sweep_config;
+        let now = whole_second(now);
         let mut counts = SweepCounts::default();
 
         // The tenant's keys are listed first and each row is then decided
@@ -481,6 +525,7 @@ impl DeviceStore for MemoryDeviceStore {
 /// row that already is, so repeating a revocation does not restart the purge
 /// grace clock; a move out of `Revoked` clears it.
 fn apply_trust_level(row: &mut Device, level: DeviceTrustLevel, now: DateTime<Utc>) {
+    let now = whole_second(now);
     let was_revoked = row.trust_level == DeviceTrustLevel::Revoked;
     row.demoted_at = demotion_stamp(row.trust_level, level, row.demoted_at, now);
     row.trust_level = level;

@@ -227,9 +227,13 @@ async fn signup_form(router: &axum::Router) -> (String, String) {
 }
 
 async fn post_signup(router: &axum::Router, password: &str) -> String {
+    post_signup_as(router, "carol", password).await
+}
+
+async fn post_signup_as(router: &axum::Router, username: &str, password: &str) -> String {
     let (cookies, token) = signup_form(router).await;
     let body = format!(
-        "_csrf={token}&username=carol&fullname=Carol+Example&email=carol%40example.com&password={password}"
+        "_csrf={token}&username={username}&fullname=Carol+Example&email=carol%40example.com&password={password}"
     );
     let resp = router
         .clone()
@@ -263,4 +267,21 @@ async fn signup_enforces_the_password_rules_on_the_server() {
     );
     let outcome = post_signup(&router, "Gnomes2%2BLongEnough").await;
     assert_eq!(outcome, "redirect /dashboard");
+}
+
+/// Signing up with a username somebody already has gets the same page as a
+/// fresh signup that awaits its mail would: the form is not a way to learn
+/// who has an account.
+#[tokio::test]
+async fn signup_with_a_taken_username_does_not_say_so() {
+    let router = app().await;
+    let outcome = post_signup_as(&router, "alice", "Gnomes2%2BLongEnough").await;
+    assert!(
+        !outcome.to_lowercase().contains("already exists"),
+        "the response named the conflict: {outcome}"
+    );
+    assert!(
+        outcome.contains("Check your email"),
+        "the generic answer is shown instead: {outcome}"
+    );
 }

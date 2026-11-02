@@ -614,9 +614,9 @@ async fn csrf_service_end_to_end_drives_call_path() {
         .unwrap()
         .to_string();
     assert!(
-        set_cookie.starts_with(&format!("{}=", config.cookie_name)),
+        set_cookie.starts_with(&format!("{}=", config.effective_cookie_name())),
         "minted cookie must be named {}",
-        config.cookie_name
+        config.effective_cookie_name()
     );
 
     // Extract the minted token from the Set-Cookie header for reuse below.
@@ -634,7 +634,10 @@ async fn csrf_service_end_to_end_drives_call_path() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/safe")
-        .header("cookie", format!("{}={}", config.cookie_name, token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), token),
+        )
         .extension(handle.clone())
         .body(Body::empty())
         .unwrap();
@@ -653,7 +656,7 @@ async fn csrf_service_end_to_end_drives_call_path() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/safe")
-        .header("cookie", format!("{}=", config.cookie_name))
+        .header("cookie", format!("{}=", config.effective_cookie_name()))
         .extension(handle.clone())
         .body(Body::empty())
         .unwrap();
@@ -669,9 +672,9 @@ async fn csrf_service_end_to_end_drives_call_path() {
         .to_str()
         .unwrap();
     assert!(
-        minted.starts_with(&format!("{}=", config.cookie_name)),
+        minted.starts_with(&format!("{}=", config.effective_cookie_name())),
         "minted cookie must be named {}",
-        config.cookie_name
+        config.effective_cookie_name()
     );
     let minted_value = minted.split('=').nth(1).unwrap().split(';').next().unwrap();
     assert!(
@@ -683,7 +686,10 @@ async fn csrf_service_end_to_end_drives_call_path() {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/state-changing")
-        .header("cookie", format!("{}={}", config.cookie_name, token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), token),
+        )
         .header(config.header_name.as_ref(), &token)
         .extension(handle.clone())
         .body(Body::empty())
@@ -762,7 +768,10 @@ async fn csrf_service_rejects_token_replayed_under_different_session() {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/state-changing")
-        .header("cookie", format!("{}={}", config.cookie_name, token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), token),
+        )
         .header(config.header_name.as_ref(), &token)
         .extension(handle_b.clone())
         .body(Body::empty())
@@ -778,7 +787,10 @@ async fn csrf_service_rejects_token_replayed_under_different_session() {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/state-changing")
-        .header("cookie", format!("{}={}", config.cookie_name, token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), token),
+        )
         .header(config.header_name.as_ref(), &token)
         .extension(handle_a.clone())
         .body(Body::empty())
@@ -818,7 +830,10 @@ async fn csrf_service_fails_closed_without_session_handle() {
     let req = Request::builder()
         .method(Method::POST)
         .uri("/state-changing")
-        .header("cookie", format!("{}={}", config.cookie_name, token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), token),
+        )
         .header(config.header_name.as_ref(), &token)
         .body(Body::empty())
         .unwrap();
@@ -861,7 +876,10 @@ async fn csrf_service_remints_stale_cookie_on_safe_verb() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/safe")
-        .header("cookie", format!("{}={}", config.cookie_name, stale_token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), stale_token),
+        )
         .extension(handle_a.clone())
         .body(Body::empty())
         .unwrap();
@@ -933,7 +951,10 @@ async fn csrf_service_remints_when_handler_rotates_session() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/rotate")
-        .header("cookie", format!("{}={}", config.cookie_name, token_before))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), token_before),
+        )
         .extension(handle.clone())
         .body(Body::empty())
         .unwrap();
@@ -1035,7 +1056,7 @@ async fn csrf_token_for_fresh_guest_survives_session_finalize() {
             })
     };
     let sid = cookie("axess.sid").expect("GET must set the session cookie");
-    let csrf = cookie(DEFAULT_CSRF_COOKIE).expect("GET must mint the CSRF cookie");
+    let csrf = cookie(FALLBACK_CSRF_COOKIE).expect("GET must mint the CSRF cookie");
 
     // 2. The fresh guest's first state-changing request: the login POST
     //    shape: double-submit cookie + header, carrying the same session id.
@@ -1046,7 +1067,7 @@ async fn csrf_token_for_fresh_guest_survives_session_finalize() {
                 .uri("/change")
                 .header(
                     "cookie",
-                    format!("axess.sid={sid}; {DEFAULT_CSRF_COOKIE}={csrf}"),
+                    format!("axess.sid={sid}; {FALLBACK_CSRF_COOKIE}={csrf}"),
                 )
                 .header(DEFAULT_CSRF_HEADER, &csrf)
                 .body(Body::empty())
@@ -1098,7 +1119,10 @@ async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
     let req = Request::builder()
         .method(Method::GET)
         .uri("/form")
-        .header("cookie", format!("{}={}", config.cookie_name, stale_token))
+        .header(
+            "cookie",
+            format!("{}={}", config.effective_cookie_name(), stale_token),
+        )
         .extension(handle.clone())
         .body(Body::empty())
         .unwrap();
@@ -1136,4 +1160,83 @@ async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
         embedded, cookie_value,
         "form token and replacement cookie must agree"
     );
+}
+
+/// `SameSite=None` without `Secure` is a cookie no browser stores, so the
+/// CSRF cookie would never arrive and every state-changing request would
+/// fail. The layer refuses the combination at construction, as
+/// `SessionConfigBuilder::build` does for the session cookie.
+#[test]
+fn same_site_none_without_secure_is_refused_at_construction() {
+    use tower_cookies::cookie::SameSite;
+    let insecure_none = CsrfConfig::new([7u8; 32])
+        .secure(false)
+        .same_site(SameSite::None);
+    assert!(
+        !insecure_none.secure && insecure_none.same_site == SameSite::None,
+        "the refused combination is configured"
+    );
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        CsrfLayer::new(insecure_none)
+    }));
+    assert!(
+        refused.is_err(),
+        "CsrfLayer::new must refuse SameSite=None without Secure"
+    );
+
+    let secure_none = CsrfConfig::new([7u8; 32])
+        .secure(true)
+        .same_site(SameSite::None);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| CsrfLayer::new(secure_none)))
+            .is_ok()
+    );
+}
+
+/// A constant CSRF signing key is a placeholder that reached production:
+/// `new` says so at error level on the session crypto target, as the
+/// session and factor-secret keys do.
+#[test]
+fn a_constant_signing_key_is_logged_at_error() {
+    let capture = crate::testing::mock_tracing::TracingCapture::install();
+    let placeholder = [7u8; 32];
+    assert!(crate::session::is_constant_key(&placeholder));
+    let config = CsrfConfig::new(placeholder);
+    assert_eq!(config.signing_key.as_ref().as_ref(), &placeholder);
+    let error = capture
+        .events()
+        .into_iter()
+        .find(|e| e.level == tracing::Level::ERROR && e.message.contains("single repeated byte"));
+    let error =
+        error.unwrap_or_else(|| panic!("no constant-key error; events: {:?}", capture.events()));
+    assert_eq!(error.target, "axess::session::crypto");
+}
+
+/// `try_new` refuses the placeholder `new` only logs.
+#[test]
+fn try_new_refuses_a_constant_signing_key() {
+    assert!(CsrfConfig::try_new([7u8; 32]).is_err());
+    let random: [u8; 32] = std::array::from_fn(|i| i as u8);
+    assert!(CsrfConfig::try_new(random).is_ok());
+}
+
+/// The default cookie name carries the `__Host-` prefix when the cookie is
+/// `Secure` (its path is always `/`), and falls back to the bare name when
+/// `Secure` is off, as `SessionConfig` does; an explicit name is kept.
+#[test]
+fn the_default_cookie_name_is_host_prefixed_when_secure() {
+    let key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let secure = CsrfConfig::new(key);
+    assert!(secure.secure, "Secure is the default");
+    assert_eq!(secure.effective_cookie_name(), "__Host-axess.csrf");
+
+    let insecure = CsrfConfig::new(key).secure(false);
+    assert_eq!(insecure.effective_cookie_name(), "axess.csrf");
+    let back = insecure.secure(true);
+    assert_eq!(back.effective_cookie_name(), "__Host-axess.csrf");
+
+    let explicit = CsrfConfig::new(key).cookie_name("csrf").secure(false);
+    assert_eq!(explicit.effective_cookie_name(), "csrf");
+    let explicit_first = CsrfConfig::new(key).secure(false).cookie_name("csrf");
+    assert_eq!(explicit_first.effective_cookie_name(), "csrf");
 }

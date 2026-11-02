@@ -97,3 +97,9 @@ fn same_site_none_without_secure_panics() {
 fn zero_session_age_panics() {
     build(&base().with_max_session_age(Duration::ZERO));
 }
+
+#[test]
+#[should_panic(expected = "max_impersonation_age must be > 0")]
+fn zero_impersonation_age_panics() {
+    build(&base().with_max_impersonation_age(Duration::ZERO));
+}

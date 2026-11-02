@@ -73,7 +73,7 @@ pub use pii::{
     MemoryDevicePiiStoreError, PiiToken, REDACTED_PLACEHOLDER, RedactedResolver,
 };
 pub use proof::{DeviceCookieConfig, DeviceCookieSlot, DeviceToken, PresentedDevice, cookie_value};
-pub use resolver::{DeviceResolver, NoopDeviceResolver, SessionDevice, SessionUser};
+pub use resolver::{DeviceResolver, NoopDeviceResolver, SessionDevice, SessionTenant, SessionUser};
 pub use store::{
     BindingsUpdate, DeviceStore, MemoryDeviceStore, MemoryDeviceStoreError, OWN_DEVICE_SCAN_LIMIT,
     OwnerClaim, SweepConfig, SweepConfigBuilder, SweepConfigError, SweepCounts, TrustTransition,

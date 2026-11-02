@@ -1,7 +1,7 @@
 //! The device string a token carries is stored as a keyed digest bound to the
 //! token's device id, and rotation checks it.
 
-use super::device_binding::{bind, verify};
+use super::device_binding::{Peppers, bind, verify};
 use super::test_support::{fixture_tenant, fixture_user, now, store, test_config};
 use super::*;
 use crate::authn::ids::DeviceId;
@@ -55,40 +55,21 @@ async fn rotation_checks_the_digest_and_the_child_keeps_it() {
     let config = test_config();
     let (plaintext, record) = issue(&store, &config, Some("fp-hex"), Some(device("d1"))).await;
 
-    let wrong = refresh_session_with_status_check(
-        &plaintext,
-        &store,
-        &config,
-        &MockRng::new(6),
-        now(),
-        Some("other"),
-        |_| async { true },
-    )
-    .await;
+    let wrong = Refresh::new(&plaintext, |_| async { true })
+        .device_info(Some("other"))
+        .run(&store, &config, &MockRng::new(6), now())
+        .await;
     assert!(matches!(wrong, Err(RefreshError::DeviceMismatch)));
-    let none = refresh_session_with_status_check(
-        &plaintext,
-        &store,
-        &config,
-        &MockRng::new(6),
-        now(),
-        None,
-        |_| async { true },
-    )
-    .await;
+    let none = Refresh::new(&plaintext, |_| async { true })
+        .run(&store, &config, &MockRng::new(6), now())
+        .await;
     assert!(matches!(none, Err(RefreshError::DeviceMismatch)));
 
-    let (_, child) = refresh_session_with_status_check(
-        &plaintext,
-        &store,
-        &config,
-        &MockRng::new(6),
-        now(),
-        Some("fp-hex"),
-        |_| async { true },
-    )
-    .await
-    .unwrap();
+    let (_, child) = Refresh::new(&plaintext, |_| async { true })
+        .device_info(Some("fp-hex"))
+        .run(&store, &config, &MockRng::new(6), now())
+        .await
+        .unwrap();
     let (_, child) = child.expect("rotated");
     assert_eq!(
         child.device_info, record.device_info,
@@ -107,9 +88,41 @@ fn the_digest_is_bound_to_the_device_id() {
     assert_ne!(for_d1, bind("fp", None, pepper));
 
     let mut row = row_with(Some(for_d1.clone()), Some(device("d1")));
-    assert_eq!(verify(&row, Some("fp"), pepper), Ok(Some(for_d1)));
+    assert_eq!(verify(&row, Some("fp"), same(pepper)), Ok(Some(for_d1)));
     row.device_id = Some(device("d2"));
-    assert_eq!(verify(&row, Some("fp"), pepper), Err(()));
+    assert_eq!(verify(&row, Some("fp"), same(pepper)), Err(()));
+}
+
+/// One pepper on both sides: the token is already bound under the current one.
+fn same(pepper: Option<&[u8]>) -> Peppers<'_> {
+    Peppers {
+        stored_under: pepper,
+        current: pepper,
+    }
+}
+
+/// A token bound under the previous pepper is verified under that pepper and
+/// the replacement is bound under the current one; the previous pepper alone
+/// does not vouch for a wrong string.
+#[test]
+fn a_binding_under_the_previous_pepper_is_verified_and_rebound() {
+    let d = device("d1");
+    let (old, new) = (Some(&b"old-pepper"[..]), Some(&b"new-pepper"[..]));
+    let row = row_with(Some(bind("fp", Some(&d), old)), Some(d));
+    let rotated = Peppers {
+        stored_under: old,
+        current: new,
+    };
+    assert_eq!(
+        verify(&row, Some("fp"), rotated),
+        Ok(Some(bind("fp", Some(&d), new)))
+    );
+    assert_eq!(verify(&row, Some("other"), rotated), Err(()));
+    assert_eq!(
+        verify(&row, Some("fp"), same(new)),
+        Err(()),
+        "a previous-pepper binding is not accepted under the current pepper alone"
+    );
 }
 
 #[test]
@@ -153,15 +166,17 @@ fn row_with(info: Option<String>, device_id: Option<DeviceId>) -> RefreshToken {
 fn a_raw_string_from_an_earlier_release_is_honoured_and_upgraded() {
     let d = device("d1");
     let row = row_with(Some("iPhone/16".to_string()), Some(d));
-    let upgraded = verify(&row, Some("iPhone/16"), None).unwrap().unwrap();
+    let upgraded = verify(&row, Some("iPhone/16"), same(None))
+        .unwrap()
+        .unwrap();
     assert_eq!(upgraded, bind("iPhone/16", Some(&d), None));
-    assert_eq!(verify(&row, Some("Android/15"), None), Err(()));
-    assert_eq!(verify(&row, None, None), Err(()));
+    assert_eq!(verify(&row, Some("Android/15"), same(None)), Err(()));
+    assert_eq!(verify(&row, None, same(None)), Err(()));
 }
 
 #[test]
 fn an_unbound_token_needs_nothing_and_stays_unbound() {
     let row = row_with(None, None);
-    assert_eq!(verify(&row, Some("anything"), None), Ok(None));
-    assert_eq!(verify(&row, None, None), Ok(None));
+    assert_eq!(verify(&row, Some("anything"), same(None)), Ok(None));
+    assert_eq!(verify(&row, None, same(None)), Ok(None));
 }

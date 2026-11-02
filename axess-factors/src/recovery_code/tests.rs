@@ -183,6 +183,7 @@ fn rows_stored_by_the_previous_release_still_verify() {
     assert!(legacy.hash.starts_with("$argon2id$"));
     let config = RecoveryCodesConfig {
         codes: vec![legacy],
+        under_previous_pepper: false,
     };
     assert!(config.needs_slow_verification());
     let after = verify_recovery_code(&config, "abcde-fghjk", at(5), None)
@@ -202,6 +203,7 @@ fn a_mixed_set_verifies_both_forms() {
     let argon = generate_recovery_codes(&CountingRng(std::sync::atomic::AtomicU8::new(100)), 1);
     let config = RecoveryCodesConfig {
         codes: vec![keyed.config.codes[0].clone(), argon.config.codes[0].clone()],
+        under_previous_pepper: false,
     };
     let k: &str = keyed.display[0].as_ref();
     let a: &str = argon.display[0].as_ref();

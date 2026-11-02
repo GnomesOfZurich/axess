@@ -87,23 +87,20 @@ use sqlx::PgPool;
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::storage::sql_common::{
-    BindingsCodec, DeviceRow, DeviceWrite, FAMILY_INSERT_CHUNK, GuardedTrustWrite,
-    SqlDeviceStoreError, SwapPlan, SweepCutoffs, TRANSITION_ATTEMPTS, TrustWrite,
-    bindings_update_after_miss, claim_after_miss, decode_all, decode_optional, parse_stored_trust,
-    plan_bindings_swap, push_family_rows, require_row, select_devices, sighting_level,
-    transition_after_miss, utc_to_unix,
+    BindingsCodec, DeviceRow, GuardedTrustWrite, SqlDeviceStoreError, SweepCutoffs, TrustWrite,
+    decode_all, decode_optional, require_row, select_devices, utc_to_unix,
 };
 use crate::device::store::{
-    BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
-    blocks_save, for_save,
+    BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition, for_save,
 };
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
 
-mod reseal;
-mod sweep;
+mod schema;
+mod statements;
 
-use reseal::reseal_rows;
+use crate::device::storage::sql_common::ops;
+use statements::PostgresSql as Sql;
 
 /// PostgreSQL-backed [`DeviceStore`].
 ///
@@ -159,138 +156,6 @@ impl PostgresDeviceStore {
         self.sweep_config = config;
         self
     }
-
-    /// Create tables + indexes. Idempotent.
-    pub async fn init_schema(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS devices (
-                tenant_id        TEXT   NOT NULL,
-                id               TEXT   NOT NULL,
-                user_id          TEXT,
-                trust_level      TEXT   NOT NULL,
-                fingerprint_hash BYTEA  NOT NULL,
-                first_seen_at    BIGINT NOT NULL,
-                last_seen_at     BIGINT NOT NULL,
-                revoked_at       BIGINT,
-                demoted_at       BIGINT,
-                bindings         TEXT   NOT NULL,
-                PRIMARY KEY (tenant_id, id)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Serves `find_by_fingerprint` in sorted order, so the newest sighting
-        // is the first entry of the range instead of the winner of a sort over
-        // every device that shares the fingerprint. It replaces the plain
-        // `(tenant_id, fingerprint_hash)` index of earlier releases, which it
-        // covers as a prefix.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_fingerprint_seen \
-             ON devices (tenant_id, fingerprint_hash, last_seen_at DESC, id)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query("DROP INDEX IF EXISTS idx_devices_fingerprint")
-            .execute(&self.pool)
-            .await?;
-        // The retention sweep reads by level and age: `Trusted` and `Seen`
-        // rows by `last_seen_at`, `Revoked` rows by `revoked_at`.
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_sweep \
-             ON devices (tenant_id, trust_level, last_seen_at)",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_revoked_at \
-             ON devices (tenant_id, revoked_at) WHERE trust_level = 'Revoked'",
-        )
-        .execute(&self.pool)
-        .await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_user \
-             ON devices (tenant_id, user_id, last_seen_at DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_devices_user_fingerprint \
-             ON devices (tenant_id, user_id, fingerprint_hash, last_seen_at DESC)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS device_bindings_refresh (
-                tenant_id TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                family_id TEXT NOT NULL,
-                PRIMARY KEY (tenant_id, device_id, family_id),
-                FOREIGN KEY (tenant_id, device_id)
-                    REFERENCES devices (tenant_id, id) ON DELETE CASCADE
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_device_bindings_refresh_family \
-             ON device_bindings_refresh (tenant_id, family_id)",
-        )
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-}
-
-/// Current trust level of a device row, `None` when the row is absent.
-async fn fetch_trust_level(
-    pool: &PgPool,
-    tenant: &str,
-    device_id: &str,
-) -> Result<Option<DeviceTrustLevel>, SqlDeviceStoreError> {
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT trust_level FROM devices WHERE tenant_id = $1 AND id = $2")
-            .bind(tenant)
-            .bind(device_id)
-            .fetch_optional(pool)
-            .await?;
-    parse_stored_trust(stored)
-}
-
-/// Replace a device's refresh-family index rows inside `tx`. The family
-/// ids are already distinct ([`refresh_family_ids`]) and the insert is
-/// idempotent as well, so a repeated family can never violate the primary
-/// key and abort the surrounding transaction.
-async fn rewrite_family_index(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    tenant: &str,
-    device_id: &str,
-    family_ids: &[String],
-) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM device_bindings_refresh WHERE tenant_id = $1 AND device_id = $2")
-        .bind(tenant)
-        .bind(device_id)
-        .execute(&mut **tx)
-        .await?;
-    // One multi-row insert per chunk keeps a device with many families to a
-    // handful of statements, well under every dialect's bind-parameter cap.
-    for chunk in family_ids.chunks(FAMILY_INSERT_CHUNK) {
-        let mut insert = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-            "INSERT INTO device_bindings_refresh (tenant_id, device_id, family_id) ",
-        );
-        push_family_rows(&mut insert, chunk, tenant, device_id);
-        insert.push(" ON CONFLICT DO NOTHING");
-        insert.build().execute(&mut **tx).await?;
-    }
-    Ok(())
 }
 
 impl DeviceStore for PostgresDeviceStore {
@@ -313,7 +178,7 @@ impl DeviceStore for PostgresDeviceStore {
                     .fetch_optional(&pool)
                     .await?;
             let (device, reseal) = decode_optional(&codec, row)?;
-            reseal_rows(&pool, reseal).await;
+            ops::reseal_rows::<Sql>(&pool, reseal).await;
             Ok(device)
         }
     }
@@ -337,7 +202,7 @@ impl DeviceStore for PostgresDeviceStore {
             .fetch_optional(&pool)
             .await?;
             let (device, reseal) = decode_optional(&codec, row)?;
-            reseal_rows(&pool, reseal).await;
+            ops::reseal_rows::<Sql>(&pool, reseal).await;
             Ok(device)
         }
     }
@@ -364,7 +229,7 @@ impl DeviceStore for PostgresDeviceStore {
             .fetch_optional(&pool)
             .await?;
             let (device, reseal) = decode_optional(&codec, row)?;
-            reseal_rows(&pool, reseal).await;
+            ops::reseal_rows::<Sql>(&pool, reseal).await;
             Ok(device)
         }
     }
@@ -391,7 +256,7 @@ impl DeviceStore for PostgresDeviceStore {
             .fetch_all(&pool)
             .await?;
             let (devices, reseals) = decode_all(&codec, rows)?;
-            reseal_rows(&pool, reseals).await;
+            ops::reseal_rows::<Sql>(&pool, reseals).await;
             Ok(devices)
         }
     }
@@ -420,7 +285,7 @@ impl DeviceStore for PostgresDeviceStore {
             .fetch_all(&pool)
             .await?;
             let (devices, reseals) = decode_all(&codec, rows)?;
-            reseal_rows(&pool, reseals).await;
+            ops::reseal_rows::<Sql>(&pool, reseals).await;
             Ok(devices)
         }
     }
@@ -433,67 +298,18 @@ impl DeviceStore for PostgresDeviceStore {
         let pool = self.pool.clone();
         let codec = self.codec.clone();
         let device = for_save(device, now);
-        async move {
-            let w = DeviceWrite::new(&codec, &device)?;
+        ops::save::<Sql>(pool, codec, device)
+    }
 
-            // Wrap the device-row upsert and the refresh-binding index
-            // refresh in a single transaction so a concurrent
-            // `find_by_refresh_family` either sees the pre-update or
-            // the post-update set, never a partially-updated index.
-            let mut tx = pool.begin().await?;
-
-            // A save never un-revokes: a device loaded before a revocation
-            // and saved after it leaves the revoked row as it is. The row
-            // is read (and, where the engine supports it, locked) in the
-            // transaction that then writes it.
-            let stored: Option<String> = sqlx::query_scalar(
-                "SELECT trust_level FROM devices WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
-            )
-            .bind(&w.tenant)
-            .bind(&w.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(stored) = parse_stored_trust(stored)?
-                && blocks_save(stored)
-            {
-                return Ok(());
-            }
-
-            sqlx::query(
-                r#"
-                INSERT INTO devices
-                    (tenant_id, id, user_id, trust_level, fingerprint_hash,
-                     first_seen_at, last_seen_at, revoked_at, demoted_at, bindings)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                ON CONFLICT (tenant_id, id) DO UPDATE SET
-                    user_id          = EXCLUDED.user_id,
-                    trust_level      = EXCLUDED.trust_level,
-                    fingerprint_hash = EXCLUDED.fingerprint_hash,
-                    first_seen_at    = EXCLUDED.first_seen_at,
-                    last_seen_at     = EXCLUDED.last_seen_at,
-                    revoked_at       = EXCLUDED.revoked_at,
-                    demoted_at       = EXCLUDED.demoted_at,
-                    bindings         = EXCLUDED.bindings
-                "#,
-            )
-            .bind(&w.tenant)
-            .bind(&w.id)
-            .bind(w.user_id.as_deref())
-            .bind(w.trust)
-            .bind(&w.fingerprint)
-            .bind(w.first_seen_at)
-            .bind(w.last_seen_at)
-            .bind(w.revoked_at)
-            .bind(w.demoted_at)
-            .bind(&w.bindings)
-            .execute(&mut *tx)
-            .await?;
-
-            rewrite_family_index(&mut tx, &w.tenant, &w.id, &w.family_ids).await?;
-
-            tx.commit().await?;
-            Ok(())
-        }
+    fn create_or_find(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
+        let pool = self.pool.clone();
+        let codec = self.codec.clone();
+        let device = for_save(device, now);
+        ops::create_or_find::<Sql>(pool, codec, device)
     }
 
     fn record_sighting(
@@ -502,30 +318,12 @@ impl DeviceStore for PostgresDeviceStore {
         id: &DeviceId,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
-        let pool = self.pool.clone();
-        let tenant = tenant_id.to_string();
-        let device_id = id.to_string();
-        let ts = utc_to_unix(now);
-        async move {
-            sqlx::query(
-                "UPDATE devices SET last_seen_at = CASE \
-                     WHEN trust_level <> 'Revoked' AND last_seen_at < $3 THEN $3 \
-                     ELSE last_seen_at END \
-                 WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(&tenant)
-            .bind(&device_id)
-            .bind(ts)
-            .execute(&pool)
-            .await?;
-            // The level the row has now: Revoked means the sighting did not
-            // touch it. A missing row is a missing device.
-            sighting_level(
-                fetch_trust_level(&pool, &tenant, &device_id).await?,
-                tenant,
-                device_id,
-            )
-        }
+        ops::record_sighting::<Sql>(
+            self.pool.clone(),
+            tenant_id.to_string(),
+            id.to_string(),
+            utc_to_unix(now),
+        )
     }
 
     fn set_trust_level(
@@ -573,43 +371,13 @@ impl DeviceStore for PostgresDeviceStore {
         level: DeviceTrustLevel,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<TrustTransition, Self::Error>> + Send {
-        let pool = self.pool.clone();
-        let tenant = tenant_id.to_string();
-        let device_id = id.to_string();
-        let w = GuardedTrustWrite::new(expected, level, now);
-        async move {
-            // One conditional UPDATE: the engine checks the current level
-            // and writes in a single statement, so a revocation that lands
-            // first makes this match no row instead of being overwritten.
-            for _ in 0..TRANSITION_ATTEMPTS {
-                let updated = sqlx::query("UPDATE devices SET trust_level = $4, revoked_at = CASE WHEN $3::text = $4::text THEN revoked_at ELSE $5::bigint END, demoted_at = CASE WHEN $6::bigint = 1 THEN demoted_at ELSE $7::bigint END WHERE tenant_id = $1 AND id = $2 AND trust_level = $3")
-            .bind(&tenant)
-            .bind(&device_id)
-            .bind(w.expected)
-            .bind(w.new)
-            .bind(w.revoked_at)
-            .bind(w.keep_demoted)
-            .bind(w.demoted_at)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-                if updated > 0 {
-                    return Ok(TrustTransition::Applied);
-                }
-                let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
-                if let Some(outcome) = transition_after_miss(current, expected) {
-                    return Ok(outcome);
-                }
-                // The row is at `expected` again: the write lost a race with
-                // a change that has since been undone. Try it again.
-            }
-            // Every attempt lost a race: the row was never found at another
-            // level, so the change is neither applied nor refused.
-            Err(SqlDeviceStoreError::Contended {
-                tenant_id: tenant,
-                device_id,
-            })
-        }
+        ops::set_trust_level_if::<Sql>(
+            self.pool.clone(),
+            tenant_id.to_string(),
+            id.to_string(),
+            expected,
+            GuardedTrustWrite::new(expected, level, now),
+        )
     }
 
     fn replace_bindings(
@@ -626,47 +394,7 @@ impl DeviceStore for PostgresDeviceStore {
         let bindings = bindings.to_vec();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
-        async move {
-            let row: Option<(String, String)> = sqlx::query_as(
-                "SELECT trust_level, bindings FROM devices WHERE tenant_id = $1 AND id = $2",
-            )
-            .bind(&tenant)
-            .bind(&device_id)
-            .fetch_optional(&pool)
-            .await?;
-            let swap =
-                match plan_bindings_swap(&codec, &tenant, &device_id, row, &expected, &bindings)? {
-                    SwapPlan::Settled(outcome) => return Ok(outcome),
-                    SwapPlan::Write(swap) => swap,
-                };
-            let mut tx = pool.begin().await?;
-            // Only the bindings column is written, only on a row that is not
-            // Revoked, and only while it still holds the bytes that were
-            // read: the engine evaluates the conditions and the write
-            // together, so a revocation cannot be undone, a revoked device
-            // cannot gain a binding, and a concurrent bindings edit makes
-            // this match no row instead of being overwritten.
-            let updated = sqlx::query("UPDATE devices SET bindings = $3 WHERE tenant_id = $1 AND id = $2 AND trust_level <> 'Revoked' AND bindings = $4")
-                .bind(&tenant)
-                .bind(&device_id)
-                .bind(&swap.blob)
-                .bind(&swap.stored)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-            if updated == 0 {
-                // Nothing written. The transaction is ended before the
-                // re-read, which needs a pooled connection of its own: with
-                // a one-connection pool it would otherwise wait for the
-                // connection this transaction still holds.
-                tx.rollback().await?;
-                let current = fetch_trust_level(&pool, &tenant, &device_id).await?;
-                return Ok(bindings_update_after_miss(current));
-            }
-            rewrite_family_index(&mut tx, &tenant, &device_id, &swap.family_ids).await?;
-            tx.commit().await?;
-            Ok(BindingsUpdate::Written)
-        }
+        ops::replace_bindings::<Sql>(pool, codec, tenant, device_id, expected, bindings)
     }
 
     fn claim_owner(
@@ -676,35 +404,12 @@ impl DeviceStore for PostgresDeviceStore {
         user: &UserId,
         _now: DateTime<Utc>,
     ) -> impl Future<Output = Result<OwnerClaim, Self::Error>> + Send {
-        let pool = self.pool.clone();
-        let tenant = tenant_id.to_string();
-        let device_id = id.to_string();
-        let user = user.to_string();
-        async move {
-            // One conditional UPDATE: the owner is set only while there is
-            // none, so of two users racing for an unowned device exactly one
-            // matches a row.
-            let updated = sqlx::query(
-                "UPDATE devices SET user_id = $3 \
-                 WHERE tenant_id = $1 AND id = $2 AND user_id IS NULL",
-            )
-            .bind(&tenant)
-            .bind(&device_id)
-            .bind(&user)
-            .execute(&pool)
-            .await?
-            .rows_affected();
-            if updated > 0 {
-                return Ok(OwnerClaim::Claimed);
-            }
-            let owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT user_id FROM devices WHERE tenant_id = $1 AND id = $2")
-                    .bind(&tenant)
-                    .bind(&device_id)
-                    .fetch_optional(&pool)
-                    .await?;
-            Ok(claim_after_miss(owner, &user))
-        }
+        ops::claim_owner::<Sql>(
+            self.pool.clone(),
+            tenant_id.to_string(),
+            id.to_string(),
+            user.to_string(),
+        )
     }
 
     fn find_active_for_user(
@@ -733,7 +438,7 @@ impl DeviceStore for PostgresDeviceStore {
             .fetch_all(&pool)
             .await?;
             let (devices, reseals) = decode_all(&codec, rows)?;
-            reseal_rows(&pool, reseals).await;
+            ops::reseal_rows::<Sql>(&pool, reseals).await;
             Ok(devices)
         }
     }
@@ -764,7 +469,7 @@ impl DeviceStore for PostgresDeviceStore {
         let pool = self.pool.clone();
         let cutoffs = SweepCutoffs::new(&self.sweep_config, now);
         let tenant = tenant_id.to_string();
-        async move { sweep::run(&pool, &tenant, &cutoffs).await }
+        ops::sweep::<Sql>(pool, tenant, cutoffs)
     }
 }
 
@@ -793,6 +498,3 @@ impl HealthCheck for PostgresDeviceStore {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod reseal_tests;

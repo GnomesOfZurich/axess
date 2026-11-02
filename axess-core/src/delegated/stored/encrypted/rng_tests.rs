@@ -3,6 +3,8 @@
 use super::*;
 use crate::delegated::stored::credential::MemoryDelegatedCredentialStore;
 use axess_rng::testing::MockRng;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{TimeZone, Utc};
 
 fn credential() -> StoredDelegation {
@@ -19,7 +21,7 @@ fn credential() -> StoredDelegation {
 fn store(
     seed: u64,
 ) -> EncryptedDelegatedCredentialStore<MemoryDelegatedCredentialStore, MemoryKeyProvider> {
-    let keys = MemoryKeyProvider::new("k1", [3u8; 32]).expect("key id");
+    let keys = MemoryKeyProvider::new("k1", test_key(3)).expect("key id");
     EncryptedDelegatedCredentialStore::new(MemoryDelegatedCredentialStore::new(), keys)
         .with_rng(MockRng::new(seed))
 }

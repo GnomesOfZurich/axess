@@ -53,9 +53,25 @@ pub trait IdentityLookup: Send + Sync + 'static {
         user_id: &UserId,
     ) -> impl Future<Output = Result<EntityState, Self::Error>> + Send;
 
-    // `get_user_in_tenant`, `default_tenant`, and the per-tenant policy
-    // getters (`lockout_policy_for_tenant`, `password_rules_for_tenant`,
-    // `ip_policy_for_tenant`) have defaults you can take as given.
+    fn default_tenant(&self) -> impl Future<Output = Result<Tenant, Self::Error>> + Send;
+
+    /// The tenant's policies. Required, with no permissive default: a
+    /// decorator that forgot to forward one would switch the tenant's
+    /// policy off without a compile error.
+    fn lockout_policy_for_tenant(&self, tenant_id: &TenantId) -> LockoutPolicy;
+
+    fn password_rules_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> impl Future<Output = Result<PasswordRules, Self::Error>> + Send;
+
+    fn ip_policy_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> impl Future<Output = Result<IpPolicy, Self::Error>> + Send;
+
+    // `get_user_tenant` and `get_user_in_tenant` have defaults derived from
+    // `get_user`; override them for a narrower query.
 }
 
 // Tier 2: read + the writes the login flow makes as it runs.
@@ -100,7 +116,13 @@ pub trait IdentityAuthnLog: IdentityLookup {
         user_id: &UserId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    // `record_last_login` defaults to a no-op.
+    /// Required as well; a store without a last-login column answers
+    /// `Ok(())`.
+    fn record_last_login(
+        &self,
+        user_id: &UserId,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 // Tier 3: read + audit + administrative writes.
@@ -312,7 +334,12 @@ failure, or until an administrator resets the counter when `duration` is
 `None`. A store that cannot report the time of the last failure stays
 locked rather than guess. A password reset still works for a locked
 account and clears the counter. A store that reports failures older than
-`attempt_window` as zero gets the sliding window for free.
+`attempt_window` as zero while the count is below the limit gets the
+sliding window for free. At the limit it reports the raw count and time
+whatever their age: the window bounds how long failures accumulate, and
+the lockout's end comes from `duration`, so an indefinite lockout, or
+one longer than the window, is not ended by the window. The sqlite
+example's `failed_attempts` and `reserve_attempt` show the condition.
 
 `IdentityAdmin` is the privileged writes. `create_tenant` and
 `create_user` are the provisioning verbs, and `create_user` takes an
@@ -377,7 +404,8 @@ impl IdentityLookup for OurBackend {
 
         Ok(row.map(|r| user_from_row(self.clock(), &r)))
     }
-    // ... get_tenant, find_tenant, default_tenant, account_status
+    // ... get_tenant, find_tenant, default_tenant, account_status, and the
+    // three tenant policies
 }
 ```
 

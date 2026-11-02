@@ -5,7 +5,9 @@ use chrono::{DateTime, Utc};
 
 use super::index::plan_indexes;
 use super::read::StoredRowState;
-use super::row::{device_key, fingerprint_hex, fingerprint_key, fingerprint_set_key};
+use super::row::{
+    device_key, fingerprint_hex, fingerprint_key, fingerprint_set_key, fingerprint_zset_key,
+};
 use super::scripts::{
     REMOVE_DEVICE, ScriptStatus, WRITE_ROW, parse_status, remove_args, write_row_args,
 };
@@ -47,18 +49,20 @@ impl ValkeyDeviceStore {
         parse_status(&reply).ok_or(ValkeyDeviceStoreError::UnexpectedScriptReply(reply))
     }
 
-    /// The two fingerprint keys a script addresses for `device`, in script
-    /// key order: its fingerprint set, then the single-id key of earlier
-    /// releases (read and cleaned up, never created).
-    fn fingerprint_keys(&self, tenant: &str, device: &Device) -> [String; 2] {
+    /// The three fingerprint keys a script addresses for `device`, in script
+    /// key order: its fingerprint index (the sorted set), then the plain set
+    /// and the single-id key of earlier releases (emptied and cleaned up,
+    /// never written).
+    fn fingerprint_keys(&self, tenant: &str, device: &Device) -> [String; 3] {
         let hex = fingerprint_hex(&device.fingerprint_hash);
         [
+            fingerprint_zset_key(&self.prefix, tenant, &hex),
             fingerprint_set_key(&self.prefix, tenant, &hex),
             fingerprint_key(&self.prefix, tenant, &hex),
         ]
     }
 
-    fn contended(tenant: &str, id: &str) -> ValkeyDeviceStoreError {
+    pub(super) fn contended(tenant: &str, id: &str) -> ValkeyDeviceStoreError {
         ValkeyDeviceStoreError::Contended {
             tenant_id: tenant.to_string(),
             device_id: id.to_string(),
@@ -121,6 +125,7 @@ impl ValkeyDeviceStore {
                         &self.encode_row(new)?,
                         now.and_then(|now| self.ttl_seconds_for(new, now)),
                         id,
+                        new.last_seen_at.timestamp(),
                         &plan.ops(),
                     );
                     let keys = [row_key.clone()]
@@ -180,7 +185,14 @@ impl ValkeyDeviceStore {
                         "replacing a device row that cannot be decoded"
                     );
                     let plan = plan_indexes(&self.prefix, None, Some(&device));
-                    let args = write_row_args(Some(&raw), &payload, ttl, &id, &plan.ops());
+                    let args = write_row_args(
+                        Some(&raw),
+                        &payload,
+                        ttl,
+                        &id,
+                        device.last_seen_at.timestamp(),
+                        &plan.ops(),
+                    );
                     let keys = [row_key.clone()]
                         .into_iter()
                         .chain(self.fingerprint_keys(&tenant, &device))
@@ -206,6 +218,7 @@ impl ValkeyDeviceStore {
                 &payload,
                 ttl,
                 &id,
+                device.last_seen_at.timestamp(),
                 &plan.ops(),
             );
             let keys = [row_key.clone()]

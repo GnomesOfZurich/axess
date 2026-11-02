@@ -2,6 +2,14 @@
 //! `rotate_token` and `issue_capped` wrap their revoke + insert pair
 //! in a `sqlx::Pool::begin()` transaction so partial-failure semantics match
 //! the trait contract; either every side-effect lands or none does.
+//!
+//! `on_token_compromise` is left at the trait default, which only logs: a
+//! refresh store holds no device store, so it cannot revoke the devices a
+//! compromised family ran on. An application that hands out refresh tokens
+//! wraps this backend in `axess::device::CascadingRefreshStore` together
+//! with its device store, and reuse of a rotated-out token then leaves every
+//! device linked to the family `Revoked`; `tests/refresh_rotation.rs` shows
+//! both the bare and the wrapped behaviour against the sqlite device store.
 
 use axess::authn::{DeviceId, TenantId, UserId};
 use axess::session::{
@@ -109,13 +117,18 @@ impl RefreshTokenStore for OurBackend {
     ) -> Result<DeviceTokenRevocation, Self::Error> {
         // Single statement, scoped by tenant: a rotation racing with it
         // either lands before (and its child carries the device id, so is
-        // revoked too) or after (and finds a revoked parent).
+        // revoked too) or after (and finds a revoked parent). The reason
+        // and time are recorded, as for every revocation, so a later
+        // presentation of one of these tokens is a stale client, not theft.
         let done = sqlx::query(
-            "UPDATE refresh_tokens SET revoked = 1
+            "UPDATE refresh_tokens
+                SET revoked = 1, revoked_reason = ?3, revoked_at = ?4
               WHERE tenant_id = ?1 AND device_id = ?2 AND revoked = 0",
         )
         .bind(tenant_id.to_string())
         .bind(device_id.to_string())
+        .bind(RevocationReason::Device.as_str())
+        .bind(self.clock().now().to_rfc3339())
         .execute(self.pool())
         .await?;
         Ok(DeviceTokenRevocation::Revoked {

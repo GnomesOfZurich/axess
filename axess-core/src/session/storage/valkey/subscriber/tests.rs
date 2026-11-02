@@ -90,10 +90,6 @@ fn dropping_a_hold_removes_its_routes() {
     assert!(shared.lock().routes.is_empty());
 }
 
-fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).expect("in range")
-}
-
 /// After the dispatcher sees `Closed`, the connection is already forgotten, so
 /// the next join sees none to replace. The loss is still remembered, and the
 /// reconnect flags every waiting watcher for a recheck.
@@ -131,17 +127,42 @@ async fn a_failed_replacement_tells_the_waiting_watchers() {
     assert_eq!(waiting.slot.next().await, Event::Recheck);
 }
 
-/// Reconnection attempts are spaced on the injected clock, doubling to a cap.
-#[test]
-fn failed_attempts_back_off_on_the_injected_clock() {
+/// Reconnection attempts are spaced on the monotonic clock, doubling to a
+/// cap.
+#[tokio::test(start_paused = true)]
+async fn failed_attempts_back_off_doubling_to_a_cap() {
+    let secs = |n: u64| std::time::Duration::from_secs(n);
     let mut backoff = Backoff::default();
-    assert!(backoff.retry_at.is_none());
-    backoff.failed(at(0));
-    assert_eq!(backoff.retry_at, Some(at(1)));
-    backoff.failed(at(1));
-    assert_eq!(backoff.retry_at, Some(at(3)));
+    assert!(backoff.ready());
+    backoff.failed();
+    assert!(!backoff.ready());
+    tokio::time::advance(secs(1)).await;
+    assert!(backoff.ready(), "the first interval is a second");
+    backoff.failed();
+    tokio::time::advance(secs(1)).await;
+    assert!(!backoff.ready());
+    tokio::time::advance(secs(1)).await;
+    assert!(backoff.ready(), "the second is two");
     for _ in 0..40 {
-        backoff.failed(at(100));
+        backoff.failed();
     }
-    assert_eq!(backoff.retry_at, Some(at(100 + BACKOFF_MAX_SECS)));
+    tokio::time::advance(secs(BACKOFF_MAX_SECS - 1)).await;
+    assert!(!backoff.ready());
+    tokio::time::advance(secs(1)).await;
+    assert!(backoff.ready(), "it never exceeds the cap");
+}
+
+/// The spacing of reconnection attempts is measured on the monotonic clock:
+/// once the longest backoff has elapsed the next attempt is due, whatever
+/// happened to the wall clock meanwhile (the registry's injected clock,
+/// which the backoff no longer reads, can be stepped back or frozen).
+#[tokio::test(start_paused = true)]
+async fn a_wall_clock_step_back_does_not_hold_off_the_reconnect() {
+    let mut backoff = Backoff::default();
+    backoff.failed();
+    tokio::time::advance(std::time::Duration::from_secs(BACKOFF_MAX_SECS + 1)).await;
+    assert!(
+        backoff.ready(),
+        "the backoff has elapsed; the wall clock's step back must not hold the attempt off"
+    );
 }

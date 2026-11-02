@@ -183,7 +183,7 @@ async fn cookieless_get_that_reads_the_csrf_token_persists_and_sets_both_cookies
     assert_eq!(writes, 1);
     assert!(session_cookie);
     assert!(
-        cookies.iter().any(|c| c.starts_with("axess.csrf=")),
+        cookies.iter().any(|c| c.starts_with("__Host-axess.csrf=")),
         "the CSRF cookie accompanies the stored session: {cookies:?}"
     );
 }
@@ -198,7 +198,7 @@ async fn mint_on_every_request_restores_the_old_behaviour() {
     let (writes, session_cookie, cookies) = get_with(app, &store, "/csrf").await;
     assert_eq!(writes, 1);
     assert!(session_cookie);
-    assert!(cookies.iter().any(|c| c.starts_with("axess.csrf=")));
+    assert!(cookies.iter().any(|c| c.starts_with("__Host-axess.csrf=")));
 }
 
 /// A token minted by a handler that read it validates on the next POST.
@@ -217,12 +217,12 @@ async fn a_token_read_by_a_handler_validates_on_post() {
         let pair = v.to_str().unwrap().split(';').next().unwrap().to_owned();
         if pair.starts_with("axess.sid=") {
             sid = pair;
-        } else if pair.starts_with("axess.csrf=") {
+        } else if pair.starts_with("__Host-axess.csrf=") {
             csrf = pair;
         }
     }
     assert!(!sid.is_empty() && !csrf.is_empty());
-    let token = csrf.trim_start_matches("axess.csrf=").to_owned();
+    let token = csrf.trim_start_matches("__Host-axess.csrf=").to_owned();
     let post = Request::post("/csrf-post")
         .header(header::COOKIE, format!("{sid}; {csrf}"))
         .header("x-csrf-token", token)

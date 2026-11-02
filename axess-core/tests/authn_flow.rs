@@ -10,7 +10,7 @@
 //! - `authn_security.rs`         ; penetration-style: fixation, refresh reuse, custom size
 //! - `authn_tenant_boundary.rs`  ; `*_in_tenant` cross-tenant refusal rails
 //! - `authn_oauth_tenant.rs`     ; OAuth EXPECTED_TENANT + identity-cross-check validator
-//! - `authn_race_conditions.rs`  ; suspend-during-auth, HOTP burn, counter-store outage
+//! - `authn_race_conditions.rs`  ; suspend-during-auth, HOTP lock, counter-store outage
 //! - `authn_service_surface.rs`  ; `AuthnService` accessor + registry-gated surface
 
 #![cfg(feature = "testing")]

@@ -3,6 +3,7 @@ use crate::session::id::SessionId;
 use crate::session::store::SessionRegistryAdapter;
 use crate::session::store::{MemorySessionRegistry, SessionRegistry};
 use crate::testing::mock_random::MockRng;
+use crate::testing::test_session;
 
 fn known_issuers() -> HashSet<String> {
     ["https://idp.example.com".to_string()]
@@ -39,10 +40,9 @@ async fn frontchannel_logout_invalidates_by_sid() {
         known_issuers(),
     );
 
-    // Simulate: valid iss + known sid.
-    if let Some((uid, sid, _)) = handler.sid_map.remove(&key) {
-        let _ = handler.registry.invalidate_session(&uid, &sid).await;
-    }
+    handler
+        .end_by_sid("https://idp.example.com", "oidc-sid-123", None)
+        .await;
 
     assert!(!registry.is_valid(&user_id, &session_id).await.unwrap());
     assert!(!sid_map.contains_key(&key));
@@ -61,7 +61,7 @@ async fn frontchannel_logout_unknown_sid_is_noop() {
         "https://idp.example.com".to_string(),
         "nonexistent".to_string(),
     );
-    assert!(handler.sid_map.remove(&nonexistent).is_none());
+    assert!(handler.sid_map.remove_if(&nonexistent, |_| true).is_none());
 }
 
 #[tokio::test]
@@ -169,10 +169,10 @@ async fn handle_frontchannel_logout_drives_registry_and_gates_issuer() {
     );
 }
 
-fn handler_with_session(
+fn bound_handler(
     registry: &MemorySessionRegistry,
     sid_map: &SidMap,
-) -> FrontChannelLogoutHandler {
+) -> BoundFrontChannelLogoutHandler {
     FrontChannelLogoutHandler::new(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),
@@ -181,15 +181,22 @@ fn handler_with_session(
     .with_session_match_required()
 }
 
-/// Knowing an `(iss, sid)` pair does not end someone else's session when
-/// the handler binds the logout to the caller's own session; the owner's
-/// own request does end it.
+fn sid_params(sid: &str) -> Query<FrontChannelLogoutParams> {
+    Query(FrontChannelLogoutParams {
+        sid: Some(sid.to_string()),
+        iss: Some("https://idp.example.com".to_string()),
+    })
+}
+
+/// Knowing an `(iss, sid)` pair does not end someone else's session through
+/// the bound route, which answers the same page either way; the owner's own
+/// request does end it.
 #[tokio::test]
 async fn a_bound_logout_ends_only_the_callers_own_session() {
     let registry = MemorySessionRegistry::new();
     let sid_map: SidMap = SidMap::new();
-    let rng = MockRng::new(21);
-    let (victim_session, attacker_session) = (SessionId::new(&rng), SessionId::new(&rng));
+    let (victim_cookie, attacker_cookie) = (test_session(), test_session());
+    let victim_session = victim_cookie.session_id().await;
     let victim = axess_identity::testing::user("victim");
     registry.register(&victim, &victim_session).await.unwrap();
     let key: SidKey = ("https://idp.example.com".to_string(), "sid-1".to_string());
@@ -200,20 +207,51 @@ async fn a_bound_logout_ends_only_the_callers_own_session() {
         victim_session,
         chrono::Utc::now(),
     );
-    let handler = handler_with_session(&registry, &sid_map);
+    let bound = bound_handler(&registry, &sid_map);
 
-    let ended = handler
-        .end_by_sid("https://idp.example.com", "sid-1", Some(&attacker_session))
-        .await;
-    assert!(!ended, "a stranger's session does not match");
-    assert!(registry.is_valid(&victim, &victim_session).await.unwrap());
+    let response = BoundFrontChannelLogoutHandler::handle_frontchannel_logout(
+        State(bound.clone()),
+        attacker_cookie,
+        sid_params("sid-1"),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the same page either way"
+    );
+    assert!(
+        registry.is_valid(&victim, &victim_session).await.unwrap(),
+        "a stranger's session does not match"
+    );
     assert!(sid_map.contains_key(&key), "the mapping is untouched");
 
-    let ended = handler
-        .end_by_sid("https://idp.example.com", "sid-1", Some(&victim_session))
-        .await;
-    assert!(ended);
+    let response = BoundFrontChannelLogoutHandler::handle_frontchannel_logout(
+        State(bound),
+        victim_cookie,
+        sid_params("sid-1"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
     assert!(!registry.is_valid(&victim, &victim_session).await.unwrap());
+    assert!(!sid_map.contains_key(&key));
+}
+
+/// The bound route checks the parameters as the plain one does: an unknown
+/// issuer is refused before the map is read.
+#[tokio::test]
+async fn the_bound_route_refuses_an_unknown_issuer() {
+    let registry = MemorySessionRegistry::new();
+    let response = BoundFrontChannelLogoutHandler::handle_frontchannel_logout(
+        State(bound_handler(&registry, &SidMap::new())),
+        test_session(),
+        Query(FrontChannelLogoutParams {
+            sid: Some("s".to_string()),
+            iss: Some("https://evil.example.com".to_string()),
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 /// An oversized `sid` or `iss` is refused before it is looked up or
@@ -252,4 +290,34 @@ fn oversized_or_unknown_parameters_are_refused() {
             .unwrap_err(),
         StatusCode::BAD_REQUEST
     );
+}
+
+/// Between the look-up and the removal another login can map the same sid
+/// to a new session; the removal takes only the mapping the caller matched.
+#[tokio::test]
+async fn end_by_sid_removes_only_the_mapping_it_matched() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map: SidMap = SidMap::new();
+    let rng = MockRng::new(34);
+    let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+    let user = axess_identity::testing::user("re-mapped");
+    registry.register(&user, &new).await.unwrap();
+    let key: SidKey = ("https://idp.example.com".to_string(), "sid-r".to_string());
+    sid_map.insert(key.clone(), "sub-r", user, new, chrono::Utc::now());
+    let handler = FrontChannelLogoutHandler::new(
+        sid_map.clone(),
+        Arc::new(SessionRegistryAdapter(registry.clone())),
+        known_issuers(),
+    );
+
+    // The caller's session is `old`, which the sid no longer maps to.
+    handler
+        .end_by_sid("https://idp.example.com", "sid-r", Some(&old))
+        .await;
+    assert_eq!(
+        sid_map.get(&key).map(|e| e.1),
+        Some(new),
+        "the new mapping stands"
+    );
+    assert!(registry.is_valid(&user, &new).await.unwrap());
 }

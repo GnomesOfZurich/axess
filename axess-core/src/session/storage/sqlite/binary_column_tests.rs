@@ -4,7 +4,7 @@
 use super::*;
 use crate::session::crypto::SessionCrypto;
 use crate::session::data::SessionData;
-use axess_rng::SystemRng;
+use axess_rng::{SecureRng, SystemRng};
 use sqlx::sqlite::SqlitePoolOptions;
 
 const KEY: [u8; 32] = [5u8; 32];
@@ -107,6 +107,114 @@ async fn a_legacy_text_row_loads_and_the_next_save_moves_it_to_bytes() {
     assert!(bin.is_some(), "rewritten into the binary column");
     assert_eq!(text, "", "legacy text emptied");
     assert!(store.load(&id).await.unwrap().is_some());
+}
+
+/// A random source that runs a closure once, on its first draw. The codec
+/// draws a nonce when it seals the bytes a conditional write is about to
+/// store, after the row was read and before it is written, so the closure
+/// is a concurrent request landing exactly there.
+struct InterleavingRng {
+    once: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl SecureRng for InterleavingRng {
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        let action = self.once.lock().unwrap().take();
+        if let Some(action) = action {
+            action();
+        }
+        SystemRng.fill_bytes(dest);
+    }
+}
+
+/// A second connection to the same database file, as another process or
+/// pool of the deployment, that loads the row and so re-seals it.
+fn reseal_from_another_connection(url: String, id: SessionId) {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let pool = SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect(&url)
+                    .await
+                    .unwrap();
+                let other = SqliteSessionStore::new(
+                    pool,
+                    SessionCrypto::new(KEY)
+                        .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
+                );
+                other.load(&id).await.unwrap().expect("the row loads");
+            });
+    })
+    .join()
+    .unwrap();
+}
+
+/// A load that re-seals the row between a conditional write's read and its
+/// write changes the stored bytes, not the revision: the write is judged on
+/// the revision and is written, instead of being refused as a conflict with a
+/// concurrent request that changed nothing.
+#[tokio::test]
+async fn a_reseal_during_a_conditional_write_is_not_a_conflict() {
+    let dir = std::env::temp_dir().join(format!("axess-reseal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = SessionId::new(&SystemRng);
+    let path = dir.join(format!("{id}.db"));
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, \
+         expires_at INTEGER NOT NULL, data_bin BLOB)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let reseal = {
+        let (url, id) = (url.clone(), id);
+        Box::new(move || reseal_from_another_connection(url, id))
+    };
+    let store = SqliteSessionStore::new(
+        pool,
+        SessionCrypto::new(KEY)
+            .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept)
+            .with_rng(Arc::new(InterleavingRng {
+                once: std::sync::Mutex::new(Some(reseal)),
+            })),
+    );
+    plant_legacy(&store, &id).await;
+    let (bin, _) = columns(&store, &id).await;
+    assert!(
+        bin.is_none(),
+        "the row is a legacy text row, due for a re-seal"
+    );
+
+    let next = SessionData {
+        revision: 1,
+        custom: serde_json::json!({"role": "owner"}),
+        ..SessionData::default()
+    };
+    let outcome = store
+        .update_if_revision(&id, 0, &next, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let (bin, _) = columns(&store, &id).await;
+    assert!(bin.is_some(), "the concurrent load re-sealed the row");
+    assert_eq!(
+        outcome,
+        ConditionalUpdate::Written,
+        "a re-seal changes the bytes, not the revision"
+    );
+    let stored = store.load(&id).await.unwrap().expect("row");
+    assert_eq!(stored.revision, 1);
+    assert_eq!(stored.custom, next.custom);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

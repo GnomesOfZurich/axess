@@ -54,6 +54,7 @@ pub struct SessionConfig {
     pub(crate) path: Arc<str>,
     pub(crate) max_custom_bytes: usize,
     pub(crate) max_authenticated_age: Option<Duration>,
+    pub(crate) max_impersonation_age: Option<Duration>,
 }
 
 impl SessionConfig {
@@ -120,6 +121,13 @@ impl SessionConfig {
     pub fn max_authenticated_age(&self) -> Option<Duration> {
         self.max_authenticated_age
     }
+
+    /// Cap on how long an impersonated session may live, measured from when
+    /// `begin_impersonation` made it (default: none). When set, a session
+    /// whose impersonation is older than this is ended on its next request.
+    pub fn max_impersonation_age(&self) -> Option<Duration> {
+        self.max_impersonation_age
+    }
 }
 
 impl Default for SessionConfig {
@@ -134,6 +142,7 @@ impl Default for SessionConfig {
             path: "/".into(),
             max_custom_bytes: DEFAULT_MAX_CUSTOM_BYTES,
             max_authenticated_age: None,
+            max_impersonation_age: None,
         }
     }
 }
@@ -202,6 +211,10 @@ impl SessionConfig {
         assert!(
             self.max_authenticated_age.is_none_or(|a| !a.is_zero()),
             "SessionConfig: max_authenticated_age must be > 0 (every session would end at once)"
+        );
+        assert!(
+            self.max_impersonation_age.is_none_or(|a| !a.is_zero()),
+            "SessionConfig: max_impersonation_age must be > 0 (every impersonation would end at once)"
         );
         assert!(
             self.same_site != SameSite::None || self.secure,
@@ -314,6 +327,13 @@ impl SessionConfigBuilder {
     /// (default: no cap). Must be non-zero.
     pub fn max_authenticated_age(mut self, max_age: Duration) -> Self {
         self.0.max_authenticated_age = Some(max_age);
+        self
+    }
+
+    /// Cap how long an impersonated session may live, measured from when
+    /// the impersonation began (default: no cap). Must be non-zero.
+    pub fn max_impersonation_age(mut self, max_age: Duration) -> Self {
+        self.0.max_impersonation_age = Some(max_age);
         self
     }
 

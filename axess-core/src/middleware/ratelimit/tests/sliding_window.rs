@@ -69,7 +69,7 @@ fn remaining_counts_down_and_follows_the_estimate() {
     let t0 = t_zero();
     for want in [2, 1, 0] {
         match store.try_acquire_at("k", t0) {
-            Acquire::Allowed { remaining } => assert_eq!(remaining, want),
+            Acquire::Allowed { remaining, .. } => assert_eq!(remaining, want),
             Acquire::Limited { .. } | Acquire::Saturated { .. } => panic!("refused"),
         }
     }

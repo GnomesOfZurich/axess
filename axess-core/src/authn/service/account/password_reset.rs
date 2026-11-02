@@ -14,11 +14,10 @@
 //!   cross-tenant rail before `complete_password_reset` does the
 //!   expensive Argon2id-flavoured rest of the flow.
 
-use crate::authn::service::{AuthnService, RequestAuthnService};
+use crate::authn::service::RequestAuthnService;
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
-    factor::{FactorConfig, FactorKind},
     store::{FactorStore, IdentityPasswordHistory, IdentityPasswordReset, IdentityStore},
     types::AuthnScope,
 };
@@ -47,10 +46,15 @@ where
     ///
     /// An identifier that does not resolve (unknown tenant, inactive tenant
     /// or unknown user) makes the same store round trips as one that does:
-    /// one tenant lookup, one user lookup, one token write and one audit
-    /// write. The write goes to a reserved user id and carries an already
-    /// expired token whose plaintext is discarded, so it can never be
-    /// redeemed; the audit row is a failure with no user attributed.
+    /// one tenant lookup, one user lookup, one account status read, one
+    /// token write and one audit write. The write goes to a reserved user
+    /// id and carries an already expired token whose plaintext is
+    /// discarded, so it can never be redeemed; the audit row is a failure
+    /// with no user attributed. An account that may not log in (suspended,
+    /// locked, terminated) is answered the same way, `Ok(None)` after the
+    /// same work, since [`complete_password_reset`](Self::complete_password_reset)
+    /// would refuse its token; its audit row names the account with
+    /// `NotActive`.
     ///
     /// # Arguments
     ///
@@ -65,15 +69,7 @@ where
         ttl: std::time::Duration,
     ) -> Result<Option<String>, AuthnError<I::Error>> {
         let now = self.inner.clock.now();
-        let expires_at = chrono::Duration::from_std(ttl)
-            .ok()
-            .filter(|d| *d > chrono::Duration::zero() && *d <= chrono::Duration::days(7))
-            .and_then(|d| now.checked_add_signed(d))
-            .ok_or_else(|| {
-                AuthnError::Internal(
-                    "password reset ttl must be positive and at most seven days".to_string(),
-                )
-            })?;
+        let expires_at = Self::reset_token_expiry(now, ttl)?;
 
         // The same input limits `begin_login` applies. An identifier or
         // tenant outside them is looked up as the empty string, which no
@@ -90,10 +86,11 @@ where
             ("", "")
         };
 
-        // The cooldown is keyed on the identifier as typed, for a registered
-        // one and an unregistered one alike, so being inside it says nothing
-        // about whether an account exists. It runs after the input limits,
-        // which map an over-long identifier to the empty string.
+        // The cooldown is keyed on the normalised identifier (case folded,
+        // invisible characters dropped), for a registered one and an
+        // unregistered one alike, so being inside it says nothing about
+        // whether an account exists. It runs after the input limits, which
+        // map an over-long identifier to the empty string.
         if self
             .inner
             .reset_requests
@@ -108,39 +105,14 @@ where
             return Ok(None);
         }
 
-        // Look up the user. If not found, return Ok(None) to avoid
-        // leaking whether the identifier exists.
-        let tenant = self
-            .inner
-            .identity
-            .find_tenant(tenant_identifier)
-            .await
-            .map_err(AuthnError::Store)?;
-        let tenant_active = tenant.as_ref().is_some_and(|t| t.status.is_active());
-        let tenant_id = tenant.map_or(crate::authn::ids::TenantId::SYSTEM, |t| t.id);
-
-        // The user lookup runs for every tenant outcome so the number of
-        // round trips does not depend on it.
-        let user = self
-            .inner
-            .identity
-            .find_user(identifier, &tenant_id)
-            .await
-            .map_err(AuthnError::Store)?
-            .filter(|u| tenant_active && u.validate().is_ok());
+        let (user, refused) = self
+            .resolve_reset_requester(identifier, tenant_identifier)
+            .await?;
 
         // Generate token: 32 random bytes → URL-safe base64. Done
         // unconditionally so the not-found path performs the same RNG +
         // SHA-256 work as the found path.
-        let mut token_bytes = [0u8; 32];
-        self.inner.rng.fill_bytes(&mut token_bytes);
-        use base64::Engine as _;
-        let plaintext = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
-        let hash = {
-            use sha2::Digest;
-            let digest = sha2::Sha256::digest(plaintext.as_bytes());
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-        };
+        let (plaintext, hash) = self.mint_reset_token();
 
         let Some(user) = user else {
             // The same two writes the found path makes. The token is
@@ -152,10 +124,15 @@ where
                 .identity
                 .store_reset_token(&crate::authn::ids::UserId::SYSTEM, &hash, now)
                 .await;
-            self.emit_audit(AuthEventBuilder::failure(
-                AuthEventType::PasswordResetRequested,
-            ))
-            .await?;
+            // The row of a refused account names it; an unknown identifier
+            // has nobody to name.
+            let mut builder = AuthEventBuilder::failure(AuthEventType::PasswordResetRequested);
+            if let Some(refused) = &refused {
+                builder = builder
+                    .attributed_to(&refused.id, &refused.tenant_id)
+                    .with_error(AuthFailureReason::NotActive);
+            }
+            self.emit_audit(builder).await?;
             return Ok(None);
         };
 
@@ -191,6 +168,102 @@ where
         .await?;
 
         Ok(Some(plaintext))
+    }
+
+    /// When a reset token issued at `now` for `ttl` expires. A `ttl` of zero,
+    /// or one longer than seven days, is refused.
+    fn reset_token_expiry(
+        now: chrono::DateTime<chrono::Utc>,
+        ttl: std::time::Duration,
+    ) -> Result<chrono::DateTime<chrono::Utc>, AuthnError<I::Error>> {
+        chrono::Duration::from_std(ttl)
+            .ok()
+            .filter(|d| *d > chrono::Duration::zero() && *d <= chrono::Duration::days(7))
+            .and_then(|d| now.checked_add_signed(d))
+            .ok_or_else(|| {
+                AuthnError::Internal(
+                    "password reset ttl must be positive and at most seven days".to_string(),
+                )
+            })
+    }
+
+    /// Resolve the account a reset is asked for: the tenant, the user in it
+    /// and the account's status, with the same round trips whether the
+    /// identifier is registered or not. Returns the user a token may be
+    /// issued to and, apart from it, the user of an account that may not log
+    /// in, so the refusal's audit row can name them; at most one is `Some`.
+    async fn resolve_reset_requester(
+        &self,
+        identifier: &str,
+        tenant_identifier: &str,
+    ) -> Result<
+        (
+            Option<crate::authn::types::User>,
+            Option<crate::authn::types::User>,
+        ),
+        AuthnError<I::Error>,
+    > {
+        // Look up the user. If not found, return Ok(None) to avoid
+        // leaking whether the identifier exists.
+        let tenant = self
+            .inner
+            .identity
+            .find_tenant(tenant_identifier)
+            .await
+            .map_err(AuthnError::Store)?;
+        let tenant_active = tenant.as_ref().is_some_and(|t| t.status.is_active());
+        let tenant_id = tenant.map_or(crate::authn::ids::TenantId::SYSTEM, |t| t.id);
+
+        // The user lookup runs for every tenant outcome so the number of
+        // round trips does not depend on it.
+        let user = self
+            .inner
+            .identity
+            .find_user(identifier, &tenant_id)
+            .await
+            .map_err(AuthnError::Store)?
+            .filter(|u| tenant_active && u.validate().is_ok());
+
+        // An account that may not log in gets no token: the commit would
+        // refuse it, so the mail would go out for nothing. The status read
+        // runs on the unknown path too, against the system id, so the
+        // round trips do not say whether the identifier is registered. A
+        // status the store cannot answer refuses as well, logged for the
+        // operator, since the unknown path shows nothing of its outage.
+        let refused = match &user {
+            Some(u) => match self.current_account_status(&u.id).await {
+                Ok(status) if status.allows_login() => None,
+                Ok(status) => {
+                    tracing::warn!(user_id = %u.id, status = ?status, "password reset refused: account is not active");
+                    Some(u.clone())
+                }
+                Err(e) => {
+                    tracing::error!(user_id = %u.id, error = %e, "password reset: the account status could not be read; refusing");
+                    Some(u.clone())
+                }
+            },
+            None => {
+                let _ = self
+                    .inner
+                    .identity
+                    .account_status(&crate::authn::ids::UserId::SYSTEM)
+                    .await;
+                None
+            }
+        };
+        let user = user.filter(|_| refused.is_none());
+        Ok((user, refused))
+    }
+
+    /// A fresh reset token: the plaintext to deliver and the SHA-256 digest
+    /// of it to store, both URL-safe base64.
+    fn mint_reset_token(&self) -> (String, String) {
+        let mut token_bytes = [0u8; 32];
+        self.inner.rng.fill_bytes(&mut token_bytes);
+        use base64::Engine as _;
+        let plaintext = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+        let hash = reset_token_hash(&plaintext);
+        (plaintext, hash)
     }
 
     /// Tenant-scoped password-reset variant.
@@ -313,16 +386,7 @@ where
         // error, where the contract is `Ok(false)` like a bad token. With a
         // tenant named, the lookup is scoped to it, so another tenant's user
         // is indistinguishable from none.
-        let user = match expected_tenant {
-            Some(tenant) => {
-                self.inner
-                    .identity
-                    .get_user_in_tenant(user_id, tenant)
-                    .await
-            }
-            None => self.inner.identity.get_user(user_id).await,
-        }
-        .map_err(AuthnError::Store)?;
+        let user = self.find_reset_user(user_id, expected_tenant).await?;
         let Some(user) = user else {
             if let Some(tenant) = expected_tenant {
                 tracing::warn!(
@@ -372,7 +436,7 @@ where
         // match stops the flow before any costly work, and one that does is
         // spent only after the new password has passed the history check, so
         // a refused password leaves the link usable.
-        if !self.reset_token_matches(user_id, token, false).await? {
+        if !self.peek_reset_token(user_id, token).await? {
             return self
                 .refuse_password_reset(Some(&user), "token_mismatch")
                 .await;
@@ -383,7 +447,10 @@ where
             user_id: user.id,
         };
 
-        self.record_replaced_hash(user_id, &user_scope).await?;
+        // Read, not written: the hash this reset replaces is recorded in the
+        // history only when the new password is installed, so a reset
+        // refused below writes nothing.
+        let replaced = self.replaced_hash_to_record(user_id, &user_scope).await?;
 
         // One blocking task checks the new password against every stored
         // hash and, when it is not a reuse, hashes it. The check verifies the
@@ -391,7 +458,7 @@ where
         // plaintext; hashing earlier would feed a PHC string into Argon2's
         // plaintext slot and the check would never match.
         let Some(new_password_hash) = self
-            .check_history_and_hash(user_id, new_password, &rules)
+            .check_history_and_hash(user_id, new_password, replaced.as_deref(), &rules)
             .await?
         else {
             // Password was used before; the token is kept.
@@ -400,33 +467,127 @@ where
                 .await;
         };
 
-        // The hashing above took tens of milliseconds, and the status was
-        // read before it. Read it again at the commit, before the token is
-        // spent and the password installed, so a suspension that landed in
-        // between is honoured and the unspent token works once the account
-        // is active again.
-        let status = self.current_account_status(user_id).await?;
-        if !status.allows_login() {
+        // The hashing above took tens of milliseconds, and the account and
+        // tenant were checked before it. Check both again at the commit,
+        // before the token is spent and the password installed, so a
+        // suspension of either that landed in between is honoured and the
+        // unspent token works once they are active again.
+        if let Some(reason) = self.reset_refusal_reason(&user).await? {
             tracing::warn!(
                 user_id = %user_id,
-                status = ?status,
-                "password reset refused at commit: account is no longer active"
+                reason,
+                "password reset refused at commit: no longer admitted"
             );
-            return self.refuse_password_reset(Some(&user), "not_active").await;
+            return self.refuse_password_reset(Some(&user), reason).await;
         }
 
         // Spend the token. Of two requests that both got this far, exactly
         // one wins; the other changes nothing.
-        if !self.reset_token_matches(user_id, token, true).await? {
+        if !self.spend_reset_token(user_id, token).await? {
             return self
                 .refuse_password_reset(Some(&user), "token_mismatch")
                 .await;
         }
 
-        self.install_new_password(user_id, &user_scope, new_password_hash, rules)
-            .await?;
+        self.commit_password_reset(
+            user_id,
+            &user,
+            user_scope,
+            replaced,
+            new_password_hash,
+            rules,
+        )
+        .await
+    }
 
-        self.finish_password_reset(&user).await
+    /// Whether `token` is the user's outstanding reset token, leaving it
+    /// unspent. `false` for a token consumed, expired, never issued or
+    /// wrong; an error only on a store outage.
+    async fn peek_reset_token(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        token: &str,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        self.inner
+            .identity
+            .check_reset_token(user_id, &reset_token_hash(token), self.inner.clock.now())
+            .await
+            .map_err(AuthnError::Store)
+    }
+
+    /// Spend `token` when it is the user's outstanding reset token: of two
+    /// requests spending one token, exactly one gets `true`.
+    async fn spend_reset_token(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        token: &str,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        self.inner
+            .identity
+            .verify_reset_token(user_id, &reset_token_hash(token), self.inner.clock.now())
+            .await
+            .map_err(AuthnError::Store)
+    }
+
+    /// The user a reset names, looked up within `expected_tenant` when one
+    /// is given.
+    async fn find_reset_user(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        expected_tenant: Option<&crate::authn::ids::TenantId>,
+    ) -> Result<Option<crate::authn::types::User>, AuthnError<I::Error>> {
+        match expected_tenant {
+            Some(tenant) => {
+                self.inner
+                    .identity
+                    .get_user_in_tenant(user_id, tenant)
+                    .await
+            }
+            None => self.inner.identity.get_user(user_id).await,
+        }
+        .map_err(AuthnError::Store)
+    }
+
+    /// Install the new password and finish the reset once the token is spent.
+    async fn commit_password_reset(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        user: &crate::authn::types::User,
+        user_scope: AuthnScope,
+        replaced: Option<String>,
+        new_password_hash: String,
+        rules: crate::authn::factor::PasswordRules,
+    ) -> Result<bool, AuthnError<I::Error>> {
+        // From here the token is spent, so what follows must run to the end
+        // whatever the caller does: a client that hangs up or a timeout
+        // drops this future, and an install without the session invalidation
+        // behind it would leave a stolen cookie valid against the new
+        // password. The commit runs on its own task, owning a handle to the
+        // service, and this future only waits for it.
+        let service = self.clone();
+        let committing = {
+            let user = user.clone();
+            let user_id = *user_id;
+            tokio::spawn(async move {
+                service
+                    .install_new_password(&user_id, &user_scope, replaced, new_password_hash, rules)
+                    .await?;
+                service.finish_password_reset(&user).await
+            })
+        };
+        match committing.await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!(
+                    user_id = %user_id,
+                    error = %e,
+                    "the password reset commit task did not finish"
+                );
+                Err(AuthnError::Internal(format!(
+                    "the password reset commit task did not finish: {e}"
+                )))
+            }
+        }
     }
 
     /// Everything after the new password is installed: sessions,
@@ -470,227 +631,44 @@ where
         // after the audit row is written.
         let revoked = self.revoke_refresh_tokens(user_id).await;
 
-        self.emit_audit(
-            AuthEventBuilder::success(AuthEventType::PasswordReset)
-                .attributed_to(&user.id, &user.tenant_id),
-        )
-        .await?;
+        let audited = self
+            .emit_audit(
+                AuthEventBuilder::success(AuthEventType::PasswordReset)
+                    .attributed_to(&user.id, &user.tenant_id),
+            )
+            .await;
 
+        // Every failure is logged, whichever is returned: the one the
+        // caller gets is the costliest left undone, the sessions still
+        // open, then the refresh tokens, then the row.
+        for (step, outcome) in [
+            ("ending the user's sessions", &sessions_ended),
+            ("revoking the user's refresh tokens", &revoked),
+            ("writing the audit row", &audited),
+        ] {
+            if let Err(e) = outcome {
+                tracing::error!(
+                    user_id = %user_id,
+                    step,
+                    error = %e,
+                    "password reset: a step after the install failed"
+                );
+            }
+        }
         sessions_ended?;
         revoked?;
+        audited?;
         Ok(true)
     }
 }
 
-impl<I, F> AuthnService<I, F>
-where
-    // Same bounds as the request-scoped block above, for the same reason:
-    // these are its helpers, and a store that cannot persist a reset token
-    // has no business reaching them.
-    I: IdentityStore + IdentityPasswordReset + IdentityPasswordHistory,
-    F: FactorStore<Error = I::Error>,
-{
-    /// Hash the supplied plaintext token via SHA-256 and compare it with the
-    /// store's per-user reset-token record, spending the record when `spend`
-    /// is set.
-    ///
-    /// Returns `Ok(true)` when the token matches the current outstanding
-    /// reset token for `user_id`. Returns `Ok(false)` when it doesn't
-    /// (consumed, expired, never issued, or simply wrong): caller maps to
-    /// "reset failed." Errors only on store outage.
-    ///
-    /// SHA-256 (rather than HMAC or Argon2) matches the begin-side
-    /// `record_reset_token` storage shape: the token is high-entropy
-    /// (32 random bytes from `SecureRng`, base64-encoded) and
-    /// single-use, so a fast hash is appropriate. If begin-side
-    /// hashing changes, this must change in lockstep.
-    async fn reset_token_matches(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        token: &str,
-        spend: bool,
-    ) -> Result<bool, AuthnError<I::Error>> {
-        use base64::Engine as _;
-        let hash = {
-            use sha2::Digest;
-            let digest = sha2::Sha256::digest(token.as_bytes());
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-        };
-        let now = self.inner.clock.now();
-        if spend {
-            self.inner
-                .identity
-                .verify_reset_token(user_id, &hash, now)
-                .await
-        } else {
-            self.inner
-                .identity
-                .check_reset_token(user_id, &hash, now)
-                .await
-        }
-        .map_err(AuthnError::Store)
-    }
-
-    /// Record the hash about to be replaced in the password history.
-    ///
-    /// Nothing is recorded when the account has no password factor, or when
-    /// the replaced hash is already the newest history entry.
-    async fn record_replaced_hash(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        user_scope: &AuthnScope,
-    ) -> Result<(), AuthnError<I::Error>> {
-        // Record the old hash in password history.
-        //
-        // Unconditional, and the guard below is about whether an *old
-        // password exists*, not about whether the backend keeps history.
-        // That distinction used to matter a great deal: the method carried
-        // a default body that panicked, so a backend which had not
-        // overridden it unwound here on the first password change any user
-        // made. It now lives on `IdentityPasswordHistory`, which has no
-        // defaults, and this flow is bounded on that trait, so a store
-        // without history cannot reach this line at all.
-        if let Some(FactorConfig::Password(ref old_config)) = self
-            .inner
-            .factors
-            .load_factor(user_scope, FactorKind::Password)
-            .await
-            .map_err(AuthnError::Store)?
-        {
-            // Every change records the hash it installs, so the replaced
-            // hash is normally already the newest entry. Record it only
-            // when it is not (the first change of an account that had no
-            // history), or each hash would count twice and a check over the
-            // last N passwords would cover about N/2.
-            let old_hash: &str = &old_config.hash;
-            let latest = self
-                .inner
-                .identity
-                .password_history(user_id, 1)
-                .await
-                .map_err(AuthnError::Store)?;
-            if latest.first().map(String::as_str) != Some(old_hash) {
-                self.inner
-                    .identity
-                    .record_password_hash(user_id, old_hash)
-                    .await
-                    .map_err(AuthnError::Store)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Record the new hash in history, then make it the live password.
-    ///
-    /// The order is the guarantee: see the comment on the writes.
-    async fn install_new_password(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        user_scope: &AuthnScope,
-        new_password_hash: String,
-        rules: crate::authn::factor::PasswordRules,
-    ) -> Result<(), AuthnError<I::Error>> {
-        // Order the writes so that the *worst* possible partial
-        // failure is benign.
-        //
-        //   * Record the NEW hash in history BEFORE activating it via
-        //     `save_factor`. If the history write fails, we abort with
-        //     the old password still live; no policy bypass.
-        //   * If the history write succeeds and `save_factor` fails, the
-        //     new hash is in history but not active. The user retries
-        //     with a different password (or the same password; which
-        //     will fail the history check, prompting them to pick a new
-        //     one). This is strictly better than the prior order, which
-        //     could leave a *live new password* missing from history,
-        //     letting the user re-use it on the next reset and silently
-        //     violate the password-rotation policy.
-        //
-        // Production backends should override `record_password_hash` and
-        // `save_factor` to share a single SQL transaction; until then,
-        // this ordering minimises blast radius.
-        self.inner
-            .identity
-            .record_password_hash(user_id, &new_password_hash)
-            .await
-            .map_err(AuthnError::Store)?;
-
-        let new_config = FactorConfig::Password(crate::authn::factor::PasswordConfig {
-            hash: crate::authn::factor::ZeroizedString::new(new_password_hash),
-            rules,
-        });
-        self.inner
-            .factors
-            .save_factor(user_scope, new_config)
-            .await
-            .map_err(AuthnError::Store)?;
-        Ok(())
-    }
-
-    /// Check `new_password` (plaintext) against the user's last
-    /// `rules.history_count` stored hashes and, when it is not among them,
-    /// return its Argon2id hash.
-    ///
-    /// Returns `Ok(None)` if the password was previously used (caller rejects
-    /// the reset) and `Ok(Some(hash))` if it is safe to use. With
-    /// `rules.history_count == 0` the history check is disabled and the hash
-    /// is returned directly.
-    ///
-    /// The whole job (up to `history_count` verifications and one hash) is
-    /// one task on the service's [`KdfExecutor`](crate::blocking::KdfExecutor),
-    /// so a reset holds neither a runtime worker nor more than one blocking
-    /// slot. The salt is drawn from the service's RNG before the task starts.
-    ///
-    /// **Security invariant, preserve on every refactor:** the loop
-    /// iterates ALL history entries to constant time, even after a match
-    /// is found. The naïve `if reused { break; }` would leak the position
-    /// of the matched hash via response time: a 5-deep history with the
-    /// recent password reused returns measurably faster than a 5-deep
-    /// history with the oldest reused, telling an attacker who's
-    /// iterating candidate passwords roughly *which* historical password
-    /// they hit. The `let mut reused = false;` accumulator + full scan +
-    /// post-loop check is load-bearing for that timing equalisation. Do
-    /// NOT "optimise" by short-circuiting the loop.
-    ///
-    /// `axess_factors::verify_password` itself uses constant-time Argon2
-    /// verification per hash, so the per-iteration cost is constant
-    /// regardless of whether that single iteration matches.
-    ///
-    /// **Plaintext-not-hash invariant:** `new_password` MUST be the
-    /// plaintext candidate. Argon2's verify routine recomputes the hash
-    /// of `new_password` against each old hash's embedded salt and
-    /// parameters; feeding an already-hashed PHC string here means
-    /// Argon2 hashes the PHC string itself, which never matches anything
-    /// real and silently disables the entire history-reuse check.
-    async fn check_history_and_hash(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        new_password: &str,
-        rules: &crate::authn::factor::PasswordRules,
-    ) -> Result<Option<String>, AuthnError<I::Error>> {
-        let history = if rules.history_count == 0 {
-            Vec::new()
-        } else {
-            self.inner
-                .identity
-                .password_history(user_id, rules.history_count)
-                .await
-                .map_err(AuthnError::Store)?
-        };
-        let salt = axess_factors::generate_password_salt(&self.inner.rng);
-        let candidate = zeroize::Zeroizing::new(new_password.to_owned());
-        let outcome = self
-            .inner
-            .kdf
-            .run(move || {
-                let mut reused = false;
-                for old_hash in &history {
-                    if axess_factors::verify_password(candidate.as_str(), old_hash).is_ok() {
-                        reused = true;
-                    }
-                }
-                (!reused).then(|| axess_factors::hash_password_with_salt(candidate.as_str(), &salt))
-            })
-            .await?;
-        Ok(outcome)
-    }
+/// The stored form of a reset token: SHA-256, base64url, for the token
+/// minted and for every token checked. A fast hash is right for it: the
+/// token is 32 random bytes from the service's RNG and single-use.
+fn reset_token_hash(token: &str) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(token.as_bytes()))
 }
+
+mod install;

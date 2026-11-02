@@ -43,28 +43,6 @@ async fn reset_failed_attempts_is_noop() {
     let uid = axess_identity::testing::user("noop-victim");
     assert!(wrapped.reset_failed_attempts(&uid).await.is_ok());
 }
-
-#[tokio::test]
-async fn lockout_policy_delegates_to_inner_not_trait_default() {
-    // Kills `NoopAuthnLog::lockout_policy -> Default::default()`. The
-    // default is max_attempts=5; we configure the inner store with a
-    // distinct value so the delegated and the mutated result diverge.
-    let custom = LockoutPolicy {
-        max_attempts: 13,
-        duration: Some(std::time::Duration::from_secs(99)),
-        attempt_window: std::time::Duration::from_secs(7),
-        ..LockoutPolicy::default()
-    };
-    let inner = MockIdentityStore::new().with_lockout_policy(custom);
-    let wrapped = NoopAuthnLog(inner);
-    let got = wrapped.lockout_policy();
-    assert_eq!(
-        got.max_attempts, 13,
-        "NoopAuthnLog::lockout_policy must delegate to inner, \
-         not return LockoutPolicy::default() (max_attempts=5)"
-    );
-}
-
 #[tokio::test]
 async fn lockout_policy_for_tenant_delegates_to_inner_not_trait_default() {
     // Kills `NoopAuthnLog::lockout_policy_for_tenant -> Default::default()`.

@@ -1,14 +1,20 @@
 //! Issuing, rotating and revoking refresh tokens.
 
 use super::device_binding;
-use super::store::{RefreshTokenStore, RotationOutcome};
+use super::store::RefreshTokenStore;
 use super::types::*;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::session::data::{AuthState, SessionData};
+use crate::session::data::SessionData;
 use axess_rng::SecureRng;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+
+mod pipeline;
+
+pub use pipeline::Refresh;
+#[cfg(feature = "device")]
+pub(super) use pipeline::{DeviceGate, DeviceRefusal};
 
 /// Compute the storage-side hash of a plaintext refresh token, returned
 /// as URL-safe base64.
@@ -36,16 +42,29 @@ pub(super) fn hash_token(plaintext: &str, pepper: Option<&[u8]>) -> String {
 }
 
 /// A refresh record found by its plaintext, and under which pepper.
-pub(super) struct Located {
-    pub(super) record: RefreshToken,
+struct Located {
+    record: RefreshToken,
     /// Found only under `previous_hash_pepper`: the record still carries the
-    /// retired hash and has to be re-stored under the current one.
-    pub(super) under_previous_pepper: bool,
+    /// retired hash, and a device binding keyed by it, and has to be
+    /// re-stored under the current one.
+    under_previous_pepper: bool,
+}
+
+impl Located {
+    /// The pepper the record was found under, which its token hash and its
+    /// device binding are keyed with.
+    fn stored_under<'a>(&self, config: &'a RefreshTokenConfig) -> Option<&'a [u8]> {
+        if self.under_previous_pepper {
+            config.previous_pepper()
+        } else {
+            config.pepper()
+        }
+    }
 }
 
 /// Look a token up by its plaintext: under the current pepper, then, when a
 /// previous pepper is configured and the first lookup missed, under that one.
-pub(super) async fn locate<S: RefreshTokenStore>(
+async fn locate<S: RefreshTokenStore>(
     plaintext: &str,
     store: &S,
     config: &RefreshTokenConfig,
@@ -69,23 +88,6 @@ pub(super) async fn locate<S: RefreshTokenStore>(
             record,
             under_previous_pepper: true,
         }))
-}
-
-/// The config a refresh of `found` runs under. A token still stored under the
-/// previous pepper is rotated even when `rotation` is off, because rotation
-/// is what writes the replacement under the current pepper.
-pub(super) fn config_for<'a>(
-    config: &'a RefreshTokenConfig,
-    found: &Located,
-) -> std::borrow::Cow<'a, RefreshTokenConfig> {
-    if found.under_previous_pepper && !config.rotation {
-        std::borrow::Cow::Owned(RefreshTokenConfig {
-            rotation: true,
-            ..config.clone()
-        })
-    } else {
-        std::borrow::Cow::Borrowed(config)
-    }
 }
 
 /// Generate a cryptographically random plaintext token (32 bytes, URL-safe base64).
@@ -153,44 +155,16 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
     Ok((plaintext, record))
 }
 
-/// Validate a refresh token and produce a new session.
+/// Validate a refresh token and produce a new session, without checking
+/// the account's status.
 ///
-/// **Deprecated**: this rotates a token for an account that may have been
+/// Deprecated: it rotates a token for an account that may have been
 /// suspended or terminated since the token was issued. Use
-/// [`refresh_session_with_status_check`] (or its tenant form), passing a
-/// predicate that reads the account's status; a caller that really has no
-/// status to consult passes `|_| async { true }` and says so.
-///
-/// On success returns `(SessionData, Option<(new_plaintext, new_record)>)`.
-/// The optional second element is present when token rotation is
-/// enabled: the old token is revoked and a fresh one issued.
-///
-/// # Security: account status and registry registration
-///
-/// This function performs **token CRUD only**. It does NOT consult any
-/// [`IdentityStore`](crate::authn::store::IdentityStore) or
-/// [`SessionRegistry`](crate::session::store::SessionRegistry). Two
-/// caller responsibilities the library cannot enforce here:
-///
-/// 1. **Account status**: a refresh token from a user who has been
-///    suspended/terminated since issuance is still valid for rotation.
-///    Use [`refresh_session_with_status_check`] to thread an
-///    `account_status` predicate through the validation; on `false`
-///    the helper returns [`RefreshError::AccountInactive`] WITHOUT
-///    rotating, so the legitimate user's family stays intact for
-///    later un-suspension.
-///
-/// 2. **Registry registration**: the returned `SessionData` is
-///    `Authenticated` but is NOT registered with any
-///    [`crate::session::SessionRegistry`]. A refresh-rotated session that the
-///    application doesn't `register` is the same anti-pattern in
-///    miniature: `invalidate_user` cannot reach it. Callers who use
-///    a `SessionRegistry` MUST register the new session id before
-///    returning the response.
+/// [`Refresh::new`] with a status predicate, then [`Refresh::run`].
 #[deprecated(
     since = "0.13.0",
     note = "rotates a token without checking that the account may still log in; \
-            use refresh_session_with_status_check, or the tenant form"
+            use Refresh::new(plaintext, status_check).run(..)"
 )]
 pub async fn refresh_session<S: RefreshTokenStore>(
     plaintext: &str,
@@ -200,16 +174,21 @@ pub async fn refresh_session<S: RefreshTokenStore>(
     now: DateTime<Utc>,
     device_info: Option<&str>,
 ) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    refresh_scoped(plaintext, store, config, rng, now, device_info, None).await
+    Refresh::without_status_check(plaintext)
+        .device_info(device_info)
+        .run(store, config, rng, now)
+        .await
 }
 
 /// [`refresh_session`] for a request that belongs to one tenant.
 ///
-/// A token that belongs to another tenant answers [`RefreshError::NotFound`]
-/// without being rotated, revoked or otherwise touched, exactly as an
-/// unknown token does. Use it when the tenant comes from the request (a
-/// host name, a path segment) so a token cannot be redeemed against a
-/// tenant it was not issued for.
+/// Deprecated: it skips the account-status check too. Use
+/// [`Refresh::new`] with a status predicate and [`Refresh::in_tenant`].
+#[deprecated(
+    since = "0.14.0",
+    note = "skips the account-status check; \
+            use Refresh::new(plaintext, status_check).in_tenant(tenant).run(..)"
+)]
 pub async fn refresh_session_in_tenant<S: RefreshTokenStore>(
     plaintext: &str,
     tenant: &TenantId,
@@ -219,216 +198,22 @@ pub async fn refresh_session_in_tenant<S: RefreshTokenStore>(
     now: DateTime<Utc>,
     device_info: Option<&str>,
 ) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    refresh_scoped(
-        plaintext,
-        store,
-        config,
-        rng,
-        now,
-        device_info,
-        Some(tenant),
-    )
-    .await
-}
-
-async fn refresh_scoped<S: RefreshTokenStore>(
-    plaintext: &str,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    device_info: Option<&str>,
-    tenant: Option<&TenantId>,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    config.check()?;
-    let found = locate(plaintext, store, config)
+    Refresh::without_status_check(plaintext)
+        .in_tenant(tenant)
+        .device_info(device_info)
+        .run(store, config, rng, now)
         .await
-        .map_err(RefreshError::Store)?
-        .ok_or(RefreshError::NotFound)?;
-    let config = config_for(config, &found);
-
-    refresh_session_from_record(found.record, store, &config, rng, now, device_info, tenant).await
 }
 
-/// Validate + rotate a refresh token given an already-loaded
-/// [`RefreshToken`] record.
+/// Refresh a session, threading a caller-supplied `account_status`
+/// predicate through the validation.
 ///
-/// Extracted from [`refresh_session`] so
-/// [`refresh_session_with_status_check`] can gate on `user_id` without
-/// having to re-run `find_token` on the happy path.
-pub(super) async fn refresh_session_from_record<S: RefreshTokenStore>(
-    record: RefreshToken,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    device_info: Option<&str>,
-    expected_tenant: Option<&TenantId>,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    if let Some(tenant) = expected_tenant
-        && record.tenant_id != *tenant
-    {
-        // A token of another tenant is indistinguishable from an unknown
-        // one, and nothing is rotated or revoked on its behalf.
-        return Err(RefreshError::NotFound);
-    }
-
-    if record.revoked {
-        return Err(handle_revoked_reuse(&record, store, config, now).await);
-    }
-
-    if token_expired(&record, config, now) {
-        return Err(RefreshError::Expired);
-    }
-
-    // Device binding check: if the stored record has device info, the caller
-    // must present a matching one. See `device_binding` for what is stored
-    // and how it is compared. The value the replacement token stores comes
-    // back with the verdict, so a token of an earlier release upgrades.
-    let child_device_info = device_binding::verify(&record, device_info, config.pepper())
-        .map_err(|()| RefreshError::DeviceMismatch)?;
-
-    // Build session data from the token's user/tenant. user_id/tenant_id
-    // are now typed at the trait surface, so the previous `try_new` parsing
-    // (and `RefreshError::InvalidToken`) are no longer needed; the
-    // RefreshTokenStore trait promises validated values come back.
-    let session = SessionData {
-        version: crate::session::data::SESSION_DATA_VERSION,
-        auth_state: AuthState::Authenticated {
-            user_id: record.user_id,
-            tenant_id: record.tenant_id,
-            // The authentication the token descends from, not the refresh:
-            // a 29-day-old token must not yield a session that passes
-            // "recent login".
-            authn_time: record.authenticated_at(),
-            // Refresh-token rotation re-establishes the same authn level
-            // implicitly; no per-factor record carried across rotation.
-            factors_completed: Vec::new(),
-        },
-        fingerprint: None,
-        // Rotated session inherits the device link from the token
-        // record. Without this, refresh-driven session resumption would
-        // appear as a "device-less" session and the layer would re-resolve
-        // it from request headers; typically yielding the same id, but
-        // an unnecessary round-trip and a lost association on the gap.
-        device_id: record.device_id,
-        custom: serde_json::Value::default(),
-        revision: 0,
-        touched_at: None,
-    };
-
-    // Token rotation: atomically revoke old + insert new in a single
-    // backend transaction so a mid-rotation crash never leaves the user
-    // both un-rotated and un-authenticated.
-    let new_token = if config.rotation {
-        let (new_plaintext, new_record) = build_refresh_token(
-            IssueRequest {
-                user_id: &record.user_id,
-                tenant_id: &record.tenant_id,
-                device_info: child_device_info,
-                family_id: Some(family_of(&record)), // Inherit (or derive) the family.
-                device_id: record.device_id,         // Inherit device link.
-            },
-            config,
-            rng,
-            now,
-            Some(record.authenticated_at()),
-        );
-
-        match store
-            .rotate_token(&record.id, &new_record)
-            .await
-            .map_err(RefreshError::Store)?
-        {
-            RotationOutcome::Rotated => {}
-            RotationOutcome::ParentAlreadyRevoked => {
-                // A parallel refresh (or a revocation) got to the parent
-                // first. Re-read it for the reason: the copy in hand was
-                // loaded while it was still live.
-                let current = match store.find_token(&record.token_hash).await {
-                    Ok(Some(found)) if found.revoked => found,
-                    _ => RefreshToken {
-                        revoked: true,
-                        revoked_reason: Some(RevocationReason::Rotated),
-                        revoked_at: None,
-                        ..record
-                    },
-                };
-                return Err(handle_revoked_reuse(&current, store, config, now).await);
-            }
-        }
-
-        Some((new_plaintext, new_record))
-    } else {
-        None
-    };
-
-    Ok((session, new_token))
-}
-
-/// Refresh a session, threading a caller-supplied
-/// `account_status` predicate through the validation.
-///
-/// Same contract as [`refresh_session`] except the refresh is gated by
-/// `status_check(&user_id)`: if the predicate returns `false`, the
-/// helper returns [`RefreshError::AccountInactive`] WITHOUT calling
-/// [`RefreshTokenStore::rotate_token`]; the legitimate user's token
-/// family is preserved unchanged so a later un-suspension restores
-/// access without forcing a full re-login.
-///
-/// Ordering: `Revoked` → `Expired` → `status_check` →
-/// device-binding → rotation. `Revoked` runs first so a compromise
-/// signal on a revoked token still triggers the family-revocation
-/// cascade even for an inactive account. `status_check` runs before
-/// the device-binding check, so a token holder with both a mismatched
-/// device fingerprint AND an inactive account surfaces as
-/// [`RefreshError::AccountInactive`]; revealing device-binding state
-/// to a caller whose account is already refused has no upside.
-/// Rotation is last, giving the same
-/// [`SessionRegistry`](crate::session::store::SessionRegistry)-
-/// invalidation-cascade protection as
-/// `complete_factor_step` (see the TOCTOU note below).
-///
-/// # When to use this vs [`refresh_session`]
-///
-/// Pick this whenever the application carries an
-/// [`IdentityStore`](crate::authn::store::IdentityStore) (or any
-/// equivalent source of truth for "is this account allowed to
-/// authenticate right now"). The bare [`refresh_session`] is for
-/// applications that have already gated the refresh route by their
-/// own status check upstream.
-///
-/// # TOCTOU window
-///
-/// Between `status_check` and `rotate_token` a concurrent suspend
-/// could land. The window is closed by the
-/// [`SessionRegistry`](crate::session::store::SessionRegistry)
-/// invalidation cascade: the suspend's `invalidate_user` evicts
-/// every registered session, and the next request through
-/// [`AuthnService::check_session`](crate::authn::service::AuthnService::check_session)
-/// observes the rotated session as invalid. Same trade-off as
-/// `complete_factor_step`'s post-register re-check covers for
-/// the factor flow.
-///
-/// # Example
-///
-/// ```ignore
-/// use axess_core::session::refresh::{refresh_session_with_status_check, RefreshError};
-/// use axess_core::authn::store::IdentityStore;
-///
-/// let result = refresh_session_with_status_check(
-///     &plaintext, &refresh_store, &config, &mut rng, now, device_info,
-///     |user_id| async move {
-///         // `identity` here is the application's IdentityStore.
-///         identity
-///             .account_status(user_id)
-///             .await
-///             // `effective_at` ends a timed suspension whose `until` has passed.
-///             .map(|status| status.effective_at(now).allows_login())
-///             .unwrap_or(false) // fail closed on store errors
-///     },
-/// ).await;
-/// ```
+/// Deprecated: [`Refresh`] is the one entry point, and composes the status
+/// check with the tenant and device checks this form cannot add.
+#[deprecated(
+    since = "0.14.0",
+    note = "use Refresh::new(plaintext, status_check).device_info(device_info).run(..)"
+)]
 pub async fn refresh_session_with_status_check<S, FStat, Fut>(
     plaintext: &str,
     store: &S,
@@ -443,31 +228,31 @@ where
     FStat: FnOnce(&UserId) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    status_checked(
-        plaintext,
-        store,
-        config,
-        rng,
-        now,
-        (None, device_info),
-        status_check,
-    )
-    .await
+    Refresh::new(plaintext, status_check)
+        .device_info(device_info)
+        .run(store, config, rng, now)
+        .await
 }
 
 /// Where a tenant-scoped refresh comes from: the tenant the request belongs
-/// to, and the device fingerprint it presents.
+/// to, and the device fingerprint it presents. The argument of the
+/// deprecated [`refresh_session_with_status_check_in_tenant`];
+/// [`Refresh::in_tenant`] and [`Refresh::device_info`] replace it.
 pub struct RefreshScope<'a> {
     /// The tenant the request belongs to.
     pub tenant: &'a TenantId,
-    /// The device fingerprint presented, as for [`refresh_session`].
+    /// The device fingerprint presented.
     pub device_info: Option<&'a str>,
 }
 
 /// [`refresh_session_with_status_check`] for a request that belongs to one
-/// tenant; a token of another tenant answers [`RefreshError::NotFound`]
-/// before the status predicate runs and before anything is rotated. See
-/// [`refresh_session_in_tenant`].
+/// tenant.
+///
+/// Deprecated: use [`Refresh`].
+#[deprecated(
+    since = "0.14.0",
+    note = "use Refresh::new(plaintext, status_check).in_tenant(tenant).device_info(device_info).run(..)"
+)]
 pub async fn refresh_session_with_status_check_in_tenant<S, FStat, Fut>(
     plaintext: &str,
     scope: RefreshScope<'_>,
@@ -482,69 +267,11 @@ where
     FStat: FnOnce(&UserId) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    status_checked(
-        plaintext,
-        store,
-        config,
-        rng,
-        now,
-        (Some(scope.tenant), scope.device_info),
-        status_check,
-    )
-    .await
-}
-
-async fn status_checked<S, FStat, Fut>(
-    plaintext: &str,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    (tenant, device_info): (Option<&TenantId>, Option<&str>),
-    status_check: FStat,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>>
-where
-    S: RefreshTokenStore,
-    FStat: FnOnce(&UserId) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    config.check()?;
-    let found = locate(plaintext, store, config)
+    Refresh::new(plaintext, status_check)
+        .in_tenant(scope.tenant)
+        .device_info(scope.device_info)
+        .run(store, config, rng, now)
         .await
-        .map_err(RefreshError::Store)?
-        .ok_or(RefreshError::NotFound)?;
-    let config = &*config_for(config, &found);
-    let record = found.record;
-
-    // A revoked token (or one of another tenant) takes the shared path first,
-    // so the compromise response is not masked as AccountInactive.
-    if record.revoked || tenant.is_some_and(|t| record.tenant_id != *t) {
-        return refresh_session_from_record(record, store, config, rng, now, device_info, tenant)
-            .await;
-    }
-    if token_expired(&record, config, now) {
-        return Err(RefreshError::Expired);
-    }
-
-    if !status_check(&record.user_id).await {
-        tracing::warn!(
-            user_id = %record.user_id,
-            "refresh refused; caller-supplied status check returned false"
-        );
-        return Err(RefreshError::AccountInactive);
-    }
-
-    refresh_session_from_record(record, store, config, rng, now, device_info, tenant).await
-}
-
-/// Whether `record` can no longer be refreshed at `now`: past its own
-/// `expires_at`, or past the family's absolute
-/// [`RefreshTokenConfig::max_lifetime`].
-fn token_expired(record: &RefreshToken, config: &RefreshTokenConfig, now: DateTime<Utc>) -> bool {
-    now >= record.expires_at
-        || config
-            .lifetime_end(record.authenticated_at())
-            .is_some_and(|end| now >= end)
 }
 
 /// The family a token's descendants carry: its own, or for a token issued
@@ -560,10 +287,13 @@ fn family_of(record: &RefreshToken) -> TokenFamilyId {
 /// What a revoked token's presentation means, and the response to it.
 ///
 /// Only a rotated-out token is evidence of theft. A token revoked by a
-/// logout, a cap eviction or an earlier family revocation is refused as
-/// [`RefreshError::Revoked`] and revokes nothing further. A rotated-out token
+/// logout, a cap eviction, a device revocation or an earlier family
+/// revocation is refused as [`RefreshError::Revoked`] and revokes nothing
+/// further. A rotated-out token
 /// presented inside [`RefreshTokenConfig::reuse_grace`] of its rotation is
-/// [`RefreshError::ConcurrentRefresh`]. Anything else is a compromise: the
+/// [`RefreshError::ConcurrentRefresh`]; the distance is measured either way,
+/// since `revoked_at` was written by whichever node rotated the token and
+/// its clock may be ahead of this one's. Anything else is a compromise: the
 /// family is revoked, and `on_token_compromise` runs whether or not the
 /// revocation succeeded, so the device cascade is never skipped by a store
 /// fault (the failure is logged, and the caller still sees `Revoked`).
@@ -575,13 +305,15 @@ async fn handle_revoked_reuse<S: RefreshTokenStore>(
 ) -> RefreshError<S::Error> {
     match record.revoked_reason {
         Some(
-            RevocationReason::Explicit | RevocationReason::Evicted | RevocationReason::Compromise,
+            RevocationReason::Explicit
+            | RevocationReason::Evicted
+            | RevocationReason::Compromise
+            | RevocationReason::Device,
         ) => return RefreshError::Revoked,
         Some(RevocationReason::Rotated) | None => {}
     }
     if let Some(at) = record.revoked_at
-        && now >= at
-        && now - at < config.reuse_grace
+        && (now - at).abs() < config.reuse_grace
     {
         return RefreshError::ConcurrentRefresh;
     }
@@ -658,7 +390,7 @@ pub(super) async fn collect_family_device_targets<S: RefreshTokenStore>(
     targets
 }
 
-/// Pure (no-I/O) builder for a refresh token record.
+/// Pure (no-I/O) builder for a refresh token record with a fresh plaintext.
 ///
 /// Splits the random/clock-dependent record construction out of
 /// [`issue_refresh_token`] so callers that need to swap one token for
@@ -671,7 +403,20 @@ pub(super) fn build_refresh_token(
     now: DateTime<Utc>,
     authn_time: Option<DateTime<Utc>>,
 ) -> (String, RefreshToken) {
-    let plaintext = generate_token_value(rng);
+    build_refresh_token_for(generate_token_value(rng), req, config, rng, now, authn_time)
+}
+
+/// [`build_refresh_token`] for a given `plaintext`: the record that stores
+/// it under the current pepper. Used to re-store a token a non-rotating
+/// client keeps, so it is found under the current pepper from then on.
+fn build_refresh_token_for(
+    plaintext: String,
+    req: IssueRequest<'_>,
+    config: &RefreshTokenConfig,
+    rng: &impl SecureRng,
+    now: DateTime<Utc>,
+    authn_time: Option<DateTime<Utc>>,
+) -> (String, RefreshToken) {
     let token_hash = hash_token(&plaintext, config.pepper());
 
     let mut id_bytes = [0u8; 16];
@@ -712,9 +457,35 @@ pub(super) fn build_refresh_token(
 /// Revoke a single refresh token by its plaintext value.
 ///
 /// Takes the [`RefreshTokenConfig`] so the lookup hash is
-/// computed with the same pepper that issuance used.
+/// computed with the same pepper that issuance used. The store records the
+/// revocation as [`RevocationReason::Explicit`], so a later presentation of
+/// the token is refused as [`RefreshError::Revoked`] and is not read as
+/// theft.
 pub async fn revoke_refresh_token<S: RefreshTokenStore>(
     plaintext: &str,
+    store: &S,
+    config: &RefreshTokenConfig,
+) -> Result<(), RefreshError<S::Error>> {
+    revoke_scoped(plaintext, None, store, config).await
+}
+
+/// [`revoke_refresh_token`] for a request that belongs to one tenant.
+///
+/// A token of another tenant answers [`RefreshError::NotFound`] and is left
+/// as it is, exactly as an unknown token is, so a logout route that takes
+/// its tenant from the request cannot revoke a token issued elsewhere.
+pub async fn revoke_refresh_token_in_tenant<S: RefreshTokenStore>(
+    plaintext: &str,
+    tenant: &TenantId,
+    store: &S,
+    config: &RefreshTokenConfig,
+) -> Result<(), RefreshError<S::Error>> {
+    revoke_scoped(plaintext, Some(tenant), store, config).await
+}
+
+async fn revoke_scoped<S: RefreshTokenStore>(
+    plaintext: &str,
+    tenant: Option<&TenantId>,
     store: &S,
     config: &RefreshTokenConfig,
 ) -> Result<(), RefreshError<S::Error>> {
@@ -724,6 +495,9 @@ pub async fn revoke_refresh_token<S: RefreshTokenStore>(
         .map_err(RefreshError::Store)?
         .ok_or(RefreshError::NotFound)?
         .record;
+    if tenant.is_some_and(|t| record.tenant_id != *t) {
+        return Err(RefreshError::NotFound);
+    }
 
     store
         .revoke_token(&record.id)

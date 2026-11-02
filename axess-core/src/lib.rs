@@ -70,19 +70,10 @@
 /// Custom tower session layer with HMAC-signed cookies and typed session data.
 pub mod session;
 
-#[cfg(any(
-    test,
-    feature = "sqlite",
-    feature = "postgres",
-    feature = "mysql",
-    feature = "valkey"
-))]
-mod subkey;
-
 pub use session::{
-    AuthSession, AuthState, ConditionalUpdate, RefreshError, RefreshToken, RefreshTokenConfig,
-    RefreshTokenStore, RevocationError, SameSite, SessionBinding, SessionConfig,
-    SessionConfigBuilder, SessionData, SessionId, SessionLayer, SessionRegistry,
+    AuthSession, AuthState, ConditionalUpdate, Impersonation, RefreshError, RefreshToken,
+    RefreshTokenConfig, RefreshTokenStore, RevocationError, SameSite, SessionBinding,
+    SessionConfig, SessionConfigBuilder, SessionData, SessionId, SessionLayer, SessionRegistry,
     SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore, UserAgentBinding,
 };
 #[cfg(any(test, feature = "memory"))]
@@ -195,17 +186,27 @@ pub use axess_factors::ldap::MockLdapProvider;
 #[cfg(feature = "oauth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
 pub use axess_factors::oauth::{
-    AuthUrlResult, DpopKey, DpopSigner, JarmResponse, OAuthClaims, OAuthError, OAuthLoginOptions,
-    OAuthProvider, OAuthProviderConfig, ResponseMode, UserInfoClaims, spawn_jwks_refresh,
+    AuthUrlResult, DpopKey, DpopProof, DpopSigner, JarmResponse, OAuthClaims, OAuthError,
+    OAuthLoginOptions, OAuthProvider, OAuthProviderBuilder, OAuthProviderConfig, ResponseMode,
+    UserInfoClaims, spawn_jwks_refresh,
+};
+
+/// The `private_key_jwt` signer for
+/// [`OAuthProviderBuilder::with_private_key_jwt`], the stored shape of its
+/// settings, and why one could not be built.
+#[cfg(feature = "oauth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+pub use axess_factors::client_assertion::{
+    ClientAssertionError, ClientAssertionSigner, SignerSpec,
 };
 
 #[cfg(all(feature = "oauth", any(test, feature = "testing")))]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "oauth", feature = "testing"))))]
 pub use axess_factors::oauth::MockOAuthProvider;
 
-#[cfg(feature = "fapi")]
-#[cfg_attr(docsrs, doc(cfg(feature = "fapi")))]
-pub use axess_factors::oauth::{DpopProof, FapiConfig, ParResponse, SenderConstraint};
+#[cfg(feature = "oauth")]
+#[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]
+pub use axess_factors::oauth::{FapiConfig, ParResponse, SenderConstraint};
 
 #[cfg(feature = "device")]
 #[cfg_attr(docsrs, doc(cfg(feature = "device")))]
@@ -217,8 +218,8 @@ pub use device::{
     DeviceTrustLevel, FingerprintHash, LifecycleDeviceResolver, MemoryDevicePiiStore,
     MemoryDevicePiiStoreError, MemoryDeviceStore, MemoryDeviceStoreError, NoopDeviceEventSink,
     NoopDeviceResolver, OwnerClaim, PiiToken, PresentedDevice, REDACTED_PLACEHOLDER,
-    RedactedResolver, ResolvedDevice, SessionDevice, SessionUser, SweepConfig, SweepConfigBuilder,
-    SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
+    RedactedResolver, ResolvedDevice, SessionDevice, SessionTenant, SessionUser, SweepConfig,
+    SweepConfigBuilder, SweepConfigError, SweepCounts, TenantPepperResolver, TrustTransition,
     cascade_revoke_by_refresh_family, cascade_revoke_devices,
 };
 
@@ -329,6 +330,14 @@ pub mod validation;
     feature = "gcp-wif"
 ))]
 pub(crate) mod outbound_http;
+#[cfg(any(
+    feature = "delegated-exchange",
+    feature = "delegated-stored",
+    feature = "aws-sts",
+    feature = "azure-fic",
+    feature = "gcp-wif"
+))]
+pub use outbound_http::ClientBuildError;
 
 pub use axess_clock::{Clock, SystemClock};
 pub use axess_rng::{SecureRng, SystemRng};

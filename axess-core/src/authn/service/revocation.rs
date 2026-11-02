@@ -38,6 +38,9 @@ pub(crate) enum RevokeFailure {
     NoRegistry,
     /// The registry backend failed; the sessions may still be valid.
     Registry(RevocationError),
+    /// The registry does not hold the named session for the named user: it
+    /// is somebody else's, or already gone. Nothing was touched.
+    NotHeld,
 }
 
 impl RevokeFailure {
@@ -50,6 +53,7 @@ impl RevokeFailure {
                 "no session registry is configured, so sessions cannot be revoked".to_owned(),
             ),
             Self::Registry(e) => AuthnError::ExternalService(e.to_string()),
+            Self::NotHeld => AuthnError::NoFlow,
         }
     }
 }
@@ -89,6 +93,14 @@ where
 
     /// End one session of `user_id`; see
     /// [`revoke_user_sessions`](Self::revoke_user_sessions).
+    ///
+    /// The session must be one the registry holds for `user_id`: the stored
+    /// row is keyed by id alone and the audit row names the caller's user,
+    /// so a pair that does not match would end another user's session and
+    /// record it against the wrong one. For such a pair nothing is touched:
+    /// the row stays, no revocation is published, and the caller gets
+    /// [`RevokeFailure::NotHeld`]. A registry that cannot list the user's
+    /// sessions refuses too, rather than reading an outage as "not theirs".
     pub(crate) async fn revoke_session(
         &self,
         user_id: &UserId,
@@ -97,6 +109,18 @@ where
         let Some(reg) = &self.inner.registry else {
             return Err(RevokeFailure::NoRegistry);
         };
+        let held = reg
+            .held_sessions(user_id)
+            .await
+            .map_err(RevokeFailure::Registry)?;
+        if !held.contains(session_id) {
+            tracing::warn!(
+                user_id = %user_id,
+                session_id = %session_id,
+                "session kick refused: the registry does not hold this session for this user"
+            );
+            return Err(RevokeFailure::NotHeld);
+        }
         let revoked = reg.invalidate_session(user_id, session_id).await;
         self.delete_session_rows(std::slice::from_ref(session_id))
             .await;
@@ -150,11 +174,17 @@ where
 
     /// End one session and record who did it. The single-session form of
     /// [`invalidate_user_sessions`](Self::invalidate_user_sessions), with the
-    /// same error contract.
+    /// same error contract plus one refusal: the session must be one the
+    /// registry holds for `user_id`.
     ///
     /// # Errors
     ///
-    /// As [`invalidate_user_sessions`](Self::invalidate_user_sessions).
+    /// As [`invalidate_user_sessions`](Self::invalidate_user_sessions), and
+    /// [`AuthnError::NoFlow`] when the registry does not hold `session_id`
+    /// for `user_id` (somebody else's session, or already gone): nothing is
+    /// deleted, nothing is published and no audit row is written. A registry
+    /// that cannot list the user's sessions is `ExternalService`, not a
+    /// refusal that pretends to know.
     pub async fn invalidate_session(
         &self,
         user_id: &UserId,

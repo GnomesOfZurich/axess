@@ -6,7 +6,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess-clock = { version = "0.13", features = ["testing"] }
+//! axess-clock = { version = "0.14", features = ["testing"] }
 //! ```
 //!
 //! Workspace crates that re-export the trait surface forward the feature

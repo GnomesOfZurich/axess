@@ -95,6 +95,11 @@ pub enum SocialError {
     #[error("social provider HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// The HTTP client could not be built, which happens when the TLS
+    /// backend fails to initialise. The builder's error is the source.
+    #[error("social provider HTTP client could not be built: {0}")]
+    ClientBuild(#[source] reqwest::Error),
+
     /// IdP returned a successful HTTP response with an unexpected shape.
     #[error("social provider invalid response: {0}")]
     InvalidResponse(String),
@@ -102,6 +107,17 @@ pub enum SocialError {
     /// The caller-supplied claim mapper rejected the userinfo response.
     #[error("social provider claim mapping: {0}")]
     ClaimMapping(String),
+}
+
+/// Refuse `url` unless it is HTTPS or loopback HTTP; `what` names the
+/// setting in the error and the URL is not echoed.
+fn require_secure_endpoint(url: &str, what: &str) -> Result<(), SocialError> {
+    if crate::endpoint::is_https_or_loopback(url) {
+        return Ok(());
+    }
+    Err(SocialError::Config(format!(
+        "{what} must use HTTPS (http is only allowed for localhost, 127.0.0.1 and [::1])"
+    )))
 }
 
 /// User identity extracted from a social provider's userinfo response.
@@ -238,12 +254,29 @@ where
     /// per-operation timeout and an `axess-social/<version>` `User-Agent`
     /// (GitHub, among others, refuses requests without one).
     ///
-    /// # Panics
+    /// The token and userinfo endpoints receive the client secret, the
+    /// code, the PKCE verifier and the access token, and the user is sent to
+    /// the authorization endpoint, so all three must be HTTPS (plain HTTP
+    /// only to `localhost`, `127.0.0.1` or `[::1]`). They are checked here,
+    /// once: the provider's fields do not change after construction.
     ///
-    /// Panics if the default `reqwest` client cannot be built, which happens
-    /// when the TLS backend fails to initialise.
-    pub fn new(config: SocialProviderConfig, claim_mapper: F) -> Self {
-        Self {
+    /// # Errors
+    ///
+    /// [`SocialError::Config`] naming the endpoint that is not HTTPS or
+    /// loopback HTTP, without echoing its URL; [`SocialError::ClientBuild`]
+    /// when the HTTP client cannot be built.
+    pub fn new(config: SocialProviderConfig, claim_mapper: F) -> Result<Self, SocialError> {
+        require_secure_endpoint(&config.authorization_endpoint, "authorization_endpoint")?;
+        require_secure_endpoint(&config.token_endpoint, "token_endpoint")?;
+        require_secure_endpoint(&config.userinfo_endpoint, "userinfo_endpoint")?;
+        // No-redirects HTTP client (SSRF defense), 30s per-op timeout.
+        let http = reqwest::ClientBuilder::new()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(SocialError::ClientBuild)?;
+        Ok(Self {
             name: Arc::from(config.name.as_str()),
             authorization_endpoint: config.authorization_endpoint,
             token_endpoint: config.token_endpoint,
@@ -254,15 +287,9 @@ where
             scopes: config.scopes,
             use_pkce: true,
             claim_mapper,
-            // No-redirects HTTP client (SSRF defense), 30s per-op timeout.
-            http: reqwest::ClientBuilder::new()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("reqwest client build"),
+            http,
             rng: Arc::new(SystemRng),
-        }
+        })
     }
 
     /// Disable PKCE for providers that reject the extra query

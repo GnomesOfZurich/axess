@@ -319,3 +319,81 @@ fn a_password_over_the_hashing_limit_is_refused_by_the_rules() {
     let at_limit = "a".repeat(MAX_PASSWORD_BYTES);
     assert!(is_valid_password(&at_limit, 3, false, false, false, false));
 }
+
+/// One key for every spelling a person reads as the same identifier, and
+/// nothing left of an identifier that was only invisible characters.
+#[test]
+fn normalise_identifier_folds_case_invisibles_and_whitespace() {
+    let key = normalise_identifier("alice@x.com");
+    assert_eq!(key.as_deref(), Some("alice@x.com"));
+    for variant in [
+        "ALICE@x.com\u{200B}",
+        " Alice@X.COM ",
+        "alice\u{FEFF}@x.com",
+        "ali\u{200D}ce@x.com",
+        "\u{FF41}lice@x.com",
+    ] {
+        assert_eq!(normalise_identifier(variant), key, "{variant:?}");
+    }
+    assert_eq!(normalise_identifier("\u{200B} \u{FEFF}"), None);
+    assert_ne!(
+        normalise_identifier("alice@x.com"),
+        normalise_identifier("alicia@x.com")
+    );
+}
+
+/// Every code point of Unicode general category Cf (Unicode 16.0, 170 code
+/// points), as ranges. The zero width non-joiner and joiner (U+200C, U+200D)
+/// are spelled into ordinary words in several scripts and are the one pair
+/// the validator lets through.
+const UNICODE_CF_RANGES: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+];
+
+#[test]
+fn every_format_character_but_the_joiners_is_refused_in_an_identifier() {
+    let mut seen = 0;
+    let mut accepted = Vec::new();
+    for &(lo, hi) in UNICODE_CF_RANGES {
+        for cp in lo..=hi {
+            let c = char::from_u32(cp).expect("a scalar value");
+            seen += 1;
+            if matches!(c, '\u{200C}' | '\u{200D}') {
+                assert!(is_acceptable_identifier(&format!("ab{c}cd")), "{cp:04X}");
+                continue;
+            }
+            if is_acceptable_identifier(&format!("ab{c}cd")) {
+                accepted.push(format!("U+{cp:04X}"));
+            }
+        }
+    }
+    assert_eq!(
+        seen, 170,
+        "the Cf table above must list all of Unicode 16.0"
+    );
+    assert!(
+        accepted.is_empty(),
+        "format characters accepted in an identifier: {}",
+        accepted.join(", ")
+    );
+}

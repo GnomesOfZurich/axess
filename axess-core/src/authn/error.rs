@@ -13,6 +13,7 @@ use crate::authn::types::EntityState;
 /// |---|---|---|
 /// | `Store` | `500 Internal Server Error` | Backend / database failure; not the client's fault. |
 /// | `NoFlow` | `409 Conflict` | No active authentication flow in the session; client must start one first. |
+/// | `Impersonated` | `403 Forbidden` | An impersonated session asked for a credential change (or another impersonation) the deployment does not allow. |
 /// | `NotActive` | `403 Forbidden` | Account exists but is disabled, suspended, or otherwise ineligible. |
 /// | `Locked` | `423 Locked` | Account locked due to too many failed attempts; retry after cooldown. |
 /// | `InvalidAssertion` | `401 Unauthorized` | FIDO2 cryptographic validation failed; credential rejected. |
@@ -33,6 +34,16 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     /// Returned by `verify_factor` when the session is not in `Authenticating` state.
     #[error("no active authentication flow")]
     NoFlow,
+
+    /// The session is an impersonation, and the deployment does not let an
+    /// impersonated session do this: issue a refresh token, enrol or delete
+    /// a factor, or impersonate again (see
+    /// [`with_impersonated_credential_changes_allowed`](crate::authn::service::AuthnServiceBuilder::with_impersonated_credential_changes_allowed)).
+    /// Suggested HTTP status `403 Forbidden`. The refusal is audited with
+    /// [`AuthFailureReason::Impersonated`](crate::authn::event::AuthFailureReason::Impersonated)
+    /// and the administrator as actor.
+    #[error("refused for an impersonated session")]
+    Impersonated,
 
     /// The account exists but is not in a state that permits login.
     #[error("account not active: {0:?}")]
@@ -95,6 +106,19 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     #[error("cross-tenant operation refused")]
     CrossTenant,
 
+    /// The password-hashing executor is saturated: its waiting queue is at
+    /// its limit or the job waited past the acquire timeout. A capacity
+    /// condition, not a fault: nothing was checked, the client may try
+    /// again. Suggested HTTP status `503 Service Unavailable` with a
+    /// `Retry-After` of `retry_after`;
+    /// [`into_response_at`](Self::into_response_at) sends both. See
+    /// [`KdfExecutor::with_max_queue`](crate::blocking::KdfExecutor::with_max_queue).
+    #[error("authentication service busy")]
+    Busy {
+        /// How long the client should wait before retrying.
+        retry_after: std::time::Duration,
+    },
+
     /// The library itself failed: a blocking task (password hashing) panicked
     /// or the blocking pool was shut down. Not the client's fault and not a
     /// store error; suggested HTTP status `500`. The message is for logs and
@@ -103,11 +127,27 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     Internal(String),
 }
 
+/// The `Retry-After` a saturated hashing executor answers with: one second,
+/// the order of a short burst of logins draining through the pool. The
+/// executor knows no better figure, and a `503` without one invites an
+/// immediate retry.
+pub(crate) const KDF_BUSY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl<E: std::error::Error + Send + Sync + 'static> From<crate::blocking::KdfError>
     for AuthnError<E>
 {
+    /// [`Busy`](crate::blocking::KdfError::Busy) is [`AuthnError::Busy`] with
+    /// a `retry_after` of one second; a panicked or shut-down executor is
+    /// [`AuthnError::Internal`].
     fn from(e: crate::blocking::KdfError) -> Self {
-        AuthnError::Internal(e.to_string())
+        match e {
+            crate::blocking::KdfError::Busy => AuthnError::Busy {
+                retry_after: KDF_BUSY_RETRY_AFTER,
+            },
+            crate::blocking::KdfError::Join(_) | crate::blocking::KdfError::Closed => {
+                AuthnError::Internal(e.to_string())
+            }
+        }
     }
 }
 
@@ -198,6 +238,9 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             }
             AuthnError::NoFlow => (StatusCode::CONFLICT, "no active authentication flow"),
+            AuthnError::Impersonated => {
+                (StatusCode::FORBIDDEN, "refused for an impersonated session")
+            }
             AuthnError::NotActive(_) => (StatusCode::FORBIDDEN, "account not active"),
             AuthnError::Locked { .. } => (StatusCode::LOCKED, "account locked"),
             AuthnError::InvalidAssertion => (StatusCode::UNAUTHORIZED, "invalid assertion"),
@@ -206,6 +249,10 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
                 (StatusCode::BAD_GATEWAY, "external service unavailable")
             }
             AuthnError::CrossTenant => (StatusCode::FORBIDDEN, "cross-tenant operation refused"),
+            AuthnError::Busy { .. } => {
+                tracing::warn!("authentication service busy; answering 503");
+                (StatusCode::SERVICE_UNAVAILABLE, "service busy, retry later")
+            }
             AuthnError::Internal(_) => {
                 tracing::error!(error = %self, "internal authentication error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -217,7 +264,13 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
         // `Retry-After`. Conservative: emit only when known + in the
         // future. Past or `None` collapses to a plain `{"error": …}`
         // body for backwards compat with existing clients.
-        let until_secs = until.and_then(|t| retry_secs_from(t, now));
+        // A busy executor's delay is a duration, not an instant; it joins
+        // the lockout expiry as the one `Retry-After` the response carries.
+        let busy_secs = match &self {
+            AuthnError::Busy { retry_after } => Some(retry_after.as_secs().max(1)),
+            _ => None,
+        };
+        let until_secs = until.and_then(|t| retry_secs_from(t, now)).or(busy_secs);
         let body = match (until, until_secs) {
             (Some(t), Some(_)) => {
                 serde_json::json!({ "error": message, "until_iso": t.to_rfc3339() })
@@ -289,6 +342,7 @@ mod into_response_tests {
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (AuthnError::NoFlow, axum::http::StatusCode::CONFLICT),
+            (AuthnError::Impersonated, axum::http::StatusCode::FORBIDDEN),
             (
                 AuthnError::NotActive(EntityState::Active),
                 axum::http::StatusCode::FORBIDDEN,
@@ -306,6 +360,12 @@ mod into_response_tests {
                 axum::http::StatusCode::BAD_GATEWAY,
             ),
             (AuthnError::CrossTenant, axum::http::StatusCode::FORBIDDEN),
+            (
+                AuthnError::Busy {
+                    retry_after: std::time::Duration::from_secs(1),
+                },
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (
                 AuthnError::Internal("hash task panicked".into()),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -598,5 +658,69 @@ mod into_response_tests {
             (1..=3600).contains(&retry_after),
             "Retry-After via trait impl must land in (0, 3600], got {retry_after}"
         );
+    }
+}
+
+#[cfg(test)]
+mod kdf_error_mapping_tests {
+    //! A saturated hashing executor is a capacity condition, not a library
+    //! fault: the caller must see a retryable answer, where a panicked or
+    //! shut-down executor is an internal error.
+
+    use super::*;
+    use crate::blocking::KdfError;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("test")]
+    struct TestStoreError;
+
+    #[test]
+    fn a_busy_executor_is_not_an_internal_error() {
+        let mapped: AuthnError<TestStoreError> = KdfError::Busy.into();
+        assert!(
+            !matches!(mapped, AuthnError::Internal(_)),
+            "Busy must be answered as retryable, not as a 500: {mapped:?}"
+        );
+    }
+
+    #[cfg(feature = "default-error-response")]
+    #[tokio::test]
+    async fn busy_answers_503_with_retry_after() {
+        use axum::http::header;
+        let err: AuthnError<TestStoreError> = AuthnError::Busy {
+            retry_after: std::time::Duration::from_secs(3),
+        };
+        let response = err.into_response_at(chrono::Utc::now());
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+        // Under a second still says one, never zero.
+        let short: AuthnError<TestStoreError> = AuthnError::Busy {
+            retry_after: std::time::Duration::from_millis(200),
+        };
+        let response = short.into_response_at(chrono::Utc::now());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn a_failed_or_closed_executor_stays_internal() {
+        let joined: AuthnError<TestStoreError> = KdfError::Join("panicked".into()).into();
+        let closed: AuthnError<TestStoreError> = KdfError::Closed.into();
+        assert!(matches!(joined, AuthnError::Internal(_)));
+        assert!(matches!(closed, AuthnError::Internal(_)));
     }
 }

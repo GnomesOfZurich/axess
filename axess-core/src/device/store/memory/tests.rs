@@ -197,6 +197,7 @@ async fn shared_contract() {
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(MemoryDeviceStore::new()).await;
     shared::a_save_never_un_revokes(MemoryDeviceStore::new()).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(MemoryDeviceStore::new()).await;
+    shared::sub_second_instants_compare_as_whole_seconds(MemoryDeviceStore::new()).await;
     shared::a_revoked_row_keeps_its_revocation_time(MemoryDeviceStore::new()).await;
     shared::a_sighting_reports_the_level_it_found(MemoryDeviceStore::new()).await;
     shared::a_revoked_save_without_a_time_is_stamped_and_purged(MemoryDeviceStore::new()).await;

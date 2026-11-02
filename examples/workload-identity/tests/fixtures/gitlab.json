@@ -1,0 +1,20 @@
+{
+  "source": "https://docs.gitlab.com/ci/secrets/id_token_authentication/ (token payload section)",
+  "recorded": "2026-10-30",
+  "kind": "constructed",
+  "issuer": "https://gitlab.example.com",
+  "audience": "https://axess.example.com",
+  "jwks": {
+    "keys": [
+      {
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "fixture-1",
+        "kty": "RSA",
+        "n": "ymriWN-tlPM9JGq3MP7thqgqqhkv1ZE9W-D8ucwlUDtPZKA-D3gkQGkF4t2K1HzzFTYKnllUmcOFmxknk4_53qZ8dqf9H7494VT9j5URFQO8i835omdGrhljwGRelq1f71tr8zh0bdfCi9-nV0Cxrb-_BU2rFM_dJmr1E3dR_gbLnb7ewqIbSah3znzNvGu2zSXXMMLh68M_KOPg0RA_-0qq6NB-Zno6JKeqkW2o3o8fjd6uTadWsDMFqIiHneG8jgLhm7h-E_jhYT7IE77uHcbDgPMb07ecxsaWLkuUuGgMfS6PZyxltC-_CBATxAp7irP6_jg8VQ1GWOkyB7jQFw",
+        "e": "AQAB"
+      }
+    ]
+  },
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6ImZpeHR1cmUtMSJ9.eyJpc3MiOiJodHRwczovL2dpdGxhYi5leGFtcGxlLmNvbSIsInN1YiI6InByb2plY3RfcGF0aDpteWdyb3VwL215cHJvamVjdDpyZWZfdHlwZTpicmFuY2g6cmVmOm1haW4iLCJhdWQiOiJodHRwczovL2F4ZXNzLmV4YW1wbGUuY29tIiwianRpIjoiYzgyZWViMGMtNWM2Zi00YTMzLWFiZjUtNGM0NzRiOTJiNTU4IiwiaWF0IjoxNzY3MjI1NjAwLCJuYmYiOjE3NjcyMjU2MDAsImV4cCI6MTc2NzIyOTIwMCwibmFtZXNwYWNlX2lkIjoiNzIiLCJuYW1lc3BhY2VfcGF0aCI6Im15Z3JvdXAiLCJwcm9qZWN0X2lkIjoiMjAiLCJwcm9qZWN0X3BhdGgiOiJteWdyb3VwL215cHJvamVjdCIsInVzZXJfaWQiOiIxIiwidXNlcl9sb2dpbiI6InNhbXBsZS11c2VyIiwicGlwZWxpbmVfaWQiOiI1NzQiLCJwaXBlbGluZV9zb3VyY2UiOiJwdXNoIiwiam9iX2lkIjoiMzAyIiwicmVmIjoibWFpbiIsInJlZl90eXBlIjoiYnJhbmNoIiwicmVmX3BhdGgiOiJyZWZzL2hlYWRzL21haW4iLCJyZWZfcHJvdGVjdGVkIjoidHJ1ZSIsImVudmlyb25tZW50IjoicHJvZHVjdGlvbiIsImVudmlyb25tZW50X3Byb3RlY3RlZCI6InRydWUiLCJydW5uZXJfZW52aXJvbm1lbnQiOiJzZWxmLWhvc3RlZCIsInNoYSI6IjcxNGE2MjljMGI0MDFmZGNlODNlODQ3ZmM5NTg5OTgzZmM2ZjQ2YmMifQ.CLqMmqr17KMWa7kruFCHjswU0vthi54F5V4UmxC5yJhcEI2woX0GEgwVdf0WELa-vdb4tlDBbY2qG_EEcekxQo4w505_7lAub2IBkEmVxJ3yFFWtQPxLikJXdxI_Ja1y4D4wIrW7gJ-xcJ-W94lLG0Ov6XlfRFYnjC61tdbWnlTC6qV5DY6m8cW780bWd8E7sb0_zWST60JzjTgUaQ4Zhf2TNhPklD1Xh9ItrTFXIhgAnyeImaZCx0QbN_wsZxQELLrHRQGE-8Oxy-jweh4Y5SQY2nzplbEHVayw7JS-1pAu5_rneN4lmQVMuIZgmmT878YU4Hx_M-NGrWzoEzFiGg"
+}

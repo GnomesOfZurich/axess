@@ -29,8 +29,26 @@
 //! the registry whether the session is still valid on a timer
 //! ([`WatchOptions::poll_interval`](crate::middleware::ws::WatchOptions::poll_interval)), so a revocation is noticed within one
 //! interval on every backend, and after a subscriber outage on Valkey. The
-//! poll can fail closed ([`WatchOptions::fail_closed`](crate::middleware::ws::WatchOptions::fail_closed)) and a connection can
-//! be given a maximum lifetime ([`WatchOptions::max_lifetime`](crate::middleware::ws::WatchOptions::max_lifetime)).
+//! poll fails closed by default ([`WatchOptions::fail_closed`](crate::middleware::ws::WatchOptions::fail_closed)):
+//! a registry that cannot answer closes the socket at the next poll, as the
+//! HTTP path refuses a request it cannot check. A connection has a maximum
+//! lifetime of one day by default ([`WatchOptions::max_lifetime`](crate::middleware::ws::WatchOptions::max_lifetime),
+//! [`DEFAULT_MAX_LIFETIME`](crate::middleware::ws::DEFAULT_MAX_LIFETIME)); the client reconnects and the upgrade runs
+//! through the session layer's checks again. Both can be turned off, and a
+//! deployment that does so has decided that a socket may outlive the
+//! library's ability to check its session.
+//!
+//! # Cross-site upgrades
+//!
+//! A page on any site can open a WebSocket to this server, and the browser
+//! sends the session cookie with the upgrade: the CSRF token never travels
+//! on it. The gate is the `Origin` header, which the
+//! [`CsrfLayer`](crate::middleware::csrf::CsrfLayer) checks on every
+//! upgrade it sees: against the allow-list when one is configured, and
+//! otherwise against the request's own `Host` and scheme
+//! ([`CsrfConfig::websocket_origin_check`](crate::middleware::csrf::CsrfConfig::websocket_origin_check),
+//! on by default). Mount the WebSocket route under that layer; a route
+//! outside it has no origin check at all.
 //!
 //! # Example
 //!
@@ -77,6 +95,11 @@ pub const SESSION_REVOKED_CLOSE_CODE: u16 = 4001;
 /// Standard reason string accompanying a session-revocation close frame.
 pub const SESSION_REVOKED_CLOSE_REASON: &str = "session_revoked";
 
+/// The lifetime a [`RevocationAwareSocket`] has by default: one day, after
+/// which the client reconnects and the upgrade runs through the session
+/// layer's checks again.
+pub const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// How a [`RevocationAwareSocket`] supervises its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchOptions {
@@ -84,9 +107,15 @@ pub struct WatchOptions {
     /// in addition to the push channel. Zero is treated as one second.
     pub poll_interval: Duration,
     /// Close the socket when the registry cannot be asked (a store error),
-    /// instead of keeping it open until the next successful answer.
+    /// instead of keeping it open until the next successful answer. On by
+    /// default: the HTTP path refuses a request whose session it cannot
+    /// check, and a socket kept open through an outage would be the one
+    /// place a revoked session stays usable. `false` keeps the socket open
+    /// until the next answer.
     pub fail_closed: bool,
     /// Close the socket after this long even if the session stays valid.
+    /// [`DEFAULT_MAX_LIFETIME`] (one day) by default; `None` lets a socket
+    /// live as long as the session.
     pub max_lifetime: Option<Duration>,
 }
 
@@ -94,8 +123,8 @@ impl Default for WatchOptions {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(30),
-            fail_closed: false,
-            max_lifetime: None,
+            fail_closed: true,
+            max_lifetime: Some(DEFAULT_MAX_LIFETIME),
         }
     }
 }
@@ -392,6 +421,65 @@ mod supervise_tests {
         registry.invalidate_user(&user).await.expect("revoke");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(watcher.is_finished(), "the poll must notice the revocation");
+    }
+
+    /// A registry that cannot be asked.
+    #[derive(Clone)]
+    struct Unreachable;
+
+    impl SessionRegistry for Unreachable {
+        type Error = std::io::Error;
+        async fn register(&self, _: &UserId, _: &SessionId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn is_valid(&self, _: &UserId, _: &SessionId) -> Result<bool, Self::Error> {
+            Err(std::io::Error::other("registry unreachable"))
+        }
+        async fn invalidate_user(&self, _: &UserId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn invalidate_session(&self, _: &UserId, _: &SessionId) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        async fn active_sessions(&self, _: &UserId) -> Result<Vec<SessionId>, Self::Error> {
+            Ok(vec![])
+        }
+    }
+
+    /// The defaults of a security library fail closed and bound the
+    /// connection: a registry that cannot answer closes the socket at the
+    /// next poll, as the HTTP path refuses a request it cannot check, and a
+    /// socket does not outlive a day without a new handshake.
+    #[test]
+    fn the_defaults_fail_closed_with_a_bounded_lifetime() {
+        let defaults = WatchOptions::default();
+        assert!(defaults.fail_closed, "a registry outage closes the socket");
+        assert_eq!(
+            defaults.max_lifetime,
+            Some(DEFAULT_MAX_LIFETIME),
+            "a socket is re-handshaken within a day"
+        );
+        assert_eq!(defaults.poll_interval, Duration::from_secs(30));
+    }
+
+    /// Under the defaults an unreachable registry closes the socket within
+    /// one poll interval.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreachable_registry_closes_the_socket_under_the_defaults() {
+        let (user, session) = ids();
+        let watcher = tokio::spawn(async move {
+            supervise(&Unreachable, &user, &session, WatchOptions::default()).await;
+        });
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        assert!(
+            !watcher.is_finished(),
+            "nothing is known before the first poll"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            watcher.is_finished(),
+            "the first poll that cannot be answered closes the socket"
+        );
     }
 
     /// A connection with a maximum lifetime ends when it runs out.

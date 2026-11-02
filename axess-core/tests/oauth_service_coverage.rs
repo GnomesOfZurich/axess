@@ -169,7 +169,7 @@ async fn revoke_oauth_token_unknown_provider_errors() {
         .with_audit_context(AuditContext::default());
 
     let result = authn
-        .revoke_oauth_token("nonexistent", "some-token", Some("access_token"))
+        .revoke_oauth_token("nonexistent", "some-token", Some("access_token"), None)
         .await;
     assert!(matches!(
         result.unwrap_err(),

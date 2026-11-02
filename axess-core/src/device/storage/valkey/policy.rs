@@ -22,16 +22,22 @@ use crate::device::types::{Device, DeviceTrustLevel};
 /// window, so it carries both. A `Seen` row's Revoked stage is due
 /// `seen_idle` after the later of its last sighting and its demotion, and the
 /// grace follows. Positive results are floored at 1 second so an
-/// already-late key still exists briefly.
+/// already-late key still exists briefly. Windows so long that the expiry
+/// cannot be represented mean the row never expires natively (`None`), as
+/// an `Unknown` row does; the sweep still walks it.
 pub(super) fn ttl_seconds(cfg: &SweepConfig, device: &Device, now: DateTime<Utc>) -> Option<i64> {
-    let expiry = match device.trust_level {
+    let (from, windows): (DateTime<Utc>, &[chrono::Duration]) = match device.trust_level {
         DeviceTrustLevel::Unknown => return None,
-        DeviceTrustLevel::Trusted => {
-            device.last_seen_at + cfg.trusted_idle + cfg.seen_idle + cfg.revoked_grace
-        }
-        DeviceTrustLevel::Seen => seen_clock(device) + cfg.seen_idle + cfg.revoked_grace,
-        DeviceTrustLevel::Revoked => device.revoked_at.unwrap_or(now) + cfg.revoked_grace,
+        DeviceTrustLevel::Trusted => (
+            device.last_seen_at,
+            &[cfg.trusted_idle, cfg.seen_idle, cfg.revoked_grace],
+        ),
+        DeviceTrustLevel::Seen => (seen_clock(device), &[cfg.seen_idle, cfg.revoked_grace]),
+        DeviceTrustLevel::Revoked => (device.revoked_at.unwrap_or(now), &[cfg.revoked_grace]),
     };
+    let expiry = windows
+        .iter()
+        .try_fold(from, |at, window| at.checked_add_signed(*window))?;
     Some(expiry.signed_duration_since(now).num_seconds().max(1))
 }
 

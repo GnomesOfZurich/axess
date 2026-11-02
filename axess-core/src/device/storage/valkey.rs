@@ -12,12 +12,14 @@
 //! | Pattern | Type | Purpose |
 //! |---------|------|---------|
 //! | `{prefix}:dev:{tenant}:{id}` | string (msgpack, optionally encrypted) | the device row |
-//! | `{prefix}:dev:fps:{tenant}:{hex_hash}` | set of device_ids | `find_by_fingerprint` index |
-//! | `{prefix}:dev:fp:{tenant}:{hex_hash}` | string (device_id) | the single-id fingerprint index of earlier releases; read when present, removed by the next write of the device it names, never created |
+//! | `{prefix}:dev:fpz:{tenant}:{hex_hash}` | sorted set of device_ids scored by `last_seen_at` | `find_by_fingerprint` index |
+//! | `{prefix}:dev:fps:{tenant}:{hex_hash}` | set of device_ids | the fingerprint index of the release before the sorted set; read only with `with_legacy_fingerprint_keys`, emptied by the next write of each device it lists, never added to |
+//! | `{prefix}:dev:fp:{tenant}:{hex_hash}` | string (device_id) | the single-id fingerprint index of earlier releases; read only with `with_legacy_fingerprint_keys`, removed by the next write of the device it names, never created |
 //! | `{prefix}:dev:user:{tenant}:{user}` | set of device_ids | `find_for_user` index |
-//! | `{prefix}:dev:fpu:{tenant}:{hex_hash}:{user}` | set of device_ids | `find_by_fingerprint_for_user` index: one user's devices with one fingerprint |
+//! | `{prefix}:dev:fpu:{tenant}:{hex_hash}:{user}` | set of device_ids | `find_by_fingerprint_for_user` index: one user's devices with one fingerprint; a miss falls back to the user's index only with `with_legacy_fingerprint_keys` |
 //! | `{prefix}:dev:fam:{tenant}:{family}` | set of device_ids | `find_by_refresh_family` index |
 //! | `{prefix}:dev:tenant:{tenant}` | set of device_ids | sweep walker (avoids `SCAN *`) |
+//! | `{prefix}:dev:new:{tenant}:{hex_hash}:{user or -}` | string (`generation:device_id`), 60 s expiry | `create_or_find` guard: the device the last create of the key inserted, under a generation each insert raises |
 //!
 //! # TTL policy
 //!
@@ -46,17 +48,25 @@
 //! owns the device, the device is still bound to the family), so a stale
 //! entry can neither return another user's device nor make a refresh-family
 //! cascade revoke a device that has left the family. `find_by_fingerprint`
-//! likewise reads the devices its fingerprint set lists and returns only
-//! those whose row still carries the fingerprint, the newest sighting first
-//! and the smaller id on a tie, as every other backend does.
+//! reads the `FINGERPRINT_READ_LIMIT` newest entries of its fingerprint
+//! index (a sorted set scored by each device's `last_seen_at` as of its last
+//! write, read with `ZREVRANGE`), so a fingerprint shared by a thousand
+//! devices costs one bounded `MGET`, and returns only those whose row still
+//! carries the fingerprint, the newest sighting first and the smaller id on
+//! a tie, as every other backend does. The bound is what it reads, not what
+//! exists: when more devices than the limit were sighted after the newest
+//! live one (revoked twins awaiting their purge, entries whose row changed
+//! fingerprint), the lookup answers from those it read, and pruning the
+//! stale ones lets the next read see further; among more devices than the
+//! limit sighted in one second the tie is broken among those read.
 //!
 //! Stale entries are tidied by scripts that re-check before they remove: a
 //! member whose row is gone is removed only if the row is still absent, so a
 //! device saved again in the meantime keeps its entry; a member whose row
 //! does not match is removed only while the row still holds the bytes that
-//! were judged (the fingerprint set is pruned the same way as the others, and
-//! a single-id key of an earlier release only while it points at that device
-//! and its row is unchanged). `find_for_user` still reads the user's whole set
+//! were judged (the fingerprint index is pruned the same way as the others,
+//! and a single-id key of an earlier release only while it points at that
+//! device and its row is unchanged). `find_for_user` still reads the user's whole set
 //! and sorts it in process (newest first, ties by device id); a per-user
 //! sorted set scored by `last_seen_at` would bound that read but changes the
 //! index layout.
@@ -85,33 +95,47 @@
 //! | `claim_owner` | Atomic CAS; sets the owner only on a row that has none, and adds the device to the owner's index in the same script. |
 //! | `sweep` | Per row, atomic CAS demotion or CAS purge. Only ever demotes, so it cannot resurrect a `Revoked` row; a row changed under it is re-planned from its new state. A row that cannot be decoded is logged and skipped. A revoked row with no `revoked_at` is stamped. |
 //! | `delete` | One script removes the row, its fingerprint entry (only while it points at this device) and its index entries, conditional on the row as read; a writer that changed it meanwhile makes the delete run again on the fresh row. |
+//! | `create_or_find` | One script inserts the row with its indexes only while the key's create guard still holds what the caller read before finding no live device of the key, and sets the guard to the new id; of two concurrent creates of one key, one inserts and the other conflicts and returns the first one's device. |
 //! | `save` | A CAS against the row as read (or its absence), retried on a conflict, so the last writer wins without two saves interleaving their index changes. A stored `Revoked` row is left as it is by a save that is not itself revoked; a revoked row saved without `revoked_at` gets the write time. |
 //!
 //! The scripts address several keys (row, fingerprint index, membership
 //! indexes); on a Valkey cluster give them one hash slot with a prefix such
 //! as `{axess}`.
 //!
-//! The fingerprint index is a set of the ids of every device that carries the
-//! fingerprint, so deleting or purging one of several devices that share it
-//! leaves the others findable, owned or not. Only an operation on a device
-//! adds or removes that device's id, in the script that writes its row.
+//! The fingerprint index is a sorted set of the ids of every device that
+//! carries the fingerprint, scored by the sighting each write carried, so
+//! deleting or purging one of several devices that share it leaves the
+//! others findable, owned or not. Only an operation on a device adds or
+//! removes that device's id, in the script that writes its row.
 //!
 //! # Upgrading the fingerprint index
 //!
-//! Earlier releases kept one device id under a string key
-//! (`{prefix}:dev:fp:...`). The set lives under a different key
-//! (`{prefix}:dev:fps:...`), so the two layouts never meet in one key and
-//! a read cannot fail on a key of the wrong type. `find_by_fingerprint` reads
-//! the set and the old key and treats the old key's device as one more
-//! candidate, so nothing stored by an older release goes missing. The next
-//! write of a device (a sighting, a trust change, a save) adds it to the set
-//! and deletes the old key if that points at it; a delete does the same.
-//! There is no migration step to run. A device that an old key never named
-//! stays unlisted until its next write, as it was before.
+//! Earlier releases kept the index as a plain set (`{prefix}:dev:fps:...`),
+//! and before that as one device id under a string key
+//! (`{prefix}:dev:fp:...`). The sorted set lives under its own key
+//! (`{prefix}:dev:fpz:...`), so the layouts never meet in one key and a read
+//! cannot fail on a key of the wrong type. The next write of a device (a
+//! sighting, a trust change, a save) lists it in the sorted set, removes it
+//! from the set and deletes the old key if that points at it; a delete does
+//! the same. There is no migration step to run.
 //!
-//! The set has no expiry of its own (a key's expiry cannot cover some of its
-//! members). A member whose row has expired is dropped by the first read that
-//! finds the row gone, like the other membership indexes.
+//! By default `find_by_fingerprint` reads the sorted set alone, which is
+//! what bounds the read. A deployment upgrading from the set or the
+//! single-id layout turns on
+//! [`with_legacy_fingerprint_keys`](ValkeyDeviceStore::with_legacy_fingerprint_keys)
+//! for the transition: the lookup then also reads the whole set and the old
+//! key as further candidates (unbounded, as before), so a device not written
+//! since the upgrade is still found by fingerprint, and
+//! `find_by_fingerprint_for_user` answers a miss on the per-user set by
+//! reading the user's whole index, where a device written before that set
+//! existed is listed (and adds what it finds to the set). Turn it off once
+//! every device that matters has been written once; a device that was
+//! dormant throughout is then found by its id and its cookie as before, and
+//! gets a new row from a fingerprint lookup.
+//!
+//! The sorted set has no expiry of its own (a key's expiry cannot cover some
+//! of its members). A member whose row has expired is dropped by the first
+//! read that finds the row gone, like the other membership indexes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -122,13 +146,15 @@ use fred::prelude::*;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::store::{
     BindingsUpdate, DeviceStore, OwnerClaim, SweepConfig, SweepCounts, TrustTransition,
-    demotion_stamp, order_newest_first,
+    demotion_stamp, order_newest_first, whole_second,
 };
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::SessionCrypto;
 use std::future::Future;
 
 mod apply;
+mod create;
+mod fingerprint;
 mod index;
 mod owner_lookup;
 mod policy;
@@ -140,11 +166,7 @@ mod sweep;
 mod tests;
 
 use apply::{Applied, Step};
-use row::{
-    device_key, family_index_key, fingerprint_hex, fingerprint_key, fingerprint_set_key,
-    tenant_index_key, user_index_key,
-};
-use scripts::{DROP_ABSENT_FINGERPRINT, DROP_STALE_FINGERPRINT};
+use row::{device_key, family_index_key, tenant_index_key, user_index_key};
 
 /// Bound on re-read/retry rounds when a concurrent writer keeps changing a
 /// row between our read and our compare-and-swap.
@@ -152,6 +174,10 @@ const MAX_ATTEMPTS: usize = 8;
 
 /// Most rows read by one batched `MGET`; a longer index is read in several.
 const MGET_CHUNK: usize = 512;
+
+/// How many of the devices sharing a fingerprint `find_by_fingerprint`
+/// reads, newest sighting first.
+const FINGERPRINT_READ_LIMIT: usize = 16;
 
 const DEFAULT_PREFIX: &str = "axess";
 
@@ -242,17 +268,30 @@ pub struct ValkeyDeviceStore {
     /// reads / writes the whole blob in one shot regardless).
     crypto: Option<SessionCrypto>,
     sweep_config: SweepConfig,
+    /// Whether the fingerprint lookups also read the index layouts of
+    /// earlier releases: the plain set and the single-id key in
+    /// `find_by_fingerprint`, the user's whole index on a miss in
+    /// `find_by_fingerprint_for_user`.
+    legacy_fingerprint_keys: bool,
 }
 
 impl ValkeyDeviceStore {
-    /// Create an encrypted store (recommended for production).
-    pub fn new(client: Client, key: [u8; 32]) -> Self {
+    /// The store every constructor starts from: the default prefix, sweep
+    /// configuration and fingerprint layout, with `crypto` as the row
+    /// envelope (`None` for plaintext).
+    fn with_parts(client: Client, crypto: Option<SessionCrypto>) -> Self {
         Self {
             client,
             prefix: DEFAULT_PREFIX.into(),
-            crypto: Some(SessionCrypto::new(key)),
+            crypto,
             sweep_config: SweepConfig::default(),
+            legacy_fingerprint_keys: false,
         }
+    }
+
+    /// Create an encrypted store (recommended for production).
+    pub fn new(client: Client, key: [u8; 32]) -> Self {
+        Self::with_parts(client, Some(SessionCrypto::new(key)))
     }
 
     /// Create an encrypted store from a [`SessionCrypto`] you configured,
@@ -266,12 +305,7 @@ impl ValkeyDeviceStore {
     /// read), so the previous key can be dropped once every row has been
     /// read or written; a sweep reads every row of a tenant.
     pub fn with_crypto(client: Client, crypto: SessionCrypto) -> Self {
-        Self {
-            client,
-            prefix: DEFAULT_PREFIX.into(),
-            crypto: Some(crypto),
-            sweep_config: SweepConfig::default(),
-        }
+        Self::with_parts(client, Some(crypto))
     }
 
     /// Accept rows sealed with `previous` as well as the current key, for key
@@ -289,12 +323,7 @@ impl ValkeyDeviceStore {
             "ValkeyDeviceStore created without encryption; \
              do not use in production"
         );
-        Self {
-            client,
-            prefix: DEFAULT_PREFIX.into(),
-            crypto: None,
-            sweep_config: SweepConfig::default(),
-        }
+        Self::with_parts(client, None)
     }
 
     /// Override the key prefix (default `axess`).
@@ -306,6 +335,20 @@ impl ValkeyDeviceStore {
     /// Override the [`SweepConfig`] driving the retention ladder.
     pub fn with_sweep_config(mut self, config: SweepConfig) -> Self {
         self.sweep_config = config;
+        self
+    }
+
+    /// Also read the fingerprint index layouts of earlier releases: in
+    /// `find_by_fingerprint` the plain set of the release before the sorted
+    /// set and the single-id key before that, and in
+    /// `find_by_fingerprint_for_user` the user's whole index when the
+    /// per-user set lists nothing. For the transition after an upgrade, so a
+    /// device not written since is still found by fingerprint; it makes the
+    /// first lookup read every device sharing the fingerprint again, and the
+    /// second read every device the user owns on each first sighting. Off by
+    /// default. See the module documentation.
+    pub fn with_legacy_fingerprint_keys(mut self) -> Self {
+        self.legacy_fingerprint_keys = true;
         self
     }
 
@@ -334,49 +377,6 @@ impl ValkeyDeviceStore {
             device_id: id.to_string(),
         }
     }
-
-    /// Remove the single-id fingerprint key of an earlier release when it
-    /// names `id` and `id`'s row no longer exists.
-    async fn drop_absent_fingerprint(
-        &self,
-        fp_key: &str,
-        tenant: &str,
-        id: &str,
-    ) -> Result<(), ValkeyDeviceStoreError> {
-        let _: i64 = self
-            .client
-            .eval(
-                DROP_ABSENT_FINGERPRINT,
-                vec![fp_key.to_string(), device_key(&self.prefix, tenant, id)],
-                vec![Value::from(id)],
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Remove a fingerprint index entry that points at `id`, but only while
-    /// `id`'s row still holds the bytes (`raw`) that were found not to carry
-    /// the fingerprint.
-    async fn drop_stale_fingerprint(
-        &self,
-        fp_key: &str,
-        tenant: &str,
-        id: &str,
-        raw: &[u8],
-    ) -> Result<(), ValkeyDeviceStoreError> {
-        let _: i64 = self
-            .client
-            .eval(
-                DROP_STALE_FINGERPRINT,
-                vec![fp_key.to_string(), device_key(&self.prefix, tenant, id)],
-                vec![
-                    Value::from(id),
-                    Value::Bytes(fred::bytes::Bytes::copy_from_slice(raw)),
-                ],
-            )
-            .await?;
-        Ok(())
-    }
 }
 
 impl DeviceStore for ValkeyDeviceStore {
@@ -402,52 +402,7 @@ impl DeviceStore for ValkeyDeviceStore {
         let tenant = tenant_id.to_string();
         let hash = *hash;
         async move {
-            let hex = fingerprint_hex(&hash);
-            let set_key = fingerprint_set_key(&store.prefix, &tenant, &hex);
-            // The set lists every device that carries the fingerprint. It is
-            // a hint: only rows that still carry it are returned, and the
-            // read tidies the entries that do not.
-            // An earlier release kept one id under a string key. It names a
-            // device the set may not list yet (the next write of that device
-            // moves it), so it is read as one more candidate. The two reads
-            // are independent and run together.
-            let legacy_key = fingerprint_key(&store.prefix, &tenant, &hex);
-            let (found, legacy) = tokio::join!(
-                store.read_index(&set_key, &tenant, |d| d.fingerprint_hash == hash),
-                store.client.get::<Option<String>, _>(&legacy_key),
-            );
-            let mut found = found?;
-            let legacy = legacy?;
-            if let Some(id) = legacy
-                && !found.iter().any(|d| d.id.to_string() == id)
-            {
-                match store.get_row_checked(&tenant, &id).await? {
-                    Some((d, raw, stale)) if d.fingerprint_hash == hash => {
-                        if stale {
-                            store.reseal_row(&d, &raw).await;
-                        }
-                        found.push(d);
-                    }
-                    Some((_, raw, _)) => {
-                        if let Err(e) = store
-                            .drop_stale_fingerprint(&legacy_key, &tenant, &id, &raw)
-                            .await
-                        {
-                            tracing::warn!(error = %e, "stale fingerprint entry not dropped");
-                        }
-                    }
-                    // The row expired natively, which leaves the key behind;
-                    // nothing else would ever remove it.
-                    None => {
-                        if let Err(e) = store
-                            .drop_absent_fingerprint(&legacy_key, &tenant, &id)
-                            .await
-                        {
-                            tracing::warn!(error = %e, "stale fingerprint entry not dropped");
-                        }
-                    }
-                }
-            }
+            let found = store.devices_with_fingerprint(&tenant, &hash).await?;
             // The same device every other backend returns: newest sighting,
             // then the smaller id.
             Ok(found.into_iter().min_by(order_newest_first))
@@ -488,7 +443,10 @@ impl DeviceStore for ValkeyDeviceStore {
         async move {
             // The per-user fingerprint set names the devices that can match,
             // so a user with many devices does not read them all.
-            store.find_owned_by_fingerprint(&tenant, &user, &hash).await
+            let owned = store
+                .owned_with_fingerprint(&tenant, &user, &hash, |_| true)
+                .await?;
+            Ok(owned.into_iter().min_by(order_newest_first))
         }
     }
 
@@ -524,6 +482,16 @@ impl DeviceStore for ValkeyDeviceStore {
         async move { store.save_row(&device, now).await }
     }
 
+    fn create_or_find(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
+        let store = self.clone();
+        let device = device.clone();
+        async move { store.create_or_find_row(&device, now).await }
+    }
+
     fn record_sighting(
         &self,
         tenant_id: &TenantId,
@@ -533,6 +501,8 @@ impl DeviceStore for ValkeyDeviceStore {
         let store = self.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
+        // Whole seconds, the precision every backend stores and compares.
+        let now = whole_second(now);
         async move {
             // Atomic compare-and-swap: only last_seen_at (and with it the
             // TTL) changes, a Revoked row is never written, and the time
@@ -568,6 +538,7 @@ impl DeviceStore for ValkeyDeviceStore {
         let store = self.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
+        let now = whole_second(now);
         async move {
             let applied = store
                 .apply(&tenant, &device_id, now, |d| {
@@ -596,6 +567,7 @@ impl DeviceStore for ValkeyDeviceStore {
         let store = self.clone();
         let tenant = tenant_id.to_string();
         let device_id = id.to_string();
+        let now = whole_second(now);
         async move {
             // The level is checked against the very bytes the compare-and-swap
             // then replaces, so a revocation that lands between the read and
@@ -725,6 +697,7 @@ impl DeviceStore for ValkeyDeviceStore {
     ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
         let store = self.clone();
         let tenant = tenant_id.to_string();
+        let now = whole_second(now);
         async move { store.sweep_tenant(&tenant, now).await }
     }
 }

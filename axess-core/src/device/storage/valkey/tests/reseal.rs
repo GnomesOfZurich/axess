@@ -81,8 +81,13 @@ async fn seeded(
     old: fn(&ValkeyDeviceStore, &Device) -> Vec<u8>,
 ) -> (ValkeyDeviceStore, Device, i64) {
     let s = sealing_store(tag).await;
-    let d = device(DeviceTrustLevel::Seen, Utc::now());
-    s.save(&d, Utc::now()).await.unwrap();
+    let d = device(
+        DeviceTrustLevel::Seen,
+        crate::device::store::whole_second(Utc::now()),
+    );
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let before = ttl(&s, &d).await;
     assert!(before > 0, "a Seen row carries an expiry");
     let bytes = old(&s, &d);
@@ -136,7 +141,9 @@ async fn the_finders_and_the_sweep_reseal() {
     assert!(is_current(&stored(&s, &d).await));
 
     overwrite(&s, &d, unbound_row(&s, &d)).await;
-    s.sweep(&d.tenant_id, Utc::now()).await.unwrap();
+    s.sweep(&d.tenant_id, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     assert!(is_current(&stored(&s, &d).await));
     kept(before, ttl(&s, &d).await);
 }
@@ -145,8 +152,13 @@ async fn the_finders_and_the_sweep_reseal() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_current_row_is_left_alone_by_a_read() {
     let s = sealing_store("cur").await;
-    let d = device(DeviceTrustLevel::Seen, Utc::now());
-    s.save(&d, Utc::now()).await.unwrap();
+    let d = device(
+        DeviceTrustLevel::Seen,
+        crate::device::store::whole_second(Utc::now()),
+    );
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let before = stored(&s, &d).await;
     s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
     assert_eq!(stored(&s, &d).await, before);
@@ -164,7 +176,9 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
 
     let mut newer = d.clone();
     newer.last_seen_at = d.last_seen_at + Duration::seconds(30);
-    s.save(&newer, Utc::now()).await.unwrap();
+    s.save(&newer, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let saved = stored(&s, &d).await;
 
     s.reseal_row(&read, &raw).await;
@@ -179,8 +193,13 @@ async fn a_reseal_never_overwrites_a_save_that_landed_meanwhile() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
     let old = sealing_store("rot").await;
-    let d = device(DeviceTrustLevel::Seen, Utc::now());
-    old.save(&d, Utc::now()).await.unwrap();
+    let d = device(
+        DeviceTrustLevel::Seen,
+        crate::device::store::whole_second(Utc::now()),
+    );
+    old.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     let before = stored(&old, &d).await;
 
     let rotated = ValkeyDeviceStore::with_crypto(
@@ -205,12 +224,19 @@ async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_save_replaces_a_row_that_cannot_be_decoded() {
     let s = sealing_store("undec").await;
-    let d = device(DeviceTrustLevel::Seen, Utc::now());
-    s.save(&d, Utc::now()).await.unwrap();
+    let d = device(
+        DeviceTrustLevel::Seen,
+        crate::device::store::whole_second(Utc::now()),
+    );
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     overwrite(&s, &d, b"not a sealed row at all, but long enough".to_vec()).await;
     assert!(s.load(&d.tenant_id, &d.id).await.is_err());
 
-    s.save(&d, Utc::now()).await.unwrap();
+    s.save(&d, crate::device::store::whole_second(Utc::now()))
+        .await
+        .unwrap();
     assert_eq!(s.load(&d.tenant_id, &d.id).await.unwrap().unwrap(), d);
 }
 
@@ -220,7 +246,7 @@ async fn a_save_replaces_a_row_that_cannot_be_decoded() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn the_sweep_skips_a_damaged_row_and_finishes_the_tenant() {
     let s = sealing_store("sweepdmg").await;
-    let t0 = Utc::now() - chrono::Duration::days(200);
+    let t0 = crate::device::store::whole_second(Utc::now()) - chrono::Duration::days(200);
     let mut bad = device(DeviceTrustLevel::Trusted, t0);
     bad.id = axess_identity::testing::device("damaged");
     let mut good = device(DeviceTrustLevel::Trusted, t0);
@@ -230,17 +256,28 @@ async fn the_sweep_skips_a_damaged_row_and_finishes_the_tenant() {
     s.save(&good, t0).await.unwrap();
     overwrite(&s, &bad, b"damaged damaged damaged damaged".to_vec()).await;
 
-    let counts = s.sweep(&good.tenant_id, Utc::now()).await.unwrap();
+    let counts = s
+        .sweep(
+            &good.tenant_id,
+            crate::device::store::whole_second(Utc::now()),
+        )
+        .await
+        .unwrap();
     assert_eq!(counts.trusted_to_seen, 1, "the healthy row was demoted");
 }
 
 /// A legacy single-id fingerprint key whose row expired is removed by the
-/// lookup that finds the row gone.
+/// lookup that finds the row gone, on a store that reads the earlier layouts.
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_lookup_removes_a_legacy_fingerprint_key_whose_row_expired() {
-    let s = sealing_store("legacyfp").await;
-    let d = device(DeviceTrustLevel::Seen, Utc::now());
+    let s = sealing_store("legacyfp")
+        .await
+        .with_legacy_fingerprint_keys();
+    let d = device(
+        DeviceTrustLevel::Seen,
+        crate::device::store::whole_second(Utc::now()),
+    );
     let (tenant, id) = (d.tenant_id.to_string(), d.id.to_string());
     let legacy = fingerprint_key(&s.prefix, &tenant, &fingerprint_hex(&d.fingerprint_hash));
     let _: () = s.client.set(&legacy, &id, None, None, false).await.unwrap();

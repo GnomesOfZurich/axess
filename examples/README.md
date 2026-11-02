@@ -11,7 +11,7 @@ you are building:
 | [`authz/`](authz/) | `cargo run -p axess-example-authz` | **Authorization.** Cedar policies for roles (RBAC), ownership (ReBAC) and attributes such as "MFA was used" (ABAC). In memory, no database. |
 | [`oauth/`](oauth/) | `cargo run -p axess-example-oauth` | **Sign in with an OpenID Connect provider** (Google, Keycloak, Auth0, …): discovery, PKCE, ID-token validation. |
 | | `cargo run -p axess-example-oauth --bin social` | **Sign in with a provider that lacks OIDC** (GitHub, Discord, Twitter/X, …), and why that is weaker. |
-| [`fapi/`](fapi/) | `cargo run -p axess-example-fapi` | **Financial-grade API security (FAPI 2.0).** PAR, DPoP sender-constrained tokens, form_post, RP-initiated logout, revocation. Ships a Keycloak realm; falls back to a mock provider. |
+| [`fapi/`](fapi/) | `cargo run -p axess-example-fapi` | **Financial-grade API security (FAPI 2.0).** `private_key_jwt` client authentication, PAR, DPoP sender-constrained tokens, form_post, RP-initiated logout, revocation. Ships a Keycloak realm; falls back to a mock provider. |
 | [`workload-identity/`](workload-identity/) | `cargo test -p axess-example-workload-identity` | **Machine callers.** Recipes for GitHub Actions and Kubernetes service accounts, and, as the last resort for a caller with no identity of its own, signed requests over a shared secret. Each recipe is tested. |
 | | `cargo run -p axess-example-workload-identity --bin local-idp` | **An in-process identity provider** minting workload JWTs from a file-backed, rotating key store, for flows without a real IdP. |
 

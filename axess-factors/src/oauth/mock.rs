@@ -338,6 +338,7 @@ impl MockOAuthProvider {
                 None
             },
             oidc_sid: None,
+            nonce: None,
             id_token_hint: Some(crate::secret::ZeroizedString::new("mock-id-token-jwt")),
             additional_claims: serde_json::Value::Object(additional),
             dpop_key: None,
@@ -369,6 +370,17 @@ impl MockOAuthProvider {
     }
 }
 
+/// The mock signs no DPoP proofs: a key handed to it is refused rather than
+/// dropped, as a real provider without DPoP support must.
+fn refuse_key(dpop: Option<DpopSigner<'_>>) -> Result<(), OAuthError> {
+    match dpop {
+        Some(_) => Err(OAuthError::Config(
+            "MockOAuthProvider signs no DPoP proofs; pass no key".to_string(),
+        )),
+        None => Ok(()),
+    }
+}
+
 impl OAuthProvider for MockOAuthProvider {
     fn name(&self) -> &Arc<str> {
         &self.name
@@ -384,6 +396,11 @@ impl OAuthProvider for MockOAuthProvider {
 
     fn authorization_response_iss_required(&self) -> bool {
         self.iss_parameter_required
+    }
+
+    /// The mock signs no DPoP proofs, so its tokens are never bound.
+    fn binds_to_dpop(&self) -> bool {
+        false
     }
 
     /// A synthetic authorization URL whose state, nonce and PKCE verifier come
@@ -420,16 +437,22 @@ impl OAuthProvider for MockOAuthProvider {
     fn fetch_userinfo<'a>(
         &'a self,
         _access_token: &'a str,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
-        Box::pin(async move { self.build_userinfo() })
+        Box::pin(async move {
+            refuse_key(dpop)?;
+            self.build_userinfo()
+        })
     }
 
     fn refresh_token<'a>(
         &'a self,
         refresh_token: &'a str,
         _original_nonce: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
+            refuse_key(dpop)?;
             let claims = self.build_claims(true)?;
             let access_token = claims
                 .access_token
@@ -452,9 +475,16 @@ impl OAuthProvider for MockOAuthProvider {
         &'a self,
         _code: &'a str,
         _pkce_verifier: String,
-        _nonce: String,
+        nonce: String,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
-        Box::pin(async move { self.build_claims(true) })
+        Box::pin(async move {
+            refuse_key(dpop)?;
+            let mut claims = self.build_claims(true)?;
+            // The ID token a real provider verified carries the login's nonce.
+            claims.nonce = Some(nonce);
+            Ok(claims)
+        })
     }
 
     /// Test-only: decode the logout token payload without signature verification.

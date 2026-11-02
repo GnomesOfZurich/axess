@@ -13,7 +13,13 @@ fn ok()
 }
 
 fn upgrade(origin: Option<&str>) -> Request<Body> {
+    upgrade_to("app.example.com", origin)
+}
+
+/// An upgrade request to `host`, as a browser sends it, with `origin`.
+fn upgrade_to(host: &str, origin: Option<&str>) -> Request<Body> {
     let mut req = Request::get("/ws")
+        .header(header::HOST, host)
         .header(header::UPGRADE, "websocket")
         .header(header::CONNECTION, "keep-alive, Upgrade");
     if let Some(origin) = origin {
@@ -53,17 +59,91 @@ async fn a_websocket_upgrade_from_a_foreign_origin_is_refused() {
     assert_eq!(own.status(), StatusCode::OK);
 }
 
-/// Without an allow-list nothing changes, and a plain GET is never an
-/// upgrade.
+/// Without an allow-list the request's own `Host` is the one origin an
+/// upgrade may come from: a cross-site page cannot open a socket with the
+/// user's cookies. The scheme must be the one the deployment serves
+/// (`https` under the default `secure`), a client that sends no `Origin`
+/// is not a browser and passes, and the gate can be turned off.
 #[tokio::test]
-async fn upgrades_pass_without_an_allow_list_and_plain_gets_are_untouched() {
+async fn an_upgrade_without_an_allow_list_must_come_from_the_requests_own_host() {
     let open = layer(&[]);
-    let res = open
-        .oneshot(upgrade(Some("https://evil.example.net")))
+    let foreign = open
+        .clone()
+        .oneshot(upgrade_to(
+            "app.example.com",
+            Some("https://evil.example.net"),
+        ))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN, "a foreign origin");
+    let downgraded = open
+        .clone()
+        .oneshot(upgrade_to(
+            "app.example.com",
+            Some("http://app.example.com"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        downgraded.status(),
+        StatusCode::FORBIDDEN,
+        "the wrong scheme"
+    );
+    let own = open
+        .clone()
+        .oneshot(upgrade_to(
+            "app.example.com",
+            Some("https://APP.example.com:443"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(own.status(), StatusCode::OK, "the request's own origin");
+    let with_port = open
+        .clone()
+        .oneshot(upgrade_to(
+            "app.example.com:8443",
+            Some("https://app.example.com:8443"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        with_port.status(),
+        StatusCode::OK,
+        "a non-default port, on both"
+    );
+    let no_origin = open
+        .clone()
+        .oneshot(upgrade_to("app.example.com", None))
+        .await
+        .unwrap();
+    assert_eq!(no_origin.status(), StatusCode::OK, "not a browser");
 
+    let plain_http = CsrfLayer::new(CsrfConfig::new([3u8; 32]).secure(false)).layer(ok());
+    let own_http = plain_http
+        .oneshot(upgrade_to("localhost:3000", Some("http://localhost:3000")))
+        .await
+        .unwrap();
+    assert_eq!(
+        own_http.status(),
+        StatusCode::OK,
+        "http when the cookies are not Secure"
+    );
+
+    let opted_out =
+        CsrfLayer::new(CsrfConfig::new([3u8; 32]).websocket_origin_check(false)).layer(ok());
+    let res = opted_out
+        .oneshot(upgrade_to(
+            "app.example.com",
+            Some("https://evil.example.net"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "the opt-out");
+}
+
+/// A plain GET is never an upgrade.
+#[tokio::test]
+async fn plain_gets_are_untouched() {
     let guarded = layer(&["https://app.example.com"]);
     let plain = Request::get("/page")
         .header(header::ORIGIN, "https://evil.example.net")

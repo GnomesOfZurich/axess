@@ -115,7 +115,22 @@ pub enum BackendError {
 // on issued_at/expires_at). Kept here so a future submodule can pick them up
 // without re-deriving the parsing rules.
 
-pub(super) fn user_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) -> User {
+/// Name the column in the error of a typed identifier decode.
+fn id_column<T, E: std::fmt::Display>(
+    table_column: &str,
+    parsed: Result<T, E>,
+) -> Result<T, BackendError> {
+    parsed.map_err(|e| BackendError::Backend(format!("{table_column} is not valid: {e}")))
+}
+
+/// Decode a `users` row. The schema enforces NOT NULL and non-empty values
+/// through CHECK constraints; a value they let through that is not a valid
+/// identifier or timestamp is a [`BackendError::Backend`] integrity error,
+/// never a panic and never a default that reads as a working account.
+pub(super) fn user_from_row(
+    clock: &dyn Clock,
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<User, BackendError> {
     let id: String = row.get("id");
     let tenant_id: String = row.get("tenant_id");
     let identifier: String = row.get("identifier");
@@ -127,24 +142,25 @@ pub(super) fn user_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) ->
     let updated_by: String = row.get("updated_by");
     let updated_at: String = row.get("updated_at");
 
-    User {
-        // The DB schema enforces NOT NULL / non-empty via CHECK constraints,
-        // so these .expect() calls guard against data-corruption scenarios only.
-        id: UserId::try_new(id.as_str()).expect("users.id must be a valid UserId"),
-        tenant_id: TenantId::try_new(tenant_id.as_str())
-            .expect("users.tenant_id must be a valid TenantId"),
+    Ok(User {
+        id: id_column("users.id", UserId::try_new(id.as_str()))?,
+        tenant_id: id_column("users.tenant_id", TenantId::try_new(tenant_id.as_str()))?,
         identifier: Arc::from(identifier.as_str()),
         display_name: Arc::from(display_name.as_str()),
-        status: entity_state_from_db(clock, &status, locked_until.as_deref()),
+        status: entity_state_from_db(clock, &status, locked_until.as_deref())?,
         webauthn_id: None,
-        created_by: UserId::try_new(created_by.as_str()).expect("users.created_by invalid"),
+        created_by: id_column("users.created_by", UserId::try_new(created_by.as_str()))?,
         created_at: parse_db_datetime(clock, &created_at),
-        updated_by: UserId::try_new(updated_by.as_str()).expect("users.updated_by invalid"),
+        updated_by: id_column("users.updated_by", UserId::try_new(updated_by.as_str()))?,
         updated_at: parse_db_datetime(clock, &updated_at),
-    }
+    })
 }
 
-pub(super) fn tenant_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) -> Tenant {
+/// Decode a `tenants` row; see [`user_from_row`] for the error contract.
+pub(super) fn tenant_from_row(
+    clock: &dyn Clock,
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<Tenant, BackendError> {
     let id: String = row.get("id");
     let identifier: String = row.get("identifier");
     let name: String = row.get("name");
@@ -154,16 +170,16 @@ pub(super) fn tenant_from_row(clock: &dyn Clock, row: &sqlx::sqlite::SqliteRow) 
     let updated_by: String = row.get("updated_by");
     let updated_at: String = row.get("updated_at");
 
-    Tenant {
-        id: TenantId::try_new(id.as_str()).expect("tenants.id must be a valid TenantId"),
+    Ok(Tenant {
+        id: id_column("tenants.id", TenantId::try_new(id.as_str()))?,
         identifier: Arc::from(identifier.as_str()),
         display_name: Arc::from(name.as_str()),
-        status: entity_state_from_db(clock, &status, None),
-        created_by: UserId::try_new(created_by.as_str()).expect("tenants.created_by invalid"),
+        status: entity_state_from_db(clock, &status, None)?,
+        created_by: id_column("tenants.created_by", UserId::try_new(created_by.as_str()))?,
         created_at: parse_db_datetime(clock, &created_at),
-        updated_by: UserId::try_new(updated_by.as_str()).expect("tenants.updated_by invalid"),
+        updated_by: id_column("tenants.updated_by", UserId::try_new(updated_by.as_str()))?,
         updated_at: parse_db_datetime(clock, &updated_at),
-    }
+    })
 }
 
 /// Parse a `datetime('now')`-style SQLite timestamp.
@@ -185,27 +201,35 @@ pub(super) fn parse_db_datetime(clock: &dyn Clock, s: &str) -> DateTime<Utc> {
 }
 
 /// Map the DB status string (and optional `locked_until` datetime) to [`EntityState`].
+///
+/// A `locked_until` that is not an RFC 3339 timestamp is an error: the lock
+/// may still be in force, so reading the row as unlocked would open an
+/// account the application closed.
 pub(super) fn entity_state_from_db(
     clock: &dyn Clock,
     status: &str,
     locked_until: Option<&str>,
-) -> EntityState {
+) -> Result<EntityState, BackendError> {
     let now = clock.now();
     // A locked_until in the future takes priority over the status column.
-    if let Some(until_str) = locked_until
-        && let Ok(until) = DateTime::parse_from_rfc3339(until_str)
-    {
-        let until: DateTime<Utc> = until.into();
+    if let Some(until_str) = locked_until {
+        let until: DateTime<Utc> = DateTime::parse_from_rfc3339(until_str)
+            .map_err(|e| {
+                BackendError::Backend(format!(
+                    "users.locked_until is not an RFC 3339 timestamp: {e}"
+                ))
+            })?
+            .into();
         if until > now {
-            return EntityState::Suspended(StatusDetail {
+            return Ok(EntityState::Suspended(StatusDetail {
                 reason: "account locked due to failed login attempts".into(),
                 since: now,
                 until: Some(until),
-            });
+            }));
         }
     }
 
-    match status {
+    Ok(match status {
         "active" => EntityState::Active,
         "candidate" => EntityState::Candidate,
         "pending" => EntityState::Pending(StatusDetail {
@@ -229,5 +253,5 @@ pub(super) fn entity_state_from_db(
             until: None,
         }),
         _ => EntityState::Guest,
-    }
+    })
 }

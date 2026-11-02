@@ -100,7 +100,7 @@ testing = []
 
 # Symmetric credential factors
 email_otp = ["dep:chrono"]
-hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:hex", "dep:subtle"]
+hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:hex", "dep:subtle", "dep:chrono"]
 password = ["dep:argon2", "dep:axess-rng"]
 # One-time fallback codes for a second factor: keyed-MAC or Argon2id stored
 # forms (the latter via `password`), generated through the injectable
@@ -141,7 +141,9 @@ oidc = ["http-body", "jwt", "dep:jsonwebtoken", "dep:openidconnect", "dep:tokio"
 # Bounded reads of remote HTTP response bodies (`axess_factors::http_body`).
 http-body = ["dep:reqwest"]
 
-# OAuth ceremony surface
+# OAuth ceremony surface. Both halves of DPoP (the client's proofs and the
+# resource server's `verify_dpop_proof`) and the FAPI 2.0 client profile sit
+# under `oauth`; `fapi` is kept as an alias for it.
 fapi = ["oauth"]
 oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axum", "dep:dashmap", "dep:axess-identity", "dep:axess-rng", "dep:subtle", "dep:chrono", "dep:p256", "dep:sha2"]
 
@@ -153,7 +155,7 @@ bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]
 # OIDC (no signed identity assertion; identity comes from a
 # TLS-trusted userinfo HTTPS GET). See `src/social.rs` module docs
 # for the full delta and when to reach for this vs OIDC.
-social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio"]
+social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio", "dep:url"]
 # SPIFFE JWT-SVID: kept separate because it implements the SPIFFE
 # *spec* (mandatory `spiffe://` URI in `sub`, trust-domain extracted
 # from the URI), not just a claim shape. The generic `WorkloadResolver`

@@ -27,9 +27,9 @@ fn credential() -> StoredDelegation {
 }
 
 fn keys() -> MemoryKeyProvider {
-    MemoryKeyProvider::new("k2", [2u8; 32])
+    MemoryKeyProvider::new("k2", test_key(2))
         .unwrap()
-        .with_historical("k1", [1u8; 32])
+        .with_historical("k1", test_key(1))
         .unwrap()
 }
 
@@ -37,10 +37,10 @@ fn keys() -> MemoryKeyProvider {
 fn v1_row() -> StoredDelegation {
     let old = CurrentKey {
         key_id: Arc::from("k1"),
-        key: Arc::new(EncryptionKey::from_bytes([1u8; 32])),
+        key: Arc::new(EncryptionKey::from_bytes(test_key(1))),
     };
     let rng = axess_rng::SystemRng;
-    let v1 = |env: String| env.replacen("v2.", "v1.", 1);
+    let v1 = |env: String| env.replacen("v3.", "v1.", 1);
     let aad_a = build_aad("gmail", &tenant(), &user(), FIELD_ACCESS);
     let aad_r = build_aad("gmail", &tenant(), &user(), FIELD_REFRESH);
     StoredDelegation {
@@ -219,4 +219,46 @@ async fn a_store_without_a_swap_is_not_resealed() {
         .with_legacy_envelopes(LegacyBlobs::Accept);
     store.load(&tenant(), &user(), "gmail").await.unwrap();
     assert!((*raw(store.inner()).await.access_token).starts_with("v1.k1."));
+}
+
+/// A provider that resolves every stored key but cannot name a current one:
+/// the KMS answers reads and refuses the call that picks the key for writes.
+struct CurrentFails(MemoryKeyProvider);
+
+impl KeyProvider for CurrentFails {
+    fn current(&self) -> Result<CurrentKey, KeyProviderError> {
+        Err(KeyProviderError::Failed("no current key".into()))
+    }
+    fn resolve(&self, key_id: &str) -> Result<Option<Arc<EncryptionKey>>, KeyProviderError> {
+        self.0.resolve(key_id)
+    }
+}
+
+/// A load needs the key the row was sealed under, not the current one; the
+/// current key is wanted only for the re-seal, which is skipped when it
+/// cannot be had.
+#[tokio::test]
+async fn a_load_decrypts_under_the_stored_key_when_no_current_key_can_be_had() {
+    let sealed_as =
+        EncryptedDelegatedCredentialStore::new(MemoryDelegatedCredentialStore::new(), keys())
+            .seal(&tenant(), &user(), credential())
+            .unwrap();
+    let inner = MemoryDelegatedCredentialStore::new();
+    inner
+        .save(&tenant(), &user(), sealed_as.clone())
+        .await
+        .unwrap();
+
+    let reader = EncryptedDelegatedCredentialStore::new(inner, CurrentFails(keys()));
+    let loaded = reader
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .expect("the stored key id still decrypts")
+        .expect("row present");
+    assert_eq!(&*loaded.access_token, "at-plaintext");
+    assert_eq!(
+        &*raw(reader.inner()).await.access_token,
+        &*sealed_as.access_token,
+        "no re-seal without a current key"
+    );
 }

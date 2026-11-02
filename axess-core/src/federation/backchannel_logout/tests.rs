@@ -349,17 +349,11 @@ async fn sid_only_logout_invalidates_session() {
     assert!(claims.sub.is_none());
     assert_eq!(claims.sid.as_deref(), Some("oidc-sid-abc"));
 
-    // Simulate the handler's sid-based invalidation.
-    if let Some((uid, sid, _)) = handler.sid_map.remove(&key) {
-        handler
-            .registry
-            .invalidate_session(&uid, &sid)
-            .await
-            .expect("revoke");
-    }
+    assert_eq!(handler.end_by_sid(&claims).await, SidOutcome::Ended);
 
-    // Session should be invalidated.
+    // Session should be invalidated, and its mapping gone.
     assert!(!registry.is_valid(&user_id, &session_id).await.unwrap());
+    assert!(!handler.sid_map.contains_key(&key));
 }
 
 /// Oversized JWT is rejected before parsing (R2-4: DoS prevention).
@@ -492,12 +486,16 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
             logout_token: token.clone(),
         }),
     )
-    .await
-    .expect("first handler call must return Ok(StatusCode)");
+    .await;
     assert_eq!(
-        response,
+        response.status(),
         StatusCode::OK,
         "first handler call must return 200 OK"
+    );
+    assert_eq!(
+        response.headers().get(axum::http::header::CACHE_CONTROL),
+        Some(&axum::http::HeaderValue::from_static("no-store")),
+        "the logout endpoint answers with Cache-Control: no-store (OIDC Back-Channel Logout 2.8)"
     );
     assert!(
         !registry.is_valid(&user_id, &session_id).await.unwrap(),
@@ -516,9 +514,14 @@ async fn handler_invalidates_session_and_rejects_jti_replay() {
     )
     .await;
     assert_eq!(
-        result.unwrap_err(),
+        result.status(),
         StatusCode::BAD_REQUEST,
         "same (issuer, jti) within IAT window must be rejected as replay"
+    );
+    assert_eq!(
+        result.headers().get(axum::http::header::CACHE_CONTROL),
+        Some(&axum::http::HeaderValue::from_static("no-store")),
+        "a refusal is not cacheable either"
     );
 }
 
@@ -546,7 +549,7 @@ fn raw_token(extra: serde_json::Value) -> String {
 }
 
 async fn post(handler: &BackChannelLogoutHandler, token: String) -> Result<StatusCode, StatusCode> {
-    BackChannelLogoutHandler::handle_backchannel_logout(
+    BackChannelLogoutHandler::handle_outcome(
         State(handler.clone()),
         Form(LogoutParams {
             logout_token: token,

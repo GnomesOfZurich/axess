@@ -79,9 +79,14 @@ observed latency.
 
 `group_search` is optional. When set, after a successful bind axess
 performs an additional search to enumerate the user's group
-memberships. The result is returned alongside the bind outcome and
-can be used to populate the user's authorisation
-attributes.
+memberships. The provider returns them in `LdapBindResult`, and the
+service keeps them in the session's authenticated state (not in the
+custom data, so a handler cannot overwrite them and the custom-data cap
+does not apply): read them with `AuthSession::ldap_groups()` on any
+later request and map them to roles or Cedar entities. They are the groups of the login that
+produced the session; a change in the directory is seen at the next
+login. Without a group search the list is empty, and a session that
+did not authenticate through an LDAP bind has none.
 
 ```rust,ignore
 pub struct LdapGroupSearch {

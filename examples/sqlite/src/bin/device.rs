@@ -112,6 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DeviceLifecycleService::new(cached_devices.clone()).with_event_sink(NoopDeviceEventSink);
 
     // ── 5. resolver, scoped to the single demo tenant ────────────────────
+    //
+    // An application whose tenant is stored in the session at login omits
+    // `with_tenant_fn`: the default reads the session's tenant.
     let demo_tenant = DEMO_TENANT;
     let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock)
         .with_tenant_fn(move |_parts| Some(demo_tenant));
@@ -131,6 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         use axess::Clock;
         let mut tick = tokio::time::interval(Duration::from_secs(60));
+        // A stall makes ticks late; Delay runs one sweep then, not one per
+        // missed tick.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             match sweep_store.sweep(&sweep_tenant, sweep_clock.now()).await {

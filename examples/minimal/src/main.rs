@@ -107,6 +107,10 @@ async fn login(
         Ok(LoginOutcome::InvalidCredentials) => {
             return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
         }
+        // Reached only when the service is built with
+        // `with_lockout_revealed_on_begin`; by default a locked account
+        // answers `InvalidCredentials` above, as an unknown username does,
+        // so the lock is not observable before any proof.
         Ok(LoginOutcome::Locked { until }) => {
             return (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response();
         }

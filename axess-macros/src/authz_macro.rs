@@ -218,8 +218,13 @@ macro_rules! require_authz {
                             $crate::tracing::error!(
                                 macro_name = "require_authz!",
                                 resource_template = $resource,
-                                ?e,
+                                error = ?e.error,
                                 "invalid Cedar UID"
+                            );
+                            // No UID exists to render, so the decision event
+                            // carries the strings the UIDs were built from.
+                            $crate::__macro_support::audit_unbuilt_deny(
+                                &user_id, $action, $resource, e.reason,
                             );
                             return $crate::axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
                         }

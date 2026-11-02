@@ -163,6 +163,14 @@ impl StoredRecoveryCode {
 pub struct RecoveryCodesConfig {
     /// Every code issued in the current set, spent or not.
     pub codes: Vec<StoredRecoveryCode>,
+    /// True once a code of this set has matched only under the previous
+    /// pepper after a rotation. A keyed row cannot be re-keyed without its
+    /// plaintext, so the set stays sealed under the retired secret: the
+    /// application should prompt the user to generate a new set, which is
+    /// made under the current pepper and starts at `false`. Absent in rows
+    /// written before the field existed, which read as `false`.
+    #[serde(default)]
+    pub under_previous_pepper: bool,
 }
 
 impl RecoveryCodesConfig {
@@ -224,7 +232,10 @@ fn generate_with(
     }
     GeneratedRecoveryCodes {
         display,
-        config: RecoveryCodesConfig { codes },
+        config: RecoveryCodesConfig {
+            codes,
+            under_previous_pepper: false,
+        },
     }
 }
 

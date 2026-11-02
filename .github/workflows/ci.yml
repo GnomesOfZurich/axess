@@ -273,12 +273,36 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Keycloak with the FAPI example's realm, for the private_key_jwt login
+      # test (axess-core/tests/oauth_keycloak_live.rs). Started as a step, not
+      # a service, because the realm file comes from the checkout. Loopback
+      # only: the realm ships admin/admin and alice/alice.
+      - name: Start Keycloak (realm fapi)
+        run: |
+          docker run -d --name axess-keycloak-test -p 127.0.0.1:8080:8080 \
+            -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+            -e KC_HTTP_ENABLED=true -e KC_HOSTNAME_STRICT=false \
+            -v "$PWD/examples/fapi/keycloak/fapi-realm.json:/opt/keycloak/data/import/fapi-realm.json:ro" \
+            quay.io/keycloak/keycloak:26.0 start-dev --import-realm
+
       - name: Run unit tests
         run: cargo test --workspace --all-features --lib
 
-      - name: Run integration tests (with Valkey + Postgres + MySQL)
+      # The unit tests above give Keycloak its start-up time; this only waits
+      # for whatever is left of it.
+      - name: Wait for Keycloak
+        run: |
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:8080/realms/fapi && exit 0
+            sleep 2
+          done
+          docker logs axess-keycloak-test | tail -50
+          exit 1
+
+      - name: Run integration tests (with Valkey + Postgres + MySQL + Keycloak)
         run: cargo test --workspace --all-features -- --ignored
         env:
+          KEYCLOAK_URL: http://127.0.0.1:8080
           VALKEY_URL: redis://localhost:6379
           POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
           MYSQL_URL: mysql://root:mysql@localhost:3306/axess_test
@@ -378,11 +402,15 @@ jobs:
   # gate regressions: a `pub use Foo` that should live behind
   # `cfg(feature = "memory")` (or `testing`) compiles fine under
   # `--all-features` and only breaks for adopters who opt out. This
-  # matrix builds three feature-minimal slices so a missing gate fails CI
+  # matrix builds feature-minimal slices so a missing gate fails CI
   # instead of an adopter's prod build.
   feature_isolation:
     name: Feature Isolation (${{ matrix.profile }})
     runs-on: ubuntu-latest
+    # A warning here is an item gated wider than its users: dead code in the
+    # profiles between the two gates, which only this matrix compiles.
+    env:
+      RUSTFLAGS: -D warnings
     strategy:
       fail-fast: false
       matrix:
@@ -419,6 +447,11 @@ jobs:
           # backend path which only Valkey carries.
           - profile: valkey-only
             flags: --no-default-features --features valkey
+          # `delegated` without a store: session crypto compiles for the
+          # encrypted credential store alone. Its unit tests once failed to
+          # build here (the bound seal's subkey was gated on the stores).
+          - profile: delegated-only
+            flags: --no-default-features --features delegated,jwt-rust-crypto
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -432,6 +465,10 @@ jobs:
         run: cargo check -p axess-core --lib ${{ matrix.flags }}
       - name: Check axess facade (${{ matrix.profile }})
         run: cargo check -p axess --lib ${{ matrix.flags }}
+      # `#[cfg(test)]` widens gates, so the unit tests compile code the
+      # library alone does not.
+      - name: Check axess-core unit tests (${{ matrix.profile }})
+        run: cargo check -p axess-core --lib --profile test ${{ matrix.flags }}
 
   # Check that examples compile
   examples:

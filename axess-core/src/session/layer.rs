@@ -20,6 +20,7 @@ mod handle;
 mod lifecycle;
 mod service;
 mod signing;
+mod swap;
 
 pub(crate) use handle::SessionHandle;
 pub(crate) use lifecycle::mark_cookie_response;
@@ -372,6 +373,17 @@ impl<S: SessionStore> SessionLayer<S> {
         self
     }
 
+    /// End an impersonated session once the impersonation is older than
+    /// `max_age`, measured from when `begin_impersonation` made it (default:
+    /// no cap). An administrator's session in a user's name then lasts at
+    /// most this long however active it is; the administrator signs in again
+    /// and impersonates afresh. Read on the layer's clock, like
+    /// [`with_max_session_age`](Self::with_max_session_age).
+    pub fn with_max_impersonation_age(mut self, max_age: Duration) -> Self {
+        self.config_mut().max_impersonation_age = Some(max_age);
+        self
+    }
+
     /// Replace the clock the layer reads (default: [`SystemClock`]). Only the
     /// absolute age cap reads it, so a simulated clock makes that cap
     /// deterministic.
@@ -483,7 +495,8 @@ impl<S: SessionStore> SessionLayer<S> {
     /// on every request before the inner handler runs.
     ///
     /// Errors returned by the resolver are logged via `tracing::warn!`
-    /// and treated as `None`; device resolution never fails the request.
+    /// and leave `device_id` as the loaded session carried it; device
+    /// resolution never fails the request.
     /// When unset (the default), `device_id` stays at whatever the loaded
     /// session carried, which for new sessions is `None`.
     ///

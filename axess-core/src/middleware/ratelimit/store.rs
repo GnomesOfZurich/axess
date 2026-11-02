@@ -89,7 +89,13 @@ enum Created {
 /// Result of trying to acquire a token.
 pub(super) enum Acquire {
     /// Token granted; remaining count returned for `X-RateLimit-Remaining` header.
-    Allowed { remaining: u32 },
+    Allowed {
+        remaining: u32,
+        /// The token came from a bucket other callers draw on too (the
+        /// group's overflow bucket), so `remaining` says something about
+        /// them and is not sent back.
+        shared: bool,
+    },
     /// Rate limited; seconds until the bucket resets.
     Limited { retry_after_secs: u64 },
     /// The bucket table is at its hard cap and this key has no bucket yet;
@@ -173,7 +179,13 @@ impl BucketStore {
         };
         let own_bucket = !near_cap && (target.group.is_none() || reserved_group.is_some());
         if !own_bucket && let Some(overflow) = &target.fold_into {
-            return self.acquire_new_or_existing(overflow, None, now_ms).0;
+            return match self.acquire_new_or_existing(overflow, None, now_ms).0 {
+                Acquire::Allowed { remaining, .. } => Acquire::Allowed {
+                    remaining,
+                    shared: true,
+                },
+                refused => refused,
+            };
         }
         let outcome = self.acquire_new_or_existing(&target.key, reserved_group, now_ms);
         if let Some(group) = reserved_group
@@ -242,6 +254,7 @@ impl BucketStore {
             let remaining = u128::from(self.max_requests) - estimate - 1;
             Acquire::Allowed {
                 remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
+                shared: false,
             }
         } else {
             Acquire::Limited {

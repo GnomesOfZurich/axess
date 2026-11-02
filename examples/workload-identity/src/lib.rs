@@ -8,7 +8,7 @@
 //! additions without reuse benefit. Adopters copy the recipe that
 //! matches their IdP and wire it against the generic resolver.
 //!
-//! Three recipes ship here:
+//! Four recipes ship here, and two platform notes on the Kubernetes one:
 //!
 //! - [`github_actions`]; GitHub Actions OIDC tokens
 //!   (`https://token.actions.githubusercontent.com`), mapping the
@@ -19,10 +19,17 @@
 //!   (`kubernetes.io.{namespace,serviceaccount.name}` claim
 //!   namespace), mapping namespace + service-account-name to the same
 //!   shape.
+//! - [`gitlab`]; GitLab CI ID tokens, mapping the numeric `project_id` /
+//!   `namespace_id` claims to the same shape, with `ref_protected` and
+//!   `environment` allowlists.
 //! - [`shared_secret`]; the last resort, for a caller with no identity
 //!   an IdP can vouch for: requests signed with a shared secret through
-//!   the `service-secret` feature. Weaker than the two above; its module
+//!   the `service-secret` feature. Weaker than the JWT recipes; its module
 //!   docs say how much.
+//!
+//! [`openshift`] and [`eks`] are not recipes of their own: they hold the
+//! issuer and audience of each platform's bound service-account token for the
+//! [`kubernetes`] recipe.
 //!
 //! Each recipe is `pub` so the example crate can be a dependency for
 //! integration tests in adopter projects, but the intended use is
@@ -30,6 +37,9 @@
 //! codebase, adjust the SPIFFE-path layout to fit your trust-domain
 //! convention.
 
+pub mod eks;
 pub mod github_actions;
+pub mod gitlab;
 pub mod kubernetes;
+pub mod openshift;
 pub mod shared_secret;

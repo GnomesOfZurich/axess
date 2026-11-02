@@ -85,6 +85,27 @@ async fn a_missing_iss_is_refused_only_when_the_idp_advertises_it() {
         .expect("an IdP that does not advertise it need not send it");
 }
 
+/// The plain `finish_oauth_login` cannot compare an `iss`, so a provider
+/// that advertises the parameter refuses it before the code is exchanged:
+/// the mix-up defence it advertises would otherwise rest on nothing. A
+/// provider that does not advertise it still takes the plain form.
+#[tokio::test]
+async fn the_plain_finish_is_refused_when_the_idp_advertises_iss() {
+    let svc = service(idp("strict").with_iss_parameter_required());
+    let (session, state) = begun(&svc, "strict").await;
+    let err = svc
+        .finish_oauth_login("code", &state, &session)
+        .await
+        .expect_err("the provider sends iss and this form cannot compare it");
+    assert!(matches!(err, OAuthError::Config(_)), "got {err:?}");
+
+    let svc = service(idp("lax"));
+    let (session, state) = begun(&svc, "lax").await;
+    svc.finish_oauth_login("code", &state, &session)
+        .await
+        .expect("a provider that does not send iss takes the plain form");
+}
+
 /// A UserInfo response for another subject is refused and returns no claims.
 #[tokio::test]
 async fn userinfo_for_another_subject_is_refused() {
@@ -98,12 +119,15 @@ async fn userinfo_for_another_subject_is_refused() {
         .build();
 
     let err = svc
-        .fetch_userinfo("ui", "token", "alice")
+        .fetch_userinfo("ui", "token", "alice", None)
         .await
         .expect_err("sub=bob is not alice");
     assert!(matches!(err, OAuthError::SubjectMismatch), "got {err:?}");
     assert!(!err.to_string().contains("bob") && !err.to_string().contains("alice"));
 
-    let claims = svc.fetch_userinfo("ui", "token", "bob").await.unwrap();
+    let claims = svc
+        .fetch_userinfo("ui", "token", "bob", None)
+        .await
+        .unwrap();
     assert_eq!(claims.sub, "bob");
 }

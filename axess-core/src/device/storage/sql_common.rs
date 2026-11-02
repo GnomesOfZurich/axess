@@ -2,9 +2,10 @@
 //!
 //! Everything that does not depend on a dialect lives here: row decoding,
 //! the sweep thresholds, the compare-and-swap decisions (trust level,
-//! bindings, owner claim) and the column values each write binds. A
-//! backend keeps only its DDL, its placeholders and bind order, its upsert
-//! syntax and its collation notes.
+//! bindings, owner claim), the column values each write binds, and (in
+//! [`ops`]) every operation that takes more than one statement. A backend
+//! keeps only its DDL, its statements with their placeholders and bind
+//! order, its upsert syntax and its collation notes.
 //!
 //! Mirrors the shape of
 //! [`session::storage::session_codec`](crate::session::storage::session_codec):
@@ -31,7 +32,7 @@ use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::store::{BindingsUpdate, OwnerClaim, SweepConfig, TrustTransition};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 use crate::session::crypto::{
-    BoundFormat, CryptoError, SessionCrypto, device_row_id, device_row_id_v1,
+    Binding, BoundFormat, CryptoError, SessionCrypto, device_row_id, device_row_id_v1,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
@@ -115,10 +116,17 @@ impl BindingsCodec {
             .map(|(bindings, _)| bindings)
     }
 
-    /// Like [`decode`](Self::decode), and also reports whether the stored
-    /// blob is in an older format than the one a write seals, so a reader
-    /// can re-seal it. An empty column and a plaintext codec are never
-    /// stale.
+    /// Like [`decode`](Self::decode), and also reports whether the reader
+    /// should re-seal the stored blob: it is bound to its row (the format of
+    /// 0.11.0, or the current format under the previous key) but not in the
+    /// form a write seals. A blob without any binding, read under the
+    /// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) window, is not
+    /// re-sealed by a read: the bindings name no device or tenant, so nothing
+    /// in the plaintext can confirm the blob belongs to the row it sits
+    /// under, and a re-seal would bind a copy from another device's row to
+    /// this one for good. The row's next bindings write seals what the
+    /// application holds. An empty column and a plaintext codec are never
+    /// re-sealed.
     pub fn decode_checked(
         &self,
         tenant_id: &str,
@@ -142,7 +150,10 @@ impl BindingsCodec {
                     )],
                     &payload,
                 )?;
-                (opened.plaintext, opened.stale)
+                (
+                    opened.plaintext,
+                    opened.stale && opened.binding != Binding::Unbound,
+                )
             }
             None => (payload, false),
         };
@@ -252,6 +263,15 @@ pub enum SqlDeviceStoreError {
         device_id: String,
     },
 
+    /// The named lock a create takes on its `(tenant, fingerprint, owner)`
+    /// key was not granted in time (the MySQL store), so nothing was read
+    /// or written; the caller may retry.
+    #[error("device create lock not granted in time: tenant={tenant_id}")]
+    CreateLockTimeout {
+        /// Tenant scope of the create.
+        tenant_id: String,
+    },
+
     /// A guarded trust-level change kept missing a row that a re-read found
     /// at the expected level, so concurrent writers changed it on every
     /// attempt. Nothing was written and the change was not refused: the
@@ -305,6 +325,25 @@ pub(crate) fn utc_to_unix(dt: DateTime<Utc>) -> i64 {
     dt.timestamp()
 }
 
+/// The name of the lock a create of `device` serialises on, for the engines
+/// that take a named lock (`pg_advisory_xact_lock`, `GET_LOCK`): a digest of
+/// the create key `(tenant, fingerprint, owner)`, so it fits every engine's
+/// name limit and reveals nothing of the key.
+#[cfg(any(feature = "postgres", feature = "mysql"))]
+pub(crate) fn create_lock_name(device: &Device) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"axess.device-create.v1\0");
+    digest.update(device.tenant_id.to_string().as_bytes());
+    digest.update([0]);
+    digest.update(device.fingerprint_hash.as_bytes());
+    digest.update([0]);
+    if let Some(user) = device.user_id.as_ref() {
+        digest.update(user.to_string().as_bytes());
+    }
+    format!("axess-device-create:{}", BASE64.encode(digest.finalize()))
+}
+
 /// `SELECT` of every `devices` column, in [`DeviceRow`] field order,
 /// followed by `$tail` (the `WHERE`/`ORDER BY` part, which carries the
 /// dialect's placeholders).
@@ -319,6 +358,27 @@ macro_rules! select_devices {
     };
 }
 pub(crate) use select_devices;
+
+/// Bind every column of a [`DeviceWrite`] to `$query` in table order
+/// (`tenant_id, id, user_id, trust_level, fingerprint_hash, first_seen_at,
+/// last_seen_at, revoked_at, demoted_at, bindings`), the order of every
+/// backend's `INSERT INTO devices` value list.
+macro_rules! bind_device_write {
+    ($query:expr, $w:expr) => {
+        $query
+            .bind(&$w.tenant)
+            .bind(&$w.id)
+            .bind($w.user_id.as_deref())
+            .bind($w.trust)
+            .bind(&$w.fingerprint)
+            .bind($w.first_seen_at)
+            .bind($w.last_seen_at)
+            .bind($w.revoked_at)
+            .bind($w.demoted_at)
+            .bind(&$w.bindings)
+    };
+}
+pub(crate) use bind_device_write;
 
 /// Raw row shape for the `devices` table. Mirrors the column order in
 /// the schema so `query_as` works without column-name binding.
@@ -470,6 +530,7 @@ pub(crate) fn require_row(
 /// the bindings the row holds afterwards are the bytes this save wrote. When
 /// a guard in the upsert kept an already revoked row as it was, the stored
 /// bytes differ and the index keeps matching them.
+#[cfg(any(test, feature = "mysql"))]
 pub(crate) fn index_follows_write(stored: Option<&str>, written: &str) -> bool {
     stored == Some(written)
 }
@@ -717,6 +778,8 @@ pub(crate) fn push_family_rows<DB>(
             .push_bind(family_id.as_str());
     });
 }
+
+pub(crate) mod ops;
 
 #[cfg(test)]
 mod device_sql_common_tests {

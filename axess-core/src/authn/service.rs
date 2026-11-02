@@ -43,6 +43,7 @@ mod login;
 #[cfg(feature = "oauth")]
 mod logout_audit;
 pub mod outcomes;
+mod refresh_tokens;
 mod reset_cooldown;
 mod revocation;
 #[cfg(feature = "device")]
@@ -63,6 +64,8 @@ pub mod session_validator;
 pub use builder::{AuthnServiceBuilder, DEFAULT_FLOW_TTL, RESET_COOLDOWN_CAPACITY};
 #[cfg(feature = "oauth")]
 pub use builder::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
+#[cfg(feature = "oauth")]
+pub use oauth_service::ScopedOAuth;
 pub use outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome};
 pub use revocation::Actor;
 pub use session_validator::{NoSessionRegistryError, SessionValidator, require_valid_session};
@@ -261,6 +264,18 @@ where
     #[cfg(feature = "oauth")]
     pub fn oauth_providers(&self) -> &crate::federation::oauth::OAuthProviderRegistry {
         &self.inner.oauth_providers
+    }
+
+    /// The per-tenant provider source, when one is configured with
+    /// [`with_tenant_oauth_providers`](AuthnServiceBuilder::with_tenant_oauth_providers).
+    /// Hand it to
+    /// [`BackChannelLogoutHandler::with_tenant_providers`](crate::federation::backchannel_logout::BackChannelLogoutHandler::with_tenant_providers)
+    /// so a logout token from a tenant's IdP is recognised.
+    #[cfg(feature = "oauth")]
+    pub fn tenant_oauth_providers(
+        &self,
+    ) -> Option<Arc<dyn crate::federation::oauth_tenant::TenantOAuthProviders>> {
+        self.inner.tenant_oauth_providers.clone()
     }
 
     /// The OIDC `sid` map this service fills on every OAuth login that

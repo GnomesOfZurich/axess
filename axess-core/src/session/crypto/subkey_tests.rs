@@ -42,7 +42,7 @@ fn a_repeated_random_draw_does_not_reuse_a_keystream_across_rows() {
 
     let bound1 = crypto.seal_bound(BoundFormat::SESSION, A, p1).unwrap();
     let bound2 = crypto.seal_bound(BoundFormat::SESSION, B, p2).unwrap();
-    let skip = 4 + crate::subkey::SALT_LEN;
+    let skip = 4 + super::subkey::SALT_LEN;
     assert_ne!(
         xor(&bound1[skip..skip + 16], &bound2[skip..skip + 16]),
         xor(p1, p2),
@@ -92,7 +92,7 @@ fn a_subkeyed_blob_opens_only_for_its_row_and_its_salt() {
     );
     // A body that is too short for a salt and a tag is refused, not panicked on.
     let mut short = BoundFormat::SESSION.subkeyed_magic().to_vec();
-    short.extend_from_slice(&[0u8; crate::subkey::SALT_LEN]);
+    short.extend_from_slice(&[0u8; super::subkey::SALT_LEN]);
     assert!(
         crypto
             .open_bound(BoundFormat::SESSION, A, &[], &short)

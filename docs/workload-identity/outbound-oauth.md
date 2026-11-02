@@ -77,14 +77,7 @@ The client authenticates to that endpoint with a `ClientAuthMethod`:
 pub enum ClientAuthMethod {
     ClientSecretBasic { client_id: String, client_secret: ZeroizedString },
     ClientSecretPost  { client_id: String, client_secret: ZeroizedString },
-    PrivateKeyJwt {
-        client_id: String,
-        signing_key: EncodingKey,
-        algorithm: Algorithm,
-        key_id: Option<String>,
-        audience: String,
-        assertion_ttl: Duration,
-    },
+    PrivateKeyJwt(Box<ClientAssertionSigner>),
 }
 ```
 
@@ -97,12 +90,21 @@ documentation rather than guessing. Both secrets are zeroized on drop.
 `PrivateKeyJwt` is RFC 7523, and it is the one to reach for in a
 FAPI-grade integration: axess signs a short-lived assertion with its
 private key and the IdP validates it against the published JWKS, so
-there is no shared secret to rotate. Its `audience` is the assertion
-JWT's own `aud` claim: per RFC 7523 §3 a value the IdP recognises as
-naming itself, usually the token endpoint URL, though some IdPs want
-their `issuer` URL instead. It does not name the downstream API. The
-`signing_key` is validated when the client is constructed, so a
-malformed key fails at startup rather than on the first call.
+there is no shared secret to rotate. It takes the same
+`ClientAssertionSigner` the user login uses, with its `kid`, `x5t` and
+`x5t#S256` headers (Microsoft Entra finds a certificate credential by the
+thumbprint). The assertion's `aud` is the token URL unless the signer fixes
+another with `with_audience`: per RFC 7523 §3 a value the IdP recognises as
+naming itself, usually the token endpoint URL, though some IdPs want their
+`issuer` URL instead. It does not name the downstream API. The signer signs
+one assertion when it is built, so a key that does not suit its algorithm
+fails at startup rather than on the first call.
+
+```rust,ignore
+let signer = ClientAssertionSigner::from_pem(client_id, &private_key_pem, Algorithm::PS256)?
+    .with_x5t_s256(certificate_thumbprint);
+let client = OutboundOAuthClient::new(token_url, ClientAuthMethod::PrivateKeyJwt(Box::new(signer)))?;
+```
 
 mTLS is not a variant here. Outbound client-certificate
 authentication is a property of the connection rather than of the token
@@ -153,9 +155,19 @@ the validity window read it under a read lock, and the window ends
 mid-flight. Call it per request rather than holding the returned
 `String`, and the refresh is handled for you.
 
-`force_refresh` bypasses the cache and replaces its contents, which is
-what to call when the downstream rejects an apparently-fresh token,
-since the IdP may have revoked it early.
+A refresh that fails while the cached token is still unexpired is not
+an error: the token is returned until it expires and each later call
+tries the endpoint again, so a short outage at the IdP does not fail
+every outbound call at once. Callers that waited for one fetch share
+its outcome rather than fetching in turn.
+
+`force_refresh` condemns the cached token and fetches its replacement,
+which is what to call when the downstream rejects an apparently-fresh
+token, since the IdP may have revoked it early. From that call on the
+condemned token is served to nobody, during the fetch or after one
+that fails. `force_refresh_of(&token)` condemns only the token the
+401 was about, so a rejection reported after another caller already
+replaced the token keeps the replacement instead of fetching again.
 
 ## Token exchange (RFC 8693)
 
@@ -173,7 +185,7 @@ let client = TokenExchangeClient::new(
     token_endpoint,
     "billing-api-prod",
     Some(ZeroizedString::new(client_secret)),
-);
+)?;
 
 let token = client
     .exchange(
@@ -268,8 +280,8 @@ by configuring the default audience on the client registration.
 
 If a call fails on a token that worked moments earlier, the IdP
 revoked it before its stated expiry. The cache has no way to learn
-this, so call `force_refresh` on a 401 and retry once before
-surfacing the error.
+this, so call `force_refresh_of` with the rejected token on a 401 and
+retry once before surfacing the error.
 
 ## Further reading
 

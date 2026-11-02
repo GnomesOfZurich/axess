@@ -9,7 +9,7 @@
 
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use std::future::Future;
 
 mod memory;
@@ -29,6 +29,12 @@ pub const OWN_DEVICE_SCAN_LIMIT: usize = 100;
 ///
 /// All methods accept `&self`; implementations use interior mutability
 /// (`Arc<DashMap<…>>` for memory, connection pool for SQL/Valkey).
+///
+/// Every timestamp a store writes is a whole second, and every comparison a
+/// store makes on one (the newest sighting, whether a sighting moves
+/// `last_seen_at`, the sweep windows) is on whole seconds, so the same rows
+/// give the same answers on every backend whatever the sub-second part of
+/// the instants a caller passes.
 pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// The error type returned by storage operations.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -155,6 +161,32 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         device: &Device,
         now: DateTime<Utc>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Insert `device` as a new row unless a live device of its tenant,
+    /// fingerprint and owner already exists, and return the device that
+    /// exists after the call: `device` itself when it was inserted, or the
+    /// existing one (newest-sighted first, then the smaller id) when it was
+    /// not.
+    ///
+    /// Live is every level but [`DeviceTrustLevel::Revoked`]. The owner is
+    /// compared exactly, so an unowned device (made during a guest request)
+    /// and one owned by a user are different keys. `now` is the time of the
+    /// write, as for [`save`](Self::save).
+    ///
+    /// This is the create step of the lifecycle's `ensure_device`: two
+    /// requests that both missed the lookup and both create must end on one
+    /// device. An implementation makes the check and the insert one step per
+    /// `(tenant, fingerprint, owner)` (a per-key lock, a serialised
+    /// transaction, a conditional script), so that of two concurrent calls
+    /// exactly one inserts and the other returns the inserted row. There is
+    /// no provided implementation: a save followed by a re-read cannot give
+    /// that guarantee, and a store that inherited one would leave two
+    /// devices behind without a compile error.
+    fn create_or_find(
+        &self,
+        device: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Device, Self::Error>> + Send;
 
     /// Touch the `last_seen_at` timestamp for the given device.
     /// Implementations SHOULD perform this as a single UPDATE rather than
@@ -565,22 +597,49 @@ pub enum SweepConfigError {
     },
 }
 
+/// `true` when `other` is a live row of the key
+/// [`DeviceStore::create_or_find`] creates under: `device`'s tenant,
+/// fingerprint and exact owner, and not revoked.
+pub(crate) fn shares_create_key(other: &Device, device: &Device) -> bool {
+    other.trust_level != DeviceTrustLevel::Revoked
+        && other.tenant_id == device.tenant_id
+        && other.fingerprint_hash == device.fingerprint_hash
+        && other.user_id == device.user_id
+}
+
 /// Newest-sighted first, ties broken by the smaller device id, so every
 /// backend returns the same device for equal `last_seen_at` whatever its
-/// iteration order.
+/// iteration order. Sightings are compared as whole seconds, the precision
+/// every backend stores (see [`whole_second`]), so two instants within one
+/// second tie on every backend alike.
 pub(crate) fn order_newest_first(a: &Device, b: &Device) -> std::cmp::Ordering {
     b.last_seen_at
-        .cmp(&a.last_seen_at)
+        .timestamp()
+        .cmp(&a.last_seen_at.timestamp())
         .then_with(|| a.id.cmp(&b.id))
 }
 
+/// `dt` floored to the second: the precision every backend stores and
+/// compares timestamps at. The SQL stores keep Unix seconds, so the memory
+/// and Valkey stores floor on write too, and a decision taken on a row (the
+/// newest sighting, whether a sighting moves the clock, a sweep window) comes
+/// out the same whatever the backend.
+pub(crate) fn whole_second(dt: DateTime<Utc>) -> DateTime<Utc> {
+    dt.with_nanosecond(0).unwrap_or(dt)
+}
+
 /// The row a [`DeviceStore::save`] stores for `device`: a revoked row with no
-/// `revoked_at` gets `now`, so it has a grace clock and can be purged.
+/// `revoked_at` gets `now`, so it has a grace clock and can be purged, and
+/// every timestamp is a [`whole_second`].
 pub(crate) fn for_save(device: &Device, now: DateTime<Utc>) -> Device {
     let mut row = device.clone();
     if row.trust_level == DeviceTrustLevel::Revoked && row.revoked_at.is_none() {
         row.revoked_at = Some(now);
     }
+    row.first_seen_at = whole_second(row.first_seen_at);
+    row.last_seen_at = whole_second(row.last_seen_at);
+    row.revoked_at = row.revoked_at.map(whole_second);
+    row.demoted_at = row.demoted_at.map(whole_second);
     row
 }
 

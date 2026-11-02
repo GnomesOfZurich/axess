@@ -88,12 +88,25 @@ impl User {
     /// legitimately hold emails, display strings, etc.) so they still need
     /// runtime validation. The typed `id` and `tenant_id` fields are guaranteed
     /// non-empty by construction, so they are not re-checked here.
+    ///
+    /// The identifier is held to
+    /// [`is_acceptable_identifier`](crate::validation::is_acceptable_identifier):
+    /// printable, free of invisible format characters and noncharacters, and
+    /// in NFC. The login path treats a stored user that fails this as
+    /// unknown, so a row with a confusable identifier, whichever path wrote
+    /// it, cannot be logged into until it is corrected.
     pub fn validate(&self) -> Result<(), String> {
         if self.identifier.is_empty() {
             return Err("User.identifier must be non-empty".to_string());
         }
         if self.identifier.contains(|c: char| c.is_control()) {
             return Err("User.identifier contains control characters".to_string());
+        }
+        if !crate::validation::is_acceptable_identifier(&self.identifier) {
+            return Err(
+                "User.identifier contains an invisible format character or is not in NFC"
+                    .to_string(),
+            );
         }
         if self.display_name.contains('\0') {
             return Err("User.display_name contains null byte".to_string());

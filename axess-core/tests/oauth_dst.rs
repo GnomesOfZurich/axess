@@ -12,7 +12,8 @@
 
 use axess_clock::testing::MockClock;
 use axess_core::testing::oauth_wiremock::{
-    oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints, oauth_setup_provider,
+    oauth_discover_provider, oauth_generate_rsa_keypair, oauth_mount_oidc_endpoints,
+    oauth_setup_provider,
 };
 use axess_factors::oauth::{OAuthError, OAuthProvider};
 use axess_rng::{SecureRng, testing::MockRng};
@@ -49,9 +50,11 @@ async fn logout_jwt_exp_follows_the_injected_clock() {
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_setup_provider(&server)
+    let provider = oauth_discover_provider(&server)
         .await
-        .with_clock(clock.clone());
+        .with_clock(clock.clone())
+        .build()
+        .expect("build");
 
     let token = sign(
         &private_der,
@@ -86,10 +89,11 @@ async fn exchange_with(clock: Option<Arc<MockClock>>) -> Result<(), OAuthError> 
     let issuer = server.uri();
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let mut provider = oauth_setup_provider(&server).await;
+    let mut provider = oauth_discover_provider(&server).await;
     if let Some(clock) = clock {
         provider = provider.with_clock(clock);
     }
+    let provider = provider.build().expect("build");
 
     let id_token = sign(
         &private_der,
@@ -115,7 +119,7 @@ async fn exchange_with(clock: Option<Arc<MockClock>>) -> Result<(), OAuthError> 
         .await;
 
     provider
-        .exchange_code("code", "verifier".to_string(), "n-1".to_string())
+        .exchange_code("code", "verifier".to_string(), "n-1".to_string(), None)
         .await
         .map(|_| ())
 }
@@ -196,7 +200,6 @@ async fn pkce_state_and_nonce_come_from_the_service_rng() {
     assert_ne!(state, other_state);
 }
 
-#[cfg(feature = "fapi")]
 #[tokio::test]
 async fn dpop_iat_and_jti_come_from_the_service_clock_and_rng() {
     use axess_core::authn::service::AuthnService;
@@ -291,9 +294,11 @@ async fn refresh_all_jwks_follows_the_provider_clock() {
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_setup_provider(&server)
+    let provider = oauth_discover_provider(&server)
         .await
-        .with_clock(clock.clone());
+        .with_clock(clock.clone())
+        .build()
+        .expect("build");
     let authn = authn_with(provider).await;
     let at_discovery = jwks_requests(&server).await;
 
@@ -357,9 +362,11 @@ async fn cached_jwks_expire_after_the_maximum_age() {
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_setup_provider(&server)
+    let provider = oauth_discover_provider(&server)
         .await
-        .with_clock(clock.clone());
+        .with_clock(clock.clone())
+        .build()
+        .expect("build");
     let token = long_lived_logout_jwt(&private_der, &kid, &server.uri());
 
     clock.advance_secs(23 * 3600);
@@ -452,7 +459,11 @@ async fn id_token_signed_with_a_rotated_key_verifies_after_the_refresh() {
     let server = MockServer::start().await;
     let (_, old_jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &old_jwk).await;
-    let provider = oauth_setup_provider(&server).await.with_clock(mock_clock());
+    let provider = oauth_discover_provider(&server)
+        .await
+        .with_clock(mock_clock())
+        .build()
+        .expect("build");
 
     let (new_der, mut new_jwk, _) = oauth_generate_rsa_keypair();
     new_jwk["kid"] = json!("test-key-2");
@@ -462,7 +473,7 @@ async fn id_token_signed_with_a_rotated_key_verifies_after_the_refresh() {
     mount_token_endpoint(&server, &id_token).await;
 
     let claims = provider
-        .exchange_code("code", "verifier".to_string(), "n-1".to_string())
+        .exchange_code("code", "verifier".to_string(), "n-1".to_string(), None)
         .await
         .expect("the rotated key is picked up");
     assert_eq!(claims.subject, "alice");
@@ -475,14 +486,18 @@ async fn id_token_signed_with_an_unpublished_key_is_refused_after_one_refresh() 
     let server = MockServer::start().await;
     let (_, jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
-    let provider = oauth_setup_provider(&server).await.with_clock(mock_clock());
+    let provider = oauth_discover_provider(&server)
+        .await
+        .with_clock(mock_clock())
+        .build()
+        .expect("build");
     let (rogue_der, _, _) = oauth_generate_rsa_keypair();
     let id_token = id_token_with_exp(&rogue_der, "rogue", &server.uri(), MOCK_EPOCH + 3600);
     mount_token_endpoint(&server, &id_token).await;
     let before = jwks_requests(&server).await;
 
     let err = provider
-        .exchange_code("code", "verifier".to_string(), "n-1".to_string())
+        .exchange_code("code", "verifier".to_string(), "n-1".to_string(), None)
         .await
         .expect_err("no key matches");
 
@@ -502,15 +517,17 @@ async fn id_token_is_refused_while_the_key_set_is_expired() {
     let (private_der, jwk, kid) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &jwk).await;
     let clock = mock_clock();
-    let provider = oauth_setup_provider(&server)
+    let provider = oauth_discover_provider(&server)
         .await
-        .with_clock(clock.clone());
+        .with_clock(clock.clone())
+        .build()
+        .expect("build");
     let id_token = id_token_with_exp(&private_der, &kid, &server.uri(), MOCK_EPOCH + 48 * 3600);
     mount_token_endpoint(&server, &id_token).await;
 
     clock.advance_secs(23 * 3600);
     provider
-        .exchange_code("code", "verifier".to_string(), "n-1".to_string())
+        .exchange_code("code", "verifier".to_string(), "n-1".to_string(), None)
         .await
         .expect("a 23 hour old key set verifies");
 
@@ -522,7 +539,7 @@ async fn id_token_is_refused_while_the_key_set_is_expired() {
         .mount(&server)
         .await;
     let err = provider
-        .exchange_code("code", "verifier".to_string(), "n-1".to_string())
+        .exchange_code("code", "verifier".to_string(), "n-1".to_string(), None)
         .await
         .expect_err("a 25 hour old key set with the endpoint down");
     assert!(matches!(err, OAuthError::JwksExpired), "got {err:?}");
@@ -532,7 +549,7 @@ async fn id_token_is_refused_while_the_key_set_is_expired() {
     mount_token_endpoint(&server, &id_token).await;
     clock.advance_secs(6);
     provider
-        .exchange_code("code", "verifier".to_string(), "n-1".to_string())
+        .exchange_code("code", "verifier".to_string(), "n-1".to_string(), None)
         .await
         .expect("verifies again once a refresh succeeds");
 }
@@ -544,7 +561,11 @@ async fn refresh_response_id_token_with_a_rotated_key_verifies() {
     let server = MockServer::start().await;
     let (_, old_jwk, _) = oauth_generate_rsa_keypair();
     oauth_mount_oidc_endpoints(&server, &old_jwk).await;
-    let provider = oauth_setup_provider(&server).await.with_clock(mock_clock());
+    let provider = oauth_discover_provider(&server)
+        .await
+        .with_clock(mock_clock())
+        .build()
+        .expect("build");
     let (new_der, mut new_jwk, _) = oauth_generate_rsa_keypair();
     new_jwk["kid"] = json!("test-key-2");
     server.reset().await;
@@ -553,7 +574,7 @@ async fn refresh_response_id_token_with_a_rotated_key_verifies() {
     mount_token_endpoint(&server, &id_token).await;
 
     let outcome = provider
-        .refresh_token("refresh-1", Some("n-1"))
+        .refresh_token("refresh-1", Some("n-1"), None)
         .await
         .expect("the rotated key is picked up on refresh too");
     let claims = outcome

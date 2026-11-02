@@ -8,6 +8,13 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_HOSTNAME_STRICT: "false"
       KC_HOSTNAME: "localhost"
+      # Serves /health/ready on the management port 9000, which the
+      # healthcheck below probes.
+      KC_HEALTH_ENABLED: "true"
+      # The JVM dies of SIGILL at startup under podman's VM on Apple
+      # silicon unless SVE is off. `UseSVE` exists only on arm64 JVMs, so
+      # the first flag keeps an x86 JVM from refusing it.
+      JAVA_OPTS_APPEND: "-XX:+IgnoreUnrecognizedVMOptions -XX:UseSVE=0"
     ports:
       # Loopback only: the realm ships admin/admin and alice/alice, which
       # must not be reachable from the rest of the network.
@@ -17,10 +24,16 @@ services:
     command:
       - start-dev
       - --import-realm
+      # DPoP is a preview feature in Keycloak 26.0: without this flag the
+      # server ignores the DPoP proof and issues plain Bearer tokens, which
+      # the FAPI profile refuses.
+      - --features=dpop
     healthcheck:
+      # Quoted: unquoted, YAML reads the `Host: localhost` inside it as a
+      # mapping key and compose refuses the file.
       test:
         - CMD-SHELL
-        - exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3 && cat <&3 | grep -q '200 OK'
+        - "exec 3<>/dev/tcp/localhost/9000 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && cat <&3 | grep -q '200 OK'"
       interval: 5s
       timeout: 5s
       retries: 30

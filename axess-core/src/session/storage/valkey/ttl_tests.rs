@@ -1,8 +1,8 @@
 //! Pure decisions behind the Valkey TTL and registry-expiry handling.
 
 use super::internal::{
-    ex_seconds, expired_cycle_outcome, registry_cutoff_ms, registry_key_ttl_secs,
-    registry_member_live, registry_member_ttl_ms,
+    DEGRADED_POLL, DEGRADED_POLL_MAX, after_degraded_poll, degraded_poll_delay, ex_seconds,
+    registry_cutoff_ms, registry_key_ttl_secs, registry_member_live, registry_member_ttl_ms,
 };
 use std::time::Duration;
 
@@ -57,10 +57,34 @@ fn cutoff_agrees_with_liveness() {
     }
 }
 
+/// The degraded poll doubles its interval for each consecutive poll the
+/// registry failed to answer, up to the cap, and a draw spreads each wait
+/// over the quarter interval on either side.
 #[test]
-fn zero_ttl_rotation_reports_a_missing_session_as_gone_for_same_or_different_keys() {
-    use crate::session::store::CycleOutcome;
-    assert_eq!(expired_cycle_outcome(true, 0), CycleOutcome::SessionGone);
-    assert_eq!(expired_cycle_outcome(true, 1), CycleOutcome::Rotated);
-    assert_eq!(expired_cycle_outcome(false, 0), CycleOutcome::Rotated);
+fn degraded_poll_backs_off_per_failed_poll_to_a_cap_and_spreads_around_the_interval() {
+    let ms = |n: u64| Duration::from_millis(n);
+    assert_eq!(DEGRADED_POLL, Duration::from_secs(5));
+    assert_eq!(DEGRADED_POLL_MAX, Duration::from_secs(60));
+    assert_eq!(degraded_poll_delay(0, 0), ms(3_750));
+    assert_eq!(degraded_poll_delay(0, 2_500), ms(6_250));
+    assert_eq!(degraded_poll_delay(0, 2_501), ms(3_750), "the draw wraps");
+    assert_eq!(degraded_poll_delay(1, 0), ms(7_500));
+    assert_eq!(degraded_poll_delay(2, 0), ms(15_000));
+    assert_eq!(degraded_poll_delay(4, 0), ms(45_000), "capped at a minute");
+    assert_eq!(degraded_poll_delay(40, 0), ms(45_000));
+    assert_eq!(degraded_poll_delay(40, 30_000), ms(75_000));
+}
+
+/// A revoked session ends the watch; an answer resets the failure count; a
+/// registry that does not answer counts one more failed poll.
+#[test]
+fn a_degraded_poll_ends_on_revocation_and_counts_unanswered_polls() {
+    let answered = |valid: bool| Ok::<bool, ()>(valid);
+    assert_eq!(after_degraded_poll(answered(false), 3), None);
+    assert_eq!(after_degraded_poll(answered(true), 3), Some(0));
+    assert_eq!(after_degraded_poll(Err::<bool, ()>(()), 3), Some(4));
+    assert_eq!(
+        after_degraded_poll(Err::<bool, ()>(()), u32::MAX),
+        Some(u32::MAX)
+    );
 }

@@ -6,7 +6,7 @@
 use crate::authn::factor::{FactorKind, FactorStep};
 use crate::authn::ids::{TenantId, UserId};
 use crate::session::{
-    data::{AdvanceOutcome, AuthState, SessionData, WorkflowState},
+    data::{AdvanceOutcome, AuthState, Impersonation, SessionData, WorkflowState},
     id::SessionId,
     layer::SessionHandle,
 };
@@ -29,7 +29,7 @@ use std::sync::Arc;
 pub struct AuthSession(pub(crate) SessionHandle);
 
 /// Identity bundle returned by [`AuthSession::snapshot`]. All
-/// four fields are read under a single `RwLock::read()` acquisition.
+/// fields are read under a single `RwLock::read()` acquisition.
 #[derive(Clone, Debug)]
 pub struct AuthSnapshot {
     /// Identifier of the authenticated user.
@@ -40,6 +40,9 @@ pub struct AuthSnapshot {
     pub session_id: SessionId,
     /// Wall-clock time at which authentication completed.
     pub authn_time: DateTime<Utc>,
+    /// The administrator acting in the user's name, and since when; `None`
+    /// for the user's own session. See [`AuthSession::impersonation`].
+    pub impersonation: Option<Impersonation>,
 }
 
 impl AuthSession {
@@ -95,6 +98,42 @@ impl AuthSession {
     /// Return `true` if the session is fully authenticated.
     pub async fn is_authenticated(&self) -> bool {
         self.0.0.read().await.data.auth_state.is_authenticated()
+    }
+
+    /// The administrator who is impersonating the user this session is
+    /// authenticated as, or `None` for an ordinary session.
+    ///
+    /// Set by `begin_impersonation` as part of the authenticated state, so
+    /// it survives anything done to the custom data and ends only with the
+    /// state (`end_impersonation`, logout, a new login). The library refuses
+    /// refresh token issuance and factor enrolment or deletion for such a
+    /// session unless the service was built with
+    /// `with_impersonated_credential_changes_allowed`, and every audit row a
+    /// request under impersonation writes names the administrator as
+    /// actor. Check it before anything else an administrator should not do
+    /// in a user's name. The session's authentication time is the
+    /// administrator's, not a fresh login's. [`impersonation`](Self::impersonation)
+    /// also says since when.
+    pub async fn impersonator(&self) -> Option<UserId> {
+        self.impersonation().await.map(|i| i.admin)
+    }
+
+    /// The impersonating administrator and when the impersonation began, or
+    /// `None` for an ordinary session. See [`impersonator`](Self::impersonator).
+    pub async fn impersonation(&self) -> Option<Impersonation> {
+        self.0.0.read().await.data.auth_state.impersonation()
+    }
+
+    /// Mark the authenticated session as `admin`'s impersonation begun at
+    /// `since`. Returns `false`, changing nothing, when the session is not
+    /// authenticated.
+    pub(crate) async fn set_impersonator(&self, admin: UserId, since: DateTime<Utc>) -> bool {
+        let mut guard = self.0.0.write().await;
+        let marked = guard.data.auth_state.set_impersonator(admin, since);
+        if marked {
+            guard.modified = true;
+        }
+        marked
     }
 
     /// Clone the current authentication state enum (cheap; fields are `Arc<str>`).
@@ -216,12 +255,14 @@ impl AuthSession {
                 user_id,
                 tenant_id,
                 authn_time,
+                impersonator,
                 ..
             } => Some(AuthSnapshot {
                 user_id: *user_id,
                 tenant_id: *tenant_id,
                 session_id: guard.id,
                 authn_time: *authn_time,
+                impersonation: *impersonator,
             }),
             _ => None,
         }
@@ -559,12 +600,11 @@ impl AuthSession {
     ///
     /// A store that cannot answer, or a session that was ended meanwhile,
     /// also gives `None`: the ceremony has to be started again, it never
-    /// runs twice. The guarantee covers requests that take the value. An
-    /// ordinary write is last-writer-wins, so an unrelated request that
-    /// loaded the session before the value was taken and saves it afterwards
-    /// puts the value back; bind a ceremony's value to something the
-    /// completing request must also present (a nonce inside the value) when
-    /// a replay of the stale copy would matter.
+    /// runs twice. Every write of a stored session is a compare-and-swap on
+    /// its revision, so an unrelated request that loaded the session before
+    /// the value was taken does not put it back when it saves: its write
+    /// finds the row changed and merges its own changes onto the stored row,
+    /// in which the value is gone.
     pub async fn take_custom(&self, key: &str) -> Option<serde_json::Value> {
         self.0.0.write().await.consume_custom(key).await
     }
@@ -575,41 +615,7 @@ impl AuthSession {
     /// `max_custom_bytes` limit; the value is not stored in that case.
     pub async fn set_custom(&self, key: impl Into<String>, value: serde_json::Value) -> bool {
         let mut guard = self.0.0.write().await;
-        let key = key.into();
-        // The bag is an object; one that was stored as another JSON type is
-        // replaced by an empty object, as `mutate_custom` does, rather than
-        // indexed (which panics on an array or a scalar).
-        if !guard.data.custom.is_object() {
-            guard.data.custom = serde_json::Value::Object(serde_json::Map::new());
-        }
-        let limit = guard.max_custom_bytes;
-        if limit > 0 {
-            // Speculatively apply the change, check size, and rollback if over limit.
-            let prev = guard.data.custom.get(&key).cloned();
-            guard.data.custom[key.clone()] = value;
-            let size = crate::session::data::json_byte_len(&guard.data.custom);
-            if size > limit {
-                // Rollback.
-                match prev {
-                    Some(v) => guard.data.custom[key] = v,
-                    None => {
-                        if let Some(obj) = guard.data.custom.as_object_mut() {
-                            obj.remove(&key);
-                        }
-                    }
-                }
-                tracing::warn!(
-                    size,
-                    max = limit,
-                    "set_custom rejected; would exceed max_custom_bytes"
-                );
-                return false;
-            }
-        } else {
-            guard.data.custom[key] = value;
-        }
-        guard.modified = true;
-        true
+        guard.set_custom_value(key.into(), value)
     }
 }
 

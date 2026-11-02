@@ -22,16 +22,20 @@ pub struct MemoryLocalIdpKeyStore {
     inner: Arc<RwLock<LoadedKeys>>,
 }
 
-/// Error type for [`MemoryLocalIdpKeyStore`]. Has no reachable variants
-/// today (every operation succeeds); the enum exists so the trait's
-/// `type Error` has a concrete type to point at and so future variants
-/// can be added without a breaking signature change.
+/// Error type for [`MemoryLocalIdpKeyStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryLocalIdpKeyStoreError {
-    /// Placeholder. No variants reachable in L1; future variants
-    /// (e.g. `LockPoisoned` if we drop the `expect`) will land here.
-    #[error("memory key store error (unreachable in L1)")]
+    /// Never returned. Kept from the releases in which no operation of the
+    /// store could fail, so a match on the enum still compiles.
+    #[error("memory key store error (never returned)")]
     Infallible,
+    /// `rotate` was offered a key whose `kid` the store already holds, as
+    /// the current key or a historical one. The store is unchanged.
+    #[error("key id {kid:?} is already in the key set")]
+    DuplicateKeyId {
+        /// The `kid` offered twice.
+        kid: String,
+    },
 }
 
 impl MemoryLocalIdpKeyStore {
@@ -89,6 +93,15 @@ impl LocalIdpKeyStore for MemoryLocalIdpKeyStore {
             let mut guard = inner
                 .write()
                 .expect("MemoryLocalIdpKeyStore lock never poisoned");
+            // The store is the one place that sees every replica's keys, so
+            // the duplicate check is made here under the write lock, not
+            // only against the caller's own snapshot.
+            let kid = new_current.key_id();
+            if guard.current.key_id() == kid || guard.historical.iter().any(|k| k.key_id() == kid) {
+                return Err(MemoryLocalIdpKeyStoreError::DuplicateKeyId {
+                    kid: kid.to_owned(),
+                });
+            }
             // Demote previous current → historical at the back of the
             // list, matching the fixture's `rotate_signing_key` order so
             // JWKS layouts (current first, then historical oldest→newest)

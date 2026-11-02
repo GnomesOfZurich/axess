@@ -237,3 +237,85 @@ async fn flush_waits_for_a_worker_that_is_held_but_not_run() {
     drop(worker);
     assert_eq!(log.flush().await, Err(AnalyticsClosed));
 }
+
+/// Wrapping a store must not turn off the tenant overrides it carries. The
+/// trait defaults for `get_user_in_tenant`, `lockout_policy`,
+/// `password_rules_for_tenant`, `ip_policy_for_tenant` and
+/// `record_last_login` are permissive (every address allowed, the default
+/// password rules, no last-login write), so a wrapper that inherits them
+/// instead of forwarding silently disables the tenant's policy.
+#[tokio::test]
+async fn tenant_overrides_reach_the_inner_store_through_the_wrapper() {
+    use crate::authn::store::IdentityLookup as _;
+    use crate::authn::types::{IpPolicy, LockoutPolicy};
+    use crate::testing::mock_authn::CallLog;
+    use crate::testing::{tenant_record, user_record};
+
+    let tenant = tenant_record("acme");
+    let user = user_record("alice", "acme");
+    let log = CallLog::new();
+    let inner = MockIdentityStore::new()
+        .with_call_log(&log)
+        .with_tenant(tenant.clone())
+        .with_user(user.clone())
+        .with_lockout_policy(LockoutPolicy {
+            max_attempts: 3,
+            ..LockoutPolicy::default()
+        })
+        .with_ip_policy(
+            &tenant.id,
+            IpPolicy {
+                allow: vec![],
+                deny: vec!["1.2.3.4".into()],
+            },
+        )
+        .with_password_rules(
+            &tenant.id,
+            crate::authn::factor::PasswordRules {
+                min_length: 20,
+                ..Default::default()
+            },
+        );
+    let (wrapped, _worker) =
+        AuditLogWithAnalytics::new(inner.clone(), RecordingSink::default(), enrich);
+
+    let ip = wrapped.ip_policy_for_tenant(&tenant.id).await.unwrap();
+    assert!(
+        !ip.is_allowed("1.2.3.4".parse().unwrap()),
+        "the tenant denies 1.2.3.4; the wrapper answered with the trait default"
+    );
+    let rules = wrapped.password_rules_for_tenant(&tenant.id).await.unwrap();
+    assert_eq!(
+        rules.min_length, 20,
+        "the tenant requires 20 characters; the wrapper answered with the trait default"
+    );
+    assert_eq!(
+        wrapped.lockout_policy_for_tenant(&tenant.id).max_attempts,
+        3,
+        "the inner store's lockout policy must be the wrapper's"
+    );
+    let found = wrapped
+        .get_user_in_tenant(&user.id, &tenant.id)
+        .await
+        .unwrap();
+    assert_eq!(found.map(|u| u.id), Some(user.id));
+    let at = chrono::Utc::now();
+    wrapped.record_last_login(&user.id, at).await.unwrap();
+    assert_eq!(
+        inner.last_login(&user.id),
+        Some(at),
+        "record_last_login must reach the inner store, not the no-op default"
+    );
+    for name in [
+        "ip_policy_for_tenant",
+        "password_rules_for_tenant",
+        "get_user_in_tenant",
+        "record_last_login",
+    ] {
+        assert!(
+            log.calls().contains(&name),
+            "{name} must be forwarded to the inner store's own method; calls were {:?}",
+            log.calls()
+        );
+    }
+}

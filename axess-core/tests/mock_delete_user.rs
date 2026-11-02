@@ -35,6 +35,7 @@ fn password_config() -> FactorConfig {
     FactorConfig::Password(PasswordConfig {
         hash: ZeroizedString::new(axess_factors::generate_password_hash("Old-password-1!")),
         rules: PasswordRules::default(),
+        password_id: None,
     })
 }
 

@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.13.0", features = ["testing"] }
+//! axess = { version = "0.14.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -261,6 +261,15 @@ mod session_ext {
             &self,
             now: DateTime<Utc>,
         ) -> impl std::future::Future<Output = ()> + Send;
+
+        /// Mark an authenticated session as `admin`'s impersonation begun
+        /// at `since`, the marker `begin_impersonation` leaves; `false`,
+        /// changing nothing, when the session is not authenticated.
+        fn set_impersonator(
+            &self,
+            admin: UserId,
+            since: DateTime<Utc>,
+        ) -> impl std::future::Future<Output = bool> + Send;
     }
 
     impl AuthSessionTestExt for AuthSession {
@@ -296,6 +305,10 @@ mod session_ext {
 
         async fn record_attempt_at(&self, now: DateTime<Utc>) {
             AuthSession::record_attempt_at(self, now).await;
+        }
+
+        async fn set_impersonator(&self, admin: UserId, since: DateTime<Utc>) -> bool {
+            AuthSession::set_impersonator(self, admin, since).await
         }
     }
 }

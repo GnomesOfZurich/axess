@@ -65,7 +65,8 @@ Your integration owns three:
 
 ## Configuring a provider
 
-You do not implement the trait; `discover` builds a provider from the IdP's own document.
+You do not implement the trait; `discover` reads the IdP's own document into a
+builder, and `build` checks its settings and returns the provider.
 
 ### The provider
 
@@ -79,13 +80,23 @@ returned provider implements the trait.
 
 ```rust,ignore
 let provider = OAuthProviderConfig::discover(
-    "https://accounts.google.com/.well-known/openid-configuration",
+    "google",
+    "https://accounts.google.com",
     client_id,
     client_secret,
-    "https://your-app.example.com/auth/callback/google".parse()?,
+    "https://your-app.example.com/auth/callback/google",
 )
-.await?;
+.await?
+.build()?;
 ```
+
+`discover` returns an `OAuthProviderBuilder`. Its `with_*` methods record a
+setting and return the builder, in any order; `build` is the one place the
+settings meet. It checks the transport of every endpoint a setter named, the
+FAPI profile's demands, the DPoP setting against the profile and the IdP,
+and the ID-token algorithm list, so a provider that cannot work fails at
+startup with a `Config` error naming the rule, and the order of the calls
+never changes the verdict.
 
 `discover` fetches the IdP's discovery document, validates it
 contains the endpoints axess needs (authorization, token, JWKS,
@@ -107,6 +118,72 @@ The configuration record carries four things:
   it needs a refresh token to keep acting as the user after the
   initial session expires.
 
+### Authenticating the client
+
+The code exchange, the refresh, the pushed authorization request and
+the revocation call each prove who the client is. There are two ways to
+do it, and a provider uses exactly one.
+
+A **client secret** is what `OAuthProviderConfig::discover` takes. It
+travels in the request (a Basic header on the token request, a form
+field on the others), so whoever can read the request or the secret
+store can impersonate the client.
+
+**`private_key_jwt`** (RFC 7523, OpenID Connect Core section 9)
+replaces the secret with a signature. Axess signs a short-lived JWT, the
+client assertion, with a private key whose public half the IdP holds,
+and sends it as `client_assertion` beside
+`client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`.
+Nothing the IdP could leak can be replayed: each assertion lives 60
+seconds and carries a fresh `jti`. Microsoft Entra requires this
+method for a certificate credential, and FAPI 2.0 allows only this
+method or mTLS.
+
+```rust,ignore
+use axess::federation::oauth::{ClientAssertionSigner, OAuthProviderConfig};
+
+let signer = ClientAssertionSigner::from_pem(client_id, &private_key_pem, jsonwebtoken::Algorithm::PS256)?
+    .with_key_id("2026-10")                 // IdPs that pick the key by kid
+    .with_x5t_s256(certificate_thumbprint); // Entra: the certificate's SHA-256 thumbprint
+
+let provider = OAuthProviderConfig::discover_with_private_key_jwt(
+    "entra",
+    "https://login.microsoftonline.com/<tenant-id>/v2.0",
+    signer,
+    "https://your-app.example.com/auth/callback/entra",
+)
+.await?
+.build()?;
+```
+
+`with_private_key_jwt` on the builder of `discover` switches the provider
+the same way, and drops its secret: while a signer is set, no request carries
+a `client_secret` or a Basic header. `ClientAssertionSigner::from_pem`
+reads a PKCS#1 or PKCS#8 RSA key and a PKCS#8 EC or Ed25519 key;
+`ClientAssertionSigner::new` takes a `jsonwebtoken::EncodingKey` you
+built yourself. Both refuse a symmetric algorithm and sign one throw-away
+assertion, so a key that does not suit its algorithm fails with a
+`ClientAssertionError` at startup. The same signer authenticates the
+outbound client (`ClientAuthMethod::PrivateKeyJwt`) and, through a stored
+`SignerSpec`, a tenant's provider.
+
+The assertion's `iat` and `exp` come from the provider's clock
+(`with_clock`) and its `jti` from the provider's RNG (`with_rng`), so a
+test under a `MockClock` and a seeded `MockRng` reproduces it exactly.
+Its `aud` is the endpoint being called, which is what Entra and Keycloak
+accept; under [`with_fapi`](fapi.md) it is the issuer, as FAPI 2.0
+requires, and `ClientAssertionSigner::with_audience` fixes one value for
+an IdP that wants something else. FAPI composes with the method: DPoP or
+mTLS constrain the tokens, the assertion authenticates the client. DPoP
+does not need FAPI: see [Binding tokens to a key](#binding-tokens-to-a-key-dpop),
+which works with a client secret too. `build` refuses a FAPI provider that
+would authenticate by a secret, whatever order the settings came in.
+
+If the IdP answers `invalid_client`, check in this order: the public key
+or certificate registered for the client is the one that signs; the
+`kid` or thumbprint header names it; the clock of the host is right (the
+assertion lives 60 seconds); the `aud` is the value the IdP expects.
+
 ### Multiple providers
 
 A common shape is to offer login with several IdPs side by side
@@ -119,10 +196,144 @@ the right provider per request.
 
 A per-tenant variation is also common: each tenant's users federate
 against the tenant's own IdP (an Okta workspace, an Azure AD
-directory). The provider name in this case is the tenant slug; the
-provider is constructed at tenant provisioning time (or lazily, on
-first use) and cached. The scope hierarchy chapter covers the
-pattern for storing per-tenant configurations.
+directory). Registering one provider per tenant at startup does not
+survive a tenant being added or edited while the service runs; the
+[Bring your own IdP](#bring-your-own-idp-per-tenant) section below
+resolves the provider by `(tenant, name)` from a store at request time
+instead.
+
+### Bring your own IdP per tenant
+
+A product where every customer signs in with its own IdP needs the
+provider chosen by `(tenant, name)` at request time, from configuration
+an operator edits while the service runs. Two tenants may each have a
+provider called `sso`, against different issuers, in one process.
+
+The pieces:
+
+- `TenantOAuthProviderRecord` is one tenant's provider: issuer, client
+  id, redirect URL, scopes, a `TenantClientCredential`, either a
+  secret or a `private_key_jwt` key (the PEM, and a `SignerSpec`: algorithm,
+  `kid`, certificate thumbprints, audience, assertion lifetime), and `dpop`, a `TenantDpop` with the three behaviours of
+  [DPoP](#binding-tokens-to-a-key-dpop): `Advertised` (the default, and
+  what a stored record without the field reads as: on where the tenant's
+  IdP advertises DPoP), `Off` (as `without_dpop()`, for a tenant whose
+  resource servers accept only Bearer tokens) and `Required` (as
+  `with_dpop()`: the provider is not built, and the login is refused,
+  when the IdP does not advertise DPoP).
+- `TenantOAuthProviderStore` keeps records.
+  `MemoryTenantOAuthProviderStore` is for tests and fixed tenant lists;
+  `SqliteTenantOAuthProviderStore` (the `sqlite` feature) keeps them in a
+  `tenant_oauth_providers` table. The store assigns each record a
+  `revision`: 1, then one more per update.
+- `StoredTenantOAuthProviders` is the `TenantOAuthProviders` over a
+  store. It discovers and builds a provider on first use and keeps it.
+  Each resolution reads the record and compares revisions, so an update
+  written by any process is used by the next login with no restart and no
+  call to make; `invalidate` drops a provider early, and `remove` deletes
+  a record and stops it resolving.
+- With `with_cipher`, `upsert` seals the credential with the
+  `FactorSecretCipher` you already use for OTP secrets, bound to the
+  tenant and the name, so the client secret or private key is never in
+  the table in clear text and a row copied to another tenant does not
+  open.
+
+```rust,ignore
+use axess::federation::oauth::{StoredTenantOAuthProviders, SqliteTenantOAuthProviderStore};
+
+let store = SqliteTenantOAuthProviderStore::new(pool);
+store.init_schema().await?;
+let tenants = Arc::new(StoredTenantOAuthProviders::new(store).with_cipher(cipher));
+
+let authn = AuthnService::builder(identity, factors)
+    .with_tenant_oauth_providers(tenants.clone())
+    .build();
+
+// An operator saves a tenant's IdP; the next login uses it.
+tenants.upsert(record).await?;
+
+// Login: the tenant comes from the route or the host, never the body.
+let (url, _state) = authn
+    .begin_oauth_login_with_tenant_provider("sso", &OAuthLoginOptions::default(), &tenant_id, &session)
+    .await?;
+```
+
+`begin_oauth_login_with_tenant_provider` takes the arguments of
+`begin_oauth_login_in_tenant` in the same order. It stores the tenant in the
+server-side session and binds the ceremony to it, as
+`begin_oauth_login_in_tenant` does:
+`complete_oauth_login` refuses a user of another tenant. The callback
+(`finish_oauth_login`, or the JARM form) is unchanged: it reads the
+tenant from the session, so the callback request chooses neither the
+tenant nor the provider. A ceremony begun before an update does not
+finish against the new issuer; it fails the issuer check and the login
+restarts.
+
+The global registration stays as the single-tenant form. A name
+registered with `with_oauth_provider` is reached by `begin_oauth_login`
+and a tenant's by `begin_oauth_login_with_tenant_provider`; the two never shadow each
+other.
+
+The helpers that follow the login resolve the provider the way the login
+did. `oauth_for_session(&session)` reads the tenant that
+`complete_oauth_login` recorded for a login begun with
+`begin_oauth_login_with_tenant_provider` and returns a `ScopedOAuth`; its `refresh_oauth_token`,
+`fetch_userinfo`, `revoke_oauth_token`, `build_end_session_url` and
+`generate_dpop_proof` take the same arguments as the
+methods of that name on the service and reach that tenant's provider. A
+session that logged in through the global registration, or through no OAuth
+provider, gets the global registration, so a single-tenant product changes
+nothing. Where there is no session (a background refresh keyed by a stored
+tenant id) use `oauth_in_tenant(&tenant)`. A tenant with no provider by that
+name is `OAuthError::UnknownProvider`, never the global one.
+
+```rust,ignore
+let authn = authn.with_audit_context(audit);
+
+// A request of a signed-in tenant user.
+let outcome = authn
+    .oauth_for_session(&session)
+    .await
+    .refresh_oauth_token("sso", &refresh_token, &subject, nonce.as_deref(), key.as_ref())
+    .await?;
+
+// A worker that holds the tenant id.
+let info = authn
+    .oauth_in_tenant(&tenant_id)
+    .fetch_userinfo("sso", &access_token, &subject, key.as_ref())
+    .await?;
+```
+
+The by-name methods directly on the service (`authn.refresh_oauth_token`
+and the others) are the single-tenant form and read the global registration
+only, as `begin_oauth_login` does.
+
+An IdP-initiated logout arrives with no session and no tenant, only an issuer.
+Build the back-channel handler with the tenant source so it finds the
+provider by that issuer:
+
+```rust,ignore
+let handler = BackChannelLogoutHandler::for_tenants(
+    authn.tenant_oauth_providers().expect("configured"),
+    registry,
+    authn.sid_map(),
+    clock,
+)
+.with_audit(authn.backchannel_logout_audit());
+// Or, beside global providers:
+// BackChannelLogoutHandler::new(&providers, registry, sid_map, clock)?
+//     .with_tenant_providers(source)
+```
+
+The handler asks the source for every tenant provider of the token's issuer;
+the one whose client id the token's `aud` names verifies it, and the session
+the `(issuer, sid)` maps to is the one that ends. Two tenants may share an
+issuer when their client ids differ. When two providers (two tenants, or a
+tenant and a global provider) share both the issuer and the client id, the
+token cannot be attributed, and the handler refuses it with
+`LogoutProviderError::Ambiguous` and ends nothing; give each tenant its own
+client registration. A tenant source that fails answers 503, so the IdP
+retries.
 
 ## The login flow
 
@@ -293,13 +504,109 @@ checked: a nonce, if present, must equal the nonce of the original login
 (pass it as `original_nonce`; it is the `nonce` member of
 `OAuthClaims::additional_claims`), and a missing nonce is accepted.
 
+A login whose tokens are bound to a DPoP key passes that key as
+`refresh_oauth_token`'s `dpop_key`; the next section says where it comes from
+and why it has to be kept.
+
+## Binding tokens to a key (DPoP)
+
+A bearer token works for whoever holds it: one copied out of a log, a cache
+or a compromised proxy is as good as the original. DPoP (RFC 9449) binds the
+access token to a key the client holds. Every request that uses the token
+carries a proof, a short JWT signed by that key and naming the request, and
+the authorization server writes the key's thumbprint into the token
+(`cnf.jkt`). A stolen token without the key is refused. DPoP binds the token
+whatever the client authenticates with, a client secret included, and does
+not need the FAPI profile.
+
+**It is on by default where the IdP offers it.** `discover` reads
+`dpop_signing_alg_values_supported` from the discovery document; when it lists
+`ES256`, the algorithm axess signs proofs with, the provider binds its tokens
+to a DPoP key with nothing configured. When the IdP does not advertise DPoP,
+or advertises only other algorithms, the provider sends Bearer requests as
+before, and there is nothing to do. `OAuthProvider::binds_to_dpop` says which
+a provider does.
+
+What a bound provider does:
+
+- `begin_oauth_login` makes a key for the login and keeps it with the
+  ceremony. The code exchange carries a proof signed by it; a response whose
+  `token_type` is not `DPoP`, or whose access token names another key in
+  `cnf.jkt`, is refused. The key comes back in `OAuthClaims::dpop_key`.
+- Every later call with the tokens takes the key: the `dpop_key` argument of
+  `refresh_oauth_token`, `fetch_userinfo` and `revoke_oauth_token`, the
+  `dpop` argument of the provider's client credentials and device grants. A
+  call given `None` is refused with `OAuthError::DpopKeyRequired` before
+  anything is sent, because a bound token presented as Bearer is refused by a
+  resource server that checks the binding, and accepted by one that does not.
+  Revocation is sent without a key too, and with a proof when given one.
+- An authorization or resource server that wants a nonce answers
+  `use_dpop_nonce` (RFC 9449 sections 8 and 9); the request is sent once more
+  with a proof that echoes it. No other refusal is retried.
+
+**Keep the key for the tokens' life.** axess does not store it, and a key
+made afresh does not match tokens already issued. Store its seed beside the
+refresh token, as secret as the token itself, and restore it in whichever
+process refreshes, after a restart or on another node:
+
+```rust,ignore
+use axess::federation::oauth::DpopKey;
+
+// After the login: keep the seed with the refresh token.
+let seed = claims.dpop_key.as_ref().map(|key| key.to_seed_bytes());
+
+// Later, in any process: restore it and refresh with it.
+let key = stored_seed.map(DpopKey::from_seed);
+let outcome = authn
+    .refresh_oauth_token("idp", &refresh_token, &subject, nonce.as_deref(), key.as_ref())
+    .await?;
+```
+
+The OAuth example keeps the seed in its session beside the refresh token
+(`examples/oauth/src/app.rs`). Sessions that were signed in before the
+provider bound its tokens hold Bearer tokens and no key. A confidential
+client's refresh token is not bound to a key (RFC 9449 section 5), so where
+the IdP accepts it they refresh with a key made then (`DpopKey::generate`)
+and kept from that refresh on; otherwise they sign in again.
+
+**`without_dpop()`** turns DPoP off for a provider whose IdP advertises it.
+It is the setting for deployments whose resource servers accept only Bearer
+tokens: a bound token arrives at them with the `DPoP` scheme and a proof,
+which they refuse. It gives up the binding, so use it only there.
+
+**`with_dpop()`** makes DPoP a requirement: `build` refuses the provider when
+the IdP does not advertise it, so an IdP whose configuration loses DPoP
+fails at startup instead of issuing Bearer tokens. The later of the two
+settings wins.
+
+```rust,ignore
+// Resource servers that take only Bearer tokens:
+let provider = OAuthProviderConfig::discover("idp", issuer, client_id, secret, redirect)
+    .await?
+    .without_dpop()
+    .build()?;
+
+// DPoP or nothing:
+let provider = OAuthProviderConfig::discover("idp", issuer, client_id, secret, redirect)
+    .await?
+    .with_dpop()
+    .build()?;
+```
+
+Without PAR (the FAPI profile asks for it) the authorization request does
+not name the key, so the code is not bound to it before the exchange; the
+tokens are. Under [FAPI](fapi.md) with `SenderConstraint::DPoP` the pushed
+request names it too (`dpop_jkt`), and DPoP is on whether or not the IdP
+advertises it; `build` then refuses `without_dpop()`, and under FAPI with
+mTLS DPoP is off and `with_dpop()` is refused.
+
 ## Endpoint transport
 
 Every endpoint that receives a client secret, a token or a code (token,
 userinfo, revocation, PAR, device authorization) must be HTTPS, with plain
 HTTP allowed only for `localhost`, `127.0.0.1` and `[::1]`. Discovery refuses
-a remote plain-HTTP endpoint, and the endpoints set by hand are checked where
-they are used, before anything is sent. The optional endpoints
+a remote plain-HTTP endpoint, and `build` refuses one set by hand, so a
+provider never holds an endpoint that would send a secret in the clear. The optional endpoints
 (`end_session_endpoint`, `revocation_endpoint`, the PAR endpoint) are read
 from the raw discovery document, since the typed metadata drops them.
 
@@ -326,14 +633,16 @@ The token's `typ` header is checked as well. By default `logout+jwt`, the
 plain `JWT` and `Logout` spellings IdPs in the field send, and no `typ` at
 all are taken, and the types of other tokens the same key signs (`dpop+jwt`,
 `at+jwt`) are refused. For an IdP that sends the explicit type, call
-`OAuthProviderConfig::with_required_logout_typ` and any token whose `typ` is
+`OAuthProviderBuilder::with_required_logout_typ` and any token whose `typ` is
 not `logout+jwt` is refused too.
 
 A token with a `sid` ends the one session that `sid` maps to; the subject's
 other sessions are ended only when the token has no `sid` or the `sid` maps to
 nothing. Providers that share an issuer are told apart by the client id the
-token's `aud` names. When the replay log of `jti` values is full of live
-entries the endpoint answers 503 (retry later) and forgets none of them.
+token's `aud` names. The replay log of `jti` values is bounded per issuer;
+when an issuer's share is full of live entries that issuer's token is
+answered 503 (retry later), nothing is forgotten, and other issuers' logouts
+go on being served.
 Userinfo is bound to the login the same way: `fetch_userinfo` takes the
 expected subject and refuses a response for any other.
 
@@ -431,13 +740,28 @@ exchange, the access token's scopes do not include the ones the
 userinfo endpoint requires. The fix is to add the required scopes
 (typically `profile` and `email`) to the `scopes` configuration.
 
+## Pinning the token algorithms
+
+By default an ID token is accepted when it verifies under a key the provider
+published and its algorithm is one the provider advertised; a logout token,
+when its algorithm is one of the asymmetric defaults. OpenID Connect Core
+3.1.3.7 asks for the algorithm the client registered
+(`id_token_signed_response_alg`, `RS256` unless said otherwise). Name it with
+`OAuthProviderBuilder::with_id_token_signing_algs(["RS256"])` and every other
+algorithm is refused for both kinds of token. Under `with_fapi` the provider
+accepts the algorithms the pin and the profile both name: a pin narrows the
+profile and never widens it, and `build` refuses a pin the profile shares
+nothing with. `docs/factors/conformance.md` shows why it matters: the suite signs a
+logout token with a second algorithm under a published key and expects a 400.
+
 ## Further reading
 
 *FAPI 2.0* covers the financial-grade extensions that layer on top of
 the OAuth provider for regulated deployments: PAR (pushed
 authorization requests, which send the authorize parameters
-server-to-server instead of through the browser), DPoP (demonstrating
-proof of possession, which binds a token to a key the client holds),
+server-to-server instead of through the browser), DPoP under the
+profile's rules (the binding described above, required and with the
+code bound too),
 and JARM (JWT-secured authorization response mode, which signs the
 IdP's response back to the client).
 *Workload identity overview* covers the inbound resolver side of

@@ -22,6 +22,19 @@
 //!
 //! The ending itself also runs on a spawned task, so cancelling the caller
 //! while it is in flight does not abort the invalidations it started.
+//!
+//! What a cancelled login leaves in the map is its own mapping, the one
+//! `insert_displacing` put in before the login settled. That is deliberate.
+//! Whether the newcomer's session lives is unknowable from here: cancelled
+//! above the session layer, its row was never written and the entry points
+//! at nothing; cancelled inside a handler that still returns, the layer
+//! saves the row and the entry is the only way a `sid` logout reaches that
+//! session. Keeping the entry costs a stale map slot that the TTL prune or
+//! the capacity eviction reclaims, and that `remove_session` drops when the
+//! session ends; dropping it could leave a live session unreachable. The
+//! displaced session ends for the same reason read the other way: its
+//! mapping is already gone, so ending it is the only way to be sure it does
+//! not stay reachable by nothing.
 
 use super::SubjectSession;
 use super::concurrent;
@@ -146,23 +159,38 @@ impl Drop for PendingEnds {
 }
 
 /// End each session in the registry, concurrently within the bound, and forget
-/// each in the subject registry.
+/// each the registry confirmed it ended in the subject registry.
+///
+/// A session the registry could not end is still live, and its `sid`
+/// mapping is already gone, so the subject entry is the one way a later
+/// `sub` logout still reaches it: it is kept. Forgetting it on the failed
+/// end used to put the session out of reach of every logout for good.
 async fn end_sessions(
     registry: Arc<dyn SessionRegistryHandle>,
     sid_map: SidMap,
     sessions: Vec<SubjectSession>,
 ) {
-    let ended = concurrent::bounded(sessions, |(_, user, session)| {
+    let outcomes = concurrent::bounded(sessions, |(_, user, session)| {
         let registry = Arc::clone(&registry);
         async move {
-            note_revocation(
-                registry.invalidate_session(&user, &session).await,
-                "ending a displaced OAuth session",
-            );
+            let outcome = registry.invalidate_session(&user, &session).await;
+            let ended = outcome.is_ok();
+            note_revocation(outcome, "ending a displaced OAuth session");
+            ended
         }
     })
     .await;
-    for ((issuer, user, session), ()) in ended {
-        sid_map.forget_subject_session(&issuer, &user, &session);
+    for ((issuer, user, session), ended) in outcomes {
+        if ended {
+            sid_map.forget_subject_session(&issuer, &user, &session);
+        } else {
+            tracing::warn!(
+                iss = %issuer,
+                user_id = %user,
+                session = %session,
+                "the registry could not end a displaced OAuth session; \
+                 it stays in the subject registry for a later logout"
+            );
+        }
     }
 }

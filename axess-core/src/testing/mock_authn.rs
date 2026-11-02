@@ -29,6 +29,11 @@ pub enum MockStoreError {
     /// Caller tried to persist an auth method at [`AuthnScope::System`](crate::authn::types::AuthnScope::System), which is rejected.
     #[error("auth methods cannot be stored at system scope")]
     InvalidSystemMethod,
+    /// A simulated outage armed by a test (for example
+    /// [`MockIdentityStore::arm_get_user_failure`]): the store could not
+    /// answer, which is not the same as answering "not found".
+    #[error("store unavailable (simulated outage)")]
+    Unavailable,
 }
 
 #[cfg(test)]

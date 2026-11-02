@@ -45,6 +45,15 @@ async fn raw(store: &PostgresSessionStore, id: &SessionId) -> Vec<u8> {
         .unwrap()
 }
 
+/// Both data columns of a row: the binary one may be NULL.
+async fn columns(store: &PostgresSessionStore, id: &SessionId) -> (Option<Vec<u8>>, String) {
+    sqlx::query_as("SELECT data_bin, data FROM sessions WHERE id = $1")
+        .bind(id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap()
+}
+
 async fn expiry(store: &PostgresSessionStore, id: &SessionId) -> i64 {
     sqlx::query_scalar("SELECT expires_at FROM sessions WHERE id = $1")
         .bind(id.to_string())
@@ -68,13 +77,10 @@ async fn plant_unbound(store: &PostgresSessionStore, id: &SessionId, expires_at:
     blob
 }
 
-/// A row as an earlier release wrote it: base64 in the text column only.
+/// A bound row as an earlier release wrote it: base64 in the text column
+/// only.
 async fn plant_text(store: &PostgresSessionStore, id: &SessionId) {
-    let text = BASE64.encode(
-        SessionCrypto::new(KEY)
-            .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
-            .unwrap(),
-    );
+    let text = BASE64.encode(store.codec.encode_bytes(id, &admin()).unwrap());
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES ($1, $2, $3)")
         .bind(id.to_string())
         .bind(text)
@@ -129,11 +135,12 @@ async fn data_copied_into_another_sessions_row_does_not_load() {
     assert!(store.load(&admin_id).await.unwrap().is_some());
 }
 
-/// A load re-seals a row that carries no row binding, keeps its expiry, and
-/// the next load reads the bound form.
+/// A load reads a row that carries no row binding under the legacy window
+/// but leaves it as it is (it proves nothing about the row it sits under);
+/// the next save writes the bound form.
 #[tokio::test]
 #[ignore = "requires a running Postgres (POSTGRES_URL)"]
-async fn load_reseals_an_unbound_row_and_keeps_its_expiry() {
+async fn load_reads_an_unbound_row_without_resealing_it() {
     let store = store().await;
     let id = new_id();
     let expires = store.clock.now().timestamp() + 600;
@@ -142,12 +149,23 @@ async fn load_reseals_an_unbound_row_and_keeps_its_expiry() {
 
     let loaded = store.load(&id).await.unwrap().expect("unbound row loads");
     assert_eq!(loaded.custom, admin().custom);
+    assert_eq!(
+        raw(&store, &id).await,
+        unbound,
+        "left as it was by the read"
+    );
+    assert_eq!(expiry(&store, &id).await, expires);
+
+    store
+        .save(&id, &loaded, Duration::from_secs(60))
+        .await
+        .unwrap();
     assert!(BoundFormat::SESSION.marks(&raw(&store, &id).await));
-    assert_eq!(expiry(&store, &id).await, expires, "the expiry is kept");
     assert!(store.load(&id).await.unwrap().is_some());
 }
 
-/// A legacy text-column row is moved to the binary column by its load.
+/// A bound row in the legacy text column is moved to the binary column by
+/// its load.
 #[tokio::test]
 #[ignore = "requires a running Postgres (POSTGRES_URL)"]
 async fn load_moves_a_text_column_row_to_the_binary_column() {
@@ -356,30 +374,37 @@ async fn racing_rotations_leave_the_data_under_one_id() {
     assert!(store.load(&old).await.unwrap().is_none());
 }
 
-/// The documented upgrade of a table created before the binary column.
+/// The documented upgrade of a table created before the binary column,
+/// holding rows as the releases before it wrote them: an unbound blob in the
+/// text column, and `data_bin` NULL once the upgrade step has run. A read
+/// leaves such a row as it is (an unbound blob proves nothing about the row
+/// it sits under); the row's next write seals it in the bound form. The
+/// conditional writes compare the NULL binary column.
 #[tokio::test]
 #[ignore = "requires a running Postgres (POSTGRES_URL)"]
 async fn the_documented_upgrade_step_makes_an_old_table_work() {
     let pool = sql_live::postgres_pool(2).await;
-    sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, expires_at BIGINT NOT NULL)").execute(&pool).await.unwrap();
-    let store = PostgresSessionStore::new(
-        pool.clone(),
-        SessionCrypto::new(KEY).with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
-    );
-    let id = new_id();
-    sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES ($1, $2, $3)")
-        .bind(id.to_string())
-        .bind(
-            BASE64.encode(
-                SessionCrypto::new(KEY)
-                    .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
-                    .unwrap(),
-            ),
-        )
-        .bind(i64::MAX)
+    sqlx::query("CREATE TABLE sessions (id TEXT PRIMARY KEY, data TEXT NOT NULL, expires_at BIGINT NOT NULL)")
         .execute(&pool)
         .await
         .unwrap();
+    let store = PostgresSessionStore::new(
+        pool.clone(),
+        SessionCrypto::new(KEY).with_legacy_blobs(LegacyBlobs::Accept),
+    );
+    let (kept, ended) = (new_id(), new_id());
+    for id in [&kept, &ended] {
+        let old = SessionCrypto::new(KEY)
+            .encrypt_unbound(&rmp_serde::to_vec_named(&admin()).unwrap())
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES ($1, $2, $3)")
+            .bind(id.to_string())
+            .bind(BASE64.encode(old))
+            .bind(i64::MAX)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 
     sqlx::query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS data_bin BYTEA")
         .execute(&pool)
@@ -389,11 +414,50 @@ async fn the_documented_upgrade_step_makes_an_old_table_work() {
         .init_schema()
         .await
         .expect("init_schema on an upgraded table");
+
+    let loaded = store.load(&kept).await.unwrap().expect("an old row loads");
+    assert_eq!(loaded.custom, admin().custom);
+    let (binary, text) = columns(&store, &kept).await;
+    assert!(binary.is_none(), "a read leaves an unbound row as it is");
+    assert!(!text.is_empty());
+
+    let next = SessionData {
+        revision: loaded.revision + 1,
+        ..loaded.clone()
+    };
     assert_eq!(
-        store.load(&id).await.unwrap().unwrap().custom,
-        admin().custom
+        store
+            .update_if_revision(&kept, loaded.revision, &next, TTL)
+            .await
+            .unwrap(),
+        ConditionalUpdate::Written
     );
-    assert!(BoundFormat::SESSION.marks(&raw(&store, &id).await));
+    let (binary, text) = columns(&store, &kept).await;
+    assert!(
+        binary.is_some_and(|b| BoundFormat::SESSION.marks(&b)),
+        "the write seals the bound form"
+    );
+    assert_eq!(text, "");
+    assert_eq!(
+        store.load(&kept).await.unwrap().unwrap().revision,
+        next.revision
+    );
+
+    let old = store.load(&ended).await.unwrap().expect("an old row loads");
+    assert_eq!(
+        store
+            .update_if_revision(&ended, old.revision, &old, Duration::ZERO)
+            .await
+            .unwrap(),
+        ConditionalUpdate::Gone
+    );
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = $1")
+        .bind(ended.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "a zero TTL removes the old row");
+
     let fresh = new_id();
     store.save(&fresh, &admin(), TTL).await.unwrap();
     assert!(store.load(&fresh).await.unwrap().is_some());

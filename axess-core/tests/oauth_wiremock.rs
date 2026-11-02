@@ -18,7 +18,7 @@ use axess_core::{
         test_session,
     },
 };
-use axess_factors::oauth::{OAuthLoginOptions, OAuthProviderConfig};
+use axess_factors::oauth::{OAuthLoginOptions, OAuthProviderBuilder, OAuthProviderConfig};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{test_tenant, test_user};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -172,7 +172,8 @@ async fn oidc_discovery_succeeds() {
         "test-client-secret",
         "http://localhost:3000/callback",
     )
-    .await;
+    .await
+    .and_then(OAuthProviderBuilder::build);
 
     assert!(provider.is_ok(), "discovery failed: {:?}", provider.err());
 }
@@ -208,7 +209,9 @@ async fn full_oauth_flow_with_signed_id_token() {
         "http://localhost:3000/callback",
     )
     .await
-    .expect("discovery should succeed");
+    .expect("discovery should succeed")
+    .build()
+    .expect("build");
 
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
@@ -313,7 +316,9 @@ async fn cross_tenant_user_refused_after_real_finish() {
         "http://localhost:3000/callback",
     )
     .await
-    .expect("discovery should succeed");
+    .expect("discovery should succeed")
+    .build()
+    .expect("build");
 
     let other_tenant_user = common::test_user_in_tenant("u1", "alice", "t2");
     let identity = MockIdentityStore::new()
@@ -412,7 +417,9 @@ async fn login_with_extra_claims(
         "http://localhost:3000/callback",
     )
     .await
-    .expect("discovery should succeed");
+    .expect("discovery should succeed")
+    .build()
+    .expect("build");
     let authn = AuthnService::builder(MockIdentityStore::new(), MockFactorStore::new())
         .with_oauth_provider(provider)
         .build()
@@ -505,6 +512,8 @@ async fn oauth_token_endpoint_error_propagates() {
         "http://localhost:3000/callback",
     )
     .await
+    .unwrap()
+    .build()
     .unwrap();
 
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
@@ -575,10 +584,12 @@ async fn revoke_unsupported_token_type_maps_to_typed_variant() {
     )
     .await
     .unwrap()
-    .with_revocation_endpoint(format!("{issuer}/revoke"));
+    .with_revocation_endpoint(format!("{issuer}/revoke"))
+    .build()
+    .unwrap();
 
     let err = provider
-        .revoke_token("dummy-token", Some("access_token"))
+        .revoke_token("dummy-token", Some("access_token"), None)
         .await
         .expect_err("revoke must fail on unsupported_token_type");
     assert!(
@@ -623,6 +634,8 @@ async fn unknown_kid_yields_typed_variant() {
         "http://localhost:3000/callback",
     )
     .await
+    .unwrap()
+    .build()
     .unwrap();
 
     let now = chrono::Utc::now().timestamp();
@@ -683,8 +696,13 @@ async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
             "http://localhost:3000/callback",
         )
     };
-    let lenient = discover().await.unwrap();
-    let strict = discover().await.unwrap().with_required_logout_typ();
+    let lenient = discover().await.unwrap().build().unwrap();
+    let strict = discover()
+        .await
+        .unwrap()
+        .with_required_logout_typ()
+        .build()
+        .unwrap();
 
     let claims = json!({
         "iss": issuer,
@@ -723,6 +741,96 @@ async fn a_required_logout_typ_refuses_a_generic_jwt_header() {
         ),
         "the explicit type passes the check and reaches the key lookup"
     );
+}
+
+/// A provider pinned to `RS256` (the default `id_token_signed_response_alg`)
+/// refuses a logout token signed with another algorithm, even one the IdP's
+/// key set could verify; the same token passes an unpinned provider. The
+/// token is signed with a published RS256 key here, so the pin is what
+/// decides: a provider pinned to `ES256` refuses it, one pinned to `RS256`
+/// takes it, and an empty or symmetric list is refused when it is set.
+#[tokio::test]
+async fn a_pinned_algorithm_list_decides_which_logout_tokens_verify() {
+    use axess_factors::oauth::{OAuthError, OAuthProvider};
+
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    let (private, jwk_published, kid) = generate_rsa_keypair();
+
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery_document(&issuer)))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk_published] })))
+        .mount(&server)
+        .await;
+
+    let discover = || {
+        OAuthProviderConfig::discover(
+            "test",
+            &issuer,
+            "client-id",
+            "secret",
+            "http://localhost:3000/callback",
+        )
+    };
+    let unpinned = discover().await.unwrap().build().unwrap();
+    let rs256 = discover()
+        .await
+        .unwrap()
+        .with_id_token_signing_algs(["RS256"])
+        .build()
+        .unwrap();
+    let es256 = discover()
+        .await
+        .unwrap()
+        .with_id_token_signing_algs(["ES256"])
+        .build()
+        .unwrap();
+
+    let claims = json!({
+        "iss": issuer,
+        "aud": "client-id",
+        "iat": chrono::Utc::now().timestamp(),
+        "exp": chrono::Utc::now().timestamp() + 120,
+        "jti": "logout-1",
+        "events": { "http://schemas.openid.net/event/backchannel-logout": {} },
+        "sub": "user-123",
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(kid);
+    axess_factors::jwt::ensure_crypto_provider();
+    let token = jsonwebtoken::encode(&header, &claims, &EncodingKey::from_rsa_der(&private))
+        .expect("JWT encode");
+
+    unpinned.verify_logout_jwt(&token).expect("unpinned");
+    rs256.verify_logout_jwt(&token).expect("pinned to RS256");
+    match es256.verify_logout_jwt(&token) {
+        Err(OAuthError::IdTokenValidation(reason)) => {
+            assert!(reason.contains("disallowed JWT algorithm"), "{reason}");
+        }
+        other => panic!("expected the algorithm to be refused, got {other:?}"),
+    }
+
+    assert!(matches!(
+        discover()
+            .await
+            .unwrap()
+            .with_id_token_signing_algs(Vec::<String>::new())
+            .build(),
+        Err(OAuthError::Config(_))
+    ));
+    assert!(matches!(
+        discover()
+            .await
+            .unwrap()
+            .with_id_token_signing_algs(["HS256"])
+            .build(),
+        Err(OAuthError::Config(_))
+    ));
 }
 
 /// A 503 response from the revocation endpoint maps to the
@@ -768,10 +876,12 @@ async fn revoke_5xx_maps_to_transient_variant() {
     )
     .await
     .unwrap()
-    .with_revocation_endpoint(format!("{issuer}/revoke"));
+    .with_revocation_endpoint(format!("{issuer}/revoke"))
+    .build()
+    .unwrap();
 
     let err = provider
-        .revoke_token("dummy-token", None)
+        .revoke_token("dummy-token", None, None)
         .await
         .expect_err("revoke must fail on 5xx");
     match err {

@@ -166,31 +166,17 @@ async fn refresh_token_reuse_after_rotation_rejected() {
     .unwrap();
 
     // First refresh: should succeed and rotate.
-    let (_, new_token) = refresh_session_with_status_check(
-        &plaintext,
-        &store,
-        &config,
-        &rng,
-        now,
-        None,
-        |_| async { true },
-    )
-    .await
-    .unwrap();
+    let (_, new_token) = Refresh::new(&plaintext, |_| async { true })
+        .run(&store, &config, &rng, now)
+        .await
+        .unwrap();
     assert!(new_token.is_some(), "rotation should issue a new token");
 
     // Reuse the OLD plaintext: should be rejected (revoked by rotation).
-    let err = refresh_session_with_status_check(
-        &plaintext,
-        &store,
-        &config,
-        &rng,
-        now,
-        None,
-        |_| async { true },
-    )
-    .await
-    .unwrap_err();
+    let err = Refresh::new(&plaintext, |_| async { true })
+        .run(&store, &config, &rng, now)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, RefreshError::Revoked),
         "reused token should be Revoked, got {err:?}"

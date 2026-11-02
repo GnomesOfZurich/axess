@@ -57,10 +57,16 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn fapi_config(&self) -> Option<&axess_factors::oauth::FapiConfig> {
         Some(&self.fapi)
     }
+    /// The stub signs no proofs, so it does not bind, whatever its profile
+    /// describes.
+    fn binds_to_dpop(&self) -> bool {
+        false
+    }
     fn refresh_token<'a>(
         &'a self,
         refresh_token: &'a str,
         _original_nonce: Option<&'a str>,
+        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -84,6 +90,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
         code: &'a str,
         pkce_verifier: String,
         nonce: String,
+        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -107,6 +114,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn fetch_userinfo<'a>(
         &'a self,
         access_token: &'a str,
+        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -152,6 +160,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
         &'a self,
         options: &'a axess_factors::oauth::OAuthLoginOptions,
         _rng: &'a dyn axess_rng::SecureRng,
+        _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<

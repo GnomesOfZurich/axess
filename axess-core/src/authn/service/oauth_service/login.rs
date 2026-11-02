@@ -22,3 +22,6 @@ mod finish;
 mod helpers;
 mod jarm;
 mod state;
+mod tenant;
+
+pub(super) use state::CeremonyTenant;

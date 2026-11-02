@@ -2,9 +2,11 @@
 //! an authorization code: HTTPS, or an IETF loopback host over plain HTTP for
 //! local development.
 //!
-//! Applied where the endpoint arrives (discovery) and again where it is used
-//! (the setters take any string), so a URL typed into configuration cannot
-//! send a secret in the clear however it got there.
+//! Applied wherever an endpoint arrives: discovery, the builder's
+//! [`build`](super::OAuthProviderBuilder::build) for the endpoints a setter
+//! named, and the mTLS aliases. A built provider therefore holds no endpoint
+//! that could send a secret in the clear, and the requests need not check
+//! again.
 
 use crate::oauth::types::OAuthError;
 

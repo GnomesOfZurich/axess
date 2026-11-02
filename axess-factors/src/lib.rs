@@ -22,6 +22,10 @@
 
 /// Server-issued [`EmailOtpConfig`](email_otp::EmailOtpConfig): the typed
 /// challenge state for the out-of-band email factor (`email_otp` feature).
+/// RFC 7523 client assertions (`private_key_jwt`), shared by the outbound
+/// client and the user login's token requests.
+#[cfg(any(feature = "oauth", feature = "outbound-oauth"))]
+pub mod client_assertion;
 #[cfg(feature = "email_otp")]
 pub mod email_otp;
 /// FIDO2/WebAuthn factor data: [`Fido2Config`](fido2::Fido2Config) +
@@ -46,6 +50,10 @@ pub use fido2_stub as fido2;
 /// axum request extensions (`bearer` feature).
 #[cfg(feature = "bearer")]
 pub mod bearer;
+/// The endpoint rule shared by the clients that send credentials or send a
+/// user to a remote endpoint.
+#[cfg(any(feature = "oidc", feature = "social"))]
+pub(crate) mod endpoint;
 /// [`FactorSecret`](factor_secret::FactorSecret): an OTP secret, plain or sealed.
 pub mod factor_secret;
 /// Workload-identity federation. The generic
@@ -83,7 +91,7 @@ pub mod ldap;
 pub mod mtls;
 /// OAuth 2.0 / OIDC ceremony surface: `OAuthProvider` trait,
 /// `DefaultOAuthProvider` (openidconnect-backed), builder, device-flow,
-/// FAPI 2.0 DPoP (`oauth` / `fapi` features).
+/// DPoP (RFC 9449) and the FAPI 2.0 profile (`oauth` / `fapi` features).
 #[cfg(feature = "oauth")]
 pub mod oauth;
 /// OIDC discovery + JWKS retrieval / rotation primitives (`oidc`
@@ -138,7 +146,7 @@ pub use password::{
 };
 
 #[cfg(feature = "hotp")]
-pub use hotp::{HOTP_LENGTH, HotpAlgorithm, HotpConfig, verify_hotp};
+pub use hotp::{HOTP_LENGTH, HotpAlgorithm, HotpConfig, HotpThrottle, verify_hotp};
 
 #[cfg(feature = "totp")]
 pub use totp::{
@@ -181,13 +189,14 @@ pub use oidc::{
 
 #[cfg(feature = "bearer")]
 pub use bearer::{
-    BearerConfig, BearerError, BearerIssuerConfig, BearerTokenLayer, BearerTokenService,
+    Audience, BearerConfig, BearerError, BearerIssuerConfig, BearerTokenLayer, BearerTokenService,
     JwtVerificationError, WorkloadIdentity, validate_bearer_token,
 };
 
 #[cfg(feature = "outbound-oauth")]
 pub use outbound_oauth_client::{
-    ClientAuthMethod, OAuthClientError, OutboundOAuthClient, basic_credentials, expiry_after,
+    ClientAuthMethod, OAuthClientError, OutboundOAuthClient, basic_authorization,
+    basic_credentials, expiry_after,
 };
 
 #[cfg(any(feature = "totp", feature = "hotp"))]

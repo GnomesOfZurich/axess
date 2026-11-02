@@ -208,3 +208,103 @@ fn ldap_filter_escape_special_chars() {
     // High-bit bytes (UTF-8 multi-byte) must be escaped.
     assert_eq!(ldap_filter_escape("ü"), "\\c3\\bc");
 }
+
+// ── Result codes that are not a verdict on the credential ─────────────────
+
+/// The LDAPMessage of a BindResponse: `SEQUENCE { messageID, [APPLICATION 1]
+/// { resultCode ENUMERATED, matchedDN "", diagnosticMessage "" } }`.
+fn bind_response(message_id: u8, rc: u8) -> Vec<u8> {
+    vec![
+        0x30, 0x0c, 0x02, 0x01, message_id, 0x61, 0x07, 0x0a, 0x01, rc, 0x04, 0x00, 0x04, 0x00,
+    ]
+}
+
+/// The messageID of an LDAPMessage: the INTEGER after the outer SEQUENCE
+/// header, whose length is in short or long form.
+fn ber_message_id(message: &[u8]) -> Option<u8> {
+    let length = *message.get(1)?;
+    let mut at = 2;
+    if length & 0x80 != 0 {
+        at += usize::from(length & 0x7f);
+    }
+    (message.get(at) == Some(&0x02) && message.get(at + 1) == Some(&0x01))
+        .then(|| message.get(at + 2).copied())
+        .flatten()
+}
+
+/// A directory that answers the first bind with `rc` and then waits for
+/// the client to go. Returns the URL to reach it on.
+async fn directory_answering(rc: u8) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ldap://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 512];
+        let n = socket.read(&mut buf).await.unwrap_or(0);
+        let id = ber_message_id(&buf[..n]).unwrap_or(1);
+        let _ = socket.write_all(&bind_response(id, rc)).await;
+        let _ = socket.read(&mut buf).await;
+    });
+    url
+}
+
+async fn bind_against(rc: u8) -> Result<LdapBindResult, LdapError> {
+    let provider = LdapProviderConfig::new(directory_answering(rc).await, "uid={user},dc=example")
+        .with_timeout(Duration::from_secs(5));
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.verify_bind("alice", "uid=alice,dc=example", "secret"),
+    )
+    .await
+    .expect("the bind answers")
+}
+
+/// `busy`, `unavailable`, `unwillingToPerform`, `operationsError` and
+/// `other` say the directory could not judge the password. They used to be
+/// answered `InvalidCredentials`, which the orchestrator counts towards the
+/// lockout: a directory outage locked every user out.
+#[tokio::test]
+async fn a_directory_that_cannot_answer_is_not_a_credential_verdict() {
+    for rc in [1u8, 51, 52, 53, 80] {
+        let outcome = bind_against(rc).await;
+        assert!(
+            matches!(&outcome, Err(LdapError::Directory { rc: got, .. }) if *got == u32::from(rc)),
+            "rc {rc}: {outcome:?}"
+        );
+    }
+}
+
+/// `invalidCredentials`, `inappropriateAuthentication` and `noSuchObject`
+/// are verdicts on the DN and password the user gave.
+#[tokio::test]
+async fn a_verdict_on_the_credential_is_still_invalid_credentials() {
+    for rc in [49u8, 48, 32] {
+        let outcome = bind_against(rc).await;
+        assert!(
+            matches!(outcome, Err(LdapError::InvalidCredentials)),
+            "rc {rc}: {outcome:?}"
+        );
+    }
+}
+
+/// `ldapi://` is a Unix domain socket on this host: nothing crosses a
+/// network, so it is as local as loopback.
+#[test]
+fn a_unix_socket_url_is_local_not_cleartext() {
+    for url in [
+        "ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi",
+        "LDAPI://%2Fvar%2Frun%2Fldapi",
+        "ldapi:///",
+    ] {
+        let p = LdapProviderConfig::new(url, "uid={user}");
+        assert!(!p.refuses_cleartext(), "{url}");
+    }
+    let remote = LdapProviderConfig::new("ldap://ldapi.example.com", "uid={user}");
+    assert!(
+        remote.refuses_cleartext(),
+        "a host named ldapi is still remote"
+    );
+}

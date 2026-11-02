@@ -1,13 +1,19 @@
 //! Switching the FAPI 2.0 profile on: the sender constraint, the ID-token
 //! algorithm allow-list, and the JARM response check.
 //!
-//! [`OAuthProviderConfig::with_fapi`] is the one entry point. It either
-//! returns a provider whose token requests are sender-constrained and whose
-//! ID tokens are checked against the profile, or an error naming what is
-//! missing; there is no half-enabled state.
+//! DPoP under the profile is the provider's one DPoP switch (see
+//! [`dpop`](super::dpop)) turned on; the profile adds its own rules on top:
+//! no client secret, PAR, the ID-token limits, JARM.
+//!
+//! [`OAuthProviderBuilder::with_fapi`](super::OAuthProviderBuilder::with_fapi)
+//! records the profile and
+//! [`OAuthProviderBuilder::build`](super::OAuthProviderBuilder::build) applies
+//! it through the checks here. It either returns a provider whose token
+//! requests are sender-constrained, whose client authenticates without a
+//! secret and whose ID tokens are checked against the profile, or an error
+//! naming what is missing; there is no half-enabled state.
 
 use super::OAuthProviderConfig;
-use crate::jwt::validation::{ALLOWED_ALGORITHMS, JwtError, ValidationConfig, verify_jwt};
 use crate::oauth::types::*;
 use openidconnect::core::CoreJwsSigningAlgorithm;
 
@@ -40,7 +46,10 @@ impl MtlsAliases {
     }
 }
 
-/// The ID-token signature algorithms a FAPI provider accepts, in the two
+/// The ID-token signature algorithms a provider accepts when it is pinned to
+/// a list (by the FAPI profile, by
+/// [`with_id_token_signing_algs`](super::OAuthProviderBuilder::with_id_token_signing_algs),
+/// or by both), in the two
 /// vocabularies the verifiers speak.
 #[derive(Debug, Clone)]
 pub(crate) struct IdTokenAlgs {
@@ -53,12 +62,12 @@ impl IdTokenAlgs {
     /// acceptable for an ID token verified against a public key set, and an
     /// empty list would accept nothing, so both are refused here rather than
     /// at the first login.
-    fn parse(names: &[String]) -> Result<Self, OAuthError> {
+    pub(super) fn parse(names: &[String], what: &str) -> Result<Self, OAuthError> {
         use jsonwebtoken::Algorithm as J;
         if names.is_empty() {
-            return Err(OAuthError::Config(
-                "FapiConfig::allowed_id_token_algs is empty: no ID token could verify".to_string(),
-            ));
+            return Err(OAuthError::Config(format!(
+                "{what} is empty: no ID token could verify"
+            )));
         }
         let mut openid = Vec::with_capacity(names.len());
         let mut jwt = Vec::with_capacity(names.len());
@@ -75,7 +84,7 @@ impl IdTokenAlgs {
                 "EdDSA" => (CoreJwsSigningAlgorithm::EdDsa, J::EdDSA),
                 other => {
                     return Err(OAuthError::Config(format!(
-                        "FapiConfig::allowed_id_token_algs: `{other}` is not an asymmetric \
+                        "{what}: `{other}` is not an asymmetric \
                          signature algorithm this provider verifies"
                     )));
                 }
@@ -85,43 +94,23 @@ impl IdTokenAlgs {
         }
         Ok(Self { openid, jwt })
     }
-}
 
-/// The OAuth error for a rejected JWT. The wording names the token by its
-/// role in the caller's message, not here.
-pub(super) fn jwt_error(e: JwtError) -> OAuthError {
-    match e {
-        JwtError::UnknownKid(kid) => OAuthError::UnknownKid(kid),
-        JwtError::TooLarge { len, max } => {
-            OAuthError::IdTokenValidation(format!("JWT too large ({len} bytes, max {max})"))
-        }
-        JwtError::InvalidHeader(msg) => {
-            OAuthError::IdTokenValidation(format!("invalid JWT header: {msg}"))
-        }
-        JwtError::DisallowedAlgorithm(alg) => {
-            OAuthError::IdTokenValidation(format!("disallowed JWT algorithm: {alg:?}"))
-        }
-        JwtError::MissingKid => {
-            OAuthError::IdTokenValidation("JWT has no `kid` header".to_string())
-        }
-        JwtError::AlgorithmMismatch {
-            header_alg,
-            jwk_alg,
-        } => OAuthError::IdTokenValidation(format!(
-            "JWT header alg {header_alg:?} does not match JWK alg {jwk_alg}"
-        )),
-        JwtError::KeyConstruction(msg) => {
-            OAuthError::IdTokenValidation(format!("failed to build key from JWK: {msg}"))
-        }
-        JwtError::VerificationFailed(msg) => {
-            OAuthError::IdTokenValidation(format!("JWT signature verification failed: {msg}"))
-        }
+    /// The algorithms both lists name, in this list's order.
+    pub(super) fn intersect(&self, other: &Self) -> Self {
+        let (openid, jwt) = self
+            .openid
+            .iter()
+            .zip(&self.jwt)
+            .filter(|(_, j)| other.jwt.contains(j))
+            .map(|(o, j)| (o.clone(), *j))
+            .unzip();
+        Self { openid, jwt }
     }
 }
 
 /// An HTTP client that presents the client certificate on every TLS
 /// handshake: no redirects, a 30 second timeout, like the one discovery built.
-fn mtls_client(
+pub(super) fn mtls_client(
     cert_path: &str,
     key_path: &str,
 ) -> Result<openidconnect::reqwest::Client, OAuthError> {
@@ -143,37 +132,37 @@ fn mtls_client(
         .map_err(|e| OAuthError::Config(format!("mTLS HTTP client build failed: {e}")))
 }
 
-impl OAuthProviderConfig {
-    /// Switch the FAPI profile on; see [`with_fapi`](Self::with_fapi).
-    pub(super) fn enable_fapi(mut self, config: FapiConfig) -> Result<Self, OAuthError> {
-        if self.par_endpoint.is_none() {
-            return Err(OAuthError::Config(
-                "FAPI 2.0 requires pushed_authorization_request_endpoint in provider metadata"
-                    .to_string(),
-            ));
-        }
-        let algs = IdTokenAlgs::parse(&config.allowed_id_token_algs)?;
-
-        if let SenderConstraint::Mtls {
-            client_cert_path,
-            client_key_path,
-        } = &config.sender_constraint
-        {
-            self.http_client = mtls_client(client_cert_path, client_key_path)?;
-            // The certificate authenticates the client (RFC 8705 §2.1), so
-            // the shared secret stays home.
-            self.client_secret = None;
-            self.use_mtls_aliases()?;
-        }
-
-        self.id_token_algs = Some(algs);
-        self.fapi = Some(config);
-        Ok(self)
+/// The FAPI profile's demands on the client (FAPI 2.0 section 5.3.1.1): it
+/// authenticates by an assertion or by its certificate (RFC 8705 section
+/// 2.1), never by a shared secret, and its authorization requests are pushed.
+pub(super) fn check_client_and_par(
+    config: &FapiConfig,
+    has_signer: bool,
+    has_par_endpoint: bool,
+) -> Result<(), OAuthError> {
+    if !has_par_endpoint {
+        return Err(OAuthError::Config(
+            "FAPI 2.0 requires pushed_authorization_request_endpoint in provider metadata \
+             or with_par_endpoint"
+                .to_string(),
+        ));
     }
+    let mtls = matches!(config.sender_constraint, SenderConstraint::Mtls { .. });
+    if !has_signer && !mtls {
+        return Err(OAuthError::Config(
+            "FAPI 2.0 does not allow a client secret: authenticate the client by \
+             private_key_jwt (with_private_key_jwt or discover_with_private_key_jwt) \
+             or by mTLS (SenderConstraint::Mtls)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
 
+impl OAuthProviderConfig {
     /// Point the token, userinfo, revocation and PAR requests at the
     /// `mtls_endpoint_aliases` the server advertised, for the ones it did.
-    fn use_mtls_aliases(&mut self) -> Result<(), OAuthError> {
+    pub(super) fn use_mtls_aliases(&mut self) -> Result<(), OAuthError> {
         use openidconnect::{TokenUrl, UserInfoUrl};
         let aliases = self.mtls_aliases.clone();
         let invalid =
@@ -222,21 +211,7 @@ impl OAuthProviderConfig {
         &self,
         response: &str,
     ) -> Result<JarmResponse, OAuthError> {
-        let handle = self.jwks_cache.fresh_handle().map_err(|e| match e {
-            crate::oidc::OidcError::JwksExpired { .. } => OAuthError::JwksExpired,
-            other => OAuthError::Discovery(other.to_string()),
-        })?;
-        let jwks = handle.read().unwrap_or_else(|p| p.into_inner());
-
-        let mut config = ValidationConfig::new();
-        config.audience = Some(self.client_id.as_str().to_string());
-        config.issuer = Some(self.metadata.issuer().as_str().to_string());
-        let allowed = match &self.id_token_algs {
-            Some(algs) => algs.jwt.as_slice(),
-            None => ALLOWED_ALGORITHMS,
-        };
-        let payload =
-            verify_jwt(response, &jwks, &config, allowed, &*self.clock).map_err(jwt_error)?;
+        let payload = self.verify_issuer_jwt(response)?;
 
         let text = |name: &str| {
             payload

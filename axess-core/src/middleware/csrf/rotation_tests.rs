@@ -123,7 +123,10 @@ async fn rotated_token_is_reachable_in_the_same_request_and_matches_the_cookie()
     let post = Request::builder()
         .method(Method::POST)
         .uri("/next")
-        .header("cookie", format!("{}={cookie}", config.cookie_name))
+        .header(
+            "cookie",
+            format!("{}={cookie}", config.effective_cookie_name()),
+        )
         .header(DEFAULT_CSRF_HEADER, after)
         .extension(h.clone())
         .body(Body::empty())

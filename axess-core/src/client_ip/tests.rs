@@ -645,3 +645,35 @@ fn ipv4_mapped_addresses_match_ipv4_entries_everywhere() {
     let client = ip_from_headers_trusted(&headers, mapped_peer, &trusted);
     assert_eq!(client, "203.0.113.9".parse::<IpAddr>().unwrap());
 }
+
+/// An allow-list written in IPv4-mapped form (`::ffff:10.0.0.0/104`) names
+/// the same proxies as `10.0.0.0/8`: it must trust the IPv4 peer, and the
+/// mapped peer a dual-stack listener reports, as the IPv4 spelling does.
+#[test]
+fn ipv4_mapped_cidr_entries_trust_the_ipv4_proxies_they_name() {
+    let mapped = TrustedProxies::from_cidrs(["::ffff:10.0.0.0/104"]).unwrap();
+    let v4_peer: IpAddr = "10.1.2.3".parse().unwrap();
+    let mapped_peer: IpAddr = "::ffff:10.1.2.3".parse().unwrap();
+    assert!(
+        mapped.trusts_peer(v4_peer),
+        "IPv4 peer inside the mapped block"
+    );
+    assert!(
+        mapped.trusts_hop(mapped_peer),
+        "mapped peer inside the mapped block"
+    );
+    assert!(!mapped.trusts_peer("11.0.0.1".parse().unwrap()));
+    assert!(
+        !mapped.trusts_peer("2001:db8::1".parse().unwrap()),
+        "a native IPv6 address is outside a mapped block"
+    );
+
+    let composed = TrustedProxies::loopback_only()
+        .with_cidrs(["::ffff:192.0.2.0/120"])
+        .unwrap();
+    assert!(composed.trusts_hop("192.0.2.9".parse().unwrap()));
+
+    let headers = xff("203.0.113.9, 10.0.0.2");
+    let client = ip_from_headers_trusted(&headers, v4_peer, &mapped);
+    assert_eq!(client, "203.0.113.9".parse::<IpAddr>().unwrap());
+}

@@ -16,6 +16,11 @@ async fn store(tag: &str) -> ValkeyDeviceStore {
     live_store(&format!("axw_{tag}_{nanos}")).await
 }
 
+/// A store told to read the index layouts of earlier releases.
+async fn store_reading_legacy(tag: &str) -> ValkeyDeviceStore {
+    store(tag).await.with_legacy_fingerprint_keys()
+}
+
 /// A device nobody owns, as a guest request makes it.
 fn guest(label: &str, fp: u8, level: DeviceTrustLevel, seen: DateTime<Utc>) -> Device {
     let mut d = shared::device(label, fp, level, seen);
@@ -37,8 +42,24 @@ async fn mint_or_find(s: &ValkeyDeviceStore, fp: FingerprintHash, now: DateTime<
         .unwrap()
 }
 
+/// The fingerprint index: the sorted set.
 fn set_key(s: &ValkeyDeviceStore, fp: &FingerprintHash) -> String {
+    fingerprint_zset_key(&s.prefix, &tenant().to_string(), &fingerprint_hex(fp))
+}
+
+/// The plain set of the release before the sorted set.
+fn plain_set_key(s: &ValkeyDeviceStore, fp: &FingerprintHash) -> String {
     fingerprint_set_key(&s.prefix, &tenant().to_string(), &fingerprint_hex(fp))
+}
+
+/// Whether the fingerprint index lists `id`.
+async fn listed(s: &ValkeyDeviceStore, fp: &FingerprintHash, id: &DeviceId) -> bool {
+    let score: Option<f64> = s
+        .client
+        .zscore(set_key(s, fp), id.to_string())
+        .await
+        .unwrap();
+    score.is_some()
 }
 
 fn legacy_key(s: &ValkeyDeviceStore, fp: &FingerprintHash) -> String {
@@ -126,7 +147,7 @@ async fn valkey_device_three_twins_come_back_newest_first_then_smaller_id() {
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_single_id_index_entry_still_finds_its_device_and_the_next_write_migrates_it()
  {
-    let s = store("legacy").await;
+    let s = store_reading_legacy("legacy").await;
     let now = at(0);
     let a = guest("old-a", 0x98, DeviceTrustLevel::Seen, now);
     let b = guest("old-b", 0x98, DeviceTrustLevel::Seen, now);
@@ -136,12 +157,10 @@ async fn valkey_device_a_single_id_index_entry_still_finds_its_device_and_the_ne
 
     // Read as before: the entry names its device.
     assert_eq!(found(&s, &a.fingerprint_hash).await, Some(b.id));
-    let in_set: bool = s
-        .client
-        .sismember(set_key(&s, &a.fingerprint_hash), b.id.to_string())
-        .await
-        .unwrap();
-    assert!(!in_set, "a read does not rewrite the index");
+    assert!(
+        !listed(&s, &a.fingerprint_hash, &b.id).await,
+        "a read does not rewrite the index"
+    );
 
     // The next write of that device lists it in the set and removes the old key.
     s.record_sighting(&tenant(), &b.id, now + chrono::Duration::seconds(5))
@@ -153,12 +172,7 @@ async fn valkey_device_a_single_id_index_entry_still_finds_its_device_and_the_ne
         .await
         .unwrap();
     assert!(old.is_none(), "the single-id key is gone");
-    let in_set: bool = s
-        .client
-        .sismember(set_key(&s, &a.fingerprint_hash), b.id.to_string())
-        .await
-        .unwrap();
-    assert!(in_set);
+    assert!(listed(&s, &a.fingerprint_hash, &b.id).await);
     assert_eq!(found(&s, &a.fingerprint_hash).await, Some(b.id));
 
     // The twin the old key never named is listed by its own next write, and
@@ -173,12 +187,13 @@ async fn valkey_device_a_single_id_index_entry_still_finds_its_device_and_the_ne
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_device_a_single_id_entry_and_a_set_are_ranked_together() {
-    let s = store("mixed").await;
+    let s = store_reading_legacy("mixed").await;
     let older = guest("mix-old", 0x99, DeviceTrustLevel::Seen, at(10));
     let newer = guest("mix-new", 0x99, DeviceTrustLevel::Seen, at(20));
     s.save(&older, at(20)).await.unwrap();
     s.save(&newer, at(20)).await.unwrap();
-    // The set lists the older device; the old key names the newer one.
+    // As the release before left it: no sorted set, the plain set lists the
+    // older device, and the old key names the newer one.
     let _: i64 = s
         .client
         .del(set_key(&s, &older.fingerprint_hash))
@@ -186,7 +201,10 @@ async fn valkey_device_a_single_id_entry_and_a_set_are_ranked_together() {
         .unwrap();
     let _: i64 = s
         .client
-        .sadd(set_key(&s, &older.fingerprint_hash), older.id.to_string())
+        .sadd(
+            plain_set_key(&s, &older.fingerprint_hash),
+            older.id.to_string(),
+        )
         .await
         .unwrap();
     let _: () = s
@@ -201,4 +219,77 @@ async fn valkey_device_a_single_id_entry_and_a_set_are_ranked_together() {
         .await
         .unwrap();
     assert_eq!(found(&s, &older.fingerprint_hash).await, Some(newer.id));
+}
+
+/// A fingerprint shared by a thousand devices is answered from the newest
+/// few: the rows of every older device are made undecodable, which a read
+/// that decoded them all would fail on, and the lookup still returns the
+/// newest device.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_device_a_shared_fingerprint_reads_only_the_newest_rows() {
+    let s = store("thousand").await;
+    let fp = FingerprintHash::from_bytes([0x9a; 32]);
+    let total = 1000;
+    let mut newest = None;
+    for i in 0..total {
+        let d = guest(&format!("crowd-{i}"), 0x9a, DeviceTrustLevel::Seen, at(i));
+        s.save(&d, at(i)).await.unwrap();
+        newest = Some(d.id);
+    }
+    // Every row but the newest few is made unreadable.
+    for i in 0..(total - super::super::FINGERPRINT_READ_LIMIT as i64) {
+        let id = dev_id(&format!("crowd-{i}")).to_string();
+        let key = device_key(&s.prefix, &tenant().to_string(), &id);
+        let _: () = s
+            .client
+            .set(key, "not a row", None, None, false)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        found(&s, &fp).await,
+        newest,
+        "the newest device is found without reading the thousand"
+    );
+}
+
+/// A device listed only in the plain set of the release before is found while
+/// the store reads the earlier layouts, and its next write moves it to the
+/// sorted set and out of the plain set; without the flag the plain set is not
+/// read.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_device_the_plain_set_of_the_release_before_is_read_only_on_request() {
+    let s = store_reading_legacy("plainset").await;
+    let d = guest("plain-only", 0x9b, DeviceTrustLevel::Seen, at(0));
+    s.save(&d, at(0)).await.unwrap();
+    let _: i64 = s
+        .client
+        .del(set_key(&s, &d.fingerprint_hash))
+        .await
+        .unwrap();
+    let _: i64 = s
+        .client
+        .sadd(plain_set_key(&s, &d.fingerprint_hash), d.id.to_string())
+        .await
+        .unwrap();
+
+    let quiet = ValkeyDeviceStore::plaintext(s.client.clone()).with_prefix(s.prefix.clone());
+    assert_eq!(found(&quiet, &d.fingerprint_hash).await, None);
+    assert_eq!(found(&s, &d.fingerprint_hash).await, Some(d.id));
+
+    s.record_sighting(&tenant(), &d.id, at(5)).await.unwrap();
+    assert!(listed(&s, &d.fingerprint_hash, &d.id).await);
+    let still_plain: bool = s
+        .client
+        .sismember(plain_set_key(&s, &d.fingerprint_hash), d.id.to_string())
+        .await
+        .unwrap();
+    assert!(
+        !still_plain,
+        "the write moved the device out of the plain set"
+    );
+    assert_eq!(found(&quiet, &d.fingerprint_hash).await, Some(d.id));
 }

@@ -8,7 +8,9 @@
 #[derive(Debug, thiserror::Error)]
 pub enum DelegatedError {
     /// Transport-level failure talking to the IdP / token endpoint:
-    /// connection refused, DNS, TLS, timeout.
+    /// connection refused, DNS, TLS, timeout. The endpoint URL is not
+    /// echoed: a configured endpoint can carry a tenant path or a key in
+    /// its query.
     #[error("HTTP transport error: {0}")]
     Transport(String),
     /// Token endpoint returned a non-2xx response. Carries status + body.
@@ -56,4 +58,14 @@ pub enum DelegatedError {
     /// reconnect".
     #[error("refresh token rejected by IdP; user must re-authorize")]
     RefreshRejected,
+    /// The default HTTP client could not be built; nothing is sent. See
+    /// [`ClientBuildError`](crate::ClientBuildError).
+    #[error(transparent)]
+    ClientBuild(#[from] crate::ClientBuildError),
+    /// The client id and secret did not make an `Authorization` header
+    /// value: a configuration fault, not a transport one. Their base64
+    /// encoding is always a valid header value, so this is not expected; it
+    /// is kept so building the header has no panic path.
+    #[error("client credentials do not make an Authorization header: {0}")]
+    ClientCredentials(#[source] reqwest::header::InvalidHeaderValue),
 }

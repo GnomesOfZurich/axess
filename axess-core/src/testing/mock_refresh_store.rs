@@ -138,7 +138,7 @@ impl RefreshTokenStore for MemoryRefreshTokenStore {
                 && token.device_id.as_ref() == Some(device_id)
                 && !token.revoked
             {
-                self.inner.update(&id, |t| t.revoked = true);
+                self.revoke_as(&id, RevocationReason::Device, None);
                 tokens += 1;
             }
         }

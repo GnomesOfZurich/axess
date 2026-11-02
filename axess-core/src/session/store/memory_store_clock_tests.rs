@@ -268,3 +268,62 @@ async fn delete_removes_session_so_subsequent_load_returns_none() {
         "delete must remove the row before TTL expiry"
     );
 }
+
+/// A zero TTL stores nothing, as in every other store: each write path
+/// removes the entry instead of leaving an unloadable one behind, and
+/// reports the session as not kept, gone, or not rotated.
+#[tokio::test]
+async fn zero_ttl_writes_store_nothing_and_remove_the_entry() {
+    let store = MemorySessionStore::new().with_clock(Arc::new(MockClock::now()));
+    let rng = SystemRng;
+    let data = SessionData {
+        revision: 3,
+        ..SessionData::default()
+    };
+    let ttl = Duration::from_secs(60);
+
+    let id = SessionId::new(&rng);
+    store.save(&id, &data, ttl).await.unwrap();
+    store.save(&id, &data, Duration::ZERO).await.unwrap();
+    assert_eq!(store.inner.len(), 0, "save: no entry is left behind");
+
+    store.save(&id, &data, ttl).await.unwrap();
+    assert!(!store.update(&id, &data, Duration::ZERO).await.unwrap());
+    assert_eq!(store.inner.len(), 0, "update: no entry is left behind");
+
+    store.save(&id, &data, ttl).await.unwrap();
+    assert_eq!(
+        store
+            .update_if_revision(&id, 9, &data, Duration::ZERO)
+            .await
+            .unwrap(),
+        ConditionalUpdate::Conflict
+    );
+    assert_eq!(store.inner.len(), 1, "a conflict removes nothing");
+    assert_eq!(
+        store
+            .update_if_revision(&id, 3, &data, Duration::ZERO)
+            .await
+            .unwrap(),
+        ConditionalUpdate::Gone
+    );
+    assert_eq!(
+        store.inner.len(),
+        0,
+        "update_if_revision: no entry is left behind"
+    );
+
+    for require_old in [false, true] {
+        let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
+        store.save(&old, &data, ttl).await.unwrap();
+        assert_eq!(
+            store
+                .cycle(&old, &new, &data, Duration::ZERO, require_old)
+                .await
+                .unwrap(),
+            CycleOutcome::SessionGone,
+            "require_old={require_old}: nothing is stored, so nothing rotated"
+        );
+        assert_eq!(store.inner.len(), 0, "cycle: no entry is left behind");
+    }
+}

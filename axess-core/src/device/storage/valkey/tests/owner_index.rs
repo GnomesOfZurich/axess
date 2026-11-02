@@ -75,12 +75,55 @@ async fn the_lookup_does_not_read_the_users_other_devices() {
     assert_eq!(found.map(|f| f.id), Some(mine.id));
 }
 
+/// A miss does not read the user's whole device index: a row the user owns
+/// under another fingerprint that cannot be decoded does not fail a lookup
+/// for a fingerprint they have no device for, which is every first sighting
+/// of a device. The index is read as a fallback only when the store is told
+/// to read the layouts of earlier releases.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_miss_reads_the_users_index_only_when_asked_to_read_earlier_layouts() {
+    let s = store("miss").await;
+    let other = shared::device("other-fp", 0x32, DeviceTrustLevel::Seen, at(0));
+    s.save(&other, at(0)).await.unwrap();
+    let key = device_key(
+        &s.prefix,
+        &other.tenant_id.to_string(),
+        &other.id.to_string(),
+    );
+    let _: () = s
+        .client
+        .set(key, "not a device row", None, None, false)
+        .await
+        .unwrap();
+    let user = other.user_id.unwrap();
+    let unseen = FingerprintHash::from_bytes([0x37; 32]);
+
+    let found = s
+        .find_by_fingerprint_for_user(&tenant(), &user, &unseen)
+        .await
+        .expect("a miss reads none of the user's other devices");
+    assert_eq!(found.map(|f| f.id), None);
+
+    let reading_legacy = ValkeyDeviceStore::plaintext(s.client.clone())
+        .with_prefix(s.prefix.clone())
+        .with_legacy_fingerprint_keys();
+    assert!(
+        reading_legacy
+            .find_by_fingerprint_for_user(&tenant(), &user, &unseen)
+            .await
+            .is_err(),
+        "told to read the earlier layouts, the lookup reads the user's index"
+    );
+}
+
 /// A row written before the set existed is found through the user's index
-/// and added to the set, so the next lookup does not need the fallback.
+/// while the store reads the earlier layouts, and added to the set, so the
+/// next lookup does not need the fallback.
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn a_row_the_set_does_not_list_is_found_and_backfilled() {
-    let s = store("backfill").await;
+    let s = store("backfill").await.with_legacy_fingerprint_keys();
     let d = shared::device("old", 0x33, DeviceTrustLevel::Trusted, at(0));
     s.save(&d, at(0)).await.unwrap();
     let key = owned_key(&s, &d);

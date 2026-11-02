@@ -6,7 +6,7 @@
 //! handler → finalize, then emits the response cookie.
 
 #[cfg(feature = "device")]
-use crate::device::resolver::ErasedDeviceResolver;
+use crate::device::resolver::{DeviceResolution, ErasedDeviceResolver};
 use crate::session::binding::SessionBinding;
 use crate::session::config::SessionConfig;
 use crate::session::id::SessionId;
@@ -209,6 +209,7 @@ where
                 clock,
                 rng,
                 registry,
+                unknown_liveness,
                 handle: handle.clone(),
                 existing_id,
             };
@@ -288,7 +289,7 @@ where
         consume: Some(ConsumeTarget {
             store,
             ttl: config.ttl,
-            row_stored,
+            loaded: load.loaded_row,
         }),
     }
 }
@@ -339,6 +340,7 @@ struct Finish<S> {
     clock: Arc<dyn axess_clock::Clock>,
     rng: Arc<dyn axess_rng::SecureRng>,
     registry: Option<Arc<dyn crate::session::store::SessionRegistryHandle>>,
+    unknown_liveness: crate::session::layer::UnknownLiveness,
     handle: SessionHandle,
     existing_id: Option<SessionId>,
 }
@@ -359,7 +361,13 @@ where
             &*self.rng,
         )
         .await;
-        let registered = settle_registry(&self.store, self.registry.as_deref(), &outcome).await;
+        let registered = settle_registry(
+            &self.store,
+            self.registry.as_deref(),
+            self.unknown_liveness,
+            &outcome,
+        )
+        .await;
         (outcome, registered)
     }
 }
@@ -393,8 +401,8 @@ where
 
 /// Resolve the device for a request and stamp it on the loaded session.
 ///
-/// `Err(_)` from the resolver is logged and treated as `None` by the erasure
-/// wrapper. `axum::body::Body` is `!Sync`, so `&Request<Body>` cannot be
+/// `Err(_)` from the resolver is logged by the erasure wrapper and leaves the
+/// session's device as it was. `axum::body::Body` is `!Sync`, so `&Request<Body>` cannot be
 /// borrowed across an `await`: the request is split into `(Parts, Body)`, the
 /// resolver runs against the parts, and the request is reassembled. Reports
 /// whether the resolved id differs from the loaded one, so an unchanged
@@ -421,6 +429,13 @@ async fn resolve_device(
         && let Some(user) = load.data.auth_state.user_id()
     {
         parts.extensions.insert(crate::device::SessionUser(*user));
+        // The tenant the session logged in under, for a resolver whose
+        // tenant is a property of the user rather than of the request.
+        if let Some(tenant) = load.data.auth_state.tenant_id() {
+            parts
+                .extensions
+                .insert(crate::device::SessionTenant(*tenant));
+        }
         // The device the session was last bound to, for a request that
         // presents no device token.
         if let Some(device) = load.data.device_id {
@@ -431,13 +446,21 @@ async fn resolve_device(
     }
     let slot = crate::device::DeviceCookieSlot::default();
     parts.extensions.insert(slot.clone());
-    let resolved = resolver.resolve_erased(&parts).await;
+    let resolution = resolver.resolve_erased(&parts).await;
     parts.extensions.remove::<crate::device::DeviceCookieSlot>();
     let request = Request::from_parts(parts, body);
-    let changed = resolved != load.data.device_id;
-    if changed {
-        load.data.device_id = resolved;
-    }
+    // A resolver that failed said nothing about the device: the session
+    // keeps the one it was bound to, and is not rewritten for it.
+    let changed = match resolution {
+        DeviceResolution::Resolved(resolved) => {
+            let changed = resolved != load.data.device_id;
+            if changed {
+                load.data.device_id = resolved;
+            }
+            changed
+        }
+        DeviceResolution::Failed => false,
+    };
     ResolvedDevice {
         load,
         changed,

@@ -28,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.13"             # facade -- depend on this, never on the internal crates
+axess = "0.14"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -41,7 +41,7 @@ turn on `memory` for the in-memory session store and `testing` for
 real database needs neither.
 
 ```toml
-axess = { version = "0.13.0", features = ["memory", "testing"] }
+axess = { version = "0.14.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the
@@ -142,6 +142,10 @@ identifier start a login at all, and what does it need first?"
 factor. `InvalidCredentials` and `Locked` say it is not. Handle those
 two here rather than falling through, or the code goes on to offer a
 password prompt for an account that is locked or does not exist.
+(`Locked` is answered only when the service is built with
+`with_lockout_revealed_on_begin`; by default a locked account gets
+`InvalidCredentials`, as an unknown identifier does, so nothing is
+learned about the account before any proof.)
 
 `verify_factor` returns a `FactorOutcome`: the answer to "did this one
 credential check out, and are we done?" `Authenticated` is the terminal
@@ -208,6 +212,61 @@ independent moving parts. Swapping the in-memory backend for a
 SQLite-backed one does not touch the state machine or the session
 store. Swapping the session store for Postgres does not touch the
 state machine or the backend.
+
+## The second walkthrough: signing in with an identity provider
+
+The first walkthrough ends with a user who typed a password. Many
+applications never ask for one: the user signs in at an identity provider
+(Entra, Google, Keycloak) and the application accepts its word. The login ends
+in the same place, an `Authenticated` session behind the same cookie, but
+something has to decide which local user the provider's answer means.
+[`examples/oauth/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/oauth)
+is that path from the redirect to a profile page. It needs the `oauth` and
+`jwt-rust-crypto` features on the facade.
+
+The login is three calls, and the middle one is yours:
+
+1. `begin_oauth_login_in_tenant` sends the browser to the provider. Naming
+   the tenant here makes `complete_oauth_login` refuse a user from any other.
+2. `finish_oauth_login_with_iss` runs when the browser comes back. It checks
+   the state, the PKCE verifier, the ID token's signature, issuer, audience,
+   nonce and expiry, and the `iss` parameter of the response (RFC 9207), and
+   returns the claims. It also leaves a claim lock in the session, a value
+   derived from this provider, this subject and this session.
+3. `complete_oauth_login` takes a local `User` and those claims, checks the
+   lock, and makes the session `Authenticated`. Claims that did not come out
+   of step 2 for this very session do not pass.
+
+Between 2 and 3 the application turns claims into a user. The example keeps a
+**federated-identity table** of `(issuer, subject)` to local user id, and
+nothing else is ever the link. The e-mail address is not: it changes hands,
+and one provider lets users type it while another verifies it. The same
+address from a second issuer is a second identity, and a second user.
+
+```rust,ignore
+{{#include ../../examples/oauth/src/app.rs:callback}}
+```
+
+An identity with no link goes to the tenant's **provisioning policy**. A
+tenant that provisions just in time creates the local user on the spot and
+links it; a tenant that does not (`Provisioning::LinkedOnly`) refuses the
+login with a 403, and an administrator links people beforehand. Either way
+the next login of a known identity finds the same user.
+
+The page after login reads the axess session, not the claims:
+
+```rust,ignore
+{{#include ../../examples/oauth/src/app.rs:profile}}
+```
+
+Logout works from both ends. `POST /auth/logout` ends the local session and
+sends the browser to the provider's logout endpoint with the ID token as the
+hint (RP-initiated logout); `POST /auth/backchannel-logout` takes the signed
+logout token the provider posts when the user signs out there, and ends the
+session it names. The example's test drives all of this as a browser does,
+against an in-process provider: `cargo test -p axess-example-oauth`. The
+*OAuth 2.0 and OIDC* chapter has the rest: refresh, FAPI, and what each
+provider needs registered.
 
 ## Signing keys
 

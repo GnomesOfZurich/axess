@@ -40,7 +40,9 @@ fn endpoint(server: &MockServer) -> Url {
 }
 
 fn client(server: &MockServer) -> AwsStsClient {
-    AwsStsClient::new().with_endpoint(endpoint(server))
+    AwsStsClient::new()
+        .expect("client")
+        .with_endpoint(endpoint(server))
 }
 
 fn sample_request() -> AssumeRoleWithWebIdentityRequest {
@@ -308,6 +310,7 @@ async fn with_http_client_override_is_used() {
         .build()
         .unwrap();
     let client = AwsStsClient::new()
+        .expect("client")
         .with_endpoint(endpoint(&server))
         .with_http_client(custom_http);
     client
@@ -318,7 +321,7 @@ async fn with_http_client_override_is_used() {
 
 #[test]
 fn default_endpoint_is_global_sts() {
-    let client = AwsStsClient::default();
+    let client = AwsStsClient::new().expect("client");
     assert_eq!(client.endpoint().as_str(), "https://sts.amazonaws.com/");
 }
 
@@ -386,7 +389,9 @@ fn parsed_credentials_block_debug_does_not_print_the_secrets() {
 
 #[tokio::test]
 async fn a_plain_http_remote_endpoint_is_refused_before_any_request() {
-    let client = AwsStsClient::new().with_endpoint(Url::parse("http://192.0.2.1:9/").unwrap());
+    let client = AwsStsClient::new()
+        .expect("client")
+        .with_endpoint(Url::parse("http://192.0.2.1:9/").unwrap());
     let err = client
         .assume_role_with_web_identity(&sample_request())
         .await
@@ -415,4 +420,25 @@ async fn the_default_client_does_not_follow_a_redirect() {
         .assume_role_with_web_identity(&sample_request())
         .await;
     assert!(result.is_err());
+}
+
+/// A client that cannot be built is an error, never `reqwest::Client::default()`
+/// (redirects followed, no connect timeout) in its place. A TLS configuration
+/// of a type no backend recognises is the one build failure a test can
+/// arrange whatever TLS backend the feature set resolves to.
+#[test]
+fn a_client_that_cannot_be_built_is_an_error_not_a_default_client() {
+    let unbuildable = reqwest::Client::builder().use_preconfigured_tls(());
+    let err = AwsStsClient::from_builder(unbuildable)
+        .err()
+        .expect("a failed build must surface, not fall back to an unhardened client");
+    assert!(matches!(err, AwsStsError::ClientBuild(_)), "{err:?}");
+    assert!(
+        std::error::Error::source(&err).is_some(),
+        "the builder's error is kept as the source: {err:?}"
+    );
+    assert!(
+        AwsStsClient::new().is_ok(),
+        "the default build still succeeds"
+    );
 }

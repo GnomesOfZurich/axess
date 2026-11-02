@@ -11,7 +11,7 @@
 /// Identity test fixture builders (`tenant`, `user`, `device`, ...) plus
 /// [`MockResolver`](crate::testing::MockResolver). Re-exported from `axess-identity` under the `testing`
 /// feature.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(feature = "testing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing {
     pub use axess_core::{MockClock, MockFactorStore, MockIdentityStore, MockRng};
@@ -28,22 +28,34 @@ pub mod testing {
 // Session layer. Kept at the root because `SessionLayer` and the core
 // session types are common facade entry points.
 pub use axess_core::{
-    AuthSession, AuthState, ConditionalUpdate, RevocationError, SameSite, SessionBinding,
-    SessionConfig, SessionConfigBuilder, SessionData, SessionId, SessionLayer, SessionRegistry,
-    SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore, UserAgentBinding,
+    AuthSession, AuthState, ConditionalUpdate, Impersonation, RevocationError, SameSite,
+    SessionBinding, SessionConfig, SessionConfigBuilder, SessionData, SessionId, SessionLayer,
+    SessionRegistry, SessionRegistryAdapter, SessionRegistryHandle, SessionRevoker, SessionStore,
+    UserAgentBinding,
 };
-#[cfg(any(test, feature = "memory"))]
+#[cfg(feature = "memory")]
 pub use axess_core::{MemorySessionRegistry, MemorySessionStore};
 
 /// Session sub-module re-exports (crypto, refresh tokens, etc.).
 pub mod session {
     pub use axess_core::session::LegacyBlobs;
-    pub use axess_core::session::refresh::{RefreshTokenId, RevocationReason, TokenFamilyId};
-    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "valkey"))]
+    // The refresh-token entry points: `issue_refresh_token`, `Refresh` (the
+    // one refresh, with its tenant, status, device and binding checks; the
+    // older `refresh_session*` forms are deprecated wrappers over it) and
+    // `revoke_refresh_token`. Wrap the store in `device::CascadingRefreshStore`
+    // so a reused rotated-out token revokes the family's devices as well. A
+    // glob, so re-exporting the deprecated forms is not itself a use of them.
+    pub use axess_core::session::refresh::*;
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "postgres",
+        feature = "mysql",
+        feature = "valkey"
+    ))]
     pub use axess_core::session::{CryptoError, SessionCrypto};
     pub use axess_core::session::{
         CycleOutcome, DeviceTokenRevocation, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
-        RotationOutcome,
+        RotationOutcome, WeakKeyError,
     };
 }
 
@@ -73,12 +85,12 @@ pub mod authn {
         create_tenant, default_catalog, require_valid_session,
     };
     pub use axess_factors::{
-        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, PepperTooShort, RECOVERY_CODE_COUNT,
-        RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD,
-        TotpAlgorithm, TotpVerifyParams, build_totp_uri, generate_password_hash,
-        generate_password_hash_with_rng, generate_recovery_codes, generate_recovery_codes_peppered,
-        generate_totp_secret, normalize_recovery_code, verify_hotp, verify_password,
-        verify_recovery_code, verify_totp,
+        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, HotpThrottle, PepperTooShort,
+        RECOVERY_CODE_COUNT, RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode,
+        TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams, build_totp_uri,
+        generate_password_hash, generate_password_hash_with_rng, generate_recovery_codes,
+        generate_recovery_codes_peppered, generate_totp_secret, normalize_recovery_code,
+        verify_hotp, verify_password, verify_recovery_code, verify_totp,
     };
 }
 
@@ -132,7 +144,7 @@ pub mod csrf {
 
 // In-memory backend for prototyping. Wraps mock identity/factor stores;
 // gated behind `testing` so production builds cannot ship it.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(feature = "testing")]
 pub use axess_core::InMemoryBackend;
 
 /// Storage backends grouped by data store. Each backend module exposes
@@ -204,15 +216,15 @@ pub mod backends {
     /// device-store types additionally require `device`. Recommended for
     /// prototypes, tests, and single-process deployments only, not for
     /// production.
-    #[cfg(any(test, feature = "memory", feature = "testing"))]
+    #[cfg(any(feature = "memory", feature = "testing"))]
     pub mod memory {
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         pub use axess_core::MemoryRefreshStoreError as RefreshStoreError;
-        #[cfg(any(test, feature = "testing"))]
+        #[cfg(feature = "testing")]
         pub use axess_core::MemoryRefreshTokenStore as RefreshTokenStore;
-        #[cfg(any(test, feature = "memory"))]
+        #[cfg(feature = "memory")]
         pub use axess_core::MemorySessionRegistry as SessionRegistry;
-        #[cfg(any(test, feature = "memory"))]
+        #[cfg(feature = "memory")]
         pub use axess_core::MemorySessionStore as SessionStore;
 
         #[cfg(feature = "device")]
@@ -277,7 +289,7 @@ pub mod local_idp {
     };
     // Test fixture variants of LocalIdp (keypair-per-`new`, mock listeners,
     // recording helpers). Gated behind `testing`.
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "testing")]
     pub use axess_core::testing::local_idp::{
         LocalIdpFixture, MockIssuanceListener, RecordedIssuance,
     };
@@ -335,17 +347,50 @@ pub mod federation {
         };
     }
 
-    /// OAuth 2.0 / OIDC providers, including FAPI 2.0 types under the
-    /// `fapi` feature.
+    /// OAuth 2.0 / OIDC providers, including the FAPI 2.0 profile (`fapi`
+    /// is an alias for `oauth`).
     #[cfg(feature = "oauth")]
     pub mod oauth {
         pub use axess_core::{
-            AuthUrlResult, OAuthClaims, OAuthError, OAuthLoginOptions, OAuthProvider,
-            OAuthProviderConfig, ResponseMode, UserInfoClaims, spawn_jwks_refresh,
+            AuthUrlResult, ClientAssertionError, ClientAssertionSigner, OAuthClaims, OAuthError,
+            OAuthLoginOptions, OAuthProvider, OAuthProviderBuilder, OAuthProviderConfig,
+            ResponseMode, SignerSpec, UserInfoClaims, spawn_jwks_refresh,
+        };
+        /// The key DPoP-bound tokens are tied to, what a request needs to
+        /// sign a proof with it, and the proof. A provider binds its tokens
+        /// to one by default when the IdP advertises DPoP; keep the key
+        /// beside the refresh token (`DpopKey::to_seed_bytes`,
+        /// `DpopKey::from_seed`).
+        pub use axess_core::{DpopKey, DpopProof, DpopSigner};
+
+        /// The by-name helpers (refresh, userinfo, revocation, logout URL)
+        /// resolved by a session's or a tenant's provider.
+        pub use axess_core::authn::service::ScopedOAuth;
+        #[cfg(feature = "sqlite")]
+        pub use axess_core::federation::oauth_tenant::SqliteTenantOAuthProviderStore;
+        /// Bring your own IdP: providers resolved by `(tenant, name)` from
+        /// a store at request time.
+        pub use axess_core::federation::oauth_tenant::{
+            BrokenTenantProvider, IssuerProviders, MemoryTenantOAuthProviderStore,
+            StoredTenantOAuthProviders, TenantClientCredential, TenantDpop,
+            TenantOAuthProviderRecord, TenantOAuthProviderStore, TenantOAuthProviderStoreError,
+            TenantOAuthProviders, TenantProvider,
+        };
+        // IdP-initiated logout: mount the back-channel handler as a route,
+        // and pass `AuthnService::backchannel_logout_audit` to `with_audit`
+        // so the sessions it ends are audited.
+        pub use axess_core::federation::backchannel_logout::{
+            BackChannelLogoutHandler, IdpSessionEnded, LogoutAudit, LogoutProviderError,
+        };
+        // The front-channel handler, and the bound form
+        // `with_session_match_required` returns, which ends a session only
+        // when it is the request's own and is mounted behind the session
+        // layer.
+        pub use axess_core::federation::frontchannel_logout::{
+            BoundFrontChannelLogoutHandler, FrontChannelLogoutHandler, FrontChannelLogoutParams,
         };
 
-        #[cfg(feature = "fapi")]
-        pub use axess_core::{DpopProof, FapiConfig, ParResponse, SenderConstraint};
+        pub use axess_core::{FapiConfig, ParResponse, SenderConstraint};
     }
 
     /// mTLS workload-identity resolution via SPIFFE X509-SVID.
@@ -402,6 +447,9 @@ pub mod social {
     feature = "azure-fic",
 ))]
 pub mod workload {
+    /// The cause inside the STS errors' `ClientBuild` variant.
+    #[cfg(any(feature = "aws-sts", feature = "azure-fic", feature = "gcp-wif"))]
+    pub use axess_core::ClientBuildError;
     pub use axess_core::workload::*;
 }
 
@@ -411,6 +459,8 @@ pub mod workload {
 /// `delegated-exchange`).
 #[cfg(any(feature = "delegated-stored", feature = "delegated-exchange"))]
 pub mod delegated {
+    /// The cause inside `DelegatedError::ClientBuild`.
+    pub use axess_core::ClientBuildError;
     pub use axess_core::delegated::*;
 }
 

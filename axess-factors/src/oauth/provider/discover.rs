@@ -5,7 +5,7 @@
 //! `end_session_endpoint`, `revocation_endpoint`) from the metadata's raw
 //! JSON.
 
-use super::OAuthProviderConfig;
+use super::{OAuthProviderBuilder, OAuthProviderConfig};
 use crate::oauth::types::OAuthError;
 use crate::oidc::JwksCache;
 use openidconnect::{ClientId, ClientSecret, IssuerUrl, RedirectUrl, core::CoreProviderMetadata};
@@ -25,17 +25,73 @@ pub(crate) fn is_issuer_url_acceptable(issuer_url: &str) -> bool {
 }
 
 impl OAuthProviderConfig {
-    /// Create a provider using OIDC discovery.
+    /// Discover a provider by OIDC discovery and return its builder.
     ///
     /// Fetches `{issuer_url}/.well-known/openid-configuration` to configure
-    /// authorization, token, and userinfo endpoints automatically.
+    /// authorization, token, and userinfo endpoints automatically. Finish
+    /// with [`OAuthProviderBuilder::build`], after any `with_*` settings.
+    ///
+    /// When the document advertises DPoP (`ES256` among its
+    /// `dpop_signing_alg_values_supported`), the provider binds its tokens
+    /// to a DPoP key from the start: see
+    /// [`with_dpop`](OAuthProviderBuilder::with_dpop) for what that asks of
+    /// the caller, and [`without_dpop`](OAuthProviderBuilder::without_dpop)
+    /// for deployments whose resource servers take only Bearer tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`OAuthError::Config`] for an issuer or redirect URL that is not
+    /// acceptable, or an advertised endpoint that is not HTTPS;
+    /// [`OAuthError::Discovery`] when the document or the key set cannot be
+    /// fetched or read.
     pub async fn discover(
         name: &str,
         issuer_url: &str,
         client_id: &str,
         client_secret: &str,
         redirect_url: &str,
-    ) -> Result<Self, OAuthError> {
+    ) -> Result<OAuthProviderBuilder, OAuthError> {
+        Self::discover_with(
+            name,
+            issuer_url,
+            client_id,
+            Some(ClientSecret::new(client_secret.to_string())),
+            redirect_url,
+        )
+        .await
+    }
+
+    /// Create a provider using OIDC discovery that authenticates to the
+    /// token endpoint by `private_key_jwt` (RFC 7523) instead of a client
+    /// secret. The client id is the signer's; no request this provider makes
+    /// carries a secret.
+    ///
+    /// The same as [`discover`](Self::discover) in every other respect.
+    ///
+    /// # Errors
+    ///
+    /// As [`discover`](Self::discover).
+    pub async fn discover_with_private_key_jwt(
+        name: &str,
+        issuer_url: &str,
+        signer: crate::client_assertion::ClientAssertionSigner,
+        redirect_url: &str,
+    ) -> Result<OAuthProviderBuilder, OAuthError> {
+        let client_id = signer.client_id().to_string();
+        Ok(
+            Self::discover_with(name, issuer_url, &client_id, None, redirect_url)
+                .await?
+                .with_private_key_jwt(signer),
+        )
+    }
+
+    async fn discover_with(
+        name: &str,
+        issuer_url: &str,
+        client_id: &str,
+        client_secret: Option<ClientSecret>,
+        redirect_url: &str,
+    ) -> Result<OAuthProviderBuilder, OAuthError> {
         // Reject non-HTTPS issuer URLs to prevent MITM during OIDC discovery.
         // Allow http://localhost / 127.0.0.1 / [::1] for local development.
         if !is_issuer_url_acceptable(issuer_url) {
@@ -58,9 +114,23 @@ impl OAuthProviderConfig {
             .build()
             .map_err(|e| OAuthError::Config(format!("HTTP client build failed: {e}")))?;
 
-        let metadata = CoreProviderMetadata::discover_async(issuer, &http_client)
+        // One fetch of the discovery document. The shared OIDC primitive
+        // reads it, binds it to the issuer it was fetched from and checks
+        // the key set's transport; the typed metadata is parsed from the
+        // same bytes, so the endpoints the provider calls and the optional
+        // endpoints read below cannot come from two answers that differ.
+        let extras = crate::oidc::discovery::DiscoveryDocument::fetch(issuer_url, &http_client)
             .await
             .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
+        let metadata: CoreProviderMetadata = serde_json::from_value(extras.raw.clone())
+            .map_err(|e| OAuthError::Discovery(format!("discovery document: {e}")))?;
+        if metadata.issuer().as_str().trim_end_matches('/') != issuer.as_str().trim_end_matches('/')
+        {
+            return Err(OAuthError::Discovery(format!(
+                "discovery document names issuer {} but was fetched from {issuer_url}",
+                metadata.issuer().as_str()
+            )));
+        }
 
         let redirect = RedirectUrl::new(redirect_url.to_string())
             .map_err(|e| OAuthError::Config(format!("invalid redirect URL: {e}")))?;
@@ -77,10 +147,7 @@ impl OAuthProviderConfig {
         // `CoreProviderMetadata` carries an empty "additional metadata" type,
         // so every field outside the standard set is dropped when the
         // document is parsed (and so when it is serialised again). Read them
-        // from the raw document, which the discovery primitive keeps.
-        let extras = crate::oidc::discovery::DiscoveryDocument::fetch(issuer_url, &http_client)
-            .await
-            .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
+        // from the raw document the primitive keeps.
         let end_session_endpoint = extras.end_session_endpoint.clone();
         let revocation_endpoint = extras.revocation_endpoint.clone();
         let par_endpoint = extras.pushed_authorization_request_endpoint.clone();
@@ -91,6 +158,10 @@ impl OAuthProviderConfig {
             .unwrap_or(false);
 
         let mtls_aliases = super::fapi_profile::MtlsAliases::from_document(&extras.raw);
+        // DPoP is on by default wherever the IdP advertises it in a form the
+        // proofs meet; `without_dpop` is the explicit way out, and `build`
+        // decides.
+        let dpop_advertised = super::dpop::advertised_in(&extras.raw);
 
         // Every endpoint that receives a secret, a token or a code travels
         // over HTTPS (loopback http allowed for development).
@@ -113,11 +184,13 @@ impl OAuthProviderConfig {
             "pushed_authorization_request_endpoint",
         )?;
 
-        Ok(Self {
+        Ok(OAuthProviderBuilder::discovered(Self {
             name: name.into(),
             metadata,
             client_id: ClientId::new(client_id.to_string()),
-            client_secret: Some(ClientSecret::new(client_secret.to_string())),
+            client_secret,
+            client_assertion: None,
+            rng: std::sync::Arc::new(axess_rng::SystemRng),
             redirect_url: redirect,
             http_client,
             jwks_cache,
@@ -128,6 +201,8 @@ impl OAuthProviderConfig {
             iss_parameter_supported,
             mtls_aliases,
             fapi: None,
+            dpop: false,
+            dpop_advertised,
             id_token_algs: None,
             clock: std::sync::Arc::new(axess_clock::SystemClock),
             allowed_post_logout_redirect_uris: Vec::new(),
@@ -138,7 +213,72 @@ impl OAuthProviderConfig {
                 "profile".to_string(),
             ],
             ceremony_timeout: std::time::Duration::from_secs(600),
-        })
+        }))
+    }
+}
+
+#[cfg(test)]
+mod discovery_fetch_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The discovery document is fetched once: the typed metadata and the
+    /// optional endpoints are read from the same answer, so a second
+    /// answer that differs cannot feed the optional endpoints.
+    #[tokio::test]
+    async fn the_discovery_document_is_fetched_once() {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "jwks_uri": format!("{issuer}/jwks"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+                "revocation_endpoint": format!("{issuer}/revoke"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "keys": [],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OAuthProviderConfig::discover(
+            "test",
+            &issuer,
+            "client-id",
+            "client-secret",
+            "https://rp.example/callback",
+        )
+        .await
+        .expect("discovery")
+        .build()
+        .expect("build");
+        assert_eq!(
+            provider.revocation_endpoint.as_deref(),
+            Some(format!("{issuer}/revoke").as_str()),
+            "the optional endpoint is read from the one document"
+        );
+        let discovery_fetches = server
+            .received_requests()
+            .await
+            .expect("requests")
+            .iter()
+            .filter(|r| r.url.path() == "/.well-known/openid-configuration")
+            .count();
+        assert_eq!(
+            discovery_fetches, 1,
+            "the discovery document is fetched once"
+        );
     }
 }
 

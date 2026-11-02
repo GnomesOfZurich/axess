@@ -25,7 +25,10 @@ async fn connect() -> Client {
     client
 }
 
-/// Connections currently in pub/sub mode, as the server lists them.
+/// Connections currently in pub/sub mode, as the server lists them. A watcher
+/// counts in `watcher_count` from the moment it registers, before its join
+/// has opened and subscribed the connection, so a count that a join raises is
+/// waited for, never read straight after the watcher count.
 async fn subscriber_connections(admin: &Client) -> usize {
     let command = CustomCommand::new_static("CLIENT", ClusterHash::FirstKey, false);
     let listing: String = admin
@@ -87,11 +90,10 @@ async fn valkey_watch_two_watchers_share_one_connection_and_both_wake() {
     })
     .await;
 
-    assert_eq!(
-        subscriber_connections(&admin).await,
-        before + 1,
-        "two watchers, one subscriber connection"
-    );
+    eventually("two watchers, one subscriber connection", || async {
+        subscriber_connections(&admin).await == before + 1
+    })
+    .await;
 
     registry.invalidate_user(&u).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -129,7 +131,10 @@ async fn valkey_watch_aborting_one_leaves_the_other_and_aborting_both_closes() {
         registry.subscriber.watcher_count() == 2
     })
     .await;
-    assert_eq!(subscriber_connections(&admin).await, before + 1);
+    eventually("one subscriber connection is open", || async {
+        subscriber_connections(&admin).await == before + 1
+    })
+    .await;
 
     // Aborted before it could quit anything itself.
     w1.abort();
@@ -199,7 +204,10 @@ async fn valkey_watch_replaces_a_dead_subscriber_connection() {
         registry.subscriber.watcher_count() == 1
     })
     .await;
-    assert_eq!(subscriber_connections(&admin).await, before + 1);
+    eventually("the subscriber connection is open", || async {
+        subscriber_connections(&admin).await == before + 1
+    })
+    .await;
 
     // Kill every pub/sub connection on the server.
     let kill = CustomCommand::new_static("CLIENT", ClusterHash::FirstKey, false);
@@ -258,6 +266,10 @@ async fn valkey_watch_rechecks_waiting_watchers_after_a_closed_connection() {
     let w1 = watch(&registry, u1, s1);
     eventually("first watcher joined", || async {
         registry.subscriber.watcher_count() == 1
+    })
+    .await;
+    eventually("the subscriber connection is open", || async {
+        subscriber_connections(&admin).await == before + 1
     })
     .await;
 

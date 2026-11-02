@@ -5,7 +5,7 @@ use super::*;
 use crate::authn::ids::testing as ids;
 use crate::session::data::{AuthState, SessionData};
 use crate::session::layer::UnknownLiveness;
-use crate::session::layer::handle::SessionInner;
+use crate::session::layer::handle::{SessionHandle, SessionInner};
 use crate::session::store::MemorySessionStore;
 use crate::testing::mock_random::MockRng;
 use std::future::Future;
@@ -36,6 +36,58 @@ fn authenticated() -> SessionData {
     data.auth_state
         .set_authenticated(ids::user("u"), ids::tenant("t"), chrono::Utc::now());
     data
+}
+
+/// Load `data` under `cfg` with no registry; whether the session was kept.
+async fn loads_as_authenticated(cfg: &SessionConfig, data: &SessionData) -> bool {
+    let store = MemorySessionStore::new();
+    let keys = SigningKeyRing::from_master([0xCC; 32]);
+    let id = SessionId::new(&MockRng::new(5));
+    store.save(&id, data, cfg.ttl).await.unwrap();
+    let outcome = load_session(
+        &store,
+        &keys,
+        cfg,
+        &cookie_headers(&keys, cfg, id),
+        Fingerprints::default(),
+        &MockRng::new(1),
+        &LoadPolicy::bare(),
+    )
+    .await;
+    outcome.data.auth_state.is_authenticated()
+}
+
+/// An impersonation older than the impersonation age cap ends on its next
+/// request; the user's own session of the same age, and a younger
+/// impersonation, stand.
+#[tokio::test]
+async fn an_impersonation_older_than_its_cap_is_ended() {
+    let cfg = SessionConfig::builder()
+        .max_impersonation_age(std::time::Duration::from_secs(3600))
+        .build();
+    let now = chrono::Utc::now();
+    let mut old = authenticated();
+    assert!(
+        old.auth_state
+            .set_impersonator(ids::user("admin"), now - chrono::Duration::hours(2))
+    );
+    let mut young = authenticated();
+    assert!(
+        young
+            .auth_state
+            .set_impersonator(ids::user("admin"), now - chrono::Duration::minutes(5))
+    );
+
+    assert!(loads_as_authenticated(&cfg, &authenticated()).await);
+    assert!(loads_as_authenticated(&cfg, &young).await);
+    assert!(
+        !loads_as_authenticated(&cfg, &old).await,
+        "the impersonation outlived the cap"
+    );
+    assert!(
+        loads_as_authenticated(&SessionConfig::default(), &old).await,
+        "no cap, no end"
+    );
 }
 
 /// A previous-key fingerprint match must not be accepted when this request
@@ -138,8 +190,51 @@ async fn oversized_custom_data_is_cleared_on_a_regenerate_without_modification()
     assert_eq!(stored.custom, serde_json::Value::default());
 }
 
+/// The size cap applies to the idle refresh too: a read-only request past
+/// half the lifetime writes the row back, and an oversized custom bag loaded
+/// from the store is cleared by that write.
+#[tokio::test]
+async fn oversized_custom_data_is_cleared_by_the_idle_refresh_write() {
+    let store = MemorySessionStore::new();
+    let cfg = SessionConfig::builder().max_custom_bytes(64).build();
+    let id = SessionId::new(&MockRng::new(4));
+    // No refresh stamp: the row is due for a refresh at once.
+    let data = SessionData {
+        custom: serde_json::json!({ "blob": "x".repeat(500) }),
+        touched_at: None,
+        ..SessionData::default()
+    };
+    store.save(&id, &data, cfg.ttl).await.unwrap();
+    let inner = SessionInner {
+        id,
+        data,
+        modified: false,
+        needs_persist: false,
+        regenerate: false,
+        pre_cycle_id: None,
+        pending_fingerprint: None,
+        max_custom_bytes: 64,
+        consume: None,
+        rng: Arc::new(axess_rng::SystemRng),
+    };
+    let handle = SessionHandle(Arc::new(RwLock::new(inner)));
+    let outcome = finalize_session(
+        &store,
+        &cfg,
+        None,
+        &axess_clock::SystemClock,
+        &handle,
+        Some(id),
+        &MockRng::new(9),
+    )
+    .await;
+    assert!(outcome.session_changed, "the refresh writes the row");
+    let stored = store.load(&outcome.final_id).await.unwrap().unwrap();
+    assert_eq!(stored.custom, serde_json::Value::default());
+}
+
 /// A registry that cannot answer.
-struct SilentRegistry;
+pub(super) struct SilentRegistry;
 
 impl crate::session::store::SessionRevoker for SilentRegistry {
     fn invalidate_user<'a>(
@@ -181,12 +276,35 @@ impl SessionRegistryHandle for SilentRegistry {
     ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async { false })
     }
-    fn active_sessions<'a>(
+    fn held_sessions<'a>(
         &'a self,
         _: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>> {
-        Box::pin(async { Vec::new() })
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Vec<SessionId>, crate::session::store::RevocationError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            Err(crate::session::store::RevocationError(
+                "registry unreachable".into(),
+            ))
+        })
     }
+}
+
+/// A registry that cannot answer reports its outage from `held_sessions`,
+/// which an implementation must write; only the derived `active_sessions`
+/// goes on with an empty list.
+#[tokio::test]
+async fn an_unanswering_registry_refuses_the_exact_list_and_fails_open_only_for_the_limit() {
+    let user = ids::user("u");
+    assert!(
+        SilentRegistry.held_sessions(&user).await.is_err(),
+        "the outage reaches the caller that must refuse on it"
+    );
+    assert!(SilentRegistry.active_sessions(&user).await.is_empty());
 }
 
 async fn load_with_silent_registry(unknown: UnknownLiveness) -> (LoadOutcome, bool, SessionId) {

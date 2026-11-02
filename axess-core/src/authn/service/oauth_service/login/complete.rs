@@ -32,6 +32,44 @@ mod sid_map_upkeep;
 #[cfg(test)]
 mod subject_registry;
 
+/// Enforce the tenant rail when the ceremony is bound to a tenant.
+///
+/// Closes the gap where a buggy claims→user resolver returns a
+/// user from a different tenant (common when the same external
+/// email exists in two tenants and the resolver searches by
+/// email alone). No check applies when the ceremony is unbound (the
+/// tenant-agnostic begin path); a binding that does not read is
+/// refused rather than taken for none.
+fn enforce_oauth_ceremony_tenant<E: std::error::Error + Send + Sync + 'static>(
+    user: &crate::authn::types::User,
+    claims: &axess_factors::oauth::OAuthClaims,
+    binding: Result<Option<super::state::CeremonyTenant>, super::state::UnreadableBinding>,
+) -> Result<(), AuthnError<E>> {
+    let expected = match binding {
+        Ok(None) => return Ok(()),
+        Ok(Some(binding)) => binding.tenant,
+        Err(super::state::UnreadableBinding) => {
+            tracing::warn!(
+                user_id = %user.id,
+                provider = %claims.provider,
+                "OAuth completion refused; the ceremony's tenant binding does not read"
+            );
+            return Err(AuthnError::CrossTenant);
+        }
+    };
+    if user.tenant_id != expected {
+        tracing::warn!(
+            user_id = %user.id,
+            user_tenant = %user.tenant_id,
+            expected_tenant = %expected,
+            provider = %claims.provider,
+            "OAuth completion refused; resolved user is in a different tenant than the ceremony is bound to"
+        );
+        return Err(AuthnError::CrossTenant);
+    }
+    Ok(())
+}
+
 impl<I, F> AuthnService<I, F>
 where
     I: IdentityStore,
@@ -73,37 +111,6 @@ where
                 Err(AuthnError::NoFlow)
             }
         }
-    }
-
-    /// Enforce the expected-tenant rail when the begin-side
-    /// stashed one.
-    ///
-    /// Closes the gap where a buggy claims→user resolver returns a
-    /// user from a different tenant (common when the same external
-    /// email exists in two tenants and the resolver searches by
-    /// email alone). The check is no-op when no expectation was
-    /// stashed (e.g. tenant-agnostic begin path).
-    async fn enforce_oauth_expected_tenant(
-        &self,
-        user: &crate::authn::types::User,
-        claims: &axess_factors::oauth::OAuthClaims,
-        session: &AuthSession,
-    ) -> Result<(), AuthnError<I::Error>> {
-        use axess_factors::oauth::types::keys as oauth_keys;
-        if let Some(serde_json::Value::String(expected)) =
-            session.get_custom(oauth_keys::EXPECTED_TENANT).await
-            && user.tenant_id.to_string() != expected
-        {
-            tracing::warn!(
-                user_id = %user.id,
-                user_tenant = %user.tenant_id,
-                expected_tenant = %expected,
-                provider = %claims.provider,
-                "OAuth completion refused; resolved user is in a different tenant than begin_oauth_login_in_tenant declared"
-            );
-            return Err(AuthnError::CrossTenant);
-        }
-        Ok(())
     }
 
     /// Register the now-Authenticated session in
@@ -242,6 +249,7 @@ where
         claims: &axess_factors::oauth::OAuthClaims,
         sid: &crate::session::id::SessionId,
         now: chrono::DateTime<chrono::Utc>,
+        tenant_provider: bool,
     ) -> pending_ends::PendingEnds {
         use crate::federation::sid_map::SidKey;
 
@@ -276,11 +284,20 @@ where
         const EVICT_BATCH: usize = 128;
         const PRUNE_BATCH: usize = 128;
 
-        let issuer = self
-            .inner
-            .oauth_providers
-            .get(claims.provider.as_ref())
+        // A tenant's provider is not in the global registry; the verified ID
+        // token's own `iss` names its issuer.
+        let global = (!tenant_provider)
+            .then(|| self.inner.oauth_providers.get(claims.provider.as_ref()))
+            .flatten();
+        let issuer = global
             .and_then(|p| p.issuer().map(|s| s.to_string()))
+            .or_else(|| {
+                claims
+                    .additional_claims
+                    .get("iss")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| claims.provider.to_string());
 
         // Every login enters the subject registry, with or without a `sid`,
@@ -432,12 +449,15 @@ where
         // Both refuse before mutating session state so a
         // bypass attempt never produces a partially-completed login.
         self.verify_oauth_claim_lock(user, claims, session).await?;
-        let tenant_check = self
-            .enforce_oauth_expected_tenant(user, claims, session)
-            .await;
-        // The binding is single-use: gone whether the check passed or not.
-        super::state::remove_expected_tenant(session).await;
-        tenant_check?;
+        // The binding is single-use: gone whether the check passes or not.
+        let binding = super::state::take_ceremony_tenant(session).await;
+        let provider_tenant = binding
+            .ok()
+            .flatten()
+            .filter(|b| b.provider_from_tenant)
+            .map(|b| b.tenant);
+        let tenant_provider = provider_tenant.is_some();
+        enforce_oauth_ceremony_tenant(user, claims, binding)?;
 
         // The tenant's own gates, as `begin_login` runs them: its status and
         // its IP policy. The OAuth completion used to skip both, so a user
@@ -464,6 +484,19 @@ where
                 &self.inner.preserved_custom_keys,
             )
             .await;
+        // The ceremony's tenant binding is gone; keep which tenant's provider
+        // this session logged in through, for the by-session helpers.
+        if let Some(tenant) = provider_tenant {
+            session
+                .set_custom(
+                    axess_factors::oauth::keys::LOGIN_TENANT,
+                    serde_json::json!({
+                        "provider": claims.provider.as_ref(),
+                        "tenant": tenant.to_string(),
+                    }),
+                )
+                .await;
+        }
         let sid = session.session_id().await;
 
         // Post-flip session-binding work: register-or-clear MUST come
@@ -493,7 +526,9 @@ where
         // `sid`. Self-contained; see helper for the TTL-prune /
         // capacity-evict / atomic-swap-with-displaced-invalidation
         // sequence.
-        let pending = self.maintain_oidc_sid_map(user, claims, &sid, now).await;
+        let pending = self
+            .maintain_oidc_sid_map(user, claims, &sid, now, tenant_provider)
+            .await;
 
         let emitted = self
             .emit_audit_at(

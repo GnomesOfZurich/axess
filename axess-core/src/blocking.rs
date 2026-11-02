@@ -63,6 +63,13 @@ pub struct KdfExecutor {
     waiting: AtomicUsize,
 }
 
+/// Jobs the pool lets wait for a permit, per permit, unless
+/// [`with_max_queue`](KdfExecutor::with_max_queue) says otherwise: with one
+/// Argon2id check in the tens of milliseconds, sixteen per permit is on
+/// the order of a second of queued work, which bounds both the latency a
+/// queued login sees and the requests a flood can hold open.
+pub const DEFAULT_QUEUE_PER_PERMIT: usize = 16;
+
 /// Counts a job as waiting for as long as it holds the guard.
 struct Waiting<'a>(&'a AtomicUsize);
 
@@ -80,13 +87,15 @@ impl KdfExecutor {
         Self::pool_with_permits(cpus)
     }
 
-    /// The blocking pool with an explicit concurrency limit (minimum 1).
+    /// The blocking pool with an explicit concurrency limit (minimum 1) and
+    /// a waiting queue of [`DEFAULT_QUEUE_PER_PERMIT`] jobs per permit.
     pub fn pool_with_permits(permits: usize) -> Self {
+        let permits = permits.max(1);
         Self {
             mode: Mode::Pool,
-            permits: Arc::new(Semaphore::new(permits.max(1))),
+            permits: Arc::new(Semaphore::new(permits)),
             started: AtomicU64::new(0),
-            max_queue: usize::MAX,
+            max_queue: permits.saturating_mul(DEFAULT_QUEUE_PER_PERMIT),
             acquire_timeout: None,
             waiting: AtomicUsize::new(0),
         }
@@ -107,9 +116,12 @@ impl KdfExecutor {
     }
 
     /// Refuse a job with [`KdfError::Busy`] when `limit` jobs are already
-    /// waiting for a permit. Unbounded by default, which lets a burst of
-    /// logins queue without limit; bound it where login traffic is
-    /// unauthenticated.
+    /// waiting for a permit. The pool's default is
+    /// [`DEFAULT_QUEUE_PER_PERMIT`] jobs per permit: a burst of logins
+    /// beyond it is answered `503` at once rather than queued without
+    /// limit, where every waiting job holds a request open and the queue
+    /// is what an unauthenticated flood fills. `usize::MAX` removes the
+    /// limit; [`inline`](Self::inline) has none.
     #[must_use]
     pub fn with_max_queue(mut self, limit: usize) -> Self {
         self.max_queue = limit;
@@ -303,6 +315,22 @@ mod tests {
             "peak concurrency {} exceeded the 2 permits",
             peak.load(Ordering::SeqCst)
         );
+    }
+
+    /// The pool's queue is finite by default, scaled by its permits; the
+    /// inline executor has no queue to fill.
+    #[test]
+    fn the_pool_queue_is_bounded_by_default() {
+        assert_eq!(
+            KdfExecutor::pool_with_permits(1).max_queue,
+            DEFAULT_QUEUE_PER_PERMIT
+        );
+        assert_eq!(
+            KdfExecutor::pool_with_permits(4).max_queue,
+            4 * DEFAULT_QUEUE_PER_PERMIT
+        );
+        assert!(KdfExecutor::pool().max_queue < usize::MAX);
+        assert_eq!(KdfExecutor::inline().max_queue, usize::MAX);
     }
 
     /// With one permit held, a queue of one admits one waiter and refuses the

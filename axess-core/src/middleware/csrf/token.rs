@@ -41,3 +41,24 @@ pub(super) fn validate_token(token: &str, session_id: &[u8], signing_key: &[u8; 
     let expected = compute_tag(nonce, session_id, signing_key);
     expected.ct_eq(tag).into()
 }
+
+/// The double-submit check: the cookie and the presented token are equal and
+/// the token verifies against the signing key and `session_id`.
+pub(super) fn validate_pair(
+    cookie_token: Option<&str>,
+    presented: Option<&str>,
+    session_id: &[u8],
+    signing_key: &[u8; 32],
+) -> bool {
+    let (Some(c), Some(p)) = (cookie_token, presented) else {
+        return false;
+    };
+    if c.is_empty() || p.is_empty() {
+        return false;
+    }
+    // Cookie and presented must match exactly (double-submit) AND the token
+    // must verify against the signing key *and* the current session id (so an
+    // attacker who can set cookies cannot inject a self-chosen value, and a
+    // token stolen from another session cannot be replayed here).
+    bool::from(c.as_bytes().ct_eq(p.as_bytes())) && validate_token(c, session_id, signing_key)
+}

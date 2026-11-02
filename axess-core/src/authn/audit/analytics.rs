@@ -487,9 +487,12 @@ where
     }
 }
 
-// `IdentityAuthnLog` and `IdentityLookup` are blanket-forwarded to the
-// inner log. The analytics-side spawn lives in `record_event` only;
-// lookups and admin-side calls are unaffected.
+// `IdentityAuthnLog` and `IdentityLookup` are forwarded to the inner log,
+// method by method. The policy methods have no trait default, so the
+// compiler holds every forward in place; the two derived lookups
+// (`get_user_tenant`, `get_user_in_tenant`) are forwarded too, so an inner
+// store's narrower query is kept. The analytics-side spawn lives in
+// `record_event` only; lookups and admin-side calls are unaffected.
 impl<L, S, E, EFut> crate::authn::store::IdentityLookup for AuditLogWithAnalytics<L, S, E>
 where
     L: crate::authn::store::IdentityAuthnLog,
@@ -555,11 +558,36 @@ where
         self.inner.account_status(user_id)
     }
 
+    fn get_user_in_tenant(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        expected_tenant: &crate::authn::ids::TenantId,
+    ) -> impl std::future::Future<Output = Result<Option<crate::authn::types::User>, Self::Error>> + Send
+    {
+        self.inner.get_user_in_tenant(user_id, expected_tenant)
+    }
+
     fn lockout_policy_for_tenant(
         &self,
         tenant_id: &crate::authn::ids::TenantId,
     ) -> crate::authn::types::LockoutPolicy {
         self.inner.lockout_policy_for_tenant(tenant_id)
+    }
+
+    fn password_rules_for_tenant(
+        &self,
+        tenant_id: &crate::authn::ids::TenantId,
+    ) -> impl std::future::Future<Output = Result<crate::authn::factor::PasswordRules, Self::Error>> + Send
+    {
+        self.inner.password_rules_for_tenant(tenant_id)
+    }
+
+    fn ip_policy_for_tenant(
+        &self,
+        tenant_id: &crate::authn::ids::TenantId,
+    ) -> impl std::future::Future<Output = Result<crate::authn::types::IpPolicy, Self::Error>> + Send
+    {
+        self.inner.ip_policy_for_tenant(tenant_id)
     }
 }
 
@@ -634,6 +662,16 @@ where
         Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
     > + Send {
         self.inner.reset_failed_attempts(user_id)
+    }
+
+    fn record_last_login(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> impl std::future::Future<
+        Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
+    > + Send {
+        self.inner.record_last_login(user_id, at)
     }
 }
 

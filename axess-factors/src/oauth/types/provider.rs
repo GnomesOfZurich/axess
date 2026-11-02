@@ -18,15 +18,6 @@ use super::error::OAuthError;
 use super::fapi::{DpopProof, DpopSigner, FapiConfig, JarmResponse, ParResponse};
 use super::login_options::OAuthLoginOptions;
 
-/// The refusal for a DPoP request to a provider that cannot sign a proof.
-fn dpop_unsupported() -> OAuthError {
-    OAuthError::Config(
-        "this provider does not support DPoP-bound token requests; \
-         sending the request without a proof would drop the binding"
-            .to_string(),
-    )
-}
-
 /// OIDC Core 12.2: the ID token of a refresh response, when there is one,
 /// names the subject of the session.
 fn refresh_subject_check(
@@ -65,10 +56,26 @@ pub mod keys {
     /// Wall-clock time (RFC3339) the ceremony started; used to
     /// detect abandoned flows past the configured TTL.
     pub const STARTED: &str = "axess.oauth.started";
-    /// Optional tenant binding stashed by `begin_oauth_login_in_tenant`.
-    /// When present, `complete_oauth_login` refuses to set the session
-    /// authenticated unless the resolved `User.tenant_id` matches.
-    pub const EXPECTED_TENANT: &str = "axess.oauth.expected_tenant";
+    /// The tenant a ceremony is bound to, as
+    /// `{"tenant": <id>, "provider_from_tenant": <bool>}`: stashed by
+    /// `begin_oauth_login_in_tenant` (`false`: the global provider) and
+    /// `begin_oauth_login_with_tenant_provider` (`true`: the provider is
+    /// resolved from the tenant's configuration, by the callback too, from
+    /// this key in the server-side session, never from the callback
+    /// request). `complete_oauth_login` refuses a resolved user of another
+    /// tenant and removes the key. A plain tenant-id string under the key is
+    /// read as a binding to the global provider. The key's name is the one
+    /// 0.13 stored the tenant under.
+    pub const CEREMONY_TENANT: &str = "axess.oauth.expected_tenant";
+
+    /// The tenant provider an authenticated session logged in through:
+    /// `{"provider": <name>, "tenant": <id>}`, written by
+    /// `complete_oauth_login` for a login begun with
+    /// `begin_oauth_login_with_tenant_provider` (the ceremony's own tenant
+    /// binding is single-use and gone by then).
+    /// `oauth_for_session` reads it so a refresh, a userinfo call, a
+    /// revocation or a logout URL reaches the provider the login ran against.
+    pub const LOGIN_TENANT: &str = "axess.oauth.login_tenant";
 
     /// Claim-binding token stashed by `finish_oauth_login` and
     /// consumed atomically by `complete_oauth_login`. Encodes the
@@ -80,6 +87,13 @@ pub mod keys {
     /// Stored under the `axess.` namespace which the documentation
     /// reserves to library use.
     pub const CLAIM_LOCK: &str = "axess.oauth.claim_lock";
+
+    /// The DPoP key of the login in flight, as the URL-safe base64 of its
+    /// seed, stashed by `begin_oauth_login` for a provider that binds tokens
+    /// to a DPoP key: the pushed authorization request names the key
+    /// (`dpop_jkt`), and `finish_oauth_login` presents the same key at the
+    /// token request. Cleared with the rest of the ceremony state.
+    pub const DPOP_KEY: &str = "axess.oauth.dpop_key";
 
     /// In-flight PAR `request_uri` + its computed expiry,
     /// stored as a JSON object `{"expires_at": "RFC3339"}`. Set by
@@ -146,11 +160,21 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// login that produced the refresh token; a refresh ID token that
     /// carries a nonce must equal it, one without a nonce is accepted, and
     /// a nonce with no original to compare it to is refused. The original
-    /// nonce is the `nonce` member of `OAuthClaims::additional_claims`.
+    /// nonce is [`OAuthClaims::nonce`], which the login returned and the
+    /// caller stored beside the refresh token.
+    ///
+    /// `dpop` is the key the tokens are bound to, for a provider that binds
+    /// them ([`binds_to_dpop`](Self::binds_to_dpop)): the token request
+    /// carries a proof signed by it and the response must say `token_type`
+    /// `DPoP`. A binding provider refuses `None` with
+    /// [`OAuthError::DpopKeyRequired`] before anything is sent, since the
+    /// refresh token sent bare would defeat the binding; a provider that
+    /// cannot sign a proof refuses `Some` rather than drop it.
     fn refresh_token<'a>(
         &'a self,
         refresh_token: &'a str,
         original_nonce: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>>;
 
     /// [`refresh_token`](Self::refresh_token), refusing a response whose
@@ -167,82 +191,45 @@ pub trait OAuthProvider: Send + Sync + 'static {
         refresh_token: &'a str,
         expected_subject: &'a str,
         original_nonce: Option<&'a str>,
-    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
-        Box::pin(async move {
-            let outcome = self.refresh_token(refresh_token, original_nonce).await?;
-            refresh_subject_check(outcome, expected_subject)
-        })
-    }
-
-    /// [`refresh_token`](Self::refresh_token) for a token bound to a DPoP key:
-    /// the token request carries a proof signed by `dpop.key`, and the
-    /// response must say `token_type` `DPoP`.
-    ///
-    /// The default passes `None` to `refresh_token` and refuses a `Some`,
-    /// since a provider that does not override this cannot sign a proof, and
-    /// sending the refresh token bare would defeat the binding.
-    fn refresh_token_with<'a>(
-        &'a self,
-        refresh_token: &'a str,
-        original_nonce: Option<&'a str>,
-        dpop: Option<DpopSigner<'a>>,
-    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
-        if dpop.is_some() {
-            return Box::pin(async { Err(dpop_unsupported()) });
-        }
-        self.refresh_token(refresh_token, original_nonce)
-    }
-
-    /// [`refresh_token_with`](Self::refresh_token_with), refusing a response
-    /// whose subject is not `expected_subject` (see
-    /// [`refresh_token_for_subject`](Self::refresh_token_for_subject)).
-    fn refresh_token_for_subject_with<'a>(
-        &'a self,
-        refresh_token: &'a str,
-        expected_subject: &'a str,
-        original_nonce: Option<&'a str>,
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             let outcome = self
-                .refresh_token_with(refresh_token, original_nonce, dpop)
+                .refresh_token(refresh_token, original_nonce, dpop)
                 .await?;
             refresh_subject_check(outcome, expected_subject)
         })
     }
 
     /// Exchange an authorization code for claims.
+    ///
+    /// `dpop` is the login's key for a provider that binds tokens to one:
+    /// the token request carries a proof signed by it, the response must
+    /// say `token_type` `DPoP`, and the returned claims hold the key. As at
+    /// [`refresh_token`](Self::refresh_token), a binding provider refuses
+    /// `None` and one that cannot sign a proof refuses `Some`.
     fn exchange_code<'a>(
         &'a self,
         code: &'a str,
         pkce_verifier: String,
         nonce: String,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>>;
 
-    /// [`exchange_code`](Self::exchange_code) for a provider that binds the
-    /// tokens to a DPoP key: the token request carries a proof signed by
-    /// `dpop.key`, the response must say `token_type` `DPoP`, and the
-    /// returned claims hold the key.
-    ///
-    /// The default passes nothing to `exchange_code` and refuses a `Some`,
-    /// for the reason given at [`refresh_token_with`](Self::refresh_token_with).
-    fn exchange_code_with<'a>(
-        &'a self,
-        code: &'a str,
-        pkce_verifier: String,
-        nonce: String,
-        dpop: Option<DpopSigner<'a>>,
-    ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
-        if dpop.is_some() {
-            return Box::pin(async { Err(dpop_unsupported()) });
-        }
-        self.exchange_code(code, pkce_verifier, nonce)
-    }
-
     /// Fetch additional user claims from the OIDC UserInfo endpoint.
+    ///
+    /// With `dpop` the request is sent with the `DPoP` authorization scheme
+    /// and a proof signed by the key that carries the token's hash, and a
+    /// `401` that challenges with `WWW-Authenticate: DPoP
+    /// error="use_dpop_nonce"` (RFC 9449 section 9) is answered once with a
+    /// proof that echoes the server's `DPoP-Nonce`. A provider that binds
+    /// tokens to a DPoP key refuses `None` before anything is sent, since
+    /// its access tokens are bound and one presented as `Bearer` is not the
+    /// token the resource server expects.
     fn fetch_userinfo<'a>(
         &'a self,
         access_token: &'a str,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>>;
 
     /// [`fetch_userinfo`](Self::fetch_userinfo), refusing a response whose
@@ -256,30 +243,15 @@ pub trait OAuthProvider: Send + Sync + 'static {
         &'a self,
         access_token: &'a str,
         expected_subject: &'a str,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
-            let claims = self.fetch_userinfo(access_token).await?;
+            let claims = self.fetch_userinfo(access_token, dpop).await?;
             if claims.sub != expected_subject {
                 return Err(OAuthError::SubjectMismatch);
             }
             Ok(claims)
         })
-    }
-
-    /// [`fetch_userinfo_for_subject`](Self::fetch_userinfo_for_subject) for a
-    /// DPoP-bound access token: the request is sent with the `DPoP`
-    /// authorization scheme and a proof signed by `dpop.key` that carries the
-    /// token's hash. The default refuses a `Some`.
-    fn fetch_userinfo_for_subject_with<'a>(
-        &'a self,
-        access_token: &'a str,
-        expected_subject: &'a str,
-        dpop: Option<DpopSigner<'a>>,
-    ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
-        if dpop.is_some() {
-            return Box::pin(async { Err(dpop_unsupported()) });
-        }
-        self.fetch_userinfo_for_subject(access_token, expected_subject)
     }
 
     /// Whether this provider requires JWT Secured Authorization Response Mode
@@ -362,19 +334,26 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// a matching `nonce` claim or verification fails. RFC 8628 / OIDC
     /// allow nonce in device flows; passing `None` preserves the prior
     /// (no-binding) behavior for backends that don't generate one.
+    ///
+    /// `dpop` is the key the tokens will be bound to, for a provider that
+    /// binds them: the token request carries a proof signed by it, the
+    /// response must say `token_type` `DPoP`, and the returned claims hold
+    /// the key. A binding provider refuses `None` before anything is sent.
     fn poll_device_token<'a>(
         &'a self,
         device_code: &'a str,
         current_interval: u64,
         nonce: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<DeviceTokenOutcome, OAuthError>> + Send + 'a>> {
         let device_code_len = device_code.len();
         let has_nonce = nonce.is_some();
+        let has_key = dpop.is_some();
         Box::pin(async move {
             Err(OAuthError::DeviceAuthorization(format!(
                 "device code flow not supported by this provider \
                  (rejected {device_code_len}-byte device_code, \
-                 interval={current_interval}s, has_nonce={has_nonce})"
+                 interval={current_interval}s, has_nonce={has_nonce}, has_key={has_key})"
             )))
         })
     }
@@ -430,10 +409,16 @@ pub trait OAuthProvider: Send + Sync + 'static {
     ///
     /// Per RFC 7009, the server MUST respond with 200 even if the token is
     /// already invalid. This method returns `Ok(())` on any 2xx response.
+    ///
+    /// A revocation issues no token, so a provider that binds tokens to a
+    /// DPoP key sends it with `dpop` `None` too; a caller that still holds
+    /// the key the token is bound to passes it, and the request carries a
+    /// proof signed by it, for an authorization server that wants one.
     fn revoke_token<'a>(
         &'a self,
         _token: &'a str,
         _token_type_hint: Option<&'a str>,
+        _dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<(), OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             Err(OAuthError::Config(
@@ -449,11 +434,19 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// containing only `client_id` and the opaque `request_uri`. The PKCE
     /// verifier, the CSRF state and the nonce are drawn from `rng`.
     ///
+    /// With `dpop`, the key the token request will present, the pushed
+    /// request carries `dpop_jkt`, the key's thumbprint (RFC 9449 section
+    /// 10), and the push carries a proof signed by the key (section 10.1),
+    /// so the authorization server binds the code to the key before the
+    /// token request presents it. Without it no `dpop_jkt` is pushed, which
+    /// RFC 9449 leaves optional: the code is bound at the token request.
+    ///
     /// Returns `(authorization_url, csrf_state, nonce, pkce_verifier)`.
     fn build_auth_url_par<'a>(
         &'a self,
         _options: &'a OAuthLoginOptions,
         _rng: &'a dyn axess_rng::SecureRng,
+        _dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<AuthUrlResult, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             Err(OAuthError::Config(
@@ -467,9 +460,15 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// Returns a `request_uri` that replaces query params in the authorization
     /// URL. The IdP stores the parameters server-side, preventing tampering
     /// and URL length issues.
+    ///
+    /// With `dpop` the push carries a proof signed by the key (RFC 9449
+    /// section 10.1), and a `use_dpop_nonce` refusal is answered once with
+    /// the server's nonce. A `dpop_jkt` parameter is the caller's to put in
+    /// `params`.
     fn push_authorization_request<'a>(
         &'a self,
         _params: &'a [(&'a str, &'a str)],
+        _dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<ParResponse, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             Err(OAuthError::Config(
@@ -512,11 +511,40 @@ pub trait OAuthProvider: Send + Sync + 'static {
         None
     }
 
+    /// Whether this provider binds its tokens to a DPoP key (RFC 9449).
+    ///
+    /// When it does, the service makes a key at `begin_oauth_login`, passes
+    /// it to the code exchange and the pushed authorization request, and
+    /// returns it in
+    /// [`OAuthClaims::dpop_key`](crate::oauth::OAuthClaims::dpop_key) for the
+    /// caller to keep and hand back on every later call with the tokens.
+    ///
+    /// Required, with no default: a provider whose
+    /// [`fapi_config`](Self::fapi_config) names
+    /// [`SenderConstraint::DPoP`](crate::oauth::SenderConstraint::DPoP)
+    /// binds only if its token requests sign the proofs they are given, which
+    /// only the implementation knows. Answer `true` exactly when the
+    /// implementation honours the key it is passed.
+    /// [`OAuthProviderConfig`](crate::oauth::OAuthProviderConfig) answers
+    /// from the switch its builder resolved: on when the IdP advertises DPoP,
+    /// unless [`without_dpop`](crate::oauth::OAuthProviderBuilder::without_dpop)
+    /// was called, and on under the FAPI profile with
+    /// [`SenderConstraint::binds_dpop`](crate::oauth::SenderConstraint::binds_dpop).
+    fn binds_to_dpop(&self) -> bool;
+
     /// Exchange client credentials for an access token (OAuth 2.0 Client
     /// Credentials grant, RFC 6749 section 4.4).
+    ///
+    /// `dpop` is the key the token will be bound to, for a provider that
+    /// binds tokens: the token request carries a proof signed by it and the
+    /// response must say `token_type` `DPoP`; the caller keeps the key
+    /// beside the token and signs every use of it. A binding provider
+    /// refuses `None` before anything is sent, since the answer would be a
+    /// bearer token where a bound one was asked for.
     fn client_credentials<'a>(
         &'a self,
         _scopes: &'a [&'a str],
+        _dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<ClientCredentialsToken, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             Err(OAuthError::Config(
@@ -549,10 +577,14 @@ mod provider_default_methods_tests {
         fn ceremony_timeout(&self) -> std::time::Duration {
             std::time::Duration::from_secs(600)
         }
+        fn binds_to_dpop(&self) -> bool {
+            false
+        }
         fn refresh_token<'a>(
             &'a self,
             _refresh_token: &'a str,
             _original_nonce: Option<&'a str>,
+            _dpop: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
@@ -561,12 +593,14 @@ mod provider_default_methods_tests {
             _code: &'a str,
             _pkce_verifier: String,
             _nonce: String,
+            _dpop: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
         fn fetch_userinfo<'a>(
             &'a self,
             _access_token: &'a str,
+            _dpop: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
@@ -609,6 +643,77 @@ mod provider_default_methods_tests {
             OAuthError::Config(msg) => assert!(msg.contains("verify_logout_jwt")),
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    /// A provider that describes a FAPI profile with DPoP but does not sign
+    /// proofs. A login through it runs the way the service runs one: a key
+    /// when the provider says it binds, the exchange given that key.
+    struct DescribesDpop(StubProvider, FapiConfig);
+
+    impl OAuthProvider for DescribesDpop {
+        fn name(&self) -> &Arc<str> {
+            self.0.name()
+        }
+        fn scopes(&self) -> &[String] {
+            self.0.scopes()
+        }
+        fn ceremony_timeout(&self) -> std::time::Duration {
+            self.0.ceremony_timeout()
+        }
+        fn fapi_config(&self) -> Option<&FapiConfig> {
+            Some(&self.1)
+        }
+        fn binds_to_dpop(&self) -> bool {
+            false
+        }
+        fn refresh_token<'a>(
+            &'a self,
+            refresh_token: &'a str,
+            original_nonce: Option<&'a str>,
+            dpop: Option<DpopSigner<'a>>,
+        ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
+            self.0.refresh_token(refresh_token, original_nonce, dpop)
+        }
+        fn exchange_code<'a>(
+            &'a self,
+            _code: &'a str,
+            _pkce_verifier: String,
+            _nonce: String,
+            _dpop: Option<DpopSigner<'a>>,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
+            Box::pin(async { Err(OAuthError::TokenExchange("reached the exchange".into())) })
+        }
+        fn fetch_userinfo<'a>(
+            &'a self,
+            access_token: &'a str,
+            dpop: Option<DpopSigner<'a>>,
+        ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
+            self.0.fetch_userinfo(access_token, dpop)
+        }
+    }
+
+    /// The profile's description alone does not make the service mint a key
+    /// the provider would then refuse: whether it binds is the provider's
+    /// own answer, so the login reaches its exchange.
+    #[tokio::test]
+    async fn a_provider_that_describes_a_dpop_profile_reaches_its_exchange() {
+        let provider = DescribesDpop(stub(), FapiConfig::default());
+        assert!(
+            provider
+                .fapi_config()
+                .is_some_and(|f| f.sender_constraint.binds_dpop()),
+            "the case: a DPoP profile"
+        );
+        let rng = axess_rng::testing::MockRng::new(7);
+        let key = provider.binds_to_dpop().then(|| DpopKey::generate(&rng));
+        let signer = key.as_ref().map(|key| DpopSigner { key, rng: &rng });
+        let outcome = provider
+            .exchange_code("code", "v".into(), "n".into(), signer)
+            .await;
+        assert!(
+            matches!(&outcome, Err(OAuthError::TokenExchange(m)) if m == "reached the exchange"),
+            "{outcome:?}"
+        );
     }
 
     /// A provider without FAPI configured must return `None`.

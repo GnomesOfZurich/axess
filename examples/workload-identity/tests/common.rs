@@ -1,6 +1,9 @@
 //! Shared test fixtures: RSA keypair, JWKS, JWT signer, verifier
 //! builder. Used by both recipe integration tests.
 
+// Each test binary compiles this file and uses only some of it.
+#![allow(dead_code)]
+
 use std::sync::{Arc, RwLock};
 
 use axess_clock::testing::MockClock;
@@ -86,4 +89,28 @@ pub fn pinned_now() -> DateTime<chrono::Utc> {
 /// `exp`-stamped here + 1h validate cleanly.
 pub fn now_and_exp() -> (i64, i64) {
     (PINNED_EPOCH_SECS, PINNED_EPOCH_SECS + 3600)
+}
+
+/// A recorded token with the JWKS that verifies it and the document its claim
+/// set was taken from. See `tests/fixtures/*.json` and `regenerate_fixtures.rs`.
+#[derive(Debug, serde::Deserialize)]
+pub struct Fixture {
+    /// The published document the claim set follows.
+    pub source: String,
+    /// The date the fixture was recorded.
+    pub recorded: String,
+    /// `real` for a token captured from a live issuer, `constructed` for one
+    /// built from the documented claim set and signed with a test key.
+    pub kind: String,
+    pub issuer: String,
+    pub audience: String,
+    pub jwks: JwkSet,
+    pub token: String,
+}
+
+/// Load `tests/fixtures/<name>.json`.
+pub fn fixture(name: &str) -> Fixture {
+    let path = format!("{}/tests/fixtures/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{path}: {e}"))
 }

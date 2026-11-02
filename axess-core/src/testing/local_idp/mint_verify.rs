@@ -149,12 +149,13 @@ fn jwks_json_serializes_to_well_formed_jwks() {
         .expect("keys[]");
     assert_eq!(keys.len(), 1);
     let key = &keys[0];
-    assert_eq!(key["kty"], "RSA");
-    assert_eq!(key["alg"], "RS256");
+    assert_eq!(key["kty"], "EC");
+    assert_eq!(key["alg"], "ES256");
     assert_eq!(key["use"], "sig");
-    assert!(key.get("n").is_some());
-    assert!(key.get("e").is_some());
-    assert!(key.get("d").is_none(), "private exponent must not leak");
+    assert_eq!(key["crv"], "P-256");
+    assert!(key.get("x").is_some());
+    assert!(key.get("y").is_some());
+    assert!(key.get("d").is_none(), "private scalar must not leak");
 }
 
 #[test]
@@ -222,7 +223,7 @@ fn clone_shares_keypair() {
 #[test]
 fn algorithm_accessor_returns_configured_alg() {
     let idp = LocalIdpFixture::new("https://test.idp.local");
-    assert_eq!(idp.algorithm(), Algorithm::RS256);
+    assert_eq!(idp.algorithm(), Algorithm::ES256);
 
     let idp384 = LocalIdpFixture::with_algorithm("https://test.idp.local", Algorithm::RS384);
     assert_eq!(idp384.algorithm(), Algorithm::RS384);
@@ -254,8 +255,14 @@ async fn jti_claim_propagates_to_verified_claims() {
 // ── verifier_algorithms() accessor ──────────────────────────────────
 
 #[test]
-fn verifier_algorithms_default_rsa_only() {
+fn verifier_algorithms_default_es256_only() {
     let idp = LocalIdpFixture::new("https://idp");
+    assert_eq!(idp.verifier_algorithms(), vec![Algorithm::ES256]);
+}
+
+#[test]
+fn verifier_algorithms_rsa_fixture_rs256_only() {
+    let idp = LocalIdpFixture::new_rsa("https://idp");
     assert_eq!(idp.verifier_algorithms(), vec![Algorithm::RS256]);
 }
 
@@ -280,7 +287,7 @@ fn verifier_algorithms_rotation_carries_historical_alg() {
 #[test]
 fn verifier_algorithms_extra_public_jwk_with_alg_included() {
     let foreign = LocalIdpSigningKey::generate_es256().with_key_id("foreign-ec");
-    let idp = LocalIdpFixture::new("https://idp").with_extra_public_jwk(foreign.jwk().clone());
+    let idp = LocalIdpFixture::new_rsa("https://idp").with_extra_public_jwk(foreign.jwk().clone());
     let algs = idp.verifier_algorithms();
     assert!(algs.contains(&Algorithm::RS256));
     assert!(algs.contains(&Algorithm::ES256));
@@ -293,7 +300,7 @@ fn verifier_algorithms_extra_public_jwk_without_alg_skipped() {
     jwk_no_alg.common.key_algorithm = None;
     let idp = LocalIdpFixture::new("https://idp").with_extra_public_jwk(jwk_no_alg);
     let algs = idp.verifier_algorithms();
-    assert_eq!(algs, vec![Algorithm::RS256], "alg-less extra JWK skipped");
+    assert_eq!(algs, vec![Algorithm::ES256], "alg-less extra JWK skipped");
 }
 
 #[test]

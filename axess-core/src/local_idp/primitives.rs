@@ -5,7 +5,6 @@
 //! import from `crate::testing`.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::jwk::Jwk;
 #[cfg(any(test, feature = "testing"))]
 use jsonwebtoken::jwk::JwkSet;
@@ -16,7 +15,6 @@ use p256::pkcs8::{DecodePrivateKey as EcDecodePrivateKey, EncodePrivateKey as Ec
 use rsa::RsaPrivateKey;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey};
 use rsa::traits::PublicKeyParts;
-use serde::{Deserialize, Serialize};
 
 pub(crate) const RSA_KEY_BITS: usize = 2048;
 /// Smallest RSA modulus accepted from imported key material.
@@ -123,7 +121,12 @@ impl LocalIdpSigningKey {
     }
 
     /// Generate a fresh RSA-2048 keypair under the given algorithm
-    /// (`RS256` / `RS384` / `RS512`). Panics on other algorithms.
+    /// (`RS256` / `RS384` / `RS512`).
+    ///
+    /// # Panics
+    ///
+    /// On another algorithm, or if key generation fails; see
+    /// [`Self::try_generate_rsa_with_algorithm`] for the fallible form.
     pub fn generate_rsa_with_algorithm(algorithm: Algorithm) -> Self {
         Self::generate_rsa_with_algorithm_and_rng(algorithm, &axess_rng::SystemRng)
     }
@@ -131,28 +134,48 @@ impl LocalIdpSigningKey {
     /// Like [`Self::generate_rsa_with_algorithm`] but drives keygen with
     /// the supplied [`SecureRng`](axess_rng::SecureRng), enabling
     /// deterministic-simulation tests to reproduce key material.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::generate_rsa_with_algorithm`]; see
+    /// [`Self::try_generate_rsa_with_algorithm_and_rng`] for the fallible form.
     pub fn generate_rsa_with_algorithm_and_rng(
         algorithm: Algorithm,
         rng: &dyn axess_rng::SecureRng,
     ) -> Self {
-        assert_rsa_alg(algorithm);
-        let mut adapter = SecureRngAdapter(rng);
-        let private_key =
-            RsaPrivateKey::new(&mut adapter, RSA_KEY_BITS).expect("RSA-2048 key generation");
-        let kid = thumbprint_kid(&format!(
-            r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#,
-            URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
-            URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
-        ));
-        Self::from_rsa_private_key(&private_key, kid, algorithm)
+        Self::try_generate_rsa_with_algorithm_and_rng(algorithm, rng)
+            .unwrap_or_else(|e| panic!("LocalIdpSigningKey RSA key generation: {e}"))
     }
 
     /// Like [`Self::generate_rsa_with_algorithm`] but returns
     /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm that is
     /// not `RS256`, `RS384` or `RS512` instead of panicking.
     pub fn try_generate_rsa_with_algorithm(algorithm: Algorithm) -> Result<Self, LocalIdpKeyError> {
+        Self::try_generate_rsa_with_algorithm_and_rng(algorithm, &axess_rng::SystemRng)
+    }
+
+    /// Like [`Self::generate_rsa_with_algorithm_and_rng`] but returns an
+    /// error instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// [`LocalIdpKeyError::UnsupportedAlgorithm`] for an algorithm that is
+    /// not `RS256`, `RS384` or `RS512`; [`LocalIdpKeyError::KeyGeneration`]
+    /// if the RSA keypair could not be generated.
+    pub fn try_generate_rsa_with_algorithm_and_rng(
+        algorithm: Algorithm,
+        rng: &dyn axess_rng::SecureRng,
+    ) -> Result<Self, LocalIdpKeyError> {
         check_rsa_alg(algorithm)?;
-        Ok(Self::generate_rsa_with_algorithm(algorithm))
+        let mut adapter = SecureRngAdapter(rng);
+        let private_key = RsaPrivateKey::new(&mut adapter, RSA_KEY_BITS)
+            .map_err(|e| LocalIdpKeyError::KeyGeneration(e.to_string()))?;
+        let kid = thumbprint_kid(&format!(
+            r#"{{"e":"{}","kty":"RSA","n":"{}"}}"#,
+            URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
+            URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
+        ));
+        Ok(Self::from_rsa_private_key(&private_key, kid, algorithm))
     }
 
     /// Load from a PEM-encoded RSA private key. Accepts both
@@ -382,16 +405,6 @@ impl LocalIdpSigningKey {
     }
 }
 
-fn assert_rsa_alg(algorithm: Algorithm) {
-    assert!(
-        matches!(
-            algorithm,
-            Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512
-        ),
-        "LocalIdpSigningKey RSA constructors only support RS256/RS384/RS512; got {algorithm:?}"
-    );
-}
-
 fn check_rsa_alg(algorithm: Algorithm) -> Result<(), LocalIdpKeyError> {
     if matches!(
         algorithm,
@@ -525,93 +538,10 @@ pub enum LocalIdpKeyError {
         /// Minimum accepted modulus length.
         min: usize,
     },
-}
-
-// ── Issuance audit hook ──────────────────────────────────────────────────────
-
-/// A single mint event observed by an [`IssuanceListener`]. Borrowed
-/// fields mirror what the fixture knew at signing time; the listener
-/// can copy whichever pieces it needs into its own log type. The
-/// signed JWT is **not** included: listeners that need to record
-/// per-token state should use [`MintClaims::with_jwt_id`] and key off
-/// `claims.jwt_id`.
-///
-/// `IssuanceEvent` is non-`Clone` and borrows from the fixture's
-/// internal state, so listeners must extract owned data inside
-/// [`IssuanceListener::on_mint`] rather than retaining the event
-/// itself.
-#[derive(Debug)]
-pub struct IssuanceEvent<'a> {
-    /// `iss` claim: the fixture's configured issuer.
-    pub issuer: &'a str,
-    /// JWT header `kid`: the signing key's id.
-    pub key_id: &'a str,
-    /// JWT header `alg`: the signing algorithm in effect.
-    pub algorithm: Algorithm,
-    /// Caller-supplied claim set (sub, aud, exp, nbf, iat, jti, custom).
-    pub claims: &'a MintClaims,
-}
-
-/// Adopter-supplied callback fired after every successful mint.
-/// Models the production-side audit log boundary: adopters writing
-/// integration tests against axess can assert on issuance behaviour
-/// (count, subject, audience, lifetime) without parsing the resulting
-/// JWT.
-///
-/// The listener fires **after** the token is signed but **before**
-/// [`LocalIdpFixture::mint`](crate::testing::local_idp::LocalIdpFixture::mint)
-/// returns. Mints that violate the fixture's
-/// [`with_max_ttl`](crate::testing::local_idp::LocalIdpFixture::with_max_ttl)
-/// cap panic before reaching the listener, so the listener only sees mints
-/// the fixture actually issued.
-///
-/// Implement this trait directly for custom recording shapes, or use
-/// the included [`MockIssuanceListener`](crate::testing::local_idp::MockIssuanceListener)
-/// for the common "capture everything, assert later" pattern.
-pub trait IssuanceListener: Send + Sync {
-    /// Invoked once per successful mint. Implementations should be
-    /// fast and panic-free; the fixture is on the caller's hot path.
-    fn on_mint(&self, event: &IssuanceEvent<'_>);
-}
-
-/// Panics if the claim set's lifetime `exp - now` exceeds `max_ttl`.
-/// Called from
-/// [`LocalIdpFixture::mint_with_header_at`](crate::testing::local_idp::LocalIdpFixture::mint_with_header_at)
-/// when the fixture has a TTL policy configured. The lifetime is measured
-/// from the supplied `now`, never from a caller-supplied `iat`, so a
-/// future-dated `iat` cannot shrink it.
-#[cfg(any(test, feature = "testing"))]
-pub(crate) fn enforce_max_ttl(claims: &MintClaims, max_ttl: Duration, now: DateTime<Utc>) {
-    let lifetime = claims.expires_at - now;
-    assert!(
-        lifetime <= max_ttl,
-        "LocalIdpFixture::mint refusing token with lifetime {lifetime} \
-         exceeding the fixture's max_ttl of {max_ttl}. \
-         Set MintClaims.expires_at within the cap or relax the policy \
-         via `with_max_ttl`.",
-    );
-}
-
-/// Returns `Err((observed, max))` if the claim set's lifetime exceeds
-/// `max_ttl`. Production-side counterpart to [`enforce_max_ttl`];
-/// `LocalIdp::mint` surfaces this as `IssuanceError::LifetimeExceedsCap`
-/// rather than panicking. Reference time is the supplied `now`
-/// (typically `Clock::now()`); the fixture's variant takes the same
-/// `now` through its `_at` mint methods.
-pub(crate) fn enforce_max_ttl_fallible(
-    claims: &MintClaims,
-    max_ttl: Duration,
-    now: DateTime<Utc>,
-) -> Result<(), (Duration, Duration)> {
-    // Measured from NOW, not from a caller-supplied `issued_at`: a future-dated
-    // `iat` would otherwise shrink the apparent lifetime under the cap while
-    // the token stays valid for the whole span.
-    let lifetime = claims.expires_at - now;
-    if lifetime <= max_ttl {
-        Ok(())
-    } else {
-        Err((lifetime, max_ttl))
-    }
+    /// The keypair could not be generated (the RNG or the RSA library
+    /// refused).
+    #[error("key generation failed: {0}")]
+    KeyGeneration(String),
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -627,155 +557,15 @@ pub(crate) fn rebuild_jwks(
     JwkSet { keys }
 }
 
-// ── MintClaims ───────────────────────────────────────────────────────────────
+mod claims;
+mod issuance;
 
-/// Builder for the claim set passed to
-/// [`LocalIdpFixture::mint`](crate::testing::local_idp::LocalIdpFixture::mint).
-///
-/// The fixture sets `iss` automatically from its configured issuer.
-/// All other claims (sub, aud, exp, nbf, iat, jti, custom) are
-/// supplied by the caller via this builder.
-#[derive(Debug, Clone)]
-pub struct MintClaims {
-    /// `sub`: required.
-    pub subject: String,
-    /// `aud`: empty `Vec` skips the claim; single-element renders
-    /// as a string, multi-element as an array (per RFC 7519 §4.1.3).
-    pub audience: Vec<String>,
-    /// `exp`: required to keep tokens auto-expiring in test runs.
-    pub expires_at: DateTime<Utc>,
-    /// `nbf`: optional.
-    pub not_before: Option<DateTime<Utc>>,
-    /// `iat`: optional. Recommended; some verifiers reject tokens
-    /// without `iat`.
-    pub issued_at: Option<DateTime<Utc>>,
-    /// `jti`: optional. Required when feeding a
-    /// [`axess_factors::jwt::verifier::JwtVerifier`] configured with a
-    /// `JtiReplayStore` (replay protection).
-    pub jwt_id: Option<String>,
-    /// Extra claims merged into the JSON object alongside the
-    /// standard fields. Must be a JSON object; caller-supplied
-    /// keys overwrite the standard claims if they collide (`iss`
-    /// being the exception: the fixture wins).
-    pub custom: serde_json::Map<String, serde_json::Value>,
-}
-
-impl MintClaims {
-    /// Build with the two required claims.
-    pub fn new(subject: impl Into<String>, expires_at: DateTime<Utc>) -> Self {
-        Self {
-            subject: subject.into(),
-            audience: Vec::new(),
-            expires_at,
-            not_before: None,
-            issued_at: None,
-            jwt_id: None,
-            custom: serde_json::Map::new(),
-        }
-    }
-
-    /// Set a single `aud` value.
-    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
-        self.audience = vec![audience.into()];
-        self
-    }
-
-    /// Set multiple `aud` values (renders as a JSON array).
-    pub fn with_audiences<I, S>(mut self, audiences: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.audience = audiences.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// Set `nbf`.
-    pub fn with_not_before(mut self, nbf: DateTime<Utc>) -> Self {
-        self.not_before = Some(nbf);
-        self
-    }
-
-    /// Set `iat`.
-    pub fn with_issued_at(mut self, iat: DateTime<Utc>) -> Self {
-        self.issued_at = Some(iat);
-        self
-    }
-
-    /// Set `jti`.
-    pub fn with_jwt_id(mut self, jti: impl Into<String>) -> Self {
-        self.jwt_id = Some(jti.into());
-        self
-    }
-
-    /// Add a single custom claim. Replaces any existing value for
-    /// the same key.
-    pub fn with_custom_claim(
-        mut self,
-        key: impl Into<String>,
-        value: impl Into<serde_json::Value>,
-    ) -> Self {
-        self.custom.insert(key.into(), value.into());
-        self
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StandardClaimsView {
-    iss: String,
-    sub: String,
-    exp: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    aud: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    nbf: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    iat: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    jti: Option<String>,
-}
-
-/// The claims RFC 7519 §4.1 registers; set from `MintClaims`' typed fields
-/// only, never from its custom map.
-const REGISTERED_CLAIMS: [&str; 7] = ["iss", "sub", "aud", "exp", "nbf", "iat", "jti"];
-
-pub(crate) fn build_claims_json(issuer: &str, claims: &MintClaims) -> serde_json::Value {
-    let aud_value = match claims.audience.as_slice() {
-        [] => None,
-        [single] => Some(serde_json::Value::String(single.clone())),
-        many => Some(serde_json::Value::Array(
-            many.iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        )),
-    };
-
-    let view = StandardClaimsView {
-        iss: issuer.to_string(),
-        sub: claims.subject.clone(),
-        exp: claims.expires_at.timestamp(),
-        aud: aud_value,
-        nbf: claims.not_before.map(|t| t.timestamp()),
-        iat: claims.issued_at.map(|t| t.timestamp()),
-        jti: claims.jwt_id.clone(),
-    };
-
-    let mut value = serde_json::to_value(view).expect("StandardClaimsView serialises");
-    if let serde_json::Value::Object(ref mut map) = value {
-        for (k, v) in &claims.custom {
-            // The registered claims are the typed fields' to state. A custom
-            // `exp` would outlive the max-TTL check (which reads the typed
-            // `expires_at`), a custom `sub` or `aud` would swap the subject
-            // or audience under the signature, and a custom `iss` would
-            // break the JWKS routing; none is honoured.
-            if REGISTERED_CLAIMS.contains(&k.as_str()) {
-                continue;
-            }
-            map.insert(k.clone(), v.clone());
-        }
-    }
-    value
-}
+pub use claims::MintClaims;
+pub(crate) use claims::build_claims_json;
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use issuance::enforce_max_ttl;
+pub(crate) use issuance::enforce_max_ttl_fallible;
+pub use issuance::{IssuanceEvent, IssuanceListener};
 
 mod rng_adapter;
 use rng_adapter::SecureRngAdapter;
@@ -783,6 +573,7 @@ use rng_adapter::SecureRngAdapter;
 #[cfg(test)]
 mod primitives_tests {
     use super::*;
+    use chrono::Utc;
     use jsonwebtoken::jwk::KeyAlgorithm;
     use rsa::rand_core::RngCore;
 
@@ -826,6 +617,15 @@ mod primitives_tests {
         );
         let err = LocalIdpSigningKey::try_generate_rsa_with_algorithm(Algorithm::HS256)
             .expect_err("HS256 is not an RSA algorithm");
+        assert!(
+            matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
+            "{err:?}"
+        );
+        let err = LocalIdpSigningKey::try_generate_rsa_with_algorithm_and_rng(
+            Algorithm::ES256,
+            &axess_rng::SystemRng,
+        )
+        .expect_err("ES256 is not an RSA algorithm");
         assert!(
             matches!(err, LocalIdpKeyError::UnsupportedAlgorithm(_)),
             "{err:?}"

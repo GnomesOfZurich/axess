@@ -462,7 +462,7 @@ fn jwk_thumbprint_es256(jwk_value: &serde_json::Value) -> Result<String, OAuthEr
     Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
 }
 
-#[cfg(all(test, feature = "fapi"))]
+#[cfg(test)]
 mod hardening_tests;
 #[cfg(test)]
 mod tests;

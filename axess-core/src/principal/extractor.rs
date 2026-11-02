@@ -252,6 +252,8 @@ mod tests {
                 tenant_id,
                 authn_time: chrono::Utc::now(),
                 factors_completed: Vec::new(),
+                impersonator: None,
+                ldap_groups: None,
             },
             ..SessionData::default()
         }

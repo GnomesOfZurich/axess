@@ -66,6 +66,39 @@ fn legacy_blob_reads_and_is_resealed_by_the_next_encode() {
     assert!(codec().decode_bytes(&id(2), &resealed).is_err());
 }
 
+/// A blob without any binding is read under the legacy window but is not
+/// marked for a re-seal: a re-seal would bind a blob moved between rows to the
+/// row it was found under. It is sealed afresh by the next save.
+#[test]
+fn an_unbound_blob_is_read_but_not_marked_for_reseal() {
+    let legacy = SessionCrypto::new([8u8; 32])
+        .encrypt_unbound(&rmp_serde::to_vec_named(&sample()).unwrap())
+        .unwrap();
+    let Decoded {
+        data: loaded,
+        reseal,
+    } = accepting_codec()
+        .decode_bytes_checked(&id(1), &legacy)
+        .unwrap();
+    assert_eq!(loaded.custom, sample().custom);
+    assert!(!reseal, "a read does not bind an unbound blob to a row");
+}
+
+/// A bound blob that only the previous key opens is marked for a re-seal
+/// under the current key.
+#[test]
+fn a_blob_under_the_previous_key_is_marked_for_reseal() {
+    let blob = codec().encode_bytes(&id(1), &sample()).unwrap();
+    let rotated =
+        SessionCodec::encrypted(SessionCrypto::new([9u8; 32]).with_previous_key([8u8; 32]));
+    let Decoded {
+        data: loaded,
+        reseal,
+    } = rotated.decode_bytes_checked(&id(1), &blob).unwrap();
+    assert_eq!(loaded.custom, sample().custom);
+    assert!(reseal);
+}
+
 #[test]
 fn marked_blob_with_empty_aad_body_is_refused() {
     let crypto = SessionCrypto::new([8u8; 32]);

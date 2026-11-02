@@ -1,10 +1,12 @@
 //! Free helpers shared across the OAuth/OIDC login ceremony submodules.
 //!
-//! Three free functions used only by the login module:
+//! Used only by the login module:
 //!
 //! - [`normalize_issuer`]: canonicalises an OIDC issuer URL.
 //! - [`is_valid_pkce_verifier`]: validates a PKCE `code_verifier` per RFC 7636.
 //! - [`compute_claim_lock`]: SHA-256 binding of (provider, subject, session_id).
+//! - [`encode_dpop_key`], [`decode_dpop_key`]: the spelling in the ceremony
+//!   state of the DPoP key a login makes at begin and presents at finish.
 
 use crate::session::extractor::AuthSession;
 
@@ -209,4 +211,22 @@ mod normalize_issuer_tests {
         assert_eq!(normalize_issuer("https://host/"), "https://host");
         assert_eq!(normalize_issuer("https://host"), "https://host");
     }
+}
+
+/// The ceremony-state spelling of a DPoP key: the URL-safe base64 of its
+/// seed, from which [`decode_dpop_key`] restores the same key.
+pub(super) fn encode_dpop_key(key: &axess_factors::oauth::DpopKey) -> String {
+    use base64::Engine as _;
+    let seed = key.to_seed_bytes();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed.as_slice())
+}
+
+/// The key [`encode_dpop_key`] spelled, or `None` for anything else.
+pub(super) fn decode_dpop_key(encoded: &str) -> Option<axess_factors::oauth::DpopKey> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .ok()?;
+    let seed: [u8; 32] = bytes.try_into().ok()?;
+    Some(axess_factors::oauth::DpopKey::from_seed(seed))
 }

@@ -154,6 +154,17 @@ under their scope; the authentication ceremony enumerates them and
 the user's authenticator (or the browser, in the passkey case)
 picks one.
 
+Registration refuses a credential id the user already holds, and
+nothing more: the factor store has no index across users, so axess
+cannot run the WebAuthn step that refuses an id registered to a
+different user. That duplicate cannot log in as anyone else, because
+every login looks credentials up per user (the discoverable path
+resolves the user from the credential's user handle first) and the
+assertion must verify against that user's stored public key; it can
+only confuse an inventory. An application that wants the
+specification's check keeps its own index of credential ids and
+refuses in its handler before `finish_fido2_registration`.
+
 ## Who may enrol and delete
 
 `begin_fido2_registration`, `finish_fido2_registration` and
@@ -162,14 +173,25 @@ picks one.
 looks one up by a request parameter has not shown the request is that
 user's. So each of the three also takes the session and requires it to be
 `Authenticated` as that user (same id and tenant), or pending signup for
-that user, so a signup can enrol its first passkey. Any other session is
-refused with `AuthnError::NoFlow` and a failed `FactorSetup`,
-`FactorEnabled` or `FactorDisabled` audit row naming the reason
-`enrolment_context`. Finishing a registration re-checks, so a session that
-was swapped between begin and finish cannot complete a ceremony it did not
-start. For a recent-authentication rule on top (re-enter the password
-before adding a key), use `AuthSession::authenticated_within` and
-`begin_step_up`.
+that user, so a signup can enrol its first passkey; deleting needs the
+full authentication, so a signup session cannot delete. An impersonated
+session is refused whoever it is authenticated as, unless the service was
+built with `with_impersonated_credential_changes_allowed`: an
+administrator does not change a user's credentials in their name, and the
+refusal answers `AuthnError::Impersonated` with the administrator as actor.
+Any other session is refused with `AuthnError::NoFlow`. Each refusal
+writes a failed `FactorSetup`, `FactorEnabled` or `FactorDisabled` audit
+row naming the reason (`enrolment_context`, `impersonated` or
+`authn_too_old`). Finishing a
+registration re-checks, so a session that was swapped between begin and
+finish cannot complete a ceremony it did not start.
+
+A recent-authentication rule is `Fido2Options::max_authn_age`, set
+through `AuthnServiceBuilder::with_fido2_options`: a session whose
+authentication is older than it is refused all three changes and must
+step up first (`begin_step_up`), so a session left open on a shared
+machine cannot enrol an attacker's passkey hours later. The default is
+no limit; a few minutes is the usual choice.
 
 ## Adding passkeys to an existing flow
 

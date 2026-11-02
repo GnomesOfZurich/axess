@@ -81,6 +81,7 @@ async fn the_default_session_client_does_not_follow_a_redirect() {
         .await
         .expect("save");
     let session = StoredDelegationSession::new(provider, store, tenant, user)
+        .expect("the default client builds")
         .with_clock(Arc::new(MockClock::at(t0())));
     assert!(session.get_access_token().await.is_err());
 }

@@ -33,6 +33,14 @@ pub struct OAuthClaims {
     pub refresh_token: Option<crate::secret::ZeroizedString>,
     /// OIDC session ID (`sid` claim) from the ID token, if present.
     pub oidc_sid: Option<String>,
+    /// The `nonce` the ID token carried, which is the nonce of the login
+    /// (the ceremony compared them). Store it beside the refresh token and
+    /// pass it as `original_nonce` to every refresh: a refresh ID token that
+    /// carries a nonce must repeat it, and one that carries a nonce when
+    /// `None` is passed is refused. `None` when the ID token had none (a
+    /// refresh response's token, or a device grant without one).
+    #[serde(default)]
+    pub nonce: Option<String>,
     /// Raw ID token JWT string, preserved for RP-Initiated Logout
     /// (`id_token_hint` parameter to the IdP's `end_session_endpoint`).
     /// Zeroized on drop. The JWT carries `sub`, `email`, and other PII.
@@ -41,14 +49,14 @@ pub struct OAuthClaims {
     /// All additional claims from the ID token as a raw JSON map.
     pub additional_claims: serde_json::Value,
     /// The DPoP key the tokens of this login are bound to, for a provider
-    /// configured with
-    /// [`SenderConstraint::DPoP`](super::fapi::SenderConstraint::DPoP); `None`
-    /// otherwise.
+    /// that [binds to DPoP](crate::oauth::OAuthProvider::binds_to_dpop)
+    /// (by default, one whose IdP advertises DPoP); `None` otherwise.
     ///
     /// Keep it for the tokens' life (`DpopKey::to_seed_bytes` exports the
     /// scalar, `DpopKey::from_seed` restores it) and hand it back on every
     /// refresh and userinfo call, since the authorization server bound the
-    /// access token to its thumbprint. Never serialised.
+    /// access token to its thumbprint. axess does not store it: a process
+    /// that refreshes the tokens without it is refused. Never serialised.
     #[serde(skip)]
     pub dpop_key: Option<std::sync::Arc<super::dpop_key::DpopKey>>,
 }

@@ -258,18 +258,20 @@ async fn post_token_endpoint(
     provider: &DelegatedProvider,
     form: &[(&str, &str)],
 ) -> Result<reqwest::Response, DelegatedError> {
-    let encoded = axess_factors::basic_credentials(&provider.client_id, &provider.client_secret);
+    let header = axess_factors::basic_authorization(&provider.client_id, &provider.client_secret)
+        .map_err(DelegatedError::ClientCredentials)?;
 
     // Before any request: the client credentials go in this POST.
     crate::outbound_http::require_https_or_loopback(&provider.token_endpoint)
         .map_err(|reason| DelegatedError::Transport(reason.to_string()))?;
 
+    // `without_url`: reqwest's message names the URL it was sent to.
     http.post(provider.token_endpoint.clone())
-        .header(AUTHORIZATION, format!("Basic {encoded}"))
+        .header(AUTHORIZATION, header)
         .form(form)
         .send()
         .await
-        .map_err(|e| DelegatedError::Transport(e.to_string()))
+        .map_err(|e| DelegatedError::Transport(e.without_url().to_string()))
 }
 
 /// RFC 6749 §5.1 token response body. Only the fields the credential

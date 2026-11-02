@@ -29,11 +29,10 @@ pub mod types;
 
 #[cfg(any(test, feature = "testing"))]
 pub use mock::MockOAuthProvider;
-pub use provider::OAuthProviderConfig;
-#[cfg(feature = "fapi")]
 pub use provider::dpop_verify::{
     DpopJtiCache, DpopVerified, DpopVerifyRequest, MemoryJtiCache, verify_dpop_proof,
 };
+pub use provider::{OAuthProviderBuilder, OAuthProviderConfig};
 pub use types::OAuthProvider;
 pub use types::*;
 

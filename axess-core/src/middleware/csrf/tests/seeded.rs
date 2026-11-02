@@ -17,7 +17,7 @@ fn csrf_cookie(resp: &Response<Body>) -> String {
         .filter_map(|hv| hv.to_str().ok())
         .find_map(|c| {
             let (k, v) = c.split(';').next()?.split_once('=')?;
-            (k.trim() == DEFAULT_CSRF_COOKIE).then(|| v.trim().to_string())
+            (k.trim() == FALLBACK_CSRF_COOKIE).then(|| v.trim().to_string())
         })
         .expect("the GET must mint the CSRF cookie")
 }

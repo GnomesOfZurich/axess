@@ -20,10 +20,10 @@
 //!    referrer chain, much narrower than a CORS-style attack.
 //! 3. **Session binding (optional, recommended where cookies reach the
 //!    iframe).** Knowing an `(iss, sid)` pair is not proof of being the user it
-//!    names. [`FrontChannelLogoutHandler::with_session_match_required`] plus
-//!    [`handle_frontchannel_logout_bound`](FrontChannelLogoutHandler::handle_frontchannel_logout_bound)
-//!    ends a session only when the request carries that very session's
-//!    cookie. The price: a browser that does not send the session cookie on
+//!    names. [`FrontChannelLogoutHandler::with_session_match_required`]
+//!    returns a [`BoundFrontChannelLogoutHandler`], whose route takes the
+//!    caller's session and ends a session only when the request carries
+//!    that very session's cookie. The price: a browser that does not send the session cookie on
 //!    the IdP's iframe (third-party cookie blocking, `SameSite=Lax`) ends
 //!    nothing, so use back-channel logout alongside.
 //! 4. **Rate limiting (REQUIRED).** Even with (1)+(2), a leaked sid is
@@ -38,7 +38,7 @@
 //! # Setup
 //!
 //! ```rust,ignore
-//! use axess::FrontChannelLogoutHandler;
+//! use axess_core::federation::frontchannel_logout::FrontChannelLogoutHandler;
 //! use axum::Router;
 //!
 //! let handler = FrontChannelLogoutHandler::new(sid_map, registry, known_issuers);
@@ -48,6 +48,15 @@
 //!         FrontChannelLogoutHandler::handle_frontchannel_logout,
 //!     ))
 //!     .with_state(handler);
+//!
+//! // Bound to the caller's own session, on a route behind the session layer:
+//! let bound = FrontChannelLogoutHandler::new(sid_map, registry, known_issuers)
+//!     .with_session_match_required();
+//! let app = Router::new()
+//!     .route("/auth/frontchannel-logout", axum::routing::get(
+//!         BoundFrontChannelLogoutHandler::handle_frontchannel_logout,
+//!     ))
+//!     .with_state(bound);
 //! ```
 //!
 //! # Differences from back-channel logout
@@ -104,9 +113,20 @@ pub struct FrontChannelLogoutHandler {
     registry: Arc<dyn SessionRevoker>,
     /// Known issuer URLs: only these can trigger logout.
     known_issuers: Arc<HashSet<String>>,
-    /// Whether [`handle_frontchannel_logout_bound`](Self::handle_frontchannel_logout_bound)
-    /// insists that the caller's own session is the one the `sid` maps to.
-    require_session_match: bool,
+}
+
+/// A [`FrontChannelLogoutHandler`] that ends a session only when it is the
+/// request's own, made by
+/// [`with_session_match_required`](FrontChannelLogoutHandler::with_session_match_required).
+///
+/// Its only route,
+/// [`handle_frontchannel_logout`](Self::handle_frontchannel_logout), takes
+/// the caller's [`AuthSession`], so it must be mounted behind the session
+/// layer; there is no route through which the session check could be
+/// skipped.
+#[derive(Clone)]
+pub struct BoundFrontChannelLogoutHandler {
+    handler: FrontChannelLogoutHandler,
 }
 
 /// Longest `iss` or `sid` the handler reads, in bytes. A real `sid` is a
@@ -128,18 +148,16 @@ impl FrontChannelLogoutHandler {
             sid_map,
             registry,
             known_issuers: Arc::new(known_issuers),
-            require_session_match: false,
         }
     }
 
-    /// Make [`handle_frontchannel_logout_bound`](Self::handle_frontchannel_logout_bound)
-    /// end a session only when the request's own session is the one the
-    /// `sid` maps to. Without it that handler behaves like
-    /// [`handle_frontchannel_logout`](Self::handle_frontchannel_logout).
+    /// A handler that ends a session only when the request's own session is
+    /// the one the `sid` maps to. Route
+    /// [`BoundFrontChannelLogoutHandler::handle_frontchannel_logout`], behind
+    /// the session layer.
     #[must_use]
-    pub fn with_session_match_required(mut self) -> Self {
-        self.require_session_match = true;
-        self
+    pub fn with_session_match_required(self) -> BoundFrontChannelLogoutHandler {
+        BoundFrontChannelLogoutHandler { handler: self }
     }
 
     /// The `iss` and `sid` of a request, when both are present and within
@@ -173,43 +191,43 @@ impl FrontChannelLogoutHandler {
     }
 
     /// End the session `(iss, sid)` maps to. When `caller` is `Some`, only if
-    /// the mapped session is the caller's own. Returns whether a session
-    /// ended.
-    async fn end_by_sid(&self, iss: &str, sid: &str, caller: Option<&SessionId>) -> bool {
+    /// the mapped session is the caller's own.
+    ///
+    /// The session is ended in the registry first; the mapping goes only
+    /// then, and only if it still names that session, so a login that
+    /// re-mapped the sid in between keeps its own mapping, and a revocation
+    /// the registry could not carry out is logged and leaves the mapping for
+    /// a later logout. The answer is the same empty page either way.
+    async fn end_by_sid(&self, iss: &str, sid: &str, caller: Option<&SessionId>) {
         let key: SidKey = (iss.to_string(), sid.to_string());
-        if let Some(caller) = caller {
-            match self.sid_map.get(&key) {
-                Some((_, mapped, _)) if &mapped == caller => {}
-                _ => {
-                    tracing::debug!(
-                        iss = %loggable(iss),
-                        "front-channel logout: the request's session is not the one this sid \
-                         maps to; ignoring"
-                    );
-                    return false;
-                }
-            }
-        }
-        if let Some((user_id, session_id, _inserted_at)) = self.sid_map.remove(&key) {
-            tracing::info!(
-                user_id = %user_id,
-                iss = %loggable(iss),
-                "front-channel logout: invalidating session by OIDC sid"
-            );
-            note_revocation(
-                self.registry
-                    .invalidate_session(&user_id, &session_id)
-                    .await,
-                "front-channel logout",
-            );
-            true
-        } else {
+        let Some((user_id, session_id, _inserted_at)) = self.sid_map.get(&key) else {
             tracing::debug!(
                 iss = %loggable(iss),
                 "front-channel logout: sid not found in sid map (session may already be invalidated)"
             );
-            false
+            return;
+        };
+        if caller.is_some_and(|caller| *caller != session_id) {
+            tracing::debug!(
+                iss = %loggable(iss),
+                "front-channel logout: the request's session is not the one this sid maps to; \
+                 ignoring"
+            );
+            return;
         }
+        tracing::info!(
+            user_id = %user_id,
+            iss = %loggable(iss),
+            "front-channel logout: invalidating session by OIDC sid"
+        );
+        let revoked = self
+            .registry
+            .invalidate_session(&user_id, &session_id)
+            .await;
+        if revoked.is_ok() {
+            self.sid_map.remove_if(&key, |entry| entry.1 == session_id);
+        }
+        note_revocation(revoked, "front-channel logout");
     }
 
     /// The empty page an iframe renders.
@@ -230,43 +248,42 @@ impl FrontChannelLogoutHandler {
         State(handler): State<FrontChannelLogoutHandler>,
         Query(params): Query<FrontChannelLogoutParams>,
     ) -> Response {
-        let (iss, sid) = match handler.accepted_params(&params) {
+        handler.respond(&params, None).await
+    }
+
+    /// Check the parameters, end the session they name (only `caller`'s, when
+    /// given), and answer with the iframe page or the refusal.
+    async fn respond(
+        &self,
+        params: &FrontChannelLogoutParams,
+        caller: Option<&SessionId>,
+    ) -> Response {
+        let (iss, sid) = match self.accepted_params(params) {
             Ok(pair) => pair,
             Err(status) => return status.into_response(),
         };
-        handler.end_by_sid(iss, sid, None).await;
+        self.end_by_sid(iss, sid, caller).await;
         Self::iframe_response()
     }
+}
 
+impl BoundFrontChannelLogoutHandler {
     /// `GET /auth/frontchannel-logout?sid=...&iss=...` for a route behind the
     /// session layer: ends the session the `sid` maps to only when it is the
     /// request's own session.
     ///
     /// Knowing a `sid` (it travels in browser history and referrers) is not
-    /// proof of being the user it names. This form takes the caller's session
-    /// from the cookie and ignores a `sid` that maps to anyone else's
-    /// session, answering the same empty page either way, so the response does
-    /// not say whether the `sid` exists. It applies only when the handler was
-    /// built with
-    /// [`with_session_match_required`](Self::with_session_match_required);
-    /// otherwise it behaves like
-    /// [`handle_frontchannel_logout`](Self::handle_frontchannel_logout).
-    pub async fn handle_frontchannel_logout_bound(
-        State(handler): State<FrontChannelLogoutHandler>,
+    /// proof of being the user it names. This route takes the caller's
+    /// session from the cookie and ignores a `sid` that maps to anyone else's
+    /// session, answering the same empty page either way, so the response
+    /// does not say whether the `sid` exists.
+    pub async fn handle_frontchannel_logout(
+        State(bound): State<BoundFrontChannelLogoutHandler>,
         session: AuthSession,
         Query(params): Query<FrontChannelLogoutParams>,
     ) -> Response {
-        let (iss, sid) = match handler.accepted_params(&params) {
-            Ok(pair) => pair,
-            Err(status) => return status.into_response(),
-        };
-        let caller = if handler.require_session_match {
-            Some(session.session_id().await)
-        } else {
-            None
-        };
-        handler.end_by_sid(iss, sid, caller.as_ref()).await;
-        Self::iframe_response()
+        let caller = session.session_id().await;
+        bound.handler.respond(&params, Some(&caller)).await
     }
 }
 

@@ -74,6 +74,48 @@ pub struct WorkloadIdentity {
     pub claims: std::collections::HashMap<String, String>,
 }
 
+// ── Audience ─────────────────────────────────────────────────────────────────
+
+/// The `aud` an issuer's tokens must name.
+///
+/// There is no silent way to skip the audience check: a token minted for
+/// any other service of the same issuer verifies against the same JWKS, so
+/// without a pin that service's token is accepted here. Skipping it is
+/// spelled [`Audience::AnyDangerous`] and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Audience {
+    /// The token's `aud` must contain exactly this value.
+    Exact(String),
+    /// Accept a token for any audience. Dangerous: every token the issuer
+    /// mints for any of its relying parties is accepted here, so a service
+    /// that can obtain one can act as the workload it names. Only for an
+    /// issuer that mints tokens for this application alone, and
+    /// [`BearerConfig::new`] warns for every issuer configured this way.
+    AnyDangerous,
+}
+
+impl Audience {
+    /// The pinned value, or `None` under [`Audience::AnyDangerous`].
+    pub fn exact(&self) -> Option<&str> {
+        match self {
+            Self::Exact(audience) => Some(audience),
+            Self::AnyDangerous => None,
+        }
+    }
+}
+
+impl From<String> for Audience {
+    fn from(audience: String) -> Self {
+        Self::Exact(audience)
+    }
+}
+
+impl From<&str> for Audience {
+    fn from(audience: &str) -> Self {
+        Self::Exact(audience.to_string())
+    }
+}
+
 // ── BearerIssuerConfig ───────────────────────────────────────────────────────
 
 /// Configuration for a single trusted JWT issuer.
@@ -86,14 +128,14 @@ pub struct BearerIssuerConfig {
     /// Expected `iss` claim value. Tokens whose `iss` doesn't match
     /// are skipped (tried against the next issuer).
     pub issuer: String,
-    /// Expected `aud` value. When `Some`, the token's `aud` must contain
-    /// this value. When `None`, audience validation is skipped, and a token
-    /// minted for any service of the same issuer is accepted;
+    /// Expected `aud` value. Under [`Audience::Exact`] the token's `aud`
+    /// must contain the value. [`Audience::AnyDangerous`] skips the check
+    /// and accepts a token minted for any service of the same issuer;
     /// [`BearerConfig::new`](crate::bearer::BearerConfig::new) logs a
-    /// warning for such an issuer. Prefer
-    /// [`BearerIssuerConfig::new`](crate::bearer::BearerIssuerConfig::new),
-    /// which requires one.
-    pub audience: Option<String>,
+    /// warning for such an issuer.
+    /// [`BearerIssuerConfig::new`](crate::bearer::BearerIssuerConfig::new)
+    /// pins one.
+    pub audience: Audience,
     /// JWKS key set for this issuer. Typically fetched at startup and
     /// refreshed periodically via a background task.
     pub jwks: Arc<JwkSet>,
@@ -108,7 +150,7 @@ impl BearerIssuerConfig {
     pub fn new(issuer: impl Into<String>, audience: impl Into<String>, jwks: Arc<JwkSet>) -> Self {
         Self {
             issuer: issuer.into(),
-            audience: Some(audience.into()),
+            audience: Audience::Exact(audience.into()),
             jwks,
             extra_claims: Vec::new(),
         }
@@ -144,7 +186,10 @@ impl BearerConfig {
     /// Configuration trusting `issuers`, judging token lifetimes on the
     /// system clock.
     pub fn new(issuers: Vec<BearerIssuerConfig>) -> Self {
-        for issuer in issuers.iter().filter(|i| i.audience.is_none()) {
+        for issuer in issuers
+            .iter()
+            .filter(|i| i.audience == Audience::AnyDangerous)
+        {
             tracing::warn!(
                 target: "axess::factors::bearer",
                 issuer = %issuer.issuer,
@@ -208,7 +253,7 @@ pub fn validate_bearer_token(
 
     // Verify signature against the issuer's JWKS.
     let mut validation_config = ValidationConfig::new();
-    validation_config.audience = issuer_cfg.audience.clone();
+    validation_config.audience = issuer_cfg.audience.exact().map(String::from);
     // The issuer was chosen by the token's own `iss`, so pinning it adds
     // nothing against a forged claim, but it makes `iss` a required claim
     // checked by the same code path as every other verifier, rather than a

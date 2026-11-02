@@ -20,8 +20,8 @@ pub enum SenderConstraint {
     DPoP,
     /// MTLS (RFC 8705): the client certificate is presented on the TLS
     /// handshake of every request to the authorization server, and the client
-    /// authenticates with it (`tls_client_auth`), so the configured client
-    /// secret is not sent. The token, revocation, userinfo and PAR requests
+    /// authenticates with it (`tls_client_auth`), so the provider needs no
+    /// `private_key_jwt` signer and sends no client secret. The token, revocation, userinfo and PAR requests
     /// go to the `mtls_endpoint_aliases` the server advertises, when it
     /// advertises them. Preferred for server-to-server.
     Mtls {
@@ -32,17 +32,30 @@ pub enum SenderConstraint {
     },
 }
 
+impl SenderConstraint {
+    /// Whether this constraint binds tokens to a DPoP key: the one place
+    /// that says the FAPI profile with [`DPoP`](Self::DPoP) implies DPoP.
+    #[must_use]
+    pub fn binds_dpop(&self) -> bool {
+        matches!(self, Self::DPoP)
+    }
+}
+
 /// FAPI 2.0 Baseline Profile configuration.
 ///
-/// When applied to a provider via [`OAuthProviderConfig::with_fapi`](crate::oauth::OAuthProviderConfig::with_fapi), enforces:
+/// When applied to a provider via
+/// [`OAuthProviderBuilder::with_fapi`](crate::oauth::OAuthProviderBuilder::with_fapi),
+/// enforces:
 /// - Mandatory PAR (authorization params sent server-to-server)
 /// - Mandatory PKCE with S256 (already the default in axess)
+/// - Client authentication by `private_key_jwt` or mTLS, never a client
+///   secret: a provider that holds neither is refused
 /// - Sender-constrained tokens (DPoP or MTLS): the token request carries the
 ///   proof or the client certificate, and a response whose `token_type` is
 ///   not what the constraint promises is refused
 /// - JARM (JWT-secured authorization responses) when `require_jarm` is set
 /// - Stricter token lifetimes (ID token `exp` ≤ 5 minutes)
-/// - `nbf` enforcement on ID tokens
+/// - An ID token `nbf` no more than 60 seconds in the future, when present
 /// - A short allow-list of ID-token signature algorithms
 #[derive(Debug, Clone)]
 pub struct FapiConfig {
@@ -80,9 +93,9 @@ impl Default for FapiConfig {
 /// and a source for the proof's `jti`.
 ///
 /// The service makes one for each token request or protected-resource call
-/// it sends for a DPoP provider and passes it to the `_with` methods of
-/// [`OAuthProvider`](crate::oauth::OAuthProvider). The provider reads the
-/// time from its own clock.
+/// it sends for a DPoP provider and passes it in the `dpop` argument of the
+/// [`OAuthProvider`](crate::oauth::OAuthProvider) methods. The provider reads
+/// the time from its own clock.
 #[derive(Clone, Copy)]
 pub struct DpopSigner<'a> {
     /// The key the access token is (or will be) bound to.

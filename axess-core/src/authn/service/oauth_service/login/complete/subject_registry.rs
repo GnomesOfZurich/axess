@@ -22,11 +22,13 @@ use std::sync::Arc;
 const PROVIDER: &str = "test-idp";
 const ISSUER: &str = "https://test-idp.example.com";
 
-/// A registry that answers `is_valid` with an error while `failing` is set.
+/// A registry that answers `is_valid` with an error while `failing` is set,
+/// and `invalidate_session` with an error while `invalidate_failing` is set.
 #[derive(Clone)]
 struct FlakyRegistry {
     inner: MemorySessionRegistry,
     failing: Arc<std::sync::atomic::AtomicBool>,
+    invalidate_failing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SessionRegistry for FlakyRegistry {
@@ -54,6 +56,12 @@ impl SessionRegistry for FlakyRegistry {
             .map_err(std::io::Error::other)
     }
     async fn invalidate_session(&self, u: &UserId, s: &SessionId) -> Result<(), Self::Error> {
+        if self
+            .invalidate_failing
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(std::io::Error::other("registry unreachable"));
+        }
         self.inner
             .invalidate_session(u, s)
             .await
@@ -69,6 +77,7 @@ impl SessionRegistry for FlakyRegistry {
 
 struct Harness {
     failing: Arc<std::sync::atomic::AtomicBool>,
+    invalidate_failing: Arc<std::sync::atomic::AtomicBool>,
     svc: AuthnService<MockIdentityStore, MockFactorStore>,
     registry: MemorySessionRegistry,
     clock: MockClock,
@@ -84,9 +93,11 @@ fn harness(capacity: usize) -> Harness {
     let registry = MemorySessionRegistry::new();
     let clock = MockClock::now();
     let failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let invalidate_failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flaky = FlakyRegistry {
         inner: registry.clone(),
         failing: failing.clone(),
+        invalidate_failing: invalidate_failing.clone(),
     };
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_registry(flaky)
@@ -96,6 +107,7 @@ fn harness(capacity: usize) -> Harness {
         .build();
     Harness {
         failing,
+        invalidate_failing,
         svc,
         registry,
         clock,
@@ -120,6 +132,7 @@ impl Harness {
             oidc_sid: sid.map(str::to_string),
             id_token_hint: None,
             additional_claims: serde_json::Value::Null,
+            nonce: None,
             dpop_key: None,
         };
         let session = test_session();
@@ -173,7 +186,7 @@ impl Harness {
             URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
             URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes()),
         );
-        let status = BackChannelLogoutHandler::handle_backchannel_logout(
+        let status = BackChannelLogoutHandler::handle_outcome(
             State(handler),
             axum::extract::Form(LogoutParams {
                 logout_token: token,
@@ -303,4 +316,36 @@ async fn registry_outage_does_not_drop_live_subject_entries() {
     for session in &sessions {
         assert!(!h.live(session).await, "the sub logout still reaches it");
     }
+}
+
+/// A login displaces the `sid` mapping of an earlier login with the same
+/// `sid` and owes that session an end. When the registry cannot end it, the
+/// session is still live and must stay in the subject registry, where the
+/// next `sub` logout finds it; it used to be forgotten on the failed end
+/// and was then out of reach of every logout.
+#[tokio::test]
+async fn a_session_the_registry_could_not_end_stays_reachable_by_sub() {
+    let h = harness(8);
+    let first = h.login(Some("sid-0")).await;
+    assert!(h.live(&first).await);
+
+    h.invalidate_failing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let second = h.login(Some("sid-0")).await;
+    assert!(h.live(&first).await, "the registry refused to end it");
+    assert!(h.live(&second).await);
+    assert_eq!(
+        h.svc.sid_map().subject_len(),
+        2,
+        "the session the registry could not end is still owed a logout"
+    );
+
+    h.invalidate_failing
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.logout(true, None).await;
+    assert!(
+        !h.live(&first).await,
+        "the sub logout reaches it once the registry is back"
+    );
+    assert!(!h.live(&second).await);
 }

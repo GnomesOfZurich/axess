@@ -3,7 +3,8 @@
 
 use super::*;
 use crate::device::storage::sql_common::SweepCutoffs;
-use crate::device::storage::sqlite::sweep::run_in_batches;
+use crate::device::storage::sql_common::ops::sweep_in_batches;
+use crate::device::storage::sqlite::statements::SqliteSql;
 use crate::device::store::SweepConfig;
 
 async fn save_idle_trusted(store: &SqliteDeviceStore, t: &TenantId, n: usize, now: DateTime<Utc>) {
@@ -28,9 +29,10 @@ async fn a_stage_runs_in_bounded_statements_and_sums_to_the_whole() {
     save_idle_trusted(&store, &t, 10, now).await;
     let cutoffs = SweepCutoffs::new(&SweepConfig::default(), now);
 
-    let (counts, statements) = run_in_batches(&store.pool, &t.to_string(), &cutoffs, 3)
-        .await
-        .unwrap();
+    let (counts, statements) =
+        sweep_in_batches::<SqliteSql>(&store.pool, &t.to_string(), &cutoffs, 3)
+            .await
+            .unwrap();
 
     assert_eq!(counts.trusted_to_seen, 10, "every row is demoted");
     assert_eq!(counts.seen_to_revoked, 0);
@@ -53,9 +55,10 @@ async fn a_stage_that_ends_on_a_full_batch_runs_once_more() {
     save_idle_trusted(&store, &t, 6, now).await;
     let cutoffs = SweepCutoffs::new(&SweepConfig::default(), now);
 
-    let (counts, statements) = run_in_batches(&store.pool, &t.to_string(), &cutoffs, 3)
-        .await
-        .unwrap();
+    let (counts, statements) =
+        sweep_in_batches::<SqliteSql>(&store.pool, &t.to_string(), &cutoffs, 3)
+            .await
+            .unwrap();
 
     assert_eq!(counts.trusted_to_seen, 6);
     assert_eq!(statements, 3 + 3);
@@ -71,7 +74,7 @@ async fn a_small_table_costs_one_statement_per_stage() {
     save_idle_trusted(&store, &t, 4, now).await;
     let cutoffs = SweepCutoffs::new(&SweepConfig::default(), now);
 
-    let (counts, statements) = run_in_batches(
+    let (counts, statements) = sweep_in_batches::<SqliteSql>(
         &store.pool,
         &t.to_string(),
         &cutoffs,
