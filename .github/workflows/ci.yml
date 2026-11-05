@@ -470,6 +470,41 @@ jobs:
       - name: Check axess-core unit tests (${{ matrix.profile }})
         run: cargo check -p axess-core --lib --profile test ${{ matrix.flags }}
 
+  # Each factor or protocol feature of axess-factors alone, so a dependency a
+  # feature uses without naming (`totp` once needed `chrono` from `hotp`)
+  # fails here instead of in an adopter's build. Mirrored by
+  # scripts/check-feature-matrix.sh.
+  factor_isolation:
+    name: Factor Isolation (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - totp
+          - hotp
+          - password
+          - email_otp
+          - recovery_code
+          - fido2
+          - ldap
+          - mtls
+          - http-body
+          - social
+          - jwt,jwt-rust-crypto
+          - oidc,jwt-rust-crypto
+          - bearer,jwt-rust-crypto
+          - oauth,jwt-rust-crypto
+          - outbound-oauth,jwt-rust-crypto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check axess-factors (${{ matrix.features }} alone)
+        run: cargo check -p axess-factors --lib --no-default-features --features ${{ matrix.features }}
+
   # Check that examples compile
   examples:
     name: Examples

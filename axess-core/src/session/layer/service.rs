@@ -220,10 +220,14 @@ where
             };
             let mut response = match response {
                 Ok(response) => response,
-                // The guard is gone, so run the finish here before
-                // returning the handler's error.
+                // The guard is gone, so run the finish here, and wait for it,
+                // before returning the handler's error: the session is stored
+                // by the time the caller sees it. An error carries no
+                // headers, so a cookie this request issued (a new device
+                // token) cannot ride it; the next request is issued one
+                // again.
                 Err(error) => {
-                    tokio::spawn(finish.run());
+                    finish_in_task(finish, &handle).await;
                     return Err(error);
                 }
             };

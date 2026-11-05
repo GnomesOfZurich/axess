@@ -8,29 +8,66 @@ use super::*;
 #[test]
 fn extract_bearer_token_valid() {
     assert_eq!(
-        extract_bearer_token(Some("Bearer eyJhbGciOiJSUzI1NiJ9.abc.def")),
+        extract_bearer_token(Some("Bearer eyJhbGciOiJSUzI1NiJ9.abc.def")).unwrap(),
         Some("eyJhbGciOiJSUzI1NiJ9.abc.def")
     );
 }
 
 #[test]
 fn extract_bearer_token_missing_header() {
-    assert_eq!(extract_bearer_token(None), None);
+    assert_eq!(extract_bearer_token(None).unwrap(), None);
 }
 
 #[test]
 fn extract_bearer_token_wrong_scheme() {
-    assert_eq!(extract_bearer_token(Some("Basic dXNlcjpwYXNz")), None);
+    assert_eq!(
+        extract_bearer_token(Some("Basic dXNlcjpwYXNz")).unwrap(),
+        None
+    );
 }
 
+/// A header that names the scheme and carries no token is malformed, not
+/// absent: it is refused rather than served as anonymous.
 #[test]
-fn extract_bearer_token_empty_after_bearer() {
-    assert_eq!(extract_bearer_token(Some("Bearer ")), None);
+fn a_bearer_header_without_a_token_is_refused() {
+    let config = BearerConfig::new(Vec::new());
+    for header in ["Bearer", "Bearer ", "Bearer   ", "bearer\t", "Bearer\t\t "] {
+        assert!(
+            matches!(
+                validate_bearer_token(Some(header), &config),
+                Err(BearerError::InvalidToken(_))
+            ),
+            "{header:?}"
+        );
+    }
+}
+
+/// A tab between the scheme and the token is whitespace, not part of the
+/// scheme, so the token is read (and judged) rather than the header ignored.
+#[test]
+fn a_tab_after_the_scheme_separates_the_token() {
+    let config = BearerConfig::new(Vec::new());
+    assert!(matches!(
+        validate_bearer_token(Some("Bearer\tnot.a.jwt!"), &config),
+        Err(BearerError::InvalidToken(_))
+    ));
+}
+
+#[tokio::test]
+async fn the_layer_answers_401_for_a_bearer_header_without_a_token() {
+    for header in ["Bearer", "Bearer ", "Bearer   "] {
+        let res = through_layer(header, BearerConfig::new(Vec::new())).await;
+        assert_eq!(
+            res.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "{header:?}"
+        );
+    }
 }
 
 #[test]
 fn extract_bearer_token_no_space_after_bearer() {
-    assert_eq!(extract_bearer_token(Some("Bearertoken")), None);
+    assert_eq!(extract_bearer_token(Some("Bearertoken")).unwrap(), None);
 }
 
 // ── validate_bearer_token ────────────────────────────────────────────
@@ -475,4 +512,103 @@ fn any_audience_is_an_explicit_dangerous_choice() {
         .expect("validates")
         .expect("a bearer token is present");
     assert_eq!(identity.audiences, vec!["some-other-service"]);
+}
+
+// ── several configs for one issuer ───────────────────────────────────
+
+/// Two configs may name the same issuer (an old and a new key set, or one
+/// per audience). A token the first one cannot verify is tried against the
+/// next.
+#[test]
+fn a_token_is_tried_against_every_config_for_its_issuer() {
+    let (_other_der, other_jwks, _) = rsa_keypair();
+    let (der, jwks, kid) = rsa_keypair();
+    let issuer = |jwks: JwkSet| BearerIssuerConfig {
+        issuer: "https://accounts.example.com".to_string(),
+        audience: Audience::Exact("my-service".to_string()),
+        jwks: Arc::new(jwks),
+        extra_claims: Vec::new(),
+    };
+    // The key that signed the token is the second config's.
+    let config = BearerConfig::new(vec![issuer(other_jwks), issuer(jwks)]);
+    let token = sign_jwt(&der, &kid, &valid_claims());
+    let identity = validate_bearer_token(Some(&format!("Bearer {token}")), &config)
+        .expect("the second config verifies it")
+        .expect("an identity");
+    assert_eq!(identity.issuer, "https://accounts.example.com");
+}
+
+/// When no config for the issuer verifies the token, it is refused.
+#[test]
+fn a_token_no_config_for_its_issuer_verifies_is_refused() {
+    let (_o1, jwks_a, _) = rsa_keypair();
+    let (_o2, jwks_b, _) = rsa_keypair();
+    let (der, _jwks, kid) = rsa_keypair();
+    let issuer = |jwks: JwkSet| BearerIssuerConfig {
+        issuer: "https://accounts.example.com".to_string(),
+        audience: Audience::Exact("my-service".to_string()),
+        jwks: Arc::new(jwks),
+        extra_claims: Vec::new(),
+    };
+    let config = BearerConfig::new(vec![issuer(jwks_a), issuer(jwks_b)]);
+    let token = sign_jwt(&der, &kid, &valid_claims());
+    assert!(matches!(
+        validate_bearer_token(Some(&format!("Bearer {token}")), &config),
+        Err(BearerError::Jwt(_))
+    ));
+}
+
+// ── the Authorization header ─────────────────────────────────────────
+
+/// Send `value` through the layer with a handler that reports whether a
+/// workload identity arrived; the status is the layer's own.
+async fn through_layer_raw(
+    value: axum::http::HeaderValue,
+    config: BearerConfig,
+) -> (axum::http::StatusCode, bool) {
+    use tower::{Layer, ServiceExt};
+    let inner = tower::service_fn(|req: axum::http::Request<axum::body::Body>| async move {
+        let has = req.extensions().get::<WorkloadIdentity>().is_some();
+        let mut res = axum::response::Response::new(axum::body::Body::empty());
+        res.extensions_mut().insert(has);
+        Ok::<_, std::convert::Infallible>(res)
+    });
+    let service = BearerTokenLayer::new(config).layer(inner);
+    let req = axum::http::Request::builder()
+        .header(axum::http::header::AUTHORIZATION, value)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = service.oneshot(req).await.unwrap();
+    let has = res.extensions().get::<bool>().copied().unwrap_or(false);
+    (res.status(), has)
+}
+
+/// A header that is not valid text carries a credential nobody can read,
+/// so it is refused; passing the request on unauthenticated would let a
+/// mangled token read as no token.
+#[tokio::test]
+async fn an_authorization_header_that_is_not_text_is_refused() {
+    let (_der, jwks, _kid) = rsa_keypair();
+    let value = axum::http::HeaderValue::from_bytes(b"Bearer \xff\xfe").unwrap();
+    let (status, _) = through_layer_raw(value, make_config(jwks)).await;
+    assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+}
+
+/// RFC 7235 section 2.1: the scheme is case-insensitive, and RFC 7230
+/// allows more than one space after it.
+#[tokio::test]
+async fn the_bearer_scheme_is_case_insensitive_and_spaces_are_trimmed() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign_jwt(&der, &kid, &valid_claims());
+    for header in [
+        format!("bearer {token}"),
+        format!("BEARER {token}"),
+        format!("Bearer   {token}"),
+        format!("Bearer {token} "),
+    ] {
+        let value = axum::http::HeaderValue::from_str(&header).unwrap();
+        let (status, has) = through_layer_raw(value, make_config(jwks.clone())).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{header}");
+        assert!(has, "{header} reads as the token it carries");
+    }
 }

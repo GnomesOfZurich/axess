@@ -445,6 +445,17 @@ impl OAuthProviderBuilder {
                 base.par_endpoint.is_some(),
             )?;
         }
+        // The assertion names the signer's client id as `iss` and `sub`,
+        // and every request names the provider's: two ids are a client the
+        // IdP would refuse on every request.
+        if let Some(signer) = &signer
+            && signer.client_id() != base.client_id.as_str()
+        {
+            return Err(OAuthError::Config(
+                "the private_key_jwt signer's client id is not the provider's client id"
+                    .to_string(),
+            ));
+        }
         if signer.is_some() || fapi.is_some() {
             base.client_secret = None;
         }

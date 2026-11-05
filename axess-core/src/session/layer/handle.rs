@@ -7,7 +7,7 @@
 //! reach it through the typed `AuthSession` extractor surface.
 
 use super::swap::{Swap, SwapStore, Swapped, swap_merging};
-use crate::session::data::SessionData;
+use crate::session::data::{SessionData, merge_concurrent};
 use crate::session::id::SessionId;
 use axess_rng::SecureRng;
 use std::sync::Arc;
@@ -121,12 +121,33 @@ impl SessionInner {
         else {
             return Some(value);
         };
+        // Once the id has rotated, the row under the id the request arrived
+        // with is retired and an attacker may know that id: it gets only the
+        // removal, on the row as loaded, never this request's data (a login
+        // would sit in it). The response stores the data under the new id.
+        let rotated = self.pre_cycle_id.is_some();
+        let removal;
+        let (local, expected) = if rotated {
+            let mut only_removal = base.clone();
+            let present = only_removal
+                .custom
+                .as_object_mut()
+                .is_some_and(|c| c.remove(key).is_some());
+            if !present {
+                // Not stored: the value was set by this request.
+                return Some(value);
+            }
+            removal = only_removal;
+            (&removal, base.revision)
+        } else {
+            (&self.data, self.data.revision)
+        };
         let mut taken = Some(value);
         let swap = Swap {
             row: &self.pre_cycle_id.unwrap_or(self.id),
             base: Some(&base),
-            local: &self.data,
-            expected: self.data.revision,
+            local,
+            expected,
             ttl,
             max_custom_bytes: self.max_custom_bytes,
         };
@@ -139,7 +160,15 @@ impl SessionInner {
         .await;
         match outcome {
             Ok(Swapped::Written(written)) => {
-                self.data = (*written).clone();
+                if rotated {
+                    // The retry merged a concurrent write into `written`;
+                    // this request's data, which the response stores under
+                    // the new id, takes it in as well, or a value another
+                    // request consumed would come back.
+                    self.data = merge_concurrent(&base, &self.data, &written);
+                } else {
+                    self.data = (*written).clone();
+                }
                 if let Some(target) = self.consume.as_mut() {
                     target.loaded = Some(*written);
                 }

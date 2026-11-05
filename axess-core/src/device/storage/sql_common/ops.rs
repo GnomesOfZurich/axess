@@ -29,17 +29,20 @@ pub(crate) trait DeviceSql: Send + Sync + 'static {
     /// The engine.
     type Db: Database;
 
-    /// Begin the transaction a create of `device` runs in, serialised
-    /// against every other create of its `(tenant, fingerprint, owner)`.
-    fn begin_create(
-        pool: &Pool<Self::Db>,
+    /// Begin, on `conn`, the transaction a create of `device` runs in,
+    /// serialised against every other create of its
+    /// `(tenant, fingerprint, owner)`.
+    fn begin_create<'c>(
+        conn: &'c mut <Self::Db as Database>::Connection,
         device: &Device,
-    ) -> impl Future<Output = Result<Transaction<'static, Self::Db>, SqlDeviceStoreError>> + Send;
+    ) -> impl Future<Output = Result<Transaction<'c, Self::Db>, SqlDeviceStoreError>> + Send;
 
     /// Release what [`begin_create`](Self::begin_create) took beyond the
-    /// transaction itself; runs before the transaction ends, on every path.
+    /// transaction itself. It runs on the same connection after the
+    /// transaction has been committed or rolled back, so what it releases
+    /// is never given up before the insert is visible to the next create.
     fn end_create(
-        tx: &mut Transaction<'_, Self::Db>,
+        conn: &mut <Self::Db as Database>::Connection,
         device: &Device,
     ) -> impl Future<Output = Result<(), sqlx::Error>> + Send;
 
@@ -212,6 +215,34 @@ pub(crate) async fn save<D: DeviceSql>(
     Ok(())
 }
 
+/// The connection a create runs on. It goes back to the pool only once the
+/// create has released what it took (see [`DeviceSql::end_create`]); on any
+/// other exit, including the future being dropped part-way, it is closed
+/// instead, which ends its session and frees a session lock it may still
+/// hold. A pooled connection that kept such a lock would block every later
+/// create of the key until the process ended.
+struct CreateConn<DB: Database> {
+    conn: sqlx::pool::PoolConnection<DB>,
+    released: bool,
+}
+
+impl<DB: Database> CreateConn<DB> {
+    async fn acquire(pool: &Pool<DB>) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            conn: pool.acquire().await?,
+            released: false,
+        })
+    }
+}
+
+impl<DB: Database> Drop for CreateConn<DB> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.conn.close_on_drop();
+        }
+    }
+}
+
 /// `create_or_find`: the live device of `device`'s create key when there is
 /// one, or `device` (already passed through `for_save`) inserted with its
 /// family index, serialised against every other create of that key.
@@ -221,21 +252,28 @@ pub(crate) async fn create_or_find<D: DeviceSql>(
     device: Device,
 ) -> Result<Device, SqlDeviceStoreError> {
     let w = DeviceWrite::new(&codec, &device)?;
-    let mut tx = D::begin_create(&pool, &device).await?;
+    // One connection for the lock and the transaction: a session lock
+    // belongs to the connection, and is released on it only after the
+    // transaction has ended.
+    let mut held = CreateConn::acquire(&pool).await?;
+    let mut tx = D::begin_create(&mut held.conn, &device).await?;
     let outcome = create_locked::<D>(&codec, &mut tx, &w).await;
-    let released = D::end_create(&mut tx, &device).await;
+    let ended = match &outcome {
+        Ok((None, _)) => tx.commit().await,
+        _ => tx.rollback().await,
+    };
+    ended?;
+    D::end_create(&mut held.conn, &device).await?;
+    held.released = true;
+    // The connection goes back before the re-seal asks the pool for one.
+    drop(held);
     let (existing, reseal) = outcome?;
-    released?;
     match existing {
         Some(existing) => {
-            tx.rollback().await?;
             reseal_rows::<D>(&pool, reseal).await;
             Ok(existing)
         }
-        None => {
-            tx.commit().await?;
-            Ok(device)
-        }
+        None => Ok(device),
     }
 }
 
@@ -244,7 +282,7 @@ pub(crate) async fn create_or_find<D: DeviceSql>(
 /// and its family index.
 async fn create_locked<D: DeviceSql>(
     codec: &BindingsCodec,
-    tx: &mut Transaction<'static, D::Db>,
+    tx: &mut Transaction<'_, D::Db>,
     w: &DeviceWrite,
 ) -> Result<(Option<Device>, Option<Reseal>), SqlDeviceStoreError> {
     if let (Some(existing), reseal) = decode_optional(codec, D::live_of_key(tx, w).await?)? {

@@ -34,7 +34,7 @@ pub(super) fn build_aad(provider: &str, tenant: &TenantId, user: &UserId, field:
 
 /// Append `bytes` length-prefixed, so no value can bleed into its neighbour.
 fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
-    buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&crate::length_prefix::length_prefix(bytes.len()));
     buf.extend_from_slice(bytes);
 }
 
@@ -57,7 +57,7 @@ fn build_aad_scoped(
     let mut sorted: Vec<&str> = scopes.iter().map(String::as_str).collect();
     sorted.sort_unstable();
     sorted.dedup();
-    buf.extend_from_slice(&(sorted.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&crate::length_prefix::length_prefix(sorted.len()));
     for scope in sorted {
         put(&mut buf, scope.as_bytes());
     }
@@ -121,6 +121,13 @@ pub(super) struct Opened {
 }
 
 impl Opened {
+    /// Whether the envelope's AAD covers `expires_at`. Only the current
+    /// version does; the expiry stored beside an older envelope is
+    /// unauthenticated.
+    pub(super) fn binds_expiry(&self) -> bool {
+        self.version == ENVELOPE_VERSION
+    }
+
     pub(super) fn is_stale(&self, current_key_id: Option<&str>) -> bool {
         current_key_id.is_some_and(|c| self.version != ENVELOPE_VERSION || self.key_id != c)
     }

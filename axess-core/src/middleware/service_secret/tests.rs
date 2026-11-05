@@ -555,6 +555,127 @@ async fn sweeping_resumes_after_the_clock_steps_back() {
     assert_eq!(v.remembered(), 1);
 }
 
+/// A clock that steps forward past the tolerance sweeps what it accepted
+/// before the step. When it steps back, those signatures are inside the
+/// tolerance again, and a replay of one is still refused; a fresh request
+/// stamped by the corrected clock is not.
+#[tokio::test]
+async fn a_replay_after_the_clock_steps_forward_and_back_is_refused() {
+    let clock = clock();
+    let (v, secrets) = verifier(&clock, addressed().tolerance(Duration::from_secs(60)));
+    assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
+
+    clock.advance_secs(200);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH + 200, "b").await,
+        StatusCode::OK
+    );
+    clock.advance_secs(-199);
+
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH, "a").await,
+        StatusCode::UNAUTHORIZED,
+        "the swept signature is refused when the clock comes back"
+    );
+    assert_eq!(verdict(&v, &secrets, EPOCH + 1, "c").await, StatusCode::OK);
+}
+
+/// A clock that steps back past the tolerance leaves what it accepted ahead
+/// of it. Those signatures are not counted against the cache, and a replay of
+/// one is still refused once the clock has caught up with its stamp.
+#[tokio::test]
+async fn a_replay_after_the_clock_steps_back_and_forward_is_refused() {
+    let clock = clock();
+    let config = addressed()
+        .tolerance(Duration::from_secs(60))
+        .max_remembered(1);
+    let (v, secrets) = verifier(&clock, config);
+    assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
+
+    clock.advance_secs(-200);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH - 200, "b").await,
+        StatusCode::OK,
+        "the entry ahead of the clock does not fill the cache"
+    );
+    clock.advance_secs(200);
+
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH, "a").await,
+        StatusCode::UNAUTHORIZED,
+        "the signature accepted before the step is still remembered"
+    );
+}
+
+/// An entry set aside while the clock was behind comes back into the count
+/// once the clock has caught up with its stamp, so it holds a place in the
+/// cache again instead of being remembered for free.
+#[tokio::test]
+async fn an_entry_set_aside_counts_again_when_the_clock_catches_up() {
+    let clock = clock();
+    let config = addressed()
+        .tolerance(Duration::from_secs(60))
+        .max_remembered(1);
+    let (v, secrets) = verifier(&clock, config);
+    assert_eq!(verdict(&v, &secrets, EPOCH, "a").await, StatusCode::OK);
+
+    clock.advance_secs(-200);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH - 200, "b").await,
+        StatusCode::OK
+    );
+    clock.advance_secs(200);
+
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH, "c").await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the entry that was set aside fills the one place again"
+    );
+}
+
+/// After a step back larger than the window, callers that stamp with the
+/// server's clock are below the mark a sweep raised before the step, and are
+/// refused as stale until the clock has passed the mark. It fails closed by
+/// design: the signatures forgotten up to the mark cannot be told from a
+/// replay of them.
+#[tokio::test]
+async fn a_step_back_leaves_server_stamped_callers_stale_until_the_clock_passes_the_mark() {
+    let clock = clock();
+    let (v, secrets) = verifier(&clock, addressed().tolerance(Duration::from_secs(60)));
+    clock.advance_secs(1_000);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH + 1_000, "a").await,
+        StatusCode::OK
+    );
+    clock.advance_secs(1_000);
+    // This request's sweep forgets "a" for age and raises the mark to its
+    // stamp.
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH + 2_000, "b").await,
+        StatusCode::OK
+    );
+
+    // The clock steps back 1500 s, past the window and below the mark.
+    clock.advance_secs(-1_500);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH + 500, "c").await,
+        StatusCode::UNAUTHORIZED,
+        "a stamp below the mark is stale"
+    );
+    clock.advance_secs(500);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH + 1_000, "d").await,
+        StatusCode::UNAUTHORIZED,
+        "a stamp at the mark is stale"
+    );
+    clock.advance_secs(1);
+    assert_eq!(
+        verdict(&v, &secrets, EPOCH + 1_001, "e").await,
+        StatusCode::OK,
+        "past the mark the caller is served again"
+    );
+}
+
 // ── Warn throttle ─────────────────────────────────────────────────────────
 
 /// One warning per second; a clock that steps back re-arms the throttle

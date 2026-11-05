@@ -80,7 +80,11 @@ let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
     // name: a renamed or deleted organisation frees its old name.
     github_actions_mapper(
         trust_domain,
-        GitHubAllowlist::new().owner_id("123456").repository_id("987654321"),
+        GitHubAllowlist::new()
+            .owner_id("123456")
+            .repository_id("987654321")
+            .git_ref("refs/heads/main")
+            .event("push"),
     ),
 );
 let principal = resolver.resolve().await?;
@@ -89,6 +93,11 @@ let principal = resolver.resolve().await?;
 The mapper requires the `repository_id` and `repository_owner_id` claims and
 refuses a token without them or with an owner id that is not on the allowlist.
 The names (`repository`, `repository_owner`) are kept as attributes for audit.
+
+The allowlist also restricts the run and fails closed: the token's `ref` or
+`environment` must be one you listed with `git_ref` or `environment`, and its
+`event_name` one you listed with `event`. A token without the claim, or an
+allowlist with nothing listed, admits nothing.
 
 For Kubernetes, `k8s_sa_mapper_pinned` with `SaUidPins` refuses a service
 account whose UID is not the one registered for its namespace and name, which
@@ -171,11 +180,24 @@ keys/
   historical/
     v1.pem             every key (current and historical) as PKCS#8 PEM
     v2.pem
+    v3.pem.new         a key minted for a rotation not yet made; not published
+  rotated_at/
+    v1                 when v1 stopped being current
+  retired/
+    v0.pem             keys taken out of the JWKS, kept for audit
 ```
 
 Rotation flips `current.kid` atomically via temp-file + rename;
 historical PEMs are retained so tokens minted under prior keys keep
-verifying through the JWKS until ops decides to retire them.
+verifying through the JWKS until they are retired. `POST /admin/retire`
+refuses a key until one hour (the longest token lifetime) has passed since
+the rotation that replaced it, a kid that was ever used is refused for a new
+key, and a rotation that fails removes the key file it wrote. A new key is
+staged as `{kid}.pem.new` and renamed to `.pem` inside the rotation, so a
+crash between minting and the pointer flip does not publish a key with no
+rotation record. A historical key left by a store that kept no `rotated_at`
+record is stamped the first time the store loads it, so it can be retired
+one hour after that first start, not at once.
 
 ### Curl walkthrough
 
@@ -226,7 +248,7 @@ curl -s http://localhost:3000/jwks.json | jq '.keys[].kid'
 - **Out-of-band key generation.** The `/admin/rotate` handler
   generates a fresh RSA key for demonstration. Real ops generate
   keys with `openssl genrsa` (or out of an HSM / KMS), copy the
-  PEM into `historical/`, and then call rotate.
+  PEM into `historical/` as `{kid}.pem.new`, and then call rotate.
 
 ### Adapting to your file layout
 

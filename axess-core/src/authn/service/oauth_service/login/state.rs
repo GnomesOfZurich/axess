@@ -122,7 +122,9 @@ where
             );
         }
         let elapsed = self.inner.clock.now() - started_at.with_timezone(&chrono::Utc);
-        elapsed.to_std().unwrap_or_default() > timeout
+        // A start in the future (a negative elapsed time) is no start the
+        // ceremony can have had: expired.
+        elapsed.to_std().map_or(true, |elapsed| elapsed > timeout)
     }
 
     /// Clear all OAuth ceremony state from the session.

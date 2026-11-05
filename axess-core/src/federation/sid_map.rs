@@ -440,7 +440,8 @@ impl SidMap {
     /// whose triple was forgotten are dropped on the way.
     pub fn sweep_subject_candidates(&self, max: usize) -> Vec<(String, UserId, SessionId)> {
         let mut state = self.lock();
-        let mut out = Vec::new();
+        let mut out: Vec<(String, UserId, SessionId)> = Vec::new();
+        let mut named: std::collections::HashSet<SessionId> = std::collections::HashSet::new();
         for _ in 0..max.min(state.subject_order.len()) {
             let Some((iss, user, session)) = state.subject_order.pop_front() else {
                 break;
@@ -449,7 +450,9 @@ impl SidMap {
                 .subject_of
                 .get(&session)
                 .is_some_and(|held| held.issuer == iss && held.user == user);
-            if live {
+            // A triple forgotten and registered again leaves two items; the
+            // second is dropped here, so it names the session once.
+            if live && named.insert(session) {
                 state.subject_order.push_back((iss.clone(), user, session));
                 out.push((iss, user, session));
             }

@@ -56,8 +56,8 @@ pub mod __macro_support;
 mod authz_macro;
 
 fn update_query(uri: &Uri, new_query: String) -> Result<Uri, http::Error> {
-    let query = form_urlencoded::parse(uri.query().map(|q| q.as_bytes()).unwrap_or_default());
-    let updated_query = form_urlencoded::Serializer::new(new_query)
+    let query = url::form_urlencoded::parse(uri.query().map(|q| q.as_bytes()).unwrap_or_default());
+    let updated_query = url::form_urlencoded::Serializer::new(new_query)
         .extend_pairs(query)
         .finish();
 
@@ -80,14 +80,14 @@ pub fn url_with_redirect_query(
     // Match the parameter NAME exactly, after percent-decoding: `ref=nextgen`
     // does not carry a `next` parameter, `%6Eext=/x` does.
     if uri.query().is_some_and(|q| {
-        form_urlencoded::parse(q.as_bytes()).any(|(name, _)| name == redirect_field)
+        url::form_urlencoded::parse(q.as_bytes()).any(|(name, _)| name == redirect_field)
     }) {
         return Ok(uri);
     };
 
     let redirect_uri_string = redirect_uri.to_string();
     let redirect_uri_encoded: String =
-        form_urlencoded::byte_serialize(redirect_uri_string.as_bytes()).collect();
+        url::form_urlencoded::byte_serialize(redirect_uri_string.as_bytes()).collect();
     let redirect_query = format!("{redirect_field}={redirect_uri_encoded}");
 
     update_query(&uri, redirect_query)

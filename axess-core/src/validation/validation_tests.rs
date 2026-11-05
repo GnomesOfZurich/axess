@@ -397,3 +397,44 @@ fn every_format_character_but_the_joiners_is_refused_in_an_identifier() {
         accepted.join(", ")
     );
 }
+
+/// A zero width space between a base letter and its combining accent must
+/// not keep the two from composing: both spellings are one key.
+#[test]
+fn an_invisible_character_does_not_split_a_name_into_two_keys() {
+    let key = normalise_identifier("caf\u{00E9}@x.com");
+    for variant in [
+        "cafe\u{200B}\u{0301}@x.com",
+        "cafe\u{0301}@x.com",
+        "cafe\u{00AD}\u{0301}@x.com",
+        "cafe\u{200D}\u{0301}@x.com",
+    ] {
+        assert_eq!(normalise_identifier(variant), key, "{variant:?}");
+    }
+}
+
+/// A new account's identifier has no surrounding whitespace, no whitespace
+/// but the ASCII space, and is NFKC-stable; the looser read-back rule still
+/// accepts what earlier versions let in.
+#[test]
+fn a_new_identifier_is_held_to_the_stricter_rule() {
+    assert!(is_acceptable_new_identifier("admin"));
+    assert!(is_acceptable_new_identifier("anna maria"));
+    assert!(is_acceptable_new_identifier("caf\u{00E9}"));
+    for bad in [
+        "admin ",
+        " admin",
+        "admin\u{00A0}",
+        "ad\u{00A0}min",
+        "ad\tmin",
+        "ad\u{3000}min",
+        "\u{FF41}dmin",
+        "\u{FB01}le",
+        "admin\u{200B}",
+    ] {
+        assert!(!is_acceptable_new_identifier(bad), "{bad:?}");
+    }
+    // Read-back keeps accepting the looser forms.
+    assert!(is_acceptable_identifier("admin "));
+    assert!(is_acceptable_identifier("admin\u{00A0}"));
+}

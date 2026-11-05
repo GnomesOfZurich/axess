@@ -57,6 +57,7 @@ impl PrincipalResolver for SessionResolver {
             user_id: snap.user_id,
             tenant_id: snap.tenant_id,
             session_id: Some(snap.session_id),
+            impersonator: snap.impersonation.map(|i| i.admin),
             attributes: BTreeMap::new(),
         }))
     }

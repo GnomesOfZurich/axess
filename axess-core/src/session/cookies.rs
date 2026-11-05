@@ -8,7 +8,7 @@
 //!
 //! # Why borrow-and-iterate instead of `Cookie::split_parse`
 //!
-//! `tower_cookies::Cookie::split_parse` takes ownership of the input
+//! `cookie::Cookie::split_parse` takes ownership of the input
 //! string and re-allocates each parsed pair. On a hot middleware that
 //! runs on every authenticated request, that was the dominant per-request
 //! allocation in flame graphs. The borrow-based scan here keeps
@@ -22,7 +22,7 @@ use axum::http::header;
 ///
 /// 4 KiB leaves abundant headroom for application-supplied cookie
 /// schemes (the legitimate axess session cookie is ~65 bytes;
-/// `tower_cookies` recommends staying well under the 4 KiB RFC 6265
+/// the `cookie` docs recommend staying well under the 4 KiB RFC 6265
 /// soft limit) while bounding the worst-case scan + clone a malicious
 /// client can force on any middleware hot path that runs
 /// [`extract_named_cookie`].

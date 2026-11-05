@@ -121,7 +121,7 @@ pub(super) async fn push_authorization_request(
     })?;
 
     let mut form: Vec<(String, String)> = Vec::with_capacity(params.len() + 3);
-    cfg.add_client_auth(&mut form, par_url)?;
+    let basic = cfg.token_grant_auth(&mut form, par_url)?;
     form.extend(
         params
             .iter()
@@ -129,7 +129,7 @@ pub(super) async fn push_authorization_request(
     );
 
     let (status, body) = cfg
-        .post_form_constrained(par_url, &form, None, dpop, "PAR request")
+        .post_form_constrained(par_url, &form, basic, dpop, "PAR request")
         .await?;
 
     if !status.is_success() {

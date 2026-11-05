@@ -67,24 +67,24 @@ fn a_sweep_runs_once_per_interval_and_not_once_per_request() {
     store.try_acquire_at("y", millis(t0, 500));
     // Due (2.0 s since construction): "y" is still live, nothing goes.
     store.try_acquire_at("p", millis(t0, 2_000));
-    assert_eq!(store.buckets.len(), 2);
+    assert_eq!(crate::locked::lock(&store.buckets).len(), 2);
     // Due again, and nothing has aged out yet.
     store.try_acquire_at("s", millis(t0, 4_000));
-    assert_eq!(store.buckets.len(), 3);
+    assert_eq!(crate::locked::lock(&store.buckets).len(), 3);
 
     // "y" aged out at 4.5 s, but the last sweep was 0.7 s ago: not due.
     store.try_acquire_at("q", millis(t0, 4_700));
     assert!(
-        store.buckets.contains_key("y"),
+        crate::locked::lock(&store.buckets).contains_key("y"),
         "a request inside the sweep interval must not scan the table"
     );
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 4);
 
     // 1.0 s after the last sweep: due, and "y" goes.
     store.try_acquire_at("r", millis(t0, 5_000));
-    assert!(!store.buckets.contains_key("y"));
+    assert!(!crate::locked::lock(&store.buckets).contains_key("y"));
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 4);
-    assert_eq!(store.buckets.len(), 4);
+    assert_eq!(crate::locked::lock(&store.buckets).len(), 4);
 }
 
 /// A clock that steps back leaves the sweep stamp in the future. The sweep
@@ -97,14 +97,14 @@ fn a_clock_step_back_does_not_stop_the_sweeps() {
     store.try_acquire_at("old", t0);
     // Sweep stamp moves to +1000 s.
     store.try_acquire_at("anchor", secs(t0, 1_000));
-    assert!(!store.buckets.contains_key("old"));
+    assert!(!crate::locked::lock(&store.buckets).contains_key("old"));
     // The clock steps back an hour; an entry created then must still be swept
     // once it has aged, long before the clock reaches +1000 s again.
     let back = secs(t0, -3_600);
     store.try_acquire_at("after-step", back);
     store.try_acquire_at("tick", secs(back, 60));
     assert!(
-        !store.buckets.contains_key("after-step"),
+        !crate::locked::lock(&store.buckets).contains_key("after-step"),
         "a stale stamp in the future must not suppress sweeps"
     );
 }
@@ -132,7 +132,7 @@ fn the_bucket_count_tracks_inserts_and_evictions() {
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 50);
     store.evict_expired_at(secs(t0, 20));
     assert_eq!(store.bucket_count.load(Ordering::Acquire), 0);
-    assert!(store.buckets.is_empty());
+    assert!(crate::locked::lock(&store.buckets).is_empty());
 }
 
 fn fill_to_the_cap(store: &BucketStore, at: DateTime<Utc>) {
@@ -155,7 +155,7 @@ fn at_the_hard_cap_a_new_key_is_refused_and_a_known_key_is_not_evicted() {
         Acquire::Saturated { retry_after_secs } => assert_eq!(retry_after_secs, 75),
         _ => panic!("a key with no bucket must be refused at the cap"),
     }
-    assert!(!store.buckets.contains_key("newcomer"));
+    assert!(!crate::locked::lock(&store.buckets).contains_key("newcomer"));
     assert_eq!(store.bucket_count.load(Ordering::Acquire), HARD_BUCKET_CAP);
 
     // A key that already has a bucket keeps its count: its second token is
@@ -198,5 +198,5 @@ async fn the_layer_answers_429_for_a_new_key_when_the_table_is_full() {
         .unwrap();
     assert_eq!(new.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(new.headers().get("retry-after").unwrap(), "75");
-    assert!(!svc.store.buckets.contains_key("10.9.9.9"));
+    assert!(!crate::locked::lock(&svc.store.buckets).contains_key("10.9.9.9"));
 }

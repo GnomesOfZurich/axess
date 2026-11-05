@@ -176,15 +176,40 @@ pub(super) fn degraded_poll_delay(failed_polls: u32, draw: u64) -> Duration {
     interval - quarter + Duration::from_millis(draw % spread_ms.saturating_add(1))
 }
 
-/// What a degraded watcher does with the registry's answer to a poll:
-/// `None` when the session is revoked (the watch ends), otherwise the count
-/// of consecutive polls the registry failed to answer, which the next wait
-/// backs off on.
-pub(super) fn after_degraded_poll<E>(answer: Result<bool, E>, failed_polls: u32) -> Option<u32> {
+/// What a revocation watcher does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Watch {
+    /// The session is revoked: the watch ends.
+    Ended,
+    /// The session is live: wait for events.
+    Waiting,
+    /// The registry cannot be trusted to have said so: poll it on a timer.
+    /// Holds the count of consecutive polls it did not answer, which the next
+    /// wait backs off on.
+    Polling(u32),
+}
+
+/// What a degraded watcher does with the registry's answer to a poll: end the
+/// watch when the session is revoked, otherwise keep polling with the count of
+/// consecutive polls the registry failed to answer.
+pub(super) fn after_degraded_poll<E>(answer: Result<bool, E>, failed_polls: u32) -> Watch {
     match answer {
-        Ok(false) => None,
-        Ok(true) => Some(0),
-        Err(_) => Some(failed_polls.saturating_add(1)),
+        Ok(false) => Watch::Ended,
+        Ok(true) => Watch::Polling(0),
+        Err(_) => Watch::Polling(failed_polls.saturating_add(1)),
+    }
+}
+
+/// What a subscribed watcher does with the registry's answer to a check it
+/// made itself (after joining, after a dropped message): end the watch when
+/// the session is revoked, wait for events when it is live. A registry that
+/// did not answer is no evidence of liveness, so it moves the watcher into
+/// the polling state.
+pub(super) fn after_check<E>(answer: Result<bool, E>) -> Watch {
+    match answer {
+        Ok(false) => Watch::Ended,
+        Ok(true) => Watch::Waiting,
+        Err(_) => Watch::Polling(0),
     }
 }
 

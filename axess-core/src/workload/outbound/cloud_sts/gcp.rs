@@ -357,7 +357,13 @@ impl GcpServiceAccountImpersonator {
     /// Override the IAM Credentials endpoint base: primarily for
     /// tests pointing at wiremock. The base must be HTTPS (plain HTTP only to a
     /// loopback host); any other is refused before a request is sent.
-    pub fn with_endpoint_base(mut self, base: Url) -> Self {
+    pub fn with_endpoint_base(mut self, mut base: Url) -> Self {
+        // `Url::join` replaces the last path segment unless the path ends in
+        // a slash, which would send requests beside the prefix, not under it.
+        if !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
         self.endpoint_base = Arc::new(base);
         self
     }

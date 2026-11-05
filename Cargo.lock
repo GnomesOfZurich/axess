@@ -261,17 +261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-lock"
-version = "3.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "290f7f2596bd5b78a9fec8088ccd89180d7f9f55b94b0576823bbbdc72ee8311"
-dependencies = [
- "event-listener",
- "event-listener-strategy",
- "pin-project-lite",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "axess"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess-core",
  "axess-factors",
@@ -345,14 +334,12 @@ dependencies = [
 
 [[package]]
 name = "axess-cache"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess-clock",
  "chrono",
  "criterion",
  "loom",
- "lru",
- "parking_lot 0.13.0",
  "proptest",
  "tokio",
  "tracing",
@@ -360,14 +347,14 @@ dependencies = [
 
 [[package]]
 name = "axess-clock"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "axess-core"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "axess-cache",
@@ -377,19 +364,16 @@ dependencies = [
  "axess-rng",
  "axum",
  "base32",
- "base64 0.23.1",
+ "base64 0.22.1",
  "cedar-policy",
  "chrono",
+ "cookie",
  "criterion",
- "dashmap",
- "form_urlencoded",
  "fred",
  "hmac 0.13.0",
  "http-body-util",
- "hyper",
  "jsonwebtoken",
  "ldap3",
- "moka",
  "openidconnect",
  "p256",
  "proptest",
@@ -413,9 +397,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
- "totp-rs",
  "tower",
- "tower-cookies",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
@@ -429,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "axess-events"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess-identity",
  "axess-strings",
@@ -444,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-authz"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess",
  "axum",
@@ -459,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-fapi"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess",
  "axum",
@@ -473,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-minimal"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess",
  "axum",
@@ -483,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-oauth"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess",
  "axess-core",
@@ -507,10 +489,11 @@ dependencies = [
 
 [[package]]
 name = "axess-example-sqlite"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "qrcode",
  "serde",
@@ -529,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-workload-identity"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess",
  "axess-clock",
@@ -554,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "axess-factors"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "argon2 0.6.0",
  "axess-clock",
@@ -562,10 +545,8 @@ dependencies = [
  "axess-rng",
  "axum",
  "base32",
- "base64 0.23.1",
+ "base64 0.22.1",
  "chrono",
- "dashmap",
- "hex",
  "hmac 0.13.0",
  "jsonwebtoken",
  "ldap3",
@@ -582,7 +563,6 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tokio",
- "totp-rs",
  "tower",
  "tracing",
  "url",
@@ -595,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "axess-identity"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess-rng",
  "rkyv",
@@ -609,23 +589,23 @@ dependencies = [
 
 [[package]]
 name = "axess-macros"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "axess-core",
  "cedar-policy",
- "form_urlencoded",
+ "url",
 ]
 
 [[package]]
 name = "axess-rng"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
- "rand 0.10.3",
+ "getrandom 0.4.3",
 ]
 
 [[package]]
 name = "axess-strings"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "compact_str",
  "criterion",
@@ -1342,15 +1322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1557,21 +1528,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "dashmap"
-version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "lock_api 0.4.14",
- "once_cell",
- "parking_lot_core 0.9.12",
- "serde",
 ]
 
 [[package]]
@@ -1915,16 +1871,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "event-listener-strategy"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
-dependencies = [
- "event-listener",
- "pin-project-lite",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2034,7 +1980,7 @@ dependencies = [
  "fred-macros",
  "futures",
  "log",
- "parking_lot 0.12.5",
+ "parking_lot",
  "rand 0.8.8",
  "redis-protocol",
  "semver",
@@ -2112,8 +2058,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"
 dependencies = [
  "futures-core",
- "lock_api 0.4.14",
- "parking_lot 0.12.5",
+ "lock_api",
+ "parking_lot",
 ]
 
 [[package]]
@@ -2296,12 +2242,6 @@ checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
 
 [[package]]
 name = "hashbrown"
-version = "0.14.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
@@ -2316,9 +2256,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "foldhash",
-]
 
 [[package]]
 name = "hashlink"
@@ -3006,15 +2943,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lock_api"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3063,15 +2991,6 @@ dependencies = [
  "scoped-tls",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "lru"
-version = "0.19.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
-dependencies = [
- "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3155,26 +3074,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "moka"
-version = "0.12.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4293f18e7567a1caf3c584855554377025c65e0aa445344d04171f5ad63d19b9"
-dependencies = [
- "async-lock",
- "crossbeam-channel",
- "crossbeam-epoch",
- "crossbeam-utils",
- "equivalent",
- "event-listener",
- "futures-util",
- "parking_lot 0.12.5",
- "portable-atomic",
- "smallvec",
- "tagptr",
- "uuid",
 ]
 
 [[package]]
@@ -3533,18 +3432,8 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api 0.4.14",
- "parking_lot_core 0.9.12",
-]
-
-[[package]]
-name = "parking_lot"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
-dependencies = [
- "lock_api 0.5.0",
- "parking_lot_core 0.10.0",
+ "lock_api",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -3555,19 +3444,7 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall 0.5.18",
- "smallvec",
- "windows-link",
-]
-
-[[package]]
-name = "parking_lot_core"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
-dependencies = [
- "libc",
- "redox_syscall 0.9.5",
+ "redox_syscall",
  "smallvec",
  "windows-link",
 ]
@@ -4188,15 +4065,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_syscall"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
-dependencies = [
- "bitflags 2.13.2",
-]
-
-[[package]]
 name = "ref-cast"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4777,7 +4645,7 @@ dependencies = [
  "futures-util",
  "log",
  "once_cell",
- "parking_lot 0.12.5",
+ "parking_lot",
  "serial_test_derive",
 ]
 
@@ -4962,7 +4830,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api 0.4.14",
+ "lock_api",
 ]
 
 [[package]]
@@ -5180,7 +5048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf776ba3fa74f83bf4b63c3dcbbf82173db2632ed8452cb2d891d33f459de70f"
 dependencies = [
  "new_debug_unreachable",
- "parking_lot 0.12.5",
+ "parking_lot",
  "phf_shared",
  "precomputed-hash",
 ]
@@ -5281,12 +5149,6 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
-
-[[package]]
-name = "tagptr"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tempfile"
@@ -5445,7 +5307,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.5",
@@ -5604,7 +5466,7 @@ dependencies = [
  "cookie",
  "futures-util",
  "http",
- "parking_lot 0.12.5",
+ "parking_lot",
  "pin-project-lite",
  "tower-layer",
  "tower-service",

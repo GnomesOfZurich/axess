@@ -77,6 +77,18 @@ async fn a_cap_of_zero_revokes_nothing_and_issues_nothing() {
     assert_eq!(active[0].id, kept.id);
 }
 
+/// A ttl of zero or less issues tokens that are born expired.
+#[test]
+fn validate_refuses_a_ttl_that_is_not_positive() {
+    for ttl in [chrono::Duration::zero(), chrono::Duration::seconds(-1)] {
+        let config = RefreshTokenConfig {
+            ttl,
+            ..RefreshTokenConfig::default()
+        };
+        assert!(config.validate().is_err(), "ttl {ttl} must be refused");
+    }
+}
+
 #[test]
 fn validate_accepts_the_defaults_and_a_keyed_config() {
     assert_eq!(RefreshTokenConfig::default().validate(), Ok(()));

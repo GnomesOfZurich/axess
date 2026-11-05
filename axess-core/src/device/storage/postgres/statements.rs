@@ -1,7 +1,7 @@
 //! The PostgreSQL statements the multi-statement device operations
 //! ([`ops`](crate::device::storage::sql_common::ops)) are built from.
 
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Connection as _, PgConnection, PgPool, Postgres, Transaction};
 
 use crate::device::storage::sql_common::ops::{DeviceSql, SweepStage};
 use crate::device::storage::sql_common::{
@@ -17,14 +17,14 @@ pub(super) struct PostgresSql;
 impl DeviceSql for PostgresSql {
     type Db = Postgres;
 
-    async fn begin_create(
-        pool: &PgPool,
+    async fn begin_create<'c>(
+        conn: &'c mut PgConnection,
         device: &Device,
-    ) -> Result<Transaction<'static, Postgres>, SqlDeviceStoreError> {
+    ) -> Result<Transaction<'c, Postgres>, SqlDeviceStoreError> {
         // A transaction-scoped advisory lock on the create key serialises
         // the read and the insert against every other create of that key;
         // it is released with the transaction on every path.
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
             .bind(create_lock_name(device))
             .execute(&mut *tx)
@@ -32,10 +32,7 @@ impl DeviceSql for PostgresSql {
         Ok(tx)
     }
 
-    async fn end_create(
-        _tx: &mut Transaction<'_, Postgres>,
-        _device: &Device,
-    ) -> Result<(), sqlx::Error> {
+    async fn end_create(_conn: &mut PgConnection, _device: &Device) -> Result<(), sqlx::Error> {
         Ok(())
     }
 
@@ -224,7 +221,8 @@ impl DeviceSql for PostgresSql {
     ) -> Result<u64, sqlx::Error> {
         Ok(sqlx::query(
             "UPDATE devices SET user_id = $3 \
-             WHERE tenant_id = $1 AND id = $2 AND user_id IS NULL",
+             WHERE tenant_id = $1 AND id = $2 AND user_id IS NULL \
+               AND trust_level <> 'Revoked'",
         )
         .bind(tenant)
         .bind(device_id)
@@ -266,30 +264,57 @@ impl DeviceSql for PostgresSql {
         cutoffs: &SweepCutoffs,
         batch: i64,
     ) -> Result<u64, sqlx::Error> {
+        // Each statement repeats the subquery's conditions in the outer
+        // WHERE: under READ COMMITTED a row changed by a concurrent commit is
+        // re-checked against the outer conditions only, so a revocation that
+        // lands meanwhile must fail them rather than be overwritten. The
+        // condition of a stage is written once and placed in both positions.
+        macro_rules! stage_sql {
+            ($set:literal, $cond:literal, $limit:literal) => {
+                concat!(
+                    $set,
+                    " WHERE ",
+                    $cond,
+                    " AND id IN (SELECT id FROM devices WHERE ",
+                    $cond,
+                    " LIMIT ",
+                    $limit,
+                    ")"
+                )
+            };
+        }
         let query = match stage {
-            SweepStage::StampRevoked => sqlx::query(
-                "UPDATE devices SET revoked_at = $2 WHERE tenant_id = $1 AND id IN (SELECT id FROM devices WHERE tenant_id = $1 AND trust_level = 'Revoked' AND revoked_at IS NULL LIMIT $3)",
-            )
+            SweepStage::StampRevoked => sqlx::query(stage_sql!(
+                "UPDATE devices SET revoked_at = $2",
+                "tenant_id = $1 AND trust_level = 'Revoked' AND revoked_at IS NULL",
+                "$3"
+            ))
             .bind(tenant)
             .bind(cutoffs.now)
             .bind(batch),
-            SweepStage::DemoteTrusted => sqlx::query(
-                "UPDATE devices SET trust_level = 'Seen', demoted_at = $3 WHERE tenant_id = $1 AND id IN (SELECT id FROM devices WHERE tenant_id = $1 AND trust_level = 'Trusted' AND last_seen_at < $2 LIMIT $4)",
-            )
+            SweepStage::DemoteTrusted => sqlx::query(stage_sql!(
+                "UPDATE devices SET trust_level = 'Seen', demoted_at = $3",
+                "tenant_id = $1 AND trust_level = 'Trusted' AND last_seen_at < $2",
+                "$4"
+            ))
             .bind(tenant)
             .bind(cutoffs.trusted)
             .bind(cutoffs.now)
             .bind(batch),
-            SweepStage::RevokeSeen => sqlx::query(
-                "UPDATE devices SET trust_level = 'Revoked', revoked_at = $3, demoted_at = NULL WHERE tenant_id = $1 AND id IN (SELECT id FROM devices WHERE tenant_id = $1 AND trust_level = 'Seen' AND last_seen_at < $2 AND (demoted_at IS NULL OR demoted_at < $2) LIMIT $4)",
-            )
+            SweepStage::RevokeSeen => sqlx::query(stage_sql!(
+                "UPDATE devices SET trust_level = 'Revoked', revoked_at = $3, demoted_at = NULL",
+                "tenant_id = $1 AND trust_level = 'Seen' AND last_seen_at < $2 AND (demoted_at IS NULL OR demoted_at < $2)",
+                "$4"
+            ))
             .bind(tenant)
             .bind(cutoffs.seen)
             .bind(cutoffs.now)
             .bind(batch),
-            SweepStage::Purge => sqlx::query(
-                "DELETE FROM devices WHERE tenant_id = $1 AND id IN (SELECT id FROM devices WHERE tenant_id = $1 AND trust_level = 'Revoked' AND revoked_at IS NOT NULL AND revoked_at < $2 LIMIT $3)",
-            )
+            SweepStage::Purge => sqlx::query(stage_sql!(
+                "DELETE FROM devices",
+                "tenant_id = $1 AND trust_level = 'Revoked' AND revoked_at IS NOT NULL AND revoked_at < $2",
+                "$3"
+            ))
             .bind(tenant)
             .bind(cutoffs.grace)
             .bind(batch),

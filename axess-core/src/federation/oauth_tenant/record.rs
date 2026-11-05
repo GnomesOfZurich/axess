@@ -82,13 +82,18 @@ pub struct TenantOAuthProviderRecord {
 
 impl TenantOAuthProviderRecord {
     /// The binding a credential of this record is sealed under: the tenant
-    /// and the provider name, so a row copied to another tenant or name does
-    /// not open.
+    /// and the provider name, with the issuer and client id as context, so a
+    /// row copied to another tenant or name, or pointed at another IdP or
+    /// client, does not open.
     fn binding_parts(&self) -> (AuthnScope, FactorKind) {
         (
             AuthnScope::Tenant(self.tenant_id),
             FactorKind::Federated(FederatedProvider::Custom(self.name.clone())),
         )
+    }
+
+    fn binding_context(&self) -> [&str; 2] {
+        [self.issuer.as_str(), self.client_id.as_str()]
     }
 
     fn secret_mut(&mut self) -> &mut FactorSecret {
@@ -116,7 +121,11 @@ impl TenantOAuthProviderRecord {
         let Some(plain) = self.secret().plain().map(str::to_string) else {
             return Ok(());
         };
-        let sealed = cipher.seal(&plain, FactorSecretBinding::new(&scope, &kind))?;
+        let context = self.binding_context();
+        let sealed = cipher.seal(
+            &plain,
+            FactorSecretBinding::new(&scope, &kind).with_context(&context),
+        )?;
         *self.secret_mut() = FactorSecret::Sealed(sealed);
         Ok(())
     }
@@ -133,20 +142,62 @@ impl TenantOAuthProviderRecord {
         &self,
         cipher: Option<&FactorSecretCipher>,
     ) -> Result<ZeroizedString, FactorSecretError> {
+        self.open_credential(cipher).map(|(text, _)| text)
+    }
+
+    /// Like [`open_secret`](Self::open_secret), also saying whether the
+    /// credential is sealed under a previous key or the first release's
+    /// binding and is due a [`reseal`](Self::reseal).
+    ///
+    /// # Errors
+    ///
+    /// As [`open_secret`](Self::open_secret).
+    pub fn open_credential(
+        &self,
+        cipher: Option<&FactorSecretCipher>,
+    ) -> Result<(ZeroizedString, bool), FactorSecretError> {
         let (scope, kind) = self.binding_parts();
         match (self.secret(), cipher) {
-            (FactorSecret::Plain(text), None) => Ok(text.clone()),
+            (FactorSecret::Plain(text), None) => Ok((text.clone(), false)),
             (FactorSecret::Plain(text), Some(cipher)) => {
                 if cipher.plain_secrets_readable() {
-                    Ok(text.clone())
+                    Ok((text.clone(), false))
                 } else {
                     Err(FactorSecretError::PlainRefused)
                 }
             }
             (FactorSecret::Sealed(_), None) => Err(FactorSecretError::NoCipher),
-            (FactorSecret::Sealed(sealed), Some(cipher)) => cipher
-                .open(sealed, FactorSecretBinding::new(&scope, &kind))
-                .map(|opened| opened.secret),
+            (FactorSecret::Sealed(sealed), Some(cipher)) => {
+                let context = self.binding_context();
+                cipher
+                    .open(
+                        sealed,
+                        FactorSecretBinding::new(&scope, &kind).with_context(&context),
+                    )
+                    .map(|opened| (opened.secret, opened.rotated))
+            }
         }
+    }
+
+    /// Seal the credential again under `cipher`'s current key and binding,
+    /// from the `plain` text [`open_credential`](Self::open_credential)
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// [`FactorSecretError::Seal`] if encryption fails.
+    pub fn reseal(
+        &mut self,
+        cipher: &FactorSecretCipher,
+        plain: &str,
+    ) -> Result<(), FactorSecretError> {
+        let (scope, kind) = self.binding_parts();
+        let context = self.binding_context();
+        let sealed = cipher.seal(
+            plain,
+            FactorSecretBinding::new(&scope, &kind).with_context(&context),
+        )?;
+        *self.secret_mut() = FactorSecret::Sealed(sealed);
+        Ok(())
     }
 }

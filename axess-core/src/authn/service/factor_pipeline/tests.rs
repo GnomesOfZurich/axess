@@ -126,7 +126,7 @@ fn build_service_with_user(
         });
     // We need a second handle to inspect events/counters after the
     // service runs; `MockIdentityStore` is `Clone` and shares the
-    // underlying `DashMap`s via `Arc`.
+    // underlying maps via `Arc`.
     let inspector = identity.clone();
     let service = AuthnService::new(identity, MockFactorStore::new())
         .with_audit_context(AuditContext::default());
@@ -547,7 +547,198 @@ async fn persist_fail_with_update_logs_warning_when_retries_exhausted() {
     );
 }
 
+/// A factor store that loses one compare-and-save, then reports the row as
+/// absent on the next read while a freshly enrolled config lands in the
+/// store: an admin delete and re-enrolment between two reads.
+#[derive(Clone)]
+struct VanishingRowFactors {
+    inner: MockFactorStore,
+    lose_next_cas: Arc<std::sync::atomic::AtomicBool>,
+    hide_next_load: Arc<std::sync::atomic::AtomicBool>,
+    enrolled: Arc<std::sync::Mutex<Option<FactorConfig>>>,
+    /// Compare-and-saves the wrapped store answered with a loss: writes
+    /// attempted against a prior that was no longer stored.
+    lost_to_the_store: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FactorStore for VanishingRowFactors {
+    type Error = crate::testing::mock_authn::MockStoreError;
+
+    async fn resolve_factor(
+        &self,
+        scope: &AuthnScope,
+        kind: FactorKind,
+    ) -> Result<Option<crate::authn::store::ResolvedFactor>, Self::Error> {
+        self.inner.resolve_factor(scope, kind).await
+    }
+    async fn load_factor(
+        &self,
+        scope: &AuthnScope,
+        kind: FactorKind,
+    ) -> Result<Option<FactorConfig>, Self::Error> {
+        use std::sync::atomic::Ordering;
+        if self.hide_next_load.swap(false, Ordering::SeqCst) {
+            let enrolled = self.enrolled.lock().unwrap().take();
+            if let Some(config) = enrolled {
+                self.inner.save_factor(scope, config).await?;
+            }
+            return Ok(None);
+        }
+        self.inner.load_factor(scope, kind).await
+    }
+    async fn save_factor(&self, scope: &AuthnScope, c: FactorConfig) -> Result<(), Self::Error> {
+        self.inner.save_factor(scope, c).await
+    }
+    async fn compare_and_save_factor(
+        &self,
+        scope: &AuthnScope,
+        prior: &FactorConfig,
+        updated: FactorConfig,
+    ) -> Result<bool, Self::Error> {
+        use std::sync::atomic::Ordering;
+        if self.lose_next_cas.swap(false, Ordering::SeqCst) {
+            self.hide_next_load.store(true, Ordering::SeqCst);
+            return Ok(false);
+        }
+        let swapped = self
+            .inner
+            .compare_and_save_factor(scope, prior, updated)
+            .await?;
+        if !swapped {
+            self.lost_to_the_store.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(swapped)
+    }
+    async fn insert_factor_if_absent(
+        &self,
+        scope: &AuthnScope,
+        config: FactorConfig,
+    ) -> Result<bool, Self::Error> {
+        self.inner.insert_factor_if_absent(scope, config).await
+    }
+    async fn available_methods(
+        &self,
+        u: &UserId,
+        t: &TenantId,
+    ) -> Result<Vec<crate::authn::store::AuthMethod>, Self::Error> {
+        self.inner.available_methods(u, t).await
+    }
+    async fn save_method(
+        &self,
+        s: &AuthnScope,
+        m: crate::authn::store::AuthMethod,
+    ) -> Result<(), Self::Error> {
+        self.inner.save_method(s, m).await
+    }
+    async fn remove_method(&self, s: &AuthnScope, n: &str) -> Result<(), Self::Error> {
+        self.inner.remove_method(s, n).await
+    }
+    async fn set_method_enabled(
+        &self,
+        s: &AuthnScope,
+        n: &str,
+        e: bool,
+    ) -> Result<bool, Self::Error> {
+        self.inner.set_method_enabled(s, n, e).await
+    }
+}
+
+#[tokio::test]
+async fn persist_fail_with_update_keeps_a_factor_enrolled_after_the_row_vanished() {
+    let inner = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
+    let factors = VanishingRowFactors {
+        inner: inner.clone(),
+        lose_next_cas: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        hide_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        enrolled: Arc::new(std::sync::Mutex::new(Some(hotp_config(77)))),
+        lost_to_the_store: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let identity = MockIdentityStore::new()
+        .with_tenant(fixture_tenant())
+        .with_user(user_with_status(EntityState::Active));
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+
+    service
+        .persist_fail_with_update(
+            &fixture_scope(),
+            FactorKind::Hotp,
+            &hotp_config_with_attempts(5, 1),
+        )
+        .await
+        .unwrap();
+
+    let stored = inner
+        .load_factor(&fixture_scope(), FactorKind::Hotp)
+        .await
+        .unwrap()
+        .expect("hotp present");
+    assert_eq!(
+        hotp_counter(&stored),
+        77,
+        "the newly enrolled factor must not be overwritten by the stale failure record"
+    );
+}
+
+/// After the row vanished and a factor was enrolled meanwhile, the retry
+/// reloads it before writing: a compare-and-save against the prior it knew
+/// was gone would only lose and spend an attempt.
+#[tokio::test]
+async fn a_failure_record_reloads_before_writing_after_the_row_vanished() {
+    let inner = MockFactorStore::new().with_factor(fixture_scope(), hotp_config(5));
+    let lost = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factors = VanishingRowFactors {
+        inner: inner.clone(),
+        lose_next_cas: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        hide_next_load: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        enrolled: Arc::new(std::sync::Mutex::new(Some(hotp_config(77)))),
+        lost_to_the_store: lost.clone(),
+    };
+    let identity = MockIdentityStore::new()
+        .with_tenant(fixture_tenant())
+        .with_user(user_with_status(EntityState::Active));
+    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+
+    service
+        .persist_fail_with_update(
+            &fixture_scope(),
+            FactorKind::Hotp,
+            &hotp_config_with_attempts(5, 1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        lost.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no write may be attempted against a prior known to be stale"
+    );
+}
+
 // ── record_factor_failure ───────────────────────────────────────────────
+
+/// The failed-factor row names the session the attempt came from, as the
+/// locked-attempt row does.
+#[tokio::test]
+async fn the_failed_factor_row_names_its_session() {
+    let user = user_with_status(EntityState::Active);
+    let (service, inspector) = build_service_with_user(user);
+    let session = authenticating_session(vec![FactorKind::Password]).await;
+
+    service
+        .record_factor_failure(&uid("u1"), &tid("t1"), &FactorKind::Password, &session)
+        .await
+        .unwrap();
+
+    let event = inspector
+        .events()
+        .into_iter()
+        .find(|e| {
+            matches!(e.event_type, AuthEventType::FactorVerified)
+                && matches!(e.event_status, AuthEventStatus::Failure)
+        })
+        .expect("failure audit row must be emitted");
+    assert_eq!(event.session_id, Some(session.session_id().await));
+}
 
 #[tokio::test]
 async fn record_factor_failure_below_threshold_returns_invalid_credential() {

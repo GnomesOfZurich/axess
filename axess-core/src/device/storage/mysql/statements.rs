@@ -5,7 +5,7 @@
 //! later one sees the columns an earlier one changed, so `trust_level`,
 //! which the other assignments read, is always assigned last.
 
-use sqlx::{MySql, MySqlPool, Transaction};
+use sqlx::{Connection as _, MySql, MySqlConnection, MySqlPool, Transaction};
 
 use crate::device::storage::sql_common::ops::{DeviceSql, SweepStage};
 use crate::device::storage::sql_common::{
@@ -25,35 +25,32 @@ pub(super) struct MysqlSql;
 impl DeviceSql for MysqlSql {
     type Db = MySql;
 
-    async fn begin_create(
-        pool: &MySqlPool,
+    async fn begin_create<'c>(
+        conn: &'c mut MySqlConnection,
         device: &Device,
-    ) -> Result<Transaction<'static, MySql>, SqlDeviceStoreError> {
+    ) -> Result<Transaction<'c, MySql>, SqlDeviceStoreError> {
         // A named lock on the create key serialises the read and the insert
         // against every other create of that key. The lock belongs to the
-        // connection, not the transaction, so `end_create` releases it on
-        // every path before the connection goes back to the pool.
-        let mut tx = pool.begin().await?;
+        // connection, not the transaction: it is taken before the
+        // transaction begins and `end_create` releases it, on this
+        // connection, after the transaction has ended.
         let taken: Option<i64> = sqlx::query_scalar("SELECT GET_LOCK(?, ?)")
             .bind(create_lock_name(device))
             .bind(CREATE_LOCK_WAIT_SECS)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut *conn)
             .await?;
         if taken != Some(1) {
             return Err(SqlDeviceStoreError::CreateLockTimeout {
                 tenant_id: device.tenant_id.to_string(),
             });
         }
-        Ok(tx)
+        Ok(conn.begin().await?)
     }
 
-    async fn end_create(
-        tx: &mut Transaction<'_, MySql>,
-        device: &Device,
-    ) -> Result<(), sqlx::Error> {
+    async fn end_create(conn: &mut MySqlConnection, device: &Device) -> Result<(), sqlx::Error> {
         sqlx::query("DO RELEASE_LOCK(?)")
             .bind(create_lock_name(device))
-            .execute(&mut **tx)
+            .execute(conn)
             .await?;
         Ok(())
     }
@@ -253,7 +250,8 @@ impl DeviceSql for MysqlSql {
     ) -> Result<u64, sqlx::Error> {
         Ok(sqlx::query(
             "UPDATE devices SET user_id = ? \
-             WHERE tenant_id = ? AND id = ? AND user_id IS NULL",
+             WHERE tenant_id = ? AND id = ? AND user_id IS NULL \
+               AND trust_level <> 'Revoked'",
         )
         .bind(user)
         .bind(tenant)

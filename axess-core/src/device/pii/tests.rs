@@ -353,7 +353,7 @@ async fn memory_store_len_and_is_empty_track_inserts() {
         value: "1.2.3.4".to_string(),
         created_at: chrono::Utc::now(),
     };
-    store.mappings.insert(token, mapping);
+    crate::locked::lock(&store.mappings).insert(token, mapping);
     assert_eq!(store.len(), 1);
     assert!(!store.is_empty());
 }
@@ -437,4 +437,43 @@ async fn list_for_subject_is_ordered_by_creation_time() {
     let values: Vec<String> = rows.into_iter().map(|m| m.value).collect();
     let expected: Vec<String> = (0..40).map(|i| format!("v{i}")).collect();
     assert_eq!(values, expected);
+}
+
+/// `Debug` shows what a mapping is about, never the plaintext value.
+#[test]
+fn mapping_debug_does_not_carry_the_value() {
+    let mapping = DevicePiiMapping {
+        token: PiiToken::new(),
+        subject_id: user("u1"),
+        tenant_id: tenant("t1"),
+        category: DevicePiiCategory::IpAddress,
+        value: "203.0.113.77".to_string(),
+        created_at: Utc::now(),
+    };
+    assert!(!format!("{mapping:?}").contains("203.0.113.77"));
+    assert!(!format!("{mapping:#?}").contains("203.0.113.77"));
+}
+
+/// A token read from the wire passes the same check as `parse`, so a stored
+/// or posted value in another spelling never becomes a second key for one
+/// mapping. The serialised form is the bare wire string.
+#[test]
+fn deserialising_a_token_checks_its_shape() {
+    let token = PiiToken::new();
+    let wire = serde_json::to_string(&token).expect("serialise");
+    assert_eq!(wire, format!("\"{}\"", token.as_str()));
+    assert_eq!(
+        serde_json::from_str::<PiiToken>(&wire).expect("round trip"),
+        token
+    );
+    let upper = format!(
+        "\"{}\"",
+        token.as_str().to_uppercase().replacen("PII", "pii", 1)
+    );
+    for bad in ["\"not-a-token\"", "\"pii:\"", upper.as_str()] {
+        assert!(
+            serde_json::from_str::<PiiToken>(bad).is_err(),
+            "{bad} was accepted"
+        );
+    }
 }

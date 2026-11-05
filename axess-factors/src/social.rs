@@ -376,8 +376,18 @@ where
             String::new()
         };
 
+        // An endpoint that already has a query takes the parameters after it.
+        let separator = if self.authorization_endpoint.contains('?') {
+            if self.authorization_endpoint.ends_with(['?', '&']) {
+                ""
+            } else {
+                "&"
+            }
+        } else {
+            "?"
+        };
         let mut url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&state={}&scope={}",
+            "{}{separator}response_type=code&client_id={}&redirect_uri={}&state={}&scope={}",
             self.authorization_endpoint,
             urlencode(&self.client_id),
             urlencode(&self.redirect_uri),

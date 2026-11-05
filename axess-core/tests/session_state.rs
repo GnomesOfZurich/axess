@@ -53,6 +53,7 @@ fn auth_state_authenticating_is_not_authenticated() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        impersonator: None,
     };
     assert!(state.is_authenticating());
     assert!(!state.is_authenticated());

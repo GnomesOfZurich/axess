@@ -165,7 +165,9 @@ A new `LocalIdp` is strict by default:
 `with_not_before`, `with_jwt_id`, and `with_custom_claim` cover the
 standard JWT fields. `mint_with_header` accepts a caller-supplied
 `jsonwebtoken::Header` for cases that need custom header fields
-(`typ`, `cty`, etc.).
+(`typ`, `cty`, etc.). `kid` and `alg` are the signing key's, and the
+key-location fields `jku`, `jwk`, `x5u` and `x5c` are cleared, because a
+token the IdP signs must be checked with the IdP's own key.
 
 The clock is injectable via `.with_clock(...)`. Production wires
 `SystemClock`; DST tests wire `MockClock` for reproducible

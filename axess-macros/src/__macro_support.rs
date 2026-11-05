@@ -470,3 +470,15 @@ mod tests {
         );
     }
 }
+
+/// The session check of a `require_authz!` built without a validator: the
+/// session record alone decides, as it always has.
+#[derive(Clone, Copy, Debug)]
+pub struct NoSessionCheck;
+
+impl NoSessionCheck {
+    /// Always `true`: nothing beyond the session record is consulted.
+    pub async fn enforce(&self, _session: &axess_core::AuthSession) -> bool {
+        true
+    }
+}

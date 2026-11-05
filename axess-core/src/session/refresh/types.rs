@@ -116,13 +116,13 @@ pub struct RefreshToken {
     /// fires (rotated-out token reused, a compromise signal), the set of
     /// `device_id` values across the family identifies which devices to
     /// transition to [`DeviceTrustLevel::Revoked`] via
-    /// [`cascade_revoke_devices`].
+    /// [`cascade_revoke_devices_and_tokens`].
     ///
     /// `None` for tokens issued before device support landed or for clients that
     /// chose not to associate the token with a device.
     ///
     /// [`DeviceTrustLevel::Revoked`]: crate::device::DeviceTrustLevel::Revoked
-    /// [`cascade_revoke_devices`]: crate::device::cascade_revoke_devices
+    /// [`cascade_revoke_devices_and_tokens`]: crate::device::cascade_revoke_devices_and_tokens
     pub device_id: Option<DeviceId>,
     /// When the user last proved who they are, as opposed to when this
     /// token was minted.
@@ -244,11 +244,14 @@ pub struct RefreshTokenConfig {
 
 impl RefreshTokenConfig {
     /// Check the invariants every issuing and refreshing function relies on:
-    /// `max_per_user` is at least 1 and a configured `hash_pepper` is not
+    /// `ttl` is positive, `max_per_user` is at least 1 and a configured `hash_pepper` is not
     /// empty. Those functions call this first and return
     /// [`RefreshError::InvalidConfig`] with the same message; call it at
     /// start-up to fail early.
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ttl <= Duration::zero() {
+            return Err("ttl must be positive");
+        }
         if self.max_per_user == 0 {
             return Err("max_per_user must be at least 1");
         }

@@ -34,6 +34,8 @@ mod directory;
 mod directory_tests;
 mod memory;
 mod record;
+#[cfg(test)]
+mod record_tests;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -171,6 +173,27 @@ pub trait TenantOAuthProviderStore: Send + Sync + 'static {
         &self,
         record: TenantOAuthProviderRecord,
     ) -> impl Future<Output = Result<TenantOAuthProviderRecord, TenantOAuthProviderStoreError>> + Send;
+
+    /// Store `record` only if the stored record still has revision `expected`,
+    /// returning what it stored (with the next revision), or `None` when the
+    /// revision had moved or the record was gone. The compare and the write
+    /// are one step.
+    ///
+    /// [`StoredTenantOAuthProviders`] uses it to move a credential sealed
+    /// under a previous key or binding to the current one the first time the
+    /// record is used. The default writes nothing and returns `None`, so a
+    /// store that does not override it keeps the record as it is; override it
+    /// where the store can make the compare and the write atomic.
+    fn put_if_revision(
+        &self,
+        record: TenantOAuthProviderRecord,
+        expected: u64,
+    ) -> impl Future<
+        Output = Result<Option<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError>,
+    > + Send {
+        let _ = (record, expected);
+        async { Ok(None) }
+    }
 
     /// Remove a record; `true` when there was one.
     fn delete(

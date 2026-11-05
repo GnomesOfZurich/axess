@@ -8,6 +8,7 @@ use axess::csrf::CsrfToken;
 use axum::{
     Extension, Form,
     extract::State,
+    http::StatusCode,
     response::{Html, IntoResponse, Redirect},
 };
 use serde::Deserialize;
@@ -389,7 +390,8 @@ pub async fn setup_totp_page(
 
     // Generate a new TOTP secret.
     let secret = axess::generate_totp_secret(&axess::SystemRng);
-    let uri = axess::build_totp_uri(&username, "axess-example", &secret, 6, 30);
+    let uri = axess::build_totp_uri(&username, "axess-example", &secret, 6, 30)
+        .expect("6 digits and a 30 second period are a valid configuration");
     let qr_svg = totp_qr_svg(&uri);
     let csrf_input = csrf_hidden_input(&csrf);
 
@@ -502,7 +504,7 @@ pub async fn post_setup_totp(
     // would need step-up first), and a store error is not "not enrolled".
     match state.backend.load_factor(&scope, FactorKind::Totp).await {
         Ok(None) => {}
-        Ok(Some(_)) => return Redirect::to("/dashboard").into_response(),
+        Ok(Some(_)) => return totp_already_enrolled().into_response(),
         Err(e) => {
             tracing::warn!(error = %e, "failed to check existing TOTP enrolment");
             return error_page("Failed to check TOTP configuration.").into_response();
@@ -524,9 +526,19 @@ pub async fn post_setup_totp(
             return error_page("Failed to save TOTP configuration.").into_response();
         }
     };
-    if let Err(e) = state.backend.save_factor(&scope, totp_config).await {
-        tracing::warn!(error = %e, "failed to store TOTP config");
-        return error_page("Failed to save TOTP configuration.").into_response();
+    // One atomic insert decides between two enrolments that passed the check
+    // above together: the loser is turned away and writes nothing more.
+    match state
+        .backend
+        .insert_factor_if_absent(&scope, totp_config)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return totp_already_enrolled().into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to store TOTP config");
+            return error_page("Failed to save TOTP configuration.").into_response();
+        }
     }
 
     // Recovery codes for when the authenticator is lost. Only the hashes
@@ -795,6 +807,18 @@ fn totp_with_error(msg: &str, csrf: &CsrfToken) -> String {
 <p style="color:red">{msg}</p>
 {form}
 </body></html>"#
+    )
+}
+
+/// The answer to an enrolment that found a TOTP factor already stored: it
+/// lost, wrote nothing and shows no recovery codes, and says so rather than
+/// sending the user on as if it had worked.
+fn totp_already_enrolled() -> (StatusCode, Html<String>) {
+    (
+        StatusCode::CONFLICT,
+        error_page(
+            "An authenticator is already enrolled for this account, so this enrolment was not saved.",
+        ),
     )
 }
 

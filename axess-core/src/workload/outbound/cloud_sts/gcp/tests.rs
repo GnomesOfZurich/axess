@@ -434,3 +434,29 @@ fn an_impersonator_that_cannot_be_built_is_an_error_not_a_default_client() {
         "the default build still succeeds"
     );
 }
+
+/// A base URL given without a trailing slash still ends in its last path
+/// segment: `join` would replace it, sending the request beside the prefix
+/// instead of under it.
+#[tokio::test]
+async fn an_endpoint_base_without_a_trailing_slash_keeps_its_last_segment() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/proxy/iam/v1/projects/-/serviceAccounts/sa@p.iam.gserviceaccount.com:generateAccessToken",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "accessToken": "tok",
+            "expireTime": "2030-01-01T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let base = Url::parse(&format!("{}/proxy/iam", server.uri())).unwrap();
+    let imp = GcpServiceAccountImpersonator::new()
+        .expect("client")
+        .with_endpoint_base(base);
+    imp.generate_access_token("fed", "sa@p.iam.gserviceaccount.com", &["scope"], None)
+        .await
+        .expect("the request goes under the prefix");
+}

@@ -566,8 +566,104 @@ async fn an_unknown_target_is_not_named_from_the_callers_record() {
     assert_eq!(rows[0].actor_id, Some(r.admin.id));
 }
 
+/// A timed suspension of the tenant that has lapsed no longer blocks, as it
+/// does not at a login: the status is read as of the service's clock.
+#[tokio::test]
+async fn a_tenant_whose_timed_suspension_has_lapsed_admits_an_impersonation() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let clock = MockClock::now();
+    let admin = test_user("admin", "ops");
+    let target = test_user("u2", "bob");
+    let mut tenant = test_tenant();
+    tenant.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: clock.now() - chrono::Duration::hours(2),
+        until: Some(clock.now() - chrono::Duration::hours(1)),
+    });
+    let identity = MockIdentityStore::new()
+        .with_tenant(tenant)
+        .with_user(admin.clone())
+        .with_user(target.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    session
+        .set_authenticated(admin.id, admin.tenant_id, clock.now())
+        .await;
+
+    let res = svc.begin_impersonation(&admin, &target, &session).await;
+
+    assert!(res.is_ok(), "{res:?}");
+    assert_eq!(session.impersonator().await, Some(admin.id));
+}
+
+/// A tenant that does not load is neither a cross-tenant attempt nor in a
+/// state: it is unknown, and the impersonation is refused.
+#[tokio::test]
+async fn a_tenant_that_does_not_load_refuses_an_impersonation_as_unknown() {
+    let clock = MockClock::now();
+    let admin = test_user("admin", "ops");
+    let target = test_user("u2", "bob");
+    let identity = MockIdentityStore::new()
+        .with_user(admin.clone())
+        .with_user(target.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    session
+        .set_authenticated(admin.id, admin.tenant_id, clock.now())
+        .await;
+
+    let res = svc.begin_impersonation(&admin, &target, &session).await;
+
+    assert!(matches!(res, Err(AuthnError::UnknownTenant)), "{res:?}");
+    assert_eq!(session.impersonator().await, None);
+}
+
 /// A suspended administrator with a session that is still open cannot
 /// take another identity through it.
+/// The tenant's status gates impersonation as it gates a login: no one is
+/// impersonated into a suspended tenant.
+#[tokio::test]
+async fn no_one_is_impersonated_into_a_suspended_tenant() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let clock = MockClock::now();
+    let admin = test_user("admin", "ops");
+    let target = test_user("u2", "bob");
+    let mut tenant = test_tenant();
+    tenant.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: clock.now(),
+        until: None,
+    });
+    let identity = MockIdentityStore::new()
+        .with_tenant(tenant)
+        .with_user(admin.clone())
+        .with_user(target.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    session
+        .set_authenticated(admin.id, admin.tenant_id, clock.now())
+        .await;
+
+    let res = svc.begin_impersonation(&admin, &target, &session).await;
+
+    assert!(matches!(res, Err(AuthnError::NotActive(_))), "{res:?}");
+    assert_eq!(session.impersonator().await, None);
+    assert_eq!(
+        session.user_id().await,
+        Some(admin.id),
+        "the session stays the admin's"
+    );
+}
+
 #[tokio::test]
 async fn a_suspended_admin_cannot_impersonate() {
     use axess_core::authn::types::{EntityState, StatusDetail};
@@ -634,5 +730,112 @@ async fn a_target_lookup_that_fails_is_audited() {
     assert_eq!(
         rows[0].user_id, None,
         "nothing was read, so no target is named"
+    );
+}
+
+/// A session that is already an impersonation is refused as one whichever
+/// administrator id the caller names.
+#[tokio::test]
+async fn a_nested_impersonation_is_refused_as_nested_whoever_the_caller_names() {
+    let r = rig();
+    let y = test_user("u3", "carol");
+    r.identity.clone().with_user(y.clone());
+    let session = impersonating(&r).await;
+
+    // The caller names the real administrator, not the impersonated user.
+    let res = r.svc.begin_impersonation(&r.admin, &y, &session).await;
+    assert!(matches!(res, Err(AuthnError::Impersonated)), "{res:?}");
+    assert_eq!(refusals(&r.identity, "nested_impersonation").len(), 1);
+
+    let res = r
+        .svc
+        .begin_impersonation_across_tenants(&r.admin.id, &y, &session)
+        .await;
+    assert!(matches!(res, Err(AuthnError::Impersonated)), "{res:?}");
+    assert_eq!(refusals(&r.identity, "nested_impersonation").len(), 2);
+}
+
+/// A registry that refuses the new session and records what it is asked
+/// to end.
+#[derive(Clone, Default)]
+struct RefusingRecordingRegistry {
+    ended: std::sync::Arc<std::sync::Mutex<Vec<axess_core::session::id::SessionId>>>,
+}
+
+impl axess_core::session::store::SessionRegistry for RefusingRecordingRegistry {
+    type Error = std::io::Error;
+    async fn register(
+        &self,
+        _: &axess_core::authn::UserId,
+        _: &axess_core::session::id::SessionId,
+    ) -> Result<(), Self::Error> {
+        Err(std::io::Error::other("registry unreachable"))
+    }
+    async fn is_valid(
+        &self,
+        _: &axess_core::authn::UserId,
+        _: &axess_core::session::id::SessionId,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+    async fn invalidate_user(&self, _: &axess_core::authn::UserId) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    async fn invalidate_session(
+        &self,
+        _: &axess_core::authn::UserId,
+        sid: &axess_core::session::id::SessionId,
+    ) -> Result<(), Self::Error> {
+        self.ended.lock().unwrap().push(*sid);
+        Ok(())
+    }
+    async fn active_sessions(
+        &self,
+        _: &axess_core::authn::UserId,
+    ) -> Result<Vec<axess_core::session::id::SessionId>, Self::Error> {
+        Ok(vec![])
+    }
+}
+
+/// The administrator's session id is ended even when the registry refuses
+/// the impersonated session: the cookie is cleared either way.
+#[tokio::test]
+async fn a_refused_impersonation_still_ends_the_administrators_session_id() {
+    let registry = RefusingRecordingRegistry::default();
+    let r = rig_with(|b| b.with_registry(registry.clone()));
+    let session = test_session();
+    session
+        .set_authenticated(r.admin.id, r.admin.tenant_id, r.clock.now())
+        .await;
+    let admin_sid = session.session_id().await;
+
+    let res = r
+        .svc
+        .begin_impersonation(&r.admin, &r.target, &session)
+        .await;
+
+    assert!(matches!(res, Err(AuthnError::NoFlow)), "{res:?}");
+    assert!(
+        registry.ended.lock().unwrap().contains(&admin_sid),
+        "the administrator's old session id is not left in the registry"
+    );
+}
+/// What authorisation sees of an impersonated session: the principal names
+/// the administrator, so a policy can forbid or require it.
+#[tokio::test]
+async fn the_principal_of_an_impersonated_session_names_the_administrator() {
+    use axess_core::{PrincipalResolver as _, SessionResolver, ToCedarEntity as _};
+    let r = rig();
+    let session = impersonating(&r).await;
+
+    let principal = SessionResolver::new(session).resolve().await.unwrap();
+    let axess_core::Principal::Human(human) = &principal else {
+        panic!("a session resolves to a human");
+    };
+    assert_eq!(human.user_id, r.target.id);
+    let entity = principal.to_cedar_entity().unwrap();
+    assert!(
+        entity.attr("impersonator").is_some(),
+        "the Cedar principal carries who is acting in the user's name"
     );
 }

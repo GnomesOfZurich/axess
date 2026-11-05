@@ -167,3 +167,55 @@ async fn the_address_in_an_already_sent_answer_is_masked() {
         other => panic!("{other:?}"),
     }
 }
+
+fn any_of_world() -> Svc {
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), FactorConfig::EmailOtp(base()))
+        .with_method(
+            &uid("u1"),
+            AuthMethod {
+                name: "password-or-email".into(),
+                steps: vec![axess_core::authn::factor::FactorStep::AnyOf(vec![
+                    FactorKind::Password,
+                    FactorKind::EmailOtp,
+                ])],
+                scope: user_scope(),
+            },
+        );
+    AuthnService::builder(identity, factors)
+        .with_rng(MockRng::new(7))
+        .with_kdf_executor(Arc::new(KdfExecutor::inline()))
+        .build()
+        .with_audit_context(AuditContext::default())
+}
+
+#[tokio::test]
+async fn an_email_code_can_be_issued_when_it_is_not_the_first_choice() {
+    let svc = any_of_world();
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+
+    let issued = svc
+        .prepare_factor_choice(&session, FactorKind::EmailOtp)
+        .await
+        .unwrap();
+
+    assert!(matches!(issued, PrepareOutcome::SendOtp { .. }));
+}
+
+#[tokio::test]
+async fn a_choice_the_step_does_not_offer_is_refused() {
+    let svc = any_of_world();
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+
+    let refused = svc.prepare_factor_choice(&session, FactorKind::Totp).await;
+
+    assert!(matches!(
+        refused,
+        Err(axess_core::authn::AuthnError::NoFlow)
+    ));
+}

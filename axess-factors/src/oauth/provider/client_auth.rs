@@ -6,6 +6,15 @@ use super::OAuthProviderConfig;
 use crate::client_assertion::CLIENT_ASSERTION_TYPE_JWT_BEARER;
 use crate::oauth::types::OAuthError;
 
+/// The id and secret of a `client_secret_basic` header, each form-urlencoded
+/// first as RFC 6749 section 2.3.1 requires, so a secret carrying `:`, `+` or
+/// `%` reaches a strict server intact. The encoding is
+/// [`crate::http_basic::form_urlencode`], which the outbound client uses too.
+pub(super) fn basic_credentials(id: &str, secret: &str) -> (String, String) {
+    use crate::http_basic::form_urlencode;
+    (form_urlencode(id), form_urlencode(secret))
+}
+
 impl OAuthProviderConfig {
     /// A fresh client assertion for a request to `endpoint`, or `None` when
     /// the provider authenticates some other way.
@@ -33,12 +42,13 @@ impl OAuthProviderConfig {
         )?))
     }
 
-    /// The client's authentication on the authorization code and refresh
-    /// grants: with a signer, `client_id` and the assertion pair in `form`;
+    /// The client's authentication on the token, revocation, device and
+    /// pushed authorization requests: with a signer, `client_id` and the assertion pair in `form`;
     /// with a secret, the id and secret for a `client_secret_basic` header
     /// (returned, for [`post_form_constrained`](Self::post_form_constrained)),
-    /// which RFC 6749 section 2.3.1 has every server accept; with neither,
-    /// `client_id` in `form` (an mTLS client).
+    /// which RFC 6749 section 2.3.1 has every server accept, and `client_id`
+    /// in `form` as well, so the request still names its client; with
+    /// neither, `client_id` in `form` (an mTLS client).
     pub(super) fn token_grant_auth(
         &self,
         form: &mut Vec<(String, String)>,
@@ -47,6 +57,7 @@ impl OAuthProviderConfig {
         if self.client_assertion.is_none()
             && let Some(secret) = &self.client_secret
         {
+            form.push(("client_id".into(), self.client_id.as_str().to_string()));
             return Ok(Some((self.client_id.as_str(), secret.secret().as_str())));
         }
         self.add_client_auth(form, endpoint)?;
@@ -54,8 +65,10 @@ impl OAuthProviderConfig {
     }
 
     /// Append the client's identity to a form for `endpoint`: `client_id`,
-    /// then either the assertion pair or the secret when one is held.
-    pub(super) fn add_client_auth(
+    /// then the assertion pair when a signer is held. A secret is never
+    /// put in the form; [`token_grant_auth`](Self::token_grant_auth) sends it
+    /// as a header.
+    fn add_client_auth(
         &self,
         form: &mut Vec<(String, String)>,
         endpoint: &str,
@@ -67,8 +80,6 @@ impl OAuthProviderConfig {
                 CLIENT_ASSERTION_TYPE_JWT_BEARER.to_string(),
             ));
             form.push(("client_assertion".into(), assertion));
-        } else if let Some(secret) = &self.client_secret {
-            form.push(("client_secret".into(), secret.secret().to_string()));
         }
         Ok(())
     }

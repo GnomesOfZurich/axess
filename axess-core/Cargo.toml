@@ -36,14 +36,12 @@ axum = { workspace = true, default-features = false, features = ["original-uri",
 base64 = { workspace = true }
 cedar-policy = { version = "4.14.0", optional = true }
 chrono = { workspace = true, features = ["serde"] }
-dashmap = { version = "6.2.1", features = ["serde"] }
 fred = { version = "10.1.0", features = ["transactions", "i-std", "i-cluster", "i-scripts", "blocking-encoding", "replicas"], optional = true }
 hmac = { workspace = true }
 # No backend here either: see axess-factors' note. The adopter picks with
 # `jwt-aws-lc` or `jwt-rust-crypto`, which this crate passes through.
 jsonwebtoken = { version = "11.1.0", default-features = false, optional = true }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"], optional = true }
-moka = { version = "0.12.16", features = ["future"], optional = true }
 # `timing-resistant-secret-traits` makes secret-bearing types refuse
 # `PartialEq` / `Hash` derives: the property an auth library wants from
 # its OIDC client.
@@ -75,9 +73,8 @@ sqlx = { version = "0.9.0", features = ["runtime-tokio"], optional = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
-form_urlencoded = "1.2.2"
 tower = { version = "0.5.3", features = ["util"] }
-tower-cookies = { version = "0.11.0", features = ["axum-core"] }
+cookie = { version = "0.18.2", features = ["percent-encode"] }
 tracing = { workspace = true }
 # A library depends on the facade (`tracing`) and leaves the subscriber,
 # the implementation, to the binary: installing one is the application's
@@ -113,7 +110,6 @@ axess-rng = { workspace = true, features = ["testing"] }
 base32 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["full"] }
 proptest = { workspace = true }
 # rcgen mints X509-SVID certs with SPIFFE URIs in SAN for mTLS resolver tests.
 rcgen = "0.14.10"
@@ -135,7 +131,6 @@ tempfile = "3.27.0"
 # examples, which need a subscriber without the `testing` feature on.
 tracing-subscriber = { workspace = true }
 tokio-test = { workspace = true }
-totp-rs = { version = "6.0.0", features = ["gen_secret"] }
 # In-crate `#[cfg(test)]` mods build wiremock fixtures directly; an optional
 # regular-dep entry of the same crate (under `testing-oauth`) re-exposes
 # wiremock to adopters via `axess_core::testing::oauth_wiremock`.
@@ -144,7 +139,7 @@ wiremock = "0.6.5"
 [[bench]]
 name = "session_layer"
 harness = false
-required-features = ["memory"]
+required-features = ["memory", "sqlite"]
 
 [[bench]]
 name = "ratelimit"
@@ -233,10 +228,8 @@ gcp-wif = ["axess-factors/http-body", "dep:reqwest"]
 # longer transitively pulls `testing` (the mock-store fixtures stay opt-in).
 local-idp = ["axess-factors/jwt", "dep:jsonwebtoken", "dep:rsa", "dep:p256"]
 
-# Authz entity cache decorators (`EntityCache` is the in-tree default; these
-# are opt-in alternatives). `moka-cache` breaks DST: opt in only if you
-# have a reason.
-moka-cache = ["authz", "dep:moka"]
+# Authz entity cache decorators (`EntityCache` is the in-tree default; this
+# is the opt-in shared alternative).
 valkey-cache = ["authz", "valkey"]
 
 # Session storage backends

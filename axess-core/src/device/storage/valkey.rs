@@ -653,7 +653,7 @@ impl DeviceStore for ValkeyDeviceStore {
             // is refused.
             let applied = store
                 .apply(&tenant, &device_id, now, |d| {
-                    if d.user_id.is_some() {
+                    if d.user_id.is_some() || d.trust_level == DeviceTrustLevel::Revoked {
                         return Step::Skip;
                     }
                     let mut next = d.clone();

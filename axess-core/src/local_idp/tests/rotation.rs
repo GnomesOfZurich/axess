@@ -503,3 +503,120 @@ async fn a_kid_another_replica_rotated_to_is_refused_by_the_store() {
         "one key under the kid once b has caught up"
     );
 }
+
+/// A store whose whole key set can be swapped, standing in for another
+/// replica (or a hand edit) changing what the store holds between reads.
+#[derive(Clone)]
+struct SwappableKeyStore {
+    inner: Arc<std::sync::Mutex<MemoryLocalIdpKeyStore>>,
+}
+
+impl SwappableKeyStore {
+    fn new(current: LocalIdpSigningKey, historical: Vec<LocalIdpSigningKey>) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(MemoryLocalIdpKeyStore::with_keys(
+                current, historical,
+            ))),
+        }
+    }
+
+    fn swap(&self, current: LocalIdpSigningKey, historical: Vec<LocalIdpSigningKey>) {
+        *self.inner.lock().expect("store lock") =
+            MemoryLocalIdpKeyStore::with_keys(current, historical);
+    }
+
+    fn snapshot(&self) -> MemoryLocalIdpKeyStore {
+        self.inner.lock().expect("store lock").clone()
+    }
+}
+
+impl LocalIdpKeyStore for SwappableKeyStore {
+    type Error = MemoryLocalIdpKeyStoreError;
+
+    async fn load_all(&self) -> Result<LoadedKeys, Self::Error> {
+        self.snapshot().load_all().await
+    }
+
+    async fn rotate(&self, new_current: LocalIdpSigningKey) -> Result<(), Self::Error> {
+        self.snapshot().rotate(new_current).await
+    }
+
+    async fn retire(&self, key_id: &str) -> Result<bool, Self::Error> {
+        self.snapshot().retire(key_id).await
+    }
+}
+
+/// Two keys under one `kid` make a verifier pick either, so a stored key
+/// set that repeats one is refused when it is loaded, whether the repeat
+/// is between the current key and a historical one or among the historical.
+#[tokio::test]
+async fn a_stored_key_set_that_repeats_a_kid_is_refused_on_load() {
+    for (current, historical) in [
+        (es("k1"), vec![es("k2"), es("k1")]),
+        (es("k3"), vec![es("k1"), es("k2"), es("k1")]),
+    ] {
+        let store = MemoryLocalIdpKeyStore::with_keys(current, historical);
+        match LocalIdp::from_key_store("https://idp.local", store).await {
+            Err(IssuanceError::DuplicateKeyId { kid }) => assert_eq!(kid, "k1"),
+            Err(e) => panic!("refused for the wrong reason: {e}"),
+            Ok(_) => panic!("a key set repeating a kid was loaded"),
+        }
+    }
+}
+
+/// A key with an empty `kid` cannot be named by a token header, so a key set
+/// carrying one is refused on load.
+#[tokio::test]
+async fn a_stored_key_with_an_empty_kid_is_refused_on_load() {
+    for store in [
+        MemoryLocalIdpKeyStore::with_current(es("")),
+        MemoryLocalIdpKeyStore::with_keys(es("k1"), vec![es("")]),
+    ] {
+        assert!(
+            matches!(
+                LocalIdp::from_key_store("https://idp.local", store).await,
+                Err(IssuanceError::EmptyKeyId)
+            ),
+            "a key set with an empty kid was loaded"
+        );
+    }
+}
+
+/// A reload that reads a key set it would refuse on load keeps the keys it
+/// had: the JWKS is unchanged and mints still sign under the old key.
+#[tokio::test]
+async fn a_reload_that_reads_a_repeated_or_empty_kid_keeps_the_keys_it_had() {
+    let store = SwappableKeyStore::new(es("k2"), vec![es("k1")]);
+    let idp = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load");
+    for (current, historical, repeated) in [
+        (es("k3"), vec![es("k3")], true),
+        (es(""), vec![es("k2")], false),
+        (es("k3"), vec![es("")], false),
+    ] {
+        store.swap(current, historical);
+        match idp.reload().await {
+            Err(IssuanceError::DuplicateKeyId { kid }) if repeated => assert_eq!(kid, "k3"),
+            Err(IssuanceError::EmptyKeyId) if !repeated => {}
+            other => panic!("the bad key set was not refused for its reason: {other:?}"),
+        }
+        assert_eq!(kids(&idp.jwks().await), vec!["k2", "k1"]);
+    }
+}
+
+/// A rotation to a key with an empty `kid` is refused before the store is
+/// touched, on the same terms as a repeated one.
+#[tokio::test]
+async fn a_rotation_to_an_empty_kid_is_refused() {
+    let store = MemoryLocalIdpKeyStore::with_current(es("k1"));
+    let idp = LocalIdp::from_key_store("https://idp.local", store.clone())
+        .await
+        .expect("load");
+    assert!(matches!(
+        idp.rotate_signing_key(es("")).await,
+        Err(IssuanceError::EmptyKeyId)
+    ));
+    assert_eq!(kids(&idp.jwks().await), vec!["k1"]);
+    assert_eq!(store.load_all().await.expect("load").current.key_id(), "k1");
+}

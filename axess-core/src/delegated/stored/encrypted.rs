@@ -44,9 +44,12 @@
 //!   moving the expiry so a stale token looks fresh and is never
 //!   refreshed) fails authentication on load instead of changing what
 //!   the runtime believes it holds. `v2` (whose AAD lacks `expires_at`)
-//!   is still read and re-sealed as `v3` by the read that found it; `v1`
-//!   (whose AAD also lacks `scopes` and `token_type`) is read only under
-//!   the legacy policy below.
+//!   is still read, but its stored expiry is unauthenticated, so the row
+//!   loads as expired and is not re-sealed: the refresh that follows saves a
+//!   `v3` row from the provider's answer (a `v2` row with no refresh token
+//!   asks the user to reconnect). `v1` (whose AAD also lacks `scopes` and
+//!   `token_type`) is read only under the legacy policy below and is
+//!   treated the same way.
 //! - `key_id`: opaque adopter-chosen identifier (e.g. `"2026-05"`,
 //!   a KMS key ARN, an HSM label). Must not contain `.`; the
 //!   [`KeyProvider`] is responsible for storing and resolving the
@@ -59,9 +62,9 @@
 //! [`KeyProvider::resolve`] returns the key for a historical
 //! `key_id` (read during decrypt). Rotation is therefore lazy: rows
 //! re-encrypt under the new key whenever they're saved (each refresh
-//! cycle, every `complete_grant`), and a row read under a retired key or in
-//! an older format (a `v2` row, or a `v1` row inside the legacy window) is
-//! re-sealed by the read that found it. That rewrite is a
+//! cycle, every `complete_grant`), and a `v3` row read under a retired key is
+//! re-sealed by the read that found it. A `v2` row, or a `v1` row inside the
+//! legacy window, is read as expired and replaced by the refresh instead. That rewrite is a
 //! compare-and-swap ([`DelegatedCredentialStore::save_if_unchanged`]), so it
 //! cannot overwrite a refresh token another request rotated in between; a
 //! store that does not implement the swap is left as it is.
@@ -78,9 +81,9 @@
 //! wrote `v1` opens a migration window with
 //! [`with_legacy_envelopes`](EncryptedDelegatedCredentialStore::with_legacy_envelopes)
 //! and [`LegacyBlobs::AcceptUntil`]`(cutoff)`, the same choice the session
-//! crypto takes: inside the window a `v1` row is read and re-sealed in the
-//! current format by the read that found it. Drop back to `Reject` once
-//! the rows have been re-sealed, or let the cutoff pass.
+//! crypto takes: inside the window a `v1` row is read (as expired) and
+//! replaced in the current format by the refresh that follows. Drop back to
+//! `Reject` once the rows have been refreshed, or let the cutoff pass.
 //!
 //! # Usage bound
 //!
@@ -126,7 +129,8 @@ use envelope::{
 
 /// Version written by this release. `v3` binds the row's `expires_at` into
 /// the AAD as well as its `scopes` and `token_type`; `v2` rows (no expiry
-/// bound) are read and re-sealed on load, `v1` rows follow [`LegacyBlobs`].
+/// bound) are read as expired and left as they are, `v1` rows follow
+/// [`LegacyBlobs`].
 const ENVELOPE_VERSION: &str = "v3";
 const SCOPED_ENVELOPE_VERSION: &str = "v2";
 const LEGACY_ENVELOPE_VERSION: &str = "v1";
@@ -200,9 +204,8 @@ where
         self.seals.load(Ordering::Relaxed)
     }
 
-    /// Leave a row as it is when it is read under a retired key or in an
-    /// older format. By default such a row is re-sealed by the read that
-    /// found it, through [`DelegatedCredentialStore::save_if_unchanged`].
+    /// Leave a row as it is when it is read under a retired key. By default
+    /// such a row is re-sealed by the read that found it, through [`DelegatedCredentialStore::save_if_unchanged`].
     /// The re-seal needs [`KeyProvider::current`]; when that fails the load
     /// is still served under the key the row names, the failure is logged
     /// and the re-seal is left to a later load.
@@ -276,6 +279,12 @@ where
         } = credential;
 
         let current = self.keys.current().map_err(|e| e.to_string())?;
+        // A provider of its own can name any id or hand over any key; the
+        // envelope would then be written and never read back.
+        keys::validate_key_id(&current.key_id).map_err(|e| e.to_string())?;
+        if current.key.is_constant() {
+            return Err(KeyProviderError::from(crate::session::WeakKeyError).to_string());
+        }
         self.seals
             .fetch_add(1 + u64::from(refresh_token.is_some()), Ordering::Relaxed);
 
@@ -368,6 +377,12 @@ where
         let Some(cred) = self.inner.load(tenant, user, provider).await? else {
             return Ok(None);
         };
+        if cred.provider != provider {
+            return Err(format!(
+                "stored credential is labelled {:?}, not the requested provider",
+                cred.provider
+            ));
+        }
 
         // The row is opened under the key it names; the current key is
         // wanted only to tell whether the row is due a re-seal. A provider
@@ -386,6 +401,7 @@ where
             None => None,
         };
         let mut stale = false;
+        let mut expiry_bound = true;
 
         let access = self
             .open_field(
@@ -398,6 +414,7 @@ where
             )
             .map_err(|e| format!("decrypt access_token: {e}"))?;
         stale |= access.is_stale(current_id.as_deref());
+        expiry_bound &= access.binds_expiry();
         let access_plain = access.plain;
 
         let refresh_plain = match cred.refresh_token.as_deref() {
@@ -406,6 +423,7 @@ where
                     .open_field(provider, &cred, rt, FIELD_REFRESH, tenant, user)
                     .map_err(|e| format!("decrypt refresh_token: {e}"))?;
                 stale |= opened.is_stale(current_id.as_deref());
+                expiry_bound &= opened.binds_expiry();
                 Some(ZeroizedString::from(opened.plain))
             }
             None => None,
@@ -415,11 +433,20 @@ where
             provider: cred.provider.clone(),
             access_token: ZeroizedString::from(access_plain),
             refresh_token: refresh_plain,
-            expires_at: cred.expires_at,
+            // An envelope older than the current version does not cover the
+            // expiry, so a store writer could have moved it. The row reads as
+            // expired: the refresh that follows saves a current row from the
+            // provider's answer. It is not re-sealed, which would vouch for
+            // the unauthenticated value.
+            expires_at: if expiry_bound {
+                cred.expires_at
+            } else {
+                Some(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+            },
             scopes: cred.scopes.clone(),
             token_type: cred.token_type.clone(),
         };
-        if stale {
+        if stale && expiry_bound {
             self.reseal(tenant, user, &cred, &plain).await;
         }
         Ok(Some(plain))
@@ -490,6 +517,8 @@ fn test_key(seed: u8) -> [u8; 32] {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod key_id_tests;
 #[cfg(test)]
 mod legacy_tests;
 #[cfg(test)]

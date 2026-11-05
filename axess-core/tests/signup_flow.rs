@@ -50,6 +50,24 @@ fn make_service() -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
 
 // ── Signup flow tests ────────────────────────────────────────────────────────
 
+/// A session id the visitor arrived with may have been planted: the pending
+/// signup lives under a fresh one.
+#[tokio::test]
+async fn begin_signup_moves_the_session_to_a_fresh_id() {
+    let service = make_service();
+    let session = test_session();
+    let before = session.session_id().await;
+
+    let user = candidate_user("u1", "alice@example.com");
+    let outcome = service
+        .begin_signup(user, "default", &session)
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, SignupOutcome::Started));
+    assert_ne!(session.session_id().await, before);
+}
+
 #[tokio::test]
 async fn begin_signup_creates_user_and_sets_pending_workflow() {
     let service = make_service();
@@ -433,4 +451,70 @@ async fn signup_rejects_control_chars_in_display_name() {
     };
     let result = service.begin_signup(user, "default", &session).await;
     assert!(matches!(result, Err(AuthnError::InvalidAssertion)));
+}
+
+/// A timed suspension of the tenant that has lapsed by `complete_signup` no
+/// longer blocks the activation: the status is read as of the clock, as a
+/// login reads it.
+#[tokio::test]
+async fn complete_signup_admits_a_tenant_whose_timed_suspension_has_lapsed() {
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    service
+        .begin_signup(
+            candidate_user("u1", "alice@example.com"),
+            "default",
+            &session,
+        )
+        .await
+        .unwrap();
+
+    let mut lapsed = test_tenant();
+    lapsed.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: Utc::now() - chrono::Duration::hours(2),
+        until: Some(Utc::now() - chrono::Duration::hours(1)),
+    });
+    let _ = identity.clone().with_tenant(lapsed);
+
+    let result = service.complete_signup(&session).await;
+
+    assert!(result.is_ok(), "{result:?}");
+    assert!(session.is_authenticated().await);
+}
+
+/// A tenant suspended between `begin_signup` and `complete_signup` refuses the
+/// activation: the tenant's status is read again, not taken from the begin.
+#[tokio::test]
+async fn complete_signup_refuses_a_tenant_suspended_since_the_begin() {
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    service
+        .begin_signup(
+            candidate_user("u1", "alice@example.com"),
+            "default",
+            &session,
+        )
+        .await
+        .unwrap();
+
+    let mut suspended = test_tenant();
+    suspended.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: Utc::now(),
+        until: None,
+    });
+    let _ = identity.clone().with_tenant(suspended);
+
+    let result = service.complete_signup(&session).await;
+
+    assert!(result.is_err(), "{result:?}");
+    assert!(
+        !session.is_authenticated().await,
+        "a suspended tenant's signup must not authenticate"
+    );
 }

@@ -250,9 +250,13 @@ pub trait RefreshTokenStore: Send + Sync {
     /// already-revoked token under reuse plus any sibling members that
     /// were still active when reuse was detected. Production overrides
     /// SHOULD pass these to
-    /// [`cascade_revoke_devices`](crate::device::cascade_revoke_devices)
+    /// [`cascade_revoke_devices_and_tokens`](crate::device::cascade_revoke_devices_and_tokens)
     /// so every device that participated in the family transitions to
-    /// [`DeviceTrustLevel::Revoked`](crate::device::DeviceTrustLevel::Revoked).
+    /// [`DeviceTrustLevel::Revoked`](crate::device::DeviceTrustLevel::Revoked)
+    /// and its refresh tokens are revoked, as
+    /// [`CascadingRefreshStore`](crate::device::CascadingRefreshStore) does
+    /// (a store that cannot revoke tokens uses
+    /// [`cascade_revoke_devices`](crate::device::cascade_revoke_devices)).
     /// The default implementation logs the device list alongside the
     /// family id; it does NOT perform the cascade itself because the
     /// trait has no access to a [`DeviceStore`](crate::device::DeviceStore).
@@ -270,7 +274,7 @@ pub trait RefreshTokenStore: Send + Sync {
             %family_id,
             device_count = compromised_devices.len(),
             "refresh token compromise detected (rotated-out token was reused); \
-             override on_token_compromise + call cascade_revoke_devices to revoke linked devices"
+             override on_token_compromise + call cascade_revoke_devices_and_tokens to revoke linked devices"
         );
         async {}
     }

@@ -26,6 +26,10 @@ impl EncryptionKey {
     pub(super) fn as_array(&self) -> &[u8; 32] {
         &self.0
     }
+
+    pub(super) fn is_constant(&self) -> bool {
+        is_constant_key(&self.0)
+    }
 }
 
 impl Drop for EncryptionKey {
@@ -176,7 +180,7 @@ impl KeyProvider for MemoryKeyProvider {
     }
 }
 
-fn validate_key_id(id: &str) -> Result<(), KeyProviderError> {
+pub(super) fn validate_key_id(id: &str) -> Result<(), KeyProviderError> {
     if id.is_empty() || id.contains('.') {
         return Err(KeyProviderError::InvalidKeyId(id.to_string()));
     }

@@ -141,14 +141,24 @@ where
     }
 
     /// Store the ceremony-started timestamp for the ceremony that owns
-    /// `state_key`.
-    pub(super) async fn stamp_ceremony_start(&self, session: &AuthSession, state_key: &str) {
-        session
+    /// `state_key`. A ceremony that cannot be timed must not start: when the
+    /// stamp does not fit the session this is [`AuthnError::NoFlow`].
+    pub(super) async fn stamp_ceremony_start(
+        &self,
+        session: &AuthSession,
+        state_key: &str,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let stored = session
             .set_custom(
                 fido2_keys::started_key(state_key),
                 serde_json::Value::String(self.inner.clock.now().to_rfc3339()),
             )
             .await;
+        if stored {
+            Ok(())
+        } else {
+            Err(AuthnError::NoFlow)
+        }
     }
 
     /// Clear a ceremony's state key and its timestamp from the session.
@@ -229,9 +239,13 @@ where
             })?;
 
         let state_json = serde_json::to_value(&auth_state).map_err(|_| AuthnError::NoFlow)?;
-        session.set_custom(fido2_keys::DISC_STATE, state_json).await;
+        if !session.set_custom(fido2_keys::DISC_STATE, state_json).await {
+            // The ceremony state did not fit; a challenge handed out without
+            // it could never be finished.
+            return Err(AuthnError::NoFlow);
+        }
         self.stamp_ceremony_start(session, fido2_keys::DISC_STATE)
-            .await;
+            .await?;
 
         serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)
     }
@@ -252,12 +266,17 @@ where
         session: &AuthSession,
     ) -> Result<serde_json::Value, AuthnError<I::Error>> {
         let challenge = self.begin_discoverable_login(session).await?;
-        session
+        let bound = session
             .set_custom(
                 fido2_keys::DISC_TENANT,
                 serde_json::Value::String(tenant_id.to_string()),
             )
             .await;
+        if !bound {
+            // The ceremony must not run without its tenant: retire it.
+            self.clear_discoverable_ceremony(session).await;
+            return Err(AuthnError::NoFlow);
+        }
         Ok(challenge)
     }
 

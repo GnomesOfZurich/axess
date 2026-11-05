@@ -5,16 +5,16 @@
 //! eviction ordering) and the pub/sub revocation channel layout.
 
 use super::internal::{
-    DEFAULT_PREFIX, ValkeyStoreError, after_degraded_poll, degraded_poll_delay, registry_cutoff_ms,
-    registry_key, registry_key_ttl_secs, registry_member_live, registry_member_ttl_ms,
-    revocation_session_channel, revocation_user_channel,
+    DEFAULT_PREFIX, ValkeyStoreError, Watch, after_check, after_degraded_poll, degraded_poll_delay,
+    registry_cutoff_ms, registry_key, registry_key_ttl_secs, registry_member_live,
+    registry_member_ttl_ms, revocation_session_channel, revocation_user_channel,
 };
 use super::subscriber::{Event, SharedSubscriber};
 use crate::session::{id::SessionId, store::SessionRegistry};
 use axess_clock::{Clock, SystemClock};
 use axess_rng::{SecureRng, SystemRng};
 use fred::prelude::*;
-use fred::types::sorted_sets::{ZRange, ZRangeBound, ZRangeKind};
+use fred::types::sorted_sets::{Ordering, ZRange, ZRangeBound, ZRangeKind};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -59,8 +59,10 @@ const RECHECK_JITTER_MAX_MS: u64 = 250;
 /// Valkey-backed session registry using sorted sets.
 ///
 /// Each user has a sorted set containing their valid session IDs, scored by
-/// registration time in epoch milliseconds. A member lives for the
-/// registry's `ttl` after its score: reads treat an older member as absent
+/// the time the session was registered or last found in use, in epoch
+/// milliseconds. A member lives for the registry's `ttl` after its score,
+/// which `is_valid` moves forward for a session that is used (so an active
+/// session never lapses): reads treat an older member as absent
 /// and prune it, so a session whose own key has long expired neither counts
 /// toward `max_sessions_per_user` nor validates. Forced logout removes the
 /// set (or a single member).
@@ -221,6 +223,32 @@ impl SessionRegistry for ValkeySessionRegistry {
                 .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
                 .await?;
         }
+        if live && let Some(score) = score {
+            // A session that is used keeps its member: a session lives as
+            // long as it is active, so a member that lapsed a fixed time
+            // after `register` would log an active user out. The score moves
+            // forward once half the lifetime has gone, so the check writes
+            // at most twice per lifetime. `XX` never creates a member (a
+            // concurrent revocation is not undone) and `GT` never moves a
+            // score back.
+            if now_ms as f64 - score >= member_ttl_ms as f64 / 2.0 {
+                let pipeline = self.client.pipeline();
+                pipeline
+                    .zadd::<(), _, _>(
+                        &key,
+                        Some(SetOptions::XX),
+                        Some(Ordering::GreaterThan),
+                        false,
+                        false,
+                        (now_ms as f64, sid_str),
+                    )
+                    .await?;
+                pipeline
+                    .expire::<(), _>(&key, registry_key_ttl_secs(self.ttl), None)
+                    .await?;
+                pipeline.all::<()>().await?;
+            }
+        }
         Ok(live)
     }
 
@@ -317,10 +345,10 @@ impl SessionRegistry for ValkeySessionRegistry {
             loop {
                 tokio::time::sleep(self.degraded_poll_delay(failed_polls)).await;
                 let answer = self.is_valid(user_id, session_id).await;
-                let Some(next) = after_degraded_poll(answer, failed_polls) else {
-                    return;
-                };
-                failed_polls = next;
+                match after_degraded_poll(answer, failed_polls) {
+                    Watch::Polling(next) => failed_polls = next,
+                    Watch::Ended | Watch::Waiting => return,
+                }
             }
         };
 
@@ -328,30 +356,24 @@ impl SessionRegistry for ValkeySessionRegistry {
         // is_valid check, so a revocation arriving after the check still
         // wakes us. The session may also have been invalidated between
         // session resolution and joining; if so, return immediately.
-        if let Ok(false) = self.is_valid(user_id, session_id).await {
-            return;
-        }
-
-        // After the connection is lost, the watcher polls the registry on a
-        // timer until a replacement flags it for a recheck. `degraded` holds
-        // the count of consecutive polls the registry did not answer, which
-        // each wait backs off on.
-        let mut degraded: Option<u32> = None;
+        // After the connection is lost, or a check the registry did not
+        // answer, the watcher polls the registry on a timer until a
+        // replacement flags it for a recheck. `state` says which, and holds the
+        // count of consecutive polls the registry did not answer, which each
+        // wait backs off on.
+        let mut state = after_check(self.is_valid(user_id, session_id).await);
         loop {
-            let event = if let Some(failed_polls) = degraded {
-                tokio::select! {
+            let event = match state {
+                Watch::Ended => return,
+                Watch::Polling(failed_polls) => tokio::select! {
                     event = watch.slot.next() => event,
                     () = tokio::time::sleep(self.degraded_poll_delay(failed_polls)) => {
                         let answer = self.is_valid(user_id, session_id).await;
-                        let Some(next) = after_degraded_poll(answer, failed_polls) else {
-                            return;
-                        };
-                        degraded = Some(next);
+                        state = after_degraded_poll(answer, failed_polls);
                         continue;
                     }
-                }
-            } else {
-                watch.slot.next().await
+                },
+                Watch::Waiting => watch.slot.next().await,
             };
             match event {
                 Event::Revoked => return,
@@ -360,15 +382,12 @@ impl SessionRegistry for ValkeySessionRegistry {
                 // its own so a burst does not turn into one instant of
                 // checks from every watcher.
                 Event::Recheck => {
-                    degraded = None;
                     tokio::time::sleep(self.recheck_delay()).await;
-                    if let Ok(false) = self.is_valid(user_id, session_id).await {
-                        return;
-                    }
+                    state = after_check(self.is_valid(user_id, session_id).await);
                 }
                 // The connection is gone: poll the registry until a
                 // replacement connection flags this watcher for a recheck.
-                Event::Closed => degraded = Some(0),
+                Event::Closed => state = Watch::Polling(0),
             }
         }
     }

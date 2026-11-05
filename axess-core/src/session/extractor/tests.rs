@@ -29,6 +29,55 @@ mod custom_bag_tests {
         ))))
     }
 
+    /// A session put into a pending workflow carries the fingerprint of the
+    /// client that did it, so the cookie cannot be replayed from another.
+    #[tokio::test]
+    async fn a_pending_workflow_binds_the_request_fingerprint() {
+        let session = make_session();
+        session.0.0.write().await.pending_fingerprint = Some("fp-client".into());
+        session
+            .set_pending_workflow(
+                axess_identity::testing::user("u-wf"),
+                axess_identity::testing::tenant("t-wf"),
+                crate::session::data::WorkflowState::new(
+                    crate::session::data::WorkflowKind::Signup,
+                    2,
+                    chrono::Utc::now(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            session.data().await.fingerprint.as_deref(),
+            Some("fp-client")
+        );
+    }
+
+    /// Entering a partial-login state replaces the session id, so an id
+    /// planted before the login does not carry the login's state.
+    #[tokio::test]
+    async fn partial_login_states_rotate_the_session_id() {
+        let user = axess_identity::testing::user("u-rot");
+        let tenant = axess_identity::testing::tenant("t-rot");
+
+        let session = make_session();
+        let before = session.peek_session_id().await;
+        session.set_identifying(user, tenant).await;
+        {
+            let g = session.0.0.read().await;
+            assert!(g.regenerate, "identifying must rotate the id");
+            assert_eq!(g.pre_cycle_id, Some(before));
+        }
+
+        let session = make_session();
+        let before = session.peek_session_id().await;
+        session
+            .begin_authenticating(user, tenant, "password".into(), vec![])
+            .await;
+        let g = session.0.0.read().await;
+        assert!(g.regenerate, "authenticating must rotate the id");
+        assert_eq!(g.pre_cycle_id, Some(before));
+    }
+
     /// Becoming authenticated drops what the visitor put in the session
     /// before the login, except the key the login owns for the flow in
     /// flight.
@@ -583,6 +632,23 @@ mod extractor_tests {
         session.set_pending_workflow(user, tenant, workflow).await;
         let state = session.auth_state().await;
         assert!(matches!(state, AuthState::PendingWorkflow { .. }));
+    }
+
+    /// A pending workflow begins under a fresh id, as an identifying or
+    /// authenticating session does: the id the visitor arrived with may have
+    /// been planted.
+    #[tokio::test]
+    async fn set_pending_workflow_rotates_the_session_id() {
+        use crate::session::data::{WorkflowKind, WorkflowState};
+        let session = make_session();
+        let before = session.session_id().await;
+        let user = axess_identity::testing::user("u-pend");
+        let tenant = axess_identity::testing::tenant("t-pend");
+        let workflow = WorkflowState::new(WorkflowKind::Signup, 3, chrono::Utc::now());
+
+        session.set_pending_workflow(user, tenant, workflow).await;
+
+        assert_ne!(session.session_id().await, before);
     }
 
     /// `clear()` resets the session to Guest with empty data. The

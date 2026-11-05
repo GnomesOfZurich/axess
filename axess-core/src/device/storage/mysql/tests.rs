@@ -47,6 +47,7 @@ async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(store(4).await).await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
+    shared::a_revoked_device_never_comes_back(|| store(4)).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(store(4).await).await;
     shared::sub_second_instants_compare_as_whole_seconds(store(4).await).await;
     shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
@@ -393,5 +394,6 @@ async fn the_sighting_lookups_read_their_index_without_a_sort() {
     }
 }
 
+mod create_lock;
 mod reseal;
 mod schema;

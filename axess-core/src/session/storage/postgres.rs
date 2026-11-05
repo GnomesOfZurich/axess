@@ -193,10 +193,11 @@ impl PostgresSessionStore {
         }
     }
 
-    /// Delete all sessions whose `expires_at` is in the past.
+    /// Delete all sessions whose `expires_at` is now or in the past: the
+    /// instant from which `load` no longer returns them.
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now = self.clock.now().timestamp();
-        let result = sqlx::query("DELETE FROM sessions WHERE expires_at < $1")
+        let result = sqlx::query("DELETE FROM sessions WHERE expires_at <= $1")
             .bind(now)
             .execute(&self.pool)
             .await?;
@@ -595,8 +596,15 @@ mod postgres_tests {
             .expect("connect_lazy must parse a valid URL")
     }
 
+    /// An encrypted store: only `plaintext_constructor_emits_warning` calls
+    /// `plaintext`, so no other test hits that warning's callsite while the
+    /// capture is installed.
     fn store() -> PostgresSessionStore {
-        PostgresSessionStore::plaintext(unreachable_pool())
+        let key = std::array::from_fn(|i| u8::try_from(i).unwrap_or(0) + 1);
+        PostgresSessionStore::new(
+            unreachable_pool(),
+            crate::session::crypto::SessionCrypto::new(key),
+        )
     }
 
     fn sample_id() -> SessionId {

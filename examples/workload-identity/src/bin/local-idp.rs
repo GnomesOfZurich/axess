@@ -34,7 +34,20 @@
 //!   current.kid          # text file containing the current kid
 //!   historical/
 //!     v1.pem             # PKCS#8 PEM, every key (current or historical)
+//!     v2.pem.new         # a key minted for a rotation not yet made
+//!   rotated_at/
+//!     v1                 # when v1 stopped being current
+//!   retired/
+//!     v0.pem             # keys taken out of the JWKS, kept for audit
 //! ```
+//!
+//! A key can be retired only once its longest-lived token has expired, a kid
+//! that was used (current, historical or retired) is never used again, and a
+//! rotation that fails leaves no key file behind. A new key is staged as
+//! `{kid}.pem.new` and takes its `.pem` name inside the rotation, so a crash
+//! in between does not publish a key that has no rotation record. A
+//! historical key from a store that kept no rotation record is stamped the
+//! first time the store loads it, and can be retired that long after.
 //!
 //! `POST /issue` and `POST /admin/rotate` require
 //! `Authorization: Bearer <token>`. Set `LOCAL_IDP_ADMIN_TOKEN` (16+
@@ -71,15 +84,17 @@ const BIND: &str = "127.0.0.1:3000";
 /// File-backed [`LocalIdpKeyStore`] using a small directory layout:
 ///
 /// - `historical/{kid}.pem`; every key (current and historical) is
-///   stored once, addressed by kid.
+///   stored once, addressed by kid. A key minted for a rotation waits as
+///   `historical/{kid}.pem.new`, which nothing reads, until `rotate` renames
+///   it.
 /// - `current.kid`; a text file naming the current kid; rotated
 ///   atomically via temp-file + rename.
 ///
 /// The trait's `rotate` method receives the new [`LocalIdpSigningKey`]
-/// the operator has already written into `historical/`; this impl only
-/// has to flip the pointer file. That keeps the rotation path safe
-/// against partial writes (the new key file existed before the pointer
-/// flip, so a crash mid-rotation leaves the old key still current).
+/// the operator has already staged in `historical/`; this impl gives the
+/// key file its `.pem` name and flips the pointer file. That keeps the
+/// rotation path safe against partial writes (a crash mid-rotation leaves
+/// the old key still current and the new one unpublished).
 #[derive(Clone)]
 struct FileLocalIdpKeyStore {
     root: PathBuf,
@@ -87,6 +102,9 @@ struct FileLocalIdpKeyStore {
     // pointer flip. Reads (`load_all`) don't need the mutex; they
     // take a consistent snapshot via a single `current.kid` read.
     rotate_lock: Arc<Mutex<()>>,
+    // Stamps the moment a key stops being current. The same clock the
+    // retire check reads (the state's), so the two cannot disagree.
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Debug, Error)]
@@ -108,10 +126,11 @@ enum FileKeyStoreError {
 }
 
 impl FileLocalIdpKeyStore {
-    fn new(root: impl Into<PathBuf>) -> Self {
+    fn new(root: impl Into<PathBuf>, clock: Arc<dyn Clock>) -> Self {
         Self {
             root: root.into(),
             rotate_lock: Arc::new(Mutex::new(())),
+            clock,
         }
     }
 
@@ -127,6 +146,12 @@ impl FileLocalIdpKeyStore {
         self.historical_dir().join(format!("{kid}.pem"))
     }
 
+    /// Where a key minted for a rotation waits until `rotate` renames it to
+    /// [`key_path`](Self::key_path). `list_kids` reads only `.pem` files.
+    fn staged_key_path(&self, kid: &str) -> PathBuf {
+        self.historical_dir().join(format!("{kid}.pem.new"))
+    }
+
     fn read_pointer(&self) -> Result<String, FileKeyStoreError> {
         let path = self.pointer_path();
         std::fs::read_to_string(&path)
@@ -135,6 +160,77 @@ impl FileLocalIdpKeyStore {
                 path: path.display().to_string(),
                 source: e,
             })
+    }
+
+    fn rotated_at_path(&self, kid: &str) -> PathBuf {
+        self.root.join("rotated_at").join(kid)
+    }
+
+    /// Note the moment `kid` stopped being the current key. Every token it
+    /// signed is valid for at most [`MAX_TTL_SECS`] after that.
+    fn record_rotation(&self, kid: &str, at: chrono::DateTime<chrono::Utc>) -> std::io::Result<()> {
+        let path = self.rotated_at_path(kid);
+        std::fs::create_dir_all(path.parent().expect("a file in rotated_at"))?;
+        std::fs::write(path, at.to_rfc3339())
+    }
+
+    /// Whether `kid` names a key this store holds or has archived. A kid that
+    /// has been used is never used for another key: tokens and the archive
+    /// are told apart by it.
+    fn kid_taken(&self, kid: &str) -> bool {
+        self.key_path(kid).exists()
+            || self.staged_key_path(kid).exists()
+            || self
+                .root
+                .join("retired")
+                .join(format!("{kid}.pem"))
+                .exists()
+    }
+
+    /// True when `kid` is a historical key that may still have live tokens:
+    /// no rotation was recorded for it (an unreadable record), or fewer than
+    /// [`MAX_TTL_SECS`] have passed since. Keys that do not exist or are
+    /// current are not blocked here; the IdP answers for those.
+    fn retire_blocked(&self, kid: &str) -> Result<bool, FileKeyStoreError> {
+        let now = self.clock.now();
+        if !valid_kid(kid) || !self.key_path(kid).exists() || self.read_pointer()? == kid {
+            return Ok(false);
+        }
+        let recorded = std::fs::read_to_string(self.rotated_at_path(kid))
+            .ok()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t.trim()).ok());
+        Ok(match recorded {
+            Some(at) => now < at.to_utc() + Duration::seconds(MAX_TTL_SECS),
+            None => true,
+        })
+    }
+
+    /// Remove the staged key of a rotation that did not complete, so the
+    /// next start does not find a key that never signed anything. The
+    /// current key, and a key already renamed into place, are never removed.
+    async fn discard_unused_key(&self, kid: &str) {
+        let _guard = self.rotate_lock.lock().await;
+        if valid_kid(kid)
+            && self.read_pointer().is_ok_and(|current| current != kid)
+            && let Err(e) = std::fs::remove_file(self.staged_key_path(kid))
+        {
+            tracing::warn!(error = %e, "could not remove the key of a failed rotation");
+        }
+    }
+
+    /// Stamp every historical key that has no rotation record with the
+    /// current time. A store that predates the records leaves its keys
+    /// unstamped, and an unstamped key can never be retired; the stamp makes
+    /// it retirable [`MAX_TTL_SECS`] after this first read, later than it
+    /// strictly had to be and so safe.
+    fn stamp_unrecorded(&self, current: &str, kids: &[String]) {
+        for kid in kids.iter().filter(|k| k.as_str() != current) {
+            if !self.rotated_at_path(kid).exists()
+                && let Err(e) = self.record_rotation(kid, self.clock.now())
+            {
+                tracing::warn!(error = %e, kid = %kid, "could not stamp a key with no rotation record");
+            }
+        }
     }
 
     fn read_key(&self, kid: &str) -> Result<LocalIdpSigningKey, FileKeyStoreError> {
@@ -187,6 +283,7 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
             if !all_kids.iter().any(|k| k == &current_kid) {
                 return Err(FileKeyStoreError::MissingCurrent { kid: current_kid });
             }
+            store.stamp_unrecorded(&current_kid, &all_kids);
             let current = store.read_key(&current_kid)?;
             let mut historical = Vec::new();
             for kid in all_kids {
@@ -210,30 +307,57 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
             let rotate_guard = store.rotate_lock.lock().await;
             let new_kid = new_current.key_id().to_string();
 
-            // The trait expects the new key's PEM to already live at
-            // `historical/{kid}.pem`; operators wrote it before calling
-            // rotate. Verify it's there so we don't flip the pointer at
-            // a missing file.
+            // The trait expects the new key's PEM to be staged at
+            // `historical/{kid}.pem.new`; operators wrote it before calling
+            // rotate. Verify it's there so we don't flip the pointer at a
+            // missing file, then give it the name `load_all` reads.
+            let staged = store.staged_key_path(&new_kid);
             let key_path = store.key_path(&new_kid);
-            if !key_path.exists() {
+            if !staged.exists() {
                 return Err(FileKeyStoreError::MissingCurrent { kid: new_kid });
             }
-
-            // Atomic pointer flip: write to a sibling temp file then
-            // rename over `current.kid`. POSIX `rename(2)` is atomic on
-            // the same filesystem; a crash before the rename leaves the
-            // old pointer intact.
-            let tmp_path = store.root.join("current.kid.tmp");
-            std::fs::write(&tmp_path, &new_kid).map_err(|e| FileKeyStoreError::Io {
-                path: tmp_path.display().to_string(),
+            std::fs::rename(&staged, &key_path).map_err(|e| FileKeyStoreError::Io {
+                path: staged.display().to_string(),
                 source: e,
             })?;
-            std::fs::rename(&tmp_path, store.pointer_path()).map_err(|e| {
-                FileKeyStoreError::Io {
-                    path: store.pointer_path().display().to_string(),
-                    source: e,
+
+            // Any failure from here leaves the key unpublished again: it goes
+            // back to its staged name, and the old key stays current.
+            let flip = (|| {
+                // Remember when the outgoing key stopped signing, so it is
+                // not retired while its tokens are still valid.
+                let outgoing = store.read_pointer()?;
+                if outgoing != new_kid {
+                    store
+                        .record_rotation(&outgoing, store.clock.now())
+                        .map_err(|e| FileKeyStoreError::Io {
+                            path: store.rotated_at_path(&outgoing).display().to_string(),
+                            source: e,
+                        })?;
                 }
-            })?;
+
+                // Atomic pointer flip: write to a sibling temp file then
+                // rename over `current.kid`. POSIX `rename(2)` is atomic on
+                // the same filesystem; a crash before the rename leaves the
+                // old pointer intact.
+                let tmp_path = store.root.join("current.kid.tmp");
+                std::fs::write(&tmp_path, &new_kid).map_err(|e| FileKeyStoreError::Io {
+                    path: tmp_path.display().to_string(),
+                    source: e,
+                })?;
+                std::fs::rename(&tmp_path, store.pointer_path()).map_err(|e| {
+                    FileKeyStoreError::Io {
+                        path: store.pointer_path().display().to_string(),
+                        source: e,
+                    }
+                })
+            })();
+            if let Err(e) = flip {
+                if let Err(undo) = std::fs::rename(&key_path, &staged) {
+                    tracing::warn!(error = %undo, "could not unpublish the key of a failed rotation");
+                }
+                return Err(e);
+            }
             drop(rotate_guard);
             Ok(())
         }
@@ -264,6 +388,13 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
                 source: e,
             })?;
             let to = retired_dir.join(format!("{kid}.pem"));
+            // `rename` replaces its target: an archived key is never replaced.
+            if to.exists() {
+                return Err(FileKeyStoreError::Io {
+                    path: to.display().to_string(),
+                    source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+                });
+            }
             std::fs::rename(&from, &to).map_err(|e| FileKeyStoreError::Io {
                 path: from.display().to_string(),
                 source: e,
@@ -336,10 +467,14 @@ fn mint_and_persist_new_key(
     if !valid_kid(kid) {
         return Err("new_kid must be 1 to 64 characters of letters, digits, '-' or '_'".into());
     }
+    if store.kid_taken(kid) {
+        return Err("that kid is already in use or archived".into());
+    }
     let mut rng = rsa::rand_core::OsRng;
     let key = RsaPrivateKey::new(&mut rng, RSA_KEY_BITS)?;
     let pem = key.to_pkcs8_pem(LineEnding::LF)?;
-    let path = store.key_path(kid);
+    // Staged, not published: the key takes its `.pem` name inside `rotate`.
+    let path = store.staged_key_path(kid);
     write_private_key(&path, pem.as_bytes())?;
     let parsed =
         LocalIdpSigningKey::from_rsa_pem(&pem, kid.to_string(), jsonwebtoken::Algorithm::RS256)?;
@@ -482,6 +617,12 @@ async fn rotate_handler(
             "new_kid must be 1 to 64 characters of letters, digits, '-' or '_'".into(),
         ));
     }
+    if state.store.kid_taken(&req.new_kid) {
+        return Err((
+            StatusCode::CONFLICT,
+            "that kid is already in use or archived; pick a new one".into(),
+        ));
+    }
     let new_key = mint_and_persist_new_key(&state.store, &req.new_kid).map_err(|e| {
         tracing::warn!(error = %e, "key generation failed");
         (
@@ -493,13 +634,16 @@ async fn rotate_handler(
     // Phase 2: ask LocalIdp to rotate. The store's `rotate` impl flips
     // the pointer atomically; LocalIdp updates its in-memory state +
     // JWKS so subsequent mints use the new key.
-    state.idp.rotate_signing_key(new_key).await.map_err(|e| {
+    if let Err(e) = state.idp.rotate_signing_key(new_key).await {
         tracing::warn!(error = %e, "rotation failed");
-        (
+        // The new key never became current; without this the next start
+        // would load its file and publish it.
+        state.store.discard_unused_key(&req.new_kid).await;
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "rotation failed".to_string(),
-        )
-    })?;
+        ));
+    }
 
     let jwks = state.idp.jwks().await;
     let kids: Vec<String> = jwks
@@ -524,6 +668,21 @@ async fn retire_handler(
     State(state): State<AppState>,
     Json(req): Json<RetireRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    match state.store.retire_blocked(&req.kid) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "tokens signed by that key may still be valid; retire it {MAX_TTL_SECS} seconds after the rotation that replaced it"
+                ),
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "retire check failed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "retire failed".into()));
+        }
+    }
     match state.idp.retire_historical_key(&req.kid).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "no such historical key".into())),
@@ -561,7 +720,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into();
     bootstrap_initial_key(&key_dir)?;
 
-    let store = FileLocalIdpKeyStore::new(key_dir);
+    // One clock for token times, rotation stamps and the retire check.
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let store = FileLocalIdpKeyStore::new(key_dir, clock.clone());
     let idp = LocalIdp::from_key_store(ISSUER, store.clone())
         .await?
         .with_max_ttl(Duration::seconds(MAX_TTL_SECS));
@@ -584,7 +745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         idp: idp.clone(),
         store,
-        clock: Arc::new(SystemClock),
+        clock,
         admin_token,
     };
 
@@ -614,62 +775,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// A binary is its own crate root, so a plain `mod tests;` would look beside
+// the file and cargo would read `src/bin/tests.rs` as another binary.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn issue_refuses_a_huge_lifetime_and_a_missing_audience() {
-        let now = chrono::Utc::now();
-        // These used to reach `now + Duration::seconds(..)`, which panics
-        // on overflow, or minted a token with no audience.
-        for ttl in [i64::MAX, i64::MIN, 0, -1, MAX_TTL_SECS + 1] {
-            let err = validated_expiry(now, ttl, Some("api")).unwrap_err();
-            assert_eq!(err.0, StatusCode::BAD_REQUEST, "ttl {ttl}");
-        }
-        for aud in [None, Some(""), Some("  ")] {
-            let err = validated_expiry(now, 60, aud).unwrap_err();
-            assert_eq!(err.0, StatusCode::BAD_REQUEST, "aud {aud:?}");
-        }
-        assert_eq!(
-            validated_expiry(now, MAX_TTL_SECS, Some("api")).unwrap(),
-            now + Duration::seconds(MAX_TTL_SECS)
-        );
-    }
-
-    #[test]
-    fn a_kid_cannot_name_another_path() {
-        for bad in [
-            "",
-            "../escape",
-            "a/b",
-            "a\\b",
-            "..",
-            "v1.pem",
-            "a b",
-            &"k".repeat(65),
-        ] {
-            assert!(!valid_kid(bad), "{bad:?} must be refused");
-        }
-        for good in ["v1", "2026-10_rotation", "K"] {
-            assert!(valid_kid(good), "{good:?} must be accepted");
-        }
-    }
-
-    #[test]
-    fn a_private_key_file_is_never_overwritten_and_is_owner_only() {
-        let dir = std::env::temp_dir().join(format!("local-idp-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("k.pem");
-        write_private_key(&path, b"first").unwrap();
-        assert!(write_private_key(&path, b"second").is_err());
-        assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0, "group/other bits must be clear: {mode:o}");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
+#[path = "local-idp/tests.rs"]
+mod tests;

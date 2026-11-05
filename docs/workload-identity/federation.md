@@ -231,7 +231,11 @@ let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
     // Trust owners and repositories by immutable numeric id, not by name.
     github_actions_mapper(
         trust_domain,
-        GitHubAllowlist::new().owner_id("123456").repository_id("987654321"),
+        GitHubAllowlist::new()
+            .owner_id("123456")
+            .repository_id("987654321")
+            .git_ref("refs/heads/main")
+            .event("push"),
     ),
 );
 let principal = resolver.resolve().await?;
@@ -247,6 +251,11 @@ that carry the name you trusted. The names (`repository`,
 preserves `actor`, `workflow`, `ref`, `sha`, `event_name` as
 Cedar attributes for policy use (allow only deploys from the
 default branch, require a specific workflow file, etc.).
+
+The allowlist also restricts the run and fails closed: the token's `ref` or
+`environment` must be one you listed with `git_ref` or `environment`, and its
+`event_name` one you listed with `event`. A token without the claim, or an
+allowlist with nothing listed, admits nothing.
 
 ### Other issuers (Okta, Azure AD, Auth0, …)
 

@@ -3,7 +3,7 @@
 
 //! Injectable [`SecureRng`] trait for deterministic simulation testing (DST).
 //!
-//! Production code depends on the trait, not on `rand::rng()` directly, so
+//! Production code depends on the trait, not on the operating system generator directly, so
 //! tests can swap in a [`testing::MockRng`] (a seeded PRNG) and get
 //! reproducible outputs from auth flows, token issuance, and key generation.
 //! This crate is a foundational primitive used by
@@ -40,11 +40,11 @@
 //! assert_eq!(a, b, "same seed → same bytes");
 //! ```
 
-use rand::Rng;
-
 #[cfg(any(test, feature = "testing"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing;
+
+pub mod hex;
 
 #[cfg(feature = "numeric")]
 #[cfg_attr(docsrs, doc(cfg(feature = "numeric")))]
@@ -77,18 +77,23 @@ impl<R: SecureRng + ?Sized> SecureRng for std::sync::Arc<R> {
     }
 }
 
-/// Production implementation backed by `rand::rng()`: a per-thread ChaCha
-/// CSPRNG seeded from the operating system and reseeded periodically and
-/// after a fork.
+/// Production implementation backed by the operating system's random
+/// generator (`getrandom`: `getrandom(2)`, `getentropy`, `BCryptGenRandom`
+/// and the like). It keeps no state of its own.
+///
+/// # Panics
+///
+/// [`SecureRng::fill_bytes`] cannot report a failure, so it panics if the
+/// operating system generator refuses, rather than hand back bytes that are
+/// not random.
 ///
 /// # Platform support
 ///
 /// This type is **not available on `wasm32-unknown-unknown`**. The
-/// underlying `rand`/`getrandom` crates panic at runtime on that target
-/// unless the consumer enables `getrandom`'s `js` feature, which is a
-/// contract that belongs to the application, not to this auth library.
-/// Refusing to compile here surfaces the choice at build time instead of
-/// at the first call to `rand::rng()`.
+/// underlying `getrandom` crate has no backend there unless the consumer
+/// opts into one, which is a contract that belongs to the application, not
+/// to this auth library. Refusing to compile here surfaces the choice at
+/// build time instead of at the first call.
 ///
 /// On `wasm32-unknown-unknown`, supply your own [`SecureRng`] (typically
 /// one wrapping `web_sys::Crypto::get_random_values`) when constructing
@@ -102,7 +107,9 @@ pub struct SystemRng;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl SecureRng for SystemRng {
     fn fill_bytes(&self, dest: &mut [u8]) {
-        rand::rng().fill_bytes(dest);
+        if let Err(err) = getrandom::fill(dest) {
+            panic!("the operating system random generator failed: {err}");
+        }
     }
 }
 

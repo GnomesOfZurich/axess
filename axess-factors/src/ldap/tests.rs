@@ -167,14 +167,7 @@ fn ldap_dn_escape_space_at_dn_boundary() {
     assert_eq!(ldap_dn_escape(" alice"), "\\ alice");
     assert_eq!(ldap_dn_escape("alice "), "alice\\ ");
     assert_eq!(ldap_dn_escape(" "), "\\ ");
-    // Interior spaces don't hit the boundary arm; 0x20 is below the
-    // 0x21..=0x7E printable range, so they hex-escape via the fallback.
-    assert_eq!(ldap_dn_escape("a b"), "a\\20b");
-}
-
-#[test]
-fn ldap_dn_escape_non_ascii_hex_escapes() {
-    assert_eq!(ldap_dn_escape("ü"), "\\c3\\bc");
+    assert_eq!(ldap_dn_escape("a b"), "a b");
 }
 
 #[test]
@@ -307,4 +300,17 @@ fn a_unix_socket_url_is_local_not_cleartext() {
         remote.refuses_cleartext(),
         "a host named ldapi is still remote"
     );
+}
+
+#[test]
+fn ldap_dn_escape_keeps_interior_spaces_and_non_ascii() {
+    assert_eq!(ldap_dn_escape("a b"), "a b");
+    assert_eq!(ldap_dn_escape("ü"), "ü");
+    assert_eq!(ldap_dn_escape("Zoë Müller"), "Zoë Müller");
+}
+
+#[test]
+fn group_filter_does_not_rewrite_user_placeholder_inside_dn() {
+    let filter = expand_group_filter("(member={dn})", "uid={user}x,ou=p", "alice");
+    assert_eq!(filter, "(member=uid={user}x,ou=p)");
 }

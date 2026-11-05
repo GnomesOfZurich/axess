@@ -86,8 +86,6 @@ where
                 .await;
         }
 
-        self.inner.metrics.factor_success();
-
         if let VerifyOutcome::PassWithUpdate(updated_config) = outcome {
             if let crate::authn::factor::FactorConfig::RecoveryCodes(codes) = &updated_config
                 && codes.under_previous_pepper
@@ -106,11 +104,23 @@ where
                 .await?;
             if !swapped {
                 // Concurrent verification spent the same step/counter
-                // first; treat as a replay and reject.
-                self.inner.metrics.factor_failure();
-                return Ok(FactorOutcome::InvalidCredential);
+                // first; treat as a replay: audited, counted against the
+                // lockout and rejected like any other failed guess.
+                return self
+                    .record_factor_failure_after(
+                        reserved,
+                        user_id,
+                        tenant_id,
+                        &current_kind,
+                        session,
+                    )
+                    .await;
             }
         }
+
+        // Counted once the pass stands: a swap lost to a concurrent request
+        // is a failure, answered above.
+        self.inner.metrics.factor_success();
 
         self.release_guess(reserved, user_id).await;
         self.rehash_outdated_password(credential, &config, &resolved_from, user_id, tenant_id)

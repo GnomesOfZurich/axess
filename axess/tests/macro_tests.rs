@@ -361,6 +361,29 @@ mod authz_tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// A malformed path parameter does not tell an anonymous caller more
+    /// than a well-formed one: not authenticated is 401 either way.
+    #[tokio::test]
+    async fn require_authz_answers_an_anonymous_caller_401_for_a_malformed_path_parameter() {
+        let resp = build_app("alice")
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/docs/%FF")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_authz_answers_an_authenticated_caller_400_for_a_malformed_path_parameter() {
+        let (status, _) = call_protected(build_app("alice"), "/docs/%FF").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn require_authz_returns_500_when_policy_store_extension_missing() {
         // Build the app WITHOUT the PolicyStore extension to exercise the

@@ -225,7 +225,11 @@ attributes; axess cannot know when your data changed, so it does not
 try. When a resource changes (owner, classification, sharing) and you
 cannot list the principals that read it, call `invalidate_resource`
 with the resource's UID, which drops every entry built for that
-resource whoever asked for it. `invalidate_principal` and
+resource whoever asked for it, and every entry whose entity set holds
+that UID, so it is also the call for a parent (a folder, group or role)
+whose attributes the entries built under it carry. This holds for the
+in-process and the Valkey cache alike; the Valkey cache keeps a per-UID index
+set beside each entry to find them. `invalidate_principal` and
 `invalidate_tenant` are the equivalents for the other two scopes, and
 all of them are on the `CacheInvalidator` trait.
 

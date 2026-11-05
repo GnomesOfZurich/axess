@@ -132,6 +132,33 @@ impl TenantOAuthProviderStore for SqliteTenantOAuthProviderStore {
         Ok(record)
     }
 
+    async fn put_if_revision(
+        &self,
+        mut record: TenantOAuthProviderRecord,
+        expected: u64,
+    ) -> Result<Option<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        record.revision = 0;
+        let json = serde_json::to_string(&record).map_err(backend)?;
+        let expected = i64::try_from(expected).map_err(backend)?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "UPDATE tenant_oauth_providers SET revision = revision + 1, record = ?3 \
+             WHERE tenant_id = ?1 AND name = ?2 AND revision = ?4 \
+             RETURNING revision",
+        )
+        .bind(record.tenant_id.to_string())
+        .bind(&record.name)
+        .bind(json)
+        .bind(expected)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(backend)?;
+        row.map(|(revision,)| {
+            record.revision = u64::try_from(revision).map_err(backend)?;
+            Ok(record)
+        })
+        .transpose()
+    }
+
     async fn delete(
         &self,
         tenant: &TenantId,

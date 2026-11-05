@@ -432,10 +432,18 @@ impl axess::authn::IdentityAdmin for OurBackend {
     }
 
     async fn activate_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        sqlx::query("UPDATE users SET status = 'active' WHERE id = ?1")
-            .bind(user_id.to_string())
-            .execute(self.pool())
-            .await?;
+        // A timed suspension is `locked_until`, and the lockout reads the
+        // failed-attempt count and time; all three go, or the account stays
+        // locked or locks again on its next failure.
+        sqlx::query(
+            "UPDATE users
+             SET status = 'active', locked_until = NULL,
+                 failed_attempts = 0, last_failed_at = NULL
+             WHERE id = ?1",
+        )
+        .bind(user_id.to_string())
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 

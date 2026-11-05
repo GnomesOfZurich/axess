@@ -193,10 +193,11 @@ impl SqliteSessionStore {
         }
     }
 
-    /// Delete all sessions whose `expires_at` is in the past.
+    /// Delete all sessions whose `expires_at` is now or in the past: the
+    /// instant from which `load` no longer returns them.
     pub async fn cleanup_expired(&self) -> Result<u64, sqlx::Error> {
         let now = self.clock.now().timestamp();
-        let result = sqlx::query("DELETE FROM sessions WHERE expires_at < ?1")
+        let result = sqlx::query("DELETE FROM sessions WHERE expires_at <= ?1")
             .bind(now)
             .execute(&self.pool)
             .await?;

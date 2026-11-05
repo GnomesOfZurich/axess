@@ -159,7 +159,10 @@ fn the_stored_mac_is_the_hmac_of_the_domain_and_the_canonical_code() {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&[0x5Au8; 32]).unwrap();
     mac.update(b"axess/recovery-code/v1\0");
     mac.update(b"AAAAAAAAAA");
-    let expected = format!("hmac-sha256:{}", hex::encode(mac.finalize().into_bytes()));
+    let expected = format!(
+        "hmac-sha256:{}",
+        axess_rng::hex::encode(mac.finalize().into_bytes())
+    );
     assert_eq!(set.config.codes[0].hash, expected);
 }
 

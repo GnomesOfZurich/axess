@@ -51,6 +51,29 @@ LIB_SETS=(
   "delegated-only|--no-default-features --features delegated,jwt-rust-crypto"
 )
 
+# axess-factors with one factor or protocol feature alone. Each feature names
+# the dependencies its module uses (`totp` once failed to build without
+# `chrono`, which only `hotp` pulled in); the default set hides that. The
+# `jwt` family needs a crypto backend beside it. Keep in step with the
+# `factor_isolation` job in ci.yml.
+FACTOR_SETS=(
+  "totp"
+  "hotp"
+  "password"
+  "email_otp"
+  "recovery_code"
+  "fido2"
+  "ldap"
+  "mtls"
+  "http-body"
+  "social"
+  "jwt,jwt-rust-crypto"
+  "oidc,jwt-rust-crypto"
+  "bearer,jwt-rust-crypto"
+  "oauth,jwt-rust-crypto"
+  "outbound-oauth,jwt-rust-crypto"
+)
+
 failed=0
 
 # Profiles named on the command line, or every profile.
@@ -88,6 +111,15 @@ for entry in "${LIB_SETS[@]}"; do
     run "$pkg --lib ($name)" cargo check -p "$pkg" --lib $flags
   done
 done
+
+# Each factor feature alone. Run with no profile names only: they are not
+# core profiles.
+if [ "${#PICK[@]}" -eq 0 ]; then
+  for features in "${FACTOR_SETS[@]}"; do
+    run "axess-factors --lib ($features alone)" \
+      cargo check -p axess-factors --lib --no-default-features --features "$features"
+  done
+fi
 
 # axess-core's unit tests under every profile: `#[cfg(test)]` code and the
 # gates it widens. The facade has no unit tests: its src holds re-exports.

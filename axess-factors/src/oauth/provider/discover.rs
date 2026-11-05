@@ -124,8 +124,7 @@ impl OAuthProviderConfig {
             .map_err(|e| OAuthError::Discovery(format!("{e}")))?;
         let metadata: CoreProviderMetadata = serde_json::from_value(extras.raw.clone())
             .map_err(|e| OAuthError::Discovery(format!("discovery document: {e}")))?;
-        if metadata.issuer().as_str().trim_end_matches('/') != issuer.as_str().trim_end_matches('/')
-        {
+        if metadata.issuer().as_str() != issuer.as_str() {
             return Err(OAuthError::Discovery(format!(
                 "discovery document names issuer {} but was fetched from {issuer_url}",
                 metadata.issuer().as_str()

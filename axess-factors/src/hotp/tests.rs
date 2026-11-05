@@ -157,64 +157,34 @@ fn verify_hotp_window_walks_forward() {
     );
 }
 
-/// Differential test: axess `hotp_generate(_, _, _, Sha256)` MUST
-/// agree with `totp-rs` at `time = counter * period` (which is
-/// definitionally HOTP-SHA-256 at that counter). Kills the
-/// surviving `&` / `<<` / `+` / `-` mutations on the SHA-256
-/// branch of `hotp_generate`. Under any of them the truncation
-/// math diverges from totp-rs's reference implementation.
-///
-/// Why differential, not RFC: RFC 4226 only specifies HOTP-SHA-1
-/// vectors. The SHA-256/SHA-512 HOTP variants are defined by the
-/// OATH "HOTP-NG" / RFC 6238 §1.2 extension but no public
-/// hard-coded vectors are widely cited. Using `totp-rs` as the
-/// oracle anchors axess's bit-arithmetic to a second, independent
-/// implementation.
-#[cfg(feature = "totp")]
+/// RFC 4226 only gives SHA-1 vectors; the SHA-256 and SHA-512 variants are
+/// pinned by RFC 6238 Appendix B, whose codes are HOTP at the counter
+/// `time / 30` with 8 digits and a secret per HMAC. Kills the surviving `&`,
+/// `<<`, `+` and `-` mutations on those two branches.
 #[test]
-fn hotp_generate_sha256_matches_totp_rs_oracle() {
-    use totp_rs::{Algorithm as TotpAlgorithm, Builder};
-    const PERIOD: u64 = 30;
-    for counter in [0u64, 1, 7, 42, 1234, 1_000_000] {
-        let oracle_totp = Builder::new()
-            .with_algorithm(TotpAlgorithm::SHA256)
-            .with_digits(6)
-            .with_skew(0)
-            .with_step_duration(PERIOD)
-            .with_secret(RFC_4226_SECRET.to_vec())
-            .build()
-            .unwrap();
-        let oracle_code = oracle_totp.generate(counter * PERIOD).to_string();
-        let axess_code = hotp_generate(RFC_4226_SECRET, counter, 6, HotpAlgorithm::Sha256);
+fn hotp_generate_matches_rfc_6238_appendix_b_for_sha256_and_sha512() {
+    const SHA256_SECRET: &[u8] = b"12345678901234567890123456789012";
+    const SHA512_SECRET: &[u8] =
+        b"1234567890123456789012345678901234567890123456789012345678901234";
+    const VECTORS: [(u64, &str, &str); 6] = [
+        (59, "46119246", "90693936"),
+        (1111111109, "68084774", "25091201"),
+        (1111111111, "67062674", "99943326"),
+        (1234567890, "91819424", "93441116"),
+        (2000000000, "90698825", "38618901"),
+        (20000000000, "77737706", "47863826"),
+    ];
+    for (time, sha256, sha512) in VECTORS {
+        let counter = time / 30;
         assert_eq!(
-            axess_code, oracle_code,
-            "axess hotp_generate-SHA256 diverged from totp-rs at counter {counter}: \
-             axess={axess_code}, oracle={oracle_code}",
+            hotp_generate(SHA256_SECRET, counter, 8, HotpAlgorithm::Sha256),
+            sha256,
+            "SHA-256 at t={time}"
         );
-    }
-}
-
-/// Differential test for SHA-512: same oracle pattern.
-#[cfg(feature = "totp")]
-#[test]
-fn hotp_generate_sha512_matches_totp_rs_oracle() {
-    use totp_rs::{Algorithm as TotpAlgorithm, Builder};
-    const PERIOD: u64 = 30;
-    for counter in [0u64, 1, 7, 42, 1234, 1_000_000] {
-        let oracle_totp = Builder::new()
-            .with_algorithm(TotpAlgorithm::SHA512)
-            .with_digits(6)
-            .with_skew(0)
-            .with_step_duration(PERIOD)
-            .with_secret(RFC_4226_SECRET.to_vec())
-            .build()
-            .unwrap();
-        let oracle_code = oracle_totp.generate(counter * PERIOD).to_string();
-        let axess_code = hotp_generate(RFC_4226_SECRET, counter, 6, HotpAlgorithm::Sha512);
         assert_eq!(
-            axess_code, oracle_code,
-            "axess hotp_generate-SHA512 diverged from totp-rs at counter {counter}: \
-             axess={axess_code}, oracle={oracle_code}",
+            hotp_generate(SHA512_SECRET, counter, 8, HotpAlgorithm::Sha512),
+            sha512,
+            "SHA-512 at t={time}"
         );
     }
 }
@@ -247,5 +217,29 @@ fn a_signed_code_never_matches_a_code_with_a_leading_zero() {
     assert_eq!(
         verify_hotp(&secret, &spaced, counter, 6, 0, HotpAlgorithm::Sha1),
         None
+    );
+}
+
+#[test]
+fn a_hex_secret_is_not_read() {
+    // The RFC 4226 secret as hex; `0`, `8` and `9` are not base32 characters.
+    let hex_secret = "3132333435363738393031323334353637383930";
+    let code = hotp_generate(b"12345678901234567890", 0, 6, HotpAlgorithm::Sha1);
+    assert_eq!(
+        verify_hotp(hex_secret, &code, 0, 6, 0, HotpAlgorithm::Sha1),
+        None,
+        "a hex secret must not verify"
+    );
+}
+
+#[test]
+fn a_secret_of_hex_letters_and_base32_digits_verifies_as_base32() {
+    // Every character is in both the hex and the base32 alphabets.
+    let secret = "ABCDEF2345ABCDEF2345ABCDEF2345AB";
+    let raw = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret).unwrap();
+    let code = hotp_generate(&raw, 7, 6, HotpAlgorithm::Sha1);
+    assert_eq!(
+        verify_hotp(secret, &code, 7, 6, 0, HotpAlgorithm::Sha1),
+        Some(7)
     );
 }

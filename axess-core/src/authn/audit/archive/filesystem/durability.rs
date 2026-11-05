@@ -187,19 +187,20 @@ async fn a_reused_batch_id_over_different_events_is_appended() {
     assert_eq!(line_count(&path), 3, "an identical retry is still skipped");
 }
 
-/// A sidecar line written by an earlier release (the bare id) still marks the
-/// batch as recorded.
+/// A sidecar written before the content digest existed holds bare ids; such a
+/// line does not hide a batch, so a recycled batch id with other events is
+/// archived.
 #[tokio::test]
-async fn a_legacy_bare_id_marker_still_skips_the_batch() {
+async fn a_bare_id_line_does_not_hide_a_batch_with_other_events() {
     let tmp = tempdir();
     let archiver = FilesystemAuditArchiver::new(tmp.path());
     let path = archiver.path_for_date(day(19));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let id = bid("old");
+    let id = bid("recycled");
     std::fs::write(batches_path(&path), format!("{id}\n")).unwrap();
     archiver
         .archive_batch(&id, &[make_event(2026, 5, 19)])
         .await
         .unwrap();
-    assert_eq!(line_count(&path), 0, "skipped: nothing was appended");
+    assert_eq!(line_count(&path), 1, "the events were archived");
 }

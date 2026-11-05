@@ -143,8 +143,7 @@ pub fn check_iat(payload: &serde_json::Value, now: i64) -> IatCheck {
     let Some(iat) = payload.get("iat").and_then(|v| v.as_i64()) else {
         return IatCheck::Missing;
     };
-    let age = now - iat;
-    if (-MAX_IAT_FUTURE_SECS..=MAX_IAT_AGE_SECS).contains(&age) {
+    if crate::iat_window::iat_within(iat, now, MAX_IAT_FUTURE_SECS, MAX_IAT_AGE_SECS) {
         IatCheck::Ok
     } else {
         IatCheck::OutOfRange { iat, now }
@@ -320,5 +319,24 @@ mod tests {
         assert!(!azp_satisfied(&non_string, "this-client"));
         let matching = serde_json::json!({ "aud": "this-client", "azp": "this-client" });
         assert!(azp_satisfied(&matching, "this-client"));
+    }
+}
+
+#[cfg(test)]
+mod iat_overflow_tests {
+    use super::*;
+
+    #[test]
+    fn an_extreme_iat_is_out_of_range_not_an_overflow() {
+        for iat in [i64::MIN, i64::MAX] {
+            let payload = serde_json::json!({ "iat": iat });
+            assert!(
+                matches!(
+                    check_iat(&payload, 1_700_000_000),
+                    IatCheck::OutOfRange { .. }
+                ),
+                "iat {iat} must be out of range"
+            );
+        }
     }
 }

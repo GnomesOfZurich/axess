@@ -17,7 +17,7 @@ use subtle::ConstantTimeEq;
 /// cross-protocol forgery: a successful compromise of one HMAC
 /// instance (e.g. a side-channel on the cookie verify path) cannot be
 /// replayed against a different consumer of the same raw key.
-pub(super) fn hkdf_expand_subkey(prk: &[u8; 32], info: &'static [u8]) -> [u8; 32] {
+pub(super) fn hkdf_expand_subkey(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
     // For 32-byte output (= one SHA-256 block) the iteration is a single
     // HMAC call: T(1) = HMAC(prk, info || 0x01). No iteration needed
     // since `L = HashLen`.
@@ -197,7 +197,19 @@ impl SigningKeyRing {
     /// under `info`. Rotating the master changes what this returns;
     /// adopters using this for their own HMAC sites must maintain
     /// their own previous-key state if they need rotation coverage.
+    ///
+    /// The two labels the layer derives its own keys under are reserved:
+    /// asking for one returns a key from a separate namespace, never the
+    /// key that signs cookies or binds fingerprints. The list is the check
+    /// below, not a registry: a new label the layer derives for its own
+    /// use must be added to it, or an adopter asking for that label would
+    /// get the layer's key.
     pub(crate) fn derive_subkey(&self, info: &'static [u8]) -> [u8; 32] {
+        if info == HKDF_INFO_COOKIE || info == HKDF_INFO_FINGERPRINT {
+            let mut separated = b"axess.v1.reserved-label.".to_vec();
+            separated.extend_from_slice(info);
+            return hkdf_expand_subkey(&self.current.master, &separated);
+        }
         hkdf_expand_subkey(&self.current.master, info)
     }
 }
@@ -307,6 +319,26 @@ mod subkey_derivation_tests {
         );
         assert_ne!(*key_b, [0u8; 32]);
         assert_ne!(*key_b, [1u8; 32]);
+    }
+
+    /// The labels the session layer itself derives its keys under are not
+    /// available to an application: asking for one must not return the key
+    /// that signs cookies or binds fingerprints.
+    #[test]
+    fn reserved_labels_do_not_return_the_layers_own_keys() {
+        let layer = SessionLayer::new(MemorySessionStore::new(), [0x42; 32]);
+        let cookie_key = layer.signing_keys.current.cookie;
+        let fingerprint_key = layer.signing_keys.current.fingerprint;
+
+        let asked_cookie = layer.derive_subkey(b"axess.v1.session.cookie.hmac");
+        let asked_fingerprint = layer.derive_subkey(b"axess.v1.session.fingerprint.hmac");
+
+        assert_ne!(
+            *asked_cookie, cookie_key,
+            "the cookie HMAC key was handed out"
+        );
+        assert_ne!(*asked_fingerprint, fingerprint_key);
+        assert_ne!(*asked_cookie, *asked_fingerprint);
     }
 
     /// Different info labels MUST produce different sub-keys for the

@@ -62,7 +62,10 @@
 //!     .json()
 //!     .with_writer(std::fs::File::create("audit.log").unwrap());
 //!
-//! let audit_filter = axess_core::authz::audit::tracing_filter();
+//! let audit_filter = Targets::new().with_target(
+//!     axess_core::authz::audit::DECISION_TARGET,
+//!     tracing::Level::INFO,
+//! );
 //!
 //! tracing_subscriber::registry()
 //!     .with(tracing_subscriber::fmt::layer())                  // app logs
@@ -121,6 +124,16 @@ mod tests {
     use tracing::subscriber::with_default;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{Layer, Registry};
+
+    /// The filter the module docs build routes decision events and nothing
+    /// else.
+    #[test]
+    fn the_documented_filter_passes_decision_events_only() {
+        let filter = tracing_subscriber::filter::Targets::new()
+            .with_target(DECISION_TARGET, tracing::Level::INFO);
+        assert!(filter.would_enable(DECISION_TARGET, &tracing::Level::INFO));
+        assert!(!filter.would_enable("app", &tracing::Level::INFO));
+    }
 
     /// Capture the bool result of `is_decision_event` for any event that
     /// fires while the layer is installed. We use this instead of building

@@ -350,3 +350,27 @@ async fn prune_expired_trait_surface_matches_inherent() {
 // there; the per-backend duplicates were dropped to keep one source of
 // truth. The cleanup-pipeline shape (label propagation, debug-only-on-
 // positive, warn-on-err) is unchanged.
+
+/// A row is gone for `load` at the second it expires, so the sweep removes
+/// it at that same second rather than one sweep later.
+#[tokio::test]
+async fn the_sweep_removes_a_row_at_the_second_it_expires() {
+    let clock = Arc::new(axess_clock::testing::MockClock::now());
+    let pool = memory_pool().await;
+    let store = SqliteSessionStore::plaintext(pool).with_clock(clock.clone());
+    store.init_schema().await.expect("init_schema");
+    let id = sample_id();
+    store
+        .save(&id, &payload_with_custom(), Duration::from_secs(10))
+        .await
+        .unwrap();
+
+    clock.advance_secs(10);
+
+    assert!(store.load(&id).await.unwrap().is_none(), "load: expired");
+    assert_eq!(
+        store.cleanup_expired().await.unwrap(),
+        1,
+        "the sweep must remove a row that load already treats as expired"
+    );
+}

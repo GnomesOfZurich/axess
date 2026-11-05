@@ -100,7 +100,7 @@ impl DiscoveryDocument {
         // a mix-up, not a configuration. And the key set it points at travels
         // over the same rail as the document, else an on-path attacker swaps
         // the keys the document names.
-        if issuer.trim_end_matches('/') != issuer_url.trim_end_matches('/') {
+        if issuer != issuer_url {
             return Err(OidcError::InvalidIssuer(format!(
                 "discovery document names issuer {issuer} but was fetched from {issuer_url}"
             )));

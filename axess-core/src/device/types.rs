@@ -43,42 +43,15 @@ mod fingerprint_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex_encode(bytes))
+        s.serialize_str(&axess_rng::hex::encode(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
         let s = String::deserialize(d)?;
-        hex_decode(&s).map_err(serde::de::Error::custom)
-    }
-
-    fn hex_encode(bytes: &[u8; 32]) -> String {
-        let mut out = String::with_capacity(64);
-        for b in bytes {
-            out.push_str(&format!("{b:02x}"));
-        }
-        out
-    }
-
-    fn hex_decode(s: &str) -> Result<[u8; 32], &'static str> {
-        if s.len() != 64 {
-            return Err("FingerprintHash must be 64 hex characters");
-        }
         let mut out = [0u8; 32];
-        for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-            let hi = nibble(chunk[0])?;
-            let lo = nibble(chunk[1])?;
-            out[i] = (hi << 4) | lo;
-        }
+        axess_rng::hex::decode_to_slice(&s, &mut out)
+            .map_err(|_| serde::de::Error::custom("FingerprintHash must be 64 hex characters"))?;
         Ok(out)
-    }
-
-    fn nibble(b: u8) -> Result<u8, &'static str> {
-        match b {
-            b'0'..=b'9' => Ok(b - b'0'),
-            b'a'..=b'f' => Ok(b - b'a' + 10),
-            b'A'..=b'F' => Ok(b - b'A' + 10),
-            _ => Err("FingerprintHash contains non-hex character"),
-        }
     }
 }
 

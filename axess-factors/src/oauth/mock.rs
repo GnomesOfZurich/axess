@@ -62,7 +62,7 @@ enum MockFailure {
     /// AS responded with `error: "unsupported_token_type"`.
     UnsupportedTokenType,
     /// AS responded with a 5xx; caller can decide retry.
-    TokenEndpointTransient { status: u16, body: String },
+    TokenEndpointTransient { status: Option<u16> },
     /// JWT verification rejected the `kid`.
     UnknownKid(String),
     /// Discovery network/parse failure.
@@ -74,10 +74,9 @@ impl MockFailure {
         match self {
             Self::Legacy(s) => OAuthError::TokenExchange(s.clone()),
             Self::UnsupportedTokenType => OAuthError::UnsupportedTokenType,
-            Self::TokenEndpointTransient { status, body } => OAuthError::TokenEndpointTransient {
-                status: *status,
-                body: body.clone(),
-            },
+            Self::TokenEndpointTransient { status } => {
+                OAuthError::TokenEndpointTransient { status: *status }
+            }
             Self::UnknownKid(kid) => OAuthError::UnknownKid(kid.clone()),
             Self::Discovery(s) => OAuthError::Discovery(s.clone()),
         }
@@ -196,15 +195,13 @@ impl MockOAuthProvider {
         self
     }
 
-    /// Mock: simulate a 5xx response from a token endpoint.
-    /// Returned as `OAuthError::TokenEndpointTransient { status, body }`
+    /// Mock: simulate a 5xx response from a token endpoint (`None` for no
+    /// answer at all).
+    /// Returned as `OAuthError::TokenEndpointTransient { status }`
     /// so callers can route through the [`OAuthError::is_transient`]
     /// retry hint.
-    pub fn with_transient_failure(mut self, status: u16, body: impl Into<String>) -> Self {
-        self.failure = Some(MockFailure::TokenEndpointTransient {
-            status,
-            body: body.into(),
-        });
+    pub fn with_transient_failure(mut self, status: Option<u16>) -> Self {
+        self.failure = Some(MockFailure::TokenEndpointTransient { status });
         self
     }
 

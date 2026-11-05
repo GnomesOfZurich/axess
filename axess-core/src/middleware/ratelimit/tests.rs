@@ -255,8 +255,8 @@ async fn evict_expired_removes_stale_buckets() {
     store.evict_expired_at(t1);
 
     // Stale bucket should be gone; fresh one remains.
-    assert!(!store.buckets.contains_key("stale"));
-    assert!(store.buckets.contains_key("fresh"));
+    assert!(!crate::locked::lock(&store.buckets).contains_key("stale"));
+    assert!(crate::locked::lock(&store.buckets).contains_key("fresh"));
 }
 
 fn header_request(user: Option<&str>, key: &str) -> Request<Body> {
@@ -437,22 +437,22 @@ async fn evict_expired_reads_the_store_clock() {
     let clock = MockClock::at(t_zero());
     let store = BucketStore::new(1, Duration::from_secs(20), Arc::new(clock.clone()));
     store.try_acquire("aged-out");
-    assert!(store.buckets.contains_key("aged-out"));
+    assert!(crate::locked::lock(&store.buckets).contains_key("aged-out"));
     store.evict_expired();
     assert!(
-        store.buckets.contains_key("aged-out"),
+        crate::locked::lock(&store.buckets).contains_key("aged-out"),
         "a bucket inside its window survives"
     );
     clock.advance_secs(21);
     store.evict_expired();
     assert!(
-        store.buckets.contains_key("aged-out"),
+        crate::locked::lock(&store.buckets).contains_key("aged-out"),
         "one window on it still weighs on the estimate"
     );
     clock.advance_secs(20);
     store.evict_expired();
     assert!(
-        !store.buckets.contains_key("aged-out"),
+        !crate::locked::lock(&store.buckets).contains_key("aged-out"),
         "evict_expired() must read the injected clock"
     );
 }
@@ -469,7 +469,7 @@ async fn evict_expired_at_evicts_when_age_equals_window() {
     // Evict at exactly two windows: 20 s, original < 20 s = false (evict).
     store.evict_expired_at(secs(t0, 20));
     assert!(
-        !store.buckets.contains_key("at-cutoff"),
+        !crate::locked::lock(&store.buckets).contains_key("at-cutoff"),
         "at age == two windows the bucket must evict (strict `<`, not `<=`)"
     );
 }

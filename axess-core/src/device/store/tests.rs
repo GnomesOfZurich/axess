@@ -732,3 +732,140 @@ async fn find_active_for_user_applies_limit_after_dropping_revoked() {
     let all = store.find_active_for_user(&t(), &u(), 10).await.unwrap();
     assert_eq!(all.len(), 1);
 }
+
+/// A store that implements only the required methods, so the trait's
+/// provided `claim_owner` is what runs.
+#[derive(Clone, Default)]
+struct RequiredOnly(MemoryDeviceStore);
+
+impl DeviceStore for RequiredOnly {
+    type Error = <MemoryDeviceStore as DeviceStore>::Error;
+
+    fn load(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.0.load(t, id)
+    }
+    fn find_by_fingerprint(
+        &self,
+        t: &TenantId,
+        h: &FingerprintHash,
+    ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
+        self.0.find_by_fingerprint(t, h)
+    }
+    fn find_for_user(
+        &self,
+        t: &TenantId,
+        u: &UserId,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
+        self.0.find_for_user(t, u, limit)
+    }
+    fn find_by_refresh_family(
+        &self,
+        t: &TenantId,
+        f: &str,
+    ) -> impl Future<Output = Result<Vec<Device>, Self::Error>> + Send {
+        self.0.find_by_refresh_family(t, f)
+    }
+    fn save(
+        &self,
+        d: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.save(d, now)
+    }
+    fn create_or_find(
+        &self,
+        d: &Device,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Device, Self::Error>> + Send {
+        self.0.create_or_find(d, now)
+    }
+    fn record_sighting(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<DeviceTrustLevel, Self::Error>> + Send {
+        self.0.record_sighting(t, id, now)
+    }
+    fn set_trust_level(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+        level: DeviceTrustLevel,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.set_trust_level(t, id, level, now)
+    }
+    fn delete(
+        &self,
+        t: &TenantId,
+        id: &DeviceId,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.0.delete(t, id)
+    }
+    fn sweep(
+        &self,
+        t: &TenantId,
+        now: DateTime<Utc>,
+    ) -> impl Future<Output = Result<SweepCounts, Self::Error>> + Send {
+        self.0.sweep(t, now)
+    }
+}
+
+/// The provided `claim_owner` on a revoked, ownerless device writes nothing
+/// (a save never un-revokes), so it must not report `Claimed`.
+#[tokio::test]
+async fn the_provided_claim_owner_refuses_a_revoked_device() {
+    let store = RequiredOnly::default();
+    let now = whole_second(Utc::now());
+    let mut device = d("dev-1", 0xaa, now);
+    device.user_id = None;
+    store.save(&device, now).await.unwrap();
+    store
+        .set_trust_level(&t(), &device.id, DeviceTrustLevel::Revoked, now)
+        .await
+        .unwrap();
+
+    let claim = store
+        .claim_owner(&t(), &device.id, &u(), now)
+        .await
+        .unwrap();
+
+    assert_eq!(claim, OwnerClaim::OwnedByOther);
+    let after = store.load(&t(), &device.id).await.unwrap().unwrap();
+    assert_eq!(after.user_id, None, "nothing was written");
+}
+
+/// The provided `find_by_fingerprint_for_user` finds a device older than the
+/// scan limit, so a user with many devices does not get a duplicate minted.
+#[tokio::test]
+async fn the_provided_own_fingerprint_lookup_finds_a_device_past_the_scan_limit() {
+    let store = RequiredOnly::default();
+    let now = whole_second(Utc::now());
+    let oldest = d("dev-oldest", 0xee, now - chrono::Duration::days(400));
+    store.save(&oldest, now).await.unwrap();
+    for n in 0..(OWN_DEVICE_SCAN_LIMIT + 5) {
+        let seen = now - chrono::Duration::minutes(n as i64);
+        store
+            .save(&d(&format!("dev-{n}"), 0x01, seen), now)
+            .await
+            .unwrap();
+    }
+
+    let found = store
+        .find_by_fingerprint_for_user(&t(), &u(), &oldest.fingerprint_hash)
+        .await
+        .unwrap();
+
+    assert_eq!(found.map(|x| x.id), Some(oldest.id));
+    let none = store
+        .find_by_fingerprint_for_user(&t(), &u(), &FingerprintHash::from_bytes([0x77; 32]))
+        .await
+        .unwrap();
+    assert!(none.is_none(), "an absent fingerprint is still absent");
+}

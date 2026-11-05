@@ -4,7 +4,7 @@ use super::{RequestAuthnService, fido2_keys};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
-    factor::FactorKind,
+    factor::{FactorConfig, FactorKind},
     service::outcomes::FactorOutcome,
     store::{FactorStore, IdentityStore},
     types::AuthnScope,
@@ -89,6 +89,18 @@ where
     /// a login failure like the others: counted, and recorded as a failed
     /// `FactorVerified` row (`cross_tenant`) against the user's tenant of
     /// record, never against the tenant the caller supplied.
+    ///
+    /// `credentials` is the list the caller verifies the assertion against,
+    /// and only the entries the store holds for `user`, with the same
+    /// credential id and the same public key, are used. A passkey that
+    /// merely carries a stored id (one registered by another account under a
+    /// copied credential id) therefore cannot log in as `user`. The match is
+    /// on credential id and public key against the user's stored
+    /// credentials, never on the id alone. The lookup that turns the
+    /// assertion's credential id or user handle into `user` is the
+    /// adopter's, and it must be tenant-scoped: a credential id is not
+    /// unique across tenants, so an unscoped lookup can name another
+    /// tenant's user.
     ///
     /// Whichever way the call ends, the ceremony's state, its stamp and the
     /// tenant it began for are gone from the session.
@@ -203,8 +215,13 @@ where
                 .await);
         }
 
-        let discoverable_keys: Vec<webauthn_rs::prelude::DiscoverableKey> =
-            credentials.iter().map(|c| (&c.passkey).into()).collect();
+        let user_scope = AuthnScope::User {
+            tenant_id: user.tenant_id,
+            user_id: user.id,
+        };
+        let discoverable_keys = self
+            .stored_discoverable_keys(&user_scope, credentials)
+            .await?;
 
         let auth_result = match webauthn.finish_discoverable_authentication(
             assertion,
@@ -218,10 +235,6 @@ where
             }
         };
 
-        let user_scope = AuthnScope::User {
-            tenant_id: user.tenant_id,
-            user_id: user.id,
-        };
         // A passkey deleted after the ceremony began is no longer a
         // credential of this user, however valid the assertion was against
         // the caller's list.
@@ -234,6 +247,44 @@ where
 
         self.continue_after_passkey(user, &auth_result, session)
             .await
+    }
+
+    /// The keys the assertion may be verified against: the caller's
+    /// `credentials` narrowed to those the store holds for the user in
+    /// `user_scope`, matched on credential id and public key together.
+    /// A user with no stored passkey yields no keys.
+    async fn stored_discoverable_keys(
+        &self,
+        user_scope: &AuthnScope,
+        credentials: &[crate::authn::factor::Fido2Credential],
+    ) -> Result<Vec<webauthn_rs::prelude::DiscoverableKey>, AuthnError<I::Error>> {
+        // The assertion is verified against the caller's list, but only the
+        // credentials the store holds for this user, with the key it holds,
+        // may stand in that list. A second account can register a passkey
+        // under a copied credential id; an application that resolves the
+        // user from the user handle and the credential by id can then pass
+        // that other key here, and the stored id alone would let it in.
+        let stored = match self
+            .inner
+            .factors
+            .load_factor(user_scope, FactorKind::Fido2)
+            .await
+            .map_err(AuthnError::Store)?
+        {
+            Some(FactorConfig::Fido2(cfg)) => cfg.credentials,
+            _ => Vec::new(),
+        };
+        let keys = credentials
+            .iter()
+            .filter(|c| {
+                stored.iter().any(|s| {
+                    s.cred_id() == c.cred_id()
+                        && s.passkey.get_public_key() == c.passkey.get_public_key()
+                })
+            })
+            .map(|c| (&c.passkey).into())
+            .collect();
+        Ok(keys)
     }
 
     /// The passkey verified and its use is recorded: let the user's own
@@ -256,32 +307,27 @@ where
             .await
             .map_err(AuthnError::Store)?;
         let Some(method) = methods.into_iter().find(|m| {
-            m.steps
-                .first()
-                .is_some_and(|step| step.accepts(&FactorKind::Fido2))
+            m.is_complete()
+                && m.steps
+                    .first()
+                    .is_some_and(|step| step.accepts(&FactorKind::Fido2))
         }) else {
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::FactorVerified)
                     .attributed_to(&user.id, &user.tenant_id)
                     .with_factor(FactorKind::Fido2)
                     .with_session(session.session_id().await)
-                    .with_error(AuthFailureReason::Other("method_not_passkey_first".into())),
+                    .with_error(AuthFailureReason::from("method_not_passkey_first")),
             )
             .await?;
             return Err(AuthnError::NoFlow);
         };
-        let steps: Vec<_> = method
-            .steps
-            .iter()
-            .filter(|step| step.primary().is_some())
-            .cloned()
-            .collect();
         let epoch = self
             .credential_epoch(&user.id, &user.tenant_id, &method.name)
             .await?;
         self.stamp_flow(session, &method.name, epoch).await;
         session
-            .begin_authenticating(user.id, user.tenant_id, method.name.clone(), steps)
+            .begin_authenticating(user.id, user.tenant_id, method.name.clone(), method.steps)
             .await;
 
         let now = self.inner.clock.now();

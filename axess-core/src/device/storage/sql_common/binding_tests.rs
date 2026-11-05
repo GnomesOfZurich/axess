@@ -164,3 +164,44 @@ fn rejecting_legacy_blobs_refuses_an_unmarked_bindings_blob() {
     let bound = strict.encode("t1", "d", &bindings()).unwrap();
     assert_eq!(strict.decode("t1", "d", &bound).unwrap(), bindings());
 }
+
+/// A blob of the previous format opened under a row id that holds a zero
+/// byte is not re-sealed by a read: the joined id is ambiguous (another pair
+/// of ids joins to the same bytes) and the bindings name no device or tenant,
+/// so a re-seal could bind a copy from another row to this one for good. The
+/// next write seals what the application holds. Unambiguous ids are
+/// re-sealed, as before.
+#[test]
+fn a_previous_format_blob_under_an_ambiguous_row_id_is_not_resealed_by_a_read() {
+    use crate::session::crypto::{BoundFormat, device_row_id_v1};
+    let crypto = SessionCrypto::new([6u8; 32]);
+    let stored_under = |tenant: &str, device: &str| {
+        let body = crypto
+            .encrypt_with_aad(
+                &BoundFormat::DEVICE_BINDINGS_V1.aad(&device_row_id_v1(tenant, device)),
+                &rmp_serde::to_vec_named(&bindings()).unwrap(),
+            )
+            .unwrap();
+        let mut blob = b"AXD\x01".to_vec();
+        blob.extend_from_slice(&body);
+        BASE64.encode(blob)
+    };
+
+    // Sealed for ("a", "b\0c"), read as ("a\0b", "c"): the same joined bytes.
+    let copied = stored_under("a", "b\0c");
+    let (decoded, reseal) = accepting_codec()
+        .decode_checked("a\0b", "c", &copied)
+        .unwrap();
+    assert_eq!(decoded, bindings());
+    assert!(
+        !reseal,
+        "an ambiguous row id must not be re-sealed by a read"
+    );
+
+    let plain = stored_under("t1", "d");
+    let (_, reseal) = accepting_codec().decode_checked("t1", "d", &plain).unwrap();
+    assert!(
+        reseal,
+        "an unambiguous earlier-format blob is still migrated"
+    );
+}

@@ -57,7 +57,7 @@
 //! Use when the backing store is `Sqlite` / `Postgres` / `Valkey` and
 //! request volume is high enough that per-request DB hits show up in
 //! flame graphs. Skip for `MemoryDeviceStore`; the underlying
-//! `DashMap::get` is already faster than the cache wrapper's atomics.
+//! map lookup is already faster than the cache wrapper's atomics.
 
 use std::future::Future;
 use std::num::NonZeroUsize;

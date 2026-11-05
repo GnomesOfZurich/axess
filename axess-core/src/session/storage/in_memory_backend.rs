@@ -81,12 +81,15 @@ impl InMemoryBackend {
     }
 
     /// Stamp the tenants and users registered afterwards with `clock`
-    /// (default: the system clock).
+    /// (default: the system clock), and read the identity store's time from
+    /// it, so a failed attempt and the lockout derived from it follow it too.
     ///
     /// Call this first in the builder chain: a record registered before it
     /// keeps the time it was created with.
     pub fn with_clock(mut self, clock: impl axess_clock::Clock) -> Self {
-        self.clock = Arc::new(clock);
+        let clock: Arc<dyn axess_clock::Clock> = Arc::new(clock);
+        self.identity = self.identity.with_clock(Arc::clone(&clock));
+        self.clock = clock;
         self
     }
 
@@ -127,6 +130,12 @@ impl InMemoryBackend {
     ///
     /// `tenant_id` must match a previously registered tenant (see
     /// [`with_default_tenant`](Self::with_default_tenant)).
+    ///
+    /// The user's id is derived from `username`
+    /// (`axess_identity::testing::user(username)`), so registering the same
+    /// username in the same tenant again replaces the user. A username
+    /// already registered in another tenant gets an id derived from
+    /// `"{username}@{tenant_id}"` instead, so the two stay separate users.
     pub fn with_user_password(
         mut self,
         username: impl Into<Arc<str>>,
@@ -138,8 +147,15 @@ impl InMemoryBackend {
         // Typed ids are Uuid newtypes derived deterministically from the
         // human identifiers so successive `with_user_password(...)` calls
         // for the same identifier resolve to the same row.
-        let user_id = axess_identity::testing::user(&username);
         let tenant_id = axess_identity::testing::tenant(&tenant_id_arc);
+        let mut user_id = axess_identity::testing::user(&username);
+        if self
+            .identity
+            .tenant_of(&user_id)
+            .is_some_and(|held| held != tenant_id)
+        {
+            user_id = axess_identity::testing::user(&format!("{username}@{tenant_id_arc}"));
+        }
 
         let now = self.clock.now();
         let user = User {

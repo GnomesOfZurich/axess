@@ -9,6 +9,163 @@ fix.
 The behaviour changes are the ones to read closely. Nothing tells you
 about those.
 
+## 0.14.0 to 0.15.0
+
+Compile breaks first, then storage, then behaviour.
+
+### Compile breaks
+
+- **`HumanPrincipal` and `AuthState::Authenticating` have `impersonator`.**
+  Add `impersonator: None` to literals; stored sessions load.
+- **`IssuanceError::EmptyKeyId`** and **`ProvisioningError::InvalidTenant(String)`**
+  are new variants. Add an arm to an exhaustive match.
+- **`AuthnError::UnknownTenant`** is a new variant, returned by impersonation
+  and signup completion for a tenant that does not load (it was
+  `CrossTenant`). Add an arm to an exhaustive match, and read a caller that
+  matched `CrossTenant` for that case.
+- **`OAuthError::TokenEndpointTransient` is `{ status: Option<u16> }`.**
+  `None` replaces status `0` (no answer), and `body` is gone. Update matches
+  and literals; `MockOAuthProvider::with_transient_failure` takes
+  `Option<u16>` and no body.
+
+- **`build_totp_uri` and `build_totp_uri_with_algorithm` return
+  `Option<String>`.** Unwrap or handle `None`, which is what `digits` outside
+  6 to 8 or a `period` under 5 now give instead of a clamped URI.
+- **`totp-rs` is gone, and with it `TotpBuilder` and `Totp`.** Code that built
+  a `Totp` to generate or check a code calls `verify_totp` (and
+  `build_totp_uri` for the provisioning URI); `TotpAlgorithm` keeps its
+  variants (`SHA1`, `SHA256`, `SHA512`). A test that plays the authenticator
+  app adds `totp-rs` as its own dev-dependency.
+- **The `moka-cache` feature and `MokaEntityCache` are removed.** Take
+  `moka-cache` out of the list in your `axess` or `axess-core` dependency and
+  use the default `EntityCache`.
+
+### Sealed factor secrets and tenant OAuth credentials
+
+OTP secrets sealed with `FactorSecretCipher` now bind the factor variant, and a
+tenant OAuth client credential also binds its issuer and client id. Rows sealed
+by 0.14.0 still open: the cipher tries the new binding and then the old one,
+and a secret opened under the old binding is reported with
+`OpenedSecret::rotated` set, so the login that verifies it writes it back
+under the new binding. A tenant OAuth record is written back when
+`StoredTenantOAuthProviders` (with a cipher) builds its provider the first
+time, through `TenantOAuthProviderStore::put_if_revision`. A store of your
+own that does not implement it (the default writes nothing) keeps its records
+under the old binding until you call `seal` again.
+
+The old binding is read for ever by default in 0.15.0, and the default becomes
+`LegacyBlobs::Reject` in 0.16. Once the rows have moved, set
+`FactorSecretCipher::with_first_binding(LegacyBlobs::AcceptUntil(cutoff))`
+(recommended now) or `Reject`, so that a custom provider named like a factor
+cannot open that factor's old secret.
+
+Changing the `issuer` or `client_id` of a record whose credential is sealed
+under the new binding makes it fail to open. Supply the credential in plain
+text with the update and seal it again.
+
+### Custom key providers
+
+`EncryptedDelegatedCredentialStore::save` now refuses a current key whose id
+contains `.` or is empty, or whose bytes are one repeated value. Before, the
+save succeeded and every load of that row failed. Rows already written under
+such an id cannot be read and were never readable.
+
+### Delegated credential rows
+
+A row whose provider label differs from the provider you load is now an error.
+Rows written by the store carry the right label; only a row edited by hand or
+written by a store keyed differently from its content is affected.
+
+A row written by 0.14 or earlier (`v2`, or `v1` under the legacy policy) is
+read as expired and is no longer re-sealed on load: its stored expiry is not
+authenticated. The next `get_access_token` refreshes it and saves a `v3` row,
+so expect one refresh per credential not used since 0.14. A row without a
+refresh token cannot refresh; the user is asked to reconnect.
+
+### Refresh skew
+
+`with_refresh_skew_secs` clamps its argument to 0 through 86400. A negative
+value used to keep expired tokens in use; one above a day was a panic risk.
+
+### Behaviour
+
+- **OIDC discovery compares the issuer exactly.** A configured issuer that
+  differs from the discovery document's only by a trailing slash is now
+  refused; configure it as the document spells it.
+- **A FAPI signer for another client is refused at build.** The signer's
+  `client_id` must be the provider's.
+- **Client authentication on revocation, `client_credentials`, the device
+  authorization request, the device poll and PAR uses HTTP Basic** (with a
+  secret) **or a client assertion** (with a signer), as the token request
+  does; the secret is no longer sent in the form. An IdP that accepted only
+  the form body must accept Basic (RFC 6749 section 2.3.1 requires it).
+- **`RevocationAwareSocket` closes with `4002 lifetime_reached`** when its
+  lifetime runs out and **`4003 session_unverified`** when the registry cannot
+  be asked; `4001 session_revoked` now means only a revoked session. A client
+  that signs out on any close in the 4000 range reconnects on the new codes
+  instead.
+- **A non-text `Authorization` header is refused with 401** by the bearer
+  layer, and the scheme is matched case-insensitively. So is a header that
+  names `Bearer` and carries no token (`Bearer`, `Bearer   `), which used to
+  pass as anonymous; `validate_bearer_token` returns `InvalidToken` for it.
+- **A token-endpoint 5xx or network error is `TokenEndpointTransient`**
+  (`status: None` when no answer arrived; the `body` field is removed, so
+  match `{ status }`), and a device poll that meets one is an
+  error rather than `Denied`.
+- **Hex-encoded OTP secrets are no longer read.** Re-encode as base32 before
+  upgrading; a hex secret now fails verification. Secrets made by
+  `generate_totp_secret` are base32 and are unaffected.
+- **The outbound OAuth client and `TokenExchangeClient` refuse a token
+  response without `token_type`** with `MalformedResponse`. A token endpoint
+  that omits the field (RFC 6749 section 5.1 and RFC 8693 section 2.2.1
+  require it) has to be fixed or fronted.
+- **JWT replay protection uses a new key format** (the issuer and the `jti`
+  together). A token recorded just before the upgrade can be accepted once
+  more after it, within that token's remaining lifetime; nothing to change.
+- **OAuth ceremonies in flight restart.** The claim lock hashes its fields
+  with lengths, so a login begun before the upgrade and finished after it
+  fails at completion; the user starts it again.
+- **`RefreshTokenConfig::validate` refuses a `ttl` of zero or less.** A
+  configuration that relied on one now fails at startup; set a positive `ttl`.
+- **`SessionLayer::derive_subkey` answers a different key for the two
+  reserved labels** the session layer derives its
+  cookie and fingerprint keys under; an application that asked for one of them
+  must use a label of its own. Every other label gives the key it did.
+- **A non-revoking save over an unreadable device row fails**; delete the
+  device to clear it.
+- **A bare-id line in a filesystem audit archive sidecar** (written before the
+  content digest existed) no longer marks a batch as archived. A batch
+  retried across the upgrade appears twice in its day file.
+
+### Identifiers
+
+- **New accounts and tenants refuse look-alike identifiers.**
+  Signup, `User::new`, `Tenant::new` and `provisioning::create_tenant`
+  refuse surrounding whitespace, whitespace other than the ASCII space, and
+  names that change under NFKC; a new tenant identifier also has the
+  invisible-character and NFC checks. Existing rows are unaffected, because
+  `User::validate` and `Tenant::validate` keep the looser rule. To find
+  existing rows the new rule would refuse, list the identifiers and run each
+  through `axess_core::validation::is_acceptable_new_identifier`; as a first
+  cut in SQL, run the query below (the same on the tenants table); it lists
+  surrounding whitespace and every non-ASCII name, which the Rust check then
+  sorts. It is SQLite syntax; on Postgres write `identifier ~ '[^ -~]'` and
+  on MySQL `identifier REGEXP '[^ -~]'` for the second condition.
+  `ProvisioningError` has a new `InvalidTenant(String)` variant: add an
+  arm to an exhaustive match.
+
+  ```sql
+  SELECT id, identifier FROM users
+  WHERE identifier <> trim(identifier) OR identifier GLOB '*[^ -~]*'
+  ```
+
+### Stored values
+
+- **A stored `PiiToken` must be the hyphenated lowercase form.** It now
+  deserialises through `PiiToken::parse`, so a row holding an uppercase or
+  braced UUID no longer loads. Rows the library wrote are unaffected; rewrite
+  any you wrote by hand.
+
 ## 0.13.0 to 0.14.0
 
 A security release. Compile errors first, then storage, then behaviour.
@@ -826,6 +983,14 @@ does not persist it degrades towards a later `authn_time`, which weakens
   Install the rate-limit layer after authentication and set
   `RateLimitUserId`, or key on `UserId`; without an identity the peer
   address is used.
+- **A passkey credential id held by another user of the tenant is refused at
+  registration.** `FactorStore::fido2_credential_holder(tenant_id,
+  credential_id)` is new with a default that answers nobody, so your store
+  compiles unchanged and the check does not run on it. To get the check,
+  implement the method; if your passkeys sit inside one opaque or sealed
+  config row, keep a `(tenant_id, credential_id, user_id)` index written with
+  the config and backfill it from the rows you can read. No axess migration
+  is needed: the in-tree stores answer from data they already hold.
 - **`PiiToken::parse`** accepts only `pii:` plus a hyphenated lowercase UUID.
   Re-emit tokens stored in another spelling.
 
@@ -1091,7 +1256,7 @@ weakening: an unvalidated header value was never evidence of anything.
 Turn the feature on and install the layer if you want the column back.
 
 ```toml
-axess = { version = "0.14", features = ["request-id"] }
+axess = { version = "0.15", features = ["request-id"] }
 ```
 
 `accept-client-id` honours an id minted upstream rather than generating

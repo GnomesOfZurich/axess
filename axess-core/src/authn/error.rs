@@ -106,6 +106,14 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     #[error("cross-tenant operation refused")]
     CrossTenant,
 
+    /// The tenant an operation names does not load: it is not stored, or a
+    /// store that holds users does not hold their tenant. Refused (fail
+    /// closed) where the operation needs the tenant's status; no tenant
+    /// state can be named, and nothing crossed a tenant boundary. Suggested
+    /// HTTP status: `403 Forbidden`.
+    #[error("tenant not found")]
+    UnknownTenant,
+
     /// The password-hashing executor is saturated: its waiting queue is at
     /// its limit or the job waited past the acquire timeout. A capacity
     /// condition, not a fault: nothing was checked, the client may try
@@ -194,8 +202,13 @@ fn retry_secs_from(
     until: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<u64> {
-    let secs = (until - now).num_seconds();
-    if secs > 0 { Some(secs as u64) } else { None }
+    // Round up: a lock with 400 ms left is a second away, not "retry now".
+    let millis = (until - now).num_milliseconds();
+    if millis > 0 {
+        Some(((millis + 999) / 1000) as u64)
+    } else {
+        None
+    }
 }
 
 /// Default `IntoResponse` mapping for [`AuthnError`].
@@ -249,6 +262,7 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
                 (StatusCode::BAD_GATEWAY, "external service unavailable")
             }
             AuthnError::CrossTenant => (StatusCode::FORBIDDEN, "cross-tenant operation refused"),
+            AuthnError::UnknownTenant => (StatusCode::FORBIDDEN, "tenant not found"),
             AuthnError::Busy { .. } => {
                 tracing::warn!("authentication service busy; answering 503");
                 (StatusCode::SERVICE_UNAVAILABLE, "service busy, retry later")
@@ -360,6 +374,7 @@ mod into_response_tests {
                 axum::http::StatusCode::BAD_GATEWAY,
             ),
             (AuthnError::CrossTenant, axum::http::StatusCode::FORBIDDEN),
+            (AuthnError::UnknownTenant, axum::http::StatusCode::FORBIDDEN),
             (
                 AuthnError::Busy {
                     retry_after: std::time::Duration::from_secs(1),
@@ -508,6 +523,21 @@ mod into_response_tests {
         assert!(
             parsed.get("until_iso").is_none(),
             "a `until` in the past must not emit until_iso"
+        );
+    }
+
+    /// A lock with a fractional second left reports the next whole second.
+    #[test]
+    fn retry_secs_from_rounds_a_partial_second_up() {
+        let now = fixed_now();
+        assert_eq!(
+            retry_secs_from(now + chrono::Duration::milliseconds(500), now),
+            Some(1),
+            "a half-second lock must not read as retry-now"
+        );
+        assert_eq!(
+            retry_secs_from(now + chrono::Duration::milliseconds(1500), now),
+            Some(2)
         );
     }
 

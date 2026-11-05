@@ -64,7 +64,8 @@ impl WorkloadId {
     }
 
     /// Validate and adopt an arbitrary SPIFFE-ID string. Rejects any
-    /// URI that does not conform to the SPIFFE-ID spec.
+    /// URI that does not conform to the SPIFFE-ID spec with
+    /// [`IdentityError::InvalidSpiffeId`], whichever part is at fault.
     pub fn parse(raw: &str) -> Result<Self, IdentityError> {
         if raw.len() > Self::MAX_LEN {
             return Err(IdentityError::InvalidSpiffeId(format!(
@@ -106,7 +107,10 @@ impl WorkloadId {
                 ));
             }
             for segment in path[1..].split('/') {
-                validate_path_segment(segment, "path segment")?;
+                validate_path_segment(segment, "path segment").map_err(|e| match e {
+                    IdentityError::InvalidComponent(msg) => IdentityError::InvalidSpiffeId(msg),
+                    other => other,
+                })?;
             }
         }
         Ok(Self(raw.to_string()))

@@ -35,7 +35,6 @@ use axum::{
     response::Response,
 };
 use std::{
-    fmt::Write as _,
     future::Future,
     pin::Pin,
     sync::{Arc, LazyLock},
@@ -44,14 +43,6 @@ use std::{
 use tower::{Layer, Service};
 
 static TRACEPARENT: LazyLock<HeaderName> = LazyLock::new(|| HeaderName::from_static("traceparent"));
-
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{:02x}", b).expect("writing into a String never fails");
-    }
-    s
-}
 
 // ── TraceContext ──────────────────────────────────────────────────────────────
 
@@ -78,8 +69,8 @@ impl TraceContext {
         let mut span_bytes = [0u8; 8];
         rng.fill_bytes(&mut trace_bytes);
         rng.fill_bytes(&mut span_bytes);
-        let trace_id = to_hex(&trace_bytes);
-        let parent_id = to_hex(&span_bytes);
+        let trace_id = axess_rng::hex::encode(trace_bytes);
+        let parent_id = axess_rng::hex::encode(span_bytes);
         let traceparent = format!("00-{trace_id}-{parent_id}-01");
         Self {
             traceparent,
@@ -129,7 +120,7 @@ impl TraceContext {
         // Generate a new parent-id for the child span.
         let mut span_bytes = [0u8; 8];
         rng.fill_bytes(&mut span_bytes);
-        let parent_id = to_hex(&span_bytes);
+        let parent_id = axess_rng::hex::encode(span_bytes);
 
         let traceparent = format!("00-{trace_id}-{parent_id}-{flags}");
         Some(Self {

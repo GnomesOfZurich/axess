@@ -239,7 +239,7 @@ pub trait AuthzEntityProvider: Send + Sync {
 /// ```rust,ignore
 /// let provider: PlatformProvider = ...;                                    // typed
 /// let provider: Arc<dyn RequestEntityProvider> = Arc::new(
-///     MokaEntityCache::new(
+///     EntityCache::new(
 ///         ValkeyEntityCache::new(provider, valkey, Duration::from_secs(60))
 ///     )
 /// );

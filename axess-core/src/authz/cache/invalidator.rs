@@ -18,9 +18,7 @@
 //! window, which audit findings frequently flag as a control gap.
 //!
 //! This trait unifies "drop entries matching this scope" across the
-//! in-process [`EntityCache`](super::EntityCache), the Moka decorator
-//! ([`MokaEntityCache`](super::MokaEntityCache), if compiled in), and
-//! the Valkey decorator
+//! in-process [`EntityCache`](super::EntityCache) and the Valkey decorator
 //! ([`ValkeyEntityCache`](super::ValkeyEntityCache), if compiled in).
 //! Adopters can dispatch through `dyn CacheInvalidator` from policy-
 //! update handlers without naming the concrete cache layer.

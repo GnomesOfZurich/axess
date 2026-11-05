@@ -272,7 +272,8 @@ impl FactorStore for OurBackend {
             "SELECT id, name, steps_json, user_id, tenant_id
              FROM auth_methods
              WHERE enabled = 1
-               AND (user_id = ?1 OR (user_id IS NULL AND tenant_id = ?2))
+               AND tenant_id = ?2
+               AND (user_id = ?1 OR user_id IS NULL)
              ORDER BY CASE WHEN user_id IS NOT NULL THEN 0 ELSE 1 END, rowid",
         )
         .bind(user_id.to_string())
@@ -287,14 +288,14 @@ impl FactorStore for OurBackend {
             let steps_json: String = row.get("steps_json");
             let row_user_id: Option<String> = row.get("user_id");
 
-            let steps: Vec<FactorStep> = serde_json::from_str(&steps_json).unwrap_or_else(|err| {
-                warn!(
-                    method_id = %id,
-                    error = %err,
-                    "Failed to parse steps_json; treating as empty"
-                );
-                vec![]
-            });
+            // Steps that cannot be read are an error: a method read as having
+            // no steps would ask for nothing.
+            let steps: Vec<FactorStep> = serde_json::from_str(&steps_json).map_err(|err| {
+                warn!(method_id = %id, error = %err, "failed to parse steps_json");
+                BackendError::Backend(format!(
+                    "auth_methods.steps_json of {id} is not valid: {err}"
+                ))
+            })?;
 
             let scope = if row_user_id.is_some() {
                 AuthnScope::User {
@@ -410,6 +411,50 @@ impl FactorStore for OurBackend {
         q = q.bind(&tenant_id);
         let res = q.execute(self.pool()).await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// The passkey ids live inside `factor_configs.config_json`, so the
+    /// lookup narrows the tenant's `fido2` rows with a substring match on
+    /// the base64url id and confirms each candidate by parsing it.
+    async fn fido2_credential_holder(
+        &self,
+        tenant_id: &TenantId,
+        credential_id: &[u8],
+    ) -> Result<Option<UserId>, Self::Error> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let encoded = URL_SAFE_NO_PAD.encode(credential_id);
+        let rows = sqlx::query(
+            "SELECT user_id, config_json FROM factor_configs
+              WHERE kind = 'fido2' AND tenant_id = ?1 AND user_id IS NOT NULL
+                AND instr(config_json, ?2) > 0",
+        )
+        .bind(tenant_id.to_string())
+        .bind(&encoded)
+        .fetch_all(self.pool())
+        .await?;
+        for row in rows {
+            let json: String = row.get("config_json");
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            if holds_credential_id(&value, &encoded) {
+                let user: String = row.get("user_id");
+                return UserId::try_new(&user).map(Some).map_err(|e| {
+                    BackendError::Backend(format!("bad user_id in factor_configs: {e}"))
+                });
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Whether any `cred_id` member anywhere in `value` equals `encoded`.
+fn holds_credential_id(value: &serde_json::Value, encoded: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, inner)| {
+            (key == "cred_id" && inner.as_str() == Some(encoded))
+                || holds_credential_id(inner, encoded)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(|v| holds_credential_id(v, encoded)),
+        _ => false,
     }
 }
 

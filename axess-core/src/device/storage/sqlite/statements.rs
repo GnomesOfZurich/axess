@@ -1,7 +1,7 @@
 //! The SQLite statements the multi-statement device operations
 //! ([`ops`](crate::device::storage::sql_common::ops)) are built from.
 
-use sqlx::{Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection as _, Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use crate::device::storage::sql_common::ops::{DeviceSql, SweepStage};
 use crate::device::storage::sql_common::{
@@ -16,20 +16,17 @@ pub(super) struct SqliteSql;
 impl DeviceSql for SqliteSql {
     type Db = Sqlite;
 
-    async fn begin_create(
-        pool: &SqlitePool,
+    async fn begin_create<'c>(
+        conn: &'c mut SqliteConnection,
         _device: &Device,
-    ) -> Result<Transaction<'static, Sqlite>, SqlDeviceStoreError> {
+    ) -> Result<Transaction<'c, Sqlite>, SqlDeviceStoreError> {
         // An immediate transaction takes the database's single write lock
         // before the read, so two creates of one key run one after the
         // other and the second one reads the first one's row.
-        Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
+        Ok(conn.begin_with("BEGIN IMMEDIATE").await?)
     }
 
-    async fn end_create(
-        _tx: &mut Transaction<'_, Sqlite>,
-        _device: &Device,
-    ) -> Result<(), sqlx::Error> {
+    async fn end_create(_conn: &mut SqliteConnection, _device: &Device) -> Result<(), sqlx::Error> {
         Ok(())
     }
 
@@ -215,7 +212,8 @@ impl DeviceSql for SqliteSql {
     ) -> Result<u64, sqlx::Error> {
         Ok(sqlx::query(
             "UPDATE devices SET user_id = ?3 \
-             WHERE tenant_id = ?1 AND id = ?2 AND user_id IS NULL",
+             WHERE tenant_id = ?1 AND id = ?2 AND user_id IS NULL \
+               AND trust_level <> 'Revoked'",
         )
         .bind(tenant)
         .bind(device_id)

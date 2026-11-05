@@ -119,7 +119,9 @@ impl BindingsCodec {
     /// Like [`decode`](Self::decode), and also reports whether the reader
     /// should re-seal the stored blob: it is bound to its row (the format of
     /// 0.11.0, or the current format under the previous key) but not in the
-    /// form a write seals. A blob without any binding, read under the
+    /// form a write seals. A blob of the earlier format whose row ids hold a
+    /// zero byte could have been sealed for another pair of ids with the same
+    /// joined form, so it is not re-sealed either. A blob without any binding, read under the
     /// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs) window, is not
     /// re-sealed by a read: the bindings name no device or tenant, so nothing
     /// in the plaintext can confirm the blob belongs to the row it sits
@@ -152,7 +154,17 @@ impl BindingsCodec {
                 )?;
                 (
                     opened.plaintext,
-                    opened.stale && opened.binding != Binding::Unbound,
+                    opened.stale
+                        && match opened.binding {
+                            Binding::Current => true,
+                            // The earlier format joined the ids with a zero
+                            // byte, so it names the row unambiguously only
+                            // when neither id holds one.
+                            Binding::Earlier => {
+                                !tenant_id.contains('\0') && !device_id.contains('\0')
+                            }
+                            Binding::Unbound => false,
+                        },
                 )
             }
             None => (payload, false),
@@ -727,8 +739,8 @@ pub(crate) fn bindings_update_after_miss(current: Option<DeviceTrustLevel>) -> B
 }
 
 /// The outcome of an owner claim that matched no row, given the owner a
-/// re-read found. A NULL owner here would mean the row was released
-/// between the two statements; it fails closed.
+/// re-read found. A NULL owner here is a revoked device, which is never
+/// claimed, or a row released between the two statements; both fail closed.
 pub(crate) fn claim_after_miss(owner: Option<Option<String>>, user: &str) -> OwnerClaim {
     match owner {
         None => OwnerClaim::Missing,

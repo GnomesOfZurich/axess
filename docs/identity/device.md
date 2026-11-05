@@ -477,7 +477,10 @@ device of the same tenant, fingerprint and owner exists and otherwise returns
 the one that does. The memory store serialises creates of one key on a
 per-key lock, SQLite runs the read and the insert in an immediate
 transaction, Postgres under a transaction-scoped advisory lock and MySQL
-under a named lock (`GET_LOCK`, released on every path). The trait's
+under a named lock (`GET_LOCK`, taken on the connection that runs the
+create and released on it only after the transaction has committed or rolled
+back; a create that is dropped part-way closes its connection, which frees the
+lock). The trait's
 provided implementation, which the Valkey store uses, saves and re-reads
 and deletes its own row when another sorts first; it can leave a second
 row when both re-reads precede the other's write.
@@ -572,7 +575,7 @@ axess ships five `DeviceStore` implementations:
 
 | Backend | Feature | Notes |
 |---|---|---|
-| `MemoryDeviceStore` | `memory` | `DashMap` + clock-driven sweep. Dev and tests. |
+| `MemoryDeviceStore` | `memory` | `Mutex<HashMap>` + clock-driven sweep. Dev and tests. |
 | `SqliteDeviceStore` | `sqlite` | SQLx pool, `INSERT … ON CONFLICT`, schema in `init_schema()`. |
 | `PostgresDeviceStore` | `postgres` | SQLx pool, same surface as the sqlite backend with the Postgres dialect. |
 | `MysqlDeviceStore` | `mysql` | SQLx pool, MySQL dialect (`?` binds, `ON DUPLICATE KEY UPDATE`, `VARBINARY(32)`). Compatible with MySQL 8.x and MariaDB 10.5+. |

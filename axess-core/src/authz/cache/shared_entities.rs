@@ -84,36 +84,3 @@ async fn entity_cache_hits_return_the_same_allocation() {
     assert_eq!(owned.iter().count(), first.iter().count());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
-
-#[cfg(feature = "moka-cache")]
-#[tokio::test]
-async fn moka_concurrent_misses_share_one_inner_call() {
-    use super::MokaEntityCache;
-    let calls = Arc::new(AtomicUsize::new(0));
-    let cache = Arc::new(MokaEntityCache::new(SlowProvider {
-        calls: calls.clone(),
-    }));
-    let (p, r, a) = (
-        uid("App::User::\"alice\""),
-        uid("App::Doc::\"d\""),
-        uid("App::Action::\"View\""),
-    );
-    let mut tasks = Vec::new();
-    for _ in 0..8 {
-        let (cache, p, r, a) = (cache.clone(), p.clone(), r.clone(), a.clone());
-        tasks.push(tokio::spawn(async move {
-            let s = session();
-            cache.shared_entities_for(&s, &p, &r, &a).await.unwrap()
-        }));
-    }
-    let mut sets = Vec::new();
-    for t in tasks {
-        sets.push(t.await.unwrap());
-    }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "one load for eight callers"
-    );
-    assert!(sets.windows(2).all(|w| Arc::ptr_eq(&w[0], &w[1])));
-}

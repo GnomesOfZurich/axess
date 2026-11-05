@@ -2,7 +2,7 @@
 //!
 //! Wraps any [`RequestEntityProvider`] in a network-shared cache so that
 //! repeat authorization checks across pods reuse the same entity build.
-//! Typically composed under [`super::MokaEntityCache`] as the L2 tier.
+//! Typically composed under [`super::EntityCache`] as the L2 tier.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,20 +26,20 @@ const DEFAULT_TTL_SECS: u64 = 60;
 ///
 /// Network-shared cache via [`fred`] (Valkey/Redis). Sub-millisecond
 /// lookup, cluster-wide scope. Use as the L2 tier; combine under an
-/// in-process [`super::MokaEntityCache`] L1 for sub-microsecond hot-path
+/// in-process [`super::EntityCache`] L1 for sub-microsecond hot-path
 /// hits.
 ///
 /// # Construction
 ///
 /// ```rust,ignore
-/// use axess_core::authz::cache::{MokaEntityCache, ValkeyEntityCache};
+/// use axess_core::authz::cache::{EntityCache, ValkeyEntityCache};
 /// use std::sync::Arc;
 /// use std::time::Duration;
 ///
 /// let provider = MyEntityProvider::new(db);
 /// let provider = ValkeyEntityCache::new(provider, valkey_client)
 ///     .with_ttl(Duration::from_secs(60));
-/// let provider = MokaEntityCache::new(provider).with_ttl(Duration::from_secs(5));
+/// let provider = EntityCache::new(provider).with_ttl(Duration::from_secs(5));
 /// let provider: Arc<dyn axess_core::authz::RequestEntityProvider> = Arc::new(provider);
 /// ```
 ///
@@ -59,6 +59,16 @@ const DEFAULT_TTL_SECS: u64 = 60;
 /// [`cache_discriminator`](RequestEntityProvider::cache_discriminator), or
 /// nothing when it has none. Cedar UIDs are already serialisable text and
 /// unique enough that no extra hashing is needed.
+///
+/// # Entity index
+///
+/// Beside each entry the cache writes, for every entity UID in the entity
+/// set and for the resource, a Valkey SET `{prefix}:authz-entities-uid:{uid}`
+/// holding the entry's key, with the same TTL as the entry.
+/// [`invalidate_resource`](Self::invalidate_resource) reads that SET and
+/// deletes the entries it names, so it also drops the entries built under a
+/// parent (a folder, group or role) whose UID is in their entity sets. An
+/// entry whose index could not be written is not stored.
 ///
 /// # Caching contract
 ///
@@ -291,22 +301,64 @@ where
         self.scan_and_delete(&pattern).await
     }
 
-    /// Drop every cache entry built for `resource`, for every principal.
+    /// Drop every cache entry built for `resource`, for every principal, and
+    /// every entry whose entity set holds `resource` as an entity of its own.
     ///
-    /// Uses the glob `{prefix}:authz-entities:*|{resource}|*`; the resource
-    /// segment is delimited by `|` on both sides. Loads of that resource
-    /// that started on this pod before the call do not write their result.
+    /// The second part is what makes this the call for a parent entity: a
+    /// folder, group or role is not the resource of the entries built under
+    /// it, but it is in their entity sets, so changing it drops those entries
+    /// too. The entries are found through the entity index (see the struct
+    /// docs); the glob `{prefix}:authz-entities:*|{resource}|*` is run as
+    /// well, for entries written before the index existed. Loads of that
+    /// resource that started on this pod before the call do not write their
+    /// result; a load for a child that started before the call may still be
+    /// stored with the old parent until the TTL.
     pub async fn invalidate_resource(
         &self,
         resource: &EntityUid,
     ) -> Result<(), fred::error::Error> {
         self.generations.bump_resource(resource);
+        let index = self.index_key(resource);
+        let members: Vec<String> = self.client.smembers(&index).await?;
+        for chunk in members.chunks(256) {
+            let _: () = self.client.del(chunk.to_vec()).await?;
+        }
+        let _: () = self.client.del(&index).await?;
         let pattern = format!(
             "{}:authz-entities:*|{}|*",
             self.prefix,
             glob_escape(&resource.to_string())
         );
         self.scan_and_delete(&pattern).await
+    }
+
+    /// The key of the SET naming the entries whose entity set holds `uid`.
+    fn index_key(&self, uid: &EntityUid) -> String {
+        format!("{}:authz-entities-uid:{uid}", self.prefix)
+    }
+
+    /// Record `entry_key` in the index SET of every entity in `entities` and
+    /// of `resource`, each expiring with the entry. Written before the entry
+    /// so an entry is never stored unindexed.
+    async fn write_index(
+        &self,
+        entry_key: &str,
+        resource: &EntityUid,
+        entities: &Entities,
+    ) -> Result<(), fred::error::Error> {
+        let mut uids: Vec<EntityUid> = entities.iter().map(|e| e.uid()).collect();
+        if !uids.contains(resource) {
+            uids.push(resource.clone());
+        }
+        let ttl_ms = self.ttl.as_millis().clamp(1, i64::MAX as u128) as i64;
+        let pipeline = self.client.pipeline();
+        for uid in uids {
+            let index = self.index_key(&uid);
+            let _: () = pipeline.sadd(&index, entry_key).await?;
+            let _: () = pipeline.pexpire(&index, ttl_ms, None).await?;
+        }
+        let _: Vec<Value> = pipeline.all().await?;
+        Ok(())
     }
 
     /// Drop every cache entry whose `tenant` segment matches.
@@ -463,10 +515,13 @@ where
             match entities.write_to_json(&mut buf) {
                 Ok(()) => match String::from_utf8(buf) {
                     Ok(s) => {
-                        let ttl_secs = self.ttl.as_secs().min(i64::MAX as u64) as i64;
+                        if let Err(e) = self.write_index(&key, resource, &entities).await {
+                            warn!(?e, key = %key, "valkey cache: index write failed; not storing");
+                            return Ok(entities);
+                        }
                         let res: Result<(), _> = self
                             .client
-                            .set(&key, s, Some(Expiration::EX(ttl_secs)), None, false)
+                            .set(&key, s, Some(expiration_for(self.ttl)), None, false)
                             .await;
                         if let Err(e) = res {
                             warn!(?e, key = %key, "valkey cache: SET failed");
@@ -524,8 +579,30 @@ where
     }
 }
 
+/// The `SET` expiry for a cache TTL. Written in milliseconds so a TTL under a
+/// second is not rounded to zero (which Valkey refuses, silently disabling the
+/// cache); never less than 1 ms.
+fn expiration_for(ttl: Duration) -> Expiration {
+    Expiration::PX(ttl.as_millis().clamp(1, i64::MAX as u128) as i64)
+}
+
 #[cfg(test)]
 mod tests {
+    /// A sub-second TTL must still be a positive expiry.
+    #[test]
+    fn a_sub_second_ttl_is_a_positive_expiry() {
+        for ttl in [Duration::from_millis(500), Duration::ZERO] {
+            match super::expiration_for(ttl) {
+                Expiration::EX(n) | Expiration::PX(n) => assert!(n >= 1, "{ttl:?} gave {n}"),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(matches!(
+            super::expiration_for(Duration::from_secs(60)),
+            Expiration::PX(60_000)
+        ));
+    }
+
     /// The glob characters a principal or tenant may carry are escaped, so a
     /// principal `a[1]` matches its own key and a tenant `*` matches only
     /// the tenant spelled `*`.
@@ -617,5 +694,118 @@ mod tests {
         assert!(!mfa.contains("mfa=1"), "the discriminator is hashed: {mfa}");
         assert_eq!(mfa, c.cache_key(&p, Some("t1"), &r, &a, Some("mfa=1")));
         assert_eq!(hash_discriminator("mfa=1").len(), 64);
+    }
+}
+
+// ── live-server tests (ignored by default) ──────────────────────────────
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A provider whose resource sits in a folder: the folder is part of
+    /// every entity set it builds, as the resource's parent.
+    struct FolderedProvider {
+        calls: Arc<AtomicUsize>,
+        folder: EntityUid,
+    }
+
+    impl RequestEntityProvider for FolderedProvider {
+        fn entities_for<'a>(
+            &'a self,
+            session: &'a AuthSession,
+            principal: &'a EntityUid,
+            resource: &'a EntityUid,
+            action: &'a EntityUid,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
+        > {
+            let _ = (session, action);
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let entity = |uid: &EntityUid, parents: HashSet<EntityUid>| {
+                    cedar_policy::Entity::new(uid.clone(), HashMap::new(), parents).unwrap()
+                };
+                Ok(Entities::from_entities(
+                    vec![
+                        entity(principal, HashSet::new()),
+                        entity(&self.folder, HashSet::new()),
+                        entity(resource, HashSet::from([self.folder.clone()])),
+                    ],
+                    None,
+                )
+                .unwrap())
+            })
+        }
+    }
+
+    fn guest_session() -> AuthSession {
+        use crate::session::SessionData;
+        use crate::session::id::SessionId;
+        use crate::session::layer::{SessionHandle, SessionInner};
+        use tokio::sync::RwLock;
+
+        let inner = SessionInner {
+            id: SessionId::new(&axess_rng::SystemRng),
+            data: SessionData::default(),
+            modified: false,
+            needs_persist: false,
+            regenerate: false,
+            pre_cycle_id: None,
+            rng: Arc::new(axess_rng::SystemRng),
+            pending_fingerprint: None,
+            max_custom_bytes: 64 * 1024,
+            consume: None,
+        };
+        AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
+    }
+
+    async fn live_client() -> Client {
+        let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let client = Client::new(Config::from_url(&url).expect("url"), None, None, None);
+        client.init().await.expect("connect");
+        client
+    }
+
+    /// Invalidating a folder drops the entries of the documents in it, on
+    /// the shared tier as on the in-process one: the folder is in their
+    /// entity sets, not in their keys.
+    #[tokio::test]
+    #[ignore = "requires a running Valkey (VALKEY_URL)"]
+    async fn invalidating_a_folder_drops_the_entries_of_the_documents_in_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let folder = EntityUid::from_str("App::Folder::\"f1\"").unwrap();
+        let cached = ValkeyEntityCache::with_options(
+            FolderedProvider {
+                calls: calls.clone(),
+                folder: folder.clone(),
+            },
+            live_client().await,
+            "axt_folder",
+            Duration::from_secs(60),
+        );
+        let s = guest_session();
+        let p = EntityUid::from_str("App::User::\"alice\"").unwrap();
+        let a = EntityUid::from_str("App::Action::\"View\"").unwrap();
+        let docs = [
+            EntityUid::from_str("App::Doc::\"d1\"").unwrap(),
+            EntityUid::from_str("App::Doc::\"d2\"").unwrap(),
+        ];
+        cached.invalidate_all().await.unwrap();
+        for res in &docs {
+            cached.entities_for(&s, &p, res, &a).await.unwrap();
+        }
+        cached.invalidate_resource(&folder).await.unwrap();
+        for res in &docs {
+            cached.entities_for(&s, &p, res, &a).await.unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "both documents are rebuilt after their folder changed"
+        );
     }
 }

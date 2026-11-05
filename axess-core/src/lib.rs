@@ -320,6 +320,10 @@ pub mod testing;
 /// Identifier / e-mail / URL validation helpers.
 pub mod validation;
 
+pub(crate) mod length_prefix;
+
+pub(crate) mod locked;
+
 /// Endpoint and client policy shared by the credential-bearing outbound
 /// HTTP clients.
 #[cfg(any(

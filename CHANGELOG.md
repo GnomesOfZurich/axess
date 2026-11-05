@@ -8,6 +8,246 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-05
+
+Every finding of the v0.14.0 security review is closed, each with a test
+that failed before it. `docs/production/migrating.md` ("0.14.0 to 0.15.0")
+lists every compile break, stored-value change and behaviour change by what
+an adopter sees.
+
+### Changed (breaking)
+
+- **`HumanPrincipal` and `AuthState::Authenticating` have `impersonator`**:
+  the administrator acting in the user's name, emitted to Cedar as
+  `axess::Human.impersonator`; a step-up keeps it. Add `impersonator: None`
+  to literals; stored sessions load.
+- **Hex-encoded OTP secrets are no longer read**: `verify_totp` and
+  `verify_hotp` decode base32 only. axess never wrote a hex secret; re-encode
+  any you stored.
+- **`build_totp_uri` and `build_totp_uri_with_algorithm` return
+  `Option<String>`**: `None` for `digits` outside 6 to 8 or a `period` under
+  5 seconds (they used to clamp).
+- **TOTP is computed in-tree and `totp-rs` is gone**: the HOTP value at
+  counter `time / period`, pinned by the RFC 6238 vectors. `TotpAlgorithm` is
+  an in-tree enum with the same variants; the `TotpBuilder` and `Totp`
+  re-exports are removed.
+- **The `moka-cache` feature and `MokaEntityCache` are removed** with the
+  `moka` dependency; use `EntityCache` or `ValkeyEntityCache`.
+- **New error variants**: `IssuanceError::EmptyKeyId` (the local IdP refuses
+  an empty or repeated `kid` on every load and in `rotate_signing_key`),
+  `ProvisioningError::InvalidTenant(String)` (an identifier the creation
+  rule refuses), `AuthnError::UnknownTenant` (impersonation and signup
+  completion when the tenant does not load; was `CrossTenant`).
+- **`OAuthError::TokenEndpointTransient` is `{ status: Option<u16> }`**:
+  `None` when no answer arrived; the empty `body` field is gone.
+  `MockOAuthProvider::with_transient_failure` takes `Option<u16>`.
+
+### Security
+
+- A passkey credential id held by another user of the tenant is refused at
+  `finish_fido2_registration` (`NoFlow`, failed `FactorSetup` audit row).
+  `FactorStore::fido2_credential_holder` answers the lookup; the default
+  answers nobody, so a store that does not implement it admits.
+- `finish_discoverable_login` verifies the assertion only against the
+  caller's stored credentials with the same public key, so a stored
+  credential id cannot be borrowed to log in as someone else.
+- A `v2` delegated credential row reads as expired (its expiry is not
+  covered by the envelope) and is refreshed, never re-sealed as `v3`; a row
+  labelled for another provider is refused.
+- Factor secrets are bound to the factor variant and tenant OAuth
+  credentials to issuer and client id (`FactorSecretBinding::with_context`).
+  Secrets sealed by 0.14.0 open and re-seal (`OpenedSecret::rotated`);
+  `FactorSecretCipher::with_first_binding(LegacyBlobs)` decides whether the
+  old binding is accepted: `Accept` by default in this release, `Reject` in
+  the next; `AcceptUntil(cutoff)` is recommended now. A tenant OAuth record
+  opened under the old binding is written back under the current one through
+  the new `TenantOAuthProviderStore::put_if_revision` (memory and SQLite
+  stores; the default writes nothing).
+- A custom key provider cannot save an envelope it cannot read back (a key
+  id with a `.` or empty, a repeated-byte key).
+- `Debug` redacts `CsrfToken` and `DevicePiiMapping::value`; the delegated
+  refresh skew is clamped to 0 through one day; `envelope_aad` panics on a
+  field over 4 GiB instead of saturating.
+- Audit archive: one refused row no longer stops archiving or purging; a
+  down sink costs three calls a tick; `drain` goes past a refused row and
+  returns the first refusal at the end; a torn day file is cut back to its
+  last newline before the next batch; a bare-id sidecar line no longer marks
+  a batch as written (a batch retried across the upgrade is archived once
+  more).
+- MySQL device store: the create lock is released after the commit, on the
+  connection that runs the create; a cancelled create closes its connection
+  instead of returning it to the pool with the lock held.
+- Audit reasons that name a known tag are recorded as that tag, not
+  `Other("...")`; every FIDO2 registration and LDAP row names its session; a
+  password reset for an unknown identifier no longer overwrites the system
+  user's reset token.
+
+### Added
+
+- `ScopedOAuth::is_refused` tells a refused scope from the global
+  registration.
+- `cascade_revoke_devices_and_tokens` revokes devices and the refresh tokens
+  issued to them; call it from `on_token_compromise`.
+- `MemorySessionRegistry::with_ttl` and `with_clock`: entries unused for the
+  TTL (24 hours by default) are forgotten.
+- `require_authz!(ns, action, resource, validator = ...)` also requires the
+  session to be live in the registry.
+- `prepare_factor_choice` prepares the factor picked at an `AnyOf` step;
+  `build_totp_uri_with_algorithm` writes `algorithm=` into the URI.
+
+### Changed
+
+- `StoredTenantOAuthProviders` reports a store error when a re-read finds a
+  later revision than the resolution read, and none when the record was
+  deleted meanwhile; the record is wiped after hashing.
+- No device store claims a revoked device that has no owner: `claim_owner`
+  answers `OwnedByOther` in the memory, Valkey, SQLite, Postgres and MySQL
+  stores.
+- `RevocationAwareSocket::is_closed` replaces `is_revoked` (deprecated); the
+  socket closes with a reason: `4001 session_revoked`, `4002
+  lifetime_reached`, `4003 session_unverified` (`LIFETIME_REACHED_CLOSE_CODE`,
+  `SESSION_UNVERIFIED_CLOSE_CODE`). A client that signs out on `4001`
+  reconnects on the other two.
+- New accounts and tenants refuse look-alike identifiers (surrounding or
+  non-ASCII whitespace, a form NFKC would change; a tenant identifier also
+  the invisible-character and NFC rules): `is_acceptable_new_identifier`,
+  `Tenant::validate_new`. Rows read back are unchanged; migrating.md has a
+  query for existing rows the rule would refuse.
+- JWT replay protection keys the store on issuer and `jti` together; a token
+  recorded just before the upgrade can be accepted once more within its
+  remaining lifetime.
+- The outbound OAuth client and `TokenExchangeClient` refuse a token response
+  without `token_type`; one path sends the device authorization request, and
+  a `client_secret_basic` request also names `client_id` in its form.
+- Documented and pinned: after a backward clock step larger than the
+  tolerance, server-stamped service callers are refused as stale until the
+  clock passes the newest stamp forgotten before the step.
+- Dependencies: `totp-rs`, `moka`, `dashmap`, `lru`, `hex`, `rand`,
+  `tower-cookies` and `form_urlencoded` leave the library crates; `base64` is
+  0.22 with the rest of the tree; `parking_lot` gives way to `std` locks
+  (poisoned locks are recovered); `axess-cache` has its own LRU with the
+  same eviction; `axess_rng::hex` is the one hex codec (a device fingerprint
+  that is not 64 hex characters is refused with one message); `SystemRng`
+  reads the OS generator through `getrandom`; the unused `once_cell` and
+  `hyper` lines go; `session::config::SameSite` is
+  now `cookie::SameSite` at the same path. The library crates resolve 187
+  crates with default features (was 271) and 359 with all (was 591).
+- The sqlite example's key file is never rewritten: a valid key only narrows
+  the mode, a new file is linked into place whole, a file with no key stops
+  the start.
+
+### Fixed
+
+- Sessions: `set_pending_workflow` (and `begin_signup`), `set_identifying`
+  and `begin_authenticating` rotate the session id; a one-shot value taken
+  after a rotation writes only the removal to the old row; a rotated session
+  merges a concurrent write instead of bringing a taken value back; a
+  pending-workflow session is bound to the client's fingerprint; a handler
+  error still stores the session; `derive_subkey` no longer returns the
+  cookie or fingerprint key for the layer's reserved labels (an application
+  that asked for those two labels gets a different key).
+- Session registry and sweeps: a used Valkey session keeps its member and
+  eviction past `max_sessions_per_user` is by last activity; the SQL sweep
+  removes a row at the second it expires; a session revoked during id
+  rotation stays revoked; a Valkey watcher polls when its registry check gets
+  no answer; a socket whose watcher died is closed by `send` with `4003`;
+  `MemorySessionRegistry` drops the entry of a user whose last session was
+  invalidated.
+- Devices and tokens: the default `find_by_fingerprint_for_user` pages past
+  `OWN_DEVICE_SCAN_LIMIT`; a Postgres retention sweep cannot undo a
+  revocation; the Valkey device store refuses to save over a row it cannot
+  decode unless the save is a revocation (delete the device to clear it); a
+  refresh-token compromise revokes the linked devices' other tokens;
+  `RefreshTokenConfig::validate` refuses a `ttl` of zero or less;
+  `ValkeyEntityCache` writes sub-second TTLs in milliseconds; an
+  earlier-format device binding under a row id holding a zero byte is not
+  re-sealed under that row.
+- Impersonation and authz: a step-up keeps the impersonation; a nested
+  attempt is refused with `Impersonated` and `nested_impersonation`; a
+  refused impersonation still ends the administrator's old session id; a
+  caller attribute named like a built-in (`session_id`, `impersonator`) does
+  not reach the Cedar principal; `require_authz!` answers an anonymous caller
+  401, not 400, on a malformed path parameter.
+- Rate limits and addresses: IPv6 rules wider than /96 cover IPv4 clients
+  (`::/0` denies or admits them); `normalise_identifier` strips invisible
+  characters before NFKC, so one login name is one key; `X-Real-IP` is
+  canonicalised; the login overflow bucket is per IPv4 address (per IPv6
+  /48); a window under one millisecond no longer divides by zero; a new
+  address folds into its prefix's overflow bucket once the table is three
+  quarters full; `Retry-After` rounds a partial second up.
+- OAuth client: the device authorization request authenticates the client;
+  a DPoP nonce retry signs a new client assertion; a device-code poll meeting
+  a `5xx` is an error, not a denial; DPoP `htu` drops query and fragment; a
+  `use_dpop_nonce` challenge is found anywhere in `WWW-Authenticate`; a
+  device response without `interval` polls every 5 seconds;
+  `with_private_key_jwt` with a signer for another client is refused by
+  `build()`; client secrets travel only in a Basic header on the revocation,
+  `client_credentials`, device-poll and pushed authorization requests; a
+  `token_type` other than `Bearer` is refused; the DPoP seed is decoded into
+  zeroizing buffers.
+- OIDC: issuer comparison is exact (a trailing slash differs); Bearer
+  middleware tries every config for the issuer, reads the scheme
+  case-insensitively, trims the token, and answers 401 to a non-text header
+  or a `Bearer` with no token (it passed as anonymous); social login appends
+  with `&` to an authorization endpoint that has a query; back-channel logout
+  picks the provider by `azp` among `aud` and answers 503 to a resend while
+  the first delivery runs; tenant providers are rebuilt when a record is
+  deleted and written anew, and a lower revision is discovered once; a refused non-Bearer refresh still saves the
+  rotated refresh token; an exchange response without `scope` grants the
+  requested scopes; the claim lock hashes its fields with lengths (ceremonies
+  in flight during the upgrade restart); a start time in the future is
+  expired; a JARM response with no code ends the ceremony; an issued-at far
+  from now is out of range, not an overflow; a token verified in its last
+  accepted second is remembered for that second; `SidMap` sweeps name a
+  session once; the GCP impersonation endpoint base keeps its last segment.
+- Signed service requests: a replay is refused across a clock step in either
+  order; a signature stamped ahead of the clock is set aside outside the
+  `max_remembered` count and counts again when the clock catches up; a stamp
+  at or below the newest one forgotten for age is stale.
+- Factors: a passkey login no longer shortens a method with an empty `AnyOf`
+  step (`AuthMethod::is_complete`); `axess-factors` builds with `--features
+  totp` alone; `build_totp_uri` writes `algorithm=SHA1`; a replayed TOTP or
+  HOTP code that loses the write race is audited and counted against the
+  lockout; a failure record never overwrites a factor enrolled meanwhile;
+  `begin_fido2_registration` returns `NoFlow` when the ceremony state does
+  not fit in the session; LDAP puts a user name with an interior space or a
+  non-ASCII letter into the bind DN as itself and leaves a literal `{user}`
+  in the group filter alone.
+- Identifiers and testing: `PiiToken` deserialises through `parse` (an
+  uppercase or braced stored token no longer loads; rows the library wrote
+  are unaffected); `WorkloadId::parse` refuses a bad path segment with
+  `InvalidSpiffeId`; `InMemoryBackend::with_clock` reaches the identity
+  store and `with_user_password` keeps one user per tenant; `TracingCapture`
+  keeps a second dispatcher registered for the life of the process, so a
+  callsite first hit by a thread with no subscriber is still captured.
+- Caches and keys: `invalidate_resource` also drops entries whose entity set
+  holds the resource, on `EntityCache` and `ValkeyEntityCache` (the Valkey
+  cache keeps a per-UID index beside each entry); the local IdP clears `jku`, `jwk`, `x5u` and `x5c`
+  from a header given to `mint_with_header`.
+- Documented: the password reset cooldown bounds repeat requests, not a
+  caller who mints identifiers; `MemoryDeviceStore` scans the whole table on
+  every write.
+
+Example applications (not published; copy with these changes):
+
+- **sqlite**: `available_methods` lists only the asked tenant's methods; the
+  TOTP master key file is kept at mode 0600; `activate_user` clears a timed
+  suspension and the failure counters; the plain-secret cutoff is a fixed
+  date; concurrent TOTP enrolments store one factor and answer the other 409;
+  an unknown `users.status` or unreadable `steps_json` is an error, not a
+  guest or an empty method.
+- **oauth**: a refresh whose userinfo names another subject ends the session;
+  an unknown or non-text `OAUTH_PROVISIONING` stops the server; the social
+  example passes on neither Spotify's nor GitHub's unverified email, falls
+  back to the Discord username when `global_name` is null, and gives its
+  pre-login cookies a ten minute `Max-Age`.
+- **workload-identity**: `GitHubAllowlist` also lists the `ref` or
+  `environment` and the event, and admits nothing when none is listed; the
+  local IdP retires a key only after its tokens have expired, never reuses a
+  kid, stages a new key as `.pem.new` until the rotation, removes the key
+  file of a failed rotation, and stamps a historical key on first load; a run
+  admitted through its `environment` records the attribute.
+
 ## [0.14.0] - 2026-11-02
 
 `docs/production/migrating.md` lists every break by what an adopter sees.

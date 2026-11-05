@@ -2,19 +2,21 @@
 
 #[cfg(any(test, feature = "memory"))]
 use crate::health::{HealthCheck, HealthStatus};
+#[cfg(any(test, feature = "memory"))]
+use crate::locked::lock;
 use crate::session::{data::SessionData, id::SessionId};
 #[cfg(any(test, feature = "memory"))]
 use crate::store::{MemoryStore, Store};
 #[cfg(any(test, feature = "memory"))]
-use dashmap::DashMap;
+use std::collections::HashMap;
 #[cfg(any(test, feature = "memory"))]
 use std::future::Future;
 #[cfg(any(test, feature = "memory"))]
 use std::pin::Pin;
 #[cfg(any(test, feature = "memory"))]
-use std::sync::Arc;
-#[cfg(any(test, feature = "memory"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, feature = "memory"))]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 // ── SessionStore ──────────────────────────────────────────────────────────────
@@ -48,7 +50,7 @@ pub enum ConditionalUpdate {
 /// Implementors: [`MemorySessionStore`], `SqliteSessionStore`, `ValkeySessionStore`.
 ///
 /// All methods accept `&self`; implementations are expected to use
-/// interior mutability (`Arc<DashMap<...>>` for memory, connection
+/// interior mutability (`Arc<RwLock<HashMap<...>>>` for memory, connection
 /// pool for SQL/Valkey).
 ///
 /// # Zero TTL
@@ -348,7 +350,15 @@ pub use handles::{
 // `cfg(test)` keeps them available for the in-crate test suite without
 // requiring `--features memory` on every `cargo test` invocation.
 
-/// In-memory session store backed by [`DashMap`].
+/// In-memory session store backed by one `RwLock<HashMap>`.
+///
+/// # Lock granularity
+///
+/// One lock covers the whole table: reads (`load`, `snapshot`) share it,
+/// every write takes it alone, and the purge that runs every 1024 writes
+/// holds it for a full scan. That is the right trade at test and
+/// single-node sizes and the wrong one for a contended server, which is
+/// not what this store is for.
 ///
 /// **For testing and single-node development only.** Not suitable for production:
 /// - Data is lost on process restart.
@@ -588,7 +598,7 @@ impl HealthCheck for MemorySessionStore {
 
 // ── MemorySessionRegistry ─────────────────────────────────────────────────────
 
-/// In-memory session registry backed by [`DashMap`].
+/// In-memory session registry backed by one `Mutex<HashMap>`.
 ///
 /// Maps `user_id -> Vec<SessionId>` (insertion-ordered). **For testing
 /// and single-node development only.**
@@ -602,10 +612,36 @@ impl HealthCheck for MemorySessionStore {
 /// for `is_valid` and `invalidate_session`, but N is bounded by the
 /// concurrent-session limit (typically ≤10) and the Memory registry
 /// is testing-only.
+///
+/// # Lifetime
+///
+/// Each entry carries the time it was registered or last used, and is
+/// forgotten once it is older than the registry's TTL (24 hours by default,
+/// as in `ValkeySessionRegistry`; see [`with_ttl`](Self::with_ttl)). A
+/// session that is used keeps its entry: `is_valid` moves the stamp forward
+/// once half the TTL has gone. The clock is injectable with
+/// [`with_clock`](Self::with_clock).
 #[cfg(any(test, feature = "memory"))]
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemorySessionRegistry {
-    valid: Arc<DashMap<Arc<str>, Vec<SessionId>>>,
+    valid: Arc<Mutex<HashMap<Arc<str>, Vec<RegisteredSession>>>>,
+    ttl: Duration,
+    clock: Arc<dyn axess_clock::Clock>,
+}
+
+/// A session id and when it was registered or last used.
+#[cfg(any(test, feature = "memory"))]
+type RegisteredSession = (SessionId, chrono::DateTime<chrono::Utc>);
+
+#[cfg(any(test, feature = "memory"))]
+impl Default for MemorySessionRegistry {
+    fn default() -> Self {
+        Self {
+            valid: Arc::default(),
+            ttl: Duration::from_secs(24 * 60 * 60),
+            clock: Arc::new(axess_clock::SystemClock),
+        }
+    }
 }
 
 #[cfg(any(test, feature = "memory"))]
@@ -613,6 +649,27 @@ impl MemorySessionRegistry {
     /// Create an empty in-memory session registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set how long an entry lives without being used. Defaults to 24 hours.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// Inject a [`Clock`](axess_clock::Clock) for deterministic simulation
+    /// testing. Defaults to [`SystemClock`](axess_clock::SystemClock).
+    pub fn with_clock(mut self, clock: Arc<dyn axess_clock::Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The oldest stamp that is still live at `now`.
+    fn cutoff(&self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+        chrono::Duration::from_std(self.ttl)
+            .ok()
+            .and_then(|ttl| now.checked_sub_signed(ttl))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
     }
 }
 
@@ -633,15 +690,17 @@ impl SessionRegistry for MemorySessionRegistry {
         user_id: &crate::authn::ids::UserId,
         session_id: &SessionId,
     ) -> Result<(), Self::Error> {
-        // Dedup-on-insert preserves FIFO semantics; a re-
-        // register of an existing id is a no-op (keeps the original
-        // position) rather than appending a duplicate.
-        let mut entry = self
-            .valid
-            .entry(Arc::from(user_id.to_string()))
-            .or_default();
-        if !entry.contains(session_id) {
-            entry.push(*session_id);
+        // Dedup-on-insert preserves FIFO semantics; a re-register of an
+        // existing id keeps the original position (it renews the stamp)
+        // rather than appending a duplicate. Entries past the TTL go.
+        let now = self.clock.now();
+        let cutoff = self.cutoff(now);
+        let mut valid = lock(&self.valid);
+        let entry = valid.entry(Arc::from(user_id.to_string())).or_default();
+        entry.retain(|(_, at)| *at > cutoff);
+        match entry.iter_mut().find(|(s, _)| s == session_id) {
+            Some((_, at)) => *at = now,
+            None => entry.push((*session_id, now)),
         }
         Ok(())
     }
@@ -651,17 +710,32 @@ impl SessionRegistry for MemorySessionRegistry {
         user_id: &crate::authn::ids::UserId,
         session_id: &SessionId,
     ) -> Result<bool, Self::Error> {
-        Ok(self
-            .valid
-            .get(user_id.to_string().as_str())
-            .is_some_and(|sessions| sessions.contains(session_id)))
+        let now = self.clock.now();
+        let cutoff = self.cutoff(now);
+        let mut valid = lock(&self.valid);
+        let Some(sessions) = valid.get_mut(user_id.to_string().as_str()) else {
+            return Ok(false);
+        };
+        let half = chrono::Duration::from_std(self.ttl / 2).unwrap_or(chrono::Duration::MAX);
+        Ok(sessions
+            .iter_mut()
+            .find(|(s, _)| s == session_id)
+            .is_some_and(|(_, at)| {
+                let live = *at > cutoff;
+                // A session that is used keeps its entry, as in the Valkey
+                // registry: the stamp moves forward once half the TTL has gone.
+                if live && now - *at >= half {
+                    *at = now;
+                }
+                live
+            }))
     }
 
     async fn invalidate_user(
         &self,
         user_id: &crate::authn::ids::UserId,
     ) -> Result<(), Self::Error> {
-        self.valid.remove(user_id.to_string().as_str());
+        lock(&self.valid).remove(user_id.to_string().as_str());
         Ok(())
     }
 
@@ -670,9 +744,13 @@ impl SessionRegistry for MemorySessionRegistry {
         user_id: &crate::authn::ids::UserId,
         session_id: &SessionId,
     ) -> Result<(), Self::Error> {
-        if let Some(mut sessions) = self.valid.get_mut(user_id.to_string().as_str()) {
-            sessions.retain(|s| s != session_id);
+        let key = user_id.to_string();
+        let mut valid = lock(&self.valid);
+        if let Some(sessions) = valid.get_mut(key.as_str()) {
+            sessions.retain(|(s, _)| s != session_id);
         }
+        // A user with no session left keeps no entry.
+        valid.retain(|k, v| &**k != key.as_str() || !v.is_empty());
         Ok(())
     }
 
@@ -680,10 +758,16 @@ impl SessionRegistry for MemorySessionRegistry {
         &self,
         user_id: &crate::authn::ids::UserId,
     ) -> Result<Vec<SessionId>, Self::Error> {
-        Ok(self
-            .valid
+        let cutoff = self.cutoff(self.clock.now());
+        Ok(lock(&self.valid)
             .get(user_id.to_string().as_str())
-            .map(|sessions| sessions.clone())
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .filter(|(_, at)| *at > cutoff)
+                    .map(|(s, _)| *s)
+                    .collect()
+            })
             .unwrap_or_default())
     }
 }

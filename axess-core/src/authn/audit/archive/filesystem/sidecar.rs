@@ -6,7 +6,7 @@
 //! order), so a source that reuses row ids for different events (a recycled
 //! rowid, a recreated table, two sources on one root) produces a different
 //! line and is appended instead of being skipped as a repeat. A line holding
-//! only an id was written by an earlier release and matches on the id alone.
+//! only an id (written before the digest existed) matches nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -71,14 +71,8 @@ impl SidecarCache {
     }
 
     /// True when the sidecar at `path` records this batch: the exact line
-    /// `marker`, or (an earlier release's line) the bare `batch_id`. A missing
-    /// sidecar records nothing.
-    pub(super) fn recorded(
-        &mut self,
-        path: &Path,
-        batch_id: &str,
-        marker: &str,
-    ) -> std::io::Result<bool> {
+    /// `marker`. A missing sidecar records nothing.
+    pub(super) fn recorded(&mut self, path: &Path, marker: &str) -> std::io::Result<bool> {
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -97,7 +91,7 @@ impl SidecarCache {
         Ok(self
             .days
             .get(path)
-            .is_some_and(|e| e.lines.contains(marker) || e.lines.contains(batch_id)))
+            .is_some_and(|e| e.lines.contains(marker)))
     }
 
     /// Read the sidecar into the index, replacing what was there.

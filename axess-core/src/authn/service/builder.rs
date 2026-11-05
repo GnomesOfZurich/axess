@@ -565,9 +565,13 @@ where
     ///
     /// The record lives in this process, on the injected clock, and holds at
     /// most [`RESET_COOLDOWN_CAPACITY`] identifiers (the least recently
-    /// requested are forgotten first). A deployment of several instances
-    /// applies the cooldown per instance; put the route behind a shared rate
-    /// limit for a bound across them. The default is no cooldown.
+    /// requested are forgotten first). A caller that submits that many
+    /// distinct identifiers inside the cooldown pushes an earlier entry out,
+    /// so the cooldown is a bound on ordinary repeat requests, not a defence
+    /// against a caller who mints identifiers; the rate limit on the route
+    /// is what bounds that. A deployment of several instances applies the
+    /// cooldown per instance; put the route behind a shared rate limit for a
+    /// bound across them. The default is no cooldown.
     pub fn with_password_reset_cooldown(mut self, cooldown: std::time::Duration) -> Self {
         self.reset_cooldown = Some(cooldown);
         self

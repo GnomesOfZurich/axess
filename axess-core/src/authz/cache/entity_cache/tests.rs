@@ -138,7 +138,7 @@ async fn invalidate_evicts_cached_entry() {
 /// concurrent cold-miss callers for the same key share one inner
 /// provider call rather than fan out to N parallel DB hits. This
 /// is what `ClockTtlCache::get_or_try_insert_with` enables: the
-/// previous (moka-backed, no single-flight) implementation would
+/// previous (no single-flight) implementation would
 /// have called the inner provider N times.
 #[tokio::test]
 async fn concurrent_cold_misses_share_one_inner_call() {
@@ -178,8 +178,8 @@ async fn concurrent_cold_misses_share_one_inner_call() {
 /// Pin the DST property: with an injected MockClock, advancing time
 /// past the TTL must cause the next call to re-invoke the inner
 /// provider. This is the test that would have failed under the
-/// previous moka-backed implementation (moka uses wall-clock time
-/// internally; advancing `MockClock` had no effect on its eviction).
+/// previous implementation (it used wall-clock time internally;
+/// advancing `MockClock` had no effect on its eviction).
 #[tokio::test]
 async fn entries_expire_under_injected_clock() {
     let clock = Arc::new(MockClock::now());

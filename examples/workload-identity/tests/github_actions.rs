@@ -19,7 +19,10 @@ const AUDIENCE: &str = "axess-platform";
 const TRUST_DOMAIN: &str = "github.actions";
 
 fn allowlist() -> GitHubAllowlist {
-    GitHubAllowlist::new().owner_id("123456")
+    GitHubAllowlist::new()
+        .owner_id("123456")
+        .git_ref("refs/heads/main")
+        .event("push")
 }
 
 fn sample_tenant() -> TenantId {
@@ -124,9 +127,9 @@ async fn recipe_rejects_repository_owner_mismatch() {
 
 #[tokio::test]
 async fn recipe_omits_missing_optional_attributes() {
-    // Only `repository` + `repository_owner` set; the optional fields
-    // are absent. Mapper should still resolve, with an empty attribute
-    // map.
+    // Only the required claims and the ref and event the allowlist needs
+    // are set; the other optional fields are absent. Mapper should still resolve, with only those
+    // attributes.
     let (der, jwks) = common::rsa_keypair("gha-min");
     let (now, exp) = common::now_and_exp();
     let token = common::sign(
@@ -140,6 +143,8 @@ async fn recipe_omits_missing_optional_attributes() {
             "repository_owner": "gnomes",
             "repository_id": "987654321",
             "repository_owner_id": "123456",
+            "ref": "refs/heads/main",
+            "event_name": "push",
         }),
         "gha-min",
         &der,
@@ -165,8 +170,8 @@ async fn recipe_omits_missing_optional_attributes() {
     };
     assert_eq!(
         w.attributes.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["repository", "repository_owner"],
-        "no optional fields: only the audit names"
+        vec!["event_name", "ref", "repository", "repository_owner"],
+        "no optional fields: the audit names and the run's ref and event"
     );
 }
 
@@ -221,10 +226,98 @@ async fn a_token_without_the_numeric_ids_is_refused() {
 /// When repository ids are listed, a sibling repository of a trusted owner is refused.
 #[tokio::test]
 async fn a_repository_outside_the_listed_ids_is_refused() {
-    let only_other = GitHubAllowlist::new().owner_id("123456").repository_id("1");
+    let only_other = allowlist().repository_id("1");
     assert!(resolve_with(|_| {}, only_other).await.is_err());
-    let listed = GitHubAllowlist::new()
-        .owner_id("123456")
-        .repository_id("987654321");
+    let listed = allowlist().repository_id("987654321");
     assert!(resolve_with(|_| {}, listed).await.is_ok());
+}
+
+/// A run on a ref the allowlist does not name (a feature branch, a pull
+/// request merge ref) is refused, and so is a run of a listed ref started by
+/// an event that is not listed.
+#[tokio::test]
+async fn a_run_on_an_unlisted_ref_or_event_is_refused() {
+    let out = resolve_with(
+        |c| c["ref"] = serde_json::json!("refs/heads/feature"),
+        allowlist(),
+    )
+    .await;
+    assert!(out.is_err(), "feature branch admitted: {out:?}");
+    let out = resolve_with(
+        |c| c["event_name"] = serde_json::json!("pull_request"),
+        allowlist(),
+    )
+    .await;
+    assert!(out.is_err(), "pull_request event admitted: {out:?}");
+}
+
+/// A token that carries no ref and no event is refused: the allowlist fails
+/// closed rather than skipping a check for a claim that is absent.
+#[tokio::test]
+async fn a_token_without_ref_or_event_is_refused() {
+    let out = resolve_with(
+        |c| {
+            let o = c.as_object_mut().unwrap();
+            o.remove("ref");
+            o.remove("event_name");
+        },
+        allowlist(),
+    )
+    .await;
+    assert!(out.is_err(), "{out:?}");
+}
+
+/// An allowlist that names only owners admits nothing.
+#[tokio::test]
+async fn an_allowlist_without_ref_or_event_rules_admits_nothing() {
+    let owners_only = GitHubAllowlist::new().owner_id("123456");
+    let out = resolve_with(|_| {}, owners_only).await;
+    assert!(out.is_err(), "{out:?}");
+}
+
+/// A listed environment admits a run whose ref is not listed, for the listed
+/// events; an unlisted environment does not.
+#[tokio::test]
+async fn a_listed_environment_admits_a_run_and_an_unlisted_one_does_not() {
+    let by_environment = GitHubAllowlist::new()
+        .owner_id("123456")
+        .environment("production")
+        .event("push");
+    let edit = |env: &'static str| {
+        move |c: &mut serde_json::Value| {
+            c["ref"] = serde_json::json!("refs/heads/feature");
+            c["environment"] = serde_json::json!(env);
+        }
+    };
+    assert!(
+        resolve_with(edit("production"), by_environment.clone())
+            .await
+            .is_ok()
+    );
+    assert!(resolve_with(edit("staging"), by_environment).await.is_err());
+}
+
+/// A run admitted through its environment records that environment, so the
+/// audit trail says which rule let it in.
+#[tokio::test]
+async fn a_run_admitted_through_its_environment_records_it() {
+    let by_environment = GitHubAllowlist::new()
+        .owner_id("123456")
+        .environment("production")
+        .event("push");
+    let Principal::Workload(w) = resolve_with(
+        |c| {
+            c["ref"] = serde_json::json!("refs/heads/feature");
+            c["environment"] = serde_json::json!("production");
+        },
+        by_environment,
+    )
+    .await
+    .expect("a listed environment admits the run") else {
+        panic!("expected Workload");
+    };
+    assert_eq!(
+        w.attributes.get("environment"),
+        Some(&serde_json::Value::String("production".to_string()))
+    );
 }

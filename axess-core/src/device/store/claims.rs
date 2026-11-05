@@ -109,3 +109,19 @@ async fn a_stale_bindings_write_conflicts_and_keeps_the_other_edit() {
     let row = store.load(&tenant(), &d.id).await.unwrap().unwrap();
     assert_eq!(row.bindings, vec![refresh("fam-1")]);
 }
+
+#[tokio::test]
+async fn a_revoked_device_with_no_owner_is_not_claimed() {
+    let store = MemoryDeviceStore::new();
+    let mut d = unowned();
+    d.trust_level = DeviceTrustLevel::Revoked;
+    d.revoked_at = Some(at());
+    store.save(&d, at()).await.unwrap();
+    let a = crate::authn::ids::testing::user("a");
+    assert_eq!(
+        store.claim_owner(&tenant(), &d.id, &a, at()).await.unwrap(),
+        OwnerClaim::OwnedByOther
+    );
+    let row = store.load(&tenant(), &d.id).await.unwrap().unwrap();
+    assert_eq!(row.user_id, None, "no owner was written");
+}

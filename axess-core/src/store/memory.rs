@@ -1,5 +1,5 @@
 //! In-memory [`Store`] backend for tests, single-process dev, and
-//! prototyping. Implements [`Store<K, V>`] over a [`DashMap`](dashmap::DashMap) with
+//! prototyping. Implements [`Store<K, V>`] over a `RwLock<HashMap>` with
 //! `chrono::DateTime<Utc>` deadlines driven by an injectable
 //! [`axess_clock::Clock`] (so DST tests can advance time via
 //! `MockClock` without `tokio::time::sleep`).
@@ -8,20 +8,21 @@
 //! at rest. Per-store wrappers like `MemorySessionStore` are thin
 //! newtypes around this backend.
 
+use crate::locked::{read, write};
 use crate::store::Store;
 use axess_clock::{Clock, SystemClock};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use dashmap::DashMap;
+use std::collections::{HashMap, hash_map::Entry as MapEntry};
 use std::convert::Infallible;
 use std::future::Future;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// In-memory `Store<K, V>` backend.
 ///
 /// `K` must be `Eq + Hash + Clone + Sized + Send + Sync + 'static` for
-/// the underlying `DashMap`; `V` must be `Clone + Send + Sync +
+/// the underlying `HashMap`; `V` must be `Clone + Send + Sync +
 /// 'static`. (`Store<K, V>` allows `K: ?Sized`, but a memory map keys
 /// by value so we tighten here.)
 ///
@@ -40,7 +41,7 @@ where
     K: Eq + Hash + Clone + Send + Sync + 'static,
     V: Clone + Send + Sync + 'static,
 {
-    inner: Arc<DashMap<K, Entry<V>>>,
+    inner: Arc<RwLock<HashMap<K, Entry<V>>>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -57,7 +58,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryStore")
-            .field("entries", &self.inner.len())
+            .field("entries", &read(&self.inner).len())
             .finish()
     }
 }
@@ -94,7 +95,7 @@ where
     /// [`with_clock`](Self::with_clock) for DST.
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(DashMap::new()),
+            inner: Arc::default(),
             clock: Arc::new(SystemClock),
         }
     }
@@ -123,10 +124,10 @@ where
     /// loads, not production hot paths.
     pub fn snapshot(&self) -> Vec<(K, V)> {
         let now = self.clock.now();
-        self.inner
+        read(&self.inner)
             .iter()
-            .filter(|e| e.value().expires_at > now)
-            .map(|e| (e.key().clone(), e.value().value.clone()))
+            .filter(|(_, e)| e.expires_at > now)
+            .map(|(k, e)| (k.clone(), e.value.clone()))
             .collect()
     }
 
@@ -138,8 +139,8 @@ where
         F: FnMut(&mut V),
     {
         let now = self.clock.now();
-        match self.inner.get_mut(key) {
-            Some(mut entry) if entry.expires_at > now => {
+        match write(&self.inner).get_mut(key) {
+            Some(entry) if entry.expires_at > now => {
                 f(&mut entry.value);
                 true
             }
@@ -148,12 +149,12 @@ where
     }
 
     /// Replace the value and deadline of a key only while a live entry is
-    /// stored under it, in one step under the map's shard lock. Returns
+    /// stored under it, in one step under the map's write lock. Returns
     /// `false` (and writes nothing) for an absent or expired key.
     pub fn replace_live(&self, key: &K, value: &V, ttl: Duration) -> bool {
         let now = self.clock.now();
-        match self.inner.get_mut(key) {
-            Some(mut entry) if entry.expires_at > now => {
+        match write(&self.inner).get_mut(key) {
+            Some(entry) if entry.expires_at > now => {
                 entry.value = value.clone();
                 entry.expires_at = self.deadline(now, ttl);
                 true
@@ -163,7 +164,7 @@ where
     }
 
     /// Replace the value and deadline of a live key only while `matches`
-    /// accepts the stored value, in one step under the map's shard lock.
+    /// accepts the stored value, in one step under the map's write lock.
     /// `None` for an absent or expired key; otherwise whether `matches`
     /// accepted (and the write happened).
     pub fn replace_live_if(
@@ -174,8 +175,8 @@ where
         matches: impl FnOnce(&V) -> bool,
     ) -> Option<bool> {
         let now = self.clock.now();
-        match self.inner.get_mut(key) {
-            Some(mut entry) if entry.expires_at > now => {
+        match write(&self.inner).get_mut(key) {
+            Some(entry) if entry.expires_at > now => {
                 if !matches(&entry.value) {
                     return Some(false);
                 }
@@ -188,12 +189,12 @@ where
     }
 
     /// Remove a live key only while `matches` accepts the stored value, in
-    /// one step under the map's shard lock. `None` for an absent or expired
+    /// one step under the map's write lock. `None` for an absent or expired
     /// key; otherwise whether `matches` accepted (and the entry was removed).
     pub fn remove_live_if(&self, key: &K, matches: impl FnOnce(&V) -> bool) -> Option<bool> {
         let now = self.clock.now();
-        match self.inner.entry(key.clone()) {
-            dashmap::Entry::Occupied(entry) if entry.get().expires_at > now => {
+        match write(&self.inner).entry(key.clone()) {
+            MapEntry::Occupied(entry) if entry.get().expires_at > now => {
                 if !matches(&entry.get().value) {
                     return Some(false);
                 }
@@ -208,9 +209,9 @@ where
     /// An expired entry is removed too but reported as `false`.
     pub fn remove_live(&self, key: &K) -> bool {
         let now = self.clock.now();
-        self.inner
+        write(&self.inner)
             .remove(key)
-            .is_some_and(|(_, entry)| entry.expires_at > now)
+            .is_some_and(|entry| entry.expires_at > now)
     }
 
     /// The expiry instant for a TTL starting at `now`, saturating at the
@@ -230,7 +231,7 @@ where
         // Count what this call removes. Subtracting two `len()` readings
         // underflows when other threads insert between them.
         let mut removed = 0u64;
-        self.inner.retain(|_, entry| {
+        write(&self.inner).retain(|_, entry| {
             let keep = entry.expires_at > now;
             if !keep {
                 removed += 1;
@@ -244,12 +245,12 @@ where
     /// yet been pruned). Use [`prune_expired`](Store::prune_expired)
     /// to reclaim them first if the count must be precise.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        read(&self.inner).len()
     }
 
     /// Whether the underlying map is empty (live + expired-not-pruned).
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        read(&self.inner).is_empty()
     }
 
     /// Whether the key has a physical entry in the map, **including
@@ -260,7 +261,7 @@ where
     /// Most callers want [`Store::get`] (which returns `None` for
     /// expired entries) instead.
     pub fn physically_contains_key(&self, key: &K) -> bool {
-        self.inner.contains_key(key)
+        read(&self.inner).contains_key(key)
     }
 }
 
@@ -273,8 +274,7 @@ where
 
     fn get(&self, key: &K) -> impl Future<Output = Result<Option<V>, Self::Error>> + Send {
         let now = self.clock.now();
-        let result = self
-            .inner
+        let result = read(&self.inner)
             .get(key)
             .filter(|e| e.expires_at > now)
             .map(|e| e.value.clone());
@@ -293,7 +293,7 @@ where
         // future deadline rather than panicking.
         let now = self.clock.now();
         let expires_at = self.deadline(now, ttl);
-        self.inner.insert(
+        write(&self.inner).insert(
             key.clone(),
             Entry {
                 value: value.clone(),
@@ -304,7 +304,7 @@ where
     }
 
     fn delete(&self, key: &K) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        self.inner.remove(key);
+        write(&self.inner).remove(key);
         async { Ok(()) }
     }
 

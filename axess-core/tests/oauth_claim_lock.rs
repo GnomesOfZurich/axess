@@ -31,11 +31,10 @@ async fn test_claim_lock(
     use sha2::{Digest, Sha256};
     let sid = session.session_id().await;
     let mut hasher = Sha256::new();
-    hasher.update(provider.as_bytes());
-    hasher.update(b":");
-    hasher.update(subject.as_bytes());
-    hasher.update(b":");
-    hasher.update(sid.as_bytes());
+    for field in [provider.as_bytes(), subject.as_bytes(), sid.as_bytes()] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 

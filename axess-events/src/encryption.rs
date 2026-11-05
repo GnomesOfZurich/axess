@@ -105,6 +105,11 @@ pub struct EncryptedBlob {
 /// tenant or subject is distinct from any present one, and a label and
 /// version lead, so a future change to the field set cannot collide with
 /// this one.
+///
+/// # Panics
+///
+/// If a field is longer than `u32::MAX` bytes: a length that saturated
+/// would let two different oversized fields share one encoding.
 #[must_use]
 pub fn envelope_aad(
     id: &EventId,
@@ -113,7 +118,7 @@ pub fn envelope_aad(
     subject: Option<&EventSubject>,
 ) -> Vec<u8> {
     fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
-        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let len = field_len(bytes.len()).expect("an AAD field is longer than u32::MAX bytes");
         buf.extend_from_slice(&len.to_be_bytes());
         buf.extend_from_slice(bytes);
     }
@@ -155,10 +160,22 @@ pub fn envelope_aad(
     buf
 }
 
+/// The length prefix of an AAD field, or `None` when it does not fit.
+fn field_len(len: usize) -> Option<u32> {
+    u32::try_from(len).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::id::UserId;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_field_over_four_gib_has_no_length_prefix() {
+        assert_eq!(field_len(u32::MAX as usize), Some(u32::MAX));
+        assert_eq!(field_len(u32::MAX as usize + 1), None);
+    }
 
     #[test]
     fn aad_differs_when_any_envelope_field_differs() {

@@ -207,9 +207,7 @@ that the tests use. A PR that introduces a `chrono::Utc::now()`
 call, a `getrandom()` call, or a direct database read outside
 the trait surface is rejected.
 
-The exceptions are extremely narrow: the `axess-cache` crate's
-`moka-cache` feature uses wall-clock-driven eviction (opt-in,
-documented as DST-breaking), the `IntoResponse` impl for `AuthnError`
+The exceptions are extremely narrow: the `IntoResponse` impl for `AuthnError`
 (the trait method cannot take a clock; call `into_response_at` where one
 is held), and the production `SystemClock`
 and `SystemRng` implementations delegate to the OS (these are

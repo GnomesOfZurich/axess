@@ -72,10 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     // `OAUTH_PROVISIONING=linked-only` turns just-in-time creation off: only
     // identities linked beforehand sign in.
-    let provisioning = match std::env::var("OAUTH_PROVISIONING").as_deref() {
-        Ok("linked-only") => Provisioning::LinkedOnly,
-        _ => Provisioning::JustInTime,
-    };
+    let provisioning = Provisioning::from_env(std::env::var("OAUTH_PROVISIONING"))?;
 
     info!("Discovering OIDC configuration from {}...", provider.issuer);
     let app = app::build(Config {

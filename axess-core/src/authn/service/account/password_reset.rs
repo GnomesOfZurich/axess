@@ -22,6 +22,15 @@ use crate::authn::{
     types::AuthnScope,
 };
 
+/// The id the dummy token of an unknown identifier is stored under, so the
+/// not-found path writes as the found path does without touching a real
+/// user's token. It is not [`UserId::SYSTEM`](crate::authn::ids::UserId::SYSTEM),
+/// which may hold a real reset token of its own, and no store has a user
+/// under it (a store that refuses the row for that is ignored, as before).
+const DUMMY_TOKEN_USER: crate::authn::ids::UserId = crate::authn::ids::UserId::from_uuid(
+    uuid::Uuid::from_u128(0x6178_6573_7300_4000_8000_6475_6d6d_7900),
+);
+
 impl<I, F> RequestAuthnService<I, F>
 where
     // `IdentityPasswordReset` is required here and nowhere else: a store
@@ -99,7 +108,7 @@ where
         {
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
-                    .with_error(AuthFailureReason::Other("cooldown".into())),
+                    .with_error(AuthFailureReason::from("cooldown")),
             )
             .await?;
             return Ok(None);
@@ -122,7 +131,7 @@ where
             let _ = self
                 .inner
                 .identity
-                .store_reset_token(&crate::authn::ids::UserId::SYSTEM, &hash, now)
+                .store_reset_token(&DUMMY_TOKEN_USER, &hash, now)
                 .await;
             // The row of a refused account names it; an unknown identifier
             // has nobody to name.
@@ -155,7 +164,7 @@ where
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::PasswordResetRequested)
                     .attributed_to(&user.id, &user.tenant_id)
-                    .with_error(AuthFailureReason::Other("token_store_error".into())),
+                    .with_error(AuthFailureReason::from("token_store_error")),
             )
             .await?;
             return Ok(None);
@@ -341,7 +350,7 @@ where
     ) -> Result<bool, AuthnError<I::Error>> {
         let builder = AuthEventBuilder::failure(AuthEventType::PasswordReset)
             .maybe_attributed_to(user.map(|u| &u.id), user.map(|u| &u.tenant_id))
-            .with_error(AuthFailureReason::Other(reason.into()));
+            .with_error(AuthFailureReason::from(reason));
         self.emit_audit(builder).await?;
         Ok(false)
     }

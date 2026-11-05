@@ -117,6 +117,18 @@ fn pre_auth_cookie(base: &str, secure: bool) -> String {
     }
 }
 
+/// A pre-auth cookie as the login sets it: HTTP-only, `Lax`, `Path=/`, ten
+/// minutes to live, and `Secure` when asked.
+fn pre_auth_cookie_for(name: &str, value: String, secure: bool) -> Cookie<'static> {
+    let mut cookie = Cookie::new(pre_auth_cookie(name, secure), value);
+    cookie.set_http_only(true);
+    cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
+    cookie.set_path("/");
+    cookie.set_secure(secure);
+    cookie.set_max_age(tower_cookies::cookie::time::Duration::minutes(10));
+    cookie
+}
+
 async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResponse {
     let csrf_state = state.github.mint_csrf_state();
     let auth = state.github.build_auth_url(&csrf_state);
@@ -131,18 +143,12 @@ async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResp
     // is set for plain HTTP; `Path=/` and no `Domain` are what the prefix
     // requires.
     let secure = secure_cookies();
-    let mut state_cookie = Cookie::new(pre_auth_cookie("oauth_state", secure), csrf_state);
-    state_cookie.set_http_only(true);
-    state_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
-    state_cookie.set_path("/");
-    state_cookie.set_secure(secure);
-    let mut pkce_cookie = Cookie::new(pre_auth_cookie("oauth_pkce", secure), auth.pkce_verifier);
-    pkce_cookie.set_http_only(true);
-    pkce_cookie.set_same_site(tower_cookies::cookie::SameSite::Lax);
-    pkce_cookie.set_path("/");
-    pkce_cookie.set_secure(secure);
-    cookies.add(state_cookie);
-    cookies.add(pkce_cookie);
+    cookies.add(pre_auth_cookie_for("oauth_state", csrf_state, secure));
+    cookies.add(pre_auth_cookie_for(
+        "oauth_pkce",
+        auth.pkce_verifier,
+        secure,
+    ));
 
     Redirect::to(&auth.url)
 }
@@ -281,7 +287,21 @@ fn html_escape(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pre_auth_cookie;
+    use super::{pre_auth_cookie, pre_auth_cookie_for};
+
+    /// The state and verifier cookies expire on their own, so an abandoned
+    /// login does not leave them in the browser indefinitely.
+    #[test]
+    fn pre_auth_cookies_expire_after_ten_minutes() {
+        for name in ["oauth_state", "oauth_pkce"] {
+            let cookie = pre_auth_cookie_for(name, "v".into(), true);
+            assert_eq!(
+                cookie.max_age(),
+                Some(tower_cookies::cookie::time::Duration::minutes(10)),
+                "{name}"
+            );
+        }
+    }
 
     /// The default (Secure) deployment sets `__Host-` cookies, so a planted
     /// bare `oauth_state` is a different cookie and is never read; plain

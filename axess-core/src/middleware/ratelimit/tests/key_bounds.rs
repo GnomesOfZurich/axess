@@ -85,7 +85,7 @@ fn a_header_flood_by_one_user_adds_at_most_the_slot_count_of_buckets() {
         let key = extract_key(&user_request(USER, &format!("v{i}")), &extractor);
         store.try_acquire_at(&key, t_zero());
     }
-    assert!(store.buckets.len() as u64 <= HEADER_SLOTS);
+    assert!(crate::locked::lock(&store.buckets).len() as u64 <= HEADER_SLOTS);
 }
 
 /// Every address inside one IPv6 /64 is one client; a different /64 is not.

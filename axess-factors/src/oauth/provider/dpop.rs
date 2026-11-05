@@ -28,6 +28,12 @@ pub(super) fn advertised_in(document: &serde_json::Value) -> bool {
         .any(|alg| alg == DPOP_SIGNING_ALG)
 }
 
+/// The `htu` of a proof: the request URL without its query and fragment
+/// (RFC 9449 section 4.2).
+pub(super) fn htu(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 /// Generate a DPoP proof JWT (RFC 9449) with `key`.
 ///
 /// Signs the `htm`/`htu`/`iat`/`jti` claims plus optional `ath` (access token
@@ -110,7 +116,7 @@ pub(super) fn generate_dpop_proof_with_nonce(
 
     let mut payload = serde_json::json!({
         "htm": http_method,
-        "htu": http_url,
+        "htu": htu(http_url),
         "iat": iat,
         "jti": jti,
     });

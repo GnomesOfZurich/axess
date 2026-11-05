@@ -101,6 +101,11 @@ REMOVED = {
     # and `with_signup_conflicts_revealed` is the opt-out.
     # `docs/production/migrating.md` names it under "0.13.0 to 0.14.0".
     "with_hidden_signup_conflicts", "AuthnServiceBuilder::with_hidden_signup_conflicts",
+    # Removed in 0.15.0: `totp-rs` left the dependency tree, and with it the
+    # `TotpBuilder` re-export; the `moka-cache` feature and `MokaEntityCache`
+    # went too. `docs/production/migrating.md` names them under "0.14.0 to
+    # the next release" to say what replaces them.
+    "TotpBuilder", "moka-cache", "MokaEntityCache",
 }
 
 ALLOW = {
@@ -517,7 +522,7 @@ for d in docs:
 
         for m in feature_pat.finditer(line):
             name = m.group(1) or m.group(2)
-            if name in ALLOW:
+            if name in ALLOW or name in REMOVED:
                 continue
             checked += 1
             if name not in FEATURES:

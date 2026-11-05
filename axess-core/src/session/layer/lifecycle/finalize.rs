@@ -3,7 +3,7 @@
 //! wrote, and capping the custom data on whatever is written.
 
 use crate::session::config::SessionConfig;
-use crate::session::data::{SessionData, cap_custom};
+use crate::session::data::{SessionData, cap_custom, merge_concurrent};
 use crate::session::id::SessionId;
 use crate::session::layer::handle::SessionHandle;
 use crate::session::layer::swap::{StoreError, Swap, Swapped, swap_merging};
@@ -204,6 +204,42 @@ where
     })
 }
 
+/// Bring a write that landed on the old row while the request ran into the
+/// data a rotation carries to the new id, as the write of an unrotated
+/// session does ([`swap_merging`]): a one-shot value a concurrent request
+/// took stays taken, and what it wrote is kept. A store that cannot answer
+/// is an error: without the row there is no telling what was taken, and the
+/// rotation fails closed rather than carry a copy that may hold it.
+///
+/// The read and the rotation are two store calls, so a write that lands
+/// between them is still not seen; narrowing that window to nothing takes a
+/// revision-checked `cycle`, which the store trait does not offer.
+async fn merge_concurrent_writes<S>(
+    store: &S,
+    config: &SessionConfig,
+    guard: &mut tokio::sync::RwLockWriteGuard<'_, crate::session::layer::handle::SessionInner>,
+    old_id: &SessionId,
+) -> Result<(), StoreError>
+where
+    S: SessionStore + Send + Sync + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let Some(base) = guard.consume.as_ref().and_then(|c| c.loaded.clone()) else {
+        return Ok(());
+    };
+    let fresh = match store.load(old_id).await.map_err(StoreError::from)? {
+        Some(fresh) if fresh.revision != base.revision => fresh,
+        _ => return Ok(()),
+    };
+    let touched_at = guard.data.touched_at.max(fresh.touched_at);
+    let mut merged = merge_concurrent(&base, &guard.data, &fresh);
+    merged.revision = fresh.revision.wrapping_add(1);
+    merged.touched_at = touched_at;
+    cap_custom(&mut merged.custom, config.max_custom_bytes);
+    guard.data = merged;
+    Ok(())
+}
+
 /// What [`cycle_session`] did.
 struct Cycled {
     /// The id the response cookie carries, when it carries one.
@@ -236,14 +272,23 @@ where
         prev
     });
     let new_id = guard.id;
+    let merged = if existing_id.is_some() {
+        merge_concurrent_writes(store, config, guard, &old_id).await
+    } else {
+        Ok(())
+    };
     // A request that ran under a stored session requires that row to
     // still be live: a logout that removed it while the request ran
     // must not be undone by moving the data to the new id.
     let require_old = existing_id.is_some();
-    match store
-        .cycle(&old_id, &new_id, &guard.data, config.ttl, require_old)
-        .await
-    {
+    let cycled = match merged {
+        Ok(()) => store
+            .cycle(&old_id, &new_id, &guard.data, config.ttl, require_old)
+            .await
+            .map_err(StoreError::from),
+        Err(e) => Err(e),
+    };
+    match cycled {
         Ok(CycleOutcome::Rotated) => {
             if guard.data.auth_state.is_authenticated()
                 && let Some(user_id) = guard.data.auth_state.user_id()

@@ -7,8 +7,12 @@ use crate::authn::{
     store::{AuthMethod, FactorStore},
     types::AuthnScope,
 };
-use dashmap::DashMap;
-use std::sync::Arc;
+use crate::locked::lock;
+use std::collections::{HashMap, hash_map::Entry};
+use std::sync::{Arc, Mutex};
+
+/// An auth method and whether it is enabled.
+type ScopedMethod = (AuthMethod, bool);
 
 /// In-memory [`FactorStore`] for unit tests.
 ///
@@ -18,12 +22,12 @@ pub struct MockFactorStore {
     /// Shared call record; see [`CallLog`].
     call_log: Option<CallLog>,
     /// `scope_key::factor_kind_str` -> FactorConfig
-    configs: Arc<DashMap<String, FactorConfig>>,
+    configs: Arc<Mutex<HashMap<String, FactorConfig>>>,
     /// `user_id -> Vec<AuthMethod>` (legacy test fixture keyed by user)
-    methods: Arc<DashMap<String, Vec<AuthMethod>>>,
+    methods: Arc<Mutex<HashMap<String, Vec<AuthMethod>>>>,
     /// `scope.key()` -> Vec<(method, enabled)>: storage for
     /// `save_method` / `remove_method` / `set_method_enabled`.
-    scoped_methods: Arc<DashMap<String, Vec<(AuthMethod, bool)>>>,
+    scoped_methods: Arc<Mutex<HashMap<String, Vec<ScopedMethod>>>>,
     /// Number of upcoming `compare_and_save_factor` calls that must
     /// report a CAS loss regardless of stored state. Lets tests
     /// exercise the retry/reload path inside
@@ -33,6 +37,13 @@ pub struct MockFactorStore {
     /// before the armed losses begin; see
     /// [`arm_cas_failures_after`](Self::arm_cas_failures_after).
     cas_skip_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of `resolve_factor` calls that go through normally before the
+    /// armed outages begin; see
+    /// [`arm_resolve_failures_after`](Self::arm_resolve_failures_after).
+    resolve_skip_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    /// Number of upcoming `resolve_factor` calls that fail with
+    /// [`MockStoreError::Unavailable`].
+    resolve_failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
     /// Number of upcoming `load_factor` calls that report no row even
     /// when one exists: a read that happened before a concurrent first
     /// write landed. Unit-test only.
@@ -67,13 +78,13 @@ impl MockFactorStore {
     /// Register a factor configuration for a given scope.
     pub fn with_factor(self, scope: AuthnScope, config: FactorConfig) -> Self {
         let key = Self::config_key(&scope, &config.kind());
-        self.configs.insert(key, config);
+        lock(&self.configs).insert(key, config);
         self
     }
 
     /// Register the available authentication methods for a user.
     pub fn with_method(self, user_id: &UserId, method: AuthMethod) -> Self {
-        self.methods
+        lock(&self.methods)
             .entry(user_id.to_string())
             .or_default()
             .push(method);
@@ -89,9 +100,9 @@ impl MockFactorStore {
         }
         .key();
         let prefix = format!("{scope_key}::");
-        self.configs.retain(|k, _| !k.starts_with(&prefix));
-        self.scoped_methods.remove(&scope_key);
-        self.methods.remove(user_id.to_string().as_str());
+        lock(&self.configs).retain(|k, _| !k.starts_with(&prefix));
+        lock(&self.scoped_methods).remove(&scope_key);
+        lock(&self.methods).remove(user_id.to_string().as_str());
     }
 
     /// Arm the CAS-contention failure mode: the next `n` calls to
@@ -113,6 +124,27 @@ impl MockFactorStore {
         self.cas_failures_remaining
             .store(n, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// The first `skip` calls to `resolve_factor` behave normally, then the
+    /// next `n` fail with [`MockStoreError::Unavailable`]: a store outage at a
+    /// chosen point of a login.
+    pub fn arm_resolve_failures_after(&self, skip: usize, n: usize) {
+        self.resolve_skip_remaining
+            .store(skip, std::sync::atomic::Ordering::SeqCst);
+        self.resolve_failures_remaining
+            .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn take_armed_resolve_failure(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dec = |a: &std::sync::atomic::AtomicUsize| {
+            a.fetch_update(SeqCst, SeqCst, |v| v.checked_sub(1)).is_ok()
+        };
+        if dec(&self.resolve_skip_remaining) {
+            return false;
+        }
+        dec(&self.resolve_failures_remaining)
+    }
 }
 
 impl FactorStore for MockFactorStore {
@@ -123,9 +155,12 @@ impl FactorStore for MockFactorStore {
         scope: &AuthnScope,
         kind: FactorKind,
     ) -> Result<Option<crate::authn::store::ResolvedFactor>, Self::Error> {
+        if self.take_armed_resolve_failure() {
+            return Err(MockStoreError::Unavailable);
+        }
         for candidate in scope.resolution_chain() {
             let key = Self::config_key(&candidate, &kind);
-            if let Some(cfg) = self.configs.get(&key).map(|r| r.clone()) {
+            if let Some(cfg) = lock(&self.configs).get(&key).cloned() {
                 return Ok(Some(crate::authn::store::ResolvedFactor {
                     config: cfg,
                     resolved_from: candidate,
@@ -150,7 +185,7 @@ impl FactorStore for MockFactorStore {
             }
         }
         let key = Self::config_key(scope, &kind);
-        Ok(self.configs.get(&key).map(|r| r.clone()))
+        Ok(lock(&self.configs).get(&key).cloned())
     }
 
     async fn save_factor(
@@ -159,7 +194,7 @@ impl FactorStore for MockFactorStore {
         config: FactorConfig,
     ) -> Result<(), Self::Error> {
         let key = Self::config_key(scope, &config.kind());
-        self.configs.insert(key, config);
+        lock(&self.configs).insert(key, config);
         Ok(())
     }
 
@@ -200,7 +235,7 @@ impl FactorStore for MockFactorStore {
         }
         let mut swapped = false;
         let updated_for_swap = updated.clone();
-        self.configs.entry(key).and_modify(|stored| {
+        lock(&self.configs).entry(key).and_modify(|stored| {
             if serde_json::to_value(&*stored).ok() == prior_json {
                 *stored = updated_for_swap.clone();
                 swapped = true;
@@ -215,13 +250,43 @@ impl FactorStore for MockFactorStore {
         config: FactorConfig,
     ) -> Result<bool, Self::Error> {
         let key = Self::config_key(scope, &config.kind());
-        match self.configs.entry(key) {
-            dashmap::mapref::entry::Entry::Vacant(v) => {
+        match lock(&self.configs).entry(key) {
+            Entry::Vacant(v) => {
                 v.insert(config);
                 Ok(true)
             }
-            dashmap::mapref::entry::Entry::Occupied(_) => Ok(false),
+            Entry::Occupied(_) => Ok(false),
         }
+    }
+
+    #[cfg(feature = "fido2")]
+    async fn fido2_credential_holder(
+        &self,
+        tenant_id: &TenantId,
+        credential_id: &[u8],
+    ) -> Result<Option<UserId>, Self::Error> {
+        let prefix = format!("user:{tenant_id}:");
+        let suffix = format!("::{}", FactorKind::Fido2.as_str());
+        let configs = lock(&self.configs);
+        for (key, config) in configs.iter() {
+            let Some(user) = key
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(&suffix))
+            else {
+                continue;
+            };
+            let FactorConfig::Fido2(cfg) = config else {
+                continue;
+            };
+            if cfg
+                .credentials
+                .iter()
+                .any(|c| c.cred_id().as_ref() == credential_id)
+            {
+                return Ok(UserId::try_new(user).ok());
+            }
+        }
+        Ok(None)
     }
 
     async fn available_methods(
@@ -230,11 +295,11 @@ impl FactorStore for MockFactorStore {
         tenant_id: &TenantId,
     ) -> Result<Vec<AuthMethod>, Self::Error> {
         note(&self.call_log, "available_methods");
-        let mut out: Vec<AuthMethod> = self
-            .methods
+        let mut out: Vec<AuthMethod> = lock(&self.methods)
             .get(user_id.to_string().as_str())
-            .map(|r| r.clone())
+            .cloned()
             .unwrap_or_default();
+        let scoped = lock(&self.scoped_methods);
 
         // Scoped storage: user-scope first, then tenant-scope. Only
         // enabled rows are returned.
@@ -243,12 +308,12 @@ impl FactorStore for MockFactorStore {
             tenant_id: *tenant_id,
         }
         .key();
-        if let Some(rows) = self.scoped_methods.get(&user_key) {
+        if let Some(rows) = scoped.get(&user_key) {
             out.extend(rows.iter().filter(|(_, en)| *en).map(|(m, _)| m.clone()));
         }
 
         let tenant_key = AuthnScope::Tenant(*tenant_id).key();
-        if let Some(rows) = self.scoped_methods.get(&tenant_key) {
+        if let Some(rows) = scoped.get(&tenant_key) {
             out.extend(rows.iter().filter(|(_, en)| *en).map(|(m, _)| m.clone()));
         }
 
@@ -262,7 +327,8 @@ impl FactorStore for MockFactorStore {
             return Err(MockStoreError::InvalidSystemMethod);
         }
         let key = scope.key();
-        let mut entry = self.scoped_methods.entry(key).or_default();
+        let mut scoped = lock(&self.scoped_methods);
+        let entry = scoped.entry(key).or_default();
         if let Some(existing) = entry.iter_mut().find(|(m, _)| m.name == method.name) {
             *existing = (method, true);
         } else {
@@ -275,7 +341,7 @@ impl FactorStore for MockFactorStore {
         if matches!(scope, AuthnScope::System) {
             return Err(MockStoreError::InvalidSystemMethod);
         }
-        if let Some(mut entry) = self.scoped_methods.get_mut(&scope.key()) {
+        if let Some(entry) = lock(&self.scoped_methods).get_mut(&scope.key()) {
             entry.retain(|(m, _)| m.name.as_ref() != name);
         }
         Ok(())
@@ -290,7 +356,7 @@ impl FactorStore for MockFactorStore {
         if matches!(scope, AuthnScope::System) {
             return Err(MockStoreError::InvalidSystemMethod);
         }
-        if let Some(mut entry) = self.scoped_methods.get_mut(&scope.key()) {
+        if let Some(entry) = lock(&self.scoped_methods).get_mut(&scope.key()) {
             for (m, en) in entry.iter_mut() {
                 if m.name.as_ref() == name {
                     *en = enabled;

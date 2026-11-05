@@ -21,6 +21,8 @@ use crate::{SessionId, TenantId, UserId};
 ///   this user. `None` for principals minted outside an HTTP request
 ///   context (background tasks acting on behalf of a user, scheduled
 ///   jobs replaying user-attributed actions).
+/// - [`impersonator`](Self::impersonator): the administrator acting in
+///   the user's name, when the session is an impersonation.
 /// - [`attributes`](Self::attributes): arbitrary key-value metadata.
 ///   Empty for baseline principals; future iterations may carry
 ///   claim-shaped data (e.g. `amr` per OIDC for the factors used at
@@ -35,6 +37,11 @@ pub struct HumanPrincipal {
     /// The session id, when the principal was built from an HTTP
     /// request. `None` for background-task and replay contexts.
     pub session_id: Option<SessionId>,
+    /// The administrator acting in this user's name, for a principal built
+    /// from an impersonated session; `None` for the user's own. Authorisation
+    /// and audit read it to tell the user from the administrator using the
+    /// user's session.
+    pub impersonator: Option<UserId>,
     /// Arbitrary key-value metadata supplied by the resolver.
     pub attributes: BTreeMap<String, serde_json::Value>,
 }
@@ -49,6 +56,7 @@ mod tests {
             user_id: UserId::from_bytes([3u8; 16]),
             tenant_id: TenantId::from_bytes([4u8; 16]),
             session_id: None,
+            impersonator: None,
             attributes: BTreeMap::new(),
         };
         assert!(h.session_id.is_none());
@@ -62,6 +70,7 @@ mod tests {
             user_id: UserId::from_bytes([5u8; 16]),
             tenant_id: TenantId::from_bytes([6u8; 16]),
             session_id: Some(SessionId::from_bytes([7u8; 16])),
+            impersonator: None,
             attributes: BTreeMap::new(),
         };
         let json = serde_json::to_string(&h).unwrap();

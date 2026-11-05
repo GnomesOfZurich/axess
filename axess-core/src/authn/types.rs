@@ -78,8 +78,24 @@ impl User {
             updated_by: created_by,
             updated_at: created_at,
         };
-        user.validate()?;
+        user.validate_new()?;
         Ok(user)
+    }
+
+    /// [`validate`](Self::validate) and the extra terms for a user being
+    /// created: the identifier is held to
+    /// [`is_acceptable_new_identifier`](crate::validation::is_acceptable_new_identifier)
+    /// (NFKC-stable, no surrounding or non-ASCII whitespace). `validate`
+    /// alone stays the rule for rows read back.
+    pub fn validate_new(&self) -> Result<(), String> {
+        self.validate()?;
+        if !crate::validation::is_acceptable_new_identifier(&self.identifier) {
+            return Err(
+                "User.identifier has surrounding or non-ASCII whitespace or is not in NFKC"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Validate that the free-form fields are well-formed.
@@ -170,8 +186,26 @@ impl Tenant {
             updated_by: created_by,
             updated_at: created_at,
         };
-        tenant.validate()?;
+        tenant.validate_new()?;
         Ok(tenant)
+    }
+
+    /// [`validate`](Self::validate) and the extra terms for a tenant being
+    /// created: the identifier is held to
+    /// [`is_acceptable_new_identifier`](crate::validation::is_acceptable_new_identifier)
+    /// (no invisible format characters, NFKC-stable, no surrounding or
+    /// non-ASCII whitespace). [`validate`](Self::validate), which runs on a row
+    /// read back, does not apply it, so an existing tenant is never locked out.
+    pub fn validate_new(&self) -> Result<(), String> {
+        self.validate()?;
+        if !crate::validation::is_acceptable_new_identifier(&self.identifier) {
+            return Err(
+                "Tenant.identifier has an invisible format character, surrounding or \
+                 non-ASCII whitespace, or is not in NFKC"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     /// Validate the free-form fields (`identifier`, `display_name`).
@@ -506,6 +540,13 @@ impl LockoutPolicy {
 /// If `allow` is non-empty, only those IPs are permitted (allowlist mode).
 /// If `allow` is empty and `deny` is non-empty, all IPs except those are
 /// permitted (denylist mode). If both are empty, all IPs are permitted.
+///
+/// An IPv4 address that arrives as IPv4-mapped IPv6 (`::ffff:10.0.0.1`, as a
+/// dual-stack listener reports it) is judged as the IPv4 address it carries,
+/// so an IPv4 entry covers it and the mapped form cannot step around one; an
+/// IPv6 entry wide enough to cover the mapped range covers IPv4 clients too.
+/// An entry that does not parse denies everything in a deny list and matches
+/// nothing in an allow list. See [`is_allowed`](Self::is_allowed).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IpPolicy {
     /// Allowed IP addresses and CIDR ranges (e.g. `"10.0.0.0/8"`, `"192.168.1.1"`).
@@ -541,18 +582,24 @@ impl IpPolicy {
     /// allow entry that does not parse matches nothing.
     pub fn is_allowed(&self, ip: std::net::IpAddr) -> bool {
         let ip = canonical_ip(ip);
+        let matches = |entry: &Arc<str>| {
+            parse_entry(entry).map(|(net, len)| match (net, ip) {
+                // An IPv6 network wider than the mapped prefix covers the
+                // IPv4 clients too, as `::ffff:a.b.c.d`.
+                (std::net::IpAddr::V6(_), std::net::IpAddr::V4(v4)) => {
+                    cidr_contains(net, len, std::net::IpAddr::V6(v4.to_ipv6_mapped()))
+                }
+                _ => cidr_contains(net, len, ip),
+            })
+        };
         if !self.allow.is_empty() {
             // Allowlist mode: IP must match at least one entry.
-            return self.allow.iter().any(|entry| {
-                parse_entry(entry).is_some_and(|(net, len)| cidr_contains(net, len, ip))
-            });
+            return self.allow.iter().any(|entry| matches(entry) == Some(true));
         }
         if !self.deny.is_empty() {
             // Denylist mode: IP must not match any entry, and every entry
             // must be readable.
-            return self.deny.iter().all(|entry| {
-                parse_entry(entry).is_some_and(|(net, len)| !cidr_contains(net, len, ip))
-            });
+            return self.deny.iter().all(|entry| matches(entry) == Some(false));
         }
         // No restrictions.
         true
@@ -631,6 +678,31 @@ fn cidr_contains(network: std::net::IpAddr, prefix_len: u32, ip: std::net::IpAdd
 #[cfg(test)]
 mod ip_policy_tests {
     use super::*;
+
+    #[test]
+    fn an_ipv6_deny_rule_wider_than_96_bits_blocks_ipv4_clients() {
+        let policy = IpPolicy {
+            allow: vec![],
+            deny: vec!["::/0".into()],
+        };
+        assert!(!policy.is_allowed("1.2.3.4".parse().unwrap()));
+        assert!(!policy.is_allowed("::ffff:1.2.3.4".parse().unwrap()));
+        let policy = IpPolicy {
+            allow: vec![],
+            deny: vec!["::ffff:0:0/80".into()],
+        };
+        assert!(!policy.is_allowed("1.2.3.4".parse().unwrap()));
+        let policy = IpPolicy {
+            allow: vec!["::/0".into()],
+            deny: vec![],
+        };
+        assert!(policy.is_allowed("1.2.3.4".parse().unwrap()));
+        let narrow = IpPolicy {
+            allow: vec![],
+            deny: vec!["2001:db8::/32".into()],
+        };
+        assert!(narrow.is_allowed("1.2.3.4".parse().unwrap()));
+    }
 
     #[test]
     fn empty_policy_allows_all() {
@@ -746,3 +818,64 @@ mod ip_policy_tests {
 
 #[cfg(test)]
 mod authn_types_tests;
+
+#[cfg(test)]
+mod new_identifier_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_user_refuses_what_a_stored_one_still_reads() {
+        let now = chrono::Utc::now();
+        let make = |ident: &str| {
+            User::new(
+                "1f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
+                "2f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
+                ident,
+                "Name",
+                EntityState::Active,
+                UserId::system(),
+                now,
+            )
+        };
+        assert!(make("admin").is_ok());
+        assert!(make("admin ").is_err());
+        assert!(make("admin\u{00A0}").is_err());
+        // The same value read back from a store still validates.
+        let mut stored = make("admin").unwrap();
+        stored.identifier = "admin ".into();
+        assert!(stored.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod new_tenant_identifier_tests {
+    use super::*;
+
+    fn make(identifier: &str) -> Result<Tenant, String> {
+        Tenant::new(
+            "2f0a7b2e-4c91-4e3f-9b2a-8d0123456789",
+            identifier,
+            "Tenant",
+            EntityState::Active,
+            UserId::system(),
+            chrono::Utc::now(),
+        )
+    }
+
+    #[test]
+    fn a_new_tenant_refuses_look_alike_identifiers_but_a_stored_one_still_reads() {
+        assert!(make("acme").is_ok());
+        for bad in [
+            "acme\u{200B}",
+            "cafe\u{0301}",
+            "acme ",
+            "acme\u{00A0}",
+            "\u{FF41}cme",
+        ] {
+            assert!(make(bad).is_err(), "{bad:?}");
+        }
+        let mut stored = make("acme").unwrap();
+        stored.identifier = "acme ".into();
+        assert!(stored.validate().is_ok(), "read-back stays lenient");
+    }
+}

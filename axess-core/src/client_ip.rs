@@ -499,8 +499,8 @@ fn client_from_chain(headers: &axum::http::HeaderMap, trusted: &TrustedProxies) 
         (Some(value), None) => value
             .to_str()
             .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .map(ChainOutcome::Client)
+            .and_then(|value| value.trim().parse::<IpAddr>().ok())
+            .map(|addr| ChainOutcome::Client(addr.to_canonical()))
             .unwrap_or(ChainOutcome::NoAnswer),
         _ => ChainOutcome::NoAnswer,
     }

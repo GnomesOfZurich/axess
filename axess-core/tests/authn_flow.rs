@@ -831,3 +831,129 @@ async fn a_recovery_code_is_refused_where_the_method_does_not_offer_one() {
     );
     assert!(!session.is_authenticated().await);
 }
+
+// ── A replay that loses the write race ──────────────────────────────────────
+
+#[tokio::test]
+async fn a_replay_that_loses_the_write_race_is_audited_and_counted() {
+    use axess_core::authn::event::AuthEventStatus;
+
+    let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "bob"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), totp_config(secret))
+        .with_method(&uid("u1"), password_totp_method());
+    let clock = MockClock::now();
+    let service = AuthnService::builder(identity.clone(), factors.clone())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let session = test_session();
+    service
+        .begin_login("bob", "default", &session)
+        .await
+        .unwrap();
+    service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &session,
+        )
+        .await
+        .unwrap();
+    let before = identity.failed_attempts_for("u1");
+
+    // The swap that spends the step is lost to a concurrent request.
+    factors.arm_cas_failures(1);
+    let code = generate_totp_code(secret, clock.now().into());
+    let r = service
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+
+    assert!(matches!(r, FactorOutcome::InvalidCredential), "{r:?}");
+    let failures = identity
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.event_type == AuthEventType::FactorVerified
+                && e.event_status == AuthEventStatus::Failure
+                && e.factor_kind == Some(FactorKind::Totp)
+        })
+        .count();
+    assert_eq!(failures, 1, "the lost replay leaves a failure row");
+    assert_eq!(
+        identity.failed_attempts_for("u1"),
+        before + 1,
+        "the lost replay counts against the lockout"
+    );
+}
+
+/// Counts the factor successes and failures the service reports.
+#[derive(Default, Clone)]
+struct FactorCounts {
+    successes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl axess_core::metrics::AuthnMetrics for FactorCounts {
+    fn factor_success(&self) {
+        self.successes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn factor_failure(&self) {
+        self.failures
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A replay that loses the write race is one failure, not also a success.
+#[tokio::test]
+async fn a_replay_that_loses_the_write_race_is_not_counted_as_a_success() {
+    let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "bob"));
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), password_config("Gnomes2+"))
+        .with_factor(user_scope(), totp_config(secret))
+        .with_method(&uid("u1"), password_totp_method());
+    let clock = MockClock::now();
+    let counts = FactorCounts::default();
+    let service = AuthnService::builder(identity.clone(), factors.clone())
+        .with_clock(clock.clone())
+        .with_metrics(counts.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    service
+        .begin_login("bob", "default", &session)
+        .await
+        .unwrap();
+    service
+        .verify_factor(
+            &FactorCredential::Password(ZeroizedString::new("Gnomes2+")),
+            &session,
+        )
+        .await
+        .unwrap();
+    let successes_before = counts.successes.load(std::sync::atomic::Ordering::SeqCst);
+
+    factors.arm_cas_failures(1);
+    let code = generate_totp_code(secret, clock.now().into());
+    let r = service
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+
+    assert!(matches!(r, FactorOutcome::InvalidCredential), "{r:?}");
+    assert_eq!(counts.failures.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        counts.successes.load(std::sync::atomic::Ordering::SeqCst),
+        successes_before,
+        "the lost swap is a failure only"
+    );
+}

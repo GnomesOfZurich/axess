@@ -32,9 +32,9 @@ use axess_rng::SecureRng;
 use axum::http::HeaderValue;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use cookie::{Cookie, SameSite, time};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tower_cookies::cookie::{Cookie, SameSite, time};
 
 use crate::authn::ids::DeviceId;
 use crate::device::types::{DeviceBinding, FingerprintHash};

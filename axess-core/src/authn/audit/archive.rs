@@ -450,63 +450,185 @@ where
     /// Run a single tick. Useful for tests and for adopters who
     /// want to drive the cycle from their own scheduler instead of
     /// spawning the built-in loop.
+    ///
+    /// A tick archives what is due and purges what is past its window, and
+    /// the two do not wait on each other. When the sink refuses a batch, the
+    /// rows are offered one by one, so a single row it cannot take does not
+    /// keep its neighbours on the hot table; the rows that were taken are
+    /// marked archived, and the error names the first one that was not. Before
+    /// that pass the oldest and the newest row are offered alone: when the sink
+    /// refuses those too it is down, and the pass stops after those two calls
+    /// instead of costing one call per row. The
+    /// purge runs whatever the archive step did, so a sink that is down, or a
+    /// row that is refused for good, does not stop archived rows from leaving
+    /// the hot table. An error from either step is returned after both ran.
     pub async fn tick(&self) -> Result<RetentionTickReport, RetentionError<S::Error, A::Error>> {
+        let (report, result) = self.tick_with_report().await;
+        result.map(|()| report)
+    }
+
+    /// A tick that keeps its report when a step ends in an error: what was
+    /// archived and purged, and the error, if any (the archive step's first).
+    async fn tick_with_report(
+        &self,
+    ) -> (
+        RetentionTickReport,
+        Result<(), RetentionError<S::Error, A::Error>>,
+    ) {
         let now = self.clock.now();
         let archive_cutoff = cutoff_before(now, self.policy.archive_after);
         let purge_cutoff = cutoff_before(now, self.policy.purge_hot_after_archive);
 
+        let mut report = RetentionTickReport::default();
+        let archived = self.archive_due(now, archive_cutoff, &mut report).await;
+        let purged = self.source.purge_hot_archived_before(purge_cutoff).await;
+        match purged {
+            Ok(n) => report.purged = n,
+            Err(e) => return (report, archived.and(Err(RetentionError::Source(e)))),
+        }
+        (report, archived)
+    }
+
+    /// The archive step of a tick: select the rows due, offer them to the
+    /// sink as one batch, and mark the ones it took. `report.archived` counts
+    /// them even when the step ends in an error.
+    async fn archive_due(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        cutoff: chrono::DateTime<chrono::Utc>,
+        report: &mut RetentionTickReport,
+    ) -> Result<(), RetentionError<S::Error, A::Error>> {
         let batch = self
             .source
-            .select_unarchived_before(archive_cutoff, self.batch_size)
+            .select_unarchived_before(cutoff, self.batch_size)
             .await
             .map_err(RetentionError::Source)?;
-
-        let mut report = RetentionTickReport::default();
-
-        if !batch.is_empty() {
-            let (ids, events): (Vec<S::EventId>, Vec<AuthEvent>) = batch.into_iter().unzip();
-            let batch_id = ArchiveBatchId::from_ids(ids.iter().map(ToString::to_string));
-            self.archiver
-                .archive_batch(&batch_id, &events)
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let (ids, events): (Vec<S::EventId>, Vec<AuthEvent>) = batch.into_iter().unzip();
+        let batch_id = ArchiveBatchId::from_ids(ids.iter().map(ToString::to_string));
+        let refused = match self.archiver.archive_batch(&batch_id, &events).await {
+            Ok(()) => {
+                self.source
+                    .mark_archived(&ids, now)
+                    .await
+                    .map_err(RetentionError::Source)?;
+                report.archived = events.len() as u64;
+                return Ok(());
+            }
+            Err(e) if ids.len() == 1 => return Err(RetentionError::Archiver(e)),
+            Err(e) => e,
+        };
+        // A sink that is down refuses every call, so offering the rows one by
+        // one would cost a call per row each tick. Probe the oldest row and the
+        // newest alone first: when both are refused as well, the sink is down
+        // and the pass stops. When only the oldest is, that row is the
+        // problem and the others are still offered.
+        let last = ids.len() - 1;
+        let mut taken = Vec::new();
+        let mut first_failure = None;
+        let mut probed_last = false;
+        for probe in [0, last] {
+            let row_id = ArchiveBatchId::from_ids([ids[probe].to_string()]);
+            match self
+                .archiver
+                .archive_batch(&row_id, std::slice::from_ref(&events[probe]))
                 .await
-                .map_err(RetentionError::Archiver)?;
+            {
+                Ok(()) => {
+                    taken.push(ids[probe].clone());
+                    probed_last = probe == last;
+                    break;
+                }
+                Err(_) if probe == last => {
+                    tracing::warn!(
+                        error = %refused,
+                        rows = ids.len(),
+                        "audit archive sink is refusing every call; leaving the batch for the next tick",
+                    );
+                    return Err(RetentionError::Archiver(refused));
+                }
+                Err(e) => {
+                    tracing::warn!(row = %ids[probe], error = %e, "audit archive refused a row");
+                    first_failure.get_or_insert(e);
+                }
+            }
+        }
+        tracing::warn!(
+            error = %refused,
+            rows = ids.len(),
+            "audit archive batch refused; offering its rows one by one",
+        );
+        for (position, (id, event)) in ids.into_iter().zip(events).enumerate() {
+            if position == 0 || (position == last && probed_last) {
+                continue;
+            }
+            let row_id = ArchiveBatchId::from_ids([id.to_string()]);
+            match self
+                .archiver
+                .archive_batch(&row_id, std::slice::from_ref(&event))
+                .await
+            {
+                Ok(()) => taken.push(id),
+                Err(e) => {
+                    tracing::warn!(row = %id, error = %e, "audit archive refused a row");
+                    first_failure.get_or_insert(e);
+                }
+            }
+        }
+        if !taken.is_empty() {
             self.source
-                .mark_archived(&ids, now)
+                .mark_archived(&taken, now)
                 .await
                 .map_err(RetentionError::Source)?;
-            report.archived = events.len() as u64;
+            report.archived = taken.len() as u64;
         }
-
-        let purged = self
-            .source
-            .purge_hot_archived_before(purge_cutoff)
-            .await
-            .map_err(RetentionError::Source)?;
-        report.purged = purged;
-
-        Ok(report)
+        match first_failure {
+            Some(e) => Err(RetentionError::Archiver(e)),
+            None => Ok(()),
+        }
     }
 
     /// Run ticks back to back until the backlog is cleared.
     ///
     /// Calls [`tick`](Self::tick) again while the last one archived a full
     /// batch, and stops at the first short batch (nothing more is eligible),
-    /// at the first error, or after [`MAX_TICKS_PER_DRAIN`] ticks, so a
+    /// at the first error that archived nothing, or after [`MAX_TICKS_PER_DRAIN`] ticks, so a
     /// source that never runs dry cannot hold the task forever; the next wake
     /// carries on. The reports are summed. When a later tick fails, the
     /// batches the earlier ones archived stay archived and marked, and the
-    /// error is what comes back.
+    /// error is what comes back. A tick whose sink refused some rows but took
+    /// others does not end the drain: it goes on, and the first such error is
+    /// returned at the end, so a row the sink refuses for good cannot hold
+    /// back the rows behind it.
     pub async fn drain(&self) -> Result<RetentionTickReport, RetentionError<S::Error, A::Error>> {
         let mut total = RetentionTickReport::default();
+        let mut first_error = None;
         for _ in 0..MAX_TICKS_PER_DRAIN {
-            let report = self.tick().await?;
+            let (report, result) = self.tick_with_report().await;
             total.archived += report.archived;
             total.purged += report.purged;
-            if report.archived < self.batch_size as u64 {
-                break;
+            match result {
+                Ok(()) => {
+                    if report.archived < self.batch_size as u64 {
+                        break;
+                    }
+                }
+                // A sink that refused some rows of a batch and took the rest
+                // has made progress: go on, so one refused row does not hold
+                // back the rows behind it. A tick that archived nothing, or
+                // a source error, ends the drain.
+                Err(e @ RetentionError::Archiver(_)) if report.archived > 0 => {
+                    first_error.get_or_insert(e);
+                }
+                Err(e) => return Err(first_error.unwrap_or(e)),
             }
         }
-        Ok(total)
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(total),
+        }
     }
 
     /// Spawn the loop on the current Tokio runtime. Dropping the returned

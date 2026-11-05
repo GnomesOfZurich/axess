@@ -95,6 +95,7 @@ async fn exchange_works_without_client_secret_for_mtls_auth() {
         .and(path("/oauth2/token"))
         .and(body_string_contains("subject_token=user-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token_type": "Bearer",
             "access_token": "downstream",
             "expires_in": 3600,
         })))
@@ -177,6 +178,7 @@ async fn exchange_carries_resource_when_set() {
             "resource=https%3A%2F%2Fapi.gnomes%2Fv1%2Fmarket",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token_type": "Bearer",
             "access_token": "scoped-to-market-api",
             "expires_in": 600,
         })))
@@ -201,6 +203,7 @@ async fn exchange_form_encodes_basic_credentials() {
             "Basic Z25vbWVzLWFwaTphJTNBYiUyNWMlMkJk",
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "token_type": "Bearer",
             "access_token": "downstream",
         })))
         .expect(1)
@@ -331,5 +334,59 @@ async fn a_transport_error_names_no_url() {
     assert!(
         !shown.contains("tenant-7f3a9c") && !shown.contains(&port.to_string()),
         "the error names the URL: {shown}"
+    );
+}
+
+/// RFC 6749 section 5.1, which RFC 8693 section 2.2.1 follows: a response
+/// without `scope` grants the scope that was requested.
+#[tokio::test]
+async fn a_response_without_scope_grants_the_requested_scopes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "downstream-jwt",
+            "token_type": "Bearer",
+            "expires_in": 600,
+        })))
+        .mount(&server)
+        .await;
+    let client = TokenExchangeClient::new(token_url(&server), "gnomes-api", Some("shh".into()))
+        .expect("client");
+    let req = TokenExchangeRequest::new("user-jwt-here", token_types::JWT)
+        .with_scopes(["compute.read", "compute.write"]);
+    let resp = client.exchange(&req).await.expect("exchange");
+    assert_eq!(
+        resp.scopes,
+        vec!["compute.read".to_string(), "compute.write".to_string()]
+    );
+}
+
+/// RFC 8693 section 2.2.1 requires `token_type`: an answer without it is
+/// refused, as the outbound client refuses it, not taken as `Bearer`.
+#[tokio::test]
+async fn a_response_without_token_type_is_refused() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "downstream",
+            "expires_in": 3600,
+        })))
+        .mount(&server)
+        .await;
+
+    let client =
+        TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
+    let err = client
+        .exchange(&TokenExchangeRequest::new("token", token_types::JWT))
+        .await
+        .expect_err("a response without token_type must be refused");
+    assert!(
+        matches!(
+            err,
+            crate::delegated::error::DelegatedError::MalformedResponse(_)
+        ),
+        "expected MalformedResponse, got {err:?}"
     );
 }

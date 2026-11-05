@@ -677,3 +677,12 @@ fn ipv4_mapped_cidr_entries_trust_the_ipv4_proxies_they_name() {
     let client = ip_from_headers_trusted(&headers, v4_peer, &mapped);
     assert_eq!(client, "203.0.113.9".parse::<IpAddr>().unwrap());
 }
+
+#[test]
+fn real_ip_is_canonicalised_like_every_other_source() {
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Real-IP", "::ffff:203.0.113.9".parse().unwrap());
+    let trusted = trusted_proxy_set().proxy_overwrites_real_ip();
+    let got = ip_from_headers_trusted(&headers, proxy(), &trusted);
+    assert_eq!(got, "203.0.113.9".parse::<IpAddr>().unwrap());
+}

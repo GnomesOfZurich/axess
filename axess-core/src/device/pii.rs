@@ -57,11 +57,12 @@
 //!   (see [`docs/identity/device.md`](https://github.com/GnomesOfZurich/axess/blob/main/docs/identity/device.md) §5.7).
 
 use crate::authn::ids::{TenantId, UserId};
+use crate::locked::lock;
 use axess_rng::{SecureRng, SystemRng};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 // ── PiiToken ─────────────────────────────────────────────────────────────────
@@ -73,9 +74,24 @@ use uuid::Uuid;
 /// is a fresh v4 minted at [`PiiToken::new`] time; tokens are
 /// unguessable and uncorrelated across mappings (two values stored
 /// for the same subject do not produce related tokens).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PiiToken(Arc<str>);
+
+/// Reads the bare wire string through [`PiiToken::parse`], so a value in
+/// any other shape is refused rather than becoming a second key for one
+/// mapping.
+impl<'de> Deserialize<'de> for PiiToken {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Self::parse(&wire).ok_or_else(|| {
+            serde::de::Error::invalid_value(
+                serde::de::Unexpected::Str(&wire),
+                &"a \"pii:<uuid>\" token, the UUID hyphenated and lowercase",
+            )
+        })
+    }
+}
 
 impl PiiToken {
     /// Mint a fresh token with a v4 UUID drawn from the operating
@@ -194,7 +210,7 @@ impl DevicePiiCategory {
 /// production; see the SQL/Valkey impls). The trait surface is always
 /// plaintext: callers don't need to know whether the backend
 /// encrypts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePiiMapping {
     /// Opaque token. Primary key.
     pub token: PiiToken,
@@ -212,6 +228,19 @@ pub struct DevicePiiMapping {
     /// Wall-clock instant the mapping was first recorded. Drives the
     /// per-category retention sweep when implemented.
     pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for DevicePiiMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevicePiiMapping")
+            .field("token", &self.token)
+            .field("subject_id", &self.subject_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("category", &self.category)
+            .field("value", &"***")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 // ── DevicePiiStore trait ─────────────────────────────────────────────────────
@@ -309,8 +338,8 @@ pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
 // ── MemoryDevicePiiStore ─────────────────────────────────────────────────────
 
-/// Infallible in-memory [`DevicePiiStore`]. Backed by a [`DashMap`]
-/// keyed on the token. **For tests and single-node examples only.**
+/// Infallible in-memory [`DevicePiiStore`]. Backed by a
+/// `Mutex<HashMap>` keyed on the token. **For tests and single-node examples only.**
 ///
 /// Tokens are minted from the store's RNG ([`SystemRng`] unless
 /// [`with_rng`](Self::with_rng) says otherwise), and
@@ -319,7 +348,7 @@ pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 /// map's iteration order.
 #[derive(Clone)]
 pub struct MemoryDevicePiiStore {
-    mappings: Arc<DashMap<PiiToken, DevicePiiMapping>>,
+    mappings: Arc<Mutex<HashMap<PiiToken, DevicePiiMapping>>>,
     rng: Arc<dyn SecureRng>,
 }
 
@@ -335,7 +364,7 @@ impl Default for MemoryDevicePiiStore {
 impl std::fmt::Debug for MemoryDevicePiiStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryDevicePiiStore")
-            .field("mappings", &self.mappings.len())
+            .field("mappings", &lock(&self.mappings).len())
             .finish_non_exhaustive()
     }
 }
@@ -355,12 +384,12 @@ impl MemoryDevicePiiStore {
     /// Number of mappings currently stored. Useful in tests asserting
     /// erasure counts.
     pub fn len(&self) -> usize {
-        self.mappings.len()
+        lock(&self.mappings).len()
     }
 
     /// `true` when no mappings are stored.
     pub fn is_empty(&self) -> bool {
-        self.mappings.is_empty()
+        lock(&self.mappings).is_empty()
     }
 }
 
@@ -390,7 +419,7 @@ impl DevicePiiStore for MemoryDevicePiiStore {
             value,
             created_at: now,
         };
-        self.mappings.insert(token.clone(), mapping);
+        lock(&self.mappings).insert(token.clone(), mapping);
         Ok(token)
     }
 
@@ -402,8 +431,7 @@ impl DevicePiiStore for MemoryDevicePiiStore {
         // Tenant rail: a mapping stored under tenant A is invisible to
         // tenant B even if the token guess hits; same shape as
         // missing. Never expose cross-tenant data through resolve.
-        Ok(self
-            .mappings
+        Ok(lock(&self.mappings)
             .get(token)
             .filter(|m| &m.tenant_id == expected_tenant)
             .map(|m| m.value.clone()))
@@ -415,20 +443,11 @@ impl DevicePiiStore for MemoryDevicePiiStore {
         tenant_id: &TenantId,
     ) -> Result<u64, Self::Error> {
         let mut erased = 0u64;
-        // Collect-then-remove avoids holding a DashMap iterator across
-        // mutations. The collected key set is small (bounded by the
-        // subject's mapping count, typically <100).
-        let to_remove: Vec<PiiToken> = self
-            .mappings
-            .iter()
-            .filter(|m| &m.subject_id == subject_id && &m.tenant_id == tenant_id)
-            .map(|m| m.key().clone())
-            .collect();
-        for key in to_remove {
-            if self.mappings.remove(&key).is_some() {
-                erased += 1;
-            }
-        }
+        lock(&self.mappings).retain(|_, m| {
+            let ours = &m.subject_id == subject_id && &m.tenant_id == tenant_id;
+            erased += u64::from(ours);
+            !ours
+        });
         Ok(erased)
     }
 
@@ -437,11 +456,10 @@ impl DevicePiiStore for MemoryDevicePiiStore {
         subject_id: &UserId,
         tenant_id: &TenantId,
     ) -> Result<Vec<DevicePiiMapping>, Self::Error> {
-        let mut out: Vec<DevicePiiMapping> = self
-            .mappings
-            .iter()
+        let mut out: Vec<DevicePiiMapping> = lock(&self.mappings)
+            .values()
             .filter(|m| &m.subject_id == subject_id && &m.tenant_id == tenant_id)
-            .map(|m| m.value().clone())
+            .cloned()
             .collect();
         out.sort_by(|a, b| {
             a.created_at

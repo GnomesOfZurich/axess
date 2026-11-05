@@ -181,6 +181,13 @@ impl FactorStore for FlakyFactors {
     ) -> Result<bool, Self::Error> {
         self.inner.set_method_enabled(s, n, e).await
     }
+    async fn fido2_credential_holder(
+        &self,
+        t: &axess_core::authn::ids::TenantId,
+        id: &[u8],
+    ) -> Result<Option<axess_core::authn::ids::UserId>, Self::Error> {
+        self.inner.fido2_credential_holder(t, id).await
+    }
 }
 
 fn dummy_response() -> RegisterPublicKeyCredential {
@@ -791,4 +798,173 @@ async fn an_inactive_account_refused_at_finish_is_recorded_as_a_setup() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].event_type, AuthEventType::FactorSetup);
     assert_eq!(rows[0].session_id, Some(session.session_id().await));
+}
+
+#[tokio::test]
+async fn beginning_registration_fails_when_the_ceremony_state_cannot_be_stored() {
+    let f = fixture();
+    let user = test_user("u1", "alice");
+    let session = session_for(&user).await;
+    assert!(
+        session
+            .set_custom("pad", serde_json::json!("x".repeat(65_500)))
+            .await
+    );
+
+    let result = f.service.begin_fido2_registration(&user, &session).await;
+
+    assert!(
+        matches!(result, Err(axess_core::authn::error::AuthnError::NoFlow)),
+        "a challenge whose state was not stored can never be finished: {result:?}"
+    );
+}
+
+/// A registration the authenticator's answer fails to verify is audited, and
+/// its row names the session it came from like the other rows of the flow.
+#[tokio::test]
+async fn a_rejected_registration_row_names_its_session() {
+    use axess_core::authn::error::AuthnError;
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let f = fixture();
+    let alice = test_user("u1", "alice");
+    let webauthn =
+        WebauthnBuilder::new("localhost", &Url::parse("https://localhost:8443").unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+    // The real verifier: the placeholder attestation does not verify.
+    let service = AuthnService::builder(f.identity.clone(), f.factors.clone())
+        .with_fido2(DefaultFido2Provider::new(webauthn))
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = session_for(&alice).await;
+    service
+        .begin_fido2_registration(&alice, &session)
+        .await
+        .unwrap();
+
+    let err = service
+        .finish_fido2_registration(&alice, &dummy_response(), "bad", &session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
+    let rows: Vec<_> = f
+        .identity
+        .events()
+        .into_iter()
+        .filter(|e| {
+            e.event_type == AuthEventType::FactorSetup && e.event_status == AuthEventStatus::Failure
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].session_id, Some(session.session_id().await));
+}
+
+/// Bob's finish yields the `BBBB` credential; `holder` already stores it.
+async fn bob_finishes_with_a_credential_held_by(
+    holder: &str,
+) -> (
+    Fixture,
+    Result<(), axess_core::authn::error::AuthnError<MockStoreError>>,
+) {
+    let f = fixture();
+    let owner = test_user(holder, "owner");
+    f.factors
+        .inner
+        .save_factor(
+            &AuthnScope::User {
+                tenant_id: owner.tenant_id,
+                user_id: owner.id,
+            },
+            FactorConfig::Fido2(Fido2Config {
+                credentials: vec![Fido2Credential::new(
+                    passkey(BBBB),
+                    "theirs",
+                    chrono::Utc::now(),
+                )],
+            }),
+        )
+        .await
+        .unwrap();
+    let bob = test_user("u3", "bob");
+    let _ = f.identity.clone().with_user(bob.clone());
+    let session = session_for(&bob).await;
+    f.service
+        .begin_fido2_registration(&bob, &session)
+        .await
+        .unwrap();
+    let result = f
+        .service
+        .finish_fido2_registration(&bob, &dummy_response(), "mine", &session)
+        .await;
+    (f, result)
+}
+
+#[tokio::test]
+async fn a_credential_id_another_user_of_the_tenant_holds_is_refused_and_audited() {
+    use axess_core::authn::error::AuthnError;
+    use axess_core::authn::event::{AuthEventStatus, AuthEventType};
+    let (f, result) = bob_finishes_with_a_credential_held_by("u2").await;
+    assert!(matches!(result, Err(AuthnError::NoFlow)), "got {result:?}");
+    let bob_scope = AuthnScope::User {
+        tenant_id: test_user("u3", "bob").tenant_id,
+        user_id: test_user("u3", "bob").id,
+    };
+    assert!(
+        f.factors
+            .inner
+            .load_factor(&bob_scope, FactorKind::Fido2)
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing was stored for the second user"
+    );
+    let rows = f.identity.events();
+    assert!(
+        rows.iter()
+            .any(|e| e.event_type == AuthEventType::FactorSetup
+                && e.event_status == AuthEventStatus::Failure),
+        "{rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|e| e.event_type == AuthEventType::FactorSetup
+                && e.event_status == AuthEventStatus::Success),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_credential_id_held_in_another_tenant_is_not_a_conflict() {
+    let f = fixture();
+    let owner = common::test_user_in_tenant("u2", "owner", "t2");
+    f.factors
+        .inner
+        .save_factor(
+            &AuthnScope::User {
+                tenant_id: owner.tenant_id,
+                user_id: owner.id,
+            },
+            FactorConfig::Fido2(Fido2Config {
+                credentials: vec![Fido2Credential::new(
+                    passkey(BBBB),
+                    "theirs",
+                    chrono::Utc::now(),
+                )],
+            }),
+        )
+        .await
+        .unwrap();
+    let user = test_user("u1", "alice");
+    let session = session_for(&user).await;
+    f.service
+        .begin_fido2_registration(&user, &session)
+        .await
+        .unwrap();
+    f.service
+        .finish_fido2_registration(&user, &dummy_response(), "mine", &session)
+        .await
+        .unwrap();
 }

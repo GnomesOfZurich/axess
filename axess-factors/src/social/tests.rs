@@ -497,3 +497,33 @@ fn cleartext_config(token: String, userinfo: String) -> SocialProviderConfig {
         scopes: vec![],
     }
 }
+
+/// An authorization endpoint that already carries a query (a tenant or
+/// policy parameter) gets the flow's parameters appended with `&`, not a
+/// second `?`.
+#[test]
+fn an_endpoint_with_a_query_string_gets_the_parameters_appended() {
+    let provider = SocialProvider::new(
+        SocialProviderConfig {
+            name: "tenanted".into(),
+            authorization_endpoint: "https://idp.example/authorize?tenant=acme".into(),
+            token_endpoint: "https://idp.example/token".into(),
+            userinfo_endpoint: "https://idp.example/user".into(),
+            client_id: "demo-client".into(),
+            client_secret: "demo-secret".into(),
+            redirect_uri: "https://app.example.com/auth/callback".into(),
+            scopes: vec!["read:user".into()],
+        },
+        github_style_mapper,
+    )
+    .expect("a valid configuration")
+    .with_rng(std::sync::Arc::new(MockRng::new(7)));
+
+    let url = provider.build_auth_url("csrf-1").url;
+    assert_eq!(url.matches('?').count(), 1, "{url}");
+    let parsed = url::Url::parse(&url).expect("a URL");
+    let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(query["tenant"], "acme", "{url}");
+    assert_eq!(query["client_id"], "demo-client", "{url}");
+    assert_eq!(query["state"], "csrf-1", "{url}");
+}

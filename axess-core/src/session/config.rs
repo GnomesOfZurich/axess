@@ -18,8 +18,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-// Re-export SameSite so callers don't need tower_cookies in their Cargo.toml.
-pub use tower_cookies::cookie::SameSite;
+// Re-export SameSite so callers do not need `cookie` in their Cargo.toml.
+pub use cookie::SameSite;
 
 /// Default cookie name when the cookie is `Secure` and scoped to `/`.
 const DEFAULT_COOKIE_NAME: &str = "__Host-axess.sid";

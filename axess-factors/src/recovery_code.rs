@@ -114,7 +114,10 @@ impl RecoveryCodePepper {
 
     /// The keyed stored form of a canonical code.
     fn stored_form(&self, canonical: &str) -> String {
-        format!("{KEYED_CODE_PREFIX}{}", hex::encode(self.mac(canonical)))
+        format!(
+            "{KEYED_CODE_PREFIX}{}",
+            axess_rng::hex::encode(self.mac(canonical))
+        )
     }
 
     fn mac(&self, canonical: &str) -> [u8; MAC_LEN] {
@@ -150,7 +153,7 @@ impl StoredRecoveryCode {
     fn keyed_mac(&self) -> Option<[u8; MAC_LEN]> {
         let rest = self.hash.strip_prefix(KEYED_CODE_PREFIX)?;
         let mut out = [0u8; MAC_LEN];
-        if hex::decode_to_slice(rest, &mut out).is_err() {
+        if axess_rng::hex::decode_to_slice(rest, &mut out).is_err() {
             out = [0u8; MAC_LEN];
         }
         Some(out)

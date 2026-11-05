@@ -605,7 +605,8 @@ async fn logout(
 /// key are refreshed with the key the login returned, restored from the
 /// session. A refresh response the library refuses (another issuer, another
 /// subject, a nonce that does not match the login's) answers 502 and changes
-/// nothing.
+/// nothing; a userinfo answer for another subject answers 502 and ends the
+/// session.
 // ANCHOR: refresh
 async fn refresh(
     State(state): State<AppState>,
@@ -661,13 +662,6 @@ async fn refresh(
             );
         }
     };
-    // The IdP may have spent the token that was sent; keep the one it returns.
-    session
-        .set_custom(
-            SESSION_REFRESH_TOKEN,
-            serde_json::Value::String(String::from(&*outcome.refresh_token)),
-        )
-        .await;
     match authn
         .fetch_userinfo(
             &provider,
@@ -679,7 +673,12 @@ async fn refresh(
     {
         Ok(_) => {}
         Err(OAuthError::SubjectMismatch) => {
+            // The IdP now vouches for another subject under this session's
+            // tokens: nothing from this refresh is kept, and the session ends.
             tracing::error!("userinfo described another subject after the refresh");
+            if let Err(e) = authn.logout(&session).await {
+                tracing::error!(error = %e, "logout audit failed");
+            }
             return page(
                 StatusCode::BAD_GATEWAY,
                 "Refresh failed",
@@ -688,6 +687,13 @@ async fn refresh(
         }
         Err(e) => tracing::debug!(error = %e, "userinfo not used"),
     }
+    // The IdP may have spent the token that was sent; keep the one it returns.
+    session
+        .set_custom(
+            SESSION_REFRESH_TOKEN,
+            serde_json::Value::String(String::from(&*outcome.refresh_token)),
+        )
+        .await;
     page(StatusCode::OK, "Refreshed", "The tokens were refreshed.")
 }
 // ANCHOR_END: refresh

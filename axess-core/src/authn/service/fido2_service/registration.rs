@@ -95,9 +95,13 @@ where
             })?;
 
         let state_json = serde_json::to_value(&reg_state).map_err(|_| AuthnError::NoFlow)?;
-        session.set_custom(fido2_keys::REG_STATE, state_json).await;
+        if !session.set_custom(fido2_keys::REG_STATE, state_json).await {
+            // The ceremony state did not fit; a challenge handed out without
+            // it could never be finished.
+            return Err(AuthnError::NoFlow);
+        }
         self.stamp_ceremony_start(session, fido2_keys::REG_STATE)
-            .await;
+            .await?;
 
         let challenge_json = serde_json::to_value(&challenge).map_err(|_| AuthnError::NoFlow)?;
         Ok((challenge_json, new_id))
@@ -111,13 +115,13 @@ where
     /// cannot complete the ceremony.
     ///
     /// A credential id the user already holds is refused with
-    /// [`AuthnError::NoFlow`] and nothing is stored. An id registered to
-    /// another user is not checked for: the factor store has no index
-    /// across users, and such a duplicate cannot log in as that user, since
-    /// every login looks credentials up per user and verifies the assertion
-    /// against that user's stored key. An application that wants the
-    /// WebAuthn cross-user check keeps its own index and refuses before
-    /// calling this.
+    /// [`AuthnError::NoFlow`] and nothing is stored. So is an id another user
+    /// of the same tenant holds, found through
+    /// [`FactorStore::fido2_credential_holder`];
+    /// that refusal also leaves a failed `FactorSetup` audit row. A store
+    /// that does not implement the lookup admits the id (its default answers
+    /// "nobody"), and an application on such a store keeps its own index.
+    /// A failed lookup fails the registration.
     #[tracing::instrument(skip(self, user, response, session))]
     pub async fn finish_fido2_registration(
         &self,
@@ -182,7 +186,8 @@ where
                     AuthEventBuilder::failure(AuthEventType::FactorSetup)
                         .attributed_to(&user.id, &user.tenant_id)
                         .with_factor(FactorKind::Fido2)
-                        .with_error(AuthFailureReason::Other("registration_rejected".into())),
+                        .with_session(session.session_id().await)
+                        .with_error(AuthFailureReason::from("registration_rejected")),
                 )
                 .await?;
                 return Err(AuthnError::NoFlow);
@@ -194,6 +199,27 @@ where
         // hook so the `Fido2Provider` impl can durably bind this
         // credential to the resolved `DeviceId`.
         let cred_id = passkey.cred_id().clone();
+
+        // A credential id another user of the tenant holds is refused: one
+        // authenticator credential belongs to one account. A failed lookup
+        // is an error, never "nobody holds it".
+        let holder = self
+            .inner
+            .factors
+            .fido2_credential_holder(&user.tenant_id, cred_id.as_ref())
+            .await
+            .map_err(AuthnError::Store)?;
+        if holder.is_some_and(|holder| holder != user.id) {
+            self.emit_audit(
+                AuthEventBuilder::failure(AuthEventType::FactorSetup)
+                    .attributed_to(&user.id, &user.tenant_id)
+                    .with_factor(FactorKind::Fido2)
+                    .with_session(session.session_id().await)
+                    .with_error(AuthFailureReason::from("credential_held_by_another_user")),
+            )
+            .await?;
+            return Err(AuthnError::NoFlow);
+        }
 
         let user_scope = AuthnScope::User {
             tenant_id: user.tenant_id,

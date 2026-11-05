@@ -1,5 +1,12 @@
 //! OAuth/OIDC error enum + transient-vs-permanent classification.
 
+fn describe_status(status: Option<u16>) -> String {
+    match status {
+        None => "no answer".to_string(),
+        Some(status) => format!("HTTP {status}"),
+    }
+}
+
 /// Errors returned by OAuth 2.0 / OIDC operations across discovery, token
 /// exchange, ID-token validation, and refresh.
 #[derive(Debug, thiserror::Error)]
@@ -98,17 +105,17 @@ pub enum OAuthError {
     #[error("revocation endpoint reports unsupported_token_type")]
     UnsupportedTokenType,
 
-    /// A server-side (5xx) failure from a token endpoint
-    /// (revocation / refresh / exchange). Distinct from
+    /// A failure of a token endpoint that a retry may cure: a server-side
+    /// (5xx) answer, or no answer at all (`status` is `None`). Distinct from
     /// [`TokenExchange`](Self::TokenExchange) so callers can distinguish
     /// "AS rejected our request" from "AS is broken right now and a
     /// retry might succeed".
-    #[error("token endpoint transient failure (HTTP {status}): {body}")]
+    #[error("token endpoint transient failure ({})", describe_status(*status))]
     TokenEndpointTransient {
-        /// HTTP status code returned by the AS (5xx range).
-        status: u16,
-        /// Body of the failed response (truncated upstream if large).
-        body: String,
+        /// HTTP status code returned by the AS (5xx range), or `None` when
+        /// no answer arrived. The response body is not kept: an error page
+        /// can echo the request, tokens and secrets included.
+        status: Option<u16>,
     },
 
     /// The UserInfo response names a different subject than the one the
@@ -152,6 +159,12 @@ pub enum OAuthError {
 }
 
 impl OAuthError {
+    /// A transient token-endpoint failure: the answer's status, or `None`
+    /// when none arrived.
+    pub(crate) fn transient(status: Option<u16>) -> Self {
+        Self::TokenEndpointTransient { status }
+    }
+
     /// Hint at whether this error is worth retrying.
     ///
     /// Returns `true` for failures the application can reasonably
@@ -264,11 +277,19 @@ mod oauth_error_is_transient_tests {
 
     #[test]
     fn token_endpoint_5xx_is_transient() {
-        let e = OAuthError::TokenEndpointTransient {
-            status: 503,
-            body: "...".into(),
-        };
+        let e = OAuthError::TokenEndpointTransient { status: Some(503) };
         assert!(e.is_transient());
+        assert_eq!(e.to_string(), "token endpoint transient failure (HTTP 503)");
+    }
+
+    #[test]
+    fn no_answer_is_transient_and_says_so() {
+        let e = OAuthError::TokenEndpointTransient { status: None };
+        assert!(e.is_transient());
+        assert_eq!(
+            e.to_string(),
+            "token endpoint transient failure (no answer)"
+        );
     }
 
     #[test]

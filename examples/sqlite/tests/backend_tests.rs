@@ -45,7 +45,13 @@ impl Browser {
             .await
             .expect("connect in-memory sqlite");
         sqlx::migrate!().run(&pool).await.expect("migrations");
-        seed(&SystemClock, &pool).await.expect("seed");
+        seed(
+            &SystemClock,
+            &pool,
+            &axess::authn::FactorSecretCipher::new([7; 32]),
+        )
+        .await
+        .expect("seed");
         let (router, _store) = build_router(pool.clone()).await;
         Self {
             router,
@@ -273,15 +279,106 @@ async fn an_enrolled_totp_factor_is_not_replaced_from_the_session() {
         ("_csrf", &token),
     ];
     let page = browser.send("POST", "/setup-totp", Some(fields)).await;
-    assert!(
-        page.status.is_redirection() || !page.status.is_success(),
-        "a replace must be refused, got {} {}",
+    assert_eq!(
         page.status,
+        StatusCode::CONFLICT,
+        "a replace must be refused and say so, got {}",
         page.body
     );
+    assert!(recovery_codes(&page.body).is_empty());
     assert_eq!(
         stored_totp(&browser.pool).await,
         before,
         "the stored factor, recovery codes and method must be unchanged"
     );
+}
+
+/// Two enrolments posted together, each with its own secret and a valid code
+/// for it: the first to write wins and the other is turned away without
+/// recovery codes, so the secret that was confirmed is the one that is kept.
+#[tokio::test]
+async fn concurrent_totp_enrolments_do_not_overwrite_each_other() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+    let token = browser.token_from("/setup-totp").await;
+
+    let cookie = browser
+        .cookies
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let enrol = |secret: String| {
+        let code = totp_code(&secret);
+        let form = serde_urlencoded::to_string(vec![
+            ("secret", secret.as_str()),
+            ("code", code.as_str()),
+            ("_csrf", token.as_str()),
+        ])
+        .expect("form encodes");
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/setup-totp")
+            .header(header::COOKIE, cookie.clone())
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(form))
+            .expect("request");
+        req.extensions_mut().insert(ConnectInfo(browser.peer));
+        let router = browser.router.clone();
+        async move {
+            let res = router.oneshot(req).await.expect("infallible");
+            let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .expect("body");
+            String::from_utf8(body.to_vec()).expect("utf8")
+        }
+    };
+    let (first, second) = tokio::join!(
+        enrol(axess::generate_totp_secret(&axess::SystemRng)),
+        enrol(axess::generate_totp_secret(&axess::SystemRng)),
+    );
+
+    let winners = [first, second]
+        .iter()
+        .filter(|body| !recovery_codes(body).is_empty())
+        .count();
+    assert_eq!(winners, 1, "enrolments that were told they won");
+}
+
+/// The store, not the handler's earlier check, decides between two
+/// enrolments: the second insert for a user reports it lost and the first
+/// secret stays. Run in order, so it fails whenever the insert is not
+/// conditional, which the concurrent test above can pass without.
+#[tokio::test]
+async fn the_second_totp_insert_for_a_user_loses_and_the_first_stays() {
+    use axess::authn::{
+        AuthnScope, FactorConfig, FactorStore, TenantId, TotpConfig, UserId, ZeroizedString,
+    };
+    let browser = Browser::new().await;
+    let backend = axess_example_sqlite::models::backend::OurBackend::new(browser.pool.clone());
+    let scope = AuthnScope::User {
+        tenant_id: TenantId::try_new("00000000-0000-0000-0000-000000000001").expect("tenant"),
+        user_id: UserId::try_new("00000000-0000-0000-0000-000000000010").expect("user"),
+    };
+    let totp = |secret: &str| {
+        FactorConfig::Totp(TotpConfig {
+            secret: ZeroizedString::new(secret).into(),
+            ..TotpConfig::default()
+        })
+    };
+    assert!(
+        backend
+            .insert_factor_if_absent(&scope, totp("FIRSTSECRET"))
+            .await
+            .expect("first insert")
+    );
+    assert!(
+        !backend
+            .insert_factor_if_absent(&scope, totp("SECONDSECRET"))
+            .await
+            .expect("second insert"),
+        "the second enrolment must lose"
+    );
+    let (stored, _) = stored_totp(&browser.pool).await;
+    assert!(stored.contains("FIRSTSECRET") && !stored.contains("SECONDSECRET"));
 }

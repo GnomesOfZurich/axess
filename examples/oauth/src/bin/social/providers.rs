@@ -35,11 +35,16 @@ pub type Provider = SocialProvider<MapperFn>;
 // ── GitHub ───────────────────────────────────────────────────────────
 
 /// `https://api.github.com/user` returns the user's numeric `id`,
-/// `login` (username), `email` (when public or `user:email` scope
-/// granted), and `name`.
+/// `login` (username), `email` (the address the user chose to show on the
+/// profile), and `name`.
 ///
-/// Scope `read:user` reads the basic profile; `user:email` returns
-/// the email even when the user has hidden it from the public profile.
+/// The `email` of `/user` is not marked verified, so the mapper leaves
+/// `SocialClaims::email` empty; read `raw["email"]` only as unverified data.
+/// A verified address is the entry of `/user/emails` that is both `verified`
+/// and `primary`, a second request this example does not make (scope
+/// `user:email` allows it).
+///
+/// Scope `read:user` reads the basic profile.
 pub fn github(
     client_id: impl Into<String>,
     client_secret: impl Into<String>,
@@ -67,7 +72,9 @@ fn github_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> {
         .ok_or_else(|| SocialError::ClaimMapping("GitHub userinfo missing numeric `id`".into()))?;
     Ok(SocialClaims {
         subject: id.to_string(),
-        email: raw.get("email").and_then(|v| v.as_str()).map(String::from),
+        // The profile address carries no verified flag, so it is not passed
+        // on as one the provider vouches for. It stays in `raw`.
+        email: None,
         display_name: raw.get("name").and_then(|v| v.as_str()).map(String::from),
         raw: raw.clone(),
     })
@@ -119,10 +126,12 @@ fn discord_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> 
     Ok(SocialClaims {
         subject: id.to_string(),
         email,
-        display_name: raw
-            .get("global_name")
-            .or_else(|| raw.get("username"))
-            .and_then(|v| v.as_str())
+        // `global_name` is JSON null for a user who has not set one, so the
+        // fallback is on the value, not on the key being absent.
+        display_name: ["global_name", "username"]
+            .iter()
+            .filter_map(|key| raw.get(*key).and_then(|v| v.as_str()))
+            .find(|name| !name.is_empty())
             .map(String::from),
         raw: raw.clone(),
     })
@@ -183,7 +192,8 @@ fn twitter_x_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError
 /// `https://api.spotify.com/v1/me` returns the user's `id` (string),
 /// `display_name`, `email`, and country / subscription tier metadata.
 ///
-/// Scope `user-read-email` is required for `email`;
+/// Spotify does not verify the `email` it returns, so the mapper leaves
+/// `SocialClaims::email` empty; read `raw["email"]` only as unverified data.
 /// `user-read-private` covers the profile fields.
 pub fn spotify(
     client_id: impl Into<String>,
@@ -212,7 +222,9 @@ fn spotify_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> 
         .ok_or_else(|| SocialError::ClaimMapping("Spotify userinfo missing string `id`".into()))?;
     Ok(SocialClaims {
         subject: id.to_string(),
-        email: raw.get("email").and_then(|v| v.as_str()).map(String::from),
+        // Spotify does not verify the address it returns, so it is not
+        // passed on as one the provider vouches for. It stays in `raw`.
+        email: None,
         display_name: raw
             .get("display_name")
             .and_then(|v| v.as_str())
@@ -304,7 +316,8 @@ mod tests {
         let raw = serde_json::json!({"id": 12345, "login": "octocat", "email": "o@c"});
         let claims = github_mapper(&raw).unwrap();
         assert_eq!(claims.subject, "12345");
-        assert_eq!(claims.email.as_deref(), Some("o@c"));
+        assert_eq!(claims.email, None, "an unverified profile address");
+        assert_eq!(claims.raw["email"], "o@c");
     }
 
     #[test]
@@ -346,5 +359,31 @@ mod tests {
         let claims = reddit_mapper(&raw).unwrap();
         assert_eq!(claims.subject, "abc123");
         assert_eq!(claims.email, None, "Reddit has no email path");
+    }
+
+    #[test]
+    fn spotify_mapper_does_not_pass_on_its_unverified_email() {
+        // Spotify does not verify the address it returns, so it is not
+        // offered as one the provider vouches for.
+        let raw = serde_json::json!({"id": "spotify-id", "email": "s@u"});
+        let claims = spotify_mapper(&raw).unwrap();
+        assert_eq!(claims.email, None, "an unverified address was passed on");
+        assert_eq!(claims.raw["email"], "s@u", "the raw response is kept");
+    }
+
+    #[test]
+    fn discord_name_falls_back_to_the_username() {
+        for global in [serde_json::json!(null), serde_json::json!("")] {
+            let raw = serde_json::json!({
+                "id": "snowflake", "username": "user", "global_name": global,
+            });
+            let claims = discord_mapper(&raw).unwrap();
+            assert_eq!(claims.display_name.as_deref(), Some("user"), "{global}");
+        }
+        let raw = serde_json::json!({"id": "s", "username": "user", "global_name": "Shown"});
+        assert_eq!(
+            discord_mapper(&raw).unwrap().display_name.as_deref(),
+            Some("Shown")
+        );
     }
 }

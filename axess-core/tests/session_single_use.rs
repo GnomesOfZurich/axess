@@ -281,6 +281,50 @@ async fn a_request_dropped_mid_handler_still_has_its_session_finalized() {
     );
 }
 
+/// A handler that changes the session and then fails still has the change
+/// stored by the time its error reaches the caller: the finalize is awaited,
+/// not left to a task that may not have run yet.
+#[tokio::test]
+async fn a_failing_handler_has_its_session_stored_before_the_error_returns() {
+    use axum::extract::FromRequestParts as _;
+    use tower::Layer as _;
+
+    let w = world(None);
+    let cookie = login(&w).await;
+    let sid: SessionId = send(&w.app, Some(&cookie), "/whoami")
+        .await
+        .0
+        .parse()
+        .unwrap();
+
+    let layer = SessionLayer::new(w.store.clone(), [9u8; 32])
+        .with_secure(false)
+        .with_ttl(TTL)
+        .with_clock(w.clock.clone());
+    let failing = tower::service_fn(|req: Request<Body>| async move {
+        let (mut parts, _body) = req.into_parts();
+        let s = AuthSession::from_request_parts(&mut parts, &())
+            .await
+            .map_err(|_| ())
+            .unwrap();
+        s.set_custom("flag", serde_json::json!(true)).await;
+        Err::<axum::response::Response, std::io::Error>(std::io::Error::other("handler failed"))
+    });
+    let req = Request::get("/")
+        .header(header::COOKIE, &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let err = layer.layer(failing).oneshot(req).await;
+    assert!(err.is_err(), "the handler's error is passed on");
+
+    let row = w.store.load(&sid).await.unwrap().unwrap();
+    assert_eq!(
+        row.custom.get("flag"),
+        Some(&serde_json::json!(true)),
+        "the session change was stored before the error returned"
+    );
+}
+
 #[tokio::test]
 async fn the_memory_store_keeps_the_compare_and_swap_contract() {
     axess_core::testing::store_contract::assert_update_if_revision_contract(

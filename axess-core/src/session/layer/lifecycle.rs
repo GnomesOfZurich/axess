@@ -25,8 +25,8 @@ use crate::session::layer::signing::SigningKeyRing;
 use crate::session::store::{SessionLiveness, SessionRegistryHandle, SessionStore};
 use axess_clock::Clock;
 use axess_rng::SecureRng;
+use cookie::Cookie;
 use subtle::ConstantTimeEq;
-use tower_cookies::cookie::Cookie;
 
 /// The binding fingerprints computed from a request: the one under the
 /// current signing key, and the one under the previous key while a rotation
@@ -413,7 +413,7 @@ pub(crate) fn build_set_cookie(
     cookie.set_secure(config.secure);
     cookie.set_same_site(config.same_site);
     cookie.set_path(config.path.as_ref().to_string());
-    cookie.set_max_age(tower_cookies::cookie::time::Duration::seconds(
+    cookie.set_max_age(cookie::time::Duration::seconds(
         config.ttl.as_secs().min(i64::MAX as u64) as i64,
     ));
 

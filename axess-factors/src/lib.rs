@@ -65,6 +65,10 @@ pub mod factor_secret;
 pub mod federation;
 #[cfg(feature = "hotp")]
 pub mod hotp;
+/// The form-urlencoded step of `client_secret_basic` credentials, shared by
+/// `oauth` and `outbound-oauth`.
+#[cfg(any(feature = "oauth", feature = "outbound-oauth"))]
+pub(crate) mod http_basic;
 /// Bounded reads of remote HTTP response bodies (`http-body` feature, on
 /// with every feature that makes outbound requests).
 #[cfg(feature = "http-body")]
@@ -74,6 +78,8 @@ pub mod http_body;
 /// (workload identity, federated OIDC checks, custom logout flows) share
 /// the same hardened parse-and-verify paths internally used by OAuth +
 /// back-channel logout.
+#[cfg(any(feature = "jwt", feature = "oidc"))]
+mod iat_window;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 /// LDAP simple-bind verifier: [`LdapProvider`](ldap::LdapProvider)
@@ -105,6 +111,9 @@ pub mod oidc;
 /// it has no consumer outside the two OTP configs.
 #[cfg(any(feature = "totp", feature = "hotp"))]
 pub mod otp_algorithm;
+/// The RFC 4226 computation `hotp` and `totp` share.
+#[cfg(any(feature = "totp", feature = "hotp"))]
+mod otp_core;
 /// Outbound OAuth client: `client_credentials` grant with optional
 /// `private_key_jwt` client assertion (RFC 7523) (`outbound-oauth`
 /// feature).
@@ -150,8 +159,8 @@ pub use hotp::{HOTP_LENGTH, HotpAlgorithm, HotpConfig, HotpThrottle, verify_hotp
 
 #[cfg(feature = "totp")]
 pub use totp::{
-    TOTP_LENGTH, TOTP_PERIOD, Totp, TotpAlgorithm, TotpBuilder, TotpConfig, TotpVerifyParams,
-    build_totp_uri, generate_totp_secret, verify_totp,
+    TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpConfig, TotpVerifyParams, build_totp_uri,
+    build_totp_uri_with_algorithm, generate_totp_secret, verify_totp,
 };
 
 #[cfg(feature = "email_otp")]
@@ -219,16 +228,13 @@ pub(crate) const MAX_HOTP_DIGITS: usize = 10;
 /// The fewest digits an HOTP or TOTP code may have (RFC 4226 §5.3, which
 /// RFC 6238 inherits): a shorter code is brute-forceable in a handful of
 /// attempts, and a length of 0 makes the code "0" match every counter.
+#[cfg(any(feature = "hotp", feature = "totp"))]
 pub(crate) const MIN_OTP_DIGITS: usize = 6;
 
 /// Maximum TOTP digit length accepted by verification.
 ///
-/// Lower than [`MAX_HOTP_DIGITS`] because the underlying `totp-rs` crate
-/// enforces RFC 6238 §1.2's 6..=8 digit range in `TotpBuilder::build`; values above
-/// 8 are rejected by the upstream library before our own guard runs.
-/// Tracking the real limit here keeps the guard meaningful and prevents
-/// silent rejection from a future caller that assumes the constant is
-/// authoritative.
+/// Lower than [`MAX_HOTP_DIGITS`] because RFC 6238 §1.2 allows 6 to 8
+/// digits for a TOTP code.
 #[cfg(feature = "totp")]
 pub(crate) const MAX_TOTP_DIGITS: usize = 8;
 

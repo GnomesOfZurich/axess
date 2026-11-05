@@ -21,6 +21,8 @@
 //! - `user_id`: string
 //! - `tenant_id`: string
 //! - `session_id`: string (only present when the principal carries one)
+//! - `impersonator`: string, the administrator's user id (only present for
+//!   the principal of an impersonated session)
 //! - any extra keys from [`HumanPrincipal::attributes`] map onto Cedar
 //!   typed values via the JSON-to-Cedar rules documented on
 //!   [`json_to_restricted_expression`].
@@ -39,7 +41,9 @@
 //! When [`HumanPrincipal::attributes`] or [`WorkloadPrincipal::attributes`]
 //! contains a key that collides with a built-in attribute name
 //! (e.g. `tenant_id`), the built-in attribute wins and the colliding key
-//! is dropped with a warning. The built-ins (tenant, user, workload
+//! is dropped with a warning. The names are reserved whether or not the
+//! principal sets them: a caller cannot supply a `session_id` or an
+//! `impersonator` the session does not carry. The built-ins (tenant, user, workload
 //! identity) are what policies pin on, and the extra attributes can come
 //! from token claims the caller influences, so they must never be able to
 //! replace them. Use a different key for application attributes.
@@ -59,6 +63,19 @@ pub const HUMAN_ENTITY_TYPE: &str = "Human";
 
 /// Cedar entity type name for workload principals.
 pub const WORKLOAD_ENTITY_TYPE: &str = "Workload";
+
+/// The attribute names of `axess::Human` the library owns, set or not.
+const HUMAN_BUILT_INS: &[&str] = &["user_id", "tenant_id", "session_id", "impersonator"];
+
+/// The attribute names of `axess::Workload` the library owns.
+const WORKLOAD_BUILT_INS: &[&str] = &[
+    "workload_id",
+    "trust_domain",
+    "issuer",
+    "tenant_id",
+    "tenant_slug",
+    "service_name",
+];
 
 /// Trait surface for converting a [`Principal`] (or one of its
 /// variants) into a `cedar_policy::Entity`. Bring this into scope to
@@ -118,7 +135,13 @@ impl ToCedarEntity for HumanPrincipal {
                 RestrictedExpression::new_string(sid.to_string()),
             );
         }
-        merge_attribute_map(&mut attrs, &self.attributes);
+        if let Some(admin) = &self.impersonator {
+            attrs.insert(
+                "impersonator".to_string(),
+                RestrictedExpression::new_string(admin.to_string()),
+            );
+        }
+        merge_attribute_map(&mut attrs, HUMAN_BUILT_INS, &self.attributes);
         Entity::new(uid, attrs, HashSet::new())
             .map_err(|e| AuthzError::EntityBuild(format!("HumanPrincipal: {e:?}")))
     }
@@ -160,7 +183,7 @@ impl ToCedarEntity for WorkloadPrincipal {
             "service_name".to_string(),
             RestrictedExpression::new_string(self.service_name.clone()),
         );
-        merge_attribute_map(&mut attrs, &self.attributes);
+        merge_attribute_map(&mut attrs, WORKLOAD_BUILT_INS, &self.attributes);
         Entity::new(uid, attrs, HashSet::new())
             .map_err(|e| AuthzError::EntityBuild(format!("WorkloadPrincipal: {e:?}")))
     }
@@ -169,13 +192,17 @@ impl ToCedarEntity for WorkloadPrincipal {
 /// Apply user-supplied attributes onto the built-in attribute map,
 /// converting each `serde_json::Value` per
 /// [`json_to_restricted_expression`]. A user key that collides with a
-/// built-in is dropped with a warning (see module-level "Conflict policy").
+/// built-in, set or not, is dropped with a warning (see module-level
+/// "Conflict policy"): `reserved` names every built-in of the entity type,
+/// since one the principal does not carry (a session id, an impersonator)
+/// must not be supplied by a caller either.
 fn merge_attribute_map(
     attrs: &mut HashMap<String, RestrictedExpression>,
+    reserved: &[&str],
     user: &std::collections::BTreeMap<String, serde_json::Value>,
 ) {
     for (k, v) in user {
-        if attrs.contains_key(k) {
+        if attrs.contains_key(k) || reserved.contains(&k.as_str()) {
             tracing::warn!(
                 attribute = %k,
                 "principal attribute collides with a built-in Cedar attribute; the built-in value is kept"
@@ -217,158 +244,4 @@ pub fn json_to_restricted_expression(v: &serde_json::Value) -> RestrictedExpress
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use axess_identity::{Issuer, TrustDomain, WorkloadId};
-    use axess_identity::{TenantId, UserId};
-
-    fn sample_human() -> HumanPrincipal {
-        HumanPrincipal {
-            user_id: UserId::from_bytes([10u8; 16]),
-            tenant_id: TenantId::from_bytes([20u8; 16]),
-            session_id: None,
-            attributes: BTreeMap::new(),
-        }
-    }
-
-    fn sample_workload() -> WorkloadPrincipal {
-        let trust = TrustDomain::new("gnomes.local").unwrap();
-        let wid = WorkloadId::build(&trust, "compute-worker", "ekekrantz").unwrap();
-        WorkloadPrincipal {
-            workload_id: wid,
-            trust_domain: trust,
-            issuer: Issuer::Cli,
-            tenant_id: TenantId::from_bytes([30u8; 16]),
-            tenant_slug: "ekekrantz".to_string(),
-            service_name: "compute-worker".to_string(),
-            attributes: BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn human_entity_uid_is_namespaced_under_axess_human() {
-        let uid = sample_human().cedar_entity_uid().unwrap();
-        let s = format!("{uid}");
-        assert!(s.starts_with("axess::Human::"), "actual: {s}");
-    }
-
-    #[test]
-    fn workload_entity_uid_is_namespaced_under_axess_workload() {
-        let uid = sample_workload().cedar_entity_uid().unwrap();
-        let s = format!("{uid}");
-        assert!(s.starts_with("axess::Workload::"), "actual: {s}");
-        assert!(s.contains("spiffe://gnomes.local/compute-worker/ekekrantz"));
-    }
-
-    #[test]
-    fn human_to_cedar_entity_includes_required_attrs() {
-        let h = sample_human();
-        let entity = h.to_cedar_entity().unwrap();
-        assert!(entity.attr("user_id").is_some());
-        assert!(entity.attr("tenant_id").is_some());
-        assert!(
-            entity.attr("session_id").is_none(),
-            "session_id absent when principal has none"
-        );
-    }
-
-    #[test]
-    fn human_to_cedar_entity_includes_session_id_when_present() {
-        let mut h = sample_human();
-        h.session_id = Some(axess_identity::SessionId::from_bytes([7u8; 16]));
-        let entity = h.to_cedar_entity().unwrap();
-        assert!(entity.attr("session_id").is_some());
-    }
-
-    #[test]
-    fn workload_to_cedar_entity_includes_all_built_in_attrs() {
-        let entity = sample_workload().to_cedar_entity().unwrap();
-        for name in [
-            "workload_id",
-            "trust_domain",
-            "issuer",
-            "tenant_id",
-            "tenant_slug",
-            "service_name",
-        ] {
-            assert!(
-                entity.attr(name).is_some(),
-                "missing built-in attribute '{name}'"
-            );
-        }
-    }
-
-    fn string_attr(entity: &Entity, name: &str) -> Option<String> {
-        match entity.attr(name) {
-            Some(Ok(cedar_policy::EvalResult::String(s))) => Some(s),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn user_supplied_attributes_cannot_replace_built_ins() {
-        let mut h = sample_human();
-        let expected = h.tenant_id.to_string();
-        h.attributes.insert(
-            "tenant_id".to_string(),
-            serde_json::json!("override-tenant"),
-        );
-        h.attributes
-            .insert("tier".to_string(), serde_json::json!("gold"));
-        let entity = h.to_cedar_entity().unwrap();
-        assert_eq!(string_attr(&entity, "tenant_id"), Some(expected));
-        assert_eq!(string_attr(&entity, "tier").as_deref(), Some("gold"));
-
-        let mut w = sample_workload();
-        let workload_id = w.workload_id.as_str().to_string();
-        w.attributes.insert(
-            "workload_id".to_string(),
-            serde_json::json!("spiffe://evil"),
-        );
-        w.attributes
-            .insert("trust_domain".to_string(), serde_json::json!("evil"));
-        let entity = w.to_cedar_entity().unwrap();
-        assert_eq!(string_attr(&entity, "workload_id"), Some(workload_id));
-        assert_eq!(
-            string_attr(&entity, "trust_domain").as_deref(),
-            Some("gnomes.local")
-        );
-    }
-
-    #[test]
-    fn principal_enum_dispatches_to_variant_method() {
-        let p = Principal::Human(sample_human());
-        let uid = p.cedar_entity_uid().unwrap();
-        assert!(format!("{uid}").starts_with("axess::Human::"));
-
-        let p = Principal::Workload(sample_workload());
-        let uid = p.cedar_entity_uid().unwrap();
-        assert!(format!("{uid}").starts_with("axess::Workload::"));
-    }
-
-    #[test]
-    fn json_to_restricted_handles_scalars() {
-        let mut w = sample_workload();
-        w.attributes
-            .insert("flag".to_string(), serde_json::json!(true));
-        w.attributes
-            .insert("name".to_string(), serde_json::json!("worker"));
-        w.attributes
-            .insert("count".to_string(), serde_json::json!(42));
-        w.attributes
-            .insert("ratio".to_string(), serde_json::json!(1.5));
-        w.attributes
-            .insert("missing".to_string(), serde_json::json!(null));
-        w.attributes
-            .insert("tags".to_string(), serde_json::json!(["a", "b"]));
-        let entity = w.to_cedar_entity().unwrap();
-        for name in ["flag", "name", "count", "ratio", "missing", "tags"] {
-            assert!(
-                entity.attr(name).is_some(),
-                "missing attribute '{name}' after JSON-to-Cedar conversion"
-            );
-        }
-    }
-}
+mod tests;

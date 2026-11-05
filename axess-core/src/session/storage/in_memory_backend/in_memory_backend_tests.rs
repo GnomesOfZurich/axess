@@ -545,3 +545,41 @@ async fn the_tenant_policies_come_from_the_wrapped_store() {
     let tenant = axess_identity::testing::tenant("t");
     assert_eq!(backend.lockout_policy_for_tenant(&tenant).max_attempts, 3);
 }
+
+/// The backend's clock reaches the identity store, so a failed attempt is
+/// stamped with it and a lockout derived from the count follows it.
+#[tokio::test]
+async fn the_backends_clock_stamps_failed_attempts() {
+    let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("in range");
+    let backend = InMemoryBackend::new()
+        .with_clock(axess_clock::testing::MockClock::at(at))
+        .with_default_tenant("default", "Default Tenant")
+        .with_user_password("alice", "default", "Gnomes2+");
+    backend.record_failed_attempt(&u()).await.unwrap();
+    assert_eq!(backend.failed_attempts(&u()).await.unwrap(), (1, Some(at)));
+}
+
+/// One username in two tenants is two users: each tenant finds its own row,
+/// never the other tenant's.
+#[tokio::test]
+async fn one_username_in_two_tenants_is_two_users() {
+    let backend = InMemoryBackend::new()
+        .with_default_tenant("default", "Default Tenant")
+        .with_user_password("alice", "default", "Gnomes2+")
+        .with_user_password("alice", "acme", "Acme3+pass");
+    let acme = axess_identity::testing::tenant("acme");
+    let here = backend
+        .find_user("alice", &t())
+        .await
+        .unwrap()
+        .expect("default alice");
+    let there = backend
+        .find_user("alice", &acme)
+        .await
+        .unwrap()
+        .expect("acme alice");
+    assert_eq!(here.tenant_id, t());
+    assert_eq!(there.tenant_id, acme);
+    assert_ne!(here.id, there.id);
+    assert_eq!(here.id, u(), "the first registration keeps the label's id");
+}

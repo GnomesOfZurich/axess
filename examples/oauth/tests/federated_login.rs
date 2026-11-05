@@ -61,6 +61,7 @@ impl Idp {
             "authorization_endpoint": format!("{issuer}/authorize"),
             "token_endpoint": format!("{issuer}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
+            "userinfo_endpoint": format!("{issuer}/userinfo"),
             "end_session_endpoint": format!("{issuer}/logout"),
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
@@ -158,6 +159,15 @@ impl Idp {
             .and(body_string_contains(format!("refresh_token={presented}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .up_to_n_times(1)
+            .mount(&self.server)
+            .await;
+    }
+
+    /// Answer userinfo requests as the subject `sub`.
+    async fn queue_userinfo(&self, sub: &str) {
+        Mock::given(method("GET"))
+            .and(path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "sub": sub })))
             .mount(&self.server)
             .await;
     }
@@ -725,6 +735,27 @@ async fn refresh_with_a_wrong_issuer_is_refused() {
     let mut stranger = Browser::new(&app);
     let reply = stranger.post("/auth/refresh").await;
     assert_eq!(reply.location.as_deref(), Some("/"));
+}
+
+/// A refresh whose userinfo answer describes another subject is refused (502)
+/// and ends the session: the next refresh is sent home. Before the check the
+/// example kept the session, so the second assertion fails.
+#[tokio::test]
+async fn refresh_with_userinfo_for_another_subject_ends_the_session() {
+    let idp = Idp::start("client-a").await;
+    let app = app_with(vec![settings("idp", &idp)], Provisioning::JustInTime).await;
+    let mut browser = Browser::new(&app);
+    browser
+        .sign_in_with(&idp, "idp", &ALICE, Some("refresh-1"))
+        .await;
+
+    idp.queue_userinfo("someone-else").await;
+    idp.queue_refresh("refresh-1", "refresh-2", None).await;
+    let reply = browser.post("/auth/refresh").await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+
+    let again = browser.post("/auth/refresh").await;
+    assert_eq!(again.location.as_deref(), Some("/"), "the session survived");
 }
 
 // ── Client authentication ────────────────────────────────────────────────────

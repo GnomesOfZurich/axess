@@ -222,8 +222,11 @@ ever stored.
 for the same tenant and identifier inside the window answer `Ok(None)`, as
 an unknown identifier does. The key is the identifier as typed, whether or
 not an account has it, so the cooldown tells a caller nothing about who is
-registered. The record is per process; put the route behind a shared rate
-limit as well when several instances serve it.
+registered. The record is per process and holds the 100,000 most recent
+identifiers, so a caller who submits that many distinct identifiers inside
+the window pushes an earlier one out: the cooldown limits repeat requests,
+not a caller who mints identifiers. Put the route behind a shared rate limit
+as well, which is the bound for that and for several instances.
 
 A completed reset invalidates the user's registered cookie sessions, which
 does not reach refresh tokens: they are a separate credential that mints a

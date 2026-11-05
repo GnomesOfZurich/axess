@@ -28,27 +28,27 @@ pub(super) async fn request_device_code(
             )
         })?;
 
-    let mut form = vec![("client_id", cfg.client_id.as_str())];
+    // The client proves who it is here as at every other endpoint
+    // (RFC 8628 section 3.1 defers to RFC 6749 section 3.2.1).
+    let mut form: Vec<(String, String)> = Vec::new();
+    let basic = cfg.token_grant_auth(&mut form, device_url)?;
     let scope_str = scopes.join(" ");
     if !scope_str.is_empty() {
-        form.push(("scope", &scope_str));
+        form.push(("scope".to_string(), scope_str));
     }
 
-    let mut response = cfg
-        .http_client
-        .post(device_url)
-        .form(&form)
-        .send()
+    let (status, body) = cfg
+        .post_form_constrained(
+            device_url,
+            &form,
+            basic,
+            None,
+            "device authorization request",
+        )
         .await
         .map_err(|e| {
             OAuthError::DeviceAuthorization(format!("device authorization request failed: {e}"))
         })?;
-
-    let status = response.status();
-    let body =
-        crate::http_body::read_for_status(&mut response, crate::http_body::MAX_TOKEN_BODY_BYTES)
-            .await
-            .map_err(|e| OAuthError::DeviceAuthorization(format!("response read failed: {e}")))?;
 
     if !status.is_success() {
         let error_code = serde_json::from_slice::<serde_json::Value>(&body)
@@ -96,10 +96,10 @@ pub(super) async fn poll_device_token(
         ),
         ("device_code".to_string(), device_code.to_string()),
     ];
-    cfg.add_client_auth(&mut form, &token_url)?;
+    let basic = cfg.token_grant_auth(&mut form, &token_url)?;
 
     let (status, body) = cfg
-        .post_form_constrained(&token_url, &form, None, dpop, "device token poll")
+        .post_form_constrained(&token_url, &form, basic, dpop, "device token poll")
         .await?;
 
     if status.is_success() {
@@ -131,6 +131,11 @@ pub(super) async fn poll_device_token(
         claims.dpop_key = dpop.map(|s| Arc::new(DpopKey::from_seed(*s.key.to_seed_bytes())));
 
         return Ok(DeviceTokenOutcome::Authorized(Box::new(claims)));
+    }
+
+    // A server error is the IdP failing, not the user refusing.
+    if status.is_server_error() {
+        return Err(OAuthError::transient(Some(status.as_u16())));
     }
 
     // Check for standard OAuth error codes.

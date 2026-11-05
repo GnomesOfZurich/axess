@@ -113,6 +113,43 @@ async fn a_modified_session_does_not_write_a_consumed_value_back() {
     assert!(outcome.session_changed);
 }
 
+/// Request B rotates the session id while request A takes the one-shot
+/// ceremony value. The row B writes under the new id must not bring the value
+/// back, and keeps B's own change.
+#[tokio::test]
+async fn a_rotation_does_not_write_a_consumed_value_under_the_new_id() {
+    let store = MemorySessionStore::new();
+    let id = SessionId::new(&MockRng::new(30));
+    let loaded = SessionData {
+        custom: serde_json::json!({"ceremony": "state", "cart": 0}),
+        ..SessionData::default()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut b = request_holding(&store, id, &loaded);
+    b.data.custom["cart"] = serde_json::json!(1);
+    b.modified = true;
+    b.rotate_id();
+    let new_id = b.id;
+
+    let mut by_a = loaded.clone();
+    by_a.custom.as_object_mut().unwrap().remove("ceremony");
+    by_a.revision = 1;
+    assert_eq!(
+        store.update_if_revision(&id, 0, &by_a, TTL).await.unwrap(),
+        ConditionalUpdate::Written
+    );
+
+    finalize(&store, b, Some(id)).await;
+
+    let stored = store.load(&new_id).await.unwrap().unwrap();
+    assert!(
+        stored.custom.get("ceremony").is_none(),
+        "a value taken by a concurrent request stays taken, got {}",
+        stored.custom
+    );
+    assert_eq!(stored.custom["cart"], serde_json::json!(1));
+}
+
 /// Write `custom` over the row at `id` as a concurrent request would: a
 /// compare-and-swap from the revision stored now.
 async fn concurrent_write(store: &MemorySessionStore, id: &SessionId, custom: serde_json::Value) {
@@ -261,6 +298,98 @@ async fn a_retry_does_not_count_a_merged_in_value_as_this_requests_change() {
     assert_eq!(stored.custom["cart"], serde_json::json!(1));
 }
 
+/// A store whose reads fail; its writes reach the wrapped store.
+#[derive(Clone)]
+struct FailingReads(MemorySessionStore);
+
+impl SessionStore for FailingReads {
+    type Error = std::io::Error;
+    async fn load(&self, _: &SessionId) -> Result<Option<SessionData>, Self::Error> {
+        Err(std::io::Error::other("store unavailable"))
+    }
+    async fn save(
+        &self,
+        id: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<(), Self::Error> {
+        self.0.save(id, d, ttl).await.unwrap();
+        Ok(())
+    }
+    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.0.delete(id).await.unwrap();
+        Ok(())
+    }
+    async fn update(
+        &self,
+        id: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        Ok(self.0.update(id, d, ttl).await.unwrap())
+    }
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected: u64,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<ConditionalUpdate, Self::Error> {
+        Ok(self
+            .0
+            .update_if_revision(id, expected, d, ttl)
+            .await
+            .unwrap())
+    }
+    async fn cycle(
+        &self,
+        old: &SessionId,
+        new: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
+        Ok(self.0.cycle(old, new, d, ttl, require_old).await.unwrap())
+    }
+    async fn prune_expired(&self) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+}
+
+/// A rotation that cannot read the row it retires cannot tell whether a
+/// concurrent request changed it, so it fails closed: the new id carries no
+/// login and no rotation is reported.
+#[tokio::test]
+async fn a_rotation_that_cannot_read_the_old_row_fails_closed() {
+    let store = FailingReads(MemorySessionStore::new());
+    let id = SessionId::new(&MockRng::new(31));
+    let loaded = SessionData {
+        custom: serde_json::json!({"ceremony": "state"}),
+        ..SessionData::default()
+    };
+    store.0.save(&id, &loaded, TTL).await.unwrap();
+    let mut b = request_holding(&store.0, id, &loaded);
+    b.data
+        .auth_state
+        .set_authenticated(ids::user("u"), ids::tenant("t"), chrono::Utc::now());
+    b.modified = true;
+    b.rotate_id();
+    let new_id = b.id;
+
+    let outcome = finalize(&store, b, Some(id)).await;
+
+    assert!(outcome.rotation.is_none(), "no rotation is reported");
+    let carried = store.0.load(&new_id).await.unwrap();
+    assert!(
+        carried.is_none_or(|row| !row.auth_state.is_authenticated()),
+        "the login must not reach the new id"
+    );
+    assert!(
+        store.0.load(&id).await.unwrap().is_none(),
+        "the retired row is deleted"
+    );
+}
+
 /// Without the loaded row to merge from, a request whose write finds the row
 /// changed discards its changes rather than overwrite them.
 #[tokio::test]
@@ -301,6 +430,7 @@ async fn a_conflicting_write_without_a_base_is_discarded() {
 struct RevokesAfterCheck {
     revoked: SessionId,
     answered: AtomicBool,
+    first_answer: SessionLiveness,
     held: Mutex<Vec<SessionId>>,
 }
 
@@ -309,7 +439,16 @@ impl RevokesAfterCheck {
         Self {
             revoked,
             answered: AtomicBool::new(false),
+            first_answer: SessionLiveness::Valid,
             held: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The registry's first answer for the revoked id is an error, not Valid.
+    fn unanswering_first(revoked: SessionId) -> Self {
+        Self {
+            first_answer: SessionLiveness::Unknown,
+            ..Self::new(revoked)
         }
     }
 
@@ -353,7 +492,7 @@ impl SessionRegistryHandle for RevokesAfterCheck {
             if self.answered.swap(true, Ordering::SeqCst) {
                 SessionLiveness::Gone
             } else {
-                SessionLiveness::Valid
+                self.first_answer
             }
         } else if self.holds(id) {
             SessionLiveness::Valid
@@ -416,6 +555,35 @@ async fn a_revocation_during_rotation_ends_the_session_under_its_new_id() {
         &registry,
         &rotation(old, new),
         UnknownLiveness::Reject,
+    )
+    .await;
+
+    assert!(!cookie, "a revoked session gets no cookie");
+    assert!(!registry.holds(&new), "the new id must not stay valid");
+    assert!(
+        store.load(&new).await.unwrap().is_none(),
+        "the row under the new id is deleted"
+    );
+}
+
+/// The registry could not answer for the old id, then registered the new one;
+/// a revocation that landed meanwhile must still end the session. The old id
+/// is read again after the registration whichever way the first read went.
+#[tokio::test]
+async fn a_revocation_after_an_unanswered_check_ends_the_session_under_its_new_id() {
+    let store = MemorySessionStore::new();
+    let (old, new) = (
+        SessionId::new(&MockRng::new(4)),
+        SessionId::new(&MockRng::new(5)),
+    );
+    moved_row(&store, &new).await;
+    let registry = RevokesAfterCheck::unanswering_first(old);
+
+    let cookie = move_registry_entry(
+        &store,
+        &registry,
+        &rotation(old, new),
+        UnknownLiveness::Accept,
     )
     .await;
 

@@ -4,19 +4,65 @@
 //! so the `now` parameter passed to `verify_totp` is the same `Clock` the
 //! rest of axess uses (production: `SystemClock`; tests: `MockClock`).
 //!
-//! Re-exports [`TotpAlgorithm`] and [`Totp`] from `totp-rs` so applications
-//! that hold the algorithm enum on a config struct don't need a direct
-//! dependency on the upstream crate.
+//! A TOTP code is the HOTP value of RFC 4226 at the counter
+//! `floor(t / step)` (RFC 6238 §4.2); [`TotpAlgorithm`] names the HMAC.
 
 use crate::factor_secret::FactorSecret;
 use crate::otp_algorithm::OtpAlgorithm;
+use crate::otp_core::{HotpAlgorithm, hotp_value};
 use crate::{MAX_TOTP_DIGITS, MIN_OTP_DIGITS, MIN_OTP_SECRET_BYTES};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-pub use totp_rs::{Algorithm as TotpAlgorithm, Builder as TotpBuilder, Totp};
+/// The HMAC a TOTP code is derived with (RFC 6238 §1.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TotpAlgorithm {
+    /// HMAC-SHA-1, the RFC default and what every authenticator app takes.
+    SHA1,
+    /// HMAC-SHA-256.
+    SHA256,
+    /// HMAC-SHA-512.
+    SHA512,
+}
+
+impl TotpAlgorithm {
+    /// The name `otpauth://` URIs carry in `algorithm=`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SHA1 => "SHA1",
+            Self::SHA256 => "SHA256",
+            Self::SHA512 => "SHA512",
+        }
+    }
+
+    fn hotp(self) -> HotpAlgorithm {
+        match self {
+            Self::SHA1 => HotpAlgorithm::Sha1,
+            Self::SHA256 => HotpAlgorithm::Sha256,
+            Self::SHA512 => HotpAlgorithm::Sha512,
+        }
+    }
+}
+
+impl std::fmt::Display for TotpAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The TOTP code for the time `seconds` as a number below `10^digits`:
+/// HOTP at the counter `seconds / step` (RFC 6238 §4.2).
+fn totp_value(
+    secret: &[u8],
+    seconds: u64,
+    step: u64,
+    digits: usize,
+    algorithm: TotpAlgorithm,
+) -> u64 {
+    hotp_value(secret, seconds / step, digits, algorithm.hotp())
+}
 
 // ── TotpConfig ───────────────────────────────────────────────────────────────
 
@@ -168,13 +214,12 @@ pub fn verify_totp(
     let past_window = raw_past.min(MAX_TOTP_WINDOW);
     let future_window = raw_future.min(MAX_TOTP_WINDOW);
 
-    let secret_trimmed = secret.trim();
     // Wrap the uppercase copy in Zeroizing so it's cleared on drop.
-    let secret_upper = Zeroizing::new(secret_trimmed.to_ascii_uppercase());
+    let secret_upper = Zeroizing::new(secret.trim().to_ascii_uppercase());
     let decoded = Zeroizing::new(
-        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret_upper)
-            .or_else(|| base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret_upper))
-            .or_else(|| hex::decode(secret_trimmed).ok())?,
+        base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &secret_upper).or_else(
+            || base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret_upper),
+        )?,
     );
 
     // Enforce RFC 4226 §4 R6 minimum secret length. A short
@@ -184,21 +229,6 @@ pub fn verify_totp(
         return None;
     }
 
-    // totp-rs stores the secret internally; pass a copy from the Zeroizing wrapper.
-    // The `Totp` struct is short-lived (dropped at end of this function).
-    // `skew` is set to 0 because verify handles the drift window explicitly
-    // via `check_candidate` at each step; letting the library apply skew on
-    // top would double-count.
-    let digits_u8: u8 = length.try_into().ok()?;
-    let totp = TotpBuilder::new()
-        .with_algorithm(algorithm)
-        .with_digits(digits_u8)
-        .with_skew(0)
-        .with_step_duration(time_step)
-        .with_secret(decoded.to_vec())
-        .build()
-        .ok()?;
-
     // Negative timestamps (pre-1970) cannot map to a TOTP step under
     // RFC 6238; reject rather than wrap silently into the future.
     let seconds: u64 = now.timestamp().try_into().ok()?;
@@ -206,9 +236,12 @@ pub fn verify_totp(
 
     let check_candidate = |step: u64| -> Option<u64> {
         let timestamp_secs = step.saturating_mul(time_step);
-        // `Token: Display` produces the zero-padded numeric string;
-        // compare with `ConstantTimeEq` to keep the compare timing-safe.
-        let expected = totp.generate(timestamp_secs).to_string();
+        // Zero-padded to `length`; compare with `ConstantTimeEq` to keep the
+        // compare timing-safe.
+        let expected = format!(
+            "{:0>length$}",
+            totp_value(&decoded, timestamp_secs, time_step, length, algorithm)
+        );
         if bool::from(expected.as_bytes().ct_eq(sanitized_code.as_bytes())) {
             Some(step)
         } else {
@@ -268,30 +301,55 @@ pub fn generate_totp_secret<R: axess_rng::SecureRng>(rng: &R) -> String {
     base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &*bytes)
 }
 
+/// The shortest period, in seconds, an `otpauth://` URI is built for.
+const MIN_TOTP_URI_PERIOD: u64 = 5;
+
 /// Build the standard `otpauth://totp/...` URI a TOTP authenticator app
-/// scans to provision a credential. `label` and `issuer` are
-/// percent-encoded per RFC 3986. `digits` is clamped to a minimum of 1
-/// and `period` to a minimum of 5 seconds; values below those bounds
-/// produce nonsensical authenticators.
+/// scans to provision a credential, for an HMAC-SHA1 secret. `label` and
+/// `issuer` are percent-encoded per RFC 3986.
+///
+/// Returns `None` when `digits` is outside the 6 to 8 range [`verify_totp`]
+/// accepts or `period` is under 5 seconds (authenticator apps do not take a
+/// shorter one): such a configuration is refused, not clamped into an
+/// authenticator whose codes the server would verify with other parameters
+/// than the ones shown to the user. See [`build_totp_uri_with_algorithm`] for
+/// SHA-256 and SHA-512 secrets.
 pub fn build_totp_uri(
     label: &str,
     issuer: &str,
     secret: &str,
     digits: usize,
     period: u64,
-) -> String {
+) -> Option<String> {
+    build_totp_uri_with_algorithm(label, issuer, secret, digits, period, TotpAlgorithm::SHA1)
+}
+
+/// Like [`build_totp_uri`], with the HMAC algorithm written into the URI as
+/// `algorithm=`, so an authenticator that honours it computes the same codes
+/// the server verifies. Refuses (`None`) the configurations
+/// [`build_totp_uri`] refuses.
+pub fn build_totp_uri_with_algorithm(
+    label: &str,
+    issuer: &str,
+    secret: &str,
+    digits: usize,
+    period: u64,
+    algorithm: TotpAlgorithm,
+) -> Option<String> {
+    if !(MIN_OTP_DIGITS..=MAX_TOTP_DIGITS).contains(&digits) || period < MIN_TOTP_URI_PERIOD {
+        return None;
+    }
     let label_enc = percent_encode_component(label);
     let issuer_enc = percent_encode_component(issuer);
-    let digits = digits.max(1);
-    let period = period.max(5);
-    format!(
-        "otpauth://totp/{issuer}:{label}?secret={secret}&issuer={issuer}&digits={digits}&period={period}",
+    Some(format!(
+        "otpauth://totp/{issuer}:{label}?secret={secret}&issuer={issuer}&algorithm={algorithm}&digits={digits}&period={period}",
         issuer = issuer_enc,
         label = label_enc,
         secret = secret,
+        algorithm = algorithm.as_str(),
         digits = digits,
         period = period
-    )
+    ))
 }
 
 #[cfg(test)]

@@ -7,13 +7,14 @@ use super::index::plan_indexes;
 use super::read::StoredRowState;
 use super::row::{
     device_key, fingerprint_hex, fingerprint_key, fingerprint_set_key, fingerprint_zset_key,
+    tenant_index_key,
 };
 use super::scripts::{
     REMOVE_DEVICE, ScriptStatus, WRITE_ROW, parse_status, remove_args, write_row_args,
 };
 use super::{MAX_ATTEMPTS, ValkeyDeviceStore, ValkeyDeviceStoreError};
 use crate::device::store::{blocks_save, for_save};
-use crate::device::types::Device;
+use crate::device::types::{Device, DeviceTrustLevel, FingerprintHash};
 use fred::prelude::*;
 
 /// The decision [`ValkeyDeviceStore::apply`] takes for the row it read.
@@ -90,12 +91,43 @@ impl ValkeyDeviceStore {
     /// script, conditional on the row as it was read; a writer that changed
     /// it meanwhile conflicts the script and the delete runs again on the
     /// fresh row.
+    ///
+    /// A row that does not decode is deleted too, against the exact bytes
+    /// found: it is the way to clear a row nobody can read (see
+    /// [`save_row`](Self::save_row)). Its fingerprint and index entries are not
+    /// known, so the readers prune them when they find the members stale.
     pub(super) async fn remove_row(
         &self,
         tenant: &str,
         id: &str,
     ) -> Result<Applied, ValkeyDeviceStoreError> {
-        self.apply_at(tenant, id, None, |_| Step::Remove).await
+        let row_key = device_key(&self.prefix, tenant, id);
+        for _ in 0..MAX_ATTEMPTS {
+            let StoredRowState::Undecodable(raw, error) =
+                self.get_row_for_write(tenant, id).await?
+            else {
+                return self.apply_at(tenant, id, None, |_| Step::Remove).await;
+            };
+            tracing::warn!(%tenant, device = %id, %error, "deleting a device row that cannot be decoded");
+            let hex = fingerprint_hex(&FingerprintHash::from_bytes([0; 32]));
+            let keys = [
+                row_key.clone(),
+                fingerprint_zset_key(&self.prefix, tenant, &hex),
+                fingerprint_set_key(&self.prefix, tenant, &hex),
+                fingerprint_key(&self.prefix, tenant, &hex),
+            ];
+            let args = remove_args(Some(&raw), id, &[]);
+            match self.run_script(REMOVE_DEVICE, keys.to_vec(), args).await? {
+                ScriptStatus::Ok => {
+                    let tenant_idx = tenant_index_key(&self.prefix, tenant);
+                    let _: () = self.client.srem(&tenant_idx, id).await?;
+                    return Ok(Applied::Removed);
+                }
+                ScriptStatus::Missing => return Ok(Applied::Missing),
+                ScriptStatus::Conflict => continue,
+            }
+        }
+        Err(Self::contended(tenant, id))
     }
 
     /// [`apply`](Self::apply) with the write time optional: `None` is for a
@@ -174,12 +206,25 @@ impl ValkeyDeviceStore {
             let previous = match self.get_row_for_write(&tenant, &id).await? {
                 StoredRowState::Absent => None,
                 StoredRowState::Decoded(prev, raw) => Some((prev, raw)),
+                StoredRowState::Undecodable(_, error)
+                    if device.trust_level != DeviceTrustLevel::Revoked =>
+                {
+                    // A row nobody can read may be a revoked device, and a
+                    // save that is not itself a revocation would bring it
+                    // back as a live one: fail closed. The row is cleared
+                    // by deleting the device.
+                    tracing::error!(
+                        %tenant, device = %id, %error,
+                        "refusing to save over a device row that cannot be decoded"
+                    );
+                    return Err(error);
+                }
                 StoredRowState::Undecodable(raw, error) => {
-                    // A save replaces the row, so a stored row nobody can
-                    // read is overwritten (against the exact bytes found)
-                    // rather than failing every later save of the device.
-                    // Its old index entries are not known; the readers prune
-                    // them when they find the members stale.
+                    // A revoking save replaces the unreadable row (against
+                    // the exact bytes found): the device ends up revoked
+                    // whatever the row held. Its old index entries are not
+                    // known; the readers prune them when they find the
+                    // members stale.
                     tracing::warn!(
                         %tenant, device = %id, %error,
                         "replacing a device row that cannot be decoded"

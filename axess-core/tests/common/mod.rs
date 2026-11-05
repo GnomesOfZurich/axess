@@ -118,17 +118,7 @@ pub fn password_totp_method() -> AuthMethod {
 pub fn generate_totp_code(secret: &str, now: std::time::SystemTime) -> String {
     use std::time::UNIX_EPOCH;
     let secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let step = secs / 30;
-    let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret).unwrap();
-    let totp = totp_rs::Builder::new()
-        .with_algorithm(totp_rs::Algorithm::SHA1)
-        .with_digits(6)
-        .with_skew(0)
-        .with_step_duration(30)
-        .with_secret(decoded)
-        .build()
-        .unwrap();
-    totp.generate(step * 30).to_string()
+    generate_hotp_code(secret, secs / 30)
 }
 
 /// Generate an HOTP code for the given base32 secret at the given counter

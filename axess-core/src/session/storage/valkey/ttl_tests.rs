@@ -1,8 +1,9 @@
 //! Pure decisions behind the Valkey TTL and registry-expiry handling.
 
 use super::internal::{
-    DEGRADED_POLL, DEGRADED_POLL_MAX, after_degraded_poll, degraded_poll_delay, ex_seconds,
-    registry_cutoff_ms, registry_key_ttl_secs, registry_member_live, registry_member_ttl_ms,
+    DEGRADED_POLL, DEGRADED_POLL_MAX, Watch, after_check, after_degraded_poll, degraded_poll_delay,
+    ex_seconds, registry_cutoff_ms, registry_key_ttl_secs, registry_member_live,
+    registry_member_ttl_ms,
 };
 use std::time::Duration;
 
@@ -80,11 +81,24 @@ fn degraded_poll_backs_off_per_failed_poll_to_a_cap_and_spreads_around_the_inter
 #[test]
 fn a_degraded_poll_ends_on_revocation_and_counts_unanswered_polls() {
     let answered = |valid: bool| Ok::<bool, ()>(valid);
-    assert_eq!(after_degraded_poll(answered(false), 3), None);
-    assert_eq!(after_degraded_poll(answered(true), 3), Some(0));
-    assert_eq!(after_degraded_poll(Err::<bool, ()>(()), 3), Some(4));
+    assert_eq!(after_degraded_poll(answered(false), 3), Watch::Ended);
+    assert_eq!(after_degraded_poll(answered(true), 3), Watch::Polling(0));
+    assert_eq!(
+        after_degraded_poll(Err::<bool, ()>(()), 3),
+        Watch::Polling(4)
+    );
     assert_eq!(
         after_degraded_poll(Err::<bool, ()>(()), u32::MAX),
-        Some(u32::MAX)
+        Watch::Polling(u32::MAX)
     );
+}
+
+/// A check the registry cannot answer must send the watcher into the polling
+/// state; waiting for the next event would leave a revoked socket open
+/// whenever the revocation message was the one that was lost.
+#[test]
+fn an_unanswered_check_moves_the_watcher_to_polling() {
+    assert_eq!(after_check(Ok::<bool, ()>(false)), Watch::Ended);
+    assert_eq!(after_check(Ok::<bool, ()>(true)), Watch::Waiting);
+    assert_eq!(after_check(Err::<bool, ()>(())), Watch::Polling(0));
 }

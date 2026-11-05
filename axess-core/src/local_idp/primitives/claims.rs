@@ -35,9 +35,10 @@ pub struct MintClaims {
     /// `JtiReplayStore` (replay protection).
     pub jwt_id: Option<String>,
     /// Extra claims merged into the JSON object alongside the
-    /// standard fields. Must be a JSON object; caller-supplied
-    /// keys overwrite the standard claims if they collide (`iss`
-    /// being the exception: the fixture wins).
+    /// standard fields. A key naming a registered claim (`iss`, `sub`,
+    /// `aud`, `exp`, `nbf`, `iat`, `jti`) is ignored: those are set from
+    /// the typed fields only, so a custom entry can never change the
+    /// subject, audience, lifetime or issuer under the signature.
     pub custom: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -90,8 +91,9 @@ impl MintClaims {
         self
     }
 
-    /// Add a single custom claim. Replaces any existing value for
-    /// the same key.
+    /// Add a single custom claim. Replaces any existing custom value for
+    /// the same key. A registered claim name is ignored when the token is
+    /// built (see [`custom`](Self::custom)).
     pub fn with_custom_claim(
         mut self,
         key: impl Into<String>,

@@ -19,7 +19,6 @@ use zeroize::Zeroizing;
 /// it with [`as_str`](Self::as_str) or extracting it (which clones it) counts.
 /// A request that arrived without a session cookie then stores a session and
 /// sets the cookies; one whose handlers never touch the token does not.
-#[derive(Debug)]
 pub struct CsrfToken {
     value: String,
     /// Set when the token is read; shared with the layer. `None` for a token
@@ -53,6 +52,14 @@ impl CsrfToken {
     pub fn as_str(&self) -> &str {
         self.note_read();
         &self.value
+    }
+}
+
+impl std::fmt::Debug for CsrfToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CsrfToken")
+            .field("value", &"***")
+            .finish_non_exhaustive()
     }
 }
 
@@ -157,5 +164,17 @@ impl CsrfIssuer {
                 token
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_does_not_carry_the_token() {
+        let token = CsrfToken::new("tok-1234567890");
+        assert!(!format!("{token:?}").contains("tok-1234567890"));
+        assert!(!format!("{token:#?}").contains("tok-1234567890"));
     }
 }

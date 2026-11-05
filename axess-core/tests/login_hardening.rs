@@ -672,3 +672,25 @@ async fn without_a_cooldown_repeated_requests_each_get_a_token() {
         );
     }
 }
+
+/// A refusal whose reason is one of the tags axess names is recorded as that
+/// tag, not as `Other` carrying the same text: a dashboard that groups by
+/// reason, and a row read back from the store, must agree on what it was.
+#[tokio::test]
+async fn a_signup_into_an_unknown_tenant_is_audited_as_the_named_reason() {
+    let (svc, identity) = signup_service(false);
+    let session = test_session();
+    svc.begin_signup(newcomer(), "no-such-tenant", &session)
+        .await
+        .unwrap();
+    let reasons: Vec<_> = identity
+        .events()
+        .iter()
+        .filter(|e| e.event_type == AuthEventType::SignupStarted)
+        .filter_map(|e| e.error.clone())
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![axess_core::authn::event::AuthFailureReason::UnknownTenant]
+    );
+}

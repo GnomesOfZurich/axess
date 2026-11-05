@@ -51,7 +51,7 @@ OAUTH_CLIENT_SECRET=your-secret \
 cargo run -p axess-example-oauth
 ```
 
-The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000). Set `OAUTH_PROVISIONING=linked-only` to turn first-login creation off.
+The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000). Set `OAUTH_PROVISIONING=linked-only` to turn first-login creation off (`just-in-time` is the default; any other value stops the server at start).
 
 ### Running with other providers
 
@@ -145,7 +145,7 @@ plain-OAuth-2.0 IdP:
 | GitHub | `https://github.com/login/oauth/authorize` | `https://github.com/login/oauth/access_token` | `https://api.github.com/user` | numeric `id`, `login`, `email`, `name` |
 | Discord | `https://discord.com/api/oauth2/authorize` | `https://discord.com/api/oauth2/token` | `https://discord.com/api/users/@me` | snowflake `id`, `username`, `email` |
 | Twitter/X | `https://twitter.com/i/oauth2/authorize` | `https://api.twitter.com/2/oauth2/token` | `https://api.twitter.com/2/users/me` | `data.id` (UUID), `data.username` |
-| Spotify | `https://accounts.spotify.com/authorize` | `https://accounts.spotify.com/api/token` | `https://api.spotify.com/v1/me` | `id`, `display_name`, `email` |
+| Spotify | `https://accounts.spotify.com/authorize` | `https://accounts.spotify.com/api/token` | `https://api.spotify.com/v1/me` | `id`, `display_name` (`email` is unverified, so not mapped) |
 | Reddit | `https://www.reddit.com/api/v1/authorize` | `https://www.reddit.com/api/v1/access_token` | `https://oauth.reddit.com/api/v1/me` | `id`, `name` (username) |
 
 Each provider has its own scope vocabulary and quirks (some require

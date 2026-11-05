@@ -95,6 +95,23 @@ pub const SESSION_REVOKED_CLOSE_CODE: u16 = 4001;
 /// Standard reason string accompanying a session-revocation close frame.
 pub const SESSION_REVOKED_CLOSE_REASON: &str = "session_revoked";
 
+/// WebSocket close code for a socket that reached its
+/// [`max_lifetime`](WatchOptions::max_lifetime) while its session stayed
+/// valid. The client may reconnect at once; the session is not revoked.
+pub const LIFETIME_REACHED_CLOSE_CODE: u16 = 4002;
+
+/// Reason string accompanying a [`LIFETIME_REACHED_CLOSE_CODE`] close frame.
+pub const LIFETIME_REACHED_CLOSE_REASON: &str = "lifetime_reached";
+
+/// WebSocket close code for a socket closed because the registry could not
+/// be asked whether the session is valid ([`fail_closed`](WatchOptions::fail_closed)).
+/// The session may still be valid; the client may reconnect and the upgrade
+/// is checked again.
+pub const SESSION_UNVERIFIED_CLOSE_CODE: u16 = 4003;
+
+/// Reason string accompanying a [`SESSION_UNVERIFIED_CLOSE_CODE`] close frame.
+pub const SESSION_UNVERIFIED_CLOSE_REASON: &str = "session_unverified";
+
 /// The lifetime a [`RevocationAwareSocket`] has by default: one day, after
 /// which the client reconnects and the upgrade runs through the session
 /// layer's checks again.
@@ -129,22 +146,51 @@ impl Default for WatchOptions {
     }
 }
 
-/// Resolve when the session must be closed: the push channel fired, the
-/// poll found it invalid (or, when failing closed, could not tell), or the
-/// lifetime ran out.
+/// Why a supervised socket is closed. Each has its own close frame, so a
+/// client tells a revoked session from one it may reconnect with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The push channel fired, or the poll found the session invalid.
+    Revoked,
+    /// The registry could not be asked and the options fail closed.
+    Unverified,
+    /// The maximum lifetime ran out.
+    LifetimeReached,
+}
+
+impl Ending {
+    fn close_frame(self) -> CloseFrame {
+        let (code, reason) = match self {
+            Self::Revoked => (SESSION_REVOKED_CLOSE_CODE, SESSION_REVOKED_CLOSE_REASON),
+            Self::Unverified => (
+                SESSION_UNVERIFIED_CLOSE_CODE,
+                SESSION_UNVERIFIED_CLOSE_REASON,
+            ),
+            Self::LifetimeReached => (LIFETIME_REACHED_CLOSE_CODE, LIFETIME_REACHED_CLOSE_REASON),
+        };
+        CloseFrame {
+            code,
+            reason: Utf8Bytes::from_static(reason),
+        }
+    }
+}
+
+/// Resolve when the session must be closed, with the reason: the push
+/// channel fired or the poll found it invalid, the poll could not tell and
+/// the options fail closed, or the lifetime ran out.
 async fn supervise<R: SessionRegistry>(
     registry: &R,
     user_id: &UserId,
     session_id: &SessionId,
     options: WatchOptions,
-) {
+) -> Ending {
     let poll = async {
         let every = options.poll_interval.max(Duration::from_secs(1));
         loop {
             tokio::time::sleep(every).await;
             match registry.is_valid(user_id, session_id).await {
                 Ok(true) => {}
-                Ok(false) => return,
+                Ok(false) => return Ending::Revoked,
                 Err(err) => {
                     tracing::warn!(
                         target: "axess::ws",
@@ -153,7 +199,7 @@ async fn supervise<R: SessionRegistry>(
                         "ws revocation poll: registry unavailable",
                     );
                     if options.fail_closed {
-                        return;
+                        return Ending::Unverified;
                     }
                 }
             }
@@ -166,9 +212,9 @@ async fn supervise<R: SessionRegistry>(
         }
     };
     tokio::select! {
-        () = registry.watch_revocation(user_id, session_id) => {}
-        () = poll => {}
-        () = lifetime => {}
+        () = registry.watch_revocation(user_id, session_id) => Ending::Revoked,
+        ending = poll => ending,
+        () = lifetime => Ending::LifetimeReached,
     }
 }
 
@@ -188,7 +234,7 @@ async fn supervise<R: SessionRegistry>(
 /// wrapper mid-connection would leak the spawned future.
 pub struct RevocationAwareSocket {
     socket: WebSocket,
-    revoke_rx: mpsc::Receiver<()>,
+    revoke_rx: mpsc::Receiver<Ending>,
     closed: bool,
     /// Held to keep the watch task alive for the wrapper's lifetime.
     /// Dropping this aborts the task (via `JoinHandle`'s Drop), preventing
@@ -198,13 +244,13 @@ pub struct RevocationAwareSocket {
     watch_task: AbortOnDrop,
 }
 
-/// The error `send` returns after the session was revoked.
+/// The error `send` returns after the supervisor closed the socket.
 #[derive(Debug)]
 struct RevokedError;
 
 impl std::fmt::Display for RevokedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("websocket closed: session revoked")
+        f.write_str("websocket closed by its session supervisor")
     }
 }
 
@@ -225,6 +271,17 @@ impl AbortOnDrop {
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// What the watcher has reported, or `Unverified` if it died. Only an empty
+/// channel means "still live"; a closed channel (the watcher panicked or was
+/// aborted) leaves the session unsupervised, so a dead watcher fails closed.
+fn watcher_signalled(rx: &mut mpsc::Receiver<Ending>) -> Option<Ending> {
+    match rx.try_recv() {
+        Ok(ending) => Some(ending),
+        Err(mpsc::error::TryRecvError::Empty) => None,
+        Err(mpsc::error::TryRecvError::Disconnected) => Some(Ending::Unverified),
     }
 }
 
@@ -270,8 +327,8 @@ impl RevocationAwareSocket {
     {
         let (tx, rx) = mpsc::channel(1);
         let watch_task = tokio::spawn(async move {
-            supervise(&registry, &user_id, &session_id, options).await;
-            if let Err(err) = tx.send(()).await {
+            let ending = supervise(&registry, &user_id, &session_id, options).await;
+            if let Err(err) = tx.send(ending).await {
                 tracing::trace!(
                     target: "axess::ws",
                     ?err,
@@ -289,21 +346,24 @@ impl RevocationAwareSocket {
 
     /// Receive the next message from the socket.
     ///
-    /// Races the underlying `socket.recv()` against the revocation channel.
-    /// On revocation, sends a `Close { code: 4001, reason: "session_revoked" }`
-    /// frame and returns `None` so callers using
+    /// Races the underlying `socket.recv()` against the supervisor. When it
+    /// ends the session, sends the close frame for the reason
+    /// (`4001 session_revoked`, `4002 lifetime_reached` or
+    /// `4003 session_unverified`) and returns `None` so callers using
     /// `while let Some(msg) = socket.recv().await` exit cleanly.
     ///
-    /// After a revocation-induced close, subsequent calls return `None`
-    /// immediately without doing further work.
+    /// After that close, subsequent calls return `None` immediately without
+    /// doing further work.
     pub async fn recv(&mut self) -> Option<Result<Message, axum::Error>> {
         if self.closed {
             return None;
         }
         tokio::select! {
             msg = self.socket.recv() => msg,
-            _ = self.revoke_rx.recv() => {
-                self.close_revoked().await;
+            ending = self.revoke_rx.recv() => {
+                // `None`: the watcher ended without a word, so the session
+                // is no longer supervised; fail closed.
+                self.close_supervised(ending.unwrap_or(Ending::Unverified)).await;
                 None
             }
         }
@@ -311,19 +371,21 @@ impl RevocationAwareSocket {
 
     /// Send a message on the socket.
     ///
-    /// If the session has been revoked since the last call, the close frame
-    /// (code 4001) is sent instead and an error is returned, so a handler
-    /// that only ever sends (a push stream) stops delivering to a revoked
-    /// session. After a revocation-induced close, every call returns an
-    /// error.
+    /// If the supervisor has ended the session since the last call, its
+    /// close frame is sent instead (as in [`recv`](Self::recv)) and an error
+    /// is returned, so a handler that only ever sends (a push stream) stops
+    /// delivering to a revoked session. After that close, every call returns
+    /// an error.
     ///
     /// # Errors
     ///
     /// Returns the underlying socket's error, or a closed-connection error
     /// when the session was revoked.
     pub async fn send(&mut self, msg: Message) -> Result<(), axum::Error> {
-        if !self.closed && self.revoke_rx.try_recv().is_ok() {
-            self.close_revoked().await;
+        if !self.closed
+            && let Some(ending) = watcher_signalled(&mut self.revoke_rx)
+        {
+            self.close_supervised(ending).await;
         }
         if self.closed {
             return Err(axum::Error::new(RevokedError));
@@ -331,23 +393,30 @@ impl RevocationAwareSocket {
         self.socket.send(msg).await
     }
 
-    /// Whether the session has been revoked and the socket closed.
-    pub fn is_revoked(&self) -> bool {
+    /// Whether the supervisor closed the socket: the session was revoked,
+    /// could not be verified while failing closed, or the socket reached its
+    /// maximum lifetime. The close frame sent to the client says which.
+    pub fn is_closed(&self) -> bool {
         self.closed
     }
 
-    /// Send the revocation close frame and mark the socket closed.
-    async fn close_revoked(&mut self) {
+    /// Whether the supervisor closed the socket, for any of the reasons
+    /// [`is_closed`](Self::is_closed) lists, not only a revocation.
+    #[deprecated(note = "use is_closed")]
+    pub fn is_revoked(&self) -> bool {
+        self.is_closed()
+    }
+
+    /// Send the close frame for `ending` and mark the socket closed.
+    async fn close_supervised(&mut self, ending: Ending) {
         self.closed = true;
-        let close = Message::Close(Some(CloseFrame {
-            code: SESSION_REVOKED_CLOSE_CODE,
-            reason: Utf8Bytes::from_static(SESSION_REVOKED_CLOSE_REASON),
-        }));
+        let close = Message::Close(Some(ending.close_frame()));
         if let Err(err) = self.socket.send(close).await {
             tracing::warn!(
                 target: "axess::ws",
                 %err,
-                "ws revocation: failed to send Close frame to client",
+                ?ending,
+                "ws supervisor: failed to send Close frame to client",
             );
         }
     }
@@ -371,7 +440,32 @@ impl RevocationAwareSocket {
 
 #[cfg(test)]
 mod abort_on_drop_tests {
-    use super::AbortOnDrop;
+    use super::{AbortOnDrop, Ending, watcher_signalled};
+    use tokio::sync::mpsc;
+
+    /// A watcher that died without reporting must close the socket.
+    #[tokio::test]
+    async fn a_dead_watcher_fails_closed() {
+        let (tx, mut rx) = mpsc::channel::<Ending>(1);
+        assert_eq!(
+            watcher_signalled(&mut rx),
+            None,
+            "a live watcher is not a signal"
+        );
+        drop(tx);
+        assert_eq!(
+            watcher_signalled(&mut rx),
+            Some(Ending::Unverified),
+            "a dead watcher must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reported_ending_is_passed_on() {
+        let (tx, mut rx) = mpsc::channel::<Ending>(1);
+        tx.send(Ending::Revoked).await.expect("send");
+        assert_eq!(watcher_signalled(&mut rx), Some(Ending::Revoked));
+    }
 
     /// Dropping the wrapper aborts the task; a bare `JoinHandle` only detaches
     /// it, which is how every closed socket left a watcher running.
@@ -421,6 +515,7 @@ mod supervise_tests {
         registry.invalidate_user(&user).await.expect("revoke");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(watcher.is_finished(), "the poll must notice the revocation");
+        assert_eq!(watcher.await.expect("watcher"), Ending::Revoked);
     }
 
     /// A registry that cannot be asked.
@@ -468,7 +563,7 @@ mod supervise_tests {
     async fn an_unreachable_registry_closes_the_socket_under_the_defaults() {
         let (user, session) = ids();
         let watcher = tokio::spawn(async move {
-            supervise(&Unreachable, &user, &session, WatchOptions::default()).await;
+            supervise(&Unreachable, &user, &session, WatchOptions::default()).await
         });
         tokio::time::sleep(Duration::from_secs(29)).await;
         assert!(
@@ -480,6 +575,7 @@ mod supervise_tests {
             watcher.is_finished(),
             "the first poll that cannot be answered closes the socket"
         );
+        assert_eq!(watcher.await.expect("watcher"), Ending::Unverified);
     }
 
     /// A connection with a maximum lifetime ends when it runs out.
@@ -492,12 +588,32 @@ mod supervise_tests {
             max_lifetime: Some(Duration::from_secs(60)),
             ..WatchOptions::default()
         };
-        let watcher = tokio::spawn(async move {
-            supervise(&registry, &user, &session, options).await;
-        });
+        let watcher =
+            tokio::spawn(async move { supervise(&registry, &user, &session, options).await });
         tokio::time::sleep(Duration::from_secs(59)).await;
         assert!(!watcher.is_finished());
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(watcher.is_finished());
+        assert_eq!(watcher.await.expect("watcher"), Ending::LifetimeReached);
+    }
+
+    /// Only a revoked session is closed as revoked. A socket that reached its
+    /// lifetime, or whose session could not be checked, closes with a code a
+    /// client reads as "reconnect", not "signed out".
+    #[test]
+    fn each_ending_has_its_own_close_frame() {
+        let frame = |ending: Ending| {
+            let frame = ending.close_frame();
+            (frame.code, frame.reason.as_str().to_owned())
+        };
+        assert_eq!(frame(Ending::Revoked), (4001, "session_revoked".to_owned()));
+        assert_eq!(
+            frame(Ending::LifetimeReached),
+            (4002, "lifetime_reached".to_owned())
+        );
+        assert_eq!(
+            frame(Ending::Unverified),
+            (4003, "session_unverified".to_owned())
+        );
     }
 }

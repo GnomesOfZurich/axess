@@ -225,12 +225,13 @@ impl std::fmt::Debug for BearerConfig {
 /// Extract and validate a bearer token against the configured issuers.
 ///
 /// Returns `Ok(Some(identity))` on success, `Ok(None)` when no bearer
-/// token is present, `Err` on validation failure.
+/// token is present, `Err` on validation failure, including a header that
+/// names the Bearer scheme and carries no token.
 pub fn validate_bearer_token(
     authorization_header: Option<&str>,
     config: &BearerConfig,
 ) -> Result<Option<WorkloadIdentity>, BearerError> {
-    let token = match extract_bearer_token(authorization_header) {
+    let token = match extract_bearer_token(authorization_header)? {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -244,29 +245,42 @@ pub fn validate_bearer_token(
         .and_then(|v| v.as_str())
         .ok_or(BearerError::MissingIssuer)?;
 
-    // Find a matching issuer config.
-    let issuer_cfg = config
-        .issuers
-        .iter()
-        .find(|c| c.issuer == iss)
-        .ok_or_else(|| BearerError::UntrustedIssuer(iss.to_string()))?;
-
-    // Verify signature against the issuer's JWKS.
-    let mut validation_config = ValidationConfig::new();
-    validation_config.audience = issuer_cfg.audience.exact().map(String::from);
-    // The issuer was chosen by the token's own `iss`, so pinning it adds
-    // nothing against a forged claim, but it makes `iss` a required claim
-    // checked by the same code path as every other verifier, rather than a
-    // string compared once above.
-    validation_config.issuer = Some(issuer_cfg.issuer.clone());
-    let claims = validation::verify_jwt(
-        token,
-        &issuer_cfg.jwks,
-        &validation_config,
-        ALLOWED_ALGORITHMS,
-        &*config.clock,
-    )
-    .map_err(|e| BearerError::Jwt(JwtVerificationError::from(e)))?;
+    // Several configs may name one issuer (an old and a new key set, one per
+    // audience): the token is accepted by the first that verifies it, and
+    // refused with the first one's reason when none does.
+    let mut first_error = None;
+    let mut verified = None;
+    for issuer_cfg in config.issuers.iter().filter(|c| c.issuer == iss) {
+        // Verify signature against the issuer's JWKS.
+        let mut validation_config = ValidationConfig::new();
+        validation_config.audience = issuer_cfg.audience.exact().map(String::from);
+        // The issuer was chosen by the token's own `iss`, so pinning it adds
+        // nothing against a forged claim, but it makes `iss` a required claim
+        // checked by the same code path as every other verifier, rather than a
+        // string compared once above.
+        validation_config.issuer = Some(issuer_cfg.issuer.clone());
+        match validation::verify_jwt(
+            token,
+            &issuer_cfg.jwks,
+            &validation_config,
+            ALLOWED_ALGORITHMS,
+            &*config.clock,
+        ) {
+            Ok(claims) => {
+                verified = Some((issuer_cfg, claims));
+                break;
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    let Some((issuer_cfg, claims)) = verified else {
+        return Err(match first_error {
+            Some(e) => BearerError::Jwt(JwtVerificationError::from(e)),
+            None => BearerError::UntrustedIssuer(iss.to_string()),
+        });
+    };
 
     // Extract identity fields.
     let subject = claims
@@ -300,14 +314,30 @@ pub fn validate_bearer_token(
     }))
 }
 
-/// Extract the token from `Authorization: Bearer <token>`.
-fn extract_bearer_token(header: Option<&str>) -> Option<&str> {
-    let value = header?;
-    let stripped = value.strip_prefix("Bearer ")?;
-    if stripped.is_empty() {
-        return None;
+/// Extract the token from `Authorization: Bearer <token>`. The scheme is
+/// case-insensitive (RFC 7235 section 2.1), any whitespace may separate it
+/// from the token, and whitespace around the token is not part of it.
+///
+/// `Ok(None)` is a header that names another scheme, or none. A header that
+/// names the Bearer scheme and carries no token is malformed, not absent, and
+/// is refused.
+fn extract_bearer_token(header: Option<&str>) -> Result<Option<&str>, BearerError> {
+    let Some(value) = header else {
+        return Ok(None);
+    };
+    let (scheme, rest) = match value.split_once(|c: char| c.is_ascii_whitespace()) {
+        Some(parts) => parts,
+        None => (value, ""),
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Ok(None);
     }
-    Some(stripped)
+    match rest.trim() {
+        "" => Err(BearerError::InvalidToken(
+            "the Bearer scheme carries no token".to_string(),
+        )),
+        token => Ok(Some(token)),
+    }
 }
 
 // ── BearerError ──────────────────────────────────────────────────────────────
@@ -445,11 +475,18 @@ where
         std::mem::swap(&mut self.inner, &mut inner);
 
         Box::pin(async move {
-            let auth_header = req
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+            // A header that is not text carries a credential nobody can
+            // read: refused, not passed on as if there were none.
+            let auth_header = match req.headers().get(axum::http::header::AUTHORIZATION) {
+                None => None,
+                Some(value) => match value.to_str() {
+                    Ok(text) => Some(text.to_string()),
+                    Err(_) => {
+                        tracing::debug!("Bearer token rejected: Authorization is not text");
+                        return Ok(invalid_token_response());
+                    }
+                },
+            };
 
             match validate_bearer_token(auth_header.as_deref(), &config) {
                 Ok(Some(identity)) => {

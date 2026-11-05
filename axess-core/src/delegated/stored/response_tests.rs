@@ -374,3 +374,34 @@ async fn invalid_grant_in_a_description_is_not_a_rejected_refresh() {
         "got {err:?}"
     );
 }
+
+/// A refresh whose answer is not a bearer token is refused to the caller,
+/// but the IdP has already rotated the refresh token and spent the old one:
+/// the new one is saved, or the connection is lost for good.
+#[tokio::test]
+async fn a_refused_non_bearer_refresh_still_saves_the_rotated_refresh_token() {
+    let server = MockServer::start().await;
+    respond(
+        &server,
+        200,
+        br#"{"access_token":"bound","refresh_token":"rotated-rt","expires_in":3600,"token_type":"DPoP"}"#
+            .to_vec(),
+    )
+    .await;
+    let provider = provider(&server);
+    let (session, store, tenant, user) =
+        session_over(provider.clone(), stored(&provider, &[], "Bearer")).await;
+
+    let err = session.get_access_token().await.expect_err("DPoP refresh");
+    assert!(
+        matches!(err, DelegatedError::UnsupportedTokenType(_)),
+        "got {err:?}"
+    );
+
+    let after = store
+        .load(&tenant, &user, &provider.name)
+        .await
+        .expect("load")
+        .expect("present");
+    assert_eq!(after.refresh_token.as_deref(), Some("rotated-rt"));
+}

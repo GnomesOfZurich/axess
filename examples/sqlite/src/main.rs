@@ -86,7 +86,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Migrations applied");
 
     // Seed test data (idempotent).
-    let totp_secret = models::backend::seed(&SystemClock, &pool).await?;
+    let totp_secret =
+        models::backend::seed(&SystemClock, &pool, &web::app::factor_secret_cipher()).await?;
     info!(
         totp_secret = %totp_secret,
         "Test data seeded. Bob's TOTP secret is shown above; scan it with your TOTP app."

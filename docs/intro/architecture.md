@@ -269,14 +269,7 @@ exercised in a `#[tokio::test]` with no database, no Valkey, no
 network. The same test that detects a regression on a development
 laptop detects it in CI without further configuration.
 
-One carve-out is worth naming. The `axess-cache` crate has an opt-in
-`moka-cache` feature that runs Moka's wall-clock-driven background
-eviction. That feature breaks DST and is documented as breaking it.
-The default `ClockTtlCache` takes a `Clock` trait and is DST-clean. If
-your test suite runs against the default configuration, you are inside
-the determinism envelope.
-
-A second carve-out is axum's `IntoResponse` for `AuthnError`, behind the
+One carve-out is worth naming: axum's `IntoResponse` for `AuthnError`, behind the
 `default-error-response` feature. The trait method takes no arguments, so
 it reads the wall clock to compute `Retry-After`. Anything that holds a
 clock calls `AuthnError::into_response_at(clock.now())`, which is

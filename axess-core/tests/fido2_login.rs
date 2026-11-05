@@ -8,7 +8,8 @@ use axess_core::Clock;
 use axess_core::authn::AuditContext;
 use axess_core::authn::error::AuthnError;
 use axess_core::authn::factor::{
-    FactorConfig, FactorCredential, FactorKind, Fido2Config, Fido2Credential, Fido2Options,
+    FactorConfig, FactorCredential, FactorKind, FactorStep, Fido2Config, Fido2Credential,
+    Fido2Options,
 };
 use axess_core::authn::service::FactorOutcome;
 use axess_core::authn::service::{AuthnService, RequestAuthnService};
@@ -29,7 +30,13 @@ const AAAA: &str = "YWFhYQ";
 const BBBB: &str = "YmJiYg";
 
 fn passkey(id: &str) -> Passkey {
-    let coord = "A".repeat(43);
+    passkey_with_key(id, 'A')
+}
+
+/// A passkey with credential id `id` whose public key is built from `fill`.
+fn passkey_with_key(id: &str, fill: char) -> Passkey {
+    // 43 base64url characters; the last one carries only four bits.
+    let coord = format!("{}A", fill.to_string().repeat(42));
     serde_json::from_value(serde_json::json!({
         "cred": {
             "cred_id": id,
@@ -118,8 +125,12 @@ impl Fido2Provider for AcceptingProvider {
         &self,
         _: &PublicKeyCredential,
         _: DiscoverableAuthentication,
-        _: &[DiscoverableKey],
+        keys: &[DiscoverableKey],
     ) -> WebauthnResult<AuthenticationResult> {
+        // Like the real verifier: with no key to verify against, nothing verifies.
+        if keys.is_empty() {
+            return Err(WebauthnError::CredentialNotFound);
+        }
         Ok(result_for(AAAA))
     }
 }
@@ -150,6 +161,19 @@ fn fixture_with(
     methods: Vec<Vec<FactorKind>>,
     tenant_status: axess_core::authn::types::EntityState,
 ) -> Fixture {
+    let steps = methods
+        .into_iter()
+        .map(|kinds| kinds.into_iter().map(FactorStep::Required).collect())
+        .collect();
+    fixture_with_steps(with_passkey, steps, tenant_status)
+}
+
+/// As [`fixture_with`], with each method given as its steps.
+fn fixture_with_steps(
+    with_passkey: bool,
+    methods: Vec<Vec<FactorStep>>,
+    tenant_status: axess_core::authn::types::EntityState,
+) -> Fixture {
     let user = test_user("u1", "alice");
     let scope = AuthnScope::User {
         tenant_id: user.tenant_id,
@@ -158,10 +182,14 @@ fn fixture_with(
     let clock = MockClock::now();
     let stored_at = chrono::Utc::now();
     let mut factors = MockFactorStore::new();
-    for (n, kinds) in methods.into_iter().enumerate() {
+    for (n, steps) in methods.into_iter().enumerate() {
         factors = factors.with_method(
             &uid("u1"),
-            AuthMethod::sequential(format!("method-{n}"), kinds, scope.clone()),
+            AuthMethod {
+                name: format!("method-{n}").into(),
+                steps,
+                scope: scope.clone(),
+            },
         );
     }
     if with_passkey {
@@ -256,6 +284,32 @@ async fn a_passkey_deleted_mid_login_cannot_finish_a_discoverable_login() {
     );
 }
 
+/// The assertion is verified against the caller's list, so a credential
+/// that carries the stored credential's id but another key (one a second
+/// account registered under a copied id) must not stand in for it: the
+/// stored key is the one that identifies the user.
+#[tokio::test]
+async fn a_caller_credential_with_the_stored_id_but_another_key_does_not_log_in() {
+    let f = fixture(true);
+    let session = test_session();
+    f.service.begin_discoverable_login(&session).await.unwrap();
+    let forged = vec![Fido2Credential::new(
+        passkey_with_key(AAAA, 'B'),
+        "attacker",
+        f.stored_at,
+    )];
+
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &forged, &session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::InvalidAssertion), "got {err:?}");
+    assert!(!session.is_authenticated().await);
+    assert_eq!(f.identity.failed_attempts_for("u1"), 1);
+}
+
 #[tokio::test]
 async fn a_stored_passkey_still_finishes_a_discoverable_login_and_records_use() {
     let f = fixture(true);
@@ -343,6 +397,89 @@ async fn a_stored_passkey_still_satisfies_the_fido2_factor() {
         "got {outcome:?}"
     );
     assert!(session.is_authenticated().await);
+}
+
+/// Fill the session's custom data to within a few bytes of its limit, so
+/// that no ceremony state fits.
+async fn fill_custom_data(session: &axess_core::session::extractor::AuthSession) {
+    for (n, size) in [60_000, 4_000, 1_000, 200, 50, 10].into_iter().enumerate() {
+        let mut k = 0;
+        while session
+            .set_custom(format!("pad{n}_{k}"), serde_json::json!("x".repeat(size)))
+            .await
+        {
+            k += 1;
+        }
+    }
+}
+
+/// A challenge handed out without the state that finishes it could never be
+/// finished: when the state does not fit the session, neither flow issues one.
+#[tokio::test]
+async fn a_password_flow_challenge_is_refused_when_its_state_does_not_fit() {
+    let f = fixture(true);
+    let session = test_session();
+    f.service
+        .begin_login("alice", "default", &session)
+        .await
+        .unwrap();
+    fill_custom_data(&session).await;
+
+    let err = f.service.prepare_factor(&session).await.unwrap_err();
+
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_discoverable_challenge_is_refused_when_its_state_does_not_fit() {
+    let f = fixture(true);
+    let session = test_session();
+    fill_custom_data(&session).await;
+
+    let err = f
+        .service
+        .begin_discoverable_login(&session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+}
+
+/// A ceremony bound to a tenant that cannot store the binding must not run
+/// unbound.
+#[tokio::test]
+async fn a_tenant_bound_challenge_is_refused_when_the_tenant_does_not_fit() {
+    let f = fixture(true);
+    let session = test_session();
+    // The state and its stamp are stored; only the tenant is new.
+    f.service.begin_discoverable_login(&session).await.unwrap();
+    fill_custom_data(&session).await;
+
+    let err = f
+        .service
+        .begin_discoverable_login_in_tenant(&test_user("u1", "alice").tenant_id, &session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
+}
+
+/// A ceremony that cannot be timed must not start.
+#[tokio::test]
+async fn a_challenge_is_refused_when_its_start_time_does_not_fit() {
+    let f = fixture(true);
+    let session = test_session();
+    f.service.begin_discoverable_login(&session).await.unwrap();
+    session.remove_custom("axess.fido2.disc_started").await;
+    fill_custom_data(&session).await;
+
+    let err = f
+        .service
+        .begin_discoverable_login(&session)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, AuthnError::NoFlow), "got {err:?}");
 }
 
 #[tokio::test]
@@ -566,6 +703,29 @@ async fn a_password_then_passkey_method_is_not_satisfied_by_the_passkey_alone() 
     let f = fixture_with(
         true,
         vec![vec![FactorKind::Password, FactorKind::Fido2]],
+        axess_core::authn::types::EntityState::Active,
+    );
+    let session = test_session();
+    let list = begin_discoverable(&f, &session).await;
+    let err = f
+        .service
+        .finish_discoverable_login(&assertion(), &test_user("u1", "alice"), &list, &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::NoFlow), "{err:?}");
+    assert!(!session.is_authenticated().await);
+}
+
+/// A passkey-first method whose second step offers no factor is skipped
+/// whole: the passkey must not end a login that needs one more step.
+#[tokio::test]
+async fn a_passkey_first_method_with_an_empty_choice_is_never_shortened() {
+    let f = fixture_with_steps(
+        true,
+        vec![vec![
+            FactorStep::Required(FactorKind::Fido2),
+            FactorStep::AnyOf(vec![]),
+        ]],
         axess_core::authn::types::EntityState::Active,
     );
     let session = test_session();

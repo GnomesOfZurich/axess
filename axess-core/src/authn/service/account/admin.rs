@@ -312,8 +312,8 @@ where
                         };
                         let mut builder = AuthEventBuilder::failure(event_type)
                             .maybe_attributed_to(None, Some(expected))
-                            .with_error(crate::authn::event::AuthFailureReason::Other(
-                                "cross_tenant_admin_action".into(),
+                            .with_error(crate::authn::event::AuthFailureReason::from(
+                                "cross_tenant_admin_action",
                             ));
                         if let Some(actor_id) = actor {
                             builder = builder.with_actor(*actor_id);

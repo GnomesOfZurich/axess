@@ -34,11 +34,10 @@ async fn stash_claim_lock(
     use sha2::{Digest, Sha256};
     let sid = session.session_id().await;
     let mut hasher = Sha256::new();
-    hasher.update(provider.as_bytes());
-    hasher.update(b":");
-    hasher.update(subject.as_bytes());
-    hasher.update(b":");
-    hasher.update(sid.as_bytes());
+    for field in [provider.as_bytes(), subject.as_bytes(), sid.as_bytes()] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
     let lock = URL_SAFE_NO_PAD.encode(hasher.finalize());
     session
         .set_custom(CLAIM_LOCK_KEY, serde_json::Value::String(lock))
@@ -149,6 +148,100 @@ async fn complete_oauth_login_refuses_a_suspended_tenant() {
         !session.is_authenticated().await,
         "a suspended tenant's user must not be authenticated by an IdP"
     );
+}
+
+/// With no session registry configured, a suspended user is still refused:
+/// the account-status gate does not depend on the registry being present.
+#[tokio::test]
+async fn complete_oauth_login_refuses_a_suspended_user_without_a_registry() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let mut user = test_user_in_tenant("u1", "alice", "t1");
+    user.status = EntityState::Suspended(StatusDetail {
+        reason: "hold".into(),
+        since: Utc::now(),
+        until: None,
+    });
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(user.clone());
+    let svc = AuthnService::new(identity, MockFactorStore::new())
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    session
+        .set_custom(
+            EXPECTED_TENANT_KEY,
+            serde_json::Value::String(axess_core::authn::ids::testing::tenant("t1").to_string()),
+        )
+        .await;
+    stash_claim_lock(&session, "test", "external-sub-123").await;
+
+    let err = svc
+        .complete_oauth_login(&user, &fake_claims(), &session)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AuthnError::Locked { until: None }), "{err:?}");
+    assert!(
+        !session.is_authenticated().await,
+        "a suspended user must not be authenticated by an IdP when no registry is configured"
+    );
+}
+
+/// Every status that does not allow login is refused with its own answer: a
+/// suspension as `Locked` carrying its end, any other state as `NotActive`
+/// carrying the state.
+#[tokio::test]
+async fn complete_oauth_login_answers_each_non_active_status_with_its_own_variant() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let detail = |until| StatusDetail {
+        reason: "hold".into(),
+        since: Utc::now(),
+        until,
+    };
+    let ends = Utc::now() + chrono::Duration::hours(1);
+    let cases = [
+        (EntityState::Suspended(detail(None)), None),
+        (EntityState::Suspended(detail(Some(ends))), Some(Some(ends))),
+        (EntityState::Guest, None),
+        (EntityState::Candidate, None),
+        (EntityState::Pending(detail(None)), None),
+        (EntityState::Terminated(detail(None)), None),
+        (EntityState::Archived(detail(None)), None),
+    ];
+    for (status, locked_until) in cases {
+        let mut user = test_user_in_tenant("u1", "alice", "t1");
+        user.status = status.clone();
+        let identity = MockIdentityStore::new()
+            .with_tenant(test_tenant())
+            .with_user(user.clone());
+        let svc = AuthnService::new(identity, MockFactorStore::new())
+            .with_audit_context(AuditContext::default());
+        let session = test_session();
+        session
+            .set_custom(
+                EXPECTED_TENANT_KEY,
+                serde_json::Value::String(
+                    axess_core::authn::ids::testing::tenant("t1").to_string(),
+                ),
+            )
+            .await;
+        stash_claim_lock(&session, "test", "external-sub-123").await;
+
+        let err = svc
+            .complete_oauth_login(&user, &fake_claims(), &session)
+            .await
+            .unwrap_err();
+
+        match (locked_until, &err) {
+            (Some(until), AuthnError::Locked { until: got }) => assert_eq!(*got, until),
+            (None, AuthnError::Locked { until: None })
+                if matches!(status, EntityState::Suspended(_)) => {}
+            (None, AuthnError::NotActive(got)) if !matches!(status, EntityState::Suspended(_)) => {
+                assert_eq!(*got, status)
+            }
+            _ => panic!("{status:?} answered {err:?}"),
+        }
+        assert!(!session.is_authenticated().await, "{status:?}");
+    }
 }
 
 #[tokio::test]

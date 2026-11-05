@@ -68,10 +68,9 @@ impl CliResolver {
         &self.workload
     }
 
-    /// Build a [`Principal::Human`] from the same principal data
-    /// (CLI-supplied tenant) instead of [`Principal::Workload`].
-    /// Useful only in narrow adapter contexts; most adopters want
-    /// the default `Workload` shape from [`resolve`](Self::resolve).
+    /// Borrow the resolved workload principal; the same value as
+    /// [`workload`](Self::workload), which [`resolve`](Self::resolve)
+    /// wraps in [`Principal::Workload`].
     pub fn as_workload_principal(&self) -> &WorkloadPrincipal {
         &self.workload
     }

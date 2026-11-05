@@ -126,9 +126,19 @@ fn a_bucket_is_evicted_only_after_two_windows() {
     store.try_acquire_at("k", t0);
     store.evict_expired_at(secs(t0, 15));
     assert!(
-        store.buckets.contains_key("k"),
+        crate::locked::lock(&store.buckets).contains_key("k"),
         "still weighs on the next window"
     );
     store.evict_expired_at(secs(t0, 20));
-    assert!(!store.buckets.contains_key("k"));
+    assert!(!crate::locked::lock(&store.buckets).contains_key("k"));
+}
+
+/// A window shorter than a millisecond is a one millisecond window, not a
+/// division by zero.
+#[test]
+fn a_window_under_a_millisecond_does_not_divide_by_zero() {
+    let store = test_store(3, Duration::from_micros(500));
+    let t0 = t_zero();
+    assert!(allowed(store.try_acquire_at("k", t0)));
+    assert!(allowed(store.try_acquire_at("k", millis(t0, 5))));
 }

@@ -18,12 +18,6 @@ use openidconnect::reqwest;
 use std::future::Future;
 use std::sync::Arc;
 
-/// The `htu` of a proof: the request URL without its query and fragment
-/// (RFC 9449 §4.2).
-fn htu(url: &str) -> &str {
-    url.split(['?', '#']).next().unwrap_or(url)
-}
-
 /// Send a request, and send it once more with the server's nonce when the
 /// answer asks for one (RFC 9449 sections 8 and 9). `send` makes and sends
 /// the request with the nonce it is given; `nonce_asked` reads the nonce out
@@ -75,6 +69,54 @@ impl FormAnswer {
     }
 }
 
+/// Whether one `WWW-Authenticate` value holds a `DPoP` challenge with
+/// `error="use_dpop_nonce"`. The value may carry several challenges
+/// (RFC 9110 section 11.6.1), each a scheme followed by comma-separated
+/// parameters, so it is read element by element, with quoted strings kept
+/// whole: a comma inside one does not end an element.
+fn challenges_ask_for_a_nonce(value: &str) -> bool {
+    let mut elements = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in value.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                elements.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    elements.push(&value[start..]);
+
+    let mut in_dpop = false;
+    for element in elements {
+        let element = element.trim();
+        let (head, rest) = match element.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, r.trim()),
+            None => (element, ""),
+        };
+        // `name=value` is a parameter of the current challenge; anything
+        // else starts a new one, whose first parameter may follow its name.
+        let param = if head.contains('=') {
+            element
+        } else {
+            in_dpop = head.eq_ignore_ascii_case("dpop");
+            rest
+        };
+        if in_dpop
+            && let Some((k, v)) = param.split_once('=')
+            && k.trim().eq_ignore_ascii_case("error")
+            && v.trim().trim_matches('"') == "use_dpop_nonce"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 impl OAuthProviderConfig {
     /// One DPoP proof for a request to `url`, with a `jti` from the signer's
     /// rng and `iat` from the provider's clock.
@@ -91,7 +133,7 @@ impl OAuthProviderConfig {
         let proof = dpop::generate_dpop_proof_with_nonce(
             signer.key,
             method,
-            htu(url),
+            url,
             access_token,
             server_nonce,
             self.clock.now().timestamp(),
@@ -125,22 +167,7 @@ impl OAuthProviderConfig {
             .get_all("www-authenticate")
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .any(|challenge| {
-                let mut parts = challenge.trim_start().splitn(2, char::is_whitespace);
-                parts
-                    .next()
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("dpop"))
-                    && parts.next().is_some_and(|params| {
-                        params.split(',').any(|param| {
-                            let mut kv = param.trim().splitn(2, '=');
-                            kv.next()
-                                .is_some_and(|k| k.trim().eq_ignore_ascii_case("error"))
-                                && kv
-                                    .next()
-                                    .is_some_and(|v| v.trim().trim_matches('"') == "use_dpop_nonce")
-                        })
-                    })
-            })
+            .any(challenges_ask_for_a_nonce)
     }
 
     /// POST `form` to `url` and read the answer: the body in full on
@@ -160,13 +187,19 @@ impl OAuthProviderConfig {
         what: &str,
     ) -> Result<(reqwest::StatusCode, Vec<u8>), OAuthError> {
         let send = |nonce: Option<String>| async move {
-            let mut request = self.http_client.post(url).form(form);
+            // A client assertion is single-use (FAPI 2.0 has the server
+            // refuse a repeated `jti`), so a retry signs its own.
+            let mut attempt = form.to_vec();
+            if nonce.is_some()
+                && let Some(slot) = attempt.iter_mut().find(|(k, _)| k == "client_assertion")
+                && let Some(fresh) = self.client_assertion_for(url)?
+            {
+                slot.1 = fresh;
+            }
+            let mut request = self.http_client.post(url).form(&attempt);
             if let Some((id, secret)) = basic {
-                // RFC 6749 section 2.3.1: each part form-urlencoded first.
-                let enc = |s: &str| {
-                    url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>()
-                };
-                request = request.basic_auth(enc(id), Some(enc(secret)));
+                let (id, secret) = super::client_auth::basic_credentials(id, secret);
+                request = request.basic_auth(id, Some(secret));
             }
             if let Some(signer) = dpop {
                 request = request.header(
@@ -174,10 +207,10 @@ impl OAuthProviderConfig {
                     self.dpop_proof(signer, "POST", url, None, nonce.as_deref())?,
                 );
             }
-            let mut response = request
-                .send()
-                .await
-                .map_err(|e| OAuthError::TokenExchange(format!("{what} failed: {e}")))?;
+            let mut response = request.send().await.map_err(|e| {
+                tracing::warn!(error = %e, "{what} got no answer");
+                OAuthError::transient(None)
+            })?;
             let status = response.status();
             let nonce = dpop_nonce_header(response.headers());
             let body = crate::http_body::read_for_status(
@@ -206,6 +239,9 @@ impl OAuthProviderConfig {
         status: reqwest::StatusCode,
         body: &[u8],
     ) -> Result<openidconnect::core::CoreTokenResponse, OAuthError> {
+        if status.is_server_error() {
+            return Err(OAuthError::transient(Some(status.as_u16())));
+        }
         if !status.is_success() {
             let refusal = serde_json::from_slice::<
                 openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
@@ -230,16 +266,19 @@ impl OAuthProviderConfig {
 
         let mut form: Vec<(String, String)> =
             vec![("grant_type".to_string(), "client_credentials".to_string())];
-        self.add_client_auth(&mut form, &token_url)?;
+        let basic = self.token_grant_auth(&mut form, &token_url)?;
         let scope_str = scopes.join(" ");
         if !scope_str.is_empty() {
             form.push(("scope".to_string(), scope_str));
         }
 
         let (status, body) = self
-            .post_form_constrained(&token_url, &form, None, dpop, "client_credentials request")
+            .post_form_constrained(&token_url, &form, basic, dpop, "client_credentials request")
             .await?;
 
+        if status.is_server_error() {
+            return Err(OAuthError::transient(Some(status.as_u16())));
+        }
         if !status.is_success() {
             let error_code = serde_json::from_slice::<serde_json::Value>(&body)
                 .ok()
@@ -280,13 +319,13 @@ impl OAuthProviderConfig {
         })?;
 
         let mut form: Vec<(String, String)> = vec![("token".to_string(), token.to_string())];
-        self.add_client_auth(&mut form, revocation_url)?;
+        let basic = self.token_grant_auth(&mut form, revocation_url)?;
         if let Some(hint) = token_type_hint {
             form.push(("token_type_hint".to_string(), hint.to_string()));
         }
 
         let (status, body) = self
-            .post_form_constrained(revocation_url, &form, None, dpop, "revocation request")
+            .post_form_constrained(revocation_url, &form, basic, dpop, "revocation request")
             .await?;
 
         if status.is_success() {
@@ -294,9 +333,8 @@ impl OAuthProviderConfig {
             return Ok(());
         }
 
-        // The body is returned to the caller in the transient error but not
-        // logged: an error page can carry the token or an echo of the
-        // request. RFC 7009 / 6749 error semantics are kept apart: a 4xx with
+        // The body is neither logged nor kept in the transient error: an
+        // error page can carry the token or an echo of the request. RFC 7009 / 6749 error semantics are kept apart: a 4xx with
         // `error: "unsupported_token_type"` means the AS cannot revoke this
         // token kind (callers treat it as a no-op); a 5xx is transient and
         // may be retried; any other 4xx is a TokenExchange error.
@@ -313,10 +351,7 @@ impl OAuthProviderConfig {
         );
 
         if status.is_server_error() {
-            Err(OAuthError::TokenEndpointTransient {
-                status: status.as_u16(),
-                body,
-            })
+            Err(OAuthError::transient(Some(status.as_u16())))
         } else if parsed_error.as_deref() == Some("unsupported_token_type") {
             Err(OAuthError::UnsupportedTokenType)
         } else {

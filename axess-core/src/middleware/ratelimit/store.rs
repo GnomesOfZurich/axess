@@ -2,12 +2,13 @@
 //! per-address-group budget and expiry sweeps.
 
 use super::keys::{GROUP_BUCKET_CAP, Target};
+use crate::locked::lock;
 use axess_clock::Clock;
 use chrono::{DateTime, Utc};
-use dashmap::{DashMap, mapref::entry::Entry};
 use std::{
+    collections::{HashMap, hash_map::Entry},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
@@ -59,21 +60,21 @@ impl TokenBucket {
     }
 }
 
-/// Shared bucket store.  [`DashMap`] gives lock-free concurrent reads/writes.
+/// Shared bucket store: one `Mutex` over the bucket table.
 #[derive(Clone)]
 pub(super) struct BucketStore {
-    pub(super) buckets: Arc<DashMap<String, TokenBucket>>,
+    pub(super) buckets: Arc<Mutex<HashMap<String, TokenBucket>>>,
     max_requests: u32,
     window_ms: u64,
     clock: Arc<dyn Clock>,
     /// Live buckets per address group (see [`GROUP_BUCKET_CAP`]).
-    group_counts: Arc<DashMap<String, usize>>,
+    group_counts: Arc<Mutex<HashMap<String, usize>>>,
     /// Table size at which a request for a key with no bucket is refused.
     hard_cap: usize,
     /// Per-group bucket budget.
     group_cap: usize,
     /// Number of entries in `buckets`, kept beside the map so the per-request
-    /// cap check does not read-lock every shard the way `DashMap::len` does.
+    /// cap check does not take the table lock.
     pub(super) bucket_count: Arc<AtomicUsize>,
     /// Clock time (epoch milliseconds) of the last expiry sweep. The caller
     /// that wins the compare-exchange on it runs the sweep; the rest carry on.
@@ -107,11 +108,13 @@ impl BucketStore {
     pub(super) fn new(max_requests: u32, window: Duration, clock: Arc<dyn Clock>) -> Self {
         let now_ms = epoch_millis(clock.now());
         Self {
-            buckets: Arc::new(DashMap::new()),
+            buckets: Arc::default(),
             max_requests,
-            window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            // A window under a millisecond is a millisecond: the counter works in
+            // whole milliseconds and divides by the window.
+            window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1),
             clock,
-            group_counts: Arc::new(DashMap::new()),
+            group_counts: Arc::default(),
             hard_cap: HARD_BUCKET_CAP,
             group_cap: GROUP_BUCKET_CAP,
             bucket_count: Arc::new(AtomicUsize::new(0)),
@@ -167,8 +170,8 @@ impl BucketStore {
         self.sweep_if_due(now_ms);
 
         // A key that already has a bucket is never refused for capacity.
-        if let Some(mut bucket) = self.buckets.get_mut(target.key.as_str()) {
-            return self.take(&mut bucket, now_ms);
+        if let Some(bucket) = lock(&self.buckets).get_mut(target.key.as_str()) {
+            return self.take(bucket, now_ms);
         }
 
         let near_cap = target.fold_near_cap
@@ -204,8 +207,9 @@ impl BucketStore {
         group: Option<&str>,
         now_ms: u64,
     ) -> (Acquire, Created) {
-        if let Some(mut bucket) = self.buckets.get_mut(key) {
-            return (self.take(&mut bucket, now_ms), Created::No);
+        let mut buckets = lock(&self.buckets);
+        if let Some(bucket) = buckets.get_mut(key) {
+            return (self.take(bucket, now_ms), Created::No);
         }
         // Reserve a slot before inserting so concurrent first requests for
         // distinct keys cannot overshoot the cap.
@@ -218,21 +222,22 @@ impl BucketStore {
                 Created::No,
             );
         }
-        match self.buckets.entry(key.to_owned()) {
+        match buckets.entry(key.to_owned()) {
             Entry::Occupied(mut occupied) => {
                 self.bucket_count.fetch_sub(1, Ordering::AcqRel);
                 (self.take(occupied.get_mut(), now_ms), Created::No)
             }
             Entry::Vacant(vacant) => {
-                let mut bucket = vacant.insert(TokenBucket::new(now_ms, group.map(str::to_owned)));
-                (self.take(&mut bucket, now_ms), Created::Yes)
+                let bucket = vacant.insert(TokenBucket::new(now_ms, group.map(str::to_owned)));
+                (self.take(bucket, now_ms), Created::Yes)
             }
         }
     }
 
     /// Count one more bucket against `group`; false when it is at its budget.
     pub(super) fn reserve_group(&self, group: &str) -> bool {
-        let mut count = self.group_counts.entry(group.to_owned()).or_insert(0);
+        let mut counts = lock(&self.group_counts);
+        let count = counts.entry(group.to_owned()).or_insert(0);
         if *count >= self.group_cap {
             return false;
         }
@@ -241,7 +246,7 @@ impl BucketStore {
     }
 
     pub(super) fn release_group(&self, group: &str) {
-        if let Some(mut count) = self.group_counts.get_mut(group) {
+        if let Some(count) = lock(&self.group_counts).get_mut(group) {
             *count = count.saturating_sub(1);
         }
     }
@@ -369,7 +374,7 @@ impl BucketStore {
     pub(super) fn evict_expired_ms(&self, now_ms: u64) {
         let mut removed = 0usize;
         let mut freed_groups: Vec<String> = Vec::new();
-        self.buckets.retain(|_, bucket| {
+        lock(&self.buckets).retain(|_, bucket| {
             // A bucket dated in the future (the clock stepped back after it
             // was written) would otherwise outlive every sweep until the
             // clock caught up, holding table slots. Re-anchor it at `now`:
@@ -393,7 +398,7 @@ impl BucketStore {
             self.release_group(group);
         }
         if !freed_groups.is_empty() {
-            self.group_counts.retain(|_, count| *count > 0);
+            lock(&self.group_counts).retain(|_, count| *count > 0);
         }
     }
 }

@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// In-memory [`Store`] backend: `DashMap` + monotonic `Instant`
+/// In-memory [`Store`] backend: `RwLock<HashMap>` + monotonic `Instant`
 /// deadlines for TTL. Codec-free (values stored by `Clone` rather
 /// than serialised) so adopters reaching for `MemoryStore` for tests
 /// don't pay an encode/decode round-trip per operation. Per-store

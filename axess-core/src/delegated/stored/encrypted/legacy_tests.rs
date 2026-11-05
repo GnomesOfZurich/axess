@@ -262,3 +262,70 @@ async fn a_load_decrypts_under_the_stored_key_when_no_current_key_can_be_had() {
         "no re-seal without a current key"
     );
 }
+
+/// A row as the previous release wrote it: `v2`, whose AAD does not cover
+/// `expires_at`, with the expiry far in the future.
+fn v2_row_with_far_expiry() -> StoredDelegation {
+    let current = CurrentKey {
+        key_id: Arc::from("k2"),
+        key: Arc::new(EncryptionKey::from_bytes(test_key(2))),
+    };
+    let rng = axess_rng::SystemRng;
+    let v2 = |env: String| env.replacen("v3.", "v2.", 1);
+    let cred = credential();
+    let aad =
+        |field: &[u8]| build_aad_v2("gmail", &tenant(), &user(), field, &cred.scopes, "Bearer");
+    StoredDelegation {
+        access_token: ZeroizedString::from(v2(encrypt_envelope(
+            &current,
+            &rng,
+            "at-plaintext",
+            &aad(FIELD_ACCESS),
+        )
+        .unwrap())),
+        refresh_token: Some(ZeroizedString::from(v2(encrypt_envelope(
+            &current,
+            &rng,
+            "rt-plaintext",
+            &aad(FIELD_REFRESH),
+        )
+        .unwrap()))),
+        expires_at: Some(Utc.with_ymd_and_hms(2999, 1, 1, 0, 0, 0).unwrap()),
+        ..cred
+    }
+}
+
+/// A `v2` row's expiry is not authenticated, so a store writer could have
+/// moved it. The row loads as expired (the refresh that follows saves a `v3`
+/// row from the provider's answer) and is not re-sealed, which would have
+/// vouched for the unauthenticated value.
+#[tokio::test]
+async fn a_v2_row_loads_as_expired_and_is_not_resealed() {
+    let inner = MemoryDelegatedCredentialStore::new();
+    inner
+        .save(&tenant(), &user(), v2_row_with_far_expiry())
+        .await
+        .unwrap();
+    let store = EncryptedDelegatedCredentialStore::new(inner, keys());
+
+    let loaded = store
+        .load(&tenant(), &user(), "gmail")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&*loaded.access_token, "at-plaintext");
+    assert!(
+        !loaded.is_fresh(Utc::now(), chrono::Duration::zero()),
+        "an unauthenticated expiry must not read as fresh: {:?}",
+        loaded.expires_at
+    );
+    assert!(
+        (*raw(store.inner()).await.access_token).starts_with("v2.k2."),
+        "the v2 row is left as it was"
+    );
+
+    let mut refreshed = loaded;
+    refreshed.expires_at = Some(Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap());
+    store.save(&tenant(), &user(), refreshed).await.unwrap();
+    assert!((*raw(store.inner()).await.access_token).starts_with("v3.k2."));
+}

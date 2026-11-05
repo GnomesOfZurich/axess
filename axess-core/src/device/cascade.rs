@@ -130,6 +130,42 @@ pub async fn cascade_revoke_devices<D: DeviceStore>(
     revoked
 }
 
+/// Revoke each device in `targets` and the refresh tokens issued to it, as
+/// [`revoke_device`] does for one. This is what to call from
+/// [`RefreshTokenStore::on_token_compromise`]: it is what
+/// [`CascadingRefreshStore`](crate::device::CascadingRefreshStore) runs, so a
+/// store that wires it by hand revokes as much as the decorator.
+///
+/// A failure on one target is logged at `warn` and does not stop the others.
+/// Returns the number of targets whose device and tokens were both revoked.
+/// A refresh store that cannot revoke tokens
+/// ([`DeviceTokenRevocation::Unsupported`]) fails every target; use
+/// [`cascade_revoke_devices`] there.
+pub async fn cascade_revoke_devices_and_tokens<D, R>(
+    device_store: &D,
+    refresh_store: &R,
+    targets: &[(TenantId, DeviceId)],
+    now: DateTime<Utc>,
+) -> u64
+where
+    D: DeviceStore,
+    R: RefreshTokenStore,
+{
+    let mut revoked = 0u64;
+    for (tenant_id, device_id) in targets {
+        match revoke_device(device_store, refresh_store, tenant_id, device_id, now).await {
+            Ok(_) => revoked += 1,
+            Err(e) => tracing::warn!(
+                error = %e,
+                %tenant_id,
+                %device_id,
+                "cascade_revoke_devices_and_tokens: per-target revoke failed; continuing"
+            ),
+        }
+    }
+    revoked
+}
+
 /// Revoke every device bound to a given refresh-token family.
 ///
 /// Composes [`DeviceStore::find_by_refresh_family`] +

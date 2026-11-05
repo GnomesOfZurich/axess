@@ -10,7 +10,7 @@ fn app(seed: u64) -> TraceContextMiddleware<axum::Router> {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    to_hex(bytes)
+    axess_rng::hex::encode(bytes)
 }
 
 async fn traceparent(app: TraceContextMiddleware<axum::Router>, incoming: Option<&str>) -> String {

@@ -231,7 +231,7 @@ async fn default_clock_is_system_clock() {
 fn prune_count_survives_concurrent_inserts() {
     let (s, clock) = store_with_clock();
     for i in 0..200 {
-        s.inner.insert(
+        write(&s.inner).insert(
             format!("seed-{i}"),
             super::Entry {
                 value: 1,
@@ -244,7 +244,7 @@ fn prune_count_survives_concurrent_inserts() {
         let s = s.clone();
         std::thread::spawn(move || {
             for i in 0..20_000 {
-                s.inner.insert(
+                write(&s.inner).insert(
                     format!("live-{i}"),
                     super::Entry {
                         value: 2,

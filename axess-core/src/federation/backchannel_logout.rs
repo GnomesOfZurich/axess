@@ -193,6 +193,33 @@ pub enum LogoutProviderError {
     },
 }
 
+/// The pair of a token being acted on. Dropped before `done`, it forgets the
+/// pair; dropped after, it settles it as spent.
+struct ActingOn<'a> {
+    log: &'a jti_log::JtiLog,
+    issuer: &'a str,
+    jti: &'a str,
+    done: bool,
+}
+
+impl Drop for ActingOn<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            self.log.settle(self.issuer, self.jti);
+        } else {
+            self.log.forget(self.issuer, self.jti);
+        }
+    }
+}
+
+/// Whether the unverified payload of a logout token is addressed to
+/// `client_id`: its `aud` names the client and its `azp`, when it has one,
+/// is the client. A token for two clients of one issuer names the one it is
+/// for in `azp`, so the lookup must not stop at the first client in `aud`.
+fn addressed_to(unverified: &serde_json::Value, client_id: &str) -> bool {
+    aud_contains(unverified, client_id) && azp_satisfied(unverified, client_id)
+}
+
 /// Maximum live entries the `jti` replay cache keeps per issuer. Sized so
 /// that at the IAT acceptance window (300 s) and a per-second logout rate
 /// well above any legitimate IdP traffic, the cache cannot itself become a
@@ -349,7 +376,7 @@ impl BackChannelLogoutHandler {
             .and_then(|entries| {
                 entries
                     .iter()
-                    .find(|e| aud_contains(unverified, &e.client_id))
+                    .find(|e| addressed_to(unverified, &e.client_id))
             })
             .cloned();
         let Some(source) = &self.tenants else {
@@ -361,7 +388,7 @@ impl BackChannelLogoutHandler {
             let Some(client_id) = built.provider.client_id().map(str::to_string) else {
                 continue;
             };
-            if aud_contains(unverified, &client_id) {
+            if addressed_to(unverified, &client_id) {
                 tenant_matches.push(ProviderEntry {
                     client_id,
                     name: built.name,
@@ -377,7 +404,7 @@ impl BackChannelLogoutHandler {
         let broken: Vec<_> = found
             .broken
             .into_iter()
-            .filter(|b| aud_contains(unverified, &b.client_id))
+            .filter(|b| addressed_to(unverified, &b.client_id))
             .collect();
         for b in &broken {
             tracing::warn!(
@@ -476,6 +503,16 @@ impl BackChannelLogoutHandler {
             return Err(StatusCode::BAD_REQUEST);
         };
         handler.admit_jti(&claims.iss, jti)?;
+        // Until the token has been acted on, its pair is in flight (recording
+        // it set that): a resend meanwhile is told to come again, and a
+        // delivery that ends any other way than done (a failure, a dropped
+        // request) leaves the pair forgotten so the resend is acted on.
+        let mut acting = ActingOn {
+            log: &handler.seen_jtis,
+            issuer: &claims.iss,
+            jti,
+            done: false,
+        };
 
         tracing::info!(
             iss = %loggable(&claims.iss),
@@ -524,10 +561,10 @@ impl BackChannelLogoutHandler {
             // The token did its work only in part. Leave it unspent so the
             // IdP's resend acts on what is left; the sessions already ended
             // are out of the map and are not ended twice.
-            handler.seen_jtis.forget(&claims.iss, jti);
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
 
+        acting.done = true;
         Ok(StatusCode::OK)
     }
 
@@ -692,6 +729,14 @@ impl BackChannelLogoutHandler {
     fn admit_jti(&self, iss: &str, jti: &str) -> Result<(), StatusCode> {
         match self.record_jti(iss, jti, self.clock.now()) {
             Recorded::New => {}
+            Recorded::InFlight => {
+                tracing::info!(
+                    iss = %loggable(iss),
+                    "back-channel logout: the first delivery of this token is still being \
+                     acted on; asking for a resend"
+                );
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             Recorded::Replay => {
                 tracing::warn!(
                     iss = %loggable(iss),
@@ -743,6 +788,8 @@ use jti_log::Recorded;
 mod audit_tests;
 #[cfg(test)]
 mod failure_tests;
+#[cfg(test)]
+mod in_flight_tests;
 #[cfg(test)]
 mod scoping_tests;
 #[cfg(test)]

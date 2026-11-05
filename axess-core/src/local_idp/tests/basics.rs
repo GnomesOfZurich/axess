@@ -277,6 +277,50 @@ async fn mint_with_header_fires_issuance_listener_and_returns_token() {
     assert_eq!(recorder.count(), 1);
 }
 
+/// Key-location headers name where a verifier may fetch the key the token is
+/// checked with; the IdP signs with its own key, so a caller's `jku`, `x5u`,
+/// `jwk` and `x5c` never reach the token.
+#[tokio::test]
+async fn mint_with_header_drops_key_location_headers() {
+    let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");
+    let idp = LocalIdp::from_key_store(
+        "https://idp.local",
+        MemoryLocalIdpKeyStore::with_current(key),
+    )
+    .await
+    .expect("load");
+
+    let header = Header {
+        jku: Some("https://evil.example/jwks".to_string()),
+        x5u: Some("https://evil.example/cert".to_string()),
+        x5c: Some(vec!["AAAA".to_string()]),
+        jwk: serde_json::from_value(serde_json::json!({"kty": "oct", "k": "AAAA"})).ok(),
+        typ: Some("custom-typ".to_string()),
+        ..Header::default()
+    };
+    let now = Utc::now();
+    let token = idp
+        .mint_with_header(
+            &MintClaims::new("worker-1", now + Duration::hours(1))
+                .with_audience("https://api")
+                .with_issued_at(now),
+            header,
+        )
+        .await
+        .expect("mint_with_header");
+
+    let decoded = jsonwebtoken::decode_header(&token).expect("decode header");
+    assert_eq!(decoded.jku, None);
+    assert_eq!(decoded.x5u, None);
+    assert_eq!(decoded.x5c, None);
+    assert!(decoded.jwk.is_none());
+    assert_eq!(
+        decoded.typ.as_deref(),
+        Some("custom-typ"),
+        "other fields stay"
+    );
+}
+
 #[tokio::test]
 async fn with_clock_drives_max_ttl_reference_when_iat_unset() {
     let key = LocalIdpSigningKey::generate_rsa().with_key_id("rsa-1");

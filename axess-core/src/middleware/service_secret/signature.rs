@@ -267,9 +267,24 @@ impl SignedRequests {
 /// first. At [`max_remembered`](SignedRequests::max_remembered) live entries
 /// a sweep is attempted at most once per second, and if the cache is still
 /// full the request is refused with `503`.
+///
+/// The clock can step. A sweep never forgets a signature stamped ahead of the
+/// clock: it is set aside, outside the count, until the clock has passed it
+/// by the tolerance. A signature forgotten for age raises a high-water mark,
+/// and a stamp at or below the mark is refused, so a signature swept while
+/// the clock read late is not accepted again when the clock comes back.
+///
+/// The mark has a cost after a backward step larger than the window: a caller
+/// that stamps with the server's clock is below a mark that a sweep raised
+/// before the step, and is refused as stale until the clock has passed it
+/// (fail closed by design; the forgotten signatures cannot be told from a
+/// replay of them). The set-aside entries (`ahead`) are those that were live
+/// at a sweep: at most `max_remembered` per backward step, and each leaves
+/// the set when a sweep finds it older than the tolerance or moves back into
+/// `live` when a sweep finds the clock within the tolerance of it.
 pub(super) struct Verifier {
     config: SignedRequests,
-    seen: Mutex<HashMap<[u8; 32], i64>>,
+    seen: Mutex<Remembered>,
     /// Unix seconds of the last sweep, claimed with `compare_exchange`.
     last_sweep: AtomicU64,
     /// Unix seconds of the last warning emitted, claimed with
@@ -289,7 +304,7 @@ impl Verifier {
     pub(super) fn new(config: SignedRequests) -> Self {
         Self {
             config,
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::new(Remembered::default()),
             last_sweep: AtomicU64::new(0),
             last_warn: AtomicU64::new(0),
         }
@@ -309,12 +324,14 @@ impl Verifier {
                 .is_ok()
     }
 
-    /// Signatures currently remembered, expired-but-unswept ones included.
+    /// Signatures counted against the cache, expired-but-unswept ones
+    /// included and those set aside ahead of the clock not.
     #[cfg(test)]
     pub(super) fn remembered(&self) -> usize {
         self.seen
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .live
             .len()
     }
 
@@ -422,25 +439,84 @@ impl Verifier {
         {
             let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
             if sweep_due {
-                seen.retain(|_, at| now.abs_diff(*at) <= window);
+                seen.sweep(now, window);
+            }
+            if seen.forgotten_through.is_some_and(|mark| stamp <= mark) {
+                return Err(Rejection::StaleStamp);
             }
             let tag = tag.bytes();
-            if seen.contains_key(&tag) {
+            if seen.live.contains_key(&tag) || seen.ahead.contains_key(&tag) {
                 return Err(Rejection::Replay(caller));
             }
-            if seen.len() >= self.config.max_remembered {
+            if seen.live.len() >= self.config.max_remembered {
                 if self.claim_sweep(now, 1) {
-                    seen.retain(|_, at| now.abs_diff(*at) <= window);
+                    seen.sweep(now, window);
                 }
-                if seen.len() >= self.config.max_remembered {
+                if seen.live.len() >= self.config.max_remembered {
                     return Err(Rejection::CacheFull);
                 }
             }
-            seen.insert(tag, stamp);
+            seen.live.insert(tag, stamp);
         }
 
         parts.extensions.insert(caller);
         Ok(Request::from_parts(parts, Body::from(body)))
+    }
+}
+
+/// The accepted signatures, by the stamp each was signed with.
+#[derive(Default)]
+struct Remembered {
+    /// Counted against `max_remembered`.
+    live: HashMap<[u8; 32], i64>,
+    /// Stamped further ahead of the clock than the tolerance when a sweep
+    /// ran: the clock stepped back after they were accepted. Not counted
+    /// while the clock is behind them, so the step does not fill the cache;
+    /// still refused as replays, and counted again once a sweep finds the
+    /// clock within the tolerance of them.
+    ahead: HashMap<[u8; 32], i64>,
+    /// The newest stamp ever forgotten for age.
+    forgotten_through: Option<i64>,
+}
+
+impl Remembered {
+    /// Forget what is older than `window` behind `now`, raising the mark, set
+    /// aside what is further than `window` ahead of it, and count again what
+    /// was set aside and is now within the window.
+    fn sweep(&mut self, now: i64, window: u64) {
+        let mut mark = self.forgotten_through;
+        let mut aged = |at: i64| {
+            let old = at < now && now.abs_diff(at) > window;
+            if old {
+                mark = Some(mark.map_or(at, |m| m.max(at)));
+            }
+            old
+        };
+        let mut back = Vec::new();
+        self.ahead.retain(|tag, at| {
+            if aged(*at) {
+                false
+            } else if *at > now && at.abs_diff(now) > window {
+                true
+            } else {
+                back.push((*tag, *at));
+                false
+            }
+        });
+        self.live.extend(back);
+        let mut set_aside = Vec::new();
+        self.live.retain(|tag, at| {
+            if aged(*at) {
+                false
+            } else if *at > now && at.abs_diff(now) > window {
+                set_aside.push((*tag, *at));
+                false
+            } else {
+                true
+            }
+        });
+        self.ahead.extend(set_aside);
+        self.forgotten_through = mark;
     }
 }
 
@@ -486,16 +562,7 @@ fn parse_header(headers: &HeaderMap) -> Option<(i64, Tags)> {
 }
 
 fn decode_hex(hex: &str) -> Option<[u8; 32]> {
-    let hex = hex.as_bytes();
-    if hex.len() != 64 {
-        return None;
-    }
     let mut out = [0u8; 32];
-    let (pairs, _) = hex.as_chunks::<2>();
-    for (byte, [high, low]) in out.iter_mut().zip(pairs) {
-        let high = char::from(*high).to_digit(16)?;
-        let low = char::from(*low).to_digit(16)?;
-        *byte = u8::try_from(high * 16 + low).ok()?;
-    }
+    axess_rng::hex::decode_to_slice(hex, &mut out).ok()?;
     Some(out)
 }

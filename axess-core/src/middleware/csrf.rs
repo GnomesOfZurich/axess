@@ -159,7 +159,7 @@ pub struct CsrfConfig {
     form_field_name: Arc<str>,
     form_body_limit: usize,
     secure: bool,
-    same_site: tower_cookies::cookie::SameSite,
+    same_site: cookie::SameSite,
     path: Arc<str>,
     /// If populated, state-changing requests must present an `Origin`
     /// (or `Referer`-derived origin) matching one of these exact strings
@@ -207,7 +207,7 @@ impl CsrfConfig {
             form_field_name: DEFAULT_CSRF_FORM_FIELD.into(),
             form_body_limit: DEFAULT_CSRF_FORM_BODY_LIMIT,
             secure: true,
-            same_site: tower_cookies::cookie::SameSite::Lax,
+            same_site: cookie::SameSite::Lax,
             path: "/".into(),
             allowed_origins: Arc::from(Vec::new()),
             mint_on_every_request: false,
@@ -323,7 +323,7 @@ impl CsrfConfig {
     }
 
     /// Set the cookie `SameSite` attribute. Default `Lax`.
-    pub fn same_site(mut self, same_site: tower_cookies::cookie::SameSite) -> Self {
+    pub fn same_site(mut self, same_site: cookie::SameSite) -> Self {
         self.same_site = same_site;
         self
     }
@@ -864,7 +864,7 @@ async fn extract_presented_token(
         Ok(b) => b,
         Err(_) => return Err("form body exceeds csrf buffer cap"),
     };
-    let field = form_urlencoded::parse(&bytes)
+    let field = url::form_urlencoded::parse(&bytes)
         .find(|(k, _)| k.as_ref() == config.form_field_name.as_ref())
         .map(|(_, v)| v.into_owned())
         .filter(|s| !s.is_empty());
@@ -873,7 +873,7 @@ async fn extract_presented_token(
 }
 
 fn build_cookie(config: &CsrfConfig, token: &str) -> String {
-    use tower_cookies::Cookie;
+    use cookie::Cookie;
 
     let mut cookie = Cookie::new(
         config.effective_cookie_name().to_string(),

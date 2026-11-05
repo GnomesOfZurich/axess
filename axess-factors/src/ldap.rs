@@ -309,10 +309,7 @@ impl LdapProviderConfig {
 
         // RFC 4515: escape special characters in user-controlled values
         // before substituting into LDAP search filters.
-        let filter = search
-            .filter_template
-            .replace("{dn}", &ldap_filter_escape(bind_dn))
-            .replace("{user}", &ldap_filter_escape(identifier));
+        let filter = expand_group_filter(&search.filter_template, bind_dn, identifier);
 
         let (results, _) = ldap
             .search(
@@ -517,35 +514,64 @@ impl LdapProvider for MockLdapProvider {
     }
 }
 
+/// Expand `{dn}` and `{user}` in a group filter template in one pass, so a
+/// placeholder-looking text inside a substituted value is left alone.
+fn expand_group_filter(template: &str, bind_dn: &str, identifier: &str) -> String {
+    let dn = ldap_filter_escape(bind_dn);
+    let user = ldap_filter_escape(identifier);
+    let mut out = String::with_capacity(template.len() + dn.len());
+    let mut rest = template;
+    while let Some(at) = rest.find('{') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        if let Some(t) = tail.strip_prefix("{dn}") {
+            out.push_str(&dn);
+            rest = t;
+        } else if let Some(t) = tail.strip_prefix("{user}") {
+            out.push_str(&user);
+            rest = t;
+        } else {
+            out.push('{');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 // ── LDAP filter escaping (RFC 4515) ──────────────────────────────────────────
 
 /// Escape a string for safe substitution into an LDAP Distinguished Name
 /// per RFC 4514 section 2.4.
 ///
 /// Escapes: NUL (as `\00`), the DN special characters `" + ,; < > \`, plus
-/// `#` at the start of the string and space at the start or end. All other
-/// printable characters pass through unchanged. Non-ASCII bytes are
-/// hex-escaped as `\XX`.
+/// `#` at the start of the string and space at the start or end. Other
+/// control characters are hex-escaped. Everything else, including interior
+/// spaces and non-ASCII letters, passes through unchanged: a DN is a
+/// string of Unicode characters, and escaping those would name a different
+/// entry than the user's.
 ///
 /// Safe for both DN templates (`uid={user},ou=…`) and UPN templates
-/// (`{user}@corp.example.com`); a valid UPN local-part contains none of
-/// these special characters, so the escape is a no-op in that case.
+/// (`{user}@corp.example.com`).
 fn ldap_dn_escape(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(len);
-    for (i, &byte) in bytes.iter().enumerate() {
-        match byte {
-            0 => out.push_str("\\00"),
-            b'"' | b'+' | b',' | b';' | b'<' | b'>' | b'\\' => {
+    let len = input.chars().count();
+    let mut out = String::with_capacity(input.len());
+    for (i, ch) in input.chars().enumerate() {
+        match ch {
+            '\0' => out.push_str("\\00"),
+            '"' | '+' | ',' | ';' | '<' | '>' | '\\' => {
                 out.push('\\');
-                out.push(byte as char);
+                out.push(ch);
             }
-            b'#' if i == 0 => out.push_str("\\#"),
-            b' ' if i == 0 || i + 1 == len => out.push_str("\\ "),
-            0x21..=0x7E => out.push(byte as char),
-            // Non-ASCII or control bytes: hex-escape.
-            _ => out.push_str(&format!("\\{byte:02x}")),
+            '#' if i == 0 => out.push_str("\\#"),
+            ' ' if i == 0 || i + 1 == len => out.push_str("\\ "),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("\\{byte:02x}"));
+                }
+            }
+            c => out.push(c),
         }
     }
     out

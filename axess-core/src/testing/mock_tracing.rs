@@ -58,14 +58,11 @@ impl TracingCapture {
             events: events.clone(),
         };
         let subscriber = tracing_subscriber::registry().with(layer);
+        anchor();
         let guard = tracing::subscriber::set_default(subscriber);
-        // While this is the only live dispatcher in the process, tracing-core
-        // registers a callsite's first hit through the hitting thread's own
-        // default subscriber. A sibling test with no subscriber that hits a
-        // callsite first caches "never interested" for it, and the macro
-        // then drops the event on this thread without asking the capture.
-        // Rebuild the cache under this subscriber so the callsites already
-        // seen in the process are asked again.
+        // The callsites registered before the anchor existed were cached
+        // through whichever thread hit them first; ask them again now that
+        // this capture is live.
         tracing::callsite::rebuild_interest_cache();
         Self {
             events,
@@ -97,6 +94,59 @@ impl TracingCapture {
             .iter()
             .any(|e| e.level == level && e.message.contains(needle))
     }
+}
+
+// ── The anchor ───────────────────────────────────────────────────────────────
+
+/// Keep a second dispatcher registered for the life of the process, so a
+/// capture is never the only one.
+///
+/// tracing-core caches each callsite's interest the first time any thread
+/// hits it. While exactly one dispatcher is registered, that first hit is
+/// resolved through the hitting thread's own default subscriber: a sibling
+/// test running with no subscriber caches "never" for the callsite, and the
+/// macro then drops the event on the capturing thread without asking the
+/// capture. With the anchor registered there are always at least two, every
+/// rebuild walks the registered dispatchers instead, and the anchor's
+/// "sometimes" keeps each callsite open so the hit asks the hitting thread's
+/// default, which on the capturing thread is the capture.
+fn anchor() {
+    static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ANCHOR.get_or_init(|| tracing::Dispatch::new(Anchor));
+}
+
+/// Interested in every callsite, enabled for none.
+struct Anchor;
+
+impl tracing::Subscriber for Anchor {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(u64::MAX)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 // ── Layer implementation ─────────────────────────────────────────────────────
@@ -195,6 +245,23 @@ mod tests {
         assert!(!capture.contains_at_level(Level::WARN, "axess::audit"));
         assert!(capture.contains("unrelated text"));
         assert_eq!(capture.events()[0].target, "axess::audit::archive");
+    }
+
+    /// A callsite first hit on a thread with no subscriber is still captured
+    /// when this thread hits it afterwards.
+    #[test]
+    fn a_callsite_first_hit_elsewhere_is_still_captured_here() {
+        fn hit() {
+            tracing::warn!("first seen on another thread");
+        }
+        let capture = TracingCapture::install();
+        std::thread::spawn(hit).join().expect("the other thread");
+        assert!(
+            capture.events().is_empty(),
+            "the other thread's event is not this thread's"
+        );
+        hit();
+        assert!(capture.contains_at_level(Level::WARN, "first seen on another thread"));
     }
 
     #[test]

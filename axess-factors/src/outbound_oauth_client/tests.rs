@@ -120,6 +120,7 @@ async fn force_refresh_bypasses_cache() {
         .and(path("/oauth2/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "tok-a",
+            "token_type": "Bearer",
             "expires_in": 3600,
         })))
         .up_to_n_times(1)
@@ -129,6 +130,7 @@ async fn force_refresh_bypasses_cache() {
         .and(path("/oauth2/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "tok-b",
+            "token_type": "Bearer",
             "expires_in": 3600,
         })))
         .mount(&server)
@@ -172,6 +174,7 @@ async fn client_secret_basic_sends_authorization_header() {
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "tok",
+            "token_type": "Bearer",
             "expires_in": 3600,
         })))
         .expect(1)
@@ -200,6 +203,7 @@ async fn client_secret_post_sends_secret_in_form_body() {
         .and(body_string_contains("client_secret=Gnomes2%2B"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "tok",
+            "token_type": "Bearer",
             "expires_in": 3600,
         })))
         .expect(1)
@@ -288,6 +292,7 @@ async fn malformed_token_response_rejected() {
 async fn missing_expires_in_defaults_to_one_hour() {
     let server = token_server_returning(json!({
         "access_token": "tok-no-exp",
+        "token_type": "Bearer",
     }))
     .await;
 
@@ -339,6 +344,7 @@ async fn private_key_jwt_sends_the_signers_assertion_for_the_token_url() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({
                 "access_token": "tok-jwt",
+                "token_type": "Bearer",
                 "expires_in": 3600,
             })),
         )
@@ -432,6 +438,7 @@ async fn scopes_are_sent_in_form_body() {
         .and(body_string_contains("scope=read+write"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "tok",
+            "token_type": "Bearer",
             "expires_in": 3600,
         })))
         .expect(1)
@@ -453,8 +460,8 @@ async fn scopes_are_sent_in_form_body() {
 #[tokio::test]
 async fn out_of_range_expires_in_is_refused() {
     for body in [
-        r#"{"access_token":"t","expires_in":10000000000000000}"#,
-        r#"{"access_token":"t","expires_in":18446744073709551615}"#,
+        r#"{"access_token":"t","token_type":"Bearer","expires_in":10000000000000000}"#,
+        r#"{"access_token":"t","token_type":"Bearer","expires_in":18446744073709551615}"#,
     ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -523,7 +530,7 @@ async fn a_redirecting_token_endpoint_is_an_error_and_the_target_is_never_called
     let target = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "access_token": "stolen", "expires_in": 60
+            "access_token": "stolen", "token_type": "Bearer", "expires_in": 60
         })))
         .mount(&target)
         .await;
@@ -560,7 +567,9 @@ async fn a_hung_token_endpoint_times_out_and_releases_the_gate() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "late", "expires_in": 60 }))
+                .set_body_json(
+                    json!({ "access_token": "late", "token_type": "Bearer", "expires_in": 60 }),
+                )
                 .set_delay(Duration::from_secs(5)),
         )
         .mount(&server)
@@ -623,7 +632,9 @@ async fn concurrent_force_refreshes_share_one_fetch() {
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "fresh", "expires_in": 3600 }))
+                .set_body_json(
+                    json!({ "access_token": "fresh", "token_type": "Bearer", "expires_in": 3600 }),
+                )
                 .set_delay(Duration::from_millis(150)),
         )
         .mount(&server)
@@ -652,17 +663,18 @@ async fn concurrent_force_refreshes_share_one_fetch() {
 async fn callers_are_served_the_unexpired_token_while_a_refresh_is_in_flight() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "first", "expires_in": 100 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "first", "token_type": "Bearer", "expires_in": 100 }),
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "second", "expires_in": 100 }))
+                .set_body_json(
+                    json!({ "access_token": "second", "token_type": "Bearer", "expires_in": 100 }),
+                )
                 .set_delay(Duration::from_millis(400)),
         )
         .mount(&server)
@@ -702,17 +714,18 @@ async fn callers_are_served_the_unexpired_token_while_a_refresh_is_in_flight() {
 async fn callers_during_a_force_refresh_never_get_the_condemned_token() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "condemned", "expires_in": 3600 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "condemned", "token_type": "Bearer", "expires_in": 3600 }),
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "fresh", "expires_in": 3600 }))
+                .set_body_json(
+                    json!({ "access_token": "fresh", "token_type": "Bearer", "expires_in": 3600 }),
+                )
                 .set_delay(Duration::from_millis(400)),
         )
         .mount(&server)
@@ -740,10 +753,9 @@ async fn callers_during_a_force_refresh_never_get_the_condemned_token() {
 async fn a_failed_force_refresh_does_not_serve_the_condemned_token_afterwards() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "condemned", "expires_in": 3600 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "condemned", "token_type": "Bearer", "expires_in": 3600 }),
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -753,10 +765,9 @@ async fn a_failed_force_refresh_does_not_serve_the_condemned_token_afterwards() 
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "fresh", "expires_in": 3600 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "fresh", "token_type": "Bearer", "expires_in": 3600 }),
+        ))
         .mount(&server)
         .await;
     let client = OutboundOAuthClient::new(token_url(&server), basic()).unwrap();
@@ -830,10 +841,9 @@ async fn waiters_on_a_failed_fetch_share_its_outcome_instead_of_fetching_in_turn
 async fn an_unexpired_token_outlives_a_failed_refresh_until_it_expires() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "first", "expires_in": 100 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "first", "token_type": "Bearer", "expires_in": 100 }),
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -881,26 +891,23 @@ async fn an_unexpired_token_outlives_a_failed_refresh_until_it_expires() {
 async fn force_refresh_of_a_replaced_token_keeps_the_replacement() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "first", "expires_in": 3600 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "first", "token_type": "Bearer", "expires_in": 3600 }),
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "second", "expires_in": 3600 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "second", "token_type": "Bearer", "expires_in": 3600 }),
+        ))
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(json!({ "access_token": "third", "expires_in": 3600 })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({ "access_token": "third", "token_type": "Bearer", "expires_in": 3600 }),
+        ))
         .mount(&server)
         .await;
     let client = OutboundOAuthClient::new(token_url(&server), basic()).unwrap();
@@ -964,4 +971,76 @@ fn the_basic_authorization_header_is_sensitive() {
         "Basic YXhlc3MtaWQ6R25vbWVzMiUyQg=="
     );
     assert!(header.is_sensitive(), "the header is marked sensitive");
+}
+
+#[tokio::test]
+async fn a_token_that_is_not_a_bearer_token_is_refused() {
+    let server = token_server_returning(json!({
+        "access_token": "tok-dpop",
+        "token_type": "DPoP",
+        "expires_in": 3600,
+    }))
+    .await;
+    let client = OutboundOAuthClient::new(
+        token_url(&server),
+        ClientAuthMethod::ClientSecretBasic {
+            client_id: "axess".into(),
+            client_secret: "shh".into(),
+        },
+    )
+    .expect("an HTTPS or loopback token URL");
+
+    let err = client
+        .get_access_token()
+        .await
+        .expect_err("a DPoP-bound token must not be used as a bearer token");
+    assert!(
+        matches!(err, OAuthClientError::MalformedResponse(_)),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn bearer_is_accepted_in_any_case() {
+    let server = token_server_returning(json!({
+        "access_token": "tok-alpha",
+        "token_type": "bearer",
+        "expires_in": 3600,
+    }))
+    .await;
+    let client = OutboundOAuthClient::new(
+        token_url(&server),
+        ClientAuthMethod::ClientSecretBasic {
+            client_id: "axess".into(),
+            client_secret: "shh".into(),
+        },
+    )
+    .expect("an HTTPS or loopback token URL");
+    assert_eq!(client.get_access_token().await.unwrap(), "tok-alpha");
+}
+
+#[tokio::test]
+async fn a_response_without_token_type_is_refused() {
+    let server = token_server_returning(json!({
+        "access_token": "tok-untyped",
+        "expires_in": 3600,
+    }))
+    .await;
+    let client = OutboundOAuthClient::new(
+        token_url(&server),
+        ClientAuthMethod::ClientSecretBasic {
+            client_id: "axess".into(),
+            client_secret: "shh".into(),
+        },
+    )
+    .expect("an HTTPS or loopback token URL");
+
+    let err = client
+        .get_access_token()
+        .await
+        .expect_err("RFC 6749 section 5.1 requires token_type");
+    assert!(
+        matches!(err, OAuthClientError::MalformedResponse(_)),
+        "{err:?}"
+    );
 }

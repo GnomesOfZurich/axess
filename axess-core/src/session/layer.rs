@@ -40,9 +40,9 @@ use crate::session::config::SessionConfig;
 use crate::session::store::{SessionRegistryHandle, SessionStore};
 use axess_clock::{Clock, SystemClock};
 use axess_rng::{SecureRng, SystemRng};
+use cookie::SameSite;
 use signing::SigningKeyRing;
 use std::{sync::Arc, time::Duration};
-use tower_cookies::cookie::SameSite;
 
 /// What the session layer does with an authenticated session when the
 /// registry set by [`SessionLayer::with_registry`] cannot answer (it errored).

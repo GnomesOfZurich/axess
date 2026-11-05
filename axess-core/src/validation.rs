@@ -205,9 +205,16 @@ fn is_invisible_format_char(c: char) -> bool {
 /// refuses the forms this folds away).
 pub fn normalise_identifier(raw: &str) -> Option<String> {
     use unicode_normalization::UnicodeNormalization as _;
+    let invisible = |c: &char| is_invisible_format_char(*c) || matches!(c, '\u{200C}' | '\u{200D}');
+    // Strip first: an invisible character between a base letter and its
+    // accent keeps NFKC from composing them. Strip again after, in case
+    // compatibility decomposition produced one.
     let folded: String = raw
+        .chars()
+        .filter(|c| !invisible(c))
+        .collect::<String>()
         .nfkc()
-        .filter(|c| !is_invisible_format_char(*c) && !matches!(c, '\u{200C}' | '\u{200D}'))
+        .filter(|c| !invisible(c))
         .collect::<String>()
         .to_lowercase();
     let trimmed = folded.trim();
@@ -231,6 +238,24 @@ pub fn is_acceptable_identifier(identifier: &str) -> bool {
     is_printable(identifier)
         && !identifier.chars().any(is_invisible_format_char)
         && unicode_normalization::is_nfc(identifier)
+}
+
+/// Whether an identifier may be given to a new account: everything
+/// [`is_acceptable_identifier`] requires, and in addition no surrounding
+/// whitespace, no whitespace other than the ASCII space (a no-break space
+/// reads as a space), and already in Unicode normalisation form KC (a
+/// fullwidth or ligature spelling is the same name as its plain one).
+///
+/// Used where an identifier is created (signup, `User::new`). It is not used
+/// when a stored row is read back
+/// ([`User::validate`](crate::authn::types::User::validate) keeps the looser
+/// rule), so an account created under an earlier rule is never locked out.
+pub fn is_acceptable_new_identifier(identifier: &str) -> bool {
+    use unicode_normalization::UnicodeNormalization as _;
+    is_acceptable_identifier(identifier)
+        && identifier == identifier.trim()
+        && !identifier.chars().any(|c| c.is_whitespace() && c != ' ')
+        && identifier.nfkc().eq(identifier.chars())
 }
 
 /// Constant-time comparison of two secret byte slices.

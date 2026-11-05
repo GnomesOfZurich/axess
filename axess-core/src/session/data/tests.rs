@@ -278,6 +278,7 @@ fn is_authenticating_only_true_for_authenticating_variant() {
             attempt_count: 0,
             last_attempt: None,
             ldap_groups: None,
+            impersonator: None,
         }
         .is_authenticating()
     );
@@ -348,11 +349,13 @@ fn begin_authenticating_constructs_authenticating_with_factors_in_order() {
             attempt_count,
             last_attempt,
             ldap_groups,
+            impersonator,
         } => {
             assert_eq!(user_id, user);
             assert_eq!(tenant_id, tenant);
             assert_eq!(&*method_name, "password+totp");
             assert_eq!(ldap_groups, None);
+            assert_eq!(impersonator, None);
             assert_eq!(
                 remaining,
                 required(vec![FactorKind::Password, FactorKind::Totp])
@@ -408,6 +411,7 @@ fn advance_factor_still_authenticating_when_factors_remain() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        impersonator: None,
     };
     let outcome = state.advance_factor(&FactorKind::Password, now());
     assert_eq!(outcome, AdvanceOutcome::StillAuthenticating);
@@ -438,6 +442,7 @@ fn advance_factor_completes_when_last_factor_verified() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        impersonator: None,
     };
     let outcome = state.advance_factor(&FactorKind::Password, t);
     assert_eq!(outcome, AdvanceOutcome::Completed);
@@ -479,6 +484,7 @@ fn advance_factor_carries_completed_factors_into_authenticated() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        impersonator: None,
     };
     assert_eq!(
         state.advance_factor(&FactorKind::Password, t),
@@ -518,6 +524,7 @@ fn advance_factor_no_op_when_kind_not_in_remaining() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        impersonator: None,
     };
     let outcome = state.advance_factor(&FactorKind::Totp, now());
     assert_eq!(outcome, AdvanceOutcome::StillAuthenticating);
@@ -562,6 +569,7 @@ fn record_attempt_at_increments_counter_and_captures_timestamp() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: None,
+        impersonator: None,
     };
     state.record_attempt_at(t);
     state.record_attempt_at(t);
@@ -721,6 +729,7 @@ fn ldap_groups_ride_the_login_into_the_authenticated_state() {
         attempt_count: 0,
         last_attempt: None,
         ldap_groups: Some(staff.clone()),
+        impersonator: None,
     };
     assert_eq!(state.ldap_groups(), None, "not before the login completes");
 
@@ -741,4 +750,30 @@ fn ldap_groups_ride_the_login_into_the_authenticated_state() {
         now(),
     );
     assert_eq!(state.ldap_groups(), None, "a new login starts without them");
+}
+
+/// An impersonated session that steps up is still the administrator's
+/// session in the user's name when the step-up completes.
+#[test]
+fn a_step_up_keeps_the_impersonation() {
+    let admin = axess_identity::testing::user("admin");
+    let since = now();
+    let mut state = AuthState::Guest;
+    state.set_authenticated(
+        axess_identity::testing::user("u1"),
+        axess_identity::testing::tenant("t1"),
+        since,
+    );
+    assert!(state.set_impersonator(admin, since));
+
+    assert!(state.begin_step_up(required(vec![FactorKind::Totp])));
+    assert_eq!(
+        state.advance_factor(&FactorKind::Totp, now()),
+        AdvanceOutcome::Completed
+    );
+    assert_eq!(
+        state.impersonation(),
+        Some(Impersonation { admin, since }),
+        "the marker survives the step-up"
+    );
 }

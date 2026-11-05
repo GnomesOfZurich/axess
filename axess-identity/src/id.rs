@@ -44,7 +44,8 @@ pub use uuid::Uuid;
 pub enum IdError {
     /// The identifier was empty.
     Empty(&'static str),
-    /// The identifier was not a valid hyphenated Uuid.
+    /// The identifier was not a Uuid in any form [`Uuid::parse_str`] reads
+    /// (hyphenated, simple, braced or URN; any case).
     NotAUuid(&'static str),
     /// The identifier matched a reserved system sentinel and the
     /// calling guard refused to accept it.
@@ -273,7 +274,8 @@ macro_rules! define_id {
             }
 
             #[doc = concat!(
-                "Construct from a string (which must be a valid hyphenated Uuid). ",
+                "Construct from a string holding a Uuid in any form [`Uuid::parse_str`] reads ",
+                "(hyphenated, simple, braced or URN; any case); every form of one Uuid is the same id. ",
                 "Returns [`IdError::Empty`] for empty input or ",
                 "[`IdError::NotAUuid`] if parsing fails.",
             )]

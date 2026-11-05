@@ -148,6 +148,7 @@ mod tests {
             user_id: UserId::from_bytes([1u8; 16]),
             tenant_id: TenantId::from_bytes([2u8; 16]),
             session_id: None,
+            impersonator: None,
             attributes: BTreeMap::new(),
         })
     }

@@ -2,7 +2,10 @@
 //! bob = password+TOTP). Idempotent so it's safe to call on every startup.
 
 use axess::Clock;
-use axess::authn::{FactorConfig, PasswordConfig, PasswordRules, TotpConfig, ZeroizedString};
+use axess::authn::{
+    AuthnScope, FactorConfig, FactorSecretCipher, PasswordConfig, PasswordRules, TenantId,
+    TotpConfig, UserId, ZeroizedString,
+};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -11,11 +14,13 @@ use uuid::Uuid;
 /// - **alice**; password-only login (`Gnomes2+`)
 /// - **bob**  ; password + TOTP login (`Gnomes2+`)
 ///
-/// Returns Bob's TOTP secret so the caller can log it.
+/// Bob's TOTP secret is sealed through `cipher` before it is stored. Returns
+/// it in plain text so the caller can log it.
 /// Idempotent: safe to call on every startup.
 pub async fn seed(
     clock: &dyn Clock,
     pool: &SqlitePool,
+    cipher: &FactorSecretCipher,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let tenant_id = "00000000-0000-0000-0000-000000000001";
     let tenant_identifier = "default";
@@ -155,6 +160,11 @@ pub async fn seed(
             secret: ZeroizedString::new(secret.clone()).into(),
             ..TotpConfig::default()
         });
+        let scope = AuthnScope::User {
+            tenant_id: TenantId::try_new(tenant_id)?,
+            user_id: UserId::try_new(bob_id)?,
+        };
+        let bob_totp_config = cipher.seal_config(bob_totp_config, &scope)?;
         let bob_totp_json = serde_json::to_string(&bob_totp_config)?;
         let bob_totp_fc_id = Uuid::new_v4().to_string();
         sqlx::query(

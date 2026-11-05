@@ -47,6 +47,7 @@ async fn shared_contract() {
     shared::ties_are_broken_by_the_smaller_id(store(4).await).await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store(4).await).await;
     shared::a_save_never_un_revokes(store(4).await).await;
+    shared::a_revoked_device_never_comes_back(|| store(4)).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(store(4).await).await;
     shared::sub_second_instants_compare_as_whole_seconds(store(4).await).await;
     shared::a_revoked_row_keeps_its_revocation_time(store(4).await).await;
@@ -261,3 +262,51 @@ async fn the_family_index_insert_is_idempotent() {
 }
 
 mod reseal;
+
+/// A revocation that commits while a sweep stage is waiting on the row must
+/// stay a revocation: the stage's UPDATE re-checks its own conditions against
+/// the row as committed, so it does not turn Revoked back into Seen.
+#[tokio::test]
+#[ignore = "requires a running Postgres (POSTGRES_URL)"]
+async fn a_sweep_racing_a_revocation_leaves_the_device_revoked() {
+    use crate::device::storage::sql_common::SweepCutoffs;
+    use crate::device::storage::sql_common::ops::SweepStage;
+    use crate::device::store::SweepConfig;
+    use crate::device::types::DeviceTrustLevel;
+
+    let s = store(4).await;
+    let d = device("sweep-race", 0x51, DeviceTrustLevel::Trusted, at(0));
+    s.save(&d, at(0)).await.unwrap();
+    let cutoffs = SweepCutoffs::new(&SweepConfig::default(), at(200 * 86_400));
+
+    // The revocation holds the row lock, uncommitted.
+    let mut revoking = s.pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE devices SET trust_level = 'Revoked', revoked_at = $3 WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(d.tenant_id.to_string())
+    .bind(d.id.to_string())
+    .bind(cutoffs.now)
+    .execute(&mut *revoking)
+    .await
+    .unwrap();
+
+    // The sweep stage reads the row as Trusted and then waits on the lock.
+    let pool = s.pool.clone();
+    let tenant_id = d.tenant_id.to_string();
+    let sweep = tokio::spawn(async move {
+        PostgresSql::sweep_stage(&pool, SweepStage::DemoteTrusted, &tenant_id, &cutoffs, 100)
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    revoking.commit().await.unwrap();
+    let changed = sweep.await.unwrap();
+
+    let after = s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(
+        after.trust_level,
+        DeviceTrustLevel::Revoked,
+        "{changed} rows changed"
+    );
+}

@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.14.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.15.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -175,7 +175,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.14.0", features = ["sqlite", "authz"] }
+axess = { version = "0.15.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:
@@ -239,13 +239,12 @@ For JWT-bearer workload identity from any non-SPIFFE issuer (GitHub Actions OIDC
 | `local-idp` | `LocalIdpFixture` in-process IdP for tests / on-host issuance | no |
 | `audit-archive-fs` | Filesystem-backed `AuditArchiver` reference implementation | no |
 
-#### Authz cache decorators
+#### Authz cache decorator
 
-These are opt-in alternatives to the in-process `EntityCache` for the Cedar entity graph. Most adopters do not need them.
+This is an opt-in alternative to the in-process `EntityCache` for the Cedar entity graph. Most adopters do not need it.
 
 | Feature | What it enables | Default |
 |---|---|---|
-| `moka-cache` | Moka-backed authz entity cache decorator (breaks DST, opt-in only) | no |
 | `valkey-cache` | Valkey-backed authz entity cache decorator (shared across replicas) | no |
 
 #### HTTP middleware

@@ -136,3 +136,64 @@ async fn valkey_is_valid_prune_spares_a_session_registered_again_meanwhile() {
         "the fresh registration must survive the prune"
     );
 }
+
+/// A session that stays active outlives the registry's lifetime: its member
+/// is kept alive by the requests that find it live, as the session's own
+/// sliding lifetime is. Before, the member expired a fixed `ttl` after
+/// `register` and an active user was logged out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_member_of_an_active_session_does_not_expire() {
+    let prefix = format!("axt_active_{}", UserId::new(&SystemRng));
+    let ttl = Duration::from_secs(10);
+    let t0 = Utc::now();
+    let user = UserId::new(&SystemRng);
+    let session = SessionId::new(&SystemRng);
+    let at = |secs: i64| {
+        ValkeySessionRegistry::with_options(
+            // One client per instant: the clocks differ, the rows are shared.
+            Client::new(Config::from_url(&live_url()).unwrap(), None, None, None),
+            prefix.clone(),
+            ttl,
+        )
+        .with_clock(Arc::new(MockClock::at(
+            t0 + chrono::Duration::seconds(secs),
+        )))
+    };
+    let (r0, r8, r16) = (at(0), at(8), at(16));
+    for r in [&r0, &r8, &r16] {
+        r.client.init().await.unwrap();
+    }
+    r0.register(&user, &session).await.unwrap();
+    assert!(r8.is_valid(&user, &session).await.unwrap());
+    assert!(
+        r16.is_valid(&user, &session).await.unwrap(),
+        "the session was active at 8 s: its registry member must still be live at 16 s"
+    );
+}
+
+/// A session nothing touches still lapses a `ttl` after its last activity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_member_of_an_idle_session_still_expires() {
+    let prefix = format!("axt_idle_{}", UserId::new(&SystemRng));
+    let ttl = Duration::from_secs(10);
+    let t0 = Utc::now();
+    let user = UserId::new(&SystemRng);
+    let session = SessionId::new(&SystemRng);
+    let registry = |secs: i64| {
+        ValkeySessionRegistry::with_options(
+            Client::new(Config::from_url(&live_url()).unwrap(), None, None, None),
+            prefix.clone(),
+            ttl,
+        )
+        .with_clock(Arc::new(MockClock::at(
+            t0 + chrono::Duration::seconds(secs),
+        )))
+    };
+    let (r0, r20) = (registry(0), registry(20));
+    r0.client.init().await.unwrap();
+    r20.client.init().await.unwrap();
+    r0.register(&user, &session).await.unwrap();
+    assert!(!r20.is_valid(&user, &session).await.unwrap());
+}

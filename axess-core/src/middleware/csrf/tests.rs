@@ -1168,7 +1168,7 @@ async fn csrf_service_hands_the_handler_a_valid_token_when_cookie_is_stale() {
 /// `SessionConfigBuilder::build` does for the session cookie.
 #[test]
 fn same_site_none_without_secure_is_refused_at_construction() {
-    use tower_cookies::cookie::SameSite;
+    use cookie::SameSite;
     let insecure_none = CsrfConfig::new([7u8; 32])
         .secure(false)
         .same_site(SameSite::None);

@@ -134,6 +134,25 @@ where
         ),
         AuthnError<I::Error>,
     > {
+        // A session that is already an impersonation is the administrator's
+        // in the impersonated user's name: letting it impersonate again
+        // would record the second take, and everything after it, as the
+        // first target's act. The row names the administrator who really
+        // holds the session and, like every refusal made before the target
+        // is read, no target. `end_impersonation` is the way back. Asked
+        // first, so the answer does not depend on which administrator id
+        // the caller names.
+        if let Some(holder) = session.impersonator().await {
+            return Err(self
+                .refuse_impersonation(
+                    &holder,
+                    None,
+                    AuthFailureReason::NestedImpersonation,
+                    AuthnError::Impersonated,
+                )
+                .await);
+        }
+
         // The session must BE the admin: authenticated as `admin_user_id`.
         // The caller names the admin as an argument, and nothing else tied
         // that name to the session, so any session could assume any
@@ -158,23 +177,6 @@ where
                 )
                 .await);
         }
-        // A session that is already an impersonation is the administrator's
-        // in the impersonated user's name: letting it impersonate again
-        // would record the second take, and everything after it, as the
-        // first target's act. The row names the administrator who really
-        // holds the session and, like every refusal made before the target
-        // is read, no target. `end_impersonation` is the way back.
-        if let Some(holder) = session.impersonator().await {
-            return Err(self
-                .refuse_impersonation(
-                    &holder,
-                    None,
-                    AuthFailureReason::NestedImpersonation,
-                    AuthnError::Impersonated,
-                )
-                .await);
-        }
-
         // The target is the store's, not the caller's record of it: a
         // `User` struct is whatever the caller built, and its `tenant_id`
         // is what the tenant rail compares. Reloaded by id; the tenant
@@ -223,20 +225,21 @@ where
         Ok((admin_snapshot, target))
     }
 
-    async fn impersonate(
+    /// Refuse an impersonation unless the standing of every party allows it.
+    ///
+    /// In order: the administrator's account must be active, the target's
+    /// account must be active, and the target's tenant and the
+    /// administrator's own tenant (read from the session) must both be
+    /// active. Each refusal writes its audit row at `now` and returns the
+    /// error; a store failure on the way returns without a row. Nothing of
+    /// the session is touched here.
+    async fn require_impersonation_standing(
         &self,
         admin_user_id: &crate::authn::ids::UserId,
-        expected_tenant: Option<&crate::authn::ids::TenantId>,
         target_user: &crate::authn::types::User,
         session: &AuthSession,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), AuthnError<I::Error>> {
-        let now = self.inner.clock.now();
-
-        let (admin_snapshot, target) = self
-            .admit_impersonation(admin_user_id, expected_tenant, target_user, session)
-            .await?;
-        let target_user = &target;
-
         // A suspended administrator with a session still open cannot take
         // another identity through it: the session outlived the account's
         // standing, and the impersonation would hand it a fresh one.
@@ -280,6 +283,54 @@ where
             return Err(AuthnError::NotActive(status));
         }
 
+        // The tenant's status gates impersonation as it gates a login: the
+        // target's tenant (the one being entered) and the admin's own (read
+        // from the admin's session) must both be active. A tenant that does
+        // not load refuses (fail closed).
+        let admin_tenant = session.tenant_id().await;
+        for tenant_id in std::iter::once(target_user.tenant_id).chain(admin_tenant) {
+            if let Err(refusal) = self.require_active_tenant(&tenant_id).await {
+                if matches!(refusal, AuthnError::Store(_)) {
+                    return Err(refusal);
+                }
+                tracing::warn!(
+                    admin = %admin_user_id,
+                    target = %target_user.id,
+                    tenant = %tenant_id,
+                    "impersonation refused: tenant is not active"
+                );
+                self.emit_audit_at(
+                    AuthEventBuilder::failure(AuthEventType::Impersonation)
+                        .attributed_to(&target_user.id, &target_user.tenant_id)
+                        .with_actor(*admin_user_id)
+                        .with_error(AuthFailureReason::NotActive),
+                    now,
+                )
+                .await?;
+                return Err(refusal);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn impersonate(
+        &self,
+        admin_user_id: &crate::authn::ids::UserId,
+        expected_tenant: Option<&crate::authn::ids::TenantId>,
+        target_user: &crate::authn::types::User,
+        session: &AuthSession,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let now = self.inner.clock.now();
+
+        let (admin_snapshot, target) = self
+            .admit_impersonation(admin_user_id, expected_tenant, target_user, session)
+            .await?;
+        let target_user = &target;
+
+        self.require_impersonation_standing(admin_user_id, target_user, session, now)
+            .await?;
+
         // The admin's own session ends with this call: its cookie is about
         // to carry the target's identity. Leaving the admin's sid in the
         // registry would keep a session alive that nobody can reach.
@@ -318,6 +369,13 @@ where
         // Same as complete_signup; refuse to leave an admin in
         // an Authenticated-but-untracked impersonation session.
         if let Some(reg) = &self.inner.registry {
+            // The administrator's old id ends first: the cookie carries the
+            // new identity whether or not the registry takes the new id, so
+            // the old entry must not outlive this call on a refusal.
+            note_revocation(
+                reg.invalidate_session(admin_user_id, &admin_sid).await,
+                "ending an impersonation",
+            );
             if !reg.register(&target_user.id, &sid).await {
                 tracing::error!(
                     admin_user_id = %admin_user_id,
@@ -334,10 +392,6 @@ where
                     )
                     .await);
             }
-            note_revocation(
-                reg.invalidate_session(admin_user_id, &admin_sid).await,
-                "ending an impersonation",
-            );
         }
 
         // Record the impersonation event with both principals: the target
@@ -412,8 +466,8 @@ where
     /// the audit row names which it was.
     ///
     /// A session that is already an impersonation is refused with
-    /// [`AuthnError::NoFlow`] and a failed row naming the administrator who
-    /// holds it; [`end_impersonation`](Self::end_impersonation) first.
+    /// [`AuthnError::Impersonated`] and a failed row naming the administrator
+    /// who holds it; [`end_impersonation`](Self::end_impersonation) first.
     ///
     /// Pass `admin_user` (not just the id) so the rail can be enforced
     /// without an extra `get_user` round-trip in the common case where the

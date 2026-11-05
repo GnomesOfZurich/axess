@@ -885,10 +885,123 @@ async fn revoke_5xx_maps_to_transient_variant() {
         .await
         .expect_err("revoke must fail on 5xx");
     match err {
-        OAuthError::TokenEndpointTransient { status, body } => {
-            assert_eq!(status, 503);
-            assert!(body.contains("upstream temporarily unavailable"));
+        OAuthError::TokenEndpointTransient { status } => {
+            assert_eq!(status, Some(503));
         }
         other => panic!("expected TokenEndpointTransient, got {other:?}"),
     }
+}
+
+/// Answers 200 (or the given body) only to a request that carries its client
+/// secret in a `client_secret_basic` header and not in the form, as an
+/// authorization server that accepts nothing else does; any other request
+/// is `invalid_client`.
+struct BasicOnly(ResponseTemplate);
+
+impl wiremock::Respond for BasicOnly {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let basic = request
+            .headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("Basic "));
+        let in_form = String::from_utf8_lossy(&request.body).contains("client_secret");
+        if basic && !in_form {
+            self.0.clone()
+        } else {
+            ResponseTemplate::new(401).set_body_json(json!({"error": "invalid_client"}))
+        }
+    }
+}
+
+/// A provider with a client secret, whose token, revocation and device
+/// endpoints refuse a secret sent in the form.
+async fn basic_only_provider(
+    server: &MockServer,
+    token_answer: ResponseTemplate,
+) -> OAuthProviderBuilder {
+    let issuer = server.uri();
+    let (_, jwk, _) = generate_rsa_keypair();
+    let mut discovery = discovery_document(&issuer);
+    discovery["revocation_endpoint"] = json!(format!("{issuer}/revoke"));
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(BasicOnly(token_answer))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/revoke"))
+        .respond_with(BasicOnly(ResponseTemplate::new(200)))
+        .mount(server)
+        .await;
+    OAuthProviderConfig::discover(
+        "test",
+        &issuer,
+        "client-id",
+        "secret",
+        "http://localhost:3000/callback",
+    )
+    .await
+    .unwrap()
+    .with_revocation_endpoint(format!("{issuer}/revoke"))
+}
+
+#[tokio::test]
+async fn revocation_authenticates_with_basic_when_the_client_holds_a_secret() {
+    use axess_factors::oauth::OAuthProvider;
+    let server = MockServer::start().await;
+    let provider = basic_only_provider(&server, ResponseTemplate::new(200))
+        .await
+        .build()
+        .unwrap();
+    provider
+        .revoke_token("dummy-token", None, None)
+        .await
+        .expect("an IdP that accepts only Basic revokes the token");
+}
+
+#[tokio::test]
+async fn client_credentials_authenticates_with_basic_when_the_client_holds_a_secret() {
+    use axess_factors::oauth::OAuthProvider;
+    let server = MockServer::start().await;
+    let answer = ResponseTemplate::new(200).set_body_json(json!({
+        "access_token": "at", "token_type": "Bearer", "expires_in": 60
+    }));
+    let provider = basic_only_provider(&server, answer).await.build().unwrap();
+    provider
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect("an IdP that accepts only Basic grants the token");
+}
+
+#[tokio::test]
+async fn the_device_poll_authenticates_with_basic_when_the_client_holds_a_secret() {
+    use axess_factors::oauth::{DeviceTokenOutcome, OAuthProvider};
+    let server = MockServer::start().await;
+    let answer = ResponseTemplate::new(200);
+    let provider = basic_only_provider(&server, answer).await.build().unwrap();
+    // A pending answer is reachable only when the client authenticated.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(BasicOnly(
+            ResponseTemplate::new(400).set_body_json(json!({"error": "authorization_pending"})),
+        ))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let outcome = provider
+        .poll_device_token("device-code", 5, None, None)
+        .await
+        .expect("a poll an IdP that accepts only Basic understands");
+    assert!(matches!(outcome, DeviceTokenOutcome::Pending));
 }

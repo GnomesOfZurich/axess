@@ -130,7 +130,7 @@ where
                 "the identity provider refused the authorization request"
             );
             self.record_oauth_failure_and_clear(
-                AuthFailureReason::Other("authorization_refused".to_string()),
+                AuthFailureReason::from("authorization_refused"),
                 &provider_name,
                 session,
             )
@@ -140,6 +140,13 @@ where
             ));
         }
         let (Some(code), Some(state)) = (&verified.code, &verified.state) else {
+            // This ceremony's own response, and no better one will follow.
+            self.record_oauth_failure_and_clear(
+                AuthFailureReason::from("authorization_response_incomplete"),
+                &provider_name,
+                session,
+            )
+            .await?;
             return Err(OAuthError::InvalidParameter);
         };
         self.finish_oauth_login_checked(

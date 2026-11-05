@@ -6,7 +6,7 @@ use super::*;
 use crate::authn::ids::DeviceId;
 use crate::device::{
     CascadingRefreshStore, Device, DeviceStore, DeviceTrustLevel, FingerprintHash,
-    MemoryDeviceStore, RevokeDeviceError, revoke_device,
+    MemoryDeviceStore, RevokeDeviceError, cascade_revoke_devices_and_tokens, revoke_device,
 };
 use crate::testing::mock_random::MockRng;
 use axess_clock::testing::MockClock;
@@ -442,5 +442,37 @@ async fn the_device_check_refuses_a_device_owned_by_another_user() {
             .run(&refresh, &test_config(), &rng, now())
             .await;
         assert!(ok.is_ok(), "{owner:?}: {ok:?}");
+    }
+}
+
+/// The cascade helper an adopter calls from `on_token_compromise` revokes the
+/// tokens of every target device as well as the devices.
+#[tokio::test]
+async fn the_cascade_helper_revokes_devices_and_their_tokens() {
+    let (refresh, devices, rng) = (store(), MemoryDeviceStore::new(), MockRng::new(11));
+    let tenant = fixture_tenant();
+    let (d1, d2) = (device_id("laptop"), device_id("phone"));
+    for (id, fp) in [(&d1, 1u8), (&d2, 2u8)] {
+        devices
+            .save(&trusted(&tenant, id, fp), crate::device::test_now())
+            .await
+            .unwrap();
+    }
+    let laptop = issue(&refresh, &rng, Some(d1), Some("ua-laptop")).await;
+    let phone = issue(&refresh, &rng, Some(d2), Some("ua-phone")).await;
+
+    let revoked =
+        cascade_revoke_devices_and_tokens(&devices, &refresh, &[(tenant, d1), (tenant, d2)], now())
+            .await;
+    assert_eq!(revoked, 2);
+
+    for (id, token, info) in [(d1, &laptop, "ua-laptop"), (d2, &phone, "ua-phone")] {
+        let device = devices.load(&tenant, &id).await.unwrap().unwrap();
+        assert_eq!(device.trust_level, DeviceTrustLevel::Revoked);
+        let outcome = Refresh::new(token, |_| async { true })
+            .device_info(Some(info))
+            .run(&refresh, &test_config(), &rng, now())
+            .await;
+        assert!(matches!(outcome, Err(RefreshError::Revoked)));
     }
 }

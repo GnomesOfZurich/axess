@@ -27,7 +27,13 @@ async fn pool() -> sqlx::SqlitePool {
         .await
         .expect("connect in-memory sqlite");
     sqlx::migrate!().run(&pool).await.expect("migrations");
-    seed(&SystemClock, &pool).await.expect("seed");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("seed");
     pool
 }
 

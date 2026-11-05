@@ -181,10 +181,10 @@ impl std::fmt::Debug for ClientAuthMethod {
 }
 
 /// The token endpoint's response (RFC 6749 §5.1). Only the fields the
-/// client actually consumes are deserialised: `token_type` (always
-/// `Bearer` for client_credentials per RFC 6749) and `scope` (server
-/// may echo a subset of requested scopes; we don't enforce against
-/// the request) are intentionally dropped. serde's default of
+/// client actually consumes are deserialised: `token_type`, which must be
+/// `Bearer` because the token is used as one, and `expires_in`. `scope`
+/// (server may echo a subset of requested scopes; we don't enforce against
+/// the request) is intentionally dropped. serde's default of
 /// ignoring unknown fields keeps the parse robust against IdPs that
 /// return extra metadata.
 #[derive(Debug, Deserialize)]
@@ -195,6 +195,9 @@ struct TokenResponse {
     /// copy would leave the original in the heap for the process's
     /// lifetime.
     access_token: ZeroizedString,
+    /// The scheme the token is presented under (RFC 6749 section 7.1).
+    /// Required (RFC 6749 section 5.1); anything but `Bearer` is refused.
+    token_type: String,
     #[serde(default)]
     expires_in: Option<u64>,
 }
@@ -271,14 +274,14 @@ pub struct OutboundOAuthClient {
 ///
 /// RFC 6749 §2.3.1: the client id and secret are form-urlencoded before
 /// they are joined with `:` and base64-encoded, so a secret carrying
-/// `:`, `+` or `%` reaches a strict IdP intact. The value is the secret in
+/// `:`, `+` or `%` reaches a strict IdP intact (the encoding step is
+/// `crate::http_basic::form_urlencode`, shared with the OAuth ceremony). The
+/// value is the secret in
 /// another spelling, so it is a [`ZeroizedString`], as is every buffer on
 /// the way to it; [`basic_authorization`] builds the header from it.
 #[must_use]
 pub fn basic_credentials(client_id: &str, client_secret: &str) -> ZeroizedString {
-    let enc = |s: &str| {
-        ZeroizedString::new(url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>())
-    };
+    let enc = |s: &str| ZeroizedString::new(crate::http_basic::form_urlencode(s));
     let id = enc(client_id);
     let secret = enc(client_secret);
     // Sized up front: a buffer that grows leaves its earlier allocations
@@ -690,6 +693,16 @@ impl OutboundOAuthClient {
             return Err(OAuthClientError::MalformedResponse(
                 "access_token field is empty".into(),
             ));
+        }
+
+        // The token is sent as a bearer token. One issued under another
+        // scheme (`DPoP`) is bound to a key this client does not hold and
+        // would be refused, or accepted unbound by a lax resource server.
+        if !parsed.token_type.eq_ignore_ascii_case("bearer") {
+            return Err(OAuthClientError::MalformedResponse(format!(
+                "token_type {:?} is not Bearer",
+                parsed.token_type
+            )));
         }
 
         // RFC 6749 §5.1: `expires_in` is optional. If absent, treat the

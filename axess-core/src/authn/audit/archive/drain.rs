@@ -16,6 +16,14 @@ fn event() -> AuthEvent {
     .build()
 }
 
+/// The event of row `id`: its `event_time` names the row, so a sink can
+/// refuse one particular row.
+fn event_of(id: u64) -> AuthEvent {
+    let mut e = event();
+    e.event_time = id as i64;
+    e
+}
+
 /// An in-memory hot table: `select` returns the oldest rows up to the limit
 /// and `mark_archived` removes them, as a real table's `archived_at IS NULL`
 /// filter would.
@@ -23,6 +31,7 @@ fn event() -> AuthEvent {
 struct Table {
     rows: Arc<Mutex<Vec<u64>>>,
     selects: Arc<Mutex<u32>>,
+    purges: Arc<Mutex<u32>>,
 }
 
 impl Table {
@@ -30,6 +39,7 @@ impl Table {
         Self {
             rows: Arc::new(Mutex::new((0..n).collect())),
             selects: Arc::new(Mutex::new(0)),
+            purges: Arc::new(Mutex::new(0)),
         }
     }
     fn left(&self) -> usize {
@@ -48,7 +58,11 @@ impl AuditRetentionSource for Table {
     ) -> Result<Vec<(u64, AuthEvent)>, Self::Error> {
         *self.selects.lock().unwrap() += 1;
         let rows = self.rows.lock().unwrap();
-        Ok(rows.iter().take(limit).map(|id| (*id, event())).collect())
+        Ok(rows
+            .iter()
+            .take(limit)
+            .map(|id| (*id, event_of(*id)))
+            .collect())
     }
     async fn mark_archived(
         &self,
@@ -62,6 +76,7 @@ impl AuditRetentionSource for Table {
         &self,
         _: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, Self::Error> {
+        *self.purges.lock().unwrap() += 1;
         Ok(0)
     }
 }
@@ -160,4 +175,122 @@ async fn the_spawned_loop_works_before_its_first_interval_has_passed() {
         0,
         "nothing archived within 2 s of an hour tick"
     );
+}
+
+/// A sink that refuses every batch holding the event of one row.
+struct Refuses(u64);
+
+impl AuditArchiver for Refuses {
+    type Error = std::io::Error;
+    async fn archive_batch(
+        &self,
+        _: &ArchiveBatchId,
+        events: &[AuthEvent],
+    ) -> Result<(), Self::Error> {
+        if events.iter().any(|e| e.event_time == self.0 as i64) {
+            return Err(std::io::Error::other("row refused"));
+        }
+        Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "refuses"
+    }
+}
+
+/// One row the sink cannot take must not keep the other rows of its batch
+/// on the hot table, and must not stop the purge.
+#[tokio::test]
+async fn a_row_the_sink_refuses_does_not_hold_back_the_others() {
+    let table = Table::with(5);
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        Refuses(3),
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    )
+    .with_batch_size(10);
+
+    assert!(lp.tick().await.is_err(), "the refused row is reported");
+
+    assert_eq!(
+        *table.rows.lock().unwrap(),
+        vec![3],
+        "only the refused row is left unarchived"
+    );
+    assert_eq!(*table.purges.lock().unwrap(), 1, "the purge still ran");
+}
+
+/// A sink that is down for everything must not stop archived rows from
+/// leaving the hot table once their window has passed.
+#[tokio::test]
+async fn a_sink_that_is_down_does_not_stop_the_purge() {
+    struct Down;
+    impl AuditArchiver for Down {
+        type Error = std::io::Error;
+        async fn archive_batch(
+            &self,
+            _: &ArchiveBatchId,
+            _: &[AuthEvent],
+        ) -> Result<(), Self::Error> {
+            Err(std::io::Error::other("sink down"))
+        }
+        fn name(&self) -> &'static str {
+            "down"
+        }
+    }
+    let table = Table::with(3);
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        Down,
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    );
+
+    assert!(lp.tick().await.is_err());
+
+    assert_eq!(*table.purges.lock().unwrap(), 1, "the purge still ran");
+    assert_eq!(table.left(), 3, "nothing was marked archived");
+}
+
+/// A sink that refuses every call and counts them.
+struct CountingDown(Arc<Mutex<u32>>);
+
+impl AuditArchiver for CountingDown {
+    type Error = std::io::Error;
+    async fn archive_batch(&self, _: &ArchiveBatchId, _: &[AuthEvent]) -> Result<(), Self::Error> {
+        *self.0.lock().unwrap() += 1;
+        Err(std::io::Error::other("sink down"))
+    }
+    fn name(&self) -> &'static str {
+        "counting-down"
+    }
+}
+
+/// A down sink costs a handful of calls a tick, not one per row.
+#[tokio::test]
+async fn a_down_sink_costs_three_calls_not_one_per_row() {
+    let calls = Arc::new(Mutex::new(0));
+    let table = Table::with(10);
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        CountingDown(calls.clone()),
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    )
+    .with_batch_size(10);
+    assert!(lp.tick().await.is_err());
+    assert_eq!(*calls.lock().unwrap(), 3, "the batch, then two probes");
+    assert_eq!(table.left(), 10);
+}
+
+/// The oldest row refused for good does not stop the drain: the other rows
+/// are archived across ticks and the refusal is reported at the end.
+#[tokio::test]
+async fn a_drain_archives_around_a_row_the_sink_always_refuses() {
+    let table = Table::with(25);
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        Refuses(0),
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    )
+    .with_batch_size(10);
+    assert!(lp.drain().await.is_err(), "the refused row is reported");
+    assert_eq!(*table.rows.lock().unwrap(), vec![0]);
 }

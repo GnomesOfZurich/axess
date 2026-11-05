@@ -13,7 +13,7 @@ This crate has no dependency on Axum or the rest of the Axess stack. You can use
 ## Capabilities
 
 - **Password** hashing and verification via Argon2id ([password-auth](https://crates.io/crates/password-auth))
-- **TOTP** (RFC 6238) generation and verification via [totp-rs](https://crates.io/crates/totp-rs), with constant-time code comparison
+- **TOTP** (RFC 6238) generation and verification on the in-tree HOTP core (RFC 4226), with constant-time code comparison
 - **HOTP** (RFC 4226) verification via [libreauth](https://crates.io/crates/libreauth), with constant-time code comparison
 - Secret generation, provisioning URI helpers for authenticator apps
 - All decoded secrets wrapped in `Zeroizing` (cleared from memory on drop)
@@ -43,7 +43,7 @@ verify_password("my-secure-password", &hash).expect("should match");
 
 // TOTP
 let secret = generate_totp_secret();
-let uri = build_totp_uri("alice@example.com", "MyApp", &secret, 6, 30);
+let uri = build_totp_uri("alice@example.com", "MyApp", &secret, 6, 30).expect("valid digits and period");
 // verify_totp(secret, code, now, length, period, past_window, future_window) -> Option<step>
 
 // TOTP with injectable RNG (for deterministic tests)

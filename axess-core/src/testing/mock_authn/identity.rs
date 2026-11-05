@@ -7,9 +7,16 @@ use crate::authn::{
     ids::{TenantId, UserId},
     types::{EntityState, LockoutPolicy, StatusDetail, Tenant, User},
 };
-use dashmap::DashMap;
+use crate::locked::lock;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq as _;
+
+/// A user's failed-attempt count and the time of the last failure.
+type FailedAttempts = (u32, chrono::DateTime<chrono::Utc>);
+
+/// A reset token's hash and its expiry.
+type ResetToken = (String, chrono::DateTime<chrono::Utc>);
 
 /// In-memory [`IdentityStore`](crate::authn::IdentityStore) for unit tests.
 ///
@@ -18,15 +25,15 @@ use subtle::ConstantTimeEq as _;
 #[derive(Clone)]
 pub struct MockIdentityStore {
     /// user_id -> User
-    users: Arc<DashMap<String, User>>,
+    users: Arc<Mutex<HashMap<String, User>>>,
     /// (tenant_id, identifier) -> user_id
-    by_identifier: Arc<DashMap<(String, String), String>>,
+    by_identifier: Arc<Mutex<HashMap<(String, String), String>>>,
     /// tenant identifier (slug) -> Tenant
-    tenants: Arc<DashMap<String, Tenant>>,
+    tenants: Arc<Mutex<HashMap<String, Tenant>>>,
     /// tenant id -> Tenant
-    tenants_by_id: Arc<DashMap<String, Tenant>>,
+    tenants_by_id: Arc<Mutex<HashMap<String, Tenant>>>,
     /// user_id -> (failed attempt count, time of the last failure)
-    failed_attempts: Arc<DashMap<String, (u32, chrono::DateTime<chrono::Utc>)>>,
+    failed_attempts: Arc<Mutex<HashMap<String, FailedAttempts>>>,
     /// Clock the last-failure time is read from. Share the service's
     /// [`MockClock`](axess_clock::testing::MockClock) with
     /// [`with_clock`](Self::with_clock) so a derived lockout expires on the
@@ -61,16 +68,16 @@ pub struct MockIdentityStore {
     /// flow records when the lookup of a principal cannot be made.
     fail_get_user: Arc<std::sync::atomic::AtomicBool>,
     /// Password history per user: `user_id -> Vec<hash>`.
-    password_history: Arc<DashMap<String, Vec<String>>>,
+    password_history: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Active password reset tokens: `user_id -> (token_hash, expires_at)`.
-    reset_tokens: Arc<DashMap<String, (String, chrono::DateTime<chrono::Utc>)>>,
+    reset_tokens: Arc<Mutex<HashMap<String, ResetToken>>>,
     /// Per-tenant password rules: `tenant_id -> PasswordRules`. Falls back
     /// to `PasswordRules::default()` for tenants without an override.
-    password_rules: Arc<DashMap<String, crate::authn::factor::PasswordRules>>,
+    password_rules: Arc<Mutex<HashMap<String, crate::authn::factor::PasswordRules>>>,
     /// tenant id -> IP policy, for
     /// [`IdentityLookup::ip_policy_for_tenant`](crate::authn::IdentityLookup::ip_policy_for_tenant).
     /// Absent means the trait default, which permits every address.
-    ip_policies: Arc<DashMap<String, crate::authn::types::IpPolicy>>,
+    ip_policies: Arc<Mutex<HashMap<String, crate::authn::types::IpPolicy>>>,
     /// Factor store whose rows for a user are erased along with the user by
     /// [`delete_user`](IdentityAdmin::delete_user); see
     /// [`with_factor_store`](Self::with_factor_store).
@@ -79,7 +86,7 @@ pub struct MockIdentityStore {
     call_log: Option<CallLog>,
     /// user_id -> time of the last successful authentication, as written by
     /// [`record_last_login`](crate::authn::IdentityAuthnLog::record_last_login).
-    last_logins: Arc<DashMap<String, chrono::DateTime<chrono::Utc>>>,
+    last_logins: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
 }
 
 impl Default for MockIdentityStore {
@@ -140,7 +147,7 @@ impl MockIdentityStore {
         tenant_id: &TenantId,
         rules: crate::authn::factor::PasswordRules,
     ) -> Self {
-        self.password_rules.insert(tenant_id.to_string(), rules);
+        lock(&self.password_rules).insert(tenant_id.to_string(), rules);
         self
     }
 
@@ -156,7 +163,7 @@ impl MockIdentityStore {
         tenant_id: &TenantId,
         policy: crate::authn::types::IpPolicy,
     ) -> Self {
-        self.ip_policies.insert(tenant_id.to_string(), policy);
+        lock(&self.ip_policies).insert(tenant_id.to_string(), policy);
         self
     }
 
@@ -235,28 +242,32 @@ impl MockIdentityStore {
 
     /// Register a user (indexed by ID and by `(tenant_id, identifier)`).
     pub fn with_user(self, user: User) -> Self {
-        self.by_identifier.insert(
+        lock(&self.by_identifier).insert(
             (user.tenant_id.to_string(), user.identifier.to_string()),
             user.id.to_string(),
         );
-        self.users.insert(user.id.to_string(), user);
+        lock(&self.users).insert(user.id.to_string(), user);
         self
+    }
+
+    /// The tenant of the registered user with this id, if any.
+    pub(crate) fn tenant_of(&self, user_id: &UserId) -> Option<TenantId> {
+        lock(&self.users)
+            .get(user_id.to_string().as_str())
+            .map(|user| user.tenant_id)
     }
 
     /// Register a tenant (indexed by ID and by identifier/slug).
     pub fn with_tenant(self, tenant: Tenant) -> Self {
-        self.tenants_by_id
-            .insert(tenant.id.to_string(), tenant.clone());
-        self.tenants.insert(tenant.identifier.to_string(), tenant);
+        lock(&self.tenants_by_id).insert(tenant.id.to_string(), tenant.clone());
+        lock(&self.tenants).insert(tenant.identifier.to_string(), tenant);
         self
     }
 
     /// Set the default tenant returned by `default_tenant()`.
     pub fn with_default_tenant(mut self, tenant: Tenant) -> Self {
-        self.tenants_by_id
-            .insert(tenant.id.to_string(), tenant.clone());
-        self.tenants
-            .insert(tenant.identifier.to_string(), tenant.clone());
+        lock(&self.tenants_by_id).insert(tenant.id.to_string(), tenant.clone());
+        lock(&self.tenants).insert(tenant.identifier.to_string(), tenant.clone());
         self.default_tenant = Some(tenant);
         self
     }
@@ -286,15 +297,15 @@ impl MockIdentityStore {
     /// produces and indexes the failed-attempts map by that.
     pub fn failed_attempts_for(&self, label: &str) -> u32 {
         let key = axess_identity::testing::user(label).to_string();
-        self.failed_attempts.get(&key).map(|r| r.0).unwrap_or(0)
+        lock(&self.failed_attempts).get(&key).map_or(0, |r| r.0)
     }
 
     /// When [`record_last_login`](crate::authn::IdentityAuthnLog::record_last_login)
     /// last ran for `user_id`, or `None` when it never did.
     pub fn last_login(&self, user_id: &UserId) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.last_logins
+        lock(&self.last_logins)
             .get(user_id.to_string().as_str())
-            .map(|r| *r)
+            .copied()
     }
 }
 
@@ -308,11 +319,8 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
     ) -> Result<Option<User>, Self::Error> {
         note(&self.call_log, "find_user");
         let key = (tenant_id.to_string(), identifier.to_string());
-        let user = self
-            .by_identifier
-            .get(&key)
-            .and_then(|uid| self.users.get(uid.as_str()))
-            .map(|r| r.clone());
+        let user_id = lock(&self.by_identifier).get(&key).cloned();
+        let user = user_id.and_then(|uid| lock(&self.users).get(uid.as_str()).cloned());
         Ok(user)
     }
 
@@ -321,10 +329,7 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
         if self.fail_get_user.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(MockStoreError::Unavailable);
         }
-        Ok(self
-            .users
-            .get(user_id.to_string().as_str())
-            .map(|r| r.clone()))
+        Ok(lock(&self.users).get(user_id.to_string().as_str()).cloned())
     }
 
     async fn get_user_in_tenant(
@@ -333,32 +338,29 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
         expected_tenant: &TenantId,
     ) -> Result<Option<User>, Self::Error> {
         note(&self.call_log, "get_user_in_tenant");
-        Ok(self
-            .users
+        Ok(lock(&self.users)
             .get(user_id.to_string().as_str())
             .filter(|u| &u.tenant_id == expected_tenant)
-            .map(|r| r.clone()))
+            .cloned())
     }
 
     async fn get_tenant(&self, tenant_id: &TenantId) -> Result<Option<Tenant>, Self::Error> {
         note(&self.call_log, "get_tenant");
-        Ok(self
-            .tenants_by_id
+        Ok(lock(&self.tenants_by_id)
             .get(tenant_id.to_string().as_str())
-            .map(|r| r.clone()))
+            .cloned())
     }
 
     async fn get_user_tenant(&self, user_id: &UserId) -> Result<Option<TenantId>, Self::Error> {
         note(&self.call_log, "get_user_tenant");
-        Ok(self
-            .users
+        Ok(lock(&self.users)
             .get(user_id.to_string().as_str())
             .map(|r| r.tenant_id))
     }
 
     async fn find_tenant(&self, identifier: &str) -> Result<Option<Tenant>, Self::Error> {
         note(&self.call_log, "find_tenant");
-        Ok(self.tenants.get(identifier).map(|r| r.clone()))
+        Ok(lock(&self.tenants).get(identifier).cloned())
     }
 
     async fn default_tenant(&self) -> Result<Tenant, Self::Error> {
@@ -369,8 +371,7 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
 
     async fn account_status(&self, user_id: &UserId) -> Result<EntityState, Self::Error> {
         note(&self.call_log, "account_status");
-        Ok(self
-            .users
+        Ok(lock(&self.users)
             .get(user_id.to_string().as_str())
             .map(|u| u.status.clone())
             .unwrap_or(EntityState::Guest))
@@ -385,10 +386,9 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
         tenant_id: &TenantId,
     ) -> Result<crate::authn::types::IpPolicy, Self::Error> {
         note(&self.call_log, "ip_policy_for_tenant");
-        Ok(self
-            .ip_policies
+        Ok(lock(&self.ip_policies)
             .get(tenant_id.to_string().as_str())
-            .map(|p| p.clone())
+            .cloned()
             .unwrap_or_default())
     }
 
@@ -397,10 +397,9 @@ impl crate::authn::store::IdentityLookup for MockIdentityStore {
         tenant_id: &TenantId,
     ) -> Result<crate::authn::factor::PasswordRules, Self::Error> {
         note(&self.call_log, "password_rules_for_tenant");
-        Ok(self
-            .password_rules
+        Ok(lock(&self.password_rules)
             .get(tenant_id.to_string().as_str())
-            .map(|r| r.clone())
+            .cloned()
             .unwrap_or_default())
     }
 }
@@ -439,10 +438,8 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
         }
         note(&self.call_log, "record_failed_attempt");
         let now = self.clock.now();
-        let mut entry = self
-            .failed_attempts
-            .entry(user_id.to_string())
-            .or_insert((0, now));
+        let mut attempts = lock(&self.failed_attempts);
+        let entry = attempts.entry(user_id.to_string()).or_insert((0, now));
         entry.0 += 1;
         entry.1 = now;
         Ok(entry.0)
@@ -462,11 +459,9 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
         note(&self.call_log, "reserve_attempt");
         let now = self.clock.now();
         let max = policy.effective_max_attempts();
-        // The entry's shard lock makes the test and the increment one step.
-        let mut entry = self
-            .failed_attempts
-            .entry(user_id.to_string())
-            .or_insert((0, now));
+        // Holding the map's lock makes the test and the increment one step.
+        let mut attempts = lock(&self.failed_attempts);
+        let entry = attempts.entry(user_id.to_string()).or_insert((0, now));
         let window = chrono::Duration::from_std(policy.attempt_window)
             .unwrap_or_else(|_| chrono::Duration::hours(1));
         // The window freshens a count below the limit only; at the limit the
@@ -494,11 +489,14 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
     async fn release_attempt(&self, user_id: &UserId) -> Result<(), Self::Error> {
         note(&self.call_log, "release_attempt");
         let key = user_id.to_string();
-        if let Some(mut entry) = self.failed_attempts.get_mut(key.as_str()) {
+        let mut attempts = lock(&self.failed_attempts);
+        let spent = attempts.get_mut(key.as_str()).is_some_and(|entry| {
             entry.0 = entry.0.saturating_sub(1);
+            entry.0 == 0
+        });
+        if spent {
+            attempts.remove(key.as_str());
         }
-        self.failed_attempts
-            .remove_if(key.as_str(), |_, v| v.0 == 0);
         Ok(())
     }
 
@@ -507,15 +505,14 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
         user_id: &UserId,
     ) -> Result<(u32, Option<chrono::DateTime<chrono::Utc>>), Self::Error> {
         note(&self.call_log, "failed_attempts");
-        Ok(self
-            .failed_attempts
+        Ok(lock(&self.failed_attempts)
             .get(user_id.to_string().as_str())
             .map(|r| (r.0, Some(r.1)))
             .unwrap_or((0, None)))
     }
 
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        self.failed_attempts.remove(user_id.to_string().as_str());
+        lock(&self.failed_attempts).remove(user_id.to_string().as_str());
         Ok(())
     }
 
@@ -525,7 +522,7 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
         at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), Self::Error> {
         note(&self.call_log, "record_last_login");
-        self.last_logins.insert(user_id.to_string(), at);
+        lock(&self.last_logins).insert(user_id.to_string(), at);
         Ok(())
     }
 }
@@ -535,18 +532,15 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
         // Unique on both `id` and `identifier`, as the trait requires: a
         // second tenant under an existing slug would otherwise silently
         // replace the first in the slug index, where a real store refuses.
-        if self
-            .tenants_by_id
-            .contains_key(tenant.id.to_string().as_str())
-            || self
-                .tenants
-                .contains_key(tenant.identifier.to_string().as_str())
+        let mut by_id = lock(&self.tenants_by_id);
+        let mut by_slug = lock(&self.tenants);
+        if by_id.contains_key(tenant.id.to_string().as_str())
+            || by_slug.contains_key(tenant.identifier.to_string().as_str())
         {
             return Err(MockStoreError::AlreadyExists);
         }
-        self.tenants
-            .insert(tenant.identifier.to_string(), tenant.clone());
-        self.tenants_by_id.insert(tenant.id.to_string(), tenant);
+        by_slug.insert(tenant.identifier.to_string(), tenant.clone());
+        by_id.insert(tenant.id.to_string(), tenant);
         Ok(())
     }
 
@@ -555,17 +549,19 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
         // Unique on the user id as well as the identifier: a primary-key
         // collision replacing the stored row would let a test "create" a
         // user over an existing one, which a real store refuses.
-        if self.by_identifier.contains_key(&key) || self.users.contains_key(&user.id.to_string()) {
+        let mut by_identifier = lock(&self.by_identifier);
+        let mut users = lock(&self.users);
+        if by_identifier.contains_key(&key) || users.contains_key(&user.id.to_string()) {
             return Err(MockStoreError::AlreadyExists);
         }
-        self.by_identifier.insert(key, user.id.to_string());
-        self.users.insert(user.id.to_string(), user);
+        by_identifier.insert(key, user.id.to_string());
+        users.insert(user.id.to_string(), user);
         Ok(())
     }
 
     async fn activate_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        let mut entry = self
-            .users
+        let mut users = lock(&self.users);
+        let entry = users
             .get_mut(user_id.to_string().as_str())
             .ok_or(MockStoreError::NotFound)?;
         entry.status = EntityState::Active;
@@ -577,8 +573,8 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
         user_id: &UserId,
         detail: StatusDetail,
     ) -> Result<(), Self::Error> {
-        let mut entry = self
-            .users
+        let mut users = lock(&self.users);
+        let entry = users
             .get_mut(user_id.to_string().as_str())
             .ok_or(MockStoreError::NotFound)?;
         entry.status = EntityState::Suspended(detail);
@@ -592,12 +588,14 @@ impl crate::authn::store::IdentityAdmin for MockIdentityStore {
     /// user is therefore `NotFound` too.
     async fn delete_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
         let key = user_id.to_string();
-        let (_, user) = self.users.remove(&key).ok_or(MockStoreError::NotFound)?;
-        self.by_identifier
+        let user = lock(&self.users)
+            .remove(&key)
+            .ok_or(MockStoreError::NotFound)?;
+        lock(&self.by_identifier)
             .remove(&(user.tenant_id.to_string(), user.identifier.to_string()));
-        self.failed_attempts.remove(&key);
-        self.password_history.remove(&key);
-        self.reset_tokens.remove(&key);
+        lock(&self.failed_attempts).remove(&key);
+        lock(&self.password_history).remove(&key);
+        lock(&self.reset_tokens).remove(&key);
         if let Some(factors) = &self.linked_factors {
             factors.forget_user(&user.tenant_id, user_id);
         }
@@ -619,8 +617,7 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         {
             return Err(MockStoreError::NotFound);
         }
-        self.reset_tokens
-            .insert(user_id.to_string(), (token_hash.to_string(), expires_at));
+        lock(&self.reset_tokens).insert(user_id.to_string(), (token_hash.to_string(), expires_at));
         Ok(())
     }
 
@@ -633,16 +630,17 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         // One atomic remove-if: of two concurrent verifications of the same
         // token exactly one may succeed (the token is single-use). A
         // mismatch or an expired token leaves the stored row alone.
-        Ok(self
-            .reset_tokens
-            .remove_if(
-                user_id.to_string().as_str(),
-                |_, (stored_hash, expires_at)| {
-                    *expires_at > now
-                        && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
-                },
-            )
-            .is_some())
+        let mut tokens = lock(&self.reset_tokens);
+        let key = user_id.to_string();
+        let matches = tokens
+            .get(key.as_str())
+            .is_some_and(|(stored_hash, expires_at)| {
+                *expires_at > now && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
+            });
+        if matches {
+            tokens.remove(key.as_str());
+        }
+        Ok(matches)
     }
 
     async fn check_reset_token(
@@ -651,11 +649,9 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
         token_hash: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool, Self::Error> {
-        Ok(self
-            .reset_tokens
+        Ok(lock(&self.reset_tokens)
             .get(user_id.to_string().as_str())
-            .is_some_and(|entry| {
-                let (stored_hash, expires_at) = entry.value();
+            .is_some_and(|(stored_hash, expires_at)| {
                 *expires_at > now && bool::from(stored_hash.as_bytes().ct_eq(token_hash.as_bytes()))
             }))
     }
@@ -664,7 +660,7 @@ impl crate::authn::store::IdentityPasswordReset for MockIdentityStore {
 impl crate::authn::store::IdentityPasswordHistory for MockIdentityStore {
     async fn record_password_hash(&self, user_id: &UserId, hash: &str) -> Result<(), Self::Error> {
         note(&self.call_log, "record_password_hash");
-        self.password_history
+        lock(&self.password_history)
             .entry(user_id.to_string())
             .or_default()
             .push(hash.to_string());
@@ -677,8 +673,7 @@ impl crate::authn::store::IdentityPasswordHistory for MockIdentityStore {
         count: usize,
     ) -> Result<Vec<String>, Self::Error> {
         note(&self.call_log, "password_history");
-        Ok(self
-            .password_history
+        Ok(lock(&self.password_history)
             .get(user_id.to_string().as_str())
             .map(|hashes| hashes.iter().rev().take(count).cloned().collect())
             .unwrap_or_default())

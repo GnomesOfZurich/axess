@@ -154,3 +154,82 @@ async fn a_take_that_lost_the_swap_to_another_take_gets_nothing() {
     assert_eq!(a.consume_custom("reg_state").await, None);
     assert!(stored(&store, &id).await.custom.get("reg_state").is_none());
 }
+
+/// A take made after the session was promoted and its id rotated writes only
+/// the removal to the row under the id the request arrived with: that id may
+/// be known to an attacker, so the authenticated state must reach only the
+/// row under the new id (written by the response).
+#[tokio::test]
+async fn a_take_after_the_id_rotated_does_not_write_the_login_to_the_old_row() {
+    let store = MemorySessionStore::new();
+    let id = SessionId::new(&MockRng::new(4));
+    let loaded = SessionData {
+        custom: bag(&[("reg_state", "S1"), ("csrf", "T1")]),
+        ..SessionData::default()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut a = request_holding(&store, id, &loaded);
+    a.data.auth_state.set_authenticated(
+        axess_identity::testing::user("u-fix"),
+        axess_identity::testing::tenant("t-fix"),
+        chrono::Utc::now(),
+    );
+    a.data.fingerprint = Some("fp".into());
+    a.modified = true;
+    a.rotate_id();
+
+    let taken = a.consume_custom("reg_state").await;
+
+    assert_eq!(taken, Some(serde_json::json!("S1")));
+    let old_row = stored(&store, &id).await;
+    assert!(
+        !old_row.auth_state.is_authenticated(),
+        "the row under the pre-rotation id must never hold the login"
+    );
+    assert_eq!(old_row.fingerprint, None);
+    assert!(
+        old_row.custom.get("reg_state").is_none(),
+        "the take is stored"
+    );
+    assert!(
+        a.data.auth_state.is_authenticated(),
+        "the request goes on authenticated, for the response to store under the new id"
+    );
+    assert!(a.consume_custom("reg_state").await.is_none());
+}
+
+/// A rotated request that takes a value after a concurrent request took
+/// another: the merge the retry made onto the row reaches the data the
+/// response stores under the new id, so the value the other request took
+/// does not come back.
+#[tokio::test]
+async fn a_rotated_take_that_lost_the_swap_carries_the_concurrent_take_into_its_data() {
+    let store = MemorySessionStore::new();
+    let id = SessionId::new(&MockRng::new(5));
+    let loaded = SessionData {
+        custom: bag(&[("k1", "one"), ("k2", "two")]),
+        ..SessionData::default()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut a = request_holding(&store, id, &loaded);
+    a.data.auth_state.set_authenticated(
+        axess_identity::testing::user("u-fix"),
+        axess_identity::testing::tenant("t-fix"),
+        chrono::Utc::now(),
+    );
+    a.modified = true;
+    a.rotate_id();
+    // Request B takes k2 before A takes k1.
+    concurrent_write(&store, &id, &loaded, bag(&[("k1", "one")])).await;
+
+    let taken = a.consume_custom("k1").await;
+
+    assert_eq!(taken, Some(serde_json::json!("one")));
+    assert!(
+        a.data.custom.get("k2").is_none(),
+        "the value another request took must not travel to the new id: {:?}",
+        a.data.custom
+    );
+    assert!(a.data.custom.get("k1").is_none());
+    assert!(a.data.auth_state.is_authenticated());
+}

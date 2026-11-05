@@ -68,7 +68,7 @@ async fn purge_expired_method_evicts_expired_row() {
     // load() bypasses the auto-purge path and goes through its own
     // expiry check, but with the row physically removed by
     // purge_expired() the load returns None either way. With the
-    // mutant body `()`, the row stays in DashMap; load()'s own
+    // mutant body `()`, the row stays in the map; load()'s own
     // expiry check still removes it on access; but the very next
     // load _re-_inserts nothing because the row is gone, so this
     // test additionally calls load() then re-checks: behaviour is
@@ -140,7 +140,7 @@ async fn ttl_boundary_at_exact_elapsed_equals_ttl_evicts() {
 }
 
 /// `purge_expired` must physically remove the entry from the
-/// internal DashMap. The existing `purge_expired_method_evicts_expired_row`
+/// internal map. The existing `purge_expired_method_evicts_expired_row`
 /// goes through `load()` which has its own expiry path, so a
 /// `purge_expired -> ()` body deletion is masked. Pin on the
 /// underlying map size to discriminate.

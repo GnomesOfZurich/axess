@@ -242,6 +242,12 @@ impl Idp {
     /// The claims of the client assertion `seen` carries, after its
     /// signature verified under the client's public key.
     fn assertion_claims(&self, seen: &Seen) -> Value {
+        self.assertion_claims_for(seen, &self.issuer)
+    }
+
+    /// [`assertion_claims`](Self::assertion_claims) for an assertion
+    /// addressed to `audience`.
+    fn assertion_claims_for(&self, seen: &Seen, audience: &str) -> Value {
         assert_eq!(
             seen.form("client_assertion_type"),
             Some(CLIENT_ASSERTION_TYPE_JWT_BEARER),
@@ -253,7 +259,7 @@ impl Idp {
         let key = jsonwebtoken::DecodingKey::from_ec_components(&B64.encode(x), &B64.encode(y))
             .expect("key");
         let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
-        validation.set_audience(&[self.issuer.as_str()]);
+        validation.set_audience(&[audience]);
         jsonwebtoken::decode::<Value>(assertion, &key, &validation)
             .expect("the assertion verifies under the client's key, for the issuer")
             .claims
@@ -907,10 +913,17 @@ async fn a_fapi_provider_with_only_a_client_secret_is_refused() {
         .client_credentials(&["scope-a"], None)
         .await
         .expect("a grant without the profile");
+    let seen = &idp.requests_to("/token")[0];
     assert_eq!(
-        idp.requests_to("/token")[0].form("client_secret"),
-        Some("test-secret"),
-        "the provider holds a secret and sends it"
+        seen.form("client_secret"),
+        None,
+        "the secret is not in the form"
+    );
+    assert!(
+        seen.authorization
+            .as_deref()
+            .is_some_and(|a| a.starts_with("Basic ")),
+        "the provider holds a secret and sends it as a Basic header"
     );
 
     for config in [FapiConfig::default(), jarm_provider_config()] {
@@ -1794,4 +1807,296 @@ async fn a_par_use_dpop_nonce_refusal_is_answered_with_the_nonce() {
     let (_, retry) = proof_of(&pushes[1]);
     assert_eq!(retry["nonce"], "par-nonce-1");
     assert_eq!(pushes[0].form("dpop_jkt"), pushes[1].form("dpop_jkt"));
+}
+
+// ── Client authentication on a retried request ───────────────────────────────
+
+/// A token request answered with `use_dpop_nonce` is sent again with a proof
+/// that echoes the nonce, and with a client assertion of its own: FAPI 2.0
+/// has the authorization server refuse an assertion whose `jti` it has seen.
+#[tokio::test]
+async fn the_nonce_retry_signs_a_fresh_client_assertion() {
+    let idp = Idp::start(json!({})).await;
+    let authn = service(dpop_provider(&idp).await);
+    let session = test_session();
+    let (nonce, csrf) = begin(&authn, &session).await;
+    let id = idp.id_token(Algorithm::PS256, &nonce, json!({}));
+    idp.mount("POST", "/token", move |seen, _| {
+        let has_nonce = seen
+            .dpop
+            .as_deref()
+            .is_some_and(|p| segment(p, 1).get("nonce") == Some(&json!("server-nonce-1")));
+        if has_nonce {
+            ResponseTemplate::new(200).set_body_json(token_json("DPoP", Some(id.clone())))
+        } else {
+            ResponseTemplate::new(400)
+                .insert_header("DPoP-Nonce", "server-nonce-1")
+                .set_body_json(json!({ "error": "use_dpop_nonce" }))
+        }
+    })
+    .await;
+
+    authn
+        .finish_oauth_login("code", &csrf, &session)
+        .await
+        .expect("the retry with the nonce succeeds");
+
+    let requests = idp.requests_to("/token");
+    assert_eq!(requests.len(), 2, "one refusal, one retry");
+    let first = idp.assertion_claims(&requests[0]);
+    let second = idp.assertion_claims(&requests[1]);
+    assert_ne!(
+        first["jti"], second["jti"],
+        "the retry replays the first request's client assertion"
+    );
+}
+
+// ── The device authorization request ─────────────────────────────────────────
+
+/// The device authorization request proves the client's identity like every
+/// other request to the IdP (RFC 8628 section 3.1 defers to RFC 6749
+/// section 3.2.1): a `private_key_jwt` client sends its assertion, and no
+/// secret.
+#[tokio::test]
+async fn the_device_authorization_request_carries_the_clients_assertion() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({})).await;
+    idp.mount("POST", "/device", |_, _| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "dc",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://idp.example/device",
+            "expires_in": 600,
+            "interval": 5,
+        }))
+    })
+    .await;
+    let provider = idp
+        .fapi_provider()
+        .await
+        .with_device_authorization_endpoint(format!("{}/device", idp.issuer))
+        .build()
+        .expect("build");
+    provider
+        .request_device_code(&["openid"])
+        .await
+        .expect("a device code");
+
+    let requests = idp.requests_to("/device");
+    assert_eq!(requests.len(), 1);
+    assert_no_secret(&requests[0]);
+    assert_eq!(requests[0].form("scope"), Some("openid"));
+    let claims = idp.assertion_claims_for(&requests[0], &format!("{}/device", idp.issuer));
+    assert_eq!(claims["iss"], CLIENT_ID);
+}
+
+/// A client with a secret sends it, as a form member next to its id, and
+/// the id once.
+#[tokio::test]
+async fn the_device_authorization_request_authenticates_the_client() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({})).await;
+    idp.mount("POST", "/device", |_, _| {
+        ResponseTemplate::new(200).set_body_json(json!({
+            "device_code": "dc",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://idp.example/device",
+            "expires_in": 600,
+        }))
+    })
+    .await;
+    let provider = idp
+        .provider()
+        .await
+        .with_device_authorization_endpoint(format!("{}/device", idp.issuer))
+        .build()
+        .expect("build");
+    provider
+        .request_device_code(&["openid"])
+        .await
+        .expect("a device code");
+
+    let requests = idp.requests_to("/device");
+    assert!(requests[0].form("client_secret").is_none());
+    let basic = requests[0]
+        .authorization
+        .as_deref()
+        .and_then(|a| a.strip_prefix("Basic "))
+        .expect("the secret is sent as a Basic header");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(basic)
+        .expect("base64");
+    assert_eq!(
+        String::from_utf8(decoded).expect("utf-8"),
+        format!("{CLIENT_ID}:test-secret")
+    );
+    let ids = requests[0]
+        .form
+        .iter()
+        .filter(|(k, _)| k == "client_id")
+        .count();
+    assert_eq!(ids, 1, "the client id is sent once");
+}
+
+// ── Failures of the token endpoint ───────────────────────────────────────────
+
+/// A `5xx` from the token endpoint is the transient failure a caller may
+/// retry, whichever grant met it, and its message does not carry the body: an
+/// error page can echo the request.
+#[tokio::test]
+async fn a_5xx_from_the_token_endpoint_is_transient_and_its_message_has_no_body() {
+    use axess_factors::oauth::OAuthProvider as _;
+    let idp = Idp::start(json!({})).await;
+    idp.mount("POST", "/token", |_, _| {
+        ResponseTemplate::new(503).set_body_string("upstream echo: client_secret=LEAKED-SECRET")
+    })
+    .await;
+    idp.mount("POST", "/revoke", |_, _| {
+        ResponseTemplate::new(503).set_body_string("upstream echo: token=LEAKED-TOKEN")
+    })
+    .await;
+    let provider = idp
+        .provider()
+        .await
+        .without_dpop()
+        .with_revocation_endpoint(format!("{}/revoke", idp.issuer))
+        .build()
+        .expect("build");
+
+    let errors = [
+        provider
+            .client_credentials(&["scope-a"], None)
+            .await
+            .expect_err("503"),
+        provider
+            .refresh_token("rt1", None, None)
+            .await
+            .expect_err("503"),
+        provider
+            .revoke_token("rt1", Some("refresh_token"), None)
+            .await
+            .expect_err("503"),
+    ];
+    // A device-code poll that meets a 5xx is not a denial.
+    let polled = provider.poll_device_token("dc", 5, None, None).await;
+    assert!(
+        matches!(&polled, Err(e) if e.is_transient()),
+        "a 503 is not the user's refusal: {:?}",
+        polled.map(|_| ())
+    );
+    for err in errors {
+        assert!(err.is_transient(), "a 503 can be retried: {err:?}");
+        let shown = err.to_string();
+        assert!(!shown.contains("LEAKED"), "{shown}");
+    }
+}
+
+/// A token endpoint that cannot be reached is as transient as one that
+/// answers 5xx.
+#[tokio::test]
+async fn an_unreachable_token_endpoint_is_transient() {
+    use axess_factors::oauth::OAuthProvider as _;
+    // The discovery document names a token endpoint nothing listens on.
+    let idp = Idp::start(json!({ "token_endpoint": "http://127.0.0.1:1/token" })).await;
+    let provider = idp.provider().await.without_dpop().build().expect("build");
+    let err = provider
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect_err("nothing answers");
+    assert!(err.is_transient(), "{err:?}");
+}
+
+// ── Challenges in one header ─────────────────────────────────────────────────
+
+/// A `WWW-Authenticate` value may carry several challenges (RFC 9110
+/// section 11.6.1); the nonce challenge is answered wherever it stands.
+#[tokio::test]
+async fn userinfo_answers_a_nonce_challenge_that_is_not_the_first_in_its_header() {
+    let idp = Idp::start(json!({})).await;
+    let (authn, claims) = dpop_login(&idp, "DPoP").await;
+    let claims = claims.expect("login");
+    let key = claims.dpop_key.clone().expect("key");
+    let access = claims.access_token.clone().expect("an access token");
+    idp.mount("GET", "/userinfo", |seen, _| {
+        let (_, payload) = proof_of(seen);
+        if payload["nonce"] == "rs-nonce-1" {
+            ResponseTemplate::new(200).set_body_json(json!({ "sub": "alice-subject" }))
+        } else {
+            ResponseTemplate::new(401)
+                .insert_header(
+                    "WWW-Authenticate",
+                    "Bearer realm=\"api\", DPoP error=\"use_dpop_nonce\", \
+                     error_description=\"a, nonce\"",
+                )
+                .insert_header("DPoP-Nonce", "rs-nonce-1")
+        }
+    })
+    .await;
+
+    authn
+        .fetch_userinfo("test", &access, "alice-subject", Some(&key))
+        .await
+        .expect("the DPoP challenge is answered though a Bearer one comes first");
+    assert_eq!(idp.requests_to("/userinfo").len(), 2);
+}
+
+/// A response the IdP signed for this ceremony, with neither a code nor an
+/// error, is an answer that will not be followed by a better one: it ends
+/// the ceremony as the error response does, instead of leaving it open.
+#[tokio::test]
+async fn a_signed_response_with_no_code_and_no_error_ends_the_ceremony() {
+    let idp = Idp::start(json!({})).await;
+    let provider = idp
+        .fapi_provider()
+        .await
+        .with_fapi(jarm_provider_config())
+        .build()
+        .expect("with_fapi");
+    let authn = service(provider);
+    let session = test_session();
+    let (_nonce, csrf) = begin(&authn, &session).await;
+    let jwt = idp.sign(
+        Algorithm::PS256,
+        &json!({
+            "iss": idp.issuer,
+            "aud": CLIENT_ID,
+            "exp": chrono::Utc::now().timestamp() + 60,
+            "state": csrf,
+        }),
+    );
+
+    let result = authn.finish_oauth_login_jarm(&jwt, &session).await;
+    assert!(
+        matches!(result, Err(OAuthError::InvalidParameter)),
+        "{result:?}"
+    );
+    assert!(
+        session.get_custom("axess.oauth.csrf_state").await.is_none(),
+        "the ceremony is cleared"
+    );
+}
+
+// ── The client id of the signer ──────────────────────────────────────────────
+
+/// The assertion names the signer's client id as `iss` and `sub`, and the
+/// request names the provider's: a signer for another client is refused when
+/// the provider is built, not by the IdP on every request.
+#[tokio::test]
+async fn a_signer_for_another_client_is_refused_at_build() {
+    let idp = Idp::start(json!({})).await;
+    axess_factors::jwt::ensure_crypto_provider();
+    let other = ClientAssertionSigner::new(
+        "another-client",
+        EncodingKey::from_ec_der(&idp.client_der),
+        Algorithm::ES256,
+    )
+    .expect("signer");
+    let built = idp.provider().await.with_private_key_jwt(other).build();
+    assert!(
+        matches!(&built, Err(OAuthError::Config(m)) if m.contains("client")),
+        "{:?}",
+        built.map(|_| ())
+    );
+    // The signer of the provider's own client builds.
+    idp.fapi_provider().await.build().expect("same client id");
 }

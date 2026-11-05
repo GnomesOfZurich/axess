@@ -2,8 +2,8 @@
 //! WebSocket upgrade test and the cookie-name prefix rules.
 
 use axum::{body::Body, extract::Request, http::header};
+use cookie::SameSite;
 use std::sync::Arc;
-use tower_cookies::cookie::SameSite;
 use url::Url;
 
 /// Canonicalize an origin string ("scheme://host[:port]") to a form suitable

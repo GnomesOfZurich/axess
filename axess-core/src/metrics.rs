@@ -147,7 +147,7 @@ pub trait AuthnMetrics: Send + Sync + 'static {
     //
     // Cache hit/miss signals from the Cedar entity-resolution cache on
     // the authorization decision path. The default `EntityCache` (and
-    // the opt-in `Moka` / `Valkey` decorators) call these once per
+    // the opt-in `Valkey` decorator) call these once per
     // lookup so ops dashboards can compute hit rates without poking at
     // the internal `axess_cache::CacheStats` snapshot.
 

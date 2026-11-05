@@ -15,6 +15,7 @@ use crate::authn::{
 };
 use crate::session::extractor::AuthSession;
 use crate::session::store::SessionLiveness;
+use crate::session::store::SessionRegistryHandle;
 use crate::session::store::note_revocation;
 use subtle::ConstantTimeEq;
 
@@ -136,7 +137,11 @@ where
         sid: &crate::session::id::SessionId,
     ) -> Result<(), AuthnError<I::Error>> {
         let Some(reg) = &self.inner.registry else {
-            return Ok(());
+            // No registry: nothing was registered, so nothing to revoke, but the
+            // account-status gate still applies. Without it a suspended or
+            // disabled user completes an OAuth login whenever no registry is
+            // configured.
+            return self.refuse_unless_active(user, claims, session, None).await;
         };
 
         if !reg.register(&user.id, sid).await {
@@ -156,14 +161,38 @@ where
         // as an Authenticated OAuth session. Without this check, an
         // invalidate that ran when no session was registered yet
         // would be effectively undone by a subsequent register.
-        // `effective_at(now)` ends a timed suspension whose `until` has passed,
-        // the same reading every login-time status decision uses.
+        self.refuse_unless_active(user, claims, session, Some((reg.as_ref(), sid)))
+            .await
+    }
+
+    /// The account-status gate of an OAuth completion: read the status,
+    /// `effective_at(now)` so a timed suspension whose `until` has passed
+    /// ends (the reading every login-time status decision uses), and refuse
+    /// when it does not allow login. A refusal clears the session and, when
+    /// `registered` names the just-registered session, takes it out of the
+    /// registry first. A store error fails closed the same way.
+    async fn refuse_unless_active(
+        &self,
+        user: &crate::authn::types::User,
+        claims: &axess_factors::oauth::OAuthClaims,
+        session: &AuthSession,
+        registered: Option<(&dyn SessionRegistryHandle, &crate::session::id::SessionId)>,
+    ) -> Result<(), AuthnError<I::Error>> {
         let status = self
             .inner
             .identity
             .account_status(&user.id)
             .await
             .map(|status| status.effective_at(self.inner.clock.now()));
+        let revoke = async {
+            if let Some((reg, sid)) = registered {
+                note_revocation(
+                    reg.invalidate_session(&user.id, sid).await,
+                    "refusing an OAuth login",
+                );
+            }
+            session.clear().await;
+        };
         match status {
             Ok(status) if !status.allows_login() => {
                 tracing::warn!(
@@ -171,14 +200,9 @@ where
                     tenant_id = %user.tenant_id,
                     provider = %claims.provider,
                     status = ?status,
-                    "OAuth completion: account status flipped to non-loginable \
-                     mid-flow; revoking just-registered session and refusing"
+                    "OAuth completion: account status does not allow login; refusing"
                 );
-                note_revocation(
-                    reg.invalidate_session(&user.id, sid).await,
-                    "refusing an OAuth login",
-                );
-                session.clear().await;
+                revoke.await;
                 self.inner.metrics.account_locked();
                 Err(match status {
                     crate::authn::types::EntityState::Suspended(detail) => AuthnError::Locked {
@@ -192,13 +216,9 @@ where
                 tracing::warn!(
                     user_id = %user.id,
                     error = %e,
-                    "OAuth post-register status re-check failed; failing closed"
+                    "OAuth status check failed; failing closed"
                 );
-                note_revocation(
-                    reg.invalidate_session(&user.id, sid).await,
-                    "refusing an OAuth login",
-                );
-                session.clear().await;
+                revoke.await;
                 Err(AuthnError::Store(e))
             }
         }

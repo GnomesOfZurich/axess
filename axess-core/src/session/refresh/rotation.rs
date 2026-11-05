@@ -112,7 +112,7 @@ pub struct IssueRequest<'a> {
     ///
     /// Threaded into the persisted record so that family revocation can
     /// drive a cascade revoke of the linked devices via
-    /// [`cascade_revoke_devices`](crate::device::cascade_revoke_devices).
+    /// [`cascade_revoke_devices_and_tokens`](crate::device::cascade_revoke_devices_and_tokens).
     /// Inherited unchanged across rotation.
     pub device_id: Option<DeviceId>,
 }

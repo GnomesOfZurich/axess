@@ -31,7 +31,7 @@
 //! enrolment and once per move, not once per login, so the count stays far
 //! below the NIST SP 800-38D random-nonce bound for any realistic user base.
 
-use crate::authn::factor::{FactorConfig, FactorKind};
+use crate::authn::factor::{FactorConfig, FactorKind, FederatedProvider};
 use crate::authn::types::AuthnScope;
 use crate::session::legacy_blobs::LegacyBlobs;
 use crate::session::weak_key::{WeakKeyError, is_constant_key, warn_if_constant_key};
@@ -48,6 +48,12 @@ use std::sync::Arc;
 
 const NONCE_LEN: usize = 12;
 
+/// Append `bytes` preceded by its length.
+fn put(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&crate::length_prefix::length_prefix(bytes.len()));
+    buf.extend_from_slice(bytes);
+}
+
 /// A 32-byte AES key, zeroed when dropped.
 struct Key([u8; 32]);
 
@@ -56,7 +62,10 @@ impl Drop for Key {
         zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
-const AAD_LABEL: &[u8] = b"axess.factor-secret.v1";
+const AAD_LABEL: &[u8] = b"axess.factor-secret.v2";
+/// The label of the binding before the factor kind carried its variant and a
+/// row could carry extra context. Secrets sealed under it are still opened.
+const AAD_LABEL_V1: &[u8] = b"axess.factor-secret.v1";
 
 /// Why a secret could not be sealed or opened.
 ///
@@ -95,17 +104,30 @@ pub enum FactorSecretError {
 pub struct FactorSecretBinding<'a> {
     scope: &'a AuthnScope,
     kind: &'a FactorKind,
+    context: &'a [&'a str],
 }
 
 impl<'a> FactorSecretBinding<'a> {
     /// Bind to the row at `scope` holding the `kind` factor.
     pub fn new(scope: &'a AuthnScope, kind: &'a FactorKind) -> Self {
-        Self { scope, kind }
+        Self {
+            scope,
+            kind,
+            context: &[],
+        }
+    }
+
+    /// Also bind the values the secret is only valid with (an issuer and a
+    /// client id, say), so a row that moves them no longer opens.
+    pub fn with_context(mut self, context: &'a [&'a str]) -> Self {
+        self.context = context;
+        self
     }
 
     /// The additional authenticated data: the label, then the tenant id, the
-    /// user id (empty above user scope) and the factor id, each preceded by
-    /// its length so no two bindings share one byte string.
+    /// user id (empty above user scope), the factor kind with its variant and
+    /// the number of context values and each of them, each preceded by its
+    /// length so no two bindings share one byte string.
     fn aad(&self) -> Vec<u8> {
         let columns = self.scope.as_columns();
         let tenant = columns.tenant_id.to_string();
@@ -113,11 +135,38 @@ impl<'a> FactorSecretBinding<'a> {
             .user_id
             .map(|user_id| user_id.to_string())
             .unwrap_or_default();
+        let kind = match self.kind {
+            FactorKind::Federated(FederatedProvider::Custom(name)) => {
+                format!("federated-custom:{name}")
+            }
+            FactorKind::Federated(provider) => format!("federated:{}", provider.as_str()),
+            other => format!("factor:{}", other.as_str()),
+        };
         let mut aad = Vec::with_capacity(AAD_LABEL.len() + 64);
         aad.extend_from_slice(AAD_LABEL);
+        for part in [tenant.as_str(), user.as_str(), kind.as_str()] {
+            put(&mut aad, part.as_bytes());
+        }
+        aad.extend_from_slice(&crate::length_prefix::length_prefix(self.context.len()));
+        for part in self.context {
+            put(&mut aad, part.as_bytes());
+        }
+        aad
+    }
+
+    /// The binding as the first release wrote it: no variant on the kind and
+    /// no context. Only read, to open what that release sealed.
+    fn aad_v1(&self) -> Vec<u8> {
+        let columns = self.scope.as_columns();
+        let tenant = columns.tenant_id.to_string();
+        let user = columns
+            .user_id
+            .map(|user_id| user_id.to_string())
+            .unwrap_or_default();
+        let mut aad = Vec::with_capacity(AAD_LABEL_V1.len() + 64);
+        aad.extend_from_slice(AAD_LABEL_V1);
         for part in [tenant.as_str(), user.as_str(), self.kind.as_str()] {
-            aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
-            aad.extend_from_slice(part.as_bytes());
+            put(&mut aad, part.as_bytes());
         }
         aad
     }
@@ -127,8 +176,9 @@ impl<'a> FactorSecretBinding<'a> {
 pub struct OpenedSecret {
     /// The secret text.
     pub secret: ZeroizedString,
-    /// True when it was sealed under the previous key, so the caller should
-    /// seal it again under the current one.
+    /// True when it was sealed under the previous key or under the first
+    /// release's binding, so the caller should seal it again under the
+    /// current key and binding.
     pub rotated: bool,
 }
 
@@ -141,6 +191,7 @@ pub struct FactorSecretCipher {
     rng: Arc<dyn SecureRng>,
     clock: Arc<dyn Clock>,
     plain: LegacyBlobs,
+    first_binding: LegacyBlobs,
 }
 
 impl FactorSecretCipher {
@@ -156,6 +207,7 @@ impl FactorSecretCipher {
             rng: Arc::new(SystemRng),
             clock: Arc::new(SystemClock),
             plain: LegacyBlobs::default(),
+            first_binding: LegacyBlobs::Accept,
         }
     }
 
@@ -194,6 +246,22 @@ impl FactorSecretCipher {
         self
     }
 
+    /// Whether a secret sealed under the first release's binding (the factor
+    /// kind without its variant, no context) is still opened, and until when.
+    ///
+    /// The default is [`LegacyBlobs::Accept`]: every deployment upgraded from
+    /// 0.14 holds such rows, and refusing them would lock those users out.
+    /// A row that opens this way is re-sealed in the current binding on the
+    /// login that opens it (a tenant OAuth record on first use), so once the
+    /// rows have moved set [`LegacyBlobs::AcceptUntil`] with a cutoff, or
+    /// [`LegacyBlobs::Reject`]. The default becomes `Reject` in 0.16. That
+    /// binding names a custom provider like the factor of the same name, so
+    /// reading it for ever is not free.
+    pub fn with_first_binding(mut self, policy: LegacyBlobs) -> Self {
+        self.first_binding = policy;
+        self
+    }
+
     /// The clock [`LegacyBlobs::AcceptUntil`] is checked against.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = clock;
@@ -209,6 +277,15 @@ impl FactorSecretCipher {
     /// True while a plain secret may still be read.
     pub fn plain_secrets_readable(&self) -> bool {
         match self.plain {
+            LegacyBlobs::Reject => false,
+            LegacyBlobs::AcceptUntil(until) => self.clock.now() < until,
+            LegacyBlobs::Accept => true,
+        }
+    }
+
+    /// True while a secret in the first release's binding may still be read.
+    pub fn first_binding_readable(&self) -> bool {
+        match self.first_binding {
             LegacyBlobs::Reject => false,
             LegacyBlobs::AcceptUntil(until) => self.clock.now() < until,
             LegacyBlobs::Accept => true,
@@ -282,15 +359,25 @@ impl FactorSecretCipher {
         }
         let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|_| FactorSecretError::Open)?;
         let cipher = Aes256Gcm::new_from_slice(&key.0).map_err(|_| FactorSecretError::Open)?;
-        let plaintext = cipher
-            .decrypt(
+        let attempt = |aad: Vec<u8>| {
+            cipher.decrypt(
                 &nonce,
                 Payload {
                     msg: &ciphertext,
-                    aad: &binding.aad(),
+                    aad: &aad,
                 },
             )
-            .map_err(|_| FactorSecretError::Open)?;
+        };
+        // What the first release sealed opens under its own binding, and is
+        // reported as due a re-seal like a secret under the previous key.
+        let (plaintext, rotated) = match attempt(binding.aad()) {
+            Ok(plaintext) => (plaintext, rotated),
+            Err(_) if self.first_binding_readable() => (
+                attempt(binding.aad_v1()).map_err(|_| FactorSecretError::Open)?,
+                true,
+            ),
+            Err(_) => return Err(FactorSecretError::Open),
+        };
         let text = String::from_utf8(plaintext).map_err(|_| FactorSecretError::Open)?;
         Ok(OpenedSecret {
             secret: ZeroizedString::new(text),
@@ -344,6 +431,7 @@ impl std::fmt::Debug for FactorSecretCipher {
             .field("current_key_id", &self.current_id)
             .field("has_previous_key", &self.previous.is_some())
             .field("plain", &self.plain)
+            .field("first_binding", &self.first_binding)
             .finish()
     }
 }
@@ -359,137 +447,4 @@ fn key_id(key: &[u8; 32]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axess_identity::testing::{tenant, user};
-    use chrono::Utc;
-
-    const KEY: [u8; 32] = *b"0123456789abcdef0123456789abcdeF";
-    const OTHER: [u8; 32] = *b"fedcba9876543210fedcba9876543210";
-
-    fn scope(t: &str, u: &str) -> AuthnScope {
-        AuthnScope::User {
-            tenant_id: tenant(t),
-            user_id: user(u),
-        }
-    }
-
-    #[test]
-    fn a_sealed_secret_opens_for_its_own_binding() {
-        let cipher = FactorSecretCipher::new(KEY);
-        let scope = scope("t1", "u1");
-        let sealed = cipher
-            .seal(
-                "JBSWY3DPEHPK3PXP",
-                FactorSecretBinding::new(&scope, &FactorKind::Totp),
-            )
-            .unwrap();
-        let opened = cipher
-            .open(&sealed, FactorSecretBinding::new(&scope, &FactorKind::Totp))
-            .unwrap();
-        assert_eq!(&*opened.secret, "JBSWY3DPEHPK3PXP");
-        assert!(!opened.rotated);
-        assert!(!sealed.ciphertext.contains("JBSWY3DPEHPK3PXP"));
-    }
-
-    #[test]
-    fn each_part_of_the_binding_is_authenticated() {
-        let cipher = FactorSecretCipher::new(KEY);
-        let sealed = cipher
-            .seal(
-                "JBSWY3DPEHPK3PXP",
-                FactorSecretBinding::new(&scope("t1", "u1"), &FactorKind::Totp),
-            )
-            .unwrap();
-        for (other, kind) in [
-            (scope("t1", "u2"), FactorKind::Totp),
-            (scope("t2", "u1"), FactorKind::Totp),
-            (scope("t1", "u1"), FactorKind::Hotp),
-            (AuthnScope::Tenant(tenant("t1")), FactorKind::Totp),
-        ] {
-            assert_eq!(
-                cipher
-                    .open(&sealed, FactorSecretBinding::new(&other, &kind))
-                    .err(),
-                Some(FactorSecretError::Open),
-                "{other:?} {kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_damaged_blob_and_a_foreign_key_are_refused() {
-        let cipher = FactorSecretCipher::new(KEY);
-        let scope = scope("t1", "u1");
-        let binding = FactorSecretBinding::new(&scope, &FactorKind::Totp);
-        let mut sealed = cipher.seal("JBSWY3DPEHPK3PXP", binding).unwrap();
-        let foreign = FactorSecretCipher::new(OTHER);
-        assert_eq!(
-            foreign.open(&sealed, binding).err(),
-            Some(FactorSecretError::UnknownKey)
-        );
-        sealed.ciphertext.insert(0, 'A');
-        assert_eq!(
-            cipher.open(&sealed, binding).err(),
-            Some(FactorSecretError::Open)
-        );
-    }
-
-    #[test]
-    fn the_previous_key_opens_and_reports_the_rotation() {
-        let old = FactorSecretCipher::new(KEY);
-        let scope = scope("t1", "u1");
-        let binding = FactorSecretBinding::new(&scope, &FactorKind::Totp);
-        let sealed = old.seal("JBSWY3DPEHPK3PXP", binding).unwrap();
-        let rotated = FactorSecretCipher::new(OTHER).with_previous_key(KEY);
-        let opened = rotated.open(&sealed, binding).unwrap();
-        assert!(opened.rotated);
-        assert!(!rotated.is_current(&sealed));
-    }
-
-    #[test]
-    fn a_constant_key_is_refused_by_try_new() {
-        assert!(FactorSecretCipher::try_new([0u8; 32]).is_err());
-        assert!(FactorSecretCipher::try_new([7u8; 32]).is_err());
-        assert!(FactorSecretCipher::try_new(KEY).is_ok());
-    }
-
-    #[test]
-    fn seal_config_seals_otp_secrets_and_leaves_the_rest() {
-        let cipher = FactorSecretCipher::new(KEY);
-        let scope = scope("t1", "u1");
-        let totp = FactorConfig::Totp(axess_factors::TotpConfig {
-            secret: "JBSWY3DPEHPK3PXP".into(),
-            ..Default::default()
-        });
-        let sealed = cipher.seal_config(totp, &scope).unwrap();
-        let FactorConfig::Totp(cfg) = &sealed else {
-            unreachable!()
-        };
-        assert!(cfg.secret.is_sealed());
-        let again = cipher.seal_config(sealed.clone(), &scope).unwrap();
-        assert_eq!(
-            serde_json::to_value(&again).unwrap(),
-            serde_json::to_value(&sealed).unwrap(),
-            "an already sealed secret is left alone"
-        );
-    }
-
-    #[test]
-    fn the_plain_window_follows_the_policy_and_the_clock() {
-        let clock = axess_clock::testing::MockClock::at(Utc::now());
-        let until = clock.now() + chrono::Duration::hours(1);
-        let cipher = FactorSecretCipher::new(KEY)
-            .with_clock(Arc::new(clock.clone()))
-            .with_plain_secrets(LegacyBlobs::AcceptUntil(until));
-        assert!(cipher.plain_secrets_readable());
-        clock.advance(chrono::Duration::hours(2));
-        assert!(!cipher.plain_secrets_readable());
-        assert!(!FactorSecretCipher::new(KEY).plain_secrets_readable());
-        assert!(
-            FactorSecretCipher::new(KEY)
-                .with_plain_secrets(LegacyBlobs::Accept)
-                .plain_secrets_readable()
-        );
-    }
-}
+mod tests;

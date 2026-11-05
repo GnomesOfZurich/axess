@@ -188,16 +188,8 @@ fn verify_totp_accepts_minimum_length_secret() {
     use chrono::DateTime;
     let raw: [u8; 16] = [0xab; 16];
     let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, &raw);
-    let totp = TotpBuilder::new()
-        .with_algorithm(TotpAlgorithm::SHA1)
-        .with_digits(6)
-        .with_skew(0)
-        .with_step_duration(30)
-        .with_secret(raw.to_vec())
-        .build()
-        .unwrap();
     let t: u64 = 1_700_000_000;
-    let code = totp.generate(t).to_string();
+    let code = format!("{:06}", totp_value(&raw, t, 30, 6, TotpAlgorithm::SHA1));
     let now = DateTime::from_timestamp(t as i64, 0).unwrap();
     let result = verify_totp(
         &b32,
@@ -219,8 +211,7 @@ fn verify_totp_accepts_minimum_length_secret() {
 }
 
 /// `verify_totp` MUST reject a `length` that exceeds [`MAX_TOTP_DIGITS`].
-/// The bound is 8 because the underlying `totp-rs` crate enforces
-/// RFC 6238 §1.2's 6..=8 digit range in `TotpBuilder::build`.
+/// The bound is 8 because RFC 6238 §1.2 allows 6 to 8 digits.
 #[test]
 fn verify_totp_rejects_length_above_max() {
     use chrono::DateTime;
@@ -297,7 +288,7 @@ fn generate_totp_secret_is_32_char_base32() {
 /// digits, and period.
 #[test]
 fn build_totp_uri_known_output() {
-    let uri = build_totp_uri("alice@example.com", "Acme Corp", "JBSWY3DPEHPK3PXP", 6, 30);
+    let uri = build_totp_uri("alice@example.com", "Acme Corp", "JBSWY3DPEHPK3PXP", 6, 30).unwrap();
     assert!(uri.starts_with("otpauth://totp/"), "wrong scheme: {uri}");
     assert!(
         uri.contains("Acme%20Corp:alice%40example.com"),
@@ -340,5 +331,161 @@ fn totp_rejects_short_length_and_zero_period() {
     assert!(
         verify_totp(&b32, "123456", now, zero_period).is_none(),
         "a zero period must be refused, not divide by zero"
+    );
+}
+
+/// A digit count or period `verify_totp` refuses is refused here too, rather
+/// than clamped into an authenticator the server would then verify with
+/// other parameters than the ones the user was shown.
+#[test]
+fn build_totp_uri_refuses_parameters_verify_refuses() {
+    for (digits, period) in [(1, 30), (5, 30), (9, 30), (12, 30), (6, 0), (6, 4)] {
+        assert_eq!(
+            build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", digits, period),
+            None,
+            "digits {digits}, period {period}"
+        );
+    }
+    for digits in 6..=8 {
+        assert!(build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", digits, 5).is_some());
+    }
+}
+
+#[test]
+fn build_totp_uri_with_algorithm_names_the_algorithm() {
+    let uri = build_totp_uri_with_algorithm(
+        "a",
+        "Acme",
+        "JBSWY3DPEHPK3PXP",
+        6,
+        30,
+        TotpAlgorithm::SHA256,
+    )
+    .unwrap();
+    assert!(
+        uri.contains("&algorithm=SHA256"),
+        "algorithm missing: {uri}"
+    );
+    let default = build_totp_uri("a", "Acme", "JBSWY3DPEHPK3PXP", 6, 30).unwrap();
+    assert!(
+        default.contains("&algorithm=SHA1"),
+        "SHA1 missing: {default}"
+    );
+}
+
+/// The RFC 6238 SHA-1 secret spelled as hex. It holds `0`, `8` and `9`, which
+/// base32 does not, so only a hex fallback could read it.
+const RFC_4226_SECRET_HEX: &str = "3132333435363738393031323334353637383930";
+
+#[test]
+fn a_hex_secret_is_not_read() {
+    use chrono::DateTime;
+    let now = DateTime::from_timestamp(59, 0).unwrap();
+    let result = verify_totp(
+        RFC_4226_SECRET_HEX,
+        "94287082",
+        now,
+        TotpVerifyParams {
+            length: Some(8),
+            period: Some(30),
+            past_window: Some(0),
+            future_window: Some(0),
+            algorithm: TotpAlgorithm::SHA1,
+        },
+    );
+    assert!(result.is_none(), "a hex secret must not verify");
+}
+
+#[test]
+fn a_secret_of_hex_letters_and_base32_digits_verifies_as_base32() {
+    use chrono::DateTime;
+    // Every character is in both the hex and the base32 alphabets.
+    let secret = "ABCDEF2345ABCDEF2345ABCDEF2345AB";
+    let raw = base32::decode(base32::Alphabet::Rfc4648 { padding: false }, secret).unwrap();
+    let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+    let code = format!(
+        "{:06}",
+        totp_value(&raw, 1_700_000_000, 30, 6, TotpAlgorithm::SHA1)
+    );
+    let result = verify_totp(
+        secret,
+        &code,
+        now,
+        TotpVerifyParams {
+            length: Some(6),
+            period: Some(30),
+            past_window: Some(0),
+            future_window: Some(0),
+            algorithm: TotpAlgorithm::SHA1,
+        },
+    );
+    assert!(result.is_some(), "the base32 reading must verify");
+}
+
+// RFC 6238 Appendix B: one secret per HMAC (the SHA-1 secret repeated to the
+// digest's block size), 8-digit codes, step 30, T0 = 0.
+const RFC_6238_SECRETS: [(TotpAlgorithm, &[u8]); 3] = [
+    (TotpAlgorithm::SHA1, b"12345678901234567890"),
+    (TotpAlgorithm::SHA256, b"12345678901234567890123456789012"),
+    (
+        TotpAlgorithm::SHA512,
+        b"1234567890123456789012345678901234567890123456789012345678901234",
+    ),
+];
+
+/// (time, SHA-1 code, SHA-256 code, SHA-512 code), every row of the table.
+const RFC_6238_VECTORS: [(u64, [&str; 3]); 6] = [
+    (59, ["94287082", "46119246", "90693936"]),
+    (1111111109, ["07081804", "68084774", "25091201"]),
+    (1111111111, ["14050471", "67062674", "99943326"]),
+    (1234567890, ["89005924", "91819424", "93441116"]),
+    (2000000000, ["69279037", "90698825", "38618901"]),
+    (20000000000, ["65353130", "77737706", "47863826"]),
+];
+
+#[test]
+fn rfc_6238_appendix_b_codes_match_for_every_algorithm_and_time() {
+    for (time, expected) in RFC_6238_VECTORS {
+        for ((algorithm, secret), expected) in RFC_6238_SECRETS.into_iter().zip(expected) {
+            let code = format!("{:08}", totp_value(secret, time, 30, 8, algorithm));
+            assert_eq!(code, expected, "{algorithm} at t={time}");
+        }
+    }
+}
+
+#[test]
+fn rfc_6238_appendix_b_codes_verify_through_verify_totp() {
+    use chrono::DateTime;
+    for (time, expected) in RFC_6238_VECTORS {
+        for ((algorithm, secret), expected) in RFC_6238_SECRETS.into_iter().zip(expected) {
+            let b32 = base32::encode(base32::Alphabet::Rfc4648 { padding: false }, secret);
+            let now = DateTime::from_timestamp(time as i64, 0).unwrap();
+            let params = TotpVerifyParams {
+                length: Some(8),
+                period: Some(30),
+                past_window: Some(0),
+                future_window: Some(0),
+                algorithm,
+            };
+            assert_eq!(
+                verify_totp(&b32, expected, now, params),
+                Some(time / 30),
+                "{algorithm} at t={time}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_provisioning_uri_is_unchanged_byte_for_byte() {
+    assert_eq!(
+        build_totp_uri("alice@example.com", "Acme Corp", "JBSWY3DPEHPK3PXP", 6, 30).unwrap(),
+        "otpauth://totp/Acme%20Corp:alice%40example.com?secret=JBSWY3DPEHPK3PXP\
+         &issuer=Acme%20Corp&algorithm=SHA1&digits=6&period=30"
+    );
+    assert_eq!(
+        build_totp_uri_with_algorithm("a", "I", "JBSWY3DPEHPK3PXP", 8, 60, TotpAlgorithm::SHA512)
+            .unwrap(),
+        "otpauth://totp/I:a?secret=JBSWY3DPEHPK3PXP&issuer=I&algorithm=SHA512&digits=8&period=60"
     );
 }

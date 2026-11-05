@@ -204,7 +204,8 @@ pub(super) fn parse_db_datetime(clock: &dyn Clock, s: &str) -> DateTime<Utc> {
 ///
 /// A `locked_until` that is not an RFC 3339 timestamp is an error: the lock
 /// may still be in force, so reading the row as unlocked would open an
-/// account the application closed.
+/// account the application closed. A status the example does not write is an
+/// error too, not a guest.
 pub(super) fn entity_state_from_db(
     clock: &dyn Clock,
     status: &str,
@@ -226,6 +227,11 @@ pub(super) fn entity_state_from_db(
                 since: now,
                 until: Some(until),
             }));
+        }
+        // A timed suspension (`suspend_user` with an end time) keeps its
+        // status; once the end has passed it no longer holds.
+        if status == "suspended" {
+            return Ok(EntityState::Active);
         }
     }
 
@@ -252,6 +258,11 @@ pub(super) fn entity_state_from_db(
             since: now,
             until: None,
         }),
-        _ => EntityState::Guest,
+        "guest" => EntityState::Guest,
+        other => {
+            return Err(BackendError::Backend(format!(
+                "users.status is not a known status: {other:?}"
+            )));
+        }
     })
 }

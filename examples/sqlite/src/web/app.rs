@@ -76,59 +76,132 @@ pub struct AppState {
 /// Where the example keeps the key its TOTP secrets are sealed under.
 const FACTOR_KEY_FILE: &str = "db/factor-secret.key";
 
-/// How long a TOTP secret still stored in plain text is read, from the start
-/// of this run. Each such secret is sealed by the login that verifies it, so
-/// the window only has to outlast the users who have not signed in yet. A
-/// real deployment writes a fixed date here, so that a restart does not
-/// extend it.
-const PLAIN_SECRET_WINDOW_DAYS: i64 = 30;
+/// The day after which a TOTP secret still stored in plain text is no longer
+/// read. Each such secret is sealed by the login that verifies it, so the date
+/// only has to outlast the users who have not signed in yet. It is a fixed
+/// date, not a span from the start of the run, so a restart does not move it.
+pub fn plain_secret_cutoff() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2027-01-31T00:00:00Z")
+        .expect("a fixed RFC 3339 date")
+        .to_utc()
+}
 
 /// The key TOTP secrets are sealed under: 32 bytes, hex encoded, in a file
 /// that is created on first use and read on every later start. Secrets sealed
 /// under a key that is lost cannot be opened, so unlike the session keys this
 /// one must survive a restart. In production, load it from a secrets manager.
-fn factor_secret_key() -> [u8; 32] {
-    let path = std::env::current_dir().map(|dir| dir.join(FACTOR_KEY_FILE));
-    if let Ok(path) = &path
-        && let Ok(text) = std::fs::read_to_string(path)
-    {
-        let text = text.trim();
-        let bytes: Option<Vec<u8>> = (text.len() == 64)
-            .then(|| {
-                (0..32)
-                    .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).ok())
-                    .collect()
-            })
-            .flatten();
-        if let Some(key) = bytes.and_then(|b| <[u8; 32]>::try_from(b).ok()) {
-            return key;
-        }
-        tracing::warn!(path = %path.display(), "factor secret key file is unreadable; making a new key");
-    }
+fn factor_secret_key() -> std::io::Result<[u8; 32]> {
+    let path = std::env::current_dir()?.join(FACTOR_KEY_FILE);
+    factor_secret_key_at(&path)
+}
+
+fn random_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     SystemRng.fill_bytes(&mut key);
-    if let Ok(path) = &path {
-        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-        let written = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(path, hex));
-        if let Err(e) = written {
-            tracing::warn!(error = %e, "could not keep the factor secret key; TOTP secrets sealed this run will not open after a restart");
-        }
-    }
     key
 }
 
+/// Creates `path` holding `contents`, readable by the owner only, if no file
+/// is there. The contents are written to a private file beside it first and
+/// linked into place, so the file at `path` is never seen empty or partly
+/// written, and two creators cannot both win: the loser gets `AlreadyExists`.
+fn create_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.tmp", hex_of(&random_key()[..8])));
+    let staged = std::path::PathBuf::from(name);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = options
+        .open(&staged)
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())
+                .and_then(|()| file.sync_all())
+        })
+        .and_then(|()| std::fs::hard_link(&staged, path));
+    let _ = std::fs::remove_file(&staged);
+    result
+}
+
+/// Narrows an existing key file to the owner. It never rewrites the file.
+fn narrow_to_owner(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_key(text: &str) -> Option<[u8; 32]> {
+    let text = text.trim();
+    let bytes: Vec<u8> = (text.len() == 64)
+        .then(|| {
+            (0..32)
+                .map(|i| u8::from_str_radix(text.get(2 * i..2 * i + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()
+        })
+        .flatten()?;
+    <[u8; 32]>::try_from(bytes).ok()
+}
+
+/// The TOTP sealing key, read from the key file at `path`, or created there
+/// (mode 0600) on first use.
+///
+/// An existing file is only read and narrowed to the owner, never rewritten.
+/// A new file appears whole or not at all, and a start that loses the race to
+/// create it reads the winner's key.
+///
+/// # Errors
+///
+/// The file cannot be created, read or narrowed to the owner, or holds
+/// something other than a key: replacing it would lose every secret sealed
+/// under the old key, so the start fails and the file is left for you to
+/// look at.
+pub fn factor_secret_key_at(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let fresh = random_key();
+    match create_private(path, &hex_of(&fresh)) {
+        Ok(()) => return Ok(fresh),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let key = parse_key(&std::fs::read_to_string(path)?).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{} does not hold a 64 character hex key; remove it only if no secret is sealed under it",
+                path.display()
+            ),
+        )
+    })?;
+    narrow_to_owner(path)?;
+    Ok(key)
+}
+
 /// The example's cipher: sealed under `factor_secret_key`, and reading a
-/// plain secret for `PLAIN_SECRET_WINDOW_DAYS` so rows written before the
-/// cipher existed (Bob's seeded TOTP) are moved by their owner's next login.
+/// plain secret until `plain_secret_cutoff` so rows written before the
+/// cipher existed are moved by their owner's next login.
 pub fn factor_secret_cipher() -> Arc<FactorSecretCipher> {
-    let until =
-        axess::Clock::now(&axess::SystemClock) + chrono::Duration::days(PLAIN_SECRET_WINDOW_DAYS);
     Arc::new(
-        FactorSecretCipher::new(factor_secret_key())
-            .with_plain_secrets(LegacyBlobs::AcceptUntil(until)),
+        FactorSecretCipher::new(
+            factor_secret_key()
+                .expect("the factor secret key file must be readable by its owner only"),
+        )
+        .with_plain_secrets(LegacyBlobs::AcceptUntil(plain_secret_cutoff())),
     )
 }
 

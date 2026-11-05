@@ -53,17 +53,8 @@ where
                 )
                 .await;
             }
-            if registry.liveness(user_id, old_id).await == SessionLiveness::Gone {
-                note_revocation(
-                    registry.invalidate_session(user_id, new_id).await,
-                    "ending a session revoked while its id rotated",
-                );
-                return end_untracked(
-                    store,
-                    new_id,
-                    "the session was revoked while its id rotated; ending it",
-                )
-                .await;
+            if revoked_during_rotation(registry, rotation).await {
+                return end_revoked_rotation(registry, store, rotation).await;
             }
             note_revocation(
                 registry.invalidate_session(user_id, old_id).await,
@@ -93,6 +84,9 @@ where
         },
         SessionLiveness::Unknown => {
             if registry.register(user_id, new_id).await {
+                if revoked_during_rotation(registry, rotation).await {
+                    return end_revoked_rotation(registry, store, rotation).await;
+                }
                 note_revocation(
                     registry.invalidate_session(user_id, old_id).await,
                     "moving a rotated session's registry entry",
@@ -108,6 +102,40 @@ where
             .await
         }
     }
+}
+
+/// Whether the registry, read again after the new id was registered, no
+/// longer holds the old one: a revocation landed during the rotation.
+async fn revoked_during_rotation(
+    registry: &dyn SessionRegistryHandle,
+    rotation: &Rotation,
+) -> bool {
+    registry.liveness(&rotation.user_id, &rotation.old_id).await == SessionLiveness::Gone
+}
+
+/// End a session revoked while its id rotated: invalidate the new id too and
+/// delete its row. Returns `false` (no cookie).
+async fn end_revoked_rotation<S>(
+    registry: &dyn SessionRegistryHandle,
+    store: &S,
+    rotation: &Rotation,
+) -> bool
+where
+    S: SessionStore + Send + Sync + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    note_revocation(
+        registry
+            .invalidate_session(&rotation.user_id, &rotation.new_id)
+            .await,
+        "ending a session revoked while its id rotated",
+    );
+    end_untracked(
+        store,
+        &rotation.new_id,
+        "the session was revoked while its id rotated; ending it",
+    )
+    .await
 }
 
 /// A rotated session the registry could not answer for, or could not

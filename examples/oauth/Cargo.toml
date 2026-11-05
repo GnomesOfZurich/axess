@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-oauth"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -13,7 +13,7 @@ repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
 # `oauth` + `jwt-rust-crypto` for OIDC; `social` + `memory` for `--bin social`.
-axess = { path = "../../axess", version = "=0.14.0", features = ["oauth", "jwt-rust-crypto", "testing", "social", "memory"] }
+axess = { path = "../../axess", version = "=0.15.0", features = ["oauth", "jwt-rust-crypto", "testing", "social", "memory"] }
 # `Algorithm` names the signing algorithm of a `private_key_jwt` key. No crypto
 # backend here: `axess`'s `jwt-rust-crypto` feature picks the one provider, and
 # a second one makes `jsonwebtoken` refuse to choose.
@@ -30,8 +30,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 # `ensure_crypto_provider` for signing test tokens, and `test_session` for the
 # claim-lock test; both are what the library tests use.
-axess-core = { path = "../../axess-core", version = "=0.14.0", features = ["testing", "oauth"] }
-axess-factors = { path = "../../axess-factors", version = "=0.14.0", features = ["jwt-rust-crypto"] }
+axess-core = { path = "../../axess-core", version = "=0.15.0", features = ["testing", "oauth"] }
+axess-factors = { path = "../../axess-factors", version = "=0.15.0", features = ["jwt-rust-crypto"] }
 # The tests stand up an OIDC provider in process and sign its tokens.
 base64 = "0.23.1"
 http-body-util = "0.1.5"

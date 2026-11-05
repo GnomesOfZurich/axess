@@ -60,11 +60,13 @@
 //!
 //! - `stats`: [`CacheStats`] public counter snapshot.
 //! - `cache`: [`ClockTtlCache`] core: LRU + TTL + single-flight loader.
+//! - `lru`: the safe O(1) LRU map the cache stores its entries in (private).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 pub mod cache;
+mod lru;
 pub mod stats;
 
 #[cfg(test)]

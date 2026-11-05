@@ -429,10 +429,10 @@ async fn reordering_scopes_does_not_break_authentication() {
 }
 
 /// A row written two releases ago (v1, AAD without scopes) still opens
-/// under the legacy policy, and the read re-seals it as v3 under the
-/// current key.
+/// under the legacy policy. Its expiry is unauthenticated, so it loads as
+/// expired and the read leaves it as it was.
 #[tokio::test]
-async fn a_v1_row_under_a_retired_key_is_read_and_resealed() {
+async fn a_v1_row_under_a_retired_key_is_read_as_expired_and_left_alone() {
     let (tenant, user) = (sample_tenant(), sample_user());
     let old_key = test_key(1);
     let new_key = test_key(2);
@@ -474,6 +474,7 @@ async fn a_v1_row_under_a_retired_key_is_read_and_resealed() {
         .with_legacy_envelopes(LegacyBlobs::Accept);
     let loaded = store.load(&tenant, &user, "gmail").await.unwrap().unwrap();
     assert_eq!(&*loaded.access_token, "at-plaintext");
+    assert_eq!(loaded.expires_at, Some(chrono::DateTime::UNIX_EPOCH));
 
     let raw = store
         .inner()
@@ -482,11 +483,11 @@ async fn a_v1_row_under_a_retired_key_is_read_and_resealed() {
         .unwrap()
         .unwrap();
     assert!(
-        (*raw.access_token).starts_with("v3.k2."),
+        (*raw.access_token).starts_with("v1.k1."),
         "{:?}",
         &*raw.access_token
     );
-    assert!(raw.refresh_token.as_deref().unwrap().starts_with("v3.k2."));
+    assert!(raw.refresh_token.as_deref().unwrap().starts_with("v1.k1."));
 }
 
 #[tokio::test]
@@ -554,9 +555,9 @@ async fn changing_only_expires_at_on_the_stored_row_fails_the_load() {
 }
 
 /// A row written by the previous release (v2, AAD without `expires_at`)
-/// opens without any legacy setting, and the read re-seals it as v3.
+/// opens without any legacy setting, as an expired row; a later save writes v3.
 #[tokio::test]
-async fn a_v2_row_is_read_by_default_and_resealed_as_v3() {
+async fn a_v2_row_is_read_by_default_and_a_save_writes_v3() {
     let (tenant, user) = (sample_tenant(), sample_user());
     let cred = sample_credential();
     let current = CurrentKey {
@@ -616,6 +617,11 @@ async fn a_v2_row_is_read_by_default_and_resealed_as_v3() {
     assert_eq!(&*loaded.access_token, "at-plaintext");
     assert_eq!(loaded.refresh_token.as_deref(), Some("rt-plaintext"));
 
+    assert_eq!(loaded.expires_at, Some(chrono::DateTime::UNIX_EPOCH));
+
+    let mut refreshed = loaded;
+    refreshed.expires_at = sample_credential().expires_at;
+    store.save(&tenant, &user, refreshed).await.unwrap();
     let raw = store
         .inner()
         .load(&tenant, &user, "gmail")
@@ -629,44 +635,12 @@ async fn a_v2_row_is_read_by_default_and_resealed_as_v3() {
     );
     assert!(raw.refresh_token.as_deref().unwrap().starts_with("v3.k1."));
 
-    // The re-sealed row now binds its expiry: moving it fails the next load.
+    // The saved row binds its expiry: moving it fails the next load.
     let mut moved = raw;
     moved.expires_at = None;
     store.inner().save(&tenant, &user, moved).await.unwrap();
     store
         .load(&tenant, &user, "gmail")
         .await
-        .expect_err("the re-sealed row binds expires_at");
-}
-
-/// A current key that is a single repeated byte is a placeholder that
-/// reached production; the provider refuses it rather than sealing
-/// credentials under it.
-#[test]
-fn memory_key_provider_refuses_a_constant_current_key() {
-    let placeholder = [0u8; 32];
-    assert!(crate::session::is_constant_key(&placeholder));
-    let err = MemoryKeyProvider::new("k", placeholder).unwrap_err();
-    assert!(
-        matches!(err, KeyProviderError::WeakKey(_)),
-        "expected WeakKey, got {err:?}"
-    );
-    assert!(MemoryKeyProvider::new("k", test_key(0)).is_ok());
-}
-
-/// A historical key only opens rows already sealed under it, so a
-/// constant one is logged at error rather than refused.
-#[test]
-fn a_constant_historical_key_is_logged_at_error() {
-    let capture = crate::testing::mock_tracing::TracingCapture::install();
-    let keys = MemoryKeyProvider::new("k2", test_key(1))
-        .expect("random key")
-        .with_historical("k1", [1u8; 32])
-        .expect("historical key id");
-    assert!(keys.resolve("k1").expect("resolves").is_some());
-    assert!(
-        capture.contains_at_level(tracing::Level::ERROR, "single repeated byte"),
-        "events: {:?}",
-        capture.events()
-    );
+        .expect_err("the saved row binds expires_at");
 }

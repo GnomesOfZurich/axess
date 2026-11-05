@@ -65,7 +65,7 @@ where
             || tenant_identifier.len() > MAX_IDENTIFIER_BYTES
             || !is_printable(&user.identifier)
             || !is_printable(&user.display_name)
-            || !crate::validation::is_acceptable_identifier(&user.identifier)
+            || !crate::validation::is_acceptable_new_identifier(&user.identifier)
         {
             self.refuse_signup(None, None, "invalid_input").await?;
             return Err(AuthnError::InvalidAssertion);
@@ -80,7 +80,14 @@ where
             .map_err(AuthnError::Store)?;
 
         let tenant = match tenant {
-            Some(t) if t.status.is_active() => t,
+            Some(t)
+                if t.status
+                    .clone()
+                    .effective_at(self.inner.clock.now())
+                    .allows_login() =>
+            {
+                t
+            }
             Some(t) => {
                 self.refuse_signup(None, Some(&t.id), "tenant_not_active")
                     .await?;
@@ -193,7 +200,7 @@ where
         self.emit_audit(
             AuthEventBuilder::failure(AuthEventType::SignupStarted)
                 .maybe_attributed_to(user_id, tenant_id)
-                .with_error(AuthFailureReason::Other(reason.into())),
+                .with_error(AuthFailureReason::from(reason)),
         )
         .await
     }
@@ -232,6 +239,18 @@ where
             self.refuse_signup(Some(&user_id), Some(&tenant_id), "not_awaiting_activation")
                 .await?;
             return Err(AuthnError::NotActive(status));
+        }
+
+        // The tenant may have been suspended since `begin_signup`: its status is
+        // read again, as every login reads it, and a tenant that does not load
+        // refuses (fail closed).
+        if let Err(refusal) = self.require_active_tenant(&tenant_id).await {
+            if !matches!(refusal, AuthnError::Store(_)) {
+                session.clear().await;
+                self.refuse_signup(Some(&user_id), Some(&tenant_id), "tenant_not_active")
+                    .await?;
+            }
+            return Err(refusal);
         }
 
         // Activate the user.

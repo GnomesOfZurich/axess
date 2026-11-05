@@ -46,6 +46,21 @@
 /// form. A policy that must tell tenants apart does so on the resource id
 /// (above).
 ///
+/// # Session validator
+///
+/// A bare `require_authz!` reads only the session record, so a session the
+/// registry ended (a password reset, a suspension, an administrator's kick)
+/// still passes behind a gate built without a registry. A fourth argument
+/// `validator = authn.session_validator()` makes the gate consult the
+/// registry first, as the validator form of
+/// [`require_authn!`](crate::require_authn) does, and answer 401 (clearing the
+/// stored session) when the session is no longer live. Without it, put a
+/// `require_authn!(validator = ..)` or `require_valid_session` layer in front.
+///
+/// ```ignore
+/// require_authz!("MyApp", "ViewLedger", "Ledger:{id}", validator = authn.session_validator())
+/// ```
+///
 /// # Required request extensions
 ///
 /// The macro pulls the following from `request.extensions()`. Apps must
@@ -87,7 +102,8 @@
 /// - **403 Forbidden**: Cedar policy denied the request
 ///   (returns `axess_core::authz::AuthzDenied`).
 /// - **400 Bad Request**: a path parameter is not valid UTF-8 after
-///   percent-decoding.
+///   percent-decoding, for an authenticated caller (an anonymous one is
+///   401 first).
 /// - **500 Internal Server Error**: missing extensions, malformed
 ///   namespace/action/resource that can't be parsed as `EntityUid`.
 ///
@@ -134,11 +150,17 @@ macro_rules! require_authz {
     // and switch Cedar namespaces per-deployment without recompiling. The
     // `$action` and `$resource` matchers stay `:literal` because they
     // identify the policy decision point and shouldn't change at runtime.
-    ($namespace:expr, $action:literal, $resource:literal) => {{
+    //
+    // The gate itself, with the session check `$validator` makes. First:
+    // an `:expr` matcher fails the whole call on a token it cannot parse.
+    (@gate $namespace:expr, $action:literal, $resource:literal, $validator:expr) => {{
+        let validator = $validator;
         $crate::axum::middleware::from_fn(
             move |auth_session: $crate::AuthSession,
              req: $crate::axum::extract::Request,
-             next: $crate::axum::middleware::Next| async move {
+             next: $crate::axum::middleware::Next| {
+              let validator = validator.clone();
+              async move {
                 use ::std::sync::Arc;
                 use $crate::axum::response::IntoResponse;
 
@@ -149,7 +171,24 @@ macro_rules! require_authz {
                 // values cannot be re-split by the caller.
                 const _: () = $crate::__macro_support::assert_one_path_placeholder($resource);
 
-                // Path parameters, if the route has any. A request that
+                // 1. Authn; Cedar deny is wasted work for an anonymous caller.
+                //    One read of the session answers both "is it authenticated"
+                //    and "as whom", so the id cannot come from a different
+                //    state than the check.
+                if !validator.enforce(&auth_session).await {
+                    return $crate::axum::http::StatusCode::UNAUTHORIZED.into_response();
+                }
+                let (user_id, tenant_id) = match auth_session.snapshot().await {
+                    ::std::option::Option::Some(snapshot) => {
+                        (snapshot.user_id.to_string(), snapshot.tenant_id.to_string())
+                    }
+                    ::std::option::Option::None => {
+                        return $crate::axum::http::StatusCode::UNAUTHORIZED.into_response();
+                    }
+                };
+
+                // Path parameters, if the route has any (after the authn check,
+                // so an anonymous caller is 401 whatever the path). A request that
                 // reached this gate without routing (no parameters at all)
                 // simply has none.
                 let (mut req_parts, req_body) = req.into_parts();
@@ -161,19 +200,6 @@ macro_rules! require_authz {
                         }
                     };
                 let req = $crate::axum::extract::Request::from_parts(req_parts, req_body);
-
-                // 1. Authn; Cedar deny is wasted work for an anonymous caller.
-                //    One read of the session answers both "is it authenticated"
-                //    and "as whom", so the id cannot come from a different
-                //    state than the check.
-                let (user_id, tenant_id) = match auth_session.snapshot().await {
-                    ::std::option::Option::Some(snapshot) => {
-                        (snapshot.user_id.to_string(), snapshot.tenant_id.to_string())
-                    }
-                    ::std::option::Option::None => {
-                        return $crate::axum::http::StatusCode::UNAUTHORIZED.into_response();
-                    }
-                };
 
                 // 2. Pull required extensions.
                 let store = match req
@@ -308,7 +334,22 @@ macro_rules! require_authz {
                         $crate::__authz::AuthzDenied.into_response()
                     }
                 }
+              }
             },
         )
     }};
+
+    // The session record alone decides who is authenticated.
+    ($namespace:expr, $action:literal, $resource:literal) => {
+        $crate::require_authz!(
+            @gate $namespace, $action, $resource,
+            $crate::__macro_support::NoSessionCheck
+        )
+    };
+
+    // The session must also be live in the registry, as with
+    // `require_authn!(validator = ..)`.
+    ($namespace:expr, $action:literal, $resource:literal, validator = $validator:expr) => {
+        $crate::require_authz!(@gate $namespace, $action, $resource, $validator)
+    };
 }

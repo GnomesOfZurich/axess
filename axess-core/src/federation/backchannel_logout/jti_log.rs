@@ -35,11 +35,19 @@ pub(super) struct JtiLog {
 
 #[derive(Default)]
 struct State {
-    /// Issuer -> `jti` -> when it was seen. An issuer with no live entry has
-    /// no partition.
-    issuers: HashMap<Arc<str>, HashMap<String, DateTime<Utc>>>,
+    /// Issuer -> `jti` -> the entry. An issuer with no live entry has no
+    /// partition.
+    issuers: HashMap<Arc<str>, HashMap<String, Entry>>,
     /// Arrival order over every issuer, oldest first; one item per entry.
     order: VecDeque<(DateTime<Utc>, Arc<str>, String)>,
+}
+
+/// One recorded pair.
+struct Entry {
+    seen_at: DateTime<Utc>,
+    /// The token is still being acted on. Cleared when the action ends,
+    /// whether it succeeded or not.
+    in_flight: bool,
 }
 
 /// What recording a pair did.
@@ -47,8 +55,13 @@ struct State {
 pub(super) enum Recorded {
     /// The pair was new and is now held.
     New,
-    /// The log still holds the pair: a replay.
+    /// The log still holds the pair and the token it came from has been
+    /// acted on: a replay.
     Replay,
+    /// The log holds the pair, and the first delivery of the token is still
+    /// being acted on: it may yet fail and leave the pair forgotten, so the
+    /// resend is asked to come again, not refused.
+    InFlight,
     /// The pair is new but the issuer's partition is full of live entries
     /// and has no room. Nothing was recorded or forgotten.
     Full,
@@ -69,7 +82,10 @@ impl JtiLog {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Record the pair as seen at `now`.
+    /// Record the pair as seen at `now`. A new pair is in flight: the caller
+    /// is about to act on its token, and until [`settle`](Self::settle) or
+    /// [`forget`](Self::forget) a second delivery of it is
+    /// [`Recorded::InFlight`].
     ///
     /// Every entry seen before `cutoff`, of any issuer, is dropped first.
     /// Then the replay check runs, so a token the log holds is a replay
@@ -87,8 +103,12 @@ impl JtiLog {
         let mut state = self.lock();
         state.expire_before(cutoff);
         let held = state.issuers.get(issuer);
-        if held.is_some_and(|seen| seen.contains_key(jti)) {
-            return Recorded::Replay;
+        if let Some(entry) = held.and_then(|seen| seen.get(jti)) {
+            return if entry.in_flight {
+                Recorded::InFlight
+            } else {
+                Recorded::Replay
+            };
         }
         if held.is_some_and(|seen| seen.len() >= self.capacity) {
             return Recorded::Full;
@@ -97,13 +117,27 @@ impl JtiLog {
             Some((held, _)) => held.clone(),
             None => issuer.into(),
         };
-        state
-            .issuers
-            .entry(issuer.clone())
-            .or_default()
-            .insert(jti.to_string(), now);
+        state.issuers.entry(issuer.clone()).or_default().insert(
+            jti.to_string(),
+            Entry {
+                seen_at: now,
+                in_flight: true,
+            },
+        );
         state.order.push_back((now, issuer, jti.to_string()));
         Recorded::New
+    }
+
+    /// The action on the pair's token ended: its pair is a replay from now on.
+    pub(super) fn settle(&self, issuer: &str, jti: &str) {
+        if let Some(entry) = self
+            .lock()
+            .issuers
+            .get_mut(issuer)
+            .and_then(|seen| seen.get_mut(jti))
+        {
+            entry.in_flight = false;
+        }
     }
 
     /// Forget the pair, so the same token is accepted again: the handler
@@ -149,7 +183,7 @@ impl State {
     /// returns when the entry was seen.
     fn take(&mut self, issuer: &str, jti: &str) -> Option<DateTime<Utc>> {
         let seen = self.issuers.get_mut(issuer)?;
-        let seen_at = seen.remove(jti)?;
+        let seen_at = seen.remove(jti)?.seen_at;
         if seen.is_empty() {
             self.issuers.remove(issuer);
         }
@@ -161,6 +195,21 @@ impl State {
 mod tests {
     use super::*;
 
+    /// Record the pair and, when it was new, settle it: the token was acted on.
+    fn record_done(
+        log: &JtiLog,
+        issuer: &str,
+        jti: &str,
+        now: DateTime<Utc>,
+        cutoff: DateTime<Utc>,
+    ) -> Recorded {
+        let recorded = log.record(issuer, jti, now, cutoff);
+        if recorded == Recorded::New {
+            log.settle(issuer, jti);
+        }
+        recorded
+    }
+
     fn at(secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()
     }
@@ -168,15 +217,24 @@ mod tests {
     #[test]
     fn a_pair_is_a_replay_until_it_ages_past_the_cutoff() {
         let log = JtiLog::new(100);
-        assert_eq!(log.record("iss", "j1", at(0), at(-300)), Recorded::New);
-        assert_eq!(log.record("iss", "j1", at(10), at(-290)), Recorded::Replay);
         assert_eq!(
-            log.record("other", "j1", at(10), at(-290)),
+            record_done(&log, "iss", "j1", at(0), at(-300)),
+            Recorded::New
+        );
+        assert_eq!(
+            record_done(&log, "iss", "j1", at(10), at(-290)),
+            Recorded::Replay
+        );
+        assert_eq!(
+            record_done(&log, "other", "j1", at(10), at(-290)),
             Recorded::New,
             "issuer is part of the key"
         );
         // Cutoff passes the first sighting: the pair is new again.
-        assert_eq!(log.record("iss", "j1", at(400), at(100)), Recorded::New);
+        assert_eq!(
+            record_done(&log, "iss", "j1", at(400), at(100)),
+            Recorded::New
+        );
     }
 
     #[test]
@@ -184,19 +242,19 @@ mod tests {
         let log = JtiLog::new(10_000);
         for n in 0..1_000 {
             assert_eq!(
-                log.record("iss", &format!("j{n}"), at(n), at(-300)),
+                record_done(&log, "iss", &format!("j{n}"), at(n), at(-300)),
                 Recorded::New
             );
         }
         assert_eq!(log.len(), 1_000);
         // Cutoff at t=500 drops exactly the 500 older sightings, once.
         assert_eq!(
-            log.record("iss", "fresh", at(1_000), at(500)),
+            record_done(&log, "iss", "fresh", at(1_000), at(500)),
             Recorded::New
         );
         assert_eq!(log.len(), 501);
         assert_eq!(
-            log.record("iss", "j999", at(1_001), at(500)),
+            record_done(&log, "iss", "j999", at(1_001), at(500)),
             Recorded::Replay,
             "newer ones stay"
         );
@@ -206,13 +264,25 @@ mod tests {
     #[test]
     fn a_forgotten_pair_is_accepted_again_and_nothing_else_moves() {
         let log = JtiLog::new(100);
-        assert_eq!(log.record("iss", "j1", at(0), at(-300)), Recorded::New);
-        assert_eq!(log.record("iss", "j2", at(1), at(-299)), Recorded::New);
+        assert_eq!(
+            record_done(&log, "iss", "j1", at(0), at(-300)),
+            Recorded::New
+        );
+        assert_eq!(
+            record_done(&log, "iss", "j2", at(1), at(-299)),
+            Recorded::New
+        );
         assert!(log.forget("iss", "j1"));
         assert!(!log.forget("iss", "j1"), "already forgotten");
         assert_eq!(log.len(), 1);
-        assert_eq!(log.record("iss", "j1", at(2), at(-298)), Recorded::New);
-        assert_eq!(log.record("iss", "j2", at(2), at(-298)), Recorded::Replay);
+        assert_eq!(
+            record_done(&log, "iss", "j1", at(2), at(-298)),
+            Recorded::New
+        );
+        assert_eq!(
+            record_done(&log, "iss", "j2", at(2), at(-298)),
+            Recorded::Replay
+        );
         assert_eq!(log.len(), 2, "no stale order item doubles an entry");
     }
 
@@ -224,22 +294,31 @@ mod tests {
         let log = JtiLog::new(10);
         for n in 0..10 {
             assert_eq!(
-                log.record("iss", &format!("j{n}"), at(n), at(-300)),
+                record_done(&log, "iss", &format!("j{n}"), at(n), at(-300)),
                 Recorded::New
             );
         }
-        assert_eq!(log.record("iss", "new", at(10), at(-300)), Recorded::Full);
+        assert_eq!(
+            record_done(&log, "iss", "new", at(10), at(-300)),
+            Recorded::Full
+        );
         assert_eq!(log.len(), 10, "nothing evicted, nothing added");
         assert_eq!(
-            log.record("iss", "j0", at(11), at(-300)),
+            record_done(&log, "iss", "j0", at(11), at(-300)),
             Recorded::Replay,
             "the oldest live entry still replays"
         );
-        assert_eq!(log.record("iss", "j9", at(11), at(-300)), Recorded::Replay);
+        assert_eq!(
+            record_done(&log, "iss", "j9", at(11), at(-300)),
+            Recorded::Replay
+        );
 
         // Once j0..j4 age past the cutoff there is room, and the token that
         // was refused is accepted.
-        assert_eq!(log.record("iss", "new", at(20), at(5)), Recorded::New);
+        assert_eq!(
+            record_done(&log, "iss", "new", at(20), at(5)),
+            Recorded::New
+        );
     }
 
     /// The bound is per issuer: an IdP that fills its own log does not get
@@ -249,22 +328,22 @@ mod tests {
         let log = JtiLog::new(10);
         for n in 0..10 {
             assert_eq!(
-                log.record("https://noisy", &format!("j{n}"), at(n), at(-300)),
+                record_done(&log, "https://noisy", &format!("j{n}"), at(n), at(-300)),
                 Recorded::New
             );
         }
         assert_eq!(
-            log.record("https://noisy", "j10", at(10), at(-300)),
+            record_done(&log, "https://noisy", "j10", at(10), at(-300)),
             Recorded::Full,
             "the noisy issuer is at its bound"
         );
         assert_eq!(
-            log.record("https://quiet", "j1", at(10), at(-300)),
+            record_done(&log, "https://quiet", "j1", at(10), at(-300)),
             Recorded::New,
             "another issuer's logout is not starved by the noisy one"
         );
         assert_eq!(
-            log.record("https://quiet", "j1", at(11), at(-300)),
+            record_done(&log, "https://quiet", "j1", at(11), at(-300)),
             Recorded::Replay
         );
         assert_eq!(log.len(), 11);
@@ -277,12 +356,12 @@ mod tests {
     fn an_issuer_whose_entries_all_expired_leaves_no_partition() {
         let log = JtiLog::new(10);
         assert_eq!(
-            log.record("https://gone", "j1", at(0), at(-300)),
+            record_done(&log, "https://gone", "j1", at(0), at(-300)),
             Recorded::New
         );
         assert_eq!(log.partitions(), 1, "the case exists");
         assert_eq!(
-            log.record("https://live", "j1", at(400), at(100)),
+            record_done(&log, "https://live", "j1", at(400), at(100)),
             Recorded::New
         );
         assert_eq!(log.len(), 1, "the old entry expired");

@@ -408,6 +408,22 @@ fn the_sweep_rotates_through_live_triples_and_skips_forgotten_ones() {
     assert!(!seen.contains(&ids[1]));
 }
 
+/// A triple forgotten and registered again before the sweep reached its old
+/// queue item has two items. One sweep still names the session once.
+#[test]
+fn a_sweep_names_a_session_once_though_it_was_registered_again() {
+    let map = SidMap::new();
+    let s = Sessions::new();
+    let alice = user("alice");
+    let id = s.next();
+    reg(&map, ISS, alice, id);
+    map.forget_subject_session(ISS, &alice, &id);
+    reg(&map, ISS, alice, id);
+
+    let swept = map.sweep_subject_candidates(2);
+    assert_eq!(swept.len(), 1, "{swept:?}");
+}
+
 #[test]
 fn the_sweep_queue_stays_bounded_when_sessions_are_forgotten() {
     let map = SidMap::new();

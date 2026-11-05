@@ -35,5 +35,8 @@ testing = []
 # path. Enables `MockNumericRng` under `testing`.
 numeric = []
 
-[dependencies]
-rand = { workspace = true, features = ["std"] }
+# `getrandom` has no backend on wasm32-unknown-unknown, where `SystemRng` is
+# not compiled either; keeping the dependency off that target keeps the
+# trait and `MockRng` usable there.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+getrandom = { workspace = true }

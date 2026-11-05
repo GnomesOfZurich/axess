@@ -9,8 +9,8 @@
 //! axess provides cache **decorators** that wrap any
 //! [`RequestEntityProvider`](super::RequestEntityProvider) in a caching
 //! layer. They are themselves `RequestEntityProvider` implementations,
-//! so they compose: stack moka over a valkey-backed cache over your
-//! concrete provider, and the consumer
+//! so they compose: stack the in-process cache over a valkey-backed
+//! cache over your concrete provider, and the consumer
 //! (the `require_authz!` macro from `axess_macros`,
 //! [`AuthzStore`](super::session::AuthzStore)) sees a single provider
 //! whose `entities_for` is now multi-tier cached.
@@ -42,16 +42,15 @@
 //!
 //! | Decorator | Tier | Backing crate | Feature |
 //! |---|---|---|---|
-//! | [`MokaEntityCache`] | in-process (per-pod) | [`moka`] | `moka-cache` (default-on) |
+//! | [`EntityCache`] | in-process (per-pod) | `axess-cache` | always available |
 //! | [`ValkeyEntityCache`] | cluster (network) | [`fred`] | `valkey-cache` (opt-in; needs Valkey/Redis) |
 //!
-//! Production deployments typically compose both: `MokaEntityCache` over
-//! `ValkeyEntityCache` over the concrete provider. moka catches the
-//! per-pod hot path; valkey ensures new pods (after restart or scale-out)
+//! Production deployments typically compose both: `EntityCache` over
+//! `ValkeyEntityCache` over the concrete provider. The in-process cache
+//! catches the per-pod hot path; valkey ensures new pods (after restart or scale-out)
 //! see warm cache rather than thundering-herd onto the DB.
 //!
 //! [tower]: https://docs.rs/tower
-//! [`moka`]: https://docs.rs/moka
 //! [`fred`]: https://docs.rs/fred
 
 mod generation;
@@ -61,16 +60,10 @@ pub use invalidator::CacheInvalidator;
 // `EntityCache` is the canonical DST-friendly decorator for any
 // `RequestEntityProvider`; TTL evaluated against an injected `Clock`
 // (from `axess-clock`), capacity-bounded LRU via `axess-cache`'s
-// `ClockTtlCache`. Always available; the Moka/Valkey backends below are
-// alternatives for deployments that already standardised on those caches.
+// `ClockTtlCache`. Always available; the Valkey backend below is an
+// alternative for deployments that share a cache across pods.
 mod entity_cache;
 pub use entity_cache::EntityCache;
-
-#[cfg(feature = "moka-cache")]
-mod moka_cache;
-
-#[cfg(feature = "moka-cache")]
-pub use moka_cache::MokaEntityCache;
 
 #[cfg(feature = "valkey-cache")]
 mod valkey_cache;

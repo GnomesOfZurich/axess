@@ -29,8 +29,6 @@ axum = { workspace = true, default-features = false, features = ["original-uri",
 base32 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"], optional = true }
-dashmap = { version = "6.2.1", features = ["serde"], optional = true }
-hex = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 # No backend chosen here: `jsonwebtoken` 11 takes its crypto from a cargo
 # feature, and pinning one makes that choice for every adopter. An adopter
@@ -64,7 +62,6 @@ sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "time", "macros"], optional = true }
-totp-rs = { version = "6.0.0", features = ["gen_secret", "serde", "zeroize"], optional = true }
 tower = { version = "0.5.3", features = ["util"], optional = true }
 tracing = { workspace = true }
 url = { workspace = true, optional = true }
@@ -100,15 +97,16 @@ testing = []
 
 # Symmetric credential factors
 email_otp = ["dep:chrono"]
-hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:hex", "dep:subtle", "dep:chrono"]
+hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:subtle", "dep:chrono"]
 password = ["dep:argon2", "dep:axess-rng"]
 # One-time fallback codes for a second factor: keyed-MAC or Argon2id stored
 # forms (the latter via `password`), generated through the injectable
 # `SecureRng`.
-recovery_code = ["password", "dep:axess-rng", "dep:chrono", "dep:hmac", "dep:sha2", "dep:subtle", "dep:hex"]
-# `totp` lists `base32`/`hex` explicitly even though they overlap with `hotp`;
-# without that, totp-only builds fail to compile until `hotp` is also enabled.
-totp = ["dep:totp-rs", "dep:axess-rng", "dep:subtle", "dep:base32", "dep:hex"]
+recovery_code = ["password", "dep:axess-rng", "dep:chrono", "dep:hmac", "dep:sha2", "dep:subtle"]
+# `totp` lists the HOTP computation's crates explicitly even though they
+# overlap with `hotp`; without that, totp-only builds fail to compile until
+# `hotp` is also enabled.
+totp = ["dep:axess-rng", "dep:subtle", "dep:base32", "dep:chrono", "dep:hmac", "dep:sha1", "dep:sha2"]
 
 # Asymmetric / transport-bound factors
 fido2 = ["dep:webauthn-rs", "dep:url", "dep:chrono", "dep:axess-identity", "dep:uuid"]
@@ -145,7 +143,7 @@ http-body = ["dep:reqwest"]
 # resource server's `verify_dpop_proof`) and the FAPI 2.0 client profile sit
 # under `oauth`; `fapi` is kept as an alias for it.
 fapi = ["oauth"]
-oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axum", "dep:dashmap", "dep:axess-identity", "dep:axess-rng", "dep:subtle", "dep:chrono", "dep:p256", "dep:sha2"]
+oauth = ["oidc", "jwt", "dep:url", "dep:uuid", "dep:axum", "dep:axess-identity", "dep:axess-rng", "dep:subtle", "dep:chrono", "dep:p256", "dep:sha2"]
 
 # Bearer + outbound + federation adapters (all sit on `jwt`)
 bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]

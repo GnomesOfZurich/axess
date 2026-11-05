@@ -247,34 +247,22 @@ async fn archiving_into_new_folders_succeeds_end_to_end() {
     assert!(archiver.root().join(".archive.lock").exists());
 }
 
-/// The id check finds an id in a large sidecar, and reads the file once.
+/// The marker check finds a marker in a large sidecar, and reads the file once.
 #[test]
 fn recorded_finds_an_id_in_a_large_sidecar_with_one_read() {
     let tmp = tempdir();
     let path = tmp.path().join("audit.jsonl.batches");
     let mut text = String::new();
     for i in 0..50_000 {
-        text.push_str(&format!("{i:064}\n"));
+        text.push_str(&format!("{i:064} digest\n"));
     }
     std::fs::write(&path, text).unwrap();
     let mut cache = sidecar::SidecarCache::default();
-    let id = |n: u32| format!("{n:064}");
-    assert!(cache.recorded(&path, &id(3), "no-such-marker").unwrap());
-    assert!(
-        cache
-            .recorded(&path, &id(49_999), "no-such-marker")
-            .unwrap()
-    );
-    assert!(
-        !cache
-            .recorded(&path, &id(50_000), "no-such-marker")
-            .unwrap()
-    );
-    assert!(
-        !cache
-            .recorded(&tmp.path().join("missing"), "x", "x y")
-            .unwrap()
-    );
+    let marker = |n: u32| format!("{n:064} digest");
+    assert!(cache.recorded(&path, &marker(3)).unwrap());
+    assert!(cache.recorded(&path, &marker(49_999)).unwrap());
+    assert!(!cache.recorded(&path, &marker(50_000)).unwrap());
+    assert!(!cache.recorded(&tmp.path().join("missing"), "x y").unwrap());
     assert_eq!(cache.loads(), 1, "one read for four questions");
 }
 
@@ -290,10 +278,10 @@ fn a_marker_noted_after_a_cache_clear_keeps_the_sidecars_earlier_lines() {
     std::fs::write(&first, "old digest-old\n").unwrap();
     std::fs::write(&second, "other digest-other\n").unwrap();
     let mut cache = sidecar::SidecarCache::with_max_days(1);
-    assert!(cache.recorded(&first, "old", "old digest-old").unwrap());
-    assert!(!cache.recorded(&first, "new", "new digest-new").unwrap());
+    assert!(cache.recorded(&first, "old digest-old").unwrap());
+    assert!(!cache.recorded(&first, "new digest-new").unwrap());
     // The second day's read is at the cap and clears the table.
-    assert!(!cache.recorded(&second, "new", "new digest-new").unwrap());
+    assert!(!cache.recorded(&second, "new digest-new").unwrap());
     // The batch is appended to both sidecars and recorded.
     for path in [&first, &second] {
         use std::io::Write as _;
@@ -302,13 +290,9 @@ fn a_marker_noted_after_a_cache_clear_keeps_the_sidecars_earlier_lines() {
         cache.note_appended(path, "new digest-new");
     }
     assert!(
-        cache.recorded(&first, "old", "old digest-old").unwrap(),
+        cache.recorded(&first, "old digest-old").unwrap(),
         "the first day's earlier batch is forgotten, so it would be archived again"
     );
-    assert!(cache.recorded(&first, "new", "new digest-new").unwrap());
-    assert!(
-        cache
-            .recorded(&second, "other", "other digest-other")
-            .unwrap()
-    );
+    assert!(cache.recorded(&first, "new digest-new").unwrap());
+    assert!(cache.recorded(&second, "other digest-other").unwrap());
 }

@@ -48,7 +48,8 @@ pub(super) fn is_valid_pkce_verifier(verifier: &str) -> bool {
 }
 
 /// Compute the claim-binding lock for an OAuth ceremony. The lock
-/// is `SHA-256(provider || ":" || subject || ":" || session_id)` encoded
+/// is `SHA-256` over `provider`, `subject` and `session_id`, each behind its
+/// length as eight big-endian bytes, encoded
 /// as URL-safe base64. It binds the IdP-attested identity to the session,
 /// so a caller that bypasses `finish_oauth_login` and invokes
 /// `complete_oauth_login` directly cannot satisfy the verification: the
@@ -63,11 +64,12 @@ pub(super) async fn compute_claim_lock(
     use sha2::{Digest, Sha256};
     let sid = session.session_id().await;
     let mut hasher = Sha256::new();
-    hasher.update(provider.as_bytes());
-    hasher.update(b":");
-    hasher.update(subject.as_bytes());
-    hasher.update(b":");
-    hasher.update(sid.as_bytes());
+    // Each field behind its length, so where one ends and the next begins
+    // is part of what is hashed.
+    for field in [provider.as_bytes(), subject.as_bytes(), sid.as_bytes()] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
@@ -222,11 +224,67 @@ pub(super) fn encode_dpop_key(key: &axess_factors::oauth::DpopKey) -> String {
 }
 
 /// The key [`encode_dpop_key`] spelled, or `None` for anything else.
+///
+/// The seed is decoded into a zeroizing stack buffer and handed on by value
+/// to [`DpopKey::from_seed`](axess_factors::oauth::DpopKey::from_seed), which
+/// wipes its own copy, so no unwiped copy of it is left behind here.
 pub(super) fn decode_dpop_key(encoded: &str) -> Option<axess_factors::oauth::DpopKey> {
     use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
+    // Room for the longest input that can decode to 32 bytes (43 characters
+    // decode to 33 bytes of buffer estimate); anything longer fails to
+    // decode and is refused.
+    let mut buf = zeroize::Zeroizing::new([0u8; 36]);
+    let len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode_slice(encoded, &mut *buf)
         .ok()?;
-    let seed: [u8; 32] = bytes.try_into().ok()?;
-    Some(axess_factors::oauth::DpopKey::from_seed(seed))
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    seed.copy_from_slice(buf.get(..len).filter(|b| b.len() == 32)?);
+    Some(axess_factors::oauth::DpopKey::from_seed(*seed))
+}
+
+#[cfg(test)]
+mod dpop_key_tests {
+    use super::{decode_dpop_key, encode_dpop_key};
+
+    #[test]
+    fn a_key_round_trips_through_its_spelling() {
+        let key = axess_factors::oauth::DpopKey::from_seed([7u8; 32]);
+        let back = decode_dpop_key(&encode_dpop_key(&key)).expect("decodes");
+        assert_eq!(*back.to_seed_bytes(), *key.to_seed_bytes());
+    }
+
+    #[test]
+    fn anything_but_a_32_byte_seed_is_refused() {
+        use base64::Engine as _;
+        let enc = |n: usize| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(vec![7u8; n]);
+        for n in [0, 31, 33, 64, 200] {
+            assert!(decode_dpop_key(&enc(n)).is_none(), "{n} bytes");
+        }
+        assert!(decode_dpop_key("not base64!").is_none());
+    }
+}
+
+#[cfg(test)]
+mod claim_lock_tests {
+    use super::compute_claim_lock;
+    use crate::testing::test_session;
+
+    /// The lock binds a provider, a subject and a session. Fields that
+    /// differ only in where the boundary between them falls are different
+    /// bindings: `("a:b", "c")` is not `("a", "b:c")`.
+    #[tokio::test]
+    async fn fields_that_differ_only_in_their_boundary_give_different_locks() {
+        let session = test_session();
+        let split_early = compute_claim_lock("a", "b:c", &session).await;
+        let split_late = compute_claim_lock("a:b", "c", &session).await;
+        assert_ne!(split_early, split_late);
+    }
+
+    #[tokio::test]
+    async fn one_binding_gives_one_lock_and_a_session_changes_it() {
+        let (one, other) = (test_session(), test_session());
+        let first = compute_claim_lock("idp", "sub", &one).await;
+        assert_eq!(first, compute_claim_lock("idp", "sub", &one).await);
+        assert_ne!(first, compute_claim_lock("idp", "sub", &other).await);
+    }
 }

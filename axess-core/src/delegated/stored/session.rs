@@ -21,6 +21,10 @@ use super::provider::DelegatedProvider;
 /// network latency.
 const DEFAULT_REFRESH_SKEW_SECS: i64 = 60;
 
+/// The largest refresh skew [`StoredDelegationSession::with_refresh_skew_secs`]
+/// keeps: one day.
+const MAX_REFRESH_SKEW_SECS: i64 = 86_400;
+
 /// Idle entries are pruned from the single-flight registry once it
 /// holds more than this many keys.
 const REFRESH_LOCK_PRUNE_THRESHOLD: usize = 1024;
@@ -151,9 +155,10 @@ where
     }
 
     /// Override the refresh-skew (default: 60 s). Refresh triggers
-    /// when `now >= expires_at - skew`.
+    /// when `now >= expires_at - skew`. The value is clamped to 0 through
+    /// one day: a negative skew would keep an expired token in use.
     pub fn with_refresh_skew_secs(mut self, secs: i64) -> Self {
-        self.refresh_skew_secs = secs;
+        self.refresh_skew_secs = secs.clamp(0, MAX_REFRESH_SKEW_SECS);
         self
     }
 
@@ -302,11 +307,14 @@ where
             scopes: refreshed.scope.unwrap_or_else(|| cred.scopes.clone()),
             ..refreshed.credential
         };
-        let access = bearer(&final_credential)?;
+        // Saved before the token type is judged: the IdP has already rotated
+        // the refresh token and spent the old one, so refusing the answer
+        // must not lose the new one.
+        let access = bearer(&final_credential);
         self.store
             .save(&self.tenant, &self.user, final_credential)
             .await
             .map_err(store_err)?;
-        Ok(access)
+        access
     }
 }

@@ -194,6 +194,7 @@ where
         user_id: &UserId,
         tenant_id: &TenantId,
         current_kind: &FactorKind,
+        session: &AuthSession,
     ) {
         if let Err(e) = self
             .inner
@@ -202,6 +203,7 @@ where
                 AuthEventBuilder::failure(AuthEventType::FactorVerified)
                     .attributed_to(user_id, tenant_id)
                     .with_factor(current_kind.clone())
+                    .with_session(session.session_id().await)
                     .build_at(self.inner.clock.now()),
             )
             .await
@@ -311,7 +313,7 @@ where
                      monitor counter-store health"
                 );
                 session.record_attempt_at(self.inner.clock.now()).await;
-                self.record_factor_failure_audit(user_id, tenant_id, current_kind)
+                self.record_factor_failure_audit(user_id, tenant_id, current_kind, session)
                     .await;
                 return Ok(verdict);
             }
@@ -321,7 +323,7 @@ where
         // lockout decisions (those are store-authoritative).
         session.record_attempt_at(self.inner.clock.now()).await;
 
-        self.record_factor_failure_audit(user_id, tenant_id, current_kind)
+        self.record_factor_failure_audit(user_id, tenant_id, current_kind, session)
             .await;
 
         if count >= policy.effective_max_attempts() {
@@ -348,6 +350,22 @@ pub(super) use reserve::GuessSlot;
 
 #[cfg(test)]
 mod tests;
+
+/// The failure-counter increment for a factor row read from the store.
+///
+/// Email OTP and HOTP rows carry a failure counter and return the row with
+/// one more failure recorded at `now`; every other kind has none and gives
+/// `None`, so the caller falls back to the config it computed or stops.
+fn recount_failure(
+    existing: &FactorConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<FactorConfig> {
+    match existing {
+        FactorConfig::EmailOtp(otp) => Some(FactorConfig::EmailOtp(apply_email_otp_failure(otp))),
+        FactorConfig::Hotp(otp) => Some(FactorConfig::Hotp(apply_hotp_failure(otp, now))),
+        _ => None,
+    }
+}
 
 impl<I, F> AuthnService<I, F>
 where
@@ -384,8 +402,9 @@ where
     ///    and log: better to under-count than to spin forever under
     ///    pathological contention.
     /// 3. **Missing-row fallback**: if a reload returns `None`
-    ///    mid-loop (admin deleted the row), fall back to a plain
-    ///    save so the failure is recorded somewhere.
+    ///    mid-loop (admin deleted the row), insert the failure record
+    ///    only if the row is still absent, so a factor enrolled in the
+    ///    meantime is never overwritten; the loop then reloads it.
     /// 4. **Wrong-kind bail-out**: if the reloaded row has a
     ///    different `FactorKind` (admin reconfigured the user
     ///    mid-flow), break without retry: the failure update no
@@ -409,15 +428,15 @@ where
             .map_err(AuthnError::Store)?;
 
         let mut applied = false;
+        // Set when the prior held is known not to be what the store has, so
+        // the next round reads the row before it writes.
+        let mut reload_first = false;
         let (mut prior_config, mut next_config) = if let Some(existing) = initial_user_scope {
             // Recompute the failure update against the live user-scope
             // value rather than the (possibly inherited) template that
             // initial verification used.
-            let recomputed = match &existing {
-                FactorConfig::EmailOtp(otp) => FactorConfig::EmailOtp(apply_email_otp_failure(otp)),
-                FactorConfig::Hotp(otp) => FactorConfig::Hotp(apply_hotp_failure(otp, now)),
-                _ => updated_config.clone(),
-            };
+            let recomputed =
+                recount_failure(&existing, now).unwrap_or_else(|| updated_config.clone());
             (existing, recomputed)
         } else {
             // No user-scope row yet. Insert only if still absent: of N
@@ -442,20 +461,16 @@ where
                     .map_err(AuthnError::Store)?;
                 match reloaded {
                     Some(existing) => {
-                        let next = match &existing {
-                            FactorConfig::EmailOtp(otp) => {
-                                FactorConfig::EmailOtp(apply_email_otp_failure(otp))
-                            }
-                            FactorConfig::Hotp(otp) => {
-                                FactorConfig::Hotp(apply_hotp_failure(otp, now))
-                            }
-                            _ => updated_config.clone(),
-                        };
+                        let next = recount_failure(&existing, now)
+                            .unwrap_or_else(|| updated_config.clone());
                         (existing, next)
                     }
                     // Row vanished between insert and reload (admin
                     // delete): the loop's missing-row fallback records it.
-                    None => (updated_config.clone(), updated_config.clone()),
+                    None => {
+                        reload_first = true;
+                        (updated_config.clone(), updated_config.clone())
+                    }
                 }
             }
         };
@@ -470,15 +485,17 @@ where
             // against the new prior on the next loop iteration. Not a
             // security signal; only the post-success CAS in
             // `persist_pass_with_update` treats `Ok(false)` as replay.
-            let swapped = self
-                .inner
-                .factors
-                .compare_and_save_factor(user_scope, &prior_config, next_config.clone())
-                .await
-                .map_err(AuthnError::Store)?;
-            if swapped {
-                applied = true;
-                break;
+            if !std::mem::take(&mut reload_first) {
+                let swapped = self
+                    .inner
+                    .factors
+                    .compare_and_save_factor(user_scope, &prior_config, next_config.clone())
+                    .await
+                    .map_err(AuthnError::Store)?;
+                if swapped {
+                    applied = true;
+                    break;
+                }
             }
             // CAS lost the race; reload and recompute the increment
             // from whatever the concurrent writer left behind.
@@ -489,38 +506,44 @@ where
                 .await
                 .map_err(AuthnError::Store)?;
             let Some(reloaded_config) = reloaded else {
-                // No user-scope row exists at all; fall back to a plain
-                // save so the failure is at least recorded somewhere.
-                if let Err(e) = self
+                // No user-scope row exists at all; record the failure
+                // with an insert that only lands on an absent row. A
+                // factor enrolled since the read wins, and the next
+                // round reloads it and counts the failure on top.
+                match self
                     .inner
                     .factors
-                    .save_factor(user_scope, updated_config.clone())
+                    .insert_factor_if_absent(user_scope, updated_config.clone())
                     .await
                 {
-                    tracing::warn!(
-                        error = %e,
-                        "fallback save_factor on missing user-scope row \
-                         also failed; failure counter not persisted"
-                    );
+                    Ok(true) => {
+                        applied = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        // A factor was enrolled since the read: the prior held
+                        // is not it, so the next round reads it first.
+                        reload_first = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "fallback insert on missing user-scope row \
+                             failed; failure counter not persisted"
+                        );
+                        applied = true;
+                        break;
+                    }
                 }
-                applied = true;
+            };
+            let Some(recounted) = recount_failure(&reloaded_config, now) else {
+                // Different factor kind appeared under user_scope (race
+                // with admin reconfiguration). Bail out without retry.
                 break;
             };
-            match &reloaded_config {
-                FactorConfig::EmailOtp(otp) => {
-                    next_config = FactorConfig::EmailOtp(apply_email_otp_failure(otp));
-                    prior_config = reloaded_config;
-                }
-                FactorConfig::Hotp(otp) => {
-                    next_config = FactorConfig::Hotp(apply_hotp_failure(otp, now));
-                    prior_config = reloaded_config;
-                }
-                _ => {
-                    // Different factor kind appeared under user_scope (race
-                    // with admin reconfiguration). Bail out without retry.
-                    break;
-                }
-            }
+            next_config = recounted;
+            prior_config = reloaded_config;
         }
 
         if !applied {

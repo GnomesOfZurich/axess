@@ -317,7 +317,12 @@ full (`drain`, at most 100 ticks per wake), so a backlog larger than
 up to `batch_size` events. Each tick reads the hot-tier events
 that have aged past `archive_after`, hands them to the archiver, and
 purges the hot rows whose archive copy was made more than
-`purge_hot_after_archive` ago. `spawn` returns a `JoinHandle`; dropping
+`purge_hot_after_archive` ago. The two steps do not wait on each other:
+when the archiver refuses a batch, the tick offers its rows one at a time,
+marks the ones taken as archived and returns the first refusal as its
+error, and the purge runs whether or not the archive step succeeded, so a
+sink that is down, or one row it cannot take, never keeps archived rows on
+the hot table. `spawn` returns a `JoinHandle`; dropping
 it leaves the loop running, so call `abort` on it to stop retention.
 The loop rests a full interval after each drain, so one that overruns
 is not followed by catch-up drains. The cutoffs come from the injected clock, while the pacing is
@@ -360,6 +365,11 @@ newline-delimited JSON-encoded events. The format is readable by
 standard tools (`grep`, `jq`, `awk`), survives forensic
 investigation, and lifts cleanly into cloud object storage when
 the deployment moves the archive there.
+
+A file that a crash left ending in a partial line (the bytes of a write
+that was never acknowledged) is cut back to its last newline before the
+next batch is appended, so a torn line cannot swallow the first line of the
+batch that follows.
 
 Writers on one root take an exclusive lock on `.archive.lock` for the
 whole batch (duplicate check, writes, rollback and fsync), so two

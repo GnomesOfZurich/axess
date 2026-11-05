@@ -49,6 +49,9 @@ pub enum ProvisioningError<E: std::error::Error + Send + Sync + 'static> {
     /// any caller inherit "platform-global" privileges that join on
     /// the system-tenant id.
     ReservedTenantId,
+    /// The tenant identifier is not acceptable for a new tenant (see
+    /// [`Tenant::validate_new`](crate::authn::types::Tenant::validate_new)).
+    InvalidTenant(String),
     /// Wrapped backend error from the underlying stores.
     Store(E),
 }
@@ -62,6 +65,7 @@ impl<E: std::error::Error + Send + Sync + 'static> std::fmt::Display for Provisi
             ProvisioningError::ReservedTenantId => {
                 f.write_str("tenant id matches the reserved system-tenant UUID; refused")
             }
+            ProvisioningError::InvalidTenant(why) => write!(f, "invalid tenant: {why}"),
             ProvisioningError::Store(e) => write!(f, "store error: {e}"),
         }
     }
@@ -72,6 +76,7 @@ impl<E: std::error::Error + Send + Sync + 'static> std::error::Error for Provisi
         match self {
             ProvisioningError::NoFactorsSpecified => None,
             ProvisioningError::ReservedTenantId => None,
+            ProvisioningError::InvalidTenant(_) => None,
             ProvisioningError::Store(e) => Some(e),
         }
     }
@@ -222,6 +227,11 @@ where
         return Err(ProvisioningError::ReservedTenantId);
     }
 
+    bootstrap
+        .tenant
+        .validate_new()
+        .map_err(ProvisioningError::InvalidTenant)?;
+
     let scope = AuthnScope::Tenant(bootstrap.tenant.id);
 
     // 1. Insert the tenant row.
@@ -359,5 +369,43 @@ mod tests {
         let factors = MockFactorStore::new();
         let res = create_tenant(&identity, &factors, bootstrap).await;
         assert!(matches!(res, Err(ProvisioningError::ReservedTenantId)));
+    }
+
+    /// A look-alike identifier is refused when a tenant is created, however
+    /// the `Tenant` was built.
+    #[tokio::test]
+    async fn create_tenant_refuses_a_look_alike_identifier() {
+        use crate::testing::mock_authn::{MockFactorStore, MockIdentityStore};
+        let mut tenant = test_tenant();
+        tenant.identifier = "acme\u{200B}".into();
+        let res = create_tenant(
+            &MockIdentityStore::new(),
+            &MockFactorStore::new(),
+            TenantBootstrap::minimal(tenant),
+        )
+        .await;
+        assert!(matches!(res, Err(ProvisioningError::InvalidTenant(_))));
+    }
+
+    /// An empty identifier or a control character is refused when a tenant
+    /// is created, as `Tenant::new` refuses it.
+    #[tokio::test]
+    async fn create_tenant_refuses_an_empty_or_control_identifier() {
+        use crate::testing::mock_authn::{MockFactorStore, MockIdentityStore};
+        for bad in ["", "ac\nme"] {
+            let mut tenant = test_tenant();
+            tenant.identifier = bad.into();
+            let identity = MockIdentityStore::new();
+            let res = create_tenant(
+                &identity,
+                &MockFactorStore::new(),
+                TenantBootstrap::minimal(tenant),
+            )
+            .await;
+            assert!(
+                matches!(res, Err(ProvisioningError::InvalidTenant(_))),
+                "{bad:?}"
+            );
+        }
     }
 }

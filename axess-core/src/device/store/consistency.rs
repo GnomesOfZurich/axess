@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::authn::ids::{DeviceId, TenantId, UserId, testing};
-use crate::device::store::{DeviceStore, SweepConfig};
+use crate::device::store::{DeviceStore, OwnerClaim, SweepConfig};
 use crate::device::types::{Device, DeviceBinding, DeviceTrustLevel, FingerprintHash};
 
 /// A fixed instant, `secs` seconds after 2027-01-15.
@@ -272,6 +272,97 @@ where
         DeviceTrustLevel::Seen,
         "explicit reinstatement works"
     );
+}
+
+/// A revoked device is never live again unless an administrator reinstates
+/// it: whatever the other write paths do afterwards (stale saves, sightings,
+/// conditional trust changes, binding swaps, ownership claims, retention
+/// sweeps, a repeated revocation), the row is `Revoked` or gone. Deterministic pseudo-random
+/// sequences, so a failure repeats; `make_store` gives each its own store.
+pub(crate) async fn a_revoked_device_never_comes_back<S, F, Fut>(make_store: F)
+where
+    S: DeviceStore,
+    S::Error: Debug,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = S>,
+{
+    use DeviceTrustLevel::{Revoked, Seen, Trusted, Unknown};
+    const LEVELS: [DeviceTrustLevel; 3] = [Trusted, Seen, Unknown];
+    let (t, id) = (tenant(), dev_id("never-back"));
+    let base = at(40_000);
+    for seed in 1u64..=6 {
+        let store = make_store().await;
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let original = device("never-back", 0x61, Trusted, base);
+        store.save(&original, base).await.unwrap();
+        let revoked_at = base + Duration::minutes(5);
+        store
+            .set_trust_level(&t, &id, Revoked, revoked_at)
+            .await
+            .unwrap();
+
+        for step in 0..30 {
+            let now = revoked_at + Duration::seconds(1 + step);
+            let level = LEVELS[next(3)];
+            let op = next(7);
+            match op {
+                0 => {
+                    let mut stale = original.clone();
+                    stale.trust_level = level;
+                    stale.user_id = [None, Some(user())][next(2)];
+                    store.save(&stale, now).await.unwrap();
+                }
+                1 => {
+                    store.record_sighting(&t, &id, now).await.unwrap();
+                }
+                2 => {
+                    let to = LEVELS[next(3)];
+                    let _ = store
+                        .set_trust_level_if(&t, &id, level, to, now)
+                        .await
+                        .unwrap();
+                }
+                3 => {
+                    let new = [refresh(&format!("fam-{seed}-{step}"), now)];
+                    let _ = store
+                        .replace_bindings(&t, &id, &[], &new, now)
+                        .await
+                        .unwrap();
+                }
+                4 => {
+                    let before = store.load(&t, &id).await.unwrap();
+                    let claim = store.claim_owner(&t, &id, &user(), now).await.unwrap();
+                    if before.is_some_and(|row| row.user_id.is_none()) {
+                        assert_eq!(
+                            claim,
+                            OwnerClaim::OwnedByOther,
+                            "seed {seed} step {step}: a revoked device was claimed"
+                        );
+                    }
+                }
+                5 => {
+                    store.sweep(&t, now).await.unwrap();
+                }
+                _ => {
+                    // Revoking again is not a reinstatement.
+                    store.set_trust_level(&t, &id, Revoked, now).await.unwrap();
+                }
+            }
+            if let Some(row) = store.load(&t, &id).await.unwrap() {
+                assert_eq!(
+                    row.trust_level, Revoked,
+                    "seed {seed} step {step} op {op}: a revoked device came back as {:?}",
+                    row.trust_level
+                );
+            }
+        }
+    }
 }
 
 /// A revoked device saved with no revocation time is stamped with the

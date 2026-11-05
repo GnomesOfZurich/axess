@@ -29,6 +29,36 @@ pub enum Provisioning {
     LinkedOnly,
 }
 
+impl Provisioning {
+    /// [`from_setting`](Self::from_setting) over the result of reading the
+    /// environment variable: a value that is not valid Unicode is an error,
+    /// never read as unset.
+    pub fn from_env(value: Result<String, std::env::VarError>) -> Result<Self, String> {
+        match value {
+            Ok(v) => Self::from_setting(Some(&v)),
+            Err(std::env::VarError::NotPresent) => Self::from_setting(None),
+            // Given but unreadable is not "unset": that would turn on
+            // creating users on a setting the operator meant to restrict.
+            Err(e @ std::env::VarError::NotUnicode(_)) => {
+                Err(format!("OAUTH_PROVISIONING is not text: {e}"))
+            }
+        }
+    }
+
+    /// Reads the `OAUTH_PROVISIONING` setting: `just-in-time` or
+    /// `linked-only`, and just-in-time when it is not set. Any other value is
+    /// an error, so a typo cannot turn on creating users.
+    pub fn from_setting(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None | Some("just-in-time") => Ok(Self::JustInTime),
+            Some("linked-only") => Ok(Self::LinkedOnly),
+            Some(other) => Err(format!(
+                "OAUTH_PROVISIONING must be `just-in-time` or `linked-only`, not {other:?}"
+            )),
+        }
+    }
+}
+
 /// What one tenant allows when an unknown identity arrives.
 #[derive(Clone, Debug)]
 pub struct TenantPolicy {

@@ -343,7 +343,7 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
             })?;
             let ttl = compute_replay_ttl(exp, self.clock_skew, &*self.clock);
             store
-                .check_and_record(jti_value, ttl)
+                .check_and_record(&replay_key(iss.as_deref(), jti_value), ttl)
                 .await
                 .map_err(|e| JwtError::VerificationFailed(format!("jti replay: {e}")))?;
         }
@@ -380,13 +380,27 @@ const REPLAY_TTL_WITHOUT_EXP: Duration = Duration::from_secs(24 * 60 * 60);
 /// [`Clock`](axess_clock::Clock) rather than a direct
 /// `chrono::Utc::now()` call, so DST tests can drive the TTL
 /// calculation deterministically.
+/// The replay-store key of a token: its issuer and its `jti` together, so two
+/// issuers that pick the same `jti` and share one store do not block each
+/// other. The issuer is length-prefixed, so no pair of values can collide.
+fn replay_key(iss: Option<&str>, jti: &str) -> String {
+    let iss = iss.unwrap_or("");
+    format!("{}:{iss}{jti}", iss.len())
+}
+
 fn compute_replay_ttl(exp: Option<i64>, skew: Duration, clock: &dyn Clock) -> Duration {
     let Some(exp) = exp else {
         return REPLAY_TTL_WITHOUT_EXP;
     };
     let now = clock.now().timestamp();
     let skew = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
-    let secs = exp.saturating_add(skew).saturating_sub(now).max(0) as u64;
+    // `+ 1`: in the last accepted second (exp + skew == now) the token is
+    // still accepted, so it must be remembered for that second too.
+    let secs = exp
+        .saturating_add(skew)
+        .saturating_sub(now)
+        .saturating_add(1)
+        .max(0) as u64;
     Duration::from_secs(secs)
 }
 

@@ -48,6 +48,13 @@ where
             _ => return Ok(FactorOutcome::InvalidCredential),
         };
 
+        // Reject an empty password before the network call: many directories
+        // treat a simple bind with no password as an unauthenticated bind and
+        // answer success, which must never log anyone in.
+        if password.is_empty() {
+            return Ok(FactorOutcome::InvalidCredential);
+        }
+
         // Reject oversized passwords before the network call.
         if password.len() > crate::validation::MAX_PASSWORD_BYTES {
             return Ok(FactorOutcome::InvalidCredential);
@@ -90,7 +97,7 @@ where
                 .await
             }
             Err(e) => {
-                self.ldap_unavailable(&e, reserved, user_id, tenant_id)
+                self.ldap_unavailable(&e, reserved, user_id, tenant_id, session)
                     .await
             }
         }
@@ -159,7 +166,8 @@ where
         self.emit_audit(
             AuthEventBuilder::success(AuthEventType::FactorVerified)
                 .attributed_to(user_id, tenant_id)
-                .with_factor(FactorKind::LdapBind),
+                .with_factor(FactorKind::LdapBind)
+                .with_session(session.session_id().await),
         )
         .await?;
 
@@ -188,6 +196,7 @@ where
         reserved: Option<u32>,
         user_id: &UserId,
         tenant_id: &TenantId,
+        session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
         // Log the full error server-side for diagnostics; return a
         // generic message to callers to avoid leaking LDAP server
@@ -205,7 +214,8 @@ where
             AuthEventBuilder::failure(AuthEventType::FactorVerified)
                 .attributed_to(user_id, tenant_id)
                 .with_factor(FactorKind::LdapBind)
-                .with_error(AuthFailureReason::Other("external_service".to_owned())),
+                .with_session(session.session_id().await)
+                .with_error(AuthFailureReason::from("external_service")),
         )
         .await?;
         Err(AuthnError::ExternalService(

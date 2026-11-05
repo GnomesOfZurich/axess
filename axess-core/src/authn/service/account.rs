@@ -61,6 +61,30 @@ where
         Ok(status.effective_at(self.inner.clock.now()))
     }
 
+    /// Refuse unless the tenant is loaded and active, the reading every login
+    /// gives a tenant: its status as of the injected clock's now, so a timed
+    /// suspension that has lapsed no longer blocks. A tenant that does not
+    /// load refuses (fail closed) as [`AuthnError::UnknownTenant`]; one that
+    /// loads in another state as [`AuthnError::NotActive`]; a store failure
+    /// as [`AuthnError::Store`]. Only the last is not a statement about the
+    /// tenant, so a caller that audits the refusal skips it for `Store`.
+    pub(crate) async fn require_active_tenant(
+        &self,
+        tenant_id: &crate::authn::ids::TenantId,
+    ) -> Result<(), AuthnError<I::Error>> {
+        let tenant = self
+            .inner
+            .identity
+            .get_tenant(tenant_id)
+            .await
+            .map_err(AuthnError::Store)?;
+        match tenant.map(|t| t.status.effective_at(self.inner.clock.now())) {
+            Some(status) if status.allows_login() => Ok(()),
+            Some(status) => Err(AuthnError::NotActive(status)),
+            None => Err(AuthnError::UnknownTenant),
+        }
+    }
+
     /// Revoke every refresh token of `user_id` when a refresh store was
     /// attached with
     /// [`with_refresh_store`](crate::authn::service::AuthnServiceBuilder::with_refresh_store);
@@ -122,6 +146,69 @@ where
             );
             self.inner.metrics.session_invalidated();
         }
+    }
+
+    /// Re-read the account status after the session is registered.
+    ///
+    /// A status that no longer allows login revokes the just-registered
+    /// session, clears it, counts the lock and breaks with
+    /// [`FactorOutcome::Locked`]. A status-read failure revokes and clears
+    /// too, and is an error (fail closed).
+    async fn recheck_status_after_register(
+        &self,
+        reg: &dyn crate::session::store::SessionRegistryHandle,
+        user_id: &crate::authn::ids::UserId,
+        sid: &crate::session::id::SessionId,
+        session: &AuthSession,
+    ) -> Result<ControlFlow<FactorOutcome>, AuthnError<I::Error>> {
+        // Re-read account status AFTER registering. Closes the
+        // race where a concurrent `suspend_user` call lands its
+        // status-update + `invalidate_user` between this function's
+        // initial status check (in `verify_factor`) and the register
+        // above; without this re-check, the just-registered session
+        // would survive the suspension as if the suspend never happened.
+        match self.current_account_status(user_id).await {
+            Ok(status) if !status.allows_login() => {
+                tracing::warn!(
+                    user_id = %user_id,
+                    status = ?status,
+                    "account status flipped to non-loginable mid-flow; \
+                     revoking just-registered session and refusing authentication"
+                );
+                note_revocation(
+                    reg.invalidate_session(user_id, sid).await,
+                    "refusing a login step",
+                );
+                // Wipe the in-memory session state so the response cookie
+                // does not ship a Set-Cookie for an authenticated session.
+                session.clear().await;
+                self.inner.metrics.account_locked();
+                let until = if let crate::authn::types::EntityState::Suspended(detail) = &status {
+                    detail.until
+                } else {
+                    None
+                };
+                return Ok(ControlFlow::Break(FactorOutcome::Locked { until }));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Fail closed on store error; better to force a re-auth
+                // than risk leaving a session live across an
+                // inconsistent suspension state.
+                tracing::warn!(
+                    user_id = %user_id,
+                    error = %e,
+                    "post-register status re-check failed; failing closed"
+                );
+                note_revocation(
+                    reg.invalidate_session(user_id, sid).await,
+                    "refusing a login step",
+                );
+                session.clear().await;
+                return Err(e);
+            }
+        }
+        Ok(ControlFlow::Continue(()))
     }
 
     /// Make a just-authenticated session reachable by the eviction path.
@@ -221,59 +308,29 @@ where
                 }
             }
 
-            // Re-read account status AFTER registering. Closes the
-            // race where a concurrent `suspend_user` call lands its
-            // status-update + `invalidate_user` between this function's
-            // initial status check (in `verify_factor`) and the register
-            // above; without this re-check, the just-registered session
-            // would survive the suspension as if the suspend never happened.
-            match self.current_account_status(user_id).await {
-                Ok(status) if !status.allows_login() => {
-                    tracing::warn!(
-                        user_id = %user_id,
-                        status = ?status,
-                        "account status flipped to non-loginable mid-flow; \
-                         revoking just-registered session and refusing authentication"
-                    );
-                    note_revocation(
-                        reg.invalidate_session(user_id, sid).await,
-                        "refusing a login step",
-                    );
-                    // Wipe the in-memory session state so the response cookie
-                    // does not ship a Set-Cookie for an authenticated session.
+            if let ControlFlow::Break(outcome) = self
+                .recheck_status_after_register(reg.as_ref(), user_id, sid, session)
+                .await?
+            {
+                return Ok(ControlFlow::Break(outcome));
+            }
+        } else {
+            // No registry: nothing could have invalidated this session, but
+            // the credentials it was verified against still must be current.
+            // The session is already Authenticated here, so a store error
+            // clears it too: returning early would leave it authenticated
+            // behind the error.
+            match self.flow_still_current(session, user_id, tenant_id).await {
+                Ok(true) => {}
+                Ok(false) => {
                     session.clear().await;
-                    self.inner.metrics.account_locked();
-                    let until = if let crate::authn::types::EntityState::Suspended(detail) = &status
-                    {
-                        detail.until
-                    } else {
-                        None
-                    };
-                    return Ok(ControlFlow::Break(FactorOutcome::Locked { until }));
+                    return Err(AuthnError::NoFlow);
                 }
-                Ok(_) => {}
                 Err(e) => {
-                    // Fail closed on store error; better to force a re-auth
-                    // than risk leaving a session live across an
-                    // inconsistent suspension state.
-                    tracing::warn!(
-                        user_id = %user_id,
-                        error = %e,
-                        "post-register status re-check failed; failing closed"
-                    );
-                    note_revocation(
-                        reg.invalidate_session(user_id, sid).await,
-                        "refusing a login step",
-                    );
                     session.clear().await;
                     return Err(e);
                 }
             }
-        } else if !self.flow_still_current(session, user_id, tenant_id).await? {
-            // No registry: nothing could have invalidated this session, but
-            // the credentials it was verified against still must be current.
-            session.clear().await;
-            return Err(AuthnError::NoFlow);
         }
         Ok(ControlFlow::Continue(()))
     }

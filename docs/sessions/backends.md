@@ -73,7 +73,7 @@ Four things about that surface shape an implementation.
 
 `Clone` is a supertrait. The layer holds the store by value and clones
 it per request, so the type must be cheap to clone: a connection pool
-or an `Arc<DashMap<..>>` behind the struct, never the data itself.
+or an `Arc<Mutex<HashMap<..>>>` behind the struct, never the data itself.
 
 The error is your associated `Self::Error`, not a type axess defines.
 

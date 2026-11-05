@@ -17,7 +17,8 @@ mod memory;
 pub use memory::{MemoryDeviceStore, MemoryDeviceStoreError};
 
 /// How many of a user's devices the default
-/// [`DeviceStore::find_by_fingerprint_for_user`] scans.
+/// [`DeviceStore::find_by_fingerprint_for_user`] asks for first; it asks for
+/// twice as many again until it finds the device or the user has no more.
 pub const OWN_DEVICE_SCAN_LIMIT: usize = 100;
 
 // ── DeviceStore trait ─────────────────────────────────────────────────────────
@@ -28,7 +29,7 @@ pub const OWN_DEVICE_SCAN_LIMIT: usize = 100;
 /// `PostgresDeviceStore`, `ValkeyDeviceStore`.
 ///
 /// All methods accept `&self`; implementations use interior mutability
-/// (`Arc<DashMap<…>>` for memory, connection pool for SQL/Valkey).
+/// (`Arc<Mutex<HashMap<…>>>` for memory, connection pool for SQL/Valkey).
 ///
 /// Every timestamp a store writes is a whole second, and every comparison a
 /// store makes on one (the newest sighting, whether a sighting moves
@@ -62,10 +63,12 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// which returns one row for the whole tenant (possibly another user's),
     /// this finds the caller's own device however many devices the user has.
     ///
-    /// The default implementation scans the user's
-    /// [`OWN_DEVICE_SCAN_LIMIT`] most recently seen devices, so a user with
-    /// more devices than that can miss an older match. Backends SHOULD
-    /// override it with an indexed query on `(tenant, user, fingerprint)`.
+    /// The default implementation asks `find_for_user` for the user's
+    /// [`OWN_DEVICE_SCAN_LIMIT`] most recently seen devices and, when the
+    /// device is not among them, for twice as many, until it is found or the
+    /// user has no more devices, so it never misses an older match. Backends
+    /// SHOULD override it with an indexed query on
+    /// `(tenant, user, fingerprint)`.
     fn find_by_fingerprint_for_user(
         &self,
         tenant_id: &TenantId,
@@ -73,11 +76,18 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
         hash: &FingerprintHash,
     ) -> impl Future<Output = Result<Option<Device>, Self::Error>> + Send {
         async move {
-            Ok(self
-                .find_for_user(tenant_id, user_id, OWN_DEVICE_SCAN_LIMIT)
-                .await?
-                .into_iter()
-                .find(|d| d.fingerprint_hash == *hash))
+            let mut fetch = OWN_DEVICE_SCAN_LIMIT;
+            loop {
+                let rows = self.find_for_user(tenant_id, user_id, fetch).await?;
+                let exhausted = rows.len() < fetch;
+                if let Some(found) = rows.into_iter().find(|d| d.fingerprint_hash == *hash) {
+                    return Ok(Some(found));
+                }
+                if exhausted {
+                    return Ok(None);
+                }
+                fetch = fetch.saturating_mul(2);
+            }
         }
     }
 
@@ -313,7 +323,8 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
     /// claim any later user could resolve it. Returns
     /// [`OwnerClaim::Claimed`] when the device is now owned by `user`
     /// (including when it already was), [`OwnerClaim::OwnedByOther`] when
-    /// another user owns it (nothing written), and [`OwnerClaim::Missing`]
+    /// another user owns it or the device is revoked and has no owner
+    /// (nothing written), and [`OwnerClaim::Missing`]
     /// when no such device exists. Two users racing for one unowned device:
     /// exactly one is `Claimed`.
     ///
@@ -331,6 +342,10 @@ pub trait DeviceStore: Send + Sync + Clone + 'static {
             let Some(mut device) = self.load(tenant_id, id).await? else {
                 return Ok(OwnerClaim::Missing);
             };
+            if device.trust_level == DeviceTrustLevel::Revoked && device.user_id.is_none() {
+                // A save never un-revokes, so nothing would be written.
+                return Ok(OwnerClaim::OwnedByOther);
+            }
             match device.user_id.as_ref() {
                 Some(owner) if owner == user => Ok(OwnerClaim::Claimed),
                 Some(_) => Ok(OwnerClaim::OwnedByOther),

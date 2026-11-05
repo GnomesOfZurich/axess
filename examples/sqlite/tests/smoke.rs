@@ -48,10 +48,20 @@ async fn seed_is_idempotent_across_startups() {
     let pool = fresh_pool().await;
     migrate(&pool).await;
 
-    seed(&SystemClock, &pool).await.expect("first seed");
-    seed(&SystemClock, &pool)
-        .await
-        .expect("second seed must be a no-op, not a constraint violation");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("first seed");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("second seed must be a no-op, not a constraint violation");
 }
 
 #[tokio::test]
@@ -62,7 +72,13 @@ async fn seeded_methods_load_back_through_runtime_path() {
     // breaks this round-trip.
     let pool = fresh_pool().await;
     migrate(&pool).await;
-    seed(&SystemClock, &pool).await.expect("seed");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("seed");
 
     // Pull alice's row through the same SELECT the load path uses,
     // and deserialize via the production code's serde shape. We
@@ -99,7 +115,13 @@ async fn root_redirects_to_login_when_unauthenticated() {
     // in a browser.
     let pool = fresh_pool().await;
     migrate(&pool).await;
-    seed(&SystemClock, &pool).await.expect("seed");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("seed");
     let (router, _store) = build_router(pool).await;
 
     let resp = router
@@ -129,7 +151,13 @@ async fn key_surface_routes_respond() {
     // wired and produces a meaningful status.
     let pool = fresh_pool().await;
     migrate(&pool).await;
-    seed(&SystemClock, &pool).await.expect("seed");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("seed");
     let (router, _store) = build_router(pool).await;
 
     for (uri, name) in [
@@ -166,7 +194,13 @@ async fn backend_construction_does_not_panic() {
 async fn app() -> axum::Router {
     let pool = fresh_pool().await;
     migrate(&pool).await;
-    seed(&SystemClock, &pool).await.expect("seed");
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("seed");
     build_router(pool).await.0
 }
 
@@ -283,5 +317,34 @@ async fn signup_with_a_taken_username_does_not_say_so() {
     assert!(
         outcome.contains("Check your email"),
         "the generic answer is shown instead: {outcome}"
+    );
+}
+
+#[tokio::test]
+async fn bobs_seeded_totp_secret_is_sealed_at_rest() {
+    let pool = fresh_pool().await;
+    migrate(&pool).await;
+    seed(
+        &SystemClock,
+        &pool,
+        &axess::authn::FactorSecretCipher::new([7; 32]),
+    )
+    .await
+    .expect("seed");
+
+    let json: String = sqlx::query_scalar(
+        "SELECT config_json FROM factor_configs
+         WHERE kind = 'totp' AND user_id = '00000000-0000-0000-0000-000000000020'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("bob's totp row");
+    let config: axess::authn::FactorConfig = serde_json::from_str(&json).expect("config");
+    let axess::authn::FactorConfig::Totp(totp) = config else {
+        panic!("bob's factor is not TOTP");
+    };
+    assert!(
+        totp.secret.plain().is_none(),
+        "bob's secret is stored plain"
     );
 }

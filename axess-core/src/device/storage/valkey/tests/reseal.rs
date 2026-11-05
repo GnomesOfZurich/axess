@@ -218,26 +218,47 @@ async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
     );
 }
 
-/// A stored row that no configured key opens does not stop the device from
-/// being saved again: the save replaces it.
+/// A stored row that no configured key opens may have been a revoked
+/// device, so a save that is not itself a revocation does not replace it: the
+/// device stays unusable instead of coming back as Seen.
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
-async fn a_save_replaces_a_row_that_cannot_be_decoded() {
+async fn a_save_does_not_replace_a_row_that_cannot_be_decoded() {
     let s = sealing_store("undec").await;
-    let d = device(
-        DeviceTrustLevel::Seen,
-        crate::device::store::whole_second(Utc::now()),
-    );
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
+    let now = crate::device::store::whole_second(Utc::now());
+    let d = device(DeviceTrustLevel::Seen, now);
+    s.save(&d, now).await.unwrap();
+    s.set_trust_level(&d.tenant_id, &d.id, DeviceTrustLevel::Revoked, now)
         .await
         .unwrap();
     overwrite(&s, &d, b"not a sealed row at all, but long enough".to_vec()).await;
     assert!(s.load(&d.tenant_id, &d.id).await.is_err());
 
-    s.save(&d, crate::device::store::whole_second(Utc::now()))
-        .await
-        .unwrap();
-    assert_eq!(s.load(&d.tenant_id, &d.id).await.unwrap().unwrap(), d);
+    assert!(
+        s.save(&d, now).await.is_err(),
+        "a save over an unreadable row must fail closed"
+    );
+    assert!(
+        s.load(&d.tenant_id, &d.id).await.is_err(),
+        "the unreadable row is still there, not replaced by a live one"
+    );
+}
+
+/// A save that is itself a revocation may replace an unreadable row.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn a_revoking_save_replaces_a_row_that_cannot_be_decoded() {
+    let s = sealing_store("undecrev").await;
+    let now = crate::device::store::whole_second(Utc::now());
+    let d = device(DeviceTrustLevel::Seen, now);
+    s.save(&d, now).await.unwrap();
+    overwrite(&s, &d, b"not a sealed row at all, but long enough".to_vec()).await;
+
+    let mut revoked = d.clone();
+    revoked.trust_level = DeviceTrustLevel::Revoked;
+    s.save(&revoked, now).await.unwrap();
+    let after = s.load(&d.tenant_id, &d.id).await.unwrap().unwrap();
+    assert_eq!(after.trust_level, DeviceTrustLevel::Revoked);
 }
 
 /// The sweep skips a row it can read in the chunk read and not when the

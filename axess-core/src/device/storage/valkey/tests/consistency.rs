@@ -49,6 +49,7 @@ async fn valkey_device_shared_contract() {
         .await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(store("sight").await).await;
     shared::a_save_never_un_revokes(store("unrevoke").await).await;
+    shared::a_revoked_device_never_comes_back(|| store("neverback")).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(store("newest").await).await;
     shared::sub_second_instants_compare_as_whole_seconds(store("fraction").await).await;
     shared::a_revoked_row_keeps_its_revocation_time(store("twice").await).await;
@@ -411,4 +412,30 @@ async fn valkey_device_deleting_the_indexed_device_does_not_orphan_its_twin() {
         .await
         .unwrap();
     assert_eq!(id, a.id);
+}
+
+/// A row nobody can read is cleared by deleting the device: the delete runs
+/// against the bytes found instead of failing on the decode.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_device_delete_clears_a_row_that_cannot_be_decoded() {
+    let s = store("undecodable").await;
+    let d = shared::device("damaged", 0x77, DeviceTrustLevel::Seen, at(0));
+    s.save(&d, at(0)).await.unwrap();
+    let key = device_key(&s.prefix, &tenant().to_string(), &d.id.to_string());
+    let _: () = s
+        .client
+        .set(key.clone(), "not a row", None, None, false)
+        .await
+        .unwrap();
+    assert!(
+        s.load(&d.tenant_id, &d.id).await.is_err(),
+        "the row is damaged"
+    );
+
+    s.delete(&d.tenant_id, &d.id).await.unwrap();
+
+    assert!(s.load(&d.tenant_id, &d.id).await.unwrap().is_none());
+    let left: bool = s.client.exists(key).await.unwrap();
+    assert!(!left, "the damaged row is gone");
 }

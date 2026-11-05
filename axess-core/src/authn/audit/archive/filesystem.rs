@@ -42,6 +42,12 @@
 //! make the retry skip a batch whose events are gone. Leaving the events in
 //! place costs at worst a repeated batch, never a lost one.
 //!
+//! A crash in the middle of a write can leave a day file, or its id sidecar,
+//! ending in a partial line. Before it appends, the archiver cuts such a
+//! file back to its last newline (and `fsync`s the cut): every acknowledged
+//! batch ends in one, so only unacknowledged bytes are dropped, and the rows
+//! they came from are still hot.
+//!
 //! # One root, one lock
 //!
 //! The lock is held for the dedup check, the writes, the rollback and the
@@ -66,7 +72,9 @@
 //! appended, and so are different events under a reused id (a source that
 //! recycles row ids): the digest tells them apart. The sidecars are read once
 //! and then answered from memory, revalidated against the file's length and
-//! modification time on every call.
+//! modification time on every call. A line holding only an id, written before
+//! the digest existed, matches nothing: a batch retried across that upgrade is
+//! archived once more.
 //!
 //! The one remaining window is a crash after the event files are durable
 //! and before the marker is: the retry then appends the batch again, which
@@ -324,6 +332,50 @@ fn append_all_or_none(
     outcome
 }
 
+/// Cut a file back to its last newline, when it does not end in one.
+///
+/// Every batch this archiver acknowledges ends each file in a newline, so a
+/// file that does not end in one was cut short by a crash in the middle of an
+/// unacknowledged write. Its rows are still hot and the retry writes them
+/// again; left in place, the half line would take the next batch's first
+/// line onto itself and make both unreadable. The cut is `fsync`ed before
+/// anything is appended.
+fn cut_torn_tail(file: &std::fs::File, path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut reader = file;
+    let mut last = [0u8; 1];
+    reader.seek(SeekFrom::Start(len - 1))?;
+    reader.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut keep = 0;
+    let mut end = len;
+    let mut chunk = [0u8; 8192];
+    while end > 0 {
+        let start = end.saturating_sub(chunk.len() as u64);
+        let n = (end - start) as usize;
+        reader.seek(SeekFrom::Start(start))?;
+        reader.read_exact(&mut chunk[..n])?;
+        if let Some(i) = chunk[..n].iter().rposition(|b| *b == b'\n') {
+            keep = start + i as u64 + 1;
+            break;
+        }
+        end = start;
+    }
+    tracing::warn!(
+        path = %path.display(),
+        dropped_bytes = len - keep,
+        "an audit archive file ended in a torn line; cutting it back to the last whole line",
+    );
+    file.set_len(keep)?;
+    file.sync_all()
+}
+
 /// Open, write and `fsync` one group of files, then `fsync` the directories
 /// from their folders up to `root`. `first` is the group's index offset in the
 /// whole plan; each file is pushed onto `touched` as soon as it is opened so
@@ -342,8 +394,10 @@ fn write_phase(
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(path)?;
+        cut_torn_tail(&file, path)?;
         let original_len = file.metadata()?.len();
         touched.push((file, original_len));
     }
@@ -389,7 +443,7 @@ fn archive_blocking(
     // recorded in the same step, so a marker recorded for any of its days
     // means all of its events are already there.
     for day in by_day.keys() {
-        if cache.recorded(&batches_path(&day_path(*day)), batch_id, &marker)? {
+        if cache.recorded(&batches_path(&day_path(*day)), &marker)? {
             return Ok(());
         }
     }
@@ -729,3 +783,5 @@ mod durability;
 mod locking;
 #[cfg(test)]
 mod retry;
+#[cfg(test)]
+mod torn;

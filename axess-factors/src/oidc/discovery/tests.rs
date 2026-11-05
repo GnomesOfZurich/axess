@@ -244,3 +244,29 @@ async fn a_discovery_body_over_the_cap_is_refused() {
         "got {err:?}"
     );
 }
+
+/// The issuer in the document must equal the one fetched from, character
+/// for character (OIDC Discovery section 4.3): a trailing slash names a
+/// different issuer, and the `iss` of every token is compared the same way.
+#[tokio::test]
+async fn document_fetch_compares_the_issuer_exactly() {
+    let server = MockServer::start().await;
+    let jwks_uri = format!("{}/jwks", server.uri());
+    // The document names the issuer with a slash the caller did not give.
+    let with_slash = format!("{}/", server.uri());
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(discovery_json(&with_slash, &jwks_uri)),
+        )
+        .mount(&server)
+        .await;
+    let client = openidconnect::reqwest::Client::new();
+    let err = DiscoveryDocument::fetch(&server.uri(), &client)
+        .await
+        .expect_err("a different issuer string must reject");
+    assert!(
+        matches!(err, OidcError::InvalidIssuer(_)),
+        "expected InvalidIssuer, got {err:?}"
+    );
+}

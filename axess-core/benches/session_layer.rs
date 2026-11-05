@@ -1,7 +1,8 @@
 //! Benchmarks for the session layer; the per-request cost every handler pays.
 //!
-//! Gated via `required-features = ["memory"]` in `axess-core/Cargo.toml`,
-//! so cargo skips this bench cleanly when the feature is off.
+//! Gated via `required-features = ["memory", "sqlite"]` in
+//! `axess-core/Cargo.toml`: `session::crypto` is compiled only with a store
+//! feature, so cargo skips this bench cleanly when either is off.
 
 use axess_core::SystemRng;
 use axess_core::session::{

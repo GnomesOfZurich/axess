@@ -181,7 +181,11 @@ impl Target {
             key: bound_key(format!("{prefix}{}", ip_bucket(addr))),
             fold_into: Some(format!("{group}:ovf")),
             group: Some(group),
-            fold_near_cap: false,
+            // Each group has its own budget, so a prefix wider than a group
+            // (an IPv6 /40 holds 256 of them) could still fill the table;
+            // near the cap a new address joins its group's overflow bucket
+            // instead of taking a slot.
+            fold_near_cap: true,
             shared: false,
         }
     }
@@ -216,7 +220,7 @@ pub(super) fn resolve_target(req: &Request<Body>, extractor: &KeyExtractor) -> T
             Some(id) => Target {
                 key: bound_key(format!("login:{}", id.bucket_key())),
                 group: None,
-                // Folded by origin: the group for an IPv6 client, so the
+                // Folded by origin: the address of an IPv4 client, the /48 of an IPv6 client, so the
                 // overflow itself cannot be minted per /64.
                 fold_into: Some(format!("login-ovf:{}", origin_group(req))),
                 fold_near_cap: true,
@@ -244,7 +248,7 @@ pub(super) fn resolve_target(req: &Request<Body>, extractor: &KeyExtractor) -> T
     }
 }
 
-/// The group of the request's origin: the resolved client address when the
+/// The overflow key of the request's origin: the resolved client address when the
 /// client-IP layer ran, else the TCP peer.
 fn origin_group(req: &Request<Body>) -> String {
     let resolved = req
@@ -252,7 +256,12 @@ fn origin_group(req: &Request<Body>) -> String {
         .get::<crate::client_ip::ClientIp>()
         .and_then(|ip| ip.get());
     match resolved.or_else(|| peer_addr(req)) {
-        Some(addr) => ip_group(addr),
+        Some(addr) => match addr.to_canonical() {
+            // An IPv4 origin is its own address; an IPv6 one is its /48,
+            // which is what it can mint at will.
+            IpAddr::V4(v4) => v4.to_string(),
+            addr @ IpAddr::V6(_) => ip_group(addr),
+        },
         None => UNKNOWN_BUCKET.to_owned(),
     }
 }

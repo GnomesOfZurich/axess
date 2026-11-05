@@ -117,6 +117,11 @@ pub enum IssuanceError<KE: std::error::Error + Send + Sync + 'static> {
         /// The `kid` that collided.
         kid: String,
     },
+    /// A key offered for rotation, or loaded from the store, has an empty
+    /// `kid`. No token header can name it, so the key set is refused and
+    /// nothing changes.
+    #[error("signing key id is empty")]
+    EmptyKeyId,
     /// JWT encoding failed. In practice this never fires for valid
     /// `LocalIdpSigningKey` material plus a well-formed `MintClaims`,
     /// but the `jsonwebtoken::encode` return type forces the path.
@@ -283,7 +288,9 @@ impl LocalIdpState {
 
 impl<K: LocalIdpKeyStore> LocalIdp<K> {
     /// Construct from a key store. Loads the current + historical keys
-    /// atomically, builds the initial JWKS, and is ready to mint.
+    /// atomically, builds the initial JWKS, and is ready to mint. A key set
+    /// in which a key has an empty `kid` ([`IssuanceError::EmptyKeyId`]) or
+    /// two keys share one ([`IssuanceError::DuplicateKeyId`]) is refused.
     pub async fn from_key_store(
         issuer: impl Into<String>,
         key_store: K,
@@ -292,6 +299,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
             .load_all()
             .await
             .map_err(IssuanceError::KeyStore)?;
+        check_key_ids(&loaded)?;
         let jwks = rebuild_jwks(&loaded.current, &loaded.historical, &[]);
         Ok(Self {
             state: Arc::new(AsyncRwLock::new(LocalIdpState {
@@ -407,7 +415,9 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
 
     /// Mint with caller-supplied header. Adopters reach for this when
     /// they need to set unusual header fields (e.g. `typ`, `cty`,
-    /// `x5t` thumbprint). The fixture's parallel method takes
+    /// `x5t` thumbprint). `kid` and `alg` are the signing key's, and the
+    /// key-location fields `jku`, `jwk`, `x5u` and `x5c` are cleared. The
+    /// fixture's parallel method takes
     /// `&mut Header` for in-place mutation; the production shape
     /// takes `Header` by value since the caller's customization is
     /// always built up before mint, never amended after.
@@ -431,6 +441,13 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         }
         header.kid = Some(state.signing_key.key_id().to_string());
         header.alg = state.signing_key.algorithm();
+        // These name where a verifier may fetch, or what key it may use
+        // instead of the IdP's own; the IdP signs with its own key, so a
+        // caller's value never reaches the token.
+        header.jku = None;
+        header.jwk = None;
+        header.x5u = None;
+        header.x5c = None;
         let claims_json = build_claims_json(&self.issuer, claims);
         let key = state.signing_key.encoding_key();
         // This is the one place axess signs rather than verifies, and
@@ -491,6 +508,9 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         let mut state = self.state.write().await;
         {
             let kid = new_current.key_id();
+            if kid.is_empty() {
+                return Err(IssuanceError::EmptyKeyId);
+            }
             if state.signing_key.key_id() == kid
                 || state.historical_keys.iter().any(|k| k.key_id() == kid)
             {
@@ -503,7 +523,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
             .rotate(new_current.clone())
             .await
             .map_err(IssuanceError::KeyStore)?;
-        match self.key_store.load_all().await {
+        match self.load_checked().await {
             Ok(loaded) => state.replace_keys(loaded),
             Err(e) => {
                 // The rotation is durable; only the re-read failed. Apply it
@@ -542,7 +562,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
             .retire(key_id)
             .await
             .map_err(IssuanceError::KeyStore)?;
-        match self.key_store.load_all().await {
+        match self.load_checked().await {
             Ok(loaded) => state.replace_keys(loaded),
             Err(e) => {
                 // The retirement is durable; only the re-read failed. Apply
@@ -559,15 +579,27 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     /// Re-read the current and historical keys from the store and rebuild
     /// the JWKS. A replica calls this to pick up a rotation or retirement
     /// another replica performed; the store is the single source of truth.
+    /// A key set with an empty or repeated `kid` is refused, as
+    /// [`from_key_store`](Self::from_key_store) refuses it, and the keys
+    /// already held stay in use.
     pub async fn reload(&self) -> Result<(), IssuanceError<K::Error>> {
         let mut state = self.state.write().await;
+        let loaded = self.load_checked().await?;
+        state.replace_keys(loaded);
+        Ok(())
+    }
+
+    /// Read the key set from the store and refuse it on the terms
+    /// [`from_key_store`](Self::from_key_store) does, so no path adopts a
+    /// set the constructor would not.
+    async fn load_checked(&self) -> Result<LoadedKeys, IssuanceError<K::Error>> {
         let loaded = self
             .key_store
             .load_all()
             .await
             .map_err(IssuanceError::KeyStore)?;
-        state.replace_keys(loaded);
-        Ok(())
+        check_key_ids(&loaded)?;
+        Ok(loaded)
     }
 
     /// Borrow the configured issuer string.
@@ -716,6 +748,28 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Refuse a key set a verifier could not read unambiguously: a key whose
+/// `kid` is empty, or two keys under one `kid`.
+fn check_key_ids<KE: std::error::Error + Send + Sync + 'static>(
+    loaded: &LoadedKeys,
+) -> Result<(), IssuanceError<KE>> {
+    let mut seen = std::collections::HashSet::new();
+    for kid in std::iter::once(&loaded.current)
+        .chain(&loaded.historical)
+        .map(LocalIdpSigningKey::key_id)
+    {
+        if kid.is_empty() {
+            return Err(IssuanceError::EmptyKeyId);
+        }
+        if !seen.insert(kid) {
+            return Err(IssuanceError::DuplicateKeyId {
+                kid: kid.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
 
 fn rebuild_jwks(
     current: &LocalIdpSigningKey,

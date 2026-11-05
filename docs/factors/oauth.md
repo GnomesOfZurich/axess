@@ -125,8 +125,8 @@ the revocation call each prove who the client is. There are two ways to
 do it, and a provider uses exactly one.
 
 A **client secret** is what `OAuthProviderConfig::discover` takes. It
-travels in the request (a Basic header on the token request, a form
-field on the others), so whoever can read the request or the secret
+travels in the request as a Basic header (RFC 6749 section 2.3.1) on
+every call that authenticates the client, so whoever can read the request or the secret
 store can impersonate the client.
 
 **`private_key_jwt`** (RFC 7523, OpenID Connect Core section 9)

@@ -17,8 +17,14 @@ pub struct DeviceAuthResponse {
     pub verification_uri_complete: Option<String>,
     /// Lifetime of the device code in seconds.
     pub expires_in: u64,
-    /// Minimum polling interval in seconds.
+    /// Minimum polling interval in seconds. RFC 8628 section 3.2 makes it
+    /// optional and has a client wait 5 seconds when it is absent.
+    #[serde(default = "default_interval")]
     pub interval: u64,
+}
+
+fn default_interval() -> u64 {
+    5
 }
 
 /// Prints everything but the device code, which is the credential the client
@@ -73,5 +79,19 @@ mod tests {
         let shown = format!("{response:?}");
         assert!(!shown.contains("device-secret-777"), "{shown}");
         assert!(shown.contains("WDJB-MJHT"));
+    }
+
+    /// RFC 8628 section 3.2: `interval` is optional, and a client waits
+    /// five seconds between polls when it is absent.
+    #[test]
+    fn a_response_without_an_interval_polls_every_five_seconds() {
+        let response: DeviceAuthResponse = serde_json::from_value(serde_json::json!({
+            "device_code": "dc",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://idp.example/device",
+            "expires_in": 600,
+        }))
+        .expect("a response without an interval parses");
+        assert_eq!(response.interval, 5);
     }
 }

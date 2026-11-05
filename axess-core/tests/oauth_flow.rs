@@ -92,6 +92,51 @@ async fn oauth_expired_ceremony_rejected() {
     ));
 }
 
+/// A ceremony whose recorded start lies in the future cannot be told from
+/// one that never started: it is expired, not live for as long as the
+/// clock needs to catch up.
+#[tokio::test]
+async fn oauth_ceremony_started_in_the_future_is_expired() {
+    let server = MockServer::start().await;
+    let (_, jwk, _) = oauth_generate_rsa_keypair();
+    oauth_mount_oidc_endpoints(&server, &jwk).await;
+    let provider = oauth_setup_provider(&server).await;
+
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let clock = MockClock::now();
+    let authn = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .with_oauth_provider(provider)
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let session = test_session();
+    authn
+        .begin_oauth_login("test", &OAuthLoginOptions::default(), &session)
+        .await
+        .unwrap();
+    let stored_state = session
+        .get_custom("axess.oauth.csrf_state")
+        .await
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap();
+    let later = chrono::Utc::now() + chrono::Duration::hours(1);
+    session
+        .set_custom(
+            "axess.oauth.started",
+            serde_json::Value::String(later.to_rfc3339()),
+        )
+        .await;
+
+    let result = authn
+        .finish_oauth_login("fake-code", &stored_state, &session)
+        .await;
+    assert!(
+        matches!(result, Err(axess_factors::oauth::OAuthError::Expired)),
+        "{result:?}"
+    );
+}
+
 /// When an operator configures `ceremony_timeout` higher than
 /// the RFC 6749 §4.1.2 RECOMMENDED 600 s authorisation-code lifetime,
 /// the effective expiry MUST still be capped at 600 s. Without this

@@ -38,7 +38,7 @@ fn buckets_dated_in_the_future_are_swept_after_the_clock_steps_back() {
     store.evict_expired_at(back);
     store.evict_expired_at(secs(back, 2 * 60));
     assert_eq!(store.len(), 0, "no bucket from the later clock is left");
-    assert!(store.buckets.is_empty());
+    assert!(crate::locked::lock(&store.buckets).is_empty());
 }
 
 /// The logged fingerprint is keyed: it is not a plain hash of the key, and a
@@ -87,6 +87,28 @@ fn one_ipv6_allocation_cannot_fill_the_table() {
     );
     let outsider = store.try_acquire_target(&client("2001:db9::1"), now);
     assert!(allowed(&outsider), "an unrelated prefix is not locked out");
+}
+
+/// One IPv6 /40 holds enough /48 groups, each with its own budget, to fill
+/// the table. Near the cap a new address folds into its group's overflow
+/// bucket as login identifiers do, so a client in an unrelated prefix is
+/// still admitted.
+#[test]
+fn an_allocation_spread_over_many_groups_cannot_lock_others_out() {
+    let store = test_store(100, Duration::from_secs(60)).with_caps(48, 10);
+    let now = t_zero();
+    for g in 0..8u16 {
+        for j in 0..20u16 {
+            let ip = format!("2001:db8:{g:x}:{j:x}::1");
+            store.try_acquire_target(&client(&ip), now);
+        }
+    }
+    let outsider = store.try_acquire_target(&client("2001:db9::1"), now);
+    assert!(
+        allowed(&outsider),
+        "an unrelated prefix is not locked out, {} buckets",
+        store.len()
+    );
 }
 
 /// Past the group budget a new client shares the prefix's overflow bucket,
@@ -284,4 +306,18 @@ async fn an_address_folded_into_the_overflow_bucket_gets_no_remaining_header() {
         None,
         "and so does the fourth, which shares that bucket with the third"
     );
+}
+
+/// Two IPv4 addresses of one /24 have an overflow bucket each, as documented
+/// (the IPv4 address, or the IPv6 /48): one origin's minted identifiers do
+/// not use up the allowance of its neighbour.
+#[test]
+fn login_overflow_is_keyed_per_ipv4_address() {
+    let a = login_target("someone@example.com", "203.0.113.7");
+    let b = login_target("someone@example.com", "203.0.113.8");
+    assert_ne!(a.fold_into, b.fold_into, "one overflow bucket per address");
+    // An IPv6 origin still folds by its /48.
+    let v6a = login_target("someone@example.com", "2001:db8:1:1::1");
+    let v6b = login_target("someone@example.com", "2001:db8:1:2::1");
+    assert_eq!(v6a.fold_into, v6b.fold_into);
 }

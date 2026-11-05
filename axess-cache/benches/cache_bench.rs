@@ -49,7 +49,7 @@
 //! | `single_flight_cold_async`           | ~610 ns     |
 //!
 //! \* `insert_under_capacity` is anomalously slow vs `insert_with_eviction`
-//!    because the underlying `lru::LruCache` grows its HashMap
+//!    because the underlying LRU map grows its HashMap
 //!    incrementally during the bench (resize amortisation cost is
 //!    measured here); the eviction bench runs against a pre-filled
 //!    cache, so no resizing happens. Steady-state insert cost is closer
@@ -61,7 +61,7 @@
 //! against `get_hit`'s ~10 ns/op single-threaded. That's a ~7x per-
 //! thread slowdown, and total throughput across 8 threads (~14M
 //! ops/s) is *worse* than single-threaded (~103M ops/s). The single
-//! `parking_lot::Mutex` serializes every read.
+//! `std::sync::Mutex` serializes every read.
 //!
 //! Implication for the deferred sharded-mutex iteration: the
 //! contention bottleneck is real and quantified. **But** the gating

@@ -17,15 +17,31 @@ use crate::session::extractor::AuthSession;
 use axess_factors::oauth::{OAuthError, OAuthProvider, keys as oauth_keys};
 use std::sync::Arc;
 
+/// Where a by-name helper looks for its provider.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Source {
+    /// The global registration.
+    #[default]
+    Global,
+    /// The tenant's provider.
+    Tenant {
+        tenant: TenantId,
+        /// When set, the tenant applies only to the provider of this name (a
+        /// session logged in through one provider says nothing about
+        /// another).
+        only: Option<String>,
+    },
+    /// No provider: the session's login-tenant record is present but does
+    /// not read, so neither the tenant's provider nor the global registration
+    /// may stand in for it.
+    Refused,
+}
+
 /// Where a by-name helper looks for its provider, and whom its audit rows
 /// are attributed to.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Scope {
-    /// The tenant whose provider is used; `None` is the global registration.
-    tenant: Option<TenantId>,
-    /// When set, the tenant applies only to the provider of this name (a
-    /// session logged in through one provider says nothing about another).
-    only: Option<String>,
+    source: Source,
     /// The local user the helpers act for, named on their audit rows.
     user: Option<UserId>,
     /// The tenant the audit rows belong to. Set with `tenant` by
@@ -45,17 +61,63 @@ impl Scope {
     /// global registration otherwise. Its audit rows belong to the tenant.
     pub(super) fn ceremony(binding: super::login::CeremonyTenant, name: &str) -> Self {
         Self {
-            tenant: binding.provider_from_tenant.then_some(binding.tenant),
-            only: Some(name.to_string()),
+            source: if binding.provider_from_tenant {
+                Source::Tenant {
+                    tenant: binding.tenant,
+                    only: Some(name.to_string()),
+                }
+            } else {
+                Source::Global
+            },
             user: None,
             audit_tenant: Some(binding.tenant),
         }
     }
 
+    /// The scope a session's login-tenant record names. Absent, the global
+    /// registration; present and well-formed, that tenant's provider of that
+    /// name; present but malformed, a refusing scope, never a quiet fallback
+    /// to the global provider.
+    pub(crate) fn from_login_tenant(value: Option<&serde_json::Value>) -> Self {
+        let Some(value) = value else {
+            return Self::global();
+        };
+        let tenant = value
+            .get("tenant")
+            .and_then(|t| t.as_str())
+            .and_then(|t| t.parse::<TenantId>().ok());
+        let provider = value
+            .get("provider")
+            .and_then(|p| p.as_str())
+            .map(str::to_string);
+        match (tenant, provider) {
+            (Some(tenant), Some(provider)) => Self {
+                source: Source::Tenant {
+                    tenant,
+                    only: Some(provider),
+                },
+                ..Self::global()
+            },
+            _ => Self {
+                source: Source::Refused,
+                ..Self::global()
+            },
+        }
+    }
+
+    fn tenant(&self) -> Option<&TenantId> {
+        match &self.source {
+            Source::Tenant { tenant, .. } => Some(tenant),
+            Source::Global | Source::Refused => None,
+        }
+    }
+
     fn tenant_for(&self, name: &str) -> Option<&TenantId> {
-        match &self.only {
-            Some(only) if only != name => None,
-            _ => self.tenant.as_ref(),
+        match &self.source {
+            Source::Tenant { tenant, only } if only.as_deref().is_none_or(|o| o == name) => {
+                Some(tenant)
+            }
+            _ => None,
         }
     }
 
@@ -78,6 +140,9 @@ where
         name: &str,
     ) -> Result<Arc<dyn OAuthProvider>, OAuthError> {
         let unknown = || OAuthError::UnknownProvider(name.to_string());
+        if scope.source == Source::Refused {
+            return Err(unknown());
+        }
         match scope.tenant_for(name) {
             Some(tenant) => self
                 .tenant_oauth_provider(tenant, name)
@@ -107,8 +172,10 @@ where
         ScopedOAuth {
             authn: self,
             scope: Scope {
-                tenant: Some(*tenant),
-                only: None,
+                source: Source::Tenant {
+                    tenant: *tenant,
+                    only: None,
+                },
                 user: None,
                 audit_tenant: Some(*tenant),
             },
@@ -127,27 +194,8 @@ where
     /// The audit rows of the helpers name the session's user and tenant when
     /// it is authenticated.
     pub async fn oauth_for_session(&self, session: &AuthSession) -> ScopedOAuth<'_, I, F> {
-        let mut scope = match session.get_custom(oauth_keys::LOGIN_TENANT).await {
-            Some(value) => {
-                let tenant = value
-                    .get("tenant")
-                    .and_then(|t| t.as_str())
-                    .and_then(|t| t.parse::<TenantId>().ok());
-                let provider = value
-                    .get("provider")
-                    .and_then(|p| p.as_str())
-                    .map(str::to_string);
-                match (tenant, provider) {
-                    (Some(tenant), Some(provider)) => Scope {
-                        tenant: Some(tenant),
-                        only: Some(provider),
-                        ..Scope::global()
-                    },
-                    _ => Scope::global(),
-                }
-            }
-            None => Scope::global(),
-        };
+        let mut scope =
+            Scope::from_login_tenant(session.get_custom(oauth_keys::LOGIN_TENANT).await.as_ref());
         scope.user = session.user_id().await;
         scope.audit_tenant = session.tenant_id().await;
         ScopedOAuth { authn: self, scope }
@@ -178,8 +226,20 @@ where
 {
     /// The tenant whose providers these helpers use, `None` for the global
     /// registration.
+    ///
+    /// `None` is also what a refused scope reads: the session's login-tenant
+    /// record is present but does not read, so neither a tenant's provider
+    /// nor the global registration is used and every by-name helper answers
+    /// [`OAuthError::UnknownProvider`]. Check [`is_refused`](Self::is_refused)
+    /// to tell the two apart.
     pub fn tenant(&self) -> Option<&TenantId> {
-        self.scope.tenant.as_ref()
+        self.scope.tenant()
+    }
+
+    /// Whether the scope is refused: the session's login-tenant record is
+    /// present but does not read, so no provider resolves under it.
+    pub fn is_refused(&self) -> bool {
+        matches!(self.scope.source, Source::Refused)
     }
 
     /// Name `user` on the audit rows these helpers write: a background
@@ -302,5 +362,58 @@ where
                 access_token,
             )
             .await
+    }
+}
+
+#[cfg(test)]
+mod login_tenant_scope_tests {
+    use super::{Scope, Source};
+    use serde_json::json;
+
+    #[test]
+    fn an_absent_login_tenant_is_the_global_scope() {
+        let scope = Scope::from_login_tenant(None);
+        assert_eq!(scope.source, Source::Global);
+    }
+
+    #[test]
+    fn a_malformed_login_tenant_refuses_instead_of_falling_back_to_global() {
+        for value in [
+            json!({ "tenant": "not-a-tenant-id", "provider": "google" }),
+            json!({ "provider": "google" }),
+            json!({ "tenant": "not-a-tenant-id" }),
+            json!("garbage"),
+        ] {
+            let scope = Scope::from_login_tenant(Some(&value));
+            assert_eq!(scope.source, Source::Refused, "{value} must refuse");
+        }
+    }
+
+    #[test]
+    fn only_a_refused_scope_reads_as_refused() {
+        let tenant = crate::authn::ids::testing::tenant("t1");
+        let well_formed = json!({ "tenant": tenant.to_string(), "provider": "google" });
+        for (value, refused) in [
+            (None, false),
+            (Some(&well_formed), false),
+            (Some(&json!("garbage")), true),
+        ] {
+            let scope = Scope::from_login_tenant(value);
+            assert_eq!(matches!(scope.source, Source::Refused), refused);
+        }
+    }
+
+    #[test]
+    fn a_well_formed_login_tenant_names_the_tenant_and_provider() {
+        let tenant = crate::authn::ids::testing::tenant("t1");
+        let value = json!({ "tenant": tenant.to_string(), "provider": "google" });
+        let scope = Scope::from_login_tenant(Some(&value));
+        assert_eq!(
+            scope.source,
+            Source::Tenant {
+                tenant,
+                only: Some("google".to_string())
+            }
+        );
     }
 }

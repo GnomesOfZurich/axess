@@ -110,8 +110,7 @@ postgres = ["axess-core/postgres"]
 sqlite = ["axess-core/sqlite"]
 valkey = ["axess-core/valkey"]
 
-# Authz entity cache decorators (opt-in alternatives to `EntityCache`)
-moka-cache = ["axess-core/moka-cache"]
+# Authz entity cache decorator (opt-in alternative to `EntityCache`)
 valkey-cache = ["axess-core/valkey-cache", "valkey"]
 
 # Umbrellas

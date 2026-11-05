@@ -35,7 +35,11 @@
 //!     bearer_token,
 //!     github_actions_mapper(
 //!         trust_domain,
-//!         GitHubAllowlist::new().owner_id("123456").repository_id("987654321"),
+//!         GitHubAllowlist::new()
+//!             .owner_id("123456")
+//!             .repository_id("987654321")
+//!             .git_ref("refs/heads/main")
+//!             .event("push"),
 //!     ),
 //! );
 //! let principal = resolver.resolve().await?;
@@ -59,8 +63,10 @@
 //!   know (the `tenant_id` argument above is that lookup, so it must fail
 //!   closed);
 //! - authorize on the whole workload id, never on the owner alone;
-//! - for anything that deploys or mutates, require the `ref` (or the
-//!   `environment`) to be a protected one, not just any branch.
+//! - list the `ref` (or the `environment`) and the event the allowlist admits;
+//!   a token on any other ref, or from any other event, is refused. For
+//!   anything that deploys or mutates, list only a protected ref or a
+//!   protected environment, never every branch or a pull request.
 //!
 //! # SPIFFE path shape
 //!
@@ -109,6 +115,9 @@ pub struct GitHubActionsClaims {
     /// Triggering event (`push`, `pull_request`, `workflow_dispatch`, …).
     #[serde(default)]
     pub event_name: Option<String>,
+    /// GitHub environment the job deploys to, when it names one.
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 /// Which GitHub owners and repositories are trusted, by immutable id.
@@ -116,10 +125,18 @@ pub struct GitHubActionsClaims {
 /// An owner id must be listed. When any repository id is listed, the token's
 /// repository id must be one of them too; leave the repository list empty to
 /// trust every repository of a listed owner.
+///
+/// The run itself is restricted too, and fails closed: its `ref` or its
+/// `environment` must be a listed one, and its `event_name` must be a listed
+/// event. A token that lacks the claim, or an allowlist with nothing listed
+/// for it, admits nothing. Matching is exact; there are no patterns.
 #[derive(Debug, Clone, Default)]
 pub struct GitHubAllowlist {
     owner_ids: BTreeSet<String>,
     repository_ids: BTreeSet<String>,
+    refs: BTreeSet<String>,
+    environments: BTreeSet<String>,
+    events: BTreeSet<String>,
 }
 
 impl GitHubAllowlist {
@@ -140,9 +157,42 @@ impl GitHubAllowlist {
         self
     }
 
-    fn admits(&self, owner_id: &str, repository_id: &str) -> bool {
-        self.owner_ids.contains(owner_id)
-            && (self.repository_ids.is_empty() || self.repository_ids.contains(repository_id))
+    /// Admit runs on exactly this git ref (for example `refs/heads/main`).
+    pub fn git_ref(mut self, git_ref: impl Into<String>) -> Self {
+        self.refs.insert(git_ref.into());
+        self
+    }
+
+    /// Admit runs that deploy to exactly this GitHub environment.
+    pub fn environment(mut self, environment: impl Into<String>) -> Self {
+        self.environments.insert(environment.into());
+        self
+    }
+
+    /// Admit runs triggered by exactly this event (for example `push`).
+    pub fn event(mut self, event: impl Into<String>) -> Self {
+        self.events.insert(event.into());
+        self
+    }
+
+    fn admits(&self, claims: &GitHubActionsClaims) -> bool {
+        let on_listed_ref = claims
+            .git_ref
+            .as_ref()
+            .is_some_and(|r| self.refs.contains(r));
+        let in_listed_environment = claims
+            .environment
+            .as_ref()
+            .is_some_and(|e| self.environments.contains(e));
+        let by_listed_event = claims
+            .event_name
+            .as_ref()
+            .is_some_and(|e| self.events.contains(e));
+        self.owner_ids.contains(&claims.repository_owner_id)
+            && (self.repository_ids.is_empty()
+                || self.repository_ids.contains(&claims.repository_id))
+            && (on_listed_ref || in_listed_environment)
+            && by_listed_event
     }
 }
 
@@ -172,7 +222,7 @@ pub fn github_actions_mapper(
             )));
         }
 
-        if !allowlist.admits(&custom.repository_owner_id, &custom.repository_id) {
+        if !allowlist.admits(custom) {
             return Err(IdentityError::NotAuthenticated);
         }
 
@@ -206,6 +256,14 @@ pub fn github_actions_mapper(
         if let Some(v) = &custom.event_name {
             attributes.insert(
                 "event_name".to_string(),
+                serde_json::Value::String(v.clone()),
+            );
+        }
+        // An allowlisted environment can admit a run on its own, so it is
+        // part of what the audit trail says about why the run got in.
+        if let Some(v) = &custom.environment {
+            attributes.insert(
+                "environment".to_string(),
                 serde_json::Value::String(v.clone()),
             );
         }

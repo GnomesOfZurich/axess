@@ -46,6 +46,23 @@ impl TenantOAuthProviderStore for MemoryTenantOAuthProviderStore {
         Ok(record)
     }
 
+    async fn put_if_revision(
+        &self,
+        mut record: TenantOAuthProviderRecord,
+        expected: u64,
+    ) -> Result<Option<TenantOAuthProviderRecord>, TenantOAuthProviderStoreError> {
+        let mut records = self.lock();
+        let key = (record.tenant_id, record.name.clone());
+        match records.get(&key) {
+            Some(old) if old.revision == expected => {
+                record.revision = expected + 1;
+                records.insert(key, record.clone());
+                Ok(Some(record))
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn delete(
         &self,
         tenant: &TenantId,

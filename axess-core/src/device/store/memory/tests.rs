@@ -107,11 +107,11 @@ async fn racing_saves_leave_no_index_entry_for_a_fingerprint_the_row_lost() {
         for task in tasks {
             task.await.unwrap();
         }
-        for entry in store.fingerprint_index.iter() {
-            let ((tenant_id, hash), id) = (entry.key(), *entry.value());
-            let row = store
+        let table = crate::locked::lock(&store.table);
+        for ((tenant_id, hash), id) in &table.fingerprint_index {
+            let row = table
                 .devices
-                .get(&(*tenant_id, id))
+                .get(&(*tenant_id, *id))
                 .expect("indexed device exists");
             assert_eq!(
                 row.fingerprint_hash, *hash,
@@ -156,7 +156,9 @@ async fn a_stale_fingerprint_entry_finds_nothing() {
     let d = device("stale-fp", 0x33, DeviceTrustLevel::Seen, now);
     store.save(&d, now).await.unwrap();
     let other = FingerprintHash::from_bytes([0x34; 32]);
-    store.fingerprint_index.insert((t, other), d.id);
+    crate::locked::lock(&store.table)
+        .fingerprint_index
+        .insert((t, other), d.id);
     assert!(
         store
             .find_by_fingerprint(&t, &other)
@@ -175,7 +177,9 @@ async fn a_legacy_revoked_row_without_a_time_ages_out() {
     let store = MemoryDeviceStore::new();
     let mut d = device("legacy", 0x44, DeviceTrustLevel::Revoked, now);
     d.revoked_at = None;
-    store.devices.insert((d.tenant_id, d.id), d.clone());
+    crate::locked::lock(&store.table)
+        .devices
+        .insert((d.tenant_id, d.id), d.clone());
     store.sweep(&t, now).await.unwrap();
     let stamped = store.load(&t, &d.id).await.unwrap().unwrap();
     assert_eq!(stamped.revoked_at, Some(now));
@@ -196,6 +200,7 @@ async fn shared_contract() {
     .await;
     shared::a_sighting_never_rewinds_and_skips_a_revoked_row(MemoryDeviceStore::new()).await;
     shared::a_save_never_un_revokes(MemoryDeviceStore::new()).await;
+    shared::a_revoked_device_never_comes_back(|| async { MemoryDeviceStore::new() }).await;
     shared::the_fingerprint_lookup_follows_the_newest_sighting(MemoryDeviceStore::new()).await;
     shared::sub_second_instants_compare_as_whole_seconds(MemoryDeviceStore::new()).await;
     shared::a_revoked_row_keeps_its_revocation_time(MemoryDeviceStore::new()).await;

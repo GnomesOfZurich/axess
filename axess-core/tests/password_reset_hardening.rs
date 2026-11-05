@@ -483,3 +483,32 @@ mod masked_failures {
         );
     }
 }
+
+/// The dummy token an unknown identifier is given is stored under an id of
+/// its own: the platform's system user may hold a real reset token, and the
+/// dummy write must not replace it.
+#[tokio::test]
+async fn an_unknown_identifier_does_not_overwrite_the_system_users_token() {
+    use axess_core::authn::store::IdentityPasswordReset;
+    let (svc, identity) = world(None);
+    let system = axess_core::authn::ids::UserId::SYSTEM;
+    let now = chrono::Utc::now();
+    identity
+        .store_reset_token(&system, "real-token-hash", now + chrono::Duration::hours(1))
+        .await
+        .unwrap();
+
+    let none = svc
+        .begin_password_reset("nobody", "default", Duration::from_secs(300))
+        .await
+        .unwrap();
+    assert!(none.is_none());
+
+    assert!(
+        identity
+            .verify_reset_token(&system, "real-token-hash", now)
+            .await
+            .unwrap(),
+        "the system user's token was overwritten by the dummy"
+    );
+}

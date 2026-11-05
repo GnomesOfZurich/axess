@@ -154,16 +154,34 @@ under their scope; the authentication ceremony enumerates them and
 the user's authenticator (or the browser, in the passkey case)
 picks one.
 
-Registration refuses a credential id the user already holds, and
-nothing more: the factor store has no index across users, so axess
-cannot run the WebAuthn step that refuses an id registered to a
-different user. That duplicate cannot log in as anyone else, because
-every login looks credentials up per user (the discoverable path
-resolves the user from the credential's user handle first) and the
-assertion must verify against that user's stored public key; it can
-only confuse an inventory. An application that wants the
-specification's check keeps its own index of credential ids and
-refuses in its handler before `finish_fido2_registration`.
+Registration refuses a credential id the user already holds, and one
+that another user of the same tenant holds (the WebAuthn rule that one
+credential belongs to one account). The cross-user answer comes from
+`FactorStore::fido2_credential_holder(tenant_id, credential_id)`. The
+refusal is `AuthnError::NoFlow`, nothing is stored, and the second case
+leaves a failed `FactorSetup` audit row. A failed lookup fails the
+registration; it is never read as "nobody holds it".
+
+The method has a default that answers `Ok(None)`, so a store written
+before it existed keeps building, and on such a store the cross-user check
+does not run: every id is admitted. The in-tree stores answer it (the mock
+store from `axess::testing`, and the SQLite example, which reads the ids
+out of the stored `fido2` rows of the tenant). A store of your own that
+keeps passkeys inside one opaque or sealed config row should keep an index
+of `(tenant_id, credential_id, user_id)` written in the same transaction
+as the config and answer from it, or keep the check in the application
+before `finish_fido2_registration`. Without the check, a duplicate cannot
+log in as another user, because every login looks credentials up per user
+and verifies the assertion against that user's stored public key; it only
+confuses an inventory.
+
+`finish_discoverable_login` matches the assertion on credential id and
+public key against the credentials stored for the user, never on the id
+alone. The step before it, turning the assertion's credential id or user
+handle into a `User`, is yours, and it must be tenant-scoped: a credential
+id is not unique across tenants, so an unscoped lookup can name another
+tenant's user (the tenant rail then refuses the login, but the lookup should
+not have crossed).
 
 ## Who may enrol and delete
 

@@ -17,8 +17,13 @@ use tokio::sync::OnceCell;
 
 /// The provider of one record revision: built once, by the first resolution
 /// that needs it, while the others that arrive meanwhile wait for that build.
+///
+/// It is held for the record's revision and its content together: a store
+/// that numbers revisions per row starts again at 1 when a row is deleted and
+/// written anew, so a revision alone can name two different records.
 struct Built {
     revision: u64,
+    fingerprint: Option<[u8; 32]>,
     provider: Arc<OnceCell<Arc<dyn OAuthProvider>>>,
 }
 
@@ -34,8 +39,10 @@ struct Built {
 /// A revision is built once: the logins that arrive while it is being built
 /// wait for that build instead of each running discovery. A build that fails
 /// is not kept, so the next resolution tries again. A resolution that read an
-/// older revision than the one held (a reader that lost a race with an
-/// update) builds for itself and does not replace the newer provider.
+/// older revision than the one held reads the record again: when the store
+/// still says the same, its revisions have started over (the record was
+/// deleted and written anew) and the record is built and held; otherwise the
+/// reader had lost a race with an update and takes the newer record.
 ///
 /// [`invalidate`](Self::invalidate) drops a held provider early, for a
 /// reason the record does not show (the IdP rotated its keys and you want
@@ -149,14 +156,38 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
             self.invalidate(tenant, name);
             return Ok(None);
         };
-        self.provider_of(&record).await.map(Some)
+        self.provider_of(&record).await
     }
 
-    /// The provider held for `record`'s revision, built when none is.
+    /// The provider held for `record`'s revision, built when none is. When
+    /// the directory holds a later revision than `record`, the record is read
+    /// again and the answer follows the store: a store error is the error,
+    /// and a record that is gone is `None`, never the older record served
+    /// once more.
     async fn provider_of(
         &self,
         record: &TenantOAuthProviderRecord,
-    ) -> Result<Arc<dyn OAuthProvider>, OAuthError> {
+    ) -> Result<Option<Arc<dyn OAuthProvider>>, OAuthError> {
+        let reread;
+        let record = if self.holds_newer_than(record) {
+            match self
+                .store
+                .get(&record.tenant_id, &record.name)
+                .await
+                .map_err(store_error)?
+            {
+                Some(current) => {
+                    reread = current;
+                    &reread
+                }
+                None => {
+                    self.invalidate(&record.tenant_id, &record.name);
+                    return Ok(None);
+                }
+            }
+        } else {
+            record
+        };
         let cell = self.cell_for(record);
         let provider = cell
             .get_or_try_init(|| async {
@@ -164,28 +195,41 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
                 Ok::<_, OAuthError>(built)
             })
             .await?;
-        Ok(provider.clone())
+        Ok(Some(provider.clone()))
     }
 
-    /// The build slot for `record`'s revision: the held one when it is for
-    /// this revision; a new one, held from now on, when the held one is
-    /// older or there is none; a new one that is not held when the held one
-    /// is newer, since this record was read before an update.
+    /// Whether the held provider of `record`'s name is for a later revision
+    /// than `record` is.
+    fn holds_newer_than(&self, record: &TenantOAuthProviderRecord) -> bool {
+        self.lock()
+            .get(&(record.tenant_id, record.name.clone()))
+            .is_some_and(|built| built.revision > record.revision)
+    }
+
+    /// The build slot for `record`: the held one when it is for this
+    /// revision and this content; a new one, held from now on, otherwise.
     fn cell_for(
         &self,
         record: &TenantOAuthProviderRecord,
     ) -> Arc<OnceCell<Arc<dyn OAuthProvider>>> {
         let mut held = self.lock();
         let key = (record.tenant_id, record.name.clone());
+        let fingerprint = fingerprint(record);
         match held.get(&key) {
-            Some(built) if built.revision == record.revision => built.provider.clone(),
-            Some(built) if built.revision > record.revision => Arc::new(OnceCell::new()),
+            Some(built)
+                if built.revision == record.revision
+                    && fingerprint.is_some()
+                    && built.fingerprint == fingerprint =>
+            {
+                built.provider.clone()
+            }
             _ => {
                 let cell = Arc::new(OnceCell::new());
                 held.insert(
                     key,
                     Built {
                         revision: record.revision,
+                        fingerprint,
                         provider: cell.clone(),
                     },
                 );
@@ -194,13 +238,37 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
         }
     }
 
+    /// Store `record` with its credential sealed under the cipher's current
+    /// key and binding, if the record is still at the revision it was read
+    /// at. A failure or a lost race leaves the record as it is: it opens
+    /// again, and moves on a later use.
+    async fn move_to_current_binding(&self, record: &TenantOAuthProviderRecord, plain: &str) {
+        let Some(cipher) = &self.cipher else { return };
+        let mut resealed = record.clone();
+        if resealed.reseal(cipher, plain).is_err() {
+            return;
+        }
+        if let Err(error) = self.store.put_if_revision(resealed, record.revision).await {
+            tracing::warn!(
+                target: "axess::federation::oauth_tenant",
+                tenant = %record.tenant_id,
+                name = %record.name,
+                %error,
+                "could not move a tenant provider credential to the current binding"
+            );
+        }
+    }
+
     async fn build(
         &self,
         record: &TenantOAuthProviderRecord,
     ) -> Result<OAuthProviderConfig, OAuthError> {
-        let opened = record
-            .open_secret(self.cipher.as_deref())
+        let (opened, rotated) = record
+            .open_credential(self.cipher.as_deref())
             .map_err(|e| OAuthError::Store(Box::new(e)))?;
+        if rotated {
+            self.move_to_current_binding(record, &opened).await;
+        }
         let config = match &record.credential {
             TenantClientCredential::Secret(_) => {
                 OAuthProviderConfig::discover(
@@ -241,6 +309,21 @@ impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
     }
 }
 
+/// A digest of what the record says, apart from its revision. `None` when
+/// the record does not serialise: no digest is then equal to another, so the
+/// provider is rebuilt rather than reused.
+///
+/// The serialised bytes hold the credential's text, so they are wiped when
+/// the digest is taken.
+fn fingerprint(record: &TenantOAuthProviderRecord) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use zeroize::Zeroizing;
+    let mut content = record.clone();
+    content.revision = 0;
+    let bytes = Zeroizing::new(serde_json::to_vec(&content).ok()?);
+    Some(Sha256::digest(&*bytes).into())
+}
+
 fn store_error(e: TenantOAuthProviderStoreError) -> OAuthError {
     OAuthError::Store(Box::new(e))
 }
@@ -263,11 +346,13 @@ impl<S: TenantOAuthProviderStore> TenantOAuthProviders for StoredTenantOAuthProv
             let mut found = IssuerProviders::default();
             for record in &records {
                 match self.provider_of(record).await {
-                    Ok(provider) => found.providers.push(TenantProvider {
+                    Ok(Some(provider)) => found.providers.push(TenantProvider {
                         tenant: record.tenant_id,
                         name: record.name.as_str().into(),
                         provider,
                     }),
+                    // Deleted since the listing.
+                    Ok(None) => {}
                     Err(error) => found.broken.push(BrokenTenantProvider {
                         tenant: record.tenant_id,
                         name: record.name.as_str().into(),

@@ -194,3 +194,89 @@ async fn cycle_moves_data_to_new_id() {
         "new id must have the data after cycle"
     );
 }
+
+/// A user whose last session is invalidated leaves no entry behind, so a
+/// long-running process that sees many users does not keep an empty list for
+/// each.
+#[tokio::test]
+async fn invalidating_the_last_session_of_a_user_drops_the_users_entry() {
+    let registry = MemorySessionRegistry::new();
+    let user = uid("u1");
+    let s1 = SessionId::new(&SystemRng);
+
+    registry.register(&user, &s1).await.unwrap();
+    registry.invalidate_session(&user, &s1).await.unwrap();
+
+    assert!(
+        crate::locked::lock(&registry.valid).is_empty(),
+        "no empty per-user list is kept"
+    );
+}
+
+fn registry_on(
+    clock: &axess_clock::testing::MockClock,
+    ttl: std::time::Duration,
+) -> MemorySessionRegistry {
+    MemorySessionRegistry::new()
+        .with_ttl(ttl)
+        .with_clock(Arc::new(clock.clone()))
+}
+
+fn mock_clock() -> axess_clock::testing::MockClock {
+    axess_clock::testing::MockClock::at(
+        chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("in range"),
+    )
+}
+
+/// An entry nobody used is not valid once the TTL has passed, and is not
+/// listed either.
+#[tokio::test]
+async fn an_unused_entry_is_not_valid_past_the_ttl() {
+    let clock = mock_clock();
+    let registry = registry_on(&clock, std::time::Duration::from_secs(3600));
+    let user = uid("u1");
+    let s1 = SessionId::new(&SystemRng);
+    registry.register(&user, &s1).await.unwrap();
+    clock.advance_secs(3599);
+    assert!(registry.is_valid(&user, &s1).await.unwrap());
+    // The check above renewed the entry (half the TTL had gone); stay unused.
+    clock.advance_secs(3601);
+    assert!(!registry.is_valid(&user, &s1).await.unwrap());
+    assert!(registry.active_sessions(&user).await.unwrap().is_empty());
+}
+
+/// An expired entry is gone once a new session registers.
+#[tokio::test]
+async fn an_expired_entry_is_dropped_by_the_next_register() {
+    let clock = mock_clock();
+    let registry = registry_on(&clock, std::time::Duration::from_secs(3600));
+    let user = uid("u1");
+    let rng = SystemRng;
+    let old = SessionId::new(&rng);
+    let fresh = SessionId::new(&rng);
+    registry.register(&user, &old).await.unwrap();
+    clock.advance_secs(3601);
+    registry.register(&user, &fresh).await.unwrap();
+    assert_eq!(
+        crate::locked::lock(&registry.valid)
+            .get(user.to_string().as_str())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(registry.active_sessions(&user).await.unwrap(), vec![fresh]);
+}
+
+/// A session that is used keeps its entry past the TTL it was registered with.
+#[tokio::test]
+async fn a_used_session_outlives_the_ttl() {
+    let clock = mock_clock();
+    let registry = registry_on(&clock, std::time::Duration::from_secs(3600));
+    let user = uid("u1");
+    let s1 = SessionId::new(&SystemRng);
+    registry.register(&user, &s1).await.unwrap();
+    for _ in 0..4 {
+        clock.advance_secs(1900);
+        assert!(registry.is_valid(&user, &s1).await.unwrap());
+    }
+}

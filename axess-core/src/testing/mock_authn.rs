@@ -1,7 +1,7 @@
 //! In-memory [`IdentityStore`](crate::authn::IdentityStore) and [`FactorStore`](crate::authn::FactorStore) for unit tests.
 //!
 //! Use the builder methods to pre-load users, tenants, and factor configs before
-//! running tests. The mocks are fully thread-safe (`Arc<DashMap<…>>`).
+//! running tests. The mocks are fully thread-safe (`Arc<Mutex<HashMap<…>>>`).
 
 mod call_log;
 mod factor;

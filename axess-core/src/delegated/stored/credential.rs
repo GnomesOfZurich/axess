@@ -74,8 +74,11 @@ impl StoredDelegation {
     /// (caller decides whether to refresh proactively); a Some
     /// expiry compares directly.
     pub fn is_fresh(&self, now: DateTime<Utc>, skew: chrono::Duration) -> bool {
+        // A negative skew would move the deadline past the expiry, and a skew
+        // beyond the representable range has no deadline: stale either way.
+        let skew = skew.max(chrono::Duration::zero());
         match self.expires_at {
-            Some(exp) => now < exp - skew,
+            Some(exp) => exp.checked_sub_signed(skew).is_some_and(|due| now < due),
             None => true,
         }
     }

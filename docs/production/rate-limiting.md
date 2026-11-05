@@ -100,8 +100,11 @@ and is limited together with the other overflow clients. The prefix budget is
 a fixed constant. A very large site (a university behind one /48) can be
 squeezed into the overflow bucket by its own scale; where that matters, key on
 something the site controls (`UserId`) instead of its address. The budget does
-not stop an attacker who holds many separate /48s, which is why the hard cap of
-262,144 buckets stays.
+not stop an attacker who holds many separate /48s (an IPv6 /40 holds 256 of
+them, which is exactly the hard cap of 262,144 buckets), so once the table is
+three quarters full a new address folds into its prefix's overflow bucket
+instead of taking a slot, and a client in an unrelated prefix is still
+admitted. The hard cap stays as the last bound.
 
 Login identifiers are minted by unauthenticated callers, so once the table is
 three quarters full a new identifier folds into an overflow bucket of its
@@ -125,7 +128,7 @@ A clock that steps backwards does not strand buckets: a bucket whose window
 starts in the future is re-anchored at the next sweep and ages out two windows
 later.
 
-The buckets live in this process, in a `DashMap`, and there is no
+The buckets live in this process, in a `Mutex<HashMap>`, and there is no
 option to put them anywhere else. That is a deliberate scope
 line rather than a missing backend: with N instances behind a load
 balancer, each one enforces the configured limit independently, so the

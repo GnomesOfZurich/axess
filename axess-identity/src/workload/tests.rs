@@ -218,3 +218,24 @@ fn deserialization_validates_workload_id_and_trust_domain() {
     assert!(serde_json::from_str::<TrustDomain>(r#""UPPER Case""#).is_err());
     assert!(serde_json::from_str::<TrustDomain>(r#""""#).is_err());
 }
+
+/// Every refusal of `parse` is `InvalidSpiffeId`, the path's as much as the
+/// authority's: `InvalidComponent` names a `build` argument, and `parse` has
+/// none.
+#[test]
+fn workload_id_parse_refuses_a_bad_path_as_an_invalid_spiffe_id() {
+    for raw in [
+        "spiffe://gnomes.local//x",
+        "spiffe://gnomes.local/x/../y",
+        "spiffe://gnomes.local/x/a b",
+        "spiffe://gnomes.local/",
+    ] {
+        assert!(
+            matches!(
+                WorkloadId::parse(raw),
+                Err(IdentityError::InvalidSpiffeId(_))
+            ),
+            "{raw}"
+        );
+    }
+}

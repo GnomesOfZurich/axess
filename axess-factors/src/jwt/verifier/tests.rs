@@ -253,6 +253,44 @@ async fn replay_store_rejects_second_use() {
     );
 }
 
+/// The replay key is the issuer and the `jti` together: two issuers that pick
+/// the same `jti` sharing one store do not block each other.
+#[tokio::test]
+async fn the_same_jti_from_two_issuers_is_not_a_replay() {
+    let (der, jwks, kid) = rsa_keypair();
+    let now = now_secs();
+    let token = |iss: &str| {
+        sign(
+            &serde_json::json!({
+                "iss": iss,
+                "sub": "x",
+                "aud": "my-svc",
+                "exp": now + 3600,
+                "iat": now,
+                "jti": "tok-1",
+            }),
+            &kid,
+            &der,
+        )
+    };
+    let verifier = JwtVerifier::new(handle(jwks))
+        .with_audience("my-svc")
+        .with_replay_store(InMemReplay::default());
+
+    verifier
+        .verify::<serde_json::Value>(&token("https://idp-a.example"))
+        .await
+        .expect("issuer a's token");
+    verifier
+        .verify::<serde_json::Value>(&token("https://idp-b.example"))
+        .await
+        .expect("issuer b's token with the same jti is not a replay");
+    verifier
+        .verify::<serde_json::Value>(&token("https://idp-a.example"))
+        .await
+        .expect_err("issuer a's token again is a replay");
+}
+
 /// Replay store with no `jti` on the token rejects. Without this
 /// pin, mistakenly skipping the `jti` claim would silently
 /// bypass replay protection.
@@ -526,16 +564,24 @@ fn compute_replay_ttl_covers_the_leeway_window() {
     // 900 seconds in the future → TTL = 960s (exp + skew - now).
     assert_eq!(
         compute_replay_ttl(Some(now + 900), skew, &clock),
-        Duration::from_secs(960),
-        "TTL must equal `exp + skew - now` exactly"
+        Duration::from_secs(961),
+        "TTL must equal `exp + skew - now`, plus the last accepted second"
     );
 
     // Expired 10 s ago but inside the 60 s leeway: the verifier still
     // accepts it for 50 s, so the jti must be held for 50 s, not 0.
     assert_eq!(
         compute_replay_ttl(Some(now - 10), skew, &clock),
-        Duration::from_secs(50),
+        Duration::from_secs(51),
         "a token inside the leeway window is still replayable and must be remembered"
+    );
+
+    // In the last accepted second (exp + skew == now) the token is still
+    // accepted, so it must be remembered for at least that second.
+    assert_eq!(
+        compute_replay_ttl(Some(now - 60), skew, &clock),
+        Duration::from_secs(1),
+        "the last accepted second must not have a zero TTL"
     );
 
     // Past the leeway window clamps to 0.
@@ -548,7 +594,7 @@ fn compute_replay_ttl_covers_the_leeway_window() {
     // Without skew the old behaviour holds exactly.
     assert_eq!(
         compute_replay_ttl(Some(now + 900), Duration::ZERO, &clock),
-        Duration::from_secs(900)
+        Duration::from_secs(901)
     );
 
     // Missing exp is held for the fallback day, never forgotten at once.

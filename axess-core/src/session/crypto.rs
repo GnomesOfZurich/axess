@@ -458,7 +458,7 @@ impl BoundFormat {
 pub(crate) fn device_row_id(tenant: &str, device: &str) -> Vec<u8> {
     let mut id = Vec::with_capacity(8 + tenant.len() + device.len());
     for part in [tenant, device] {
-        id.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        id.extend_from_slice(&crate::length_prefix::length_prefix(part.len()));
         id.extend_from_slice(part.as_bytes());
     }
     id

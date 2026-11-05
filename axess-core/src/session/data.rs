@@ -274,6 +274,12 @@ pub enum AuthState {
         /// [`AuthState::Authenticated::ldap_groups`]; `None` until then.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ldap_groups: Option<Vec<String>>,
+        /// The impersonation of the `Authenticated` state a step-up began
+        /// from, kept so the state the step-up completes into is still the
+        /// administrator's; `None` for a login and for a step-up of the
+        /// user's own session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        impersonator: Option<Impersonation>,
     },
 
     /// All factors verified: user is fully authenticated.
@@ -431,6 +437,7 @@ impl AuthState {
             attempt_count: 0,
             last_attempt: None,
             ldap_groups: None,
+            impersonator: None,
         };
     }
 
@@ -446,6 +453,7 @@ impl AuthState {
             tenant_id,
             factors_completed,
             ldap_groups,
+            impersonator,
             ..
         } = self
         else {
@@ -462,6 +470,7 @@ impl AuthState {
             // The groups of the login stay with the session; an LDAP bind
             // in the step-up replaces them.
             ldap_groups: ldap_groups.take(),
+            impersonator: impersonator.take(),
         };
         true
     }
@@ -551,6 +560,7 @@ impl AuthState {
                 remaining,
                 completed,
                 ldap_groups,
+                impersonator,
                 ..
             } => {
                 // The step this factor satisfies is done; the factor itself
@@ -564,12 +574,13 @@ impl AuthState {
                     let tid = *tenant_id;
                     let factors = std::mem::take(completed);
                     let ldap_groups = ldap_groups.take();
+                    let impersonator = impersonator.take();
                     *self = AuthState::Authenticated {
                         user_id: uid,
                         tenant_id: tid,
                         authn_time,
                         factors_completed: factors,
-                        impersonator: None,
+                        impersonator,
                         ldap_groups,
                     };
                     AdvanceOutcome::Completed

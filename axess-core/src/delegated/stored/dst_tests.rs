@@ -246,3 +246,53 @@ async fn rejected_refresh_reloads_and_uses_a_credential_another_node_rotated() {
     assert_eq!(session.get_access_token().await.unwrap(), "from-other-node");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+/// Run one `get_access_token` against a store holding `row`, with the
+/// refresh skew the adopter asked for; the IdP answers a refresh with
+/// `fresh`.
+async fn token_with_skew(
+    row: impl FnOnce(&DelegatedProvider) -> StoredDelegation,
+    skew: i64,
+) -> String {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(token_body("fresh", "r2")))
+        .mount(&server)
+        .await;
+    let provider = provider(&server.uri());
+    let store = Arc::new(MemoryDelegatedCredentialStore::new());
+    let (tenant, user) = (TenantId::from_bytes([9; 16]), UserId::from_bytes([1; 16]));
+    store.save(&tenant, &user, row(&provider)).await.unwrap();
+    let session = StoredDelegationSession::new(provider, store, tenant, user)
+        .expect("the default client builds")
+        .with_clock(Arc::new(MockClock::at(t0())))
+        .with_refresh_skew_secs(skew);
+    session.get_access_token().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_negative_refresh_skew_does_not_make_an_expired_token_fresh() {
+    assert_eq!(token_with_skew(|p| stale("r1", p), -3600).await, "fresh");
+}
+
+#[tokio::test]
+async fn a_huge_refresh_skew_refreshes_instead_of_panicking() {
+    let row = |p: &DelegatedProvider| StoredDelegation {
+        expires_at: Some(t0() + Duration::seconds(3600)),
+        ..stale("r1", p)
+    };
+    assert_eq!(token_with_skew(row, i64::MAX).await, "fresh");
+}
+
+#[test]
+fn is_fresh_treats_a_negative_skew_as_none_and_a_huge_one_as_stale() {
+    let p = provider("https://idp.example");
+    let row = stale("r1", &p);
+    assert!(!row.is_fresh(t0(), Duration::seconds(-3600)));
+    let live = StoredDelegation {
+        expires_at: Some(t0() + Duration::seconds(3600)),
+        ..row
+    };
+    assert!(!live.is_fresh(t0(), Duration::MAX));
+}

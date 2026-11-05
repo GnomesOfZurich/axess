@@ -59,7 +59,8 @@ pub mod types;
 
 pub use cache::CachedDeviceStore;
 pub use cascade::{
-    RevokeDeviceError, cascade_revoke_by_refresh_family, cascade_revoke_devices, revoke_device,
+    RevokeDeviceError, cascade_revoke_by_refresh_family, cascade_revoke_devices,
+    cascade_revoke_devices_and_tokens, revoke_device,
 };
 pub use cascade_store::CascadingRefreshStore;
 pub use events::{DeviceEventSink, NoopDeviceEventSink};

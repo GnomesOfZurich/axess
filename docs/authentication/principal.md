@@ -25,6 +25,7 @@ pub struct HumanPrincipal {
     pub user_id: UserId,
     pub tenant_id: TenantId,
     pub session_id: Option<SessionId>,
+    pub impersonator: Option<UserId>,
     pub attributes: BTreeMap<String, serde_json::Value>,
 }
 

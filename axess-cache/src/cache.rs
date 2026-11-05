@@ -3,17 +3,27 @@
 //! The cache implementation itself lives here; the public counters
 //! snapshot is in [`crate::stats`].
 
+use crate::lru::LruMap;
 use crate::stats::{CacheCounters, CacheStats};
 use axess_clock::Clock;
-use lru::LruCache;
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::OnceCell;
+
+/// `Mutex::lock` that takes the guard back from a poisoned lock.
+trait LockUnpoisoned<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockUnpoisoned<T> for Mutex<T> {
+    fn lock_unpoisoned(&self) -> MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Cached value plus the absolute (epoch-µs) instant at which it expires.
 ///
@@ -35,12 +45,14 @@ struct Entry<V> {
 /// - **TTL**: checked on read. Expired entries are removed lazily when
 ///   touched; [`cleanup_expired`](Self::cleanup_expired) sweeps the whole
 ///   map for callers who want to reclaim memory eagerly.
-/// - **Capacity**: enforced at insert time by [`LruCache`]. Inserting into a
+/// - **Capacity**: enforced at insert time by the internal LRU map. Inserting into a
 ///   full cache evicts the least-recently-used entry.
 ///
 /// # Concurrency
 ///
-/// Internal state is wrapped in a [`parking_lot::Mutex`]. Reads briefly
+/// Internal state is wrapped in a [`std::sync::Mutex`] (a poisoned lock is
+/// recovered, not propagated: the cache holds no invariant a panic can break
+/// half-way). Reads briefly
 /// acquire the lock to update LRU recency. The single mutex becomes the
 /// bottleneck only once multiple threads contend on the same hot key;
 /// `benches/cache_bench.rs` quantifies the regression. A sharded variant
@@ -59,7 +71,7 @@ where
     K: Hash + Eq + Send + Sync,
     V: Clone + Send + Sync,
 {
-    inner: Mutex<LruCache<K, Entry<V>>>,
+    inner: Mutex<LruMap<K, Entry<V>>>,
     /// In-flight loads for [`Self::get_or_try_insert_with`]. Held under a
     /// dedicated mutex so cache reads aren't blocked by single-flight
     /// bookkeeping. The TOCTOU between this map and `inner` is benign:
@@ -80,7 +92,7 @@ where
     /// Construct a cache with the given capacity, TTL, and Clock.
     pub fn new(capacity: NonZeroUsize, ttl: Duration, clock: Arc<dyn Clock>) -> Self {
         Self {
-            inner: Mutex::new(LruCache::new(capacity)),
+            inner: Mutex::new(LruMap::new(capacity)),
             inflight: Mutex::new(HashMap::new()),
             clock,
             ttl,
@@ -111,8 +123,8 @@ where
     /// exclusive.
     pub fn get(&self, key: &K) -> Option<V> {
         let now_micros = self.clock.now().timestamp_micros();
-        let mut guard = self.inner.lock();
-        // LruCache::get updates recency, which is what we want on a hit;
+        let mut guard = self.inner.lock_unpoisoned();
+        // LruMap::get updates recency, which is what we want on a hit;
         // on an expired-hit we then `pop` to evict.
         if let Some(entry) = guard.get(key)
             && entry.expires_at_micros > now_micros
@@ -138,7 +150,7 @@ where
         // of wrapping negative (which would make every entry born expired).
         let ttl_micros = i64::try_from(self.ttl.as_micros()).unwrap_or(i64::MAX);
         let expires_at_micros = now_micros.saturating_add(ttl_micros);
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.lock_unpoisoned();
         let len_before = guard.len();
         let cap = guard.cap().get();
         guard.put(
@@ -148,7 +160,7 @@ where
                 expires_at_micros,
             },
         );
-        // LruCache::put on a full cache evicts the LRU entry to make room.
+        // LruMap::put on a full cache evicts the LRU entry to make room.
         // Detect the eviction by checking that we hit (or were already at)
         // capacity and the cache size didn't grow. Counts both
         // "displaced existing key" and "popped LRU" paths; the former
@@ -182,8 +194,8 @@ where
     /// removal already inserted into LRU, which our LRU pop then
     /// removes. Both paths converge on "key is not cached afterward."
     pub fn invalidate(&self, key: &K) -> bool {
-        let inflight_removed = self.inflight.lock().remove(key).is_some();
-        let lru_removed = self.inner.lock().pop(key).is_some();
+        let inflight_removed = self.inflight.lock_unpoisoned().remove(key).is_some();
+        let lru_removed = self.inner.lock_unpoisoned().pop(key).is_some();
         let removed = inflight_removed || lru_removed;
         if removed {
             self.stats.invalidations.fetch_add(1, Ordering::Relaxed);
@@ -210,14 +222,14 @@ where
     pub fn invalidate_by(&self, predicate: impl Fn(&K) -> bool) -> usize {
         // Inflight first, then LRU; lock-ordering rule.
         {
-            let mut inflight = self.inflight.lock();
+            let mut inflight = self.inflight.lock_unpoisoned();
             let to_remove: Vec<K> = inflight.keys().filter(|k| predicate(k)).cloned().collect();
             for k in &to_remove {
                 inflight.remove(k);
             }
         }
 
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.lock_unpoisoned();
         let to_remove: Vec<K> = guard
             .iter()
             .filter_map(|(k, _)| if predicate(k) { Some(k.clone()) } else { None })
@@ -247,9 +259,9 @@ where
     )]
     pub fn invalidate_all(&self) {
         // Inflight first, then LRU; lock-ordering rule.
-        self.inflight.lock().clear();
+        self.inflight.lock_unpoisoned().clear();
 
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.lock_unpoisoned();
         let count = guard.len();
         guard.clear();
         drop(guard);
@@ -274,7 +286,7 @@ where
     )]
     pub fn cleanup_expired(&self) -> usize {
         let now_micros = self.clock.now().timestamp_micros();
-        let mut guard = self.inner.lock();
+        let mut guard = self.inner.lock_unpoisoned();
         let to_remove: Vec<K> = guard
             .iter()
             .filter_map(|(k, e)| {
@@ -353,7 +365,7 @@ where
 
         // Slow path: claim or join an in-flight cell.
         let (cell, joined) = {
-            let mut inflight = self.inflight.lock();
+            let mut inflight = self.inflight.lock_unpoisoned();
             match inflight.get(&key) {
                 Some(existing) => (existing.clone(), true),
                 None => {
@@ -393,7 +405,7 @@ where
                 // *must* take inflight first (lock-ordering rule), it
                 // cannot interleave between our check and our LRU insert.
                 {
-                    let mut inflight = self.inflight.lock();
+                    let mut inflight = self.inflight.lock_unpoisoned();
                     if let Some(existing) = inflight.get(&key)
                         && Arc::ptr_eq(existing, &cell)
                     {
@@ -434,17 +446,17 @@ where
     /// Current number of entries (including any that are expired but not
     /// yet evicted by a read or [`cleanup_expired`](Self::cleanup_expired)).
     pub fn len(&self) -> usize {
-        self.inner.lock().len()
+        self.inner.lock_unpoisoned().len()
     }
 
     /// `true` if the cache holds zero entries.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().len() == 0
+        self.inner.lock_unpoisoned().len() == 0
     }
 
     /// Configured capacity (LRU bound).
     pub fn capacity(&self) -> NonZeroUsize {
-        self.inner.lock().cap()
+        self.inner.lock_unpoisoned().cap()
     }
 
     /// Number of in-flight loads currently waiting to resolve.
@@ -453,7 +465,7 @@ where
     /// and for tests that verify `get_or_try_insert_with` cleans up its
     /// in-flight cells correctly even on panic-unwind.
     pub fn pending_loads_count(&self) -> usize {
-        self.inflight.lock().len()
+        self.inflight.lock_unpoisoned().len()
     }
 }
 
@@ -480,7 +492,7 @@ where
     V: Clone + Send + Sync,
 {
     fn drop(&mut self) {
-        let mut inflight = self.cache.inflight.lock();
+        let mut inflight = self.cache.inflight.lock_unpoisoned();
         // Joiners clone the cell under this same lock, so the count is
         // exact here: the map's reference, the caller's local `cell` and
         // this guard's make three. Anything above that is a joiner still

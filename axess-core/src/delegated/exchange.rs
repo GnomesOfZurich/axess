@@ -165,7 +165,8 @@ pub struct TokenExchangeResponse {
     /// must echo this; carries the same URN shape as
     /// `requested_token_type`.
     pub issued_token_type: String,
-    /// `token_type` per RFC 6749 §5.1; almost always `Bearer`.
+    /// `token_type` per RFC 6749 §5.1; almost always `Bearer`. Required in
+    /// the response: one without it is refused as malformed.
     pub token_type: String,
     /// Seconds until the issued token expires. `None` if the AS
     /// omitted `expires_in`.
@@ -307,14 +308,15 @@ impl TokenExchangeClient {
         let scopes: Vec<String> = parsed
             .scope
             .map(|s| s.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_default();
+            // RFC 6749 section 5.1: an omitted `scope` is the scope requested.
+            .unwrap_or_else(|| request.scopes.clone());
 
         Ok(TokenExchangeResponse {
             access_token: parsed.access_token,
             issued_token_type: parsed
                 .issued_token_type
                 .unwrap_or_else(|| token_types::ACCESS_TOKEN.to_string()),
-            token_type: parsed.token_type.unwrap_or_else(|| "Bearer".to_string()),
+            token_type: parsed.token_type,
             expires_in: parsed.expires_in,
             scopes,
             refresh_token: parsed.refresh_token,
@@ -333,8 +335,9 @@ struct TokenExchangeResponseBody {
     access_token: ZeroizedString,
     #[serde(default)]
     issued_token_type: Option<String>,
-    #[serde(default)]
-    token_type: Option<String>,
+    /// Required (RFC 8693 section 2.2.1): an answer without it is refused,
+    /// as the outbound OAuth client refuses one.
+    token_type: String,
     #[serde(default)]
     expires_in: Option<u64>,
     #[serde(default)]

@@ -338,6 +338,9 @@ impl AuthSession {
             .data
             .auth_state
             .begin_authenticating(user_id, tenant_id, method_name, steps);
+        // The id the visitor arrived with may have been planted: the partial
+        // login lives under a fresh one.
+        guard.rotate_id();
         // Bind fingerprint early; during Authenticating state; so that
         // mid-MFA sessions are also protected against hijacking.
         if guard.data.fingerprint.is_none()
@@ -436,6 +439,8 @@ impl AuthSession {
         let mut guard = self.0.0.write().await;
         // Pure state mutation lives on AuthState.
         guard.data.auth_state.set_identifying(user_id, tenant_id);
+        // A planted session id must not carry the login that begins here.
+        guard.rotate_id();
         // Bind fingerprint as early as possible (during Identifying state)
         // so a stolen session cookie cannot be replayed from a different device.
         if guard.data.fingerprint.is_none()
@@ -459,6 +464,15 @@ impl AuthSession {
             .data
             .auth_state
             .set_pending_workflow(user_id, tenant_id, workflow);
+        // A planted session id must not carry the workflow that begins here.
+        guard.rotate_id();
+        // Bind the fingerprint, as the other partial-login setters do, so the
+        // pending-workflow cookie cannot be replayed from another client.
+        if guard.data.fingerprint.is_none()
+            && let Some(fp) = guard.pending_fingerprint.take()
+        {
+            guard.data.fingerprint = Some(fp);
+        }
         guard.modified = true;
     }
 

@@ -143,10 +143,9 @@ async fn a_full_replay_log_answers_503_and_still_catches_the_oldest_replay() {
     let now = h.clock.now();
     let cutoff = now - chrono::Duration::seconds(JTI_RETENTION_SECS);
     for n in 0..JTI_CACHE_MAX {
-        assert_eq!(
-            h.seen_jtis.record(ISS, &format!("fill-{n}"), now, cutoff),
-            Recorded::New
-        );
+        let jti = format!("fill-{n}");
+        assert_eq!(h.seen_jtis.record(ISS, &jti, now, cutoff), Recorded::New);
+        h.seen_jtis.settle(ISS, &jti);
     }
 
     let fresh = token("client-a", serde_json::json!({"sid": "s", "jti": "new"}));
@@ -157,5 +156,41 @@ async fn a_full_replay_log_answers_503_and_still_catches_the_oldest_replay() {
         post(&h, replay).await,
         Err(StatusCode::BAD_REQUEST),
         "the oldest live entry is still a replay"
+    );
+}
+
+/// A token addressed to two clients of one issuer names the one it is for in
+/// `azp` (OIDC Core section 2). The provider of that client verifies it,
+/// though another provider's client id comes first in `aud`.
+#[tokio::test]
+async fn azp_picks_the_provider_among_the_clients_in_aud() {
+    let registry = MemorySessionRegistry::new();
+    let sid_map = SidMap::new();
+    let h = handler(&registry, sid_map.clone());
+    let rng = MockRng::new(5);
+    let session = SessionId::new(&rng);
+    let user = axess_identity::testing::user("user-2");
+    registry.register(&user, &session).await.unwrap();
+    sid_map.insert(
+        (ISS.to_string(), "sid-b".to_string()),
+        "idp-subject-b",
+        user,
+        session,
+        chrono::Utc::now(),
+    );
+
+    let t = token(
+        "client-a",
+        serde_json::json!({
+            "aud": ["client-a", "client-b"],
+            "azp": "client-b",
+            "sid": "sid-b",
+            "jti": "azp-1",
+        }),
+    );
+    assert_eq!(post(&h, t).await, Ok(StatusCode::OK));
+    assert!(
+        !registry.is_valid(&user, &session).await.unwrap(),
+        "the session ended"
     );
 }

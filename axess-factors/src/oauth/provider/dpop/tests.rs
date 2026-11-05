@@ -209,3 +209,24 @@ fn a_generated_proof_verifies_and_reports_the_keys_thumbprint() {
     .expect("verifies");
     assert_eq!(verified.thumbprint, k.thumbprint().unwrap());
 }
+
+/// RFC 9449 section 4.2: `htu` is the request URL without its query and
+/// fragment, whichever caller made the proof, including a caller of the
+/// public trait method who hands over the URL it is about to request.
+#[test]
+fn htu_drops_the_query_and_the_fragment() {
+    let k = key(0x34);
+    let proof = generate_dpop_proof(
+        &k,
+        "GET",
+        "https://rs.example.com/resource?page=2&token=abc#top",
+        None,
+        IAT,
+        JTI,
+    )
+    .unwrap();
+    assert_eq!(
+        decode_part(&proof.proof_jwt, 1)["htu"],
+        "https://rs.example.com/resource"
+    );
+}

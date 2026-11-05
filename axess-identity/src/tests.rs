@@ -15,6 +15,7 @@ fn human_principal_tenant_id_accessor() {
         user_id: sample_user(),
         tenant_id: tenant,
         session_id: None,
+        impersonator: None,
         attributes: BTreeMap::new(),
     };
     let p = Principal::Human(human);
@@ -67,6 +68,7 @@ fn attributes_accessor_returns_populated_human_map() {
         user_id: sample_user(),
         tenant_id: sample_tenant(),
         session_id: None,
+        impersonator: None,
         attributes: attrs,
     };
     let p = Principal::Human(human);
@@ -148,6 +150,7 @@ fn principal_serde_round_trip_human() {
         user_id: sample_user(),
         tenant_id: sample_tenant(),
         session_id: None,
+        impersonator: None,
         attributes: BTreeMap::new(),
     };
     let p = Principal::Human(human);
