@@ -12,7 +12,7 @@ for (an intake worker, a relay, a cron job):
 
 - **Shared secret** (`src/shared_secret.rs`); the caller signs each request
   with a secret both ends hold, through the `service-secret` feature, and
-  the route verifies it and refuses altered, stale and replayed requests.
+  the route verifies it and refuses altered, stale and replayed requests. Replay memory is per process: with several replicas keep the handler idempotent (for example dedupe on the report's contents) or route the webhook to a single instance, or a signed request can be replayed to another replica within its five-minute window.
   This is the weakest machine credential axess offers: prefer the
   recipes above whenever the caller can use them. The book chapter
   *Shared secrets: the last resort* sets the options side by side.
@@ -73,13 +73,12 @@ let trust_domain = TrustDomain::new("github.actions").unwrap();
 let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
     verifier.clone(),
     trust_domain.clone(),
-    tenant_id,
+    |owner_id| tenants.get(owner_id).copied(), // None refuses the token
     Issuer::custom("github_actions").unwrap(),
     bearer_token,
     // Trust owners and repositories by their immutable numeric ids, never by
     // name: a renamed or deleted organisation frees its old name.
     github_actions_mapper(
-        trust_domain,
         GitHubAllowlist::new()
             .owner_id("123456")
             .repository_id("987654321")
@@ -113,12 +112,13 @@ For a new IdP (e.g. CircleCI):
    the fields you care about (axess's `JwtVerifier` ignores unknown claims).
 3. Write a mapper closure: `Fn(&VerifiedClaims<YourClaims>) ->
    Result<WorkloadMapping, IdentityError>` that produces the
-   `(workload_id, service_name, tenant_slug, attributes)` shape.
+   `(service_name, tenant_slug, attributes)` shape; the resolver builds the
+   workload id from them under its own trust domain.
 4. Wire as in the example above, with
    `Issuer::custom("your_idp_label").unwrap()` for audit-log attribution.
 
 The library handles signature verification, `iss`/`aud`/`exp`/`nbf`/`alg`
-checks, JWKS rotation, and trust-domain pinning. Your recipe handles only
+checks, JWKS rotation, the workload id and the tenant lookup. Your recipe handles only
 the claim-shape translation.
 
 ## See also
@@ -168,9 +168,21 @@ to `./keys/historical/v1.pem`. The server binds to `127.0.0.1:3000`
 with issuer `http://localhost:3000`. Override the key directory with
 `LOCAL_IDP_KEY_DIR=…`.
 
-`POST /issue` and `POST /admin/rotate` require
-`Authorization: Bearer $TOKEN`. Set `LOCAL_IDP_ADMIN_TOKEN` (16 or more
-characters) before starting, or copy the token the server logs at startup.
+Two kinds of bearer token guard the mutating routes, and neither opens the
+other's:
+
+- `/admin/rotate` and `/admin/retire` take the admin token. Set
+  `LOCAL_IDP_ADMIN_TOKEN` (16 or more characters) before starting, or read the
+  one the server generated from `keys/admin-token` (a file only its owner can
+  read; the log names the path and never shows the token).
+- `/issue` takes an issue token that belongs to one caller and names the
+  subjects and audiences that caller may request. Set `LOCAL_IDP_ISSUE_CALLERS`
+  to a JSON array, for example
+  `[{"name":"ci","token":"<16+ characters>","subjects":["worker-1"],"audiences":["https://api"]}]`.
+  Unset, the server generates one `demo` caller (`worker-1` at `https://api`)
+  and writes its token to `keys/issue-token`. A request for another subject or
+  audience is refused with 403, and every mint is logged with the caller's name,
+  the subject and the audience.
 
 ### File layout
 
@@ -210,16 +222,16 @@ curl -s http://localhost:3000/.well-known/openid-configuration | jq .
 curl -s http://localhost:3000/jwks.json | jq '.keys[].kid'
 # "v1"
 
-# 3. Mint a token
+# 3. Mint a token (an issue token: $ISSUE_TOKEN is the contents of keys/issue-token)
 curl -s -X POST http://localhost:3000/issue \
-  -H "authorization: Bearer $TOKEN" \
+  -H "authorization: Bearer $ISSUE_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"subject":"worker-1","audience":"https://api","ttl_secs":300}'
 # { "token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0..." }
 
-# 4. Rotate to a new key
+# 4. Rotate to a new key (the admin token: $ADMIN_TOKEN is keys/admin-token)
 curl -s -X POST http://localhost:3000/admin/rotate \
-  -H "authorization: Bearer $TOKEN" \
+  -H "authorization: Bearer $ADMIN_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"new_kid":"v2"}'
 # { "new_current": "v2", "historical": ["v2", "v1"] }
@@ -238,9 +250,11 @@ curl -s http://localhost:3000/jwks.json | jq '.keys[].kid'
 - **Production HTTPS.** Real deployments terminate TLS upstream or
   use `axum-server` with a `RustlsConfig`. Either is purely an axum
   concern.
-- **Per-operator authorization on `/admin/rotate`.** One shared bearer
-  token guards both admin routes here. A real deployment gates the route
-  to named operators (see `require_authz!` in `axess-macros`).
+- **Per-operator authorization on `/admin/*`.** One shared bearer
+  token guards both admin routes here, and the issue callers are a static
+  list. A real deployment gates the routes to named operators (see
+  `require_authz!` in `axess-macros`) and takes callers from its own
+  directory.
 - **`tokio::fs` for non-blocking I/O.** The example uses `std::fs`
   for clarity. The key-store operations are small and infrequent
   enough that the blocking cost is invisible at the example's

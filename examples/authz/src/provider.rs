@@ -105,6 +105,10 @@ pub enum ProviderError {
 
     #[error("entity build error: {0}")]
     Build(String),
+
+    /// This provider serves one application with no tenants.
+    #[error("this provider is not tenant aware; refusing tenant {0}")]
+    TenantUnsupported(String),
 }
 
 // `?` rather than a `map_err` closure at each of the nine fallible calls
@@ -216,6 +220,23 @@ impl AuthzEntityProvider for DocEntityProvider {
         }
 
         Ok(Entities::from_entities(entities, self.schema.get())?)
+    }
+
+    /// This example has no tenants: a check without one is answered by
+    /// `entities_for`, and a check made in a tenant is refused (the session
+    /// treats the error as a denial) rather than answered from data that is
+    /// not tenant scoped.
+    async fn entities_for_tenant(
+        &self,
+        principal: &EntityUid,
+        tenant: Option<&str>,
+        resource_id: &String,
+        action: &EntityUid,
+    ) -> Result<Entities, Self::Error> {
+        match tenant {
+            None => self.entities_for(principal, resource_id, action).await,
+            Some(tenant) => Err(ProviderError::TenantUnsupported(tenant.to_string())),
+        }
     }
 
     /// Build the Cedar entity UID for a document.

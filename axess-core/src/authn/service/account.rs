@@ -235,7 +235,18 @@ where
         if let Some(reg) = &self.inner.registry {
             // Enforce concurrent session limit: evict oldest sessions.
             if let Some(max) = self.inner.max_sessions_per_user {
-                let active = reg.active_sessions(user_id).await;
+                // A registry that cannot list the sessions cannot enforce the
+                // cap, so the login is refused rather than counted as none.
+                let Ok(active) = reg.held_sessions(user_id).await else {
+                    tracing::error!(
+                        user_id = %user_id,
+                        "session registry could not list the user's sessions; \
+                         clearing session and refusing authentication under the \
+                         concurrent session limit"
+                    );
+                    session.clear().await;
+                    return Err(AuthnError::NoFlow);
+                };
                 let victims = victims_before_register(&active, sid, max);
                 self.evict_sessions(reg.as_ref(), user_id, &victims).await;
             }
@@ -263,7 +274,20 @@ where
             // a peer has already revoked. (Evicting "everyone but me" made two
             // parallel logins at a cap of one revoke each other.)
             if let Some(max) = self.inner.max_sessions_per_user {
-                let active = reg.active_sessions(user_id).await;
+                let Ok(active) = reg.held_sessions(user_id).await else {
+                    tracing::error!(
+                        user_id = %user_id,
+                        "session registry could not list the user's sessions after \
+                         registering; revoking this session and refusing authentication \
+                         under the concurrent session limit"
+                    );
+                    note_revocation(
+                        reg.invalidate_session(user_id, sid).await,
+                        "refusing a login step",
+                    );
+                    session.clear().await;
+                    return Err(AuthnError::NoFlow);
+                };
                 let victims = victims_after_register(&active, max);
                 self.evict_sessions(reg.as_ref(), user_id, victims).await;
                 if victims.contains(sid) {
@@ -387,8 +411,8 @@ where
             let mut event_builder = AuthEventBuilder::success(AuthEventType::Authenticated)
                 .attributed_to(user_id, tenant_id)
                 .with_session(sid);
-            for kind in &factors_completed {
-                event_builder = event_builder.with_factors_completed(kind.clone());
+            for (kind, at) in &factors_completed {
+                event_builder = event_builder.with_factors_completed(kind.clone(), *at);
             }
             if let Err(e) = self.emit_audit(event_builder).await {
                 self.end_session_after_audit_failure(user_id, session).await;

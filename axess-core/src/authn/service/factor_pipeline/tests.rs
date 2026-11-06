@@ -212,11 +212,7 @@ async fn enforce_account_status_returns_ok_for_active() {
 async fn enforce_account_status_locked_with_until_passes_through_until_and_emits_audit() {
     // In the future: a suspension whose `until` has passed is over.
     let until = Utc::now() + chrono::Duration::days(1);
-    let detail = StatusDetail {
-        reason: "policy".into(),
-        since: Utc::now(),
-        until: Some(until),
-    };
+    let detail = StatusDetail::administrative("policy", Utc::now()).with_until(Some(until));
     let user = user_with_status(EntityState::Suspended(detail));
     let (service, inspector) = build_service_with_user(user);
     let session = authenticating_session(vec![FactorKind::Totp]).await;
@@ -257,11 +253,7 @@ async fn enforce_account_status_locked_with_until_passes_through_until_and_emits
 
 #[tokio::test]
 async fn enforce_account_status_locked_indefinite_returns_until_none() {
-    let detail = StatusDetail {
-        reason: "indefinite".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("indefinite", Utc::now());
     let user = user_with_status(EntityState::Suspended(detail));
     let (service, inspector) = build_service_with_user(user);
     let session = authenticating_session(vec![FactorKind::Password]).await;
@@ -282,11 +274,7 @@ async fn enforce_account_status_locked_indefinite_returns_until_none() {
 
 #[tokio::test]
 async fn enforce_account_status_pending_returns_not_active_without_audit() {
-    let detail = StatusDetail {
-        reason: "pending email verification".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::verification("pending email verification", Utc::now());
     let user = user_with_status(EntityState::Pending(detail));
     let (service, inspector) = build_service_with_user(user);
     let session = authenticating_session(vec![FactorKind::Password]).await;
@@ -309,11 +297,7 @@ async fn enforce_account_status_pending_returns_not_active_without_audit() {
 
 #[tokio::test]
 async fn enforce_account_status_no_next_kind_still_emits_audit_without_factor_field() {
-    let detail = StatusDetail {
-        reason: "policy".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("policy", Utc::now());
     let user = user_with_status(EntityState::Suspended(detail));
     let (service, inspector) = build_service_with_user(user);
     let session = authenticating_session(vec![]).await;

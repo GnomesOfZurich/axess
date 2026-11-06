@@ -21,9 +21,9 @@
 //! encrypts exactly one message and AES-GCM's random-nonce limit (about 2^32
 //! seals per key) does not apply to them. The master key still wants rotating
 //! on the usual schedule; it no longer has a write budget. A blob in the
-//! earlier layout (the key used directly, a random nonce per seal) is still
-//! read and is re-sealed in the new layout by the same paths that re-seal
-//! any other stale blob. [`SessionCrypto::encrypt_with_aad`] keeps the
+//! earlier layout (the key used directly, a random nonce per seal) is a legacy
+//! blob: read only while [`LegacyBlobs`] reads them, and then re-sealed in the
+//! new layout by the same paths that re-seal any other stale blob. [`SessionCrypto::encrypt_with_aad`] keeps the
 //! direct layout for callers that use it themselves, and
 //! [`SessionCrypto::seals`] meters those calls.
 //!
@@ -101,7 +101,6 @@ pub struct SessionCrypto {
     seals: Arc<AtomicU64>,
 }
 
-pub(crate) use super::weak_key::warn_if_constant_key;
 pub use super::weak_key::{WeakKeyError, is_constant_key};
 
 /// Error from encrypt/decrypt operations.
@@ -114,10 +113,24 @@ impl SessionCrypto {
     /// [`SystemRng`] for nonce generation; tests under DST should use
     /// [`SessionCrypto::with_rng`] to inject a deterministic RNG.
     ///
-    /// A key that is a single repeated byte (all zeros, a test placeholder)
-    /// is logged at `error`; use [`try_new`](Self::try_new) to refuse it.
+    /// # Panics
+    ///
+    /// On a key that is a single repeated byte (all zeros, a test
+    /// placeholder). Use [`try_new`](Self::try_new) to handle the refusal.
+    #[track_caller]
     pub fn new(key: [u8; 32]) -> Self {
-        warn_if_constant_key("session encryption key", &key);
+        super::weak_key::refuse_constant_key("session encryption key", &key);
+        Self::new_unchecked_inner(key)
+    }
+
+    /// [`new`](Self::new) without the constant-key check, for tests that use a
+    /// placeholder key.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_unchecked(key: [u8; 32]) -> Self {
+        Self::new_unchecked_inner(key)
+    }
+
+    fn new_unchecked_inner(key: [u8; 32]) -> Self {
         Self {
             current: Arc::new(EncryptionKey(key)),
             previous: None,
@@ -137,7 +150,7 @@ impl SessionCrypto {
         if is_constant_key(&key) {
             return Err(WeakKeyError);
         }
-        Ok(Self::new(key))
+        Ok(Self::new_unchecked_inner(key))
     }
 
     /// Choose whether blobs written before row binding are read. See
@@ -192,18 +205,22 @@ impl SessionCrypto {
 
     /// Enable key rotation: on decrypt, try the current key first, then this
     /// previous key as a fallback.
+    ///
+    /// # Panics
+    ///
+    /// On a previous key that is a single repeated byte, or that equals the
+    /// current key (a rotation that takes the old key out of use never
+    /// happens).
+    #[track_caller]
     pub fn with_previous_key(mut self, key: [u8; 32]) -> Self {
-        warn_if_constant_key("previous session encryption key", &key);
-        if bool::from(subtle::ConstantTimeEq::ct_eq(
-            key.as_slice(),
-            self.current.0.as_slice(),
-        )) {
-            tracing::error!(
-                target: "axess::session::crypto",
-                "previous session encryption key equals the current key; \
-                 the rotation protects nothing"
-            );
-        }
+        super::weak_key::refuse_constant_key("previous session encryption key", &key);
+        assert!(
+            !bool::from(subtle::ConstantTimeEq::ct_eq(
+                key.as_slice(),
+                self.current.0.as_slice(),
+            )),
+            "previous session encryption key equals the current key; the rotation protects nothing"
+        );
         self.previous = Some(Arc::new(EncryptionKey(key)));
         self
     }
@@ -212,7 +229,7 @@ impl SessionCrypto {
     /// sealed this way is not bound to its row.
     #[cfg(test)]
     pub(crate) fn encrypt_unbound(&self, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        self.encrypt_with_aad(&[], plaintext)
+        self.seal_direct(&[], plaintext)
     }
 
     /// Encrypt plaintext with AES-256-GCM, authenticating `aad` alongside it.
@@ -233,7 +250,20 @@ impl SessionCrypto {
     /// per-record subkey (see the module documentation). The `aes-gcm` crate
     /// performs constant-time authentication tag comparison internally during
     /// decryption.
+    ///
+    /// An empty `aad` is refused: a blob sealed with none opens as a
+    /// pre-binding row of any id wherever legacy blobs are read.
     pub fn encrypt_with_aad(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        if aad.is_empty() {
+            return Err(CryptoError);
+        }
+        self.seal_direct(aad, plaintext)
+    }
+
+    /// The seal behind [`encrypt_with_aad`](Self::encrypt_with_aad), which
+    /// accepts any `aad` including the empty one, for fixtures that write
+    /// pre-binding blobs.
+    pub(crate) fn seal_direct(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         self.seals.fetch_add(1, Ordering::Relaxed);
         let cipher = Aes256Gcm::new_from_slice(&self.current.0).map_err(|_| CryptoError)?;
 
@@ -591,7 +621,10 @@ impl SessionCrypto {
     /// flagged `stale` and `legacy`. A blob with none of these markers is a
     /// pre-binding blob, tried under the empty AAD and flagged the same way.
     ///
-    /// Both of the last two kinds are refused unless the crypto's
+    /// The earlier layout of the current format (the key used directly) counts
+    /// as a legacy blob too.
+    ///
+    /// All three kinds are refused unless the crypto's
     /// [`LegacyBlobs`] policy reads them. Under a policy that reads them, a
     /// blob whose first four bytes happen to equal a marker (of either layout
     /// of the current format) but which does not open under that format (a
@@ -618,10 +651,20 @@ impl SessionCrypto {
             }
         } else if let Some(body) = data.strip_prefix(&format.magic[..]) {
             // The earlier layout of the current format: the key used
-            // directly. Readable, and stale so that it is re-sealed under a
-            // subkey. A failure here is final unless legacy blobs are still
-            // read, because a legacy blob's random nonce can begin with this
+            // directly. It is a legacy blob like the earlier formats, read
+            // only while legacy blobs are, and stale so that it is re-sealed
+            // under a subkey. The public `encrypt_with_aad` seals under the
+            // same key, so output an application made with an AAD it did not
+            // fully control must not open as a row under the default policy.
+            // A failure here is final unless legacy blobs are still read,
+            // because a legacy blob's random nonce can begin with this
             // marker (about one in 2^32), and then it is tried as one below.
+            if !legacy_readable {
+                tracing::warn!(
+                    "refusing a blob in the earlier direct layout (legacy blobs are not read)"
+                );
+                return Err(CryptoError);
+            }
             match self.decrypt_with_aad_reporting(&format.aad(row_id), body) {
                 Ok((plaintext, _used_previous)) => {
                     return Ok(Opened {
@@ -684,22 +727,33 @@ mod tests {
         assert!(is_constant_key(&[9u8; 32]) && !is_constant_key(&mixed_key()));
     }
 
-    #[cfg(feature = "testing")]
     #[test]
-    fn a_constant_or_repeated_key_is_logged_at_error() {
-        let capture = crate::testing::mock_tracing::TracingCapture::install();
-        let _ = SessionCrypto::new(mixed_key());
-        assert!(capture.events().is_empty(), "a mixed key is not reported");
+    #[should_panic(expected = "session encryption key is a single repeated byte")]
+    fn new_refuses_a_constant_key() {
         let _ = SessionCrypto::new([0u8; 32]);
-        assert!(capture.contains_at_level(tracing::Level::ERROR, "single repeated byte"));
-        let capture = crate::testing::mock_tracing::TracingCapture::install();
+    }
+
+    #[test]
+    #[should_panic(expected = "previous session encryption key is a single repeated byte")]
+    fn with_previous_key_refuses_a_constant_key() {
+        let _ = SessionCrypto::new(mixed_key()).with_previous_key([0u8; 32]);
+    }
+
+    #[test]
+    #[should_panic(expected = "equals the current key")]
+    fn with_previous_key_refuses_the_current_key() {
         let _ = SessionCrypto::new(mixed_key()).with_previous_key(mixed_key());
-        assert!(capture.contains_at_level(tracing::Level::ERROR, "equals the current key"));
+    }
+
+    #[test]
+    fn new_unchecked_accepts_a_constant_key_and_new_a_mixed_one() {
+        let _ = SessionCrypto::new_unchecked([0u8; 32]);
+        let _ = SessionCrypto::new(mixed_key());
     }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let crypto = SessionCrypto::new([42u8; 32]);
+        let crypto = SessionCrypto::new(crate::testing::test_key(42));
         let plaintext = b"hello session data";
         let encrypted = crypto.encrypt_unbound(plaintext).unwrap();
         let decrypted = crypto.decrypt_unbound(&encrypted).unwrap();
@@ -708,16 +762,16 @@ mod tests {
 
     #[test]
     fn decrypt_wrong_key_fails() {
-        let crypto1 = SessionCrypto::new([1u8; 32]);
-        let crypto2 = SessionCrypto::new([2u8; 32]);
+        let crypto1 = SessionCrypto::new(crate::testing::test_key(1));
+        let crypto2 = SessionCrypto::new(crate::testing::test_key(2));
         let encrypted = crypto1.encrypt_unbound(b"secret").unwrap();
         assert!(crypto2.decrypt_unbound(&encrypted).is_err());
     }
 
     #[test]
     fn key_rotation_decrypt_with_previous() {
-        let old_key = [1u8; 32];
-        let new_key = [2u8; 32];
+        let old_key = crate::testing::test_key(1);
+        let new_key = crate::testing::test_key(2);
 
         let old_crypto = SessionCrypto::new(old_key);
         let encrypted = old_crypto.encrypt_unbound(b"rotated data").unwrap();
@@ -730,7 +784,7 @@ mod tests {
 
     #[test]
     fn short_data_fails() {
-        let crypto = SessionCrypto::new([42u8; 32]);
+        let crypto = SessionCrypto::new(crate::testing::test_key(42));
         assert!(crypto.decrypt_unbound(&[0u8; 5]).is_err());
     }
 
@@ -740,8 +794,8 @@ mod tests {
     /// everything under the old key on the next write.
     #[test]
     fn key_rotation_current_key_wins_when_valid() {
-        let current = [9u8; 32];
-        let prev = [1u8; 32];
+        let current = crate::testing::test_key(9);
+        let prev = crate::testing::test_key(1);
         let crypto = SessionCrypto::new(current).with_previous_key(prev);
         let encrypted = crypto.encrypt_unbound(b"current-key data").unwrap();
         let decrypted = crypto.decrypt_unbound(&encrypted).unwrap();
@@ -755,7 +809,7 @@ mod tests {
     /// `delete` mutants.
     #[test]
     fn decrypt_payload_at_nonce_length_boundary_fails() {
-        let crypto = SessionCrypto::new([7u8; 32]);
+        let crypto = SessionCrypto::new(crate::testing::test_key(7));
         assert!(crypto.decrypt_unbound(&[0u8; NONCE_LEN]).is_err());
     }
 
@@ -763,8 +817,8 @@ mod tests {
     /// not overwrite `current`. Pins the assignment direction.
     #[test]
     fn with_previous_key_does_not_replace_current_key() {
-        let current = [3u8; 32];
-        let prev = [4u8; 32];
+        let current = crate::testing::test_key(3);
+        let prev = crate::testing::test_key(4);
         // Configure with prev, then encrypt; encryption uses CURRENT.
         let crypto = SessionCrypto::new(current).with_previous_key(prev);
         let encrypted = crypto.encrypt_unbound(b"under-current").unwrap();

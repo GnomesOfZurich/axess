@@ -74,8 +74,9 @@ user with the same username in a different tenant is not
 returned. A `verify_factor` call works against the session's
 tenant id; a factor configuration registered in a different
 tenant is not consulted. A `find_sessions_for_user` call takes
-both user id and tenant id; sessions in other tenants are not
-returned.
+a user id and a limit, not a tenant id: it lists the sessions of that one
+user (the memory store does; the SQL and Valkey stores return an
+`Unsupported` error).
 
 The structural defence is what lets a multi-tenant deployment
 make the strongest possible authorisation claim: not only does
@@ -213,6 +214,8 @@ pub struct LockoutPolicy {
     pub duration: Option<Duration>,    // default 15 min; None = indefinite
     pub attempt_window: Duration,      // default 1 hour
     pub on_counter_unavailable: CounterUnavailable,   // default Lock
+    pub throttle: Option<Throttle>,    // default 1 s doubling to 64 s,
+                                       // keyed on account and address
 }
 ```
 
@@ -223,13 +226,23 @@ an administrator has to clear it. `attempt_window` is how far back
 failures count, so five failures spread over two hours do not lock an
 account whose window is one hour.
 
-The scoping is per user only. Per-tenant and per-IP lockout
+The lock's scoping is per user only. Per-tenant and per-IP lockout
 scales do not exist on this type, and adding one would be the wrong place for it: a
 per-IP threshold that locks *accounts* is a denial-of-service tool in
 an attacker's hands. Rate-limit by IP instead, at the middleware layer,
 where the response is a 429 rather than a locked account
 (*Rate limiting* covers `KeyExtractor::LoginIdentifier`, which is the
 per-account half of that defence).
+
+`throttle` is the one place the client address enters this type, and it
+locks nothing: consecutive wrong guesses under a key of account and
+address earn a delay that doubles per failure (one second to sixty-four
+by default) and is answered as `FactorOutcome::Throttled { retry_after }`,
+a refusal with the time left, never a sleep. A right guess clears it, a
+known device is exempt from it as from the lock, and `max_attempts` still
+caps the whole. `ThrottleKey::Account` drops the address from the key;
+`LockoutPolicy::without_throttle()` turns it off. *Factors* has the
+schedule and the pipeline order.
 
 `on_counter_unavailable` decides what happens when the counter store
 itself is down. That case is not hypothetical: `record_failed_attempt`

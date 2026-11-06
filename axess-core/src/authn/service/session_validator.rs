@@ -17,6 +17,18 @@ use std::sync::Arc;
 )]
 pub struct NoSessionRegistryError;
 
+/// Why [`AuthnService::active_sessions`](super::AuthnService::active_sessions)
+/// could not list a user's sessions.
+#[derive(Debug, thiserror::Error)]
+pub enum ActiveSessionsError {
+    /// No session registry is configured.
+    #[error(transparent)]
+    NoRegistry(#[from] NoSessionRegistryError),
+    /// The registry could not answer.
+    #[error("session registry could not list the user's sessions: {0}")]
+    Registry(crate::session::store::RevocationError),
+}
+
 /// Cloneable, non-generic handle used by [`require_valid_session`] to check
 /// authentication state and (when wired) tenant identity against the registry.
 #[derive(Clone)]

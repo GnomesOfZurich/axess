@@ -9,7 +9,7 @@
 //! `#[ignore]` test below.
 
 use super::internal::{
-    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, registry_key,
+    CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES, ValkeyStoreError, log_session_id, registry_key,
     revocation_session_channel, revocation_user_channel, script_unavailable, session_key,
 };
 use super::registry::ValkeySessionRegistry;
@@ -42,7 +42,7 @@ fn test_id() -> SessionId {
 /// round-trip back to the same `SessionData`.
 #[test]
 fn store_encode_decode_encrypted() {
-    let key = [99u8; 32];
+    let key = crate::testing::test_key(99);
     let codec = SessionCodec::encrypted(SessionCrypto::new(key));
     let data = SessionData::default();
     let bytes = codec.encode_bytes(&test_id(), &data).expect("encode_bytes");
@@ -62,7 +62,7 @@ fn encode_rejects_oversized_payload() {
     let client = Client::new(config, None, None, None);
 
     // Create a store with a limit smaller than any possible serialized SessionData.
-    let store = ValkeySessionStore::plaintext(client).with_max_payload(1);
+    let store = ValkeySessionStore::plaintext_insecure(client).with_max_payload(1);
 
     let data = SessionData::default();
     let result = store.encode(&test_id(), &data);
@@ -80,7 +80,7 @@ fn encode_accepts_payload_within_limit() {
     let client = Client::new(config, None, None, None);
 
     // Default limit (64 KiB): default SessionData is tiny.
-    let store = ValkeySessionStore::plaintext(client);
+    let store = ValkeySessionStore::plaintext_insecure(client);
     let data = SessionData::default();
     assert!(store.encode(&test_id(), &data).is_ok());
 }
@@ -160,7 +160,7 @@ fn default_max_payload_bytes_is_64_kib() {
 /// would accept any size).
 #[test]
 fn encode_size_boundary_is_strict_greater_than() {
-    let store = ValkeySessionStore::plaintext(dummy_client());
+    let store = ValkeySessionStore::plaintext_insecure(dummy_client());
     let data = SessionData::default();
 
     // Find the natural encoded size by measuring with a huge cap.
@@ -204,7 +204,7 @@ fn encode_size_boundary_is_strict_greater_than() {
 /// `SessionData` with one custom byte).
 #[test]
 fn store_encode_decode_roundtrip_pins_bodies() {
-    let store = ValkeySessionStore::plaintext(dummy_client());
+    let store = ValkeySessionStore::plaintext_insecure(dummy_client());
 
     // `SessionData::default()` has `custom: Value::Null`. The
     // `decode -> Ok(Default::default())` mutation is observable
@@ -274,7 +274,7 @@ fn from_impls_preserve_source_variant() {
 /// and are caught.
 #[tokio::test]
 async fn load_propagates_error_against_unreachable_valkey() {
-    let store = ValkeySessionStore::plaintext(unreachable_client());
+    let store = ValkeySessionStore::plaintext_insecure(unreachable_client());
     let rng = SystemRng;
     let id = SessionId::new(&rng);
     let result = tokio::time::timeout(Duration::from_secs(3), store.load(&id)).await;
@@ -286,7 +286,7 @@ async fn load_propagates_error_against_unreachable_valkey() {
 
 #[tokio::test]
 async fn save_propagates_error_against_unreachable_valkey() {
-    let store = ValkeySessionStore::plaintext(unreachable_client());
+    let store = ValkeySessionStore::plaintext_insecure(unreachable_client());
     let rng = SystemRng;
     let id = SessionId::new(&rng);
     let result = tokio::time::timeout(
@@ -302,7 +302,7 @@ async fn save_propagates_error_against_unreachable_valkey() {
 
 #[tokio::test]
 async fn delete_propagates_error_against_unreachable_valkey() {
-    let store = ValkeySessionStore::plaintext(unreachable_client());
+    let store = ValkeySessionStore::plaintext_insecure(unreachable_client());
     let rng = SystemRng;
     let id = SessionId::new(&rng);
     let result = tokio::time::timeout(Duration::from_secs(3), store.delete(&id)).await;
@@ -314,7 +314,7 @@ async fn delete_propagates_error_against_unreachable_valkey() {
 
 #[tokio::test]
 async fn cycle_propagates_error_against_unreachable_valkey() {
-    let store = ValkeySessionStore::plaintext(unreachable_client());
+    let store = ValkeySessionStore::plaintext_insecure(unreachable_client());
     let rng = SystemRng;
     let old = SessionId::new(&rng);
     let new = SessionId::new(&rng);
@@ -431,7 +431,7 @@ async fn active_sessions_propagates_error_against_unreachable_valkey() {
 /// the method makes that an intentional contract.
 #[tokio::test]
 async fn prune_expired_returns_zero_per_native_expiry_contract() {
-    let store = ValkeySessionStore::plaintext(dummy_client());
+    let store = ValkeySessionStore::plaintext_insecure(dummy_client());
     let count = store.prune_expired().await.expect("Ok per contract");
     assert_eq!(
         count, 0,
@@ -460,7 +460,7 @@ async fn valkey_integration() {
     let client = Client::new(config, None, None, None);
     client.init().await.expect("connect to Valkey");
 
-    let encryption_key = [77u8; 32];
+    let encryption_key = crate::testing::test_key(77);
     let store =
         ValkeySessionStore::encrypted(client.clone(), encryption_key).with_prefix("axess_test");
     let registry =
@@ -533,8 +533,8 @@ async fn valkey_integration() {
     assert!(!registry.is_valid(user_id, &sid_b).await.expect("b"));
 
     // Key rotation: save with old key, load with new key + old as fallback.
-    let old_key = [77u8; 32];
-    let new_key = [88u8; 32];
+    let old_key = crate::testing::test_key(77);
+    let new_key = crate::testing::test_key(88);
     let old_store =
         ValkeySessionStore::encrypted(client.clone(), old_key).with_prefix("axess_test");
     let rotation_store =
@@ -618,7 +618,7 @@ async fn valkey_session_cycle_is_atomic() {
         None,
     );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::plaintext(client).with_prefix("axt_cycle");
+    let store = ValkeySessionStore::plaintext_insecure(client.clone()).with_prefix("axt_cycle");
     let rng = SystemRng;
     let (old, new) = (SessionId::new(&rng), SessionId::new(&rng));
     let data = SessionData::default();
@@ -627,10 +627,39 @@ async fn valkey_session_cycle_is_atomic() {
         .await
         .unwrap();
 
-    // An out-of-range expiry makes the SET inside the script fail.
-    let failed = store
-        .cycle(&old, &new, &data, Duration::from_secs(u64::MAX / 2), true)
+    // A client that may not SET makes the SET inside the script fail.
+    let acl =
+        || fred::types::CustomCommand::new_static("ACL", fred::types::ClusterHash::FirstKey, false);
+    let _: String = client
+        .custom(
+            acl(),
+            vec![
+                "SETUSER",
+                "axt_noset",
+                "on",
+                ">pw",
+                "~*",
+                "&*",
+                "+@all",
+                "-set",
+            ],
+        )
+        .await
+        .expect("ACL SETUSER");
+    let url = live_client_url().replacen("redis://", "redis://axt_noset:pw@", 1);
+    let restricted = Client::new(Config::from_url(&url).unwrap(), None, None, None);
+    restricted
+        .init()
+        .await
+        .expect("connect as the restricted user");
+    let failed = ValkeySessionStore::plaintext_insecure(restricted)
+        .with_prefix("axt_cycle")
+        .cycle(&old, &new, &data, Duration::from_secs(60), true)
         .await;
+    let _: i64 = client
+        .custom(acl(), vec!["DELUSER", "axt_noset"])
+        .await
+        .unwrap();
     assert!(failed.is_err());
     assert!(
         store.load(&old).await.unwrap().is_some(),
@@ -674,7 +703,7 @@ async fn valkey_store_never_revives_an_ended_session() {
         None,
     );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::plaintext(client).with_prefix("axt_revival");
+    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix("axt_revival");
     crate::session::store::revival_tests::run_all(&store).await;
 }
 
@@ -689,7 +718,8 @@ async fn valkey_encrypted_store_never_revives_an_ended_session() {
         None,
     );
     client.init().await.expect("connect");
-    let store = ValkeySessionStore::new(client, [11u8; 32]).with_prefix("axt_revival_enc");
+    let store = ValkeySessionStore::new(client, crate::testing::test_key(11))
+        .with_prefix("axt_revival_enc");
     crate::session::store::revival_tests::run_all(&store).await;
 }
 
@@ -707,7 +737,7 @@ async fn valkey_load_reads_an_unbound_blob_without_resealing_it_and_reject_refus
         None,
     );
     client.init().await.expect("connect");
-    let key = [13u8; 32];
+    let key = crate::testing::test_key(13);
     let store = ValkeySessionStore::new(client.clone(), key)
         .with_prefix("axt_reseal")
         .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept);
@@ -760,10 +790,10 @@ async fn valkey_update_if_revision_keeps_the_contract() {
     let config = Config::from_url(&live_client_url()).expect("parse redis URL");
     let client = Client::new(config, None, None, None);
     client.init().await.expect("connect to Valkey");
-    let encrypted =
-        ValkeySessionStore::encrypted(client.clone(), [5u8; 32]).with_prefix("axess_cas");
+    let encrypted = ValkeySessionStore::encrypted(client.clone(), crate::testing::test_key(5))
+        .with_prefix("axess_cas");
     crate::testing::store_contract::assert_update_if_revision_contract(&encrypted).await;
-    let plain = ValkeySessionStore::plaintext(client).with_prefix("axess_cas_plain");
+    let plain = ValkeySessionStore::plaintext_insecure(client).with_prefix("axess_cas_plain");
     crate::testing::store_contract::assert_update_if_revision_contract(&plain).await;
 }
 
@@ -783,7 +813,7 @@ async fn valkey_zero_ttl_writes_store_nothing() {
     );
     client.init().await.expect("connect");
     let prefix = format!("axt_zero_{}", SessionId::new(&SystemRng));
-    let store = ValkeySessionStore::plaintext(client.clone()).with_prefix(prefix.clone());
+    let store = ValkeySessionStore::plaintext_insecure(client.clone()).with_prefix(prefix.clone());
     let exists = |id: SessionId| {
         let client = client.clone();
         let prefix = prefix.clone();
@@ -839,4 +869,33 @@ async fn valkey_zero_ttl_writes_store_nothing() {
             "cycle: no key is left behind"
         );
     }
+}
+
+/// A store lifetime beyond the server's expiry range still saves: the key's
+/// expiry is capped instead of being rejected as an invalid expire time.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_save_with_an_enormous_ttl_still_stores() {
+    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let client = Client::new(Config::from_url(&url).unwrap(), None, None, None);
+    client.init().await.expect("connect");
+    let store = ValkeySessionStore::plaintext_insecure(client).with_prefix(format!(
+        "axt_hugettl_{}",
+        crate::authn::ids::UserId::new(&axess_rng::SystemRng)
+    ));
+    let id = test_id();
+    store
+        .save(&id, &SessionData::default(), Duration::MAX)
+        .await
+        .unwrap();
+    assert!(store.load(&id).await.unwrap().is_some());
+}
+
+/// A debug log line names a session by a short prefix, never the whole id.
+#[test]
+fn a_logged_session_id_is_a_truncated_prefix() {
+    let id = test_id();
+    let logged = log_session_id(&id);
+    assert_eq!(logged, "00000000...");
+    assert!(!logged.contains(&id.to_string()));
 }

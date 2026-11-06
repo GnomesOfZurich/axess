@@ -119,11 +119,7 @@ async fn suspend_invalidates_registry_sessions() {
         .suspend_user_across_tenants(
             Actor::System,
             &uid("u1"),
-            StatusDetail {
-                reason: "admin action".into(),
-                since: Utc::now(),
-                until: None,
-            },
+            StatusDetail::administrative("admin action", Utc::now()),
         )
         .await
         .unwrap();
@@ -166,14 +162,14 @@ async fn refresh_token_reuse_after_rotation_rejected() {
     .unwrap();
 
     // First refresh: should succeed and rotate.
-    let (_, new_token) = Refresh::new(&plaintext, |_| async { true })
+    let (_, new_token) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now)
         .await
         .unwrap();
     assert!(new_token.is_some(), "rotation should issue a new token");
 
     // Reuse the OLD plaintext: should be rejected (revoked by rotation).
-    let err = Refresh::new(&plaintext, |_| async { true })
+    let err = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now)
         .await
         .unwrap_err();

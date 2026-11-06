@@ -57,6 +57,9 @@ fn a_private_key_file_is_never_overwritten_and_is_owner_only() {
 
 // ── Key lifecycle guards ────────────────────────────────────────────────
 
+const ADMIN_TOKEN: &str = "admin-token-0123456789";
+const CI_TOKEN: &str = "ci-issue-token-0123456789";
+
 async fn state_in(dir: &Path) -> AppState {
     state_in_with_clock(dir, Arc::new(SystemClock)).await
 }
@@ -72,7 +75,13 @@ async fn state_in_with_clock(dir: &Path, clock: Arc<dyn Clock>) -> AppState {
         idp,
         store,
         clock,
-        admin_token: "unused-in-these-tests".into(),
+        admin_token: ADMIN_TOKEN.into(),
+        callers: Arc::new(vec![IssueCaller {
+            name: "ci".into(),
+            token: CI_TOKEN.into(),
+            subjects: vec!["worker-1".into()],
+            audiences: vec!["https://api".into()],
+        }]),
     }
 }
 
@@ -227,4 +236,138 @@ async fn a_historical_key_with_no_record_is_stamped_and_then_retires() {
     clock.advance_secs(MAX_TTL_SECS + 1);
     assert_eq!(retire(&state, "v1").await, Ok(StatusCode::NO_CONTENT));
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The store itself refuses to retire a key whose tokens may be live, so a
+/// rotation that lands between a caller's check and the retire cannot get the
+/// key retired at once.
+#[tokio::test]
+async fn the_store_refuses_to_retire_a_just_rotated_key() {
+    let dir = scratch_dir("store-retire");
+    let state = state_in(&dir).await;
+    rotate(&state, "v2").await.unwrap();
+
+    let early = LocalIdpKeyStore::retire(&state.store, "v1").await;
+    assert!(
+        matches!(early, Err(FileKeyStoreError::RetireBlocked { .. })),
+        "retired straight away: {early:?}"
+    );
+    assert!(state.store.key_path("v1").exists());
+
+    age_rotation(&state.store, "v1");
+    assert!(matches!(
+        LocalIdpKeyStore::retire(&state.store, "v1").await,
+        Ok(true)
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A generated secret goes to a file only its owner can read, and replaces
+/// what an earlier run left there, with looser permissions or not.
+#[test]
+fn a_secret_file_is_owner_only_and_replaces_the_old_one() {
+    let dir = scratch_dir("secret-file");
+    let path = dir.join("admin-token");
+    std::fs::write(&path, "old-and-world-readable-token").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    write_secret_file(&path, "new-secret").unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-secret");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert_eq!(generate_token().len(), 48);
+    assert_ne!(generate_token(), generate_token());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+async fn post_json(
+    state: &AppState,
+    uri: &str,
+    bearer: &str,
+    body: serde_json::Value,
+) -> StatusCode {
+    use tower::ServiceExt;
+    let request = axum::http::Request::post(uri)
+        .header("authorization", format!("Bearer {bearer}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    guarded_routes(state.clone())
+        .oneshot(request)
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The issue token opens `/issue` and nothing under `/admin`; the admin token
+/// opens `/admin` and not `/issue`.
+#[tokio::test]
+async fn an_issue_token_cannot_administer_and_the_admin_token_cannot_issue() {
+    let dir = scratch_dir("two-tokens");
+    let state = state_in(&dir).await;
+    let mint = serde_json::json!({"subject": "worker-1", "audience": "https://api"});
+    let rotate = serde_json::json!({"new_kid": "v2"});
+    let retire = serde_json::json!({"kid": "v1"});
+
+    assert_eq!(
+        post_json(&state, "/issue", CI_TOKEN, mint.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_json(&state, "/issue", ADMIN_TOKEN, mint).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_json(&state, "/admin/rotate", CI_TOKEN, rotate.clone()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_json(&state, "/admin/retire", CI_TOKEN, retire).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_json(&state, "/admin/rotate", ADMIN_TOKEN, rotate).await,
+        StatusCode::OK
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An issue token mints only for the subjects and audiences of its caller.
+#[tokio::test]
+async fn an_issue_token_mints_only_what_its_caller_may_request() {
+    let dir = scratch_dir("scoped-issue");
+    let state = state_in(&dir).await;
+    for (subject, audience) in [
+        ("admin-service", "https://api"),
+        ("worker-1", "https://payments"),
+        ("admin-service", "https://payments"),
+    ] {
+        let body = serde_json::json!({"subject": subject, "audience": audience});
+        assert_eq!(
+            post_json(&state, "/issue", CI_TOKEN, body).await,
+            StatusCode::FORBIDDEN,
+            "{subject} at {audience}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn callers_are_checked_when_they_are_read() {
+    let one = |token: &str| {
+        format!(r#"[{{"name":"a","token":"{token}","subjects":["s"],"audiences":["x"]}}]"#)
+    };
+    assert!(parse_callers(&one("0123456789abcdef"), ADMIN_TOKEN).is_ok());
+    assert!(parse_callers(&one("short"), ADMIN_TOKEN).is_err());
+    assert!(parse_callers(&one(ADMIN_TOKEN), ADMIN_TOKEN).is_err());
+    let twice = r#"[{"name":"a","token":"0123456789abcdef","subjects":[],"audiences":[]},
+                    {"name":"b","token":"0123456789abcdef","subjects":[],"audiences":[]}]"#;
+    assert!(parse_callers(twice, ADMIN_TOKEN).is_err());
 }

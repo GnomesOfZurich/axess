@@ -274,3 +274,105 @@ async fn the_get_user_outage_is_unavailable_and_can_be_disarmed() {
     store.disarm_get_user_failure();
     assert!(store.get_user(&user.id).await.unwrap().is_some());
 }
+
+mod throttle {
+    //! The throttle entry is read and recorded under a key of tenant, user
+    //! and address; the record is atomic, so parallel failures all count.
+
+    use super::*;
+    use crate::authn::store::IdentityAuthnLog;
+    use crate::authn::types::{Throttle, ThrottleSubject};
+    use axess_clock::Clock as _;
+    use axess_clock::testing::MockClock;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn subject(last: u8) -> ThrottleSubject {
+        Throttle::default().subject(
+            &axess_identity::testing::tenant("t"),
+            &axess_identity::testing::user("u"),
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))),
+        )
+    }
+
+    fn store() -> (MockIdentityStore, MockClock) {
+        let clock = MockClock::at(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap());
+        (MockIdentityStore::new().with_clock(clock.clone()), clock)
+    }
+
+    #[tokio::test]
+    async fn parallel_failures_are_all_counted() {
+        let (store, _clock) = store();
+        let throttle = Throttle::default();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            let store = store.clone();
+            set.spawn(async move {
+                store
+                    .record_throttle_failure(&subject(1), &throttle)
+                    .await
+                    .unwrap()
+            });
+        }
+        while let Some(done) = set.join_next().await {
+            done.unwrap();
+        }
+        let state = store.throttle_state(&subject(1)).await.unwrap().unwrap();
+        assert_eq!(state.failures, 12);
+    }
+
+    #[tokio::test]
+    async fn a_right_guess_clears_the_key_and_another_key_is_untouched() {
+        let (store, _clock) = store();
+        let throttle = Throttle::default();
+        store
+            .record_throttle_failure(&subject(1), &throttle)
+            .await
+            .unwrap();
+        store
+            .record_throttle_failure(&subject(2), &throttle)
+            .await
+            .unwrap();
+        store.clear_throttle(&subject(1)).await.unwrap();
+        assert_eq!(store.throttle_state(&subject(1)).await.unwrap(), None);
+        assert_eq!(
+            store
+                .throttle_state(&subject(2))
+                .await
+                .unwrap()
+                .map(|s| s.failures),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_key_starts_over_at_one_and_is_forgotten_by_the_next_record() {
+        let (store, clock) = store();
+        let throttle = Throttle::default();
+        for _ in 0..3 {
+            store
+                .record_throttle_failure(&subject(1), &throttle)
+                .await
+                .unwrap();
+        }
+        store
+            .record_throttle_failure(&subject(2), &throttle)
+            .await
+            .unwrap();
+        clock.advance(chrono::Duration::seconds(129));
+        store
+            .record_throttle_failure(&subject(1), &throttle)
+            .await
+            .unwrap();
+        let state = store.throttle_state(&subject(1)).await.unwrap().unwrap();
+        assert_eq!(
+            (state.failures, state.last_failure_at),
+            (1, clock.now()),
+            "older than twice max_delay: as good as absent"
+        );
+        assert_eq!(
+            store.throttle_state(&subject(2)).await.unwrap(),
+            None,
+            "a record sweeps every stale key, so the map does not grow without bound"
+        );
+    }
+}

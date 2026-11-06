@@ -22,12 +22,31 @@
 //! the legitimate user out. Always pair `PeerIp` with
 //! [`KeyExtractor::LoginIdentifier`](crate::middleware::ratelimit::KeyExtractor::LoginIdentifier) on `/login`-class routes:
 //!
-//! ```rust,ignore
-//! use axess_core::middleware::ratelimit::{KeyExtractor, RateLimitConfig, RateLimitLayer, RateLimitLoginIdentifier};
+//! A layer runs before the handler it wraps, so the identifier has to be
+//! put on the request by a layer **outside** the limiter, not by the login
+//! handler. `inject_login_identifier` is that step: it buffers the body,
+//! lets the application parse the username out of it, inserts
+//! `RateLimitLoginIdentifier` and hands back a request with the same body.
+//! Layers added later wrap the earlier ones, so the injector goes last:
+//!
+//! ```rust,no_run
+//! // no_run: it binds a listener and serves.
+//! use axess_core::middleware::ratelimit::{
+//!     KeyExtractor, RateLimitConfig, RateLimitLayer, RateLimitLoginIdentifier,
+//!     inject_login_identifier,
+//! };
+//! use axum::{
+//!     body::Body, http::Request, middleware::{from_fn, Next}, response::IntoResponse,
+//!     routing::post,
+//! };
 //! use std::time::Duration;
 //!
-//! // The application parses the login form, then injects the identifier
-//! // into request extensions BEFORE the rate-limit layer runs.
+//! fn username_of_form(body: &[u8]) -> Option<RateLimitLoginIdentifier> {
+//!     let (_, name) = url::form_urlencoded::parse(body).find(|(key, _)| key == "username")?;
+//!     RateLimitLoginIdentifier::new(name)
+//! }
+//!
+//! # async fn login_handler() {}
 //! let per_username = RateLimitLayer::new(
 //!     RateLimitConfig::builder()
 //!         .max_requests(10)
@@ -42,10 +61,18 @@
 //!         .key(KeyExtractor::PeerIp)
 //!         .build(),
 //! );
-//! let login_route = axum::Router::new()
-//!     .route("/login", axum::routing::post(login_handler))
+//! let login_route: axum::Router = axum::Router::new()
+//!     .route("/login", post(login_handler))
 //!     .layer(per_username)
-//!     .layer(per_ip);
+//!     .layer(per_ip)
+//!     // Outermost, so it runs first and the extension is there when
+//!     // `per_username` reads it.
+//!     .layer(from_fn(|request: Request<Body>, next: Next| async move {
+//!         match inject_login_identifier(request, 16 * 1024, username_of_form).await {
+//!             Ok(request) => next.run(request).await,
+//!             Err(status) => status.into_response(),
+//!         }
+//!     }));
 //! ```
 //!
 //! The identifier is normalised before keying (Unicode NFKC, lowercase,
@@ -135,7 +162,7 @@ use tower::{Layer, Service};
 
 mod keys;
 mod store;
-use keys::resolve_target;
+use keys::try_resolve_target;
 use store::{Acquire, BucketStore};
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -160,22 +187,26 @@ pub enum KeyExtractor {
     /// Rate limit by TCP peer address via axum's `ConnectInfo`.
     ///
     /// Requires `Router::into_make_service_with_connect_info::<SocketAddr>()`
-    /// on your axum server. Falls back to a shared bucket (`"unknown"`) if
-    /// `ConnectInfo` is not available; this is fail-closed (all requests
-    /// share one bucket = stricter limiting).
+    /// on your axum server. A request with no peer address is answered 500
+    /// and logged as an error (at most once a second per worker thread);
+    /// [`RateLimitConfigBuilder::allow_shared_bucket`] puts such requests in
+    /// one shared bucket (`"unknown"`) instead.
     PeerIp,
     /// Rate limit by authenticated user (reads the [`RateLimitUserId`]
-    /// request extension the auth layer injects). Falls back to a
-    /// shared anonymous bucket if the extension is absent; unauthenticated
-    /// callers cannot select their own bucket.
+    /// request extension the auth layer injects). A request without the
+    /// extension is answered 500 and logged as an error (the layer that
+    /// inserts it is missing or runs after the limiter);
+    /// [`RateLimitConfigBuilder::allow_shared_bucket`] limits it on its own
+    /// peer address instead.
     UserId,
     /// Rate limit by tenant (reads the [`RateLimitTenantId`] request
-    /// extension the auth layer injects). Falls back to a shared
-    /// anonymous bucket if the extension is absent.
+    /// extension the auth layer injects). Falls back to the request's
+    /// own peer address (and logs a warning) if the extension is absent.
     TenantId,
     /// Rate limit by the **login identifier** (username/email submitted to a
     /// login route). Reads the [`RateLimitLoginIdentifier`] request extension
-    /// that the application sets after parsing the login form.
+    /// that a layer outside the limiter sets after parsing the login form
+    /// ([`inject_login_identifier`]); a handler runs too late to set it.
     ///
     /// # Why it exists
     ///
@@ -188,9 +219,9 @@ pub enum KeyExtractor {
     /// Always pair this with `PeerIp` on login routes; see the module-level
     /// example.
     ///
-    /// Falls back to a shared anonymous-bucket sentinel when no extension is
-    /// present, so a misconfigured route fails closed (one shared bucket)
-    /// rather than evading the limit.
+    /// A request without the extension is answered 500 and logged as an
+    /// error; [`RateLimitConfigBuilder::allow_shared_bucket`] limits it on
+    /// its own peer address instead.
     LoginIdentifier,
     /// Rate limit by a header value, **within an authenticated identity**.
     ///
@@ -232,6 +263,14 @@ pub struct RateLimitConfig {
     /// Randomness for the per-instance key that fingerprints bucket keys in
     /// the debug log. Defaults to [`SystemRng`]; tests inject a seeded RNG.
     pub rng: Arc<dyn SecureRng>,
+    /// When `false` (the default), a request that lacks what the extractor
+    /// reads is answered 500: a [`KeyExtractor::LoginIdentifier`],
+    /// [`KeyExtractor::UserId`] or [`KeyExtractor::TenantId`] limiter without
+    /// its extension, and a [`KeyExtractor::PeerIp`] limiter without a peer
+    /// address. When `true` ([`RateLimitConfigBuilder::allow_shared_bucket`])
+    /// such requests are limited per peer, or share one bucket when there is
+    /// no peer either.
+    pub allow_shared_bucket: bool,
 }
 
 impl std::fmt::Debug for RateLimitConfig {
@@ -253,6 +292,7 @@ pub struct RateLimitConfigBuilder {
     retry_after: bool,
     clock: Arc<dyn Clock>,
     rng: Arc<dyn SecureRng>,
+    allow_shared_bucket: bool,
 }
 
 impl RateLimitConfig {
@@ -265,6 +305,7 @@ impl RateLimitConfig {
             retry_after: true,
             clock: Arc::new(SystemClock),
             rng: Arc::new(SystemRng),
+            allow_shared_bucket: false,
         }
     }
 }
@@ -306,6 +347,17 @@ impl RateLimitConfigBuilder {
         self
     }
 
+    /// Limit a request that lacks what the extractor reads instead of
+    /// answering 500: one without the identity extension is limited per peer
+    /// address, one with no peer address shares a single bucket. The default
+    /// is to answer 500 (and log one error a minute), because a limiter wired
+    /// in the wrong order protects nothing and silently charges everyone to
+    /// one bucket.
+    pub fn allow_shared_bucket(mut self) -> Self {
+        self.allow_shared_bucket = true;
+        self
+    }
+
     /// Consume the builder and produce a [`RateLimitConfig`].
     ///
     /// # Panics
@@ -340,6 +392,7 @@ impl RateLimitConfigBuilder {
             retry_after: self.retry_after,
             clock: self.clock,
             rng: self.rng,
+            allow_shared_bucket: self.allow_shared_bucket,
         }
     }
 }
@@ -364,8 +417,8 @@ pub struct RateLimitTenantId(pub axess_identity::TenantId);
 /// per-target rate limiting on login routes.
 ///
 /// The application is responsible for parsing the login form body and
-/// inserting this extension into the request before the rate-limit layer
-/// runs. The identifier is normalised on construction (Unicode NFKC,
+/// inserting this extension from a layer **outside** the rate-limit layer,
+/// since a handler runs after it ([`inject_login_identifier`] is that step). The identifier is normalised on construction (Unicode NFKC,
 /// lowercase, format characters such as zero-width spaces removed) so case
 /// and look-alike variation can't trivially evade the limit.
 ///
@@ -386,7 +439,7 @@ impl RateLimitLoginIdentifier {
     /// Build a normalised login-identifier key. Trims whitespace, applies
     /// Unicode NFKC, lowercases, drops invisible format characters, and
     /// rejects input that is empty after that by returning `None`; the caller
-    /// should treat that as the anonymous bucket.
+    /// should treat that as a request without an identifier.
     ///
     /// The key is the identifier alone. In a multi-tenant application use
     /// [`new_in_tenant`](Self::new_in_tenant).
@@ -429,6 +482,50 @@ impl RateLimitLoginIdentifier {
     }
 }
 
+/// Put the login identifier on a request for a `LoginIdentifier` limiter that
+/// sits inside the layer calling this.
+///
+/// Buffers the body (at most `body_limit` bytes; a longer one is refused with
+/// `413`), calls `parse` on it, inserts the [`RateLimitLoginIdentifier`] it
+/// returns, and gives the request back with the same body so the handler
+/// still reads it. A body `parse` finds no identifier in gets no extension,
+/// and so lands in the shared anonymous bucket. Call it from the outermost
+/// layer of the route, e.g. a `middleware::from_fn`; see the module docs.
+///
+/// # Errors
+///
+/// `413` for a body over `body_limit`, `400` for one that cannot be read:
+/// answer the request with the status.
+pub async fn inject_login_identifier<F>(
+    request: Request<Body>,
+    body_limit: usize,
+    parse: F,
+) -> Result<Request<Body>, StatusCode>
+where
+    F: FnOnce(&[u8]) -> Option<RateLimitLoginIdentifier>,
+{
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, body_limit).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // `to_bytes` reports an over-long body and a broken one the same
+            // way; the limit is what a client can hit.
+            tracing::debug!(%error, "login body refused while reading the identifier");
+            return Err(if error.to_string().contains("length limit") {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            });
+        }
+    };
+    let identifier = parse(&bytes);
+    let mut request = Request::from_parts(parts, Body::from(bytes));
+    if let Some(identifier) = identifier {
+        request.extensions_mut().insert(identifier);
+    }
+    Ok(request)
+}
+
 /// Whether the builder should emit the "very low max_requests" warning.
 fn should_warn_very_low_max_requests(max_requests: u32) -> bool {
     max_requests < 5
@@ -447,6 +544,7 @@ pub struct RateLimitLayer {
     store: BucketStore,
     key_extractor: KeyExtractor,
     retry_after: bool,
+    allow_shared_bucket: bool,
     /// Key for the debug-log fingerprints: random per layer instance.
     log_key: Arc<Zeroizing<[u8; 32]>>,
     metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
@@ -454,13 +552,29 @@ pub struct RateLimitLayer {
 
 impl RateLimitLayer {
     /// Create a new rate-limit layer from the given configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_requests` is zero or `window` is zero, as
+    /// [`RateLimitConfigBuilder::build`] does. The fields of
+    /// [`RateLimitConfig`] are public, so a struct literal or a later
+    /// assignment can skip the builder's checks; they are made again here.
     pub fn new(config: RateLimitConfig) -> Self {
+        assert!(
+            config.max_requests > 0,
+            "RateLimitConfig: max_requests must be > 0"
+        );
+        assert!(
+            !config.window.is_zero(),
+            "RateLimitConfig: window must be > 0"
+        );
         let mut log_key = Zeroizing::new([0u8; 32]);
         config.rng.fill_bytes(&mut *log_key);
         Self {
             store: BucketStore::new(config.max_requests, config.window, config.clock),
             key_extractor: config.key_extractor,
             retry_after: config.retry_after,
+            allow_shared_bucket: config.allow_shared_bucket,
             log_key: Arc::new(log_key),
             metrics: None,
         }
@@ -488,6 +602,7 @@ impl<S> Layer<S> for RateLimitLayer {
             store: self.store.clone(),
             key_extractor: self.key_extractor.clone(),
             retry_after: self.retry_after,
+            allow_shared_bucket: self.allow_shared_bucket,
             log_key: self.log_key.clone(),
             metrics: self.metrics.clone(),
         }
@@ -501,6 +616,7 @@ pub struct RateLimitService<S> {
     store: BucketStore,
     key_extractor: KeyExtractor,
     retry_after: bool,
+    allow_shared_bucket: bool,
     log_key: Arc<Zeroizing<[u8; 32]>>,
     metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
 }
@@ -521,7 +637,14 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let target = resolve_target(&req, &self.key_extractor);
+        let Ok(target) = try_resolve_target(&req, &self.key_extractor, self.allow_shared_bucket)
+        else {
+            return Box::pin(async move {
+                let mut response = Response::new(ResBody::default());
+                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                Ok(response)
+            });
+        };
         let retry_after_enabled = self.retry_after;
 
         let metrics = self.metrics.clone();

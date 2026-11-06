@@ -41,9 +41,13 @@ async fn the_minted_token_is_the_seeded_rngs_nonce_bound_to_the_session() {
                 .rng(MockRng::new(2)),
         ))
         .layer(
-            SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
-                .with_secure(false)
-                .with_rng(MockRng::new(1)),
+            SessionLayer::new(
+                MemorySessionStore::new(),
+                crate::testing::test_key(42),
+                crate::MemorySessionRegistry::new().handle(),
+            )
+            .with_secure(false)
+            .with_rng(MockRng::new(1)),
         );
 
     let resp = app

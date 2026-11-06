@@ -14,8 +14,9 @@ use crate::authn::types::EntityState;
 /// | `Store` | `500 Internal Server Error` | Backend / database failure; not the client's fault. |
 /// | `NoFlow` | `409 Conflict` | No active authentication flow in the session; client must start one first. |
 /// | `Impersonated` | `403 Forbidden` | An impersonated session asked for a credential change (or another impersonation) the deployment does not allow. |
-/// | `NotActive` | `403 Forbidden` | Account exists but is disabled, suspended, or otherwise ineligible. |
-/// | `Locked` | `423 Locked` | Account locked due to too many failed attempts; retry after cooldown. |
+/// | `NotActive` | `403 Forbidden` | Account exists and its `EntityState` does not admit a login: pending, terminated, archived, or a `Suspended` reached on a path that does not answer `Locked`. An administrative suspension ends only when an operator ends it. |
+/// | `Locked` | `423 Locked` | The failure counter's lockout (ends by itself after the policy's `duration`, or when an operator resets the counter), or a `Suspended` account on the login path. One status for both: a client retries after `Retry-After`; it learns nothing about which it was. |
+/// | `Throttled` | `429 Too Many Requests` | Consecutive wrong guesses under this key have earned a delay that has not run; `Retry-After` carries it. |
 /// | `InvalidAssertion` | `401 Unauthorized` | FIDO2 cryptographic validation failed; credential rejected. |
 /// | `ExternalService` | `502 Bad Gateway` | Upstream provider (LDAP, OAuth IdP) returned an error or timed out. |
 /// | `Internal` | `500 Internal Server Error` | The library failed in a way that is not the client's fault and not a store error (a hashing task panicked or the blocking pool shut down). |
@@ -45,31 +46,50 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
     #[error("refused for an impersonated session")]
     Impersonated,
 
-    /// The account exists but is not in a state that permits login.
+    /// The account exists and its [`EntityState`] does not admit a login.
+    ///
+    /// Carries the state the store answered: `Pending`, `Terminated`,
+    /// `Archived`, `Candidate`, or a `Suspended` on a path that does not
+    /// answer [`Locked`](Self::Locked). A
+    /// `Suspended` whose detail's cause is
+    /// [`Administrative`](crate::authn::types::StatusCause::Administrative)
+    /// is an operator's act and ends only when an operator ends it (or at
+    /// the `until` the operator set); the detail's
+    /// [`cause`](crate::authn::types::StatusDetail::cause) says which, and
+    /// [`EntityState::is_administratively_disabled`] reads it.
     #[error("account not active: {0:?}")]
     NotActive(EntityState),
 
-    /// The account is locked (suspension or accumulated failed attempts).
+    /// The login was refused because the account is locked.
     ///
-    /// Returned by:
-    /// - `prepare_factor` when [`account_status`](crate::authn::IdentityLookup::account_status)
-    ///   reports `Suspended`.
-    /// - FIDO2 `finish_discoverable_login` when the lockout threshold is
-    ///   reached during a discoverable assertion's failure path.
+    /// Two sources answer this one variant, and the variant is an
+    /// error-level union of them, not a statement about [`EntityState`]:
     ///
-    /// `until` is the suspension expiry when known (for `Suspended`
-    /// accounts whose `StatusDetail.until` is set), `None` for
-    /// indefinite locks or for the failed-attempt lockout (which has
-    /// no inherent expiry: an admin must reset). Use
-    /// [`lockout_expiry`](Self::lockout_expiry) for one-call access
-    /// that also handles the legacy
-    /// `NotActive(EntityState::Suspended(_))` case.
+    /// - The failure counter. The library derives its lockout from
+    ///   `failed_attempts` under the tenant's `LockoutPolicy` at every gate
+    ///   before a verifier runs; it is never an `EntityState`. It ends by
+    ///   itself after the policy's `duration`, or when an operator resets
+    ///   the counter (a password reset does too) when `duration` is `None`.
+    ///   `until` is the lockout's end when the policy has one.
+    /// - A `Suspended` account on the login path (`prepare_factor`,
+    ///   `verify_factor`, the passkey and OAuth completions), whatever the
+    ///   detail's cause. An administrative suspension comes from an operator
+    ///   and ends only by an operator; `until` is the detail's `until`.
     ///
-    /// Callers should display a generic "account locked" message
-    /// (rendering `until` if present and non-trivial) rather than
-    /// distinguishing failed-attempt vs admin-suspension reasons;
-    /// that distinction is operator-visible via the audit log,
-    /// never a property of the error response.
+    /// Returned by `prepare_factor` when
+    /// [`account_status`](crate::authn::IdentityLookup::account_status)
+    /// reports `Suspended` or the counter is at the limit, and by the FIDO2
+    /// `finish_discoverable_login` when the lockout threshold is reached on
+    /// a discoverable assertion's failure path.
+    /// [`lockout_expiry`](Self::lockout_expiry) reads `until` from this
+    /// variant and from `NotActive(Suspended(_))` in one call.
+    ///
+    /// A login screen shows one "account locked" message (with `until` when
+    /// present) and does not say which source it was; that distinction is
+    /// for the operator in the audit log. A decision that must tell them
+    /// apart (a self-service recovery admits a locked-out account and never
+    /// a disabled one) does not read this error: it reads the account's
+    /// `EntityState` and asks [`EntityState::can_self_recover`].
     #[error("account locked")]
     Locked {
         /// Wall-clock expiry of the lock, when known.
@@ -127,6 +147,21 @@ pub enum AuthnError<E: std::error::Error + Send + Sync + 'static> {
         retry_after: std::time::Duration,
     },
 
+    /// Consecutive wrong guesses under this key (the account and the client
+    /// address, by the tenant's
+    /// [`LockoutPolicy::throttle`](crate::authn::types::LockoutPolicy::throttle))
+    /// have earned a delay that has not run. Returned by `prepare_factor`;
+    /// `verify_factor` answers the same refusal as
+    /// [`FactorOutcome::Throttled`](crate::authn::service::FactorOutcome::Throttled).
+    /// No credential was checked and nothing was counted. Suggested HTTP
+    /// status `429 Too Many Requests` with `Retry-After` of `retry_after`;
+    /// [`into_response_at`](Self::into_response_at) sends both.
+    #[error("too many attempts")]
+    Throttled {
+        /// How long until a guess under this key runs again.
+        retry_after: std::time::Duration,
+    },
+
     /// The library itself failed: a blocking task (password hashing) panicked
     /// or the blocking pool was shut down. Not the client's fault and not a
     /// store error; suggested HTTP status `500`. The message is for logs and
@@ -164,13 +199,12 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
     /// a locked account, regardless of whether the lock surfaces as
     /// [`AuthnError::Locked`] or as `AuthnError::NotActive(EntityState::Suspended(_))`.
     ///
-    /// Returns `None` for indefinite locks, for failed-attempt
-    /// lockouts (which have no inherent expiry), and for any
-    /// non-lock error variant. Use this from UI code that wants to
-    /// render "try again at X" without distinguishing the two error
-    /// shapes: both a `prepare_factor` Suspended-account rejection
-    /// and a FIDO2 discoverable-login lockout collapse to a single
-    /// `Option<DateTime<Utc>>` lookup.
+    /// Returns `None` for an indefinite suspension, for a failed-attempt
+    /// lockout whose policy has no `duration`, and for any non-lock error
+    /// variant. Use this from UI code that wants to render "try again at X"
+    /// without distinguishing the two error shapes: both a `prepare_factor`
+    /// Suspended-account rejection and a FIDO2 discoverable-login lockout
+    /// collapse to a single `Option<DateTime<Utc>>` lookup.
     ///
     /// Saves callers from deep-pattern-matching
     /// `EntityState::Suspended(StatusDetail { until, .. })` and
@@ -267,6 +301,10 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
                 tracing::warn!("authentication service busy; answering 503");
                 (StatusCode::SERVICE_UNAVAILABLE, "service busy, retry later")
             }
+            AuthnError::Throttled { .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many attempts, retry later",
+            ),
             AuthnError::Internal(_) => {
                 tracing::error!(error = %self, "internal authentication error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -278,10 +316,14 @@ impl<E: std::error::Error + Send + Sync + 'static> AuthnError<E> {
         // `Retry-After`. Conservative: emit only when known + in the
         // future. Past or `None` collapses to a plain `{"error": …}`
         // body for backwards compat with existing clients.
-        // A busy executor's delay is a duration, not an instant; it joins
-        // the lockout expiry as the one `Retry-After` the response carries.
+        // A busy executor's or a throttle's delay is a duration, not an
+        // instant; it joins the lockout expiry as the one `Retry-After` the
+        // response carries, rounded up so a fraction of a second is never
+        // "retry now".
         let busy_secs = match &self {
-            AuthnError::Busy { retry_after } => Some(retry_after.as_secs().max(1)),
+            AuthnError::Busy { retry_after } | AuthnError::Throttled { retry_after } => {
+                Some(retry_after.as_millis().div_ceil(1000).max(1) as u64)
+            }
             _ => None,
         };
         let until_secs = until.and_then(|t| retry_secs_from(t, now)).or(busy_secs);
@@ -382,6 +424,12 @@ mod into_response_tests {
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
             ),
             (
+                AuthnError::Throttled {
+                    retry_after: std::time::Duration::from_secs(2),
+                },
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
                 AuthnError::Internal("hash task panicked".into()),
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             ),
@@ -407,6 +455,38 @@ mod into_response_tests {
                 parsed.get("error").and_then(|v| v.as_str()).is_some(),
                 "{label} body must contain a string `error` field, got {parsed}"
             );
+        }
+    }
+
+    /// `Throttled { retry_after }` answers 429 with the delay as
+    /// `Retry-After`, rounded up so a fraction of a second is never
+    /// `Retry-After: 0`, and no `until_iso`: the delay is a duration, not an
+    /// instant.
+    #[tokio::test]
+    async fn throttled_emits_429_with_the_delay_rounded_up_as_retry_after() {
+        use axum::http::header;
+        for (delay_ms, expected) in [(2_000u64, "2"), (1_400, "2"), (300, "1")] {
+            let err: AuthnError<TestStoreError> = AuthnError::Throttled {
+                retry_after: std::time::Duration::from_millis(delay_ms),
+            };
+            let response = err.into_response_at(fixed_now());
+            assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .expect("Retry-After present")
+                    .to_str()
+                    .unwrap(),
+                expected,
+                "a delay of {delay_ms} ms"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "too many attempts, retry later");
+            assert!(json.get("until_iso").is_none());
         }
     }
 
@@ -485,11 +565,8 @@ mod into_response_tests {
         use axum::http::header;
 
         let until = fixed_now() + chrono::Duration::seconds(60);
-        let detail = StatusDetail {
-            reason: "test suspend".into(),
-            since: fixed_now(),
-            until: Some(until),
-        };
+        let detail =
+            StatusDetail::administrative("test suspend", fixed_now()).with_until(Some(until));
         let err: AuthnError<TestStoreError> = AuthnError::NotActive(EntityState::Suspended(detail));
         let response = err.into_response_at(fixed_now());
 
@@ -645,12 +722,13 @@ mod into_response_tests {
         assert_eq!(locked_indefinite.lockout_expiry(), None);
 
         // NotActive(Suspended(StatusDetail { until: Some(t), .. })) → Some(t)
-        let suspended: AuthnError<TestStoreError> =
-            AuthnError::NotActive(EntityState::Suspended(StatusDetail {
-                reason: std::sync::Arc::from("test-suspended"),
-                since: t - chrono::Duration::seconds(60),
-                until: Some(t),
-            }));
+        let suspended: AuthnError<TestStoreError> = AuthnError::NotActive(EntityState::Suspended(
+            StatusDetail::administrative(
+                std::sync::Arc::from("test-suspended"),
+                t - chrono::Duration::seconds(60),
+            )
+            .with_until(Some(t)),
+        ));
         assert_eq!(
             suspended.lockout_expiry(),
             Some(t),

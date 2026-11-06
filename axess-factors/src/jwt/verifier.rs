@@ -138,6 +138,9 @@ pub struct JwtVerifier<R = NoReplay> {
     /// The caller chose to accept any audience (see
     /// [`allow_any_audience`](JwtVerifier::allow_any_audience)).
     audience_waived: bool,
+    /// The caller chose to accept any issuer (see
+    /// [`allow_any_issuer`](JwtVerifier::allow_any_issuer)).
+    issuer_waived: bool,
     /// Injected clock; drives `exp` / `nbf` validation and replay-store
     /// TTL computation. Defaults to [`SystemClock`]. Set a
     /// `MockClock`-backed `Arc<dyn Clock>` via `with_clock` for DST tests.
@@ -159,6 +162,7 @@ impl JwtVerifier<NoReplay> {
             require_exp: true,
             replay: None,
             audience_waived: false,
+            issuer_waived: false,
             clock: Arc::new(SystemClock),
         }
     }
@@ -218,6 +222,20 @@ impl<R> JwtVerifier<R> {
         self
     }
 
+    /// Record that accepting a token from any issuer is intended.
+    ///
+    /// Without an issuer pin ([`with_issuer`](Self::with_issuer)) a token
+    /// signed by any key in the set would verify whatever `iss` it carries,
+    /// so `verify` refuses a verifier built with none. This call states the
+    /// decision, for a key set that belongs to the application alone. The
+    /// resolvers that turn a JWT into a workload identity still require a
+    /// pinned issuer.
+    #[must_use]
+    pub fn allow_any_issuer(mut self) -> Self {
+        self.issuer_waived = true;
+        self
+    }
+
     /// Whether an `iss` is pinned.
     pub fn has_issuer(&self) -> bool {
         self.expected_issuer.is_some()
@@ -262,6 +280,7 @@ impl<R> JwtVerifier<R> {
             require_exp: self.require_exp,
             replay: Some(store),
             audience_waived: self.audience_waived,
+            issuer_waived: self.issuer_waived,
             clock: self.clock,
         }
     }
@@ -295,12 +314,22 @@ impl<R: JtiReplayStore> JwtVerifier<R> {
                     .to_string(),
             ));
         }
+        if self.expected_issuer.is_none() && !self.issuer_waived {
+            return Err(JwtError::VerificationFailed(
+                "no issuer is pinned: a token signed by any key in the set would verify. \
+                 Call with_issuer, or allow_any_issuer to state that accepting any issuer \
+                 is intended"
+                    .to_string(),
+            ));
+        }
         let config = ValidationConfig {
             issuer: self.expected_issuer.clone(),
             audience: self.expected_audience.clone(),
             leeway_secs: self.clock_skew.as_secs(),
             require_nbf: self.require_nbf,
             require_exp: self.require_exp,
+            allow_any_audience: self.audience_waived,
+            allow_any_issuer: self.issuer_waived,
         };
 
         let raw = {

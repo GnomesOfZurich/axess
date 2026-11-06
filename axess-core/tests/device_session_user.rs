@@ -3,6 +3,7 @@
 
 #![cfg(all(feature = "memory", feature = "device"))]
 
+use axess_core::testing::AuthSessionTestExt;
 use std::sync::Arc;
 
 use axess_clock::SystemClock;
@@ -58,9 +59,12 @@ fn app(store: &MemoryDeviceStore) -> Router {
         .route("/login/{user}", get(login))
         .route("/device", get(device))
         .layer(
-            SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
-                .with_secure(false)
-                .with_device_resolver(resolver),
+            SessionLayer::without_registry_insecure(
+                MemorySessionStore::new(),
+                axess_core::testing::test_key(42),
+            )
+            .with_secure(false)
+            .with_device_resolver(resolver),
         )
 }
 
@@ -96,9 +100,12 @@ async fn an_authenticated_user_does_not_get_another_users_trusted_device() {
     .with_tenant_fn(|_| Some(tenant()))
     .with_user_fn(|_| Some(testing::user("victim")));
     let owner_app = Router::new().route("/device", get(device)).layer(
-        SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
-            .with_secure(false)
-            .with_device_resolver(owner_resolver),
+        SessionLayer::without_registry_insecure(
+            MemorySessionStore::new(),
+            axess_core::testing::test_key(42),
+        )
+        .with_secure(false)
+        .with_device_resolver(owner_resolver),
     );
     let victim_device: String =
         body(owner_app.oneshot(get_req("/device", None)).await.unwrap()).await;

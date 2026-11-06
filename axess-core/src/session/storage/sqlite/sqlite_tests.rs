@@ -23,7 +23,7 @@ async fn memory_pool() -> SqlitePool {
 
 async fn store() -> SqliteSessionStore {
     let pool = memory_pool().await;
-    let store = SqliteSessionStore::plaintext(pool);
+    let store = SqliteSessionStore::plaintext_insecure(pool);
     store.init_schema().await.expect("init_schema");
     store
 }
@@ -357,7 +357,7 @@ async fn prune_expired_trait_surface_matches_inherent() {
 async fn the_sweep_removes_a_row_at_the_second_it_expires() {
     let clock = Arc::new(axess_clock::testing::MockClock::now());
     let pool = memory_pool().await;
-    let store = SqliteSessionStore::plaintext(pool).with_clock(clock.clone());
+    let store = SqliteSessionStore::plaintext_insecure(pool).with_clock(clock.clone());
     store.init_schema().await.expect("init_schema");
     let id = sample_id();
     store
@@ -373,4 +373,70 @@ async fn the_sweep_removes_a_row_at_the_second_it_expires() {
         1,
         "the sweep must remove a row that load already treats as expired"
     );
+}
+
+fn oversized() -> SessionData {
+    SessionData {
+        custom: serde_json::json!({"blob": "x".repeat(100 * 1024)}),
+        ..SessionData::default()
+    }
+}
+
+/// The store refuses a payload over its cap (64 KiB by default) on every
+/// write path, as the Valkey store does, instead of writing session data that
+/// grows without bound.
+#[tokio::test]
+async fn an_oversized_payload_is_refused_on_every_write_path() {
+    let store = store().await;
+    let (id, other) = (sample_id(), sample_id());
+    let ttl = Duration::from_secs(60);
+
+    let saved = store.save(&id, &oversized(), ttl).await;
+    assert!(
+        matches!(
+            saved,
+            Err(SqlStoreError::PayloadTooLarge { max: 65_536, .. })
+        ),
+        "save wrote 100 KiB: {saved:?}"
+    );
+    store.save(&id, &payload_with_custom(), ttl).await.unwrap();
+    let updated = store.update(&id, &oversized(), ttl).await;
+    assert!(updated.is_err(), "update wrote an oversized payload");
+    let cycled = store.cycle(&id, &other, &oversized(), ttl, true).await;
+    assert!(cycled.is_err(), "cycle wrote an oversized payload");
+    assert!(
+        store.load(&id).await.unwrap().is_some(),
+        "the old row is kept"
+    );
+}
+
+/// The cap is configurable and strict: a payload of exactly the cap is kept,
+/// one byte under it is refused.
+#[tokio::test]
+async fn the_payload_cap_is_configurable_and_strict() {
+    let data = payload_with_custom();
+    let size = SessionCodec::plaintext()
+        .encode_bytes(&sample_id(), &data)
+        .unwrap()
+        .len();
+    let ttl = Duration::from_secs(60);
+    let at_cap = store().await.with_max_payload(size);
+    at_cap.save(&sample_id(), &data, ttl).await.unwrap();
+    let under = store().await.with_max_payload(size - 1);
+    assert!(matches!(
+        under.save(&sample_id(), &data, ttl).await,
+        Err(SqlStoreError::PayloadTooLarge { .. })
+    ));
+}
+
+/// A store that cannot list sessions by user says so, instead of answering
+/// that the user has none.
+#[tokio::test]
+async fn listing_sessions_by_user_is_reported_unsupported() {
+    let store = store().await;
+    let user = axess_identity::testing::user("alice");
+    assert!(matches!(
+        store.find_sessions_for_user(&user, 10).await,
+        Err(SqlStoreError::Unsupported("find_sessions_for_user"))
+    ));
 }

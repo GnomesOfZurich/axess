@@ -100,8 +100,8 @@ let app = Router::new()
 #### Session store selection
 
 - [ ] **In-memory stores** (`MemorySessionStore`, `MemoryRefreshTokenStore`) are for testing only. They use non-constant-time lookups and do not persist across restarts.
-- [ ] **SQL stores** (`SqliteSessionStore`, `PostgresSessionStore`, `MysqlSessionStore`) support optional AES-256-GCM encryption at rest via `SqliteSessionStore::new(pool, SessionCrypto::new(key))`; opt out only via the explicit `::plaintext(pool)` constructor (dev/test only).
-- [ ] **Valkey store** supports AES-256-GCM encryption via `ValkeySessionStore::new(client, key)`. Plaintext available via `::plaintext(client)` for dev/test.
+- [ ] **SQL stores** (`SqliteSessionStore`, `PostgresSessionStore`, `MysqlSessionStore`) support optional AES-256-GCM encryption at rest via `SqliteSessionStore::new(pool, SessionCrypto::new(key))`; opt out only via the explicit `::plaintext_insecure(pool)` constructor (dev/test only).
+- [ ] **Valkey store** supports AES-256-GCM encryption via `ValkeySessionStore::new(client, key)`. Plaintext available via `::plaintext_insecure(client)` for dev/test.
 - [ ] All encryption-capable stores support **key rotation** via `SessionCrypto::with_previous_key(old_key)`; sessions encrypted with the previous key are transparently re-encrypted on the next access.
 
 #### Content Security Policy
@@ -120,11 +120,12 @@ let app = Router::new()
 - [ ] **Prefer OIDC whenever the provider supports it.** Reach for `SocialProvider` only for IdPs that explicitly don't (GitHub user login, Twitter/X, Discord, Reddit, Spotify, …).
 - [ ] Understand the weaker security model: identity comes from a userinfo HTTPS GET, not from a signed assertion. A compromised IdP can impersonate any of its users to your service; you accept that blast radius when you adopt the provider.
 - [ ] Keep PKCE on (the default). A handful of providers reject the extra parameter; `SocialProvider::without_pkce` is the opt-out and should be used sparingly.
-- [ ] Verify `csrf_state` echo on the callback before calling `exchange_code`; `SocialProvider::mint_csrf_state` produces a fresh value routed through the same injectable RNG as PKCE.
+- [ ] Store `AuthUrl::state` and the PKCE verifier from `build_auth_url` (the provider mints both) and pass the stored and the echoed state to `exchange_code`, which compares them in constant time and refuses a PKCE verifier under 43 characters before sending anything.
 
 #### Workload identity
 
-- [ ] **Pin the trust domain** at resolver construction. Every shipped resolver (`JwtSvidResolver`, `MtlsResolver`, `WorkloadResolver`) accepts an expected `TrustDomain` and rejects tokens / certs whose synthesised `WorkloadId` lives under a different one; defense in depth against a confused-deputy where the JWKS or CA happens to be shared across trust domains.
+- [ ] **Pin the trust domain** at resolver construction. Every shipped resolver (`JwtSvidResolver`, `MtlsResolver`, `WorkloadResolver`) accepts an expected `TrustDomain`. `MtlsResolver` rejects certs whose SPIFFE ID lives under a different one; `WorkloadResolver` builds the `WorkloadId` itself under the pinned domain (the claim mapper cannot name another). The separation between issuers sharing a JWKS is the verifier's `iss` and `aud` pins.
+- [ ] Give `WorkloadResolver` and `MtlsResolver` a slug-to-`TenantId` lookup that answers `None` for a tenant you do not know; the resolver calls it on the verified claims' or certificate's own slug and refuses the request when it is `None`.
 - [ ] For the generic `WorkloadResolver`, keep adopter-supplied claim mappers **strict** about which `subject` paths the application admits. The recipes in [`examples/workload-identity/`](examples/workload-identity/) are templates, not policy.
 - [ ] When fetching SVIDs from a local SPIRE agent, use the `spire-workload` crate today; see [`docs/workload-identity/jwt-svid.md`](docs/workload-identity/jwt-svid.md) for the fetch-side recipe.
 
@@ -279,7 +280,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | CSRF | Signed double-submit cookie; required for state-changing form posts. |
 | Rate limiting | Token-bucket via `RateLimitLayer`. `KeyExtractor::{PeerIp, ClientIp}` for direct vs proxied deployments; `ClientIp` reads what `client_ip::layer` resolved and no header. |
 | Request ID | `X-Request-Id` extraction + generation. |
-| Trace ID | W3C Trace Context (`traceparent`) propagation. |
+| Trace ID | W3C Trace Context (`traceparent`): a new trace per request; an inbound header is adopted only with `trust_inbound(true)`. |
 | WebSocket | Revocation-aware wrapper that closes connections on session invalidation. |
 
 ### Audit and observability
@@ -332,7 +333,7 @@ Axess processes personal data as part of authentication. This section documents 
 
 ### Recommendations
 
-- **Encrypt at rest**: pass a `SessionCrypto::new(key)` to the SQL session-store constructors (`SqliteSessionStore::new(pool, crypto)`, same for Postgres / MySQL) or use `ValkeySessionStore::new(client, key)` so session data (which contains `user_id`) is AES-256-GCM protected. The explicit `::plaintext(pool)` constructor opts out and is dev/test only.
+- **Encrypt at rest**: pass a `SessionCrypto::new(key)` to the SQL session-store constructors (`SqliteSessionStore::new(pool, crypto)`, same for Postgres / MySQL) or use `ValkeySessionStore::new(client, key)` so session data (which contains `user_id`) is AES-256-GCM protected. The explicit `::plaintext_insecure(pool)` constructor opts out and is dev/test only.
 - **Log retention**: configure your log aggregator to retain auth events per your compliance requirements (MiFID II: 5 years; GDPR: minimize).
 - **Right to erasure**: deleting a user's sessions (`SessionRegistry::invalidate_user`) and database records satisfies GDPR erasure for axess-managed data. The `custom` session field is the application's responsibility.
 

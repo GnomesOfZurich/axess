@@ -50,10 +50,10 @@ async fn recipe_resolves_real_k8s_shape_token() {
     let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
-        k8s_sa_mapper(trust.clone()),
+        k8s_sa_mapper(),
     );
 
     let principal = resolver.resolve().await.expect("recipe must resolve");
@@ -110,10 +110,10 @@ async fn recipe_resolves_minimal_token_without_pod_block() {
     let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
-        k8s_sa_mapper(trust),
+        k8s_sa_mapper(),
     );
 
     let Principal::Workload(w) = resolver
@@ -153,10 +153,10 @@ async fn wrong_issuer_rejected_before_mapper_runs() {
     let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
-        k8s_sa_mapper(trust),
+        k8s_sa_mapper(),
     );
 
     assert!(
@@ -180,10 +180,10 @@ async fn resolve_pinned(
     WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("kubernetes").unwrap(),
         token,
-        k8s_sa_mapper_pinned(trust, pins),
+        k8s_sa_mapper_pinned(pins),
     )
     .resolve()
     .await

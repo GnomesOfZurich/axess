@@ -123,20 +123,49 @@ fn migrate_does_not_regress_future_version() {
     );
 }
 
-/// `user_id()` returns `None` only for Guest and `Some`
+/// `pending_user_id()` returns `None` only for Guest and `Some`
+/// for every other variant; `authenticated_user_id()` only for Authenticated.
+#[test]
+fn only_an_authenticated_state_has_an_authenticated_user_id() {
+    let user = axess_identity::testing::user("u1");
+    let tenant = axess_identity::testing::tenant("t1");
+    assert!(AuthState::Guest.authenticated_user_id().is_none());
+    assert!(
+        AuthState::Identifying {
+            user_id: user,
+            tenant_id: tenant,
+        }
+        .authenticated_user_id()
+        .is_none()
+    );
+    assert_eq!(
+        AuthState::Authenticated {
+            user_id: user,
+            tenant_id: tenant,
+            authn_time: chrono::Utc::now(),
+            factors_completed: vec![],
+            impersonator: None,
+            ldap_groups: None,
+        }
+        .authenticated_user_id(),
+        Some(&user)
+    );
+}
+
+/// `pending_user_id()` returns `None` only for Guest and `Some`
 /// for every other variant. Kills `-> None` body replacement.
 #[test]
-fn user_id_returns_none_only_for_guest() {
+fn pending_user_id_returns_none_only_for_guest() {
     let user = axess_identity::testing::user("u1");
     let tenant = axess_identity::testing::tenant("t1");
 
-    assert!(AuthState::Guest.user_id().is_none());
+    assert!(AuthState::Guest.pending_user_id().is_none());
     assert_eq!(
         AuthState::Identifying {
             user_id: user,
             tenant_id: tenant,
         }
-        .user_id(),
+        .pending_user_id(),
         Some(&user)
     );
     assert_eq!(
@@ -148,7 +177,7 @@ fn user_id_returns_none_only_for_guest() {
             impersonator: None,
             ldap_groups: None,
         }
-        .user_id(),
+        .pending_user_id(),
         Some(&user)
     );
 }
@@ -234,7 +263,10 @@ fn session_data_json_round_trip() {
             user_id: axess_identity::testing::user("alice"),
             tenant_id: axess_identity::testing::tenant("acme"),
             authn_time: chrono::Utc::now(),
-            factors_completed: vec![FactorKind::Password, FactorKind::Totp],
+            factors_completed: vec![
+                (FactorKind::Password, chrono::Utc::now()),
+                (FactorKind::Totp, chrono::Utc::now()),
+            ],
             impersonator: None,
             ldap_groups: None,
         },
@@ -422,7 +454,7 @@ fn advance_factor_still_authenticating_when_factors_remain() {
             ..
         } => {
             assert_eq!(remaining, required(vec![FactorKind::Totp]));
-            assert_eq!(completed, vec![FactorKind::Password]);
+            assert_eq!(kinds(&completed), vec![FactorKind::Password]);
         }
         other => panic!("expected still Authenticating, got {other:?}"),
     }
@@ -460,7 +492,7 @@ fn advance_factor_completes_when_last_factor_verified() {
             assert_eq!(authn_time, t);
             assert_eq!(impersonator, None, "a login is nobody's impersonation");
             assert_eq!(ldap_groups, None, "no LDAP bind in this login");
-            assert_eq!(factors_completed, vec![FactorKind::Password]);
+            assert_eq!(kinds(&factors_completed), vec![FactorKind::Password]);
         }
         other => panic!("expected Authenticated, got {other:?}"),
     }
@@ -499,7 +531,7 @@ fn advance_factor_carries_completed_factors_into_authenticated() {
             factors_completed, ..
         } => {
             assert_eq!(
-                factors_completed,
+                kinds(&factors_completed),
                 vec![FactorKind::Password, FactorKind::Totp],
                 "completion order must be preserved"
             );
@@ -655,7 +687,7 @@ fn a_choice_step_is_completed_by_whichever_factor_it_offers() {
         AuthState::Authenticated {
             factors_completed, ..
         } => assert_eq!(
-            factors_completed,
+            kinds(&factors_completed),
             vec![FactorKind::Password, FactorKind::RecoveryCode]
         ),
         other => panic!("expected Authenticated, got {other:?}"),
@@ -776,4 +808,101 @@ fn a_step_up_keeps_the_impersonation() {
         Some(Impersonation { admin, since }),
         "the marker survives the step-up"
     );
+}
+
+fn kinds(factors: &[(FactorKind, chrono::DateTime<chrono::Utc>)]) -> Vec<FactorKind> {
+    factors.iter().map(|(kind, _)| kind.clone()).collect()
+}
+
+fn user_and_tenant() -> (UserId, TenantId) {
+    (
+        axess_identity::testing::user("u1"),
+        axess_identity::testing::tenant("t1"),
+    )
+}
+
+/// A password login, then a step-up with TOTP: the password keeps the time of
+/// the login, the TOTP gets the step-up's, and `authn_time` is the step-up's.
+#[test]
+fn a_step_up_keeps_the_time_of_the_factors_before_it() {
+    let (user, tenant) = user_and_tenant();
+    let login = now() - chrono::Duration::hours(3);
+    let step_up = now();
+    let mut state = AuthState::Authenticating {
+        user_id: user,
+        tenant_id: tenant,
+        method_name: "password".into(),
+        remaining: required(vec![FactorKind::Password]),
+        completed: vec![],
+        attempt_count: 0,
+        last_attempt: None,
+        ldap_groups: None,
+        impersonator: None,
+    };
+    assert_eq!(
+        state.advance_factor(&FactorKind::Password, login),
+        AdvanceOutcome::Completed
+    );
+    assert!(state.begin_step_up(required(vec![FactorKind::Totp])));
+    assert_eq!(
+        state.advance_factor(&FactorKind::Totp, step_up),
+        AdvanceOutcome::Completed
+    );
+
+    assert_eq!(
+        state.factor_completed_at(&FactorKind::Password),
+        Some(login)
+    );
+    assert_eq!(state.factor_completed_at(&FactorKind::Totp), Some(step_up));
+    assert_eq!(state.factor_completed_at(&FactorKind::Fido2), None);
+    match state {
+        AuthState::Authenticated { authn_time, .. } => assert_eq!(authn_time, step_up),
+        other => panic!("expected Authenticated, got {other:?}"),
+    }
+}
+
+/// A row written by 0.15.0 holds a plain list of kinds: each is read as
+/// verified at the row's `authn_time`, and the next write is the new form.
+#[test]
+fn a_plain_list_of_factor_kinds_reads_as_verified_at_authn_time() {
+    let (user, tenant) = user_and_tenant();
+    let at = now();
+    let current = AuthState::Authenticated {
+        user_id: user,
+        tenant_id: tenant,
+        authn_time: at,
+        factors_completed: vec![(FactorKind::Password, at), (FactorKind::Totp, at)],
+        impersonator: None,
+        ldap_groups: None,
+    };
+    let mut row = serde_json::to_value(&current).unwrap();
+    row["factors_completed"] = serde_json::json!(["Password", "Totp"]);
+
+    let read: AuthState = serde_json::from_value(row).unwrap();
+    assert_eq!(read, current);
+
+    let written = serde_json::to_value(&read).unwrap();
+    assert!(written["factors_completed"][0].is_array(), "{written}");
+    assert_eq!(serde_json::from_value::<AuthState>(written).unwrap(), read);
+}
+
+/// An in-flight login of an earlier release has no `authn_time`; its factors
+/// read as verified at the Unix epoch, which no freshness check passes.
+#[test]
+fn a_plain_list_in_an_authenticating_row_reads_as_the_epoch() {
+    let (user, tenant) = user_and_tenant();
+    let current = AuthState::Authenticating {
+        user_id: user,
+        tenant_id: tenant,
+        method_name: "step-up".into(),
+        remaining: required(vec![FactorKind::Totp]),
+        completed: vec![(FactorKind::Password, DateTime::<Utc>::UNIX_EPOCH)],
+        attempt_count: 0,
+        last_attempt: None,
+        ldap_groups: None,
+        impersonator: None,
+    };
+    let mut row = serde_json::to_value(&current).unwrap();
+    row["completed"] = serde_json::json!(["Password"]);
+    assert_eq!(serde_json::from_value::<AuthState>(row).unwrap(), current);
 }

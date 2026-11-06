@@ -107,24 +107,21 @@ Reading the tenant out of the leaf comes first, and that read validates nothing.
 ### The resolver
 
 `MtlsResolver` reads the SPIFFE URI out of the leaf certificate,
-checks it against the configured trust domain, and produces a
-`Principal::Workload`.
+checks it against the configured trust domain, looks the tenant up from
+the certificate's own slug, and produces a `Principal::Workload`.
 
 ```rust,ignore
 use axess::federation::mtls::{MtlsResolver, PeerCertChain, peek_spiffe};
 use axess_identity::PrincipalResolver;
 
-// Which tenant this is, from the SPIFFE ID, before the resolver is
-// built: `peek_spiffe` is a plain function over the leaf certificate
-// and does no validation beyond parsing the SAN URI.
-let leaf = chain.leaf().ok_or(MtlsError::EmptyChain)?;
-let components = peek_spiffe(leaf)?;
-let tenant_id = my_directory.tenant_for(&components.tenant_slug)?;
+// The slug in the certificate's SPIFFE ID is looked up by the resolver,
+// in your registry (a cached map, say), after it has parsed the leaf.
+let tenants = my_directory.tenants_by_slug(); // HashMap<String, TenantId>
 
 let resolver = MtlsResolver::from_chain(
     &chain,
     "prod.example.com".parse()?,
-    tenant_id,
+    move |slug: &str| tenants.get(slug).copied(),
 )?;
 let principal = resolver.resolve().await?;   // Principal::Workload
 ```
@@ -135,10 +132,11 @@ hands you one certificate rather than a chain, `MtlsResolver::new` takes it
 directly and is infallible.
 
 Either way the resolver holds the leaf, the trust domain it accepts,
-and the tenant. There is no configuration struct and no tenant-resolver
-trait: mapping a SPIFFE path to a `TenantId` is the adopter's, done
-before construction with `peek_spiffe`, because the convention is the
-deployment's.
+and the slug-to-tenant lookup. There is no configuration struct and no
+tenant-resolver trait: the registry behind the lookup is the adopter's,
+because the convention is the deployment's. The tenant always follows
+from the certificate being resolved; there is no way to hand the
+resolver a tenant chosen before the certificate was read.
 
 The work is small because most of the validation already happened: the
 terminator validated the chain, and the resolver parses the SAN URI and
@@ -168,19 +166,20 @@ deliberately, so the cryptographic claim flows through one path rather
 than through whatever the middleware peeked at earlier, then compares
 the presented trust domain against the configured one. A mismatch is
 `IdentityError::InvalidSpiffeId`, naming both domains, and is logged at
-`warn`. Every other parse failure collapses to
-`IdentityError::NotAuthenticated`, with the specific `MtlsError` logged
-at `debug`.
+`warn`. A tenant slug the lookup does not know is
+`IdentityError::NotAuthenticated`, logged at `warn`. Every other parse
+failure collapses to `IdentityError::NotAuthenticated`, with the
+specific `MtlsError` logged at `debug`.
 
 That collapse is deliberate: a caller presenting a bad certificate
 learns only that it was rejected, while the operator reading the logs
 learns which of `CertParse`, `NoSan` or `NoSpiffeUri` it was. When you
 want the distinction in your own code, call `peek_spiffe` yourself,
-which the tenant lookup means you are doing anyway.
+for instance to log the slug of a refused certificate.
 
-The resolver does not resolve tenants. The tenant is
-decided before it is built, and `resolve` copies the `TenantId` it was
-given into the principal.
+The resolver keeps no tenant registry of its own: `resolve` calls the
+lookup you gave it on the slug of the certificate it parsed, and puts
+the `TenantId` it answers into the principal.
 
 ### What the principal looks like
 
@@ -277,9 +276,9 @@ Anything else means the SPIFFE path does not have the
 path convention needs to change, because axess does not make the shape
 configurable.
 
-If `peek_spiffe` succeeds but your own tenant lookup then fails, the
-`tenant_slug` in the path is not one your directory knows. That is
-your mapping to fix, not axess's; the resolver never sees it.
+If `resolve` answers `NotAuthenticated` although the certificate parses, the
+`tenant_slug` in the path is not one your lookup knows. That is your
+mapping to fix, not axess's.
 
 ## Further reading
 

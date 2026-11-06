@@ -59,13 +59,21 @@ The caller:
 let signer = ServiceSecret::from_env("intake", "INTAKE_WEBHOOK_SECRET")?
     .expect("configured")
     .signer();
-let header = signer.sign_for("intake", now_unix_seconds, &Method::POST, "/public/intake/bounce", &body);
-client.post(url).header(SIGNATURE_HEADER, header).body(body).send().await?;
+// The signature covers Content-Type and Content-Encoding: pass the headers
+// that go out (an empty map when the request sends neither).
+let mut headers = HeaderMap::new();
+headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+let header = signer.sign_for("intake", now_unix_seconds, &Method::POST, "/public/intake/bounce", &headers, &body);
+client.post(url).headers(headers).header(SIGNATURE_HEADER, header).body(body).send().await?;
 ```
 
 The route reads the body in full to check the signature (up to
-`SignedRequests::max_body_bytes`, 1 MiB by default, `413` beyond it),
-then hands it on unchanged. It refuses a signature whose timestamp is
+`SignedRequests::max_body_bytes`, 256 KiB by default, `413` beyond it),
+then hands it on unchanged. The body is held in memory before any
+secret is checked, so each concurrent request, signed or not, can hold up
+to that many bytes: set the limit to the largest body the route takes and
+cap the concurrency of every signed route (a `tower` `ConcurrencyLimitLayer`
+outside the layer), since N concurrent requests can hold N times the limit. It refuses a signature whose timestamp is
 more than `SignedRequests::tolerance` (five minutes by default) from
 its clock in either direction, and one it has already accepted within
 that window.
@@ -77,7 +85,7 @@ Handlers that change state should still be idempotent.
 A signature names its recipient. The route is configured with
 `SignedRequests::audience("intake")`, the caller signs with
 `ServiceSigner::sign_for("intake", ...)`, and the signature covers that name
-(`v2`), so what one recipient receives does not verify at another service
+(`v3`), so what one recipient receives does not verify at another service
 that shares the secret. A `SignedRequests` with no audience is refused by
 `ServiceSecretLayer::signed` with `ServiceSecretError::MissingAudience`.
 Even so, give every recipient its own secret: a secret shared by two
@@ -91,10 +99,21 @@ route's clock. Move the callers to `sign_for` first, set the window to the
 date by which they will have moved, and delete the setting afterwards (at the
 instant the route stops reading `v1` whether or not it is deleted).
 
+The `v3` signature also covers the request's `Content-Type` and
+`Content-Encoding` (each hashed with SHA-256, an absent header hashing as the
+empty string), so a request cannot be re-typed or re-encoded on its way. No
+other header is signed. `sign_for` sends `v3=` and, beside it, `v2=` for a
+route that has not moved yet; a route reads the highest scheme it enables, and
+refuses `v2` unless it opts in for a migration window with
+`SignedRequests::accept_v2_until(instant)` (a header that carries `v3` is
+always judged by it). Move the callers to the new `sign_for` first, set the
+window to the date by which they will have moved, and delete the setting
+afterwards.
+
 A caller not written in Rust can sign by following the recipe on
 `SIGNATURE_HEADER`: an HMAC-SHA256 key derived from the secret, then an
-HMAC-SHA256 over the version, timestamp, method, request target and
-body, sent as `t=<seconds>,v2=<hex>`, with the audience between the request target and the body.
+HMAC-SHA256 over the version, timestamp, method, request target, audience,
+the two header hashes and the body, sent as `t=<seconds>,v3=<hex>`.
 
 ## Presented secrets
 

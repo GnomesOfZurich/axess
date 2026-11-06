@@ -1,6 +1,7 @@
-//! A constant key is a placeholder that reached production. These checks
-//! need no backend, so they live outside the feature-gated `crypto` module
-//! and the session layer can run them under every feature set.
+//! A constant key is a placeholder that reached production; the constructors
+//! refuse it. These checks need no backend, so they live outside the
+//! feature-gated `crypto` module and the session layer can run them under
+//! every feature set.
 
 /// Whether `key` is a single byte repeated 32 times (all zeros included).
 ///
@@ -17,8 +18,8 @@ pub fn is_constant_key(key: &[u8; 32]) -> bool {
 #[error("key is a single repeated byte, not random key material")]
 pub struct WeakKeyError;
 
-/// Log an error when `key` is a constant placeholder. Non-fatal so the
-/// infallible constructors keep their signatures.
+/// Log an error when `key` is a constant placeholder, for the constructors
+/// that stay infallible.
 pub(crate) fn warn_if_constant_key(what: &str, key: &[u8; 32]) {
     if is_constant_key(key) {
         tracing::error!(
@@ -27,4 +28,16 @@ pub(crate) fn warn_if_constant_key(what: &str, key: &[u8; 32]) {
              load a random 32-byte key from a secret store"
         );
     }
+}
+
+/// Refuse a constant placeholder key by panicking with the reason, as the
+/// cookie prefix checks do. The infallible constructors call this; the
+/// `try_new` forms return [`WeakKeyError`] instead.
+#[track_caller]
+pub(crate) fn refuse_constant_key(what: &str, key: &[u8; 32]) {
+    assert!(
+        !is_constant_key(key),
+        "{what} is a single repeated byte (a placeholder, not random key material); \
+         load 32 random bytes from a secret store, or use try_new to handle the refusal"
+    );
 }

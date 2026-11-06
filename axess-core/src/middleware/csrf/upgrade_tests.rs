@@ -195,3 +195,14 @@ fn prefixed_names_with_secure_and_plain_names_are_accepted() {
     let _ = CsrfLayer::new(CsrfConfig::new([3u8; 32]).cookie_name("__Secure-csrf"));
     let _ = CsrfLayer::new(CsrfConfig::new([3u8; 32]).cookie_name("csrf").secure(false));
 }
+
+#[test]
+fn a_cookie_path_that_could_inject_attributes_is_refused() {
+    for bad in ["/; Domain=example.com", "app", "/a\r\nX: y", ""] {
+        let refused = std::panic::catch_unwind(|| {
+            check_cookie_rules("csrf", true, bad, cookie::SameSite::Lax)
+        });
+        assert!(refused.is_err(), "path {bad:?} was accepted");
+    }
+    check_cookie_rules("csrf", true, "/app", cookie::SameSite::Lax);
+}

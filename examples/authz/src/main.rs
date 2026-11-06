@@ -91,9 +91,11 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The default is `info`: debug logs authorization decisions and the
+    // principals they concern. Set `RUST_LOG=debug` for development only.
     tracing_subscriber::registry()
         .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(
-            |_| "axess_example_authz=debug,axess=debug".into(),
+            |_| "axess_example_authz=info,axess=info".into(),
         )))
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
@@ -113,15 +115,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Build the AuthzStore with our entity provider.
     let namespace = "DocApp";
     let provider = Arc::new(DocEntityProvider::new(data.clone(), namespace));
-    let authz = Arc::new(AuthzStore::new(policy_store, provider, namespace));
-
-    // 4. Optional: validate provider ↔ schema consistency at startup.
-    authz.validate()?;
+    // `try_new` validates provider ↔ schema consistency at startup.
+    let authz = Arc::new(AuthzStore::try_new(policy_store, provider, namespace)?);
     info!("Entity provider validated against Cedar schema");
 
     let state = AppState { authz, data };
 
-    // 5. Build the router.
+    // 4. Build the router.
     let app = Router::new()
         .route("/", get(handlers::index))
         .route(

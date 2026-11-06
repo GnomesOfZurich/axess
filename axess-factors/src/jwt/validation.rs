@@ -145,11 +145,24 @@ pub struct ValidationConfig {
     /// and a replay store cannot bound it; only a caller that has another
     /// bound on the token's life turns this off.
     pub require_exp: bool,
+    /// Accept a token for any audience when `audience` is `None`. Off by
+    /// default: [`verify_jwt`] refuses a config that pins no audience, since
+    /// a token minted for another service of the same issuer would verify.
+    /// Set it only for an issuer that mints tokens for this application
+    /// alone.
+    pub allow_any_audience: bool,
+    /// Accept a token from any issuer when `issuer` is `None`. Off by
+    /// default: [`verify_jwt`] refuses a config that pins no issuer, since
+    /// a token signed by any key in the set would verify whatever it names
+    /// as its issuer.
+    pub allow_any_issuer: bool,
 }
 
 impl ValidationConfig {
-    /// Default-tuned config: 60 s leeway, no iss/aud pinning, nbf optional,
-    /// exp required.
+    /// Default-tuned config: 60 s leeway, nbf optional, exp required, and
+    /// neither `iss` nor `aud` pinned. [`verify_jwt`] refuses that until
+    /// both are pinned or [`allow_any_audience`](Self::allow_any_audience)
+    /// and [`allow_any_issuer`](Self::allow_any_issuer) say otherwise.
     pub fn new() -> Self {
         Self {
             issuer: None,
@@ -157,6 +170,8 @@ impl ValidationConfig {
             leeway_secs: 60,
             require_nbf: false,
             require_exp: true,
+            allow_any_audience: false,
+            allow_any_issuer: false,
         }
     }
 }
@@ -182,6 +197,8 @@ pub(crate) fn verify_jwt_signature(
 ) -> Result<serde_json::Value, JwtError> {
     let mut config = ValidationConfig::new();
     config.audience = expected_audience.map(String::from);
+    config.allow_any_audience = true;
+    config.allow_any_issuer = true;
     verify_jwt(
         token,
         jwks,
@@ -193,6 +210,9 @@ pub(crate) fn verify_jwt_signature(
 
 /// Verify a JWT signature and validate registered claims per the
 /// supplied [`ValidationConfig`] against an injected [`Clock`].
+///
+/// Refuses a config that pins no audience or no issuer unless its
+/// `allow_any_audience` or `allow_any_issuer` is set.
 ///
 /// Beyond signature verification it adds four knobs:
 /// 1. **Issuer pinning**: when `config.issuer` is `Some`, `iss` mismatch is rejected.
@@ -217,6 +237,25 @@ pub fn verify_jwt(
     // backends compiled in it has no default and panics. See
     // `crate::jwt::ensure_crypto_provider`.
     crate::jwt::ensure_crypto_provider();
+
+    // A claim nobody pinned is a claim nobody checks. Refused before any
+    // decoding, like the verifier does, unless the config says so.
+    if config.audience.is_none() && !config.allow_any_audience {
+        return Err(JwtError::VerificationFailed(
+            "no audience is pinned: a token minted for any other service of the same \
+             issuer would verify. Set `audience`, or `allow_any_audience` to state that \
+             accepting any audience is intended"
+                .to_string(),
+        ));
+    }
+    if config.issuer.is_none() && !config.allow_any_issuer {
+        return Err(JwtError::VerificationFailed(
+            "no issuer is pinned: a token signed by any key in the set would verify. \
+             Set `issuer`, or `allow_any_issuer` to state that accepting any issuer is \
+             intended"
+                .to_string(),
+        ));
+    }
 
     // The size bound comes first: every later step allocates in proportion
     // to the token.

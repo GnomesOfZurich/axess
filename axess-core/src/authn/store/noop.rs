@@ -1,6 +1,8 @@
 //! The no-op [`IdentityAuthnLog`] adapter.
 
 use super::*;
+use crate::authn::event::AuthEvent;
+use crate::authn::types::{Throttle, ThrottleState, ThrottleSubject};
 
 /// Wraps an [`IdentityLookup`] backend with a no-op [`IdentityAuthnLog`]
 /// impl on top, so it satisfies the `AuthnService::new` bound without
@@ -15,7 +17,10 @@ use super::*;
 ///   even a policy of one) is crossed regardless of how many failures
 ///   occur.
 /// - `reset_failed_attempts` is a no-op.
-/// - `record_last_login` inherits the trait default no-op.
+/// - `throttle_state` always reports `None` and `record_throttle_failure`
+///   stores nothing, so the throttle is off with the lockout: no delay is
+///   ever earned, whatever `LockoutPolicy::throttle` says.
+/// - `record_last_login` is a no-op.
 ///
 /// Appropriate uses:
 ///
@@ -168,6 +173,32 @@ impl<L: IdentityLookup> IdentityAuthnLog for NoopAuthnLog<L> {
             %user_id,
             "NoopAuthnLog: reset_failed_attempts is a no-op",
         );
+        Ok(())
+    }
+
+    async fn throttle_state(
+        &self,
+        _key: &ThrottleSubject,
+    ) -> Result<Option<ThrottleState>, Self::Error> {
+        // Nothing is stored, so no delay is ever earned: the throttle is off
+        // with the lockout.
+        Ok(None)
+    }
+
+    async fn record_throttle_failure(
+        &self,
+        key: &ThrottleSubject,
+        _throttle: &Throttle,
+    ) -> Result<(), Self::Error> {
+        tracing::trace!(
+            target: "axess::authn::noop_log",
+            user_id = %key.user_id,
+            "NoopAuthnLog: throttle failure not persisted; throttle disabled",
+        );
+        Ok(())
+    }
+
+    async fn clear_throttle(&self, _key: &ThrottleSubject) -> Result<(), Self::Error> {
         Ok(())
     }
 

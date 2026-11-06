@@ -40,11 +40,11 @@ async fn an_empty_pepper_is_refused_before_anything_is_stored() {
     );
     assert!(store.active_tokens(&user).await.unwrap().is_empty());
 
-    let refreshed = Refresh::new("anything", |_| async { true })
+    let refreshed = Refresh::any_tenant("anything", |_| async { true })
         .run(&store, &config, &MockRng::new(2), now())
         .await;
     assert!(matches!(refreshed, Err(RefreshError::InvalidConfig(_))));
-    let checked = Refresh::new("anything", |_| async { true })
+    let checked = Refresh::any_tenant("anything", |_| async { true })
         .run(&store, &config, &MockRng::new(3), now())
         .await;
     assert!(matches!(checked, Err(RefreshError::InvalidConfig(_))));
@@ -129,4 +129,87 @@ async fn concurrent_issues_for_one_user_never_exceed_the_cap() {
             "round {round}: exactly the cap must remain active"
         );
     }
+}
+
+/// A refresh family ends 90 days after the authentication it descends from,
+/// unless the cap is lifted.
+#[test]
+fn the_default_caps_a_family_at_ninety_days() {
+    assert_eq!(
+        RefreshTokenConfig::default().max_lifetime,
+        Some(Duration::days(90))
+    );
+}
+
+/// A device string stored without a pepper is an unkeyed digest a reader of
+/// the store can confirm a guess against; the config refuses it by name.
+#[tokio::test]
+async fn a_device_string_without_a_pepper_is_an_invalid_config() {
+    let config = RefreshTokenConfig::default();
+    assert!(config.hash_pepper.is_none());
+    let result = issue_refresh_token(
+        IssueRequest {
+            user_id: &fixture_user(),
+            tenant_id: &fixture_tenant(),
+            device_info: Some("laptop".to_owned()),
+            family_id: None,
+            device_id: None,
+        },
+        &config,
+        &store(),
+        &MockRng::new(3),
+        now(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(RefreshError::InvalidConfig(_))),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_presenting_a_device_string_without_a_pepper_is_an_invalid_config() {
+    let config = RefreshTokenConfig::default();
+    let result = Refresh::any_tenant("any-token", |_| async { true })
+        .device_info(Some("laptop"))
+        .run(&store(), &config, &MockRng::new(4), now())
+        .await;
+    assert!(
+        matches!(result, Err(RefreshError::InvalidConfig(_))),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn allow_unkeyed_hashes_and_a_pepper_each_permit_a_device_string() {
+    for config in [
+        RefreshTokenConfig::default().allow_unkeyed_hashes(),
+        RefreshTokenConfig {
+            hash_pepper: Some(Zeroizing::new(b"pepper".to_vec())),
+            ..RefreshTokenConfig::default()
+        },
+    ] {
+        issue_refresh_token(
+            IssueRequest {
+                user_id: &fixture_user(),
+                tenant_id: &fixture_tenant(),
+                device_info: Some("laptop".to_owned()),
+                family_id: None,
+                device_id: None,
+            },
+            &config,
+            &store(),
+            &MockRng::new(3),
+            now(),
+        )
+        .await
+        .expect("issue");
+    }
+}
+
+#[test]
+fn with_max_lifetime_none_lifts_the_cap() {
+    let config = RefreshTokenConfig::default().with_max_lifetime(None);
+    assert_eq!(config.max_lifetime, None);
+    assert_eq!(config.validate(), Ok(()));
 }

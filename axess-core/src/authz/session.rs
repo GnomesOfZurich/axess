@@ -77,14 +77,42 @@ pub struct AuthzStore<P: AuthzEntityProvider> {
 }
 
 impl<P: AuthzEntityProvider> AuthzStore<P> {
-    /// Create a new `AuthzStore`.
+    /// Create an `AuthzStore` and validate the entity provider against the
+    /// evaluator's Cedar schema, so a mismatch between the two (a misspelled
+    /// `Role` type, say) is a startup error instead of denials, or a
+    /// bypassed `forbid`, found in production.
     ///
     /// - `evaluator`: production: `Arc::new(PolicyStore::from_text(...)?)`.
-    ///   Tests: `Arc::new(MockPolicyEvaluator::new())`.
+    ///   Tests: `Arc::new(MockPolicyEvaluator::new())`, which has no schema
+    ///   and so validates nothing.
     /// - `provider`: your [`AuthzEntityProvider`] implementation.
     /// - `namespace`: the Cedar entity namespace used in your schema and
     ///   policy files (e.g. `"MyApp"`). All UID builders on this store use it.
-    pub fn new(
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`AuthzEntityProvider::validate_schema`] returns for the
+    /// evaluator's schema.
+    pub fn try_new(
+        evaluator: Arc<dyn PolicyEvaluator>,
+        provider: Arc<P>,
+        namespace: impl Into<Arc<str>>,
+    ) -> Result<Self, AuthzError> {
+        let store = Self::new_unvalidated(evaluator, provider, namespace);
+        store.validate()?;
+        Ok(store)
+    }
+
+    /// Create an `AuthzStore` without checking the provider against the
+    /// schema.
+    ///
+    /// **Prefer [`try_new`](Self::try_new).** A provider whose entity types do
+    /// not match the schema denies silently, or lets a `forbid` that names a
+    /// type the provider never produces match nothing; nothing reports it
+    /// until a request is wrong. Use this only where the provider is
+    /// deliberately not valid against the schema, such as a test of the
+    /// failure itself.
+    pub fn new_unvalidated(
         evaluator: Arc<dyn PolicyEvaluator>,
         provider: Arc<P>,
         namespace: impl Into<Arc<str>>,
@@ -96,10 +124,11 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         }
     }
 
-    /// Optional startup check: validate the entity provider against the Cedar schema.
+    /// Validate the entity provider against the Cedar schema.
     ///
-    /// Call this after constructing the store to catch type mismatches between
-    /// your provider and the compiled policy schema before accepting traffic.
+    /// [`try_new`](Self::try_new) runs this; call it again after a policy
+    /// reload to catch type mismatches between your provider and the new
+    /// schema.
     pub fn validate(&self) -> Result<(), AuthzError> {
         if let Some(schema) = self.evaluator.schema() {
             self.provider.validate_schema(schema)?;
@@ -203,9 +232,7 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         session: &crate::session::AuthSession,
         ctx: Ctx,
     ) -> Result<AuthzSession<P, Ctx>, AuthzError> {
-        let snapshot = session.snapshot().await.ok_or_else(|| {
-            AuthzError::InvalidEntityUid("the session is not authenticated".to_string())
-        })?;
+        let snapshot = session.snapshot().await.ok_or(AuthzError::NoPrincipal)?;
         let mut authz = self.for_user_id_with_context(&snapshot.user_id.to_string(), ctx)?;
         authz.tenant = Some(snapshot.tenant_id.to_string());
         Ok(authz)
@@ -396,199 +423,4 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
 }
 
 #[cfg(test)]
-mod authz_session_tests {
-    use super::*;
-    use crate::authz::store::PolicyStore;
-    use cedar_policy::{Entities, EntityUid, Schema};
-
-    const SCHEMA_JSON: &str = r#"{
-        "TestApp": {
-            "entityTypes": {
-                "User": { "memberOfTypes": [] },
-                "Resource": { "memberOfTypes": [] }
-            },
-            "actions": {
-                "View": {
-                    "appliesTo": {
-                        "principalTypes": ["User"],
-                        "resourceTypes": ["Resource"]
-                    }
-                }
-            }
-        }
-    }"#;
-
-    const POLICY_TEXT: &str = r#"permit(
-        principal == TestApp::User::"alice",
-        action == TestApp::Action::"View",
-        resource == TestApp::Resource::"doc1"
-    );"#;
-
-    struct ErroringProvider;
-
-    impl AuthzEntityProvider for ErroringProvider {
-        type ResourceId = String;
-        type Error = std::convert::Infallible;
-
-        async fn entities_for(
-            &self,
-            principal: &EntityUid,
-            resource_id: &Self::ResourceId,
-            action: &EntityUid,
-        ) -> Result<Entities, Self::Error> {
-            tracing::trace!(
-                target: "axess::authz::test_stub",
-                ?principal,
-                ?resource_id,
-                ?action,
-                "ErroringProvider::entities_for: returning empty entities",
-            );
-            Ok(Entities::empty())
-        }
-
-        fn resource_uid(&self, id: &Self::ResourceId) -> Result<EntityUid, AuthzError> {
-            super::super::store::make_uid("TestApp", "Resource", id)
-        }
-
-        fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
-            tracing::trace!(
-                target: "axess::authz::test_stub",
-                ?schema,
-                "ErroringProvider::validate_schema: synthetic failure",
-            );
-            Err(AuthzError::SchemaParse(
-                "synthetic schema validation failure".to_string(),
-            ))
-        }
-    }
-
-    #[test]
-    fn validate_propagates_provider_validation_error() {
-        // Pins `AuthzStore::validate -> Ok(())` mutation. The
-        // mutation skips the inner `provider.validate_schema`
-        // call. With a provider that errors, the genuine path returns
-        // `Err`; the mutation would silently return `Ok(())` and
-        // mask startup-time schema mismatches.
-        let evaluator: Arc<dyn PolicyEvaluator> =
-            Arc::new(PolicyStore::from_text(POLICY_TEXT, SCHEMA_JSON).unwrap());
-        let store = AuthzStore::new(evaluator, Arc::new(ErroringProvider), "TestApp");
-        let result = store.validate();
-        assert!(
-            matches!(result, Err(AuthzError::SchemaParse(_))),
-            "validate() must propagate provider's validate_schema error, got {result:?}"
-        );
-    }
-
-    /// Records the tenant it was asked for; refuses the resource id `bad`.
-    struct TenantRecordingProvider {
-        seen: Mutex<Vec<Option<String>>>,
-    }
-
-    impl AuthzEntityProvider for TenantRecordingProvider {
-        type ResourceId = String;
-        type Error = std::convert::Infallible;
-
-        async fn entities_for(
-            &self,
-            principal: &EntityUid,
-            resource_id: &Self::ResourceId,
-            action: &EntityUid,
-        ) -> Result<Entities, Self::Error> {
-            tracing::trace!(?principal, ?resource_id, ?action, "tenant-less path");
-            self.seen.lock().unwrap().push(None);
-            Ok(Entities::empty())
-        }
-
-        async fn entities_for_tenant(
-            &self,
-            principal: &EntityUid,
-            tenant: Option<&str>,
-            resource_id: &Self::ResourceId,
-            action: &EntityUid,
-        ) -> Result<Entities, Self::Error> {
-            tracing::trace!(?principal, ?resource_id, ?action, "tenant path");
-            self.seen.lock().unwrap().push(tenant.map(str::to_string));
-            Ok(Entities::empty())
-        }
-
-        fn resource_uid(&self, id: &Self::ResourceId) -> Result<EntityUid, AuthzError> {
-            if id == "bad" {
-                return Err(AuthzError::InvalidEntityUid("bad".to_string()));
-            }
-            super::super::store::make_uid("TestApp", "Resource", id)
-        }
-
-        fn validate_schema(&self, schema: &Schema) -> Result<(), AuthzError> {
-            tracing::trace!(?schema, "accepted");
-            Ok(())
-        }
-    }
-
-    fn tenant_store() -> Arc<AuthzStore<TenantRecordingProvider>> {
-        let evaluator: Arc<dyn PolicyEvaluator> =
-            Arc::new(PolicyStore::from_text(POLICY_TEXT, SCHEMA_JSON).unwrap());
-        Arc::new(AuthzStore::new(
-            evaluator,
-            Arc::new(TenantRecordingProvider {
-                seen: Mutex::new(Vec::new()),
-            }),
-            "TestApp",
-        ))
-    }
-
-    /// The tenant a session was opened for reaches the provider.
-    #[tokio::test]
-    async fn the_session_tenant_reaches_the_provider() {
-        let store = tenant_store();
-        let authz = store.for_user_in_tenant("alice", "tenant-a").unwrap();
-        assert!(authz.is_permitted("View", &"doc1".to_string()).await);
-        let authz = store.for_user_id("alice").unwrap();
-        assert!(authz.is_permitted("View", &"doc1".to_string()).await);
-        let seen = store.provider.seen.lock().unwrap().clone();
-        assert_eq!(seen, vec![Some("tenant-a".to_string()), None]);
-    }
-
-    /// A denial before Cedar is asked still emits the decision event.
-    #[tokio::test]
-    async fn a_denial_before_evaluation_emits_a_decision_event() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Clone, Default)]
-        struct Capture(Arc<Mutex<Vec<String>>>);
-        struct Fields(String);
-        impl tracing::field::Visit for Fields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                self.0.push_str(&format!("{}={value:?} ", field.name()));
-            }
-        }
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if event.metadata().target() == super::super::audit::DECISION_TARGET {
-                    let mut fields = Fields(String::new());
-                    event.record(&mut fields);
-                    self.0.lock().unwrap().push(fields.0);
-                }
-            }
-        }
-
-        let capture = Capture::default();
-        let subscriber = tracing_subscriber::registry().with(capture.clone());
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let store = tenant_store();
-        let authz = store.for_user_id("alice").unwrap();
-        assert!(!authz.is_permitted("View", &"bad".to_string()).await);
-
-        let events = capture.0.lock().unwrap().clone();
-        assert!(
-            events
-                .iter()
-                .any(|e| e.contains("invalid_resource") && e.contains("deny")),
-            "events: {events:?}"
-        );
-    }
-}
+mod authz_session_tests;

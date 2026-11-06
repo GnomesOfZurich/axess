@@ -43,7 +43,7 @@ async fn observer() -> sqlx::MySqlPool {
 #[tokio::test]
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn a_cancelled_create_does_not_leave_its_lock_on_a_pooled_connection() {
-    let store = MysqlDeviceStore::plaintext(sql_live::mysql_pool(1).await);
+    let store = MysqlDeviceStore::plaintext_insecure(sql_live::mysql_pool(1).await);
     store.init_schema().await.unwrap();
     let observer = observer().await;
     let d = device("cancelled", 240, DeviceTrustLevel::Seen, at(10));
@@ -96,7 +96,7 @@ async fn a_cancelled_create_does_not_leave_its_lock_on_a_pooled_connection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn concurrent_creates_of_one_key_leave_one_live_device() {
-    let store = MysqlDeviceStore::plaintext(sql_live::mysql_pool(24).await);
+    let store = MysqlDeviceStore::plaintext_insecure(sql_live::mysql_pool(24).await);
     store.init_schema().await.unwrap();
     for round in 0..120u8 {
         let creators = (0..16u8).map(|n| {

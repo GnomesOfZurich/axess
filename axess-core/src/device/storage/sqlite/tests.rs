@@ -22,7 +22,7 @@ pub(super) async fn fresh_store() -> SqliteDeviceStore {
         .connect("sqlite::memory:")
         .await
         .expect("memory sqlite connect");
-    let store = SqliteDeviceStore::plaintext(pool);
+    let store = SqliteDeviceStore::plaintext_insecure(pool);
     store.init_schema().await.expect("init_schema");
     store
 }
@@ -650,7 +650,7 @@ async fn encrypted_store_round_trips_bindings() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let key = [0x42u8; 32];
+    let key = crate::testing::test_key(0x42);
     let crypto = SessionCrypto::new(key);
     let store = SqliteDeviceStore::new(pool, crypto);
     store.init_schema().await.unwrap();
@@ -726,7 +726,7 @@ async fn file_store() -> FileDb {
         .connect_with(options)
         .await
         .expect("file sqlite connect");
-    let store = SqliteDeviceStore::plaintext(pool);
+    let store = SqliteDeviceStore::plaintext_insecure(pool);
     store.init_schema().await.expect("init_schema");
     FileDb { store, path }
 }

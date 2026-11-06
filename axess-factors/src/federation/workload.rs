@@ -15,9 +15,16 @@
 //! identity in different claims (`sub`, `azp`, `client_id`, a custom
 //! `service`, …); rather than baking one convention into axess, the
 //! adopter supplies a small claim type + mapping closure per issuer.
-//! The resolver handles JWT verification + trust-domain pinning +
-//! `Principal` construction; the closure handles
-//! claim → identity-components.
+//! The resolver handles JWT verification + `Principal` construction; the
+//! closure handles claim → identity-components (service name, tenant slug,
+//! attributes).
+//!
+//! The resolver builds the [`WorkloadId`] itself, from its own expected trust
+//! domain and the mapped service and tenant slug, and derives the
+//! [`TenantId`] from the verified claims' slug through the lookup it was
+//! given, refusing a slug the lookup does not know. The mapper cannot choose
+//! the trust domain or the tenant. The separation between issuers is still
+//! the verifier's `iss` and `aud` pins.
 //!
 //! # SPIFFE-spec adapter
 //!
@@ -48,21 +55,22 @@ use crate::jwt::verifier::{
     JtiReplayStore, JwtVerifier, NoReplay, VerifiedClaims, verifier_is_pinned,
 };
 
+/// The adopter's registry: a tenant slug to its typed id, `None` when unknown.
+type TenantLookup = Arc<dyn Fn(&str) -> Option<TenantId> + Send + Sync>;
+
 /// Output of the caller-supplied claim-mapping closure.
 ///
 /// The closure builds these from the verified JWT claims; the resolver
-/// wraps them into a [`Principal::Workload`] after pinning the trust
-/// domain.
+/// builds the [`WorkloadId`] from them under its own trust domain, looks the
+/// tenant up from the slug, and wraps the result into a
+/// [`Principal::Workload`].
 #[derive(Debug, Clone)]
 pub struct WorkloadMapping {
-    /// Synthesized SPIFFE-shape identifier. The resolver checks that
-    /// its trust domain matches the resolver's `expected_trust_domain`
-    /// before accepting the token.
-    pub workload_id: WorkloadId,
     /// Service name component (second SPIFFE path segment).
     pub service_name: String,
-    /// Tenant slug component (third SPIFFE path segment). Used to
-    /// derive the typed [`TenantId`] in adopter middleware.
+    /// Tenant slug component (third SPIFFE path segment). The resolver's
+    /// tenant lookup turns it into the typed [`TenantId`]; a slug the lookup
+    /// does not know refuses the token.
     pub tenant_slug: String,
     /// Provider-specific attributes preserved on the resulting
     /// [`WorkloadPrincipal::attributes`]; useful for Cedar policies
@@ -86,13 +94,12 @@ pub struct WorkloadMapping {
 /// );
 /// let trust_domain = TrustDomain::new("okta.gnomes.local").unwrap();
 ///
-/// // Per-request: adopter middleware peeks at the token to look up
-/// // tenant_id, then constructs the resolver with a claim mapper that
-/// // pulls the workload identity from the `sub` claim.
+/// // Per request: the tenant registry (a cached slug → TenantId map) is the
+/// // lookup, and a claim mapper pulls the workload identity from `sub`.
 /// let resolver = WorkloadResolver::new(
 ///     verifier.clone(),
 ///     trust_domain.clone(),
-///     tenant_id,
+///     move |slug: &str| tenants.get(slug).copied(),
 ///     Issuer::OAuth, // or Issuer::custom("github_actions").unwrap(), etc.
 ///     token,
 ///     |claims| {
@@ -100,9 +107,7 @@ pub struct WorkloadMapping {
 ///             IdentityError::InvalidComponent("missing sub claim".into())
 ///         })?;
 ///         // …adopter parses sub into (service, tenant_slug)…
-///         let workload_id = WorkloadId::build(&trust_domain, service, tenant_slug)?;
 ///         Ok(WorkloadMapping {
-///             workload_id,
 ///             service_name: service.to_string(),
 ///             tenant_slug: tenant_slug.to_string(),
 ///             attributes: BTreeMap::new(),
@@ -119,7 +124,7 @@ where
 {
     verifier: Arc<JwtVerifier<R>>,
     expected_trust_domain: TrustDomain,
-    tenant_id: TenantId,
+    tenant_lookup: TenantLookup,
     issuer: Issuer,
     token: String,
     claim_mapper: F,
@@ -144,10 +149,17 @@ where
     /// or [`Issuer::Custom`] with a stable short label
     /// (e.g. `"github_actions"`, `"kubernetes"`) when audit logs need
     /// finer granularity.
+    ///
+    /// `tenant_lookup` maps the mapped `tenant_slug` to the typed
+    /// [`TenantId`] (typically a cached `HashMap<String, TenantId>`); the
+    /// resolver calls it on the slug of the *verified* claims and refuses
+    /// the token with [`IdentityError::NotAuthenticated`] when it answers
+    /// `None`. `expected_trust_domain` is the domain of the resulting
+    /// [`WorkloadId`], which the resolver builds itself.
     pub fn new(
         verifier: Arc<JwtVerifier<R>>,
         expected_trust_domain: TrustDomain,
-        tenant_id: TenantId,
+        tenant_lookup: impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static,
         issuer: Issuer,
         token: impl Into<String>,
         claim_mapper: F,
@@ -155,7 +167,7 @@ where
         Self {
             verifier,
             expected_trust_domain,
-            tenant_id,
+            tenant_lookup: Arc::new(tenant_lookup),
             issuer,
             token: token.into(),
             claim_mapper,
@@ -184,53 +196,31 @@ where
 
         let mapped = (self.claim_mapper)(&claims)?;
 
-        // Trust-domain pinning; defense in depth against a confused
-        // deputy where the JWKS happens to be shared across trust
-        // domains. Mirrors the JwtSvidResolver + MtlsResolver pattern.
-        let token_trust_domain = extract_trust_domain(&mapped.workload_id)?;
-        if token_trust_domain != self.expected_trust_domain {
-            tracing::warn!(
-                expected = %self.expected_trust_domain,
-                presented = %token_trust_domain,
-                "WorkloadResolver: trust domain mismatch",
-            );
-            return Err(IdentityError::InvalidSpiffeId(format!(
-                "trust domain mismatch: expected {expected}, presented {presented}",
-                expected = self.expected_trust_domain,
-                presented = token_trust_domain,
-            )));
-        }
+        // The tenant is the registry's answer for the verified claims' own
+        // slug, never a value the caller supplied before the token was read.
+        let Some(tenant_id) = (self.tenant_lookup)(&mapped.tenant_slug) else {
+            tracing::warn!("WorkloadResolver: tenant slug is not in the registry");
+            return Err(IdentityError::NotAuthenticated);
+        };
+
+        // The id is built here, under the resolver's own trust domain, from
+        // the mapped service and slug: the mapper cannot name another domain.
+        let workload_id = WorkloadId::build(
+            &self.expected_trust_domain,
+            &mapped.service_name,
+            &mapped.tenant_slug,
+        )?;
 
         Ok(Principal::Workload(WorkloadPrincipal {
-            workload_id: mapped.workload_id,
-            trust_domain: token_trust_domain,
+            workload_id,
+            trust_domain: self.expected_trust_domain.clone(),
             issuer: self.issuer.clone(),
-            tenant_id: self.tenant_id,
+            tenant_id,
             tenant_slug: mapped.tenant_slug,
             service_name: mapped.service_name,
             attributes: mapped.attributes,
         }))
     }
-}
-
-/// Pull the trust domain off a parsed [`WorkloadId`].
-///
-/// The SPIFFE-ID format is `spiffe://<trust_domain>/<path>`; the
-/// trust domain is the host component. Used by the trust-domain
-/// pinning check after the claim mapper has produced its `WorkloadId`.
-fn extract_trust_domain(id: &WorkloadId) -> Result<TrustDomain, IdentityError> {
-    let raw = id.as_str();
-    let after = raw
-        .strip_prefix("spiffe://")
-        .ok_or_else(|| IdentityError::InvalidSpiffeId(format!("missing scheme: {raw}")))?;
-    let td_str = after
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            IdentityError::InvalidSpiffeId(format!("SPIFFE URI missing trust domain: {raw}"))
-        })?;
-    TrustDomain::new(td_str)
 }
 
 #[cfg(test)]

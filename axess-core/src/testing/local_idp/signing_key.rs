@@ -40,7 +40,9 @@ async fn from_rsa_pem_pkcs1_round_trips_through_verifier() {
             .with_audience("https://api.example.com")
             .with_issued_at(Utc::now()),
     );
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -59,7 +61,9 @@ async fn from_rsa_pem_pkcs8_round_trips_through_verifier() {
             .with_audience("https://api.example.com")
             .with_issued_at(Utc::now()),
     );
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -90,7 +94,9 @@ async fn from_rsa_pkcs1_der_round_trips() {
             .with_audience("https://api.example.com")
             .with_issued_at(Utc::now()),
     );
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -121,7 +127,9 @@ async fn same_pem_loaded_twice_produces_interchangeable_fixtures() {
             .with_issued_at(Utc::now()),
     );
     // Verify using idp2's JWKS handle; they should be interchangeable.
-    let verifier = JwtVerifier::new(idp2.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp2.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token)
         .await

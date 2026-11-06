@@ -48,8 +48,16 @@ a path other than `/` and no name was chosen, the default falls back to
 is used as given and checked: a prefix that the other settings cannot honour
 panics at startup. If a request carries the cookie name twice with different
 values, the session layer treats it as no cookie rather than picking one.
+That refusal is a denial of service for a cookie that can be planted: a
+sibling subdomain, or a man in the middle on plain HTTP, sets a second
+cookie of the same name and the user reads as logged out until it expires.
+Only the `__Host-` prefix (`Secure`, `Path=/`, no `Domain`) stops a browser
+from accepting such a cookie, which is why a non-root `with_path`,
+`with_secure(false)` or an unprefixed `with_cookie_name` leaves it open.
 Responses that set the session cookie carry `Cache-Control: no-store`
-(unless the handler set its own) and `Vary: Cookie`.
+and `Vary: Cookie`. A handler's own `Cache-Control` stays only when it
+already names `no-store` or `private`; a cacheable policy such as
+`public, max-age=600` is replaced.
 
 The cookie attributes are conservative by default: `HttpOnly`
 (client-side JavaScript cannot read it), `SameSite=Lax` (it is sent
@@ -371,13 +379,16 @@ never overwrites what a concurrent request wrote; when it loses the race the
 other request's write has already re-armed the row. A session stored before
 the stamp existed is re-armed once, on its next request.
 
-Some deployments want a hard cap: a session expires absolutely at a
-fixed time after it authenticated, regardless of activity. Set it with
-`SessionLayer::with_max_session_age` (or `max_authenticated_age` on the
-config builder). On the next request after the cap, the session is
-deleted and the request runs as a new guest. The age is measured from the
-authentication time stored in the session, using the layer's clock
-(`with_clock`). There is no cap by default.
+A session also expires absolutely at a fixed time after it authenticated,
+regardless of activity: 7 days by default. Change it with
+`SessionLayer::with_max_session_age(Some(age))` (or `max_authenticated_age`
+on the config builder), or lift it with `with_max_session_age(None)`, which
+leaves the sliding TTL as the only bound. On the next request after the cap,
+the session is deleted and the request runs as a new guest. The age is
+measured from the authentication time stored in the session, using the
+layer's clock (`with_clock`). An impersonated session is capped at 1 hour
+from when the impersonation began, set with `with_max_impersonation_age`
+(`None` lifts it).
 
 ### Revocation
 
@@ -392,14 +403,16 @@ depends on what guards the route:
 - `require_valid_session` consults the registry and answers 401. It also
   clears the stored session and rotates its id, so the row stops saying
   `Authenticated`.
-- A `SessionLayer` built with `with_registry` consults the registry for
-  every authenticated session on every request, whatever guards the
-  route. A session the registry no longer holds is deleted from the store
+- A `SessionLayer` consults the registry it was built with
+  (`SessionLayer::new(store, key, registry)`) for every authenticated
+  session on every request, whatever guards the route. A session the registry no longer holds is deleted from the store
   and the request runs as a new guest with a replacement cookie. When the
   registry cannot answer, `with_unknown_liveness` decides: the default
   treats the request as a guest without touching the row, and `Accept`
-  trusts the stored session. This is the setting to use if revocation must
-  be immediate; it costs one registry call per authenticated request.
+  trusts the stored session. The check costs one registry call per
+  authenticated request. `SessionLayer::without_registry_insecure` builds a
+  layer with no registry and logs an error: revocation then reaches only the
+  routes behind a validator.
 
 When a handler rotates an authenticated session with `regenerate`, a layer
 built with a registry moves the registry entry to the new id by itself.
@@ -426,9 +439,10 @@ no audit row claims otherwise. `AuthnServiceBuilder::build` logs a warning
 when no registry is attached, because without one none of these end an
 existing session.
 
-`require_authn!` takes a validator when the layer has no registry:
+`require_authn!` takes a validator for a layer built without a registry:
 `require_authn!(url = "/login", validator = authn.session_validator())`
 consults the registry and ends a revoked session like `require_valid_session`.
+`require_authz!` always takes one, as its fourth argument.
 
 ### Single-use values
 

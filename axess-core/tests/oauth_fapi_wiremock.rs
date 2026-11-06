@@ -1678,7 +1678,7 @@ async fn userinfo_on_a_dpop_provider_is_refused_bare() {
     let provider = dpop_provider(&idp).await;
     use axess_factors::oauth::OAuthProvider as _;
     let err = provider
-        .fetch_userinfo(&access, None)
+        .fetch_userinfo_unchecked(&access, None)
         .await
         .expect_err("the provider's bare form is refused too");
     assert!(matches!(err, OAuthError::DpopKeyRequired), "{err:?}");
@@ -1969,7 +1969,7 @@ async fn a_5xx_from_the_token_endpoint_is_transient_and_its_message_has_no_body(
             .await
             .expect_err("503"),
         provider
-            .refresh_token("rt1", None, None)
+            .refresh_token_unchecked("rt1", None, None)
             .await
             .expect_err("503"),
         provider

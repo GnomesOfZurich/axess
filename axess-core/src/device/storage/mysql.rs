@@ -166,10 +166,8 @@
 //! for its index and for the absence of a sort.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
-use axess_clock::Clock;
 use chrono::{DateTime, Utc};
 use sqlx::MySqlPool;
 
@@ -247,7 +245,7 @@ impl MysqlDeviceStore {
     }
 
     /// Create a plaintext store (development/testing only).
-    pub fn plaintext(pool: MySqlPool) -> Self {
+    pub fn plaintext_insecure(pool: MySqlPool) -> Self {
         tracing::warn!(
             "MysqlDeviceStore created without encryption; \
              do not use in production"
@@ -257,14 +255,6 @@ impl MysqlDeviceStore {
             codec: BindingsCodec::plaintext(),
             sweep_config: SweepConfig::default(),
         }
-    }
-
-    /// Has no effect: every time-dependent method of the store is given the
-    /// instant it works from, so there is no clock to inject.
-    #[deprecated(note = "the store reads time only from the `now` its methods are given")]
-    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
-        let _ = clock;
-        self
     }
 
     /// Override the [`SweepConfig`] driving the retention ladder.

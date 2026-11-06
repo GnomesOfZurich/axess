@@ -106,15 +106,17 @@ pub enum OAuthError {
     UnsupportedTokenType,
 
     /// A failure of a token endpoint that a retry may cure: a server-side
-    /// (5xx) answer, or no answer at all (`status` is `None`). Distinct from
+    /// (5xx) answer, an answer cut off before its body was complete, or no
+    /// answer at all (`status` is `None`). Distinct from
     /// [`TokenExchange`](Self::TokenExchange) so callers can distinguish
     /// "AS rejected our request" from "AS is broken right now and a
     /// retry might succeed".
     #[error("token endpoint transient failure ({})", describe_status(*status))]
     TokenEndpointTransient {
-        /// HTTP status code returned by the AS (5xx range), or `None` when
-        /// no answer arrived. The response body is not kept: an error page
-        /// can echo the request, tokens and secrets included.
+        /// HTTP status code returned by the AS (5xx range, or the status of
+        /// an answer whose body could not be read to the end), or `None`
+        /// when no answer arrived. The response body is not kept: an error
+        /// page can echo the request, tokens and secrets included.
         status: Option<u16>,
     },
 

@@ -56,24 +56,33 @@ pub struct StoredTenantOAuthProviders<S> {
 }
 
 impl<S: TenantOAuthProviderStore> StoredTenantOAuthProviders<S> {
-    /// Providers over `store`, with the system clock and RNG and no cipher
-    /// (credentials are read and written as plain text).
-    pub fn new(store: S) -> Self {
+    /// Providers over `store`, with the system clock and RNG. `upsert` seals
+    /// each credential with `cipher` and a provider is built by opening it,
+    /// so a client secret or private key is never in the table in clear
+    /// text, and a sealed credential cannot be read without the cipher.
+    pub fn new(store: S, cipher: Arc<FactorSecretCipher>) -> Self {
+        Self::with_optional_cipher(store, Some(cipher))
+    }
+
+    /// Providers over `store` with no cipher: credentials are read and
+    /// written as plain text.
+    ///
+    /// For tests and development only, like the `plaintext` constructors of
+    /// the session and device stores. A production directory keeps client
+    /// secrets and private keys in a table, which is where a backup, a
+    /// replica or a SQL injection reads them; use [`new`](Self::new).
+    pub fn new_unencrypted(store: S) -> Self {
+        Self::with_optional_cipher(store, None)
+    }
+
+    fn with_optional_cipher(store: S, cipher: Option<Arc<FactorSecretCipher>>) -> Self {
         Self {
             store,
-            cipher: None,
+            cipher,
             clock: Arc::new(axess_clock::SystemClock),
             rng: Arc::new(axess_rng::SystemRng),
             built: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Seal credentials with `cipher` on [`upsert`](Self::upsert) and open
-    /// them when a provider is built. A sealed credential cannot be read
-    /// without it.
-    pub fn with_cipher(mut self, cipher: Arc<FactorSecretCipher>) -> Self {
-        self.cipher = Some(cipher);
-        self
     }
 
     /// The clock the built providers use for ID-token checks and for the

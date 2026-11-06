@@ -5,6 +5,7 @@
 
 #![cfg(feature = "memory")]
 
+use axess::testing::AuthSessionTestExt;
 use axess::{MemorySessionStore, SessionLayer, require_authn, require_partial_authn};
 use axum::{
     Router,
@@ -16,7 +17,7 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 fn session_layer() -> SessionLayer<MemorySessionStore> {
-    SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
+    SessionLayer::without_registry_insecure(MemorySessionStore::new(), axess::testing::test_key(42))
         .with_ttl(Duration::from_secs(3600))
         .with_secure(false)
 }
@@ -112,12 +113,24 @@ async fn require_partial_authn_returns_401_for_guest() {
 mod authz_tests {
     use super::*;
     use axess::authz::{PolicyStore, RequestEntityProvider};
+
     use axess::require_authz;
     use axess_core::authz::AuthzError;
     use axum::{Extension, http::Method};
     use cedar_policy::{Entities, Entity, EntityUid, RestrictedExpression};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+
+    /// A validator without a registry: the session record decides, which is
+    /// all these tests exercise.
+    fn session_validator() -> axess::authn::SessionValidator {
+        axess::authn::AuthnService::builder(
+            axess::testing::MockIdentityStore::new(),
+            axess::testing::MockFactorStore::new(),
+        )
+        .build()
+        .session_validator()
+    }
 
     // The policy pins a single principal id; must match the v5-derived
     // hyphenated UUID that `axess::testing::user("alice")` produces, since
@@ -258,20 +271,27 @@ mod authz_tests {
         let app = Router::new()
             .route(
                 "/docs/{id}",
-                get(|| async { "doc body" }).layer(require_authz!("App", "View", "Doc:{id}")),
+                get(|| async { "doc body" }).layer(require_authz!(
+                    "App",
+                    "View",
+                    "Doc:{id}",
+                    validator = session_validator()
+                )),
             )
             .route(
                 "/admin",
                 get(|| async { "admin body" }).layer(require_authz!(
                     "App",
                     "Manage",
-                    "Platform:global"
+                    "Platform:global",
+                    validator = session_validator()
                 )),
             )
             .fallback(get(|| async { "fallback body" }).layer(require_authz!(
                 "App",
                 "Manage",
-                "Platform:global"
+                "Platform:global",
+                validator = session_validator()
             )))
             .route(
                 "/login",
@@ -391,7 +411,12 @@ mod authz_tests {
         let app = Router::new()
             .route(
                 "/docs/{id}",
-                get(|| async { "doc body" }).layer(require_authz!("App", "View", "Doc:{id}")),
+                get(|| async { "doc body" }).layer(require_authz!(
+                    "App",
+                    "View",
+                    "Doc:{id}",
+                    validator = session_validator()
+                )),
             )
             .route(
                 "/login",
@@ -426,7 +451,12 @@ mod authz_tests {
         let app = Router::new()
             .route(
                 "/docs/{id}",
-                get(|| async { "doc body" }).layer(require_authz!("App", "View", "Doc:{slug}")),
+                get(|| async { "doc body" }).layer(require_authz!(
+                    "App",
+                    "View",
+                    "Doc:{slug}",
+                    validator = session_validator()
+                )),
             )
             .route(
                 "/login",
@@ -502,7 +532,7 @@ mod authz_tests {
         // gate must evaluate from the attribute alone rather than 500.
         let store = MemorySessionStore::new();
         let layer = || {
-            SessionLayer::new(store.clone(), [42u8; 32])
+            SessionLayer::without_registry_insecure(store.clone(), axess::testing::test_key(42))
                 .with_ttl(Duration::from_secs(3600))
                 .with_secure(false)
         };
@@ -542,7 +572,8 @@ mod authz_tests {
             .layer::<_, std::convert::Infallible>(require_authz!(
                 "App",
                 "Manage",
-                "Platform:global"
+                "Platform:global",
+                validator = session_validator()
             ))
             .layer::<_, std::convert::Infallible>(Extension(policy_store()))
             .layer::<_, std::convert::Infallible>(Extension(provider()))

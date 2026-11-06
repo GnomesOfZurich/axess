@@ -33,12 +33,12 @@
 //!     include_str!("../policies/app.cedar"),
 //!     include_str!("../policies/app.cedarschema.json"),
 //! )?);
-//! let authz = Arc::new(AuthzStore::new(
+//! // try_new catches provider <-> schema mismatches at startup.
+//! let authz = Arc::new(AuthzStore::try_new(
 //!     policy_store,
 //!     Arc::new(MyEntityProvider::new(db)),
 //!     "MyApp",
-//! ));
-//! authz.validate()?; // catch provider ↔ schema mismatches at startup
+//! )?);
 //!
 //! // In a handler, RBAC/ReBAC check:
 //! let authz_session = state.authz.for_user_id(&user_id)?;

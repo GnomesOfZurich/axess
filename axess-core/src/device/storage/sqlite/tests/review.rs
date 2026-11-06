@@ -45,7 +45,7 @@ async fn a_losing_bindings_swap_reports_a_conflict_on_a_one_connection_pool() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let store = SqliteDeviceStore::plaintext(pool);
+    let store = SqliteDeviceStore::plaintext_insecure(pool);
     store.init_schema().await.unwrap();
     let (t, u, d) = ids();
     let before = vec![refresh("fam-a")];

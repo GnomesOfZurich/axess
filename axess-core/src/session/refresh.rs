@@ -35,14 +35,12 @@ use rotation::{generate_token_value, hash_token};
 #[cfg(test)]
 use zeroize::Zeroizing;
 
-// Globs, so re-exporting the deprecated entry points is not itself a use of
-// them. Every public item of both modules is meant to be exported.
-#[cfg(feature = "device")]
-pub use device_check::*;
+// A glob: every public item of the module is meant to be exported.
 pub use rotation::*;
 pub use store::{DeviceTokenRevocation, RefreshTokenStore, RotationOutcome};
 pub use types::{
-    RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenId, RevocationReason, TokenFamilyId,
+    PreviousPepper, RefreshError, RefreshToken, RefreshTokenConfig, RefreshTokenId,
+    RevocationReason, TokenFamilyId,
 };
 
 #[cfg(test)]
@@ -155,6 +153,8 @@ mod refresh_unit_tests {
         assert_eq!(cfg.max_per_user, 10);
         assert!(cfg.rotation, "rotation must be on by default");
         assert!(cfg.hash_pepper.is_none(), "no pepper by default");
+        assert_eq!(cfg.max_lifetime, Some(Duration::days(90)));
+        assert!(!cfg.allow_unkeyed_hashes);
     }
 
     // ── RefreshError Display ─────────────────────────────────────────────

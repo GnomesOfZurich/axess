@@ -664,6 +664,37 @@ where
         self.inner.reset_failed_attempts(user_id)
     }
 
+    fn throttle_state(
+        &self,
+        key: &crate::authn::types::ThrottleSubject,
+    ) -> impl std::future::Future<
+        Output = Result<
+            Option<crate::authn::types::ThrottleState>,
+            <L as crate::authn::store::IdentityLookup>::Error,
+        >,
+    > + Send {
+        self.inner.throttle_state(key)
+    }
+
+    fn record_throttle_failure(
+        &self,
+        key: &crate::authn::types::ThrottleSubject,
+        throttle: &crate::authn::types::Throttle,
+    ) -> impl std::future::Future<
+        Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
+    > + Send {
+        self.inner.record_throttle_failure(key, throttle)
+    }
+
+    fn clear_throttle(
+        &self,
+        key: &crate::authn::types::ThrottleSubject,
+    ) -> impl std::future::Future<
+        Output = Result<(), <L as crate::authn::store::IdentityLookup>::Error>,
+    > + Send {
+        self.inner.clear_throttle(key)
+    }
+
     fn record_last_login(
         &self,
         user_id: &crate::authn::ids::UserId,

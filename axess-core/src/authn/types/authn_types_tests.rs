@@ -12,29 +12,13 @@ use crate::authn::ids::UserId;
 fn entity_state_is_active_only_for_active() {
     assert!(EntityState::Active.is_active());
     assert!(
-        !EntityState::Suspended(StatusDetail {
-            reason: "test".into(),
-            since: chrono::Utc::now(),
-            until: None,
-        })
-        .is_active()
+        !EntityState::Suspended(StatusDetail::administrative("test", chrono::Utc::now()))
+            .is_active()
     );
     assert!(
-        !EntityState::Terminated(StatusDetail {
-            reason: "test".into(),
-            since: chrono::Utc::now(),
-            until: None,
-        })
-        .is_active()
+        !EntityState::Terminated(StatusDetail::closure("test", chrono::Utc::now())).is_active()
     );
-    assert!(
-        !EntityState::Archived(StatusDetail {
-            reason: "test".into(),
-            since: chrono::Utc::now(),
-            until: None,
-        })
-        .is_active()
-    );
+    assert!(!EntityState::Archived(StatusDetail::closure("test", chrono::Utc::now())).is_active());
     assert!(!EntityState::Candidate.is_active());
 }
 
@@ -292,11 +276,9 @@ fn suspension_ends_when_until_passes() {
     use chrono::TimeZone;
     let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
     let detail = |until| {
-        EntityState::Suspended(StatusDetail {
-            reason: "lockout".into(),
-            since: now - chrono::Duration::hours(1),
-            until,
-        })
+        EntityState::Suspended(
+            StatusDetail::lockout("lockout", now - chrono::Duration::hours(1)).with_until(until),
+        )
     };
     assert!(
         detail(Some(now - chrono::Duration::seconds(1)))
@@ -311,12 +293,96 @@ fn suspension_ends_when_until_passes() {
     );
     assert!(!detail(None).effective_at(now).allows_login());
     assert!(
-        !EntityState::Terminated(StatusDetail {
-            reason: "x".into(),
-            since: now,
-            until: Some(now - chrono::Duration::days(1)),
-        })
+        !EntityState::Terminated(
+            StatusDetail::closure("x", now).with_until(Some(now - chrono::Duration::days(1)))
+        )
         .effective_at(now)
         .allows_login()
     );
+}
+
+fn every_cause() -> Vec<StatusCause> {
+    vec![
+        StatusCause::Administrative,
+        StatusCause::Verification,
+        StatusCause::Lockout,
+        StatusCause::Closure,
+        StatusCause::Other("billing".into()),
+    ]
+}
+
+fn detail(cause: StatusCause) -> StatusDetail {
+    StatusDetail {
+        cause,
+        reason: "test".into(),
+        since: chrono::Utc::now(),
+        until: None,
+    }
+}
+
+/// A recovery flow admits an active account and one a lockout holds; it
+/// never admits an account an operator disabled, closed, or whose cause it
+/// cannot read.
+#[test]
+fn can_self_recover_admits_active_and_a_lockout_only() {
+    assert!(EntityState::Active.can_self_recover());
+    assert!(!EntityState::Guest.can_self_recover());
+    assert!(!EntityState::Candidate.can_self_recover());
+    for cause in every_cause() {
+        let d = detail(cause.clone());
+        assert_eq!(
+            EntityState::Suspended(d.clone()).can_self_recover(),
+            cause == StatusCause::Lockout,
+            "Suspended({cause:?})"
+        );
+        for state in [
+            EntityState::Pending(d.clone()),
+            EntityState::Terminated(d.clone()),
+            EntityState::Archived(d),
+        ] {
+            assert!(!state.can_self_recover(), "{state:?}");
+        }
+    }
+}
+
+/// Only an operator's act reads as an administrative disablement: a lockout,
+/// a pending verification, a closure or an adopter's own cause does not,
+/// whichever state carries it.
+#[test]
+fn is_administratively_disabled_names_an_operators_act_only() {
+    assert!(!EntityState::Active.is_administratively_disabled());
+    assert!(!EntityState::Guest.is_administratively_disabled());
+    assert!(!EntityState::Candidate.is_administratively_disabled());
+    for cause in every_cause() {
+        let d = detail(cause.clone());
+        let expect = cause == StatusCause::Administrative;
+        for state in [
+            EntityState::Pending(d.clone()),
+            EntityState::Suspended(d.clone()),
+            EntityState::Terminated(d.clone()),
+            EntityState::Archived(d),
+        ] {
+            assert_eq!(state.is_administratively_disabled(), expect, "{state:?}");
+        }
+    }
+}
+
+/// A timed lockout that has ended is active again, and so recoverable; an
+/// administrative suspension whose time has passed is active too, since the
+/// operator set the end.
+#[test]
+fn the_helpers_read_the_effective_state() {
+    let now = chrono::Utc::now();
+    let ended = StatusDetail::lockout("too many attempts", now - chrono::Duration::hours(2))
+        .with_until(Some(now - chrono::Duration::hours(1)));
+    assert!(
+        EntityState::Suspended(ended)
+            .effective_at(now)
+            .can_self_recover()
+    );
+    let open = StatusDetail::administrative("review", now)
+        .with_until(Some(now + chrono::Duration::hours(1)));
+    let state = EntityState::Suspended(open).effective_at(now);
+    assert!(state.is_administratively_disabled());
+    assert!(!state.can_self_recover());
 }

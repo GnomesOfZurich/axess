@@ -91,11 +91,18 @@ pub(super) fn open(
 /// `user_scope`.
 pub(super) fn close(
     cipher: Option<&FactorSecretCipher>,
+    allow_plaintext: bool,
     opened: &OpenedFactor,
     mut updated: FactorConfig,
     user_scope: &AuthnScope,
     kind: &FactorKind,
 ) -> Result<FactorConfig, FactorSecretError> {
+    if cipher.is_none()
+        && !allow_plaintext
+        && matches!(secret_of(&updated), Some(FactorSecret::Plain(_)))
+    {
+        return Err(FactorSecretError::PlaintextNotAllowed);
+    }
     let (Some(cipher), Some(stored)) = (cipher, &opened.stored) else {
         return Ok(updated);
     };

@@ -34,7 +34,7 @@ impl OAuthProvider for Counting {
     fn binds_to_dpop(&self) -> bool {
         false
     }
-    fn refresh_token<'a>(
+    fn refresh_token_unchecked<'a>(
         &'a self,
         _refresh_token: &'a str,
         _original_nonce: Option<&'a str>,
@@ -51,7 +51,7 @@ impl OAuthProvider for Counting {
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
         Box::pin(async { Err(OAuthError::Config("counting".into())) })
     }
-    fn fetch_userinfo<'a>(
+    fn fetch_userinfo_unchecked<'a>(
         &'a self,
         _access_token: &'a str,
         _dpop: Option<DpopSigner<'a>>,

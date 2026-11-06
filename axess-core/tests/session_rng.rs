@@ -5,6 +5,7 @@
 use axess_core::authn::ids::testing as ids;
 use axess_core::session::id::SessionId;
 use axess_core::session::{extractor::AuthSession, layer::SessionLayer, store::MemorySessionStore};
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::MockRng;
 use axum::{Router, body::Body, http::Request, routing::get};
 use chrono::Utc;
@@ -26,9 +27,13 @@ fn app(seed: u64) -> Router {
         .route("/whoami", get(whoami))
         .route("/login", get(login))
         .layer(
-            SessionLayer::new(MemorySessionStore::new(), [7u8; 32])
-                .with_secure(false)
-                .with_rng(MockRng::new(seed)),
+            SessionLayer::new(
+                MemorySessionStore::new(),
+                axess_core::testing::test_key(7),
+                axess_core::MemorySessionRegistry::new().handle(),
+            )
+            .with_secure(false)
+            .with_rng(MockRng::new(seed)),
         )
 }
 

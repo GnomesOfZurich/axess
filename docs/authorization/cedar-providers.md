@@ -341,7 +341,12 @@ that guards an optional attribute with `context has ..` and treats its
 absence as allowed, so declare the attributes policies rely on as
 required, and install a provider wherever policies reason about the
 context. `examples/authz` shows the `DeleteDocument` rule that needs
-`mfa_verified`.
+`mfa_verified`. The first request through a gate whose policies mention
+`context`, with no provider installed, logs a warning.
+
+`axess::authz::require`, the function form, takes the `Context` as its
+last argument and evaluates with exactly that; pass `Context::empty()` only
+when no policy reads `context`.
 
 ### When to extend the context
 

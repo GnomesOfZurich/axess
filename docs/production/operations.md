@@ -45,8 +45,11 @@ origin is refused even before the token is checked.
 
 A session registry is wired with `AuthnServiceBuilder::with_registry`
 (Valkey for more than one instance), so a password reset or an admin
-action can revoke live sessions. Without one, those calls have nothing
-to revoke and sessions stay valid until they expire.
+action can revoke live sessions, and the same registry is the third
+argument of `SessionLayer::new`, so the revocation reaches the stored row
+on every route. Without a registry those calls have nothing to revoke and
+sessions stay valid until they expire (`SessionLayer::without_registry_insecure`
+builds a layer that way and logs an error).
 
 The trusted-proxy list is configured. The application reads the
 forwarded header (`X-Forwarded-For` or `Forwarded`) only when
@@ -115,7 +118,7 @@ Rotating it without invalidating sessions requires keeping the
 old key available for verification during the transition.
 
 ```rust,ignore
-let session_layer = SessionLayer::new(store, new_signing_key)
+let session_layer = SessionLayer::new(store, new_signing_key, registry)
     .with_previous_signing_key(old_signing_key)
     .with_ttl(session_ttl);
 ```
@@ -179,9 +182,11 @@ the envelope key, a fresh 16-byte salt and the record's row identity
 and a blob costs 16 bytes more than before. Rotate the envelope key on your
 compliance cycle, not to stay inside a count.
 
-A blob written by an earlier release (the key used directly) is still read and
-is re-sealed in the new layout by the read that finds it, as any stale blob
-is: after an upgrade each live row costs one extra write the first time it is
+A blob written by an earlier release (the key used directly) is a legacy
+blob: it is read only while `LegacyBlobs` reads them (`AcceptUntil` or
+`Accept`; the default `Reject` refuses it, so the user signs in again) and is
+re-sealed in the new layout by the read that finds it, as any stale blob is:
+after an upgrade each live row costs one extra write the first time it is
 read. Only a caller that
 seals with `SessionCrypto::encrypt_with_aad` itself draws on the budget;
 `SessionCrypto::seals` counts those calls, per process, so sum it across

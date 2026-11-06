@@ -233,3 +233,41 @@ async fn a_rotated_take_that_lost_the_swap_carries_the_concurrent_take_into_its_
     assert!(a.data.custom.get("k1").is_none());
     assert!(a.data.auth_state.is_authenticated());
 }
+
+/// A login rotates the id, then the handler takes a one-shot value while an
+/// attacker, who knows the guest id, writes a key to the retired row. The
+/// data the response stores under the new id must not hold the planted key.
+#[tokio::test]
+async fn a_rotated_take_does_not_carry_keys_planted_on_the_retired_row() {
+    let store = MemorySessionStore::new();
+    let id = SessionId::new(&MockRng::new(6));
+    let loaded = SessionData {
+        custom: bag(&[("reg_state", "S1")]),
+        ..SessionData::default()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut a = request_holding(&store, id, &loaded);
+    a.data.auth_state.set_authenticated(
+        axess_identity::testing::user("u-fix"),
+        axess_identity::testing::tenant("t-fix"),
+        chrono::Utc::now(),
+    );
+    a.modified = true;
+    a.rotate_id();
+    concurrent_write(
+        &store,
+        &id,
+        &loaded,
+        bag(&[("reg_state", "S1"), ("planted", "x")]),
+    )
+    .await;
+
+    let taken = a.consume_custom("reg_state").await;
+
+    assert_eq!(taken, Some(serde_json::json!("S1")));
+    assert!(
+        a.data.custom.get("planted").is_none(),
+        "a key planted on the retired row must not reach the new id: {:?}",
+        a.data.custom
+    );
+}

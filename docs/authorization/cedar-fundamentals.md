@@ -67,7 +67,7 @@ let policy_store = PolicyStore::load_directory("./policies")?;
 let schema = std::fs::read_to_string("./policies/schema.cedarschema")?;
 policy_store.validate_against(&schema)?;
 
-let authz_store = AuthzStore::new(policy_store);
+let authz_store = AuthzStore::try_new(policy_store, provider, "MyApp")?;
 ```
 
 The load is recursive: every `.cedar` file under the directory is

@@ -91,12 +91,12 @@ pub(super) async fn build_auth_url_par(
         .append_pair("client_id", cfg.client_id.as_str())
         .append_pair("request_uri", &par_response.request_uri);
 
-    Ok((
-        auth_url,
-        state_str,
-        nonce_str,
-        pkce_verifier.secret().to_string(),
-    ))
+    Ok(AuthUrlResult {
+        url: auth_url,
+        csrf_state: state_str,
+        nonce: nonce_str,
+        pkce_verifier: pkce_verifier.secret().to_string(),
+    })
 }
 
 /// POST the authorization request parameters to the IdP's PAR endpoint.

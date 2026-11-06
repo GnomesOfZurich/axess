@@ -63,7 +63,7 @@ async fn loads_as_authenticated(cfg: &SessionConfig, data: &SessionData) -> bool
 #[tokio::test]
 async fn an_impersonation_older_than_its_cap_is_ended() {
     let cfg = SessionConfig::builder()
-        .max_impersonation_age(std::time::Duration::from_secs(3600))
+        .max_impersonation_age(Some(std::time::Duration::from_secs(3600)))
         .build();
     let now = chrono::Utc::now();
     let mut old = authenticated();
@@ -85,7 +85,12 @@ async fn an_impersonation_older_than_its_cap_is_ended() {
         "the impersonation outlived the cap"
     );
     assert!(
-        loads_as_authenticated(&SessionConfig::default(), &old).await,
+        !loads_as_authenticated(&SessionConfig::default(), &old).await,
+        "the default caps an impersonation at an hour"
+    );
+    let uncapped = SessionConfig::builder().max_impersonation_age(None).build();
+    assert!(
+        loads_as_authenticated(&uncapped, &old).await,
         "no cap, no end"
     );
 }
@@ -295,16 +300,19 @@ impl SessionRegistryHandle for SilentRegistry {
 }
 
 /// A registry that cannot answer reports its outage from `held_sessions`,
-/// which an implementation must write; only the derived `active_sessions`
-/// goes on with an empty list.
+/// which an implementation must write, and `active_sessions` reports the same
+/// outage instead of an empty list that reads as "no sessions".
 #[tokio::test]
-async fn an_unanswering_registry_refuses_the_exact_list_and_fails_open_only_for_the_limit() {
+async fn an_unanswering_registry_reports_its_outage_from_both_listings() {
     let user = ids::user("u");
     assert!(
         SilentRegistry.held_sessions(&user).await.is_err(),
         "the outage reaches the caller that must refuse on it"
     );
-    assert!(SilentRegistry.active_sessions(&user).await.is_empty());
+    assert!(
+        SilentRegistry.active_sessions(&user).await.is_err(),
+        "an outage is not an empty list"
+    );
 }
 
 async fn load_with_silent_registry(unknown: UnknownLiveness) -> (LoadOutcome, bool, SessionId) {

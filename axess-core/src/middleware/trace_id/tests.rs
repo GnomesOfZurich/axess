@@ -30,7 +30,7 @@ fn test_app() -> TraceContextMiddleware<axum::Router> {
             }
         }),
     );
-    TraceContextLayer::new().layer(app)
+    TraceContextLayer::new().trust_inbound(true).layer(app)
 }
 
 #[tokio::test]
@@ -285,4 +285,87 @@ fn from_header_rejects_invalid_values_not_only_bad_lengths() {
         assert!(parse(bad).is_none(), "{bad} must be rejected");
     }
     assert!(parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01").is_some());
+}
+
+/// At a trust boundary the inbound `traceparent` is the caller's claim: with
+/// `trust_inbound(false)` its trace id and sampled flag are not adopted.
+#[tokio::test]
+async fn an_untrusted_inbound_traceparent_starts_a_new_trace() {
+    let inbound = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let app = axum::Router::new().route(
+        "/test",
+        axum::routing::get(|req: Request<Body>| async move {
+            let ctx = req.extensions().get::<TraceContext>().cloned().unwrap();
+            ctx.trace_id
+        }),
+    );
+    let service = TraceContextLayer::new().trust_inbound(false).layer(app);
+    let response = service
+        .oneshot(
+            Request::get("/test")
+                .header("traceparent", inbound)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let echoed = response
+        .headers()
+        .get("traceparent")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let trace_id = String::from_utf8(body.to_vec()).unwrap();
+    assert_ne!(trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert!(
+        echoed.contains(&trace_id),
+        "the response carries the new trace"
+    );
+    assert!(
+        echoed.ends_with("-01"),
+        "a new root is sampled by this service's own choice"
+    );
+}
+
+/// The default ignores an inbound `traceparent`: the header comes from
+/// whoever sent the request, so it starts a new trace; `trust_inbound(true)`
+/// is the opt-in for an internal edge behind one that vetted it.
+#[tokio::test]
+async fn the_default_ignores_the_inbound_traceparent() {
+    let inbound = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+    let echoed = |layer: TraceContextLayer| async move {
+        let app = axum::Router::new().route("/test", axum::routing::get(|| async { "ok" }));
+        let response = layer
+            .layer(app)
+            .oneshot(
+                Request::get("/test")
+                    .header("traceparent", inbound)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        response
+            .headers()
+            .get("traceparent")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let default = echoed(TraceContextLayer::new()).await;
+    assert!(
+        !default.contains("4bf92f3577b34da6a3ce929d0e0e4736"),
+        "the caller's trace id is not adopted: {default}"
+    );
+    assert!(
+        default.ends_with("-01"),
+        "the caller's sampled flag is not adopted: {default}"
+    );
+    let trusted = echoed(TraceContextLayer::new().trust_inbound(true)).await;
+    assert!(trusted.contains("4bf92f3577b34da6a3ce929d0e0e4736") && trusted.ends_with("-00"));
 }

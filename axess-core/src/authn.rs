@@ -53,15 +53,17 @@ pub use event::{
     AuditContext, AuthEvent, AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason,
 };
 pub use factor::{
-    EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, FactorSecret, FactorStep,
-    FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, LdapBindFactorConfig, OtpAlgorithm,
-    PasswordConfig, PasswordRules, SealedFactorSecret, TotpConfig, ZeroizedString, default_catalog,
+    BreachCheckError, BreachCheckUnavailable, BreachedPasswordCheck, EmailOtpConfig, FactorConfig,
+    FactorCredential, FactorKind, FactorSecret, FactorStep, FactorTemplate, FederatedProvider,
+    Fido2Config, HotpConfig, LdapBindFactorConfig, NewPasswordError, OtpAlgorithm, PasswordConfig,
+    PasswordRules, SealedFactorSecret, TotpConfig, ZeroizedString, default_catalog,
 };
 pub use ids::{DeviceId, IdError, TenantId, UserId};
 pub use provisioning::{ProvisioningError, TenantBootstrap, create_tenant};
 pub use service::{
-    Actor, AuthnService, AuthnServiceBuilder, FactorOutcome, LoginOutcome, NoSessionRegistryError,
-    PrepareOutcome, RequestAuthnService, SessionValidator, SignupOutcome, require_valid_session,
+    ActiveSessionsError, Actor, AuthnService, AuthnServiceBuilder, ChosenPasswordError,
+    FactorOutcome, LoginOutcome, NoSessionRegistryError, PrepareOutcome, RequestAuthnService,
+    SessionValidator, SignupOutcome, SignupVerification, require_valid_session,
 };
 #[cfg(feature = "oauth")]
 pub use service::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
@@ -72,5 +74,5 @@ pub use store::{
 };
 pub use types::{
     AuthnScope, CounterUnavailable, EntityState, IpPolicy, LockoutPolicy, ScopeColumns,
-    StatusDetail, Tenant, User,
+    StatusCause, StatusDetail, Tenant, Throttle, ThrottleKey, ThrottleState, ThrottleSubject, User,
 };

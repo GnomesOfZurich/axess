@@ -6,7 +6,7 @@
 use super::encryption::{encrypted_codec, encrypted_codec_with_rotation, plaintext_codec};
 use super::internal::{
     COMPARE_DEL_SCRIPT, COMPARE_SET_SCRIPT, CYCLE_SCRIPT, DEFAULT_MAX_PAYLOAD_BYTES,
-    DEFAULT_PREFIX, RESEAL_SCRIPT, ValkeyStoreError, ex_seconds, live_ex_seconds,
+    DEFAULT_PREFIX, RESEAL_SCRIPT, ValkeyStoreError, ex_seconds, live_ex_seconds, log_session_id,
     script_unavailable, session_key,
 };
 use crate::session::{
@@ -15,7 +15,7 @@ use crate::session::{
     storage::session_codec::{Decoded, SessionCodec},
     store::{
         ConditionalUpdate, CycleOutcome, SessionStore,
-        cas::{CasRow, CasWrite, cas_by_revision},
+        cas::{CasRow, CasWrite, cas_by_revision, cycle_by_revision},
     },
 };
 use fred::bytes::Bytes;
@@ -61,8 +61,11 @@ impl ValkeySessionStore {
 
     /// Create a **plaintext** store (development/testing only).
     ///
-    /// Session data is stored unencrypted in Valkey. Do not use in production.
-    pub fn plaintext(client: Client) -> Self {
+    /// Session data (including the user id) is stored **unsealed** in Valkey:
+    /// anyone who can read the keyspace can read every session. The named
+    /// opt-out beside [`new`](Self::new), which takes the key. Do not use in
+    /// production.
+    pub fn plaintext_insecure(client: Client) -> Self {
         tracing::warn!(
             "ValkeySessionStore created without encryption: \
              do not use in production"
@@ -164,8 +167,10 @@ impl ValkeySessionStore {
 
     /// Choose whether blobs written before row binding are read; see
     /// [`LegacyBlobs`](crate::session::crypto::LegacyBlobs). The default is
-    /// to read them and re-seal each on load. Has no effect on a plaintext
-    /// store.
+    /// `Reject`: such a blob is refused. `AcceptUntil` reads them until a
+    /// cutoff, during which an unbound blob can be moved between rows (a
+    /// read leaves it as it is; the next save binds it). Has no effect on a
+    /// plaintext store.
     pub fn with_legacy_blobs(mut self, policy: crate::session::crypto::LegacyBlobs) -> Self {
         self.codec = self.codec.with_legacy_blobs(policy);
         self
@@ -202,6 +207,16 @@ impl ValkeySessionStore {
 }
 
 impl SessionStore for ValkeySessionStore {
+    /// Sessions are sealed blobs keyed by id with the user inside, so Valkey
+    /// cannot list them by user without reading every key.
+    async fn find_sessions_for_user(
+        &self,
+        _user_id: &crate::authn::ids::UserId,
+        _limit: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Err(ValkeyStoreError::Unsupported("find_sessions_for_user"))
+    }
+
     type Error = ValkeyStoreError;
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
@@ -213,11 +228,11 @@ impl SessionStore for ValkeySessionStore {
                 if reseal {
                     self.reseal(id, &b, &data).await;
                 }
-                debug!(session_id = %id, "session loaded from valkey");
+                debug!(session_id = %log_session_id(id), "session loaded from valkey");
                 Ok(Some(data))
             }
             None => {
-                debug!(session_id = %id, "session not found in valkey");
+                debug!(session_id = %log_session_id(id), "session not found in valkey");
                 Ok(None)
             }
         }
@@ -240,14 +255,14 @@ impl SessionStore for ValkeySessionStore {
         self.client
             .set::<(), _, _>(&key, bytes, Some(Expiration::EX(ex)), None, false)
             .await?;
-        debug!(session_id = %id, ttl_secs = ttl.as_secs(), "session saved to valkey");
+        debug!(session_id = %log_session_id(id), ttl_secs = ttl.as_secs(), "session saved to valkey");
         Ok(())
     }
 
     async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
         let key = session_key(&self.prefix, id);
         self.client.del::<(), _>(&key).await?;
-        debug!(session_id = %id, "session deleted from valkey");
+        debug!(session_id = %log_session_id(id), "session deleted from valkey");
         Ok(())
     }
 
@@ -361,12 +376,33 @@ impl SessionStore for ValkeySessionStore {
         }
 
         debug!(
-            old_session_id = %old_id,
-            new_session_id = %new_id,
+            old_session_id = %log_session_id(old_id),
+            new_session_id = %log_session_id(new_id),
             ttl_secs = ex,
             "session cycled in valkey"
         );
         Ok(CycleOutcome::Rotated)
+    }
+
+    async fn cycle_if_revision(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> Result<CycleOutcome, Self::Error> {
+        cycle_by_revision(
+            self,
+            old_id,
+            new_id,
+            data,
+            ttl,
+            require_old,
+            expected_revision,
+        )
+        .await
     }
 
     /// Valkey/Redis evicts expired keys natively (active +

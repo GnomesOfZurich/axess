@@ -3,7 +3,14 @@
 
 use super::*;
 use axess_clock::testing::MockClock;
-use axum::{Router, http::Method, routing::post};
+use axum::{
+    Router,
+    http::{
+        Method,
+        header::{CONTENT_ENCODING, CONTENT_TYPE},
+    },
+    routing::post,
+};
 use chrono::{TimeZone, Utc};
 use std::time::Duration;
 use tower::ServiceExt;
@@ -189,10 +196,14 @@ fn signed_app(clock: &MockClock, config: SignedRequests) -> Router {
 }
 
 fn signed(value: &str, at: i64, method: Method, target: &str, body: &str) -> Request<Body> {
-    let header =
-        secret("caller", value)
-            .signer()
-            .sign_for(AUDIENCE, at, &method, target, body.as_bytes());
+    let header = secret("caller", value).signer().sign_for(
+        AUDIENCE,
+        at,
+        &method,
+        target,
+        &HeaderMap::new(),
+        body.as_bytes(),
+    );
     Request::builder()
         .method(Method::POST)
         .uri("/hook")
@@ -270,33 +281,41 @@ async fn a_body_over_the_limit_is_refused_before_the_signature_is_checked() {
     assert_eq!(send(&app, req).await.0, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// The recipe the docs give a caller that is not written in Rust, computed
+/// here without the library's own helpers.
 #[test]
 fn the_signature_header_follows_the_documented_recipe() {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let header = secret("relay", RELAY).signer().sign_for(
         AUDIENCE,
         EPOCH,
         &Method::POST,
         "/hook?a=1",
+        &headers,
         b"body",
     );
 
     let mut key = crate::session::hmac::new_signer(RELAY.as_bytes());
     hmac::Mac::update(&mut key, b"axess-service-signature-v1");
     let key = hmac::Mac::finalize(key).into_bytes();
-    let mut mac = crate::session::hmac::new_signer(&key);
-    hmac::Mac::update(
-        &mut mac,
-        format!("v2\n{EPOCH}\nPOST\n/hook?a=1\nbilling\nbody").as_bytes(),
-    );
-    let expected: String = hmac::Mac::finalize(mac)
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    let tag = |message: String| {
+        let mut mac = crate::session::hmac::new_signer(&key);
+        hmac::Mac::update(&mut mac, message.as_bytes());
+        hex(&hmac::Mac::finalize(mac).into_bytes())
+    };
+    let sha = |text: &str| hex(&sha2::Sha256::digest(text.as_bytes()));
+    let v2 = tag(format!("v2\n{EPOCH}\nPOST\n/hook?a=1\nbilling\nbody"));
+    let v3 = tag(format!(
+        "v3\n{EPOCH}\nPOST\n/hook?a=1\nbilling\n{}\n{}\nbody",
+        sha("application/json"),
+        sha("")
+    ));
 
     assert_eq!(
         header.to_str().expect("ascii"),
-        format!("t={EPOCH},v2={expected}")
+        format!("t={EPOCH},v2={v2},v3={v3}")
     );
 }
 
@@ -431,6 +450,7 @@ fn signed_for(audience: &str, value: &str, at: i64, target: &str, body: &str) ->
         at,
         &Method::POST,
         target,
+        &HeaderMap::new(),
         body.as_bytes(),
     );
     Request::builder()
@@ -736,5 +756,143 @@ async fn a_replay_after_a_clock_step_back_is_still_warned_about() {
     assert_eq!(
         warns_after, 2,
         "the replay after the step back must be warned about, not demoted to debug"
+    );
+}
+
+// ── v3: the content headers are signed ────────────────────────────────────
+
+/// A request signed with `content_type` and `content_encoding` (either may be
+/// absent), delivered with `sent_type` and `sent_encoding`.
+fn signed_with_headers(
+    signed_as: (Option<&str>, Option<&str>),
+    sent_as: (Option<&str>, Option<&str>),
+    at: i64,
+    body: &str,
+) -> Request<Body> {
+    let mut signed_headers = HeaderMap::new();
+    if let Some(value) = signed_as.0 {
+        signed_headers.insert(CONTENT_TYPE, HeaderValue::from_str(value).expect("valid"));
+    }
+    if let Some(value) = signed_as.1 {
+        signed_headers.insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_str(value).expect("valid"),
+        );
+    }
+    let header = secret("caller", RELAY).signer().sign_for(
+        AUDIENCE,
+        at,
+        &Method::POST,
+        "/hook",
+        &signed_headers,
+        body.as_bytes(),
+    );
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/hook")
+        .header(SIGNATURE_HEADER, header);
+    if let Some(value) = sent_as.0 {
+        req = req.header(CONTENT_TYPE, value);
+    }
+    if let Some(value) = sent_as.1 {
+        req = req.header(CONTENT_ENCODING, value);
+    }
+    req.body(Body::from(body.to_owned())).expect("request")
+}
+
+/// A signed request cannot be re-typed or re-encoded on its way: the content
+/// headers are part of what is signed, whichever way they are changed.
+#[tokio::test]
+async fn a_changed_content_type_or_encoding_breaks_the_signature() {
+    let app = signed_app(&clock(), addressed());
+    let json = Some("application/json");
+    let form = Some("application/x-www-form-urlencoded");
+    let gzip = Some("gzip");
+    let cases = [
+        ((json, None), (form, None)),
+        ((json, None), (None, None)),
+        ((None, None), (json, None)),
+        ((json, None), (json, gzip)),
+        ((json, gzip), (json, None)),
+    ];
+    for (i, (signed_as, sent_as)) in cases.into_iter().enumerate() {
+        let req = signed_with_headers(signed_as, sent_as, EPOCH, &format!("{{{i}}}"));
+        assert_eq!(
+            send(&app, req).await.0,
+            StatusCode::UNAUTHORIZED,
+            "{signed_as:?} sent as {sent_as:?}"
+        );
+    }
+    for (i, same) in [(json, None), (None, None), (json, gzip)]
+        .into_iter()
+        .enumerate()
+    {
+        let req = signed_with_headers(same, same, EPOCH, &format!("[{i}]"));
+        assert_eq!(send(&app, req).await.0, StatusCode::OK, "{same:?}");
+    }
+}
+
+/// `v2` is refused by default, since it signs no header; a header that
+/// carries both is judged by `v3`.
+#[tokio::test]
+async fn a_v2_only_signature_is_refused_unless_the_route_still_accepts_it() {
+    let clock = clock();
+    let v2_only = |at: i64, body: &str| {
+        let key = secret("caller", RELAY).signing_key;
+        let tag =
+            signature::sign_bytes_v2(&key, at, &Method::POST, "/hook", AUDIENCE, body.as_bytes());
+        let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+        Request::builder()
+            .method(Method::POST)
+            .uri("/hook")
+            .header(SIGNATURE_HEADER, format!("t={at},v2={hex}"))
+            .body(Body::from(body.to_owned()))
+            .expect("request")
+    };
+    let app = signed_app(&clock, addressed());
+    assert_eq!(
+        send(&app, v2_only(EPOCH, "a")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    let until = Utc.timestamp_opt(EPOCH + 1_000, 0).single().expect("valid");
+    let app = signed_app(&clock, addressed().accept_v2_until(until));
+    assert_eq!(send(&app, v2_only(EPOCH, "b")).await.0, StatusCode::OK);
+    // Inside the window a header with a v3 is still judged by its v3: the
+    // v2 beside it does not make a re-typed request pass.
+    let retyped = signed_with_headers(
+        (Some("application/json"), None),
+        (Some("text/plain"), None),
+        EPOCH,
+        "c",
+    );
+    assert_eq!(send(&app, retyped).await.0, StatusCode::UNAUTHORIZED);
+
+    clock.advance_secs(1_000);
+    assert_eq!(
+        send(&app, v2_only(EPOCH + 1_000, "d")).await.0,
+        StatusCode::UNAUTHORIZED,
+        "refused from the instant"
+    );
+}
+
+/// The default body limit is 256 KiB.
+#[tokio::test]
+async fn the_default_body_limit_is_256_kib() {
+    let app = signed_app(&clock(), addressed());
+    // The status only: the echo handler answers with the whole body.
+    let status = |body: String, at: i64| {
+        let app = app.clone();
+        async move {
+            app.oneshot(signed(RELAY, at, Method::POST, "/hook", &body))
+                .await
+                .expect("infallible")
+                .status()
+        }
+    };
+    assert_eq!(status("x".repeat(256 * 1024), EPOCH).await, StatusCode::OK);
+    assert_eq!(
+        status("x".repeat(256 * 1024 + 1), EPOCH + 1).await,
+        StatusCode::PAYLOAD_TOO_LARGE
     );
 }

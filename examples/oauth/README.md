@@ -21,11 +21,13 @@ The example uses `MockIdentityStore` and `MockFactorStore` because the focus is 
 - A federated-identity table: `(issuer, subject)` to local user id. The e-mail address is never the link, so the same address from a second issuer is a second user
 - Just-in-time provisioning under a tenant policy (`Provisioning::JustInTime` creates the user on first login; `LinkedOnly` refuses an identity nobody linked, and `Provisioner::invite` links one beforehand)
 - The claim lock: `complete_oauth_login` refuses claims that did not come out of this session's `finish_oauth_login_with_iss`
+- `POST /auth/logout` and `POST /auth/refresh` refuse a request whose `Origin` (or `Sec-Fetch-Site`) is not the application's own, so they stay safe if the cookie is ever sent cross-site
 - Logout from both ends: `POST /auth/logout` (local, then the provider's end-session endpoint with the ID token as hint) and `POST /auth/backchannel-logout` (the provider ends a session)
 - A `/profile` that reads the axess session and the user store, not the claims
 - Refresh on demand: `POST /auth/refresh` exchanges the stored refresh token (`refresh_oauth_token` with the stored DPoP key), keeps the rotated one and asks userinfo about the same subject
 - DPoP-bound tokens wherever the IdP advertises DPoP: the login's key (`OAuthClaims::dpop_key`) is kept beside the refresh token and signs the refresh and userinfo calls
 - `private_key_jwt` instead of a secret: set `OAUTH_PRIVATE_KEY_FILE` to a PEM key (`OAUTH_PRIVATE_KEY_ALG`, default `RS256`; `OAUTH_PRIVATE_KEY_KID` optional)
+- `OAUTH_ID_TOKEN_ALGS` names the signature algorithms ID tokens may use (comma separated); unset, it is `RS256`, so a provider that advertises other algorithms is not trusted to choose
 
 ### Endpoints
 
@@ -51,7 +53,9 @@ OAUTH_CLIENT_SECRET=your-secret \
 cargo run -p axess-example-oauth
 ```
 
-The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000). Set `OAUTH_PROVISIONING=linked-only` to turn first-login creation off (`just-in-time` is the default; any other value stops the server at start).
+The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000). `OAUTH_PROVISIONING` decides what an identity nobody linked gets: `linked-only` (the default) refuses it, so only users linked beforehand (`Provisioner::invite`) sign in; `just-in-time` creates the local user on first login. Any other value stops the server at start. To try the example against your own Google account, run it with `OAUTH_PROVISIONING=just-in-time`.
+
+**Warning:** `just-in-time` against a public IdP means anyone who can sign in there can sign up here. With Google's default issuer that is any Google account. Use it only for an internal IdP (a Keycloak realm, an Entra tenant) whose users you already trust, or put your own policy in `TenantPolicy` first (an allowed e-mail domain, a group, an invitation).
 
 ### Running with other providers
 

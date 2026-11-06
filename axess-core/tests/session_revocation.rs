@@ -15,6 +15,7 @@ use axess_core::session::{
         SessionStore,
     },
 };
+use axess_core::testing::AuthSessionTestExt;
 use axum::{
     Router,
     body::Body,
@@ -35,18 +36,29 @@ struct World {
 }
 
 fn world(max_age: Option<Duration>) -> World {
+    world_with(|layer| match max_age {
+        Some(max_age) => layer.with_max_session_age(Some(max_age)),
+        None => layer.with_max_session_age(None),
+    })
+}
+
+fn world_with(
+    configure: impl FnOnce(SessionLayer<MemorySessionStore>) -> SessionLayer<MemorySessionStore>,
+) -> World {
     let store = MemorySessionStore::new();
     let registry: Arc<dyn SessionRegistryHandle> =
         Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new()));
     let clock = MockClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
     let reg = registry.clone();
-    let mut layer = SessionLayer::new(store.clone(), [9u8; 32])
+    let layer = configure(
+        SessionLayer::new(
+            store.clone(),
+            axess_core::testing::test_key(9),
+            registry.clone(),
+        )
         .with_secure(false)
-        .with_registry(registry.clone())
-        .with_clock(clock.clone());
-    if let Some(max_age) = max_age {
-        layer = layer.with_max_session_age(max_age);
-    }
+        .with_clock(clock.clone()),
+    );
     let clock_login = clock.clone();
     let app = Router::new()
         .route(
@@ -160,7 +172,10 @@ async fn without_a_registry_on_the_layer_the_row_outlives_revocation() {
             "/whoami",
             get(|s: AuthSession| async move { s.is_authenticated().await.to_string() }),
         )
-        .layer(SessionLayer::new(store, [9u8; 32]).with_secure(false));
+        .layer(
+            SessionLayer::without_registry_insecure(store, axess_core::testing::test_key(9))
+                .with_secure(false),
+        );
     let mut jar = None;
     get_as(&app, &mut jar, "/login").await;
     registry
@@ -198,4 +213,30 @@ async fn a_session_older_than_the_absolute_cap_is_ended_however_active() {
     assert_ne!(get_as(&w.app, &mut jar, "/whoami").await, "guest");
     w.clock.advance_secs(1801);
     assert_eq!(get_as(&w.app, &mut jar, "/whoami").await, "guest");
+}
+
+const DAY: i64 = 24 * 3600;
+
+#[tokio::test]
+async fn a_session_is_ended_after_seven_days_by_default_however_active() {
+    let w = world_with(|layer| layer);
+    let mut jar = None;
+    get_as(&w.app, &mut jar, "/login").await;
+    for _ in 0..6 {
+        w.clock.advance_secs(DAY);
+        assert_ne!(get_as(&w.app, &mut jar, "/whoami").await, "guest");
+    }
+    w.clock.advance_secs(DAY + 1);
+    assert_eq!(get_as(&w.app, &mut jar, "/whoami").await, "guest");
+}
+
+#[tokio::test]
+async fn lifting_the_session_age_cap_keeps_an_active_session_past_seven_days() {
+    let w = world_with(|layer| layer.with_max_session_age(None));
+    let mut jar = None;
+    get_as(&w.app, &mut jar, "/login").await;
+    for _ in 0..10 {
+        w.clock.advance_secs(DAY);
+        assert_ne!(get_as(&w.app, &mut jar, "/whoami").await, "guest");
+    }
 }

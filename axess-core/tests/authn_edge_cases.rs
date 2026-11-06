@@ -95,11 +95,7 @@ async fn suspended_user_cannot_login() {
         tenant_id: tid("t1"),
         identifier: "alice".into(),
         display_name: "Alice".into(),
-        status: EntityState::Suspended(StatusDetail {
-            reason: "test".into(),
-            since: Utc::now(),
-            until: None,
-        }),
+        status: EntityState::Suspended(StatusDetail::administrative("test", Utc::now())),
         webauthn_id: None,
         created_by: axess_core::authn::ids::UserId::system(),
         created_at: now,

@@ -158,6 +158,7 @@ where
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
         self.inner.metrics.factor_success();
         self.release_guess(reserved, user_id).await;
+        self.clear_throttle_for(user_id, tenant_id).await;
 
         // The audit row first: a failed write must leave the session
         // where it was, where the other order had already advanced it

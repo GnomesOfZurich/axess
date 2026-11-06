@@ -9,11 +9,14 @@ use axess_core::{
 use std::sync::Arc;
 
 fn make_store(evaluator: MockPolicyEvaluator) -> Arc<AuthzStore<MockEntityProvider>> {
-    Arc::new(AuthzStore::new(
-        Arc::new(evaluator),
-        Arc::new(MockEntityProvider::new("Test")),
-        "Test",
-    ))
+    Arc::new(
+        AuthzStore::try_new(
+            Arc::new(evaluator),
+            Arc::new(MockEntityProvider::new("Test")),
+            "Test",
+        )
+        .unwrap(),
+    )
 }
 
 #[tokio::test]

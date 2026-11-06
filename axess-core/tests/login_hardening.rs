@@ -74,6 +74,7 @@ fn rig(hash: &str, totp: bool, kdf: KdfExecutor, policy: LockoutPolicy) -> Rig {
     let svc = AuthnService::builder(identity.clone(), factors.clone())
         .with_clock(clock.clone())
         .with_kdf_executor(kdf.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     Rig {
@@ -205,6 +206,7 @@ async fn a_rehash_does_not_drop_a_login_on_another_instance() {
     let other = AuthnService::builder(r.identity.clone(), r.factors.clone())
         .with_clock(r.clock.clone())
         .with_kdf_executor(r.kdf.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let first = test_session();
@@ -350,6 +352,8 @@ async fn a_verified_guess_gives_its_reservation_back() {
     r.svc.verify_factor(&pw("nope"), &wrong).await.unwrap();
     assert_eq!(r.identity.failed_attempts_for("u1"), 1);
 
+    // Past the delay the wrong guess earned this address.
+    r.clock.advance(chrono::Duration::seconds(1));
     let outcome = r
         .svc
         .verify_factor(&pw("Gnomes2+"), &session)
@@ -457,7 +461,10 @@ async fn a_taken_identifier_answers_as_a_free_one_by_default() {
         .begin_signup(newcomer(), "default", &taken)
         .await
         .unwrap();
-    assert!(matches!(outcome, SignupOutcome::Started), "{outcome:?}");
+    assert!(
+        matches!(outcome, SignupOutcome::Started(None)),
+        "{outcome:?}"
+    );
     // The caller sees `Started`; the application sees an anonymous session.
     assert!(taken.auth_state().await.is_guest());
     assert!(taken.user_id().await.is_none());
@@ -476,7 +483,10 @@ async fn a_taken_identifier_answers_as_a_free_one_by_default() {
     free.identifier = "bob@example.com".into();
     let fresh = test_session();
     let outcome = svc.begin_signup(free, "default", &fresh).await.unwrap();
-    assert!(matches!(outcome, SignupOutcome::Started), "{outcome:?}");
+    assert!(
+        matches!(outcome, SignupOutcome::Started(Some(_))),
+        "{outcome:?}"
+    );
     assert!(
         fresh.pending_user_id().await.is_some(),
         "a free identifier is created and the signup is pending for it"
@@ -501,7 +511,9 @@ async fn a_taken_identifier_is_reported_only_when_revealed() {
 #[tokio::test]
 async fn resuming_ones_own_signup_is_audited() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let svc = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .allow_plaintext_factor_secrets()
+        .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
     let mut user = newcomer();
@@ -510,9 +522,9 @@ async fn resuming_ones_own_signup_is_audited() {
         .begin_signup(user.clone(), "default", &session)
         .await
         .unwrap();
-    assert!(matches!(first, SignupOutcome::Started), "{first:?}");
+    assert!(matches!(first, SignupOutcome::Started(_)), "{first:?}");
     let again = svc.begin_signup(user, "default", &session).await.unwrap();
-    assert!(matches!(again, SignupOutcome::Started), "{again:?}");
+    assert!(matches!(again, SignupOutcome::Started(_)), "{again:?}");
 
     let rows: Vec<_> = identity
         .events()
@@ -548,11 +560,11 @@ fn reset_service(
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"));
-    let mut builder =
-        AuthnService::builder(identity, MockFactorStore::new()).with_clock(clock.clone());
-    if let Some(cooldown) = cooldown {
-        builder = builder.with_password_reset_cooldown(cooldown);
-    }
+    let builder = AuthnService::builder(identity, MockFactorStore::new()).with_clock(clock.clone());
+    let builder = match cooldown {
+        Some(cooldown) => builder.with_password_reset_cooldown(cooldown),
+        None => builder.without_password_reset_cooldown(),
+    };
     (
         builder.build().with_audit_context(AuditContext::default()),
         clock,
@@ -631,6 +643,7 @@ async fn the_cooldown_keys_on_the_normalised_identifier() {
     let svc = AuthnService::builder(identity, MockFactorStore::new())
         .with_clock(clock.clone())
         .with_password_reset_cooldown(Duration::from_secs(60))
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -657,6 +670,41 @@ async fn the_cooldown_keys_on_the_normalised_identifier() {
         1,
         "exactly one token was written: {:?}",
         log.calls()
+    );
+}
+
+/// A builder nobody configured holds a minute's cooldown.
+#[tokio::test]
+async fn a_new_builder_has_a_minute_of_cooldown() {
+    let clock = MockClock::now();
+    let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
+    assert!(
+        svc.begin_password_reset("alice", "default", TTL)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        svc.begin_password_reset("alice", "default", TTL)
+            .await
+            .unwrap()
+            .is_none(),
+        "a second request inside the default cooldown"
+    );
+    clock.advance(chrono::Duration::seconds(61));
+    assert!(
+        svc.begin_password_reset("alice", "default", TTL)
+            .await
+            .unwrap()
+            .is_some()
     );
 }
 

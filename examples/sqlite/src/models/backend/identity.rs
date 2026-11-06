@@ -3,7 +3,7 @@
 
 use axess::authn::{
     AuditOutcome, AuthEvent, EntityState, IpPolicy, LockoutPolicy, PasswordRules, StatusDetail,
-    Tenant, TenantId, User, UserId,
+    Tenant, TenantId, Throttle, ThrottleState, ThrottleSubject, User, UserId,
 };
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -34,8 +34,8 @@ impl axess::authn::IdentityLookup for OurBackend {
         tenant_id: &TenantId,
     ) -> Result<Option<User>, Self::Error> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, identifier, display_name, status, failed_attempts, locked_until,
-                    created_by, created_at, updated_by, updated_at
+            "SELECT id, tenant_id, identifier, display_name, status, status_cause, failed_attempts,
+                    locked_until, created_by, created_at, updated_by, updated_at
              FROM users
              WHERE tenant_id = ?1 AND identifier = ?2",
         )
@@ -49,8 +49,8 @@ impl axess::authn::IdentityLookup for OurBackend {
 
     async fn get_user(&self, user_id: &UserId) -> Result<Option<User>, Self::Error> {
         let row = sqlx::query(
-            "SELECT id, tenant_id, identifier, display_name, status, failed_attempts, locked_until,
-                    created_by, created_at, updated_by, updated_at
+            "SELECT id, tenant_id, identifier, display_name, status, status_cause, failed_attempts,
+                    locked_until, created_by, created_at, updated_by, updated_at
              FROM users
              WHERE id = ?1",
         )
@@ -117,7 +117,7 @@ impl axess::authn::IdentityLookup for OurBackend {
     }
 
     async fn account_status(&self, user_id: &UserId) -> Result<EntityState, Self::Error> {
-        let row = sqlx::query("SELECT status, locked_until FROM users WHERE id = ?1")
+        let row = sqlx::query("SELECT status, status_cause, locked_until FROM users WHERE id = ?1")
             .bind(user_id.to_string())
             .fetch_optional(self.pool())
             .await?;
@@ -126,8 +126,14 @@ impl axess::authn::IdentityLookup for OurBackend {
             None => EntityState::Guest,
             Some(r) => {
                 let status: String = r.get("status");
+                let status_cause: Option<String> = r.get("status_cause");
                 let locked_until: Option<String> = r.get("locked_until");
-                entity_state_from_db(self.clock(), &status, locked_until.as_deref())?
+                entity_state_from_db(
+                    self.clock(),
+                    &status,
+                    status_cause.as_deref(),
+                    locked_until.as_deref(),
+                )?
             }
         })
     }
@@ -370,6 +376,84 @@ impl axess::authn::IdentityAuthnLog for OurBackend {
         Ok((count, last))
     }
 
+    async fn throttle_state(
+        &self,
+        key: &ThrottleSubject,
+    ) -> Result<Option<ThrottleState>, Self::Error> {
+        let row = sqlx::query(
+            "SELECT failures, last_failure_at FROM login_throttle
+             WHERE tenant_id = ?1 AND user_id = ?2 AND address = ?3",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(key.user_id.to_string())
+        .bind(throttle_address(key))
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let failures: i64 = row.get("failures");
+        let last: String = row.get("last_failure_at");
+        let last_failure_at = DateTime::parse_from_rfc3339(&last)
+            .map_err(|e| BackendError::Backend(format!("login_throttle.last_failure_at: {e}")))?
+            .with_timezone(&Utc);
+        Ok(Some(ThrottleState {
+            failures: u32::try_from(failures).unwrap_or(u32::MAX),
+            last_failure_at,
+        }))
+    }
+
+    async fn record_throttle_failure(
+        &self,
+        key: &ThrottleSubject,
+        throttle: &Throttle,
+    ) -> Result<(), Self::Error> {
+        let now = self.clock().now();
+        let forget_before = failure_time(
+            now - chrono::Duration::from_std(throttle.forget_after())
+                .unwrap_or(chrono::Duration::hours(1)),
+        );
+        // Rows older than twice the longest delay throttle nothing; sweeping
+        // them on every record keeps the table at the size of the keys that
+        // still matter, with no job to run.
+        sqlx::query("DELETE FROM login_throttle WHERE last_failure_at < ?1")
+            .bind(&forget_before)
+            .execute(self.pool())
+            .await?;
+        // One statement: the read and the increment cannot be separated by a
+        // concurrent failure, so parallel guesses all count. A row the sweep
+        // just missed (older than the bound by less than a tick) starts over
+        // at one by the same bound.
+        sqlx::query(
+            "INSERT INTO login_throttle (tenant_id, user_id, address, failures, last_failure_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT (tenant_id, user_id, address) DO UPDATE SET
+                 failures = CASE WHEN login_throttle.last_failure_at < ?5
+                                 THEN 1 ELSE login_throttle.failures + 1 END,
+                 last_failure_at = ?4",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(key.user_id.to_string())
+        .bind(throttle_address(key))
+        .bind(failure_time(now))
+        .bind(&forget_before)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_throttle(&self, key: &ThrottleSubject) -> Result<(), Self::Error> {
+        sqlx::query(
+            "DELETE FROM login_throttle WHERE tenant_id = ?1 AND user_id = ?2 AND address = ?3",
+        )
+        .bind(key.tenant_id.to_string())
+        .bind(key.user_id.to_string())
+        .bind(throttle_address(key))
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
         sqlx::query("UPDATE users SET failed_attempts = 0, last_failed_at = NULL WHERE id = ?1")
             .bind(user_id.to_string())
@@ -432,12 +516,13 @@ impl axess::authn::IdentityAdmin for OurBackend {
     }
 
     async fn activate_user(&self, user_id: &UserId) -> Result<(), Self::Error> {
-        // A timed suspension is `locked_until`, and the lockout reads the
-        // failed-attempt count and time; all three go, or the account stays
-        // locked or locks again on its next failure.
+        // A timed suspension is `locked_until` and its cause is
+        // `status_cause`, and the lockout reads the failed-attempt count and
+        // time; all of them go, or the account stays locked, locks again on
+        // its next failure, or reads a cause it no longer has.
         sqlx::query(
             "UPDATE users
-             SET status = 'active', locked_until = NULL,
+             SET status = 'active', status_cause = NULL, locked_until = NULL,
                  failed_attempts = 0, last_failed_at = NULL
              WHERE id = ?1",
         )
@@ -452,12 +537,21 @@ impl axess::authn::IdentityAdmin for OurBackend {
         user_id: &UserId,
         detail: StatusDetail,
     ) -> Result<(), Self::Error> {
+        // The cause is written beside the status so it reads back as it was
+        // given: a lockout a caller materialises stays a lockout, an
+        // operator's hold stays an operator's.
         let until = detail.until.map(|u| u.to_rfc3339());
-        sqlx::query("UPDATE users SET status = 'suspended', locked_until = ?2 WHERE id = ?1")
-            .bind(user_id.to_string())
-            .bind(until)
-            .execute(self.pool())
-            .await?;
+        let cause = serde_json::to_string(&detail.cause)
+            .map_err(|e| BackendError::Backend(format!("status cause does not encode: {e}")))?;
+        sqlx::query(
+            "UPDATE users SET status = 'suspended', status_cause = ?2, locked_until = ?3
+             WHERE id = ?1",
+        )
+        .bind(user_id.to_string())
+        .bind(cause)
+        .bind(until)
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
@@ -676,4 +770,11 @@ impl axess::authn::IdentityPasswordHistory for OurBackend {
 /// SQL sorts correctly as text.
 fn failure_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+}
+
+/// The `address` column of a throttle key: the address, or the empty string
+/// for the account-only key, so it can take part in the primary key (SQLite
+/// treats two NULLs as distinct there).
+fn throttle_address(key: &ThrottleSubject) -> String {
+    key.address.map(|ip| ip.to_string()).unwrap_or_default()
 }

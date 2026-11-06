@@ -415,8 +415,9 @@ impl CsrfLayer {
     ///
     /// Panics when the cookie name carries a `__Host-` or `__Secure-` prefix
     /// the configuration cannot honour (no `Secure`, or for `__Host-` a path
-    /// other than `/`), or when `SameSite=None` is set without `Secure`:
-    /// browsers drop such a cookie silently.
+    /// other than `/`), when `SameSite=None` is set without `Secure`
+    /// (browsers drop such a cookie silently), or when the cookie path does
+    /// not start with `/` or holds `;` or a control character.
     pub fn new(config: CsrfConfig) -> Self {
         check_cookie_rules(
             config.effective_cookie_name(),
@@ -596,303 +597,24 @@ where
     }
 }
 
-/// A state-changing request the CSRF check refuses.
-struct Refused;
-
 /// The response for a request the CSRF check refuses.
 fn forbidden() -> Response<Body> {
     (StatusCode::FORBIDDEN, "CSRF validation failed").into_response()
 }
 
-/// Decide whether a state-changing request carries a valid CSRF token.
-///
-/// Fails closed: with no session id there is nothing to bind the token to,
-/// so the request is refused. The Origin/Referer check runs before any body
-/// is buffered. On success the request is returned with its body intact (a
-/// form-encoded body may have been read to find the token); on failure the
-/// request is refused with [`Refused`].
-async fn validate_state_changing(
-    mut req: Request<Body>,
-    config: &CsrfConfig,
-    session_id: Option<SessionId>,
-    cookie_token: Option<&str>,
-) -> Result<Request<Body>, Refused> {
-    let method = req.method().clone();
-    // Fail closed: without a session id we cannot verify the
-    // binding, so a mis-ordered layer stack (CsrfLayer outside the
-    // session layer) is rejected rather than silently validating
-    // an unbound token.
-    let Some(session_id) = session_id else {
-        tracing::warn!(
-            method = %method,
-            path = %req.uri().path(),
-            "csrf: no session id on state-changing request \
-             (CsrfLayer must be layered inside the session layer)"
-        );
-        return Err(Refused);
-    };
-
-    // Origin/Referer defence in depth, if configured. Runs
-    // BEFORE the body-buffering path so a mismatched Origin
-    // never triggers form-body extraction.
-    if !config.allowed_origins.is_empty() && !origin_matches_allowed(&req, &config.allowed_origins)
-    {
-        tracing::warn!(
-            method = %method,
-            path = %req.uri().path(),
-            "csrf: Origin/Referer validation failed"
-        );
-        return Err(Refused);
-    }
-
-    // Extract the presented token, possibly by buffering a
-    // form-urlencoded body. `req` may be re-created with its
-    // body restored.
-    let (extracted, req_after) = match extract_presented_token(req, config).await {
-        Ok(pair) => pair,
-        Err(reason) => {
-            tracing::warn!(
-                method = %method,
-                reason = %reason,
-                "csrf: request rejected during token extraction"
-            );
-            return Err(Refused);
-        }
-    };
-    req = req_after;
-    let presented = extracted;
-    let cookie_present = cookie_token;
-    if !validate_pair(
-        cookie_present,
-        presented.as_deref(),
-        session_id.as_bytes(),
-        &config.signing_key,
-    ) {
-        tracing::warn!(
-            method = %method,
-            path = %req.uri().path(),
-            cookie_present = cookie_present.is_some(),
-            header_or_form_present = presented.is_some(),
-            "csrf: token validation failed"
-        );
-        return Err(Refused);
-    }
-    Ok(req)
-}
-
-/// The token handed to the handler before it runs.
-struct EntryToken {
-    /// A fresh token minted for this response, when the client has no usable one.
-    provisional_mint: Option<String>,
-    /// The value the handler sees in the [`CsrfToken`] extension.
-    extension_token: String,
-}
-
-/// Decide which token the handler sees at request entry.
-///
-/// Handlers
-/// that read `CsrfToken` from the request extension (to embed
-/// in an HTML form, say) need SOME value; give them either
-/// the presented cookie or a fresh mint bound to the current
-/// session id. A token can only be minted when a session id
-/// is present to bind it to; without one we leave the client
-/// tokenless rather than issue an unbound token.
-///
-/// A presented cookie that does not verify against the session id
-/// at entry (left over from before the id changed) is not handed
-/// to the handler: embedding it would render a form whose first
-/// submit is refused. It is treated as absent here, so the handler
-/// sees a fresh token bound to the current id, and the same token
-/// goes out as the replacement cookie. Validation of a
-/// state-changing request is unchanged and has already run.
-fn entry_token(
-    config: &CsrfConfig,
-    cookie_token: Option<&str>,
-    session_id: Option<SessionId>,
-) -> EntryToken {
-    let usable_cookie = cookie_token.filter(|c| {
-        !c.is_empty()
-            && session_id
-                .as_ref()
-                .is_none_or(|sid| validate_token(c, sid.as_bytes(), &config.signing_key))
-    });
-    let provisional_mint = match (usable_cookie, session_id.as_ref()) {
-        (Some(_), _) => None,
-        (None, Some(sid_at_entry)) => Some(mint_token(
-            sid_at_entry.as_bytes(),
-            &config.signing_key,
-            &*config.rng,
-        )),
-        (None, None) => None,
-    };
-    let extension_token = provisional_mint
-        .clone()
-        .or_else(|| usable_cookie.map(str::to_owned))
-        .or_else(|| cookie_token.map(str::to_owned))
-        .unwrap_or_default();
-    EntryToken {
-        provisional_mint,
-        extension_token,
-    }
-}
-
-/// The token to ship as `Set-Cookie` after the handler ran, if any.
-///
-/// The post-handler session id decides: if the cookie the client will present
-/// next no longer verifies against it (typical after `session.regenerate()`), a
-/// token for the new id is issued; otherwise only a token minted at entry is sent.
-fn replacement_token(
-    config: &CsrfConfig,
-    issuer: &CsrfIssuer,
-    provisional_mint: Option<String>,
-    cookie_token: Option<&str>,
-    session_id_after: Option<SessionId>,
-) -> Option<String> {
-    // The token the client would present next request: either the
-    // freshly-provisioned mint (if we issued one) or the cookie
-    // they sent this request. Empty string means "no token to
-    // present": treat as absent.
-    let effective_cookie = provisional_mint
-        .as_deref()
-        .or(cookie_token)
-        .filter(|t| !t.is_empty());
-    match (effective_cookie, session_id_after.as_ref()) {
-        (Some(existing), Some(sid_after))
-            if validate_token(existing, sid_after.as_bytes(), &config.signing_key) =>
-        {
-            // Cookie still binds to the post-handler session id
-            // (usually because the handler didn't rotate). Mint
-            // only if we chose to at entry.
-            provisional_mint
-        }
-        (_, Some(sid_after)) => {
-            // Either no effective cookie, or the effective cookie
-            // no longer binds to the current session id (typical
-            // after `session.regenerate()`). Use the issuer's token
-            // for the new id: it is the one a handler that rotated
-            // may already have embedded in its response body.
-            Some(issuer.token_for(*sid_after))
-        }
-        (_, None) => None,
-    }
-}
-
-fn is_state_changing(method: &axum::http::Method) -> bool {
-    // A deny-list of the SAFE methods (RFC 9110 §9.2.1), not an allow-list
-    // of the unsafe ones: PURGE, MKCOL, LOCK, PROPPATCH and any custom method
-    // change state and were skipped by the old list.
-    !matches!(
-        *method,
-        axum::http::Method::GET
-            | axum::http::Method::HEAD
-            | axum::http::Method::OPTIONS
-            | axum::http::Method::TRACE
-    )
-}
-
-fn extract_cookie_token(req: &Request<Body>, cookie_name: &str) -> Option<String> {
-    // Delegates to the shared `utils::cookies` helper. The cap is
-    // enforced inside the helper; CSRF passes its own `MAX_COOKIE_VALUE_BYTES`
-    // constant so the value is auditable next to the rest of the CSRF
-    // configuration.
-    crate::cookies::extract_named_cookie(req.headers(), cookie_name, MAX_COOKIE_VALUE_BYTES)
-}
-
-/// Return the presented CSRF token and the (possibly-rebuilt) request.
-///
-/// Extraction order:
-///
-/// 1. Header (`config.header_name`): no body cost. Standard for AJAX.
-/// 2. Form field (`config.form_field_name`): only if the request is
-///    `application/x-www-form-urlencoded`. Buffers the body up to
-///    `config.form_body_limit` bytes, parses for the field, then restores
-///    the (in-memory) body into the request so downstream handlers still
-///    read the form normally.
-///
-/// Multipart form data (`multipart/form-data`) is deliberately NOT
-/// supported: extracting one field would parse the entire upload,
-/// which is the wrong tradeoff for CSRF middleware. JS-driven multipart
-/// clients should set the header instead.
-///
-/// Returns `Err(reason)` when the request declares (or streams) a
-/// body larger than `form_body_limit` on the form-field path: the
-/// caller fails the request closed rather than let a hostile client
-/// exhaust memory.
-async fn extract_presented_token(
-    req: Request<Body>,
-    config: &CsrfConfig,
-) -> Result<(Option<String>, Request<Body>), &'static str> {
-    // Header path first; if present, the body stays untouched.
-    if let Some(value) = req.headers().get(config.header_name.as_ref())
-        && let Ok(s) = value.to_str()
-        && !s.is_empty()
-    {
-        return Ok((Some(s.to_string()), req));
-    }
-
-    // Form-field path is scoped to state-changing requests carrying an
-    // urlencoded body. Anything else: no form field to look at, return
-    // `None` with the request untouched.
-    let is_urlencoded = req
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            let base = s.split(';').next().unwrap_or("").trim();
-            base.eq_ignore_ascii_case("application/x-www-form-urlencoded")
-        })
-        .unwrap_or(false);
-    if !is_urlencoded {
-        return Ok((None, req));
-    }
-
-    // Reject up front if the client declared a body larger than the cap.
-    if let Some(declared) = req
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok())
-        && declared > config.form_body_limit
-    {
-        return Err("form body exceeds csrf buffer cap");
-    }
-
-    // Split, buffer, parse, restore. `axum::body::to_bytes` enforces
-    // the cap even for chunked bodies with no Content-Length.
-    let (parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, config.form_body_limit).await {
-        Ok(b) => b,
-        Err(_) => return Err("form body exceeds csrf buffer cap"),
-    };
-    let field = url::form_urlencoded::parse(&bytes)
-        .find(|(k, _)| k.as_ref() == config.form_field_name.as_ref())
-        .map(|(_, v)| v.into_owned())
-        .filter(|s| !s.is_empty());
-    let restored = Request::from_parts(parts, Body::from(bytes));
-    Ok((field, restored))
-}
-
-fn build_cookie(config: &CsrfConfig, token: &str) -> String {
-    use cookie::Cookie;
-
-    let mut cookie = Cookie::new(
-        config.effective_cookie_name().to_string(),
-        token.to_string(),
-    );
-    // Intentionally NOT HttpOnly; JavaScript needs to read the token to
-    // include it in headers (the double-submit pattern requires this).
-    cookie.set_http_only(false);
-    cookie.set_secure(config.secure);
-    cookie.set_same_site(config.same_site);
-    cookie.set_path(config.path.as_ref().to_string());
-    cookie.to_string()
-}
-
 mod guards;
-use guards::{
-    check_cookie_rules, is_websocket_upgrade, normalize_origin, origin_is_own_host,
-    origin_matches_allowed,
+use guards::check_cookie_rules;
+// Shared with the session layer, which applies the same Origin rule to a
+// WebSocket upgrade.
+pub(crate) use guards::{
+    is_websocket_upgrade, normalize_origin, origin_is_own_host, origin_matches_allowed,
 };
+mod issued;
+use issued::{EntryToken, build_cookie, entry_token, replacement_token};
+mod presented;
+#[cfg(test)]
+use presented::extract_presented_token;
+use presented::{Refused, extract_cookie_token, is_state_changing, validate_state_changing};
 mod token;
 use token::{mint_token, validate_pair, validate_token};
 

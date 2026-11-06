@@ -1,24 +1,33 @@
 //! Protected routes; accessible only to fully authenticated users.
 
 use crate::web::app::AppState;
+use crate::web::auth;
 use crate::web::csrf_hidden_input;
 use axess::authn::{AuthnScope, FactorKind, FactorStore};
 use axess::csrf::CsrfToken;
-use axess::{AuthSession, require_authn};
+use axess::{AuthSession, RateLimitLayer, require_authn};
 use axum::{
     Extension, Router,
     extract::State,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
 };
 
 /// Build the sub-router for protected routes.
 ///
 /// All routes are guarded by `require_authn!`; unauthenticated requests are
 /// redirected to `/login`.
-pub fn router() -> Router<AppState> {
+///
+/// `limit` is the rate limiter for the one route here that checks a password
+/// (`POST /setup-totp`); it runs after the guard, so guests are turned away
+/// before they use up any of its budget.
+pub fn router(limit: RateLimitLayer) -> Router<AppState> {
     Router::new()
         .route("/dashboard", get(dashboard))
+        .route(
+            "/setup-totp",
+            get(auth::setup_totp_page).merge(post(auth::post_setup_totp).layer(limit)),
+        )
         .route_layer(require_authn!("/login"))
 }
 

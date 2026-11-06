@@ -23,11 +23,11 @@ cargo feature and will not pick one for you. Anything enabling
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.15.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.16.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.15.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.16.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,
@@ -147,7 +147,11 @@ encourages puts reads on a replica and writes on the primary, so a primary
 outage leaves logins working and the counter dead. (A correct login that
 overlaps more simultaneous logins than `max_attempts` can be refused for
 the moment their reservations are held; that is the price of a limit that
-holds.) `LockoutPolicy::on_counter_unavailable`
+holds.) Before the reservation, `LockoutPolicy::throttle` refuses a guess
+that comes inside the delay its key (account and client address) has
+earned, as `FactorOutcome::Throttled`, so one guesser is slowed down
+without the account being locked; its store reads follow the same
+`on_counter_unavailable`. `LockoutPolicy::on_counter_unavailable`
 decides what happens then. It defaults to `CounterUnavailable::Lock`,
 which treats the attempt as locked and keeps brute force bounded.
 `CounterUnavailable::Allow` keeps those users logging in and leaves

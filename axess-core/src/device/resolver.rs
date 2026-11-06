@@ -60,15 +60,13 @@ pub struct SessionUser(pub UserId);
 /// The tenant the session authenticated into, placed in the request
 /// extensions by the session layer before a [`DeviceResolver`] runs.
 ///
-/// It is the tenant [`AuthSession::set_authenticated`] stored at login, so an
+/// It is the tenant the login service stored when it authenticated the session, so an
 /// adopter whose tenant is a property of the signed-in user needs no
 /// `TenantId` request extension for device tracking: the default `tenant_fn`
 /// of [`LifecycleDeviceResolver`](crate::device::LifecycleDeviceResolver)
 /// falls back to it. A `TenantId` extension, when the adopter sets one, is
 /// read first. Absent for a guest and for a session part-way through a login,
 /// like [`SessionUser`].
-///
-/// [`AuthSession::set_authenticated`]: crate::session::extractor::AuthSession::set_authenticated
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTenant(pub TenantId);
 

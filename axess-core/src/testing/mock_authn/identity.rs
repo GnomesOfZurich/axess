@@ -5,7 +5,10 @@ use crate::authn::store::AuditOutcome;
 use crate::authn::{
     event::AuthEvent,
     ids::{TenantId, UserId},
-    types::{EntityState, LockoutPolicy, StatusDetail, Tenant, User},
+    types::{
+        EntityState, LockoutPolicy, StatusDetail, Tenant, Throttle, ThrottleState, ThrottleSubject,
+        User,
+    },
 };
 use crate::locked::lock;
 use std::collections::HashMap;
@@ -34,6 +37,11 @@ pub struct MockIdentityStore {
     tenants_by_id: Arc<Mutex<HashMap<String, Tenant>>>,
     /// user_id -> (failed attempt count, time of the last failure)
     failed_attempts: Arc<Mutex<HashMap<String, FailedAttempts>>>,
+    /// Throttle entries per key, as
+    /// [`record_throttle_failure`](crate::authn::IdentityAuthnLog::record_throttle_failure)
+    /// writes them. A record sweeps every stale entry, so the map holds only
+    /// keys that still throttle.
+    throttles: Arc<Mutex<HashMap<ThrottleSubject, ThrottleState>>>,
     /// Clock the last-failure time is read from. Share the service's
     /// [`MockClock`](axess_clock::testing::MockClock) with
     /// [`with_clock`](Self::with_clock) so a derived lockout expires on the
@@ -104,6 +112,7 @@ impl MockIdentityStore {
             tenants: Default::default(),
             tenants_by_id: Default::default(),
             failed_attempts: Default::default(),
+            throttles: Default::default(),
             clock: Arc::new(axess_clock::SystemClock),
             events: Default::default(),
             default_tenant: None,
@@ -513,6 +522,40 @@ impl crate::authn::store::IdentityAuthnLog for MockIdentityStore {
 
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
         lock(&self.failed_attempts).remove(user_id.to_string().as_str());
+        Ok(())
+    }
+
+    async fn throttle_state(
+        &self,
+        key: &ThrottleSubject,
+    ) -> Result<Option<ThrottleState>, Self::Error> {
+        note(&self.call_log, "throttle_state");
+        Ok(lock(&self.throttles).get(key).copied())
+    }
+
+    async fn record_throttle_failure(
+        &self,
+        key: &ThrottleSubject,
+        throttle: &Throttle,
+    ) -> Result<(), Self::Error> {
+        note(&self.call_log, "record_throttle_failure");
+        let now = self.clock.now();
+        // Holding the map's lock makes the read and the increment one step.
+        let mut throttles = lock(&self.throttles);
+        // Forget what no longer throttles, so the map holds only live keys.
+        throttles.retain(|_, state| !throttle.is_stale(state, now));
+        let entry = throttles.entry(*key).or_insert(ThrottleState {
+            failures: 0,
+            last_failure_at: now,
+        });
+        entry.failures = entry.failures.saturating_add(1);
+        entry.last_failure_at = now;
+        Ok(())
+    }
+
+    async fn clear_throttle(&self, key: &ThrottleSubject) -> Result<(), Self::Error> {
+        note(&self.call_log, "clear_throttle");
+        lock(&self.throttles).remove(key);
         Ok(())
     }
 

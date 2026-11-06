@@ -5,10 +5,11 @@
 
 use axess::authn::AuthnService;
 use axess::authz::{PolicyStore, RequestEntityProvider};
+use axess::testing::AuthSessionTestExt;
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{
     AuthSession, MemorySessionRegistry, MemorySessionStore, SessionLayer, SessionRegistry,
-    require_authz,
+    require_authn, require_authz,
 };
 use axess_core::authz::AuthzError;
 use axum::{
@@ -86,14 +87,14 @@ fn app() -> App {
     let store = Arc::new(PolicyStore::from_text(&policy, SCHEMA).expect("policy"));
     let provider: Arc<dyn RequestEntityProvider> = Arc::new(Provider);
     let reg = registry.clone();
-    let session_layer = SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false);
+    let session_layer = SessionLayer::without_registry_insecure(
+        MemorySessionStore::new(),
+        axess::testing::test_key(42),
+    )
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false);
     let app = Router::new()
-        .route(
-            "/plain",
-            get(|| async { "ok" }).layer(require_authz!("App", "Manage", "Platform:global")),
-        )
+        .route("/plain", get(|| async { "ok" }).layer(require_authn!()))
         .route(
             "/guarded",
             get(|| async { "ok" }).layer(require_authz!(
@@ -153,7 +154,7 @@ async fn login(app: &Router) -> String {
 }
 
 #[tokio::test]
-async fn a_revoked_session_passes_the_bare_gate_and_fails_the_validator_gate() {
+async fn a_revoked_session_passes_the_bare_authn_guard_and_fails_the_validator_gate() {
     let a = app();
     let cookie = login(&a.app).await;
     assert_eq!(status(&a.app, &cookie, "/plain").await, StatusCode::OK);
@@ -167,7 +168,7 @@ async fn a_revoked_session_passes_the_bare_gate_and_fails_the_validator_gate() {
     assert_eq!(
         status(&a.app, &cookie, "/plain").await,
         StatusCode::OK,
-        "the bare gate reads only the session record"
+        "the bare authn guard reads only the session record"
     );
     assert_eq!(
         status(&a.app, &cookie, "/guarded").await,

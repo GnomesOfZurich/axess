@@ -232,12 +232,40 @@ async fn a_sealed_secret_with_no_cipher_is_a_clear_error() {
     );
 }
 
+/// Storing a one-time-code secret through the service with no cipher is
+/// refused by name: the write would put the seed in the table in clear text.
 #[tokio::test]
-async fn with_no_cipher_a_plain_secret_works_as_before() {
+async fn with_no_cipher_a_plain_secret_is_refused_and_the_row_left() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), hotp(SECRET.into(), 0))
         .with_method(&uid("u1"), hotp_method());
     let svc = service(factors.clone(), None);
+
+    let err = login(&svc, 0).await.unwrap_err();
+    assert!(
+        matches!(&err, AuthnError::Internal(text) if text.contains("allow_plaintext_factor_secrets")),
+        "{err:?}"
+    );
+    let row = stored(&factors, &user_scope()).await.unwrap();
+    assert_eq!(
+        serde_json::to_string(&row).unwrap(),
+        serde_json::to_string(&hotp(SECRET.into(), 0)).unwrap(),
+        "the row is untouched"
+    );
+}
+
+#[tokio::test]
+async fn with_the_plaintext_opt_out_a_plain_secret_works_as_before() {
+    let factors = MockFactorStore::new()
+        .with_factor(user_scope(), hotp(SECRET.into(), 0))
+        .with_method(&uid("u1"), hotp_method());
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let svc = AuthnService::builder(identity, factors.clone())
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
 
     assert!(matches!(
         login(&svc, 0).await.unwrap(),

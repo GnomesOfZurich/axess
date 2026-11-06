@@ -9,7 +9,7 @@ use crate::session::crypto::{BoundFormat, device_row_id_v1};
 use crate::testing::sql_live;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
-const KEY: [u8; 32] = [0x42; 32];
+const KEY: [u8; 32] = crate::testing::test_key(0x42);
 
 fn refresh(family: &str) -> DeviceBinding {
     DeviceBinding::Refresh {

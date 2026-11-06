@@ -64,3 +64,8 @@ its own example, and mixing them in here would cost the chapter the
 property it is built on: that a reader can hold the whole file in their
 head. `examples/sqlite` is the same flow against a real store, with an
 audit trail and password reset.
+
+`MemorySessionStore` is unbounded and per process, so it is for demos: the
+example gives sessions a 30 minute lifetime and purges the expired ones
+every five minutes, and production uses a persistent store (see
+`examples/sqlite`).

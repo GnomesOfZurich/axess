@@ -28,7 +28,7 @@ async fn status_check_true_allows_rotation() {
     .await
     .unwrap();
 
-    let (session, new_token) = Refresh::new(&plaintext, |_user_id| async { true })
+    let (session, new_token) = Refresh::any_tenant(&plaintext, |_user_id| async { true })
         .run(&store, &config, &rng, ts)
         .await
         .expect("status=true must allow refresh");
@@ -68,7 +68,7 @@ async fn status_check_false_refuses_and_preserves_token() {
     .await
     .unwrap();
 
-    let err = Refresh::new(&plaintext, |_user_id| async { false })
+    let err = Refresh::any_tenant(&plaintext, |_user_id| async { false })
         .run(&store, &config, &rng, ts)
         .await
         .expect_err("status=false must refuse refresh");
@@ -125,7 +125,7 @@ async fn revoked_token_bypasses_status_check() {
     .unwrap();
 
     // Rotate once (revokes the parent).
-    let _ = Refresh::new(&plaintext, |_| async { true })
+    let _ = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
@@ -133,7 +133,7 @@ async fn revoked_token_bypasses_status_check() {
     // Replay the original; should hit the family-revocation path,
     // returning `RefreshError::Revoked`, NOT `AccountInactive`,
     // even though the status check would have refused.
-    let err = Refresh::new(&plaintext, |_user_id| async { false })
+    let err = Refresh::any_tenant(&plaintext, |_user_id| async { false })
         .run(&store, &config, &rng, ts)
         .await
         .expect_err("revoked token must error");

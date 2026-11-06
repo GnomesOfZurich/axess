@@ -106,7 +106,7 @@ impl OAuthProvider for OAuthProviderConfig {
         self.verify_issuer_jwt(token)
     }
 
-    fn fetch_userinfo<'a>(
+    fn fetch_userinfo_unchecked<'a>(
         &'a self,
         access_token: &'a str,
         dpop: Option<DpopSigner<'a>>,
@@ -114,7 +114,7 @@ impl OAuthProvider for OAuthProviderConfig {
         Box::pin(self.fetch_userinfo_constrained(access_token, dpop))
     }
 
-    fn refresh_token<'a>(
+    fn refresh_token_unchecked<'a>(
         &'a self,
         refresh_token: &'a str,
         original_nonce: Option<&'a str>,
@@ -185,12 +185,12 @@ impl OAuthProvider for OAuthProviderConfig {
 
         let (auth_url, csrf_state, nonce) = auth_request.url();
 
-        Ok((
-            auth_url,
-            csrf_state.secret().clone(),
-            nonce.secret().clone(),
-            secrets.pkce_verifier.secret().to_string(),
-        ))
+        Ok(AuthUrlResult {
+            url: auth_url,
+            csrf_state: csrf_state.secret().clone(),
+            nonce: nonce.secret().clone(),
+            pkce_verifier: secrets.pkce_verifier.secret().to_string(),
+        })
     }
 
     fn build_auth_url_par<'a>(

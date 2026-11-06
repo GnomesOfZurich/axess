@@ -93,6 +93,7 @@ async fn from_key_store_es256_mint_roundtrips_through_verifier() {
 
     let verifier = JwtVerifier::new(idp.jwks_handle().await)
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms(idp.verifier_algorithms().await);
     let verified = verifier
         .verify::<CustomClaims>(&token)
@@ -573,4 +574,17 @@ async fn an_empty_string_audience_is_refused_as_no_audience() {
             "aud {audiences:?} minted: {outcome:?}"
         );
     }
+}
+
+/// An already-expired claim set is an invalid lifetime, not a cap exceeded.
+#[tokio::test]
+async fn an_expired_claim_set_is_an_invalid_lifetime() {
+    let idp = es256_idp().await;
+    let claims = MintClaims::new("worker-1", chrono::Utc::now() - Duration::hours(1));
+    assert!(matches!(
+        idp.mint(&claims).await,
+        Err(IssuanceError::InvalidLifetime(
+            crate::local_idp::LifetimeFault::AlreadyExpired
+        ))
+    ));
 }

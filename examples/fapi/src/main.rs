@@ -14,11 +14,13 @@
 //!
 //! ## Dual-mode operation
 //!
-//! **Mock mode (default):** Runs with an in-process mock OIDC server. Zero setup.
-//! Shows the API wiring without external dependencies.
+//! **Mock mode (opt-in):** `FAPI_MOCK=1` runs an in-process mock OIDC server
+//! that accepts any code and signs in as a seeded user. Zero setup, no
+//! external dependencies, never for a deployment. Without `FAPI_ISSUER` and
+//! without `FAPI_MOCK=1` the example refuses to start.
 //!
 //! ```sh
-//! cargo run -p axess-example-fapi
+//! FAPI_MOCK=1 cargo run -p axess-example-fapi
 //! ```
 //!
 //! **Live mode:** Set environment variables to connect to a real FAPI-compliant IdP.
@@ -33,16 +35,18 @@
 //!
 //! `FAPI_PRIVATE_KEY_FILE` names the PEM private key the client signs its
 //! assertions with (`FAPI_PRIVATE_KEY_ALG`, default `ES256`;
-//! `FAPI_PRIVATE_KEY_KID` sets the assertion's `kid`). Without it the example
-//! signs with the development key in `keycloak/dev-client-key.pem`, which the
-//! bundled Keycloak realm registers and nothing else accepts.
+//! `FAPI_PRIVATE_KEY_KID` sets the assertion's `kid`). Without it, and only
+//! for an issuer on `localhost` or `127.0.0.1`, the example signs with the
+//! development key in `keycloak/dev-client-key.pem`, which the bundled
+//! Keycloak realm registers and nothing else accepts. Any other issuer
+//! requires `FAPI_PRIVATE_KEY_FILE`.
 //!
 //! ## Endpoints
 //!
 //! - `GET  /`; home page with login link
 //! - `GET  /auth/login`; initiates FAPI login (PAR → redirect to IdP)
-//! - `GET  /auth/callback`; handles IdP callback (query mode)
-//! - `POST /auth/callback`; handles IdP callback (form_post mode)
+//! - `POST /auth/callback`; handles IdP callback (form_post mode only; there
+//!   is no query-mode `GET` callback)
 //! - `GET  /profile`; the signed-in user and the key the tokens are bound to
 //! - `POST /auth/refresh`; refreshes the tokens with a DPoP proof
 //! - `POST /auth/logout`; RP-Initiated Logout (revoke tokens, redirect to IdP)
@@ -57,12 +61,12 @@ use axess::federation::oauth::{
 };
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{
-    AuthSession, Clock, MemorySessionRegistry, MemorySessionStore, SecureRng, SessionLayer,
-    SessionRegistryAdapter, SystemClock, SystemRng,
+    AuthSession, Clock, KeyExtractor, MemorySessionRegistry, MemorySessionStore, RateLimitConfig,
+    RateLimitLayer, SecureRng, SessionLayer, SessionRegistryAdapter, SessionStore, SystemClock,
+    SystemRng,
 };
 use axum::{
     Form, Router,
-    extract::Query,
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
 };
@@ -100,6 +104,9 @@ struct AppState {
     authn: Arc<Service>,
     identity: MockIdentityStore,
     tenant: TenantId,
+    /// The tenant policy: the e-mail domains whose identities may be created
+    /// as local users. An identity outside them is refused, not provisioned.
+    allowed_email_domains: Vec<String>,
     provider_name: String,
     post_logout_redirect: String,
 }
@@ -113,7 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
 
-    let is_live = std::env::var("FAPI_ISSUER").is_ok();
+    let mode = run_mode(
+        std::env::var("FAPI_ISSUER").ok().as_deref(),
+        std::env::var("FAPI_MOCK").ok().as_deref(),
+    )?;
+    let is_live = matches!(mode, Mode::Live);
 
     // The tenant the IdP's users are created in. A real application reads it
     // from its tenant table; the in-memory store is seeded here.
@@ -139,6 +150,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let session_store = MemorySessionStore::new();
+    // Logins that were started and never finished, and sessions that ran out,
+    // stay in the store until it is pruned. A persistent store is pruned the
+    // same way.
+    {
+        let store = session_store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                tick.tick().await;
+                match store.prune_expired().await {
+                    Ok(n) if n > 0 => info!(pruned = n, "expired sessions pruned"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "session prune failed"),
+                }
+            }
+        });
+    }
     // `axess::SystemRng` routes through the foundation crate's RNG
     // abstraction (same path the library uses internally), so the example
     // models the pattern adopters should copy instead of teaching `rand::*`.
@@ -149,30 +177,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `SameSite=Lax` cookie is sent. Against a provider on another site the
     // browser withholds a `Lax` cookie from that POST and the callback finds no
     // session: use `.with_same_site(SameSite::None)` there, which browsers
-    // accept only together with `Secure` (so keep cookies `Secure`).
-    let session_layer = SessionLayer::new(session_store, signing_key)
-        .with_secure(secure_cookies())
-        // A session the registry no longer holds (a logout, a forced logout)
-        // is refused on its next request.
-        .with_registry(Arc::new(SessionRegistryAdapter(registry)));
+    // accept only together with `Secure` (so keep cookies `Secure`). That
+    // switch also lets a cross-site page send the cookie with a forged `POST`;
+    // refresh and logout stay safe only through `same_origin_only`, so keep it.
+    // A session the registry no longer holds (a logout, a forced logout) is
+    // refused on its next request.
+    let session_layer = SessionLayer::new(
+        session_store,
+        signing_key,
+        Arc::new(SessionRegistryAdapter(registry)),
+    )
+    .with_secure(secure_cookies());
 
+    let allowed_email_domains = if is_live {
+        parse_domains(&std::env::var("FAPI_ALLOWED_EMAIL_DOMAINS").map_err(|_| {
+            "FAPI_ALLOWED_EMAIL_DOMAINS is required: the e-mail domains \
+                 (comma separated) whose identities may sign up"
+        })?)
+    } else {
+        vec!["bank.example.com".to_string()]
+    };
     let state = AppState {
         authn: Arc::new(authn),
         identity,
         tenant,
+        allowed_email_domains,
         provider_name,
         post_logout_redirect: format!("{APP_ORIGIN}/"),
     };
 
-    let app = Router::new()
-        .route("/", get(home))
-        .route("/auth/login", get(login))
-        .route("/auth/callback", get(callback_get).post(callback_post))
-        .route("/profile", get(profile))
-        .route("/auth/refresh", post(refresh))
-        .route("/auth/logout", post(logout))
-        .with_state(state)
-        .layer(session_layer);
+    let app = routes().with_state(state).layer(session_layer);
 
     // Resolve the client address once, outside everything that reads one.
     // A FAPI deployment sits behind a TLS terminator, so name that
@@ -183,7 +217,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     info!("Listening on 127.0.0.1:3000; open {APP_ORIGIN}");
     if !is_live {
-        info!("Running in MOCK mode; set FAPI_ISSUER to connect to a real IdP");
+        tracing::warn!(
+            "Running in MOCK mode: the mock IdP accepts any code. Never run it \
+             where others can reach it; set FAPI_ISSUER to use a real IdP"
+        );
     }
     // `with_connect_info` is what puts the peer address where the
     // client-IP layer can read it.
@@ -196,7 +233,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Logins one client address may start per window. `/auth/login` pushes an
+/// authorization request to the IdP (server to server) and opens a session
+/// with a pending login, so an unthrottled caller costs the IdP and the store.
+const LOGIN_LIMIT: u32 = 10;
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A per-client-address limit for `/auth/login`. It keys on the address
+/// `axess::client_ip::layer` resolves (installed outside everything in
+/// `main`); without that layer every request shares one bucket, which limits
+/// harder, not less. A deployment behind several replicas needs a limit at
+/// the edge as well, since this one counts per process.
+fn login_limiter() -> RateLimitLayer {
+    RateLimitLayer::new(
+        RateLimitConfig::builder()
+            .max_requests(LOGIN_LIMIT)
+            .window(LOGIN_WINDOW)
+            .key(KeyExtractor::ClientIp)
+            .build(),
+    )
+}
+
+/// The example's routes. The callback is `POST` only: the login asks for
+/// `form_post`, so a code in a URL query is never expected and never accepted.
+fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(home))
+        .route("/auth/login", get(login).route_layer(login_limiter()))
+        .route("/auth/callback", post(callback_post))
+        .route("/profile", get(profile))
+        .merge(
+            // The callback is a cross-site POST by design and is protected by
+            // `state`; refresh and logout are the application's own forms.
+            Router::new()
+                .route("/auth/refresh", post(refresh))
+                .route("/auth/logout", post(logout))
+                .route_layer(axum::middleware::from_fn(same_origin_only)),
+        )
+}
+
+/// Whether the `Origin` (or, without one, `Sec-Fetch-Site`) names the app.
+fn origin_allowed(headers: &axum::http::HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match (header("origin"), header("sec-fetch-site")) {
+        (Some(origin), _) => origin == APP_ORIGIN,
+        (None, Some(site)) => site == "same-origin",
+        (None, None) => false,
+    }
+}
+
+/// Refuse a state-changing request that does not come from the application's
+/// own origin. A browser sends `Origin` with every `POST`; `Sec-Fetch-Site`
+/// is the fallback for one that omits it. A request with neither is not a
+/// browser form and is refused too.
+///
+/// The session cookie is `SameSite=Lax`, which already keeps it off a
+/// cross-site `POST`. Switching to `SameSite=None` (the comment at the
+/// session layer says when a cross-site IdP needs it) takes that protection
+/// away, and this check is what keeps refresh and logout from being forgeable
+/// then.
+async fn same_origin_only(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let ok = origin_allowed(req.headers());
+    if !ok {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "cross-origin request refused",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 // ── Mock mode ──────────────────────────────────────────────────────────────
+
+/// Which identity provider the process talks to.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    Live,
+    Mock,
+}
+
+/// Decide the mode from `FAPI_ISSUER` and `FAPI_MOCK`. The mock IdP accepts
+/// any code, so it runs only when asked for with `FAPI_MOCK=1`: an unset or
+/// misspelled `FAPI_ISSUER` is an error, not a silent mock.
+fn run_mode(issuer: Option<&str>, mock: Option<&str>) -> Result<Mode, String> {
+    let issuer = issuer.filter(|i| !i.is_empty());
+    let mock = mock == Some("1");
+    match (issuer, mock) {
+        (Some(_), false) => Ok(Mode::Live),
+        (None, true) => Ok(Mode::Mock),
+        (Some(_), true) => Err("FAPI_ISSUER and FAPI_MOCK=1 are both set; choose one".to_string()),
+        (None, false) => Err(
+            "FAPI_ISSUER is not set. Set it to a FAPI-compliant issuer, or set \
+             FAPI_MOCK=1 to run the mock IdP (which accepts any code; local use only)"
+                .to_string(),
+        ),
+    }
+}
 
 fn build_mock_provider() -> (axess::testing::MockOAuthProvider, String) {
     use axess::testing::MockOAuthProvider;
@@ -217,7 +353,7 @@ fn build_mock_provider() -> (axess::testing::MockOAuthProvider, String) {
     // can't be applied. In mock mode we demonstrate the API surface without
     // the full PAR→redirect→callback round trip.
     info!("Mock mode: PAR and DPoP are shown in code but not exercised end-to-end");
-    info!("Mock mode: Set FAPI_ISSUER to test against a real FAPI IdP");
+    info!("Mock mode: Set FAPI_ISSUER instead of FAPI_MOCK to test against a real FAPI IdP");
 
     (mock, "fapi-mock".to_string())
 }
@@ -255,9 +391,18 @@ struct ClientKey {
 
 impl ClientKey {
     /// `FAPI_PRIVATE_KEY_FILE` (with `FAPI_PRIVATE_KEY_ALG`, default `ES256`,
-    /// and `FAPI_PRIVATE_KEY_KID`), or the development key when it is unset.
-    fn from_env() -> Result<Self, String> {
-        let Ok(path) = std::env::var("FAPI_PRIVATE_KEY_FILE") else {
+    /// and `FAPI_PRIVATE_KEY_KID`), or the development key when it is unset
+    /// and `issuer` is a local one. The development key is published with the
+    /// source, so no other issuer may be given it.
+    fn from_env(issuer: &str) -> Result<Self, String> {
+        Self::load(issuer, std::env::var("FAPI_PRIVATE_KEY_FILE").ok())
+    }
+
+    fn load(issuer: &str, file: Option<String>) -> Result<Self, String> {
+        let Some(path) = file else {
+            if !is_local_issuer(issuer) {
+                return Err("FAPI_PRIVATE_KEY_FILE is required for non-local issuers".to_string());
+            }
             tracing::warn!(
                 "FAPI_PRIVATE_KEY_FILE is not set: signing with the published \
                  development key, which only the bundled Keycloak realm accepts"
@@ -297,11 +442,30 @@ impl ClientKey {
     }
 }
 
+/// Whether the issuer's host is `localhost` or `127.0.0.1`: the only issuers
+/// the published development key may sign for.
+fn is_local_issuer(issuer: &str) -> bool {
+    let Some((_, rest)) = issuer.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // A `user@` prefix is not the host: `http://localhost@evil.example/`.
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, port)| {
+        if port.bytes().all(|b| b.is_ascii_digit()) {
+            h
+        } else {
+            host_port
+        }
+    });
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1"
+}
+
 async fn build_live_provider() -> Result<(OAuthProviderConfig, String), Box<dyn std::error::Error>>
 {
     let issuer = std::env::var("FAPI_ISSUER")?;
     let client_id = std::env::var("FAPI_CLIENT_ID").unwrap_or_else(|_| missing_live_creds());
-    let signer = ClientKey::from_env()?.signer(&client_id)?;
+    let signer = ClientKey::from_env(&issuer)?.signer(&client_id)?;
     let provider_name = std::env::var("FAPI_PROVIDER_NAME").unwrap_or_else(|_| "fapi".to_string());
 
     info!("Discovering OIDC configuration from {issuer}...");
@@ -384,7 +548,7 @@ async fn login(
     }
 }
 
-/// Callback parameters; works for both GET (query) and POST (form_post).
+/// Callback parameters, from the `form_post` body.
 #[derive(Deserialize)]
 struct CallbackParams {
     code: String,
@@ -392,16 +556,6 @@ struct CallbackParams {
     /// The issuer of the authorization response (RFC 9207), which the
     /// callback compares with the provider's; a FAPI server sends it.
     iss: Option<String>,
-}
-
-/// GET callback; standard redirect mode.
-async fn callback_get(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    Query(params): Query<CallbackParams>,
-    session: AuthSession,
-    audit: AuditContext,
-) -> impl IntoResponse {
-    handle_callback(&state, &params, &session, audit).await
 }
 
 /// POST callback; form_post response mode (FAPI preferred).
@@ -500,10 +654,28 @@ async fn handle_callback(
     .into_response()
 }
 
+/// The e-mail domains of a comma-separated list, lower-cased.
+fn parse_domains(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(|d| d.trim().to_ascii_lowercase())
+        .filter(|d| !d.is_empty())
+        .collect()
+}
+
+/// The tenant policy for who may be created as a local user: the identity
+/// must carry an e-mail address in one of the allowed domains.
+fn domain_allowed(allowed: &[String], email: Option<&str>) -> bool {
+    email
+        .and_then(|e| e.rsplit_once('@'))
+        .is_some_and(|(local, domain)| {
+            !local.is_empty() && allowed.iter().any(|a| a.eq_ignore_ascii_case(domain))
+        })
+}
+
 /// The local user an identity signs in as: the one created for its
-/// `(issuer, subject)` on its first login. The example keeps the link in the
-/// user's login identifier; the `oauth` example shows a link table and a
-/// tenant policy for who may be created.
+/// `(issuer, subject)` on its first login, if the tenant policy lets it be
+/// created. The example keeps the link in the user's login identifier; the
+/// `oauth` example shows a link table.
 async fn local_user(state: &AppState, claims: &OAuthClaims) -> Result<User, String> {
     let issuer = claims
         .additional_claims
@@ -519,21 +691,31 @@ async fn local_user(state: &AppState, claims: &OAuthClaims) -> Result<User, Stri
     {
         return Ok(user);
     }
+    if !domain_allowed(&state.allowed_email_domains, claims.email.as_deref()) {
+        return Err("the identity's e-mail domain is not allowed to sign up".to_string());
+    }
     let user = User::new(
         UserId::new(&SystemRng).to_string(),
         state.tenant.to_string(),
-        identifier,
+        identifier.clone(),
         claims.email.as_deref().unwrap_or(&claims.subject),
         EntityState::Active,
         UserId::system(),
         SystemClock.now(),
     )?;
-    state
-        .identity
-        .create_user(user.clone())
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(user)
+    match state.identity.create_user(user.clone()).await {
+        Ok(()) => Ok(user),
+        // A concurrent first login for the same identity may have created it
+        // first (the store answers "already exists", an error type of its
+        // own): read again and sign in as that user. Only when nobody holds
+        // the identifier is the failure the caller's.
+        Err(create_error) => state
+            .identity
+            .find_user(&identifier, &state.tenant)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| create_error.to_string()),
+    }
 }
 
 /// Becoming authenticated cleared the session's custom data; store what the
@@ -847,194 +1029,4 @@ fn secure_cookies() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const REALM: &str = include_str!("../keycloak/fapi-realm.json");
-    const COMPOSE: &str = include_str!("../keycloak/compose.yml");
-    const REALM_ISSUER: &str = "http://localhost:8080/realms/fapi";
-
-    fn realm() -> serde_json::Value {
-        serde_json::from_str(REALM).expect("realm JSON")
-    }
-
-    fn realm_client() -> serde_json::Value {
-        realm()["clients"]
-            .as_array()
-            .expect("clients")
-            .iter()
-            .find(|c| c["clientId"] == "axess-fapi-client")
-            .expect("the example's client")
-            .clone()
-    }
-
-    /// The bundled realm authenticates the example's client by
-    /// `private_key_jwt` with `ES256` and holds no secret for it.
-    #[test]
-    fn the_realm_authenticates_the_client_by_private_key_jwt() {
-        let client = realm_client();
-        assert_eq!(client["clientAuthenticatorType"], "client-jwt");
-        assert!(client.get("secret").is_none(), "the realm holds no secret");
-        assert_eq!(
-            client["attributes"]["token.endpoint.auth.signing.alg"],
-            "ES256"
-        );
-        assert_eq!(client["attributes"]["use.jwks.string"], "true");
-    }
-
-    /// The development key signs assertions that verify under the key the
-    /// realm registers for the client, with the `kid` it registers it under,
-    /// so the key file and the realm cannot drift apart unnoticed.
-    #[test]
-    fn the_development_key_is_the_key_the_realm_registers() {
-        let client = realm_client();
-        let jwks: serde_json::Value = serde_json::from_str(
-            client["attributes"]["jwks.string"]
-                .as_str()
-                .expect("jwks.string"),
-        )
-        .expect("JWKS");
-        let jwk = &jwks["keys"][0];
-        assert_eq!(jwk["kid"], DEV_CLIENT_KEY_ID);
-
-        let assertion = ClientKey::development()
-            .signer("axess-fapi-client")
-            .expect("the development key parses")
-            .mint(REALM_ISSUER, &axess::SystemClock, &axess::SystemRng)
-            .expect("an assertion");
-        let key = jsonwebtoken::DecodingKey::from_ec_components(
-            jwk["x"].as_str().expect("x"),
-            jwk["y"].as_str().expect("y"),
-        )
-        .expect("the realm's key");
-        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
-        validation.set_audience(&[REALM_ISSUER]);
-        let verified = jsonwebtoken::decode::<serde_json::Value>(&assertion, &key, &validation)
-            .expect("the assertion verifies under the realm's key");
-        assert_eq!(verified.header.kid.as_deref(), Some(DEV_CLIENT_KEY_ID));
-        assert_eq!(verified.claims["iss"], "axess-fapi-client");
-        assert_eq!(verified.claims["sub"], "axess-fapi-client");
-    }
-
-    /// Keycloak signs ID tokens `RS256` unless told otherwise, and the FAPI
-    /// profile refuses `RS256`: the client must ask for an algorithm the
-    /// profile accepts, and the realm must hold a key for it.
-    #[test]
-    fn the_realm_signs_id_tokens_with_an_algorithm_the_profile_accepts() {
-        let realm = realm();
-        let alg = realm_client()["attributes"]["id.token.signed.response.alg"]
-            .as_str()
-            .expect("the client names its ID token algorithm")
-            .to_string();
-        assert!(
-            FapiConfig::default().allowed_id_token_algs.contains(&alg),
-            "{alg} is outside the profile's list"
-        );
-        assert_eq!(realm["defaultSignatureAlgorithm"], alg.as_str());
-        let (provider, curve) = match alg.as_str() {
-            "ES256" => ("ecdsa-generated", Some("P-256")),
-            "PS256" => ("rsa-generated", None),
-            "EdDSA" => ("eddsa-generated", None),
-            other => panic!("no key provider known for {other}"),
-        };
-        let providers = realm["components"]["org.keycloak.keys.KeyProvider"]
-            .as_array()
-            .expect("the realm declares its key providers")
-            .clone();
-        assert!(
-            providers.iter().any(|p| p["providerId"] == provider
-                && curve.is_none_or(|c| p["config"]["ecdsaEllipticCurveKey"][0] == c)),
-            "no {provider} key for {alg}: {providers:?}"
-        );
-    }
-
-    /// Keycloak 26.0 treats DPoP as a preview feature: without the flag it
-    /// ignores the proof and issues `Bearer` tokens, which the profile
-    /// refuses.
-    #[test]
-    fn the_bundled_keycloak_enables_dpop() {
-        assert!(COMPOSE.contains("--features=dpop"));
-        assert_eq!(
-            realm_client()["attributes"]["dpop.bound.access.tokens"],
-            "true"
-        );
-    }
-
-    /// The redirect URI and the post-logout redirect the example sends are
-    /// registered, on the host the example serves.
-    #[test]
-    fn the_realm_registers_the_example_s_redirects() {
-        let client = realm_client();
-        let callback = format!("{APP_ORIGIN}/auth/callback");
-        assert!(
-            client["redirectUris"]
-                .as_array()
-                .expect("redirectUris")
-                .iter()
-                .any(|u| u == callback.as_str()),
-            "{callback} is not registered"
-        );
-        let post_logout = format!("{APP_ORIGIN}/");
-        assert!(
-            client["attributes"]["post.logout.redirect.uris"]
-                .as_str()
-                .expect("post.logout.redirect.uris")
-                .split("##")
-                .any(|u| u == post_logout),
-            "{post_logout} is not registered"
-        );
-    }
-
-    /// The login asks for `offline_access`, which Keycloak grants only to a
-    /// user holding that role. A user imported with an explicit role list
-    /// gets no default roles, so the realm names them.
-    #[test]
-    fn the_demo_user_may_have_a_refresh_token() {
-        let realm = realm();
-        let alice = realm["users"]
-            .as_array()
-            .expect("users")
-            .iter()
-            .find(|u| u["username"] == "alice")
-            .expect("alice")
-            .clone();
-        let default_roles = format!("default-roles-{}", realm["realm"].as_str().expect("realm"));
-        assert!(
-            alice["realmRoles"]
-                .as_array()
-                .expect("realmRoles")
-                .iter()
-                .any(|r| r == default_roles.as_str()),
-            "alice lacks {default_roles}, which holds offline_access"
-        );
-    }
-
-    /// The success page shows `groups` and `roles`, which the library reads
-    /// from top-level ID token claims; Keycloak puts neither there unless the
-    /// client maps them.
-    #[test]
-    fn the_client_maps_groups_and_roles_into_the_id_token() {
-        let client = realm_client();
-        let mappers = client["protocolMappers"]
-            .as_array()
-            .expect("protocolMappers");
-        for claim in ["groups", "roles"] {
-            assert!(
-                mappers.iter().any(|m| m["config"]["claim.name"] == claim
-                    && m["config"]["id.token.claim"] == "true"),
-                "no ID token mapper for {claim}"
-            );
-        }
-    }
-
-    /// The DPoP key survives the session: restored, it is the same key.
-    #[test]
-    fn the_dpop_key_round_trips_through_the_session_value() {
-        let key = DpopKey::generate(&SystemRng);
-        let restored = dpop_key_from_json(dpop_key_to_json(&key)).expect("restored");
-        assert_eq!(
-            restored.thumbprint().expect("thumbprint"),
-            key.thumbprint().expect("thumbprint")
-        );
-    }
-}
+mod tests;

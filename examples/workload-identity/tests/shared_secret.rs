@@ -82,7 +82,19 @@ async fn a_route_without_a_secret_does_not_exist() {
 #[tokio::test]
 async fn a_signature_made_for_another_recipient_is_refused() {
     let body = serde_json::to_vec(&report()).expect("serializes");
-    let header = signer().sign_for("reports", now(), &Method::POST, BOUNCE_PATH, &body);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let header = signer().sign_for(
+        "reports",
+        now(),
+        &Method::POST,
+        BOUNCE_PATH,
+        &headers,
+        &body,
+    );
     let req = Request::post(BOUNCE_PATH)
         .header("content-type", "application/json")
         .header(axess::service_secret::SIGNATURE_HEADER, header)

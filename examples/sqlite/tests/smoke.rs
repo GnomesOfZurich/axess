@@ -51,14 +51,14 @@ async fn seed_is_idempotent_across_startups() {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("first seed");
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("second seed must be a no-op, not a constraint violation");
@@ -75,7 +75,7 @@ async fn seeded_methods_load_back_through_runtime_path() {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -118,7 +118,7 @@ async fn root_redirects_to_login_when_unauthenticated() {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -154,7 +154,7 @@ async fn key_surface_routes_respond() {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -192,16 +192,20 @@ async fn backend_construction_does_not_panic() {
 }
 
 async fn app() -> axum::Router {
+    app_with_pool().await.0
+}
+
+async fn app_with_pool() -> (axum::Router, sqlx::SqlitePool) {
     let pool = fresh_pool().await;
     migrate(&pool).await;
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
-    build_router(pool).await.0
+    (build_router(pool.clone()).await.0, pool)
 }
 
 #[tokio::test]
@@ -300,7 +304,23 @@ async fn signup_enforces_the_password_rules_on_the_server() {
         "a weak password must be refused by the server, got: {outcome}"
     );
     let outcome = post_signup(&router, "Gnomes2%2BLongEnough").await;
-    assert_eq!(outcome, "redirect /dashboard");
+    assert!(outcome.contains("Check your email"), "{outcome}");
+}
+
+/// A password on the breached list meets the rules and is still refused,
+/// with the library's sentence on the signup page; nothing is created.
+#[tokio::test]
+async fn signup_refuses_a_breached_password_by_name() {
+    let router = app().await;
+    let outcome = post_signup(&router, "Password1234").await;
+    assert!(
+        outcome.contains("known from a data breach"),
+        "a breached password must be refused by name, got: {outcome}"
+    );
+    assert!(
+        !outcome.contains("at least 12 characters"),
+        "the refusal must be the breach check's, not the rules': {outcome}"
+    );
 }
 
 /// Signing up with a username somebody already has gets the same page as a
@@ -327,7 +347,7 @@ async fn bobs_seeded_totp_secret_is_sealed_at_rest() {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -346,5 +366,77 @@ async fn bobs_seeded_totp_secret_is_sealed_at_rest() {
     assert!(
         totp.secret.plain().is_none(),
         "bob's secret is stored plain"
+    );
+}
+
+/// A signup that fails part-way leaves nothing behind: no half-built user
+/// holding the username, so the same person can try again.
+#[tokio::test]
+async fn a_failed_signup_leaves_no_half_built_user() {
+    let (router, pool) = app_with_pool().await;
+    sqlx::query(
+        "CREATE TRIGGER refuse_methods BEFORE INSERT ON auth_methods
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("trigger");
+
+    let outcome = post_signup(&router, "Gnomes2%2BLongEnough").await;
+    assert!(
+        !outcome.starts_with("redirect"),
+        "the signup should have failed: {outcome}"
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE identifier = 'carol'")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 0, "the failed signup left its user behind");
+    let creds: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factor_configs WHERE user_id NOT IN (SELECT id FROM users)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(creds, 0, "credentials were left without a user");
+}
+
+/// Whatever password the login page offers for the test accounts meets the
+/// rules the example enforces on every other password.
+#[tokio::test]
+async fn the_login_page_offers_no_password_weaker_than_the_rules() {
+    let resp = app()
+        .await
+        .oneshot(
+            Request::builder()
+                .uri("/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    let marker = "<code>alice</code> / <code>";
+    let start = html.find(marker).expect("alice's password is listed") + marker.len();
+    let password = html[start..].split("</code>").next().unwrap();
+    let rules = axess::authn::PasswordRules::default();
+    assert!(
+        password.chars().count() >= rules.min_length,
+        "{password:?} is too short"
+    );
+    assert!(
+        password.chars().any(|c| c.is_uppercase()),
+        "{password:?}: no upper case"
+    );
+    assert!(
+        password.chars().any(|c| c.is_lowercase()),
+        "{password:?}: no lower case"
+    );
+    assert!(
+        password.chars().any(|c| c.is_ascii_digit()),
+        "{password:?}: no digit"
     );
 }

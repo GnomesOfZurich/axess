@@ -29,17 +29,26 @@ fn render_with_csrf(template: &'static str, csrf: &CsrfToken) -> Html<String> {
     Html(
         template
             .replace("__RECOVERY_FORM__", RECOVERY_FORM)
+            .replace("__TEST_ACCOUNTS__", &test_accounts_html())
             .replace("__CSRF_INPUT__", &csrf_hidden_input(csrf)),
     )
 }
 
-/// Whether `password` satisfies `rules` (length counted in characters).
-fn meets_rules(password: &str, rules: &axess::authn::PasswordRules) -> bool {
-    password.chars().count() >= rules.min_length
-        && (!rules.require_uppercase || password.chars().any(|c| c.is_uppercase()))
-        && (!rules.require_lowercase || password.chars().any(|c| c.is_lowercase()))
-        && (!rules.require_digit || password.chars().any(|c| c.is_ascii_digit()))
-        && (!rules.require_special || password.chars().any(|c| !c.is_alphanumeric()))
+/// The login page's list of seeded accounts: shown only while they are
+/// seeded, and with the password they were given.
+fn test_accounts_html() -> String {
+    if !crate::models::backend::seed_enabled() {
+        return String::new();
+    }
+    let password = crate::models::backend::SEED_PASSWORD;
+    format!(
+        r#"<hr>
+<p><strong>Test accounts:</strong></p>
+<ul>
+  <li><code>alice</code> / <code>{password}</code>; password only</li>
+  <li><code>bob</code> / <code>{password}</code>; password + TOTP (secret printed in the server log)</li>
+</ul>"#
+    )
 }
 
 /// Tenant that self-service signup creates accounts in.
@@ -121,6 +130,11 @@ pub async fn post_login(
             &csrf,
         ))
         .into_response(),
+        // Guesses from this address are being slowed down. The form says
+        // what a wrong password says, so a guesser learns nothing new.
+        Ok(FactorOutcome::Throttled { .. }) => {
+            Html(login_with_error("Invalid username or password.", &csrf)).into_response()
+        }
         Ok(FactorOutcome::FactorRequired(other)) => {
             tracing::warn!(kind = ?other, "unexpected factor kind after password");
             error_page("Unsupported factor type.").into_response()
@@ -185,6 +199,15 @@ async fn second_factor(
         Ok(FactorOutcome::InvalidCredential) => {
             Html(totp_with_error("Wrong code; please try again.", &csrf)).into_response()
         }
+        Ok(FactorOutcome::Throttled { retry_after }) => Html(totp_with_error(
+            &{
+                let secs = retry_after.as_secs().max(1);
+                let unit = if secs == 1 { "second" } else { "seconds" };
+                format!("Too many wrong codes; try again in {secs} {unit}.")
+            },
+            &csrf,
+        ))
+        .into_response(),
         Ok(FactorOutcome::Locked { .. }) => {
             // Session is locked; send back to login to start fresh.
             Redirect::to("/login").into_response()
@@ -237,10 +260,7 @@ pub async fn post_signup(
     audit: AuditContext,
     Form(form): Form<SignupForm>,
 ) -> impl IntoResponse {
-    use axess::authn::{
-        AuthnScope, EntityState, FactorConfig, FactorStore, PasswordConfig, PasswordRules,
-        SignupOutcome, User, ZeroizedString,
-    };
+    use axess::authn::{AuthnScope, EntityState, PasswordRules, SignupOutcome, User};
 
     // The tenant a new account joins is the application's decision (here
     // the single seeded tenant; a multi-tenant app derives it from the
@@ -248,15 +268,30 @@ pub async fn post_signup(
     // otherwise anyone could create an account inside any tenant by naming it.
     let tenant = SIGNUP_TENANT;
 
-    // The form's `minlength` is a hint to the browser. Enforce the rules on
-    // the server, where a script that skips the form is checked too.
+    // The form's `minlength` is a hint to the browser. The service admits the
+    // password on the server, where a script that skips the form is checked
+    // too: the rules first, then the breached-password check it was built
+    // with. Before `begin_signup`, so a refused password creates nothing.
     let rules = PasswordRules::default();
-    if !meets_rules(&form.password, &rules) {
-        return Html(signup_with_error(
-            "The password must be at least 12 characters with upper case, lower case and a digit.",
-            &csrf,
-        ))
-        .into_response();
+    if let Err(refusal) = state
+        .service
+        .check_chosen_password(&form.password, &rules)
+        .await
+    {
+        use axess::NewPasswordError;
+        let sentence = match refusal {
+            NewPasswordError::TooLong | NewPasswordError::RulesNotMet => {
+                "The password must be at least 12 characters with upper case, lower case and a digit."
+                    .to_owned()
+            }
+            // The library's own sentence: the password is known from a
+            // breach, or the check could not answer and the service refuses
+            // an unscreened password.
+            NewPasswordError::Breached | NewPasswordError::BreachCheckUnavailable => {
+                format!("Not accepted: {refusal}.")
+            }
+        };
+        return Html(signup_with_error(&sentence, &csrf)).into_response();
     }
 
     // Build a Candidate user; not yet activated.
@@ -285,60 +320,72 @@ pub async fn post_signup(
     // abuse is spotted by grouping those rows by address.
     let service = state.service.with_audit_context(audit);
 
+    let pending_before = session.pending_user_id().await;
     match service.begin_signup(user, tenant, &session).await {
-        Ok(SignupOutcome::Started) => {
-            // `Started` with no user on the session means the username is
-            // taken: the service answers a taken identifier like a free one
-            // so the form cannot be used to learn who has an account. The
-            // visitor gets the same page a signup awaiting its mail would;
-            // a real deployment mails the holder instead of creating anyone.
-            let Some(user_id) = session.pending_user_id().await else {
+        Ok(SignupOutcome::Started(verification)) => {
+            // `Started` without a verification secret means nothing was
+            // created: the username is taken, and the service answers it like
+            // a free one so the form cannot be used to learn who has an
+            // account. The visitor gets the same page a signup awaiting its
+            // mail would, after the same hashing work: the free path spends
+            // one Argon2 hash on the password, so this one does too, and the
+            // response time does not tell them apart.
+            let Some(verification) = verification else {
+                if let Err(e) = service.burn_password_check(&form.password).await {
+                    tracing::warn!(error = %e, "password check burn failed");
+                }
                 return Html(SIGNUP_CHECK_EMAIL).into_response();
+            };
+            let Some(user_id) = session.pending_user_id().await else {
+                return error_page("Signup session lost its user.").into_response();
             };
             let tenant_id = match session.pending_tenant_id().await {
                 Some(t) => t,
                 None => return error_page("Signup session lost tenant.").into_response(),
             };
 
-            // Hash password and store as a factor.
-            let hash = axess::generate_password_hash(&form.password);
-            let scope = AuthnScope::User { tenant_id, user_id };
-            let pw_config = FactorConfig::Password(PasswordConfig {
-                hash: ZeroizedString::new(hash),
-                rules: PasswordRules::default(),
-                password_id: None,
-            });
-            if let Err(e) = state.backend.save_factor(&scope, pw_config).await {
-                tracing::warn!(error = %e, "failed to store password factor");
-                return error_page("Signup failed; could not save credentials.").into_response();
-            }
-
-            // Store auth method (password-only for now; user can enroll TOTP later).
-            let method_json = serde_json::json!([{"Required": "Password"}]).to_string();
-            if let Err(e) = sqlx::query(
-                "INSERT INTO auth_methods (id, name, steps_json, user_id, tenant_id, enabled)
-                 VALUES (?1, 'password', ?2, ?3, ?4, 1)
-                 ON CONFLICT(id) DO NOTHING",
-            )
-            .bind(uuid::Uuid::new_v4().to_string())
-            .bind(&method_json)
-            .bind(user_id.to_string())
-            .bind(tenant_id.to_string())
-            .execute(state.backend.pool())
-            .await
-            {
-                tracing::warn!(error = %e, "failed to store auth method");
-                return error_page("Signup failed; could not save auth method.").into_response();
-            }
-
-            // Auto-complete signup (skip email verification for this example).
-            match service.complete_signup(&session).await {
-                Ok(()) => Redirect::to("/dashboard").into_response(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "complete_signup error");
-                    error_page("Signup completion failed.").into_response()
+            // The session that submits its own signup again keeps the account
+            // and the password it stored the first time; it only gets a new
+            // secret (the earlier one no longer works).
+            let resumed = pending_before == Some(user_id);
+            if !resumed {
+                // Every step from here on can fail, and the user row exists
+                // already, holding the username: any failure removes it again.
+                if let Err(msg) = store_signup_credentials(
+                    &state,
+                    AuthnScope::User { tenant_id, user_id },
+                    &form.password,
+                )
+                .await
+                {
+                    abandon_signup(&state, &session, &user_id).await;
+                    return error_page(msg).into_response();
+                }
+                if !session
+                    .set_custom(PENDING_SIGNUP, serde_json::json!({ "email": form.email }))
+                    .await
+                {
+                    abandon_signup(&state, &session, &user_id).await;
+                    return error_page("Signup failed.").into_response();
                 }
             }
+
+            // The account stays a candidate until the person proves they can
+            // read the address: `complete_signup` takes the secret the link
+            // carries, and the session keeps only its digest. The link is
+            // opened in the same browser. In production, mail the link; this
+            // example has no mailer, so a DEBUG BUILD writes it to the
+            // `dev_mail` log target (the secret is a bearer credential and
+            // never reaches an info-level log).
+            if cfg!(debug_assertions) {
+                tracing::debug!(
+                    target: "dev_mail",
+                    "email verification link for {}: /verify-email?token={}",
+                    form.email,
+                    verification.secret()
+                );
+            }
+            Html(SIGNUP_CHECK_EMAIL).into_response()
         }
         // Only a service built with `with_signup_conflicts_revealed` answers
         // this; the example's service does not, and shows the same page as
@@ -354,6 +401,117 @@ pub async fn post_signup(
             error_page("Signup failed.").into_response()
         }
     }
+}
+
+// ── GET /verify-email ────────────────────────────────────────────────────────
+
+/// The session key holding a signup's address.
+const PENDING_SIGNUP: &str = "pending_signup";
+
+#[derive(Deserialize)]
+pub struct VerifyEmailQuery {
+    pub token: String,
+}
+
+/// The link mailed after signup. It completes the signup of the session that
+/// began it, which is the only session that is pending one: opened elsewhere,
+/// or with any other secret, or after the secret expired, it completes
+/// nothing.
+pub async fn verify_email(
+    State(state): State<AppState>,
+    session: AuthSession,
+    audit: AuditContext,
+    axum::extract::Query(query): axum::extract::Query<VerifyEmailQuery>,
+) -> axum::response::Response {
+    // Completing the signup checks the secret against the digest the session
+    // holds (in constant time), activates the user and signs the session in;
+    // it also drops the pending data with the rest of the session's custom
+    // data.
+    match state
+        .service
+        .with_audit_context(audit)
+        .complete_signup(&session, &query.token)
+        .await
+    {
+        Ok(()) => Redirect::to("/dashboard").into_response(),
+        Err(axess::authn::AuthnError::NoFlow | axess::authn::AuthnError::InvalidAssertion) => (
+            StatusCode::BAD_REQUEST,
+            error_page(
+                "This verification link is not valid here. Open it in the browser you signed up in, before it expires.",
+            ),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "complete_signup error");
+            error_page("Signup completion failed.").into_response()
+        }
+    }
+}
+
+/// Stores the new user's password factor and its password-only auth method.
+/// The error is the message to show; the cause is logged.
+async fn store_signup_credentials(
+    state: &AppState,
+    scope: axess::authn::AuthnScope,
+    password: &str,
+) -> Result<(), &'static str> {
+    use axess::authn::{FactorConfig, FactorStore, PasswordConfig, PasswordRules, ZeroizedString};
+    let axess::authn::AuthnScope::User { tenant_id, user_id } = scope else {
+        return Err("Signup failed.");
+    };
+
+    // Hash the password under the rules it was checked against, and store it
+    // as a factor. `hash_chosen_password` admits the password again (the
+    // rules and the service's breached-password check) before hashing it on
+    // the service's executor, so a caller that skipped the check above still
+    // cannot enrol a refused password.
+    let rules = PasswordRules::default();
+    let hash = match state.service.hash_chosen_password(password, &rules).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            tracing::warn!(error = %e, "signup password refused");
+            return Err("Signup failed; the password was not accepted.");
+        }
+    };
+    let pw_config = FactorConfig::Password(PasswordConfig {
+        hash: ZeroizedString::new(hash),
+        rules,
+        password_id: None,
+    });
+    if let Err(e) = state.backend.save_factor(&scope, pw_config).await {
+        tracing::warn!(error = %e, "failed to store password factor");
+        return Err("Signup failed; could not save credentials.");
+    }
+
+    // Store auth method (password-only for now; user can enroll TOTP later).
+    let method_json = serde_json::json!([{"Required": "Password"}]).to_string();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO auth_methods (id, name, steps_json, user_id, tenant_id, enabled)
+         VALUES (?1, 'password', ?2, ?3, ?4, 1)
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&method_json)
+    .bind(user_id.to_string())
+    .bind(tenant_id.to_string())
+    .execute(state.backend.pool())
+    .await
+    {
+        tracing::warn!(error = %e, "failed to store auth method");
+        return Err("Signup failed; could not save auth method.");
+    }
+    Ok(())
+}
+
+/// Removes a signup that did not finish: the candidate user and whatever
+/// credentials were written for it, then the pending session. Best effort:
+/// a failure here is logged, and the row is the application's to purge.
+async fn abandon_signup(state: &AppState, session: &AuthSession, user_id: &axess::authn::UserId) {
+    use axess::authn::IdentityAdmin;
+    if let Err(e) = state.backend.delete_user(user_id).await {
+        tracing::warn!(error = %e, "could not remove the half-built signup user");
+    }
+    session.clear().await;
 }
 
 // ── GET /setup-totp ──────────────────────────────────────────────────────────
@@ -382,30 +540,81 @@ pub async fn setup_totp_page(
         }
     }
 
+    // The secret is made here and kept in the server-side session, never in
+    // the page: the form posts only a code, and the handler reads the secret
+    // back from the session, so the client cannot choose what is enrolled.
+    let secret = axess::generate_totp_secret(&axess::SystemRng);
+    if !session
+        .set_custom(
+            PENDING_TOTP_SECRET,
+            serde_json::Value::String(secret.clone()),
+        )
+        .await
+    {
+        return error_page("Could not start the enrolment.").into_response();
+    }
+    totp_setup_page(&session, &csrf, &secret, None)
+        .await
+        .into_response()
+}
+
+/// Whether `candidate` is the user's current password.
+async fn current_password_matches(
+    state: &AppState,
+    scope: &axess::authn::AuthnScope,
+    candidate: String,
+) -> bool {
+    use axess::authn::{FactorConfig, FactorKind, FactorStore};
+    let Ok(Some(FactorConfig::Password(config))) =
+        state.backend.load_factor(scope, FactorKind::Password).await
+    else {
+        return false;
+    };
+    let hash = String::from(&*config.hash);
+    // Argon2 is slow on purpose: keep it off the async threads.
+    tokio::task::spawn_blocking(move || axess::verify_password(candidate, &hash).is_ok())
+        .await
+        .unwrap_or(false)
+}
+
+/// The session key holding the TOTP secret an enrolment in progress will
+/// store once the user proves they hold it.
+const PENDING_TOTP_SECRET: &str = "pending_totp_secret";
+
+/// The enrolment page for `secret`: QR code, manual secret and the code form.
+async fn totp_setup_page(
+    session: &AuthSession,
+    csrf: &CsrfToken,
+    secret: &str,
+    error: Option<&str>,
+) -> Html<String> {
     let username = session
         .user_id()
         .await
         .map(|id| id.to_string())
         .unwrap_or_else(|| "user".to_string());
-
-    // Generate a new TOTP secret.
-    let secret = axess::generate_totp_secret(&axess::SystemRng);
-    let uri = axess::build_totp_uri(&username, "axess-example", &secret, 6, 30)
+    let uri = axess::build_totp_uri(&username, "axess-example", secret, 6, 30)
         .expect("6 digits and a 30 second period are a valid configuration");
     let qr_svg = totp_qr_svg(&uri);
-    let csrf_input = csrf_hidden_input(&csrf);
+    let csrf_input = csrf_hidden_input(csrf);
+    let error = error
+        .map(|msg| format!(r#"<p style="color:red">{}</p>"#, html_escape(msg)))
+        .unwrap_or_default();
 
     Html(format!(
         r#"<!doctype html>
 <html><head><title>Setup TOTP</title></head><body>
 <h1>Enroll TOTP</h1>
+{error}
 <p>Scan this QR code with your authenticator app (Aegis, Authy, Google Authenticator):</p>
 <div style="display:inline-block; padding:8px; background:#fff; border:1px solid #ddd">{qr_svg}</div>
-<p>Or enter the secret manually: <pre style="background:#f0f0f0; padding:10px; font-size:1.2em">{secret}</pre></p>
+<p>Or enter the secret manually: <pre id="totp-secret" style="background:#f0f0f0; padding:10px; font-size:1.2em">{secret}</pre></p>
 <details><summary>Show otpauth:// URI</summary><p><code>{uri}</code></p></details>
 <form method="POST" action="/setup-totp">
   {csrf_input}
-  <input type="hidden" name="secret" value="{secret}">
+  <label>Your current password:<br>
+    <input type="password" name="current_password" autocomplete="current-password" required>
+  </label><br><br>
   <label>Enter the 6-digit code to verify enrollment:<br>
     <input type="text" name="code" inputmode="numeric" pattern="[0-9]*"
            autocomplete="one-time-code" required autofocus maxlength="6">
@@ -416,7 +625,6 @@ pub async fn setup_totp_page(
 <p><a href="/dashboard">Cancel</a></p>
 </body></html>"#
     ))
-    .into_response()
 }
 
 /// Render the `otpauth://` URI as an inline SVG QR code.
@@ -440,8 +648,10 @@ fn totp_qr_svg(uri: &str) -> String {
 
 #[derive(Deserialize)]
 pub struct SetupTotpForm {
-    pub secret: String,
     pub code: String,
+    /// The account's current password: adding a second factor is a
+    /// privilege change, so a session alone does not authorise it.
+    pub current_password: String,
 }
 
 pub async fn post_setup_totp(
@@ -457,37 +667,6 @@ pub async fn post_setup_totp(
     if !session.is_authenticated().await {
         return Redirect::to("/login").into_response();
     }
-
-    // Verify the code against the secret before storing.
-    // Use defaults: 6 digits, 30s period, ±1 window.
-    let verified_step = match axess::verify_totp(
-        &form.secret,
-        &form.code,
-        state.backend.clock().now(),
-        axess::TotpVerifyParams::default(),
-    ) {
-        Some(step) => step, // Valid code; proceed.
-        None => {
-            let csrf_input = csrf_hidden_input(&csrf);
-            return Html(format!(
-                r#"<!doctype html><html><head><title>Setup TOTP</title></head><body>
-<h1>Enroll TOTP</h1>
-<p style="color:red">Invalid code; please try again.</p>
-<p>Secret: <pre>{secret}</pre></p>
-<form method="POST" action="/setup-totp">
-  {csrf_input}
-  <input type="hidden" name="secret" value="{secret}">
-  <label>6-digit code:<br>
-    <input type="text" name="code" inputmode="numeric" required autofocus maxlength="6">
-  </label><br><br>
-  <button type="submit">Verify & Enable TOTP</button>
-</form>
-</body></html>"#,
-                secret = html_escape(&form.secret),
-            ))
-            .into_response();
-        }
-    };
 
     let user_id = match session.user_id().await {
         Some(id) => id,
@@ -511,9 +690,54 @@ pub async fn post_setup_totp(
         }
     }
 
+    // The secret is the one the enrolment page put in this session; nothing
+    // the form carries can replace it. No pending secret means the page was
+    // never opened (or the enrolment already finished): start over.
+    let Some(secret) = session
+        .get_custom(PENDING_TOTP_SECRET)
+        .await
+        .and_then(|v| v.as_str().map(str::to_owned))
+    else {
+        return Redirect::to("/setup-totp").into_response();
+    };
+
+    // A session that was hijacked or left open does not know the password.
+    // The route sits behind the rate limiter, which bounds guessing here.
+    if !current_password_matches(&state, &scope, form.current_password).await {
+        return totp_setup_page(
+            &session,
+            &csrf,
+            &secret,
+            Some("The current password is wrong."),
+        )
+        .await
+        .into_response();
+    }
+
+    // Verify the code against the secret before storing.
+    // Use defaults: 6 digits, 30s period, ±1 window.
+    let verified_step = match axess::verify_totp(
+        &secret,
+        &form.code,
+        state.backend.clock().now(),
+        axess::TotpVerifyParams::default(),
+    ) {
+        Some(step) => step, // Valid code; proceed.
+        None => {
+            return totp_setup_page(
+                &session,
+                &csrf,
+                &secret,
+                Some("Invalid code; please try again."),
+            )
+            .await
+            .into_response();
+        }
+    };
+
     // Store the TOTP factor config.
     let totp_config = FactorConfig::Totp(TotpConfig {
-        secret: ZeroizedString::new(form.secret).into(),
+        secret: ZeroizedString::new(secret).into(),
         // The enrolment code is spent: the same code cannot then log in.
         last_step: Some(verified_step),
         ..TotpConfig::default()
@@ -526,51 +750,35 @@ pub async fn post_setup_totp(
             return error_page("Failed to save TOTP configuration.").into_response();
         }
     };
-    // One atomic insert decides between two enrolments that passed the check
-    // above together: the loser is turned away and writes nothing more.
+    // Recovery codes for when the authenticator is lost. Only the hashes
+    // are stored; the plaintext is shown once, below, and never again.
+    let codes = axess::generate_recovery_codes(&axess::SystemRng, axess::RECOVERY_CODE_COUNT);
+
+    // The factor, the recovery codes and the method upgrade are one
+    // transaction: either the account asks for the second factor and has it,
+    // or nothing was written. The insert also decides between two
+    // enrolments that passed the check above together: the loser is turned
+    // away and writes nothing.
+    let steps = vec![
+        FactorStep::Required(FactorKind::Password),
+        FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
+    ];
     match state
         .backend
-        .insert_factor_if_absent(&scope, totp_config)
+        .enrol_totp(
+            &scope,
+            totp_config,
+            FactorConfig::RecoveryCodes(codes.config),
+            &steps,
+        )
         .await
     {
         Ok(true) => {}
         Ok(false) => return totp_already_enrolled().into_response(),
         Err(e) => {
-            tracing::warn!(error = %e, "failed to store TOTP config");
+            tracing::warn!(error = %e, "failed to enrol TOTP");
             return error_page("Failed to save TOTP configuration.").into_response();
         }
-    }
-
-    // Recovery codes for when the authenticator is lost. Only the hashes
-    // are stored; the plaintext is shown once, below, and never again.
-    let codes = axess::generate_recovery_codes(&axess::SystemRng, axess::RECOVERY_CODE_COUNT);
-    if let Err(e) = state
-        .backend
-        .save_factor(&scope, FactorConfig::RecoveryCodes(codes.config))
-        .await
-    {
-        tracing::warn!(error = %e, "failed to store recovery codes");
-        return error_page("Failed to save recovery codes.").into_response();
-    }
-
-    // Upgrade the auth method: password, then TOTP or a recovery code.
-    let steps = vec![
-        FactorStep::Required(FactorKind::Password),
-        FactorStep::AnyOf(vec![FactorKind::Totp, FactorKind::RecoveryCode]),
-    ];
-    let steps_json = serde_json::to_string(&steps).expect("factor steps always serialize");
-    if let Err(e) = sqlx::query(
-        "UPDATE auth_methods SET name = 'password+totp', steps_json = ?3
-         WHERE user_id = ?1 AND tenant_id = ?2",
-    )
-    .bind(user_id.to_string())
-    .bind(tenant_id.to_string())
-    .bind(steps_json)
-    .execute(state.backend.pool())
-    .await
-    {
-        tracing::warn!(error = %e, "failed to upgrade auth method");
-        return error_page("Failed to update auth method.").into_response();
     }
 
     // Enabling MFA is a privilege boundary: it raises Alice's AAL and
@@ -580,6 +788,7 @@ pub async fn post_setup_totp(
     // not auto-cycle here because the boundary is app-defined; see
     // `AuthSession::regenerate` docs for the full list of moments where
     // this call belongs.
+    session.remove_custom(PENDING_TOTP_SECRET).await;
     session.regenerate().await;
 
     tracing::info!(user = %user_id, "TOTP enrolled successfully");
@@ -740,7 +949,7 @@ pub async fn post_reset_password(
     // as that, not as an invalid token. The library checks them again, before
     // it spends the token, so the link still works for a second attempt.
     match state.backend.password_rules_for_tenant(&tenant_id).await {
-        Ok(rules) if !meets_rules(&form.new_password, &rules) => {
+        Ok(rules) if !rules.accepts(&form.new_password) => {
             return Html(format!(
                 r#"<!doctype html><html><head><title>Password Reset</title></head><body>
 <h1>Password Too Weak</h1>
@@ -886,12 +1095,7 @@ const LOGIN_HTML: &str = r#"<!doctype html>
   </label><br><br>
   <button type="submit">Login</button>
 </form>
-<hr>
-<p><strong>Test accounts:</strong></p>
-<ul>
-  <li><code>alice</code> / <code>Gnomes2+</code>; password only</li>
-  <li><code>bob</code> / <code>Gnomes2+</code>; password + TOTP (secret printed in server log)</li>
-</ul>
+__TEST_ACCOUNTS__
 <p><em>Or <a href="/signup">sign up</a> to create your own account, then enroll TOTP from the dashboard.</em></p>
 <p><a href="/forgot-password">Forgot your password?</a></p>
 </body></html>"#;
@@ -901,7 +1105,8 @@ const LOGIN_HTML: &str = r#"<!doctype html>
 /// for its verification mail in a deployment with a mailer.
 const SIGNUP_CHECK_EMAIL: &str = r#"<!doctype html><html><head><title>Sign Up</title></head><body>
 <h1>Check your email</h1>
-<p>If that username was free, your account has been created and a verification link is on its way. If it was not, the account holder has been told.</p>
+<p>If that username was free, your account has been created and a verification link is on its way; open it in this browser to finish. If it was not, the account holder has been told.</p>
+<p>For this example, a debug build prints the link to the <strong>server log</strong> (target <code>dev_mail</code>).</p>
 <p><a href="/login">Back to login</a></p>
 </body></html>"#;
 

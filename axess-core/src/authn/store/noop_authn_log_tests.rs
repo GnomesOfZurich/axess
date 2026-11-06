@@ -92,3 +92,27 @@ async fn get_user_in_tenant_reaches_the_inner_stores_override() {
         "the wrapper must forward to the inner store's own method, not its default"
     );
 }
+
+#[tokio::test]
+async fn the_throttle_records_nothing_and_reads_nothing() {
+    use crate::authn::types::Throttle;
+    let wrapped = NoopAuthnLog(MockIdentityStore::new());
+    let throttle = Throttle::default();
+    let key = throttle.subject(
+        &axess_identity::testing::tenant("t"),
+        &axess_identity::testing::user("noop-victim"),
+        None,
+    );
+    for _ in 0..5 {
+        wrapped
+            .record_throttle_failure(&key, &throttle)
+            .await
+            .unwrap();
+        assert_eq!(
+            wrapped.throttle_state(&key).await.unwrap(),
+            None,
+            "the Noop adapter turns the throttle off as it turns the lockout off"
+        );
+    }
+    assert!(wrapped.clear_throttle(&key).await.is_ok());
+}

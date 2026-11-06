@@ -197,3 +197,142 @@ async fn valkey_registry_member_of_an_idle_session_still_expires() {
     r0.register(&user, &session).await.unwrap();
     assert!(!r20.is_valid(&user, &session).await.unwrap());
 }
+
+/// The background watcher only reads: its checks do not move the member's
+/// score, so a session nobody uses still lapses a `ttl` after its last
+/// request even while a watcher polls the registry for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_watcher_checks_do_not_keep_an_idle_session_alive() {
+    let _serial = super::SUBSCRIBER_TESTS.lock().await;
+    let prefix = format!("axt_watchread_{}", UserId::new(&SystemRng));
+    let ttl = Duration::from_secs(10);
+    let t0 = Utc::now();
+    let user = UserId::new(&SystemRng);
+    let session = SessionId::new(&SystemRng);
+    let at = |secs: i64| {
+        ValkeySessionRegistry::with_options(connect_lazy(), prefix.clone(), ttl).with_clock(
+            Arc::new(MockClock::at(t0 + chrono::Duration::seconds(secs))),
+        )
+    };
+    let (r0, r7) = (at(0), at(7));
+    r0.client.init().await.unwrap();
+    r7.client.init().await.unwrap();
+    r0.register(&user, &session).await.unwrap();
+    let key = format!("{prefix}:reg:{user}");
+    let score = |c: Client| {
+        let (key, session) = (key.clone(), session.to_string());
+        async move { c.zscore::<Option<f64>, _, _>(key, session).await.unwrap() }
+    };
+    let before = score(connect().await).await;
+
+    // 7 s into a 10 s lifetime: past the half at which a request would slide.
+    let watcher = {
+        let (r7, user) = (r7.clone(), user);
+        tokio::spawn(async move { r7.watch_revocation(&user, &session).await })
+    };
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        score(connect().await).await,
+        before,
+        "the watcher's own check moved the member's score"
+    );
+    watcher.abort();
+}
+
+fn connect_lazy() -> Client {
+    Client::new(Config::from_url(&live_url()).unwrap(), None, None, None)
+}
+
+/// A Valkey user that may do everything except PUBLISH.
+async fn client_without_publish(admin: &Client, name: &str) -> Client {
+    let command =
+        fred::types::CustomCommand::new_static("ACL", fred::types::ClusterHash::FirstKey, false);
+    let _: String = admin
+        .custom(
+            command,
+            vec![
+                "SETUSER", name, "on", ">pw", "~*", "&*", "+@all", "-publish",
+            ],
+        )
+        .await
+        .expect("ACL SETUSER");
+    let url = live_url().replacen("redis://", &format!("redis://{name}:pw@"), 1);
+    let client = Client::new(Config::from_url(&url).unwrap(), None, None, None);
+    client.init().await.expect("connect as the restricted user");
+    client
+}
+
+/// A revocation whose push to the other nodes failed is reported: the
+/// registry entry is gone, but the watchers elsewhere were not told, and the
+/// caller must not read that as a complete revocation.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_revocation_reports_a_failed_publish() {
+    let admin = connect().await;
+    let name = format!(
+        "nopub{}",
+        UserId::new(&SystemRng).to_string().replace('-', "")
+    );
+    let restricted = client_without_publish(&admin, &name).await;
+    let registry = ValkeySessionRegistry::with_options(
+        restricted,
+        format!("axt_pub_{}", UserId::new(&SystemRng)),
+        Duration::from_secs(60),
+    );
+    let (user, session) = (UserId::new(&SystemRng), SessionId::new(&SystemRng));
+    registry.register(&user, &session).await.unwrap();
+    let one = registry.invalidate_session(&user, &session).await;
+    registry.register(&user, &session).await.unwrap();
+    let all = registry.invalidate_user(&user).await;
+    let drop_user =
+        fred::types::CustomCommand::new_static("ACL", fred::types::ClusterHash::FirstKey, false);
+    let _: i64 = admin
+        .custom(drop_user, vec!["DELUSER", name.as_str()])
+        .await
+        .unwrap();
+    assert!(one.is_err(), "invalidate_session hid the failed publish");
+    assert!(all.is_err(), "invalidate_user hid the failed publish");
+}
+
+/// A lifetime too long for the server's expiry range still registers: the
+/// key's expiry is capped instead of being rejected as an invalid expire time.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_with_an_enormous_ttl_still_registers() {
+    let registry = ValkeySessionRegistry::with_options(
+        connect().await,
+        format!("axt_huge_{}", UserId::new(&SystemRng)),
+        Duration::MAX,
+    );
+    let (user, session) = (UserId::new(&SystemRng), SessionId::new(&SystemRng));
+    registry.register(&user, &session).await.unwrap();
+    assert!(registry.is_valid(&user, &session).await.unwrap());
+}
+
+/// Without an injected clock the score is the Valkey server's time, not the
+/// app node's.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_registry_scores_with_the_servers_clock() {
+    let admin = connect().await;
+    let prefix = format!("axt_server_clock_{}", UserId::new(&SystemRng));
+    let registry = ValkeySessionRegistry::with_options(
+        connect().await,
+        prefix.clone(),
+        Duration::from_secs(60),
+    );
+    let (user, session) = (UserId::new(&SystemRng), SessionId::new(&SystemRng));
+    registry.register(&user, &session).await.unwrap();
+
+    let command =
+        fred::types::CustomCommand::new_static("TIME", fred::types::ClusterHash::FirstKey, false);
+    let time: Vec<String> = admin.custom(command, Vec::<String>::new()).await.unwrap();
+    let server_ms = time[0].parse::<i64>().unwrap() * 1000 + time[1].parse::<i64>().unwrap() / 1000;
+    let score: Option<f64> = admin
+        .zscore(format!("{prefix}:reg:{user}"), session.to_string())
+        .await
+        .unwrap();
+    let skew = (score.unwrap() - server_ms as f64).abs();
+    assert!(skew < 1500.0, "score is {skew} ms from the server's clock");
+}

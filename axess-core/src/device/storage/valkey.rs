@@ -318,7 +318,7 @@ impl ValkeyDeviceStore {
 
     /// Create a plaintext store (development/testing only). Logs a
     /// warning so production builds don't accidentally pick this path.
-    pub fn plaintext(client: Client) -> Self {
+    pub fn plaintext_insecure(client: Client) -> Self {
         tracing::warn!(
             "ValkeyDeviceStore created without encryption; \
              do not use in production"

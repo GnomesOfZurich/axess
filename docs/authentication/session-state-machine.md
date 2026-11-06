@@ -37,7 +37,7 @@ pub enum AuthState {
         tenant_id: TenantId,
         method_name: Arc<str>,
         remaining: Vec<FactorKind>,
-        completed: Vec<FactorKind>,
+        completed: Vec<(FactorKind, DateTime<Utc>)>,
         attempt_count: u32,
         last_attempt: Option<DateTime<Utc>>,
     },
@@ -46,7 +46,7 @@ pub enum AuthState {
         user_id: UserId,
         tenant_id: TenantId,
         authn_time: DateTime<Utc>,
-        factors_completed: Vec<FactorKind>,
+        factors_completed: Vec<(FactorKind, DateTime<Utc>)>,
     },
 
     PendingWorkflow {
@@ -87,7 +87,7 @@ a side table keeps the decision local and reviewable.
 the tenant id, the moment of successful authentication (for the audit
 trail), and the list of factors that were used. The factor list is
 load-bearing. A tenant policy that requires `Fido2` for certain routes
-can check `factors_completed.contains(&FactorKind::Fido2)` directly,
+can check `factor_completed_at(&FactorKind::Fido2)` (or `has_completed_factor`) directly,
 without consulting an external store.
 
 `PendingWorkflow` is the variant most adopters do not initially expect

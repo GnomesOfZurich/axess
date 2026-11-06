@@ -71,7 +71,18 @@ where
         let Some(reg) = &self.inner.registry else {
             return Err(RevokeFailure::NoRegistry);
         };
-        let live = reg.active_sessions(user_id).await;
+        // Best effort: the rows of sessions the registry could not name are
+        // left to expire, while `invalidate_user` below still runs and its
+        // failure is what the caller hears.
+        let live = reg.held_sessions(user_id).await.unwrap_or_else(|e| {
+            tracing::warn!(
+                user_id = %user_id,
+                error = %e,
+                "session registry could not list the user's sessions; \
+                 their stored rows are not deleted here"
+            );
+            Vec::new()
+        });
         let revoked = reg.invalidate_user(user_id).await;
         self.delete_session_rows(&live).await;
         revoked.map_err(RevokeFailure::Registry)

@@ -86,6 +86,8 @@ axess-rng = { workspace = true, features = ["testing"] }
 # rcgen mints SPIFFE-shape X509-SVID certs for mTLS resolver tests.
 rcgen = "0.14.10"
 rsa = { version = "0.9.10", features = ["pkcs5"] }
+# The breached-password screening is async; its unit tests need a runtime.
+tokio = { workspace = true, features = ["rt", "macros"] }
 wiremock = "0.6.5"
 
 [features]
@@ -98,7 +100,9 @@ testing = []
 # Symmetric credential factors
 email_otp = ["dep:chrono"]
 hotp = ["dep:hmac", "dep:sha1", "dep:sha2", "dep:base32", "dep:subtle", "dep:chrono"]
-password = ["dep:argon2", "dep:axess-rng"]
+# `sha1` for the range protocol's split of a password's digest
+# (`password::breached::range_prefix`), not for any hashing of our own.
+password = ["dep:argon2", "dep:axess-rng", "dep:sha1"]
 # One-time fallback codes for a second factor: keyed-MAC or Argon2id stored
 # forms (the latter via `password`), generated through the injectable
 # `SecureRng`.
@@ -153,7 +157,7 @@ bearer = ["jwt", "dep:axum", "dep:tower", "dep:thiserror"]
 # OIDC (no signed identity assertion; identity comes from a
 # TLS-trusted userinfo HTTPS GET). See `src/social.rs` module docs
 # for the full delta and when to reach for this vs OIDC.
-social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio", "dep:url"]
+social = ["http-body", "dep:reqwest", "dep:sha2", "dep:base64", "dep:thiserror", "dep:axess-rng", "dep:tokio", "dep:url", "dep:subtle"]
 # SPIFFE JWT-SVID: kept separate because it implements the SPIFFE
 # *spec* (mandatory `spiffe://` URI in `sub`, trust-domain extracted
 # from the URI), not just a claim shape. The generic `WorkloadResolver`

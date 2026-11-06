@@ -52,7 +52,9 @@ async fn mint_propagates_custom_claims() {
         .with_custom_claim("roles", serde_json::json!(["admin", "auditor"]));
 
     let token = idp.mint(&claims);
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     let verified = verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -69,7 +71,9 @@ async fn audience_mismatch_rejected_by_verifier() {
         .with_issued_at(Utc::now());
     let token = idp.mint(&claims);
 
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     let result = verifier.verify::<CustomClaims>(&token).await;
     assert!(
         result.is_err(),
@@ -90,6 +94,7 @@ async fn expired_token_rejected_against_advanced_clock() {
     let clock = Arc::new(MockClock::at(now + Duration::seconds(200)));
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api.example.com")
+        .allow_any_issuer()
         .with_clock(clock);
     let result = verifier.verify::<CustomClaims>(&token).await;
     assert!(
@@ -112,6 +117,7 @@ async fn not_yet_valid_token_rejected_against_pre_nbf_clock() {
     let clock = Arc::new(MockClock::at(now));
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api.example.com")
+        .allow_any_issuer()
         .with_clock(clock);
     let result = verifier.verify::<CustomClaims>(&token).await;
     assert!(result.is_err(), "pre-nbf clock must reject token");
@@ -127,7 +133,9 @@ async fn mint_jwt_svid_produces_spiffe_subject() {
         "https://api.gnomes",
         Duration::minutes(5),
     );
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.gnomes");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.gnomes")
+        .allow_any_issuer();
     let verified = verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -201,8 +209,12 @@ async fn multi_audience_validates_against_either() {
         .with_issued_at(Utc::now());
     let token = idp.mint(&claims);
 
-    let v1 = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
-    let v2 = JwtVerifier::new(idp.jwks_handle()).with_audience("https://other.example.com");
+    let v1 = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
+    let v2 = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://other.example.com")
+        .allow_any_issuer();
     assert!(v1.verify::<CustomClaims>(&token).await.is_ok());
     assert!(v2.verify::<CustomClaims>(&token).await.is_ok());
 }
@@ -244,7 +256,9 @@ async fn jti_claim_propagates_to_verified_claims() {
         .with_jwt_id("test-jti-1234");
     let token = idp.mint(&claims);
 
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api.example.com")
+        .allow_any_issuer();
     let verified = verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -330,9 +344,35 @@ async fn verifier_algorithms_drives_with_algorithms_for_es256() {
     // adopter to know which algorithms the fixture happens to use.
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms(idp.verifier_algorithms());
     verifier
         .verify::<CustomClaims>(&token)
         .await
         .expect("ES256 mint verifies under accessor-driven allowlist");
+}
+
+/// The fixture models the production IdP: it signs with its own key, so a
+/// caller's key-location headers never reach the token.
+#[test]
+fn mint_with_header_drops_key_location_headers() {
+    let idp = LocalIdpFixture::new("https://test.idp.local");
+    let mut header = Header {
+        jku: Some("https://evil.example/jwks".to_string()),
+        x5u: Some("https://evil.example/cert".to_string()),
+        x5c: Some(vec!["AAAA".to_string()]),
+        jwk: serde_json::from_value(serde_json::json!({"kty": "oct", "k": "AAAA"})).ok(),
+        typ: Some("custom-typ".to_string()),
+        ..Header::default()
+    };
+    let token = idp.mint_with_header(
+        &MintClaims::new("alice", one_hour_from_now()).with_audience("https://api"),
+        &mut header,
+    );
+    let decoded = jsonwebtoken::decode_header(&token).expect("decode header");
+    assert_eq!(decoded.jku, None);
+    assert_eq!(decoded.x5u, None);
+    assert_eq!(decoded.x5c, None);
+    assert!(decoded.jwk.is_none());
+    assert_eq!(decoded.typ.as_deref(), Some("custom-typ"));
 }

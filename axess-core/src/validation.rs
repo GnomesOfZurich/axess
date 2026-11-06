@@ -32,30 +32,19 @@ pub fn is_valid_password(
     require_digit: bool,
     require_special: bool,
 ) -> bool {
-    // A password login refuses anything over `MAX_PASSWORD_BYTES` before
-    // hashing it, so a longer one accepted here (at signup or a reset) would
-    // be a password its owner can never log in with.
-    if password.len() > MAX_PASSWORD_BYTES {
-        return false;
+    // The check lives with the password rules, which also gate hashing a new
+    // password: a longer one accepted here would be a password its owner can
+    // never log in with.
+    axess_factors::PasswordRules {
+        min_length,
+        require_uppercase: require_upper,
+        require_lowercase: require_lower,
+        require_digit,
+        require_special,
+        history_count: 0,
+        breached_check: true,
     }
-    // Characters, not UTF-8 bytes: a 5-character password of 2-byte
-    // letters must not satisfy a minimum of 8.
-    if password.chars().count() < min_length {
-        return false;
-    }
-    if require_upper && !password.chars().any(|c| c.is_ascii_uppercase()) {
-        return false;
-    }
-    if require_lower && !password.chars().any(|c| c.is_ascii_lowercase()) {
-        return false;
-    }
-    if require_digit && !password.chars().any(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    if require_special && !password.chars().any(|c| !c.is_alphanumeric()) {
-        return false;
-    }
-    true
+    .accepts(password)
 }
 
 /// Validate a password against a tenant's [`PasswordRules`](crate::authn::factor::PasswordRules):
@@ -123,7 +112,8 @@ pub fn is_valid_otp_code(code: &str, length: u8) -> bool {
 ///
 /// Argon2 technically accepts up to 4 GiB, but hashing even a few MB is a CPU DoS.
 /// 1024 bytes covers any realistic password (including passphrase generators).
-pub const MAX_PASSWORD_BYTES: usize = 1024;
+/// Defined beside the password rules in `axess-factors`.
+pub use axess_factors::MAX_PASSWORD_BYTES;
 
 /// Maximum OTP code length accepted before hash verification (bytes).
 ///

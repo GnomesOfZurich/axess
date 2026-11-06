@@ -22,7 +22,7 @@ Axess is a session-based multi-factor authentication and Cedar Policy authorizat
 
 ```toml
 [dependencies]
-axess = { version = "0.15.0", features = ["sqlite", "authz", "testing"] }
+axess = { version = "0.16.0", features = ["sqlite", "authz", "testing"] }
 axum = "0.8"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", features = ["full"] }
@@ -31,7 +31,8 @@ tokio = { version = "1", features = ["full"] }
 ```rust,no_run
 use axess::authn::AuthnService;
 use axess::backends::sqlite::SessionStore as SqliteSessionStore;
-use axess::{InMemoryBackend, SessionLayer};
+use axess::session::SessionCrypto;
+use axess::{InMemoryBackend, MemorySessionRegistry, SessionLayer};
 use axum::{Router, routing::get};
 use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
@@ -39,7 +40,11 @@ use std::{sync::Arc, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = SqlitePool::connect("sqlite:app.db").await?;
-    let session_store = SqliteSessionStore::plaintext(pool.clone());
+    // 32 random bytes from your secret store; sessions are sealed with it.
+    let key_from_secret_store: [u8; 32] = std::fs::read("/run/secrets/axess-session-key")?
+        .try_into()
+        .map_err(|_| "session key must be exactly 32 bytes")?;
+    let session_store = SqliteSessionStore::new(pool.clone(), SessionCrypto::new(key_from_secret_store));
     session_store.init_schema().await?;
 
     // Replace InMemoryBackend with your DB-backed `IdentityStore` +
@@ -47,13 +52,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and `docs/identity/store.md`.
     let backend = InMemoryBackend::new()
         .with_user_password("alice", "default", "Gnomes2+");
-    let _service = Arc::new(AuthnService::new(backend.clone(), backend));
+    // One registry for the service (it records every login) and the session
+    // layer (it ends a revoked session on every route). Use the Valkey
+    // registry for more than one instance.
+    let registry = MemorySessionRegistry::new();
+    let _service = Arc::new(
+        AuthnService::builder_from_backend(backend)
+            .with_registry(registry.clone())
+            .build(),
+    );
 
-    // 32 random bytes from your secret store; a constant key is logged at error.
+    // 32 random bytes from your secret store; a constant key is refused.
     let signing_key: [u8; 32] = std::fs::read("/run/secrets/axess-signing-key")?
         .try_into()
         .map_err(|_| "signing key must be exactly 32 bytes")?;
-    let session_layer = SessionLayer::new(session_store, signing_key)
+    let session_layer = SessionLayer::new(session_store, signing_key, registry.handle())
         .with_ttl(Duration::from_secs(86400));
 
     let app = Router::new()
@@ -175,7 +188,7 @@ For the complete docs index, see [`docs/README.md`](docs/README.md).
 
 ```toml
 [dependencies]
-axess = { version = "0.15.0", features = ["sqlite", "authz"] }
+axess = { version = "0.16.0", features = ["sqlite", "authz"] }
 ```
 
 To track the development branch instead of a release:

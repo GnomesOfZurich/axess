@@ -160,6 +160,31 @@ impl SessionCodec {
         })
     }
 
+    /// [`encode_bytes`](Self::encode_bytes) refusing a payload over `max`
+    /// bytes with [`SqlStoreError::PayloadTooLarge`]. The SQL stores write
+    /// through this.
+    #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+    pub fn encode_bytes_within(
+        &self,
+        id: &SessionId,
+        data: &SessionData,
+        max: usize,
+    ) -> Result<Vec<u8>, SqlStoreError> {
+        let encoded = self.encode_bytes(id, data)?;
+        if encoded.len() > max {
+            tracing::warn!(
+                size = encoded.len(),
+                max,
+                "session payload exceeds maximum allowed size"
+            );
+            return Err(SqlStoreError::PayloadTooLarge {
+                size: encoded.len(),
+                max,
+            });
+        }
+        Ok(encoded)
+    }
+
     /// Deserialize (and optionally decrypt) session data from binary
     /// storage; no base64 wrap.
     ///
@@ -324,7 +349,24 @@ pub enum SqlStoreError {
     /// AES-256-GCM encryption or decryption of session payload failed.
     #[error("encryption/decryption error: {0}")]
     Crypto(#[from] crate::session::crypto::CryptoError),
+
+    /// The encoded session payload exceeds the store's maximum size
+    /// (`with_max_payload`; 64 KiB by default).
+    #[error("encoded session payload too large ({size} bytes, max {max} bytes)")]
+    PayloadTooLarge {
+        /// Encoded payload length in bytes.
+        size: usize,
+        /// Configured maximum payload length in bytes.
+        max: usize,
+    },
+
+    /// The store cannot do what was asked; the text names the method.
+    #[error("not supported by this store: {0}")]
+    Unsupported(&'static str),
 }
+
+/// The default largest encoded session payload a store accepts: 64 KiB.
+pub(crate) const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests;

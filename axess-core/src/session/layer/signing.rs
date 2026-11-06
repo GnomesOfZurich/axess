@@ -204,15 +204,28 @@ impl SigningKeyRing {
     /// below, not a registry: a new label the layer derives for its own
     /// use must be added to it, or an adopter asking for that label would
     /// get the layer's key.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a label that starts with `axess.v1.reserved-label.`, the
+    /// namespace the reserved labels are remapped into: such a label would
+    /// share its key with the remap of another one.
     pub(crate) fn derive_subkey(&self, info: &'static [u8]) -> [u8; 32] {
+        assert!(
+            !info.starts_with(RESERVED_LABEL_PREFIX),
+            "derive_subkey: labels starting with `axess.v1.reserved-label.` are reserved"
+        );
         if info == HKDF_INFO_COOKIE || info == HKDF_INFO_FINGERPRINT {
-            let mut separated = b"axess.v1.reserved-label.".to_vec();
+            let mut separated = RESERVED_LABEL_PREFIX.to_vec();
             separated.extend_from_slice(info);
             return hkdf_expand_subkey(&self.current.master, &separated);
         }
         hkdf_expand_subkey(&self.current.master, info)
     }
 }
+
+/// The namespace the reserved labels are remapped into.
+const RESERVED_LABEL_PREFIX: &[u8] = b"axess.v1.reserved-label.";
 
 /// Compute HMAC-SHA256 of `bytes` under `key`; return the raw 32-byte
 /// tag. Verify paths compare against this directly to avoid a
@@ -295,8 +308,16 @@ mod subkey_derivation_tests {
     /// and `derive_subkey`.
     #[test]
     fn different_masters_yield_different_subkeys() {
-        let layer_a = SessionLayer::new(MemorySessionStore::new(), [0xAA; 32]);
-        let layer_b = SessionLayer::new(MemorySessionStore::new(), [0xBB; 32]);
+        let layer_a = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0xAA; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
+        let layer_b = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0xBB; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
 
         let info = b"axess.test.v1";
         let key_a = layer_a.derive_subkey(info);
@@ -326,7 +347,11 @@ mod subkey_derivation_tests {
     /// that signs cookies or binds fingerprints.
     #[test]
     fn reserved_labels_do_not_return_the_layers_own_keys() {
-        let layer = SessionLayer::new(MemorySessionStore::new(), [0x42; 32]);
+        let layer = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0x42; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
         let cookie_key = layer.signing_keys.current.cookie;
         let fingerprint_key = layer.signing_keys.current.fingerprint;
 
@@ -341,13 +366,39 @@ mod subkey_derivation_tests {
         assert_ne!(*asked_cookie, *asked_fingerprint);
     }
 
+    /// The reserved labels are remapped into a namespace of their own; a label
+    /// that starts with that namespace's prefix would collide with the remap
+    /// of another label, so it is refused.
+    #[test]
+    fn a_label_in_the_reserved_namespace_is_refused() {
+        let layer = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0x42; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer.derive_subkey(b"axess.v1.reserved-label.axess.v1.session.cookie.hmac")
+        }));
+        assert!(
+            refused.is_err(),
+            "a label in the reserved namespace shares a key with another label"
+        );
+        // A label that merely resembles the prefix is still allowed.
+        let _ = layer.derive_subkey(b"axess.v1.reserved-label");
+        let _ = layer.derive_subkey(b"my-app.axess.v1.reserved-label.x");
+    }
+
     /// Different info labels MUST produce different sub-keys for the
     /// same master. This is the domain-separation property:
     /// a side-channel on the cookie path cannot replay against the
     /// fingerprint path because the keys are unrelated.
     #[test]
     fn different_info_labels_yield_different_subkeys() {
-        let layer = SessionLayer::new(MemorySessionStore::new(), [0x42; 32]);
+        let layer = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0x42; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
         let key_cookie = layer.derive_subkey(b"axess.v1.session.cookie.hmac");
         let key_csrf = layer.derive_subkey(b"axess.v1.csrf");
         let key_push = layer.derive_subkey(b"axess.v1.push");
@@ -363,7 +414,11 @@ mod subkey_derivation_tests {
     /// session cookie's HMAC depends on across requests.
     #[test]
     fn subkey_is_deterministic_under_same_inputs() {
-        let layer = SessionLayer::new(MemorySessionStore::new(), [0x77; 32]);
+        let layer = SessionLayer::new_unchecked(
+            MemorySessionStore::new(),
+            [0x77; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
         let info = b"axess.v1.session.cookie.hmac";
         let k1 = layer.derive_subkey(info);
         let k2 = layer.derive_subkey(info);

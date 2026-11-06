@@ -187,8 +187,9 @@ External-issuer is the non-SPIFFE case. The credential is not a
 SVID at all (a Kubernetes service-account token, a GitHub Actions
 OIDC token, an Azure AD workload token). All of these go through
 the single generic `WorkloadResolver`: the adopter supplies a
-claim parser + mapping closure that synthesises a SPIFFE-shape
-`WorkloadId` from whichever claims the issuer's JWT carries. The
+claim parser + mapping closure that names the service and tenant slug
+from whichever claims the issuer's JWT carries, from which the resolver
+synthesises a SPIFFE-shape `WorkloadId` under its own trust domain. The
 synthesis is what lets the rest of the system work uniformly: by the
 time the policy evaluator sees it, the external workload looks like any
 other workload, and the audit rows you write about it carry the same

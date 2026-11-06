@@ -22,8 +22,9 @@ use super::{FinalizeOutcome, Rotation};
 ///
 /// A login rotates a guest id the registry never held, and the handler
 /// registers the new id itself; the registry then holds the new id and the
-/// cookie is issued. When it holds neither id the session was revoked while
-/// its request ran.
+/// cookie is issued. When it holds neither id, or the session was already
+/// authenticated and the old id is gone, the session was revoked while its
+/// request ran.
 ///
 /// Returns `false` when the session was ended instead of moved: its row
 /// under the new id has been deleted, and the response sets no cookie.
@@ -38,6 +39,7 @@ where
     S::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let Rotation {
+        was_authenticated,
         user_id,
         old_id,
         new_id,
@@ -53,8 +55,8 @@ where
                 )
                 .await;
             }
-            if revoked_during_rotation(registry, rotation).await {
-                return end_revoked_rotation(registry, store, rotation).await;
+            if let Some(end) = reread_old_id(registry, store, rotation, unknown).await {
+                return end;
             }
             note_revocation(
                 registry.invalidate_session(user_id, old_id).await,
@@ -63,6 +65,13 @@ where
             true
         }
         SessionLiveness::Gone => match registry.liveness(user_id, new_id).await {
+            // A login rotates a guest id the registry never held, and the
+            // handler registered the new id: that is a session. A session
+            // that was authenticated held its old id, so an old id that is
+            // gone was revoked, whatever the new id says.
+            SessionLiveness::Valid if *was_authenticated => {
+                end_revoked_rotation(registry, store, rotation).await
+            }
             SessionLiveness::Valid => true,
             SessionLiveness::Gone => {
                 end_untracked(
@@ -84,8 +93,8 @@ where
         },
         SessionLiveness::Unknown => {
             if registry.register(user_id, new_id).await {
-                if revoked_during_rotation(registry, rotation).await {
-                    return end_revoked_rotation(registry, store, rotation).await;
+                if let Some(end) = reread_old_id(registry, store, rotation, unknown).await {
+                    return end;
                 }
                 note_revocation(
                     registry.invalidate_session(user_id, old_id).await,
@@ -104,13 +113,42 @@ where
     }
 }
 
-/// Whether the registry, read again after the new id was registered, no
-/// longer holds the old one: a revocation landed during the rotation.
-async fn revoked_during_rotation(
+/// Read the old id again after the new one was registered. `Some(false)`
+/// ends the rotation (no cookie), `None` lets it go ahead.
+///
+/// `Gone` means a revocation landed during the rotation: the session ends.
+/// `Unknown` means the registry could not answer this time, which is not a
+/// revocation but is not a confirmation either: `unknown` decides, as for
+/// every other registry call of the rotation. `Reject` ends the session and
+/// invalidates the new id again; `Accept` lets it go ahead.
+///
+/// A window remains by construction: the registry's calls are not one
+/// transaction, so a revocation that lands after this read, and before the
+/// old id is invalidated, is not seen here. It is caught by the next request's
+/// registry check, which finds the new id revoked with the rest.
+async fn reread_old_id<S>(
     registry: &dyn SessionRegistryHandle,
+    store: &S,
     rotation: &Rotation,
-) -> bool {
-    registry.liveness(&rotation.user_id, &rotation.old_id).await == SessionLiveness::Gone
+    unknown: crate::session::layer::UnknownLiveness,
+) -> Option<bool>
+where
+    S: SessionStore + Send + Sync + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    match registry.liveness(&rotation.user_id, &rotation.old_id).await {
+        SessionLiveness::Valid => None,
+        SessionLiveness::Gone => Some(end_revoked_rotation(registry, store, rotation).await),
+        SessionLiveness::Unknown => match unknown {
+            crate::session::layer::UnknownLiveness::Accept => None,
+            crate::session::layer::UnknownLiveness::Reject => {
+                tracing::error!(
+                    "the registry could not confirm the old id after the rotation registered the new one; ending it"
+                );
+                Some(end_revoked_rotation(registry, store, rotation).await)
+            }
+        },
+    }
 }
 
 /// End a session revoked while its id rotated: invalidate the new id too and

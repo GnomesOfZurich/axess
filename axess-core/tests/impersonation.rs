@@ -15,6 +15,7 @@ use axess_core::authn::service::{AuthnService, RequestAuthnService};
 use axess_core::authn::store::{IdentityAdmin as _, IdentityLookup as _};
 use axess_core::session::extractor::AuthSession;
 use axess_core::session::refresh::RefreshTokenConfig;
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     mock_refresh_store::MemoryRefreshTokenStore,
@@ -575,11 +576,10 @@ async fn a_tenant_whose_timed_suspension_has_lapsed_admits_an_impersonation() {
     let admin = test_user("admin", "ops");
     let target = test_user("u2", "bob");
     let mut tenant = test_tenant();
-    tenant.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: clock.now() - chrono::Duration::hours(2),
-        until: Some(clock.now() - chrono::Duration::hours(1)),
-    });
+    tenant.status = EntityState::Suspended(
+        StatusDetail::administrative("hold", clock.now() - chrono::Duration::hours(2))
+            .with_until(Some(clock.now() - chrono::Duration::hours(1))),
+    );
     let identity = MockIdentityStore::new()
         .with_tenant(tenant)
         .with_user(admin.clone())
@@ -635,11 +635,7 @@ async fn no_one_is_impersonated_into_a_suspended_tenant() {
     let admin = test_user("admin", "ops");
     let target = test_user("u2", "bob");
     let mut tenant = test_tenant();
-    tenant.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: clock.now(),
-        until: None,
-    });
+    tenant.status = EntityState::Suspended(StatusDetail::administrative("hold", clock.now()));
     let identity = MockIdentityStore::new()
         .with_tenant(tenant)
         .with_user(admin.clone())
@@ -675,11 +671,7 @@ async fn a_suspended_admin_cannot_impersonate() {
     r.identity
         .suspend_user(
             &r.admin.id,
-            StatusDetail {
-                reason: "offboarded".into(),
-                since: r.clock.now(),
-                until: None,
-            },
+            StatusDetail::administrative("offboarded", r.clock.now()),
         )
         .await
         .unwrap();
@@ -838,4 +830,42 @@ async fn the_principal_of_an_impersonated_session_names_the_administrator() {
         entity.attr("impersonator").is_some(),
         "the Cedar principal carries who is acting in the user's name"
     );
+}
+
+/// The administrator's own tenant must be active, as the store holds it: a
+/// session that names another, active, tenant does not stand in for it.
+#[tokio::test]
+async fn the_administrators_stored_tenant_gates_impersonation_not_the_sessions() {
+    use axess_core::authn::types::{EntityState, StatusDetail};
+    let clock = MockClock::now();
+    let mut ops_tenant = test_tenant();
+    ops_tenant.status = EntityState::Suspended(StatusDetail::administrative("hold", clock.now()));
+    let mut other_tenant = test_tenant();
+    other_tenant.id = common::tid("t2");
+    other_tenant.identifier = "other".into();
+    // The administrator is stored in the suspended tenant; the target lives
+    // in an active one.
+    let admin = test_user("admin", "ops");
+    let target = common::test_user_in_tenant("u9", "zed", "t2");
+    let identity = MockIdentityStore::new()
+        .with_tenant(ops_tenant)
+        .with_tenant(other_tenant)
+        .with_user(admin.clone())
+        .with_user(target.clone());
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .build()
+        .with_audit_context(AuditContext::default());
+    // A session that claims the active tenant for the same administrator.
+    let session = test_session();
+    session
+        .set_authenticated(admin.id, common::tid("t2"), clock.now())
+        .await;
+
+    let res = svc
+        .begin_impersonation_across_tenants(&admin.id, &target, &session)
+        .await;
+
+    assert!(matches!(res, Err(AuthnError::NotActive(_))), "{res:?}");
+    assert_eq!(session.impersonator().await, None);
 }

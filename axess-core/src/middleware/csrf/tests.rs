@@ -1014,7 +1014,12 @@ async fn csrf_token_for_fresh_guest_survives_session_finalize() {
     use axum::routing::{get, post};
     use tower::ServiceExt;
 
-    let session_layer = SessionLayer::new(MemorySessionStore::new(), [42u8; 32]).with_secure(false);
+    let session_layer = SessionLayer::new(
+        MemorySessionStore::new(),
+        crate::testing::test_key(42),
+        crate::MemorySessionRegistry::new().handle(),
+    )
+    .with_secure(false);
     let csrf_layer = CsrfLayer::new(CsrfConfig::new([7u8; 32]).secure(false));
     let app = Router::new()
         .route(
@@ -1239,4 +1244,43 @@ fn the_default_cookie_name_is_host_prefixed_when_secure() {
     assert_eq!(explicit.effective_cookie_name(), "csrf");
     let explicit_first = CsrfConfig::new(key).secure(false).cookie_name("csrf");
     assert_eq!(explicit_first.effective_cookie_name(), "csrf");
+}
+
+/// With no session id (the session layer missing or outside this one), the
+/// cookie the client sent cannot be checked, so it is not handed to handlers
+/// as the token to embed in a page.
+#[tokio::test]
+async fn an_unverifiable_cookie_is_not_handed_to_handlers_as_the_token() {
+    use axum::http::{Method, Request};
+    use std::convert::Infallible;
+    use tower::{Layer, ServiceExt, service_fn};
+
+    let echo_token = service_fn(|req: Request<Body>| async move {
+        let token = req
+            .extensions()
+            .get::<CsrfToken>()
+            .map(|t| t.as_str().to_owned())
+            .unwrap_or_else(|| "no extension".to_owned());
+        Ok::<_, Infallible>(Response::new(Body::from(token)))
+    });
+    let config = CsrfConfig::new([31u8; 32]);
+    let service = CsrfLayer::new(config.clone()).layer(echo_token);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/form")
+        .header(
+            "cookie",
+            format!("{}=attacker-chosen-value", config.effective_cookie_name()),
+        )
+        .body(Body::empty())
+        .unwrap();
+    let resp = service.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body.as_ref(),
+        b"",
+        "the token handlers see must be empty, not the client's cookie"
+    );
 }

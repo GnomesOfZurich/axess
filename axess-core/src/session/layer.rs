@@ -45,7 +45,7 @@ use signing::SigningKeyRing;
 use std::{sync::Arc, time::Duration};
 
 /// What the session layer does with an authenticated session when the
-/// registry set by [`SessionLayer::with_registry`] cannot answer (it errored).
+/// registry given to [`SessionLayer::new`] cannot answer (it errored).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UnknownLiveness {
     /// Treat the request as a guest for now, leave the stored row alone and
@@ -66,7 +66,7 @@ pub enum UnknownLiveness {
 /// ```text
 /// let app = Router::new()
 ///     .route("/login", post(login_handler))
-///     .layer(SessionLayer::new(store, signing_key));
+///     .layer(SessionLayer::new(store, signing_key, registry));
 /// ```
 ///
 /// # Configuration
@@ -74,7 +74,7 @@ pub enum UnknownLiveness {
 /// Cookie attributes and TTL are set via the `with_*` builder methods:
 ///
 /// ```text
-/// let layer = SessionLayer::new(store, key)
+/// let layer = SessionLayer::new(store, key, registry)
 ///     .with_ttl(Duration::from_secs(7200))
 ///     .with_secure(false)
 ///     .with_same_site(SameSite::Strict);
@@ -109,10 +109,13 @@ pub struct SessionLayer<S> {
     pub(super) rng: Arc<dyn SecureRng>,
     /// Clock for the absolute session age cap; defaults to [`SystemClock`].
     pub(super) clock: Arc<dyn Clock>,
-    /// Registry consulted for every authenticated record, when set; see
-    /// [`with_registry`](Self::with_registry).
+    /// Registry consulted for every authenticated record. `None` only for a
+    /// layer built by [`without_registry_insecure`](Self::without_registry_insecure).
     pub(super) registry: Option<Arc<dyn SessionRegistryHandle>>,
     pub(super) unknown_liveness: UnknownLiveness,
+    /// Origins a WebSocket upgrade may come from; empty means the request's
+    /// own host. See [`with_websocket_origins`](Self::with_websocket_origins).
+    pub(super) websocket_origins: Arc<[Arc<str>]>,
     /// Optional device resolver invoked once per request between
     /// session-data load and the inner handler. Stamps
     /// [`SessionData::device_id`](crate::session::SessionData::device_id)
@@ -122,10 +125,27 @@ pub struct SessionLayer<S> {
 }
 
 impl<S: SessionStore> SessionLayer<S> {
-    /// Create a session layer with the given store and 32-byte HMAC signing key.
+    /// Create a session layer with the given store, 32-byte HMAC signing key
+    /// and session registry.
     ///
-    /// Uses [`SessionConfig::default()`]: production-safe defaults (24-hour TTL,
-    /// `Secure`, `HttpOnly`, `SameSite=Lax`).
+    /// Uses [`SessionConfig::default()`]: production-safe defaults (24-hour
+    /// sliding TTL, a 7-day cap from authentication and a 1-hour cap on
+    /// impersonation, `Secure`, `HttpOnly`, `SameSite=Lax`). Lift a cap with
+    /// [`with_max_session_age(None)`](Self::with_max_session_age) or
+    /// [`with_max_impersonation_age(None)`](Self::with_max_impersonation_age).
+    ///
+    /// The registry is consulted for every authenticated session, so that a
+    /// revocation (suspension, password reset, administrator kick,
+    /// log-out-everywhere, the per-user session cap) takes effect on the next
+    /// request whatever guards the route: an authenticated session the
+    /// registry no longer holds is deleted from the store and the request runs
+    /// as a new guest, with the client's cookie replaced. Guests and part-way
+    /// logins are not checked. The cost is one registry call per authenticated
+    /// request. Pass the registry the authentication service was built with.
+    /// What happens when the registry cannot answer is set by
+    /// [`with_unknown_liveness`](Self::with_unknown_liveness). A deployment
+    /// that truly keeps no registry builds with
+    /// [`without_registry_insecure`](Self::without_registry_insecure).
     ///
     /// The signing key derives sub-keys via HKDF for cookie HMAC,
     /// fingerprint HMAC, and CSRF; keep it in a secret store and rotate
@@ -135,18 +155,20 @@ impl<S: SessionStore> SessionLayer<S> {
     /// # Example
     ///
     /// ```no_run
-    /// use axess_core::{MemorySessionStore, session::SessionLayer};
-    /// use std::time::Duration;
+    /// use axess_core::{MemorySessionRegistry, MemorySessionStore, session::SessionLayer};
+    /// use axess_core::session::store::SessionRegistryAdapter;
+    /// use std::{sync::Arc, time::Duration};
     ///
     /// // Production: load 32 random bytes from a secret store (KMS, Vault, a
-    /// // mounted secret). A constant key such as all zeros is logged at error.
+    /// // mounted secret). A constant key such as all zeros is refused.
     /// let signing_key: [u8; 32] = std::fs::read("/run/secrets/axess-signing-key")
     ///     .expect("signing key file")
     ///     .try_into()
     ///     .expect("exactly 32 bytes");
     /// let store = MemorySessionStore::default();
+    /// let registry = Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new()));
     ///
-    /// let layer = SessionLayer::new(store, signing_key)
+    /// let layer = SessionLayer::new(store, signing_key, registry)
     ///     .with_ttl(Duration::from_secs(3600))
     ///     .with_cookie_name("myapp.sid");
     ///
@@ -154,8 +176,54 @@ impl<S: SessionStore> SessionLayer<S> {
     /// //     let app = axum::Router::new().layer(layer);
     /// # let _ = layer;
     /// ```
-    pub fn new(store: S, signing_key: [u8; 32]) -> Self {
-        super::weak_key::warn_if_constant_key("session signing key", &signing_key);
+    ///
+    /// # Panics
+    ///
+    /// On a `signing_key` that is a single repeated byte (all zeros
+    /// included), a placeholder that reached production. Use
+    /// [`try_new`](Self::try_new) to handle the refusal.
+    #[track_caller]
+    pub fn new(store: S, signing_key: [u8; 32], registry: Arc<dyn SessionRegistryHandle>) -> Self {
+        super::weak_key::refuse_constant_key("session signing key", &signing_key);
+        Self::build(store, signing_key, Some(registry))
+    }
+
+    /// [`new`](Self::new) without the constant-key check, for tests that use
+    /// a placeholder key.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_unchecked(
+        store: S,
+        signing_key: [u8; 32],
+        registry: Arc<dyn SessionRegistryHandle>,
+    ) -> Self {
+        Self::build(store, signing_key, Some(registry))
+    }
+
+    /// Create a session layer that keeps no registry, so a revocation removes
+    /// the session from the registry only: the stored row stays valid on any
+    /// route not behind the validator middleware. Logs at error level once, at
+    /// build. Prefer [`new`](Self::new).
+    ///
+    /// # Panics
+    ///
+    /// On a constant `signing_key`, as [`new`](Self::new).
+    #[track_caller]
+    pub fn without_registry_insecure(store: S, signing_key: [u8; 32]) -> Self {
+        super::weak_key::refuse_constant_key("session signing key", &signing_key);
+        tracing::error!(
+            target: "axess::session::layer",
+            "SessionLayer built without a registry: a revoked session (password reset, \
+             administrator kick, log-out-everywhere) stays valid in the store on every route \
+             not behind the validator middleware"
+        );
+        Self::build(store, signing_key, None)
+    }
+
+    fn build(
+        store: S,
+        signing_key: [u8; 32],
+        registry: Option<Arc<dyn SessionRegistryHandle>>,
+    ) -> Self {
         Self {
             store,
             // Derive distinct cookie / fingerprint HMAC sub-keys
@@ -169,8 +237,9 @@ impl<S: SessionStore> SessionLayer<S> {
             metrics: None,
             rng: Arc::new(SystemRng),
             clock: Arc::new(SystemClock),
-            registry: None,
+            registry,
             unknown_liveness: UnknownLiveness::default(),
+            websocket_origins: Arc::from(Vec::new()),
             #[cfg(feature = "device")]
             device_resolver: None,
         }
@@ -181,12 +250,17 @@ impl<S: SessionStore> SessionLayer<S> {
     ///
     /// # Errors
     ///
-    /// [`WeakKeyError`](super::weak_key::WeakKeyError) for such a key.
-    pub fn try_new(store: S, signing_key: [u8; 32]) -> Result<Self, super::weak_key::WeakKeyError> {
+    /// [`WeakKeyError`](super::weak_key::WeakKeyError) for a signing key that
+    /// is a single repeated byte.
+    pub fn try_new(
+        store: S,
+        signing_key: [u8; 32],
+        registry: Arc<dyn SessionRegistryHandle>,
+    ) -> Result<Self, super::weak_key::WeakKeyError> {
         if super::weak_key::is_constant_key(&signing_key) {
             return Err(super::weak_key::WeakKeyError);
         }
-        Ok(Self::new(store, signing_key))
+        Ok(Self::build(store, signing_key, Some(registry)))
     }
 
     /// Configure a previous signing master key for zero-downtime
@@ -311,6 +385,12 @@ impl<S: SessionStore> SessionLayer<S> {
     /// known label lets an attacker forge against that path, so the
     /// material is held under the same drop discipline as the master
     /// key. Deref through `*` or `as_ref()` to access the raw `[u8; 32]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a label that starts with `axess.v1.reserved-label.`: the
+    /// layer's own labels are remapped under that prefix, and a label there
+    /// would share a key with one of them.
     pub fn derive_subkey(&self, info: &'static [u8]) -> zeroize::Zeroizing<[u8; 32]> {
         // Derives from the CURRENT master only. Adopters using
         // `derive_subkey` to feed their own HMAC sites (CSRF, push
@@ -337,23 +417,38 @@ impl<S: SessionStore> SessionLayer<S> {
         self
     }
 
-    /// Consult a session registry for every authenticated session, so that a
-    /// revocation (suspension, password reset, administrator kick,
-    /// log-out-everywhere, the per-user session cap) takes effect on the
-    /// next request whatever guards the route.
+    /// Name the origins a WebSocket upgrade may come from.
     ///
-    /// Without this, revocation removes the session only from the registry;
-    /// the stored row stays valid and only handlers behind the validator
-    /// middleware notice. With it, an authenticated session the registry no
-    /// longer holds is deleted from the store and the request runs as a new
-    /// guest, with the client's cookie replaced. Guests and part-way logins
-    /// are not checked. The cost is one registry call per authenticated
-    /// request. What happens when the registry cannot answer is set by
-    /// [`with_unknown_liveness`](Self::with_unknown_liveness).
+    /// The layer checks the `Origin` of every WebSocket upgrade before it
+    /// touches the session: a page on any site can open a socket to this
+    /// server and the browser sends the session cookie with the upgrade, so
+    /// the `Origin` header is the only gate. The rule is the CSRF layer's:
+    /// with an allow-list the `Origin` must be one of `origins` (after
+    /// canonicalising, so `https://APP.example.com:443` is
+    /// `https://app.example.com`), and an upgrade without one is refused;
+    /// without one (the default) the `Origin` must be the request's own
+    /// `Host` under `https` (`http` or `https` when the cookies are not
+    /// `Secure`), and an upgrade with no `Origin`, which is not a browser's,
+    /// passes. A refused upgrade answers `403` and no handler runs.
     ///
-    /// Pass the registry the authentication service was built with.
-    pub fn with_registry(mut self, registry: Arc<dyn SessionRegistryHandle>) -> Self {
-        self.registry = Some(registry);
+    /// Call this when the socket is served from another host than the page
+    /// that opens it. An entry that is not an origin is dropped, with a
+    /// warning.
+    #[must_use]
+    pub fn with_websocket_origins(
+        mut self,
+        origins: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
+        let mut kept: Vec<Arc<str>> = Vec::new();
+        for raw in origins {
+            match crate::middleware::csrf::normalize_origin(raw.as_ref()) {
+                Some(origin) => kept.push(Arc::from(origin)),
+                None => tracing::warn!(
+                    "SessionLayer::with_websocket_origins: dropped an entry that is not an origin"
+                ),
+            }
+        }
+        self.websocket_origins = Arc::from(kept);
         self
     }
 
@@ -366,21 +461,23 @@ impl<S: SessionStore> SessionLayer<S> {
 
     /// End an authenticated session once it is older than `max_age`
     /// measured from when it authenticated, however recently it was used
-    /// (default: no cap, so only the sliding TTL bounds a session). The age
-    /// is read from the layer's clock; see [`with_clock`](Self::with_clock).
-    pub fn with_max_session_age(mut self, max_age: Duration) -> Self {
-        self.config_mut().max_authenticated_age = Some(max_age);
+    /// (default: 7 days). `None` lifts the cap, so that only the sliding TTL
+    /// bounds a session. The age is read from the layer's clock; see
+    /// [`with_clock`](Self::with_clock).
+    pub fn with_max_session_age(mut self, max_age: Option<Duration>) -> Self {
+        self.config_mut().max_authenticated_age = max_age;
         self
     }
 
     /// End an impersonated session once the impersonation is older than
-    /// `max_age`, measured from when `begin_impersonation` made it (default:
-    /// no cap). An administrator's session in a user's name then lasts at
-    /// most this long however active it is; the administrator signs in again
-    /// and impersonates afresh. Read on the layer's clock, like
+    /// `max_age`, measured from when `begin_impersonation` made it (default: 1
+    /// hour; `None` lifts the cap). An administrator's session in a user's
+    /// name then lasts at most this long however active it is; the
+    /// administrator signs in again and impersonates afresh. Read on the
+    /// layer's clock, like
     /// [`with_max_session_age`](Self::with_max_session_age).
-    pub fn with_max_impersonation_age(mut self, max_age: Duration) -> Self {
-        self.config_mut().max_impersonation_age = Some(max_age);
+    pub fn with_max_impersonation_age(mut self, max_age: Option<Duration>) -> Self {
+        self.config_mut().max_impersonation_age = max_age;
         self
     }
 
@@ -400,6 +497,14 @@ impl<S: SessionStore> SessionLayer<S> {
 
     /// Override the cookie name (default: `"__Host-axess.sid"`, or
     /// `"axess.sid"` when `Secure` is off or the path is not `/`).
+    ///
+    /// A name without the `__Host-` prefix can be planted from a sibling
+    /// subdomain, or by a man in the middle on plain HTTP. A request that
+    /// then carries the name twice with different values is treated as
+    /// having no session cookie (the layer refuses to choose), so the user
+    /// is logged out for as long as the planted cookie lives. Only the
+    /// `__Host-` prefix (`Secure`, path `/`) keeps a browser from accepting
+    /// such a cookie, so keep it unless you must not.
     pub fn with_cookie_name(mut self, name: impl Into<Arc<str>>) -> Self {
         let config = self.config_mut();
         config.cookie_name = name.into();
@@ -411,6 +516,10 @@ impl<S: SessionStore> SessionLayer<S> {
     ///
     /// Set to `false` only for local HTTP development. In production,
     /// cookies without the `Secure` flag can be intercepted on the network.
+    /// Without `Secure` the default name loses its `__Host-` prefix, so a
+    /// network attacker can also plant a second cookie of the same name and
+    /// log the user out for good (see
+    /// [`with_cookie_name`](Self::with_cookie_name)).
     pub fn with_secure(mut self, secure: bool) -> Self {
         if !secure {
             tracing::warn!(
@@ -448,8 +557,20 @@ impl<S: SessionStore> SessionLayer<S> {
     }
 
     /// Set the cookie `Path` attribute (default: `"/"`).
+    ///
+    /// A path other than `/` makes a cookie whose name was not set with
+    /// [`with_cookie_name`](Self::with_cookie_name) lose its `__Host-`
+    /// prefix (a warning says so): the browser then accepts a cookie of the
+    /// same name planted from a sibling subdomain, which can log the user
+    /// out for good (a request with the name twice reads as no cookie) or
+    /// fixate a session. Keep `/` where you can.
     pub fn with_path(mut self, path: impl Into<Arc<str>>) -> Self {
-        self.config_mut().path = path.into();
+        let config = self.config_mut();
+        config.path = path.into();
+        crate::session::config::warn_if_host_prefix_dropped(
+            &config.path,
+            config.cookie_name_explicit,
+        );
         self
     }
 
@@ -464,7 +585,7 @@ impl<S: SessionStore> SessionLayer<S> {
     /// ```text
     /// use axess::session::UserAgentBinding;
     ///
-    /// let layer = SessionLayer::new(store, key)
+    /// let layer = SessionLayer::new(store, key, registry)
     ///     .with_binding(UserAgentBinding);
     /// ```
     pub fn with_binding(mut self, binding: impl SessionBinding) -> Self {
@@ -526,7 +647,11 @@ mod make_mut_tests {
     #[should_panic(expected = "SessionLayer setter called after the layer was cloned")]
     fn setter_after_clone_panics_in_debug() {
         let store = MemorySessionStore::new();
-        let layer = SessionLayer::new(store, [0u8; 32]);
+        let layer = SessionLayer::new_unchecked(
+            store,
+            [0u8; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
         let cloned = layer.clone();
         // Cloning bumps the Arc strong count to 2; the next `with_ttl`
         // will trip the assertion before `Arc::make_mut` deep-copies.
@@ -537,11 +662,46 @@ mod make_mut_tests {
     #[test]
     fn setter_before_clone_does_not_panic() {
         let store = MemorySessionStore::new();
-        let layer = SessionLayer::new(store, [0u8; 32])
-            .with_ttl(Duration::from_secs(60))
-            .with_secure(false);
+        let layer = SessionLayer::new_unchecked(
+            store,
+            [0u8; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        )
+        .with_ttl(Duration::from_secs(60))
+        .with_secure(false);
         // Clone after setters is fine; the configuration is already finalised.
         drop(layer.clone());
+    }
+}
+
+/// The constructors refuse a signing key that is a single repeated byte.
+#[cfg(test)]
+mod weak_signing_key_tests {
+    use super::*;
+    use crate::session::store::MemorySessionStore;
+
+    fn registry() -> Arc<dyn SessionRegistryHandle> {
+        crate::MemorySessionRegistry::new().handle()
+    }
+
+    #[test]
+    #[should_panic(expected = "session signing key is a single repeated byte")]
+    fn new_refuses_a_constant_key() {
+        let _ = SessionLayer::new(MemorySessionStore::new(), [0u8; 32], registry());
+    }
+
+    #[test]
+    #[should_panic(expected = "session signing key is a single repeated byte")]
+    fn without_registry_insecure_refuses_a_constant_key() {
+        let _ = SessionLayer::without_registry_insecure(MemorySessionStore::new(), [9u8; 32]);
+    }
+
+    #[test]
+    fn try_new_refuses_and_new_unchecked_accepts_a_constant_key() {
+        assert!(SessionLayer::try_new(MemorySessionStore::new(), [0u8; 32], registry()).is_err());
+        let _ = SessionLayer::new_unchecked(MemorySessionStore::new(), [0u8; 32], registry());
+        let mixed = crate::testing::test_key(1);
+        assert!(SessionLayer::try_new(MemorySessionStore::new(), mixed, registry()).is_ok());
     }
 }
 
@@ -565,7 +725,14 @@ mod with_secure_warning_tests {
     fn with_secure_false_emits_warning() {
         let capture = TracingCapture::install();
         let store = MemorySessionStore::new();
-        drop(SessionLayer::new(store, [0u8; 32]).with_secure(false));
+        drop(
+            SessionLayer::new_unchecked(
+                store,
+                [0u8; 32],
+                crate::MemorySessionRegistry::new().handle(),
+            )
+            .with_secure(false),
+        );
         assert!(
             capture.contains_at_level(tracing::Level::WARN, "Secure cookie flag disabled"),
             "with_secure(false) must warn about plain-HTTP cookies"
@@ -576,11 +743,72 @@ mod with_secure_warning_tests {
     fn with_secure_true_does_not_emit_warning() {
         let capture = TracingCapture::install();
         let store = MemorySessionStore::new();
-        drop(SessionLayer::new(store, [0u8; 32]).with_secure(true));
+        drop(
+            SessionLayer::new_unchecked(
+                store,
+                [0u8; 32],
+                crate::MemorySessionRegistry::new().handle(),
+            )
+            .with_secure(true),
+        );
         assert!(
             !capture.contains_at_level(tracing::Level::WARN, "Secure cookie flag disabled"),
             "with_secure(true) must NOT warn; `delete !` mutation would invert this"
         );
+    }
+}
+
+/// A path other than `/` drops the `__Host-` prefix of the default cookie
+/// name; `with_path` says so once, and stays quiet when nothing is dropped.
+#[cfg(test)]
+mod with_path_warning_tests {
+    use super::*;
+    use crate::session::store::MemorySessionStore;
+    use crate::testing::mock_tracing::TracingCapture;
+
+    fn warnings(capture: &TracingCapture) -> usize {
+        capture
+            .events()
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message.contains("__Host-"))
+            .count()
+    }
+
+    #[test]
+    fn a_non_root_path_warns_once_that_the_host_prefix_is_dropped() {
+        let capture = TracingCapture::install();
+        drop(
+            SessionLayer::new_unchecked(
+                MemorySessionStore::new(),
+                [0u8; 32],
+                crate::MemorySessionRegistry::new().handle(),
+            )
+            .with_path("/app"),
+        );
+        assert_eq!(warnings(&capture), 1, "events: {:?}", capture.events());
+    }
+
+    #[test]
+    fn the_root_path_and_a_chosen_name_do_not_warn() {
+        let capture = TracingCapture::install();
+        drop(
+            SessionLayer::new_unchecked(
+                MemorySessionStore::new(),
+                [0u8; 32],
+                crate::MemorySessionRegistry::new().handle(),
+            )
+            .with_path("/"),
+        );
+        drop(
+            SessionLayer::new_unchecked(
+                MemorySessionStore::new(),
+                [0u8; 32],
+                crate::MemorySessionRegistry::new().handle(),
+            )
+            .with_cookie_name("sid")
+            .with_path("/app"),
+        );
+        assert_eq!(warnings(&capture), 0);
     }
 }
 
@@ -600,7 +828,12 @@ mod signing_key_retire_tests {
     #[test]
     fn remove_previous_signing_key_retires_the_slot() {
         let store = MemorySessionStore::new();
-        let layer = SessionLayer::new(store, [0xBB; 32]).with_previous_signing_key([0xAA; 32]);
+        let layer = SessionLayer::new_unchecked(
+            store,
+            [0xBB; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        )
+        .with_previous_signing_key([0xAA; 32]);
         assert!(
             layer.has_previous_signing_key(),
             "with_previous_signing_key must install a slot the predicate observes"
@@ -620,7 +853,11 @@ mod signing_key_retire_tests {
     #[test]
     fn remove_previous_signing_key_on_fresh_layer_is_noop() {
         let store = MemorySessionStore::new();
-        let layer = SessionLayer::new(store, [0xBB; 32]);
+        let layer = SessionLayer::new_unchecked(
+            store,
+            [0xBB; 32],
+            crate::MemorySessionRegistry::new().handle(),
+        );
         assert!(!layer.has_previous_signing_key());
         let after = layer.remove_previous_signing_key();
         assert!(!after.has_previous_signing_key());

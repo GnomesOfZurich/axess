@@ -74,7 +74,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
     .unwrap();
 
     // Rotate v1 → v2; v2 must inherit the device link.
-    let (session, new_token) = Refresh::new(&plaintext_v1, |_| async { true })
+    let (session, new_token) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
         .run(&refresh_store, &config, &rng, ts)
         .await
         .unwrap();
@@ -94,7 +94,7 @@ async fn refresh_compromise_to_device_revocation_full_cascade() {
     // on_token_compromise just logs; we replicate the cascade
     // step a production override would perform by collecting
     // family targets and driving the primitive directly.
-    let err = Refresh::new(&plaintext_v1, |_| async { true })
+    let err = Refresh::any_tenant(&plaintext_v1, |_| async { true })
         .run(&refresh_store, &config, &rng, ts)
         .await;
     assert!(matches!(err, Err(RefreshError::Revoked)));
@@ -152,7 +152,7 @@ async fn collect_family_targets_deduplicates_same_device_across_family() {
     )
     .await
     .unwrap();
-    let (_session, _) = Refresh::new(&plaintext_v1, |_| async { true })
+    let (_session, _) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();

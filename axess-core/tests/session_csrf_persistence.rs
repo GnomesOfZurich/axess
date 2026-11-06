@@ -28,6 +28,13 @@ struct ForgetfulStore;
 
 impl SessionStore for ForgetfulStore {
     type Error = <MemorySessionStore as SessionStore>::Error;
+    async fn find_sessions_for_user(
+        &self,
+        _: &axess_core::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
 
     async fn load(&self, _id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         Ok(None)
@@ -84,7 +91,7 @@ fn router<S: SessionStore>(store: S) -> Router {
         )
         .layer(CsrfLayer::new(CsrfConfig::new([42u8; 32])))
         .layer(
-            SessionLayer::new(store, [42u8; 32])
+            SessionLayer::new(store, axess_core::testing::test_key(42), axess_core::MemorySessionRegistry::new().handle())
                 .with_ttl(Duration::from_secs(3600))
                 .with_secure(false),
         )

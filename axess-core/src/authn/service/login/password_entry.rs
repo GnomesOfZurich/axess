@@ -33,6 +33,12 @@ where
     /// lock the same way unless the service was built with
     /// [`with_lockout_revealed_on_begin`](crate::authn::AuthnServiceBuilder::with_lockout_revealed_on_begin);
     /// use it and `verify_factor` directly when the lock should be shown.
+    /// A throttled guess (see [`LockoutPolicy::throttle`](crate::authn::types::LockoutPolicy::throttle))
+    /// is answered `InvalidCredential` for the same reason, with the one
+    /// dummy hash, since only an identifier that exists can be throttled;
+    /// the audit row says `throttled`, and `verify_factor` answers
+    /// [`Throttled`](FactorOutcome::Throttled) with the delay where the
+    /// form may show it.
     ///
     /// Otherwise the result is that of `verify_factor` on the password:
     /// [`Authenticated`](FactorOutcome::Authenticated),
@@ -65,7 +71,15 @@ where
             LoginOutcome::FactorRequired(FactorKind::Password) => {
                 let credential =
                     FactorCredential::Password(crate::authn::factor::ZeroizedString::new(password));
-                self.verify_factor(&credential, session).await
+                match self.verify_factor(&credential, session).await? {
+                    // Refused before any hash ran: spend the one hash every
+                    // other path spends, and say what a wrong password says.
+                    FactorOutcome::Throttled { .. } => {
+                        self.burn_password_check(password).await?;
+                        Ok(FactorOutcome::InvalidCredential)
+                    }
+                    outcome => Ok(outcome),
+                }
             }
             other => {
                 // A first factor other than a password leaves the session

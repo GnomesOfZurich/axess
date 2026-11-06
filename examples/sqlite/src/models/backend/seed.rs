@@ -9,10 +9,29 @@ use axess::authn::{
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+/// The password of both seeded accounts. It meets the example's own password
+/// rules (12 characters or more, upper case, lower case, a digit).
+pub const SEED_PASSWORD: &str = "Gnomes2+Example";
+
+/// Whether the example seeds its test accounts: in a debug build always, in a
+/// release build only when `EXAMPLE_SEED=1`. The accounts have a published
+/// password, so a deployment that copied this example must not create them
+/// by default.
+pub fn seed_enabled() -> bool {
+    seed_wanted(
+        cfg!(debug_assertions),
+        std::env::var("EXAMPLE_SEED").ok().as_deref(),
+    )
+}
+
+fn seed_wanted(debug_build: bool, flag: Option<&str>) -> bool {
+    debug_build || flag == Some("1")
+}
+
 /// Seed the database with a default tenant and two test users.
 ///
-/// - **alice**; password-only login (`Gnomes2+`)
-/// - **bob**  ; password + TOTP login (`Gnomes2+`)
+/// - **alice**; password-only login ([`SEED_PASSWORD`])
+/// - **bob**  ; password + TOTP login ([`SEED_PASSWORD`])
 ///
 /// Bob's TOTP secret is sealed through `cipher` before it is stored. Returns
 /// it in plain text so the caller can log it.
@@ -74,8 +93,8 @@ pub async fn seed(
     .execute(pool)
     .await?;
 
-    // Password hash for "Gnomes2+".
-    let password_hash = axess::generate_password_hash("Gnomes2+");
+    let password_hash = axess::hash_new_password(SEED_PASSWORD, &PasswordRules::default())
+        .expect("the seed password meets the default password rules");
 
     // Alice: password factor config at user scope.
     let alice_pw_config = FactorConfig::Password(PasswordConfig {
@@ -195,4 +214,22 @@ pub async fn seed(
     .await?;
 
     Ok(totp_secret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seed_wanted;
+
+    #[test]
+    fn a_release_build_seeds_only_when_asked() {
+        assert!(!seed_wanted(false, None));
+        assert!(!seed_wanted(false, Some("0")));
+        assert!(!seed_wanted(false, Some("true")));
+        assert!(seed_wanted(false, Some("1")));
+    }
+
+    #[test]
+    fn a_debug_build_seeds() {
+        assert!(seed_wanted(true, None));
+    }
 }

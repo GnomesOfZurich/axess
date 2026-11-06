@@ -248,6 +248,36 @@ where
         count
     }
 
+    /// Remove every cache entry whose key and value match `predicate`.
+    /// Returns the number removed.
+    ///
+    /// For entries that must go when something their *value* refers to
+    /// changes (a parent held inside a cached entity set), which a
+    /// key-only predicate cannot see. In-flight loads are not touched: a
+    /// load's value is not known until it resolves, so one that started
+    /// before this call may still be stored.
+    ///
+    /// O(n) over the cache.
+    pub fn invalidate_entries_by(&self, predicate: impl Fn(&K, &V) -> bool) -> usize {
+        let mut guard = self.inner.lock_unpoisoned();
+        let to_remove: Vec<K> = guard
+            .iter()
+            .filter(|(k, entry)| predicate(k, &entry.value))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = to_remove.len();
+        for k in &to_remove {
+            guard.pop(k);
+        }
+        drop(guard);
+        if count > 0 {
+            self.stats
+                .invalidations
+                .fetch_add(count as u64, Ordering::Relaxed);
+        }
+        count
+    }
+
     /// Drop every entry from the cache. Also drops every in-flight load
     /// cell, so any load resolving after this call is barred from
     /// promoting its value to the cache (post-`invalidate_all` cache

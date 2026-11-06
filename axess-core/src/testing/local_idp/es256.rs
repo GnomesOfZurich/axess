@@ -73,6 +73,7 @@ async fn es256_from_pem_roundtrips() {
     let token = idp.mint(&claims);
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms([Algorithm::ES256]);
     verifier
         .verify::<CustomClaims>(&token)
@@ -128,6 +129,7 @@ async fn es256_from_sec1_pem_roundtrips() {
     let token = idp.mint(&claims);
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms([Algorithm::ES256]);
     verifier
         .verify::<CustomClaims>(&token)
@@ -197,6 +199,7 @@ async fn es256_rotate_to_es256_preserves_grace_window() {
 
     let verifier = JwtVerifier::new(rotated.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms([Algorithm::ES256]);
     verifier
         .verify::<CustomClaims>(&token_pre)
@@ -230,6 +233,7 @@ async fn es256_rotate_from_rsa_to_ec() {
 
     let verifier = JwtVerifier::new(rotated.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms([Algorithm::RS256, Algorithm::ES256]);
     verifier
         .verify::<CustomClaims>(&token_rsa)

@@ -31,7 +31,9 @@
 //!
 //! // Verifier reads the fixture's JWKS handle and validates the
 //! // signature + iss + exp.
-//! let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api.example.com");
+//! let verifier = JwtVerifier::new(idp.jwks_handle())
+//!     .with_issuer(idp.issuer())
+//!     .with_audience("https://api.example.com");
 //! let claims = verifier.verify::<MyClaims>(&token, "https://api.example.com").await?;
 //! ```
 //!
@@ -306,7 +308,9 @@ impl LocalIdpFixture {
     ///     .with_historical_signing_key(k1);
     ///
     /// // Verifier dispatches by token's kid header against the JWKS.
-    /// let verifier = JwtVerifier::new(rotated_idp.jwks_handle()).with_audience("https://api");
+    /// let verifier = JwtVerifier::new(rotated_idp.jwks_handle())
+    ///     .with_issuer(rotated_idp.issuer())
+    ///     .with_audience("https://api");
     /// verifier.verify::<()>(&token_old).await?; // hits historical k1
     /// verifier.verify::<()>(&rotated_idp.mint(&claims)).await?; // hits k2
     /// ```
@@ -494,6 +498,7 @@ impl LocalIdpFixture {
     ///
     /// ```rust,ignore
     /// let verifier = JwtVerifier::new(idp.jwks_handle())
+    ///     .with_issuer(idp.issuer())
     ///     .with_audience("https://api.example.com")
     ///     .with_algorithms(idp.verifier_algorithms());
     /// ```
@@ -582,7 +587,9 @@ impl LocalIdpFixture {
 
     /// Mint with caller-supplied header. Adopters reach for this
     /// when they need to set unusual header fields (e.g. test
-    /// `x5t` thumbprint matching).
+    /// `x5t` thumbprint matching). `kid` and `alg` are the signing key's,
+    /// and the key-location fields `jku`, `jwk`, `x5u` and `x5c` are cleared,
+    /// as the production `LocalIdp` does.
     pub fn mint_with_header(&self, claims: &MintClaims, header: &mut Header) -> String {
         self.mint_with_header_at(claims, header, Utc::now())
     }
@@ -600,6 +607,13 @@ impl LocalIdpFixture {
         }
         header.kid = Some(self.inner.signing_key.key_id().to_string());
         header.alg = self.inner.signing_key.algorithm();
+        // As the production IdP does: these name where a verifier may fetch,
+        // or what key it may use instead of the IdP's own, and the IdP signs
+        // with its own key.
+        header.jku = None;
+        header.jwk = None;
+        header.x5u = None;
+        header.x5c = None;
         let claims_json = build_claims_json(&self.inner.issuer, claims);
         let key = self.inner.signing_key.encoding_key();
         // Signing needs a crypto provider, and with two backends compiled in
@@ -607,7 +621,7 @@ impl LocalIdpFixture {
         // panics unless something earlier in the process installed one.
         axess_factors::jwt::ensure_crypto_provider();
         let token =
-            encode(header, &claims_json, &key).expect("JWT encode never fails on valid inputs");
+            encode(header, &claims_json, key).expect("JWT encode never fails on valid inputs");
         if let Some(listener) = &self.inner.issuance_listener {
             let event = IssuanceEvent {
                 issuer: &self.inner.issuer,

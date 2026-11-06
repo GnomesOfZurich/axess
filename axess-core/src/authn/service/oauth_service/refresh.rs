@@ -134,7 +134,7 @@ where
             rng: &*self.inner.rng,
         });
         let outcome = match provider
-            .refresh_token_for_subject(refresh_token, expected_subject, original_nonce, signer)
+            .refresh_token(refresh_token, expected_subject, original_nonce, signer)
             .await
         {
             Ok(c) => c,

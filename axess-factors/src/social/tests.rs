@@ -6,6 +6,10 @@ use axess_rng::testing::MockRng;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// A flow's state and a PKCE verifier of the length the library mints.
+const STATE: &str = "state-0123456789abcdefghijklmnopqrstuvwxyzABC";
+const VERIFIER: &str = "verifier-0123456789abcdefghijklmnopqrstuvwxyzAB";
+
 fn github_style_mapper(raw: &serde_json::Value) -> Result<SocialClaims, SocialError> {
     let id = raw
         .get("id")
@@ -61,7 +65,7 @@ fn build_auth_url_includes_pkce_and_state_by_default() {
     .expect("a valid configuration")
     .with_rng(std::sync::Arc::new(MockRng::new(7)));
 
-    let result = provider.build_auth_url("csrf-state-xyz");
+    let result = provider.build_auth_url();
 
     assert!(
         result
@@ -70,7 +74,7 @@ fn build_auth_url_includes_pkce_and_state_by_default() {
     );
     assert!(result.url.contains("response_type=code"));
     assert!(result.url.contains("client_id=demo-client"));
-    assert!(result.url.contains("state=csrf-state-xyz"));
+    assert!(result.url.contains(&format!("state={}", result.state)));
     assert!(result.url.contains("code_challenge="));
     assert!(result.url.contains("code_challenge_method=S256"));
     assert!(
@@ -97,7 +101,7 @@ fn without_pkce_omits_code_challenge() {
     .expect("a valid configuration")
     .without_pkce();
 
-    let result = provider.build_auth_url("csrf-1");
+    let result = provider.build_auth_url();
 
     assert!(!result.url.contains("code_challenge"));
     assert!(result.pkce_verifier.is_empty());
@@ -113,7 +117,7 @@ async fn happy_path_exchanges_code_then_fetches_userinfo() {
         .and(body_string_contains("grant_type=authorization_code"))
         .and(body_string_contains("code=the-code"))
         .and(body_string_contains("client_id=demo-client-id"))
-        .and(body_string_contains("code_verifier=pkce-verifier-stub"))
+        .and(body_string_contains(format!("code_verifier={VERIFIER}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "tok-abc",
             "token_type": "bearer",
@@ -137,7 +141,7 @@ async fn happy_path_exchanges_code_then_fetches_userinfo() {
 
     let provider = make_provider(&mock);
     let access_token = provider
-        .exchange_code("the-code", "pkce-verifier-stub")
+        .exchange_code(STATE, STATE, "the-code", VERIFIER)
         .await
         .expect("exchange_code");
     assert_eq!(&*access_token, "tok-abc");
@@ -170,7 +174,7 @@ async fn token_endpoint_without_access_token_is_invalid_response() {
 
     let provider = make_provider(&mock);
     let err = provider
-        .exchange_code("stale-code", "pkce-verifier-stub")
+        .exchange_code(STATE, STATE, "stale-code", VERIFIER)
         .await
         .expect_err("missing access_token must error");
     assert!(
@@ -299,18 +303,14 @@ async fn default_client_sends_the_axess_user_agent() {
     assert_eq!(claims.subject, "7");
 }
 
-/// A supplied client's own `User-Agent` is the one that goes out; the
-/// library no longer stamps its own over it.
+/// A `User-Agent` the adopter's builder sets is the one that goes out.
 #[tokio::test]
-async fn supplied_client_keeps_its_own_user_agent() {
+async fn supplied_builder_keeps_its_own_user_agent() {
     let server = MockServer::start().await;
     userinfo_mock(&server, "adopter-app/3.1").await;
-    let client = reqwest::Client::builder()
-        .user_agent("adopter-app/3.1")
-        .build()
-        .unwrap();
     let claims = make_provider(&server)
-        .with_http_client(client)
+        .with_http_client_builder(|builder| builder.user_agent("adopter-app/3.1"))
+        .unwrap()
         .fetch_userinfo("tok")
         .await
         .unwrap();
@@ -348,7 +348,7 @@ async fn a_token_body_over_the_cap_is_refused() {
     serve(&server, "/login/oauth/access_token", body).await;
 
     let err = make_provider(&server)
-        .exchange_code("c", "v")
+        .exchange_code(STATE, STATE, "c", VERIFIER)
         .await
         .expect_err("oversized token body");
 
@@ -368,7 +368,7 @@ async fn a_token_body_at_the_cap_is_read() {
     serve(&server, "/login/oauth/access_token", body).await;
 
     let token = make_provider(&server)
-        .exchange_code("c", "v")
+        .exchange_code(STATE, STATE, "c", VERIFIER)
         .await
         .expect("a body of exactly the cap is read");
 
@@ -416,6 +416,7 @@ async fn a_userinfo_body_at_the_cap_is_read() {
 fn auth_url_debug_redacts_the_pkce_verifier() {
     let auth = AuthUrl {
         url: "https://idp.example/authorize?code_challenge=abc".to_owned(),
+        state: "state-value".to_owned(),
         pkce_verifier: "verifier-secret-123".to_owned(),
     };
     let shown = format!("{auth:?} {auth:#?}");
@@ -519,11 +520,124 @@ fn an_endpoint_with_a_query_string_gets_the_parameters_appended() {
     .expect("a valid configuration")
     .with_rng(std::sync::Arc::new(MockRng::new(7)));
 
-    let url = provider.build_auth_url("csrf-1").url;
+    let auth = provider.build_auth_url();
+    let url = auth.url.clone();
     assert_eq!(url.matches('?').count(), 1, "{url}");
     let parsed = url::Url::parse(&url).expect("a URL");
     let query: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
     assert_eq!(query["tenant"], "acme", "{url}");
     assert_eq!(query["client_id"], "demo-client", "{url}");
-    assert_eq!(query["state"], "csrf-1", "{url}");
+    assert_eq!(query["state"], auth.state, "{url}");
+}
+
+// ── state, verifier and client guards ────────────────────────────────────────
+
+/// The library mints the state: a fresh 256-bit value per flow, in the URL
+/// and on the result, not one the caller can pick or reuse.
+#[test]
+fn build_auth_url_mints_a_fresh_state_per_flow() {
+    let provider = SocialProvider::new(
+        SocialProviderConfig {
+            name: "github".into(),
+            authorization_endpoint: "https://github.com/login/oauth/authorize".into(),
+            token_endpoint: "https://github.com/login/oauth/access_token".into(),
+            userinfo_endpoint: "https://api.github.com/user".into(),
+            client_id: "demo-client".into(),
+            client_secret: "demo-secret".into(),
+            redirect_uri: "https://app.example.com/auth/callback".into(),
+            scopes: vec!["read:user".into()],
+        },
+        github_style_mapper,
+    )
+    .expect("a valid configuration");
+    let first = provider.build_auth_url();
+    let second = provider.build_auth_url();
+    assert_eq!(first.state.len(), 43, "{}", first.state);
+    assert_ne!(first.state, second.state);
+    assert!(
+        first.url.contains(&format!("&state={}&", first.state)),
+        "{}",
+        first.url
+    );
+}
+
+/// A returned state that is not the expected one is refused before the
+/// token endpoint is contacted, as is a missing expected state.
+#[tokio::test]
+async fn a_state_that_differs_is_refused_before_any_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let provider = make_provider(&mock);
+
+    for (expected, returned) in [
+        (STATE, "state-other"),
+        (STATE, ""),
+        (STATE, &STATE[..STATE.len() - 1]),
+        ("", ""),
+    ] {
+        let result = provider
+            .exchange_code(expected, returned, "the-code", VERIFIER)
+            .await;
+        assert!(
+            matches!(result, Err(SocialError::StateMismatch)),
+            "{expected:?} / {returned:?}: {result:?}"
+        );
+    }
+}
+
+/// With PKCE on, a verifier shorter than RFC 7636's 43 characters (an empty
+/// one from a missing cookie, say) is refused rather than sent.
+#[tokio::test]
+async fn a_short_pkce_verifier_is_refused_before_any_request() {
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock)
+        .await;
+    let provider = make_provider(&mock);
+    for short in ["", "short", &VERIFIER[..42]] {
+        let result = provider
+            .exchange_code(STATE, STATE, "the-code", short)
+            .await;
+        assert!(
+            matches!(result, Err(SocialError::InvalidPkceVerifier)),
+            "{short:?}: {result:?}"
+        );
+    }
+}
+
+/// Whatever the adopter's builder sets, the client does not follow
+/// redirects: a redirect from the userinfo endpoint is an error and its
+/// target is never requested.
+#[tokio::test]
+async fn the_client_builder_cannot_restore_redirects() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/elsewhere", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/elsewhere"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id": 1 })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = make_provider(&server)
+        .with_http_client_builder(|builder| {
+            builder
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .timeout(std::time::Duration::from_secs(3600))
+        })
+        .unwrap();
+    let result = provider.fetch_userinfo("tok").await;
+    assert!(result.is_err(), "{result:?}");
 }

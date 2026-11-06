@@ -26,12 +26,13 @@ This is the crate most applications should depend on. It re-exports the curated 
 
 ```toml
 [dependencies]
-axess = { version = "0.15.0", features = ["sqlite", "authz"] }
+axess = { version = "0.16.0", features = ["sqlite", "authz"] }
 ```
 
 ```rust,no_run
-use axess::{AuthnService, InMemoryBackend, SessionLayer};
+use axess::{AuthnService, InMemoryBackend, MemorySessionRegistry, SessionLayer};
 use axess::backends::sqlite::SessionStore as SqliteSessionStore;
+use axess::session::SessionCrypto;
 use axum::{Router, routing::get};
 use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
@@ -39,15 +40,27 @@ use std::{sync::Arc, time::Duration};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = SqlitePool::connect("sqlite:app.db").await?;
-    let session_store = SqliteSessionStore::plaintext(pool.clone());
+    // 32 random bytes from your secret store; sessions are sealed with it.
+    let key_from_secret_store: [u8; 32] = std::fs::read("/run/secrets/axess-session-key")?
+        .try_into()
+        .map_err(|_| "session key must be exactly 32 bytes")?;
+    let session_store = SqliteSessionStore::new(pool.clone(), SessionCrypto::new(key_from_secret_store));
     session_store.init_schema().await?;
 
     let backend = InMemoryBackend::new()
         .with_user_password("alice", "default", "Gnomes2+");
-    let _service = Arc::new(AuthnService::new(backend.clone(), backend));
+    // One registry for the service (it records every login) and the session
+    // layer (it ends a revoked session on every route). Use the Valkey
+    // registry for more than one instance.
+    let registry = MemorySessionRegistry::new();
+    let _service = Arc::new(
+        AuthnService::builder_from_backend(backend)
+            .with_registry(registry.clone())
+            .build(),
+    );
 
     let signing_key: [u8; 32] = [/* load from your secret store */ 0; 32];
-    let session_layer = SessionLayer::new(session_store, signing_key)
+    let session_layer = SessionLayer::new(session_store, signing_key, registry.handle())
         .with_ttl(Duration::from_secs(86400));
 
     let app = Router::new()

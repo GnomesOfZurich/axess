@@ -79,7 +79,7 @@ async fn a_refresh_response_without_an_id_token_returns_the_rotated_tokens() {
 
     let outcome = idp
         .provider
-        .refresh_token("rt1", Some("n1"), None)
+        .refresh_token_unchecked("rt1", Some("n1"), None)
         .await
         .expect("no ID token is not a failure");
     assert!(outcome.id_token_claims.is_none());
@@ -94,7 +94,11 @@ async fn the_sent_refresh_token_is_returned_when_the_idp_does_not_rotate() {
     let idp = idp().await;
     idp.respond(json!({ "access_token": "at2", "token_type": "Bearer", "expires_in": 60 }))
         .await;
-    let outcome = idp.provider.refresh_token("rt1", None, None).await.unwrap();
+    let outcome = idp
+        .provider
+        .refresh_token_unchecked("rt1", None, None)
+        .await
+        .unwrap();
     assert_eq!(&*outcome.refresh_token, "rt1");
 }
 
@@ -113,7 +117,7 @@ async fn the_refresh_id_token_nonce_must_be_the_original_when_present() {
     idp.respond(respond_with(Some("evil"))).await;
     let err = idp
         .provider
-        .refresh_token("rt1", Some("n1"), None)
+        .refresh_token_unchecked("rt1", Some("n1"), None)
         .await
         .unwrap_err();
     assert!(
@@ -124,7 +128,7 @@ async fn the_refresh_id_token_nonce_must_be_the_original_when_present() {
     // A nonce with no original to compare it to is refused too.
     let err = idp
         .provider
-        .refresh_token("rt1", None, None)
+        .refresh_token_unchecked("rt1", None, None)
         .await
         .unwrap_err();
     assert!(
@@ -135,7 +139,7 @@ async fn the_refresh_id_token_nonce_must_be_the_original_when_present() {
     idp.respond(respond_with(Some("n1"))).await;
     let ok = idp
         .provider
-        .refresh_token("rt1", Some("n1"), None)
+        .refresh_token_unchecked("rt1", Some("n1"), None)
         .await
         .unwrap();
     assert_eq!(ok.id_token_claims.unwrap().subject, "alice");
@@ -143,7 +147,7 @@ async fn the_refresh_id_token_nonce_must_be_the_original_when_present() {
     idp.respond(respond_with(None)).await;
     let ok = idp
         .provider
-        .refresh_token("rt1", Some("n1"), None)
+        .refresh_token_unchecked("rt1", Some("n1"), None)
         .await
         .unwrap();
     assert_eq!(ok.id_token_claims.unwrap().subject, "alice");

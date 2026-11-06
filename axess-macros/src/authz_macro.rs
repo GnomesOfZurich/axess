@@ -19,7 +19,7 @@
 ///
 /// # Arguments
 ///
-/// Three positional string literals:
+/// Three positional string literals, then the session validator:
 ///
 /// 1. **`namespace`**: Cedar namespace, e.g. `"Gnomes"` or `"MyApp"`.
 ///    Must match the namespace used in the loaded Cedar policy file.
@@ -48,14 +48,13 @@
 ///
 /// # Session validator
 ///
-/// A bare `require_authz!` reads only the session record, so a session the
-/// registry ended (a password reset, a suspension, an administrator's kick)
-/// still passes behind a gate built without a registry. A fourth argument
-/// `validator = authn.session_validator()` makes the gate consult the
-/// registry first, as the validator form of
+/// The fourth argument is required: `validator = authn.session_validator()`
+/// makes the gate consult the session registry first, as the validator form of
 /// [`require_authn!`](crate::require_authn) does, and answer 401 (clearing the
-/// stored session) when the session is no longer live. Without it, put a
-/// `require_authn!(validator = ..)` or `require_valid_session` layer in front.
+/// stored session) when the session is no longer live. A gate that read the
+/// session record alone would let through a session the registry ended (a
+/// password reset, a suspension, an administrator's kick). A bare
+/// `require_authz!("ns", "action", "Type:id")` does not compile.
 ///
 /// ```ignore
 /// require_authz!("MyApp", "ViewLedger", "Ledger:{id}", validator = authn.session_validator())
@@ -121,10 +120,14 @@
 /// let app = Router::new()
 ///     // Resource ID extracted from `{id}` path param at runtime:
 ///     .route("/ledgers/{id}",
-///            get(get_ledger).layer(require_authz!("MyApp", "ViewLedger", "Ledger:{id}")))
+///            get(get_ledger).layer(require_authz!(
+///                "MyApp", "ViewLedger", "Ledger:{id}",
+///                validator = authn.session_validator())))
 ///     // Static resource, no path params needed:
 ///     .route("/users",
-///            get(list_users).layer(require_authz!("MyApp", "ManageUsers", "Platform:global")))
+///            get(list_users).layer(require_authz!(
+///                "MyApp", "ManageUsers", "Platform:global",
+///                validator = authn.session_validator())))
 ///     // The two extensions every `require_authz!` reads, installed outside
 ///     // the gates (layers added last run first):
 ///     .layer(Extension(store))
@@ -287,7 +290,7 @@ macro_rules! require_authz {
                 //    it from the session and the request head; an error is a
                 //    denial. Without a provider the context is empty, which
                 //    the policy store fails closed on for any policy that
-                //    reads it.
+                //    reads it, and the first such request logs a warning.
                 let (req_parts, req_body) = req.into_parts();
                 let context = match req_parts
                     .extensions
@@ -315,7 +318,14 @@ macro_rules! require_authz {
                             }
                         }
                     }
-                    ::std::option::Option::None => $crate::__cedar::Context::empty(),
+                    ::std::option::Option::None => {
+                        static WARNED: ::std::sync::atomic::AtomicBool =
+                            ::std::sync::atomic::AtomicBool::new(false);
+                        $crate::__macro_support::warn_once_without_context_provider(
+                            &store, &WARNED, $action,
+                        );
+                        $crate::__cedar::Context::empty()
+                    }
                 };
                 let req = $crate::axum::extract::Request::from_parts(req_parts, req_body);
 
@@ -339,16 +349,10 @@ macro_rules! require_authz {
         )
     }};
 
-    // The session record alone decides who is authenticated.
-    ($namespace:expr, $action:literal, $resource:literal) => {
-        $crate::require_authz!(
-            @gate $namespace, $action, $resource,
-            $crate::__macro_support::NoSessionCheck
-        )
-    };
-
-    // The session must also be live in the registry, as with
-    // `require_authn!(validator = ..)`.
+    // The session must be live in the registry, as with
+    // `require_authn!(validator = ..)`. There is no form without one: a gate
+    // that reads the stored session record alone trusts a session the
+    // registry has ended.
     ($namespace:expr, $action:literal, $resource:literal, validator = $validator:expr) => {
         $crate::require_authz!(@gate $namespace, $action, $resource, $validator)
     };

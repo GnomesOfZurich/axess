@@ -33,6 +33,33 @@ pub fn audit_unbuilt_deny(user_id: &str, action: &str, resource_template: &str, 
     axess_core::authz::audit::emit_early_deny(user_id, action, resource_template, reason);
 }
 
+/// Log, the first time `warned` says so, that `require_authz!` ran with no
+/// `RequestContextProvider` installed while the policies read `context`.
+/// Returns whether it logged.
+///
+/// Such a policy set decides on an empty context: a rule that requires
+/// `context.mfa_verified` denies every request, and a `forbid` written as
+/// `context has mfa_verified && !context.mfa_verified` stops matching. Either
+/// is almost always a missing `Extension<Arc<dyn RequestContextProvider>>`.
+pub fn warn_once_without_context_provider(
+    store: &axess_core::authz::PolicyStore,
+    warned: &std::sync::atomic::AtomicBool,
+    action: &str,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if !store.mentions_context() || warned.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    crate::tracing::warn!(
+        macro_name = "require_authz!",
+        action,
+        "the policies read `context` but no RequestContextProvider extension is installed; \
+         every check runs on an empty context. Install \
+         Extension(Arc<dyn RequestContextProvider>) earlier in the middleware chain"
+    );
+    true
+}
+
 /// A UID of the request could not be built; `reason` names which one, in
 /// the words of the decision event (`invalid_resource`, `invalid_action`,
 /// `invalid_principal`).
@@ -304,6 +331,35 @@ pub fn interpolate_path_params(template: &str, params: &HashMap<String, String>)
 mod tests {
     use super::*;
 
+    const GUARDED_SCHEMA: &str = r#"{"App": {"entityTypes": {"User": {}, "Doc": {}},
+        "actions": {"View": {"appliesTo": {"principalTypes": ["User"],
+        "resourceTypes": ["Doc"], "context": {"type": "Record",
+        "attributes": {"mfa": {"type": "Boolean", "required": false}}}}}}}}"#;
+
+    #[test]
+    fn a_missing_context_provider_is_warned_once_when_policies_read_the_context() {
+        use std::sync::atomic::AtomicBool;
+        let guarded = axess_core::authz::PolicyStore::from_text(
+            "permit(principal, action, resource) when { context has mfa && context.mfa };",
+            GUARDED_SCHEMA,
+        )
+        .unwrap();
+        let plain = axess_core::authz::PolicyStore::from_text(
+            "permit(principal, action, resource);",
+            GUARDED_SCHEMA,
+        )
+        .unwrap();
+
+        let warned = AtomicBool::new(false);
+        assert!(!warn_once_without_context_provider(&plain, &warned, "View"));
+        assert!(warn_once_without_context_provider(
+            &guarded, &warned, "View"
+        ));
+        assert!(!warn_once_without_context_provider(
+            &guarded, &warned, "View"
+        ));
+    }
+
     #[test]
     fn unicode_escape_in_user_id_stays_data() {
         let p = params(&[("id", "x")]);
@@ -468,17 +524,5 @@ mod tests {
             "Bad:{unterm",
             "unmatched '{{' preserved literally"
         );
-    }
-}
-
-/// The session check of a `require_authz!` built without a validator: the
-/// session record alone decides, as it always has.
-#[derive(Clone, Copy, Debug)]
-pub struct NoSessionCheck;
-
-impl NoSessionCheck {
-    /// Always `true`: nothing beyond the session record is consulted.
-    pub async fn enforce(&self, _session: &axess_core::AuthSession) -> bool {
-        true
     }
 }

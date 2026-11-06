@@ -14,7 +14,10 @@
 #[cfg(feature = "testing")]
 #[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
 pub mod testing {
-    pub use axess_core::{MockClock, MockFactorStore, MockIdentityStore, MockRng};
+    pub use axess_core::testing::{AuthSessionTestExt, test_key};
+    pub use axess_core::{
+        BreachCheckOutage, MockClock, MockFactorStore, MockIdentityStore, MockRng,
+    };
     pub use axess_identity::testing::*;
 
     #[cfg(feature = "ldap")]
@@ -40,11 +43,10 @@ pub use axess_core::{MemorySessionRegistry, MemorySessionStore};
 pub mod session {
     pub use axess_core::session::LegacyBlobs;
     // The refresh-token entry points: `issue_refresh_token`, `Refresh` (the
-    // one refresh, with its tenant, status, device and binding checks; the
-    // older `refresh_session*` forms are deprecated wrappers over it) and
+    // one refresh, with its tenant, status, device and binding checks) and
     // `revoke_refresh_token`. Wrap the store in `device::CascadingRefreshStore`
     // so a reused rotated-out token revokes the family's devices as well. A
-    // glob, so re-exporting the deprecated forms is not itself a use of them.
+    // glob, so a new public item is exported without a second edit.
     pub use axess_core::session::refresh::*;
     #[cfg(any(
         feature = "sqlite",
@@ -54,8 +56,8 @@ pub mod session {
     ))]
     pub use axess_core::session::{CryptoError, SessionCrypto};
     pub use axess_core::session::{
-        CycleOutcome, DeviceTokenRevocation, RefreshToken, RefreshTokenConfig, RefreshTokenStore,
-        RotationOutcome, WeakKeyError,
+        CycleOutcome, DeviceTokenRevocation, PreviousPepper, RefreshToken, RefreshTokenConfig,
+        RefreshTokenStore, RotationOutcome, WeakKeyError,
     };
 }
 
@@ -71,26 +73,31 @@ pub mod authn {
         FactorSecretBinding, FactorSecretCipher, FactorSecretError, OpenedSecret,
     };
     pub use axess_core::{
-        Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder,
-        AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError,
-        AuthnScope, AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId,
-        EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig, FactorCredential, FactorKind,
-        FactorOutcome, FactorSecret, FactorStep, FactorStore, FactorTemplate, FederatedProvider,
-        Fido2Config, HotpConfig, IdentityAdmin, IdentityAuthnLog, IdentityLookup,
-        IdentityPasswordHistory, IdentityPasswordReset, IdentityStore, IpPolicy,
-        LdapBindFactorConfig, LockoutPolicy, LoginOutcome, NoSessionRegistryError, NoopAuthnLog,
-        OtpAlgorithm, PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError,
-        RequestAuthnService, ResolvedFactor, SealedFactorSecret, SessionValidator, SignupOutcome,
-        StatusDetail, Tenant, TenantBootstrap, TenantId, TotpConfig, User, UserId, ZeroizedString,
-        create_tenant, default_catalog, require_valid_session,
+        ActiveSessionsError, Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent,
+        AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod,
+        AuthnBackend, AuthnError, AuthnScope, AuthnService, AuthnServiceBuilder, BreachCheckError,
+        BreachCheckUnavailable, BreachedPasswordCheck, BreachedPasswordList, ChosenPasswordError,
+        CounterUnavailable, DeviceId, EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig,
+        FactorCredential, FactorKind, FactorOutcome, FactorSecret, FactorStep, FactorStore,
+        FactorTemplate, FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin,
+        IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory, IdentityPasswordReset,
+        IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy, LoginOutcome,
+        NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig, PasswordRules,
+        PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor, SealedFactorSecret,
+        SessionValidator, SignupOutcome, SignupVerification, StatusCause, StatusDetail, Tenant,
+        TenantBootstrap, TenantId, Throttle, ThrottleKey, ThrottleState, ThrottleSubject,
+        TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
+        require_valid_session,
     };
     pub use axess_factors::{
-        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, HotpThrottle, PepperTooShort,
-        RECOVERY_CODE_COUNT, RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode,
-        TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams, build_totp_uri,
-        generate_password_hash, generate_password_hash_with_rng, generate_recovery_codes,
-        generate_recovery_codes_peppered, generate_totp_secret, normalize_recovery_code,
-        verify_hotp, verify_password, verify_recovery_code, verify_totp,
+        GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, HotpThrottle, NewPasswordError,
+        PepperTooShort, RECOVERY_CODE_COUNT, RecoveryCodePepper, RecoveryCodesConfig,
+        StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD, TotpAlgorithm, TotpVerifyParams,
+        build_totp_uri, check_password_breached, count_in_range, generate_password_hash,
+        generate_password_hash_with_rng, generate_recovery_codes, generate_recovery_codes_peppered,
+        generate_totp_secret, hash_new_password, hash_new_password_checked,
+        normalize_recovery_code, range_prefix, verify_hotp, verify_password, verify_recovery_code,
+        verify_totp,
     };
 }
 
@@ -382,10 +389,9 @@ pub mod federation {
         pub use axess_core::federation::backchannel_logout::{
             BackChannelLogoutHandler, IdpSessionEnded, LogoutAudit, LogoutProviderError,
         };
-        // The front-channel handler, and the bound form
-        // `with_session_match_required` returns, which ends a session only
-        // when it is the request's own and is mounted behind the session
-        // layer.
+        // The front-channel handler, and the bound form `new` returns, which
+        // ends a session only when it is the request's own and is mounted
+        // behind the session layer (`new_unbound` makes the plain handler).
         pub use axess_core::federation::frontchannel_logout::{
             BoundFrontChannelLogoutHandler, FrontChannelLogoutHandler, FrontChannelLogoutParams,
         };
@@ -466,11 +472,13 @@ pub mod delegated {
 
 // Factor verification functions from axess-factors
 pub use axess_factors::{
-    GeneratedRecoveryCodes, HOTP_LENGTH, HotpAlgorithm, PepperTooShort, RECOVERY_CODE_COUNT,
+    BreachCheckError, BreachCheckUnavailable, BreachedPasswordCheck, GeneratedRecoveryCodes,
+    HOTP_LENGTH, HotpAlgorithm, NewPasswordError, PepperTooShort, RECOVERY_CODE_COUNT,
     RecoveryCodePepper, RecoveryCodesConfig, StoredRecoveryCode, TOTP_LENGTH, TOTP_PERIOD,
-    TotpAlgorithm, TotpVerifyParams, build_totp_uri, generate_password_hash,
-    generate_password_hash_with_rng, generate_recovery_codes, generate_recovery_codes_peppered,
-    generate_totp_secret, normalize_recovery_code, verify_hotp, verify_password,
+    TotpAlgorithm, TotpVerifyParams, build_totp_uri, check_password_breached, count_in_range,
+    generate_password_hash, generate_password_hash_with_rng, generate_recovery_codes,
+    generate_recovery_codes_peppered, generate_totp_secret, hash_new_password,
+    hash_new_password_checked, normalize_recovery_code, range_prefix, verify_hotp, verify_password,
     verify_recovery_code, verify_totp,
 };
 

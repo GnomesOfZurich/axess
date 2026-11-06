@@ -147,11 +147,19 @@ pub mod social;
 #[cfg(feature = "totp")]
 pub mod totp;
 
+#[cfg(all(feature = "password", any(test, feature = "testing")))]
+pub use password::breached::BreachCheckOutage;
+#[cfg(feature = "password")]
+pub use password::breached::{
+    BreachCheckError, BreachCheckUnavailable, BreachedPasswordCheck, BreachedPasswordList,
+    check_password_breached, count_in_range, range_prefix,
+};
 #[cfg(feature = "password")]
 pub use password::{
-    PasswordConfig, PasswordRules, PasswordVerifyError, generate_password_hash,
-    generate_password_hash_with_rng, generate_password_salt, hash_password_with_salt,
-    password_needs_rehash, verify_password,
+    MAX_PASSWORD_BYTES, NewPasswordError, PasswordConfig, PasswordRules, PasswordVerifyError,
+    generate_password_hash, generate_password_hash_with_rng, generate_password_salt,
+    hash_new_password, hash_new_password_checked, hash_password_with_salt, password_needs_rehash,
+    verify_password,
 };
 
 #[cfg(feature = "hotp")]

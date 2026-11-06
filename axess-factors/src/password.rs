@@ -16,6 +16,11 @@
 //! blocking context. The orchestrator runs them through
 //! `axess_core::blocking`.
 //!
+//! A password a person has just chosen goes through [`hash_new_password`]
+//! (the rules) or [`hash_new_password_checked`] (the rules and a
+//! [`breached::BreachedPasswordCheck`]); see [`breached`] for the check and
+//! the range-protocol helpers.
+//!
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::{Algorithm, Argon2, Params, Version};
 use axess_rng::SecureRng;
@@ -27,6 +32,12 @@ pub const ARGON2_M_COST_KIB: u32 = 19 * 1024;
 pub const ARGON2_T_COST: u32 = 2;
 /// Argon2id parallelism.
 pub const ARGON2_P_COST: u32 = 1;
+/// Longest password accepted, in bytes.
+///
+/// Argon2 technically accepts up to 4 GiB, but hashing even a few MB is a CPU
+/// DoS. 1024 bytes covers any realistic password (including passphrase
+/// generators). A login refuses a longer one before hashing it.
+pub const MAX_PASSWORD_BYTES: usize = 1024;
 /// Bytes of salt in a new hash.
 pub const PASSWORD_SALT_LEN: usize = 16;
 
@@ -130,10 +141,115 @@ pub fn generate_password_hash_with_rng(
 
 /// Hash `password` with a salt from the operating system's RNG.
 ///
+/// This checks nothing: not the length, not any [`PasswordRules`]. It is for
+/// hashing a value that is already accepted (a stored password being hashed
+/// again, a generated code, a test fixture). To hash a password a person has
+/// just chosen, at signup or enrolment, use [`hash_new_password`].
+///
 /// Prefer [`generate_password_hash_with_rng`] where the caller holds an
 /// injected RNG.
 pub fn generate_password_hash(password: impl AsRef<[u8]>) -> String {
     generate_password_hash_with_rng(&axess_rng::SystemRng, password)
+}
+
+/// Why [`hash_new_password`] or [`hash_new_password_checked`] refused a
+/// password.
+///
+/// Each variant's `Display` is a sentence fit to show the person choosing
+/// the password; none names what the breach check saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewPasswordError {
+    /// The password is longer than [`MAX_PASSWORD_BYTES`]; a login would
+    /// refuse it before hashing, so its owner could never sign in.
+    TooLong,
+    /// The password does not satisfy the [`PasswordRules`].
+    RulesNotMet,
+    /// The password is known from a data breach; only
+    /// [`hash_new_password_checked`] (and the flows built on it) answer this.
+    Breached,
+    /// The breached-password check could not answer and the policy was
+    /// [`BreachCheckUnavailable::Refuse`](breached::BreachCheckUnavailable::Refuse).
+    BreachCheckUnavailable,
+}
+
+impl fmt::Display for NewPasswordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TooLong => "password is longer than the maximum accepted length",
+            Self::RulesNotMet => "password does not meet the password rules",
+            Self::Breached => "password is known from a data breach; choose another",
+            Self::BreachCheckUnavailable => {
+                "the breached-password check is unavailable; try again later"
+            }
+        })
+    }
+}
+
+impl std::error::Error for NewPasswordError {}
+
+/// The length and rules admission shared by [`hash_new_password`] and
+/// [`hash_new_password_checked`]: the password as text when it is within
+/// [`MAX_PASSWORD_BYTES`] and passes [`PasswordRules::accepts`].
+fn admit_by_rules<'p>(
+    password: &'p [u8],
+    rules: &PasswordRules,
+) -> Result<&'p str, NewPasswordError> {
+    if password.len() > MAX_PASSWORD_BYTES {
+        return Err(NewPasswordError::TooLong);
+    }
+    let Ok(text) = std::str::from_utf8(password) else {
+        return Err(NewPasswordError::RulesNotMet);
+    };
+    if !rules.accepts(text) {
+        return Err(NewPasswordError::RulesNotMet);
+    }
+    Ok(text)
+}
+
+/// Hash a password a person has just chosen, at signup or enrolment,
+/// checking the rules only.
+///
+/// Refuses a password over [`MAX_PASSWORD_BYTES`] and one that fails
+/// [`PasswordRules::accepts`] (length in characters and each complexity
+/// requirement the rules switch on), then hashes with a salt from the
+/// operating system's RNG. History reuse (`history_count`) needs the stored
+/// hashes and is not checked here. It does not consult a breach list: a
+/// password from a public breach corpus passes when it meets the rules. Where
+/// one is configured, use [`hash_new_password_checked`], which is the same
+/// admission with the check in front of the hash. Slow by design: call from
+/// blocking context.
+pub fn hash_new_password(
+    password: impl AsRef<[u8]>,
+    rules: &PasswordRules,
+) -> Result<String, NewPasswordError> {
+    let password = password.as_ref();
+    admit_by_rules(password, rules)?;
+    Ok(generate_password_hash(password))
+}
+
+/// Hash a password a person has just chosen, after the rules and the
+/// breached-password check.
+///
+/// The admission of [`hash_new_password`] first (cheap and local, so a
+/// password that fails the rules is never sent to a check), then
+/// [`check_password_breached`](breached::check_password_breached) with
+/// `check` and `policy` under the tenant's `rules`, then the hash with a
+/// salt from the operating system's RNG. Refuses with
+/// [`NewPasswordError::Breached`] for a password the check knows, and with
+/// [`NewPasswordError::BreachCheckUnavailable`] when the check errs and
+/// `policy` is [`Refuse`](breached::BreachCheckUnavailable::Refuse). With
+/// `check` `None` it is [`hash_new_password`] in async form. The hash is
+/// computed on the calling task: call from blocking context, or through an
+/// executor as `axess_core` does.
+pub async fn hash_new_password_checked(
+    password: &str,
+    rules: &PasswordRules,
+    check: Option<&dyn breached::BreachedPasswordCheck>,
+    policy: breached::BreachCheckUnavailable,
+) -> Result<String, NewPasswordError> {
+    admit_by_rules(password.as_bytes(), rules)?;
+    breached::check_password_breached(password, rules, check, policy).await?;
+    Ok(generate_password_hash(password))
 }
 
 use crate::secret::ZeroizedString;
@@ -174,10 +290,47 @@ pub struct PasswordRules {
     pub require_special: bool,
     /// Number of previous password hashes to check for reuse.
     ///
-    /// `0` disables history checking (default). Set to e.g. `12` for SOC2
-    /// compliance ("cannot reuse last 12 passwords").
-    #[serde(default)]
+    /// `0` disables history checking. The default is
+    /// [`DEFAULT_PASSWORD_HISTORY`], so a password cannot be reset to one of
+    /// the last five; set to e.g. `12` for SOC2 compliance ("cannot reuse
+    /// last 12 passwords").
+    #[serde(default = "default_history_count")]
     pub history_count: usize,
+    /// Whether a chosen password is screened against the deployment's
+    /// [`BreachedPasswordCheck`](breached::BreachedPasswordCheck), when one
+    /// is configured. `true` by default, and for a stored row written before
+    /// the field existed, so a tenant is exempted only on purpose by setting
+    /// `false`. Without a configured check the field changes nothing.
+    #[serde(default = "default_breached_check")]
+    pub breached_check: bool,
+}
+
+impl PasswordRules {
+    /// Whether `password` is within [`MAX_PASSWORD_BYTES`] and satisfies the
+    /// length and complexity requirements. History reuse is not checked.
+    pub fn accepts(&self, password: &str) -> bool {
+        if password.len() > MAX_PASSWORD_BYTES {
+            return false;
+        }
+        // Characters, not UTF-8 bytes: a 5-character password of 2-byte
+        // letters must not satisfy a minimum of 8.
+        password.chars().count() >= self.min_length
+            && (!self.require_uppercase || password.chars().any(|c| c.is_ascii_uppercase()))
+            && (!self.require_lowercase || password.chars().any(|c| c.is_ascii_lowercase()))
+            && (!self.require_digit || password.chars().any(|c| c.is_ascii_digit()))
+            && (!self.require_special || password.chars().any(|c| !c.is_alphanumeric()))
+    }
+}
+
+/// How many previous passwords [`PasswordRules::default`] refuses to reuse.
+pub const DEFAULT_PASSWORD_HISTORY: usize = 5;
+
+fn default_history_count() -> usize {
+    DEFAULT_PASSWORD_HISTORY
+}
+
+fn default_breached_check() -> bool {
+    true
 }
 
 impl Default for PasswordRules {
@@ -188,7 +341,8 @@ impl Default for PasswordRules {
             require_lowercase: true,
             require_digit: true,
             require_special: false,
-            history_count: 0,
+            history_count: DEFAULT_PASSWORD_HISTORY,
+            breached_check: true,
         }
     }
 }
@@ -284,6 +438,42 @@ mod tests {
     }
 
     #[test]
+    fn a_new_password_over_the_limit_is_refused() {
+        let long = format!("Aa1{}", "x".repeat(MAX_PASSWORD_BYTES - 2));
+        assert_eq!(long.len(), MAX_PASSWORD_BYTES + 1);
+        assert_eq!(
+            hash_new_password(&long, &PasswordRules::default()),
+            Err(NewPasswordError::TooLong)
+        );
+        let at_limit = format!("Aa1{}", "x".repeat(MAX_PASSWORD_BYTES - 3));
+        assert!(hash_new_password(&at_limit, &PasswordRules::default()).is_ok());
+    }
+
+    #[test]
+    fn a_new_password_that_fails_the_rules_is_refused() {
+        let rules = PasswordRules::default();
+        for weak in [
+            "short1A",
+            "alllowercase123",
+            "ALLUPPERCASE123",
+            "NoDigitsHereAtAll",
+        ] {
+            assert_eq!(
+                hash_new_password(weak, &rules),
+                Err(NewPasswordError::RulesNotMet),
+                "{weak}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_good_new_password_hashes_and_verifies() {
+        let hash = hash_new_password("Gnomes2+andmore", &PasswordRules::default()).unwrap();
+        assert!(verify_password("Gnomes2+andmore", &hash).is_ok());
+        assert!(!password_needs_rehash(&hash));
+    }
+
+    #[test]
     fn password_rules_default_is_pinned() {
         let r = PasswordRules::default();
         assert_eq!(r.min_length, 12);
@@ -291,9 +481,12 @@ mod tests {
         assert!(r.require_lowercase);
         assert!(r.require_digit);
         assert!(!r.require_special);
-        assert_eq!(r.history_count, 0);
+        assert_eq!(r.history_count, 5);
+        assert!(r.breached_check);
     }
 }
 
 #[cfg(test)]
 mod legacy_hashes;
+
+pub mod breached;

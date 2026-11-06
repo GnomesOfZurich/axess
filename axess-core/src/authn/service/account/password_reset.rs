@@ -297,16 +297,34 @@ where
 
     /// Complete a password-reset flow by verifying the token and setting a new password.
     ///
+    /// **Not tenant-scoped:** `user_id` is looked up whatever tenant holds it.
+    /// A handler whose authorisation scope is one tenant (any multi-tenant
+    /// application) should call
+    /// [`complete_password_reset_in_tenant`](Self::complete_password_reset_in_tenant)
+    /// instead, which is the rail.
+    ///
     /// The token is single-use, consumed on verification. Returns `Ok(true)`
     /// if the reset succeeded, `Ok(false)` if the token was invalid, expired,
     /// the new password does not meet the tenant's
     /// [`PasswordRules`](crate::authn::factor::PasswordRules) (minimum length
-    /// and complexity), or it violates the tenant's history-reuse rule. A
-    /// password refused for either reason leaves the token unspent, so the
-    /// person can pick another with the same link. A tenant that is missing
-    /// or not active refuses the reset the same way. An unknown `user_id`
-    /// answers `Ok(false)` as a bad token does. Every refusal writes a
-    /// failed `PasswordReset` audit row naming the reason.
+    /// and complexity), it is known to the service's breached-password check
+    /// (or the check could not answer and the service refuses unscreened
+    /// passwords, the default), or it violates the tenant's history-reuse
+    /// rule. A password refused for any of these reasons leaves the token
+    /// unspent, so the person can pick another with the same link. A tenant
+    /// that is missing or not active refuses the reset the same way. An
+    /// unknown `user_id` answers `Ok(false)` as a bad token does. Every
+    /// refusal writes a failed `PasswordReset` audit row naming the reason:
+    /// `password_rules`, `password_breached`, `breach_check_unavailable`,
+    /// `password_reused`, `token_mismatch`, `unknown_user`, `invalid_user`,
+    /// or the account's or tenant's state.
+    ///
+    /// The breach check, when the service was built with
+    /// [`with_breached_password_check`](crate::authn::service::AuthnServiceBuilder::with_breached_password_check)
+    /// and the tenant's `breached_check` holds, is asked after the token has
+    /// been checked and before it is spent, so an unauthenticated caller
+    /// cannot make the server call the check and a refused password keeps
+    /// the link usable.
     ///
     /// A lockout the failure counter imposes does not block a reset (the
     /// account is still active and the reset is how its owner recovers);
@@ -449,6 +467,21 @@ where
             return self
                 .refuse_password_reset(Some(&user), "token_mismatch")
                 .await;
+        }
+
+        // The breached-password check, when the service has one and the
+        // tenant has not turned it off. After the token has been checked,
+        // so a caller without one cannot make the server call the check;
+        // before the token is spent, so a refused password leaves the link
+        // usable. The rules were checked above, so a password that fails
+        // them never reaches the check.
+        if let Err(refusal) = self
+            .screen_chosen_password_breached(new_password, &rules)
+            .await
+        {
+            let reason = super::super::chosen_password::chosen_password_refusal_reason(refusal);
+            tracing::warn!(user_id = %user_id, reason, "password reset refused: new password not admitted");
+            return self.refuse_password_reset(Some(&user), reason).await;
         }
 
         let user_scope = AuthnScope::User {

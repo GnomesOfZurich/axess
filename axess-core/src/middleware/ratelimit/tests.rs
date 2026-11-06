@@ -11,6 +11,8 @@ use tower::ServiceExt;
 
 mod hardening;
 mod key_bounds;
+mod login_injector;
+mod misconfig;
 mod sliding_window;
 mod sweep;
 
@@ -400,11 +402,19 @@ async fn login_identifier_normalises_case_and_whitespace() {
 }
 
 #[tokio::test]
-async fn login_identifier_missing_extension_falls_to_anonymous_bucket() {
-    // No extension → all such requests share one bucket. This is the
-    // "fail closed" stance: a misconfigured route limits anonymous
+async fn login_identifier_missing_extension_falls_to_anonymous_bucket_when_allowed() {
+    // With the shared bucket allowed, no extension and no peer put all such
+    // requests in one bucket: a misconfigured route limits anonymous
     // traffic collectively rather than letting it bypass the layer.
-    let svc = make_login_service(1);
+    let svc = RateLimitLayer::new(
+        RateLimitConfig::builder()
+            .max_requests(1)
+            .window(Duration::from_secs(60))
+            .key(KeyExtractor::LoginIdentifier)
+            .allow_shared_bucket()
+            .build(),
+    )
+    .layer(OkService);
 
     let res = ServiceExt::oneshot(svc.clone(), make_login_request(None))
         .await

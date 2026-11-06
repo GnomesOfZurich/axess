@@ -15,7 +15,7 @@ fn bindings() -> Vec<DeviceBinding> {
 }
 
 fn codec() -> BindingsCodec {
-    BindingsCodec::encrypted(SessionCrypto::new([6u8; 32]))
+    BindingsCodec::encrypted(SessionCrypto::new(crate::testing::test_key(6)))
 }
 
 #[test]
@@ -34,13 +34,15 @@ fn tenant_and_device_ids_cannot_be_shifted_across_the_separator() {
 
 fn accepting_codec() -> BindingsCodec {
     use crate::session::crypto::LegacyBlobs;
-    BindingsCodec::encrypted(SessionCrypto::new([6u8; 32]).with_legacy_blobs(LegacyBlobs::Accept))
+    BindingsCodec::encrypted(
+        SessionCrypto::new(crate::testing::test_key(6)).with_legacy_blobs(LegacyBlobs::Accept),
+    )
 }
 
 #[test]
 fn a_legacy_blob_is_refused_by_default_and_read_when_accepted() {
     let legacy = BASE64.encode(
-        SessionCrypto::new([6u8; 32])
+        SessionCrypto::new(crate::testing::test_key(6))
             .encrypt_unbound(&rmp_serde::to_vec_named(&bindings()).unwrap())
             .unwrap(),
     );
@@ -51,7 +53,7 @@ fn a_legacy_blob_is_refused_by_default_and_read_when_accepted() {
 #[test]
 fn legacy_blob_decodes_and_the_next_encode_is_bound() {
     let legacy = BASE64.encode(
-        SessionCrypto::new([6u8; 32])
+        SessionCrypto::new(crate::testing::test_key(6))
             .encrypt_unbound(&rmp_serde::to_vec_named(&bindings()).unwrap())
             .unwrap(),
     );
@@ -67,7 +69,7 @@ fn legacy_blob_decodes_and_the_next_encode_is_bound() {
 
 #[test]
 fn marked_blob_with_empty_aad_body_is_refused() {
-    let body = SessionCrypto::new([6u8; 32])
+    let body = SessionCrypto::new(crate::testing::test_key(6))
         .encrypt_unbound(&rmp_serde::to_vec_named(&bindings()).unwrap())
         .unwrap();
     let mut blob = b"AXD\x01".to_vec();
@@ -99,7 +101,7 @@ fn a_miss_that_finds_the_expected_level_is_retried_not_reported_applied() {
 #[test]
 fn a_blob_of_the_previous_format_decodes_and_is_replaced_on_encode() {
     use crate::session::crypto::{BoundFormat, device_row_id_v1};
-    let crypto = SessionCrypto::new([6u8; 32]);
+    let crypto = SessionCrypto::new(crate::testing::test_key(6));
     let body = crypto
         .encrypt_with_aad(
             &BoundFormat::DEVICE_BINDINGS_V1.aad(&device_row_id_v1("t1", "d")),
@@ -138,16 +140,16 @@ fn ids_that_differ_only_by_a_zero_byte_split_do_not_share_a_blob() {
 fn rejecting_legacy_blobs_refuses_an_unmarked_bindings_blob() {
     use crate::session::crypto::LegacyBlobs;
     let strict = BindingsCodec::encrypted(
-        SessionCrypto::new([6u8; 32]).with_legacy_blobs(LegacyBlobs::Reject),
+        SessionCrypto::new(crate::testing::test_key(6)).with_legacy_blobs(LegacyBlobs::Reject),
     );
     let legacy = BASE64.encode(
-        SessionCrypto::new([6u8; 32])
+        SessionCrypto::new(crate::testing::test_key(6))
             .encrypt_unbound(&rmp_serde::to_vec_named(&bindings()).unwrap())
             .unwrap(),
     );
     assert!(strict.decode("t1", "d", &legacy).is_err());
     // The 0.11.0 marked format is refused as well, not only the unmarked one.
-    let body = SessionCrypto::new([6u8; 32])
+    let body = SessionCrypto::new(crate::testing::test_key(6))
         .encrypt_with_aad(
             &BoundFormat::DEVICE_BINDINGS_V1.aad(&device_row_id_v1("t1", "d")),
             &rmp_serde::to_vec_named(&bindings()).unwrap(),
@@ -174,7 +176,7 @@ fn rejecting_legacy_blobs_refuses_an_unmarked_bindings_blob() {
 #[test]
 fn a_previous_format_blob_under_an_ambiguous_row_id_is_not_resealed_by_a_read() {
     use crate::session::crypto::{BoundFormat, device_row_id_v1};
-    let crypto = SessionCrypto::new([6u8; 32]);
+    let crypto = SessionCrypto::new(crate::testing::test_key(6));
     let stored_under = |tenant: &str, device: &str| {
         let body = crypto
             .encrypt_with_aad(

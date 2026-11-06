@@ -232,18 +232,19 @@ The pieces:
   written by any process is used by the next login with no restart and no
   call to make; `invalidate` drops a provider early, and `remove` deletes
   a record and stops it resolving.
-- With `with_cipher`, `upsert` seals the credential with the
-  `FactorSecretCipher` you already use for OTP secrets, bound to the
-  tenant and the name, so the client secret or private key is never in
-  the table in clear text and a row copied to another tenant does not
-  open.
+- `StoredTenantOAuthProviders::new(store, cipher)` takes the
+  `FactorSecretCipher` you already use for OTP secrets, and `upsert` seals
+  the credential with it, bound to the tenant and the name, so the client
+  secret or private key is never in the table in clear text and a row
+  copied to another tenant does not open. `new_unencrypted(store)` is for
+  tests and development only.
 
 ```rust,ignore
 use axess::federation::oauth::{StoredTenantOAuthProviders, SqliteTenantOAuthProviderStore};
 
 let store = SqliteTenantOAuthProviderStore::new(pool);
 store.init_schema().await?;
-let tenants = Arc::new(StoredTenantOAuthProviders::new(store).with_cipher(cipher));
+let tenants = Arc::new(StoredTenantOAuthProviders::new(store, cipher));
 
 let authn = AuthnService::builder(identity, factors)
     .with_tenant_oauth_providers(tenants.clone())
@@ -377,6 +378,19 @@ async fn begin_oauth_login(
 The redirect URI passed at this step must exactly match the one
 registered with the IdP at provisioning time. A mismatch is the
 single most common reason a federated login fails out of the box.
+
+### Where the ceremony secrets live
+
+Between the begin and the callback the in-flight ceremony sits in the
+session's custom data: the PKCE verifier, the state, the nonce and, for a
+provider that binds tokens, the DPoP key's seed. axess does not seal those
+fields one by one. They are as private as the session store: sealed whenever
+the store was built with a `SessionCrypto` key (the Valkey, SQLite, Postgres
+and MySQL stores seal the whole row), and plain text in the store only
+through the plaintext constructors, which are for development and testing.
+Run OAuth against a store built with a key, and treat read access to the
+session store as access to an in-flight ceremony. The ceremony lasts at most
+`ceremony_timeout`, and the callback removes it.
 
 ### Handle the callback
 

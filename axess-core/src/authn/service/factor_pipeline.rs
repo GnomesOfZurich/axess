@@ -46,7 +46,9 @@ use crate::session::extractor::AuthSession;
 ///
 /// Caller maps each variant to its own response shape:
 /// - `verify_factor` → `Locked { until }` becomes [`FactorOutcome::Locked { until }`],
+///   `Throttled { retry_after }` becomes [`FactorOutcome::Throttled { retry_after }`],
 /// - `prepare_factor` → `Locked { until }` becomes `Err(AuthnError::Locked { until })`,
+///   `Throttled { retry_after }` becomes `Err(AuthnError::Throttled { retry_after })`,
 ///   `NotActive(status)` becomes `Err(AuthnError::NotActive(status))`.
 ///
 /// Both call sites audit identically before reaching this point: the
@@ -69,6 +71,14 @@ pub(super) enum AccountStatusEnforcement {
     /// (`Pending`, `Terminated`, `Archived`, `Candidate`, `Guest`).
     /// No audit row was emitted; only `Suspended` triggers the audit.
     NotActive(EntityState),
+    /// Consecutive wrong guesses under this request's key have earned a
+    /// delay that has not run (see [`Throttle`](crate::authn::types::Throttle)).
+    /// Audit row already emitted. Checked after the lock, so a locked account
+    /// answers `Locked` whatever its throttle says.
+    Throttled {
+        /// How long until a guess under the key runs again.
+        retry_after: std::time::Duration,
+    },
 }
 
 impl<I, F> RequestAuthnService<I, F>
@@ -98,7 +108,7 @@ where
     ) -> Result<AccountStatusEnforcement, AuthnError<I::Error>> {
         let status = self.current_account_status(user_id).await?;
 
-        if status.is_locked() {
+        if status.is_suspended() {
             let until = if let EntityState::Suspended(detail) = &status {
                 detail.until
             } else {
@@ -114,11 +124,23 @@ where
         // The counter is the lockout, whatever the store did with the
         // status. Checked here, before any verifier runs, so a locked
         // account answers `Locked` to a correct guess as to a wrong one.
-        if let Some(lock) = self.derived_lockout(user_id, tenant_id).await? {
+        if let Some(lock) = self
+            .derived_lockout_for(user_id, tenant_id, session)
+            .await?
+        {
             self.inner.metrics.account_locked();
             self.record_locked_attempt_audit(user_id, tenant_id, next_kind, session)
                 .await?;
             return Ok(AccountStatusEnforcement::Locked { until: lock.until });
+        }
+        // The throttle, after the lock: a guess inside its delay is refused
+        // before anything is reserved or hashed, so a guesser pays the delay
+        // and the account pays nothing.
+        if let Some(retry_after) = self.throttle_for(user_id, tenant_id, session).await? {
+            self.inner.metrics.attempt_throttled();
+            self.record_throttled_attempt_audit(user_id, tenant_id, next_kind, session)
+                .await?;
+            return Ok(AccountStatusEnforcement::Throttled { retry_after });
         }
         Ok(AccountStatusEnforcement::Ok)
     }
@@ -163,6 +185,49 @@ where
                 })
             }
         }
+    }
+
+    /// [`derived_lockout`](Self::derived_lockout) for a request: none when the
+    /// session's device is one the account has used (see
+    /// [`with_device_store`](super::AuthnServiceBuilder::with_device_store)),
+    /// so the lock keeps every other origin out and not the owner's own.
+    pub(super) async fn derived_lockout_for(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        session: &AuthSession,
+    ) -> Result<Option<crate::authn::types::DerivedLockout>, AuthnError<I::Error>> {
+        let lock = self.derived_lockout(user_id, tenant_id).await?;
+        if lock.is_some() && self.on_known_device(user_id, tenant_id, session).await {
+            return Ok(None);
+        }
+        Ok(lock)
+    }
+
+    /// Whether the session's device is one `user_id` has used: a `Seen` or
+    /// `Trusted` row of the tenant owned by the user, in the store given to
+    /// [`with_device_store`](super::AuthnServiceBuilder::with_device_store).
+    /// Always `false` without one.
+    pub(super) async fn on_known_device(
+        &self,
+        user_id: &UserId,
+        tenant_id: &TenantId,
+        session: &AuthSession,
+    ) -> bool {
+        #[cfg(feature = "device")]
+        if let (Some(devices), Some(device)) =
+            (&self.inner.known_devices, session.device_id().await)
+            && devices.is_known(tenant_id, &device, user_id).await
+        {
+            tracing::debug!(
+                user_id = %user_id,
+                "lockout: the session's device is one the account has used"
+            );
+            return true;
+        }
+        #[cfg(not(feature = "device"))]
+        let _ = (user_id, tenant_id, session);
+        false
     }
 
     /// Emit the `FactorVerified Failure` audit row for an
@@ -319,6 +384,11 @@ where
             }
         };
 
+        // The wrong guess earns this request's key its next delay. After the
+        // counter, so the lock's count is never short of a guess the throttle
+        // has seen.
+        self.record_throttled_guess(user_id, tenant_id).await;
+
         // Update session state for UI feedback only; never used for
         // lockout decisions (those are store-authoritative).
         session.record_attempt_at(self.inner.clock.now()).await;
@@ -347,6 +417,7 @@ where
 
 mod reserve;
 pub(super) use reserve::GuessSlot;
+mod throttle;
 
 #[cfg(test)]
 mod tests;

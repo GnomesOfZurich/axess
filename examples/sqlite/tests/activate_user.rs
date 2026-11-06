@@ -23,7 +23,7 @@ async fn pool() -> sqlx::SqlitePool {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -40,11 +40,8 @@ async fn activating_a_user_ends_a_timed_suspension_and_clears_the_counters() {
     backend
         .suspend_user(
             &alice,
-            StatusDetail {
-                reason: "review".into(),
-                since: now,
-                until: Some(now + chrono::Duration::hours(1)),
-            },
+            StatusDetail::administrative("review", now)
+                .with_until(Some(now + chrono::Duration::hours(1))),
         )
         .await
         .expect("suspend");

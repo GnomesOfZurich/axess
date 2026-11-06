@@ -25,6 +25,20 @@ use std::sync::Arc;
 /// ```
 ///
 /// Changes are committed to the store automatically when the response is sent.
+///
+/// A handler cannot mark a session authenticated: the transition out of the
+/// anonymous state belongs to [`AuthnService`](crate::authn::service::AuthnService),
+/// which checks the account, the tenant and the registry first. The method
+/// that does it is crate-private.
+///
+/// ```compile_fail,E0624
+/// use axess_core::authn::ids::{TenantId, UserId};
+/// use axess_core::session::extractor::AuthSession;
+///
+/// async fn handler(session: AuthSession, user: UserId, tenant: TenantId) {
+///     session.set_authenticated(user, tenant, chrono::Utc::now()).await;
+/// }
+/// ```
 #[derive(Clone)]
 pub struct AuthSession(pub(crate) SessionHandle);
 
@@ -86,7 +100,14 @@ impl AuthSession {
     /// attribution and for driving the login pipeline, never as an
     /// authorization principal.
     pub async fn pending_user_id(&self) -> Option<UserId> {
-        self.0.0.read().await.data.auth_state.user_id().cloned()
+        self.0
+            .0
+            .read()
+            .await
+            .data
+            .auth_state
+            .pending_user_id()
+            .cloned()
     }
 
     /// Return the tenant ID of the login in flight, if any. See
@@ -283,7 +304,7 @@ impl AuthSession {
     /// survives; the keys an application registered with
     /// `AuthnServiceBuilder::with_preserved_custom_keys` survive when the
     /// transition goes through the authentication service.
-    pub async fn set_authenticated(
+    pub(crate) async fn set_authenticated(
         &self,
         user_id: UserId,
         tenant_id: TenantId,

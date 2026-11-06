@@ -2,13 +2,11 @@
 //! still trusted.
 
 use super::rotation::{DeviceGate, DeviceRefusal, Refresh};
-use super::store::RefreshTokenStore;
-use super::types::{RefreshError, RefreshToken, RefreshTokenConfig};
+// Named by the doc links below.
+#[cfg(doc)]
+use super::types::RefreshError;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
 use crate::device::{DeviceStore, DeviceTrustLevel};
-use crate::session::data::SessionData;
-use axess_rng::SecureRng;
-use chrono::{DateTime, Utc};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -72,31 +70,4 @@ impl<'a, F> Refresh<'a, F> {
     pub fn device_store<D: DeviceStore>(self, devices: &'a D) -> Self {
         self.device_gate(Box::new(CheckedAgainst(devices)))
     }
-}
-
-/// [`refresh_session`](super::refresh_session) that first checks the device
-/// the token was issued to.
-///
-/// Deprecated: it skips the account-status check. Use [`Refresh::new`] with
-/// a status predicate and [`Refresh::device_store`], which also composes
-/// with the tenant check this form cannot add.
-#[deprecated(
-    since = "0.14.0",
-    note = "skips the account-status check; \
-            use Refresh::new(plaintext, status_check).device_store(devices).run(..)"
-)]
-pub async fn refresh_session_with_device_check<S: RefreshTokenStore, D: DeviceStore>(
-    plaintext: &str,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    device_info: Option<&str>,
-    device_store: &D,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    Refresh::without_status_check(plaintext)
-        .device_info(device_info)
-        .device_store(device_store)
-        .run(store, config, rng, now)
-        .await
 }

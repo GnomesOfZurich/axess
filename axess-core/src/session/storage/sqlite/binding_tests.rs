@@ -7,7 +7,7 @@ use axess_rng::SystemRng;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use sqlx::sqlite::SqlitePoolOptions;
 
-const KEY: [u8; 32] = [3u8; 32];
+const KEY: [u8; 32] = crate::testing::test_key(3);
 
 async fn store() -> SqliteSessionStore {
     let pool = SqlitePoolOptions::new()
@@ -215,7 +215,7 @@ async fn load_reseals_a_row_sealed_under_the_previous_key_and_keeps_its_expiry()
 
     let rotated = SqliteSessionStore::new(
         store.pool.clone(),
-        SessionCrypto::new([4u8; 32]).with_previous_key(KEY),
+        SessionCrypto::new(crate::testing::test_key(4)).with_previous_key(KEY),
     );
     let loaded = rotated
         .load(&id)
@@ -228,11 +228,14 @@ async fn load_reseals_a_row_sealed_under_the_previous_key_and_keeps_its_expiry()
     assert!(BoundFormat::SESSION.marks(&after));
     assert_eq!(expiry(&store, &id).await, expires, "the expiry is kept");
     assert!(
-        SqliteSessionStore::new(store.pool.clone(), SessionCrypto::new([4u8; 32]))
-            .load(&id)
-            .await
-            .unwrap()
-            .is_some(),
+        SqliteSessionStore::new(
+            store.pool.clone(),
+            SessionCrypto::new(crate::testing::test_key(4))
+        )
+        .load(&id)
+        .await
+        .unwrap()
+        .is_some(),
         "the current key alone opens the re-sealed row"
     );
 }

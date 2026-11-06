@@ -611,3 +611,43 @@ async fn an_oversized_user_agent_is_capped_on_every_path() {
     // A short value is untouched.
     assert_eq!(cap_user_agent("curl/8".to_owned()), "curl/8");
 }
+
+/// An audit event stored as a plain list of kinds reads each as verified at
+/// the event's own time; the new form round-trips.
+#[test]
+fn factors_completed_reads_a_plain_list_and_round_trips_the_timed_form() {
+    let at = chrono::Utc::now();
+    let event = AuthEventBuilder::success(AuthEventType::Authenticated)
+        .with_factors_completed(FactorKind::Password, at - chrono::Duration::hours(1))
+        .with_factors_completed(FactorKind::Totp, at)
+        .build_at(at);
+    let timed = serde_json::to_value(&event).unwrap();
+    let back: AuthEvent = serde_json::from_value(timed.clone()).unwrap();
+    assert_eq!(back.factors_completed, event.factors_completed);
+
+    let mut old = timed;
+    old["factors_completed"] = serde_json::json!(["Password", "Totp"]);
+    let read: AuthEvent = serde_json::from_value(old).unwrap();
+    assert_eq!(
+        read.factors_completed,
+        vec![
+            (FactorKind::Password, event.event_time),
+            (FactorKind::Totp, event.event_time)
+        ]
+    );
+}
+
+/// A reason that happens to spell a known tag is that tag once it has been
+/// through its string form: the round trip is the identity.
+#[test]
+fn a_reason_that_spells_a_known_tag_round_trips_as_itself() {
+    let spelled = AuthFailureReason::Other("unknown_tenant".to_owned());
+
+    let parsed = AuthFailureReason::from(spelled.as_str());
+    assert_eq!(parsed, spelled);
+
+    let json = serde_json::to_string(&spelled).unwrap();
+    let back: AuthFailureReason = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, spelled);
+    assert_eq!(back, AuthFailureReason::UnknownTenant);
+}

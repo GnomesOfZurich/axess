@@ -28,7 +28,7 @@ use axess::service_secret::{
 use axum::{
     Json, Router,
     body::Body,
-    http::{Method, Request, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header::CONTENT_TYPE},
     routing::post,
 };
 use serde::{Deserialize, Serialize};
@@ -69,6 +69,15 @@ pub fn secrets_from_env() -> Result<ServiceSecrets, ServiceSecretError> {
 
 /// The bounce route, admitting only requests signed with one of
 /// `secrets`. With no secret configured the route answers `404`.
+///
+/// # Replay memory is per process
+///
+/// A request is accepted once: the library remembers the signatures it has
+/// seen and refuses a repeat. That memory lives in this process. Behind
+/// several replicas, a signed request seen by one can be replayed to another
+/// within the signature's validity window (about five minutes). Keep the
+/// handler idempotent (dedupe on the report's contents, so a repeat changes
+/// nothing), or route the webhook to a single instance.
 pub fn bounce_routes(secrets: ServiceSecrets) -> Result<Router, ServiceSecretError> {
     Ok(Router::new()
         .route(BOUNCE_PATH, post(receive_bounce))
@@ -101,11 +110,16 @@ pub fn signed_bounce(
     report: &BounceReport,
 ) -> Request<Body> {
     let body = serde_json::to_vec(report).expect("a BounceReport always serializes");
+    // The signature covers Content-Type and Content-Encoding, so the headers
+    // that go out are the ones that are signed.
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let signature = signer.sign_for(
         BOUNCE_AUDIENCE,
         now_unix_seconds,
         &Method::POST,
         BOUNCE_PATH,
+        &headers,
         &body,
     );
     Request::builder()

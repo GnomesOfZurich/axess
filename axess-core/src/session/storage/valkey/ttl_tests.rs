@@ -22,7 +22,7 @@ fn zero_ttl_means_already_expired() {
 
 #[test]
 fn huge_ttl_saturates() {
-    assert_eq!(ex_seconds(Duration::MAX), Some(i64::MAX));
+    assert_eq!(ex_seconds(Duration::MAX), Some(1 << 40));
 }
 
 #[test]
@@ -101,4 +101,22 @@ fn an_unanswered_check_moves_the_watcher_to_polling() {
     assert_eq!(after_check(Ok::<bool, ()>(false)), Watch::Ended);
     assert_eq!(after_check(Ok::<bool, ()>(true)), Watch::Waiting);
     assert_eq!(after_check(Err::<bool, ()>(())), Watch::Polling(0));
+}
+
+#[test]
+fn registry_key_ttl_stays_inside_the_servers_expiry_range() {
+    // The server multiplies seconds by 1000 and adds the clock.
+    assert!(registry_key_ttl_secs(Duration::MAX) <= i64::MAX / 1000 / 2);
+}
+
+#[test]
+fn a_time_reply_is_read_as_epoch_milliseconds() {
+    use super::registry::parse_server_time_ms;
+    let reply = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+    assert_eq!(
+        parse_server_time_ms(&reply("1793887670", "748458")),
+        Some(1_793_887_670_748)
+    );
+    assert_eq!(parse_server_time_ms(&reply("x", "1")), None);
+    assert_eq!(parse_server_time_ms(&["1".to_string()]), None);
 }

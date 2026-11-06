@@ -29,10 +29,10 @@ async fn resolve(
     WorkloadResolver::<K8sCustomClaims, _, _>::new(
         verifier,
         trust.clone(),
-        TenantId::from_bytes([7u8; 16]),
+        |_slug: &str| Some(TenantId::from_bytes([7u8; 16])),
         Issuer::custom("kubernetes").unwrap(),
         f.token,
-        k8s_sa_mapper_pinned(trust, pins),
+        k8s_sa_mapper_pinned(pins),
     )
     .resolve()
     .await

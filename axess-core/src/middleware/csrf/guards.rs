@@ -14,7 +14,7 @@ use url::Url;
 /// and the default port is dropped for `http` / `https`. Tuple origins
 /// serialize to `"scheme://host[:port]"`; opaque origins (`"null"`,
 /// non-tuple-origin schemes) are rejected.
-pub(super) fn normalize_origin(raw: &str) -> Option<String> {
+pub(crate) fn normalize_origin(raw: &str) -> Option<String> {
     let parsed = Url::parse(raw).ok()?;
     match parsed.origin() {
         url::Origin::Tuple(..) => Some(parsed.origin().ascii_serialization()),
@@ -25,7 +25,7 @@ pub(super) fn normalize_origin(raw: &str) -> Option<String> {
 /// Compare the request's `Origin` (fallback `Referer`-derived) origin
 /// against the allowed list. Any missing / malformed / non-matching
 /// case fails closed.
-pub(super) fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) -> bool {
+pub(crate) fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) -> bool {
     // Origin first: browsers set it on cross-origin state-changing
     // requests. `Origin: null` (opaque origin, cross-origin redirect,
     // sandboxed iframe) is normalized to `None` and treated as failure.
@@ -62,7 +62,7 @@ pub(super) fn origin_matches_allowed(req: &Request<Body>, allowed: &[Arc<str>]) 
 /// WebSocket upgrade, so its absence means a non-browser client, which has
 /// no ambient cookies a cross-site page could borrow. A malformed `Origin`,
 /// an opaque one (`null`), or a request with no host fails closed.
-pub(super) fn origin_is_own_host(req: &Request<Body>, secure: bool) -> bool {
+pub(crate) fn origin_is_own_host(req: &Request<Body>, secure: bool) -> bool {
     let Some(header) = req.headers().get(header::ORIGIN) else {
         return true;
     };
@@ -91,7 +91,7 @@ pub(super) fn origin_is_own_host(req: &Request<Body>, secure: bool) -> bool {
 
 /// Whether `req` asks to upgrade to a WebSocket: `Upgrade: websocket` with
 /// `Connection` listing `upgrade`, both compared case-insensitively.
-pub(super) fn is_websocket_upgrade(req: &Request<Body>) -> bool {
+pub(crate) fn is_websocket_upgrade(req: &Request<Body>) -> bool {
     let headers = req.headers();
     let names = |name: header::HeaderName, token: &str| {
         headers.get_all(name).iter().any(|value| {
@@ -114,6 +114,10 @@ pub(super) fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 /// On such a combination, as `SessionConfigBuilder::build` does for the
 /// session cookie.
 pub(super) fn check_cookie_rules(name: &str, secure: bool, path: &str, same_site: SameSite) {
+    assert!(
+        crate::session::config::is_valid_cookie_path(path),
+        "CsrfConfig: path must start with '/' and contain no ';' or control characters"
+    );
     assert!(
         same_site != SameSite::None || secure,
         "CsrfConfig: `SameSite=None` requires `secure = true` (browsers reject the cookie otherwise)"

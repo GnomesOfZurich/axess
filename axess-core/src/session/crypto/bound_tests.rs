@@ -2,7 +2,7 @@
 
 use super::*;
 
-const KEY: [u8; 32] = [5u8; 32];
+const KEY: [u8; 32] = crate::testing::test_key(5);
 const A: &[u8] = b"session-a";
 const B: &[u8] = b"session-b";
 
@@ -97,9 +97,10 @@ fn marked_blob_never_falls_back_to_empty_aad() {
 
 #[test]
 fn key_rotation_still_opens_bound_blobs() {
-    let old = SessionCrypto::new([1u8; 32]);
+    let old = SessionCrypto::new(crate::testing::test_key(1));
     let sealed = old.seal_bound(BoundFormat::SESSION, A, b"rotated").unwrap();
-    let rotated = SessionCrypto::new([2u8; 32]).with_previous_key([1u8; 32]);
+    let rotated = SessionCrypto::new(crate::testing::test_key(2))
+        .with_previous_key(crate::testing::test_key(1));
     let opened = rotated
         .open_bound(BoundFormat::SESSION, A, &[], &sealed)
         .unwrap();
@@ -306,7 +307,7 @@ fn a_legacy_blob_whose_nonce_starts_with_the_marker_still_opens() {
 /// the new key alone.
 #[test]
 fn a_blob_opened_with_the_previous_key_is_stale() {
-    let old = SessionCrypto::new([1u8; 32]);
+    let old = SessionCrypto::new(crate::testing::test_key(1));
     let sealed = old
         .seal_bound(
             BoundFormat::DEVICE_BINDINGS,
@@ -315,7 +316,8 @@ fn a_blob_opened_with_the_previous_key_is_stale() {
         )
         .unwrap();
 
-    let rotated = SessionCrypto::new([2u8; 32]).with_previous_key([1u8; 32]);
+    let rotated = SessionCrypto::new(crate::testing::test_key(2))
+        .with_previous_key(crate::testing::test_key(1));
     let opened = open_device(&rotated, "t", "d", &sealed).unwrap();
     assert_eq!(opened.plaintext, b"bindings");
     assert!(opened.stale, "the previous key opened it");
@@ -327,7 +329,7 @@ fn a_blob_opened_with_the_previous_key_is_stale() {
             &opened.plaintext,
         )
         .unwrap();
-    let new_only = SessionCrypto::new([2u8; 32]);
+    let new_only = SessionCrypto::new(crate::testing::test_key(2));
     let again = open_device(&new_only, "t", "d", &resealed).unwrap();
     assert!(!again.stale);
     assert!(open_device(&new_only, "t", "d", &sealed).is_err());
@@ -361,4 +363,41 @@ fn a_legacy_blob_whose_nonce_starts_with_the_subkeyed_marker_still_opens() {
             .open_bound(BoundFormat::SESSION, A, &[], &legacy)
             .is_err()
     );
+}
+
+/// An application that seals its own data with the public `encrypt_with_aad`
+/// under the session key must not be able to forge a session row: output made
+/// with an AAD that names the session format and a row id, marked as the
+/// direct layout, is refused unless legacy blobs are read.
+#[test]
+fn the_direct_layout_is_refused_under_the_default_policy() {
+    let crypto = SessionCrypto::new(KEY);
+    let body = crypto
+        .encrypt_with_aad(&BoundFormat::SESSION.aad(A), b"forged")
+        .unwrap();
+    let mut blob = BoundFormat::SESSION.magic.to_vec();
+    blob.extend_from_slice(&body);
+    assert!(
+        crypto
+            .open_bound(BoundFormat::SESSION, A, &[], &blob)
+            .is_err(),
+        "a blob made with encrypt_with_aad opened as a session row"
+    );
+    assert!(
+        accepting()
+            .open_bound(BoundFormat::SESSION, A, &[], &blob)
+            .is_ok(),
+        "a policy that reads legacy blobs still reads the direct layout"
+    );
+}
+
+/// An empty AAD would make the blob open as a pre-binding row of any id.
+#[test]
+fn the_public_seal_refuses_an_empty_aad() {
+    let crypto = SessionCrypto::new(KEY);
+    assert!(
+        crypto.encrypt_with_aad(&[], b"x").is_err(),
+        "a blob sealed with no AAD opens as an unbound row"
+    );
+    assert!(crypto.encrypt_with_aad(b"app.v1", b"x").is_ok());
 }

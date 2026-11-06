@@ -14,9 +14,7 @@ use fred::types::{ClusterHash, CustomCommand};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
-/// The tests count the server's subscriber connections, so they run one at a
-/// time.
-static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use super::SUBSCRIBER_TESTS;
 
 async fn connect() -> Client {
     let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
@@ -70,7 +68,7 @@ async fn registered(registry: &ValkeySessionRegistry, user: &UserId) -> SessionI
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_watch_two_watchers_share_one_connection_and_both_wake() {
-    let _serial = ONE_AT_A_TIME.lock().await;
+    let _serial = SUBSCRIBER_TESTS.lock().await;
     let admin = connect().await;
     let registry = ValkeySessionRegistry::with_options(
         connect().await,
@@ -112,7 +110,7 @@ async fn valkey_watch_two_watchers_share_one_connection_and_both_wake() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_watch_aborting_one_leaves_the_other_and_aborting_both_closes() {
-    let _serial = ONE_AT_A_TIME.lock().await;
+    let _serial = SUBSCRIBER_TESTS.lock().await;
     let admin = connect().await;
     let registry = ValkeySessionRegistry::with_options(
         connect().await,
@@ -185,7 +183,7 @@ async fn valkey_watch_aborting_one_leaves_the_other_and_aborting_both_closes() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_watch_replaces_a_dead_subscriber_connection() {
-    let _serial = ONE_AT_A_TIME.lock().await;
+    let _serial = SUBSCRIBER_TESTS.lock().await;
     let admin = connect().await;
     let registry = ValkeySessionRegistry::with_options(
         connect().await,
@@ -250,7 +248,7 @@ async fn valkey_watch_replaces_a_dead_subscriber_connection() {
 #[tokio::test]
 #[ignore = "requires a running Valkey (VALKEY_URL)"]
 async fn valkey_watch_rechecks_waiting_watchers_after_a_closed_connection() {
-    let _serial = ONE_AT_A_TIME.lock().await;
+    let _serial = SUBSCRIBER_TESTS.lock().await;
     let admin = connect().await;
     let registry = ValkeySessionRegistry::with_options(
         connect().await,
@@ -290,5 +288,56 @@ async fn valkey_watch_rechecks_waiting_watchers_after_a_closed_connection() {
     tokio::time::timeout(Duration::from_secs(3), w1)
         .await
         .expect("the waiting watcher rechecks after the reconnect")
+        .unwrap();
+}
+
+/// A client that reconnects on its own after the server drops it.
+async fn connect_reconnecting(delay_ms: u32) -> Client {
+    let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+    let policy = ReconnectPolicy::new_constant(0, delay_ms);
+    let client = Client::new(Config::from_url(&url).unwrap(), None, None, Some(policy));
+    client.init().await.expect("connect");
+    client
+}
+
+/// The subscriber connection drops and the client reconnects by itself while
+/// a revocation is published: the broadcast never closes and never lags, yet
+/// the waiting watcher still learns of the revocation, because the
+/// reconnect resubscribes and flags a recheck.
+#[tokio::test]
+#[ignore = "requires a running Valkey (VALKEY_URL)"]
+async fn valkey_watch_rechecks_after_the_client_reconnects_by_itself() {
+    let _serial = SUBSCRIBER_TESTS.lock().await;
+    let admin = connect().await;
+    let registry = ValkeySessionRegistry::with_options(
+        connect_reconnecting(1500).await,
+        format!("axt_watch_e_{}", user()),
+        Duration::from_secs(60),
+    );
+    let before = subscriber_connections(&admin).await;
+    let u1 = user();
+    let s1 = registered(&registry, &u1).await;
+    let w1 = watch(&registry, u1, s1);
+    eventually("the subscriber connection is open", || async {
+        subscriber_connections(&admin).await == before + 1
+    })
+    .await;
+
+    let kill = CustomCommand::new_static("CLIENT", ClusterHash::FirstKey, false);
+    let _: i64 = admin
+        .custom(kill, vec!["KILL", "TYPE", "pubsub"])
+        .await
+        .expect("CLIENT KILL");
+    eventually("the subscriber connection is gone", || async {
+        subscriber_connections(&admin).await == before
+    })
+    .await;
+
+    // Published while the client is between connections.
+    registry.invalidate_session(&u1, &s1).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(6), w1)
+        .await
+        .expect("the watcher learns of the revocation after the reconnect")
         .unwrap();
 }

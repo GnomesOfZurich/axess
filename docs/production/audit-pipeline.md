@@ -322,7 +322,13 @@ when the archiver refuses a batch, the tick offers its rows one at a time,
 marks the ones taken as archived and returns the first refusal as its
 error, and the purge runs whether or not the archive step succeeded, so a
 sink that is down, or one row it cannot take, never keeps archived rows on
-the hot table. `spawn` returns a `JoinHandle`; dropping
+the hot table. A row the archiver keeps refusing is set aside so it cannot
+hold up the rows behind it, whatever the batch size: at once when the
+archiver took another row in the same tick, otherwise after three refusals
+in as many ticks (a batch of one, or a bad row at each end of a batch, looks
+like a sink that is down). A row set aside is left out of the selection for
+an hour and then offered again; the record is in the process, so a restart
+offers every row afresh. `spawn` returns a `JoinHandle`; dropping
 it leaves the loop running, so call `abort` on it to stop retention.
 The loop rests a full interval after each drain, so one that overruns
 is not followed by catch-up drains. The cutoffs come from the injected clock, while the pacing is

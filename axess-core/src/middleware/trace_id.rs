@@ -1,8 +1,14 @@
 //! W3C Trace Context middleware for Axess.
 //!
 //! Implements the [W3C Trace Context](https://www.w3.org/TR/trace-context/) `traceparent`
-//! header for distributed tracing. Incoming requests with a valid `traceparent` header
-//! are propagated; requests without one get a new trace context generated.
+//! header for distributed tracing. Every request gets a new trace context; an
+//! inbound `traceparent` is ignored unless the layer is told to trust it.
+//!
+//! An inbound header is the caller's claim: its trace id can collide with or
+//! poison another trace, and its sampled flag can force sampling of every
+//! request. A service that sits behind an edge that already vetted the header
+//! (an internal hop) opts in with `TraceContextLayer::trust_inbound(true)`,
+//! and then a valid inbound `traceparent` is propagated as a child span.
 //!
 //! The trace ID is also injected into the tracing span so log aggregators can
 //! correlate HTTP requests with application traces.
@@ -136,14 +142,17 @@ impl TraceContext {
 
 /// Tower service that propagates or generates W3C `traceparent` headers.
 ///
-/// - If the request has a valid `traceparent`, creates a child span and propagates it.
-/// - If the request has no `traceparent` (or an invalid one), generates a new root trace.
+/// - By default an inbound `traceparent` is ignored and a new root trace is generated.
+/// - With [`trust_inbound(true)`](TraceContextLayer::trust_inbound), a valid inbound
+///   `traceparent` gets a child span and is propagated; one that is absent or
+///   invalid generates a new root trace.
 /// - The `traceparent` is set on both the request (for downstream handlers) and the response.
 /// - A [`TraceContext`] is inserted into request extensions for handler access.
 #[derive(Clone)]
 pub struct TraceContextMiddleware<S> {
     inner: S,
     rng: Arc<dyn SecureRng>,
+    trust_inbound: bool,
 }
 
 impl<S: std::fmt::Debug> std::fmt::Debug for TraceContextMiddleware<S> {
@@ -171,9 +180,12 @@ where
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         // Parse or generate trace context.
         let rng = &*self.rng;
-        let ctx = req
-            .headers()
-            .get(&*TRACEPARENT)
+        let inbound = if self.trust_inbound {
+            req.headers().get(&*TRACEPARENT)
+        } else {
+            None
+        };
+        let ctx = inbound
             .and_then(|v| v.to_str().ok())
             .and_then(|v| TraceContext::from_header(v, rng))
             .unwrap_or_else(|| TraceContext::new_root(rng));
@@ -217,6 +229,7 @@ where
 #[derive(Clone)]
 pub struct TraceContextLayer {
     rng: Arc<dyn SecureRng>,
+    trust_inbound: bool,
 }
 
 impl std::fmt::Debug for TraceContextLayer {
@@ -237,7 +250,22 @@ impl TraceContextLayer {
     pub fn new() -> Self {
         Self {
             rng: Arc::new(axess_rng::SystemRng),
+            trust_inbound: false,
         }
+    }
+
+    /// Whether an inbound `traceparent` is adopted (`true`) or ignored, so
+    /// every request starts a new trace (the default, `false`).
+    ///
+    /// An inbound header is the caller's claim: its trace id can collide with
+    /// or poison another trace, and its sampled flag can force sampling of
+    /// every request. Leave this off on an internet-facing edge, and turn it
+    /// on for a service that sits behind one that already vetted the header
+    /// (an internal hop that should join its caller's trace).
+    #[must_use]
+    pub fn trust_inbound(mut self, trust: bool) -> Self {
+        self.trust_inbound = trust;
+        self
     }
 
     /// Draw trace and span IDs from `rng` instead, so a seeded RNG makes
@@ -255,6 +283,7 @@ impl<S> Layer<S> for TraceContextLayer {
         TraceContextMiddleware {
             inner,
             rng: self.rng.clone(),
+            trust_inbound: self.trust_inbound,
         }
     }
 }

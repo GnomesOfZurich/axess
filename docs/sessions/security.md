@@ -100,12 +100,13 @@ pepper, and stores the result alongside the session.
 ```rust,ignore
 pub trait SessionBinding: Send + Sync + 'static {
     /// The raw binding material. `None` means the signal is absent for
-    /// this request, and binding is skipped rather than failed.
+    /// this request: the session is bound to a fixed "no material" value,
+    /// so a replay that does present material fails the binding.
     fn extract(&self, req: &Request<Body>) -> Option<Vec<u8>>;
 }
 
 // The one that ships:
-let layer = SessionLayer::new(store, signing_key)
+let layer = SessionLayer::new(store, signing_key, registry)
     .with_binding(UserAgentBinding);
 ```
 
@@ -143,10 +144,13 @@ logs the user out once, at an unsurprising moment. An IP-derived
 binding does not qualify on a mobile network, which is why nothing
 ships with one.
 
-If you want a softer response, the place to put it is your own
-`SessionBinding` implementation: return `None` when the signal is
-absent or when you would rather not judge, and binding is skipped for
-that request.
+A request the binding yields no material for (`extract` returns `None`,
+for example no `User-Agent` header) is not skipped. The layer binds the
+session to a fixed value that stands for "no material", so a session
+that logged in without the header fails the binding on a replay that
+sends one, and a bound session fails on a request that omits it. If you
+want a softer response, the place to put it is your own `SessionBinding`
+implementation, which decides what material a request yields.
 
 ## When the check runs
 
@@ -157,6 +161,15 @@ The fingerprint is recomputed and compared **once per HTTP request**, at
 `set_authenticated` when authentication completes. So even a pre-MFA
 session cannot be replayed from another device. Once set it is never
 overwritten.
+
+A session past `Guest` that stores no fingerprint (stored before you
+turned binding on, or on a path that bound nothing) is bound to the
+client of its next request, and checked against that from then on. That
+request is trusted, since nothing is stored to compare it with, so turn
+binding on before the sessions you care about exist where you can. There
+is no fail-open setting: when binding is configured every request yields
+a fingerprint (see above), so there is no request it cannot be checked
+against.
 
 Once per request is the whole of it, and the gap is persistent
 connections. A WebSocket or an SSE stream is checked at the upgrade and

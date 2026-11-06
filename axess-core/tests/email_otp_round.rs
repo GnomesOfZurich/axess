@@ -11,7 +11,7 @@ use axess_core::authn::{
     factor::{EmailOtpConfig, FactorConfig, FactorCredential, FactorKind},
     service::{AuthnService, PrepareOutcome, RequestAuthnService},
     store::{AuthMethod, FactorStore},
-    types::AuthnScope,
+    types::{AuthnScope, LockoutPolicy},
 };
 use axess_core::blocking::KdfExecutor;
 use axess_core::testing::{
@@ -29,7 +29,10 @@ fn world(cfg: EmailOtpConfig) -> (Svc, MockFactorStore, MockClock) {
     let identity = MockIdentityStore::new()
         .with_clock(clock.clone())
         .with_tenant(test_tenant())
-        .with_user(test_user("u1", "alice"));
+        .with_user(test_user("u1", "alice"))
+        // The code's own allowance is under test; several wrong codes land
+        // within a second, which the throttle would refuse first.
+        .with_lockout_policy(LockoutPolicy::default().without_throttle());
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), FactorConfig::EmailOtp(cfg))
         .with_method(
@@ -218,4 +221,59 @@ async fn a_choice_the_step_does_not_offer_is_refused() {
         refused,
         Err(axess_core::authn::AuthnError::NoFlow)
     ));
+}
+
+fn totp_or_email_world() -> Svc {
+    let identity = MockIdentityStore::new()
+        .with_tenant(test_tenant())
+        .with_user(test_user("u1", "alice"));
+    let factors = MockFactorStore::new()
+        .with_factor(
+            user_scope(),
+            common::totp_config("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"),
+        )
+        .with_factor(user_scope(), FactorConfig::EmailOtp(base()))
+        .with_method(
+            &uid("u1"),
+            AuthMethod {
+                name: "totp-or-email".into(),
+                steps: vec![axess_core::authn::factor::FactorStep::AnyOf(vec![
+                    FactorKind::Totp,
+                    FactorKind::EmailOtp,
+                ])],
+                scope: user_scope(),
+            },
+        );
+    AuthnService::builder(identity, factors)
+        .with_rng(MockRng::new(7))
+        .with_kdf_executor(Arc::new(KdfExecutor::inline()))
+        .build()
+        .with_audit_context(AuditContext::default())
+}
+
+#[tokio::test]
+async fn the_email_code_is_checked_as_the_email_code_when_that_is_the_choice() {
+    let svc = totp_or_email_world();
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+
+    let issued = svc
+        .prepare_factor_choice(&session, FactorKind::EmailOtp)
+        .await
+        .unwrap();
+    let PrepareOutcome::SendOtp { code, .. } = issued else {
+        panic!("{issued:?}");
+    };
+
+    let outcome = svc
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            axess_core::authn::service::FactorOutcome::Authenticated
+        ),
+        "{outcome:?}"
+    );
 }

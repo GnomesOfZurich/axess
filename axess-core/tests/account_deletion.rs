@@ -18,6 +18,7 @@ use axess_core::session::refresh::{
 use axess_core::session::store::{
     MemorySessionRegistry, MemorySessionStore, SessionRegistry, SessionStore,
 };
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     MemoryRefreshTokenStore, MockRng,
     mock_authn::{MockFactorStore, MockIdentityStore},
@@ -87,7 +88,7 @@ async fn deleting_a_user_ends_their_sessions_and_tokens_then_audits() {
         "the stored row is gone"
     );
     assert!(
-        Refresh::new(&plaintext, |_| async { true })
+        Refresh::any_tenant(&plaintext, |_| async { true })
             .run(&refresh, &config, &rng, clock.now())
             .await
             .is_err(),

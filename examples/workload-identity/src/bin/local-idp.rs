@@ -49,9 +49,19 @@
 //! historical key from a store that kept no rotation record is stamped the
 //! first time the store loads it, and can be retired that long after.
 //!
-//! `POST /issue` and `POST /admin/rotate` require
-//! `Authorization: Bearer <token>`. Set `LOCAL_IDP_ADMIN_TOKEN` (16+
-//! characters) or read the one generated at startup from the log.
+//! Two kinds of bearer token, never interchangeable:
+//!
+//! - `/admin/*` (rotate, retire) takes the admin token: set
+//!   `LOCAL_IDP_ADMIN_TOKEN` (16+ characters), or read the one generated at
+//!   startup from `<key dir>/admin-token`, a file only its owner can read.
+//!   The log carries that path, never the token.
+//! - `/issue` takes an issue token, which belongs to one caller and names the
+//!   subjects and audiences that caller may request. `LOCAL_IDP_ISSUE_CALLERS`
+//!   is a JSON array of `{"name", "token", "subjects", "audiences"}`; unset,
+//!   one `demo` caller is generated (`worker-1` at `https://api`) with its
+//!   token in `<key dir>/issue-token`. A request outside the caller's lists is
+//!   refused with 403, and every mint logs the caller with the subject and
+//!   audience.
 //!
 //! See `README.md` for the full curl walkthrough.
 
@@ -123,6 +133,8 @@ enum FileKeyStoreError {
     },
     #[error("current.kid pointer references missing key {kid}")]
     MissingCurrent { kid: String },
+    #[error("tokens signed by key {kid} may still be valid")]
+    RetireBlocked { kid: String },
 }
 
 impl FileLocalIdpKeyStore {
@@ -380,6 +392,12 @@ impl LocalIdpKeyStore for FileLocalIdpKeyStore {
             if !from.exists() {
                 return Ok(false);
             }
+            // Checked here, under the rotate lock: a rotation cannot land
+            // between the check and the move, so the key that was current a
+            // moment ago is not retired while its tokens are still valid.
+            if store.retire_blocked(&kid)? {
+                return Err(FileKeyStoreError::RetireBlocked { kid });
+            }
             // Moved aside, not deleted: the file is the only copy of a key
             // that signed tokens, and the move is what a later audit needs.
             let retired_dir = store.root.join("retired");
@@ -427,6 +445,34 @@ fn valid_kid(kid: &str) -> bool {
         && kid
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Write a secret to `path`, readable by the owner only, replacing what was
+/// there. The mode is set on the open and again afterwards, so a file left by
+/// an earlier run with looser permissions is tightened too.
+fn write_secret_file(path: &Path, secret: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(secret.as_bytes())
+}
+
+/// A fresh random bearer token: 24 bytes from the system RNG, in hex.
+fn generate_token() -> String {
+    let mut bytes = [0u8; 24];
+    axess::SecureRng::fill_bytes(&axess::SystemRng, &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
@@ -490,38 +536,113 @@ struct AppState {
     // `iat` / `exp` flow through this clock so a DST simulation can
     // pin token issuance time by swapping in a `MockClock`.
     clock: Arc<dyn Clock>,
-    /// Bearer token the mint and rotate endpoints require.
+    /// Bearer token the rotate and retire endpoints require. It does not
+    /// open `/issue`.
     admin_token: Arc<str>,
+    /// The callers `/issue` admits, each with its own token and its own
+    /// subjects and audiences.
+    callers: Arc<Vec<IssueCaller>>,
 }
 
-/// Admit only requests carrying `Authorization: Bearer <admin token>`.
-///
-/// `/issue` mints a token for any subject and `/admin/rotate` replaces the
-/// signing key, so neither may be open to whoever can reach the port. The
-/// comparison does not stop at the first differing byte.
-async fn require_admin(
-    State(state): State<AppState>,
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let presented = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or("");
-    let expected = state.admin_token.as_bytes();
+/// One caller of `/issue`: its bearer token and what it may ask for.
+#[derive(Clone, Deserialize)]
+struct IssueCaller {
+    /// Named in the log beside every token this caller mints.
+    name: String,
+    token: String,
+    /// The subjects this caller may request a token for.
+    subjects: Vec<String>,
+    /// The audiences this caller may request a token for.
+    audiences: Vec<String>,
+}
+
+impl IssueCaller {
+    /// Whether this caller may be given a token for `subject` at `audience`.
+    fn allows(&self, subject: &str, audience: &str) -> bool {
+        self.subjects.iter().any(|s| s == subject) && self.audiences.iter().any(|a| a == audience)
+    }
+}
+
+/// `presented` equals `expected`, without stopping at the first differing
+/// byte.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    let expected = expected.as_bytes();
     let presented = presented.as_bytes();
     let same_length = presented.len() == expected.len();
     let diff = expected
         .iter()
         .zip(presented.iter().chain(std::iter::repeat(&0)))
         .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-    if same_length && diff == 0 {
+    same_length && diff == 0
+}
+
+fn bearer(request: &axum::extract::Request) -> &str {
+    request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+}
+
+/// Admit only requests carrying `Authorization: Bearer <admin token>`.
+///
+/// `/admin/rotate` replaces the signing key and `/admin/retire` drops one, so
+/// neither may be open to whoever can reach the port, or to a caller that
+/// only holds an issue token.
+async fn require_admin(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if token_matches(bearer(&request), &state.admin_token) {
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()
     }
+}
+
+/// Admit only a request carrying a known caller's issue token, and hand the
+/// caller to the handler. Every caller is compared, so the time taken does not
+/// say which token was close.
+async fn require_issue_caller(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let presented = bearer(&request).to_string();
+    let mut found: Option<&IssueCaller> = None;
+    for caller in state.callers.iter() {
+        if token_matches(&presented, &caller.token) {
+            found = Some(caller);
+        }
+    }
+    match found {
+        Some(caller) => {
+            request.extensions_mut().insert(caller.clone());
+            next.run(request).await
+        }
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// The routes behind a bearer token: `/issue` for the issue callers, `/admin/*`
+/// for the admin token.
+fn guarded_routes(state: AppState) -> Router {
+    let issue = Router::new()
+        .route("/issue", post(issue_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_issue_caller,
+        ));
+    let admin = Router::new()
+        .route("/admin/rotate", post(rotate_handler))
+        .route("/admin/retire", post(retire_handler))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
+    issue.merge(admin).with_state(state)
 }
 
 #[derive(Deserialize)]
@@ -572,14 +693,27 @@ struct IssueResponse {
 
 async fn issue_handler(
     State(state): State<AppState>,
+    axum::Extension(caller): axum::Extension<IssueCaller>,
     Json(req): Json<IssueRequest>,
 ) -> Result<Json<IssueResponse>, (StatusCode, String)> {
     let now = state.clock.now();
     let expires_at = validated_expiry(now, req.ttl_secs, req.audience.as_deref())?;
-    let mut claims = MintClaims::new(req.subject, expires_at).with_issued_at(now);
-    if let Some(aud) = req.audience {
-        claims = claims.with_audience(aud);
+    // `validated_expiry` refused a missing audience.
+    let audience = req.audience.as_deref().unwrap_or_default();
+    if !caller.allows(&req.subject, audience) {
+        tracing::warn!(
+            caller = %caller.name,
+            subject = %req.subject,
+            audience = %audience,
+            "issue refused: outside what the caller may request"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "this caller may not request that subject and audience".into(),
+        ));
     }
+    let mut claims = MintClaims::new(req.subject.clone(), expires_at).with_issued_at(now);
+    claims = claims.with_audience(audience);
     let token = state
         .idp
         .mint(&claims)
@@ -589,6 +723,13 @@ async fn issue_handler(
             tracing::warn!(error = %e, "mint failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "mint failed".to_string())
         })?;
+    tracing::info!(
+        caller = %caller.name,
+        subject = %req.subject,
+        audience = %audience,
+        ttl_secs = req.ttl_secs,
+        "token issued"
+    );
     Ok(Json(IssueResponse { token }))
 }
 
@@ -668,27 +809,19 @@ async fn retire_handler(
     State(state): State<AppState>,
     Json(req): Json<RetireRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    match state.store.retire_blocked(&req.kid) {
-        Ok(false) => {}
-        Ok(true) => {
-            return Err((
-                StatusCode::CONFLICT,
-                format!(
-                    "tokens signed by that key may still be valid; retire it {MAX_TTL_SECS} seconds after the rotation that replaced it"
-                ),
-            ));
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "retire check failed");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, "retire failed".into()));
-        }
-    }
     match state.idp.retire_historical_key(&req.kid).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "no such historical key".into())),
         Err(IssuanceError::RetireCurrentKey) => Err((
             StatusCode::CONFLICT,
             "the current key cannot be retired; rotate first".into(),
+        )),
+        // Decided by the store under its rotate lock, not before it.
+        Err(IssuanceError::KeyStore(FileKeyStoreError::RetireBlocked { .. })) => Err((
+            StatusCode::CONFLICT,
+            format!(
+                "tokens signed by that key may still be valid; retire it {MAX_TTL_SECS} seconds after the rotation that replaced it"
+            ),
         )),
         Err(e) => {
             tracing::warn!(error = %e, "retire failed");
@@ -702,6 +835,56 @@ async fn root_handler() -> impl IntoResponse {
         StatusCode::OK,
         "axess-example-workload-identity local-idp; try GET /.well-known/openid-configuration, GET /jwks.json, POST /issue, POST /admin/rotate\n",
     )
+}
+
+/// The callers `/issue` admits: `LOCAL_IDP_ISSUE_CALLERS` (a JSON array), or
+/// one generated `demo` caller whose token goes to `<dir>/issue-token`.
+fn issue_callers(dir: &Path, admin_token: &str) -> Result<Vec<IssueCaller>, String> {
+    let callers = match std::env::var("LOCAL_IDP_ISSUE_CALLERS") {
+        Ok(json) => parse_callers(&json, admin_token)?,
+        Err(std::env::VarError::NotPresent) => {
+            let token = generate_token();
+            let path = dir.join("issue-token");
+            write_secret_file(&path, &token).map_err(|e| e.to_string())?;
+            tracing::info!(path = %path.display(), "generated an issue token for the demo caller; read it from that file");
+            vec![IssueCaller {
+                name: "demo".into(),
+                token,
+                subjects: vec!["worker-1".into()],
+                audiences: vec!["https://api".into()],
+            }]
+        }
+        Err(e) => return Err(format!("LOCAL_IDP_ISSUE_CALLERS is not text: {e}")),
+    };
+    Ok(callers)
+}
+
+/// Parse and check the callers: each token 16+ characters, no two alike, none
+/// the admin token (an issue token must not open `/admin/*`).
+fn parse_callers(json: &str, admin_token: &str) -> Result<Vec<IssueCaller>, String> {
+    let callers: Vec<IssueCaller> =
+        serde_json::from_str(json).map_err(|e| format!("LOCAL_IDP_ISSUE_CALLERS: {e}"))?;
+    for (i, c) in callers.iter().enumerate() {
+        if c.token.len() < 16 {
+            return Err(format!(
+                "LOCAL_IDP_ISSUE_CALLERS: the token of {} must be at least 16 characters",
+                c.name
+            ));
+        }
+        if c.token == admin_token {
+            return Err(format!(
+                "LOCAL_IDP_ISSUE_CALLERS: the token of {} is the admin token",
+                c.name
+            ));
+        }
+        if callers[..i].iter().any(|o| o.token == c.token) {
+            return Err(format!(
+                "LOCAL_IDP_ISSUE_CALLERS: {} shares a token with another caller",
+                c.name
+            ));
+        }
+    }
+    Ok(callers)
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────
@@ -719,6 +902,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "./keys".to_string())
         .into();
     bootstrap_initial_key(&key_dir)?;
+    let token_dir = key_dir.clone();
 
     // One clock for token times, rotation stamps and the retire check.
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -727,40 +911,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .with_max_ttl(Duration::seconds(MAX_TTL_SECS));
     // The mint and rotate endpoints need a bearer token. Use the one the
-    // operator supplies, or draw a fresh one and print it once.
+    // operator supplies, or draw a fresh one and write it to a file only the
+    // owner can read.
     let admin_token: Arc<str> = match std::env::var("LOCAL_IDP_ADMIN_TOKEN") {
         Ok(t) if t.len() >= 16 => t.into(),
         Ok(_) => return Err("LOCAL_IDP_ADMIN_TOKEN must be at least 16 characters".into()),
         Err(_) => {
-            let mut bytes = [0u8; 24];
-            axess::SecureRng::fill_bytes(&axess::SystemRng, &mut bytes);
-            let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            // Printed once to stderr, never through the log pipeline, where a
-            // bearer credential would be retained and shipped.
-            eprintln!("generated admin token for /issue and /admin/rotate: {token}");
-            tracing::info!("generated an admin token; printed once to stderr");
+            let token = generate_token();
+            // Not printed: stderr is captured by containers and service
+            // managers into the same retained, shipped log pipeline as the
+            // rest of the output, and a bearer credential does not belong in
+            // it. The path is all the log carries.
+            let path = token_dir.join("admin-token");
+            write_secret_file(&path, &token)?;
+            tracing::info!(path = %path.display(), "generated an admin token; read it from that file");
             token.into()
         }
     };
+    let callers = issue_callers(&token_dir, &admin_token)?;
     let state = AppState {
         idp: idp.clone(),
         store,
         clock,
         admin_token,
+        callers: Arc::new(callers),
     };
 
     // Mount the discovery router and the admin/issue endpoints on the
     // same axum app. The two `Router` instances live under disjoint
     // path prefixes so axum's nest/merge plumbing wires them cleanly.
-    let guarded: Router = Router::new()
-        .route("/issue", post(issue_handler))
-        .route("/admin/rotate", post(rotate_handler))
-        .route("/admin/retire", post(retire_handler))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            require_admin,
-        ))
-        .with_state(state);
+    let guarded = guarded_routes(state);
     let admin_router: Router = Router::new().route("/", get(root_handler)).merge(guarded);
     let app = admin_router.merge(idp.router());
 

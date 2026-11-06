@@ -102,10 +102,13 @@ async fn read_secret(
     let resolver = WorkloadResolver::<CallerClaims, _, _>::new(
         svc.verifier.clone(),
         svc.trust.clone(),
-        svc.tenant,
+        {
+            let tenant = svc.tenant;
+            move |_slug: &str| Some(tenant)
+        },
         Issuer::custom("pipeline").expect("issuer name"),
         bearer.to_string(),
-        caller_mapper(svc.trust.clone(), caller_allowlist()),
+        caller_mapper(caller_allowlist()),
     );
     resolver
         .resolve()

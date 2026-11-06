@@ -53,6 +53,13 @@ impl CallCountingStore {
 
 impl crate::session::store::SessionStore for CallCountingStore {
     type Error = <MemorySessionStore as crate::session::store::SessionStore>::Error;
+    async fn find_sessions_for_user(
+        &self,
+        _: &crate::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         self.inner.load(id).await
     }
@@ -361,6 +368,13 @@ struct FailingCycleStore {
 
 impl crate::session::store::SessionStore for FailingCycleStore {
     type Error = std::io::Error;
+    async fn find_sessions_for_user(
+        &self,
+        _: &crate::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         Ok(self.inner.load(id).await.unwrap())
     }
@@ -888,4 +902,58 @@ async fn finalize_session_rotation_without_a_stored_session_still_writes() {
 
     assert_eq!(outcome.final_id, new);
     assert!(store.load(&new).await.unwrap().is_some());
+}
+
+fn cache_control_after_marking(handler_set: &[&'static str]) -> Vec<String> {
+    use axum::http::{HeaderValue, header};
+    let mut headers = axum::http::HeaderMap::new();
+    for value in handler_set {
+        headers.append(header::CACHE_CONTROL, HeaderValue::from_static(value));
+    }
+    mark_cookie_response(&mut headers);
+    headers
+        .get_all(header::CACHE_CONTROL)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+/// A response that sets a session cookie is never left cacheable by a shared
+/// cache, whatever policy the handler chose.
+#[test]
+fn a_cookie_response_overrides_a_cacheable_policy_with_no_store() {
+    for cacheable in [
+        "public, max-age=600",
+        "max-age=600",
+        "s-maxage=60",
+        "public",
+        "no-cache",
+    ] {
+        assert_eq!(
+            cache_control_after_marking(&[cacheable]),
+            vec!["no-store".to_string()],
+            "handler policy `{cacheable}` survived next to a session cookie"
+        );
+    }
+    assert_eq!(
+        cache_control_after_marking(&["public, max-age=60", "max-age=5"]),
+        vec!["no-store".to_string()],
+        "every Cache-Control header is replaced"
+    );
+}
+
+/// A policy that already keeps the response out of shared caches is the
+/// handler's own choice and stays.
+#[test]
+fn a_cookie_response_keeps_a_policy_shared_caches_already_refuse() {
+    for refusing in ["no-store", "private, max-age=60", "No-Store, max-age=0"] {
+        assert_eq!(
+            cache_control_after_marking(&[refusing]),
+            vec![refusing.to_string()]
+        );
+    }
+    assert_eq!(
+        cache_control_after_marking(&[]),
+        vec!["no-store".to_string()]
+    );
 }

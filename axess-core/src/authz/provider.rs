@@ -52,6 +52,18 @@
 //!         todo!()
 //!     }
 //!
+//!     async fn entities_for_tenant(
+//!         &self,
+//!         principal: &EntityUid,
+//!         tenant: Option<&str>,
+//!         resource_id: &uuid::Uuid,
+//!         action: &EntityUid,
+//!     ) -> Result<Entities, sqlx::Error> {
+//!         // load the same entities, scoped to `tenant`; an application with
+//!         // no tenants calls `entities_for` for `None` and refuses `Some`
+//!         todo!()
+//!     }
+//!
 //!     fn resource_uid(&self, id: &uuid::Uuid) -> Result<EntityUid, AuthzError> {
 //!         // build Document::"uuid" UID
 //!         todo!()
@@ -142,6 +154,41 @@ pub fn validate_sample_entities(
 /// the caller controls the id string. A future axess release may add a
 /// schema-validation pass that rejects untenanted entity types; until
 /// then this is a load-bearing application invariant.
+///
+/// # `entities_for_tenant` is required
+///
+/// A provider states what it does for a check made in a tenant. One that
+/// ignores the tenant would otherwise give no tenant isolation without saying
+/// so, so there is no default:
+///
+/// ```compile_fail,E0046
+/// use axess_core::authz::{AuthzEntityProvider, AuthzError};
+/// use cedar_policy::{Entities, EntityUid, Schema};
+///
+/// struct Silent;
+///
+/// impl AuthzEntityProvider for Silent {
+///     type ResourceId = String;
+///     type Error = AuthzError;
+///
+///     async fn entities_for(
+///         &self,
+///         _: &EntityUid,
+///         _: &String,
+///         _: &EntityUid,
+///     ) -> Result<Entities, AuthzError> {
+///         Ok(Entities::empty())
+///     }
+///
+///     fn resource_uid(&self, _: &String) -> Result<EntityUid, AuthzError> {
+///         unreachable!()
+///     }
+///
+///     fn validate_schema(&self, _: &Schema) -> Result<(), AuthzError> {
+///         Ok(())
+///     }
+/// }
+/// ```
 pub trait AuthzEntityProvider: Send + Sync {
     /// The type used to identify a resource in your application domain
     /// (e.g. `uuid::Uuid`, `i64`, a domain-specific newtype).
@@ -171,26 +218,27 @@ pub trait AuthzEntityProvider: Send + Sync {
     /// tenant its session was opened for (see
     /// [`AuthzStore::for_user_in_tenant`][super::session::AuthzStore::for_user_in_tenant]
     /// and [`AuthzStore::for_session`][super::session::AuthzStore::for_session]),
-    /// `None` when it was opened without one. Override it to load the
-    /// principal's roles and the resource for that tenant only. The default
-    /// ignores the tenant and calls `entities_for`, so existing providers
-    /// are unchanged.
+    /// `None` when it was opened without one. Load the principal's roles and
+    /// the resource for that tenant only.
+    ///
+    /// Required, with no default: a provider that ignored the tenant would
+    /// give no tenant isolation without saying so. One that is not tenant
+    /// aware answers `None` by calling [`entities_for`](Self::entities_for)
+    /// and refuses `Some(tenant)` with an error of its own, which the session
+    /// treats as a denial.
     fn entities_for_tenant(
         &self,
         principal: &EntityUid,
         tenant: Option<&str>,
         resource_id: &Self::ResourceId,
         action: &EntityUid,
-    ) -> impl std::future::Future<Output = Result<Entities, Self::Error>> + Send {
-        let _ = tenant;
-        self.entities_for(principal, resource_id, action)
-    }
+    ) -> impl std::future::Future<Output = Result<Entities, Self::Error>> + Send;
 
     /// Build the Cedar [`EntityUid`] for a resource instance.
     ///
     /// Must produce a UID whose type matches the Cedar schema. The namespace
     /// is the provider's responsibility: typically captured at construction
-    /// time from the same value passed to [`AuthzStore::new`][super::session::AuthzStore::new].
+    /// time from the same value passed to [`AuthzStore::try_new`][super::session::AuthzStore::try_new].
     fn resource_uid(&self, id: &Self::ResourceId) -> Result<EntityUid, AuthzError>;
 
     /// Startup validation: assert that this provider's entity types

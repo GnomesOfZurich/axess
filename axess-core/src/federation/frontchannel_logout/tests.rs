@@ -34,7 +34,7 @@ async fn frontchannel_logout_invalidates_by_sid() {
     );
     assert!(registry.is_valid(&user_id, &session_id).await.unwrap());
 
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         known_issuers(),
@@ -52,7 +52,7 @@ async fn frontchannel_logout_invalidates_by_sid() {
 async fn frontchannel_logout_unknown_sid_is_noop() {
     let registry = MemorySessionRegistry::new();
     let sid_map: SidMap = SidMap::new();
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         sid_map,
         Arc::new(SessionRegistryAdapter(registry)),
         known_issuers(),
@@ -66,7 +66,7 @@ async fn frontchannel_logout_unknown_sid_is_noop() {
 
 #[tokio::test]
 async fn frontchannel_logout_rejects_unknown_issuer() {
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         SidMap::new(),
         Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
         known_issuers(),
@@ -77,7 +77,7 @@ async fn frontchannel_logout_rejects_unknown_issuer() {
 
 #[tokio::test]
 async fn frontchannel_logout_rejects_missing_iss() {
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         SidMap::new(),
         Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
         known_issuers(),
@@ -128,7 +128,7 @@ async fn handle_frontchannel_logout_drives_registry_and_gates_issuer() {
         chrono::Utc::now(),
     );
 
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         known_issuers(),
@@ -178,7 +178,6 @@ fn bound_handler(
         Arc::new(SessionRegistryAdapter(registry.clone())),
         known_issuers(),
     )
-    .with_session_match_required()
 }
 
 fn sid_params(sid: &str) -> Query<FrontChannelLogoutParams> {
@@ -258,7 +257,7 @@ async fn the_bound_route_refuses_an_unknown_issuer() {
 /// logged, and an unknown issuer is refused.
 #[test]
 fn oversized_or_unknown_parameters_are_refused() {
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         SidMap::new(),
         Arc::new(SessionRegistryAdapter(MemorySessionRegistry::new())),
         known_issuers(),
@@ -304,7 +303,7 @@ async fn end_by_sid_removes_only_the_mapping_it_matched() {
     registry.register(&user, &new).await.unwrap();
     let key: SidKey = ("https://idp.example.com".to_string(), "sid-r".to_string());
     sid_map.insert(key.clone(), "sub-r", user, new, chrono::Utc::now());
-    let handler = FrontChannelLogoutHandler::new(
+    let handler = FrontChannelLogoutHandler::new_unbound(
         sid_map.clone(),
         Arc::new(SessionRegistryAdapter(registry.clone())),
         known_issuers(),

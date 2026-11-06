@@ -38,7 +38,7 @@
 //! let resolver  = LifecycleDeviceResolver::new(extractor, lifecycle, clock);
 //!
 //! // 6. hand the resolver to the session layer
-//! let layer = SessionLayer::new(sessions, signing_key)
+//! let layer = SessionLayer::new(sessions, signing_key, registry)
 //!     .with_device_resolver(resolver);
 //! router.layer(layer);
 //! ```

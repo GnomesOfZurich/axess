@@ -231,7 +231,7 @@ impl SessionData {
 /// Calling [`AuthSession::clear`](super::extractor::AuthSession::clear) from
 /// any state resets the session back to `Guest` (logout).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", from = "AuthStateWire")]
 pub enum AuthState {
     /// No authentication started; anonymous visitor.
     #[default]
@@ -257,14 +257,15 @@ pub enum AuthState {
         /// offer a choice ([`FactorStep::AnyOf`]). Sessions written before
         /// steps were kept here hold a plain list of kinds, read as
         /// required steps.
-        #[serde(deserialize_with = "deserialize_remaining_steps")]
         remaining: Vec<FactorStep>,
-        /// Factor kinds that have already been verified in this flow,
-        /// in the order they were completed. Carried into
-        /// [`AuthState::Authenticated::factors_completed`] on transition
-        /// so audit events can record the full list.
-        #[serde(default)]
-        completed: Vec<FactorKind>,
+        /// Factor kinds that have already been verified in this flow, each
+        /// with the time it was verified, in the order they were completed.
+        /// Carried into [`AuthState::Authenticated::factors_completed`] on
+        /// transition so audit events can record the full list. A session
+        /// written before the times were kept reads each of its factors as
+        /// verified at the Unix epoch: the row knows no better, and that
+        /// never passes a freshness check.
+        completed: Vec<(FactorKind, DateTime<Utc>)>,
         /// Number of failed attempts on the current factor step.
         attempt_count: u32,
         /// Timestamp of last attempt (for rate limiting / lockout).
@@ -272,13 +273,13 @@ pub enum AuthState {
         /// The groups the directory returned when an LDAP bind step of this
         /// login verified, carried into
         /// [`AuthState::Authenticated::ldap_groups`]; `None` until then.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         ldap_groups: Option<Vec<String>>,
         /// The impersonation of the `Authenticated` state a step-up began
         /// from, kept so the state the step-up completes into is still the
         /// administrator's; `None` for a login and for a step-up of the
         /// user's own session.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         impersonator: Option<Impersonation>,
     },
 
@@ -288,18 +289,22 @@ pub enum AuthState {
         user_id: UserId,
         /// Tenant the user belongs to.
         tenant_id: TenantId,
-        /// Wall-clock time when authentication completed (from injectable Clock).
+        /// Wall-clock time when authentication completed (from injectable
+        /// Clock): the moment the most recent factor completed. A step-up
+        /// moves it forward; the factors of the original login keep their
+        /// own times in `factors_completed`.
         authn_time: DateTime<Utc>,
-        /// Factor kinds that were verified to reach this state, in
-        /// completion order. Used by the audit log to distinguish
+        /// Factor kinds that were verified to reach this state, each with
+        /// the time it was verified, in completion order. Used by the audit log to distinguish
         /// "user logged in with password only because the tenant
         /// disables TOTP" (legitimate single-factor) from "user
         /// reached Authenticated without verifying TOTP" (bypass
         /// attack). Empty for sessions whose state predates this
         /// field; `serde(default)` keeps existing serialized
-        /// sessions readable.
-        #[serde(default)]
-        factors_completed: Vec<FactorKind>,
+        /// sessions readable. A session written as a plain list of kinds
+        /// (0.15.0 and earlier) reads each of them as verified at its
+        /// `authn_time`, the only time that row knew.
+        factors_completed: Vec<(FactorKind, DateTime<Utc>)>,
         /// The administrator acting in `user_id`'s name and when the
         /// impersonation began, for a session `begin_impersonation` made;
         /// `None` for the user's own session. Part of the authenticated
@@ -307,7 +312,7 @@ pub enum AuthState {
         /// ends with the state (`end_impersonation`, logout, a new login).
         /// Stored as an object (`{"admin": .., "since": ..}`). Sessions
         /// written before this field read as `None`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         impersonator: Option<Impersonation>,
         /// The groups the directory returned when this login's LDAP bind
         /// factor verified (empty when the provider searches no groups);
@@ -316,7 +321,7 @@ pub enum AuthState {
         /// handler cannot overwrite them, the custom-data cap cannot drop
         /// them, and they end with the state. Read with
         /// `AuthSession::ldap_groups`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none")]
         ldap_groups: Option<Vec<String>>,
     },
 
@@ -343,14 +348,30 @@ pub struct Impersonation {
 }
 
 impl AuthState {
-    /// Return the authenticated user ID if one is associated with this state.
-    pub fn user_id(&self) -> Option<&UserId> {
+    /// The user ID this state names, whatever its progress: also for
+    /// `Identifying`, `Authenticating` and `PendingWorkflow`, where it is
+    /// only a claim the login has not yet proven.
+    ///
+    /// **Not an authorization principal.** Use it for audit attribution and
+    /// for driving the login pipeline. For a principal use
+    /// [`authenticated_user_id`](Self::authenticated_user_id).
+    pub fn pending_user_id(&self) -> Option<&UserId> {
         match self {
             AuthState::Guest => None,
             AuthState::Identifying { user_id, .. } => Some(user_id),
             AuthState::Authenticating { user_id, .. } => Some(user_id),
             AuthState::Authenticated { user_id, .. } => Some(user_id),
             AuthState::PendingWorkflow { user_id, .. } => Some(user_id),
+        }
+    }
+
+    /// The user ID of a fully authenticated state, `None` for every other
+    /// (guest, identifying, authenticating, pending a workflow). The one to
+    /// use as an authorization principal.
+    pub fn authenticated_user_id(&self) -> Option<&UserId> {
+        match self {
+            AuthState::Authenticated { user_id, .. } => Some(user_id),
+            _ => None,
         }
     }
 
@@ -362,6 +383,22 @@ impl AuthState {
             AuthState::Authenticating { tenant_id, .. } => Some(tenant_id),
             AuthState::Authenticated { tenant_id, .. } => Some(tenant_id),
             AuthState::PendingWorkflow { tenant_id, .. } => Some(tenant_id),
+        }
+    }
+
+    /// When `kind` was last verified in this authenticated state, or `None`
+    /// from any other state or when it was not. A step-up that verifies a
+    /// kind again moves its time forward; earlier factors keep theirs.
+    pub fn factor_completed_at(&self, kind: &FactorKind) -> Option<DateTime<Utc>> {
+        match self {
+            AuthState::Authenticated {
+                factors_completed, ..
+            } => factors_completed
+                .iter()
+                .filter(|(k, _)| k == kind)
+                .map(|(_, at)| *at)
+                .max(),
+            _ => None,
         }
     }
 
@@ -567,7 +604,7 @@ impl AuthState {
                 // (not the step's other choices) is what was completed.
                 if let Some(pos) = remaining.iter().position(|step| step.accepts(kind)) {
                     remaining.remove(pos);
-                    completed.push(kind.clone());
+                    completed.push((kind.clone(), authn_time));
                 }
                 if remaining.is_empty() {
                     let uid = *user_id;
@@ -613,29 +650,6 @@ impl AuthState {
     }
 }
 
-/// Read `Authenticating::remaining` as steps, accepting the earlier shape
-/// (a list of factor kinds) as required steps, so a session written by an
-/// earlier release mid-login still loads after an upgrade.
-fn deserialize_remaining_steps<'de, D>(deserializer: D) -> Result<Vec<FactorStep>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StepOrKind {
-        Step(FactorStep),
-        Kind(FactorKind),
-    }
-    let items = Vec::<StepOrKind>::deserialize(deserializer)?;
-    Ok(items
-        .into_iter()
-        .map(|item| match item {
-            StepOrKind::Step(step) => step,
-            StepOrKind::Kind(kind) => FactorStep::Required(kind),
-        })
-        .collect())
-}
-
 /// Result of [`AuthState::advance_factor`].
 ///
 /// The session-level orchestration in `AuthSession::advance_factor`
@@ -668,6 +682,13 @@ pub struct WorkflowState {
     pub total_steps: u32,
     /// When this workflow was initiated.
     pub initiated_at: DateTime<Utc>,
+    /// Lowercase hex SHA-256 of the secret that completes the workflow, when
+    /// it has one (signup). Only the digest is kept in the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_digest: Option<String>,
+    /// When the secret stops being accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_expires_at: Option<DateTime<Utc>>,
 }
 
 impl WorkflowState {
@@ -678,7 +699,17 @@ impl WorkflowState {
             current_step: 0,
             total_steps,
             initiated_at: now,
+            verification_digest: None,
+            verification_expires_at: None,
         }
+    }
+
+    /// Require a secret to complete this workflow: its hex SHA-256 `digest`,
+    /// accepted until `expires_at`.
+    pub fn with_verification(mut self, digest: String, expires_at: DateTime<Utc>) -> Self {
+        self.verification_digest = Some(digest);
+        self.verification_expires_at = Some(expires_at);
+        self
     }
 }
 
@@ -695,8 +726,10 @@ pub enum WorkflowKind {
     Custom(Arc<str>),
 }
 
+mod wire;
+use wire::AuthStateWire;
 mod merge;
-pub(crate) use merge::merge_concurrent;
+pub(crate) use merge::{merge_concurrent, merge_rotating};
 
 #[cfg(test)]
 mod tests;

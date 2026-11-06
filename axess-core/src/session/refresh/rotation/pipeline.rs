@@ -47,21 +47,19 @@ pub(in crate::session::refresh) enum DeviceRefusal {
     Store(String),
 }
 
-/// The status predicate of a refresh that has none: only the deprecated
-/// entry points that skip the check build one.
-pub(in crate::session::refresh) type NoStatusCheck = fn(&UserId) -> std::future::Ready<bool>;
-
 /// A refresh of a session from a refresh token: the one entry point.
 ///
-/// Build it with [`new`](Self::new), which takes the token and the
-/// account-status predicate, add the checks the request needs
-/// ([`in_tenant`](Self::in_tenant), [`device_info`](Self::device_info),
-/// [`device_store`](Self::device_store)), and [`run`](Self::run) it:
+/// Build it with [`new`](Self::new), which takes the token, the tenant the
+/// request belongs to and the account-status predicate, add the checks the
+/// request needs ([`device_info`](Self::device_info),
+/// [`device_store`](Self::device_store)), and [`run`](Self::run) it. A route
+/// that really serves every tenant builds it with
+/// [`any_tenant`](Self::any_tenant) instead, which says so:
 ///
 /// ```ignore
 /// use axess_core::session::refresh::Refresh;
 ///
-/// let (session, rotated) = Refresh::new(&plaintext, |user_id| async move {
+/// let (session, rotated) = Refresh::new(&plaintext, &tenant, |user_id| async move {
 ///         // `identity` is the application's IdentityStore.
 ///         identity
 ///             .account_status(user_id)
@@ -70,7 +68,6 @@ pub(in crate::session::refresh) type NoStatusCheck = fn(&UserId) -> std::future:
 ///             .map(|status| status.effective_at(now).allows_login())
 ///             .unwrap_or(false) // fail closed on store errors
 ///     })
-///     .in_tenant(&tenant)
 ///     .device_info(Some(fingerprint))
 ///     .device_store(&devices)
 ///     .run(&refresh_store, &config, &rng, now)
@@ -81,7 +78,7 @@ pub(in crate::session::refresh) type NoStatusCheck = fn(&UserId) -> std::future:
 ///
 /// The config is checked; the token is located under the current pepper,
 /// then the previous one; a token of another tenant than
-/// [`in_tenant`](Self::in_tenant)'s is [`RefreshError::NotFound`]; a revoked
+/// [`new`](Self::new)'s is [`RefreshError::NotFound`]; a revoked
 /// token takes the reuse response (a rotated-out token revokes its family);
 /// an expired token is [`RefreshError::Expired`]; the status predicate
 /// refuses with [`RefreshError::AccountInactive`]; the device gate refuses
@@ -114,19 +111,44 @@ pub struct Refresh<'a, F> {
     device_info: Option<&'a str>,
     #[cfg(feature = "device")]
     device: Option<Box<dyn DeviceGate + 'a>>,
-    status: Option<F>,
+    status: F,
 }
 
 impl<'a, F> Refresh<'a, F> {
     /// A refresh of the session `plaintext` (the refresh token the client
-    /// presented) stands for, gated by `status_check(&user_id)`: a `false`
-    /// refuses with [`RefreshError::AccountInactive`] without rotating.
+    /// presented) for a request that belongs to `tenant` (a host name, a path
+    /// segment), gated by `status_check(&user_id)`: a `false` refuses with
+    /// [`RefreshError::AccountInactive`] without rotating.
+    ///
+    /// A token of another tenant answers [`RefreshError::NotFound`] before
+    /// anything else is read or written, exactly as an unknown token does,
+    /// so a token cannot be redeemed against a tenant it was not issued for.
     ///
     /// Pass a predicate that reads the account's status (suspended,
     /// terminated) from the application's identity store and fails closed
     /// on its errors. A caller that really has nothing to consult (its
     /// route is gated upstream) passes `|_| async { true }` and says so.
-    pub fn new<Fut>(plaintext: &'a str, status_check: F) -> Self
+    pub fn new<Fut>(plaintext: &'a str, tenant: &'a TenantId, status_check: F) -> Self
+    where
+        F: FnOnce(&UserId) -> Fut,
+        Fut: Future<Output = bool>,
+    {
+        Self {
+            plaintext,
+            tenant: Some(tenant),
+            device_info: None,
+            #[cfg(feature = "device")]
+            device: None,
+            status: status_check,
+        }
+    }
+
+    /// [`new`](Self::new) for a route that serves every tenant: the token's
+    /// own tenant is not compared with the request's, so a token issued to
+    /// any tenant is redeemed here. The opt-out of the tenant check; use it
+    /// only where the token alone names the tenant (a single-tenant
+    /// deployment, a tenant-less host) and say so.
+    pub fn any_tenant<Fut>(plaintext: &'a str, status_check: F) -> Self
     where
         F: FnOnce(&UserId) -> Fut,
         Fut: Future<Output = bool>,
@@ -137,18 +159,8 @@ impl<'a, F> Refresh<'a, F> {
             device_info: None,
             #[cfg(feature = "device")]
             device: None,
-            status: Some(status_check),
+            status: status_check,
         }
-    }
-
-    /// Refresh only a token of `tenant`, the tenant the request belongs to
-    /// (a host name, a path segment). A token of another tenant answers
-    /// [`RefreshError::NotFound`] before anything else is read or written,
-    /// exactly as an unknown token does, so a token cannot be redeemed
-    /// against a tenant it was not issued for.
-    pub fn in_tenant(mut self, tenant: &'a TenantId) -> Self {
-        self.tenant = Some(tenant);
-        self
     }
 
     /// The device fingerprint the request presents. A token issued with a
@@ -195,6 +207,9 @@ impl<'a, F> Refresh<'a, F> {
         Fut: Future<Output = bool>,
     {
         config.check()?;
+        config
+            .validate_device_info(self.device_info.is_some())
+            .map_err(RefreshError::InvalidConfig)?;
         let found = locate(self.plaintext, store, config)
             .await
             .map_err(RefreshError::Store)?
@@ -229,21 +244,6 @@ impl<'a, F> Refresh<'a, F> {
             session,
             config.rotation.then_some((new_plaintext, new_record)),
         ))
-    }
-}
-
-impl<'a> Refresh<'a, NoStatusCheck> {
-    /// A refresh that does not consult the account's status: only the
-    /// deprecated entry points that skip the check build one.
-    pub(in crate::session::refresh) fn without_status_check(plaintext: &'a str) -> Self {
-        Self {
-            plaintext,
-            tenant: None,
-            device_info: None,
-            #[cfg(feature = "device")]
-            device: None,
-            status: None,
-        }
     }
 }
 
@@ -291,20 +291,18 @@ where
     Ok(())
 }
 
-/// The caller's account-status predicate, when it has one, refuses the
-/// refresh of an account that may no longer log in.
+/// The caller's account-status predicate refuses the refresh of an account
+/// that may no longer log in.
 async fn check_status<E, FStat, Fut>(
     record: &RefreshToken,
-    status: Option<FStat>,
+    status: FStat,
 ) -> Result<(), RefreshError<E>>
 where
     E: std::error::Error + Send + Sync + 'static,
     FStat: FnOnce(&UserId) -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    if let Some(status) = status
-        && !status(&record.user_id).await
-    {
+    if !status(&record.user_id).await {
         tracing::warn!(
             user_id = %record.user_id,
             "refresh refused; caller-supplied status check returned false"
@@ -418,14 +416,18 @@ fn replacement_for(
             Some(record.authenticated_at()),
         ))
     } else if under_previous_pepper {
-        Some(build_refresh_token_for(
+        let (plaintext, mut moved) = build_refresh_token_for(
             plaintext.to_string(),
             child_of(record, child_device_info),
             config,
             rng,
             now,
             Some(record.authenticated_at()),
-        ))
+        );
+        // A change of key, not a new grant: the token ends when it was due
+        // to, however often a pepper rotation re-stores it.
+        moved.expires_at = record.expires_at;
+        Some((plaintext, moved))
     } else {
         None
     }

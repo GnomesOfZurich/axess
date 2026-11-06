@@ -44,7 +44,9 @@ use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, Header, encode};
 use tokio::sync::RwLock as AsyncRwLock;
 
-use self::primitives::{build_claims_json, enforce_max_ttl_fallible, key_algorithm_to_algorithm};
+use self::primitives::{
+    TtlRefusal, build_claims_json, enforce_max_ttl_fallible, key_algorithm_to_algorithm,
+};
 
 // Primitives live in `crate::local_idp::primitives`; the test fixture in
 // `crate::testing::local_idp` imports them. Adopters write
@@ -70,64 +72,8 @@ pub mod discovery;
 
 pub use discovery::LocalIdpMetadata;
 
-// ── Errors ────────────────────────────────────────────────────────────────────
-
-/// Errors from `LocalIdp` issuance and key-store operations.
-///
-/// Parameterised over the key store's error type so that backend
-/// errors propagate with their original type, mirroring the shape of
-/// [`crate::authn::error::AuthnError`].
-#[derive(Debug, thiserror::Error)]
-pub enum IssuanceError<KE: std::error::Error + Send + Sync + 'static> {
-    /// The claim set's lifetime, `exp` less the IdP clock's now, exceeds
-    /// the configured `max_ttl` cap. The lifetime is never measured from
-    /// the claim set's `iat`, so a backdated `iat` cannot stretch it.
-    /// Production refuses the mint rather than producing a token a
-    /// downstream verifier would honour despite the policy.
-    #[error("token lifetime {observed} exceeds configured max-TTL {max}")]
-    LifetimeExceedsCap {
-        /// The computed lifetime of the proposed token.
-        observed: Duration,
-        /// The configured cap.
-        max: Duration,
-    },
-    /// The claim set names no audience and the IdP was not told to allow
-    /// that. A token without `aud` is accepted by every verifier that does
-    /// not pin an audience, so minting one is an explicit choice
-    /// ([`LocalIdp::allow_no_audience`]). An `aud` entry that is the empty
-    /// string names nobody and is refused on the same terms, whatever else
-    /// the list holds.
-    #[error("refusing to mint a token with no audience")]
-    MissingAudience,
-    /// The key asked to be retired is the current signing key. Rotate to a
-    /// new key first, then retire the old one.
-    #[error("the current signing key cannot be retired")]
-    RetireCurrentKey,
-    /// The underlying `LocalIdpKeyStore` surfaced an error during
-    /// load or rotation. The original backend error is preserved
-    /// as `#[source]`.
-    #[error("key store error")]
-    KeyStore(#[source] KE),
-    /// A rotation offered a key whose `kid` is already in the JWKS (the
-    /// current key or a historical one). Two keys under one `kid` make
-    /// verifiers pick either, so the rotation is refused and nothing
-    /// changes.
-    #[error("signing key id {kid:?} is already in use")]
-    DuplicateKeyId {
-        /// The `kid` that collided.
-        kid: String,
-    },
-    /// A key offered for rotation, or loaded from the store, has an empty
-    /// `kid`. No token header can name it, so the key set is refused and
-    /// nothing changes.
-    #[error("signing key id is empty")]
-    EmptyKeyId,
-    /// JWT encoding failed. In practice this never fires for valid
-    /// `LocalIdpSigningKey` material plus a well-formed `MintClaims`,
-    /// but the `jsonwebtoken::encode` return type forces the path.
-    #[error("JWT encoding error: {0}")]
-    Encoding(String),
-}
+mod errors;
+pub use errors::{IssuanceError, LifetimeFault};
 
 // ── Key store ────────────────────────────────────────────────────────────────
 
@@ -367,7 +313,8 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
     /// claim sets; the lifetime is `exp` less the IdP clock's now. Contrast with
     /// [`crate::testing::local_idp::LocalIdpFixture::with_max_ttl`],
     /// which panics at the misuse site (fixture mints have no error
-    /// channel because they're test-time).
+    /// channel because they're test-time). A cap of zero or less admits no
+    /// token: every mint is refused with [`IssuanceError::InvalidLifetime`].
     pub fn with_max_ttl(mut self, ttl: Duration) -> Self {
         self.max_ttl = Some(ttl);
         self
@@ -430,8 +377,12 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
 
         if let Some(max_ttl) = self.max_ttl {
             let now = self.clock.now();
-            enforce_max_ttl_fallible(claims, max_ttl, now)
-                .map_err(|(observed, max)| IssuanceError::LifetimeExceedsCap { observed, max })?;
+            enforce_max_ttl_fallible(claims, max_ttl, now).map_err(|refusal| match refusal {
+                TtlRefusal::Exceeds { observed, max } => {
+                    IssuanceError::LifetimeExceedsCap { observed, max }
+                }
+                TtlRefusal::Invalid(fault) => IssuanceError::InvalidLifetime(fault),
+            })?;
         }
 
         if self.require_audience
@@ -456,7 +407,7 @@ impl<K: LocalIdpKeyStore> LocalIdp<K> {
         // adopter and a dependency that chose differently) it cannot, and
         // would panic here.
         axess_factors::jwt::ensure_crypto_provider();
-        let token = encode(&header, &claims_json, &key)
+        let token = encode(&header, &claims_json, key)
             .map_err(|e| IssuanceError::Encoding(e.to_string()))?;
 
         if let Some(listener) = &self.issuance_listener {

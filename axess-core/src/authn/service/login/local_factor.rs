@@ -64,7 +64,7 @@ where
         .await?;
 
         let close = |updated: crate::authn::factor::FactorConfig| -> Result<crate::authn::factor::FactorConfig, AuthnError<I::Error>> {
-            factor_secrets::close(cipher, &opened, updated, &user_scope, &current_kind)
+            factor_secrets::close(cipher, self.inner.allow_plaintext_factor_secrets, &opened, updated, &user_scope, &current_kind)
                 .map_err(|e| {
                     tracing::error!(error = %e, factor = %current_kind, "factor secret cannot be sealed");
                     AuthnError::Internal(e.to_string())
@@ -123,6 +123,7 @@ where
         self.inner.metrics.factor_success();
 
         self.release_guess(reserved, user_id).await;
+        self.clear_throttle_for(user_id, tenant_id).await;
         self.rehash_outdated_password(credential, &config, &resolved_from, user_id, tenant_id)
             .await;
 

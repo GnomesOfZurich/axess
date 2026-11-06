@@ -295,6 +295,21 @@ async fn the_registry_and_identity_checks_overlap() {
                 answer
             })
         }
+        fn liveness<'a>(
+            &'a self,
+            user_id: &'a crate::authn::ids::UserId,
+            session_id: &'a crate::session::id::SessionId,
+        ) -> Pin<Box<dyn Future<Output = crate::session::store::SessionLiveness> + Send + 'a>>
+        {
+            use crate::session::store::SessionLiveness;
+            Box::pin(async move {
+                if self.is_valid(user_id, session_id).await {
+                    SessionLiveness::Valid
+                } else {
+                    SessionLiveness::Gone
+                }
+            })
+        }
         fn register<'a>(
             &'a self,
             _: &'a crate::authn::ids::UserId,

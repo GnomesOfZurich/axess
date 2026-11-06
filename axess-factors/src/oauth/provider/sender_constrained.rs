@@ -218,7 +218,17 @@ impl OAuthProviderConfig {
                 crate::http_body::MAX_TOKEN_BODY_BYTES,
             )
             .await
-            .map_err(|e| OAuthError::TokenExchange(format!("response read failed: {e}")))?;
+            .map_err(|e| match e {
+                // The connection broke mid-answer: the IdP may answer whole
+                // next time, so this is a failure a retry can cure.
+                crate::http_body::BodyError::Read(_) => {
+                    tracing::warn!(error = %e, status = status.as_u16(), "{what} answer was cut off");
+                    OAuthError::transient(Some(status.as_u16()))
+                }
+                crate::http_body::BodyError::TooLarge { .. } => {
+                    OAuthError::TokenExchange(format!("response read failed: {e}"))
+                }
+            })?;
             Ok(FormAnswer {
                 status,
                 nonce,

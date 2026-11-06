@@ -217,16 +217,19 @@ specifically to avoid leaking that. A silently-succeeding default would
 have been worse, since recovery would appear to work while no token was
 ever stored.
 
-`begin_password_reset` can also hold a per-identifier cooldown:
-`AuthnServiceBuilder::with_password_reset_cooldown` makes a second request
+`begin_password_reset` holds a per-identifier cooldown, 60 seconds unless
+`AuthnServiceBuilder::with_password_reset_cooldown` sets another window or
+`without_password_reset_cooldown` removes it. It makes a second request
 for the same tenant and identifier inside the window answer `Ok(None)`, as
 an unknown identifier does. The key is the identifier as typed, whether or
 not an account has it, so the cooldown tells a caller nothing about who is
-registered. The record is per process and holds the 100,000 most recent
-identifiers, so a caller who submits that many distinct identifiers inside
-the window pushes an earlier one out: the cooldown limits repeat requests,
-not a caller who mints identifiers. Put the route behind a shared rate limit
-as well, which is the bound for that and for several instances.
+registered. The record is per process and holds at most 100,000 identifiers,
+each for the window and no longer. A cooldown that has not run out is never
+pushed out by other identifiers, so a flood of them cannot clear one
+person's; when that many are live, a new identifier is answered `Ok(None)`
+until one runs out, so a caller who mints identifiers can hold the route shut
+for a window at a time. Put the route behind a shared rate limit as well,
+which is the bound for that and for several instances.
 
 A completed reset invalidates the user's registered cookie sessions, which
 does not reach refresh tokens: they are a separate credential that mints a
@@ -344,6 +347,20 @@ the lockout's end comes from `duration`, so an indefinite lockout, or
 one longer than the window, is not ended by the window. The sqlite
 example's `failed_attempts` and `reserve_attempt` show the condition.
 
+The throttle beside the lock is three more methods, keyed on a
+`ThrottleSubject` (tenant, user and, under the default
+`ThrottleKey::AccountAndAddress`, the client address) that the library
+builds from the request: `throttle_state` reads the consecutive failures
+and the time of the last as a `ThrottleState`, `record_throttle_failure`
+adds one at the store's now, in one atomic step as `record_failed_attempt`
+is, and `clear_throttle` forgets the key when a guess is right. None has
+a default body: a store that silently reported nothing would leave every
+account unthrottled. An entry older than `Throttle::forget_after` (twice
+the longest delay) is as good as absent, and a store must not let such
+entries grow without bound: the sqlite example sweeps them in
+`record_throttle_failure` with one `DELETE` before its upsert, and the
+in-memory stores drop them from the map on every record.
+
 `IdentityAdmin` is the privileged writes. `create_tenant` and
 `create_user` are the provisioning verbs, and `create_user` takes an
 already-built `User`, so identifier generation and defaulting happen in
@@ -351,6 +368,58 @@ your code, not behind the trait. `activate_user` moves a user out of
 the pending state. The rest of the tier is suspension and deletion.
 Password history and reset tokens used to live here; they are capability
 traits of their own now, for the reasons above.
+
+### A suspension says why
+
+`Pending`, `Suspended`, `Terminated` and `Archived` each carry a
+`StatusDetail`: a `reason` for display, `since`, an optional `until`, and
+a `cause`. The cause is a `StatusCause`, and it says what put the account
+in the state:
+
+- `Administrative`: an operator's act, `suspend_user` from a console or
+  your own tooling. It ends when an operator ends it, or at `until` when
+  the operator set one.
+- `Verification`: the account awaits activation, an email or a document
+  check. `activate_user` ends it.
+- `Lockout`: a store materialises a failed-attempt lockout as a stored
+  state. Axess itself never writes this one: its lockout is derived from
+  `failed_attempts` at every gate and is never an `EntityState`. The
+  variant exists so a store that keeps a lock in its status column can
+  say so, and so a reader never has to guess it from `reason`.
+- `Closure`: the account is closed; `Terminated` and `Archived` carry it.
+- `Other(key)`: your own cause under a short machine key. A row written
+  before the field existed reads as `Other("unspecified")`.
+
+Build a detail with the constructor that names its cause,
+`StatusDetail::administrative(reason, since)`, `verification`, `lockout`,
+`closure` or `other(key, reason, since)`, and `.with_until(Some(t))` for
+a timed one. A store that keeps its own status columns writes the cause
+beside them so it reads back; the sqlite example keeps a `status_cause`
+column.
+
+Two questions an eligibility check asks are methods on `EntityState`, so
+nobody keys a decision on the spelling of `reason`:
+
+- `is_administratively_disabled()`: did an operator put this account out
+  of service? True for any detail-carrying state whose cause is
+  `Administrative`.
+- `can_self_recover()`: may the person start a recovery themselves, a
+  second-factor reset or a password reset that bypasses the login? True
+  for `Active` and for `Suspended` with cause `Lockout`, and for nothing
+  else: not an administrative suspension, not a closure, not a pending
+  verification, not an unspecified cause. The account a lockout holds is
+  exactly who recovery exists for; the account an operator disabled must
+  never pass.
+
+Ask them of `effective_at(now)`, so a timed suspension that has ended
+answers as the active account it is.
+
+The login path answers an error-level union. `AuthnError::Locked` is the
+counter's lockout, which ends by itself, and a `Suspended` account alike;
+`NotActive` is every other state. One message serves a login screen, so
+the error does not separate them, and it says nothing about the state:
+an eligibility decision reads the account's `EntityState` and asks the
+two questions above.
 
 ## Implementing them
 
@@ -470,6 +539,14 @@ increment-then-read above is two statements; under contention, prefer
 whatever single-statement form your database offers (`UPDATE ...
 RETURNING failed_attempts` on PostgreSQL) so two concurrent failures
 cannot both read the same count.
+
+The throttle entry is its own small table, keyed on tenant, user and
+address (the empty string for the account-only key), because one account
+has one counter but as many throttle keys as addresses have guessed at
+it. The sqlite example's `login_throttle` migration and
+`record_throttle_failure` show the shape: an `INSERT ... ON CONFLICT DO
+UPDATE SET failures = failures + 1` so parallel guesses all count, with
+the stale-row sweep beside it.
 
 The audit read is the hottest query in this layer.
 The index (user_id, tenant_id, event_time DESC) makes it cheap; without

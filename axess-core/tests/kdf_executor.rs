@@ -10,7 +10,7 @@ use axess_core::authn::{
     factor::{EmailOtpConfig, FactorConfig, FactorCredential, FactorKind, ZeroizedString},
     service::{AuthnService, FactorOutcome, PrepareOutcome},
     store::{AuthMethod, FactorStore},
-    types::AuthnScope,
+    types::{AuthnScope, LockoutPolicy},
 };
 use axess_core::blocking::KdfExecutor;
 use axess_core::testing::{
@@ -27,7 +27,10 @@ fn password_world(
 ) -> axess_core::authn::service::RequestAuthnService<MockIdentityStore, MockFactorStore> {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
-        .with_user(test_user("u1", "alice"));
+        .with_user(test_user("u1", "alice"))
+        // What a guess costs is under test, so a right one follows a wrong
+        // one at once; the throttle's own cost is tested where it lives.
+        .with_lockout_policy(LockoutPolicy::default().without_throttle());
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());

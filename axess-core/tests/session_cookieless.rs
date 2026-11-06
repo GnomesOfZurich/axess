@@ -33,6 +33,13 @@ struct CountingStore {
 
 impl SessionStore for CountingStore {
     type Error = <MemorySessionStore as SessionStore>::Error;
+    async fn find_sessions_for_user(
+        &self,
+        _: &axess_core::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         self.inner.load(id).await
@@ -118,7 +125,7 @@ fn router_with(store: CountingStore, csrf: CsrfConfig) -> Router {
                 .layer(csrf),
         )
         .layer(
-            SessionLayer::new(store, [42u8; 32])
+            SessionLayer::new(store, axess_core::testing::test_key(42), axess_core::MemorySessionRegistry::new().handle())
                 .with_ttl(Duration::from_secs(3600))
                 .with_secure(false),
         )

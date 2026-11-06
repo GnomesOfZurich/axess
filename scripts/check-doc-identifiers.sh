@@ -50,6 +50,19 @@ ROOT = pathlib.Path(".")
 # *type* had no way through the gate at all and the only recourse was
 # ALLOW, which would have been a false claim about provenance.
 REMOVED = {
+    # 0.16.0: the deprecated `refresh_session_with_status_check_in_tenant`
+    # and its `RefreshScope` argument went with it; the "0.15.0 to 0.16.0"
+    # section names them to say `Refresh::new` replaces each.
+    "RefreshScope",
+    # 0.16.0: `RevocationAwareSocket::is_revoked` went with the close reasons;
+    # the "0.15.0 to 0.16.0" section names it to say `is_closed` replaces it.
+    "RevocationAwareSocket::is_revoked", "is_revoked",
+    # 0.16.0: `EntityState::is_locked` is `is_suspended`; the "0.15.0 to 0.16.0"
+    # section names the old one.
+    "EntityState::is_locked", "is_locked",
+    # 0.16.0: `AuthzStore::new` became `new_unvalidated`, with `try_new` the
+    # validating constructor; the "0.15.0 to 0.16.0" section names the old one.
+    "AuthzStore::new",
     # 0.13.0: the unaddressed v1 service signature; the migration guide names it.
     "ServiceSigner::sign",
     # 0.14.0: the provider settings moved from `OAuthProviderConfig` to
@@ -63,29 +76,29 @@ REMOVED = {
     # section names them to say what replaces them.
     "SidMap::take_subject_sessions", "take_subject_sessions", "SidMap::remove",
     "IdentityLookup::lockout_policy",
-    # Removed in 0.6.0. `docs/production/migrating.md` names it under
+    # Removed in 0.6.0. the migration guide (`docs/production/migrating/`) names it under
     # "0.5.0 to 0.6.0" to say the call has no replacement.
     "ShortString::prefix",
     # Removed in 0.7.0: the runtime policy that checked whether a route had
-    # wired an audit context. `docs/production/migrating.md` names it to say
+    # wired an audit context. the migration guide (`docs/production/migrating/`) names it to say
     # the check is the compiler's now, and `docs/production/audit-events.md`
     # names it to say why the SQL detector outlives it.
     "AuditContextPolicy",
     # Removed in 0.11.0: `verify_reset_token` takes the instant, so the mock
-    # no longer needs a clock of its own. `docs/production/migrating.md`
+    # no longer needs a clock of its own. the migration guide (`docs/production/migrating/`)
     # names it under "0.10.0 to 0.11.0" to say what replaces it.
     "MockIdentityStore::with_clock",
     # Removed in 0.12.0: the public seal and open with an empty AAD, which
-    # bound nothing to the row. `docs/production/migrating.md` names them
+    # bound nothing to the row. the migration guide (`docs/production/migrating/`) names them
     # under "0.11.0 to 0.12.0" to say what replaces them.
     "SessionCrypto::encrypt", "encrypt",
     # Removed in 0.12.0: the store counts, evicts and inserts in one step
-    # through `issue_capped`. `docs/production/migrating.md` names it under
+    # through `issue_capped`. the migration guide (`docs/production/migrating/`) names it under
     # "0.11.0 to 0.12.0" to say what replaces it.
     "RefreshTokenStore::issue_with_eviction", "issue_with_eviction",
     # Removed in 0.13.0: every administrative call names its actor and
     # defaults to the tenant rail, so the variants that left the actor out or
-    # the rail off are gone. `docs/production/migrating.md` names them under
+    # the rail off are gone. the migration guide (`docs/production/migrating/`) names them under
     # "0.12.0 to 0.13.0" to say what replaces them.
     "invalidate_user_sessions_as", "invalidate_session_as",
     "RequestAuthnService::invalidate_user_sessions_as",
@@ -99,11 +112,11 @@ REMOVED = {
     "RequestAuthnService::begin_impersonation_in_tenant",
     # Removed in 0.14.0: hiding a taken identifier at signup is the default,
     # and `with_signup_conflicts_revealed` is the opt-out.
-    # `docs/production/migrating.md` names it under "0.13.0 to 0.14.0".
+    # the migration guide (`docs/production/migrating/`) names it under "0.13.0 to 0.14.0".
     "with_hidden_signup_conflicts", "AuthnServiceBuilder::with_hidden_signup_conflicts",
     # Removed in 0.15.0: `totp-rs` left the dependency tree, and with it the
     # `TotpBuilder` re-export; the `moka-cache` feature and `MokaEntityCache`
-    # went too. `docs/production/migrating.md` names them under "0.14.0 to
+    # went too. the migration guide (`docs/production/migrating/`) names them under "0.14.0 to
     # the next release" to say what replaces them.
     "TotpBuilder", "moka-cache", "MokaEntityCache",
 }

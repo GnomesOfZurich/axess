@@ -59,10 +59,10 @@ async fn recipe_resolves_real_github_shape_token() {
     let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust.clone(), allowlist()),
+        github_actions_mapper(allowlist()),
     );
 
     let principal = resolver.resolve().await.expect("recipe must resolve");
@@ -109,10 +109,10 @@ async fn recipe_rejects_repository_owner_mismatch() {
     let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust, allowlist()),
+        github_actions_mapper(allowlist()),
     );
 
     let err = resolver
@@ -155,10 +155,10 @@ async fn recipe_omits_missing_optional_attributes() {
     let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust, allowlist()),
+        github_actions_mapper(allowlist()),
     );
 
     let Principal::Workload(w) = resolver
@@ -189,10 +189,10 @@ async fn resolve_with(
     WorkloadResolver::<GitHubActionsClaims, _, _>::new(
         verifier,
         trust.clone(),
-        sample_tenant(),
+        |_slug: &str| Some(sample_tenant()),
         Issuer::custom("github_actions").unwrap(),
         token,
-        github_actions_mapper(trust, allow),
+        github_actions_mapper(allow),
     )
     .resolve()
     .await

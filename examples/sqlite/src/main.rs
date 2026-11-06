@@ -16,16 +16,20 @@
 //!
 //! | Username  | Tenant  | Password     |
 //! |-----------|---------|--------------|
-//! | alice     | default | Gnomes2+      |
+//! | alice     | default | Gnomes2+Example |
 //!
 //! ### Password + TOTP login
 //!
 //! | Username  | Tenant  | Password     |
 //! |-----------|---------|--------------|
-//! | bob       | default | Gnomes2+      |
+//! | bob       | default | Gnomes2+Example |
 //!
-//! Bob's TOTP secret is printed in the server log at startup (search for "TOTP secret").
-//! Use any TOTP app (Aegis, Authy, Google Authenticator) to scan it.
+//! The accounts are seeded by a debug build, or by a release build run with
+//! `EXAMPLE_SEED=1`.
+//!
+//! Bob's TOTP secret is printed in the server log at startup, at debug level
+//! on the `dev_seed` target (search for "TOTP secret"; it needs a debug
+//! build). Use any TOTP app (Aegis, Authy, Google Authenticator) to scan it.
 //!
 //! ### Self-service signup + TOTP enrollment
 //!
@@ -37,8 +41,8 @@
 //! ## Database
 //!
 //! SQLite file: `db/axess-example.db` relative to the current working directory.
-//! Migrations run automatically at startup. The DB is seeded with test users on
-//! first run (idempotent; subsequent runs skip existing rows).
+//! Migrations run automatically at startup. When seeding is on, the DB is seeded
+//! with test users on first run (idempotent; subsequent runs skip existing rows).
 //!
 //! ## Session signing key
 //!
@@ -47,7 +51,7 @@
 //! secret store and keep it stable across restarts.**
 
 use axess::SystemClock;
-use axess_example_sqlite::{models, web};
+use axess_example_sqlite::{DEFAULT_LOG_FILTER, models, web};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::{error::Error, str::FromStr};
 use tracing::info;
@@ -56,9 +60,9 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
-        .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(
-            |_| "axess_example_sqlite=debug,axess=debug,sqlx=warn".into(),
-        )))
+        .with(EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
+        ))
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
 
@@ -85,13 +89,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
     sqlx::migrate!().run(&pool).await?;
     info!("Migrations applied");
 
-    // Seed test data (idempotent).
-    let totp_secret =
-        models::backend::seed(&SystemClock, &pool, &web::app::factor_secret_cipher()).await?;
-    info!(
-        totp_secret = %totp_secret,
-        "Test data seeded. Bob's TOTP secret is shown above; scan it with your TOTP app."
-    );
+    // Seed test data (idempotent): a debug build, or EXAMPLE_SEED=1. The
+    // accounts share a published password, so a release build creates none
+    // unless asked.
+    if models::backend::seed_enabled() {
+        let totp_secret =
+            models::backend::seed(&SystemClock, &pool, &web::app::factor_secret_cipher()).await?;
+        info!("Test accounts seeded (see the login page).");
+        // The secret is a credential: it goes to the debug-level `dev_seed`
+        // target, never to an info-level log.
+        tracing::debug!(
+            target: "dev_seed",
+            totp_secret = %totp_secret,
+            "Bob's TOTP secret; scan it with your TOTP app."
+        );
+    } else {
+        info!("Test accounts not seeded (set EXAMPLE_SEED=1 to create them).");
+    }
 
     let (router, session_store) = web::app::build_router(pool).await;
 

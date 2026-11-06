@@ -316,7 +316,7 @@ struct World {
 async fn world() -> World {
     let acme = Idp::start("acme", "client-acme").await;
     let beta = Idp::start("beta", "client-beta").await;
-    let directory: Arc<Directory> = Arc::new(StoredTenantOAuthProviders::new(
+    let directory: Arc<Directory> = Arc::new(StoredTenantOAuthProviders::new_unencrypted(
         MemoryTenantOAuthProviderStore::new(),
     ));
     directory

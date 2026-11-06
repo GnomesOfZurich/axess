@@ -81,7 +81,9 @@ impl LoadPolicy<'static> {
 /// [`SigningKeyRing`]). The session is trusted, but the response MUST
 /// emit a fresh `Set-Cookie` under the current key AND any stored
 /// fingerprint value must be re-computed under the current key so
-/// subsequent requests verify without falling back.
+/// subsequent requests verify without falling back. It is also set when the
+/// load bound an authenticated session that stored no fingerprint, so the
+/// fingerprint is written back.
 pub(crate) struct LoadOutcome {
     pub(crate) id: SessionId,
     pub(crate) data: SessionData,
@@ -119,6 +121,10 @@ pub(crate) struct FinalizeOutcome {
 
 /// An authenticated session whose id changed during a request.
 pub(crate) struct Rotation {
+    /// Whether the session was already authenticated when the request loaded
+    /// it, so the registry held its old id (a login rotates a guest id the
+    /// registry never held).
+    pub(crate) was_authenticated: bool,
     pub(crate) user_id: crate::authn::ids::UserId,
     pub(crate) old_id: SessionId,
     pub(crate) new_id: SessionId,
@@ -170,67 +176,155 @@ where
         .map(|v| v.verified_by_previous)
         .unwrap_or(false);
 
-    let mut session_ended = false;
-    let mut loaded_row = None;
-    let (mut existing_id, mut session_data) = if let Some(verified) = verified {
-        match store.load(&verified.id).await {
-            Ok(Some(mut data)) => {
-                let row = data.clone();
-                if data.migrate() {
-                    tracing::debug!(
-                        new_version = data.version,
-                        "session data migrated to newer schema version"
-                    );
-                }
-                match authenticated_session_verdict(&data, config, policy, &verified.id).await {
-                    SessionVerdict::Keep => {
-                        loaded_row = Some(row);
-                        (Some(verified.id), data)
-                    }
-                    SessionVerdict::End => {
-                        // Revoked or too old: the row must not stay
-                        // Authenticated, so it goes now (best effort), and the
-                        // request runs as a fresh guest.
-                        if let Err(e) = store.delete(&verified.id).await {
-                            tracing::error!(
-                                error = %e,
-                                "deleting an ended session failed; the row may remain until its TTL"
-                            );
-                        }
-                        session_ended = true;
-                        (None, SessionData::default())
-                    }
-                    SessionVerdict::Distrust => (None, SessionData::default()),
-                }
-            }
-            Ok(None) => (None, SessionData::default()),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "session store load failed; falling back to empty session"
-                );
-                (None, SessionData::default())
-            }
-        }
-    } else {
-        (None, SessionData::default())
+    let StoredSession {
+        mut existing_id,
+        data: mut session_data,
+        loaded_row,
+        session_ended,
+    } = match verified {
+        Some(verified) => load_stored_session(store, verified.id, config, policy).await,
+        None => StoredSession::fresh(),
     };
 
-    // Session binding check with rotation fallback. Constant-time
-    // comparison prevents timing side-channels; the previous-key
-    // comparison runs only on current-key mismatch, and only if a
-    // rotated fingerprint was precomputed by the caller.
-    //
-    // On previous-key match, the stored fingerprint is REPLACED with
-    // the current-key value so subsequent requests match on the fast
-    // path without falling back. The session data is thereby marked
-    // for persistence via the modified/rotation_fallback_used signal
-    // read at the finalize + response-cookie stages.
+    let binding = check_binding(&mut session_data, fingerprints, policy);
+    let binding_invalidated = binding.invalidated;
+    if binding_invalidated {
+        // The cookie's id is now untrusted; clear it so a fresh id is
+        // minted below before the inner handler runs. Without this the
+        // in-flight request would still execute under the
+        // attacker-plantable id (the response cookie would only rotate
+        // it on the way out).
+        existing_id = None;
+    }
+    rotation_fallback_used |= binding.fingerprint_rewritten;
+
+    let id = existing_id.unwrap_or_else(|| SessionId::new(rng));
+
+    LoadOutcome {
+        id,
+        data: session_data,
+        existing_id,
+        binding_invalidated,
+        rotation_fallback_used,
+        session_ended,
+        // A binding mismatch distrusts the row after it loaded.
+        loaded_row: existing_id.and(loaded_row),
+    }
+}
+
+/// The stored record behind a verified session cookie, as the load found it.
+struct StoredSession {
+    /// The cookie's id, when the row is trusted so far.
+    existing_id: Option<SessionId>,
+    data: SessionData,
+    /// The row as the store held it, before migration and re-binding.
+    loaded_row: Option<SessionData>,
+    /// The row was refused as revoked or too old, and deleted.
+    session_ended: bool,
+}
+
+impl StoredSession {
+    /// No trusted row: the request runs as a fresh guest.
+    fn fresh() -> Self {
+        Self {
+            existing_id: None,
+            data: SessionData::default(),
+            loaded_row: None,
+            session_ended: false,
+        }
+    }
+}
+
+/// Load, migrate and vet the row of a session whose cookie verified. Any
+/// failure (no row, a store error, a revoked or over-age record) yields a
+/// fresh guest; a revoked or over-age row is deleted on the way.
+async fn load_stored_session<S>(
+    store: &S,
+    id: SessionId,
+    config: &SessionConfig,
+    policy: &LoadPolicy<'_>,
+) -> StoredSession
+where
+    S: SessionStore + Send + Sync + 'static,
+    S::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    match store.load(&id).await {
+        Ok(Some(mut data)) => {
+            let row = data.clone();
+            if data.migrate() {
+                tracing::debug!(
+                    new_version = data.version,
+                    "session data migrated to newer schema version"
+                );
+            }
+            match authenticated_session_verdict(&data, config, policy, &id).await {
+                SessionVerdict::Keep => StoredSession {
+                    existing_id: Some(id),
+                    data,
+                    loaded_row: Some(row),
+                    session_ended: false,
+                },
+                SessionVerdict::End => {
+                    // Revoked or too old: the row must not stay
+                    // Authenticated, so it goes now (best effort), and the
+                    // request runs as a fresh guest.
+                    if let Err(e) = store.delete(&id).await {
+                        tracing::error!(
+                            error = %e,
+                            "deleting an ended session failed; the row may remain until its TTL"
+                        );
+                    }
+                    StoredSession {
+                        session_ended: true,
+                        ..StoredSession::fresh()
+                    }
+                }
+                SessionVerdict::Distrust => StoredSession::fresh(),
+            }
+        }
+        Ok(None) => StoredSession::fresh(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "session store load failed; falling back to empty session"
+            );
+            StoredSession::fresh()
+        }
+    }
+}
+
+/// What [`check_binding`] did to a loaded session.
+struct BindingCheck {
+    /// The fingerprint mismatched and the session was reset to a guest.
+    invalidated: bool,
+    /// The stored fingerprint was rewritten (re-keyed or first bound), so the
+    /// response must persist it and re-issue the cookie.
+    fingerprint_rewritten: bool,
+}
+
+/// Session binding check with rotation fallback. Constant-time
+/// comparison prevents timing side-channels; the previous-key
+/// comparison runs only on current-key mismatch, and only if a
+/// rotated fingerprint was precomputed by the caller.
+///
+/// On previous-key match, the stored fingerprint is REPLACED with
+/// the current-key value so subsequent requests match on the fast
+/// path without falling back. The session data is thereby marked
+/// for persistence via the `fingerprint_rewritten` signal read at the
+/// finalize and response-cookie stages.
+fn check_binding(
+    session_data: &mut SessionData,
+    fingerprints: Fingerprints<'_>,
+    policy: &LoadPolicy<'_>,
+) -> BindingCheck {
     let Fingerprints {
         current: current_fingerprint,
         previous: previous_fingerprint,
     } = fingerprints;
-    let mut binding_invalidated = false;
+    let mut check = BindingCheck {
+        invalidated: false,
+        fingerprint_rewritten: false,
+    };
     // A session that was BOUND (it stores a fingerprint) and a request that
     // presents no binding material is a mismatch, not a skip: leaving the
     // material out was the one way a stolen bound session still passed.
@@ -251,7 +345,7 @@ where
                  re-storing under current key"
             );
             session_data.fingerprint = Some(current_hash.to_string());
-            rotation_fallback_used = true;
+            check.fingerprint_rewritten = true;
         } else {
             tracing::warn!(
                 "session fingerprint mismatch; invalidating session (possible hijacking)"
@@ -259,29 +353,23 @@ where
             if let Some(m) = policy.metrics {
                 m.session_binding_mismatch();
             }
-            session_data = SessionData::default();
-            binding_invalidated = true;
-            // The cookie's id is now untrusted; clear it so a fresh id is
-            // minted below before the inner handler runs. Without this the
-            // in-flight request would still execute under the
-            // attacker-plantable id (the response cookie would only rotate
-            // it on the way out).
-            existing_id = None;
+            *session_data = SessionData::default();
+            check.invalidated = true;
         }
+    } else if !session_data.auth_state.is_guest()
+        && let Some(current_hash) = current_fingerprint
+    {
+        // A session past `Guest` that stores no fingerprint (it was stored
+        // before binding was turned on, or on a path that bound nothing) is
+        // bound to this client now, so that every later request is checked
+        // against it. Binding is configured exactly when a request yields a
+        // fingerprint: the layer binds a request without material to a fixed
+        // value, so none is a request the binding does not apply to.
+        tracing::info!("binding an authenticated session that stored no fingerprint");
+        session_data.fingerprint = Some(current_hash.to_string());
+        check.fingerprint_rewritten = true;
     }
-
-    let id = existing_id.unwrap_or_else(|| SessionId::new(rng));
-
-    LoadOutcome {
-        id,
-        data: session_data,
-        existing_id,
-        binding_invalidated,
-        rotation_fallback_used,
-        session_ended,
-        // A binding mismatch distrusts the row after it loaded.
-        loaded_row: existing_id.and(loaded_row),
-    }
+    check
 }
 
 /// What to do with a stored session after it loaded.
@@ -351,13 +439,23 @@ pub(crate) use registry::settle_registry;
 
 /// Keep a response that sets a session or CSRF cookie out of shared caches.
 ///
-/// Adds `Cache-Control: no-store` when the handler set none (a handler's own
-/// choice is left alone) and names `Cookie` in `Vary` unless it is already
-/// there, so a cache that stores the response anyway does not serve one
-/// client's cookie to another.
+/// Sets `Cache-Control: no-store` unless the handler's own policy already
+/// keeps the response out of shared caches (it names `no-store` or
+/// `private`); any other policy, `public, max-age=600` included, is replaced,
+/// since a shared cache that stored it would serve one client's cookie to
+/// another. It also names `Cookie` in `Vary` unless it is already there, for a
+/// cache that stores the response anyway.
 pub(crate) fn mark_cookie_response(headers: &mut axum::http::HeaderMap) {
     use axum::http::{HeaderValue, header};
-    if !headers.contains_key(header::CACHE_CONTROL) {
+    let refused = headers.get_all(header::CACHE_CONTROL).iter().any(|v| {
+        v.to_str().is_ok_and(|v| {
+            v.split(',').map(str::trim).any(|directive| {
+                let name = directive.split('=').next().unwrap_or_default().trim();
+                name.eq_ignore_ascii_case("no-store") || name.eq_ignore_ascii_case("private")
+            })
+        })
+    });
+    if !refused {
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
     let varies_on_cookie = headers.get_all(header::VARY).iter().any(|v| {
@@ -434,3 +532,6 @@ mod policy_tests;
 
 #[cfg(test)]
 mod concurrency_tests;
+
+#[cfg(test)]
+mod reread_tests;

@@ -7,6 +7,7 @@
 
 #![cfg(all(feature = "memory", feature = "authz"))]
 
+use axess::testing::AuthSessionTestExt;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,6 +23,17 @@ use axum::{
 };
 use cedar_policy::{Context, Entities, Entity, EntityUid, RestrictedExpression};
 use tower::ServiceExt;
+
+/// A validator without a registry: the session record decides, which is all
+/// these tests exercise.
+fn session_validator() -> axess::authn::SessionValidator {
+    axess::authn::AuthnService::builder(
+        axess::testing::MockIdentityStore::new(),
+        axess::testing::MockFactorStore::new(),
+    )
+    .build()
+    .session_validator()
+}
 
 const EXAMPLE_POLICY: &str = include_str!("../../examples/authz/policies/app.cedar");
 const EXAMPLE_SCHEMA: &str = include_str!("../../examples/authz/policies/app.cedarschema.json");
@@ -54,7 +66,7 @@ const GUARDED_SCHEMA: &str = r#"{
 }"#;
 
 fn session_layer() -> SessionLayer<MemorySessionStore> {
-    SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
+    SessionLayer::without_registry_insecure(MemorySessionStore::new(), axess::testing::test_key(42))
         .with_ttl(std::time::Duration::from_secs(3600))
         .with_secure(false)
 }
@@ -151,7 +163,8 @@ fn app(setup: Setup, namespace: &'static str) -> Router {
             get(|| async { "deleted" }).layer(require_authz!(
                 namespace,
                 "DeleteDocument",
-                "Document:{id}"
+                "Document:{id}",
+                validator = session_validator()
             )),
         )
         .route(
@@ -159,12 +172,18 @@ fn app(setup: Setup, namespace: &'static str) -> Router {
             get(|| async { "viewed" }).layer(require_authz!(
                 namespace,
                 "ViewDocument",
-                "Document:{id}"
+                "Document:{id}",
+                validator = session_validator()
             )),
         )
         .route(
             "/app/{id}",
-            get(|| async { "viewed" }).layer(require_authz!(namespace, "View", "Doc:{id}")),
+            get(|| async { "viewed" }).layer(require_authz!(
+                namespace,
+                "View",
+                "Doc:{id}",
+                validator = session_validator()
+            )),
         )
         .route(
             "/login",

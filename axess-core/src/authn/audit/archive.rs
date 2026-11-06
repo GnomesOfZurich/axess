@@ -55,6 +55,9 @@
 use crate::authn::event::AuthEvent;
 use std::time::Duration;
 
+mod skipped;
+use skipped::Skipped;
+
 /// Stable identity of one archive batch.
 ///
 /// Derived from the source id of every event in the batch, so the retention
@@ -403,6 +406,8 @@ where
     tick_interval: Duration,
     batch_size: usize,
     clock: std::sync::Arc<dyn axess_clock::Clock>,
+    /// Rows the sink keeps refusing, which the selection steps past.
+    skipped: std::sync::Mutex<Skipped>,
 }
 
 impl<S, A> AuditRetentionLoop<S, A>
@@ -420,6 +425,7 @@ where
             tick_interval: Duration::from_secs(3600),
             batch_size: 10_000,
             clock: std::sync::Arc::new(axess_clock::SystemClock),
+            skipped: std::sync::Mutex::default(),
         }
     }
 
@@ -462,6 +468,14 @@ where
     /// purge runs whatever the archive step did, so a sink that is down, or a
     /// row that is refused for good, does not stop archived rows from leaving
     /// the hot table. An error from either step is returned after both ran.
+    ///
+    /// A row the sink keeps refusing is set aside, so it cannot hold up the
+    /// rows behind it: at once when the sink took another row in the same tick,
+    /// otherwise (a batch of one, or both ends of a batch refused, which looks
+    /// like a sink that is down) after three refusals in as many ticks. A row
+    /// set aside is left out of the selection for an hour and then offered
+    /// again; the record is kept in the process, so a restart offers every row
+    /// afresh.
     pub async fn tick(&self) -> Result<RetentionTickReport, RetentionError<S::Error, A::Error>> {
         let (report, result) = self.tick_with_report().await;
         result.map(|()| report)
@@ -498,11 +512,27 @@ where
         cutoff: chrono::DateTime<chrono::Utc>,
         report: &mut RetentionTickReport,
     ) -> Result<(), RetentionError<S::Error, A::Error>> {
+        // Rows set aside as refused are asked for on top of the batch size
+        // and left out, so the rows behind them are reached however small
+        // the batch is.
+        let held = {
+            let mut skipped = self.skipped.lock().unwrap_or_else(|e| e.into_inner());
+            skipped.expire(now);
+            skipped.held()
+        };
         let batch = self
             .source
-            .select_unarchived_before(cutoff, self.batch_size)
+            .select_unarchived_before(cutoff, self.batch_size.saturating_add(held))
             .await
             .map_err(RetentionError::Source)?;
+        let batch: Vec<_> = {
+            let skipped = self.skipped.lock().unwrap_or_else(|e| e.into_inner());
+            batch
+                .into_iter()
+                .filter(|(id, _)| !skipped.is_held(&id.to_string()))
+                .take(self.batch_size)
+                .collect()
+        };
         if batch.is_empty() {
             return Ok(());
         }
@@ -515,9 +545,13 @@ where
                     .await
                     .map_err(RetentionError::Source)?;
                 report.archived = events.len() as u64;
+                self.forget_refusals(&ids);
                 return Ok(());
             }
-            Err(e) if ids.len() == 1 => return Err(RetentionError::Archiver(e)),
+            Err(e) if ids.len() == 1 => {
+                self.note_refusals(&ids, false, now);
+                return Err(RetentionError::Archiver(e));
+            }
             Err(e) => e,
         };
         // A sink that is down refuses every call, so offering the rows one by
@@ -527,6 +561,7 @@ where
         // problem and the others are still offered.
         let last = ids.len() - 1;
         let mut taken = Vec::new();
+        let mut refused_ids = Vec::new();
         let mut first_failure = None;
         let mut probed_last = false;
         for probe in [0, last] {
@@ -542,6 +577,11 @@ where
                     break;
                 }
                 Err(_) if probe == last => {
+                    // Nothing was taken, so a bad row at each end cannot be
+                    // told from a sink that is down: both ends are struck,
+                    // and a row refused tick after tick is set aside, which
+                    // lets the rows between them through.
+                    self.note_refusals(&[ids[0].clone(), ids[last].clone()], false, now);
                     tracing::warn!(
                         error = %refused,
                         rows = ids.len(),
@@ -551,6 +591,7 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(row = %ids[probe], error = %e, "audit archive refused a row");
+                    refused_ids.push(ids[probe].clone());
                     first_failure.get_or_insert(e);
                 }
             }
@@ -573,6 +614,7 @@ where
                 Ok(()) => taken.push(id),
                 Err(e) => {
                     tracing::warn!(row = %id, error = %e, "audit archive refused a row");
+                    refused_ids.push(id);
                     first_failure.get_or_insert(e);
                 }
             }
@@ -583,10 +625,28 @@ where
                 .await
                 .map_err(RetentionError::Source)?;
             report.archived = taken.len() as u64;
+            // The sink took rows this tick, so it is up and the rows it
+            // refused are the ones it will not take: they are set aside.
+            self.forget_refusals(&taken);
+            self.note_refusals(&refused_ids, true, now);
         }
         match first_failure {
             Some(e) => Err(RetentionError::Archiver(e)),
             None => Ok(()),
+        }
+    }
+
+    fn note_refusals(&self, ids: &[S::EventId], certain: bool, now: chrono::DateTime<chrono::Utc>) {
+        let mut skipped = self.skipped.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            skipped.refused(id.to_string(), certain, now);
+        }
+    }
+
+    fn forget_refusals(&self, ids: &[S::EventId]) {
+        let mut skipped = self.skipped.lock().unwrap_or_else(|e| e.into_inner());
+        for id in ids {
+            skipped.taken(&id.to_string());
         }
     }
 

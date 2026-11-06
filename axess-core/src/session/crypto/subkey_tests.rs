@@ -3,7 +3,7 @@
 
 use super::*;
 
-const KEY: [u8; 32] = [5u8; 32];
+const KEY: [u8; 32] = crate::testing::test_key(5);
 const A: &[u8] = b"row-a";
 const B: &[u8] = b"row-b";
 
@@ -29,8 +29,8 @@ fn a_repeated_random_draw_does_not_reuse_a_keystream_across_rows() {
     let crypto = SessionCrypto::new(KEY).with_rng(Arc::new(Stuck));
     let (p1, p2) = (b"AAAAAAAAAAAAAAAA", b"BBBBBBBBBBBBBBBB");
 
-    let direct1 = crypto.encrypt_with_aad(&[], p1).unwrap();
-    let direct2 = crypto.encrypt_with_aad(&[], p2).unwrap();
+    let direct1 = crypto.seal_direct(&[], p1).unwrap();
+    let direct2 = crypto.seal_direct(&[], p2).unwrap();
     assert_eq!(
         xor(
             &direct1[NONCE_LEN..NONCE_LEN + 16],
@@ -102,7 +102,7 @@ fn a_subkeyed_blob_opens_only_for_its_row_and_its_salt() {
 
 #[test]
 fn the_earlier_direct_layout_of_the_current_format_is_read_and_stale() {
-    let crypto = SessionCrypto::new(KEY);
+    let crypto = SessionCrypto::new(KEY).with_legacy_blobs(LegacyBlobs::Accept);
     let body = crypto
         .encrypt_with_aad(&BoundFormat::SESSION.aad(A), b"old layout")
         .unwrap();
@@ -126,16 +126,17 @@ fn the_earlier_direct_layout_of_the_current_format_is_read_and_stale() {
 
 #[test]
 fn a_subkeyed_blob_under_the_previous_key_is_stale() {
-    let old = SessionCrypto::new([1u8; 32]);
+    let old = SessionCrypto::new(crate::testing::test_key(1));
     let sealed = old.seal_bound(BoundFormat::SESSION, A, b"rotated").unwrap();
-    let rotated = SessionCrypto::new([2u8; 32]).with_previous_key([1u8; 32]);
+    let rotated = SessionCrypto::new(crate::testing::test_key(2))
+        .with_previous_key(crate::testing::test_key(1));
     let opened = rotated
         .open_bound(BoundFormat::SESSION, A, &[], &sealed)
         .unwrap();
     assert_eq!(opened.plaintext, b"rotated");
     assert!(opened.stale);
     assert!(
-        SessionCrypto::new([2u8; 32])
+        SessionCrypto::new(crate::testing::test_key(2))
             .open_bound(BoundFormat::SESSION, A, &[], &sealed)
             .is_err()
     );

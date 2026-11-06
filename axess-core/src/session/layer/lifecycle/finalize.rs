@@ -3,7 +3,7 @@
 //! wrote, and capping the custom data on whatever is written.
 
 use crate::session::config::SessionConfig;
-use crate::session::data::{SessionData, cap_custom, merge_concurrent};
+use crate::session::data::{SessionData, cap_custom, merge_rotating};
 use crate::session::id::SessionId;
 use crate::session::layer::handle::SessionHandle;
 use crate::session::layer::swap::{StoreError, Swap, Swapped, swap_merging};
@@ -211,34 +211,45 @@ where
 /// is an error: without the row there is no telling what was taken, and the
 /// rotation fails closed rather than carry a copy that may hold it.
 ///
-/// The read and the rotation are two store calls, so a write that lands
-/// between them is still not seen; narrowing that window to nothing takes a
-/// revision-checked `cycle`, which the store trait does not offer.
+/// Returns the revision of the old row the data now stands on, which the
+/// rotation checks (`cycle_if_revision`), so a write landing after this read
+/// is answered as a conflict and merged on the next round instead of lost.
+/// `None` when there is no loaded row to merge from, and so nothing to check.
 async fn merge_concurrent_writes<S>(
     store: &S,
     config: &SessionConfig,
     guard: &mut tokio::sync::RwLockWriteGuard<'_, crate::session::layer::handle::SessionInner>,
     old_id: &SessionId,
-) -> Result<(), StoreError>
+) -> Result<Option<u64>, StoreError>
 where
     S: SessionStore + Send + Sync + 'static,
     S::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let Some(base) = guard.consume.as_ref().and_then(|c| c.loaded.clone()) else {
-        return Ok(());
+        return Ok(None);
     };
     let fresh = match store.load(old_id).await.map_err(StoreError::from)? {
         Some(fresh) if fresh.revision != base.revision => fresh,
-        _ => return Ok(()),
+        _ => return Ok(Some(base.revision)),
     };
     let touched_at = guard.data.touched_at.max(fresh.touched_at);
-    let mut merged = merge_concurrent(&base, &guard.data, &fresh);
+    let mut merged = merge_rotating(&base, &guard.data, &fresh);
     merged.revision = fresh.revision.wrapping_add(1);
     merged.touched_at = touched_at;
     cap_custom(&mut merged.custom, config.max_custom_bytes);
     guard.data = merged;
-    Ok(())
+    // A further round merges onto what was just read, so what it carries over
+    // is this request's own change and not the other request's.
+    let revision = fresh.revision;
+    if let Some(target) = guard.consume.as_mut() {
+        target.loaded = Some(fresh);
+    }
+    Ok(Some(revision))
 }
+
+/// How many times a rotation re-reads the old row after a concurrent write
+/// beat it to the removal, before it gives up and fails closed.
+const CYCLE_ATTEMPTS: usize = 4;
 
 /// What [`cycle_session`] did.
 struct Cycled {
@@ -272,29 +283,54 @@ where
         prev
     });
     let new_id = guard.id;
-    let merged = if existing_id.is_some() {
-        merge_concurrent_writes(store, config, guard, &old_id).await
-    } else {
-        Ok(())
-    };
+    let was_authenticated = guard
+        .consume
+        .as_ref()
+        .and_then(|c| c.loaded.as_ref())
+        .is_some_and(|loaded| loaded.auth_state.is_authenticated());
     // A request that ran under a stored session requires that row to
     // still be live: a logout that removed it while the request ran
     // must not be undone by moving the data to the new id.
     let require_old = existing_id.is_some();
-    let cycled = match merged {
-        Ok(()) => store
-            .cycle(&old_id, &new_id, &guard.data, config.ttl, require_old)
-            .await
-            .map_err(StoreError::from),
-        Err(e) => Err(e),
-    };
+    let mut cycled: Result<CycleOutcome, StoreError> = Ok(CycleOutcome::Conflict);
+    for _ in 0..CYCLE_ATTEMPTS {
+        let merged = if existing_id.is_some() {
+            merge_concurrent_writes(store, config, guard, &old_id).await
+        } else {
+            Ok(None)
+        };
+        // The removal of the old row is conditional on the revision the
+        // merge read, so a write that lands after the read is a conflict, not
+        // a loss: it is merged and the rotation tried again.
+        cycled = match merged {
+            Ok(Some(revision)) => store
+                .cycle_if_revision(
+                    &old_id,
+                    &new_id,
+                    &guard.data,
+                    config.ttl,
+                    require_old,
+                    revision,
+                )
+                .await
+                .map_err(StoreError::from),
+            Ok(None) => store
+                .cycle(&old_id, &new_id, &guard.data, config.ttl, require_old)
+                .await
+                .map_err(StoreError::from),
+            Err(e) => Err(e),
+        };
+        if !matches!(cycled, Ok(CycleOutcome::Conflict)) {
+            break;
+        }
+    }
     match cycled {
         Ok(CycleOutcome::Rotated) => {
-            if guard.data.auth_state.is_authenticated()
-                && let Some(user_id) = guard.data.auth_state.user_id()
+            if let Some(user_id) = guard.data.auth_state.authenticated_user_id()
                 && old_id != new_id
             {
                 rotation = Some(Rotation {
+                    was_authenticated,
                     user_id: *user_id,
                     old_id,
                     new_id,
@@ -303,6 +339,26 @@ where
             Cycled {
                 id: new_id,
                 rotation,
+                cookie: true,
+            }
+        }
+        Ok(CycleOutcome::Conflict) => {
+            // Other requests kept writing the session for every round: fail
+            // closed as for a store that cannot rotate.
+            tracing::error!(
+                "concurrent requests kept writing the session; clearing it (fail closed)"
+            );
+            if let Err(e) = store.delete(&old_id).await {
+                tracing::error!(
+                    error = %e,
+                    "session store delete after a conflicted cycle failed; \
+                     the old session id may authenticate until its TTL"
+                );
+            }
+            guard.data = SessionData::default();
+            Cycled {
+                id: new_id,
+                rotation: None,
                 cookie: true,
             }
         }

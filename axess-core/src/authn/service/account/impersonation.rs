@@ -22,7 +22,8 @@
 //! `AuthnServiceBuilder::with_impersonated_credential_changes_allowed`, the
 //! audit context of a request under impersonation names the administrator
 //! as actor on every row, and `SessionLayer::with_max_impersonation_age`
-//! ends the session once the impersonation is older than the cap.
+//! ends the session once the impersonation is older than the cap (1 hour by
+//! default; `None` lifts it).
 
 use crate::authn::service::RequestAuthnService;
 use crate::authn::{
@@ -229,7 +230,7 @@ where
     ///
     /// In order: the administrator's account must be active, the target's
     /// account must be active, and the target's tenant and the
-    /// administrator's own tenant (read from the session) must both be
+    /// administrator's own tenant (read from the store) must both be
     /// active. Each refusal writes its audit row at `now` and returns the
     /// error; a store failure on the way returns without a row. Nothing of
     /// the session is touched here.
@@ -237,7 +238,6 @@ where
         &self,
         admin_user_id: &crate::authn::ids::UserId,
         target_user: &crate::authn::types::User,
-        session: &AuthSession,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), AuthnError<I::Error>> {
         // A suspended administrator with a session still open cannot take
@@ -284,10 +284,16 @@ where
         }
 
         // The tenant's status gates impersonation as it gates a login: the
-        // target's tenant (the one being entered) and the admin's own (read
-        // from the admin's session) must both be active. A tenant that does
-        // not load refuses (fail closed).
-        let admin_tenant = session.tenant_id().await;
+        // target's tenant (the one being entered) and the admin's own (the
+        // store's record of the administrator, not the tenant the session
+        // names) must both be active. A tenant that does not load refuses
+        // (fail closed).
+        let admin_tenant = self
+            .inner
+            .identity
+            .get_user_tenant(admin_user_id)
+            .await
+            .map_err(AuthnError::Store)?;
         for tenant_id in std::iter::once(target_user.tenant_id).chain(admin_tenant) {
             if let Err(refusal) = self.require_active_tenant(&tenant_id).await {
                 if matches!(refusal, AuthnError::Store(_)) {
@@ -328,7 +334,7 @@ where
             .await?;
         let target_user = &target;
 
-        self.require_impersonation_standing(admin_user_id, target_user, session, now)
+        self.require_impersonation_standing(admin_user_id, target_user, now)
             .await?;
 
         // The admin's own session ends with this call: its cookie is about

@@ -29,6 +29,8 @@ const DEFAULT_COOKIE_NAME: &str = "__Host-axess.sid";
 /// rules, so the unprefixed name is the one that still works.
 const FALLBACK_COOKIE_NAME: &str = "axess.sid";
 const DEFAULT_TTL: Duration = Duration::from_secs(24 * 60 * 60); // 24 hours
+const DEFAULT_MAX_AUTHENTICATED_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
+const DEFAULT_MAX_IMPERSONATION_AGE: Duration = Duration::from_secs(60 * 60); // 1 hour
 /// Default maximum size of serialized custom session data (64 KiB).
 const DEFAULT_MAX_CUSTOM_BYTES: usize = 64 * 1024;
 
@@ -114,17 +116,18 @@ impl SessionConfig {
     }
 
     /// Absolute cap on how long an authenticated session may live, measured
-    /// from the moment it authenticated (default: none, so the sliding
-    /// [`ttl`](Self::ttl) is the only bound). When set, a session whose
-    /// authentication is older than this is ended on its next request,
+    /// from the moment it authenticated (default: 7 days; `None` means no
+    /// cap, so the sliding [`ttl`](Self::ttl) is the only bound). A session
+    /// whose authentication is older than this is ended on its next request,
     /// however recently it was used.
     pub fn max_authenticated_age(&self) -> Option<Duration> {
         self.max_authenticated_age
     }
 
     /// Cap on how long an impersonated session may live, measured from when
-    /// `begin_impersonation` made it (default: none). When set, a session
-    /// whose impersonation is older than this is ended on its next request.
+    /// `begin_impersonation` made it (default: 1 hour; `None` means no cap).
+    /// A session whose impersonation is older than this is ended on its next
+    /// request.
     pub fn max_impersonation_age(&self) -> Option<Duration> {
         self.max_impersonation_age
     }
@@ -141,8 +144,8 @@ impl Default for SessionConfig {
             http_only: true,
             path: "/".into(),
             max_custom_bytes: DEFAULT_MAX_CUSTOM_BYTES,
-            max_authenticated_age: None,
-            max_impersonation_age: None,
+            max_authenticated_age: Some(DEFAULT_MAX_AUTHENTICATED_AGE),
+            max_impersonation_age: Some(DEFAULT_MAX_IMPERSONATION_AGE),
         }
     }
 }
@@ -165,8 +168,9 @@ impl SessionConfig {
     /// Panics (with a message naming the setting) if `ttl` is zero, the
     /// cookie name is empty or not a valid cookie token, a `__Host-` or
     /// `__Secure-` name is used without `Secure`, a `__Host-` name is used
-    /// with a `Path` other than `/`, or `SameSite=None` is used without
-    /// `Secure` (browsers reject that combination).
+    /// with a `Path` other than `/`, `SameSite=None` is used without
+    /// `Secure` (browsers reject that combination), or the path does not
+    /// start with `/` or holds `;` or a control character.
     pub(crate) fn finalize(mut self) -> Self {
         if !self.cookie_name_explicit {
             self.cookie_name = if self.secure && self.path.as_ref() == "/" {
@@ -209,6 +213,10 @@ impl SessionConfig {
             );
         }
         assert!(
+            is_valid_cookie_path(&self.path),
+            "SessionConfig: path must start with '/' and contain no ';' or control characters"
+        );
+        assert!(
             self.max_authenticated_age.is_none_or(|a| !a.is_zero()),
             "SessionConfig: max_authenticated_age must be > 0 (every session would end at once)"
         );
@@ -221,6 +229,13 @@ impl SessionConfig {
             "SessionConfig: `SameSite=None` requires `secure = true` (browsers reject the cookie otherwise)"
         );
     }
+}
+
+/// Whether `path` can be written as a cookie `Path` attribute as given: it
+/// starts with `/` and holds only printable ASCII other than `;`, so it
+/// cannot carry another attribute or break the header.
+pub(crate) fn is_valid_cookie_path(path: &str) -> bool {
+    path.starts_with('/') && path.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b';')
 }
 
 /// RFC 6265 `token` characters: what a cookie name may contain.
@@ -243,6 +258,19 @@ fn is_cookie_token_byte(b: u8) -> bool {
                 | b'|'
                 | b'~'
         )
+}
+
+/// Warn that a path other than `/` makes an unnamed cookie lose its
+/// `__Host-` prefix, and with it the browser's refusal of a cookie planted by
+/// a sibling subdomain.
+pub(crate) fn warn_if_host_prefix_dropped(path: &str, cookie_name_explicit: bool) {
+    if path != "/" && !cookie_name_explicit {
+        tracing::warn!(
+            "SessionConfig: path `{path}` is not `/`, so the cookie loses its `__Host-` prefix; \
+             a sibling subdomain can then plant a cookie of the same name (cookie tossing, \
+             session fixation). Serve the session from `/` to keep the prefix."
+        );
+    }
 }
 
 /// Whether the builder should emit the "insecure cookie" warning.
@@ -310,8 +338,13 @@ impl SessionConfigBuilder {
     }
 
     /// Set the cookie `Path` attribute (default: `"/"`).
+    ///
+    /// A path other than `/` makes an unnamed cookie lose its `__Host-`
+    /// prefix (a warning says so): the browser then accepts a cookie of the
+    /// same name planted from a sibling subdomain. Keep `/` where you can.
     pub fn path(mut self, path: impl Into<Arc<str>>) -> Self {
         self.0.path = path.into();
+        warn_if_host_prefix_dropped(&self.0.path, self.0.cookie_name_explicit);
         self
     }
 
@@ -324,16 +357,18 @@ impl SessionConfigBuilder {
     }
 
     /// Cap how long an authenticated session may live, however active it is
-    /// (default: no cap). Must be non-zero.
-    pub fn max_authenticated_age(mut self, max_age: Duration) -> Self {
-        self.0.max_authenticated_age = Some(max_age);
+    /// (default: 7 days). `None` lifts the cap, leaving the sliding TTL as the
+    /// only bound. A cap must be non-zero.
+    pub fn max_authenticated_age(mut self, max_age: Option<Duration>) -> Self {
+        self.0.max_authenticated_age = max_age;
         self
     }
 
     /// Cap how long an impersonated session may live, measured from when
-    /// the impersonation began (default: no cap). Must be non-zero.
-    pub fn max_impersonation_age(mut self, max_age: Duration) -> Self {
-        self.0.max_impersonation_age = Some(max_age);
+    /// the impersonation began (default: 1 hour). `None` lifts the cap. A cap
+    /// must be non-zero.
+    pub fn max_impersonation_age(mut self, max_age: Option<Duration>) -> Self {
+        self.0.max_impersonation_age = max_age;
         self
     }
 
@@ -347,7 +382,9 @@ impl SessionConfigBuilder {
     /// prefix would be silently dropped by browsers and the security promise
     /// lost; better to fail fast at construction time than to ship a
     /// misconfigured cookie), if a `__Host-` name is used with a `Path`
-    /// other than `/`, or if `SameSite=None` is used without `Secure=true`.
+    /// other than `/`, if `SameSite=None` is used without `Secure=true`, or
+    /// if the path does not start with `/` or holds `;` or a control
+    /// character (it would be written into `Set-Cookie` as given).
     pub fn build(self) -> SessionConfig {
         self.0.finalize()
     }
@@ -456,5 +493,33 @@ mod tests {
     #[should_panic(expected = "not valid in a cookie name")]
     fn cookie_name_must_be_a_token() {
         let _ = SessionConfig::builder().cookie_name("a b").build();
+    }
+
+    /// A path that carries another attribute, a control character or no
+    /// leading slash would be written into `Set-Cookie` as given.
+    #[test]
+    fn a_path_that_could_inject_cookie_attributes_is_refused() {
+        for bad in [
+            "/; Domain=example.com; SameSite=None",
+            "/a;b",
+            "app",
+            "",
+            "/a\r\nSet-Cookie: x=1",
+            "/a\tb",
+            "/\u{7f}",
+            "/caf\u{e9}",
+        ] {
+            let refused = std::panic::catch_unwind(|| {
+                SessionConfig::builder()
+                    .path(bad)
+                    .cookie_name("axess.sid")
+                    .build()
+            });
+            assert!(refused.is_err(), "path {bad:?} was accepted");
+        }
+        for good in ["/", "/app", "/app/v1/x-y_z"] {
+            let config = SessionConfig::builder().path(good).build();
+            assert_eq!(config.path(), good);
+        }
     }
 }

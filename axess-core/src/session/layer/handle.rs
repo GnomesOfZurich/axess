@@ -7,7 +7,7 @@
 //! reach it through the typed `AuthSession` extractor surface.
 
 use super::swap::{Swap, SwapStore, Swapped, swap_merging};
-use crate::session::data::{SessionData, merge_concurrent};
+use crate::session::data::{SessionData, merge_rotating};
 use crate::session::id::SessionId;
 use axess_rng::SecureRng;
 use std::sync::Arc;
@@ -161,11 +161,13 @@ impl SessionInner {
         match outcome {
             Ok(Swapped::Written(written)) => {
                 if rotated {
-                    // The retry merged a concurrent write into `written`;
-                    // this request's data, which the response stores under
-                    // the new id, takes it in as well, or a value another
-                    // request consumed would come back.
-                    self.data = merge_concurrent(&base, &self.data, &written);
+                    // The retry merged a concurrent write into `written`.
+                    // This request's data, which the response stores under
+                    // the new id, learns only what a concurrent request took
+                    // (or a value another request consumed would come back),
+                    // never what it added: the retired id may be known to an
+                    // attacker.
+                    self.data = merge_rotating(&base, &self.data, &written);
                 } else {
                     self.data = (*written).clone();
                 }

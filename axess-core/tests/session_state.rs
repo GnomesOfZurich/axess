@@ -23,7 +23,7 @@ fn session_data_default_is_guest() {
 #[test]
 fn auth_state_user_id_returns_none_for_guest() {
     let state = AuthState::Guest;
-    assert!(state.user_id().is_none());
+    assert!(state.pending_user_id().is_none());
     assert!(state.tenant_id().is_none());
 }
 
@@ -38,7 +38,7 @@ fn auth_state_authenticated_has_user_and_tenant() {
         ldap_groups: None,
     };
     assert!(state.is_authenticated());
-    assert_eq!(state.user_id(), Some(&uid("u1")));
+    assert_eq!(state.authenticated_user_id(), Some(&uid("u1")));
     assert_eq!(state.tenant_id(), Some(&tid("t1")));
 }
 

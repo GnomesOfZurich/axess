@@ -148,14 +148,24 @@ impl InMemoryBackend {
         // human identifiers so successive `with_user_password(...)` calls
         // for the same identifier resolve to the same row.
         let tenant_id = axess_identity::testing::tenant(&tenant_id_arc);
-        let mut user_id = axess_identity::testing::user(&username);
-        if self
-            .identity
-            .tenant_of(&user_id)
-            .is_some_and(|held| held != tenant_id)
-        {
-            user_id = axess_identity::testing::user(&format!("{username}@{tenant_id_arc}"));
-        }
+        // The plain username's id, unless another tenant holds it; then an id
+        // from the username and tenant together, unless another tenant holds
+        // that too (a literal username such as `a@b` can); then the same
+        // pair length-prefixed, which no username can imitate.
+        let free = |id: &UserId| {
+            self.identity
+                .tenant_of(id)
+                .is_none_or(|held| held == tenant_id)
+        };
+        let user_id = [
+            username.to_string(),
+            format!("{username}@{tenant_id_arc}"),
+            format!("{}:{tenant_id_arc}/{username}", tenant_id_arc.len()),
+        ]
+        .iter()
+        .map(|name| axess_identity::testing::user(name))
+        .find(free)
+        .expect("a username taken in every tenant under all three id forms");
 
         let now = self.clock.now();
         let user = User {
@@ -294,6 +304,28 @@ impl crate::authn::store::IdentityAuthnLog for InMemoryBackend {
 
     async fn reset_failed_attempts(&self, user_id: &UserId) -> Result<(), Self::Error> {
         self.identity.reset_failed_attempts(user_id).await
+    }
+
+    async fn throttle_state(
+        &self,
+        key: &crate::authn::types::ThrottleSubject,
+    ) -> Result<Option<crate::authn::types::ThrottleState>, Self::Error> {
+        self.identity.throttle_state(key).await
+    }
+
+    async fn record_throttle_failure(
+        &self,
+        key: &crate::authn::types::ThrottleSubject,
+        throttle: &crate::authn::types::Throttle,
+    ) -> Result<(), Self::Error> {
+        self.identity.record_throttle_failure(key, throttle).await
+    }
+
+    async fn clear_throttle(
+        &self,
+        key: &crate::authn::types::ThrottleSubject,
+    ) -> Result<(), Self::Error> {
+        self.identity.clear_throttle(key).await
     }
 
     async fn record_last_login(

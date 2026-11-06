@@ -287,6 +287,7 @@ async fn from_ec_pem_accepts_sec1_pem() {
     );
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_algorithms(idp.verifier_algorithms());
     verifier
         .verify::<CustomClaims>(&token)

@@ -67,6 +67,21 @@
 - [Behind an mTLS terminator](production/mtls.md)
 - [Operations runbook](production/operations.md)
 - [Migration guide](production/migrating.md)
+  - [0.15.0 to 0.16.0](production/migrating/0.15.0-to-0.16.0.md)
+  - [0.14.0 to 0.15.0](production/migrating/0.14.0-to-0.15.0.md)
+  - [0.13.0 to 0.14.0](production/migrating/0.13.0-to-0.14.0.md)
+  - [0.12.0 to 0.13.0](production/migrating/0.12.0-to-0.13.0.md)
+  - [0.11.0 to 0.12.0](production/migrating/0.11.0-to-0.12.0.md)
+  - [0.10.0 to 0.11.0](production/migrating/0.10.0-to-0.11.0.md)
+  - [0.9.0 to 0.10.0](production/migrating/0.9.0-to-0.10.0.md)
+  - [0.8.1 to 0.9.0](production/migrating/0.8.1-to-0.9.0.md)
+  - [0.7.0 to 0.8.0](production/migrating/0.7.0-to-0.8.0.md)
+  - [0.6.0 to 0.7.0](production/migrating/0.6.0-to-0.7.0.md)
+  - [0.5.0 to 0.6.0](production/migrating/0.5.0-to-0.6.0.md)
+  - [0.4.0 to 0.5.0](production/migrating/0.4.0-to-0.5.0.md)
+  - [0.2.2 to 0.3.0](production/migrating/0.2.2-to-0.3.0.md)
+  - [0.2.0 to 0.2.1](production/migrating/0.2.0-to-0.2.1.md)
+  - [0.1.x to 0.2.0](production/migrating/0.1.x-to-0.2.0.md)
 
 # Part IX: Project
 

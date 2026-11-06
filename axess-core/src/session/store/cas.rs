@@ -11,7 +11,7 @@
 
 use crate::session::data::SessionData;
 use crate::session::id::SessionId;
-use crate::session::store::ConditionalUpdate;
+use crate::session::store::{ConditionalUpdate, CycleOutcome, SessionStore};
 use std::future::Future;
 use std::time::Duration;
 
@@ -111,6 +111,74 @@ pub(crate) async fn cas_by_revision<R: CasRow>(
         }
     }
     Ok(ConditionalUpdate::Conflict)
+}
+
+/// [`SessionStore::cycle_if_revision`](super::SessionStore::cycle_if_revision)
+/// over a store's [`CasRow`] steps.
+///
+/// The old row is removed only while it still holds what was read at the
+/// expected revision, so a write that landed between the caller's read and
+/// the removal makes the removal miss and the answer
+/// [`CycleOutcome::Conflict`]; whoever removes the row owns the rotation, as
+/// the delete decides in `cycle`. The new row is written after the removal.
+/// A failure between the two leaves neither row, which the layer treats as
+/// the failed rotation it fails closed on.
+pub(crate) async fn cycle_by_revision<S>(
+    store: &S,
+    old_id: &SessionId,
+    new_id: &SessionId,
+    data: &SessionData,
+    ttl: Duration,
+    require_old: bool,
+    expected_revision: u64,
+) -> Result<CycleOutcome, <S as SessionStore>::Error>
+where
+    S: SessionStore + CasRow<Error = <S as SessionStore>::Error>,
+{
+    if ttl.is_zero() {
+        // Nothing is stored for a zero ttl: both rows go, and the revision
+        // only decides whether this caller still owned the row.
+        if let Some((revision, _)) = CasRow::read(store, old_id).await?
+            && revision != expected_revision
+        {
+            return Ok(CycleOutcome::Conflict);
+        }
+        return store.cycle(old_id, new_id, data, ttl, require_old).await;
+    }
+    for _ in 0..CAS_ATTEMPTS {
+        let step = match CasRow::read(store, old_id).await? {
+            None => CasWrite::Gone,
+            Some((revision, _)) if revision != expected_revision => {
+                return Ok(CycleOutcome::Conflict);
+            }
+            Some((_, seen)) if old_id == new_id => {
+                store.replace_if(new_id, &seen, data, ttl).await?
+            }
+            Some((_, seen)) => match store.delete_if(old_id, &seen).await? {
+                CasWrite::Done => {
+                    store.save(new_id, data, ttl).await?;
+                    return Ok(CycleOutcome::Rotated);
+                }
+                other => other,
+            },
+        };
+        match step {
+            CasWrite::Done => return Ok(CycleOutcome::Rotated),
+            CasWrite::Missed => {}
+            CasWrite::Gone if require_old => return Ok(CycleOutcome::SessionGone),
+            CasWrite::Gone => {
+                // A login on a guest whose id was never stored: no old row
+                // to remove (an expired remnant of it goes too), and the new
+                // row is always written.
+                if old_id != new_id {
+                    store.delete(old_id).await?;
+                }
+                store.save(new_id, data, ttl).await?;
+                return Ok(CycleOutcome::Rotated);
+            }
+        }
+    }
+    Ok(CycleOutcome::Conflict)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! `OAuthProvider` trait + session-key constants + `AuthUrlResult` alias.
+//! `OAuthProvider` trait + session-key constants + `AuthUrlResult`.
 //!
 //! The trait is the hub of the OAuth/OIDC type surface: every adopter
 //! impl (production [`OAuthProviderConfig`](super::super::OAuthProviderConfig)
@@ -105,10 +105,34 @@ pub mod keys {
     pub const PAR_INFLIGHT: &str = "axess.oauth.par_inflight";
 }
 
-/// Result type for `build_auth_url` and `build_auth_url_par`.
+/// What `build_auth_url` and `build_auth_url_par` return: the URL to send the
+/// user to, and the three values of the ceremony that must wait in the
+/// session until the callback.
 ///
-/// Contains `(authorization_url, csrf_state, nonce, pkce_verifier)`.
-pub type AuthUrlResult = (url::Url, String, String, String);
+/// Named fields, because all three values are plain strings and a positional
+/// tuple would let them be swapped without a compile error. `Debug` does not
+/// print the PKCE verifier, the one value that is not in the URL.
+pub struct AuthUrlResult {
+    /// The authorization URL to redirect the user to.
+    pub url: url::Url,
+    /// The CSRF `state` in the URL; the callback must echo it.
+    pub csrf_state: String,
+    /// The nonce the ID token must carry.
+    pub nonce: String,
+    /// The PKCE verifier the token request presents.
+    pub pkce_verifier: String,
+}
+
+impl std::fmt::Debug for AuthUrlResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthUrlResult")
+            .field("url", &self.url)
+            .field("csrf_state", &self.csrf_state)
+            .field("nonce", &self.nonce)
+            .field("pkce_verifier", &"[redacted]")
+            .finish()
+    }
+}
 
 /// Abstraction over OAuth/OIDC token operations.
 ///
@@ -152,7 +176,16 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// Ceremony timeout for the OAuth redirect flow.
     fn ceremony_timeout(&self) -> std::time::Duration;
 
-    /// Exchange a refresh token at the IdP's token endpoint.
+    /// Exchange a refresh token at the IdP's token endpoint, refusing a
+    /// response whose subject is not `expected_subject`.
+    ///
+    /// OIDC Core 12.2 requires the ID token of a refresh response to carry the
+    /// same `sub` as the original one: a token for another subject must never
+    /// be taken as a refresh of this session's identity. Callers pass the
+    /// subject the login recorded (`OAuthClaims::subject`). A response with no
+    /// ID token has no subject to compare and passes. Providers need not
+    /// override this; it checks whatever
+    /// [`refresh_token_unchecked`](Self::refresh_token_unchecked) returns.
     ///
     /// Returns a [`RefreshOutcome`]: the rotated tokens always, and the
     /// verified ID-token claims when the response carried an ID token (OIDC
@@ -173,33 +206,32 @@ pub trait OAuthProvider: Send + Sync + 'static {
     fn refresh_token<'a>(
         &'a self,
         refresh_token: &'a str,
-        original_nonce: Option<&'a str>,
-        dpop: Option<DpopSigner<'a>>,
-    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>>;
-
-    /// [`refresh_token`](Self::refresh_token), refusing a response whose
-    /// subject is not `expected_subject`.
-    ///
-    /// OIDC Core 12.2 requires the ID token of a refresh response to carry the
-    /// same `sub` as the original one: a token for another subject must never
-    /// be taken as a refresh of this session's identity. Callers pass the
-    /// subject the login recorded (`OAuthClaims::subject`). A response with no
-    /// ID token has no subject to compare and passes. Providers need not
-    /// override this; it checks whatever `refresh_token` returns.
-    fn refresh_token_for_subject<'a>(
-        &'a self,
-        refresh_token: &'a str,
         expected_subject: &'a str,
         original_nonce: Option<&'a str>,
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
             let outcome = self
-                .refresh_token(refresh_token, original_nonce, dpop)
+                .refresh_token_unchecked(refresh_token, original_nonce, dpop)
                 .await?;
             refresh_subject_check(outcome, expected_subject)
         })
     }
+
+    /// [`refresh_token`](Self::refresh_token) **without** the subject check.
+    ///
+    /// Nothing here compares the refresh response's `sub` with the session's
+    /// (OIDC Core 12.2): a response for another subject is returned as if it
+    /// were a refresh of this one. This is the method providers implement;
+    /// call it only where the subject is checked by other means, and use
+    /// [`refresh_token`](Self::refresh_token) or
+    /// `AuthnService::refresh_oauth_token` everywhere else.
+    fn refresh_token_unchecked<'a>(
+        &'a self,
+        refresh_token: &'a str,
+        original_nonce: Option<&'a str>,
+        dpop: Option<DpopSigner<'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>>;
 
     /// Exchange an authorization code for claims.
     ///
@@ -216,7 +248,13 @@ pub trait OAuthProvider: Send + Sync + 'static {
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>>;
 
-    /// Fetch additional user claims from the OIDC UserInfo endpoint.
+    /// Fetch additional user claims from the OIDC UserInfo endpoint, refusing
+    /// a response whose `sub` is not `expected_subject` (OIDC Core 5.3.2).
+    ///
+    /// A UserInfo response is only about the user the ID token named when its
+    /// `sub` equals that token's `sub`. A substituted access token or a
+    /// mis-routed proxy returns another user's profile otherwise, which the
+    /// caller would merge or link on. The error carries neither subject.
     ///
     /// With `dpop` the request is sent with the `DPoP` authorization scheme
     /// and a proof signed by the key that carries the token's hash, and a
@@ -229,30 +267,32 @@ pub trait OAuthProvider: Send + Sync + 'static {
     fn fetch_userinfo<'a>(
         &'a self,
         access_token: &'a str,
-        dpop: Option<DpopSigner<'a>>,
-    ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>>;
-
-    /// [`fetch_userinfo`](Self::fetch_userinfo), refusing a response whose
-    /// `sub` is not `expected_subject` (OIDC Core 5.3.2).
-    ///
-    /// A UserInfo response is only about the user the ID token named when its
-    /// `sub` equals that token's `sub`. A substituted access token or a
-    /// mis-routed proxy returns another user's profile otherwise, which the
-    /// caller would merge or link on. The error carries neither subject.
-    fn fetch_userinfo_for_subject<'a>(
-        &'a self,
-        access_token: &'a str,
         expected_subject: &'a str,
         dpop: Option<DpopSigner<'a>>,
     ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
         Box::pin(async move {
-            let claims = self.fetch_userinfo(access_token, dpop).await?;
+            let claims = self.fetch_userinfo_unchecked(access_token, dpop).await?;
             if claims.sub != expected_subject {
                 return Err(OAuthError::SubjectMismatch);
             }
             Ok(claims)
         })
     }
+
+    /// [`fetch_userinfo`](Self::fetch_userinfo) **without** the `sub` check.
+    ///
+    /// The response is returned whoever it describes (OIDC Core 5.3.2 asks
+    /// the client to compare it with the ID token's `sub`): a substituted
+    /// access token or a mis-routed proxy yields another user's profile, which
+    /// a caller that merges or links on it would take as this user's. This is
+    /// the method providers implement; call it only where the subject is
+    /// checked by other means, and use [`fetch_userinfo`](Self::fetch_userinfo)
+    /// or `AuthnService::fetch_userinfo` everywhere else.
+    fn fetch_userinfo_unchecked<'a>(
+        &'a self,
+        access_token: &'a str,
+        dpop: Option<DpopSigner<'a>>,
+    ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>>;
 
     /// Whether this provider requires JWT Secured Authorization Response Mode
     /// (JARM): its authorization requests ask for `response_mode=jwt`, the
@@ -289,7 +329,8 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// The PKCE verifier, the CSRF state and the nonce are drawn from `rng`,
     /// so a seeded generator reproduces them exactly.
     ///
-    /// Returns `(authorization_url, csrf_state, nonce, pkce_verifier)`.
+    /// Returns the URL with the state, nonce and PKCE verifier of the ceremony
+    /// ([`AuthUrlResult`]).
     fn build_auth_url(
         &self,
         options: &OAuthLoginOptions,
@@ -441,7 +482,8 @@ pub trait OAuthProvider: Send + Sync + 'static {
     /// token request presents it. Without it no `dpop_jkt` is pushed, which
     /// RFC 9449 leaves optional: the code is bound at the token request.
     ///
-    /// Returns `(authorization_url, csrf_state, nonce, pkce_verifier)`.
+    /// Returns the URL with the state, nonce and PKCE verifier of the ceremony
+    /// ([`AuthUrlResult`]).
     fn build_auth_url_par<'a>(
         &'a self,
         _options: &'a OAuthLoginOptions,
@@ -580,7 +622,7 @@ mod provider_default_methods_tests {
         fn binds_to_dpop(&self) -> bool {
             false
         }
-        fn refresh_token<'a>(
+        fn refresh_token_unchecked<'a>(
             &'a self,
             _refresh_token: &'a str,
             _original_nonce: Option<&'a str>,
@@ -597,7 +639,7 @@ mod provider_default_methods_tests {
         ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async move { Err(OAuthError::Config("stub".into())) })
         }
-        fn fetch_userinfo<'a>(
+        fn fetch_userinfo_unchecked<'a>(
             &'a self,
             _access_token: &'a str,
             _dpop: Option<DpopSigner<'a>>,
@@ -666,13 +708,14 @@ mod provider_default_methods_tests {
         fn binds_to_dpop(&self) -> bool {
             false
         }
-        fn refresh_token<'a>(
+        fn refresh_token_unchecked<'a>(
             &'a self,
             refresh_token: &'a str,
             original_nonce: Option<&'a str>,
             dpop: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<RefreshOutcome, OAuthError>> + Send + 'a>> {
-            self.0.refresh_token(refresh_token, original_nonce, dpop)
+            self.0
+                .refresh_token_unchecked(refresh_token, original_nonce, dpop)
         }
         fn exchange_code<'a>(
             &'a self,
@@ -683,12 +726,12 @@ mod provider_default_methods_tests {
         ) -> Pin<Box<dyn Future<Output = Result<OAuthClaims, OAuthError>> + Send + 'a>> {
             Box::pin(async { Err(OAuthError::TokenExchange("reached the exchange".into())) })
         }
-        fn fetch_userinfo<'a>(
+        fn fetch_userinfo_unchecked<'a>(
             &'a self,
             access_token: &'a str,
             dpop: Option<DpopSigner<'a>>,
         ) -> Pin<Box<dyn Future<Output = Result<UserInfoClaims, OAuthError>> + Send + 'a>> {
-            self.0.fetch_userinfo(access_token, dpop)
+            self.0.fetch_userinfo_unchecked(access_token, dpop)
         }
     }
 

@@ -23,6 +23,16 @@
 //! Adopters can dispatch through `dyn CacheInvalidator` from policy-
 //! update handlers without naming the concrete cache layer.
 //!
+//! # Cross-pod
+//!
+//! Every invalidator here acts on the pod that calls it. The in-process
+//! [`EntityCache`](super::EntityCache) is per pod, so the other pods keep
+//! serving the old entities until their own TTL (60 seconds by default)
+//! expires. A multi-pod deployment must broadcast the invalidation itself
+//! (see the cross-pod note on `ValkeyEntityCache`): publish
+//! the scope on a channel and have each pod call its invalidator on receipt.
+//! axess does not subscribe for you.
+//!
 //! # Scope semantics
 //!
 //! - [`invalidate_principal`](CacheInvalidator::invalidate_principal):

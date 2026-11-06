@@ -64,7 +64,8 @@ fn a_credential_sealed_by_the_first_release_still_opens() {
             },
         )
         .unwrap();
-    let cipher = FactorSecretCipher::new(KEY);
+    let cipher = FactorSecretCipher::new(KEY)
+        .with_first_binding(crate::session::legacy_blobs::LegacyBlobs::Accept);
     let mut old = rec;
     old.credential = TenantClientCredential::Secret(FactorSecret::Sealed(SealedFactorSecret {
         key_id: current_key_id(&cipher),

@@ -47,7 +47,9 @@ async fn historical_key_still_verifies_under_combined_jwks() {
     assert_eq!(rotated_idp.jwks().keys.len(), 2);
 
     // Verifier dispatches by header kid; both tokens succeed.
-    let verifier = JwtVerifier::new(rotated_idp.jwks_handle()).with_audience("https://api");
+    let verifier = JwtVerifier::new(rotated_idp.jwks_handle())
+        .with_audience("https://api")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token_under_old)
         .await
@@ -89,7 +91,9 @@ async fn rotate_signing_key_moves_previous_current_to_historical() {
         Some("k2".to_string()),
     );
 
-    let verifier = JwtVerifier::new(idp_v2.jwks_handle()).with_audience("https://api");
+    let verifier = JwtVerifier::new(idp_v2.jwks_handle())
+        .with_audience("https://api")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token_v1)
         .await
@@ -135,7 +139,9 @@ async fn multiple_rotations_accumulate_historical_keys() {
         3,
         "three keys: k3 current, k1+k2 historical"
     );
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api")
+        .allow_any_issuer();
     for (label, token) in [("t1", &t1), ("t2", &t2), ("t3", &t3)] {
         verifier
             .verify::<CustomClaims>(token)
@@ -171,7 +177,9 @@ async fn extra_public_jwk_appears_in_jwks_but_not_used_for_signing() {
             .with_audience("https://api")
             .with_issued_at(now),
     );
-    let verifier = JwtVerifier::new(our_idp.jwks_handle()).with_audience("https://api");
+    let verifier = JwtVerifier::new(our_idp.jwks_handle())
+        .with_audience("https://api")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&our_token)
         .await

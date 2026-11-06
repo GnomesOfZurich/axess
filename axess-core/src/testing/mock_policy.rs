@@ -20,11 +20,11 @@
 //!         .permit_ns("TestApp", "ViewLedger", "Resource", "ledger-abc")
 //! );
 //!
-//! let store = Arc::new(AuthzStore::new(
+//! let store = Arc::new(AuthzStore::try_new(
 //!     evaluator,
 //!     Arc::new(MockEntityProvider::new("TestApp")),
 //!     "TestApp",
-//! ));
+//! ).unwrap());
 //!
 //! let authz = store.for_user_id("user-1").unwrap();
 //! assert!(authz.is_permitted("ViewLedger", &"ledger-abc".to_string()).await);
@@ -205,6 +205,18 @@ impl AuthzEntityProvider for MockEntityProvider {
             "MockEntityProvider: returning empty entity set",
         );
         Ok(Entities::empty())
+    }
+
+    /// The mock is tenant-blind on purpose: every tenant gets the empty set.
+    async fn entities_for_tenant(
+        &self,
+        principal: &EntityUid,
+        tenant: Option<&str>,
+        resource_id: &String,
+        action: &EntityUid,
+    ) -> Result<Entities, AuthzError> {
+        let _ = tenant;
+        self.entities_for(principal, resource_id, action).await
     }
 
     // Note: the compiler will warn about `async fn` in trait. The method is

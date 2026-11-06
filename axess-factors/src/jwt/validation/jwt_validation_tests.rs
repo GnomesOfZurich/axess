@@ -95,6 +95,8 @@ fn verify_jwt_accepts_at_exact_exp_plus_leeway_boundary() {
     let cfg = ValidationConfig {
         audience: None,
         leeway_secs: leeway,
+        allow_any_audience: true,
+        allow_any_issuer: true,
         ..ValidationConfig::default()
     };
     let result = verify_jwt(&token, &jwks, &cfg, ALLOWED_ALGORITHMS, &clock);
@@ -140,6 +142,8 @@ fn verify_jwt_accepts_at_exact_nbf_minus_leeway_boundary() {
     let cfg = ValidationConfig {
         audience: None,
         leeway_secs: leeway,
+        allow_any_audience: true,
+        allow_any_issuer: true,
         ..ValidationConfig::default()
     };
     let result = verify_jwt(&token, &jwks, &cfg, ALLOWED_ALGORITHMS, &clock);
@@ -363,7 +367,7 @@ fn missing_exp_rejected_by_default() {
     );
 
     // Only a caller that turns the requirement off takes it.
-    let mut config = ValidationConfig::new();
+    let mut config = lax_config();
     config.require_exp = false;
     assert!(verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock).is_ok());
 }
@@ -414,7 +418,7 @@ fn missing_iss_rejected_when_issuer_pinned() {
     claims.as_object_mut().unwrap().remove("iss");
     let token = sign_jwt(&claims, &kid, &der);
 
-    let mut config = ValidationConfig::new();
+    let mut config = lax_config();
     config.issuer = Some("https://idp.example.com".to_string());
     let result = verify_jwt(&token, &jwks, &config, ALLOWED_ALGORITHMS, &SystemClock);
     assert!(
@@ -521,4 +525,50 @@ fn a_jwk_marked_for_encryption_is_not_a_signature_key() {
     let token_no_use = sign_jwt(&sample_claims(), &kid, &der);
     assert!(verify_jwt_signature(&token_no_use, &jwks, None, ALLOWED_ALGORITHMS).is_ok());
     let _ = token;
+}
+
+/// A config that pins nothing and says so, for the tests of the other checks.
+fn lax_config() -> ValidationConfig {
+    ValidationConfig {
+        allow_any_audience: true,
+        allow_any_issuer: true,
+        ..ValidationConfig::new()
+    }
+}
+
+/// `verify_jwt` with a config that pins no audience or no issuer refuses
+/// unless the config says that is intended; a pin or the flag lifts it.
+#[test]
+fn verify_jwt_refuses_an_unpinned_audience_and_issuer_unless_waived() {
+    let (der, jwks, kid) = rsa_keypair();
+    let mut claims = sample_claims();
+    claims["iss"] = serde_json::json!("https://idp.example.com");
+    claims["aud"] = serde_json::json!("svc");
+    let token = sign_jwt(&claims, &kid, &der);
+    let verify = |config: &ValidationConfig| {
+        verify_jwt(&token, &jwks, config, ALLOWED_ALGORITHMS, &SystemClock)
+    };
+
+    let none = ValidationConfig::new();
+    let err = verify(&none).expect_err("nothing pinned");
+    assert!(err.to_string().contains("audience"), "{err}");
+
+    let mut audience_only = ValidationConfig::new();
+    audience_only.audience = Some("svc".to_string());
+    let err = verify(&audience_only).expect_err("no issuer pinned");
+    assert!(err.to_string().contains("issuer"), "{err}");
+
+    let mut issuer_only = ValidationConfig::new();
+    issuer_only.issuer = Some("https://idp.example.com".to_string());
+    let err = verify(&issuer_only).expect_err("no audience pinned");
+    assert!(err.to_string().contains("audience"), "{err}");
+
+    let mut pinned = audience_only.clone();
+    pinned.issuer = Some("https://idp.example.com".to_string());
+    assert!(verify(&pinned).is_ok());
+
+    let mut waived = ValidationConfig::new();
+    waived.allow_any_audience = true;
+    waived.allow_any_issuer = true;
+    assert!(verify(&waived).is_ok());
 }

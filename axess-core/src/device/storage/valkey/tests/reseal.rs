@@ -17,7 +17,7 @@ async fn sealing_store(tag: &str) -> ValkeyDeviceStore {
     // These tests read rows of the earlier formats on purpose, so the store
     // runs inside the accepting window; the default refuses them, which the
     // offline tests in `super` cover.
-    ValkeyDeviceStore::new(client, [7u8; 32])
+    ValkeyDeviceStore::new(client, crate::testing::test_key(7))
         .with_prefix(format!("axr_{tag}_{nanos}"))
         .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept)
 }
@@ -204,14 +204,15 @@ async fn a_store_with_a_previous_key_reads_and_reseals_rows_of_the_old_key() {
 
     let rotated = ValkeyDeviceStore::with_crypto(
         old.client.clone(),
-        SessionCrypto::new([9u8; 32]).with_previous_key([7u8; 32]),
+        SessionCrypto::new(crate::testing::test_key(9))
+            .with_previous_key(crate::testing::test_key(7)),
     )
     .with_prefix(old.prefix.to_string());
     assert_eq!(rotated.load(&d.tenant_id, &d.id).await.unwrap().unwrap(), d);
     assert_ne!(stored(&old, &d).await, before, "the read re-sealed the row");
 
-    let new_only =
-        ValkeyDeviceStore::new(old.client.clone(), [9u8; 32]).with_prefix(old.prefix.to_string());
+    let new_only = ValkeyDeviceStore::new(old.client.clone(), crate::testing::test_key(9))
+        .with_prefix(old.prefix.to_string());
     assert_eq!(
         new_only.load(&d.tenant_id, &d.id).await.unwrap().unwrap(),
         d

@@ -66,7 +66,7 @@ fn unloadable_key() -> TenantClientCredential {
 type Directory = StoredTenantOAuthProviders<MemoryTenantOAuthProviderStore>;
 
 fn directory() -> Directory {
-    StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new())
+    StoredTenantOAuthProviders::new_unencrypted(MemoryTenantOAuthProviderStore::new())
 }
 
 /// `n` resolutions of acme's `sso` at once; every one must build.
@@ -270,9 +270,9 @@ async fn a_record_in_the_first_binding_is_stored_in_the_current_one_on_first_use
     use crate::session::legacy_blobs::LegacyBlobs;
     const KEY: [u8; 32] = *b"0123456789abcdef0123456789abcdeF";
     let (_server, issuer) = idp().await;
-    let cipher = Arc::new(FactorSecretCipher::new(KEY));
-    let directory = StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new())
-        .with_cipher(cipher.clone());
+    let cipher = Arc::new(FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Accept));
+    let directory =
+        StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher.clone());
     let acme = tenant("acme");
     let mut probe = record("acme", &issuer, "client-1", secret());
     probe.seal(&cipher).unwrap();
@@ -356,7 +356,7 @@ impl TenantOAuthProviderStore for StaleListing {
 #[tokio::test]
 async fn a_failed_re_read_is_reported_not_answered_with_the_older_record() {
     let (_server, issuer) = idp().await;
-    let directory = StoredTenantOAuthProviders::new(StaleListing {
+    let directory = StoredTenantOAuthProviders::new_unencrypted(StaleListing {
         inner: MemoryTenantOAuthProviderStore::new(),
         stale: std::sync::Mutex::new(None),
         fail_get: std::sync::atomic::AtomicBool::new(false),
@@ -383,4 +383,23 @@ async fn a_failed_re_read_is_reported_not_answered_with_the_older_record() {
     assert!(found.providers.is_empty(), "the older record was served");
     assert_eq!(found.broken.len(), 1);
     assert!(matches!(found.broken[0].error, OAuthError::Store(_)));
+}
+
+/// The directory is built with its cipher, so a credential is sealed on
+/// `upsert` without a second call to ask for it.
+#[tokio::test]
+async fn a_directory_built_with_its_cipher_seals_a_credential_on_upsert() {
+    use crate::authn::factor_secret::FactorSecretCipher;
+    let cipher = Arc::new(FactorSecretCipher::new(
+        *b"0123456789abcdef0123456789abcdeF",
+    ));
+    let directory = StoredTenantOAuthProviders::new(MemoryTenantOAuthProviderStore::new(), cipher);
+    let stored = directory
+        .upsert(record("acme", "https://idp.example", "client-1", secret()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        stored.credential,
+        TenantClientCredential::Secret(FactorSecret::Sealed(_))
+    ));
 }

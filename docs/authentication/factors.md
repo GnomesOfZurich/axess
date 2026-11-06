@@ -126,7 +126,11 @@ home and only the hardware key with them. The state machine's
 `Authenticating::remaining` field carries the residue of steps yet to
 complete: after the password step, `remaining` looks like
 `[AnyOf(vec![Totp, Fido2])]` and the application's login page renders
-the choice between them.
+the choice between them. A choice that needs a challenge (an email
+code) is made with `prepare_factor_choice(session, kind)`; the session
+remembers it for that step, and `verify_factor` then checks the submitted
+code as that factor, not as the first one the step lists. A step prepared
+without a choice checks a code as the first listed factor it fits.
 
 `Required(kind)` is shorthand for a one-element `AnyOf(vec![kind])`,
 but the distinction matters for audit clarity. A successful login that
@@ -217,6 +221,35 @@ for instance) or `None` when the lockout requires administrative
 intervention. The application surfaces this to the user with the right
 copy; the audit log records the lockout regardless.
 
+The lock is per account, so anyone who knows a username can lock it.
+`AuthnServiceBuilder::with_device_store` narrows that: a login from a
+device the account has `Seen` or `Trusted` still works while the lock
+holds every other origin out (see `LockoutPolicy`).
+
+Progressive throttling is the other answer to the same attack, and it is
+on by default. `LockoutPolicy::throttle` holds a `Throttle`: after `n`
+consecutive wrong guesses under one key, a guess before
+`last_failure + min(first_delay * 2^(n-1), max_delay)` is refused as
+`FactorOutcome::Throttled { retry_after }` (from `prepare_factor`,
+`Err(AuthnError::Throttled { retry_after })`). The default waits one
+second after the first failure and doubles per failure to sixty-four
+seconds: 1, 2, 4, 8, 16, 32, 64, 64. The key is
+`ThrottleKey::AccountAndAddress`, the tenant, the user and the client
+address `client_ip::layer` resolved, so a guesser on one address does not
+delay the account's owner on another; `ThrottleKey::Account` shares one
+delay across every address. A request with no resolved address is keyed
+on the account alone, and when the layer is not installed the service
+logs an error once saying so. The refusal is a refusal, never a sleep: it
+runs before the guess is reserved, so a throttled request costs no counter
+write and no hash. A right guess clears the key; a session on a device the
+account has used is not throttled, for the reason it is not locked. The
+per-account lock stays the ceiling: a guesser cycling addresses still
+meets `max_attempts`. Answer `Throttled` to the person as a wrong password
+and send `retry_after` as `Retry-After` where the client reads headers;
+the default `IntoResponse` maps it to 429. `LockoutPolicy::without_throttle()`
+is the opt-out, for a deployment whose limiter in front of the route
+already slows a guesser down.
+
 ### Begin and complete
 
 `verify_factor` is the verb that drives a method forward, but a login
@@ -244,7 +277,16 @@ is in progress).
    to that method's full step list.
 
 `complete_signup` is the corresponding verb for the `PendingWorkflow`
-case. After a signup ceremony completes (email verified, KYC checks
+case. `begin_signup` mints a single-use verification secret and answers
+`SignupOutcome::Started(Some(verification))`; the session keeps only its
+digest, and you mail the secret to the address the person gave. When
+they return with it, `complete_signup(&session, secret)` compares it in
+constant time, refuses a wrong or expired one (24 hours by default,
+`with_signup_verification_ttl` changes it), and transitions the session
+from `PendingWorkflow { kind: Signup, ... }` to `Authenticated`. A taken
+identifier answers `Started(None)`: nothing to mail. Submitting the
+signup again from the same session replaces the secret. After a signup
+ceremony completes (email verified, KYC checks
 passed, terms accepted), the orchestrator transitions the session
 from `PendingWorkflow { kind: Signup, ... }` to `Authenticated`. The
 factor list on the resulting `Authenticated` variant is the list that
@@ -315,6 +357,15 @@ Two small gates decide when to ask. `AuthSession::authenticated_within`
 ones) both answer from the session; when one says no, call
 `begin_step_up`.
 
+A third gate, `AuthSession::completed_factor_within(kind, max_age, now)`,
+answers for one factor by its own time. The session's `authn_time` is the
+moment the most recent factor completed, so after a step-up with TOTP
+`authenticated_within` is true for the TOTP's age, and `has_completed_factor`
+for the password is still true although the password was entered at the
+original login. `completed_factor_within(&FactorKind::Password, ..)` reports
+the password's own age. Each entry of `factors_completed` is a
+`(FactorKind, DateTime<Utc>)` pair.
+
 There is no `require_step_up` orchestrator that decides for you, and the
 device decision is separate: `decide_step_up_for_user` is a free function
 over a `Device`, the user logging in and a `StepUpPolicy`, returning
@@ -326,12 +377,14 @@ step-up unless you set `trusted` to an empty list, and a `Revoked` device
 is never judged more leniently than an `Unknown` one (an empty `revoked`
 list means the `unknown` list applies). A request with no resolved device
 is judged as `Unknown` by `decide_step_up_for_optional`. A device owned by
-a different user counts as `Unknown`, so trust earned by one person never
-carries over to another.
+a different user, or by nobody, counts as `Unknown`, so trust earned by one
+person never carries over to another.
 `LoginOutcome::StepUpRequired { device_id, allowed_factors }` is the shape
 the application builds from that answer (`begin_login` never returns it
-itself); acting on it means calling `begin_step_up` with those factors once
-the session is authenticated.
+itself). It is a label and enforces nothing: relabelling the outcome leaves
+the session on the original method's steps. The call that enforces is
+`begin_step_up` with those factors, made once the session is authenticated;
+withhold what the login would have granted until that step has ended too.
 
 The application controls when step-up is required. The Cedar policy
 engine can express "this action requires `Fido2` in

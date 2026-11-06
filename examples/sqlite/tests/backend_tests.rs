@@ -1,13 +1,16 @@
-//! The second-factor flow end to end, driven through the router the way a
-//! browser drives it: cookies carried between requests, a CSRF token read
-//! from each form.
+//! The second-factor and signup flows end to end, driven through the router
+//! the way a browser drives it: cookies carried between requests, a CSRF
+//! token read from each form.
 //!
 //! Alice enrolls TOTP and is shown her recovery codes once. From then on
 //! her login asks for TOTP or a recovery code; a code gets her in once and
 //! is refused the second time.
 
 use axess::SystemClock;
-use axess_example_sqlite::{models::backend::seed, web::app::build_router};
+use axess_example_sqlite::{
+    models::backend::{SEED_PASSWORD, seed},
+    web::app::build_router,
+};
 use axum::{
     Router,
     body::Body,
@@ -48,7 +51,7 @@ impl Browser {
         seed(
             &SystemClock,
             &pool,
-            &axess::authn::FactorSecretCipher::new([7; 32]),
+            &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
         )
         .await
         .expect("seed");
@@ -127,7 +130,7 @@ impl Browser {
     }
 
     async fn log_in(&mut self) -> Page {
-        let fields = vec![("identifier", "alice"), ("password", "Gnomes2+")];
+        let fields = vec![("identifier", "alice"), ("password", SEED_PASSWORD)];
         self.post("/login", "/login", fields).await
     }
 
@@ -145,6 +148,15 @@ fn attribute(html: &str, prefix: &str) -> String {
         + prefix.len();
     let end = html[start..].find('"').expect("closing quote");
     html[start..start + end].to_owned()
+}
+
+/// The secret the enrolment page shows for typing in by hand.
+fn shown_secret(html: &str) -> String {
+    let start = html.find(r#"id="totp-secret""#).expect("secret shown");
+    let rest = &html[start..];
+    let open = rest.find('>').expect("tag end") + 1;
+    let close = rest[open..].find('<').expect("closing tag");
+    rest[open..open + close].to_owned()
 }
 
 /// The current code for a base32 TOTP secret, as an authenticator shows it.
@@ -178,13 +190,13 @@ async fn a_recovery_code_stands_in_for_totp_once() {
     let page = browser.log_in().await;
     assert_eq!(page.location.as_deref(), Some("/dashboard"));
     let setup = browser.send("GET", "/setup-totp", None).await;
-    let secret = attribute(&setup.body, r#"name="secret" value=""#);
+    let secret = shown_secret(&setup.body);
     let token = attribute(&setup.body, r#"name="_csrf" value=""#);
     let code = totp_code(&secret);
     let fields = vec![
-        ("secret", secret.as_str()),
-        ("code", &code),
-        ("_csrf", &token),
+        ("code", code.as_str()),
+        ("current_password", SEED_PASSWORD),
+        ("_csrf", token.as_str()),
     ];
     let enrolled = browser.send("POST", "/setup-totp", Some(fields)).await;
     assert_eq!(enrolled.status, StatusCode::OK, "{}", enrolled.body);
@@ -217,6 +229,13 @@ async fn a_recovery_code_stands_in_for_totp_once() {
         .await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains("Wrong code"), "{}", page.body);
+    // The wrong guess earned this browser a second's delay: a code typed
+    // straight away is refused unread, and runs once the second has passed.
+    let page = browser
+        .post("/totp", "/recovery-code", vec![("code", &codes[1])])
+        .await;
+    assert!(page.body.contains("Too many wrong codes"), "{}", page.body);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     let page = browser
         .post("/totp", "/recovery-code", vec![("code", &codes[1])])
         .await;
@@ -252,13 +271,13 @@ async fn an_enrolled_totp_factor_is_not_replaced_from_the_session() {
     browser.log_in().await;
 
     let setup = browser.send("GET", "/setup-totp", None).await;
-    let secret = attribute(&setup.body, r#"name="secret" value=""#);
+    let secret = shown_secret(&setup.body);
     let token = attribute(&setup.body, r#"name="_csrf" value=""#);
     let code = totp_code(&secret);
     let fields = vec![
-        ("secret", secret.as_str()),
-        ("code", &code),
-        ("_csrf", &token),
+        ("code", code.as_str()),
+        ("current_password", SEED_PASSWORD),
+        ("_csrf", token.as_str()),
     ];
     let enrolled = browser.send("POST", "/setup-totp", Some(fields)).await;
     assert_eq!(enrolled.status, StatusCode::OK, "{}", enrolled.body);
@@ -275,8 +294,9 @@ async fn an_enrolled_totp_factor_is_not_replaced_from_the_session() {
     let token = browser.token_from("/dashboard").await;
     let fields = vec![
         ("secret", attacker.as_str()),
-        ("code", &attacker_code),
-        ("_csrf", &token),
+        ("current_password", SEED_PASSWORD),
+        ("code", attacker_code.as_str()),
+        ("_csrf", token.as_str()),
     ];
     let page = browser.send("POST", "/setup-totp", Some(fields)).await;
     assert_eq!(
@@ -293,14 +313,16 @@ async fn an_enrolled_totp_factor_is_not_replaced_from_the_session() {
     );
 }
 
-/// Two enrolments posted together, each with its own secret and a valid code
-/// for it: the first to write wins and the other is turned away without
-/// recovery codes, so the secret that was confirmed is the one that is kept.
+/// Two enrolments posted together with a valid code: the first to write wins
+/// and the other is turned away without recovery codes, so the secret that
+/// was confirmed is the one that is kept.
 #[tokio::test]
 async fn concurrent_totp_enrolments_do_not_overwrite_each_other() {
     let mut browser = Browser::new().await;
     browser.log_in().await;
-    let token = browser.token_from("/setup-totp").await;
+    let setup = browser.send("GET", "/setup-totp", None).await;
+    let token = attribute(&setup.body, r#"name="_csrf" value=""#);
+    let secret = shown_secret(&setup.body);
 
     let cookie = browser
         .cookies
@@ -308,11 +330,11 @@ async fn concurrent_totp_enrolments_do_not_overwrite_each_other() {
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join("; ");
-    let enrol = |secret: String| {
+    let enrol = || {
         let code = totp_code(&secret);
         let form = serde_urlencoded::to_string(vec![
-            ("secret", secret.as_str()),
             ("code", code.as_str()),
+            ("current_password", SEED_PASSWORD),
             ("_csrf", token.as_str()),
         ])
         .expect("form encodes");
@@ -333,10 +355,7 @@ async fn concurrent_totp_enrolments_do_not_overwrite_each_other() {
             String::from_utf8(body.to_vec()).expect("utf8")
         }
     };
-    let (first, second) = tokio::join!(
-        enrol(axess::generate_totp_secret(&axess::SystemRng)),
-        enrol(axess::generate_totp_secret(&axess::SystemRng)),
-    );
+    let (first, second) = tokio::join!(enrol(), enrol());
 
     let winners = [first, second]
         .iter()
@@ -381,4 +400,423 @@ async fn the_second_totp_insert_for_a_user_loses_and_the_first_stays() {
     );
     let (stored, _) = stored_totp(&browser.pool).await;
     assert!(stored.contains("FIRSTSECRET") && !stored.contains("SECONDSECRET"));
+}
+
+/// Enrolment is all or nothing: when the method upgrade finds no row to
+/// upgrade, no TOTP factor and no recovery codes stay behind, so a login
+/// that still asks for the password only is never paired with a stored
+/// second factor, and the dashboard still offers to enrol.
+#[tokio::test]
+async fn a_failed_method_upgrade_leaves_no_second_factor_stored() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+    let setup = browser.send("GET", "/setup-totp", None).await;
+    let secret = shown_secret(&setup.body);
+    let token = attribute(&setup.body, r#"name="_csrf" value=""#);
+
+    sqlx::query("DELETE FROM auth_methods WHERE user_id = '00000000-0000-0000-0000-000000000010'")
+        .execute(&browser.pool)
+        .await
+        .expect("remove alice's method");
+
+    let code = totp_code(&secret);
+    let fields = vec![
+        ("code", code.as_str()),
+        ("current_password", SEED_PASSWORD),
+        ("_csrf", token.as_str()),
+    ];
+    let page = browser.send("POST", "/setup-totp", Some(fields)).await;
+    assert!(
+        recovery_codes(&page.body).is_empty(),
+        "a failed enrolment must show no recovery codes: {}",
+        page.body
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factor_configs
+          WHERE kind IN ('totp', 'recovery_code')
+            AND user_id = '00000000-0000-0000-0000-000000000010'",
+    )
+    .fetch_one(&browser.pool)
+    .await
+    .expect("count");
+    assert_eq!(stored, 0, "the enrolment must leave no factor rows behind");
+}
+
+/// The secret that is enrolled is the one the page issued, held in the
+/// session: a secret the client posts, with a valid code for it, is ignored.
+#[tokio::test]
+async fn the_client_cannot_choose_the_secret_it_enrols() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+    let setup = browser.send("GET", "/setup-totp", None).await;
+    assert!(
+        !setup.body.contains(r#"name="secret""#),
+        "the secret must not travel in a form field: {}",
+        setup.body
+    );
+    let token = attribute(&setup.body, r#"name="_csrf" value=""#);
+
+    let chosen = axess::generate_totp_secret(&axess::SystemRng);
+    let chosen_code = totp_code(&chosen);
+    let fields = vec![
+        ("secret", chosen.as_str()),
+        ("current_password", SEED_PASSWORD),
+        ("code", chosen_code.as_str()),
+        ("_csrf", token.as_str()),
+    ];
+    let page = browser.send("POST", "/setup-totp", Some(fields)).await;
+    assert!(
+        recovery_codes(&page.body).is_empty(),
+        "a client-chosen secret must not enrol: {}",
+        page.body
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factor_configs
+          WHERE kind = 'totp' AND user_id = '00000000-0000-0000-0000-000000000010'",
+    )
+    .fetch_one(&browser.pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        stored, 0,
+        "nothing may be stored for a secret the server did not issue"
+    );
+}
+
+/// Enrolling a second factor needs the account's current password: a session
+/// alone, with a valid code for the issued secret, enrols nothing.
+#[tokio::test]
+async fn enrolling_totp_needs_the_current_password() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+    let setup = browser.send("GET", "/setup-totp", None).await;
+    let secret = shown_secret(&setup.body);
+    let token = attribute(&setup.body, r#"name="_csrf" value=""#);
+    let code = totp_code(&secret);
+
+    let fields = vec![
+        ("code", code.as_str()),
+        ("current_password", "not the password"),
+        ("_csrf", token.as_str()),
+    ];
+    let page = browser.send("POST", "/setup-totp", Some(fields)).await;
+    assert!(
+        recovery_codes(&page.body).is_empty(),
+        "a wrong current password must not enrol: {}",
+        page.body
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factor_configs
+          WHERE kind = 'totp' AND user_id = '00000000-0000-0000-0000-000000000010'",
+    )
+    .fetch_one(&browser.pool)
+    .await
+    .expect("count");
+    assert_eq!(stored, 0, "no factor may be stored without the password");
+
+    let fields = vec![
+        ("code", code.as_str()),
+        ("current_password", SEED_PASSWORD),
+        ("_csrf", token.as_str()),
+    ];
+    let page = browser.send("POST", "/setup-totp", Some(fields)).await;
+    assert_eq!(recovery_codes(&page.body).len(), axess::RECOVERY_CODE_COUNT);
+}
+
+/// `/setup-totp` checks a password, so it answers to the same rate limit as
+/// the login routes: a run of guesses is cut off.
+#[tokio::test]
+async fn setup_totp_is_rate_limited() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+    let setup = browser.send("GET", "/setup-totp", None).await;
+    let token = attribute(&setup.body, r#"name="_csrf" value=""#);
+
+    let mut statuses = Vec::new();
+    for _ in 0..15 {
+        let fields = vec![
+            ("code", "000000"),
+            ("current_password", "guess"),
+            ("_csrf", token.as_str()),
+        ];
+        statuses.push(
+            browser
+                .send("POST", "/setup-totp", Some(fields))
+                .await
+                .status,
+        );
+    }
+    assert!(
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
+        "fifteen guesses in a row were never limited: {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn setup_totp_turns_a_guest_away() {
+    let mut browser = Browser::new().await;
+    let page = browser.send("GET", "/setup-totp", None).await;
+    assert!(page.status.is_redirection(), "{}", page.status);
+    assert!(page.location.as_deref().unwrap_or("").starts_with("/login"));
+}
+
+/// Captures what the app logs on the `dev_mail` target, where the example
+/// writes the mail it would send.
+#[derive(Clone, Default)]
+struct MailLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for MailLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MailLog {
+    type Writer = MailLog;
+    fn make_writer(&'a self) -> MailLog {
+        self.clone()
+    }
+}
+
+impl MailLog {
+    /// Start capturing on this thread (the test runs on one thread).
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let log = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_env_filter(tracing_subscriber::EnvFilter::new("dev_mail=debug"))
+            .with_ansi(false)
+            .finish();
+        (log, tracing::subscriber::set_default(subscriber))
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log lock").clone()).expect("utf8 log")
+    }
+
+    /// The path of the verification link in the log.
+    fn verification_link(&self) -> String {
+        let text = self.text();
+        let start = text
+            .find("/verify-email?token=")
+            .unwrap_or_else(|| panic!("no verification link in the log: {text}"));
+        text[start..]
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != '"')
+            .collect()
+    }
+}
+
+impl Browser {
+    async fn sign_up(&mut self, username: &str) -> Page {
+        let fields = vec![
+            ("username", username),
+            ("fullname", "Carol Example"),
+            ("email", "carol@example.com"),
+            ("password", "Gnomes2+LongEnough"),
+        ];
+        self.post("/signup", "/signup", fields).await
+    }
+}
+
+async fn user_status(pool: &sqlx::SqlitePool, username: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT status FROM users WHERE identifier = ?1")
+        .bind(username)
+        .fetch_optional(pool)
+        .await
+        .expect("status")
+}
+
+/// A signup does not activate the account or sign anyone in: that waits for
+/// the link mailed to the address, opened in the browser that signed up.
+#[tokio::test]
+async fn a_signup_is_completed_by_the_emailed_link() {
+    let (log, _guard) = MailLog::capture();
+    let mut browser = Browser::new().await;
+
+    let page = browser.sign_up("carol").await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.body.contains("Check your email"), "{}", page.body);
+    assert_eq!(
+        user_status(&browser.pool, "carol").await.as_deref(),
+        Some("candidate")
+    );
+    let dashboard = browser.send("GET", "/dashboard", None).await;
+    assert!(
+        dashboard.status.is_redirection(),
+        "signed in before verifying"
+    );
+
+    let link = log.verification_link();
+    let page = browser.send("GET", &link, None).await;
+    assert_eq!(
+        page.location.as_deref(),
+        Some("/dashboard"),
+        "{}",
+        page.body
+    );
+    assert_eq!(
+        user_status(&browser.pool, "carol").await.as_deref(),
+        Some("active")
+    );
+    let dashboard = browser.send("GET", "/dashboard", None).await;
+    assert_eq!(dashboard.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_wrong_or_foreign_verification_link_completes_nothing() {
+    let (log, _guard) = MailLog::capture();
+    let mut browser = Browser::new().await;
+    browser.sign_up("carol").await;
+    let link = log.verification_link();
+
+    let wrong = browser.send("GET", "/verify-email?token=nope", None).await;
+    assert!(wrong.location.is_none(), "{}", wrong.body);
+
+    // The right token, from a browser that never began the signup.
+    let mut stranger = Browser::new().await;
+    stranger.router = browser.router.clone();
+    let page = stranger.send("GET", &link, None).await;
+    assert!(page.location.is_none(), "{}", page.body);
+    assert_eq!(
+        user_status(&browser.pool, "carol").await.as_deref(),
+        Some("candidate")
+    );
+}
+
+/// A signup for a taken username takes about as long as one for a free name,
+/// and answers the same page: the form is not an oracle for who has an
+/// account.
+#[tokio::test]
+async fn a_taken_username_costs_the_same_work_as_a_free_one() {
+    let mut browser = Browser::new().await;
+    let timed = |username: &'static str| {
+        let fields = vec![
+            ("username", username),
+            ("fullname", "Carol Example"),
+            ("email", "carol@example.com"),
+            ("password", "Gnomes2+LongEnough"),
+        ];
+        (username, fields)
+    };
+    let (_, free_fields) = timed("carol");
+    let (_, taken_fields) = timed("alice");
+
+    let token = browser.token_from("/signup").await;
+    let mut fields = free_fields;
+    fields.push(("_csrf", &token));
+    let start = std::time::Instant::now();
+    let free = browser.send("POST", "/signup", Some(fields)).await;
+    let free_took = start.elapsed();
+
+    // Another visitor, with a session of their own, asks for the same name.
+    let mut visitor = Browser::new().await;
+    visitor.router = browser.router.clone();
+    let token = visitor.token_from("/signup").await;
+    let mut fields = taken_fields;
+    fields.push(("_csrf", &token));
+    let start = std::time::Instant::now();
+    let taken = visitor.send("POST", "/signup", Some(fields)).await;
+    let taken_took = start.elapsed();
+
+    assert_eq!(free.body, taken.body, "the two answers differ");
+    assert!(
+        taken_took * 2 >= free_took,
+        "the taken path answered in {taken_took:?}, the free one in {free_took:?}"
+    );
+}
+
+/// Pages that carry account state are not cached, framed or allowed to load
+/// anything: the TOTP page shows the secret, so it most of all.
+#[tokio::test]
+async fn pages_are_not_cached_or_framed_and_carry_a_csp() {
+    let mut browser = Browser::new().await;
+    browser.log_in().await;
+    for uri in ["/setup-totp", "/login", "/dashboard"] {
+        let mut req = Request::builder().uri(uri);
+        let cookie = browser
+            .cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        req = req.header(header::COOKIE, cookie);
+        let mut req = req.body(Body::empty()).expect("request");
+        req.extensions_mut().insert(ConnectInfo(browser.peer));
+        let res = browser
+            .router
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("infallible");
+        let headers = res.headers();
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).map(|v| v.as_bytes()),
+            Some(&b"no-store"[..]),
+            "{uri}"
+        );
+        assert_eq!(
+            headers.get(header::X_FRAME_OPTIONS).map(|v| v.as_bytes()),
+            Some(&b"DENY"[..]),
+            "{uri}"
+        );
+        let csp = headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap_or_else(|| panic!("{uri} has no CSP"))
+            .to_str()
+            .expect("ascii");
+        assert!(csp.contains("frame-ancestors 'none'"), "{uri}: {csp}");
+    }
+}
+
+/// Reading a form is not an attempt: only submissions count against the
+/// limit, so a person who reloads the login page is never turned away.
+#[tokio::test]
+async fn reading_the_login_page_is_not_limited() {
+    let mut browser = Browser::new().await;
+    for _ in 0..15 {
+        let page = browser.send("GET", "/login", None).await;
+        assert_eq!(page.status, StatusCode::OK);
+    }
+}
+
+/// Login and forgot-password have a bucket each: a run of failed logins from
+/// one address does not stop that address asking for a reset, and the other
+/// way round.
+#[tokio::test]
+async fn login_and_forgot_password_do_not_share_a_limit() {
+    let mut browser = Browser::new().await;
+    let mut limited = false;
+    for _ in 0..15 {
+        let fields = vec![("identifier", "nobody"), ("password", "wrong password")];
+        let page = browser.post("/login", "/login", fields).await;
+        limited |= page.status == StatusCode::TOO_MANY_REQUESTS;
+    }
+    assert!(limited, "fifteen failed logins in a row were never limited");
+
+    let fields = vec![("identifier", "alice")];
+    let page = browser
+        .post("/forgot-password", "/forgot-password", fields)
+        .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+}
+
+/// Asking twice for the same account's reset inside the cooldown mints one
+/// token, so the form cannot be used to flood an inbox.
+#[tokio::test]
+async fn a_second_reset_request_inside_the_cooldown_mints_no_token() {
+    let (log, _guard) = MailLog::capture();
+    let mut browser = Browser::new().await;
+    for _ in 0..2 {
+        let fields = vec![("identifier", "alice")];
+        browser
+            .post("/forgot-password", "/forgot-password", fields)
+            .await;
+    }
+    let links = log.text().matches("password reset link").count();
+    assert_eq!(links, 1, "{}", log.text());
 }

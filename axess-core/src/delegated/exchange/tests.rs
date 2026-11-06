@@ -67,6 +67,7 @@ async fn exchange_passes_actor_token_for_azure_obo_shape() {
         ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "graph-token",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "token_type": "Bearer",
             "expires_in": 3600,
         })))
@@ -97,6 +98,7 @@ async fn exchange_works_without_client_secret_for_mtls_auth() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token_type": "Bearer",
             "access_token": "downstream",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "expires_in": 3600,
         })))
         .mount(&server)
@@ -169,6 +171,31 @@ async fn exchange_rejects_empty_access_token_in_response() {
     );
 }
 
+/// RFC 8693 section 2.2.1 requires `issued_token_type`; a response without
+/// it is refused rather than read as an access token.
+#[tokio::test]
+async fn exchange_rejects_a_response_without_issued_token_type() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth2/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "tok",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })))
+        .mount(&server)
+        .await;
+
+    let client =
+        TokenExchangeClient::new(token_url(&server), "axess", Some("shh".into())).expect("client");
+    let req = TokenExchangeRequest::new("token", token_types::JWT);
+    let err = client.exchange(&req).await.expect_err("must be refused");
+    assert!(
+        matches!(err, DelegatedError::MalformedResponse(ref why) if why.contains("issued_token_type")),
+        "got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn exchange_carries_resource_when_set() {
     let server = MockServer::start().await;
@@ -180,6 +207,7 @@ async fn exchange_carries_resource_when_set() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token_type": "Bearer",
             "access_token": "scoped-to-market-api",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "expires_in": 600,
         })))
         .expect(1)
@@ -205,6 +233,7 @@ async fn exchange_form_encodes_basic_credentials() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "token_type": "Bearer",
             "access_token": "downstream",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
         })))
         .expect(1)
         .mount(&server)
@@ -346,6 +375,7 @@ async fn a_response_without_scope_grants_the_requested_scopes() {
         .and(path("/oauth2/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "downstream-jwt",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "token_type": "Bearer",
             "expires_in": 600,
         })))
@@ -371,6 +401,7 @@ async fn a_response_without_token_type_is_refused() {
         .and(path("/oauth2/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "access_token": "downstream",
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "expires_in": 3600,
         })))
         .mount(&server)

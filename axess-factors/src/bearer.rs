@@ -254,6 +254,8 @@ pub fn validate_bearer_token(
         // Verify signature against the issuer's JWKS.
         let mut validation_config = ValidationConfig::new();
         validation_config.audience = issuer_cfg.audience.exact().map(String::from);
+        // `AnyDangerous` is the configured decision to accept any audience.
+        validation_config.allow_any_audience = issuer_cfg.audience == Audience::AnyDangerous;
         // The issuer was chosen by the token's own `iss`, so pinning it adds
         // nothing against a forged claim, but it makes `iss` a required claim
         // checked by the same code path as every other verifier, rather than a

@@ -12,7 +12,7 @@ use crate::device::store::sql_contract as contract;
 use crate::testing::sql_live;
 
 async fn store(connections: u32) -> PostgresDeviceStore {
-    let store = PostgresDeviceStore::plaintext(sql_live::postgres_pool(connections).await);
+    let store = PostgresDeviceStore::plaintext_insecure(sql_live::postgres_pool(connections).await);
     store.init_schema().await.expect("init_schema");
     store
 }
@@ -73,7 +73,7 @@ fn refresh(family: &str) -> DeviceBinding {
 #[ignore = "requires a running Postgres (POSTGRES_URL)"]
 async fn a_losing_bindings_swap_reports_a_conflict_on_a_one_connection_pool() {
     let pool = sql_live::postgres_pool(1).await;
-    let store = PostgresDeviceStore::plaintext(pool);
+    let store = PostgresDeviceStore::plaintext_insecure(pool);
     store.init_schema().await.unwrap();
     let (t, id) = (tenant(), dev_id("one-conn"));
     let before = vec![refresh("fam-a")];
@@ -173,7 +173,7 @@ async fn the_family_index_follows_the_device() {
 #[ignore = "requires a running Postgres (POSTGRES_URL)"]
 async fn an_encrypted_store_seals_the_bindings_column() {
     let pool = sql_live::postgres_pool(4).await;
-    let store = PostgresDeviceStore::new(pool, SessionCrypto::new([0x42; 32]));
+    let store = PostgresDeviceStore::new(pool, SessionCrypto::new(crate::testing::test_key(0x42)));
     store.init_schema().await.unwrap();
     let mut d = device("sealed", 3, DeviceTrustLevel::Seen, at(10));
     d.bindings = vec![refresh("fam-secret")];

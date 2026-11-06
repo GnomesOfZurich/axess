@@ -23,7 +23,7 @@
 //!         .with_issuer(axess_example_workload_identity::eks::issuer("eu-west-1", "ABCDEF0123456789"))
 //!         .with_audience("axess-platform"),
 //! );
-//! // then k8s_sa_mapper_pinned(trust_domain, pins) as in the kubernetes module
+//! // then k8s_sa_mapper_pinned(pins) as in the kubernetes module
 //! ```
 
 /// The audience of the token the IRSA webhook projects, meant for AWS STS.

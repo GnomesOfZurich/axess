@@ -88,20 +88,22 @@ fn okta_claims() -> serde_json::Value {
     })
 }
 
-fn okta_mapper(
-    trust_domain: TrustDomain,
-) -> impl Fn(&VerifiedClaims<OktaStyleClaims>) -> Result<WorkloadMapping, IdentityError> {
+/// The adopter's slug-to-tenant registry: only `ekekrantz` is known.
+fn tenant_lookup() -> impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static {
+    |slug: &str| (slug == "ekekrantz").then(sample_tenant)
+}
+
+fn okta_mapper()
+-> impl Fn(&VerifiedClaims<OktaStyleClaims>) -> Result<WorkloadMapping, IdentityError> {
     move |claims: &VerifiedClaims<OktaStyleClaims>| -> Result<WorkloadMapping, IdentityError> {
         let service = claims.custom.service.clone();
         let tenant_slug = claims.custom.organization.clone();
-        let workload_id = WorkloadId::build(&trust_domain, &service, &tenant_slug)?;
         let mut attributes = BTreeMap::new();
         attributes.insert(
             "azp".to_string(),
             serde_json::Value::String(claims.custom.azp.clone()),
         );
         Ok(WorkloadMapping {
-            workload_id,
             service_name: service,
             tenant_slug,
             attributes,
@@ -118,10 +120,10 @@ async fn valid_token_resolves_via_custom_mapper() {
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust.clone(),
-        sample_tenant(),
+        tenant_lookup(),
         Issuer::OAuth,
         token,
-        okta_mapper(trust.clone()),
+        okta_mapper(),
     );
 
     let principal = resolver.resolve().await.expect("must resolve");
@@ -168,10 +170,10 @@ async fn wrong_iss_rejected_by_verifier() {
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust.clone(),
-        sample_tenant(),
+        tenant_lookup(),
         Issuer::OAuth,
         token,
-        okta_mapper(trust),
+        okta_mapper(),
     );
     let err = resolver.resolve().await.expect_err("wrong iss must reject");
     assert!(
@@ -180,30 +182,52 @@ async fn wrong_iss_rejected_by_verifier() {
     );
 }
 
+/// The resolver builds the workload id from its own trust domain, so the
+/// pin is a real check: the mapper has no say in it.
 #[tokio::test]
-async fn trust_domain_mismatch_rejected() {
+async fn the_workload_id_carries_the_resolvers_trust_domain() {
     let (der, jwks, kid) = rsa_keypair();
     let token = sign(&okta_claims(), &kid, &der);
-    // Resolver pins `okta.gnomes.local`; mapper synthesises
-    // workload_id under a different domain.
-    let resolver_trust = TrustDomain::new("okta.gnomes.local").unwrap();
-    let attacker_trust = TrustDomain::new("attacker.example").unwrap();
-
+    let trust = TrustDomain::new("pinned.example").unwrap();
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
-        resolver_trust,
-        sample_tenant(),
+        trust.clone(),
+        tenant_lookup(),
         Issuer::OAuth,
         token,
-        okta_mapper(attacker_trust),
+        okta_mapper(),
     );
-    let err = resolver
-        .resolve()
-        .await
-        .expect_err("trust-domain mismatch must reject");
+    match resolver.resolve().await.expect("must resolve") {
+        Principal::Workload(w) => {
+            assert_eq!(
+                w.workload_id.as_str(),
+                "spiffe://pinned.example/feed-worker/ekekrantz"
+            );
+            assert_eq!(w.trust_domain, trust);
+        }
+        Principal::Human(_) => panic!("expected Workload, got Human"),
+    }
+}
+
+/// The tenant comes from the verified claims' slug through the lookup; a slug
+/// the lookup does not know is refused, not given a tenant the caller guessed.
+#[tokio::test]
+async fn an_unknown_tenant_slug_is_refused() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(&okta_claims(), &kid, &der);
+    let trust = TrustDomain::new("okta.gnomes.local").unwrap();
+    let resolver = WorkloadResolver::new(
+        build_verifier(jwks),
+        trust,
+        |slug: &str| (slug == "someone-else").then(sample_tenant),
+        Issuer::OAuth,
+        token,
+        okta_mapper(),
+    );
+    let err = resolver.resolve().await.expect_err("unknown slug");
     assert!(
-        matches!(err, IdentityError::InvalidSpiffeId(_)),
-        "expected InvalidSpiffeId, got {err:?}"
+        matches!(err, IdentityError::NotAuthenticated),
+        "expected NotAuthenticated, got {err:?}"
     );
 }
 
@@ -218,7 +242,7 @@ async fn claim_mapper_error_propagated() {
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust,
-        sample_tenant(),
+        tenant_lookup(),
         Issuer::OAuth,
         token,
         |_claims: &VerifiedClaims<OktaStyleClaims>| {
@@ -261,10 +285,10 @@ async fn custom_claim_deser_failure_rejected() {
     let resolver = WorkloadResolver::new(
         build_verifier(jwks),
         trust.clone(),
-        sample_tenant(),
+        tenant_lookup(),
         Issuer::OAuth,
         token,
-        okta_mapper(trust),
+        okta_mapper(),
     );
     let err = resolver
         .resolve()
@@ -304,10 +328,10 @@ async fn a_verifier_without_an_audience_or_issuer_pin_is_refused() {
         let resolver = WorkloadResolver::new(
             verifier,
             trust.clone(),
-            sample_tenant(),
+            tenant_lookup(),
             Issuer::OAuth,
             token.clone(),
-            okta_mapper(trust.clone()),
+            okta_mapper(),
         );
         assert!(
             matches!(

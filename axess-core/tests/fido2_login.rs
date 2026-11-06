@@ -627,11 +627,7 @@ async fn an_account_suspended_mid_registration_cannot_add_a_passkey() {
     f.identity
         .suspend_user(
             &user.id,
-            StatusDetail {
-                reason: "test".into(),
-                since: chrono::Utc::now(),
-                until: None,
-            },
+            StatusDetail::administrative("test", chrono::Utc::now()),
         )
         .await
         .unwrap();
@@ -693,7 +689,13 @@ async fn a_passkey_only_method_ends_authenticated_with_the_passkey_recorded() {
     match session.auth_state().await {
         axess_core::session::data::AuthState::Authenticated {
             factors_completed, ..
-        } => assert_eq!(factors_completed, vec![FactorKind::Fido2]),
+        } => assert_eq!(
+            factors_completed
+                .iter()
+                .map(|(kind, _)| kind.clone())
+                .collect::<Vec<_>>(),
+            vec![FactorKind::Fido2]
+        ),
         other => panic!("{other:?}"),
     }
 }
@@ -766,11 +768,7 @@ async fn a_suspended_tenant_refuses_the_passkey_login() {
     let f = fixture_with(
         true,
         vec![vec![FactorKind::Fido2]],
-        EntityState::Suspended(StatusDetail {
-            reason: "hold".into(),
-            since: chrono::Utc::now(),
-            until: None,
-        }),
+        EntityState::Suspended(StatusDetail::administrative("hold", chrono::Utc::now())),
     );
     let session = test_session();
     let list = begin_discoverable(&f, &session).await;
@@ -974,11 +972,7 @@ async fn the_ceremony_tenant_is_cleared_on_the_tenant_gate_exit() {
     let f = fixture_with(
         true,
         vec![vec![FactorKind::Fido2]],
-        EntityState::Suspended(StatusDetail {
-            reason: "hold".into(),
-            since: chrono::Utc::now(),
-            until: None,
-        }),
+        EntityState::Suspended(StatusDetail::administrative("hold", chrono::Utc::now())),
     );
     let session = test_session();
     f.service

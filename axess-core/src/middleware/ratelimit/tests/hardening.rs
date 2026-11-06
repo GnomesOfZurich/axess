@@ -135,8 +135,8 @@ fn clients_past_the_group_budget_share_an_overflow_bucket() {
     assert!(allowed(&store.try_acquire_target(&client("10.0.1.1"), now)));
 }
 
-/// Near the cap a new login identifier folds into its origin's overflow
-/// bucket instead of taking a slot; identifiers that already had a bucket
+/// Near the cap a new login identifier folds into an overflow bucket chosen
+/// by the identifier instead of taking a slot; identifiers that already had a bucket
 /// keep it.
 #[test]
 fn new_login_identifiers_fold_into_an_overflow_bucket_near_the_cap() {
@@ -151,11 +151,10 @@ fn new_login_identifiers_fold_into_an_overflow_bucket_near_the_cap() {
         let t = login_target(&format!("minted{i}@example.com"), "203.0.113.7");
         store.try_acquire_target(&t, now);
     }
-    assert_eq!(store.len(), 76, "all of them shared one overflow bucket");
-    // A second origin has its own overflow.
-    let other = login_target("minted0@example.com", "198.51.100.9");
-    assert!(allowed(&store.try_acquire_target(&other, now)));
-    assert_eq!(store.len(), 77);
+    assert!(
+        store.len() <= 75 + keys::LOGIN_OVERFLOW_BUCKETS as usize,
+        "minted names share a bounded set of overflow buckets"
+    );
     // An identifier that was admitted before the fold keeps its bucket.
     let first = login_target("user0@example.com", "203.0.113.7");
     assert!(allowed(&store.try_acquire_target(&first, now)));
@@ -308,16 +307,61 @@ async fn an_address_folded_into_the_overflow_bucket_gets_no_remaining_header() {
     );
 }
 
-/// Two IPv4 addresses of one /24 have an overflow bucket each, as documented
-/// (the IPv4 address, or the IPv6 /48): one origin's minted identifiers do
-/// not use up the allowance of its neighbour.
+/// The overflow bucket of a login identifier is chosen by the identifier, not
+/// by where the request came from: every origin that names one account draws
+/// on the same bucket, and neither the origin nor a missing client-IP layer
+/// changes it.
 #[test]
-fn login_overflow_is_keyed_per_ipv4_address() {
+fn login_overflow_is_keyed_on_the_identifier_not_the_origin() {
     let a = login_target("someone@example.com", "203.0.113.7");
-    let b = login_target("someone@example.com", "203.0.113.8");
-    assert_ne!(a.fold_into, b.fold_into, "one overflow bucket per address");
-    // An IPv6 origin still folds by its /48.
-    let v6a = login_target("someone@example.com", "2001:db8:1:1::1");
-    let v6b = login_target("someone@example.com", "2001:db8:1:2::1");
-    assert_eq!(v6a.fold_into, v6b.fold_into);
+    let b = login_target("someone@example.com", "198.51.100.8");
+    let v6 = login_target("someone@example.com", "2001:db8:1:1::1");
+    assert_eq!(a.fold_into, b.fold_into, "two origins, one account");
+    assert_eq!(a.fold_into, v6.fold_into);
+    let mut bare = make_login_request(Some("someone@example.com"));
+    bare.extensions_mut()
+        .insert(std::net::SocketAddr::from(([192, 0, 2, 1], 1)));
+    assert_eq!(
+        resolve_target(&bare, &KeyExtractor::LoginIdentifier).fold_into,
+        a.fold_into,
+        "no client-IP layer: same overflow bucket"
+    );
+}
+
+/// One address that fills the table with minted identifiers does not stop the
+/// account it later targets from being limited across every other address.
+#[test]
+fn an_account_is_limited_across_origins_once_the_table_is_full() {
+    let store = test_store(2, Duration::from_secs(60)).with_caps(100, 1024);
+    let now = t_zero();
+    for i in 0..75 {
+        let t = login_target(&format!("minted{i}@example.com"), "203.0.113.7");
+        store.try_acquire_target(&t, now);
+    }
+    let mut ok = 0;
+    for i in 0..10 {
+        let t = login_target("victim@example.com", &format!("198.51.100.{i}"));
+        if allowed(&store.try_acquire_target(&t, now)) {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 2, "ten origins, one account, two attempts");
+}
+
+/// The config's fields are public, so a literal or a later assignment can
+/// skip the builder's checks; the layer makes them again.
+#[test]
+#[should_panic(expected = "max_requests must be > 0")]
+fn a_config_edited_to_zero_requests_is_refused_by_the_layer() {
+    let mut config = RateLimitConfig::builder().build();
+    config.max_requests = 0;
+    let _ = RateLimitLayer::new(config);
+}
+
+#[test]
+#[should_panic(expected = "window must be > 0")]
+fn a_config_edited_to_a_zero_window_is_refused_by_the_layer() {
+    let mut config = RateLimitConfig::builder().build();
+    config.window = Duration::ZERO;
+    let _ = RateLimitLayer::new(config);
 }

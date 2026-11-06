@@ -54,6 +54,13 @@ pub const MAX_COOKIE_VALUE_BYTES: usize = 4096;
 ///   Refusing to choose treats the request as having no cookie. Repeats of
 ///   the same value are harmless and are accepted.
 ///
+///   The price is a denial of service: an attacker who can plant a second
+///   cookie of the same name (a sibling subdomain, or a man in the middle on
+///   plain HTTP) makes the victim's session read as absent on every request
+///   until the planted cookie expires. Only a `__Host-` name (`Secure`, path
+///   `/`, no `Domain`) stops that: the browser refuses such a cookie from any
+///   other host or path.
+///
 /// `max_value_bytes` is **mandatory**: there is no "no-cap" sentinel.
 /// Pass a sensible constant per use site (the session layer and CSRF
 /// middleware both pass 4096, which leaves headroom for application-

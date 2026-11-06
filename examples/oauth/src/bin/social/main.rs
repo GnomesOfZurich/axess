@@ -48,7 +48,7 @@ struct AppState {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(
-            |_| "axess_example_social=debug,axess=debug".into(),
+            |_| "axess_example_social=info,axess=info".into(),
         )))
         .with(tracing_subscriber::fmt::layer())
         .try_init()?;
@@ -130,8 +130,8 @@ fn pre_auth_cookie_for(name: &str, value: String, secure: bool) -> Cookie<'stati
 }
 
 async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResponse {
-    let csrf_state = state.github.mint_csrf_state();
-    let auth = state.github.build_auth_url(&csrf_state);
+    // The provider mints the state and the PKCE verifier itself.
+    let auth = state.github.build_auth_url();
 
     // Store CSRF state + PKCE verifier in short-lived cookies. A real
     // app would use the SessionLayer's pre-auth session instead; cookies
@@ -143,7 +143,7 @@ async fn login(State(state): State<AppState>, cookies: Cookies) -> impl IntoResp
     // is set for plain HTTP; `Path=/` and no `Domain` are what the prefix
     // requires.
     let secure = secure_cookies();
-    cookies.add(pre_auth_cookie_for("oauth_state", csrf_state, secure));
+    cookies.add(pre_auth_cookie_for("oauth_state", auth.state, secure));
     cookies.add(pre_auth_cookie_for(
         "oauth_pkce",
         auth.pkce_verifier,
@@ -172,18 +172,6 @@ async fn callback(
         .get(&pre_auth_cookie("oauth_state", secure))
         .map(|c| c.value().to_string())
         .unwrap_or_default();
-    // Constant-time comparison: the state is a secret the attacker must not
-    // be able to guess byte by byte from response timing.
-    let matches: bool =
-        subtle::ConstantTimeEq::ct_eq(stored_state.as_bytes(), q.state.as_bytes()).into();
-    if stored_state.is_empty() || !matches {
-        return Html(
-            r#"<h1>Auth failed</h1><p>CSRF state mismatch.</p><p><a href="/">Back</a></p>"#
-                .to_string(),
-        )
-        .into_response();
-    }
-
     let pkce_verifier = cookies
         .get(&pre_auth_cookie("oauth_pkce", secure))
         .map(|c| c.value().to_string())
@@ -198,8 +186,28 @@ async fn callback(
         cookies.remove(gone);
     }
 
-    let access_token = match state.github.exchange_code(&q.code, &pkce_verifier).await {
+    // `exchange_code` compares the stored state with the one the IdP echoed (in
+    // constant time) and refuses an empty verifier, before it sends anything.
+    let access_token = match state
+        .github
+        .exchange_code(&stored_state, &q.state, &q.code, &pkce_verifier)
+        .await
+    {
         Ok(t) => t,
+        Err(axess::social::SocialError::StateMismatch) => {
+            return Html(
+                r#"<h1>Auth failed</h1><p>CSRF state mismatch.</p><p><a href="/">Back</a></p>"#
+                    .to_string(),
+            )
+            .into_response();
+        }
+        Err(axess::social::SocialError::InvalidPkceVerifier) => {
+            return Html(
+                r#"<h1>Auth failed</h1><p>Missing PKCE verifier.</p><p><a href="/">Back</a></p>"#
+                    .to_string(),
+            )
+            .into_response();
+        }
         Err(e) => {
             tracing::warn!(error = %e, "token exchange failed");
             return Html(

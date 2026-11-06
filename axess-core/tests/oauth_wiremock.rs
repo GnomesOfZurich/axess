@@ -1005,3 +1005,74 @@ async fn the_device_poll_authenticates_with_basic_when_the_client_holds_a_secret
         .expect("a poll an IdP that accepts only Basic understands");
     assert!(matches!(outcome, DeviceTokenOutcome::Pending));
 }
+
+/// A token endpoint that answers 200 and then drops the connection before
+/// the body is complete. Returns the endpoint's address.
+async fn token_endpoint_that_cuts_off_its_body() -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                          content-length: 500\r\n\r\n{\"access_token\":\"at",
+                    )
+                    .await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// The connection broke while the answer was being read: the IdP may answer
+/// whole next time, so the failure is one a retry can cure.
+#[tokio::test]
+async fn a_token_answer_cut_off_after_a_200_is_transient() {
+    use axess_factors::oauth::OAuthProvider;
+    let server = MockServer::start().await;
+    let issuer = server.uri();
+    let (_, jwk, _) = generate_rsa_keypair();
+    let cut = token_endpoint_that_cuts_off_its_body().await;
+    let mut discovery = discovery_document(&issuer);
+    discovery["token_endpoint"] = json!(format!("http://{cut}/token"));
+    Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/jwks"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "keys": [jwk] })))
+        .mount(&server)
+        .await;
+    let provider = OAuthProviderConfig::discover(
+        "test",
+        &issuer,
+        "client-id",
+        "secret",
+        "http://localhost:3000/callback",
+    )
+    .await
+    .unwrap()
+    .build()
+    .unwrap();
+
+    let err = provider
+        .client_credentials(&["scope-a"], None)
+        .await
+        .expect_err("the answer was cut off");
+
+    assert!(
+        err.is_transient(),
+        "a cut-off body is not permanent: {err:?}"
+    );
+}

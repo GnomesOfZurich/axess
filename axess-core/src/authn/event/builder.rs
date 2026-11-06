@@ -47,7 +47,7 @@ pub struct AuthEventBuilder {
     error: Option<AuthFailureReason>,
     actor_id: Option<UserId>,
     device_id: Option<DeviceId>,
-    factors_completed: Vec<FactorKind>,
+    factors_completed: Vec<(FactorKind, i64)>,
 }
 
 impl AuthEventBuilder {
@@ -276,12 +276,18 @@ impl AuthEventBuilder {
         self
     }
 
-    /// Append a verified factor to the `factors_completed` list. Call once
-    /// per factor that was verified to reach the authenticated state, in
-    /// completion order. The library does this automatically for the
-    /// `Authenticated` event emitted by `complete_factor_step`.
-    pub fn with_factors_completed(mut self, kind: FactorKind) -> Self {
-        self.factors_completed.push(kind);
+    /// Append a verified factor, with the time it was verified, to the
+    /// `factors_completed` list. Call once per factor that was verified to
+    /// reach the authenticated state, in completion order. The library does
+    /// this automatically for the `Authenticated` event emitted by
+    /// `complete_factor_step`.
+    pub fn with_factors_completed(
+        mut self,
+        kind: FactorKind,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        self.factors_completed
+            .push((kind, completed_at.timestamp_micros()));
         self
     }
 

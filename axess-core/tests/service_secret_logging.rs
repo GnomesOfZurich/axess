@@ -78,10 +78,14 @@ fn signed_app(clock: &MockClock, config: SignedRequests) -> Router {
 }
 
 fn signed(value: &str, at: i64, method: Method, target: &str, body: &str) -> Request<Body> {
-    let header =
-        secret("caller", value)
-            .signer()
-            .sign_for(AUDIENCE, at, &method, target, body.as_bytes());
+    let header = secret("caller", value).signer().sign_for(
+        AUDIENCE,
+        at,
+        &method,
+        target,
+        &axum::http::HeaderMap::new(),
+        body.as_bytes(),
+    );
     Request::builder()
         .method(Method::POST)
         .uri("/hook")
@@ -117,12 +121,16 @@ async fn a_replay_is_logged_once_with_the_caller_and_no_secret_material() {
         warns[0].contains("replay") && warns[0].contains("relay"),
         "{warns:?}"
     );
-    let header =
-        secret("relay", RELAY)
-            .signer()
-            .sign_for(AUDIENCE, EPOCH, &Method::POST, "/hook", b"x");
+    let header = secret("relay", RELAY).signer().sign_for(
+        AUDIENCE,
+        EPOCH,
+        &Method::POST,
+        "/hook",
+        &axum::http::HeaderMap::new(),
+        b"x",
+    );
     let header = header.to_str().expect("ascii").to_owned();
-    let tag = header.split("v2=").nth(1).expect("tag");
+    let tag = header.split("v3=").nth(1).expect("tag");
     for event in &events {
         assert!(!event.contains(tag) && !event.contains(RELAY), "{event}");
     }

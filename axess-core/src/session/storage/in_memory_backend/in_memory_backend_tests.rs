@@ -176,11 +176,7 @@ async fn create_tenant_and_create_user_persist() {
 async fn suspend_and_activate_user_change_account_status() {
     // Kills `suspend_user -> Ok(())` and `activate_user -> Ok(())`.
     let backend = populated_backend();
-    let detail = StatusDetail {
-        reason: "ax-028 test".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("test", Utc::now());
     backend.suspend_user(&u(), detail).await.unwrap();
     let suspended = backend.account_status(&u()).await.unwrap();
     assert!(
@@ -582,4 +578,31 @@ async fn one_username_in_two_tenants_is_two_users() {
     assert_eq!(there.tenant_id, acme);
     assert_ne!(here.id, there.id);
     assert_eq!(here.id, u(), "the first registration keeps the label's id");
+}
+
+/// A username that already looks like a fallback id (`a@b`), registered in
+/// another tenant, is not replaced when the plain name is later registered in
+/// that tenant: the fallback id of `a` in tenant `b` is taken, so another one
+/// is chosen and both users keep their own tenant.
+#[tokio::test]
+async fn a_fallback_id_never_replaces_a_user_of_another_tenant() {
+    let backend = InMemoryBackend::new()
+        .with_default_tenant("X", "X")
+        .with_default_tenant("Y", "Y")
+        .with_default_tenant("b", "b")
+        .with_user_password("a", "Y", "Gnomes2+")
+        .with_user_password("a@b", "X", "Gnomes2+")
+        .with_user_password("a", "b", "Gnomes2+");
+    let tenant = |name: &str| axess_identity::testing::tenant(name);
+    let mut ids = std::collections::HashSet::new();
+    for (identifier, home) in [("a", "Y"), ("a@b", "X"), ("a", "b")] {
+        let found = backend
+            .find_user(identifier, &tenant(home))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("{identifier} in {home} is gone"));
+        assert_eq!(found.tenant_id, tenant(home));
+        ids.insert(found.id);
+    }
+    assert_eq!(ids.len(), 3, "three users, three ids");
 }

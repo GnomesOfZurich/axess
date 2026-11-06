@@ -100,6 +100,24 @@ impl std::fmt::Debug for ClientAuth {
     }
 }
 
+/// The ID token algorithms from `OAUTH_ID_TOKEN_ALGS` (comma separated):
+/// `RS256` when it is unset or blank, the algorithm OpenID Connect registers
+/// by default. An empty list would accept whatever the provider's discovery
+/// document advertises.
+pub fn id_token_algs_from_setting(value: Option<&str>) -> Vec<String> {
+    let algs: Vec<String> = value
+        .unwrap_or_default()
+        .split(',')
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if algs.is_empty() {
+        vec!["RS256".to_string()]
+    } else {
+        algs
+    }
+}
+
 /// One identity-provider registration, in one place.
 ///
 /// Both the authentication service and the back-channel logout handler need a
@@ -125,7 +143,8 @@ pub struct ProviderSettings {
     /// The signature algorithms the provider's tokens may use, as registered
     /// (`id_token_signed_response_alg`). Empty accepts what the provider
     /// advertises; name one (`RS256` is the OpenID Connect default) to refuse
-    /// every other.
+    /// every other. `main.rs` fills it from [`id_token_algs_from_setting`],
+    /// which never leaves it empty.
     pub id_token_algs: Vec<String>,
 }
 
@@ -310,12 +329,23 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
     // In production, load a persistent key from a secret store.
     let mut signing_key = [0u8; 32];
     SystemRng.fill_bytes(&mut signing_key);
-    let session_layer = SessionLayer::new(MemorySessionStore::new(), signing_key)
-        .with_secure(config.secure_cookies)
-        // A session the registry no longer holds (back-channel logout, a
-        // forced logout) is refused on its next request.
-        .with_registry(Arc::new(SessionRegistryAdapter(registry)));
+    // A session the registry no longer holds (back-channel logout, a forced
+    // logout) is refused on its next request.
+    let session_layer = SessionLayer::new(
+        MemorySessionStore::new(),
+        signing_key,
+        Arc::new(SessionRegistryAdapter(registry)),
+    )
+    .with_secure(config.secure_cookies);
 
+    // The application's own origin: what a browser sends as `Origin` from this
+    // application's pages. Every provider is served from the same one.
+    let origin: Arc<str> = config
+        .providers
+        .first()
+        .map(|p| p.base_url.trim_end_matches('/').to_string())
+        .ok_or_else(|| BuildError::Setup("no provider configured".into()))?
+        .into();
     let state = AppState {
         authn: authn.clone(),
         identity: identity.clone(),
@@ -330,13 +360,22 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
             post(BackChannelLogoutHandler::handle_backchannel_logout),
         )
         .with_state(backchannel);
+    // Logout and refresh are the application's own state-changing forms. The
+    // callback and the back-channel logout are not: the IdP calls those, and
+    // they carry their own proof (`state`, a signed logout token).
+    let own_forms = Router::new()
+        .route("/auth/logout", post(logout))
+        .route("/auth/refresh", post(refresh))
+        .route_layer(axum::middleware::from_fn_with_state(
+            origin,
+            same_origin_only,
+        ));
     let router = Router::new()
         .route("/", get(home))
         .route("/auth/login/{provider}", get(login))
         .route("/auth/callback/{provider}", get(callback))
         .route("/profile", get(profile))
-        .route("/auth/logout", post(logout))
-        .route("/auth/refresh", post(refresh))
+        .merge(own_forms)
         .with_state(state)
         .merge(logout_routes)
         .layer(session_layer);
@@ -349,6 +388,42 @@ pub async fn build(config: Config) -> Result<App, BuildError> {
         tenant: tenant_id,
         provisioner,
     })
+}
+
+/// Whether the `Origin` (or, without one, `Sec-Fetch-Site`) names the app.
+fn origin_allowed(headers: &axum::http::HeaderMap, app_origin: &str) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    match (header("origin"), header("sec-fetch-site")) {
+        (Some(origin), _) => origin == app_origin,
+        (None, Some(site)) => site == "same-origin",
+        (None, None) => false,
+    }
+}
+
+/// Refuse a state-changing request that does not come from the application's
+/// own origin. A browser sends `Origin` with every `POST`; `Sec-Fetch-Site`
+/// is the fallback for one that omits it. A request with neither is not a
+/// browser form and is refused too.
+///
+/// The session cookie is `SameSite=Lax`, which already keeps it off a
+/// cross-site `POST`; this check is what keeps logout and refresh from being
+/// forgeable if the cookie is ever sent cross-site (`SameSite=None`) or a
+/// sibling subdomain is not trusted. It is a stand-in for a CSRF token:
+/// `axess::csrf` provides the signed double-submit layer for an application
+/// that renders forms it can put one in.
+async fn same_origin_only(
+    State(app_origin): State<Arc<str>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !origin_allowed(req.headers(), &app_origin) {
+        return page(
+            StatusCode::FORBIDDEN,
+            "Refused",
+            "The request did not come from this application.",
+        );
+    }
+    next.run(req).await
 }
 
 async fn home(State(state): State<AppState>) -> Html<String> {
@@ -676,6 +751,20 @@ async fn refresh(
             // The IdP now vouches for another subject under this session's
             // tokens: nothing from this refresh is kept, and the session ends.
             tracing::error!("userinfo described another subject after the refresh");
+            // The new tokens are live at the IdP until it is told otherwise.
+            // `revoke_oauth_token` posts to the discovery document's
+            // revocation endpoint; a failure is logged and the logout goes on.
+            for (token, hint) in [
+                (&*outcome.refresh_token, "refresh_token"),
+                (&*outcome.access_token, "access_token"),
+            ] {
+                if let Err(e) = authn
+                    .revoke_oauth_token(&provider, token, Some(hint), None)
+                    .await
+                {
+                    tracing::warn!(error = %e, hint, "could not revoke the new token");
+                }
+            }
             if let Err(e) = authn.logout(&session).await {
                 tracing::error!(error = %e, "logout audit failed");
             }

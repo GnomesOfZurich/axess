@@ -9,6 +9,7 @@ use axess_core::authn::AuditContext;
 use axess_core::authn::event::{AuthEventStatus, AuthEventType};
 use axess_core::authn::service::{Actor, AuthnService};
 use axess_core::session::store::{MemorySessionRegistry, SessionRegistry};
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,

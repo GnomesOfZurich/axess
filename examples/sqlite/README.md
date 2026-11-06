@@ -13,7 +13,7 @@ This is the example to start with if you want to understand how the pieces fit t
 
 | Flow | Routes | What you see |
 |------|--------|-------------|
-| Signup | `GET/POST /signup` | Account creation with password factor and auth method stored automatically |
+| Signup | `GET/POST /signup`, `GET /verify-email` | Account creation with password factor and auth method; the account stays a candidate until the mailed link is opened (logged by debug builds, target `dev_mail`) |
 | Login | `GET/POST /login` | Password verification, lockout on too many failures |
 | MFA (TOTP) | `GET/POST /totp` | Second-factor code entry during login |
 | Recovery code | `POST /recovery-code` | A one-time recovery code in place of the TOTP code, offered on the `/totp` page |
@@ -26,7 +26,9 @@ This is the example to start with if you want to understand how the pieces fit t
 
 ## Security features in this example
 
-- **Rate limiting** on all auth routes (10 requests/minute per IP via `RateLimitLayer`)
+- **Rate limiting** per client IP via `RateLimitLayer`, on submissions only (reading a form is free): login 10 a minute, forgot-password 5 a minute, each in its own bucket, and one shared bucket of 10 for signup, second factor, reset completion, email verification and TOTP setup
+- **Password reset cooldown**: one reset token per account a minute (`with_password_reset_cooldown`)
+- **Breached-password check** on every chosen password, at signup and reset (`with_breached_password_check`); a password the check knows is refused by name, and one the check could not screen is refused too, unless the deployment opts out
 - **Session encryption at rest** with AES-256-GCM and key rotation (`SessionCrypto::new(key).with_previous_key(old_key)`)
 - **HMAC-signed session cookies** with constant-time verification
 - **Per-user lockout** after repeated failed attempts
@@ -39,14 +41,18 @@ cargo run -p axess-example-sqlite
 
 The server starts on [http://127.0.0.1:3000](http://127.0.0.1:3000).
 
-### Test accounts (seeded automatically)
+### Test accounts (seeded by a debug build)
+
+A debug build seeds two accounts. A release build seeds nothing unless you run it with `EXAMPLE_SEED=1`: the accounts share a published password, so never seed them anywhere real.
 
 | Username | Password | MFA |
 |----------|----------|-----|
-| alice | Gnomes2+ | Password only |
-| bob | Gnomes2+ | Password + TOTP (secret printed in server log) |
+| alice | Gnomes2+Example | Password only |
+| bob | Gnomes2+Example | Password + TOTP (secret printed in the server log at debug level, target `dev_seed`) |
 
 Or sign up at `/signup` to create your own account, then enroll TOTP from the dashboard.
+
+Signup is open to anyone and limited only by the per-IP rate limit. The address is checked by a link that must be opened in the browser that signed up (the pending signup lives in that browser's session); a candidate that never verifies keeps its username until the application purges it. An open signup in production also needs its own abuse controls (a CAPTCHA, an allow-list or an invitation) and a mailer.
 
 ### Password reset flow
 
@@ -78,6 +84,8 @@ templates/             HTML templates
 **Factor storage.** Password hashes and TOTP secrets are stored as JSON-serialized `FactorConfig` values. The `save_factor` method uses SQLite `ON CONFLICT ... DO UPDATE` for upserts.
 
 **TOTP secrets at rest.** The router builds a `FactorSecretCipher` from a key kept in `db/factor-secret.key` (created on first start; in production load it from a secrets manager) and passes it to the service with `with_factor_secret_cipher`. Enrolment seals the secret with `seal_config` before `save_factor`, so the `config_json` column holds ciphertext bound to that user's row. The seed seals Bob's secret through the same cipher, so it is ciphertext from the first start. The cipher still reads a plain secret (`LegacyBlobs::AcceptUntil`) until a fixed date, 2027-01-31 (`plain_secret_cutoff`), so a row written before the cipher existed is sealed by its owner's next login; the date does not move on a restart, and a real deployment sets its own.
+
+**Breached passwords.** The router builds the service with `with_breached_password_check(BreachedPasswordList::new(..))`, a fixed list of six common passwords that meet the default rules, so the refusal can be seen: sign up with `Password1234` and the page says the password is known from a data breach. The signup handler asks `service.check_chosen_password` before `begin_signup` (a refused password creates nothing) and `service.hash_chosen_password` when it stores the factor; the reset flow screens inside `complete_password_reset`. `BreachedPasswordList` lives under axess's `testing` feature because a short list is not protection. A deployment swaps in a range lookup: implement `BreachedPasswordCheck` with one `is_breached` that calls `axess::range_prefix(password)`, fetches `GET https://<range service>/range/<prefix>`, and answers `axess::count_in_range(&body, &suffix).is_some_and(|n| n > 0)`, mapping a transport or status error to `BreachCheckError::new(..)`; then pass it to `with_breached_password_check` in place of the list and drop `testing` from the `axess` features. The book's "Breached passwords" section in `docs/factors/password-totp.md` has the adapter in full.
 
 **Auth method storage.** Each user has an `auth_methods` row holding their `FactorStep`s as JSON: `[{"Required":"Password"}]` after signup, and after TOTP enrollment `[{"Required":"Password"},{"AnyOf":["Totp","RecoveryCode"]}]`, a second step with a choice. `verify_factor` takes either credential for that step and prompts for TOTP first.
 
@@ -127,7 +135,7 @@ curl -v -A 'curl/8.0 (different)' http://localhost:3000/whoami
 # Note: /devices lists devices owned by the demo user. The example does
 # not run an authn flow, so all sighted devices are unowned
 # (`user_id = None`) and won't appear here until a real authn flow
-# associates them via `set_authenticated` + a follow-up update.
+# associates them via a login + a follow-up update.
 curl -v http://localhost:3000/devices
 ```
 

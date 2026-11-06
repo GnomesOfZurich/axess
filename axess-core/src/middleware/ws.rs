@@ -43,12 +43,16 @@
 //! A page on any site can open a WebSocket to this server, and the browser
 //! sends the session cookie with the upgrade: the CSRF token never travels
 //! on it. The gate is the `Origin` header, which the
-//! [`CsrfLayer`](crate::middleware::csrf::CsrfLayer) checks on every
-//! upgrade it sees: against the allow-list when one is configured, and
-//! otherwise against the request's own `Host` and scheme
-//! ([`CsrfConfig::websocket_origin_check`](crate::middleware::csrf::CsrfConfig::websocket_origin_check),
-//! on by default). Mount the WebSocket route under that layer; a route
-//! outside it has no origin check at all.
+//! [`SessionLayer`](crate::session::SessionLayer) checks on every upgrade it
+//! sees, before it reads the session: against the allow-list
+//! ([`SessionLayer::with_websocket_origins`](crate::session::SessionLayer::with_websocket_origins))
+//! when one is configured, and otherwise against the request's own `Host`
+//! and scheme. A socket route is covered wherever it is mounted, with or
+//! without the [`CsrfLayer`](crate::middleware::csrf::CsrfLayer), which
+//! applies the same rule to the upgrades it sees (its own allow-list, from
+//! [`CsrfConfig::require_origin`](crate::middleware::csrf::CsrfConfig::require_origin)).
+//! When the page that opens the socket is on another host than the socket,
+//! name its origin on the session layer.
 //!
 //! # Example
 //!
@@ -358,14 +362,17 @@ impl RevocationAwareSocket {
         if self.closed {
             return None;
         }
+        // Biased: a revocation that is already signalled ends the session
+        // before a message the client has already sent is handed over.
         tokio::select! {
-            msg = self.socket.recv() => msg,
+            biased;
             ending = self.revoke_rx.recv() => {
                 // `None`: the watcher ended without a word, so the session
                 // is no longer supervised; fail closed.
                 self.close_supervised(ending.unwrap_or(Ending::Unverified)).await;
                 None
             }
+            msg = self.socket.recv() => msg,
         }
     }
 
@@ -398,13 +405,6 @@ impl RevocationAwareSocket {
     /// maximum lifetime. The close frame sent to the client says which.
     pub fn is_closed(&self) -> bool {
         self.closed
-    }
-
-    /// Whether the supervisor closed the socket, for any of the reasons
-    /// [`is_closed`](Self::is_closed) lists, not only a revocation.
-    #[deprecated(note = "use is_closed")]
-    pub fn is_revoked(&self) -> bool {
-        self.is_closed()
     }
 
     /// Send the close frame for `ending` and mark the socket closed.
@@ -481,6 +481,9 @@ mod abort_on_drop_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "memory"))]
+mod recv_tests;
 
 #[cfg(all(test, feature = "memory"))]
 mod supervise_tests {

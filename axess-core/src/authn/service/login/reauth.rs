@@ -25,6 +25,11 @@ impl AuthSession {
     ///
     /// Pass the service's clock reading as `now`. A `false` is the cue to
     /// call `begin_step_up`.
+    ///
+    /// The age is that of the session's `authn_time`, the moment the most
+    /// recent factor completed. After a step-up it is the step-up's, so it
+    /// says nothing about how long ago an earlier factor (the password of
+    /// the original login) was verified.
     pub async fn authenticated_within(
         &self,
         max_age: std::time::Duration,
@@ -38,13 +43,35 @@ impl AuthSession {
             .is_ok_and(|age| age <= max_age)
     }
 
+    /// Whether the session is authenticated and `kind` was verified no more
+    /// than `max_age` before `now`: the factor's own time, not the session's
+    /// `authn_time`. After a step-up with TOTP, the password of the original
+    /// login is as old as that login. A `false` is the cue to call
+    /// `begin_step_up` with `kind`.
+    pub async fn completed_factor_within(
+        &self,
+        kind: &FactorKind,
+        max_age: std::time::Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.auth_state()
+            .await
+            .factor_completed_at(kind)
+            .is_some_and(|at| (now - at).to_std().is_ok_and(|age| age <= max_age))
+    }
+
     /// Whether the session is authenticated and `kind` is among the factors
     /// it has completed.
+    ///
+    /// A factor from the original login still counts after a step-up,
+    /// however long ago it was verified. For freshness of one factor use
+    /// [`completed_factor_within`](Self::completed_factor_within); for that of
+    /// the most recent factor, [`authenticated_within`](Self::authenticated_within).
     pub async fn has_completed_factor(&self, kind: &FactorKind) -> bool {
         matches!(
             self.auth_state().await,
             crate::session::data::AuthState::Authenticated { factors_completed, .. }
-                if factors_completed.contains(kind)
+                if factors_completed.iter().any(|(k, _)| k == kind)
         )
     }
 }
@@ -133,7 +160,7 @@ where
             .await?;
         {
             let mut guard = session.0.0.write().await;
-            let same_user = guard.data.auth_state.user_id() == Some(&user_id)
+            let same_user = guard.data.auth_state.pending_user_id() == Some(&user_id)
                 && guard.data.auth_state.tenant_id() == Some(&tenant_id);
             if !same_user || !guard.data.auth_state.begin_step_up(steps) {
                 return Err(AuthnError::NoFlow);

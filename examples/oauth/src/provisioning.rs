@@ -46,12 +46,14 @@ impl Provisioning {
     }
 
     /// Reads the `OAUTH_PROVISIONING` setting: `just-in-time` or
-    /// `linked-only`, and just-in-time when it is not set. Any other value is
-    /// an error, so a typo cannot turn on creating users.
+    /// `linked-only`, and linked-only when it is not set: creating users on
+    /// first login needs an explicit `just-in-time`, because with a public
+    /// IdP such as Google it lets anyone with an account there sign up. Any
+    /// other value is an error, so a typo cannot turn on creating users.
     pub fn from_setting(value: Option<&str>) -> Result<Self, String> {
         match value {
-            None | Some("just-in-time") => Ok(Self::JustInTime),
-            Some("linked-only") => Ok(Self::LinkedOnly),
+            None | Some("linked-only") => Ok(Self::LinkedOnly),
+            Some("just-in-time") => Ok(Self::JustInTime),
             Some(other) => Err(format!(
                 "OAUTH_PROVISIONING must be `just-in-time` or `linked-only`, not {other:?}"
             )),
@@ -151,7 +153,8 @@ pub struct Provisioner<I, T> {
     rng: Arc<dyn SecureRng>,
     // One resolution at a time: two first logins of one identity must not
     // each create a user. A database-backed table gets the same guarantee
-    // from its unique key instead and needs no gate.
+    // from its unique key instead; without the gate, `create_and_link` signs
+    // the loser in as the winner's user and removes the one it created.
     gate: tokio::sync::Mutex<()>,
 }
 
@@ -254,9 +257,24 @@ where
             .create_user(user.clone())
             .await
             .map_err(|e| ResolveError::Store(e.to_string()))?;
-        self.identities
+        // The table answers with the user the identity is linked to: ours, or
+        // the one a concurrent login linked first. Sign in as that one, and
+        // do not leave the user this call created behind, linked to no one.
+        let linked = self
+            .identities
             .link_if_absent(issuer, subject, user.id)
             .await;
-        Ok(user)
+        if linked == user.id {
+            return Ok(user);
+        }
+        self.identity
+            .delete_user(&user.id)
+            .await
+            .map_err(|e| ResolveError::Store(e.to_string()))?;
+        match self.identity.get_user(&linked).await {
+            Ok(Some(winner)) => Ok(winner),
+            Ok(None) => Err(ResolveError::LinkedUserMissing(linked)),
+            Err(e) => Err(ResolveError::Store(e.to_string())),
+        }
     }
 }

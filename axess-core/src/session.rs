@@ -48,8 +48,8 @@ pub use id::SessionId;
 pub use layer::{SessionLayer, UnknownLiveness};
 pub use legacy_blobs::LegacyBlobs;
 pub use refresh::{
-    DeviceTokenRevocation, IssueRequest, RefreshError, RefreshToken, RefreshTokenConfig,
-    RefreshTokenStore, RotationOutcome,
+    DeviceTokenRevocation, IssueRequest, PreviousPepper, RefreshError, RefreshToken,
+    RefreshTokenConfig, RefreshTokenStore, RotationOutcome,
 };
 pub use store::{
     ConditionalUpdate, CycleOutcome, RevocationError, SessionLiveness, SessionRegistry,

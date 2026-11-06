@@ -55,17 +55,17 @@ async fn rotation_checks_the_digest_and_the_child_keeps_it() {
     let config = test_config();
     let (plaintext, record) = issue(&store, &config, Some("fp-hex"), Some(device("d1"))).await;
 
-    let wrong = Refresh::new(&plaintext, |_| async { true })
+    let wrong = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("other"))
         .run(&store, &config, &MockRng::new(6), now())
         .await;
     assert!(matches!(wrong, Err(RefreshError::DeviceMismatch)));
-    let none = Refresh::new(&plaintext, |_| async { true })
+    let none = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &MockRng::new(6), now())
         .await;
     assert!(matches!(none, Err(RefreshError::DeviceMismatch)));
 
-    let (_, child) = Refresh::new(&plaintext, |_| async { true })
+    let (_, child) = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("fp-hex"))
         .run(&store, &config, &MockRng::new(6), now())
         .await

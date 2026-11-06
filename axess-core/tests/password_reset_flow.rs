@@ -85,11 +85,7 @@ async fn begin_password_reset_returns_token_for_existing_user() {
 #[tokio::test]
 async fn begin_password_reset_inactive_tenant_returns_none() {
     let mut suspended = test_tenant();
-    suspended.status = EntityState::Suspended(StatusDetail {
-        reason: "test".into(),
-        since: Utc::now(),
-        until: None,
-    });
+    suspended.status = EntityState::Suspended(StatusDetail::administrative("test", Utc::now()));
     let identity = MockIdentityStore::new()
         .with_tenant(suspended)
         .with_user(fixture_user("u1", "alice", "t1"));
@@ -115,11 +111,7 @@ async fn begin_password_reset_inactive_tenant_returns_none() {
 #[tokio::test]
 async fn begin_password_reset_suspended_account_returns_none() {
     let mut suspended = fixture_user("u1", "alice", "t1");
-    suspended.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now(),
-        until: None,
-    });
+    suspended.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(suspended);
@@ -380,7 +372,11 @@ async fn password_history_records_each_hash_once() {
         .with_tenant(test_tenant())
         .with_user(user.clone());
     let inspector = identity.clone();
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    // Three resets in a row for one account: the default cooldown would
+    // refuse the second.
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .without_password_reset_cooldown()
+        .build()
         .with_audit_context(AuditContext::default());
 
     for password in ["First-password-1", "Second-password-2", "Third-password-3"] {

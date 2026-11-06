@@ -85,7 +85,9 @@ HMAC-SHA256 under the pepper). The client string itself is not stored.
 Refresh recomputes the digest from the string presented and compares in
 constant time, under the pepper the token was found under (the previous one
 during a pepper rotation), and the child token carries the digest under the
-current pepper. Without a pepper the digest is unkeyed. A token of an
+current pepper. Without a pepper the digest is unkeyed, so the config refuses
+a `device_info` unless it has a `hash_pepper` or `allow_unkeyed_hashes()` (an
+`InvalidConfig` error at issue and refresh). A token of an
 earlier release stores the raw string; it is still honoured and its child
 carries the digest. *Device identity* has the detail.
 
@@ -225,15 +227,16 @@ pub struct RefreshTokenConfig {
     pub max_per_user: usize,
     pub rotation: bool,
     pub hash_pepper: Option<Zeroizing<Vec<u8>>>,
-    pub previous_hash_pepper: Option<Zeroizing<Vec<u8>>>,
+    pub previous_hash_pepper: Option<PreviousPepper>,
     pub max_lifetime: Option<Duration>,
+    pub allow_unkeyed_hashes: bool,
     pub reuse_grace: Duration,
 }
 ```
 
 The defaults are conservative for most applications: a thirty-day TTL,
-ten concurrent tokens per user, rotation enabled, no pepper, no absolute
-lifetime and no reuse grace.
+ten concurrent tokens per user, rotation enabled, no pepper, an absolute
+lifetime of ninety days and no reuse grace.
 
 `ttl` is how long a refresh token is valid before it expires without
 being used. Thirty days is enough that most users do not feel the
@@ -244,14 +247,15 @@ set this higher.
 
 `max_lifetime` is the absolute lifetime of a family, counted from the
 authentication it descends from (the `authn_time` carried through rotation).
-Without it expiry is sliding: a token refreshed at least once per `ttl` never
-expires, so a stolen family that is rotated faster than the owner can notice
-lives for ever. With it, a refresh at or after `authn_time + max_lifetime`
+Without a cap expiry is sliding: a token refreshed at least once per `ttl`
+never expires, so a stolen family that is rotated faster than the owner can
+notice lives for ever. With it, a refresh at or after `authn_time + max_lifetime`
 returns `Expired` on both refresh paths, and every token's `expires_at` is
 clamped to that instant at issue and at rotation, so the stored expiry is the
 truth. It must be positive and at least `ttl`; `validate` refuses anything
-else. Ninety days is a reasonable hardening value. The default is `None`
-because forcing re-authentication is a product decision.
+else. The default is ninety days; `with_max_lifetime(None)` lifts the cap
+for users meant to stay signed in indefinitely, and
+`with_max_lifetime(Some(..))` sets another.
 
 `reuse_grace` is the window described above for racing refreshes. It must not
 be negative.
@@ -286,16 +290,25 @@ refreshed by force, even when `rotation` is off, so the token the client
 receives is stored under the new pepper. Reuse detection is unchanged: the
 rotated-out record keeps its old hash and is still found by the retry. After
 one `ttl` (or `max_lifetime`, for tokens nobody uses) set
-`previous_hash_pepper` back to `None`. Only a keyed previous pepper can be
-named, so moving from no pepper to a pepper still invalidates the tokens.
+`previous_hash_pepper` back to `None`. `previous_hash_pepper` is a
+`PreviousPepper`: `PreviousPepper::keyed(old)` for a keyed pepper, or
+`PreviousPepper::Unkeyed` when the deployment ran without one, so that moving
+from no pepper to a pepper loses no token.
+
+Device binding needs the pepper. A `device_info` supplied while `hash_pepper`
+is `None` is refused with `InvalidConfig`, because its unkeyed digest lets a
+reader of the store confirm a guessed device string. A deployment that accepts
+that calls `allow_unkeyed_hashes()` on the config.
 
 ## Refreshing for one tenant
 
 A refresh finds a token by its hash alone, so a token issued for one tenant
-can be presented to an endpoint that serves another. When the tenant comes
-from the request (a host name, a path segment), add `Refresh::in_tenant`: a
+can be presented to an endpoint that serves another. `Refresh::new` therefore
+takes the tenant the request belongs to (a host name, a path segment): a
 token of any other tenant answers `NotFound`, exactly as an unknown token
 does, and is not rotated, revoked or checked against the status predicate.
+`Refresh::any_tenant` is the named opt-out for a route that really serves
+every tenant.
 
 ## Atomicity contracts
 

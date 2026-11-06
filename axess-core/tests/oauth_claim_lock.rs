@@ -270,11 +270,10 @@ async fn suspended_user_post_register_returns_locked() {
     let mock = MockOAuthProvider::new("idp5").with_user("sub5", "u@e.com", vec![], vec![]);
     let now = Utc::now();
     let suspended_user = axess_core::authn::types::User {
-        status: EntityState::Suspended(StatusDetail {
-            reason: std::sync::Arc::from("account under review"),
-            since: now,
-            until: None,
-        }),
+        status: EntityState::Suspended(StatusDetail::administrative(
+            std::sync::Arc::from("account under review"),
+            now,
+        )),
         ..common::test_user("u1", "user1")
     };
     let identity = MockIdentityStore::new()

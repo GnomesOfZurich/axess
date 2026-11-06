@@ -148,6 +148,7 @@ async fn missing_nbf_rejected_when_required() {
 
     let verifier = JwtVerifier::new(handle(jwks))
         .with_audience("my-svc")
+        .allow_any_issuer()
         .require_nbf(true);
 
     let err = verifier
@@ -180,6 +181,7 @@ async fn nbf_in_future_beyond_leeway_rejected() {
 
     let verifier = JwtVerifier::new(handle(jwks))
         .with_audience("my-svc")
+        .allow_any_issuer()
         .require_nbf(true);
 
     let err = verifier
@@ -237,6 +239,7 @@ async fn replay_store_rejects_second_use() {
 
     let verifier = JwtVerifier::new(handle(jwks))
         .with_audience("my-svc")
+        .allow_any_issuer()
         .with_replay_store(InMemReplay::default());
 
     verifier
@@ -275,6 +278,7 @@ async fn the_same_jti_from_two_issuers_is_not_a_replay() {
     };
     let verifier = JwtVerifier::new(handle(jwks))
         .with_audience("my-svc")
+        .allow_any_issuer()
         .with_replay_store(InMemReplay::default());
 
     verifier
@@ -312,6 +316,7 @@ async fn replay_store_requires_jti() {
 
     let verifier = JwtVerifier::new(handle(jwks))
         .with_audience("my-svc")
+        .allow_any_issuer()
         .with_replay_store(InMemReplay::default());
 
     let err = verifier
@@ -638,10 +643,14 @@ async fn a_missing_audience_pin_refuses_unless_waived() {
         .expect_err("no audience decision, no verification");
     assert!(err.to_string().contains("audience"), "{err}");
 
-    let waived = JwtVerifier::new(handle(jwks.clone())).allow_any_audience();
+    let waived = JwtVerifier::new(handle(jwks.clone()))
+        .allow_any_audience()
+        .allow_any_issuer();
     waived.verify::<serde_json::Value>(&token).await.unwrap();
 
-    let pinned = JwtVerifier::new(handle(jwks)).with_audience("svc");
+    let pinned = JwtVerifier::new(handle(jwks))
+        .with_audience("svc")
+        .allow_any_issuer();
     let mut with_aud = claims;
     with_aud["aud"] = serde_json::json!("svc");
     pinned
@@ -668,7 +677,44 @@ async fn an_oversized_signed_token_is_refused() {
         &kid,
         &der,
     );
-    let verifier = JwtVerifier::new(handle(jwks)).with_audience("my-svc");
+    let verifier = JwtVerifier::new(handle(jwks))
+        .with_audience("my-svc")
+        .allow_any_issuer();
     let err = verifier.verify::<WorkloadClaims>(&token).await.unwrap_err();
     assert!(matches!(err, JwtError::TooLarge { .. }), "{err:?}");
+}
+
+/// A verifier with no issuer pin and no waiver refuses every token, since a
+/// token signed by any key in the set would verify whatever it names as its
+/// issuer; the waiver and the pin each lift the refusal.
+#[tokio::test]
+async fn a_missing_issuer_pin_refuses_unless_waived() {
+    let (der, jwks, kid) = rsa_keypair();
+    let token = sign(
+        &serde_json::json!({
+            "iss": "https://any.example.com",
+            "sub": "s",
+            "aud": "svc",
+            "exp": now_secs() + 300,
+        }),
+        &kid,
+        &der,
+    );
+
+    let bare = JwtVerifier::new(handle(jwks.clone())).with_audience("svc");
+    let err = bare
+        .verify::<serde_json::Value>(&token)
+        .await
+        .expect_err("no issuer decision, no verification");
+    assert!(err.to_string().contains("issuer"), "{err}");
+
+    let waived = JwtVerifier::new(handle(jwks.clone()))
+        .with_audience("svc")
+        .allow_any_issuer();
+    waived.verify::<serde_json::Value>(&token).await.unwrap();
+
+    let pinned = JwtVerifier::new(handle(jwks))
+        .with_audience("svc")
+        .with_issuer("https://any.example.com");
+    pinned.verify::<serde_json::Value>(&token).await.unwrap();
 }

@@ -47,6 +47,13 @@ section{margin-bottom:1.6em}
 and a handful of routes showing RBAC, ReBAC (ownership), and ABAC (MFA) policy checks.</p>
 
 <section>
+<p><strong>Demo only.</strong> The user in the URL and the <code>?mfa=</code> flag are chosen by the
+caller, so anyone can act as <code>alice</code> with MFA. In a real service the principal comes from
+the authenticated session (<code>AuthzStore::for_session</code>, which refuses a session that is not
+fully authenticated) and MFA from that session's verified factors, never from the request.</p>
+</section>
+
+<section>
 <h2>Seeded data</h2>
 <table>
   <tr><th>User</th><th>Role</th><th>Note</th></tr>

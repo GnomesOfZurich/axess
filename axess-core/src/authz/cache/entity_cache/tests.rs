@@ -476,3 +476,72 @@ async fn invalidate_resource_drops_every_principals_entry_for_it() {
         "d1 twice rebuilt, d2 still cached"
     );
 }
+
+/// A provider whose resource sits in a folder: the folder is part of every
+/// entity set it builds, as the resource's parent.
+struct FolderedProvider {
+    calls: Arc<AtomicUsize>,
+    folder: EntityUid,
+}
+
+impl RequestEntityProvider for FolderedProvider {
+    fn entities_for<'a>(
+        &'a self,
+        session: &'a AuthSession,
+        principal: &'a EntityUid,
+        resource: &'a EntityUid,
+        action: &'a EntityUid,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Entities, AuthzError>> + Send + 'a>,
+    > {
+        let _ = (session, action);
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let entity = |uid: &EntityUid, parents: HashSet<EntityUid>| {
+                cedar_policy::Entity::new(uid.clone(), std::collections::HashMap::new(), parents)
+                    .unwrap()
+            };
+            Ok(Entities::from_entities(
+                vec![
+                    entity(principal, HashSet::new()),
+                    entity(&self.folder, HashSet::new()),
+                    entity(resource, HashSet::from([self.folder.clone()])),
+                ],
+                None,
+            )
+            .unwrap())
+        })
+    }
+}
+
+/// Invalidating a folder drops the entries of the documents in it: the
+/// folder is in their entity sets, not in their keys.
+#[tokio::test]
+async fn invalidating_a_folder_drops_the_entries_of_the_documents_in_it() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let folder = EntityUid::from_str("App::Folder::\"f1\"").unwrap();
+    let cached = EntityCache::new(FolderedProvider {
+        calls: calls.clone(),
+        folder: folder.clone(),
+    });
+    let s = guest_session();
+    let p = principal();
+    let a = action();
+    let other = EntityUid::from_str("App::Folder::\"f2\"").unwrap();
+    for res in [doc("d1"), doc("d2")] {
+        cached.entities_for(&s, &p, &res, &a).await.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    assert_eq!(cached.invalidate_resource(&other), 0, "an unrelated folder");
+    assert_eq!(cached.invalidate_resource(&folder), 2);
+
+    for res in [doc("d1"), doc("d2")] {
+        cached.entities_for(&s, &p, &res, &a).await.unwrap();
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "both documents were rebuilt under the changed folder"
+    );
+}

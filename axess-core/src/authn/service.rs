@@ -37,8 +37,11 @@
 
 mod account;
 mod builder;
+mod chosen_password;
 mod factor_pipeline;
 mod factor_secrets;
+#[cfg(feature = "device")]
+mod known_device;
 mod login;
 #[cfg(feature = "oauth")]
 mod logout_audit;
@@ -61,14 +64,22 @@ pub(crate) mod oauth_service;
 
 pub mod session_validator;
 
-pub use builder::{AuthnServiceBuilder, DEFAULT_FLOW_TTL, RESET_COOLDOWN_CAPACITY};
+pub use builder::{
+    AuthnServiceBuilder, DEFAULT_FLOW_TTL, DEFAULT_PASSWORD_RESET_COOLDOWN,
+    DEFAULT_SIGNUP_VERIFICATION_TTL, RESET_COOLDOWN_CAPACITY,
+};
 #[cfg(feature = "oauth")]
 pub use builder::{DEFAULT_JWKS_REFRESH_INTERVAL, DEFAULT_SID_MAP_CAPACITY};
+pub use chosen_password::ChosenPasswordError;
 #[cfg(feature = "oauth")]
 pub use oauth_service::ScopedOAuth;
-pub use outcomes::{FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome};
+pub use outcomes::{
+    FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome, SignupVerification,
+};
 pub use revocation::Actor;
-pub use session_validator::{NoSessionRegistryError, SessionValidator, require_valid_session};
+pub use session_validator::{
+    ActiveSessionsError, NoSessionRegistryError, SessionValidator, require_valid_session,
+};
 #[cfg(feature = "device")]
 pub use step_up::{
     StepUpPolicy, StepUpPolicyBuilder, decide_step_up_for_optional, decide_step_up_for_user,
@@ -328,16 +339,21 @@ where
     /// session" flows that need to read the active set before filtering
     /// out the current session.
     ///
-    /// Returns an empty vec when the registry's backend doesn't support
-    /// enumeration. Returns `Err(NoSessionRegistryError)` when no
-    /// registry is wired.
+    /// # Errors
+    ///
+    /// [`ActiveSessionsError::NoRegistry`] when no registry is wired, and
+    /// [`ActiveSessionsError::Registry`] when the registry could not list the
+    /// user's sessions: an outage is never answered with an empty list.
     pub async fn active_sessions(
         &self,
         user_id: &crate::authn::ids::UserId,
-    ) -> Result<Vec<crate::session::id::SessionId>, NoSessionRegistryError> {
+    ) -> Result<Vec<crate::session::id::SessionId>, ActiveSessionsError> {
         match &self.inner.registry {
-            Some(reg) => Ok(reg.active_sessions(user_id).await),
-            None => Err(NoSessionRegistryError),
+            Some(reg) => reg
+                .active_sessions(user_id)
+                .await
+                .map_err(ActiveSessionsError::Registry),
+            None => Err(ActiveSessionsError::NoRegistry(NoSessionRegistryError)),
         }
     }
 

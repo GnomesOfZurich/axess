@@ -288,7 +288,7 @@ fn scripts_compare_before_they_write_or_delete() {
 
 fn offline_store() -> ValkeyDeviceStore {
     let client = Client::new(Config::default(), None, None, None);
-    ValkeyDeviceStore::new(client, [7u8; 32])
+    ValkeyDeviceStore::new(client, crate::testing::test_key(7))
 }
 
 /// A sealed row moved to another device's key must not open there.
@@ -402,7 +402,7 @@ fn legacy_rows_are_accepted_only_until_the_cutoff() {
     let a = device(DeviceTrustLevel::Seen, t0());
     let (tenant, id) = (a.tenant_id.to_string(), a.id.to_string());
     let clock = std::sync::Arc::new(MockClock::at(t0()));
-    let crypto = SessionCrypto::new([7u8; 32])
+    let crypto = SessionCrypto::new(crate::testing::test_key(7))
         .with_legacy_blobs(LegacyBlobs::AcceptUntil(t0() + Duration::days(1)))
         .with_clock(clock.clone());
     let legacy = crypto
@@ -504,7 +504,7 @@ async fn live_store(prefix: &str) -> ValkeyDeviceStore {
     let url = std::env::var("VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let client = Client::new(Config::from_url(&url).expect("url"), None, None, None);
     client.init().await.expect("connect");
-    ValkeyDeviceStore::plaintext(client).with_prefix(prefix.to_string())
+    ValkeyDeviceStore::plaintext_insecure(client).with_prefix(prefix.to_string())
 }
 
 fn named(id: &str, fp: u8, level: DeviceTrustLevel, last_seen: DateTime<Utc>) -> Device {

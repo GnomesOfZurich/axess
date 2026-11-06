@@ -10,7 +10,7 @@
 //! - `refresh`  ; `RefreshTokenStore`
 //! - [`seed`]     ; first-boot data: a default tenant + alice/bob test users
 
-use axess::authn::{EntityState, StatusDetail, Tenant, TenantId, User, UserId};
+use axess::authn::{EntityState, StatusCause, StatusDetail, Tenant, TenantId, User, UserId};
 use axess::{Clock, SystemClock};
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
@@ -22,7 +22,7 @@ mod identity;
 mod refresh;
 mod seed;
 
-pub use seed::seed;
+pub use seed::{SEED_PASSWORD, seed, seed_enabled};
 
 // ── OurBackend ────────────────────────────────────────────────────────────────
 
@@ -136,6 +136,7 @@ pub(super) fn user_from_row(
     let identifier: String = row.get("identifier");
     let display_name: String = row.get("display_name");
     let status: String = row.get("status");
+    let status_cause: Option<String> = row.get("status_cause");
     let locked_until: Option<String> = row.get("locked_until");
     let created_by: String = row.get("created_by");
     let created_at: String = row.get("created_at");
@@ -147,7 +148,12 @@ pub(super) fn user_from_row(
         tenant_id: id_column("users.tenant_id", TenantId::try_new(tenant_id.as_str()))?,
         identifier: Arc::from(identifier.as_str()),
         display_name: Arc::from(display_name.as_str()),
-        status: entity_state_from_db(clock, &status, locked_until.as_deref())?,
+        status: entity_state_from_db(
+            clock,
+            &status,
+            status_cause.as_deref(),
+            locked_until.as_deref(),
+        )?,
         webauthn_id: None,
         created_by: id_column("users.created_by", UserId::try_new(created_by.as_str()))?,
         created_at: parse_db_datetime(clock, &created_at),
@@ -174,7 +180,7 @@ pub(super) fn tenant_from_row(
         id: id_column("tenants.id", TenantId::try_new(id.as_str()))?,
         identifier: Arc::from(identifier.as_str()),
         display_name: Arc::from(name.as_str()),
-        status: entity_state_from_db(clock, &status, None)?,
+        status: entity_state_from_db(clock, &status, None, None)?,
         created_by: id_column("tenants.created_by", UserId::try_new(created_by.as_str()))?,
         created_at: parse_db_datetime(clock, &created_at),
         updated_by: id_column("tenants.updated_by", UserId::try_new(updated_by.as_str()))?,
@@ -205,13 +211,29 @@ pub(super) fn parse_db_datetime(clock: &dyn Clock, s: &str) -> DateTime<Utc> {
 /// A `locked_until` that is not an RFC 3339 timestamp is an error: the lock
 /// may still be in force, so reading the row as unlocked would open an
 /// account the application closed. A status the example does not write is an
-/// error too, not a guest.
+/// error too, not a guest, and so is a `status_cause` that does not decode.
+///
+/// The cause is the one `suspend_user` wrote. A row with none (written
+/// before the column existed) reads by its status: a suspension as
+/// [`StatusCause::unspecified`], which no eligibility check admits; a
+/// pending row as [`StatusCause::Verification`]; a terminated or archived
+/// row as [`StatusCause::Closure`].
 pub(super) fn entity_state_from_db(
     clock: &dyn Clock,
     status: &str,
+    status_cause: Option<&str>,
     locked_until: Option<&str>,
 ) -> Result<EntityState, BackendError> {
     let now = clock.now();
+    let stored_cause = status_cause
+        .map(|text| {
+            serde_json::from_str::<StatusCause>(text).map_err(|e| {
+                BackendError::Backend(format!("users.status_cause does not decode: {e}"))
+            })
+        })
+        .transpose()?;
+    let cause = |by_status: StatusCause| stored_cause.clone().unwrap_or(by_status);
+
     // A locked_until in the future takes priority over the status column.
     if let Some(until_str) = locked_until {
         let until: DateTime<Utc> = DateTime::parse_from_rfc3339(until_str)
@@ -222,8 +244,11 @@ pub(super) fn entity_state_from_db(
             })?
             .into();
         if until > now {
+            // `locked_until` is written by `suspend_user` alone: a timed
+            // suspension, with the cause the caller gave.
             return Ok(EntityState::Suspended(StatusDetail {
-                reason: "account locked due to failed login attempts".into(),
+                cause: cause(StatusCause::unspecified()),
+                reason: "account suspended".into(),
                 since: now,
                 until: Some(until),
             }));
@@ -239,21 +264,25 @@ pub(super) fn entity_state_from_db(
         "active" => EntityState::Active,
         "candidate" => EntityState::Candidate,
         "pending" => EntityState::Pending(StatusDetail {
+            cause: cause(StatusCause::Verification),
             reason: "account pending activation".into(),
             since: now,
             until: None,
         }),
         "suspended" => EntityState::Suspended(StatusDetail {
+            cause: cause(StatusCause::unspecified()),
             reason: "account suspended".into(),
             since: now,
             until: None,
         }),
         "terminated" => EntityState::Terminated(StatusDetail {
+            cause: cause(StatusCause::Closure),
             reason: "account terminated".into(),
             since: now,
             until: None,
         }),
         "archived" => EntityState::Archived(StatusDetail {
+            cause: cause(StatusCause::Closure),
             reason: "account archived".into(),
             since: now,
             until: None,

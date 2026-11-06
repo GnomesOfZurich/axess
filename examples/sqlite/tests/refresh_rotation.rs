@@ -30,7 +30,7 @@ async fn backend() -> OurBackend {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -193,7 +193,10 @@ mod compromise_revokes_the_familys_devices {
     use std::sync::Arc;
 
     async fn device_store(backend: &OurBackend) -> SqliteDeviceStore {
-        let devices = SqliteDeviceStore::new(backend.pool().clone(), SessionCrypto::new([7u8; 32]));
+        let devices = SqliteDeviceStore::new(
+            backend.pool().clone(),
+            SessionCrypto::new(*b"0123456789abcdef0123456789abcdeF"),
+        );
         devices.init_schema().await.expect("device schema");
         devices
     }
@@ -248,11 +251,11 @@ mod compromise_revokes_the_familys_devices {
         )
         .await
         .expect("issued");
-        Refresh::new(&v1, |_| async { true })
+        Refresh::any_tenant(&v1, |_| async { true })
             .run(store, &config, &SystemRng, now)
             .await
             .expect("first refresh rotates");
-        let reuse = Refresh::new(&v1, |_| async { true })
+        let reuse = Refresh::any_tenant(&v1, |_| async { true })
             .run(store, &config, &SystemRng, now)
             .await;
         assert!(

@@ -16,7 +16,17 @@ pub(super) const DEFAULT_PREFIX: &str = "axess";
 /// This guards against unbounded growth of `SessionData.custom` blowing up
 /// Valkey memory. Configurable via
 /// [`ValkeySessionStore::with_max_payload`](super::ValkeySessionStore::with_max_payload).
-pub(super) const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1024;
+pub(super) const DEFAULT_MAX_PAYLOAD_BYTES: usize =
+    crate::session::storage::session_codec::DEFAULT_MAX_PAYLOAD_BYTES;
+
+/// How a session id appears in a log line: its first eight characters. A
+/// session id is a credential, so the full value never reaches a log; the
+/// prefix is enough to follow one session through a debug trace.
+pub(super) fn log_session_id(id: &SessionId) -> String {
+    let full = id.to_string();
+    let head: String = full.chars().take(8).collect();
+    format!("{head}...")
+}
 
 pub(super) fn session_key(prefix: &str, id: &SessionId) -> String {
     format!("{prefix}:sess:{id}")
@@ -146,10 +156,15 @@ pub(super) fn ex_seconds(ttl: Duration) -> Option<i64> {
 }
 
 /// Seconds for a Valkey `EX` argument of a TTL the caller knows is not zero:
-/// whole seconds, clamped up to one.
+/// whole seconds, clamped up to one and down to 2^40 (some 34 000 years):
+/// the server turns the seconds into an absolute millisecond time and rejects
+/// one that does not fit.
 pub(super) fn live_ex_seconds(ttl: Duration) -> i64 {
-    ttl.as_secs().clamp(1, i64::MAX as u64) as i64
+    ttl.as_secs().clamp(1, EX_MAX_SECS as u64) as i64
 }
+
+/// The longest expiry given to a key: 2^40 seconds.
+const EX_MAX_SECS: i64 = 1 << 40;
 
 /// How often a watcher without a subscriber connection asks the registry
 /// whether its session is still valid, before backoff and spread.
@@ -231,11 +246,17 @@ pub(super) fn registry_cutoff_ms(now_ms: i64, member_ttl_ms: i64) -> f64 {
 
 /// Seconds for the registry key's own `EXPIRE`: at least the member
 /// lifetime rounded up, and never below one second, so the key outlives the
-/// newest member it holds and a sub-second TTL cannot wipe the set.
+/// newest member it holds and a sub-second TTL cannot wipe the set. Capped at
+/// [`REGISTRY_KEY_TTL_MAX_SECS`]: the server turns the seconds into an
+/// absolute millisecond time and rejects one that does not fit.
 pub(super) fn registry_key_ttl_secs(ttl: Duration) -> i64 {
     let ms = registry_member_ttl_ms(ttl);
-    (ms / 1000 + i64::from(ms % 1000 != 0)).max(1)
+    (ms / 1000 + i64::from(ms % 1000 != 0)).clamp(1, REGISTRY_KEY_TTL_MAX_SECS)
 }
+
+/// The longest expiry given to a registry key: 2^40 seconds, some 34 000
+/// years, far inside what the server accepts.
+const REGISTRY_KEY_TTL_MAX_SECS: i64 = EX_MAX_SECS;
 
 // ── Error type ───────────────────────────────────────────────────────────────
 
@@ -269,6 +290,10 @@ pub enum ValkeyStoreError {
         /// Configured maximum payload length in bytes.
         max: usize,
     },
+
+    /// The store cannot do what was asked; the text names the method.
+    #[error("not supported by this store: {0}")]
+    Unsupported(&'static str),
 }
 
 impl From<fred::error::Error> for ValkeyStoreError {

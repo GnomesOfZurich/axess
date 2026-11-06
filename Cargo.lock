@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "axess"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess-core",
  "axess-factors",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "axess-cache"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess-clock",
  "chrono",
@@ -347,14 +347,14 @@ dependencies = [
 
 [[package]]
 name = "axess-clock"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "chrono",
 ]
 
 [[package]]
 name = "axess-core"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "axess-cache",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "axess-events"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess-identity",
  "axess-strings",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-authz"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess",
  "axum",
@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-fapi"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess",
  "axum",
@@ -449,13 +449,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "axess-example-minimal"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess",
  "axum",
@@ -465,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-oauth"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess",
  "axess-core",
@@ -477,7 +478,6 @@ dependencies = [
  "rsa",
  "serde",
  "serde_json",
- "subtle",
  "tokio",
  "tower",
  "tower-cookies",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-sqlite"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess",
  "axum",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "axess-example-workload-identity"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess",
  "axess-clock",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "axess-factors"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "argon2 0.6.0",
  "axess-clock",
@@ -575,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "axess-identity"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess-rng",
  "rkyv",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "axess-macros"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "axess-core",
  "cedar-policy",
@@ -598,14 +598,14 @@ dependencies = [
 
 [[package]]
 name = "axess-rng"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "getrandom 0.4.3",
 ]
 
 [[package]]
 name = "axess-strings"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "compact_str",
  "criterion",

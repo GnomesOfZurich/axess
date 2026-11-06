@@ -108,8 +108,93 @@ pub(crate) async fn same_id_cycle_requires_the_row<S: SessionStore>(store: &S) {
     assert!(store.load(&id).await.unwrap().is_none());
 }
 
+/// A rotation conditional on the revision rotates a row that holds it, answers
+/// a conflict for a row that was written meanwhile (and leaves it alone), and
+/// treats a row that is gone like `cycle`.
+pub(crate) async fn cycle_if_revision_checks_the_revision<S: SessionStore>(store: &S) {
+    let at = |tag: &str, revision: u64| SessionData {
+        revision,
+        ..data(tag)
+    };
+    let (old, new) = ids();
+    store.save(&old, &at("seen", 3), TTL).await.unwrap();
+
+    // Another request wrote the row after it was read at revision 3.
+    store
+        .save(&old, &at("written meanwhile", 4), TTL)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .cycle_if_revision(&old, &new, &at("mine", 4), TTL, true, 3)
+            .await
+            .unwrap(),
+        CycleOutcome::Conflict
+    );
+    assert_eq!(
+        store.load(&old).await.unwrap().expect("left alone").custom,
+        data("written meanwhile").custom
+    );
+    assert!(store.load(&new).await.unwrap().is_none(), "nothing written");
+
+    assert_eq!(
+        store
+            .cycle_if_revision(&old, &new, &at("mine", 5), TTL, true, 4)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
+    assert!(store.load(&old).await.unwrap().is_none());
+    assert_eq!(
+        store.load(&new).await.unwrap().unwrap().custom,
+        data("mine").custom
+    );
+
+    // A row that is gone is gone when it was required, and created when not.
+    let (gone, next) = ids();
+    assert_eq!(
+        store
+            .cycle_if_revision(&gone, &next, &at("x", 1), TTL, true, 0)
+            .await
+            .unwrap(),
+        CycleOutcome::SessionGone
+    );
+    assert!(store.load(&next).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .cycle_if_revision(&gone, &next, &at("x", 1), TTL, false, 0)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
+    assert!(store.load(&next).await.unwrap().is_some());
+
+    // To the same id, the revision decides as well.
+    let (same, _) = ids();
+    store.save(&same, &at("a", 7), TTL).await.unwrap();
+    assert_eq!(
+        store
+            .cycle_if_revision(&same, &same, &at("b", 8), TTL, true, 6)
+            .await
+            .unwrap(),
+        CycleOutcome::Conflict
+    );
+    assert_eq!(
+        store
+            .cycle_if_revision(&same, &same, &at("b", 8), TTL, true, 7)
+            .await
+            .unwrap(),
+        CycleOutcome::Rotated
+    );
+    assert_eq!(
+        store.load(&same).await.unwrap().unwrap().custom,
+        data("b").custom
+    );
+}
+
 /// Run every check against one store.
 pub(crate) async fn run_all<S: SessionStore>(store: &S) {
+    cycle_if_revision_checks_the_revision(store).await;
     update_never_revives(store).await;
     cycle_with_required_old_never_revives(store).await;
     cycle_without_required_old_creates(store).await;

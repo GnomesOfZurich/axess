@@ -26,10 +26,10 @@ async fn resolve(
     WorkloadResolver::<GitLabClaims, _, _>::new(
         verifier,
         trust.clone(),
-        TenantId::from_bytes([9u8; 16]),
+        |_slug: &str| Some(TenantId::from_bytes([9u8; 16])),
         Issuer::custom("gitlab_ci").unwrap(),
         f.token,
-        gitlab_mapper(trust, allow),
+        gitlab_mapper(allow),
     )
     .resolve()
     .await
@@ -46,10 +46,10 @@ async fn resolve_token(
     WorkloadResolver::<GitLabClaims, _, _>::new(
         common::build_verifier(jwks, issuer, audience),
         trust.clone(),
-        TenantId::from_bytes([9u8; 16]),
+        |_slug: &str| Some(TenantId::from_bytes([9u8; 16])),
         Issuer::custom("gitlab_ci").unwrap(),
         token,
-        gitlab_mapper(trust, allow),
+        gitlab_mapper(allow),
     )
     .resolve()
     .await

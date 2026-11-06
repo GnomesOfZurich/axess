@@ -32,7 +32,7 @@
 //!    via adopter-side middleware. The chain is request-scoped; axess
 //!    does not own its lifetime.
 //! 4. Per request, build an [`MtlsResolver`] (peer cert + expected
-//!    trust domain + caller-resolved [`TenantId`](axess_identity::TenantId)) and call
+//!    trust domain + a slug → [`TenantId`](axess_identity::TenantId) lookup) and call
 //!    `resolve().await`.
 //!
 //! axess provides the request-extension type and the SPIFFE-ID parse;
@@ -51,12 +51,12 @@
 //!
 //! Unlike the JWT-SVID flow (where a custom `tid` claim carries the
 //! typed [`TenantId`](axess_identity::TenantId) UUID), an X509-SVID has no JWT claims. The
-//! adopter middleware does the `tenant_slug → TenantId` lookup against
-//! its own registry before constructing the resolver, typically via a
-//! cached `HashMap<String, TenantId>` populated at startup. The
-//! resolver itself is intentionally registry-agnostic; baking a tenant
-//! registry trait into axess would couple this module to adopter data
-//! shapes.
+//! resolver takes a `slug → TenantId` lookup (typically a cached
+//! `HashMap<String, TenantId>` populated at startup) and calls it on the
+//! `tenant_slug` of the certificate it parses, so the tenant always follows
+//! from the certificate. A slug the lookup does not know refuses the
+//! request. The registry stays the adopter's: baking a tenant registry trait
+//! into axess would couple this module to adopter data shapes.
 //!
 //! See `axess_core::authn::jwt::svid::JwtSvidResolver` for the JWT-SVID
 //! cousin (federation feature in axess-core).
@@ -231,6 +231,9 @@ fn reject_signing_leaf(cert: &X509Certificate<'_>) -> Result<(), MtlsError> {
     Ok(())
 }
 
+/// The adopter's registry: a tenant slug to its typed id, `None` when unknown.
+type TenantLookup = Arc<dyn Fn(&str) -> Option<TenantId> + Send + Sync>;
+
 /// Resolver that produces [`Principal::Workload`] from a SPIFFE
 /// X509-SVID in a peer certificate.
 ///
@@ -239,23 +242,26 @@ fn reject_signing_leaf(cert: &X509Certificate<'_>) -> Result<(), MtlsError> {
 pub struct MtlsResolver {
     expected_trust_domain: TrustDomain,
     peer_cert: CertificateDer<'static>,
-    tenant_id: TenantId,
+    tenant_lookup: TenantLookup,
 }
 
 impl MtlsResolver {
-    /// Construct a resolver. The caller has already used [`peek_spiffe`]
-    /// to look up the typed [`TenantId`] from the cert's `tenant_slug`.
-    /// `expected_trust_domain` is the trust domain axess will accept;
-    /// certs from any other trust domain are rejected on `resolve`.
+    /// Construct a resolver. `expected_trust_domain` is the trust domain
+    /// axess will accept; certs from any other trust domain are rejected on
+    /// `resolve`. `tenant_lookup` maps the certificate's own `tenant_slug` to
+    /// the typed [`TenantId`] (typically a cached
+    /// `HashMap<String, TenantId>`); `resolve` calls it on the slug of the
+    /// certificate it parsed and answers [`IdentityError::NotAuthenticated`]
+    /// when it knows no such tenant.
     pub fn new(
         peer_cert: CertificateDer<'static>,
         expected_trust_domain: TrustDomain,
-        tenant_id: TenantId,
+        tenant_lookup: impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static,
     ) -> Self {
         Self {
             expected_trust_domain,
             peer_cert,
-            tenant_id,
+            tenant_lookup: Arc::new(tenant_lookup),
         }
     }
 
@@ -266,25 +272,26 @@ impl MtlsResolver {
     /// wiring middleware inserted an empty [`PeerCertChain`].
     ///
     /// Prefer this over [`new`](Self::new) when what is in the request
-    /// extensions is the chain rather than a leaf. The tenant is still
-    /// the caller's to resolve, from [`peek_spiffe`] on
-    /// [`PeerCertChain::leaf`].
+    /// extensions is the chain rather than a leaf. `tenant_lookup` is as
+    /// for [`new`](Self::new).
     pub fn from_chain(
         chain: &PeerCertChain,
         expected_trust_domain: TrustDomain,
-        tenant_id: TenantId,
+        tenant_lookup: impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static,
     ) -> Result<Self, MtlsError> {
         let leaf = chain.leaf().ok_or(MtlsError::EmptyChain)?;
-        Ok(Self::new(leaf.clone(), expected_trust_domain, tenant_id))
+        Ok(Self::new(
+            leaf.clone(),
+            expected_trust_domain,
+            tenant_lookup,
+        ))
     }
 }
 
 impl PrincipalResolver for MtlsResolver {
     async fn resolve(&self) -> Result<Principal, IdentityError> {
-        // Re-parse the cert here (cheap) so the resolve path is the
-        // single source of truth for the principal; the
-        // `peek_spiffe` step in adopter middleware feeds the tenant
-        // lookup but the cryptographic claim flows through here.
+        // Parse the cert here so the resolve path is the single source of
+        // truth for the principal, tenant included.
         let comps = peek_spiffe(&self.peer_cert).map_err(|e| match e {
             MtlsError::Identity(id) => id,
             other => {
@@ -306,11 +313,18 @@ impl PrincipalResolver for MtlsResolver {
             )));
         }
 
+        // The tenant is the registry's answer for the slug this certificate
+        // names, not a value chosen before the certificate was read.
+        let Some(tenant_id) = (self.tenant_lookup)(&comps.tenant_slug) else {
+            tracing::warn!("MtlsResolver: tenant slug is not in the registry");
+            return Err(IdentityError::NotAuthenticated);
+        };
+
         Ok(Principal::Workload(WorkloadPrincipal {
             workload_id: comps.workload_id,
             trust_domain: comps.trust_domain,
             issuer: Issuer::Mtls,
-            tenant_id: self.tenant_id,
+            tenant_id,
             tenant_slug: comps.tenant_slug,
             service_name: comps.service_name,
             attributes: BTreeMap::new(),

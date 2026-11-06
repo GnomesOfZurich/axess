@@ -48,7 +48,7 @@ async fn max_lifetime_caps_a_family_that_rotates_before_its_ttl() {
 
     for day in [20, 40] {
         let at = start + Duration::days(day);
-        let (_, next) = Refresh::new(&plaintext, |_| async { true })
+        let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
             .run(&store, &config, &rng, at)
             .await
             .unwrap();
@@ -69,7 +69,7 @@ async fn max_lifetime_caps_a_family_that_rotates_before_its_ttl() {
         .unwrap();
     assert_eq!(last.expires_at, end);
 
-    let at_cap = Refresh::new(&plaintext, |_| async { true })
+    let at_cap = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, end)
         .await;
     assert!(matches!(at_cap, Err(RefreshError::Expired)), "{at_cap:?}");
@@ -89,7 +89,7 @@ async fn max_lifetime_is_enforced_on_the_status_checked_path() {
     record.expires_at = now() + Duration::days(90);
     store.store_token(&record).await.unwrap();
     let at = now() + Duration::days(31);
-    let result = Refresh::new(&plaintext, |_| async {
+    let result = Refresh::any_tenant(&plaintext, |_| async {
         panic!("the predicate must not run for an expired family")
     })
     .run(&store, &config, &rng, at)
@@ -114,7 +114,7 @@ fn max_lifetime_below_ttl_or_zero_is_refused() {
         ..test_config()
     };
     assert!(ok.validate().is_ok());
-    assert!(test_config().validate().is_ok(), "the default is no cap");
+    assert!(test_config().validate().is_ok(), "the test config is valid");
 }
 
 // ── revocation reasons ──────────────────────────────────────────────────
@@ -135,7 +135,7 @@ async fn an_evicted_token_is_refused_without_a_family_revocation() {
     let evicted = store.find_token(&old.token_hash).await.unwrap().unwrap();
     assert_eq!(evicted.revoked_reason, Some(RevocationReason::Evicted));
 
-    let result = Refresh::new(&old_plain, |_| async { true })
+    let result = Refresh::any_tenant(&old_plain, |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)), "{result:?}");
@@ -151,7 +151,7 @@ async fn a_logged_out_token_reused_does_not_revoke_its_family() {
     let config = test_config();
     let rng = MockRng::new(14);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
-    let (_, rotated) = Refresh::new(&plaintext, |_| async { true })
+    let (_, rotated) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
@@ -168,14 +168,14 @@ async fn a_logged_out_token_reused_does_not_revoke_its_family() {
     assert_eq!(record.revoked_reason, Some(RevocationReason::Explicit));
 
     let (other_plain, other) = issue(&store, &config, &rng, now()).await;
-    let again = Refresh::new(&child_plain, |_| async { true })
+    let again = Refresh::any_tenant(&child_plain, |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(again, Err(RefreshError::Revoked)));
     let still = store.find_token(&other.token_hash).await.unwrap().unwrap();
     assert!(!still.revoked, "an unrelated family is untouched");
     assert!(
-        Refresh::new(&other_plain, |_| async { true })
+        Refresh::any_tenant(&other_plain, |_| async { true })
             .run(&store, &config, &rng, now())
             .await
             .is_ok()
@@ -193,14 +193,14 @@ async fn reuse_inside_the_grace_window_is_concurrent_and_outside_is_theft() {
     };
     let rng = MockRng::new(15);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
-    let (_, next) = Refresh::new(&plaintext, |_| async { true })
+    let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
     let (_, child) = next.unwrap();
 
     let soon = now() + Duration::seconds(2);
-    let parallel = Refresh::new(&plaintext, |_| async { true })
+    let parallel = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, soon)
         .await;
     assert!(
@@ -211,7 +211,7 @@ async fn reuse_inside_the_grace_window_is_concurrent_and_outside_is_theft() {
     assert!(!child_row.revoked, "nothing was revoked inside the grace");
 
     let late = now() + Duration::seconds(30);
-    let theft = Refresh::new(&plaintext, |_| async { true })
+    let theft = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, late)
         .await;
     assert!(matches!(theft, Err(RefreshError::Revoked)), "{theft:?}");
@@ -233,7 +233,7 @@ async fn reuse_inside_the_grace_window_is_concurrent_when_the_rotation_is_stampe
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
     // The other node, 3 s ahead, rotates the token.
     let ahead = now() + Duration::seconds(3);
-    let (_, next) = Refresh::new(&plaintext, |_| async { true })
+    let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, ahead)
         .await
         .unwrap();
@@ -242,7 +242,7 @@ async fn reuse_inside_the_grace_window_is_concurrent_when_the_rotation_is_stampe
     assert!(!parent_row.revoked, "the child is live before the reuse");
 
     // This node, at its own `now`, sees the rotation 3 s in the future.
-    let parallel = Refresh::new(&plaintext, |_| async { true })
+    let parallel = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(
@@ -254,7 +254,7 @@ async fn reuse_inside_the_grace_window_is_concurrent_when_the_rotation_is_stampe
 
     // Beyond the window in that direction it is theft, as it is behind.
     let far_ahead = now() - Duration::seconds(30);
-    let theft = Refresh::new(&plaintext, |_| async { true })
+    let theft = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, far_ahead)
         .await;
     assert!(matches!(theft, Err(RefreshError::Revoked)), "{theft:?}");
@@ -267,12 +267,12 @@ async fn default_grace_treats_an_immediate_reuse_as_theft() {
     let config = test_config();
     let rng = MockRng::new(16);
     let (plaintext, _) = issue(&store, &config, &rng, now()).await;
-    let (_, next) = Refresh::new(&plaintext, |_| async { true })
+    let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
     let (_, child) = next.unwrap();
-    let again = Refresh::new(&plaintext, |_| async { true })
+    let again = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(again, Err(RefreshError::Revoked)));
@@ -314,7 +314,7 @@ async fn reuse_of_a_family_less_token_revokes_its_descendants() {
     legacy.family_id = None;
     store.store_token(&legacy).await.unwrap();
 
-    let (_, next) = Refresh::new(&plaintext, |_| async { true })
+    let (_, next) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await
         .unwrap();
@@ -325,7 +325,7 @@ async fn reuse_of_a_family_less_token_revokes_its_descendants() {
         "the child's family is the parent's id"
     );
 
-    let reuse = Refresh::new(&plaintext, |_| async { true })
+    let reuse = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(matches!(reuse, Err(RefreshError::Revoked)));
@@ -352,8 +352,7 @@ async fn refresh_in_tenant_refuses_a_foreign_token_without_rotating() {
     let (plaintext, record) = issue(&store, &config, &rng, now()).await;
     let other = axess_identity::testing::tenant("tenant-2");
 
-    let foreign = Refresh::new(&plaintext, |_| async { true })
-        .in_tenant(&other)
+    let foreign = Refresh::new(&plaintext, &other, |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(
@@ -363,19 +362,31 @@ async fn refresh_in_tenant_refuses_a_foreign_token_without_rotating() {
     let row = store.find_token(&record.token_hash).await.unwrap().unwrap();
     assert!(!row.revoked, "the foreign attempt rotated nothing");
 
-    let status_checked = Refresh::new(&plaintext, |_| async {
+    let status_checked = Refresh::new(&plaintext, &other, |_| async {
         panic!("the predicate must not run for a foreign tenant")
     })
-    .in_tenant(&other)
     .run(&store, &config, &rng, now())
     .await;
     assert!(matches!(status_checked, Err(RefreshError::NotFound)));
 
-    let own = Refresh::new(&plaintext, |_| async { true })
-        .in_tenant(&fixture_tenant())
+    let own = Refresh::new(&plaintext, &fixture_tenant(), |_| async { true })
         .run(&store, &config, &rng, now())
         .await;
     assert!(own.is_ok());
+}
+
+/// `any_tenant` is the named opt-out: it redeems a token of whichever tenant
+/// issued it.
+#[tokio::test]
+async fn any_tenant_refreshes_a_token_of_whichever_tenant_issued_it() {
+    let store = store();
+    let config = test_config();
+    let rng = MockRng::new(19);
+    let (plaintext, _) = issue(&store, &config, &rng, now()).await;
+    let refreshed = Refresh::any_tenant(&plaintext, |_| async { true })
+        .run(&store, &config, &rng, now())
+        .await;
+    assert!(refreshed.is_ok(), "{refreshed:?}");
 }
 
 /// Logout scoped to a tenant: a token of another tenant is not found and

@@ -26,7 +26,7 @@ async fn make_store() -> SqliteSessionStore {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let store = SqliteSessionStore::plaintext(pool);
+    let store = SqliteSessionStore::plaintext_insecure(pool);
     store.init_schema().await.unwrap();
     store
 }
@@ -42,7 +42,7 @@ async fn make_store_with_mock_clock() -> (SqliteSessionStore, Arc<MockClock>) {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    let store = SqliteSessionStore::plaintext(pool).with_clock(clock.clone());
+    let store = SqliteSessionStore::plaintext_insecure(pool).with_clock(clock.clone());
     store.init_schema().await.unwrap();
     (store, clock)
 }
@@ -366,7 +366,7 @@ async fn save_overwrites_existing() {
 /// codec or stripped the encryption call entirely.
 #[tokio::test]
 async fn encrypted_roundtrip_preserves_custom_bag() {
-    let key = [7u8; 32];
+    let key = axess_core::testing::test_key(7);
     let store = make_encrypted_store(key, None).await;
     let rng = SystemRng;
     let id = SessionId::new(&rng);
@@ -394,8 +394,8 @@ async fn encrypted_roundtrip_preserves_custom_bag() {
 /// (verified by a follow-up read after re-saving).
 #[tokio::test]
 async fn key_rotation_reads_old_writes_new() {
-    let key_a = [1u8; 32];
-    let key_b = [2u8; 32];
+    let key_a = axess_core::testing::test_key(1);
+    let key_b = axess_core::testing::test_key(2);
     let pool = fresh_pool().await;
 
     // Phase 1: current = A, no previous.
@@ -447,8 +447,8 @@ async fn key_rotation_reads_old_writes_new() {
 /// misconfiguration on a fleet rotation).
 #[tokio::test]
 async fn wrong_key_fails_to_decrypt() {
-    let key_a = [10u8; 32];
-    let key_b = [11u8; 32];
+    let key_a = axess_core::testing::test_key(10);
+    let key_b = axess_core::testing::test_key(11);
     let pool = fresh_pool().await;
 
     let store_a = make_encrypted_store_on_pool(pool.clone(), key_a, None).await;
@@ -521,5 +521,8 @@ async fn authenticated_state_roundtrip_byte_perfect() {
 async fn update_if_revision_keeps_the_contract_plaintext_and_encrypted() {
     use axess_core::testing::store_contract::assert_update_if_revision_contract;
     assert_update_if_revision_contract(&make_store().await).await;
-    assert_update_if_revision_contract(&make_encrypted_store([7u8; 32], None).await).await;
+    assert_update_if_revision_contract(
+        &make_encrypted_store(axess_core::testing::test_key(7), None).await,
+    )
+    .await;
 }

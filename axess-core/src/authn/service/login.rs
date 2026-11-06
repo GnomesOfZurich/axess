@@ -60,7 +60,10 @@ where
             ControlFlow::Continue(tenant) => tenant,
             ControlFlow::Break(outcome) => return Ok(outcome),
         };
-        let user = match self.find_loginnable_user(identifier, &tenant).await? {
+        let user = match self
+            .find_loginnable_user(identifier, &tenant, session)
+            .await?
+        {
             ControlFlow::Continue(user) => user,
             ControlFlow::Break(outcome) => return Ok(outcome),
         };
@@ -109,6 +112,7 @@ where
         &self,
         identifier: &str,
         tenant: &Tenant,
+        session: &AuthSession,
     ) -> Result<ControlFlow<LoginOutcome, User>, AuthnError<I::Error>> {
         // 2. Find user with timing equalization; when the identifier is
         // unknown OR the returned User fails validation, the helper
@@ -142,7 +146,8 @@ where
         // costs the same store calls as a permitted one.
         let status = self.current_account_status(&user.id).await?;
         let derived = if status.allows_login() {
-            self.derived_lockout(&user.id, &tenant.id).await?
+            self.derived_lockout_for(&user.id, &tenant.id, session)
+                .await?
         } else {
             let _ = self.inner.identity.failed_attempts(&user.id).await;
             None
@@ -163,7 +168,7 @@ where
             // administrative-state mismatches on the status column instead
             // of on a free-text tag. The other non-active states keep the
             // tag, having no status of their own.
-            let locked = status.is_locked() || derived.is_some();
+            let locked = status.is_suspended() || derived.is_some();
             let builder = if locked {
                 AuthEventBuilder::locked(AuthEventType::LoginAttempt)
             } else {
@@ -383,17 +388,29 @@ where
             AccountStatusEnforcement::Locked { until, .. } => {
                 return Err(AuthnError::Locked { until });
             }
+            // A throttled guesser does not get a challenge delivered either.
+            AccountStatusEnforcement::Throttled { retry_after } => {
+                return Err(AuthnError::Throttled { retry_after });
+            }
             AccountStatusEnforcement::NotActive(status) => {
                 return Err(AuthnError::NotActive(status));
             }
         }
 
         let step = remaining.first().ok_or(AuthnError::NoFlow)?;
+        let picked_by_person = choice.is_some();
         let current_kind = match choice {
             Some(kind) if step.accepts(&kind) => kind,
             Some(_) => return Err(AuthnError::NoFlow),
             None => step.primary().ok_or(AuthnError::NoFlow)?.clone(),
         };
+
+        // What the person picks is remembered for `verify_factor`; asking for
+        // the step's default forgets an earlier pick.
+        let picked = picked_by_person.then_some(&current_kind);
+        if !Self::record_chosen_factor(session, &user_id, remaining.len(), picked).await {
+            return Err(AuthnError::NoFlow);
+        }
 
         match current_kind {
             FactorKind::Password
@@ -553,10 +570,19 @@ where
                 .await;
         }
 
-        self.verify_local_factor(
-            credential, session, &user_id, &tenant_id, prepared, reserved,
-        )
-        .await
+        let outcome = self
+            .verify_local_factor(
+                credential, session, &user_id, &tenant_id, prepared, reserved,
+            )
+            .await?;
+        // The step is passed: the pick belonged to it, not to the next one.
+        if matches!(
+            outcome,
+            FactorOutcome::Authenticated | FactorOutcome::FactorRequired(_)
+        ) {
+            session.remove_custom(prepare::CHOSEN_FACTOR).await;
+        }
+        Ok(outcome)
     }
 
     /// Log out the current session: clear it and invalidate it in the registry.

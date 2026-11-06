@@ -164,8 +164,7 @@ refresh store without revoke-by-device. It composes with the other checks
 of the one refresh entry point:
 
 ```rust,ignore
-let (session, rotated) = Refresh::new(&plaintext, status_check)
-    .in_tenant(&tenant)
+let (session, rotated) = Refresh::new(&plaintext, &tenant, status_check)
     .device_info(Some(fingerprint))
     .device_store(&devices)
     .run(&refresh_store, &config, &rng, now)
@@ -197,9 +196,11 @@ working once the previous pepper is dropped. Pass the keyed fingerprint (the
 hex of the `FingerprintHash` the extractor computed) rather than a raw
 `User-Agent`: the string is still whatever the client's request yields, and
 the device id link above is the strong binding. Configure
-`RefreshTokenConfig::hash_pepper` so the digest is keyed; without one it is
-an unkeyed hash, which a reader of the store can confirm a guessed device
-string against (it never lets a caller pass with the wrong string). A token
+`RefreshTokenConfig::hash_pepper` so the digest is keyed; without one the
+config refuses a `device_info` (`InvalidConfig`) unless it calls
+`allow_unkeyed_hashes()`, because an unkeyed hash lets a reader of the store
+confirm a guessed device string against it (it never lets a caller pass with
+the wrong string). A token
 issued by an earlier release stores the raw string; it is still honoured, and
 the token that replaces it on its first refresh carries the digest. With
 rotation off nothing replaces the token, so the raw string stays until the
@@ -400,7 +401,7 @@ let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock)
     .with_tenant_fn(|_parts| Some(tenant));
 
 // The tenant is a property of the signed-in user: set nothing. The tenant
-// stored by `AuthSession::set_authenticated` at login reaches the resolver
+// stored by the login service reaches the resolver
 // as `SessionTenant`, and the first authenticated request gets a device
 // cookie.
 let resolver = LifecycleDeviceResolver::new(extractor, lifecycle, SystemClock);

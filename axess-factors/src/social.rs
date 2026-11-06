@@ -38,9 +38,12 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! use axess_factors::social::{SocialProvider, SocialClaims, SocialError};
+//! ```no_run
+//! // no_run: the flow calls the provider's endpoints over the network.
+//! use axess_factors::ZeroizedString;
+//! use axess_factors::social::{SocialClaims, SocialError, SocialProvider, SocialProviderConfig};
 //!
+//! # async fn demo(client_id: String, client_secret: String, code: String) -> Result<(), SocialError> {
 //! // Startup wiring; one provider per IdP.
 //! let github = SocialProvider::new(
 //!     SocialProviderConfig {
@@ -49,7 +52,7 @@
 //!         token_endpoint: "https://github.com/login/oauth/access_token".into(),
 //!         userinfo_endpoint: "https://api.github.com/user".into(),
 //!         client_id,
-//!         client_secret,
+//!         client_secret: ZeroizedString::new(client_secret),
 //!         redirect_uri: "https://app.example.com/auth/callback/github".into(),
 //!         scopes: vec!["read:user".into(), "user:email".into()],
 //!     },
@@ -64,20 +67,29 @@
 //!             raw: raw.clone(),
 //!         })
 //!     },
-//! );
+//! )?;
 //!
-//! // Per request: kick off the flow.
-//! let csrf_state = mint_csrf_state();
-//! let pkce = github.build_auth_url(&csrf_state);
-//! // → store (csrf_state, pkce.verifier) in the user's pre-auth session,
-//! //   then redirect to pkce.url.
+//! // Per request: kick off the flow. The provider mints the state itself.
+//! let auth = github.build_auth_url();
+//! // → store (auth.state, auth.pkce_verifier) in the user's pre-auth session,
+//! //   then redirect to auth.url.
 //!
-//! // Callback handler: verify state, exchange code, fetch userinfo.
-//! let access_token = github.exchange_code(&code, &pkce_verifier).await?;
+//! // Callback handler: the stored state and the one the IdP echoed are
+//! // compared (in constant time) by the exchange, which then trades the code
+//! // for a token; fetch userinfo with it.
+//! # let returned_state = auth.state.clone();
+//! let access_token = github
+//!     .exchange_code(&auth.state, &returned_state, &code, &auth.pkce_verifier)
+//!     .await?;
 //! let claims = github.fetch_userinfo(&access_token).await?;
+//! # let _ = claims;
+//! # Ok(())
+//! # }
 //! ```
 
 use std::sync::Arc;
+
+use subtle::ConstantTimeEq as _;
 
 use axess_rng::{SecureRng, SystemRng};
 use serde::Deserialize;
@@ -107,6 +119,17 @@ pub enum SocialError {
     /// The caller-supplied claim mapper rejected the userinfo response.
     #[error("social provider claim mapping: {0}")]
     ClaimMapping(String),
+
+    /// The `state` the IdP returned is not the one the flow stored (or none
+    /// was stored). The code is not exchanged.
+    #[error("social provider state does not match the flow")]
+    StateMismatch,
+
+    /// PKCE is on and the verifier is shorter than the 43 characters RFC
+    /// 7636 requires: it did not come from [`SocialProvider::build_auth_url`]
+    /// (a missing cookie read as empty, say). The code is not exchanged.
+    #[error("social provider PKCE verifier is missing or too short")]
+    InvalidPkceVerifier,
 }
 
 /// Refuse `url` unless it is HTTPS or loopback HTTP; `what` names the
@@ -150,13 +173,18 @@ pub struct SocialClaims {
 
 /// Result of building the authorization URL.
 ///
-/// The adopter stores `csrf_state` + `pkce_verifier` in the user's
-/// pre-auth session, then redirects to `url`. On callback both values
-/// come back out of the session and feed
-/// [`SocialProvider::exchange_code`].
+/// The adopter stores `state` + `pkce_verifier` in the user's pre-auth
+/// session, then redirects to `url`. On callback both values come back out of
+/// the session, with the `state` the IdP echoed, and feed
+/// [`SocialProvider::exchange_code`]. A plain-OAuth-2.0 flow has no nonce:
+/// there is no ID token for one to bind to.
 pub struct AuthUrl {
     /// Redirect URL to send the user to.
     pub url: String,
+    /// The CSRF state the provider minted for this flow (32 random bytes,
+    /// base64url, 43 characters); it is in `url`. Store it, and pass it back
+    /// as the expected state to [`SocialProvider::exchange_code`].
+    pub state: String,
     /// PKCE verifier (RFC 7636); store, then pass back to
     /// [`SocialProvider::exchange_code`]. Empty string when PKCE is
     /// disabled via [`SocialProvider::without_pkce`].
@@ -169,6 +197,7 @@ impl std::fmt::Debug for AuthUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthUrl")
             .field("url", &self.url)
+            .field("state", &self.state)
             .field("pkce_verifier", &"[redacted]")
             .finish()
     }
@@ -269,13 +298,7 @@ where
         require_secure_endpoint(&config.authorization_endpoint, "authorization_endpoint")?;
         require_secure_endpoint(&config.token_endpoint, "token_endpoint")?;
         require_secure_endpoint(&config.userinfo_endpoint, "userinfo_endpoint")?;
-        // No-redirects HTTP client (SSRF defense), 30s per-op timeout.
-        let http = reqwest::ClientBuilder::new()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(SocialError::ClientBuild)?;
+        let http = build_http_client(|builder| builder)?;
         Ok(Self {
             name: Arc::from(config.name.as_str()),
             authorization_endpoint: config.authorization_endpoint,
@@ -310,39 +333,32 @@ where
         self
     }
 
-    /// Swap the `reqwest::Client` used for token-exchange and
+    /// Adjust the `reqwest::ClientBuilder` behind the token-exchange and
     /// userinfo calls.
     ///
-    /// Default: no-redirect (SSRF defense) + 30s per-op timeout +
-    /// `axess-social/<version>` `User-Agent`. Override when the
-    /// adopter needs a custom User-Agent (some providers reject the
-    /// default), a custom TLS provider, an outbound HTTP proxy, or a
-    /// different per-op timeout.
+    /// `adjust` receives a builder that already carries the
+    /// `axess-social/<version>` `User-Agent` and returns it changed: a
+    /// custom User-Agent (some providers reject the default), a TLS
+    /// provider or root store, an outbound HTTP proxy. The library then sets
+    /// the no-redirect policy (SSRF defense) and the 30-second per-operation
+    /// timeout on the result, so nothing `adjust` does can drop them; a
+    /// whole `reqwest::Client` cannot be supplied for the same reason.
     ///
-    /// The `User-Agent` belongs to the client: a supplied client sends
-    /// whatever it was built with, and none if it was built with none.
-    /// Set one on it for providers that require it.
+    /// # Errors
     ///
-    /// Adopters are responsible for keeping the no-redirect SSRF
-    /// defense in their custom client; the library does not enforce
-    /// it on the supplied instance.
-    pub fn with_http_client(mut self, http: reqwest::Client) -> Self {
-        self.http = http;
-        self
+    /// [`SocialError::ClientBuild`] when the adjusted builder cannot build.
+    pub fn with_http_client_builder(
+        mut self,
+        adjust: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+    ) -> Result<Self, SocialError> {
+        self.http = build_http_client(adjust)?;
+        Ok(self)
     }
 
-    /// Mint a fresh CSRF state token (32 random bytes, base64url-encoded,
-    /// 43 chars).
-    ///
-    /// The adopter stores the returned value in the pre-auth session
-    /// before redirecting, then verifies on the callback that the
-    /// IdP-echoed `state` query parameter matches. Routes through the
-    /// same injected RNG as PKCE so DST tests pin both deterministically.
-    ///
-    /// Provided as a helper so adopters don't reimplement CSRF-state
-    /// minting (which has a sharp edge: too few bytes invites
-    /// collisions, the wrong character set breaks URL safety).
-    pub fn mint_csrf_state(&self) -> String {
+    /// Mint a fresh CSRF state token: 32 random bytes, base64url, 43 chars.
+    /// Routes through the same injected RNG as PKCE so DST tests pin both
+    /// deterministically.
+    fn mint_csrf_state(&self) -> String {
         use base64::Engine as _;
         let mut buf = [0u8; 32];
         self.rng.fill_bytes(&mut buf);
@@ -357,12 +373,14 @@ where
 
     /// Build the authorization URL the user is redirected to.
     ///
-    /// `csrf_state` is the per-flow CSRF token the adopter mints
-    /// (32+ random bytes, base64url, stored in pre-auth session).
-    /// The IdP echoes it back on the callback; verify equality
-    /// before calling [`exchange_code`](Self::exchange_code).
-    pub fn build_auth_url(&self, csrf_state: &str) -> AuthUrl {
+    /// The provider mints the per-flow CSRF state itself (the caller cannot
+    /// pass an empty or constant one) and returns it in [`AuthUrl::state`].
+    /// The IdP echoes it back on the callback;
+    /// [`exchange_code`](Self::exchange_code) compares the two.
+    pub fn build_auth_url(&self) -> AuthUrl {
         use base64::Engine as _;
+
+        let state = self.mint_csrf_state();
 
         let pkce_verifier = if self.use_pkce {
             // RFC 7636 §4.1: 43–128 chars from the unreserved set.
@@ -391,7 +409,7 @@ where
             self.authorization_endpoint,
             urlencode(&self.client_id),
             urlencode(&self.redirect_uri),
-            urlencode(csrf_state),
+            urlencode(&state),
             urlencode(&self.scopes.join(" ")),
         );
 
@@ -405,10 +423,22 @@ where
             ));
         }
 
-        AuthUrl { url, pkce_verifier }
+        AuthUrl {
+            url,
+            state,
+            pkce_verifier,
+        }
     }
 
     /// Exchange an authorization code for an access token.
+    ///
+    /// `expected_state` is the [`AuthUrl::state`] the flow stored and
+    /// `returned_state` the `state` query parameter the IdP echoed. They are
+    /// compared in constant time first, and a difference (or an empty
+    /// expected state: nothing was stored) is [`SocialError::StateMismatch`]
+    /// with no request made. With PKCE on, a `pkce_verifier` under 43
+    /// characters is [`SocialError::InvalidPkceVerifier`], also before any
+    /// request.
     ///
     /// Sends the standard RFC 6749 §4.1.3 token request to the
     /// provider's token endpoint. Returns the access token only, as a
@@ -416,9 +446,19 @@ where
     /// social providers do not issue ID tokens.
     pub async fn exchange_code(
         &self,
+        expected_state: &str,
+        returned_state: &str,
         code: &str,
         pkce_verifier: &str,
     ) -> Result<ZeroizedString, SocialError> {
+        if expected_state.is_empty()
+            || !bool::from(expected_state.as_bytes().ct_eq(returned_state.as_bytes()))
+        {
+            return Err(SocialError::StateMismatch);
+        }
+        if self.use_pkce && pkce_verifier.len() < MIN_PKCE_VERIFIER_LEN {
+            return Err(SocialError::InvalidPkceVerifier);
+        }
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -481,6 +521,25 @@ where
 
         (self.claim_mapper)(&raw)
     }
+}
+
+/// RFC 7636 §4.1: a code verifier is at least 43 characters.
+const MIN_PKCE_VERIFIER_LEN: usize = 43;
+
+/// The HTTP client: the default `User-Agent`, then the adopter's changes,
+/// then no redirects (SSRF defense) and a 30-second per-operation timeout,
+/// which come last so nothing before them can undo them.
+fn build_http_client(
+    adjust: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> Result<reqwest::Client, SocialError> {
+    adjust(
+        reqwest::ClientBuilder::new()
+            .user_agent(concat!("axess-social/", env!("CARGO_PKG_VERSION"))),
+    )
+    .redirect(reqwest::redirect::Policy::none())
+    .timeout(std::time::Duration::from_secs(30))
+    .build()
+    .map_err(SocialError::ClientBuild)
 }
 
 /// Minimal `application/x-www-form-urlencoded` encoder for the auth-URL

@@ -35,14 +35,16 @@
 //! itself, but it cannot read a row this release saved (the text column is
 //! empty): that user signs in again.
 
-use crate::session::storage::session_codec::{Decoded, SessionCodec, SqlStoreError, expires_at};
+use crate::session::storage::session_codec::{
+    DEFAULT_MAX_PAYLOAD_BYTES, Decoded, SessionCodec, SqlStoreError, expires_at,
+};
 use crate::session::storage::sql_helpers::log_cleanup_outcome;
 use crate::session::{
     data::SessionData,
     id::SessionId,
     store::{
         ConditionalUpdate, CycleOutcome, SessionStore,
-        cas::{CasRow, CasWrite, cas_by_revision},
+        cas::{CasRow, CasWrite, cas_by_revision, cycle_by_revision},
     },
 };
 use axess_clock::{Clock, SystemClock};
@@ -69,7 +71,7 @@ pub type SqliteStoreError = SqlStoreError;
 /// is encrypted before storage and decrypted on load.
 ///
 /// For local development or testing where encryption is not needed, use
-/// [`plaintext`](SqliteSessionStore::plaintext) instead. This is an
+/// [`plaintext_insecure`](SqliteSessionStore::plaintext_insecure) instead. This is an
 /// explicit opt-out so that production code never accidentally stores
 /// sessions unencrypted.
 ///
@@ -80,13 +82,15 @@ pub type SqliteStoreError = SqlStoreError;
 /// let store = SqliteSessionStore::new(pool, SessionCrypto::new(key));
 ///
 /// // Development only: plaintext (explicit opt-out).
-/// let store = SqliteSessionStore::plaintext(pool);
+/// let store = SqliteSessionStore::plaintext_insecure(pool);
 /// ```
 #[derive(Clone)]
 pub struct SqliteSessionStore {
     pool: SqlitePool,
     codec: SessionCodec,
     clock: Arc<dyn Clock>,
+    /// Largest encoded payload a write accepts, in bytes.
+    max_payload_bytes: usize,
 }
 
 impl SqliteSessionStore {
@@ -96,11 +100,16 @@ impl SqliteSessionStore {
             pool,
             codec: SessionCodec::encrypted(crypto),
             clock: Arc::new(SystemClock),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
         }
     }
 
     /// Create a **plaintext** store (development/testing only).
-    pub fn plaintext(pool: SqlitePool) -> Self {
+    ///
+    /// Session data (including the user id) is stored **unsealed**: anyone who
+    /// can read the table can read every session. The named opt-out beside
+    /// [`new`](Self::new), which takes the key; do not use in production.
+    pub fn plaintext_insecure(pool: SqlitePool) -> Self {
         tracing::warn!(
             "SqliteSessionStore created without encryption; \
              do not use in production"
@@ -109,7 +118,18 @@ impl SqliteSessionStore {
             pool,
             codec: SessionCodec::plaintext(),
             clock: Arc::new(SystemClock),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
         }
+    }
+
+    /// Set the largest encoded session payload a write accepts, in bytes
+    /// (default 64 KiB, as for the Valkey store). `save`, `update`, `cycle`
+    /// and the conditional updates return
+    /// [`SqlStoreError::PayloadTooLarge`] over it, so session data an
+    /// attacker can grow does not grow the row without bound.
+    pub fn with_max_payload(mut self, max_bytes: usize) -> Self {
+        self.max_payload_bytes = max_bytes;
+        self
     }
 
     /// Inject a [`Clock`] for deterministic-simulation testing.
@@ -245,6 +265,16 @@ impl SqliteSessionStore {
 }
 
 impl SessionStore for SqliteSessionStore {
+    /// SQL rows hold the session as one sealed blob with no user column, so
+    /// they cannot be listed by user.
+    async fn find_sessions_for_user(
+        &self,
+        _user_id: &crate::authn::ids::UserId,
+        _limit: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Err(SqlStoreError::Unsupported("find_sessions_for_user"))
+    }
+
     type Error = SqlStoreError;
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
@@ -283,7 +313,9 @@ impl SessionStore for SqliteSessionStore {
             return SessionStore::delete(self, id).await;
         }
         let id_str = id.to_string();
-        let encoded = self.codec.encode_bytes(id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(id, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
 
         sqlx::query(
@@ -324,7 +356,9 @@ impl SessionStore for SqliteSessionStore {
             return Ok(false);
         }
         let id_str = id.to_string();
-        let encoded = self.codec.encode_bytes(id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(id, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
         let now = self.clock.now().timestamp();
 
@@ -372,16 +406,22 @@ impl SessionStore for SqliteSessionStore {
                 .await?;
             return Ok(CycleOutcome::SessionGone);
         }
-        let encoded = self.codec.encode_bytes(new_id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(new_id, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
         let now = self.clock.now().timestamp();
 
         let mut tx = self.pool.begin().await?;
 
         // The delete of the old row comes first and decides whether the
-        // rotation may proceed: it takes the row lock, so a logout that
-        // deleted the row first leaves nothing to remove here, and a logout
-        // that arrives later waits for this transaction. With `require_old`
+        // rotation may proceed. SQLite has no row locks: the delete is the
+        // transaction's first write, so it takes the database-wide write lock
+        // (every path below starts with a write, so a deferred transaction
+        // needs no upgrade). A logout that deleted the row first leaves
+        // nothing to remove here, and one that arrives later waits for this
+        // transaction to commit, or fails with SQLITE_BUSY once the pool's
+        // busy timeout runs out. With `require_old`
         // a delete that removed no live row rolls the transaction back (by
         // dropping it) instead of writing the authenticated data under the
         // new id.
@@ -436,6 +476,27 @@ impl SessionStore for SqliteSessionStore {
 
         tx.commit().await?;
         Ok(CycleOutcome::Rotated)
+    }
+
+    async fn cycle_if_revision(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> Result<CycleOutcome, Self::Error> {
+        cycle_by_revision(
+            self,
+            old_id,
+            new_id,
+            data,
+            ttl,
+            require_old,
+            expected_revision,
+        )
+        .await
     }
 
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
@@ -496,7 +557,9 @@ impl CasRow for SqliteSessionStore {
     ) -> Result<CasWrite, Self::Error> {
         // Sealed once the row is known to be live: a session that is gone or
         // moved on costs no seal.
-        let encoded = self.codec.encode_bytes(id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(id, data, self.max_payload_bytes)?;
         let replaced = sqlx::query(
             "UPDATE sessions SET data = '', data_bin = ?1, expires_at = ?2 \
              WHERE id = ?3 AND expires_at > ?4 AND data_bin IS ?5 AND data = ?6",

@@ -4,7 +4,6 @@ use super::device_binding;
 use super::store::RefreshTokenStore;
 use super::types::*;
 use crate::authn::ids::{DeviceId, TenantId, UserId};
-use crate::session::data::SessionData;
 use axess_rng::SecureRng;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
@@ -55,7 +54,7 @@ impl Located {
     /// device binding are keyed with.
     fn stored_under<'a>(&self, config: &'a RefreshTokenConfig) -> Option<&'a [u8]> {
         if self.under_previous_pepper {
-            config.previous_pepper()
+            config.previous_pepper().flatten()
         } else {
             config.pepper()
         }
@@ -82,7 +81,7 @@ async fn locate<S: RefreshTokenStore>(
         return Ok(None);
     };
     Ok(store
-        .find_token(&hash_token(plaintext, Some(previous)))
+        .find_token(&hash_token(plaintext, previous))
         .await?
         .map(|record| Located {
             record,
@@ -135,6 +134,9 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
     now: DateTime<Utc>,
 ) -> Result<(String, RefreshToken), RefreshError<S::Error>> {
     config.check()?;
+    config
+        .validate_device_info(req.device_info.is_some())
+        .map_err(RefreshError::InvalidConfig)?;
     // The record stores a keyed digest of the device string, not the string.
     let req = IssueRequest {
         device_info: req
@@ -153,125 +155,6 @@ pub async fn issue_refresh_token<S: RefreshTokenStore>(
         .map_err(RefreshError::Store)?;
 
     Ok((plaintext, record))
-}
-
-/// Validate a refresh token and produce a new session, without checking
-/// the account's status.
-///
-/// Deprecated: it rotates a token for an account that may have been
-/// suspended or terminated since the token was issued. Use
-/// [`Refresh::new`] with a status predicate, then [`Refresh::run`].
-#[deprecated(
-    since = "0.13.0",
-    note = "rotates a token without checking that the account may still log in; \
-            use Refresh::new(plaintext, status_check).run(..)"
-)]
-pub async fn refresh_session<S: RefreshTokenStore>(
-    plaintext: &str,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    device_info: Option<&str>,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    Refresh::without_status_check(plaintext)
-        .device_info(device_info)
-        .run(store, config, rng, now)
-        .await
-}
-
-/// [`refresh_session`] for a request that belongs to one tenant.
-///
-/// Deprecated: it skips the account-status check too. Use
-/// [`Refresh::new`] with a status predicate and [`Refresh::in_tenant`].
-#[deprecated(
-    since = "0.14.0",
-    note = "skips the account-status check; \
-            use Refresh::new(plaintext, status_check).in_tenant(tenant).run(..)"
-)]
-pub async fn refresh_session_in_tenant<S: RefreshTokenStore>(
-    plaintext: &str,
-    tenant: &TenantId,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    device_info: Option<&str>,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>> {
-    Refresh::without_status_check(plaintext)
-        .in_tenant(tenant)
-        .device_info(device_info)
-        .run(store, config, rng, now)
-        .await
-}
-
-/// Refresh a session, threading a caller-supplied `account_status`
-/// predicate through the validation.
-///
-/// Deprecated: [`Refresh`] is the one entry point, and composes the status
-/// check with the tenant and device checks this form cannot add.
-#[deprecated(
-    since = "0.14.0",
-    note = "use Refresh::new(plaintext, status_check).device_info(device_info).run(..)"
-)]
-pub async fn refresh_session_with_status_check<S, FStat, Fut>(
-    plaintext: &str,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    device_info: Option<&str>,
-    status_check: FStat,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>>
-where
-    S: RefreshTokenStore,
-    FStat: FnOnce(&UserId) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    Refresh::new(plaintext, status_check)
-        .device_info(device_info)
-        .run(store, config, rng, now)
-        .await
-}
-
-/// Where a tenant-scoped refresh comes from: the tenant the request belongs
-/// to, and the device fingerprint it presents. The argument of the
-/// deprecated [`refresh_session_with_status_check_in_tenant`];
-/// [`Refresh::in_tenant`] and [`Refresh::device_info`] replace it.
-pub struct RefreshScope<'a> {
-    /// The tenant the request belongs to.
-    pub tenant: &'a TenantId,
-    /// The device fingerprint presented.
-    pub device_info: Option<&'a str>,
-}
-
-/// [`refresh_session_with_status_check`] for a request that belongs to one
-/// tenant.
-///
-/// Deprecated: use [`Refresh`].
-#[deprecated(
-    since = "0.14.0",
-    note = "use Refresh::new(plaintext, status_check).in_tenant(tenant).device_info(device_info).run(..)"
-)]
-pub async fn refresh_session_with_status_check_in_tenant<S, FStat, Fut>(
-    plaintext: &str,
-    scope: RefreshScope<'_>,
-    store: &S,
-    config: &RefreshTokenConfig,
-    rng: &impl SecureRng,
-    now: DateTime<Utc>,
-    status_check: FStat,
-) -> Result<(SessionData, Option<(String, RefreshToken)>), RefreshError<S::Error>>
-where
-    S: RefreshTokenStore,
-    FStat: FnOnce(&UserId) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    Refresh::new(plaintext, status_check)
-        .in_tenant(scope.tenant)
-        .device_info(scope.device_info)
-        .run(store, config, rng, now)
-        .await
 }
 
 /// The family a token's descendants carry: its own, or for a token issued

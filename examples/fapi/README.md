@@ -30,6 +30,8 @@ until [ "$(podman inspect -f '{{.State.Health.Status}}' axess-fapi-keycloak)" = 
 export FAPI_ISSUER=http://localhost:8080/realms/fapi
 export FAPI_CLIENT_ID=axess-fapi-client
 export FAPI_PROVIDER_NAME=keycloak
+# The tenant policy: only these e-mail domains may sign up as local users.
+export FAPI_ALLOWED_EMAIL_DOMAINS=bank.example.com
 # No FAPI_PRIVATE_KEY_FILE: the client signs with the development key the realm registers.
 
 cargo run -p axess-example-fapi
@@ -67,13 +69,19 @@ The [`keycloak/fapi-realm.json`](keycloak/fapi-realm.json) is imported on Keyclo
 
 ## Mock mode (no Keycloak required)
 
-If you want to see the wiring without running any container, drop the env vars:
+If you want to see the wiring without running any container, ask for the mock explicitly:
 
 ```sh
-cargo run -p axess-example-fapi
+FAPI_MOCK=1 cargo run -p axess-example-fapi
 ```
 
+Without `FAPI_ISSUER` and without `FAPI_MOCK=1` the example refuses to start: the mock IdP accepts any code, so an unset or misspelled `FAPI_ISSUER` must not fall into it silently. It logs a warning while it runs. Never run it where others can reach it.
+
 Mock mode uses an in-process `MockOAuthProvider`. It exercises the API surface but cannot do a real PAR round-trip (no PAR endpoint to push to). Use this for inspecting the example code; use Keycloak for any flow you actually care about end to end.
+
+## Who may sign up
+
+An identity the IdP authenticates is not automatically a local user. On its first login the example creates one only when the identity's e-mail address is in one of the domains named by `FAPI_ALLOWED_EMAIL_DOMAINS` (comma separated, required in live mode); anything else is refused and leaves no user behind. A concurrent first login for the same identity signs in as the user the other one created. Replace the domain check with your own tenant policy (an allowed issuer, a group, an invitation).
 
 ## Client authentication
 
@@ -82,7 +90,7 @@ FAPI 2.0 lets the client authenticate by `private_key_jwt` or mTLS, never by a c
 The key:
 
 - `FAPI_PRIVATE_KEY_FILE=/path/to/key.pem` names the PEM private key the client signs with. `FAPI_PRIVATE_KEY_ALG` is its algorithm (`ES256` by default; FAPI 2.0 allows `PS256`, `ES256` and `EdDSA`) and `FAPI_PRIVATE_KEY_KID` the `kid` the IdP registered it under. Register the public half at your IdP for the client.
-- Without `FAPI_PRIVATE_KEY_FILE` the example signs with [`keycloak/dev-client-key.pem`](keycloak/dev-client-key.pem) (`ES256`, `kid` `axess-fapi-dev`) and logs a warning. That key is published with the source: the bundled realm accepts it and nothing else must. Never register it at a real IdP.
+- Without `FAPI_PRIVATE_KEY_FILE`, and only when the issuer host is `localhost` or `127.0.0.1`, the example signs with [`keycloak/dev-client-key.pem`](keycloak/dev-client-key.pem) (`ES256`, `kid` `axess-fapi-dev`) and logs a warning; any other issuer makes it exit with an error. That key is published with the source: the bundled realm accepts it and nothing else must. Never register it at a real IdP.
 
 To use a key of your own with the bundled realm, generate one and put its public JWK in the client's `jwks.string` attribute in `keycloak/fapi-realm.json`, then recreate the container (below):
 
@@ -91,6 +99,10 @@ openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -nocrypt 
 ```
 
 The example's tests check that the development key and the realm's registered key are one pair.
+
+## Rate limiting and housekeeping
+
+`/auth/login` pushes an authorization request to the IdP and opens a session, so the example limits it to ten requests a minute per client address (`axess::RateLimitLayer` keyed on the address `client_ip::layer` resolves) and prunes expired sessions and unfinished logins from the store every five minutes. The limit counts per process: a deployment with several replicas must also rate-limit `/auth/login` at the edge (the TLS terminator or gateway).
 
 ## Conformance testing
 
@@ -103,7 +115,7 @@ The OpenID Foundation runs a free hosted conformance suite at <https://www.certi
 | **private_key_jwt** | The provider authenticates with a signed client assertion; no client secret exists |
 | **PAR** | `begin_oauth_login` auto-pushes params to PAR endpoint when FAPI enabled |
 | **DPoP** | The token request carries a proof; after login the page shows a proof for a hypothetical API call, signed by the key the token is bound to |
-| **form_post** | Callback accepts both GET (query) and POST (form_post); code never appears in URL |
+| **form_post** | The callback accepts `POST` (form_post) only; there is no query-mode `GET` callback, so the code never appears in a URL |
 | **Refresh** | The refresh button exchanges the stored refresh token with a proof from the login's key, so the new access token stays bound to it |
 | **RP-Initiated Logout** | Logout button redirects to IdP's `end_session_endpoint` with the login's `id_token_hint` |
 | **Token Revocation** | Logout handler revokes the login's refresh token with `revoke_oauth_token()` before redirecting |
@@ -115,8 +127,7 @@ The OpenID Foundation runs a free hosted conformance suite at <https://www.certi
 |--------|------|-------------|
 | GET | `/` | Home page with login link |
 | GET | `/auth/login` | Initiates FAPI login (PAR + redirect) |
-| GET | `/auth/callback` | IdP callback (query mode) |
-| POST | `/auth/callback` | IdP callback (form_post mode) |
+| POST | `/auth/callback` | IdP callback (form_post mode only) |
 | GET | `/profile` | The signed-in user and the key the tokens are bound to |
 | POST | `/auth/refresh` | DPoP-bound refresh of the tokens |
 | POST | `/auth/logout` | RP-Initiated Logout + token revocation |

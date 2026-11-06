@@ -16,6 +16,7 @@ use axess_core::authn::{
     types::Tenant,
 };
 use axess_core::session::store::MemorySessionRegistry;
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     MockClock, MockRng,
     mock_authn::{MockFactorStore, MockIdentityStore},

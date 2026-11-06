@@ -85,8 +85,8 @@ policies/
 ```rust
 let policy_store = Arc::new(PolicyStore::from_text(policy_text, schema_json)?);
 let provider = Arc::new(DocEntityProvider::new(data, "DocApp"));
-let authz = Arc::new(AuthzStore::new(policy_store, provider, "DocApp"));
-authz.validate()?; // catch schema mismatches at startup, not at request time
+// try_new validates the provider against the schema: a mismatch is a startup error
+let authz = Arc::new(AuthzStore::try_new(policy_store, provider, "DocApp")?);
 ```
 
 **AuthzEntityProvider.** Your application implements this trait to build Cedar entity graphs from your data. The provider loads users, roles, and resources and constructs Cedar `Entity` values with attributes and parent relationships.
@@ -96,11 +96,14 @@ authz.validate()?; // catch schema mismatches at startup, not at request time
 - `is_permitted(action, resource)` returns a boolean (for UI capability hints)
 - `batch_check(checks)` evaluates multiple (action, resource) pairs in one call
 
-**ABAC context.** For policies that check request-level attributes (MFA status, IP address), use `for_user_id_with_context()`:
+**ABAC context.** For policies that check request-level attributes (MFA status, IP address), build the session from the authenticated session with `for_session()`, and read the MFA fact from that session's factor history:
 
 ```rust
-let ctx = StandardRequestContext::new(mfa_verified, ip_address);
-let authz = state.authz.for_user_id_with_context(&user_id, ctx)?;
+// Never take user_id or MFA from the request: the principal and the MFA fact
+// come from the authenticated session.
+let mfa = auth_session.has_completed_factor(&FactorKind::Totp).await;
+let ctx = StandardRequestContext::new(mfa, ip_address);
+let authz = state.authz.for_session(&auth_session, ctx).await?;
 authz.require("DeleteDocument", &doc_id).await?;
 ```
 

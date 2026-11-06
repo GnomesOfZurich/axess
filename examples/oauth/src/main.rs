@@ -66,9 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_auth: client_auth(),
         post_logout_redirect: format!("{base_url}/"),
         base_url,
-        id_token_algs: std::env::var("OAUTH_ID_TOKEN_ALGS")
-            .map(|v| v.split(',').map(|a| a.trim().to_string()).collect())
-            .unwrap_or_default(),
+        id_token_algs: app::id_token_algs_from_setting(
+            std::env::var("OAUTH_ID_TOKEN_ALGS").ok().as_deref(),
+        ),
     };
     // `OAUTH_PROVISIONING=linked-only` turns just-in-time creation off: only
     // identities linked beforehand sign in.

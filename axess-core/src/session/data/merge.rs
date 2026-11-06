@@ -19,12 +19,34 @@ pub(crate) fn merge_concurrent(
     local: &SessionData,
     fresh: &SessionData,
 ) -> SessionData {
+    merge(base, local, fresh, true)
+}
+
+/// [`merge_concurrent`] for a rotation that changed the authentication state
+/// (a login, a logout, a step-up): the request cleared or rebuilt the custom
+/// bag on purpose, so a key a concurrent request added to the retired row is
+/// not carried into it (an anonymous visitor could have planted it before
+/// the login). A key the concurrent request took still stays taken.
+pub(crate) fn merge_rotating(
+    base: &SessionData,
+    local: &SessionData,
+    fresh: &SessionData,
+) -> SessionData {
+    merge(base, local, fresh, local.auth_state == base.auth_state)
+}
+
+fn merge(
+    base: &SessionData,
+    local: &SessionData,
+    fresh: &SessionData,
+    keep_additions: bool,
+) -> SessionData {
     SessionData {
         version: pick(&base.version, &local.version, &fresh.version),
         auth_state: pick(&base.auth_state, &local.auth_state, &fresh.auth_state),
         fingerprint: pick(&base.fingerprint, &local.fingerprint, &fresh.fingerprint),
         device_id: pick(&base.device_id, &local.device_id, &fresh.device_id),
-        custom: merge_custom(&base.custom, &local.custom, &fresh.custom),
+        custom: merge_custom(&base.custom, &local.custom, &fresh.custom, keep_additions),
         revision: fresh.revision,
         touched_at: fresh.touched_at,
     }
@@ -43,7 +65,7 @@ fn pick<T: PartialEq + Clone>(base: &T, local: &T, fresh: &T) -> T {
 /// guest's `null`, or a value an application stored whole) counts as empty
 /// for the keys it holds; when none of the three is an object the whole
 /// value is picked like any other field.
-fn merge_custom(base: &Value, local: &Value, fresh: &Value) -> Value {
+fn merge_custom(base: &Value, local: &Value, fresh: &Value, keep_additions: bool) -> Value {
     if ![base, local, fresh].iter().any(|bag| bag.is_object()) {
         return pick(base, local, fresh);
     }
@@ -52,6 +74,7 @@ fn merge_custom(base: &Value, local: &Value, fresh: &Value) -> Value {
         base.as_object().unwrap_or(&empty),
         local.as_object().unwrap_or(&empty),
         fresh.as_object().unwrap_or(&empty),
+        keep_additions,
     ))
 }
 
@@ -59,8 +82,17 @@ fn merge_bags(
     base: &Map<String, Value>,
     local: &Map<String, Value>,
     fresh: &Map<String, Value>,
+    keep_additions: bool,
 ) -> Map<String, Value> {
     let mut merged = fresh.clone();
+    if !keep_additions {
+        // Only what this request holds survives, less what a concurrent
+        // request took from it.
+        merged = local
+            .keys()
+            .filter_map(|key| fresh.get(key).map(|value| (key.clone(), value.clone())))
+            .collect();
+    }
     for key in base.keys().chain(local.keys()) {
         let (before, after) = (base.get(key), local.get(key));
         if before == after {

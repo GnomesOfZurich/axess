@@ -171,11 +171,7 @@ async fn a_suspension_reports_a_registry_that_could_not_end_the_sessions() {
         .suspend_user_across_tenants(
             Actor::System,
             &uid("u1"),
-            StatusDetail {
-                reason: "hold".into(),
-                since: Utc::now(),
-                until: None,
-            },
+            StatusDetail::administrative("hold", Utc::now()),
         )
         .await;
     assert!(

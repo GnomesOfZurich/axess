@@ -479,6 +479,75 @@ fn decode_scope(tenant_id: &str, user_id: Option<&str>) -> Result<AuthnScope, Ba
     }
 }
 
+impl OurBackend {
+    /// Stores a first TOTP factor, the recovery codes and the upgraded
+    /// `password+totp` method for a user as one transaction.
+    ///
+    /// Returns `Ok(false)` when a TOTP factor is already stored (nothing is
+    /// written). Any other failure, including a method upgrade that does not
+    /// change exactly one row, rolls everything back and is an error, so a
+    /// stored second factor is never paired with a method that does not ask
+    /// for it.
+    pub async fn enrol_totp(
+        &self,
+        scope: &AuthnScope,
+        totp: FactorConfig,
+        recovery_codes: FactorConfig,
+        steps: &[FactorStep],
+    ) -> Result<bool, BackendError> {
+        let cols = scope.as_columns();
+        let tenant_str = cols.tenant_id.to_string();
+        let user_str = cols
+            .user_id
+            .map(|u| u.to_string())
+            .ok_or_else(|| BackendError::Backend("enrolment needs a user scope".into()))?;
+        let steps_json = serde_json::to_string(steps)?;
+
+        let mut tx = self.pool().begin().await?;
+        for (config, first_write) in [(&totp, true), (&recovery_codes, false)] {
+            let conflict = if first_write {
+                "DO NOTHING"
+            } else {
+                "DO UPDATE SET config_json = excluded.config_json,
+                               updated_at = excluded.updated_at"
+            };
+            let res = sqlx::query(AssertSqlSafe(format!(
+                "INSERT INTO factor_configs (id, user_id, tenant_id, kind, config_json, enabled, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, datetime('now'))
+                 ON CONFLICT {} {conflict}",
+                factor_conflict_target(true)
+            )))
+            .bind(Uuid::new_v4().to_string())
+            .bind(&user_str)
+            .bind(&tenant_str)
+            .bind(config.kind().as_str())
+            .bind(serde_json::to_string(config)?)
+            .execute(&mut *tx)
+            .await?;
+            if first_write && res.rows_affected() == 0 {
+                return Ok(false);
+            }
+        }
+        let upgraded = sqlx::query(
+            "UPDATE auth_methods SET name = 'password+totp', steps_json = ?3
+             WHERE user_id = ?1 AND tenant_id = ?2",
+        )
+        .bind(&user_str)
+        .bind(&tenant_str)
+        .bind(steps_json)
+        .execute(&mut *tx)
+        .await?;
+        if upgraded.rows_affected() != 1 {
+            return Err(BackendError::Backend(format!(
+                "the method upgrade changed {} rows, expected 1",
+                upgraded.rows_affected()
+            )));
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+}
+
 /// The `ON CONFLICT` target that names the unique index covering `scope`.
 /// Tenant and system rows store `user_id` NULL, which the table-level
 /// `UNIQUE(user_id, tenant_id, kind)` never matches (SQLite treats NULLs as

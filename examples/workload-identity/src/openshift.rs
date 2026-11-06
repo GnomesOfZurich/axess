@@ -25,7 +25,7 @@
 //!         .with_issuer(axess_example_workload_identity::openshift::DEFAULT_ISSUER)
 //!         .with_audience("axess-platform"),
 //! );
-//! // then k8s_sa_mapper_pinned(trust_domain, pins) as in the kubernetes module
+//! // then k8s_sa_mapper_pinned(pins) as in the kubernetes module
 //! ```
 
 /// The service-account issuer of a default OpenShift 4 cluster.

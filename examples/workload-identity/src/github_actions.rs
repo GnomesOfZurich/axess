@@ -30,11 +30,10 @@
 //! let resolver = WorkloadResolver::<GitHubActionsClaims, _, _>::new(
 //!     verifier.clone(),
 //!     trust_domain.clone(),
-//!     tenant_id,                              // adopter looked up from owner
+//!     |owner_id| tenants.get(owner_id).copied(), // owners you know; None refuses
 //!     Issuer::custom("github_actions").unwrap(),
 //!     bearer_token,
 //!     github_actions_mapper(
-//!         trust_domain,
 //!         GitHubAllowlist::new()
 //!             .owner_id("123456")
 //!             .repository_id("987654321")
@@ -60,8 +59,8 @@
 //!   do not move. This recipe requires both claims and refuses a token
 //!   without them;
 //! - give the mapper a [`GitHubAllowlist`] and refuse an owner id you do not
-//!   know (the `tenant_id` argument above is that lookup, so it must fail
-//!   closed);
+//!   know (the tenant lookup argument above is that check: it answers
+//!   `None` for an owner id you do not know, which refuses the token);
 //! - authorize on the whole workload id, never on the owner alone;
 //! - list the `ref` (or the `environment`) and the event the allowlist admits;
 //!   a token on any other ref, or from any other event, is refused. For
@@ -81,7 +80,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axess_factors::federation::workload::WorkloadMapping;
 use axess_factors::jwt::verifier::VerifiedClaims;
-use axess_identity::{IdentityError, TrustDomain, WorkloadId};
+use axess_identity::IdentityError;
 use serde::Deserialize;
 
 /// GitHub Actions OIDC custom-claim shape. Only the fields needed for
@@ -198,10 +197,9 @@ impl GitHubAllowlist {
 
 /// Build the claim-mapping closure for [`WorkloadResolver`](axess_factors::federation::workload::WorkloadResolver).
 ///
-/// Captures the `trust_domain` so the synthesised `WorkloadId` lives
-/// under the SPIFFE trust domain the resolver pins.
+/// The resolver builds the `WorkloadId` itself, under the trust domain it
+/// pins, from the service name and tenant slug this mapper returns.
 pub fn github_actions_mapper(
-    trust_domain: TrustDomain,
     allowlist: GitHubAllowlist,
 ) -> impl Fn(&VerifiedClaims<GitHubActionsClaims>) -> Result<WorkloadMapping, IdentityError> + Send + Sync
 {
@@ -225,12 +223,6 @@ pub fn github_actions_mapper(
         if !allowlist.admits(custom) {
             return Err(IdentityError::NotAuthenticated);
         }
-
-        let workload_id = WorkloadId::build(
-            &trust_domain,
-            &custom.repository_id,
-            &custom.repository_owner_id,
-        )?;
 
         let mut attributes = BTreeMap::new();
         attributes.insert(
@@ -269,7 +261,6 @@ pub fn github_actions_mapper(
         }
 
         Ok(WorkloadMapping {
-            workload_id,
             service_name: custom.repository_id.clone(),
             tenant_slug: custom.repository_owner_id.clone(),
             attributes,

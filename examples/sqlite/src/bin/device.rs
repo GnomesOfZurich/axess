@@ -161,9 +161,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(Extension(devices.clone()))
         .layer(Extension(demo_tenant))
         .layer(
-            SessionLayer::new(sessions, signing_key)
-                .with_secure(secure_cookies())
-                .with_ttl(Duration::from_secs(3600)),
+            // This demo never signs anyone in, so its registry stays empty;
+            // a deployment that does shares the authentication service's.
+            SessionLayer::new(
+                sessions,
+                signing_key,
+                axess::MemorySessionRegistry::new().handle(),
+            )
+            .with_secure(secure_cookies())
+            .with_ttl(Duration::from_secs(3600)),
         );
 
     // The client address is part of the device fingerprint. Without this

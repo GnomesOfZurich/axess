@@ -53,7 +53,23 @@ pub trait IssuanceListener: Send + Sync {
     fn on_mint(&self, event: &IssuanceEvent<'_>);
 }
 
-/// Panics if the claim set's lifetime `exp - now` exceeds `max_ttl`.
+/// Why [`enforce_max_ttl_fallible`] refused a claim set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtlRefusal {
+    /// The lifetime `exp - now` is over the cap.
+    Exceeds {
+        /// The computed lifetime.
+        observed: Duration,
+        /// The configured cap.
+        max: Duration,
+    },
+    /// The cap or the claim set cannot produce a usable token.
+    Invalid(crate::local_idp::LifetimeFault),
+}
+
+/// Panics if the claim set is refused by [`enforce_max_ttl_fallible`]: its
+/// lifetime `exp - now` exceeds `max_ttl`, `max_ttl` is not positive, the
+/// token has already expired, or `nbf` is after `exp`.
 /// Called from
 /// [`LocalIdpFixture::mint_with_header_at`](crate::testing::local_idp::LocalIdpFixture::mint_with_header_at)
 /// when the fixture has a TTL policy configured. The lifetime is measured
@@ -61,34 +77,58 @@ pub trait IssuanceListener: Send + Sync {
 /// future-dated `iat` cannot shrink it.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn enforce_max_ttl(claims: &MintClaims, max_ttl: Duration, now: DateTime<Utc>) {
-    let lifetime = claims.expires_at - now;
-    assert!(
-        lifetime <= max_ttl,
-        "LocalIdpFixture::mint refusing token with lifetime {lifetime} \
-         exceeding the fixture's max_ttl of {max_ttl}. \
-         Set MintClaims.expires_at within the cap or relax the policy \
-         via `with_max_ttl`.",
-    );
+    match enforce_max_ttl_fallible(claims, max_ttl, now) {
+        Ok(()) => {}
+        Err(TtlRefusal::Exceeds { observed, max }) => panic!(
+            "LocalIdpFixture::mint refusing token with lifetime {observed} \
+             exceeding the fixture's max_ttl of {max}. \
+             Set MintClaims.expires_at within the cap or relax the policy \
+             via `with_max_ttl`.",
+        ),
+        Err(TtlRefusal::Invalid(fault)) => {
+            panic!("LocalIdpFixture::mint refusing an invalid lifetime: {fault}")
+        }
+    }
 }
 
-/// Returns `Err((observed, max))` if the claim set's lifetime exceeds
-/// `max_ttl`. Production-side counterpart to [`enforce_max_ttl`];
-/// `LocalIdp::mint` surfaces this as `IssuanceError::LifetimeExceedsCap`
-/// rather than panicking. Reference time is the supplied `now`
+/// Returns the refusal if the claim set's lifetime exceeds `max_ttl`
+/// ([`TtlRefusal::Exceeds`]), or the cap is zero or negative, the token has
+/// already expired (`exp <= now`), or `nbf` is after `exp`
+/// ([`TtlRefusal::Invalid`]).
+/// Production-side counterpart to [`enforce_max_ttl`];
+/// `LocalIdp::mint` surfaces these as `IssuanceError::LifetimeExceedsCap`
+/// and `IssuanceError::InvalidLifetime` rather than panicking. Reference time
+/// is the supplied `now`
 /// (typically `Clock::now()`); the fixture's variant takes the same
 /// `now` through its `_at` mint methods.
 pub(crate) fn enforce_max_ttl_fallible(
     claims: &MintClaims,
     max_ttl: Duration,
     now: DateTime<Utc>,
-) -> Result<(), (Duration, Duration)> {
+) -> Result<(), TtlRefusal> {
+    use crate::local_idp::LifetimeFault;
     // Measured from NOW, not from a caller-supplied `issued_at`: a future-dated
     // `iat` would otherwise shrink the apparent lifetime under the cap while
     // the token stays valid for the whole span.
     let lifetime = claims.expires_at - now;
+    // A cap that is not positive admits nothing; a token that is already
+    // expired, or whose `nbf` is after its `exp`, is never valid. Each is a
+    // refusal, not a mint that only looks within the cap.
+    if max_ttl <= Duration::zero() {
+        return Err(TtlRefusal::Invalid(LifetimeFault::NonPositiveCap));
+    }
+    if lifetime <= Duration::zero() {
+        return Err(TtlRefusal::Invalid(LifetimeFault::AlreadyExpired));
+    }
+    if claims.not_before.is_some_and(|nbf| nbf > claims.expires_at) {
+        return Err(TtlRefusal::Invalid(LifetimeFault::NotBeforeAfterExpiry));
+    }
     if lifetime <= max_ttl {
         Ok(())
     } else {
-        Err((lifetime, max_ttl))
+        Err(TtlRefusal::Exceeds {
+            observed: lifetime,
+            max: max_ttl,
+        })
     }
 }

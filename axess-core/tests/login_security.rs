@@ -16,6 +16,7 @@ use axess_core::authn::{
     types::{EntityState, LockoutPolicy, StatusDetail},
 };
 use axess_core::blocking::KdfExecutor;
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     mock_authn::{CallLog, MockFactorStore, MockIdentityStore},
     test_session,
@@ -65,6 +66,7 @@ fn rig_with(user_status: EntityState, totp: bool) -> Rig {
     let svc = AuthnService::builder(identity.clone(), factors)
         .with_clock(clock.clone())
         .with_kdf_executor(kdf.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     Rig {
@@ -109,8 +111,12 @@ async fn lockout_is_enforced_before_the_verifier_and_expires() {
     let early = test_session();
     r.svc.begin_login("alice", "default", &early).await.unwrap();
 
+    // Each guess waits out the delay the one before it earned, so the lock
+    // and not the throttle answers the third.
     assert_eq!(attempt(&r, "wrong1").await, "InvalidCredential");
+    r.clock.advance(chrono::Duration::seconds(1));
     assert_eq!(attempt(&r, "wrong2").await, "InvalidCredential");
+    r.clock.advance(chrono::Duration::seconds(2));
     assert_eq!(attempt(&r, "wrong3").await, "locked:true");
     assert_eq!(r.identity.failed_attempts_for("u1"), 3);
 
@@ -149,6 +155,7 @@ async fn a_zero_max_attempts_policy_does_not_lock_everyone() {
     let svc = AuthnService::builder(identity, factors)
         .with_clock(r.clock.clone())
         .with_kdf_executor(Arc::new(KdfExecutor::inline()))
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -196,11 +203,7 @@ fn derived_lockout_rules() {
 #[tokio::test]
 async fn a_pending_account_is_not_distinguishable_at_begin_login() {
     let r = rig_with(
-        EntityState::Pending(StatusDetail {
-            reason: "review".into(),
-            since: chrono::Utc::now(),
-            until: None,
-        }),
+        EntityState::Pending(StatusDetail::verification("review", chrono::Utc::now())),
         false,
     );
     let outcome = r
@@ -222,11 +225,8 @@ async fn a_locked_known_user_makes_the_same_store_calls_as_an_unknown_one() {
         let log = CallLog::new();
         let mut user = test_user("u1", "alice");
         if locked {
-            user.status = EntityState::Suspended(StatusDetail {
-                reason: "hold".into(),
-                since: chrono::Utc::now(),
-                until: None,
-            });
+            user.status =
+                EntityState::Suspended(StatusDetail::administrative("hold", chrono::Utc::now()));
         }
         let identity = MockIdentityStore::new()
             .with_call_log(&log)
@@ -234,6 +234,7 @@ async fn a_locked_known_user_makes_the_same_store_calls_as_an_unknown_one() {
             .with_user(user);
         let svc = AuthnService::builder(identity, MockFactorStore::new().with_call_log(&log))
             .with_kdf_executor(Arc::new(KdfExecutor::inline()))
+            .allow_plaintext_factor_secrets()
             .build()
             .with_audit_context(AuditContext::default());
         let _ = svc
@@ -356,6 +357,7 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
         .with_clock(clock.clone())
         .with_kdf_executor(Arc::new(KdfExecutor::inline()))
         .with_refresh_store(store.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -370,7 +372,7 @@ async fn a_password_reset_revokes_the_users_refresh_tokens() {
             .unwrap()
     );
 
-    let refreshed = Refresh::new(&plaintext, |_| async { true })
+    let refreshed = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, clock.now())
         .await;
     assert!(
@@ -408,7 +410,9 @@ async fn an_unknown_user_is_resolved_before_the_status_is_read() {
     let identity = MockIdentityStore::new()
         .with_call_log(&log)
         .with_tenant(test_tenant());
-    let svc = AuthnService::new(identity, MockFactorStore::new())
+    let svc = AuthnService::builder(identity, MockFactorStore::new())
+        .allow_plaintext_factor_secrets()
+        .build()
         .with_audit_context(AuditContext::default());
     let res = svc
         .complete_password_reset(&uid("ghost"), "t", "A-long-new-passphrase-9!")
@@ -471,8 +475,10 @@ async fn login_with_password_spends_exactly_one_hash_on_every_path() {
         .await);
     assert_eq!(r.kdf.jobs_started() - before, 1);
 
-    // Lock the account, then try the right password.
-    for _ in 0..2 {
+    // Lock the account, then try the right password. Each wrong guess waits
+    // out the delay the one before it earned, so each is counted.
+    for delay in [1, 2] {
+        r.clock.advance(chrono::Duration::seconds(delay));
         let _ = r
             .svc
             .login_with_password("alice", "default", "wrong", &test_session())
@@ -542,6 +548,49 @@ async fn step_up_asks_an_authenticated_session_for_another_factor() {
         session
             .authenticated_within(Duration::from_secs(5), r.clock.now())
             .await
+    );
+}
+
+/// A factor is as fresh as its own verification: fresh inside the window,
+/// stale outside it, and never fresh for a factor that was not completed.
+#[tokio::test]
+async fn completed_factor_within_measures_the_factors_own_age() {
+    let r = rig_with(EntityState::Active, true);
+    let session = test_session();
+    session
+        .set_authenticated(uid("u1"), common::tid("t1"), r.clock.now())
+        .await;
+    r.svc
+        .begin_step_up(&session, vec![FactorKind::Totp])
+        .await
+        .unwrap();
+    r.clock.advance(chrono::Duration::seconds(60));
+    let code = generate_totp_code(SECRET, r.clock.now().into());
+    let done = r
+        .svc
+        .verify_factor(&FactorCredential::OtpCode(code.into()), &session)
+        .await
+        .unwrap();
+    assert!(matches!(done, FactorOutcome::Authenticated), "{done:?}");
+
+    let within = |max: u64| {
+        let session = session.clone();
+        let now = r.clock.now();
+        async move {
+            session
+                .completed_factor_within(&FactorKind::Totp, Duration::from_secs(max), now)
+                .await
+        }
+    };
+    assert!(within(5).await, "a fresh factor is inside the window");
+    r.clock.advance(chrono::Duration::seconds(600));
+    assert!(!within(5).await, "a stale factor is outside it");
+    assert!(within(3600).await);
+    assert!(
+        !session
+            .completed_factor_within(&FactorKind::Fido2, Duration::from_secs(3600), r.clock.now())
+            .await,
+        "a factor never completed is never fresh"
     );
 }
 
@@ -650,6 +699,7 @@ async fn impersonation_requires_the_session_to_be_the_admin_and_marks_the_result
         .with_user(target.clone());
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -707,6 +757,7 @@ async fn a_candidate_is_not_resumed_by_a_different_session() {
         .with_user(candidate.clone());
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_signup_conflicts_revealed()
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let stranger = test_session();
@@ -779,6 +830,7 @@ async fn a_logout_cancelled_during_the_audit_write_leaves_a_guest() {
         .with_user(test_user("u1", "alice"));
     let svc = AuthnService::builder(identity.clone(), MockFactorStore::new())
         .with_registry(registry.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();

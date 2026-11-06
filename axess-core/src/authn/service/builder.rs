@@ -10,6 +10,8 @@ use axess_clock::{Clock, SystemClock};
 use axess_rng::{SecureRng, SystemRng};
 use std::sync::Arc;
 
+mod breached_password;
+
 /// Configures an [`AuthnService`], and is what the built handle shares.
 ///
 /// Customisation happens here rather than on the built service because the
@@ -46,10 +48,17 @@ where
     /// default); see
     /// [`with_signup_conflicts_revealed`](Self::with_signup_conflicts_revealed).
     pub(crate) reveal_signup_conflicts: bool,
+    /// How long the secret `begin_signup` mints completes the signup; see
+    /// [`with_signup_verification_ttl`](Self::with_signup_verification_ttl).
+    pub(crate) signup_verification_ttl: std::time::Duration,
     /// Whether an impersonated session may issue refresh tokens and enrol
     /// or delete factors; see
     /// [`with_impersonated_credential_changes_allowed`](Self::with_impersonated_credential_changes_allowed).
     pub(crate) impersonated_credential_changes: bool,
+    /// Where a locked account's own devices are looked up; see
+    /// [`with_device_store`](Self::with_device_store).
+    #[cfg(feature = "device")]
+    pub(crate) known_devices: Option<Arc<dyn super::known_device::KnownDevices>>,
     /// Whether `begin_login` answers a locked account with
     /// [`LoginOutcome::Locked`](crate::authn::service::LoginOutcome::Locked)
     /// rather than as it answers an unknown identifier (the default); see
@@ -59,6 +68,10 @@ where
     /// transition to `Authenticated`; see
     /// [`with_preserved_custom_keys`](Self::with_preserved_custom_keys).
     pub(crate) preserved_custom_keys: Vec<String>,
+    /// Set once the throttle has reported a request with no resolved client
+    /// address because `client_ip::layer` is not installed, so the fault is
+    /// logged once per service and not per guess.
+    pub(crate) throttle_address_unknown_reported: std::sync::atomic::AtomicBool,
     /// The session store, when the application handed it over so that a
     /// revocation can delete the rows as well as the registry entries.
     pub(crate) session_rows: Option<Arc<dyn SessionRowRemover>>,
@@ -67,6 +80,16 @@ where
     pub(crate) recovery_peppers: super::verification::RecoveryPeppers,
     /// The cipher OTP secrets are sealed and opened with, when configured.
     pub(crate) factor_secret_cipher: Option<Arc<crate::authn::factor_secret::FactorSecretCipher>>,
+    /// Whether a one-time-code secret may be written without a cipher; see
+    /// [`allow_plaintext_factor_secrets`](Self::allow_plaintext_factor_secrets).
+    pub(crate) allow_plaintext_factor_secrets: bool,
+    /// What every chosen password is screened against, when configured; see
+    /// [`with_breached_password_check`](Self::with_breached_password_check).
+    pub(crate) breached_password_check: Option<Arc<dyn axess_factors::BreachedPasswordCheck>>,
+    /// What becomes of a chosen password when that check cannot answer;
+    /// refuse unless
+    /// [`allow_unchecked_when_breach_check_unavailable`](Self::allow_unchecked_when_breach_check_unavailable).
+    pub(crate) on_breach_check_unavailable: axess_factors::BreachCheckUnavailable,
     #[cfg(feature = "fido2")]
     pub(crate) fido2: Option<Arc<dyn axess_factors::fido2::Fido2Provider>>,
     #[cfg(feature = "fido2")]
@@ -100,8 +123,19 @@ where
     pub(crate) jwks_refresh_task: Option<super::oauth_service::JwksRefreshTask>,
 }
 
+/// The password reset cooldown a new builder starts with: a minute. Change it
+/// with [`AuthnServiceBuilder::with_password_reset_cooldown`], remove it with
+/// [`AuthnServiceBuilder::without_password_reset_cooldown`].
+pub const DEFAULT_PASSWORD_RESET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How many identifiers the password reset cooldown remembers.
 pub const RESET_COOLDOWN_CAPACITY: usize = 100_000;
+
+/// How long the secret `begin_signup` mints completes the signup, unless
+/// [`with_signup_verification_ttl`](AuthnServiceBuilder::with_signup_verification_ttl)
+/// says otherwise: 24 hours.
+pub const DEFAULT_SIGNUP_VERIFICATION_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 3600);
 
 /// How long a login may sit between `begin_login` and its last factor before
 /// the next step answers [`NoFlow`](crate::authn::error::AuthnError::NoFlow):
@@ -188,15 +222,22 @@ where
             kdf: Arc::new(crate::blocking::KdfExecutor::pool()),
             refresh_revoker: None,
             flow_ttl: DEFAULT_FLOW_TTL,
-            reset_cooldown: None,
+            reset_cooldown: Some(DEFAULT_PASSWORD_RESET_COOLDOWN),
             reset_requests: None,
             reveal_signup_conflicts: false,
+            signup_verification_ttl: DEFAULT_SIGNUP_VERIFICATION_TTL,
             impersonated_credential_changes: false,
             reveal_lockout_on_begin: false,
+            #[cfg(feature = "device")]
+            known_devices: None,
             preserved_custom_keys: Vec::new(),
+            throttle_address_unknown_reported: std::sync::atomic::AtomicBool::new(false),
             session_rows: None,
             recovery_peppers: Default::default(),
             factor_secret_cipher: None,
+            allow_plaintext_factor_secrets: false,
+            breached_password_check: None,
+            on_breach_check_unavailable: Default::default(),
             #[cfg(feature = "fido2")]
             fido2: None,
             #[cfg(feature = "fido2")]
@@ -284,13 +325,30 @@ where
     /// the same login while the cipher's plain-secret policy still reads it
     /// (see [`FactorSecretCipher`](crate::authn::factor_secret::FactorSecretCipher)).
     /// Seal new enrolments with the same cipher's `seal_config`. Without one
-    /// nothing changes: secrets are read and written as plain text, and a
-    /// sealed secret fails with a clear error.
+    /// the service refuses to write a TOTP or HOTP secret (see
+    /// [`allow_plaintext_factor_secrets`](Self::allow_plaintext_factor_secrets)),
+    /// and a sealed secret fails with a clear error.
     pub fn with_factor_secret_cipher(
         mut self,
         cipher: Arc<crate::authn::factor_secret::FactorSecretCipher>,
     ) -> Self {
         self.factor_secret_cipher = Some(cipher);
+        self
+    }
+
+    /// Let the service write TOTP and HOTP secrets in plain text, with no
+    /// cipher.
+    ///
+    /// **For development and tests only**, like the `plaintext` constructors
+    /// of the session and device stores. Without a cipher the service
+    /// refuses, with
+    /// [`FactorSecretError::PlaintextNotAllowed`](crate::authn::factor_secret::FactorSecretError::PlaintextNotAllowed),
+    /// to store a one-time-code secret: a seed in the table in clear text
+    /// is a second factor for anyone who can read a backup or a replica.
+    /// Production sets
+    /// [`with_factor_secret_cipher`](Self::with_factor_secret_cipher).
+    pub fn allow_plaintext_factor_secrets(mut self) -> Self {
+        self.allow_plaintext_factor_secrets = true;
         self
     }
 
@@ -564,16 +622,58 @@ where
     /// which still belongs in front of the handler.
     ///
     /// The record lives in this process, on the injected clock, and holds at
-    /// most [`RESET_COOLDOWN_CAPACITY`] identifiers (the least recently
-    /// requested are forgotten first). A caller that submits that many
-    /// distinct identifiers inside the cooldown pushes an earlier entry out,
-    /// so the cooldown is a bound on ordinary repeat requests, not a defence
-    /// against a caller who mints identifiers; the rate limit on the route
-    /// is what bounds that. A deployment of several instances applies the
+    /// most [`RESET_COOLDOWN_CAPACITY`] identifiers, each for the cooldown
+    /// and no longer. A cooldown that has not run out is never pushed out by
+    /// other identifiers, so a flood of them cannot clear one person's;
+    /// instead, when that many cooldowns are live, a new identifier is
+    /// answered `Ok(None)` until one runs out. A caller who mints
+    /// identifiers can therefore hold the reset route shut for a cooldown at
+    /// a time; the rate limit on the route is what bounds that. A deployment of several instances applies the
     /// cooldown per instance; put the route behind a shared rate limit for a
-    /// bound across them. The default is no cooldown.
+    /// bound across them. The default is
+    /// [`DEFAULT_PASSWORD_RESET_COOLDOWN`], a minute.
     pub fn with_password_reset_cooldown(mut self, cooldown: std::time::Duration) -> Self {
         self.reset_cooldown = Some(cooldown);
+        self
+    }
+
+    /// Answer every password reset request with a token, however soon the
+    /// last one for the identifier was.
+    ///
+    /// Removes the cooldown a new builder starts with
+    /// ([`DEFAULT_PASSWORD_RESET_COOLDOWN`]). Without one, anyone who knows
+    /// an address can fill its inbox with reset mail at the speed of the
+    /// route, so take this only when the route is behind a rate limit keyed
+    /// on the identifier, or in a test that resets the same account twice.
+    pub fn without_password_reset_cooldown(mut self) -> Self {
+        self.reset_cooldown = None;
+        self
+    }
+
+    /// How long the secret `begin_signup` mints completes the signup
+    /// (default: 24 hours). After that `complete_signup` refuses it; the
+    /// session submits the signup again to get a new secret.
+    pub fn with_signup_verification_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.signup_verification_ttl = ttl;
+        self
+    }
+
+    /// Let the account's own devices through a per-account lockout.
+    ///
+    /// With a device store, a login from a device the locked account has
+    /// already used (a row of the tenant owned by the user, at
+    /// [`Seen`](crate::device::DeviceTrustLevel::Seen) or
+    /// [`Trusted`](crate::device::DeviceTrustLevel::Trusted), as the session
+    /// layer's device resolver bound it to the session) still works while the
+    /// failure counter has the account locked; every other origin stays
+    /// locked out. Without one, or when the store cannot answer, the lock
+    /// holds for everyone. See
+    /// [`LockoutPolicy`](crate::authn::types::LockoutPolicy). An
+    /// administrator's suspension is not affected.
+    #[cfg(feature = "device")]
+    #[must_use]
+    pub fn with_device_store<D: crate::device::DeviceStore>(mut self, devices: D) -> Self {
+        self.known_devices = Some(Arc::new(super::known_device::StoreKnownDevices(devices)));
         self
     }
 
@@ -648,7 +748,10 @@ where
     ///
     /// Logs a warning when no session registry was attached: without one,
     /// suspending a user, resetting a password and an administrator's kick
-    /// end no existing session, which then lives until its TTL.
+    /// end no existing session, which then lives until its TTL. Logs another
+    /// when no breached-password check was attached: without one, a reset or
+    /// a signup accepts a password from a public breach corpus when it meets
+    /// the rules.
     pub fn build(self) -> AuthnService<I, F> {
         let mut this = self;
         if this.registry.is_none() {
@@ -656,6 +759,13 @@ where
                 "AuthnService built without a session registry: suspending a user, \
                  resetting a password and kicking a session end no existing session; \
                  attach one with with_registry"
+            );
+        }
+        if this.breached_password_check.is_none() {
+            tracing::warn!(
+                "AuthnService built without a breached-password check: a reset or a signup \
+                 accepts a password known from a breach when it meets the rules; \
+                 attach one with with_breached_password_check"
             );
         }
         this.reset_requests = this.reset_cooldown.map(|cooldown| {

@@ -58,9 +58,25 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         require_old: bool,
     ) -> impl Future<Output = Result<CycleOutcome, Self::Error>> + Send;
 
+    /// `cycle`, but only while the old row still holds `expected_revision`;
+    /// a write that landed since the caller read it answers
+    /// `CycleOutcome::Conflict` and writes nothing. The default reads the row
+    /// and then calls `cycle`, which leaves a window open; override it where
+    /// the backend can make the comparison part of its own delete.
+    fn cycle_if_revision(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> impl Future<Output = Result<CycleOutcome, Self::Error>> + Send;
+
     fn prune_expired(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
-    /// Defaults to `Ok(vec![])`; override where the backend can index it.
+    /// Defaults to `Ok(vec![])`, meaning "does not enumerate"; override
+    /// where the backend can index it.
     fn find_sessions_for_user(
         &self,
         user_id: &UserId,
@@ -98,8 +114,10 @@ dirty session. `delete` removes a session on logout. `cycle`
 atomically rotates the session id (used at the `Guest` to
 `Authenticated` transition, and at sensitive step-up points).
 `cleanup_expired` removes rows whose expiry has passed.
-`find_sessions_for_user` is the verb behind
-"log this user out of all sessions" admin operations.
+Ending every session of a user is the registry's job
+(`SessionRegistry::invalidate_user`), not `find_sessions_for_user`: the
+in-tree backends do not override that method, and its default answers an
+empty list whatever the user holds, so it cannot drive a revocation.
 
 The implementations differ in how they store the rows and how they
 implement the verbs, but the surface is the same.

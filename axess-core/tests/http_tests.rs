@@ -13,6 +13,7 @@ use axess_core::session::{
     binding::UserAgentBinding, extractor::AuthSession, layer::SessionLayer,
     store::MemorySessionStore,
 };
+use axess_core::testing::AuthSessionTestExt;
 use axum::{
     Router,
     body::Body,
@@ -25,8 +26,8 @@ use tower::ServiceExt;
 
 fn test_router() -> Router {
     let store = MemorySessionStore::new();
-    let signing_key = [42u8; 32];
-    let session_layer = SessionLayer::new(store, signing_key)
+    let signing_key = axess_core::testing::test_key(42);
+    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
         .with_ttl(Duration::from_secs(3600))
         .with_secure(false);
 
@@ -131,8 +132,9 @@ async fn session_cookie_contains_hmac_signature() {
 #[tokio::test]
 async fn unmodified_session_does_not_set_cookie() {
     let store = MemorySessionStore::new();
-    let signing_key = [42u8; 32];
-    let session_layer = SessionLayer::new(store, signing_key).with_secure(false);
+    let signing_key = axess_core::testing::test_key(42);
+    let session_layer =
+        SessionLayer::without_registry_insecure(store, signing_key).with_secure(false);
 
     let app = Router::new()
         // Reading the id keeps the session, so a cookieless first request
@@ -259,8 +261,8 @@ async fn modified_only_session_round_trips_value() {
 #[tokio::test]
 async fn oversized_custom_data_is_cleared_on_save() {
     let store = MemorySessionStore::new();
-    let signing_key = [13u8; 32];
-    let session_layer = SessionLayer::new(store, signing_key)
+    let signing_key = axess_core::testing::test_key(13);
+    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
         .with_ttl(Duration::from_secs(3600))
         .with_secure(false)
         .with_max_custom_bytes(32);
@@ -335,8 +337,8 @@ async fn oversized_custom_data_is_cleared_on_save() {
 #[tokio::test]
 async fn max_custom_bytes_zero_disables_clamp() {
     let store = MemorySessionStore::new();
-    let signing_key = [13u8; 32];
-    let session_layer = SessionLayer::new(store, signing_key)
+    let signing_key = axess_core::testing::test_key(13);
+    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
         .with_ttl(Duration::from_secs(3600))
         .with_secure(false)
         .with_max_custom_bytes(0); // disabled
@@ -401,8 +403,8 @@ async fn max_custom_bytes_zero_disables_clamp() {
 
 fn binding_router() -> Router {
     let store = MemorySessionStore::new();
-    let signing_key = [42u8; 32];
-    let session_layer = SessionLayer::new(store, signing_key)
+    let signing_key = axess_core::testing::test_key(42);
+    let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
         .with_ttl(Duration::from_secs(3600))
         .with_secure(false)
         .with_binding(UserAgentBinding);
@@ -511,8 +513,8 @@ async fn binding_invalidates_on_different_user_agent() {
 #[tokio::test]
 async fn binding_not_set_for_unauthenticated_sessions() {
     let store = MemorySessionStore::new();
-    let signing_key = [42u8; 32];
-    let session_layer = SessionLayer::new(store.clone(), signing_key)
+    let signing_key = axess_core::testing::test_key(42);
+    let session_layer = SessionLayer::without_registry_insecure(store.clone(), signing_key)
         .with_secure(false)
         .with_binding(UserAgentBinding);
 
@@ -543,6 +545,95 @@ async fn binding_not_set_for_unauthenticated_sessions() {
 
     let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
     assert_eq!(&body[..], b"no_binding");
+}
+
+/// A session that logged in on a request without a User-Agent is bound to
+/// "no User-Agent": a replay that does send one fails the binding.
+#[tokio::test]
+async fn binding_holds_for_a_session_that_logged_in_without_a_user_agent() {
+    let app = binding_router();
+
+    let resp = app
+        .clone()
+        .oneshot(Request::post("/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = extract_cookie(&resp);
+
+    let replay = app
+        .clone()
+        .oneshot(
+            Request::get("/check")
+                .header(header::COOKIE, &cookie)
+                .header(header::USER_AGENT, "Thief/1.0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        StatusCode::UNAUTHORIZED,
+        "a replay with a User-Agent passed a session bound to none"
+    );
+
+    let same = app
+        .oneshot(
+            Request::get("/check")
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(same.status(), StatusCode::OK);
+}
+
+/// An authenticated session stored before binding was turned on has no
+/// fingerprint. The first request after binding is on binds it to that
+/// client; a replay from another client then fails.
+#[tokio::test]
+async fn binding_turned_on_later_binds_an_existing_authenticated_session() {
+    let store = MemorySessionStore::new();
+    let signing_key = axess_core::testing::test_key(42);
+    let unbound = Router::new().route("/login", post(login_handler)).layer(
+        SessionLayer::without_registry_insecure(store.clone(), signing_key).with_secure(false),
+    );
+    let bound = Router::new().route("/check", get(check_handler)).layer(
+        SessionLayer::without_registry_insecure(store, signing_key)
+            .with_secure(false)
+            .with_binding(UserAgentBinding),
+    );
+
+    let resp = unbound
+        .oneshot(Request::post("/login").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let cookie = extract_cookie(&resp);
+
+    let check = |ua: &'static str| {
+        let app = bound.clone();
+        let cookie = cookie.clone();
+        async move {
+            app.oneshot(
+                Request::get("/check")
+                    .header(header::COOKIE, cookie)
+                    .header(header::USER_AGENT, ua)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    assert_eq!(check("Owner/1.0").await, StatusCode::OK);
+    assert_eq!(
+        check("Thief/1.0").await,
+        StatusCode::UNAUTHORIZED,
+        "an authenticated session with no fingerprint was never bound"
+    );
 }
 
 // Note: login_required!() and require_partial_authn!() macros live in
@@ -597,8 +688,8 @@ mod device_resolver_wiring {
 
     fn router_with_resolver<R: DeviceResolver>(resolver: R) -> Router {
         let store = MemorySessionStore::new();
-        let signing_key = [42u8; 32];
-        let session_layer = SessionLayer::new(store, signing_key)
+        let signing_key = axess_core::testing::test_key(42);
+        let session_layer = SessionLayer::without_registry_insecure(store, signing_key)
             .with_secure(false)
             .with_device_resolver(resolver);
 
@@ -649,8 +740,9 @@ mod device_resolver_wiring {
         // SessionLayer without `with_device_resolver`; the device-id
         // column stays None even when the `device` feature is on.
         let store = MemorySessionStore::new();
-        let signing_key = [42u8; 32];
-        let session_layer = SessionLayer::new(store, signing_key).with_secure(false);
+        let signing_key = axess_core::testing::test_key(42);
+        let session_layer =
+            SessionLayer::without_registry_insecure(store, signing_key).with_secure(false);
         let app = Router::new()
             .route("/reflect", get(reflect_device_handler))
             .layer(session_layer);
@@ -702,12 +794,13 @@ mod device_resolver_wiring {
     async fn a_resolver_failure_keeps_the_stored_device_binding() {
         let id = axess_core::authn::ids::testing::device("dev-kept-on-fault");
         let store = MemorySessionStore::new();
-        let session_layer = SessionLayer::new(store, [42u8; 32])
-            .with_secure(false)
-            .with_device_resolver(FailingLaterResolver {
-                id,
-                calls: std::sync::atomic::AtomicUsize::new(0),
-            });
+        let session_layer =
+            SessionLayer::without_registry_insecure(store, axess_core::testing::test_key(42))
+                .with_secure(false)
+                .with_device_resolver(FailingLaterResolver {
+                    id,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
         let app = Router::new()
             .route("/reflect", get(persist_and_reflect_handler))
             .layer(session_layer);

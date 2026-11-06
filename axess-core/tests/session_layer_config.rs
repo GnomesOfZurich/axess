@@ -13,7 +13,11 @@ use std::time::Duration;
 use tower::{Layer, service_fn};
 
 fn base() -> SessionLayer<MemorySessionStore> {
-    SessionLayer::new(MemorySessionStore::new(), [1u8; 32])
+    SessionLayer::new(
+        MemorySessionStore::new(),
+        axess_core::testing::test_key(1),
+        axess_core::MemorySessionRegistry::new().handle(),
+    )
 }
 
 fn build(layer: &SessionLayer<MemorySessionStore>) {
@@ -95,11 +99,24 @@ fn same_site_none_without_secure_panics() {
 #[test]
 #[should_panic(expected = "max_authenticated_age must be > 0")]
 fn zero_session_age_panics() {
-    build(&base().with_max_session_age(Duration::ZERO));
+    build(&base().with_max_session_age(Some(Duration::ZERO)));
 }
 
 #[test]
 #[should_panic(expected = "max_impersonation_age must be > 0")]
 fn zero_impersonation_age_panics() {
-    build(&base().with_max_impersonation_age(Duration::ZERO));
+    build(&base().with_max_impersonation_age(Some(Duration::ZERO)));
+}
+
+#[test]
+fn the_default_config_caps_a_session_at_seven_days_and_an_impersonation_at_an_hour() {
+    let config = SessionConfig::default();
+    assert_eq!(
+        config.max_authenticated_age(),
+        Some(Duration::from_secs(7 * 24 * 3600))
+    );
+    assert_eq!(
+        config.max_impersonation_age(),
+        Some(Duration::from_secs(3600))
+    );
 }

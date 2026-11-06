@@ -51,6 +51,7 @@ pub struct SessionService<S, Inner> {
     clock: Arc<dyn axess_clock::Clock>,
     registry: Option<Arc<dyn crate::session::store::SessionRegistryHandle>>,
     unknown_liveness: crate::session::layer::UnknownLiveness,
+    websocket_origins: Arc<[Arc<str>]>,
     #[cfg(feature = "device")]
     device_resolver: Option<Arc<dyn ErasedDeviceResolver>>,
 }
@@ -61,6 +62,50 @@ pub struct SessionService<S, Inner> {
 /// layer reads it to avoid storing a session for traffic that never uses one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FreshSession;
+
+/// The binding fingerprint pair of a request, computed before the request is
+/// moved. `(current, previous)`: `previous` is only `Some` when a rotation
+/// window is active. The pair is threaded into `load_session` so verification
+/// can fall back to the previous key and re-store the fingerprint under the
+/// current key.
+///
+/// A request the binding yields no material for is bound to a fixed
+/// value that stands for "no material": a session that logged in
+/// without it stays bound to that, and a replay that does present
+/// material fails the comparison instead of skipping it.
+fn request_fingerprints(
+    binding: Option<&dyn SessionBinding>,
+    signing_keys: &SigningKeyRing,
+    req: &Request<Body>,
+) -> (Option<String>, Option<String>) {
+    match binding {
+        Some(binding) => {
+            let material = binding
+                .extract(req)
+                .unwrap_or_else(|| crate::session::binding::NO_BINDING_MATERIAL.to_vec());
+            let (curr, prev) = signing_keys.compute_binding_fingerprints(&material);
+            (Some(curr), prev)
+        }
+        None => (None, None),
+    }
+}
+
+/// Whether `req` may proceed past the WebSocket Origin rule: anything that is
+/// not an upgrade, an upgrade from an allowed origin when there is an
+/// allow-list, and otherwise an upgrade from the request's own host.
+fn websocket_origin_admitted(req: &Request<Body>, allowed: &[Arc<str>], secure: bool) -> bool {
+    use crate::middleware::csrf::{
+        is_websocket_upgrade, origin_is_own_host, origin_matches_allowed,
+    };
+    if !is_websocket_upgrade(req) {
+        return true;
+    }
+    if allowed.is_empty() {
+        origin_is_own_host(req, secure)
+    } else {
+        origin_matches_allowed(req, allowed)
+    }
+}
 
 impl<S, Inner> Layer<Inner> for SessionLayer<S>
 where
@@ -84,6 +129,7 @@ where
             clock: self.clock.clone(),
             registry: self.registry.clone(),
             unknown_liveness: self.unknown_liveness,
+            websocket_origins: self.websocket_origins.clone(),
             binding: self.binding.clone(),
             metrics: self.metrics.clone(),
             rng: self.rng.clone(),
@@ -100,7 +146,7 @@ where
     Inner: Service<Request<Body>, Response = Response<ResBody>> + Clone + Send + 'static,
     Inner::Future: Send + 'static,
     Inner::Error: Send + 'static,
-    ResBody: Send + 'static,
+    ResBody: Default + Send + 'static,
 {
     type Response = Response<ResBody>;
     type Error = Inner::Error;
@@ -111,6 +157,21 @@ where
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        // A WebSocket upgrade is a GET a browser sends with the session cookie
+        // from any site, so its Origin is checked here, before the session is
+        // read: a socket route outside the CSRF layer is covered too.
+        if !websocket_origin_admitted(&req, &self.websocket_origins, self.config.secure) {
+            tracing::warn!(
+                path = %req.uri().path(),
+                "session: WebSocket upgrade refused, Origin is not an allowed origin or the \
+                 request's own host"
+            );
+            return Box::pin(async {
+                let mut response = Response::new(ResBody::default());
+                *response.status_mut() = axum::http::StatusCode::FORBIDDEN;
+                Ok(response)
+            });
+        }
         let store = self.store.clone();
         let config = self.config.clone();
         let signing_keys = self.signing_keys.clone();
@@ -127,20 +188,8 @@ where
         let mut inner = self.inner.clone();
         std::mem::swap(&mut inner, &mut self.inner);
 
-        // Pre-compute the binding fingerprint pair from the request
-        // before moving it. `compute_binding_fingerprints` returns
-        // (current, previous): `previous` is only `Some` when a
-        // rotation window is active. The pair is threaded into
-        // `load_session` so verification can fall back to the previous
-        // key and re-store the fingerprint under the current key.
         let (current_fingerprint, previous_fingerprint) =
-            match session_binding.as_deref().and_then(|b| b.extract(&req)) {
-                Some(material) => {
-                    let (curr, prev) = signing_keys.compute_binding_fingerprints(&material);
-                    (Some(curr), prev)
-                }
-                None => (None, None),
-            };
+            request_fingerprints(session_binding.as_deref(), &signing_keys, &req);
 
         Box::pin(async move {
             // 1. Load session; cookie verify, store load, fingerprint check, fresh-mint.
@@ -429,9 +478,7 @@ async fn resolve_device(
     // Hand the resolver the user the session has fully authenticated, so a
     // device is matched to its owner. A guest, or a session part-way through
     // a login, supplies none: its claimed user is not verified.
-    if load.data.auth_state.is_authenticated()
-        && let Some(user) = load.data.auth_state.user_id()
-    {
+    if let Some(user) = load.data.auth_state.authenticated_user_id() {
         parts.extensions.insert(crate::device::SessionUser(*user));
         // The tenant the session logged in under, for a resolver whose
         // tenant is a property of the user rather than of the request.

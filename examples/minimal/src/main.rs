@@ -6,7 +6,10 @@
 
 // ANCHOR: wiring
 use axess::authn::{AuditContext, AuthnService, FactorCredential, FactorOutcome, LoginOutcome};
-use axess::{AuthSession, InMemoryBackend, MemorySessionStore, SecureRng, SessionLayer, SystemRng};
+use axess::{
+    AuthSession, InMemoryBackend, MemorySessionRegistry, MemorySessionStore, SecureRng,
+    SessionLayer, SystemRng,
+};
 use axum::Json;
 use axum::extract::State;
 use axum::{Router, http::StatusCode, response::IntoResponse, routing::get};
@@ -19,6 +22,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = InMemoryBackend::new().with_user_password("alice", "default", "Gnomes2+");
 
     // 2. Session store + 3. signing key.
+    // `MemorySessionStore` is unbounded and per process: it is for demos.
+    // Production uses a persistent store (see the sqlite example).
     let session_store = MemorySessionStore::new();
     // A fresh random key per start: fine for a demo, where a restart only
     // signs everyone out. See "Signing keys" below for what production does.
@@ -26,17 +31,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     SystemRng.fill_bytes(&mut signing_key);
 
     // 4. AuthnService -- type-erased over clock and RNG; production wires
-    //    SystemClock + SystemRng.
-    let service = Arc::new(AuthnService::new(backend.clone(), backend));
+    //    SystemClock + SystemRng. The session registry records every login, so
+    //    that a password reset or a forced logout ends the session; the
+    //    session layer below reads the same one. The in-memory registry is
+    //    per process: production uses the Valkey registry.
+    let registry = MemorySessionRegistry::new();
+    let service = Arc::new(
+        AuthnService::builder_from_backend(backend)
+            .with_registry(registry.clone())
+            .build(),
+    );
 
     // 5. SessionLayer threads the session through each request.
-    let session_layer = SessionLayer::new(session_store, signing_key)
-        .with_ttl(Duration::from_secs(86_400))
+    // A short lifetime, so the sessions that failed or abandoned logins leave
+    // behind do not pile up for a day.
+    let session_layer = SessionLayer::new(session_store.clone(), signing_key, registry.handle())
+        .with_ttl(Duration::from_secs(30 * 60))
         .with_secure(secure_cookies()); // see "Cookie security" below.
+
+    // Drop expired sessions every few minutes; nothing else removes them
+    // from the in-memory store.
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            tick.tick().await;
+            session_store.purge_expired();
+        }
+    });
 
     let app = Router::new()
         .route("/", get(public_page))
         .route("/dashboard", get(protected_page))
+        // No rate limiting here: production must put a limiter on /login
+        // (see examples/sqlite for `RateLimitLayer`).
         .route("/login", axum::routing::post(login))
         .with_state(service)
         .layer(session_layer);
@@ -111,9 +138,7 @@ async fn login(
         // `with_lockout_revealed_on_begin`; by default a locked account
         // answers `InvalidCredentials` above, as an unknown username does,
         // so the lock is not observable before any proof.
-        Ok(LoginOutcome::Locked { until }) => {
-            return (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response();
-        }
+        Ok(LoginOutcome::Locked { until }) => return locked_reply(until),
         Ok(LoginOutcome::StepUpRequired { .. }) => {
             return (StatusCode::UNAUTHORIZED, "step-up required").into_response();
         }
@@ -144,14 +169,31 @@ async fn login(
         Ok(FactorOutcome::InvalidCredential) => {
             (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
         }
-        Ok(FactorOutcome::Locked { until }) => {
-            (StatusCode::FORBIDDEN, format!("locked until {until:?}")).into_response()
-        }
+        Ok(FactorOutcome::Locked { until }) => locked_reply(until),
+        // Guesses from this address are slowed down: the same answer as a
+        // wrong password, with `Retry-After` for a client that reads it.
+        Ok(FactorOutcome::Throttled { retry_after }) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                axum::http::header::RETRY_AFTER,
+                retry_after.as_secs().max(1).to_string(),
+            )],
+            "invalid credentials",
+        )
+            .into_response(),
         Err(e) => {
             eprintln!("verify_factor failed: {e}");
             (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
         }
     }
+}
+
+/// The answer for a locked account: the one a wrong password gets, so the
+/// response does not tell a guesser that an account exists and is locked.
+/// The lock is logged on the server.
+fn locked_reply(until: impl std::fmt::Debug) -> axum::response::Response {
+    eprintln!("login refused, account locked until {until:?}");
+    (StatusCode::UNAUTHORIZED, "invalid credentials").into_response()
 }
 // ANCHOR_END: login
 
@@ -163,4 +205,17 @@ fn secure_cookies() -> bool {
         eprintln!("WARNING: AXESS_DEV_INSECURE_COOKIES=1, cookies are sent without Secure");
     }
     !insecure
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_locked_account_gets_the_wrong_password_answer() {
+        let reply = locked_reply(Some("tomorrow"));
+        assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
+        let body = axum::body::to_bytes(reply.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"invalid credentials");
+    }
 }

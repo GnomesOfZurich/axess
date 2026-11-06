@@ -80,11 +80,10 @@ fn user(display_name: &str) -> User {
 }
 
 fn suspended() -> EntityState {
-    EntityState::Suspended(crate::authn::types::StatusDetail {
-        reason: "hold".into(),
-        since: chrono::Utc::now() - chrono::Duration::days(1),
-        until: None,
-    })
+    EntityState::Suspended(crate::authn::types::StatusDetail::administrative(
+        "hold",
+        chrono::Utc::now() - chrono::Duration::days(1),
+    ))
 }
 
 struct Rig {

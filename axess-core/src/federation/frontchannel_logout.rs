@@ -13,19 +13,19 @@
 //!
 //! 1. **Known-issuer allowlist (this handler).** Requests for unknown
 //!    issuers are rejected before any sid_map touch.
-//! 2. **`SameSite=Lax/Strict` session cookies (your axum layer).** A
-//!    cross-origin GET from `attacker.com` carrying a guessed
-//!    `?iss=…&sid=…` cannot trigger a SameSite cookie request, so the
-//!    blast radius is limited to forged hits from the IdP origin's own
-//!    referrer chain, much narrower than a CORS-style attack.
-//! 3. **Session binding (optional, recommended where cookies reach the
-//!    iframe).** Knowing an `(iss, sid)` pair is not proof of being the user it
-//!    names. [`FrontChannelLogoutHandler::with_session_match_required`]
+//! 2. **Session binding (the default).** Knowing an `(iss, sid)` pair is not
+//!    proof of being the user it names. [`FrontChannelLogoutHandler::new`]
 //!    returns a [`BoundFrontChannelLogoutHandler`], whose route takes the
 //!    caller's session and ends a session only when the request carries
-//!    that very session's cookie. The price: a browser that does not send the session cookie on
-//!    the IdP's iframe (third-party cookie blocking, `SameSite=Lax`) ends
-//!    nothing, so use back-channel logout alongside.
+//!    that very session's cookie. The price: a browser that does not send the
+//!    session cookie on the IdP's iframe (third-party cookie blocking,
+//!    `SameSite=Lax`) ends nothing, so use back-channel logout alongside.
+//! 3. **`SameSite=Lax/Strict` session cookies (your axum layer).** These
+//!    protect the bound route, which needs the cookie. They do **not**
+//!    protect the unbound route
+//!    ([`FrontChannelLogoutHandler::new_unbound`]): it reads no cookie, so a
+//!    GET from anywhere, a plain `<img src>` included, carrying a leaked
+//!    `?iss=…&sid=…` ends that session whatever the cookie's attributes.
 //! 4. **Rate limiting (REQUIRED).** Even with (1)+(2), a leaked sid is
 //!    a denial-of-session primitive. Wrap the route with
 //!    [`RateLimitLayer`] keyed at minimum on
@@ -38,25 +38,27 @@
 //! # Setup
 //!
 //! ```rust,ignore
-//! use axess_core::federation::frontchannel_logout::FrontChannelLogoutHandler;
+//! use axess_core::federation::frontchannel_logout::{
+//!     BoundFrontChannelLogoutHandler, FrontChannelLogoutHandler,
+//! };
 //! use axum::Router;
 //!
-//! let handler = FrontChannelLogoutHandler::new(sid_map, registry, known_issuers);
-//!
-//! let app = Router::new()
-//!     .route("/auth/frontchannel-logout", axum::routing::get(
-//!         FrontChannelLogoutHandler::handle_frontchannel_logout,
-//!     ))
-//!     .with_state(handler);
-//!
 //! // Bound to the caller's own session, on a route behind the session layer:
-//! let bound = FrontChannelLogoutHandler::new(sid_map, registry, known_issuers)
-//!     .with_session_match_required();
+//! let bound = FrontChannelLogoutHandler::new(sid_map, registry, known_issuers);
 //! let app = Router::new()
 //!     .route("/auth/frontchannel-logout", axum::routing::get(
 //!         BoundFrontChannelLogoutHandler::handle_frontchannel_logout,
 //!     ))
 //!     .with_state(bound);
+//!
+//! // The named opt-out: no session check, so anyone who holds an `(iss, sid)`
+//! // pair can end that session. Behind a rate limit only.
+//! let unbound = FrontChannelLogoutHandler::new_unbound(sid_map, registry, known_issuers);
+//! let app = Router::new()
+//!     .route("/auth/frontchannel-logout", axum::routing::get(
+//!         FrontChannelLogoutHandler::handle_frontchannel_logout,
+//!     ))
+//!     .with_state(unbound);
 //! ```
 //!
 //! # Differences from back-channel logout
@@ -116,8 +118,7 @@ pub struct FrontChannelLogoutHandler {
 }
 
 /// A [`FrontChannelLogoutHandler`] that ends a session only when it is the
-/// request's own, made by
-/// [`with_session_match_required`](FrontChannelLogoutHandler::with_session_match_required).
+/// request's own, made by [`FrontChannelLogoutHandler::new`].
 ///
 /// Its only route,
 /// [`handle_frontchannel_logout`](Self::handle_frontchannel_logout), takes
@@ -135,11 +136,34 @@ pub struct BoundFrontChannelLogoutHandler {
 const MAX_PARAM_BYTES: usize = 256;
 
 impl FrontChannelLogoutHandler {
-    /// Create a new front-channel logout handler.
+    /// Create a front-channel logout handler bound to the caller's session:
+    /// it ends the session a `sid` maps to only when that is the request's
+    /// own. Route [`BoundFrontChannelLogoutHandler::handle_frontchannel_logout`],
+    /// behind the session layer.
     ///
     /// `known_issuers` should contain the issuer URLs of all registered OAuth
     /// providers. Requests from unknown issuers are rejected.
+    #[must_use]
+    #[allow(clippy::new_ret_no_self)] // the bound handler is the default; `new_unbound` is `Self`
     pub fn new(
+        sid_map: SidMap,
+        registry: Arc<dyn SessionRevoker>,
+        known_issuers: HashSet<String>,
+    ) -> BoundFrontChannelLogoutHandler {
+        BoundFrontChannelLogoutHandler {
+            handler: Self::new_unbound(sid_map, registry, known_issuers),
+        }
+    }
+
+    /// Create a front-channel logout handler that checks nothing about the
+    /// request's session: anyone who holds an `(iss, sid)` pair, and an `iss`
+    /// and `sid` appear in URLs, history and referrers, ends that session.
+    /// `SameSite` does not help, since the route reads no cookie.
+    ///
+    /// Use it only where the IdP's iframe cannot carry the session cookie
+    /// and a forged logout is an accepted cost, behind a rate limit; prefer
+    /// [`new`](Self::new), or back-channel logout.
+    pub fn new_unbound(
         sid_map: SidMap,
         registry: Arc<dyn SessionRevoker>,
         known_issuers: HashSet<String>,
@@ -149,15 +173,6 @@ impl FrontChannelLogoutHandler {
             registry,
             known_issuers: Arc::new(known_issuers),
         }
-    }
-
-    /// A handler that ends a session only when the request's own session is
-    /// the one the `sid` maps to. Route
-    /// [`BoundFrontChannelLogoutHandler::handle_frontchannel_logout`], behind
-    /// the session layer.
-    #[must_use]
-    pub fn with_session_match_required(self) -> BoundFrontChannelLogoutHandler {
-        BoundFrontChannelLogoutHandler { handler: self }
     }
 
     /// The `iss` and `sid` of a request, when both are present and within

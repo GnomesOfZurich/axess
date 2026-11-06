@@ -12,6 +12,7 @@ use axess_core::authn::{
     AuditContext, RequestAuthnService, error::AuthnError, service::AuthnService,
 };
 use axess_core::session::store::{MemorySessionRegistry, SessionRegistry};
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
@@ -28,11 +29,7 @@ fn service(identity: MockIdentityStore) -> RequestAuthnService<MockIdentityStore
 
 fn suspended_user(id: &str, identifier: &str) -> axess_core::authn::types::User {
     let mut u = test_user_in_tenant(id, identifier, "t1");
-    u.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now(),
-        until: None,
-    });
+    u.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
     u
 }
 
@@ -102,11 +99,7 @@ async fn password_reset_is_refused_while_suspended_and_the_token_survives() {
     svc.suspend_user_across_tenants(
         Actor::System,
         &uid("u1"),
-        StatusDetail {
-            reason: "hold".into(),
-            since: Utc::now(),
-            until: None,
-        },
+        StatusDetail::administrative("hold", Utc::now()),
     )
     .await
     .unwrap();

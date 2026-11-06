@@ -280,3 +280,74 @@ async fn a_used_session_outlives_the_ttl() {
         assert!(registry.is_valid(&user, &s1).await.unwrap());
     }
 }
+
+/// Entries of users who never come back are dropped by other users'
+/// registrations: the map does not keep one entry per user ever seen.
+#[tokio::test]
+async fn expired_entries_of_users_who_never_return_are_pruned() {
+    use crate::testing::mock_clock::MockClock;
+    let clock = Arc::new(MockClock::now());
+    let registry = MemorySessionRegistry::new()
+        .with_ttl(Duration::from_secs(60))
+        .with_clock(clock.clone());
+    for batch in 0..10 {
+        for n in 0..100 {
+            registry
+                .register(&uid(&format!("u{batch}-{n}")), &SessionId::new(&SystemRng))
+                .await
+                .unwrap();
+        }
+        clock.advance_secs(120);
+    }
+    let held = lock(&registry.valid).len();
+    assert!(held <= 200, "{held} users held after 1000 one-off logins");
+}
+
+/// The memory store lists the live sessions of one user, newest first, up to
+/// the limit, and no one else's.
+#[tokio::test]
+async fn the_memory_store_lists_the_sessions_of_one_user() {
+    use crate::session::data::{AuthState, SessionData};
+    let store = MemorySessionStore::new();
+    let ttl = Duration::from_secs(60);
+    let data = |user: &str| SessionData {
+        auth_state: AuthState::Identifying {
+            user_id: uid(user),
+            tenant_id: axess_identity::testing::tenant("t"),
+        },
+        ..SessionData::default()
+    };
+    let (a1, a2, b1) = (
+        SessionId::new(&SystemRng),
+        SessionId::new(&SystemRng),
+        SessionId::new(&SystemRng),
+    );
+    store.save(&a1, &data("alice"), ttl).await.unwrap();
+    store.save(&a2, &data("alice"), ttl).await.unwrap();
+    store.save(&b1, &data("bob"), ttl).await.unwrap();
+
+    let alice = store
+        .find_sessions_for_user(&uid("alice"), 10)
+        .await
+        .unwrap();
+    let mut ids: Vec<_> = alice.iter().map(|(id, _)| *id).collect();
+    ids.sort_by_key(|id| id.to_string());
+    let mut want = vec![a1, a2];
+    want.sort_by_key(|id| id.to_string());
+    assert_eq!(ids, want);
+    assert_eq!(
+        store
+            .find_sessions_for_user(&uid("alice"), 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        store
+            .find_sessions_for_user(&uid("carol"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -63,6 +63,7 @@ impl Idp {
             "jwks_uri": format!("{issuer}/jwks"),
             "userinfo_endpoint": format!("{issuer}/userinfo"),
             "end_session_endpoint": format!("{issuer}/logout"),
+            "revocation_endpoint": format!("{issuer}/revoke"),
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
@@ -75,6 +76,11 @@ impl Idp {
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
             .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -170,6 +176,18 @@ impl Idp {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "sub": sub })))
             .mount(&self.server)
             .await;
+    }
+
+    /// The form bodies of the revocation requests received so far.
+    async fn revocation_requests(&self) -> Vec<String> {
+        self.server
+            .received_requests()
+            .await
+            .expect("recording")
+            .into_iter()
+            .filter(|r| r.url.path() == "/revoke")
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect()
     }
 
     /// The token-endpoint requests received so far, as (headers, form body).
@@ -294,8 +312,22 @@ impl Browser {
         self.send(Request::get(uri), Body::empty()).await
     }
 
+    /// A `POST` from the application's own page, as a browser sends it.
     async fn post(&mut self, uri: &str) -> Reply {
-        self.send(Request::post(uri), Body::empty()).await
+        self.send(
+            Request::post(uri).header(header::ORIGIN, BASE),
+            Body::empty(),
+        )
+        .await
+    }
+
+    /// A `POST` that carries the given `Origin`, or none.
+    async fn post_from(&mut self, uri: &str, origin: Option<&str>) -> Reply {
+        let request = match origin {
+            Some(o) => Request::post(uri).header(header::ORIGIN, o),
+            None => Request::post(uri),
+        };
+        self.send(request, Body::empty()).await
     }
 
     /// Sign in at `provider` as `who`: the login redirect, the IdP's answer
@@ -756,6 +788,53 @@ async fn refresh_with_userinfo_for_another_subject_ends_the_session() {
 
     let again = browser.post("/auth/refresh").await;
     assert_eq!(again.location.as_deref(), Some("/"), "the session survived");
+}
+
+/// The tokens a refresh just issued for a subject the IdP then disowned are
+/// revoked at the IdP before the session ends, not left alive there.
+#[tokio::test]
+async fn refresh_with_userinfo_for_another_subject_revokes_the_new_tokens() {
+    let idp = Idp::start("client-a").await;
+    let app = app_with(vec![settings("idp", &idp)], Provisioning::JustInTime).await;
+    let mut browser = Browser::new(&app);
+    browser
+        .sign_in_with(&idp, "idp", &ALICE, Some("refresh-1"))
+        .await;
+
+    idp.queue_userinfo("someone-else").await;
+    idp.queue_refresh("refresh-1", "refresh-2", None).await;
+    let reply = browser.post("/auth/refresh").await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
+
+    let revoked = idp.revocation_requests().await;
+    assert!(
+        revoked.iter().any(|b| b.contains("token=refresh-2")),
+        "the rotated refresh token was not revoked: {revoked:?}"
+    );
+    assert!(
+        revoked.iter().any(|b| b.contains("token=access-2")),
+        "the new access token was not revoked: {revoked:?}"
+    );
+}
+
+/// A cross-site page cannot log the user out or refresh their tokens.
+#[tokio::test]
+async fn logout_and_refresh_refuse_a_post_from_another_origin() {
+    let idp = Idp::start("client-a").await;
+    let app = app_with(vec![settings("idp", &idp)], Provisioning::JustInTime).await;
+    let mut browser = Browser::new(&app);
+    browser
+        .sign_in_with(&idp, "idp", &ALICE, Some("refresh-1"))
+        .await;
+
+    for uri in ["/auth/logout", "/auth/refresh"] {
+        for origin in [Some("https://evil.example"), Some("null"), None] {
+            let reply = browser.post_from(uri, origin).await;
+            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{uri} from {origin:?}");
+        }
+    }
+    let profile = browser.get("/profile").await;
+    assert_eq!(profile.status, StatusCode::OK, "the session must survive");
 }
 
 // ── Client authentication ────────────────────────────────────────────────────

@@ -8,6 +8,7 @@ mod common;
 use axess_core::authn::Actor;
 use axess_core::authn::{AuditContext, RequestAuthnService};
 use axess_core::authn::{error::AuthnError, service::AuthnService, types::StatusDetail};
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
@@ -32,11 +33,7 @@ async fn suspend_user_in_tenant_rejects_cross_tenant_target() {
     // User u1 lives in tenant t1. Caller asserts expected_tenant=t2.
     // Library MUST refuse with CrossTenant.
     let svc = make_service_with_user_in("u1", "alice", "t1");
-    let detail = StatusDetail {
-        reason: "test".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("test", Utc::now());
     let res = svc
         .suspend_user(Actor::System, &uid("u1"), &tid("t2"), detail)
         .await;
@@ -46,11 +43,7 @@ async fn suspend_user_in_tenant_rejects_cross_tenant_target() {
 #[tokio::test]
 async fn suspend_user_in_tenant_accepts_matching_tenant() {
     let svc = make_service_with_user_in("u1", "alice", "t1");
-    let detail = StatusDetail {
-        reason: "test".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("test", Utc::now());
     let res = svc
         .suspend_user(Actor::System, &uid("u1"), &tid("t1"), detail)
         .await;

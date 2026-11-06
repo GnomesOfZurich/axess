@@ -91,7 +91,22 @@ digest of the whole, so long identifiers that share a prefix keep separate
 buckets and no uncut key can be crafted to equal a cut one. An IPv6 client is
 keyed by its /64 prefix, and `KeyExtractor::Header` maps a user's header
 values onto 16 sub-buckets, so one authenticated user cannot fill the table by
-sending distinct values.
+sending distinct values. An authenticated user who sends no header, or one that
+is not text, holds one further fixed slot of their own; a request with no
+authenticated user is keyed on its peer address.
+
+A request that lacks the identity a `UserId`, `TenantId` or `LoginIdentifier`
+limiter reads (the layer that inserts it is missing or runs after the limiter)
+is answered 500, and the limiter logs an error at most once a minute per worker
+thread. A limiter that cannot read a peer address (`PeerIp` without
+`into_make_service_with_connect_info`) answers 500 too, and logs an error at
+most once a second per worker thread. Both are wiring mistakes, and a limiter
+that guessed a bucket for them would either charge everyone to one budget or
+quietly stop limiting. `allow_shared_bucket()` on the config builder is the
+named opt-out: a request without the identity is keyed on its own peer address
+under an `anon:` prefix, and a request without a peer address goes to one
+`ip:unknown` bucket (so one client can exhaust the limit for all). `ClientIp`
+without `client_ip::layer` still shares one bucket and logs a warning.
 
 A /64 per client still leaves one IPv6 allocation able to mint 65,536 buckets
 in a /48. Each IPv4 /24 and IPv6 /48 therefore holds at most 1,024 live
@@ -107,9 +122,15 @@ instead of taking a slot, and a client in an unrelated prefix is still
 admitted. The hard cap stays as the last bound.
 
 Login identifiers are minted by unauthenticated callers, so once the table is
-three quarters full a new identifier folds into an overflow bucket of its
-origin (the IPv4 address, or the IPv6 /48) instead of taking a slot.
-Identifiers that already have a bucket keep it.
+three quarters full a new identifier folds into one of 1,024 overflow
+buckets, picked by a digest of the identifier, instead of taking a slot.
+The bucket depends on the identifier alone, never on where the request came
+from, so every origin that names one account draws on the same budget and
+the limiter works the same with or without `client_ip::layer`. Identifiers
+that already have a bucket keep it.
+The overflow buckets are shared by every origin, so an attacker who fills the
+table and then drains them limits new identifiers for everyone: that is the
+cap's own alarm, and the signal to raise the cap or find the source.
 
 The debug log for a refused request carries a short fingerprint of the key,
 not the key. It is an HMAC under a random key drawn when the layer is built
@@ -207,6 +228,52 @@ then two buckets, and repeated logins naming `ceo@victim.com` against another
 tenant cannot exhaust the victim tenant's budget. `new` keys on the identifier
 alone and is for single-tenant applications. Put a `LoginIdentifier` limiter on every login-class route, and
 layer a `PeerIp` one beside it for the volumetric case.
+
+The extension has to be on the request when the limiter reads it, and a
+handler runs after every layer around it, so a login handler that "injects the
+identifier" sets it too late: every login would fall into the one shared
+anonymous bucket. Put the injector in a layer outside the limiter.
+`inject_login_identifier` buffers the body (up to a limit you give, `413`
+beyond it), calls your parser on it, inserts the `RateLimitLoginIdentifier` and
+returns a request with the same body. Layers added later wrap earlier ones, so
+it goes last:
+
+```rust,ignore
+// ignore: the book compiles no crate; the same wiring is a doc test on
+// `inject_login_identifier`.
+use axess_core::middleware::ratelimit::{
+    KeyExtractor, RateLimitConfig, RateLimitLayer, RateLimitLoginIdentifier,
+    inject_login_identifier,
+};
+use axum::{
+    body::Body, http::Request, middleware::{from_fn, Next}, response::IntoResponse,
+    routing::post,
+};
+use std::time::Duration;
+
+fn username_of_form(body: &[u8]) -> Option<RateLimitLoginIdentifier> {
+    let (_, name) = url::form_urlencoded::parse(body).find(|(key, _)| key == "username")?;
+    RateLimitLoginIdentifier::new(name)
+}
+
+# async fn login_handler() {}
+let per_username = RateLimitLayer::new(
+    RateLimitConfig::builder()
+        .max_requests(10)
+        .window(Duration::from_secs(60))
+        .key(KeyExtractor::LoginIdentifier)
+        .build(),
+);
+let login_route: axum::Router = axum::Router::new()
+    .route("/login", post(login_handler))
+    .layer(per_username)
+    .layer(from_fn(|request: Request<Body>, next: Next| async move {
+        match inject_login_identifier(request, 16 * 1024, username_of_form).await {
+            Ok(request) => next.run(request).await,
+            Err(status) => status.into_response(),
+        }
+    }));
+```
 
 ### Per-endpoint rate limits
 

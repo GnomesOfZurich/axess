@@ -48,6 +48,22 @@ fn make_service() -> RequestAuthnService<MockIdentityStore, MockFactorStore> {
     AuthnService::new(identity, factors).with_audit_context(AuditContext::default())
 }
 
+/// Begin a signup and return the verification secret it minted.
+async fn begin(
+    service: &RequestAuthnService<MockIdentityStore, MockFactorStore>,
+    session: &axess_core::session::extractor::AuthSession,
+    user: User,
+) -> String {
+    match service
+        .begin_signup(user, "default", session)
+        .await
+        .unwrap()
+    {
+        SignupOutcome::Started(Some(verification)) => verification.secret().to_owned(),
+        other => panic!("expected a verification secret, got {other:?}"),
+    }
+}
+
 // ── Signup flow tests ────────────────────────────────────────────────────────
 
 /// A session id the visitor arrived with may have been planted: the pending
@@ -64,7 +80,7 @@ async fn begin_signup_moves_the_session_to_a_fresh_id() {
         .await
         .unwrap();
 
-    assert!(matches!(outcome, SignupOutcome::Started));
+    assert!(matches!(outcome, SignupOutcome::Started(_)));
     assert_ne!(session.session_id().await, before);
 }
 
@@ -79,7 +95,7 @@ async fn begin_signup_creates_user_and_sets_pending_workflow() {
         .await
         .unwrap();
 
-    assert!(matches!(outcome, SignupOutcome::Started));
+    assert!(matches!(outcome, SignupOutcome::Started(_)));
 
     // Session should be in PendingWorkflow(Signup).
     let state = session.auth_state().await;
@@ -193,12 +209,12 @@ async fn begin_signup_resubmit_from_the_pending_session_is_idempotent() {
         .begin_signup(user.clone(), "default", &session)
         .await
         .unwrap();
-    assert!(matches!(first, SignupOutcome::Started));
+    assert!(matches!(first, SignupOutcome::Started(_)));
     let again = service
         .begin_signup(user, "default", &session)
         .await
         .unwrap();
-    assert!(matches!(again, SignupOutcome::Started), "{again:?}");
+    assert!(matches!(again, SignupOutcome::Started(_)), "{again:?}");
 }
 
 #[tokio::test]
@@ -225,13 +241,10 @@ async fn complete_signup_activates_user_and_authenticates() {
 
     // Begin signup.
     let user = candidate_user("u1", "alice@example.com");
-    service
-        .begin_signup(user, "default", &session)
-        .await
-        .unwrap();
+    let secret = begin(&service, &session, user).await;
 
     // Complete signup; should activate user and authenticate session.
-    service.complete_signup(&session).await.unwrap();
+    service.complete_signup(&session, &secret).await.unwrap();
 
     assert!(session.is_authenticated().await);
     assert_eq!(
@@ -246,8 +259,8 @@ async fn complete_signup_without_pending_workflow_returns_no_flow() {
     let session = test_session();
 
     // Session is Guest; no PendingWorkflow.
-    let result = service.complete_signup(&session).await;
-    assert!(result.is_err());
+    let result = service.complete_signup(&session, "anything").await;
+    assert!(matches!(result, Err(AuthnError::NoFlow)), "{result:?}");
 }
 
 #[tokio::test]
@@ -259,11 +272,8 @@ async fn signup_records_audit_events() {
     let session = test_session();
 
     let user = candidate_user("u1", "alice@example.com");
-    service
-        .begin_signup(user, "default", &session)
-        .await
-        .unwrap();
-    service.complete_signup(&session).await.unwrap();
+    let secret = begin(&service, &session, user).await;
+    service.complete_signup(&session, &secret).await.unwrap();
 
     let events = identity.events();
     assert_eq!(events.len(), 2);
@@ -296,11 +306,7 @@ async fn suspend_user_changes_status() {
     let service =
         AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
-    let detail = StatusDetail {
-        reason: "policy violation".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("policy violation", Utc::now());
     service
         .suspend_user_across_tenants(Actor::System, &uid("u1"), detail)
         .await
@@ -308,7 +314,7 @@ async fn suspend_user_changes_status() {
 
     // User should now be suspended.
     let status = identity.account_status(&uid("u1")).await.unwrap();
-    assert!(status.is_locked());
+    assert!(status.is_suspended());
 
     // Audit event should be recorded.
     let events = identity.events();
@@ -376,11 +382,7 @@ async fn suspend_then_reactivate() {
         AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
 
     // Suspend.
-    let detail = StatusDetail {
-        reason: "investigation".into(),
-        since: Utc::now(),
-        until: None,
-    };
+    let detail = StatusDetail::administrative("investigation", Utc::now());
     service
         .suspend_user_across_tenants(Actor::System, &uid("u1"), detail)
         .await
@@ -390,7 +392,7 @@ async fn suspend_then_reactivate() {
             .account_status(&uid("u1"))
             .await
             .unwrap()
-            .is_locked()
+            .is_suspended()
     );
 
     // Reactivate.
@@ -462,24 +464,21 @@ async fn complete_signup_admits_a_tenant_whose_timed_suspension_has_lapsed() {
     let service = AuthnService::new(identity.clone(), MockFactorStore::new())
         .with_audit_context(AuditContext::default());
     let session = test_session();
-    service
-        .begin_signup(
-            candidate_user("u1", "alice@example.com"),
-            "default",
-            &session,
-        )
-        .await
-        .unwrap();
+    let secret = begin(
+        &service,
+        &session,
+        candidate_user("u1", "alice@example.com"),
+    )
+    .await;
 
     let mut lapsed = test_tenant();
-    lapsed.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now() - chrono::Duration::hours(2),
-        until: Some(Utc::now() - chrono::Duration::hours(1)),
-    });
+    lapsed.status = EntityState::Suspended(
+        StatusDetail::administrative("hold", Utc::now() - chrono::Duration::hours(2))
+            .with_until(Some(Utc::now() - chrono::Duration::hours(1))),
+    );
     let _ = identity.clone().with_tenant(lapsed);
 
-    let result = service.complete_signup(&session).await;
+    let result = service.complete_signup(&session, &secret).await;
 
     assert!(result.is_ok(), "{result:?}");
     assert!(session.is_authenticated().await);
@@ -493,28 +492,126 @@ async fn complete_signup_refuses_a_tenant_suspended_since_the_begin() {
     let service = AuthnService::new(identity.clone(), MockFactorStore::new())
         .with_audit_context(AuditContext::default());
     let session = test_session();
-    service
-        .begin_signup(
-            candidate_user("u1", "alice@example.com"),
-            "default",
-            &session,
-        )
-        .await
-        .unwrap();
+    let secret = begin(
+        &service,
+        &session,
+        candidate_user("u1", "alice@example.com"),
+    )
+    .await;
 
     let mut suspended = test_tenant();
-    suspended.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now(),
-        until: None,
-    });
+    suspended.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
     let _ = identity.clone().with_tenant(suspended);
 
-    let result = service.complete_signup(&session).await;
+    let result = service.complete_signup(&session, &secret).await;
 
     assert!(result.is_err(), "{result:?}");
     assert!(
         !session.is_authenticated().await,
         "a suspended tenant's signup must not authenticate"
+    );
+}
+
+// ── The verification secret ──────────────────────────────────────────────────
+
+/// The secret `begin_signup` mints is what completes the signup: a session
+/// that began one cannot activate itself with anything else.
+#[tokio::test]
+async fn complete_signup_refuses_a_wrong_secret() {
+    let service = make_service();
+    let session = test_session();
+    let secret = begin(&service, &session, candidate_user("u1", "a@example.com")).await;
+
+    for wrong in ["", "nope", &format!("{secret}x"), &secret[1..]] {
+        let result = service.complete_signup(&session, wrong).await;
+        assert!(
+            matches!(result, Err(AuthnError::InvalidAssertion)),
+            "{wrong:?}: {result:?}"
+        );
+        assert!(!session.is_authenticated().await);
+    }
+    service.complete_signup(&session, &secret).await.unwrap();
+    assert!(session.is_authenticated().await);
+}
+
+/// The session holds a digest of the secret, never the secret.
+#[tokio::test]
+async fn the_pending_signup_holds_a_digest_not_the_secret() {
+    let service = make_service();
+    let session = test_session();
+    let secret = begin(&service, &session, candidate_user("u1", "a@example.com")).await;
+
+    let AuthState::PendingWorkflow { workflow, .. } = session.auth_state().await else {
+        panic!("pending signup expected");
+    };
+    let digest = workflow.verification_digest.expect("a digest is stored");
+    assert!(!digest.contains(&secret));
+    assert_ne!(digest, secret);
+    assert!(workflow.verification_expires_at.is_some());
+}
+
+/// A secret older than the verification lifetime completes nothing; the
+/// session that submits the signup again gets a new one, and the old one
+/// stops working.
+#[tokio::test]
+async fn an_expired_or_replaced_secret_completes_nothing() {
+    use axess_clock::testing::MockClock;
+    let clock = MockClock::at(Utc::now());
+    let identity = MockIdentityStore::new().with_tenant(test_tenant());
+    let service = AuthnService::builder(identity, MockFactorStore::new())
+        .with_clock(clock.clone())
+        .with_signup_verification_ttl(std::time::Duration::from_secs(3600))
+        .build()
+        .with_audit_context(AuditContext::default());
+    let session = test_session();
+    let user = candidate_user("u1", "a@example.com");
+    let first = begin(&service, &session, user.clone()).await;
+
+    clock.advance(chrono::Duration::minutes(61));
+    let result = service.complete_signup(&session, &first).await;
+    assert!(
+        matches!(result, Err(AuthnError::InvalidAssertion)),
+        "{result:?}"
+    );
+    assert!(!session.is_authenticated().await);
+
+    let second = begin(&service, &session, user).await;
+    assert_ne!(first, second);
+    let result = service.complete_signup(&session, &first).await;
+    assert!(
+        matches!(result, Err(AuthnError::InvalidAssertion)),
+        "{result:?}"
+    );
+    service.complete_signup(&session, &second).await.unwrap();
+    assert!(session.is_authenticated().await);
+}
+
+/// The secret is single use: once the signup is complete, the same secret
+/// finds no pending signup.
+#[tokio::test]
+async fn a_completed_signups_secret_cannot_be_used_again() {
+    let service = make_service();
+    let session = test_session();
+    let secret = begin(&service, &session, candidate_user("u1", "a@example.com")).await;
+    service.complete_signup(&session, &secret).await.unwrap();
+    let result = service.complete_signup(&session, &secret).await;
+    assert!(matches!(result, Err(AuthnError::NoFlow)), "{result:?}");
+}
+
+/// A signup pending without a stored digest (begun by an older release, or
+/// built by hand) cannot be completed with any secret.
+#[tokio::test]
+async fn a_pending_signup_without_a_digest_cannot_be_completed() {
+    let service = make_service();
+    let user = candidate_user("u1", "a@example.com");
+    service
+        .begin_signup(user.clone(), "default", &test_session())
+        .await
+        .unwrap();
+    let session = common::signup_session_for(&user).await;
+    let result = service.complete_signup(&session, "anything").await;
+    assert!(
+        matches!(result, Err(AuthnError::InvalidAssertion)),
+        "{result:?}"
     );
 }

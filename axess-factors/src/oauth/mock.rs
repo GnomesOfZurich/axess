@@ -420,7 +420,12 @@ impl OAuthProvider for MockOAuthProvider {
             .append_pair("client_id", &self.mock_client_id)
             .append_pair("state", &state)
             .append_pair("nonce", &nonce);
-        Ok((url, state, nonce, verifier))
+        Ok(AuthUrlResult {
+            url,
+            csrf_state: state,
+            nonce,
+            pkce_verifier: verifier,
+        })
     }
 
     fn scopes(&self) -> &[String] {
@@ -431,7 +436,7 @@ impl OAuthProvider for MockOAuthProvider {
         self.ceremony_timeout
     }
 
-    fn fetch_userinfo<'a>(
+    fn fetch_userinfo_unchecked<'a>(
         &'a self,
         _access_token: &'a str,
         dpop: Option<DpopSigner<'a>>,
@@ -442,7 +447,7 @@ impl OAuthProvider for MockOAuthProvider {
         })
     }
 
-    fn refresh_token<'a>(
+    fn refresh_token_unchecked<'a>(
         &'a self,
         refresh_token: &'a str,
         _original_nonce: Option<&'a str>,
@@ -530,6 +535,66 @@ mod tests {
         clock.advance_secs(90);
         let later = payload_of(&provider.mock_logout_token(Some("u"), None));
         assert_eq!(later["iat"], start + 90);
+    }
+
+    /// The authorization URL comes back as named fields: the state and nonce
+    /// are in the URL, and the verifier is not.
+    #[test]
+    fn the_authorization_url_result_names_its_fields() {
+        let provider = MockOAuthProvider::new("idp");
+        let rng = axess_rng::testing::MockRng::new(5);
+        let auth = provider
+            .build_auth_url(&OAuthLoginOptions::default(), &rng)
+            .unwrap();
+        let query = auth.url.query().unwrap_or_default().to_owned();
+        assert!(
+            query.contains(&format!("state={}", auth.csrf_state)),
+            "{query}"
+        );
+        assert!(query.contains(&format!("nonce={}", auth.nonce)), "{query}");
+        assert!(!query.contains(&auth.pkce_verifier));
+        let shown = format!("{auth:?}");
+        assert!(!shown.contains(&auth.pkce_verifier), "{shown}");
+    }
+
+    /// `fetch_userinfo` and `refresh_token` on the trait check `sub`; the
+    /// unchecked forms are the ones that do not.
+    #[tokio::test]
+    async fn userinfo_and_refresh_check_the_subject_by_default() {
+        let provider =
+            MockOAuthProvider::new("idp").with_user("alice", "a@example.com", vec![], vec![]);
+
+        assert!(provider.fetch_userinfo("tok", "alice", None).await.is_ok());
+        assert!(matches!(
+            provider.fetch_userinfo("tok", "mallory", None).await,
+            Err(OAuthError::SubjectMismatch)
+        ));
+        assert_eq!(
+            provider
+                .fetch_userinfo_unchecked("tok", None)
+                .await
+                .unwrap()
+                .sub,
+            "alice"
+        );
+
+        assert!(
+            provider
+                .refresh_token("rt", "alice", None, None)
+                .await
+                .is_ok()
+        );
+        let refused = provider.refresh_token("rt", "mallory", None, None).await;
+        assert!(
+            matches!(refused, Err(OAuthError::IdTokenValidation(_))),
+            "{refused:?}"
+        );
+        assert!(
+            provider
+                .refresh_token_unchecked("rt", None, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

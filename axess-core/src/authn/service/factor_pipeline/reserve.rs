@@ -60,6 +60,12 @@ where
         };
         match reserved {
             Ok(Some(count)) => Ok(GuessSlot::Reserved(count)),
+            // At the limit. A session on a device the account has used is let
+            // through unmetered, as a counter outage under `Allow` is: a wrong
+            // guess is still counted afterwards, a right one resets the count.
+            Ok(None) if self.on_known_device(user_id, tenant_id, session).await => {
+                Ok(GuessSlot::Unmetered)
+            }
             Ok(None) => {
                 self.inner.metrics.account_locked();
                 self.record_locked_attempt_audit(user_id, tenant_id, Some(kind.clone()), session)

@@ -166,6 +166,42 @@ async fn concurrent_write(store: &MemorySessionStore, id: &SessionId, custom: se
     );
 }
 
+/// A login clears what the visitor held and rotates the id. A key a
+/// concurrent request wrote to the old row meanwhile (planted before the
+/// login) must not reappear in the authenticated session under the new id.
+#[tokio::test]
+async fn a_login_does_not_take_in_keys_a_concurrent_request_planted() {
+    let store = MemorySessionStore::new();
+    let id = SessionId::new(&MockRng::new(40));
+    let loaded = SessionData {
+        custom: serde_json::json!({"flow": "s", "old": 1}),
+        ..SessionData::default()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut login = request_holding(&store, id, &loaded);
+    login.data = authenticated();
+    login.data.custom = serde_json::json!({"flow": "s"});
+    login.modified = true;
+    login.rotate_id();
+    let new_id = login.id;
+    concurrent_write(
+        &store,
+        &id,
+        serde_json::json!({"flow": "s", "old": 1, "planted": "x"}),
+    )
+    .await;
+
+    finalize(&store, login, Some(id)).await;
+
+    let stored = store.load(&new_id).await.unwrap().unwrap();
+    assert!(
+        stored.custom.get("planted").is_none(),
+        "a key planted before the login must not enter the session, got {}",
+        stored.custom
+    );
+    assert_eq!(stored.custom["flow"], "s");
+}
+
 /// Request C restarts a ceremony; this request takes another one-shot value
 /// and so picks C's ceremony up through a merge; request E then takes the
 /// ceremony. This request's finalize conflicts with E and must not write
@@ -213,6 +249,13 @@ struct WritesAfterFirstRead {
 
 impl SessionStore for WritesAfterFirstRead {
     type Error = std::convert::Infallible;
+    async fn find_sessions_for_user(
+        &self,
+        _: &crate::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         let row = self.inner.load(id).await?;
         let pending = self.then_write.lock().unwrap().take();
@@ -304,6 +347,13 @@ struct FailingReads(MemorySessionStore);
 
 impl SessionStore for FailingReads {
     type Error = std::io::Error;
+    async fn find_sessions_for_user(
+        &self,
+        _: &crate::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
     async fn load(&self, _: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         Err(std::io::Error::other("store unavailable"))
     }
@@ -520,6 +570,7 @@ impl SessionRegistryHandle for RevokesAfterCheck {
 
 fn rotation(old: SessionId, new: SessionId) -> Rotation {
     Rotation {
+        was_authenticated: false,
         user_id: ids::user("u"),
         old_id: old,
         new_id: new,
@@ -644,6 +695,29 @@ async fn a_rotation_whose_new_id_the_handler_registered_keeps_its_cookie() {
     assert!(cookie);
     assert!(store.load(&new).await.unwrap().is_some());
     assert!(registry.is_valid(&ids::user("u"), &new).await);
+}
+
+/// An authenticated session revoked at the moment the handler registered the
+/// new id itself: the old id is gone, and the new one must not outlive the
+/// revocation.
+#[tokio::test]
+async fn a_revoked_authenticated_session_does_not_survive_the_handler_registering_its_new_id() {
+    let store = MemorySessionStore::new();
+    let (old, new) = (
+        SessionId::new(&MockRng::new(12)),
+        SessionId::new(&MockRng::new(13)),
+    );
+    moved_row(&store, &new).await;
+    let registry = SessionRegistryAdapter(MemorySessionRegistry::new());
+    assert!(registry.register(&ids::user("u"), &new).await);
+    let mut rotated = rotation(old, new);
+    rotated.was_authenticated = true;
+
+    let cookie = move_registry_entry(&store, &registry, &rotated, UnknownLiveness::Reject).await;
+
+    assert!(!cookie, "the revoked session got a cookie");
+    assert!(store.load(&new).await.unwrap().is_none());
+    assert!(!registry.is_valid(&ids::user("u"), &new).await);
 }
 
 /// A rotation the registry tracked from the old id moves the entry.
@@ -797,6 +871,13 @@ struct FailingWrites(MemorySessionStore);
 
 impl SessionStore for FailingWrites {
     type Error = std::io::Error;
+    async fn find_sessions_for_user(
+        &self,
+        _: &crate::authn::ids::UserId,
+        _: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Ok(Vec::new())
+    }
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
         Ok(self.0.load(id).await.unwrap())
     }
@@ -904,5 +985,158 @@ async fn a_rotation_of_an_ended_session_issues_no_cookie() {
     assert!(
         !outcome.session_changed,
         "no cookie for a row that was not written"
+    );
+}
+
+/// A store that lets one concurrent write land between the layer's read of
+/// the old row and the rotation, the window a merge before the rotation
+/// cannot close.
+#[derive(Clone)]
+struct WritesBeforeCycle {
+    inner: MemorySessionStore,
+    then_write: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl WritesBeforeCycle {
+    async fn interpose(&self, id: &SessionId) {
+        let next = {
+            let mut pending = self.then_write.lock().unwrap();
+            (!pending.is_empty()).then(|| pending.remove(0))
+        };
+        if let Some(custom) = next {
+            concurrent_write(&self.inner, id, custom).await;
+        }
+    }
+}
+
+impl SessionStore for WritesBeforeCycle {
+    type Error = std::convert::Infallible;
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
+        self.inner.load(id).await
+    }
+    async fn find_sessions_for_user(
+        &self,
+        user: &crate::authn::ids::UserId,
+        limit: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        self.inner.find_sessions_for_user(user, limit).await
+    }
+    async fn save(
+        &self,
+        id: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<(), Self::Error> {
+        self.inner.save(id, d, ttl).await
+    }
+    async fn delete(&self, id: &SessionId) -> Result<(), Self::Error> {
+        self.inner.delete(id).await
+    }
+    async fn update(
+        &self,
+        id: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<bool, Self::Error> {
+        self.inner.update(id, d, ttl).await
+    }
+    async fn update_if_revision(
+        &self,
+        id: &SessionId,
+        expected: u64,
+        d: &SessionData,
+        ttl: Duration,
+    ) -> Result<ConditionalUpdate, Self::Error> {
+        self.inner.update_if_revision(id, expected, d, ttl).await
+    }
+    async fn cycle(
+        &self,
+        old: &SessionId,
+        new: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+    ) -> Result<CycleOutcome, Self::Error> {
+        self.interpose(old).await;
+        self.inner.cycle(old, new, d, ttl, require_old).await
+    }
+    async fn cycle_if_revision(
+        &self,
+        old: &SessionId,
+        new: &SessionId,
+        d: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> Result<CycleOutcome, Self::Error> {
+        self.interpose(old).await;
+        self.inner
+            .cycle_if_revision(old, new, d, ttl, require_old, expected_revision)
+            .await
+    }
+    async fn prune_expired(&self) -> Result<u64, Self::Error> {
+        self.inner.prune_expired().await
+    }
+}
+
+/// Another request takes the one-shot ceremony value after this rotation has
+/// read the old row and before it rotates. The rotated row must not bring the
+/// value back; the rotation is retried on what the other request wrote.
+#[tokio::test]
+async fn a_write_between_the_read_and_the_rotation_is_not_lost() {
+    let store = WritesBeforeCycle {
+        inner: MemorySessionStore::new(),
+        then_write: Arc::new(Mutex::new(vec![serde_json::json!({"cart": 0})])),
+    };
+    let id = SessionId::new(&MockRng::new(41));
+    let loaded = SessionData {
+        custom: serde_json::json!({"ceremony": "state", "cart": 0}),
+        ..SessionData::default()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut b = request_holding(&store.inner, id, &loaded);
+    b.data.custom["cart"] = serde_json::json!(1);
+    b.modified = true;
+    b.rotate_id();
+    let new_id = b.id;
+
+    finalize(&store, b, Some(id)).await;
+
+    let stored = store.load(&new_id).await.unwrap().unwrap();
+    assert!(
+        stored.custom.get("ceremony").is_none(),
+        "a value taken by a concurrent request stays taken, got {}",
+        stored.custom
+    );
+    assert_eq!(stored.custom["cart"], serde_json::json!(1));
+}
+
+/// A rotation of a session whose old row keeps being written to gives up and
+/// fails closed rather than carry over a copy that lost a write.
+#[tokio::test]
+async fn a_rotation_that_keeps_conflicting_fails_closed() {
+    let store = WritesBeforeCycle {
+        inner: MemorySessionStore::new(),
+        then_write: Arc::new(Mutex::new(
+            (0..8).map(|n| serde_json::json!({"cart": n})).collect(),
+        )),
+    };
+    let id = SessionId::new(&MockRng::new(42));
+    let loaded = SessionData {
+        custom: serde_json::json!({"cart": 0}),
+        ..authenticated()
+    };
+    store.save(&id, &loaded, TTL).await.unwrap();
+    let mut b = request_holding(&store.inner, id, &loaded);
+    b.modified = true;
+    b.rotate_id();
+    let new_id = b.id;
+
+    finalize(&store, b, Some(id)).await;
+
+    assert!(store.load(&new_id).await.unwrap().is_none());
+    assert!(
+        store.load(&id).await.unwrap().is_none(),
+        "the old id is retired"
     );
 }

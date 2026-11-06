@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.15.0", features = ["testing"] }
+//! axess = { version = "0.16.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -85,6 +85,19 @@ pub mod local_idp;
 /// (pulls in `wiremock` + `rsa`).
 #[cfg(feature = "testing-oauth")]
 pub mod oauth_wiremock;
+
+/// A 32-byte key for tests that is not a single repeated byte, so the
+/// constructors that refuse a placeholder accept it. Distinct seeds give
+/// distinct keys.
+pub const fn test_key(seed: u8) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        key[i] = seed.wrapping_add(i as u8);
+        i += 1;
+    }
+    key
+}
 
 pub use mock_authn::{CallLog, MockFactorStore, MockIdentityStore, MockStoreError};
 pub use mock_clock::MockClock;
@@ -194,6 +207,23 @@ pub fn test_session_with_rng(
         consume: None,
     };
     crate::session::extractor::AuthSession(SessionHandle(Arc::new(RwLock::new(inner))))
+}
+
+/// [`test_session`] that the device subsystem has bound to `device_id`, as the
+/// session layer's device resolver does for a request from that device.
+#[cfg(feature = "device")]
+pub fn test_session_on_device(
+    device_id: crate::authn::ids::DeviceId,
+) -> crate::session::extractor::AuthSession {
+    let session = test_session();
+    session
+        .0
+        .0
+        .try_write()
+        .expect("a fresh session is unshared")
+        .data
+        .device_id = Some(device_id);
+    session
 }
 
 /// Test-fixture extension trait that re-exposes the

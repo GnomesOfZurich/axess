@@ -2,7 +2,7 @@
 //!
 //! Thin wrapper: looks up the configured provider, validates the
 //! access token isn't empty, delegates to the provider's
-//! [`fetch_userinfo_for_subject`](axess_factors::oauth::OAuthProvider::fetch_userinfo_for_subject).
+//! [`fetch_userinfo`](axess_factors::oauth::OAuthProvider::fetch_userinfo).
 //! HTTP 401 / 403 / non-2xx errors are mapped to typed [`OAuthError`]
 //! variants so callers can branch on token-expired vs
 //! insufficient-scope vs other failures.
@@ -89,7 +89,7 @@ where
             rng: &*self.inner.rng,
         });
         provider
-            .fetch_userinfo_for_subject(access_token, expected_subject, signer)
+            .fetch_userinfo(access_token, expected_subject, signer)
             .await
     }
 }

@@ -32,6 +32,11 @@ pub enum LoginOutcome {
     /// [`StepUpPolicy`](crate::authn::service::step_up::StepUpPolicy)
     /// returned a non-empty factor set.
     ///
+    /// The variant is a label for the caller's UI and enforces nothing:
+    /// the session is only held to a step-up once the application has called
+    /// [`RequestAuthnService::begin_step_up`](super::RequestAuthnService::begin_step_up)
+    /// on the authenticated session. Call it first, then show the prompt.
+    ///
     /// axess does not emit this variant from
     /// [`RequestAuthnService::begin_login`](super::RequestAuthnService::begin_login)
     /// directly; `Device` resolution is a middleware concern
@@ -244,6 +249,49 @@ pub enum FactorOutcome {
         /// Wall-clock instant at which the lockout expires, or `None` for an indefinite lockout.
         until: Option<chrono::DateTime<chrono::Utc>>,
     },
+    /// Consecutive wrong guesses under this key (the account and the
+    /// client address, by the tenant's
+    /// [`LockoutPolicy::throttle`](crate::authn::types::LockoutPolicy::throttle))
+    /// have earned a delay that has not run: the credential was not checked
+    /// and nothing was counted. Answer it as a wrong credential to the
+    /// person, with `retry_after` as `Retry-After` where the client reads
+    /// headers; it says nothing a wrong guess did not already say.
+    Throttled {
+        /// How long until a guess under this key runs again.
+        retry_after: std::time::Duration,
+    },
+}
+
+/// The single-use secret that completes a signup, and when it stops working.
+///
+/// The session keeps only a digest of it. Hand it to the person through a
+/// channel they alone read (a mailed link, a code); it is shown here once and
+/// cannot be recovered from the session. `Debug` does not print it.
+#[derive(Clone)]
+pub struct SignupVerification {
+    pub(crate) secret: zeroize::Zeroizing<String>,
+    pub(crate) expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl SignupVerification {
+    /// The secret, URL-safe text of 43 characters (256 bits).
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+
+    /// When `complete_signup` stops accepting the secret.
+    pub fn expires_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.expires_at
+    }
+}
+
+impl std::fmt::Debug for SignupVerification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignupVerification")
+            .field("secret", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Result of beginning a signup flow.
@@ -251,7 +299,23 @@ pub enum FactorOutcome {
 pub enum SignupOutcome {
     /// User account created, session moved to `PendingWorkflow(Signup)`.
     /// The application should now send a verification email or similar.
-    Started,
+    ///
+    /// With the default hidden conflicts this is also the answer for an
+    /// identifier that was already taken: nothing was created and the session
+    /// stays anonymous. So `Started` alone does not mean an account was made.
+    /// Read [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id):
+    /// `None` means the identifier was taken, and the handler must not send a
+    /// verification mail or say anything the caller could tell apart from a
+    /// success (the same page, the same timing as far as it can).
+    ///
+    /// The payload is the verification secret of the signup now in flight:
+    /// `Some` when an account is pending (a new one, or this session's own
+    /// signup submitted again, which replaces the earlier secret), `None`
+    /// when the identifier was taken. Mail the secret to the address the
+    /// person gave and pass it to
+    /// [`complete_signup`](crate::authn::service::RequestAuthnService::complete_signup)
+    /// when they return with it.
+    Started(Option<SignupVerification>),
     /// A user with this identifier already exists in the tenant.
     AlreadyExists,
     /// The target tenant does not exist or is not active.

@@ -105,18 +105,18 @@ pub trait RefreshTokenStore: Send + Sync {
     /// reads as a rotated-out token reused, revokes its family and raises the
     /// compromise hook.
     ///
-    /// The provided body returns [`DeviceTokenRevocation::Unsupported`] and
-    /// revokes nothing, so a store written before this method existed
-    /// compiles and says plainly that it cannot do it; the caller must not
-    /// treat that as a revocation.
+    /// There is no provided body: a store that cannot revoke by device must
+    /// say so by returning [`DeviceTokenRevocation::Unsupported`], which
+    /// revokes nothing and which [`revoke_device`](crate::device::revoke_device)
+    /// turns into [`RevokeDeviceError::TokensUnsupported`](crate::device::RevokeDeviceError::TokensUnsupported).
+    /// The caller must not treat that as a revocation. A default that
+    /// answered it for you let a store compile and silently leave a lost
+    /// device's tokens usable.
     fn revoke_device_tokens(
         &self,
         tenant_id: &TenantId,
         device_id: &DeviceId,
-    ) -> impl std::future::Future<Output = Result<DeviceTokenRevocation, Self::Error>> + Send {
-        let _ = (tenant_id, device_id);
-        async { Ok(DeviceTokenRevocation::Unsupported) }
-    }
+    ) -> impl std::future::Future<Output = Result<DeviceTokenRevocation, Self::Error>> + Send;
 
     /// Return all non-revoked tokens for a user, ordered by `issued_at` ascending.
     fn active_tokens(
@@ -139,11 +139,17 @@ pub trait RefreshTokenStore: Send + Sync {
     ///
     /// ```sql
     /// UPDATE refresh_tokens
-    ///    SET revoked_at = NOW()
+    ///    SET revoked = 1, revoked_reason = 'compromise', revoked_at = NOW()
     ///  WHERE user_id = $1
     ///    AND family_id = $2
-    ///    AND revoked_at IS NULL
+    ///    AND revoked = 0
     /// ```
+    ///
+    /// It records the reason
+    /// [`RevocationReason::Compromise`](super::RevocationReason::Compromise)
+    /// and the time, and leaves a token that is already revoked as it is (a
+    /// rotated token swept by the family revocation stays `Rotated`), as in
+    /// the table above.
     ///
     /// Two failure modes the contract is meant to prevent:
     ///

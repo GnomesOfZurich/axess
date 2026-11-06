@@ -15,31 +15,34 @@
 //!
 //! # Wiring pattern
 //!
+//! The decision is only a decision: `begin_step_up` is the call that makes
+//! the session prove a factor, and it needs an `Authenticated` session. So
+//! the step-up goes after the ordinary login has finished, and the
+//! application withholds whatever the login would have granted until the
+//! step-up has ended too.
+//!
 //! ```text
-//! let outcome = service.begin_login(identifier, tenant, &session).await?;
-//! let outcome = match (outcome, resolved_device) {
-//!     (outcome @ LoginOutcome::FactorRequired(_), Some(device)) => {
-//!         match decide_step_up_for_user(&device, &user_id, &policy) {
-//!             Some(allowed_factors) => LoginOutcome::StepUpRequired {
-//!                 device_id: device.id.clone(),
-//!                 allowed_factors,
-//!             },
-//!             None => outcome,
-//!         }
+//! // 1. the ordinary login ends in FactorOutcome::Authenticated.
+//! // 2. decide, with the device the session layer resolved:
+//! match decide_step_up_for_optional(device.as_ref(), &user_id, &policy) {
+//!     Some(allowed_factors) => {
+//!         // 3. enforce: the session becomes `Authenticating` again with one
+//!         //    step left, and is not authenticated until it is proven.
+//!         let first = service.begin_step_up(&session, allowed_factors).await?;
+//!         // show the prompt for `first`, then prepare_factor / verify_factor.
+//!         // (`LoginOutcome::StepUpRequired` is the label to hand your UI.)
 //!     }
-//!     (other, _) => other,
-//! };
+//!     None => { /* proceed */ }
+//! }
 //! ```
 //!
 //! `user_id` is the id the login is for, which the application holds from
-//! its own identifier lookup; `begin_login` does not return it.
-//!
-//! The relabelled outcome enforces nothing by itself: the remaining steps
-//! are still the original method's. To make the session actually prove one
-//! of `allowed_factors`, call
-//! [`begin_step_up`](crate::authn::service::RequestAuthnService::begin_step_up)
-//! once the session is authenticated, then drive `prepare_factor` and
-//! `verify_factor` as for any login.
+//! its own identifier lookup; `begin_login` does not return it. A call to
+//! `decide_step_up_for_user` or `decide_step_up_for_optional` on its own
+//! enforces nothing: relabelling an outcome as
+//! [`LoginOutcome::StepUpRequired`](crate::authn::service::LoginOutcome::StepUpRequired)
+//! without calling [`begin_step_up`](crate::authn::service::RequestAuthnService::begin_step_up)
+//! leaves the session on the original method's steps.
 //!
 //! axess does **not** reach into the device subsystem from
 //! `begin_login`. `Device` resolution is a middleware concern
@@ -219,19 +222,18 @@ impl StepUpPolicyBuilder {
 /// Wraps [`StepUpPolicy::for_level`] with the empty-vec → `None`
 /// translation so callers don't have to write the conditional twice.
 ///
-/// A device owned by a different user counts as [`DeviceTrustLevel::Unknown`]:
-/// its trust was earned by someone else and does not carry over. An
-/// unowned device, or one the user owns, is judged by its own level.
+/// Only a device the user owns is judged by its own level. A device owned
+/// by a different user, or by nobody, counts as [`DeviceTrustLevel::Unknown`]:
+/// its trust was earned by someone else, or by no one, and does not carry
+/// over.
 pub fn decide_step_up_for_user(
     device: &Device,
     user: &UserId,
     policy: &StepUpPolicy,
 ) -> Option<Vec<FactorKind>> {
-    let owned_by_someone_else = device.user_id.as_ref().is_some_and(|owner| owner != user);
-    let level = if owned_by_someone_else {
-        DeviceTrustLevel::Unknown
-    } else {
-        device.trust_level
+    let level = match &device.user_id {
+        Some(owner) if owner == user => device.trust_level,
+        _ => DeviceTrustLevel::Unknown,
     };
     factors_or_none(policy.for_level(level))
 }
@@ -347,6 +349,19 @@ mod tests {
         );
     }
 
+    /// A device with no owner carries nobody's trust: it is judged as an
+    /// unknown one for every user, however it is labelled.
+    #[test]
+    fn an_unowned_trusted_device_is_judged_as_unknown() {
+        let relaxed = StepUpPolicy::builder().trusted(Vec::new()).build();
+        let mut device = build_device(DeviceTrustLevel::Trusted);
+        device.user_id = None;
+        assert_eq!(
+            decide_step_up_for_user(&device, &owner(), &relaxed),
+            Some(vec![FactorKind::Totp])
+        );
+    }
+
     /// A request with no resolved device is judged as an unknown one.
     #[test]
     fn no_device_is_judged_as_unknown() {
@@ -437,8 +452,5 @@ mod tests {
             decide_step_up_for_user(&device, &other, &p),
             Some(p.for_level(DeviceTrustLevel::Unknown).to_vec())
         );
-        let mut unowned = build_device(DeviceTrustLevel::Trusted);
-        unowned.user_id = None;
-        assert!(decide_step_up_for_user(&unowned, &other, &p).is_none());
     }
 }

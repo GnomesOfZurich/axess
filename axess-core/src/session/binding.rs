@@ -28,7 +28,7 @@
 //! # Usage
 //!
 //! ```text
-//! let layer = SessionLayer::new(store, key)
+//! let layer = SessionLayer::new(store, key, registry)
 //!     .with_binding(UserAgentBinding);
 //! ```
 //!
@@ -47,8 +47,12 @@ use hmac::Mac;
 /// On subsequent requests, the HMAC is recomputed and compared to detect
 /// session hijacking (cookie theft from a different client).
 ///
-/// Return `None` if the binding signal is absent (e.g. no User-Agent header),
-/// in which case binding is skipped for that request.
+/// Return `None` if the binding signal is absent (e.g. no User-Agent header).
+/// Absent material is not skipped: the layer binds the session to a fixed
+/// value that stands for "no material". A session that logged in on a request
+/// without it fails the binding on any later request that does present
+/// material, and a bound session fails on a request that omits it. Leaving the
+/// header out therefore never gets a replayed cookie past the binding.
 ///
 /// # Scope: where binding is checked
 ///
@@ -83,6 +87,9 @@ pub trait SessionBinding: Send + Sync + 'static {
     /// header values without pre-hashing.
     fn extract(&self, req: &Request<Body>) -> Option<Vec<u8>>;
 }
+
+/// The material a request is bound to when the [`SessionBinding`] yields none.
+pub(crate) const NO_BINDING_MATERIAL: &[u8] = b"axess:no-binding-material";
 
 /// Compute the HMAC-SHA256 fingerprint used for storage and comparison.
 ///

@@ -316,11 +316,10 @@ async fn failed_read_when_beginning_registration_is_an_error() {
 
 fn suspended_until(until: chrono::DateTime<chrono::Utc>) -> axess_core::authn::types::EntityState {
     use axess_core::authn::types::{EntityState, StatusDetail};
-    EntityState::Suspended(StatusDetail {
-        reason: "test".into(),
-        since: until - chrono::Duration::days(1),
-        until: Some(until),
-    })
+    EntityState::Suspended(
+        StatusDetail::administrative("test", until - chrono::Duration::days(1))
+            .with_until(Some(until)),
+    )
 }
 
 fn fixture_with_status(
@@ -773,11 +772,7 @@ async fn an_inactive_account_refused_at_finish_is_recorded_as_a_setup() {
     f.identity
         .suspend_user(
             &alice.id,
-            axess_core::authn::types::StatusDetail {
-                reason: "test".into(),
-                since: chrono::Utc::now(),
-                until: None,
-            },
+            axess_core::authn::types::StatusDetail::administrative("test", chrono::Utc::now()),
         )
         .await
         .unwrap();

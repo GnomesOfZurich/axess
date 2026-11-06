@@ -32,6 +32,12 @@ where
     ///
     /// Generates an authorization URL with PKCE, state (CSRF), and nonce.
     /// Returns `(authorization_url, csrf_state_token)`.
+    ///
+    /// The ceremony's secrets (the PKCE verifier and, for a provider that
+    /// binds tokens, the DPoP key's seed) are kept in the session's custom
+    /// data, not sealed field by field: they are as private as the session
+    /// store, which seals the whole row only when it was built with a
+    /// `SessionCrypto` key. Use an encrypted store.
     #[tracing::instrument(skip(self, options, session))]
     pub async fn begin_oauth_login(
         &self,
@@ -112,7 +118,12 @@ where
         let dpop_key = provider
             .binds_to_dpop()
             .then(|| axess_factors::oauth::DpopKey::generate(&*self.inner.rng));
-        let (auth_url, csrf_state, nonce, pkce_verifier) = if used_par {
+        let axess_factors::oauth::AuthUrlResult {
+            url: auth_url,
+            csrf_state,
+            nonce,
+            pkce_verifier,
+        } = if used_par {
             let signer = dpop_key
                 .as_ref()
                 .map(|key| axess_factors::oauth::DpopSigner {

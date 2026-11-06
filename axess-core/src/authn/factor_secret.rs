@@ -34,7 +34,7 @@
 use crate::authn::factor::{FactorConfig, FactorKind, FederatedProvider};
 use crate::authn::types::AuthnScope;
 use crate::session::legacy_blobs::LegacyBlobs;
-use crate::session::weak_key::{WeakKeyError, is_constant_key, warn_if_constant_key};
+use crate::session::weak_key::{WeakKeyError, is_constant_key};
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, Payload},
@@ -85,6 +85,14 @@ pub enum FactorSecretError {
          (FactorSecretCipher::with_plain_secrets)"
     )]
     PlainRefused,
+    /// A one-time-code secret would be stored in plain text: the service has
+    /// no cipher and the builder was not told plain text is intended.
+    #[error(
+        "the factor secret would be stored in plain text: configure \
+         AuthnServiceBuilder::with_factor_secret_cipher, or call \
+         allow_plaintext_factor_secrets for development and tests"
+    )]
+    PlaintextNotAllowed,
     /// The sealed secret names a key this cipher does not hold.
     #[error("the factor secret was sealed under a key this cipher does not hold")]
     UnknownKey,
@@ -195,10 +203,26 @@ pub struct FactorSecretCipher {
 }
 
 impl FactorSecretCipher {
-    /// A cipher sealing under `key`. A key that is a single repeated byte is
-    /// logged at `error`; use [`try_new`](Self::try_new) to refuse it.
+    /// A cipher sealing under `key`.
+    ///
+    /// # Panics
+    ///
+    /// On a key that is a single repeated byte. Use
+    /// [`try_new`](Self::try_new) to handle the refusal.
+    #[track_caller]
     pub fn new(key: [u8; 32]) -> Self {
-        warn_if_constant_key("factor secret encryption key", &key);
+        crate::session::weak_key::refuse_constant_key("factor secret encryption key", &key);
+        Self::new_unchecked_inner(key)
+    }
+
+    /// [`new`](Self::new) without the constant-key check, for tests that use
+    /// a placeholder key.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_unchecked(key: [u8; 32]) -> Self {
+        Self::new_unchecked_inner(key)
+    }
+
+    fn new_unchecked_inner(key: [u8; 32]) -> Self {
         let current_id = key_id(&key);
         Self {
             current: Arc::new(Key(key)),
@@ -207,7 +231,7 @@ impl FactorSecretCipher {
             rng: Arc::new(SystemRng),
             clock: Arc::new(SystemClock),
             plain: LegacyBlobs::default(),
-            first_binding: LegacyBlobs::Accept,
+            first_binding: LegacyBlobs::Reject,
         }
     }
 
@@ -220,20 +244,27 @@ impl FactorSecretCipher {
         if is_constant_key(&key) {
             return Err(WeakKeyError);
         }
-        Ok(Self::new(key))
+        Ok(Self::new_unchecked_inner(key))
     }
 
     /// Keep secrets sealed under `key` readable, for a key rotation. They are
     /// sealed again under the current key the next time they verify.
+    ///
+    /// # Panics
+    ///
+    /// On a previous key that is a single repeated byte, or that equals the
+    /// current key.
+    #[track_caller]
     pub fn with_previous_key(mut self, key: [u8; 32]) -> Self {
-        warn_if_constant_key("previous factor secret encryption key", &key);
+        crate::session::weak_key::refuse_constant_key(
+            "previous factor secret encryption key",
+            &key,
+        );
         let id = key_id(&key);
-        if id == self.current_id {
-            tracing::error!(
-                target: "axess::authn::factor_secret",
-                "previous factor secret key equals the current key; the rotation protects nothing"
-            );
-        }
+        assert!(
+            id != self.current_id,
+            "previous factor secret key equals the current key; the rotation protects nothing"
+        );
         self.previous = Some((Arc::new(Key(key)), id));
         self
     }
@@ -249,14 +280,13 @@ impl FactorSecretCipher {
     /// Whether a secret sealed under the first release's binding (the factor
     /// kind without its variant, no context) is still opened, and until when.
     ///
-    /// The default is [`LegacyBlobs::Accept`]: every deployment upgraded from
-    /// 0.14 holds such rows, and refusing them would lock those users out.
-    /// A row that opens this way is re-sealed in the current binding on the
-    /// login that opens it (a tenant OAuth record on first use), so once the
-    /// rows have moved set [`LegacyBlobs::AcceptUntil`] with a cutoff, or
-    /// [`LegacyBlobs::Reject`]. The default becomes `Reject` in 0.16. That
-    /// binding names a custom provider like the factor of the same name, so
-    /// reading it for ever is not free.
+    /// The default is [`LegacyBlobs::Reject`]. That binding names a custom
+    /// provider like the factor of the same name, so reading it is not free.
+    /// A deployment upgraded from 0.14 that still holds such rows sets
+    /// [`LegacyBlobs::AcceptUntil`] with a cutoff for the window in which they
+    /// move: a row that opens this way is re-sealed in the current binding on
+    /// the login that opens it (a tenant OAuth record on first use). Without
+    /// that, those users cannot open their secret.
     pub fn with_first_binding(mut self, policy: LegacyBlobs) -> Self {
         self.first_binding = policy;
         self

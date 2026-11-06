@@ -6,12 +6,12 @@
 
 use super::internal::{
     DEFAULT_PREFIX, ValkeyStoreError, Watch, after_check, after_degraded_poll, degraded_poll_delay,
-    registry_cutoff_ms, registry_key, registry_key_ttl_secs, registry_member_live,
+    log_session_id, registry_cutoff_ms, registry_key, registry_key_ttl_secs, registry_member_live,
     registry_member_ttl_ms, revocation_session_channel, revocation_user_channel,
 };
 use super::subscriber::{Event, SharedSubscriber};
 use crate::session::{id::SessionId, store::SessionRegistry};
-use axess_clock::{Clock, SystemClock};
+use axess_clock::Clock;
 use axess_rng::{SecureRng, SystemRng};
 use fred::prelude::*;
 use fred::types::sorted_sets::{Ordering, ZRange, ZRangeBound, ZRangeKind};
@@ -51,6 +51,15 @@ fn live_max() -> ZRange {
     }
 }
 
+/// Milliseconds from a `TIME` reply: seconds, then microseconds within the
+/// second.
+pub(super) fn parse_server_time_ms(reply: &[String]) -> Option<i64> {
+    let [secs, micros] = reply else { return None };
+    let secs: i64 = secs.parse().ok()?;
+    let micros: i64 = micros.parse().ok()?;
+    secs.checked_mul(1000)?.checked_add(micros / 1000)
+}
+
 /// Upper bound of the delay before a watcher's recheck, in milliseconds.
 const RECHECK_JITTER_MAX_MS: u64 = 250;
 
@@ -68,11 +77,13 @@ const RECHECK_JITTER_MAX_MS: u64 = 250;
 /// set (or a single member).
 /// Clone is cheap: the inner client is `Arc`-based.
 ///
-/// Per-session FIFO ordering uses an injected [`Clock`] for the
-/// sorted-set score (defaults to [`SystemClock`]). DST tests inject a
-/// `MockClock` via [`with_clock`](Self::with_clock) so the
-/// `max_sessions_per_user` eviction order is deterministic instead of
-/// depending on wall-clock millis between rapid `register()` calls.
+/// Scores and expiry cutoffs are read from the Valkey server's clock (one
+/// `TIME` per operation), not from each app node's own, so nodes whose clocks
+/// disagree still prune and order the same set the same way. DST tests inject
+/// a [`Clock`] via [`with_clock`](Self::with_clock), which replaces the server
+/// clock, so the `max_sessions_per_user` eviction order is deterministic
+/// instead of depending on wall-clock millis between rapid `register()`
+/// calls; with one injected, every node sharing the set must use the same one.
 #[derive(Clone)]
 pub struct ValkeySessionRegistry {
     pub(super) client: Client,
@@ -80,9 +91,10 @@ pub struct ValkeySessionRegistry {
     /// TTL for registry entries. Should be >= session TTL to avoid
     /// premature eviction. Default: 24 hours.
     ttl: Duration,
-    /// Injected clock for the FIFO ordering score. Defaults to
-    /// [`SystemClock`]; tests override via [`with_clock`].
-    clock: Arc<dyn Clock>,
+    /// Injected clock for the score and the expiry cutoff. `None` reads the
+    /// Valkey server's own clock (`TIME`), so app nodes with skewed clocks
+    /// agree; tests override via [`with_clock`](Self::with_clock).
+    clock: Option<Arc<dyn Clock>>,
     /// Random source for the delay before a watcher's recheck after dropped
     /// messages. Defaults to [`SystemRng`]; tests override via
     /// [`with_rng`](Self::with_rng).
@@ -99,7 +111,7 @@ impl ValkeySessionRegistry {
             client,
             prefix: DEFAULT_PREFIX.into(),
             ttl: Duration::from_secs(24 * 60 * 60),
-            clock: Arc::new(SystemClock),
+            clock: None,
             rng: Arc::new(SystemRng),
             subscriber: SharedSubscriber::new(),
         }
@@ -111,18 +123,19 @@ impl ValkeySessionRegistry {
             client,
             prefix: prefix.into(),
             ttl,
-            clock: Arc::new(SystemClock),
+            clock: None,
             rng: Arc::new(SystemRng),
             subscriber: SharedSubscriber::new(),
         }
     }
 
-    /// Inject a [`Clock`] for deterministic-simulation testing.
-    /// Defaults to [`SystemClock`]; pass a `MockClock`-backed handle
-    /// so the FIFO ordering score is deterministic across `register`
-    /// calls.
+    /// Inject a [`Clock`] for deterministic-simulation testing, in place of
+    /// the Valkey server's clock (the default): pass a `MockClock`-backed
+    /// handle so the FIFO ordering score is deterministic across `register`
+    /// calls. Not for production: it makes every node's own clock the
+    /// authority for the shared set.
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
-        self.clock = clock;
+        self.clock = Some(clock);
         self
     }
 
@@ -149,6 +162,59 @@ impl ValkeySessionRegistry {
         degraded_poll_delay(failed_polls, self.draw())
     }
 
+    /// The current time in epoch milliseconds: the injected clock's, or the
+    /// Valkey server's.
+    async fn now_ms(&self) -> Result<i64, ValkeyStoreError> {
+        if let Some(clock) = &self.clock {
+            return Ok(clock.now().timestamp_millis());
+        }
+        let command =
+            fred::types::CustomCommand::new_static("TIME", fred::types::ClusterHash::Random, false);
+        let reply: Vec<String> = self.client.custom(command, Vec::<String>::new()).await?;
+        parse_server_time_ms(&reply).ok_or_else(|| {
+            ValkeyStoreError::Connection(fred::error::Error::new(
+                fred::error::ErrorKind::Protocol,
+                "malformed TIME reply",
+            ))
+        })
+    }
+
+    /// Whether the member is held and unexpired, by reading it and nothing
+    /// else: no slide of the score, no prune. The revocation watchers use
+    /// this, so their own polling never counts as the session's activity and
+    /// an idle session still lapses a `ttl` after its last request.
+    async fn is_live(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<bool, ValkeyStoreError> {
+        let key = registry_key(&self.prefix, user_id.to_string().as_str());
+        let score: Option<f64> = self.client.zscore(&key, session_id.to_string()).await?;
+        let now_ms = self.now_ms().await?;
+        let member_ttl_ms = registry_member_ttl_ms(self.ttl);
+        Ok(score.is_some_and(|score| registry_member_live(score, now_ms, member_ttl_ms)))
+    }
+
+    /// Tell the watchers of `channel` that their session is revoked. The
+    /// entry is already gone from the registry, so a failed publish costs
+    /// only the push: it is tried once more, and when it still fails the
+    /// error is returned so the caller knows the watchers on other nodes were
+    /// not told (they find out on their next recheck or request).
+    async fn publish_revocation(&self, channel: &str) -> Result<(), ValkeyStoreError> {
+        let mut result = self.client.publish::<(), _, _>(channel, "1").await;
+        if result.is_err() {
+            result = self.client.publish::<(), _, _>(channel, "1").await;
+        }
+        result.map_err(|e| {
+            tracing::warn!(
+                target: "axess::session::valkey",
+                error = %e,
+                "revocation was not published; watchers on other nodes were not told"
+            );
+            ValkeyStoreError::from(e)
+        })
+    }
+
     /// One draw from the injected random source.
     fn draw(&self) -> u64 {
         let mut bytes = [0u8; 4];
@@ -168,7 +234,7 @@ impl SessionRegistry for ValkeySessionRegistry {
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
         let sid_str = session_id.to_string();
         let ttl_secs = registry_key_ttl_secs(self.ttl);
-        let now_ms = self.clock.now().timestamp_millis();
+        let now_ms = self.now_ms().await?;
         let cutoff = registry_cutoff_ms(now_ms, registry_member_ttl_ms(self.ttl));
 
         // ZADD with score = epoch ms (from the injected `Clock`).
@@ -177,8 +243,8 @@ impl SessionRegistry for ValkeySessionRegistry {
         // relies on for FIFO semantics. Pipeline ZADD + EXPIRE in a
         // single round-trip so a crash between the two commands
         // cannot leave the sorted set without a TTL (orphan registry
-        // entries). `now_ms` comes from the injected clock, so a
-        // `MockClock` gives deterministic ordering.
+        // entries). `now_ms` is the server's clock unless one is injected,
+        // and a `MockClock` gives deterministic ordering.
         let score = now_ms as f64;
         let pipeline = self.client.pipeline();
         pipeline
@@ -192,7 +258,7 @@ impl SessionRegistry for ValkeySessionRegistry {
 
         debug!(
             user_id = %user_id,
-            session_id = %session_id,
+            session_id = %log_session_id(session_id),
             "session registered in valkey registry"
         );
         Ok(())
@@ -209,7 +275,7 @@ impl SessionRegistry for ValkeySessionRegistry {
         // `None` if absent: equivalent to the previous SISMEMBER
         // boolean, but reading from the sorted-set storage shape.
         let score: Option<f64> = self.client.zscore(&key, &sid_str).await?;
-        let now_ms = self.clock.now().timestamp_millis();
+        let now_ms = self.now_ms().await?;
         let member_ttl_ms = registry_member_ttl_ms(self.ttl);
         let live = score.is_some_and(|score| registry_member_live(score, now_ms, member_ttl_ms));
         if score.is_some() && !live {
@@ -261,12 +327,8 @@ impl SessionRegistry for ValkeySessionRegistry {
 
         // Publish on the user-level revocation channel so any watcher
         // subscribed to *any* of this user's sessions wakes up.
-        // Pub/sub is fire-and-forget; missed messages are tolerable
-        // because request-time `is_valid` catches up on the next
-        // request: `watch_revocation` is for proactive WS close, not
-        // exclusive enforcement.
         let channel = revocation_user_channel(&self.prefix, user_id.to_string().as_str());
-        let _: Result<(), _> = self.client.publish(&channel, "1").await;
+        self.publish_revocation(&channel).await?;
 
         debug!(
             user_id = %user_id,
@@ -285,14 +347,13 @@ impl SessionRegistry for ValkeySessionRegistry {
         self.client.zrem::<(), _, _>(&key, &sid_str).await?;
 
         // Publish on the session-level channel for any watcher of this
-        // specific session. See note in `invalidate_user` re: tolerance
-        // of dropped messages.
+        // specific session.
         let channel = revocation_session_channel(&self.prefix, &sid_str);
-        let _: Result<(), _> = self.client.publish(&channel, "1").await;
+        self.publish_revocation(&channel).await?;
 
         debug!(
             user_id = %user_id,
-            session_id = %session_id,
+            session_id = %log_session_id(session_id),
             "session removed from valkey registry"
         );
         Ok(())
@@ -310,7 +371,7 @@ impl SessionRegistry for ValkeySessionRegistry {
         // default `Ok(vec![])`, silently disabling the limit for every
         // Valkey-backed deployment.
         let key = registry_key(&self.prefix, user_id.to_string().as_str());
-        let now_ms = self.clock.now().timestamp_millis();
+        let now_ms = self.now_ms().await?;
         let cutoff = registry_cutoff_ms(now_ms, registry_member_ttl_ms(self.ttl));
         self.client
             .zremrangebyscore::<(), _, _, _>(&key, expired_min(), expired_max(cutoff))
@@ -344,7 +405,7 @@ impl SessionRegistry for ValkeySessionRegistry {
             let mut failed_polls = 0;
             loop {
                 tokio::time::sleep(self.degraded_poll_delay(failed_polls)).await;
-                let answer = self.is_valid(user_id, session_id).await;
+                let answer = self.is_live(user_id, session_id).await;
                 match after_degraded_poll(answer, failed_polls) {
                     Watch::Polling(next) => failed_polls = next,
                     Watch::Ended | Watch::Waiting => return,
@@ -361,14 +422,14 @@ impl SessionRegistry for ValkeySessionRegistry {
         // replacement flags it for a recheck. `state` says which, and holds the
         // count of consecutive polls the registry did not answer, which each
         // wait backs off on.
-        let mut state = after_check(self.is_valid(user_id, session_id).await);
+        let mut state = after_check(self.is_live(user_id, session_id).await);
         loop {
             let event = match state {
                 Watch::Ended => return,
                 Watch::Polling(failed_polls) => tokio::select! {
                     event = watch.slot.next() => event,
                     () = tokio::time::sleep(self.degraded_poll_delay(failed_polls)) => {
-                        let answer = self.is_valid(user_id, session_id).await;
+                        let answer = self.is_live(user_id, session_id).await;
                         state = after_degraded_poll(answer, failed_polls);
                         continue;
                     }
@@ -383,7 +444,7 @@ impl SessionRegistry for ValkeySessionRegistry {
                 // checks from every watcher.
                 Event::Recheck => {
                     tokio::time::sleep(self.recheck_delay()).await;
-                    state = after_check(self.is_valid(user_id, session_id).await);
+                    state = after_check(self.is_live(user_id, session_id).await);
                 }
                 // The connection is gone: poll the registry until a
                 // replacement connection flags this watcher for a recheck.

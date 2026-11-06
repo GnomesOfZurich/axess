@@ -98,7 +98,7 @@ fn bench_session_json_serde(c: &mut Criterion) {
 
 /// AES-256-GCM encrypt/decrypt roundtrip (encrypted SQLite/Valkey store path).
 fn bench_session_crypto(c: &mut Criterion) {
-    let crypto = SessionCrypto::new([42u8; 32]);
+    let crypto = SessionCrypto::new(axess_core::testing::test_key(42));
     let data = SessionData::default();
     let plaintext = serde_json::to_vec(&data).unwrap();
 

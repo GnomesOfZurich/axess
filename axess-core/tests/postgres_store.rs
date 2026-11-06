@@ -29,7 +29,7 @@ async fn make_store() -> Option<(PostgresSessionStore, sqlx::PgPool)> {
         .connect(&url)
         .await
         .ok()?;
-    let store = PostgresSessionStore::plaintext(pool.clone());
+    let store = PostgresSessionStore::plaintext_insecure(pool.clone());
 
     // init_schema is idempotent (IF NOT EXISTS). Run it every time
     // so tests work regardless of execution order.

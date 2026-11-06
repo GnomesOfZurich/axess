@@ -42,7 +42,7 @@ where
         event: AuthEventType,
         session: Option<&AuthSession>,
     ) -> AuthnError<I::Error> {
-        let builder = if status.is_locked() {
+        let builder = if status.is_suspended() {
             AuthEventBuilder::locked(event)
         } else {
             AuthEventBuilder::failure(event).with_error(AuthFailureReason::NotActive)

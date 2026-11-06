@@ -39,7 +39,9 @@ let store = SqliteSessionStore::new(pool, SessionCrypto::new(key));
 store.init_schema().await?;
 
 let signing_key: [u8; 32] = load_signing_key();
-let session_layer = SessionLayer::new(store, signing_key)
+// One registry for the layer and the service: the layer ends a revoked
+// session on every route, the service records each login in it.
+let session_layer = SessionLayer::new(store, signing_key, session_registry_handle)
     .with_ttl(Duration::from_secs(86400));
 
 let authn = Arc::new(

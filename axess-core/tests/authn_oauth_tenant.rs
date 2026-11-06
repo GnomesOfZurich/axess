@@ -7,6 +7,7 @@ mod common;
 
 use axess_core::authn::AuditContext;
 use axess_core::authn::{error::AuthnError, service::AuthnService};
+use axess_core::testing::AuthSessionTestExt;
 use axess_core::testing::{
     mock_authn::{MockFactorStore, MockIdentityStore},
     test_session,
@@ -126,11 +127,7 @@ async fn complete_oauth_login_refuses_a_suspended_tenant() {
     use axess_core::authn::types::{EntityState, StatusDetail};
     let user = test_user_in_tenant("u1", "alice", "t1");
     let mut tenant = test_tenant();
-    tenant.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now(),
-        until: None,
-    });
+    tenant.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
     let identity = MockIdentityStore::new()
         .with_tenant(tenant)
         .with_user(user.clone());
@@ -156,11 +153,7 @@ async fn complete_oauth_login_refuses_a_suspended_tenant() {
 async fn complete_oauth_login_refuses_a_suspended_user_without_a_registry() {
     use axess_core::authn::types::{EntityState, StatusDetail};
     let mut user = test_user_in_tenant("u1", "alice", "t1");
-    user.status = EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now(),
-        until: None,
-    });
+    user.status = EntityState::Suspended(StatusDetail::administrative("hold", Utc::now()));
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(user.clone());
@@ -192,11 +185,7 @@ async fn complete_oauth_login_refuses_a_suspended_user_without_a_registry() {
 #[tokio::test]
 async fn complete_oauth_login_answers_each_non_active_status_with_its_own_variant() {
     use axess_core::authn::types::{EntityState, StatusDetail};
-    let detail = |until| StatusDetail {
-        reason: "hold".into(),
-        since: Utc::now(),
-        until,
-    };
+    let detail = |until| StatusDetail::administrative("hold", Utc::now()).with_until(until);
     let ends = Utc::now() + chrono::Duration::hours(1);
     let cases = [
         (EntityState::Suspended(detail(None)), None),

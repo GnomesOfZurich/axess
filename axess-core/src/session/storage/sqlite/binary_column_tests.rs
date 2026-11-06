@@ -7,7 +7,7 @@ use crate::session::data::SessionData;
 use axess_rng::{SecureRng, SystemRng};
 use sqlx::sqlite::SqlitePoolOptions;
 
-const KEY: [u8; 32] = [5u8; 32];
+const KEY: [u8; 32] = crate::testing::test_key(5);
 
 fn admin() -> SessionData {
     SessionData {
@@ -240,7 +240,7 @@ async fn a_cycle_writes_the_new_row_as_bytes() {
 #[tokio::test]
 async fn a_legacy_plaintext_json_row_still_loads() {
     let pool = pool().await;
-    let store = SqliteSessionStore::plaintext(pool);
+    let store = SqliteSessionStore::plaintext_insecure(pool);
     store.init_schema().await.unwrap();
     let id = SessionId::new(&SystemRng);
     sqlx::query("INSERT INTO sessions (id, data, expires_at) VALUES (?1, ?2, ?3)")

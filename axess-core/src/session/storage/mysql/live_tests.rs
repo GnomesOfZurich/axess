@@ -9,7 +9,7 @@ use axess_clock::testing::MockClock;
 use axess_rng::SystemRng;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
-const KEY: [u8; 32] = [3u8; 32];
+const KEY: [u8; 32] = crate::testing::test_key(3);
 const TTL: Duration = Duration::from_secs(60);
 
 async fn store() -> MysqlSessionStore {
@@ -101,7 +101,7 @@ async fn an_ended_session_is_never_revived() {
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn a_plaintext_store_round_trips_and_deletes() {
     let pool = sql_live::mysql_pool(2).await;
-    let store = MysqlSessionStore::plaintext(pool);
+    let store = MysqlSessionStore::plaintext_insecure(pool);
     store.init_schema().await.unwrap();
     let id = new_id();
     store.save(&id, &admin(), TTL).await.unwrap();
@@ -469,4 +469,29 @@ async fn the_documented_upgrade_step_makes_an_old_table_work() {
 #[ignore = "requires a running MySQL (MYSQL_URL)"]
 async fn update_if_revision_keeps_the_contract() {
     crate::testing::store_contract::assert_update_if_revision_contract(&store().await).await;
+}
+
+/// The store refuses a payload over its cap and keeps the row it had.
+#[tokio::test]
+#[ignore = "requires a running MySQL (MYSQL_URL)"]
+async fn an_oversized_payload_is_refused_and_the_old_row_kept() {
+    let store = store().await;
+    let id = new_id();
+    store.save(&id, &admin(), TTL).await.unwrap();
+    let big = SessionData {
+        custom: serde_json::json!({"blob": "x".repeat(100 * 1024)}),
+        ..SessionData::default()
+    };
+    assert!(matches!(
+        store.save(&id, &big, TTL).await,
+        Err(SqlStoreError::PayloadTooLarge { .. })
+    ));
+    assert!(matches!(
+        store.cycle(&id, &new_id(), &big, TTL, true).await,
+        Err(SqlStoreError::PayloadTooLarge { .. })
+    ));
+    assert_eq!(
+        store.load(&id).await.unwrap().unwrap().custom["role"],
+        "admin"
+    );
 }

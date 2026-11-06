@@ -12,8 +12,8 @@ use std::pin::Pin;
 // baked in: `is_valid` fails closed, `invalidate_*` report a failed
 // revocation as a [`RevocationError`], `register` returns `bool`,
 // `held_sessions` returns the registry's error, and `active_sessions`, built
-// on it, fails open with `vec![]` so registry outages don't lock users out
-// of the concurrent-session limit.
+// on it, fails open with `vec![]`. The concurrent-session limit does not use
+// `active_sessions`: with a cap set, a login whose listing fails is refused.
 
 /// A revocation the registry could not carry out.
 ///
@@ -93,23 +93,15 @@ pub trait SessionRegistryHandle: SessionRevoker {
     /// [`SessionLiveness::Unknown`] when it could not answer. Bookkeeping
     /// that drops state for ended sessions acts on `Gone` alone.
     ///
-    /// The default cannot tell an error from a negative answer, because
-    /// [`is_valid`](Self::is_valid) fails closed with `false`; it reports
-    /// `Unknown` for `false`. [`SessionRegistryAdapter`] overrides it with the
-    /// exact answer.
+    /// Required: [`is_valid`](Self::is_valid) fails closed with `false`, so
+    /// it cannot tell an error from a negative answer, and a handle that
+    /// derived `liveness` from it could only ever say `Unknown` for a revoked
+    /// session. [`SessionRegistryAdapter`] reports the exact answer.
     fn liveness<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
         session_id: &'a SessionId,
-    ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>> {
-        Box::pin(async move {
-            if self.is_valid(user_id, session_id).await {
-                SessionLiveness::Valid
-            } else {
-                SessionLiveness::Unknown
-            }
-        })
-    }
+    ) -> Pin<Box<dyn Future<Output = SessionLiveness> + Send + 'a>>;
 
     /// Register a session under the user. Returns `true` on success,
     /// `false` on registry error. Callers that *require* the registry
@@ -135,25 +127,15 @@ pub trait SessionRegistryHandle: SessionRevoker {
         user_id: &'a crate::authn::ids::UserId,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>>;
 
-    /// [`held_sessions`](Self::held_sessions) for the callers that go on
-    /// without the list when the registry cannot answer: an outage is
-    /// logged and answered with an empty list, so the concurrent-session
-    /// limit does not lock users out while the registry is down.
+    /// The same list as [`held_sessions`](Self::held_sessions), under the name
+    /// admin session lists use. A registry that cannot answer returns the
+    /// error, never an empty list: "no sessions" and "could not ask" must not
+    /// look alike to a caller that enforces a limit or revokes on the result.
     fn active_sessions<'a>(
         &'a self,
         user_id: &'a crate::authn::ids::UserId,
-    ) -> Pin<Box<dyn Future<Output = Vec<SessionId>> + Send + 'a>> {
-        Box::pin(async move {
-            self.held_sessions(user_id).await.unwrap_or_else(|e| {
-                tracing::error!(
-                    user_id = %user_id,
-                    error = %e,
-                    "session registry could not list the user's sessions; \
-                     concurrent session limit disabled for this request"
-                );
-                Vec::new()
-            })
-        })
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionId>, RevocationError>> + Send + 'a>> {
+        self.held_sessions(user_id)
     }
 }
 

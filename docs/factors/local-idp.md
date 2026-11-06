@@ -371,6 +371,7 @@ need custom fields.
 use axess::jwt::verifier::JwtVerifier;
 
 let verifier = JwtVerifier::new(idp.jwks_handle())
+    .with_issuer(idp.issuer())
     .with_audience("https://api.example.com")
     .with_algorithms(idp.verifier_algorithms());
 

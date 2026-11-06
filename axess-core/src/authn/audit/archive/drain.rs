@@ -294,3 +294,107 @@ async fn a_drain_archives_around_a_row_the_sink_always_refuses() {
     assert!(lp.drain().await.is_err(), "the refused row is reported");
     assert_eq!(*table.rows.lock().unwrap(), vec![0]);
 }
+
+/// A sink that refuses every batch holding the event of any of its rows.
+struct RefusesAll(Vec<u64>);
+
+impl AuditArchiver for RefusesAll {
+    type Error = std::io::Error;
+    async fn archive_batch(
+        &self,
+        _: &ArchiveBatchId,
+        events: &[AuthEvent],
+    ) -> Result<(), Self::Error> {
+        if events
+            .iter()
+            .any(|e| self.0.contains(&(e.event_time as u64)))
+        {
+            return Err(std::io::Error::other("row refused"));
+        }
+        Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "refuses-all"
+    }
+}
+
+/// With a batch of one, the oldest row refused for good is the whole batch:
+/// the rows behind it must still be archived.
+#[tokio::test]
+async fn a_batch_of_one_moves_past_a_row_the_sink_always_refuses() {
+    let table = Table::with(4);
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        Refuses(0),
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    )
+    .with_batch_size(1);
+    for _ in 0..20 {
+        let _ = lp.tick().await;
+    }
+    assert_eq!(*table.rows.lock().unwrap(), vec![0]);
+}
+
+/// Bad rows at both ends of a batch look like a sink that is down; they must
+/// not hold the good rows between them back for ever.
+#[tokio::test]
+async fn bad_rows_at_both_ends_of_a_batch_do_not_stop_the_rows_between() {
+    let table = Table::with(14);
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        RefusesAll(vec![0, 9]),
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    )
+    .with_batch_size(10);
+    for _ in 0..20 {
+        let _ = lp.tick().await;
+    }
+    assert_eq!(*table.rows.lock().unwrap(), vec![0, 9]);
+}
+
+/// A sink that was down for a while takes the rows once it is back.
+#[tokio::test]
+async fn a_row_skipped_while_the_sink_was_down_is_offered_again() {
+    struct Switch(Arc<Mutex<bool>>);
+    impl AuditArchiver for Switch {
+        type Error = std::io::Error;
+        async fn archive_batch(
+            &self,
+            _: &ArchiveBatchId,
+            _: &[AuthEvent],
+        ) -> Result<(), Self::Error> {
+            if *self.0.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("sink down"))
+            }
+        }
+        fn name(&self) -> &'static str {
+            "switch"
+        }
+    }
+    let up = Arc::new(Mutex::new(false));
+    let table = Table::with(3);
+    let clock = axess_clock::testing::MockClock::now();
+    let lp = AuditRetentionLoop::new(
+        table.clone(),
+        Switch(up.clone()),
+        AuditRetentionPolicy::default().with_archive_after(Duration::ZERO),
+    )
+    .with_batch_size(1)
+    .with_clock(Arc::new(clock.clone()));
+    for _ in 0..10 {
+        let _ = lp.tick().await;
+    }
+    assert_eq!(table.left(), 3, "nothing could be archived");
+    *up.lock().unwrap() = true;
+    clock.advance(chrono::Duration::hours(25));
+    for _ in 0..10 {
+        let _ = lp.tick().await;
+    }
+    assert_eq!(
+        table.left(),
+        0,
+        "everything is archived once the sink is up"
+    );
+}

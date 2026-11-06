@@ -313,9 +313,7 @@ impl TokenExchangeClient {
 
         Ok(TokenExchangeResponse {
             access_token: parsed.access_token,
-            issued_token_type: parsed
-                .issued_token_type
-                .unwrap_or_else(|| token_types::ACCESS_TOKEN.to_string()),
+            issued_token_type: parsed.issued_token_type,
             token_type: parsed.token_type,
             expires_in: parsed.expires_in,
             scopes,
@@ -333,8 +331,8 @@ struct TokenExchangeResponseBody {
     /// copy would leave the original in the heap for the process's
     /// lifetime.
     access_token: ZeroizedString,
-    #[serde(default)]
-    issued_token_type: Option<String>,
+    /// Required (RFC 8693 section 2.2.1): an answer without it is refused.
+    issued_token_type: String,
     /// Required (RFC 8693 section 2.2.1): an answer without it is refused,
     /// as the outbound OAuth client refuses one.
     token_type: String,

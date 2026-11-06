@@ -52,9 +52,11 @@ Instead: one `WorkloadResolver<C, F, R>` is generic over
 - `R`; JTI replay-store type (defaults to `NoReplay`)
 
 The library handles JWT verification (signature against JWKS,
-`iss`/`aud`/`exp`/`nbf`/`alg` checks), trust-domain pinning, and
-`Principal` construction. The closure handles claim
-→ identity-components.
+`iss`/`aud`/`exp`/`nbf`/`alg` checks), `WorkloadId` construction under the
+resolver's own trust domain, the tenant lookup from the verified claims'
+slug, and `Principal` construction. The closure handles claim
+→ identity-components (service name, tenant slug, attributes); it cannot
+name the trust domain or the tenant.
 
 ## Ready-made recipes
 
@@ -75,7 +77,7 @@ custom claim block carries the pod's identity.
 
 ```rust,ignore
 use axess_example_workload_identity::kubernetes::{
-    k8s_sa_mapper, K8sCustomClaims,
+    k8s_sa_mapper_pinned, K8sCustomClaims, SaUidPins,
 };
 use axess_factors::federation::workload::WorkloadResolver;
 use axess_factors::jwt::verifier::JwtVerifier;
@@ -89,16 +91,18 @@ let verifier = Arc::new(
         .with_audience("axess-platform"),
 );
 let trust_domain = TrustDomain::new("cluster.local").unwrap();
+// The service accounts you trust, each with the UID the cluster gave it.
+let pins = SaUidPins::new().pin("payments", "worker", "5f6e1c0a-...");
 
-// Per request: adopter middleware peeks at the token to look up
-// tenant_id from the namespace, then constructs the resolver.
+// Per request: the resolver looks the tenant up from the namespace in the
+// verified token, with the registry you give it (None refuses the token).
 let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
     verifier.clone(),
     trust_domain.clone(),
-    tenant_id,
+    move |namespace: &str| tenants.get(namespace).copied(),
     Issuer::custom("kubernetes").unwrap(),
     bearer_token,
-    k8s_sa_mapper(trust_domain),
+    k8s_sa_mapper_pinned(pins),
 );
 let principal = resolver.resolve().await?;
 ```
@@ -110,11 +114,12 @@ recipe's path layout if your trust-domain convention differs.
 A service account is named by `(namespace, name)`, and anyone who may create
 service accounts in that namespace can delete one and create another under
 the same name. The `kubernetes.io.serviceaccount.uid` claim does not survive
-that: a recreated account has a new UID. `k8s_sa_mapper` records the UID as
-the `sa_uid` attribute but does not require it. To refuse a recreated or
-unregistered account, use `k8s_sa_mapper_pinned` with a `SaUidPins` listing the
-UID registered for each `(namespace, name)` you trust; it rejects a token whose
-UID is missing or different.
+that: a recreated account has a new UID. The wire-up above therefore uses
+`k8s_sa_mapper_pinned` with a `SaUidPins` listing the UID registered for each
+`(namespace, name)` you trust; it rejects a token whose UID is missing or
+different, and any account that is not listed. The unpinned `k8s_sa_mapper`
+records the UID as the `sa_uid` attribute but does not require it, so a
+recreated account inherits the old name's trust; avoid it.
 
 OpenShift and Amazon EKS issue the same bound service-account token with the
 same `kubernetes.io` claim block, so they use this recipe unchanged; what
@@ -172,11 +177,10 @@ let trust_domain = TrustDomain::new("gitlab.ci").unwrap();
 let resolver = WorkloadResolver::<GitLabClaims, _, _>::new(
     verifier.clone(),
     trust_domain.clone(),
-    tenant_id,
+    move |namespace_id: &str| tenants.get(namespace_id).copied(), // None refuses
     Issuer::custom("gitlab_ci").unwrap(),
     bearer_token,
     gitlab_mapper(
-        trust_domain,
         GitLabAllowlist::new()
             .namespace_id("1204")
             .project_id("4711")
@@ -269,8 +273,8 @@ Write your own recipe. For any new IdP:
    sends.
 3. Write a mapper closure
    `Fn(&VerifiedClaims<YourClaims>) -> Result<WorkloadMapping, IdentityError>`
-   that produces the `(workload_id, service_name, tenant_slug,
-   attributes)` shape.
+   that produces the `(service_name, tenant_slug, attributes)` shape;
+   the resolver builds the workload id from them.
 4. Wire as above, with `Issuer::custom("your_idp_label").unwrap()`
    for audit-log attribution (the constructor validates the label
    format: `[a-z0-9_]{1,32}`).

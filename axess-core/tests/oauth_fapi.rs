@@ -62,7 +62,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
     fn binds_to_dpop(&self) -> bool {
         false
     }
-    fn refresh_token<'a>(
+    fn refresh_token_unchecked<'a>(
         &'a self,
         refresh_token: &'a str,
         _original_nonce: Option<&'a str>,
@@ -111,7 +111,7 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
             )))
         })
     }
-    fn fetch_userinfo<'a>(
+    fn fetch_userinfo_unchecked<'a>(
         &'a self,
         access_token: &'a str,
         _dpop: Option<axess_factors::oauth::DpopSigner<'a>>,
@@ -175,12 +175,12 @@ impl axess_factors::oauth::OAuthProvider for FapiStubProvider {
         tracing::trace!(?options, "OAuth provider stub: build_auth_url_par");
         Box::pin(async move {
             let url = url::Url::parse("https://idp.example.com/authorize?request_uri=urn:ietf:params:oauth:request_uri:stub").unwrap();
-            Ok((
+            Ok(axess_factors::oauth::AuthUrlResult {
                 url,
-                "stub-csrf-state".to_string(),
-                "stub-nonce".to_string(),
-                "a".repeat(43),
-            ))
+                csrf_state: "stub-csrf-state".to_string(),
+                nonce: "stub-nonce".to_string(),
+                pkce_verifier: "a".repeat(43),
+            })
         })
     }
 }

@@ -67,6 +67,8 @@ Applied so far across several files where the tests-to-production ratio exceeded
 
 `AuthSession` carries identity / session-state accessors as `pub`. State *mutation* methods (`set_authenticated`, `begin_authenticating`, `advance_factor`, `record_attempt_at`) are state-machine transitions that the factor pipeline drives; they are `pub(crate)` so handler code cannot corrupt the state machine. Adopters drive flow through `AuthnService`; the session is read-only-ish from outside axess-core.
 
+Tests that need a session in a given state import `axess::testing::AuthSessionTestExt` (`axess_core::testing::AuthSessionTestExt` in axess-core), which re-exposes the transitions on `AuthSession`; an import of it in handler code is a review flag.
+
 Per-app workflow mutations (`set_identifying`, `set_pending_workflow`, `clear`, `regenerate`) remain `pub`; apps build their own two-step identify / workflow-step / logout flows on top.
 
 ### No `#[deprecated]` pre-1.0

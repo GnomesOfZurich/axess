@@ -3,6 +3,7 @@
 
 #![cfg(all(feature = "memory", feature = "device"))]
 
+use axess_core::testing::AuthSessionTestExt;
 use std::sync::Arc;
 
 use axess_clock::SystemClock;
@@ -57,9 +58,12 @@ async fn whoami(session: AuthSession) -> &'static str {
 }
 
 fn session_layer(store: &MemoryDeviceStore) -> SessionLayer<MemorySessionStore> {
-    SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
-        .with_secure(false)
-        .with_device_resolver(resolver(store))
+    SessionLayer::without_registry_insecure(
+        MemorySessionStore::new(),
+        axess_core::testing::test_key(42),
+    )
+    .with_secure(false)
+    .with_device_resolver(resolver(store))
 }
 
 /// No `TenantId` extension anywhere: the tenant is only in the session.

@@ -100,13 +100,35 @@ fn peek_spiffe_rejects_extra_path_segments() {
     );
 }
 
+/// The adopter's slug-to-tenant registry: only `ekekrantz` is known.
+fn tenant_lookup() -> impl Fn(&str) -> Option<TenantId> + Send + Sync + 'static {
+    |slug: &str| (slug == "ekekrantz").then(sample_tenant)
+}
+
+/// The tenant is the lookup's answer for the certificate's own slug; a slug
+/// it does not know is refused.
+#[tokio::test]
+async fn an_unknown_tenant_slug_is_refused() {
+    let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/stranger");
+    let resolver = MtlsResolver::new(
+        cert,
+        TrustDomain::new("gnomes.local").unwrap(),
+        tenant_lookup(),
+    );
+    let err = resolver.resolve().await.expect_err("unknown slug");
+    assert!(
+        matches!(err, IdentityError::NotAuthenticated),
+        "expected NotAuthenticated, got {err:?}"
+    );
+}
+
 #[tokio::test]
 async fn mtls_resolver_returns_workload_principal_on_match() {
     let cert = cert_with_san_uri("spiffe://gnomes.local/compute-worker/ekekrantz");
     let resolver = MtlsResolver::new(
         cert,
         TrustDomain::new("gnomes.local").unwrap(),
-        sample_tenant(),
+        tenant_lookup(),
     );
     let principal = resolver.resolve().await.expect("must resolve");
     match principal {
@@ -133,7 +155,7 @@ async fn mtls_resolver_rejects_trust_domain_mismatch() {
     let resolver = MtlsResolver::new(
         cert,
         TrustDomain::new("gnomes.local").unwrap(),
-        sample_tenant(),
+        tenant_lookup(),
     );
     let err = resolver
         .resolve()
@@ -151,7 +173,7 @@ async fn mtls_resolver_rejects_non_spiffe_cert() {
     let resolver = MtlsResolver::new(
         cert,
         TrustDomain::new("gnomes.local").unwrap(),
-        sample_tenant(),
+        tenant_lookup(),
     );
     let err = resolver
         .resolve()
@@ -197,7 +219,7 @@ async fn from_chain_takes_the_leaf_and_resolves() {
     let resolver = MtlsResolver::from_chain(
         &chain,
         TrustDomain::new("gnomes.local").unwrap(),
-        sample_tenant(),
+        tenant_lookup(),
     )
     .expect("non-empty chain");
 
@@ -217,7 +239,7 @@ fn from_chain_rejects_an_empty_chain() {
     match MtlsResolver::from_chain(
         &PeerCertChain::new(Vec::new()),
         TrustDomain::new("gnomes.local").unwrap(),
-        sample_tenant(),
+        tenant_lookup(),
     ) {
         Err(MtlsError::EmptyChain) => {}
         Err(other) => panic!("expected EmptyChain, got {other}"),

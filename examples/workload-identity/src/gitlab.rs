@@ -44,11 +44,10 @@
 //! let resolver = WorkloadResolver::<GitLabClaims, _, _>::new(
 //!     verifier.clone(),
 //!     trust_domain.clone(),
-//!     tenant_id,                          // adopter looked up from namespace_id
+//!     |namespace_id| tenants.get(namespace_id).copied(), // None refuses the token
 //!     Issuer::custom("gitlab_ci").unwrap(),
 //!     bearer_token,
 //!     gitlab_mapper(
-//!         trust_domain,
 //!         GitLabAllowlist::new()
 //!             .namespace_id("1204")
 //!             .project_id("4711")
@@ -90,7 +89,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use axess_factors::federation::workload::WorkloadMapping;
 use axess_factors::jwt::verifier::VerifiedClaims;
-use axess_identity::{IdentityError, TrustDomain, WorkloadId};
+use axess_identity::IdentityError;
 use serde::Deserialize;
 
 /// GitLab writes booleans in ID tokens as the strings `"true"` and `"false"`;
@@ -241,18 +240,15 @@ impl GitLabAllowlist {
 
 /// Build the claim-mapping closure for [`WorkloadResolver`](axess_factors::federation::workload::WorkloadResolver).
 ///
-/// Captures the `trust_domain` so the synthesised `WorkloadId` lives
-/// under the SPIFFE trust domain the resolver pins.
+/// The resolver builds the `WorkloadId` itself, under the trust domain it
+/// pins, from the service name and tenant slug this mapper returns.
 pub fn gitlab_mapper(
-    trust_domain: TrustDomain,
     allowlist: GitLabAllowlist,
 ) -> impl Fn(&VerifiedClaims<GitLabClaims>) -> Result<WorkloadMapping, IdentityError> + Send + Sync
 {
     move |claims| {
         let c = &claims.custom;
         allowlist.check(c)?;
-
-        let workload_id = WorkloadId::build(&trust_domain, &c.project_id, &c.namespace_id)?;
 
         let mut attributes = BTreeMap::new();
         let mut put = |key: &str, value: Option<&String>| {
@@ -272,7 +268,6 @@ pub fn gitlab_mapper(
         put("pipeline_id", c.pipeline_id.as_ref());
 
         Ok(WorkloadMapping {
-            workload_id,
             service_name: c.project_id.clone(),
             tenant_slug: c.namespace_id.clone(),
             attributes,

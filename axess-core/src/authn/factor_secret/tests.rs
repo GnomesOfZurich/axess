@@ -87,6 +87,29 @@ fn the_previous_key_opens_and_reports_the_rotation() {
 }
 
 #[test]
+#[should_panic(expected = "factor secret encryption key is a single repeated byte")]
+fn new_refuses_a_constant_key() {
+    let _ = FactorSecretCipher::new([7u8; 32]);
+}
+
+#[test]
+#[should_panic(expected = "previous factor secret encryption key is a single repeated byte")]
+fn with_previous_key_refuses_a_constant_key() {
+    let _ = FactorSecretCipher::new(KEY).with_previous_key([7u8; 32]);
+}
+
+#[test]
+#[should_panic(expected = "equals the current key")]
+fn with_previous_key_refuses_the_current_key() {
+    let _ = FactorSecretCipher::new(KEY).with_previous_key(KEY);
+}
+
+#[test]
+fn new_unchecked_accepts_a_constant_key() {
+    let _ = FactorSecretCipher::new_unchecked([7u8; 32]);
+}
+
+#[test]
 fn a_constant_key_is_refused_by_try_new() {
     assert!(FactorSecretCipher::try_new([0u8; 32]).is_err());
     assert!(FactorSecretCipher::try_new([7u8; 32]).is_err());
@@ -199,7 +222,7 @@ fn sealed_by_the_first_release(scope: &AuthnScope, kind: &str) -> SealedFactorSe
 
 #[test]
 fn a_secret_sealed_by_the_first_release_opens_and_asks_to_be_sealed_again() {
-    let cipher = FactorSecretCipher::new(KEY);
+    let cipher = FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Accept);
     let scope = scope("t1", "u1");
     let old = sealed_by_the_first_release(&scope, "totp");
     let opened = cipher
@@ -223,11 +246,17 @@ fn a_secret_sealed_by_the_first_release_opens_and_asks_to_be_sealed_again() {
 }
 
 #[test]
-fn the_first_bindings_default_reads_and_a_rejecting_policy_or_a_lapsed_cutoff_refuses_it() {
+fn the_first_binding_is_refused_by_default_and_read_only_when_asked() {
     let scope = scope("t1", "u1");
     let old = sealed_by_the_first_release(&scope, "totp");
     let totp = FactorSecretBinding::new(&scope, &FactorKind::Totp);
-    assert!(FactorSecretCipher::new(KEY).open(&old, totp).is_ok());
+    assert_eq!(
+        FactorSecretCipher::new(KEY).open(&old, totp).err(),
+        Some(FactorSecretError::Open),
+        "the default must not read the first release's binding"
+    );
+    let accepting = FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Accept);
+    assert!(accepting.open(&old, totp).is_ok());
 
     let rejecting = FactorSecretCipher::new(KEY).with_first_binding(LegacyBlobs::Reject);
     assert_eq!(
@@ -238,7 +267,7 @@ fn the_first_bindings_default_reads_and_a_rejecting_policy_or_a_lapsed_cutoff_re
     // "totp" opened a TOTP secret.
     let custom = FactorKind::Federated(FederatedProvider::Custom("totp".to_string()));
     assert!(
-        FactorSecretCipher::new(KEY)
+        accepting
             .open(&old, FactorSecretBinding::new(&scope, &custom))
             .is_ok()
     );

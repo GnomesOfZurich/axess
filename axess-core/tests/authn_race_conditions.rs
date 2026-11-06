@@ -41,6 +41,7 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
     let registry = MemorySessionRegistry::new();
     let svc = AuthnService::builder(identity.clone(), factors)
         .with_registry(registry.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -54,11 +55,7 @@ async fn auth_completing_concurrently_with_suspend_returns_locked() {
     identity
         .suspend_user(
             &uid("u1"),
-            StatusDetail {
-                reason: "concurrent admin suspend".into(),
-                since: Utc::now(),
-                until: None,
-            },
+            StatusDetail::administrative("concurrent admin suspend", Utc::now()),
         )
         .await
         .unwrap();
@@ -110,6 +107,7 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     let inspector = factors.clone();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -143,8 +141,10 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
             .unwrap()
     }
 
-    // Three wrong codes: the limit.
-    for _ in 0..3 {
+    // Three wrong codes: the limit. Each waits out the delay the one before
+    // it earned, so the throttle refuses none of them.
+    for delay in [0, 1, 2] {
+        clock.advance(chrono::Duration::seconds(delay));
         assert!(matches!(
             try_code(&service, "000000").await,
             FactorOutcome::InvalidCredential
@@ -162,6 +162,7 @@ async fn hotp_locks_after_max_attempts_and_keeps_the_token_in_sync() {
     assert!(hotp.is_locked_at(clock.now()), "the factor is locked");
 
     // While the lock holds, the genuine code is refused and nothing moves.
+    clock.advance(chrono::Duration::seconds(4));
     let code_0 = generate_hotp_code(secret, 0);
     assert!(matches!(
         try_code(&service, &code_0).await,
@@ -206,8 +207,10 @@ async fn wrong_password_during_counter_outage_never_returns_err() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     service
@@ -255,8 +258,10 @@ async fn wrong_password_during_counter_outage_allows_when_configured() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
 
     let session = test_session();
     service
@@ -295,8 +300,10 @@ async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
 
     identity.arm_record_event_failure();
 
@@ -330,7 +337,9 @@ async fn audit_outage_fails_closed_identically_for_known_and_unknown_users() {
 #[tokio::test]
 async fn unknown_identifier_attempts_reach_the_audit_trail() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
-    let service = AuthnService::new(identity.clone(), MockFactorStore::new())
+    let service = AuthnService::builder(identity.clone(), MockFactorStore::new())
+        .allow_plaintext_factor_secrets()
+        .build()
         .with_audit_context(AuditContext::default());
 
     let outcome = service

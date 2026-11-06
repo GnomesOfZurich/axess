@@ -20,12 +20,14 @@ use std::net::IpAddr;
 /// at most this many buckets and cannot fill the shared table.
 pub(super) const HEADER_SLOTS: u64 = 16;
 
-/// Sentinel bucket key for unauthenticated requests when the extractor is
-/// scoped to an authenticated identity (`UserId` / `TenantId`). All such
-/// requests share a single bucket so the per-identity rate limit cannot be
-/// trivially evaded by sending unauthenticated traffic; they are
-/// rate-limited collectively under this key.
-pub(super) const ANONYMOUS_BUCKET: &str = "anon";
+/// Overflow buckets login identifiers fold into once the table is three
+/// quarters full. The identifier's digest picks one, so the table grows by at
+/// most this many buckets however many names are minted.
+///
+/// Every origin shares them, so an attacker who fills the table and then
+/// drains them limits new identifiers for everyone: that is the cap's own
+/// alarm, not something the fold hides.
+pub(super) const LOGIN_OVERFLOW_BUCKETS: u64 = 1024;
 
 /// Bucket for requests whose origin could not be established: no peer
 /// address, or no `ClientIp` because the layer is not installed. Everything
@@ -191,22 +193,41 @@ impl Target {
     }
 }
 
+/// A prerequisite of the extractor is missing from the request: the layer
+/// that inserts it is not installed, or runs after the limiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Misconfigured;
+
 /// The bucket key for a request, as a plain string (the same key
-/// [`resolve_target`] puts in [`Target::key`]).
+/// [`resolve_target`] puts in [`Target::key`]), with shared buckets allowed.
 #[cfg(test)]
 pub(super) fn extract_key(req: &Request<Body>, extractor: &KeyExtractor) -> String {
     resolve_target(req, extractor).key
 }
 
+/// The target of a request with shared buckets allowed (the opt-out).
+#[cfg(test)]
 pub(super) fn resolve_target(req: &Request<Body>, extractor: &KeyExtractor) -> Target {
-    match extractor {
+    try_resolve_target(req, extractor, true).expect("shared buckets allowed")
+}
+
+/// The target of a request. When `allow_shared` is false, a missing
+/// prerequisite is [`Misconfigured`] (after one throttled error log) instead
+/// of a bucket every such request shares or a per-peer stand-in.
+pub(super) fn try_resolve_target(
+    req: &Request<Body>,
+    extractor: &KeyExtractor,
+    allow_shared: bool,
+) -> Result<Target, Misconfigured> {
+    let unidentified = |name: &'static str| unidentified_target(req, name, allow_shared);
+    Ok(match extractor {
         KeyExtractor::ClientIp => client_ip_target(req),
-        KeyExtractor::PeerIp => peer_target(req, ""),
+        KeyExtractor::PeerIp => peer_target(req, "", allow_shared)?,
         KeyExtractor::UserId => req
             .extensions()
             .get::<RateLimitUserId>()
             .map(|u| Target::plain(bound_key(format!("user:{}", u.0))))
-            .unwrap_or_else(|| Target::shared(ANONYMOUS_BUCKET)),
+            .map_or_else(|| unidentified("UserId"), Ok)?,
         KeyExtractor::TenantId => req
             .extensions()
             .get::<RateLimitTenantId>()
@@ -215,19 +236,21 @@ pub(super) fn resolve_target(req: &Request<Body>, extractor: &KeyExtractor) -> T
                 shared: true,
                 ..Target::plain(bound_key(format!("tenant:{}", t.0)))
             })
-            .unwrap_or_else(|| Target::shared(ANONYMOUS_BUCKET)),
+            .map_or_else(|| unidentified("TenantId"), Ok)?,
         KeyExtractor::LoginIdentifier => match req.extensions().get::<RateLimitLoginIdentifier>() {
             Some(id) => Target {
                 key: bound_key(format!("login:{}", id.bucket_key())),
                 group: None,
-                // Folded by origin: the address of an IPv4 client, the /48 of an IPv6 client, so the
-                // overflow itself cannot be minted per /64.
-                fold_into: Some(format!("login-ovf:{}", origin_group(req))),
+                // Folded by identifier, not by origin: a client that fills
+                // the table with minted names must not decide which bucket
+                // the next name lands in, and every origin that names one
+                // account has to draw on the same budget.
+                fold_into: Some(login_overflow_key(&id.bucket_key())),
                 fold_near_cap: true,
                 // Everyone who targets this account shares it.
                 shared: true,
             },
-            None => Target::shared(ANONYMOUS_BUCKET),
+            None => unidentified("LoginIdentifier")?,
         },
         // A header value is the caller's own claim, so it only subdivides a
         // bucket the caller cannot choose: an authenticated identity. Without
@@ -242,28 +265,77 @@ pub(super) fn resolve_target(req: &Request<Body>, extractor: &KeyExtractor) -> T
                 (Some(user), Some(v)) => {
                     Target::plain(bound_key(format!("h:{}:{}", user.0, header_slot(&v))))
                 }
-                _ => peer_target(req, "ip:"),
+                // No header, or one that is not text: a fixed slot of the
+                // user's own, not a second budget in the address bucket.
+                (Some(user), None) => Target::plain(bound_key(format!("h:{}:none", user.0))),
+                (None, _) => peer_target(req, "ip:", allow_shared)?,
             }
         }
-    }
+    })
 }
 
-/// The overflow key of the request's origin: the resolved client address when the
-/// client-IP layer ran, else the TCP peer.
-fn origin_group(req: &Request<Body>) -> String {
-    let resolved = req
-        .extensions()
-        .get::<crate::client_ip::ClientIp>()
-        .and_then(|ip| ip.get());
-    match resolved.or_else(|| peer_addr(req)) {
-        Some(addr) => match addr.to_canonical() {
-            // An IPv4 origin is its own address; an IPv6 one is its /48,
-            // which is what it can mint at will.
-            IpAddr::V4(v4) => v4.to_string(),
-            addr @ IpAddr::V6(_) => ip_group(addr),
-        },
-        None => UNKNOWN_BUCKET.to_owned(),
+/// The overflow bucket a login identifier folds into near the cap: one of
+/// [`LOGIN_OVERFLOW_BUCKETS`], chosen by the digest of its bucket key.
+fn login_overflow_key(bucket_key: &str) -> String {
+    let digest = Sha256::digest(bucket_key.as_bytes());
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&digest[..8]);
+    format!(
+        "login-ovf:{}",
+        u64::from_be_bytes(first) % LOGIN_OVERFLOW_BUCKETS
+    )
+}
+
+/// Whether a log line of `kind` is due on this thread: the first one is, and
+/// then one per `every`. A wiring mistake repeats on every request, so a line
+/// each time would flood the log, and one line ever is missed by anyone who
+/// reads the log after the first request. The clock is per thread, which
+/// keeps the check free of a lock and bounds the rate by the worker count.
+fn log_due(kind: &'static str, every: std::time::Duration) -> bool {
+    use std::{cell::RefCell, collections::HashMap, time::Instant};
+    thread_local! {
+        static LAST: RefCell<HashMap<&'static str, Instant>> = RefCell::default();
     }
+    LAST.with(|last| {
+        let now = Instant::now();
+        let mut last = last.borrow_mut();
+        match last.get(kind) {
+            Some(at) if now.duration_since(*at) < every => false,
+            _ => {
+                last.insert(kind, now);
+                true
+            }
+        }
+    })
+}
+
+/// The bucket of a request that names no identity although the extractor
+/// reads one. The layer that inserts the extension is missing or runs after
+/// this one. Refused as [`Misconfigured`] unless shared buckets are allowed,
+/// in which case the request is limited per peer, under the `anon:` kind.
+fn unidentified_target(
+    req: &Request<Body>,
+    extractor: &'static str,
+    allow_shared: bool,
+) -> Result<Target, Misconfigured> {
+    if !allow_shared {
+        if log_due(extractor, std::time::Duration::from_secs(60)) {
+            tracing::error!(
+                "{extractor} rate limiting: no identity in request extensions; answering \
+                 500. Put the layer that inserts it outside this one, or call \
+                 allow_shared_bucket() on the config to limit such requests per peer."
+            );
+        }
+        return Err(Misconfigured);
+    }
+    if log_due(extractor, std::time::Duration::from_secs(60)) {
+        tracing::warn!(
+            "{extractor} rate limiting: no identity in request extensions; requests are \
+             limited per peer address instead. Put the layer that inserts it outside \
+             this one."
+        );
+    }
+    peer_target(req, "anon:", true)
 }
 
 /// Read the address `client_ip::layer` resolved for this request.
@@ -308,25 +380,44 @@ fn peer_addr(req: &Request<Body>) -> Option<IpAddr> {
 
 /// The bucket for the TCP peer, with `prefix` in front of its address.
 ///
-/// Falls back to a shared bucket (`"unknown"`) if no peer address is
-/// available. This is fail-closed: all unknown-origin requests share one
-/// bucket, meaning stricter (not weaker) rate limiting.
-fn peer_target(req: &Request<Body>, prefix: &str) -> Target {
+/// With no peer address available the request is [`Misconfigured`], unless
+/// shared buckets are allowed: then all such requests share one bucket
+/// (`"unknown"`), which limits more strictly, not more weakly.
+fn peer_target(
+    req: &Request<Body>,
+    prefix: &str,
+    allow_shared: bool,
+) -> Result<Target, Misconfigured> {
     match peer_addr(req) {
-        Some(addr) => Target::address(addr, prefix_or_ip(prefix)),
+        Some(addr) => Ok(Target::address(addr, prefix_or_ip(prefix))),
         None => {
-            use std::sync::Once;
-            static WARN: Once = Once::new();
-            WARN.call_once(|| {
-                tracing::warn!(
-                    "PeerIp rate limiting: no SocketAddr in request extensions; \
-                     all requests will share a single bucket. Use \
-                     Router::into_make_service_with_connect_info::<SocketAddr>() \
-                     or, behind a proxy, client_ip::layer with \
-                     KeyExtractor::ClientIp."
-                );
-            });
-            Target::shared(&format!("{}{UNKNOWN_BUCKET}", prefix_or_ip(prefix)))
+            if log_due("peer", std::time::Duration::from_secs(1)) {
+                if allow_shared {
+                    tracing::error!(
+                        "rate limiting: no SocketAddr in request extensions; \
+                         every such request shares a single bucket, so one client can \
+                         exhaust the limit for all. Use \
+                         Router::into_make_service_with_connect_info::<SocketAddr>() \
+                         or, behind a proxy, client_ip::layer with \
+                         KeyExtractor::ClientIp."
+                    );
+                } else {
+                    tracing::error!(
+                        "rate limiting: no SocketAddr in request extensions; answering \
+                         500. Use Router::into_make_service_with_connect_info::<SocketAddr>() \
+                         or, behind a proxy, client_ip::layer with KeyExtractor::ClientIp, \
+                         or call allow_shared_bucket() on the config."
+                    );
+                }
+            }
+            if allow_shared {
+                Ok(Target::shared(&format!(
+                    "{}{UNKNOWN_BUCKET}",
+                    prefix_or_ip(prefix)
+                )))
+            } else {
+                Err(Misconfigured)
+            }
         }
     }
 }

@@ -121,6 +121,8 @@ pub struct PolicyStore {
     /// The entity types of the schema's actions. A provider entity of one
     /// of these types is an action entity and is checked against the schema.
     action_types: HashSet<EntityTypeName>,
+    /// Whether any policy mentions `context`.
+    mentions_context: bool,
 }
 
 /// Why the provider's entities could not be evaluated with the schema's
@@ -156,13 +158,25 @@ impl PolicyStore {
             .map(|action| action.uid().type_name().clone())
             .collect();
 
+        // A policy's text is the one place `context` can appear as a name, so
+        // the check is a text search: a false positive (the word in a
+        // comment or a string) only makes a warning fire that need not.
+        let mentions_context = policy_set.to_string().contains("context");
+
         Ok(Self {
             policy_set,
+            mentions_context,
             schema,
             authorizer: Authorizer::new(),
             action_entities,
             action_types,
         })
+    }
+
+    /// Whether any policy mentions `context`. A request evaluated on an empty
+    /// context against such a store is probably missing its context provider.
+    pub fn mentions_context(&self) -> bool {
+        self.mentions_context
     }
 
     /// The provider's entities plus the schema's action entities.

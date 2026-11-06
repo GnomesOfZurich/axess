@@ -72,11 +72,10 @@ fn tenant(status: EntityState) -> Tenant {
 }
 
 fn suspended(until: Option<chrono::DateTime<chrono::Utc>>) -> EntityState {
-    EntityState::Suspended(StatusDetail {
-        reason: "hold".into(),
-        since: chrono::Utc::now() - chrono::Duration::days(2),
-        until,
-    })
+    EntityState::Suspended(
+        StatusDetail::administrative("hold", chrono::Utc::now() - chrono::Duration::days(2))
+            .with_until(until),
+    )
 }
 
 fn identity(t: EntityState, u: EntityState) -> MockIdentityStore {

@@ -24,7 +24,7 @@ async fn pool() -> sqlx::SqlitePool {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");
@@ -87,4 +87,73 @@ async fn an_auth_method_with_unreadable_steps_is_an_error() {
         .expect("corrupt");
     let methods = backend.available_methods(&alice, &tenant).await;
     assert!(methods.is_err(), "read as {methods:?}");
+}
+
+/// The cause a suspension was written with is the cause it reads back with:
+/// a lockout a store materialises stays a lockout, an operator's suspension
+/// stays an operator's.
+#[tokio::test]
+async fn a_suspension_reads_back_with_the_cause_it_was_written_with() {
+    use axess::authn::{IdentityAdmin, StatusCause, StatusDetail};
+    let pool = pool().await;
+    let backend = OurBackend::new(pool.clone());
+    let alice = UserId::try_new(ALICE).expect("user");
+    let now = chrono::Utc::now();
+
+    backend
+        .suspend_user(
+            &alice,
+            StatusDetail::lockout("too many attempts", now)
+                .with_until(Some(now + chrono::Duration::hours(1))),
+        )
+        .await
+        .expect("suspend");
+    match backend.account_status(&alice).await.expect("status") {
+        EntityState::Suspended(detail) => {
+            assert_eq!(detail.cause, StatusCause::Lockout);
+            assert!(detail.until.is_some());
+        }
+        other => panic!("expected a suspension, got {other:?}"),
+    }
+
+    backend
+        .suspend_user(&alice, StatusDetail::administrative("fraud review", now))
+        .await
+        .expect("suspend");
+    match backend.account_status(&alice).await.expect("status") {
+        EntityState::Suspended(detail) => {
+            assert_eq!(detail.cause, StatusCause::Administrative);
+            assert!(detail.until.is_none());
+        }
+        other => panic!("expected a suspension, got {other:?}"),
+    }
+}
+
+/// A suspended row written before the cause column existed reads as a
+/// suspension with an unspecified cause; a pending row is awaiting
+/// verification and a terminated one is closed, by what the status says.
+#[tokio::test]
+async fn a_row_without_a_stored_cause_reads_by_its_status() {
+    use axess::authn::StatusCause;
+    let pool = pool().await;
+    let backend = OurBackend::new(pool.clone());
+    let alice = UserId::try_new(ALICE).expect("user");
+
+    set_user(&pool, "suspended", None).await;
+    match backend.account_status(&alice).await.expect("status") {
+        EntityState::Suspended(detail) => assert_eq!(detail.cause, StatusCause::unspecified()),
+        other => panic!("expected a suspension, got {other:?}"),
+    }
+
+    set_user(&pool, "pending", None).await;
+    match backend.account_status(&alice).await.expect("status") {
+        EntityState::Pending(detail) => assert_eq!(detail.cause, StatusCause::Verification),
+        other => panic!("expected pending, got {other:?}"),
+    }
+
+    set_user(&pool, "terminated", None).await;
+    match backend.account_status(&alice).await.expect("status") {
+        EntityState::Terminated(detail) => assert_eq!(detail.cause, StatusCause::Closure),
+        other => panic!("expected terminated, got {other:?}"),
+    }
 }

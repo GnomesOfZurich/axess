@@ -78,10 +78,8 @@
 //! ```
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
-use axess_clock::Clock;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
@@ -131,7 +129,7 @@ impl PostgresDeviceStore {
     }
 
     /// Create a plaintext store (development/testing only).
-    pub fn plaintext(pool: PgPool) -> Self {
+    pub fn plaintext_insecure(pool: PgPool) -> Self {
         tracing::warn!(
             "PostgresDeviceStore created without encryption; \
              do not use in production"
@@ -141,14 +139,6 @@ impl PostgresDeviceStore {
             codec: BindingsCodec::plaintext(),
             sweep_config: SweepConfig::default(),
         }
-    }
-
-    /// Has no effect: every time-dependent method of the store is given the
-    /// instant it works from, so there is no clock to inject.
-    #[deprecated(note = "the store reads time only from the `now` its methods are given")]
-    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
-        let _ = clock;
-        self
     }
 
     /// Override the [`SweepConfig`] driving the retention ladder.

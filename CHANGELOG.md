@@ -8,12 +8,93 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
-## [0.15.0] - 2026-11-05
+## [0.16.0] - 2026-11-06
 
-Every finding of the v0.14.0 security review is closed, each with a test
-that failed before it. `docs/production/migrating.md` ("0.14.0 to 0.15.0")
-lists every compile break, stored-value change and behaviour change by what
-an adopter sees.
+### Changed (breaking)
+
+- `SessionLayer::new(store, key, registry)` takes the session registry, so a revocation ends the session on every route; `without_registry_insecure(store, key)` is the opt-out and logs an error once; `with_registry` is gone; `MemorySessionRegistry::handle()` gives the handle the layer takes.
+- `SessionConfig::default()` ends a session 7 days after it authenticated and an impersonation after 1 hour; `with_max_session_age(None)` and `with_max_impersonation_age(None)` lift the caps, and the setters take `Option<Duration>`.
+- `RefreshTokenConfig::default()` ends a family 90 days after login (`with_max_lifetime(None)` lifts it); `device_info` with no `hash_pepper` is `InvalidConfig` unless `allow_unkeyed_hashes()`; `previous_hash_pepper` is a `PreviousPepper`, whose `Unkeyed` moves a deployment to a pepper without invalidating a token.
+- `SessionCrypto::new`, `SessionLayer::new`, `without_registry_insecure` and `FactorSecretCipher::new` panic on a constant key, and `with_previous_key` on a constant or the current key; `try_new` returns the error; `new_unchecked` and `testing::test_key(seed)` serve tests under `testing`.
+- A service with no `FactorSecretCipher` refuses to store a TOTP or HOTP secret (`FactorSecretError::PlaintextNotAllowed`) unless `allow_plaintext_factor_secrets()`; `StoredTenantOAuthProviders::new` takes the cipher, `new_unencrypted` is for tests.
+- `JwtVerifier::verify` and `verify_jwt` refuse a token with no issuer and no audience pinned; `allow_any_issuer()` and `allow_any_audience()` state the intent.
+- `AuthzStore::try_new` validates the entity provider against the schema at startup (`new` is `new_unvalidated`); `AuthzEntityProvider::entities_for_tenant` is required; `axess::authz::require` takes a `Context`, and `require_authz!` warns once when the policies read a context no provider supplies.
+- `require_authz!` always takes `validator = ..`; the three-argument form is removed.
+- A new `AuthnServiceBuilder` holds a 60 second password-reset cooldown and refuses the last five passwords; `without_password_reset_cooldown()` and `history_count: 0` opt out.
+- `LockoutPolicy::throttle` slows consecutive wrong guesses down per account and client address (1 s doubling to 64 s, answered as `FactorOutcome::Throttled { retry_after }` / `AuthnError::Throttled`, 429 with `Retry-After`) before the per-account lock; `IdentityAuthnLog` requires `throttle_state`, `record_throttle_failure` and `clear_throttle`; `without_throttle()` is the opt-out.
+- `AuthSession::set_authenticated` is crate-private (tests use `testing::AuthSessionTestExt`); `refresh_session`, `refresh_session_in_tenant`, `refresh_session_with_device_check`, `refresh_session_with_status_check` and `refresh_session_with_status_check_in_tenant` are removed in favour of `Refresh::new(token, tenant, status_check)`.
+- `Refresh::new` takes the tenant (`Refresh::any_tenant` opts out; `in_tenant` is gone); `WorkloadResolver` and `MtlsResolver` take a slug-to-tenant lookup, derive the tenant from the verified identity and build the `WorkloadId` from their own trust domain.
+- `active_sessions` returns an error when the registry cannot list sessions, and the concurrent-session cap refuses a login on that outage.
+- `SessionStore::find_sessions_for_user` is required; the SQL and Valkey stores answer `Unsupported`.
+- `SessionRegistryHandle::liveness` is required; `SessionRegistryAdapter` is unchanged.
+- `RefreshTokenStore::revoke_device_tokens` has no default body; a store implements it or answers `Unsupported`.
+- `FactorSecretCipher::with_first_binding` defaults to `Reject`; secrets sealed in the 0.14.0 binding open only under `Accept` or `AcceptUntil`.
+- `factors_completed` carries a time per factor (`Vec<(FactorKind, DateTime<Utc>)>` in `AuthState`, epoch microseconds in `AuthEvent`), so a step-up no longer re-times the original login; rows written as a plain list still load.
+- `AuthState::user_id` is `pending_user_id`; `authenticated_user_id` answers only for `Authenticated`.
+- Rate limiters answer 500 when the identity extension or peer address they key on is missing; `allow_shared_bucket()` restores the shared bucket.
+- `begin_signup` answers `Started(Some(SignupVerification))` with a single-use secret (24 hours, `with_signup_verification_ttl`) that `complete_signup(&session, secret)` requires; a taken identifier answers `Started(None)`.
+- Social login: `build_auth_url()` returns `AuthUrl { url, state, pkce_verifier }`, `exchange_code` checks the state and refuses a PKCE verifier under 43 characters, `with_http_client_builder` replaces `with_http_client`; the OIDC `AuthUrlResult` has named fields.
+- OAuth: trait `fetch_userinfo` and `refresh_token` take the expected `sub` (implementors provide the `_unchecked` forms); a token exchange without `issued_token_type` is malformed; `FrontChannelLogoutHandler::new` is session-bound, `new_unbound` is the opt-out.
+- `SessionLayer` refuses a cross-site WebSocket upgrade (403) by the CSRF layer's rule; `with_websocket_origins` sets the allow-list.
+- Signed requests are `v3`: `Content-Type` and `Content-Encoding` are signed, `sign_for` takes the headers, `v2` is read only until `accept_v2_until`, and `max_body_bytes` defaults to 256 KiB.
+- `TraceContextLayer` ignores an inbound `traceparent` by default; `trust_inbound(true)` opts in.
+- The unsealed session-store and device-store constructors are `plaintext_insecure` on the SQLite, Postgres, MySQL and Valkey stores, and the device stores' no-op `with_clock` is removed; the READMEs' quickstart builds `SqliteSessionStore::new(pool, SessionCrypto::new(key))`.
+- New enum variants for exhaustive matches: `IssuanceError::InvalidLifetime(LifetimeFault)`, `CycleOutcome::Conflict`, `SqlStoreError::PayloadTooLarge` and `::Unsupported`, `ValkeyStoreError::Unsupported`.
+- `StatusDetail` carries `cause: StatusCause` (`Administrative`, `Verification`, `Lockout`, `Closure`, `Other(key)`), built by `StatusDetail::administrative(reason, since)` and kin, and `EntityState::is_administratively_disabled()` and `can_self_recover()` answer an eligibility check without reading `reason`; a row stored without a cause reads as `Other("unspecified")`; `EntityState::is_locked` is `is_suspended`.
+
+### Added
+
+- A locked account's own `Seen` or `Trusted` devices still log in (`with_device_store`) while the lockout keeps every other origin out.
+- `AuthSession::completed_factor_within(kind, max_age, now)` and `AuthState::factor_completed_at(kind)`.
+- `SessionStore::cycle_if_revision`: a rotation conditional on the revision it merged, implemented by the five in-tree stores.
+- `ratelimit::inject_login_identifier`: the layer step that sets `RateLimitLoginIdentifier` before a `LoginIdentifier` limiter reads it.
+- `with_max_payload` on the SQL session stores (64 KiB by default, as Valkey).
+- `hash_new_password(password, &PasswordRules)` refuses an over-long or rule-failing password before hashing (`NewPasswordError`); `PasswordRules::accepts` is the one check, and `MAX_PASSWORD_BYTES` lives in `axess-factors`.
+- A breached-password check at password choice: `AuthnServiceBuilder::with_breached_password_check` takes a `BreachedPasswordCheck`, after which a password reset, and an application's own signup or change through `AuthnService::check_chosen_password` and `hash_chosen_password`, refuse a password the check knows (`NewPasswordError::Breached`, audit reason `password_breached`) and by default one it could not screen (`BreachCheckUnavailable`, opt-out `allow_unchecked_when_breach_check_unavailable()`); `PasswordRules::breached_check` exempts a tenant; `range_prefix` and `count_in_range` are the k-anonymity range protocol's pure halves, `hash_new_password_checked` the free-function form, and `BreachedPasswordList` (under `testing`) a fixed list for tests and examples.
+
+### Fixed
+
+- A session rotation no longer loses a write that lands while it runs; a conflict is merged and retried, then fails closed.
+- A login or logout that scrubbed the session keeps it scrubbed through the cycle and through `consume_custom`.
+- A rotation ends when the old id is gone, and a re-read that answers `Unknown` follows `UnknownLiveness`.
+- `verify_factor` checks the factor the person chose and prepared.
+- The audit archive sets a refused row aside and archives the rows behind it.
+- `EntityCache::invalidate_resource` drops the entries built under a parent.
+- The password reset cooldown is never pushed out by other identifiers; a full record sounds an error.
+- Impersonation checks the administrator's stored tenant.
+- A device with no owner is `Unknown` to step-up.
+- `AuthzStore::for_session` on an unauthenticated session returns `NoPrincipal` (401).
+- Login identifiers past the table cap share overflow buckets keyed on the identifier; a missing identity extension is limited per peer; an authenticated user without the keyed header holds one slot; `RateLimitLayer::new` refuses a zero limit or window.
+- `CsrfLayer` without a session hands handlers an empty `CsrfToken`.
+- `RevocationAwareSocket::recv` closes on a revocation before a queued message.
+- The Valkey registry scores and prunes on the server's `TIME`, reports a failed revocation `PUBLISH`, reads without renewing the session, rechecks after the client reconnects by itself, and caps an enormous TTL, as the session store does.
+- `MemorySessionRegistry` forgets users who never return.
+- A token answer cut off after a 200 is transient; `AuthFailureReason` round-trips as itself; a non-rotating refresh token keeps its expiry across a pepper rotation; `InMemoryBackend` never gives a user an id another tenant holds.
+- The local IdP builds its `EncodingKey` once, refuses an unusable lifetime, and its fixture clears `jku`, `jwk`, `x5u` and `x5c`.
+
+### Security
+
+- A cookie `Path` that could inject attributes is refused, and a path other than `/` warns that it drops the `__Host-` prefix.
+- A response that sets the session cookie is never cacheable by a shared cache.
+- A session that logged in with no `User-Agent` is bound to the absence, and an authenticated session with no stored fingerprint is bound on its next request.
+- `SessionCrypto::encrypt_with_aad` refuses an empty AAD, and the blob layout of 0.12.0 and earlier reads only under a legacy-reading `LegacyBlobs` policy.
+- `SessionLayer::derive_subkey` refuses labels in the reserved namespace.
+- Debug logs in the Valkey store and registry name a session by its first eight characters.
+
+### Documentation
+
+- `SIGNATURE_HEADER` says no header is signed; `max_body_bytes` says the body is buffered before any secret is checked; ceremony secrets are as private as the session store; `RefreshTokenConfig::default()` has no `max_lifetime`; entity cache invalidation is local to the pod; the workload trust-domain check catches mapper bugs.
+- The step-up wiring calls `begin_step_up`; the `revoke_family` SQL records the reason; the Valkey docs describe the sealed format and the `LegacyBlobs` policy; the social and authz quick starts compile; duplicate cookie names and `__Host-` are explained; `SignupOutcome::Started` says a taken identifier answers it too.
+
+### Example apps
+
+- The sqlite example enrols TOTP in one transaction with a server-held secret behind the current password and the limiter, completes signup through an emailed link, answers taken and free usernames alike, sends no-store, frame and CSP headers, and seeds only in a debug build or with `EXAMPLE_SEED=1`.
+- The FAPI example runs its mock IdP only with `FAPI_MOCK=1`, signs with the published key only for a localhost issuer, takes `form_post` only, checks the origin of refresh and logout, and creates a first login only for a domain in `FAPI_ALLOWED_EMAIL_DOMAINS`.
+- The OAuth example provisions `linked-only` by default and revokes new tokens at the IdP on a subject mismatch.
+- `local-idp` writes its admin token to an owner-only file and takes separate, scoped tokens for `/issue`.
+- The Kubernetes wire-up uses the UID-pinned mapper.
+
+## [0.15.0] - 2026-11-05
 
 ### Changed (breaking)
 
@@ -103,7 +184,7 @@ an adopter sees.
 - No device store claims a revoked device that has no owner: `claim_owner`
   answers `OwnedByOther` in the memory, Valkey, SQLite, Postgres and MySQL
   stores.
-- `RevocationAwareSocket::is_closed` replaces `is_revoked` (deprecated); the
+- `RevocationAwareSocket::is_closed` replaces `is_revoked` (removed); the
   socket closes with a reason: `4001 session_revoked`, `4002
   lifetime_reached`, `4003 session_unverified` (`LIFETIME_REACHED_CLOSE_CODE`,
   `SESSION_UNVERIFIED_CLOSE_CODE`). A client that signs out on `4001`
@@ -1192,7 +1273,7 @@ model, and the login flow flattened every `AnyOf` to its first choice, so
 fallback for a lost authenticator, are the first factor that needs the
 choice, and arrive with it. Internal service callers get a shared-secret
 check to replace hand-written ones. See
-[the migration guide](docs/production/migrating.md#070-to-080).
+[the migration guide](docs/production/migrating/0.7.0-to-0.8.0.md).
 
 ### Added
 

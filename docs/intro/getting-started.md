@@ -28,7 +28,7 @@ The shortest functional `Cargo.toml` looks like this.
 
 ```toml
 [dependencies]
-axess = "0.15"             # facade -- depend on this, never on the internal crates
+axess = "0.16"             # facade -- depend on this, never on the internal crates
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = "0.5"             # transitively from axum, but listed for clarity
@@ -41,7 +41,7 @@ turn on `memory` for the in-memory session store and `testing` for
 real database needs neither.
 
 ```toml
-axess = { version = "0.15.0", features = ["memory", "testing"] }
+axess = { version = "0.16.0", features = ["memory", "testing"] }
 ```
 
 The complete feature reference lives in the
@@ -102,7 +102,9 @@ types. In the in-memory case they are the same object, hence the
 clone. In production they typically remain the same struct (a single
 backend implementing both traits), again with a clone.
 
-`SessionLayer::new(store, key)` constructs the Tower layer. The
+`SessionLayer::new(store, key, registry)` constructs the Tower layer; the
+registry is the one the service records logins in, so a password reset or
+a forced logout ends the session on every route. The
 chained `.with_ttl(86_400)` sets a one-day session lifetime, and
 `.with_secure(false)` permits HTTP cookies for local development. See
 *Cookie security* below for the production setting.

@@ -10,11 +10,12 @@ use axum::{
     extract::{OriginalUri, Request},
     http::{
         HeaderMap, Method, StatusCode,
-        header::{CONTENT_LENGTH, HeaderName, HeaderValue},
+        header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue},
     },
 };
 use chrono::{DateTime, Utc};
 use hmac::Mac;
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -28,11 +29,14 @@ use zeroize::Zeroizing;
 
 /// The header a signed request carries: `x-axess-signature`.
 ///
-/// Its value is `t=<unix seconds>,v2=<signature>`, where the signature is
-/// the lowercase hex of
+/// Its value is `t=<unix seconds>,v3=<signature>` (and `v2=<signature>`
+/// beside it, for a recipient that has not moved to `v3` yet), where the
+/// `v3` signature is the lowercase hex of
 ///
 /// ```text
-/// HMAC-SHA256(key, "v2\n" + t + "\n" + METHOD + "\n" + path?query + "\n" + audience + "\n" + body)
+/// HMAC-SHA256(key, "v3\n" + t + "\n" + METHOD + "\n" + path?query + "\n" + audience
+///                  + "\n" + hex(SHA-256(content-type)) + "\n" + hex(SHA-256(content-encoding))
+///                  + "\n" + body)
 /// key = HMAC-SHA256(secret, "axess-service-signature-v1")
 /// ```
 ///
@@ -41,9 +45,28 @@ use zeroize::Zeroizing;
 /// client sent it (the path, plus `?` and the query when there is one), and
 /// `audience` is the recipient's name as configured with
 /// [`SignedRequests::audience`] (not the `Host` header, which a proxy may
-/// rewrite). [`ServiceSigner::sign_for`] does all of this; the recipe is here
-/// for a caller that is not written in Rust. Unknown `key=value` pairs in the
-/// header are ignored, so a later scheme can be sent beside `v2`.
+/// rewrite). `content-type` and `content-encoding` are the values of those
+/// headers as sent (several header lines of one name joined with `", "`), and
+/// a header that is absent hashes as the empty string: `hex(SHA-256(""))` is
+/// `e3b0c442...b855`. [`ServiceSigner::sign_for`] does all of this; the recipe
+/// is here for a caller that is not written in Rust. Unknown `key=value`
+/// pairs in the header are ignored, so a later scheme can be sent beside
+/// `v3`.
+///
+/// A route reads the highest scheme it enables: `v3` whenever the header
+/// carries it. It reads `v2` (the same message without the two header hashes,
+/// tagged `"v2\n"`) only until the instant given to
+/// [`SignedRequests::accept_v2_until`], and only when the header has no `v3`.
+///
+/// # What the signature covers and does not cover
+///
+/// `v3` covers `Content-Type` and `Content-Encoding`, so a request cannot be
+/// re-typed (JSON to a form, say) or re-encoded on its way without breaking
+/// the signature. No other header is signed, `Authorization` included, and
+/// neither is any header under `v2`. A handler must not trust an unsigned
+/// header of a signed request for anything that matters: take identity from
+/// the signature's caller, not from a header. Run the call over TLS, which is
+/// what keeps a third party from altering it at all.
 ///
 /// # `v1`: the unaddressed form, read only inside a window
 ///
@@ -63,6 +86,47 @@ pub(super) fn derive_key(secret: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut mac = new_signer(secret);
     mac.update(KEY_LABEL);
     Zeroizing::new(mac.finalize().into_bytes().into())
+}
+
+/// The `v3` tag: the `v2` message with the hashes of `Content-Type` and
+/// `Content-Encoding` before the body.
+pub(super) fn sign_bytes_v3(
+    key: &[u8; 32],
+    unix_seconds: i64,
+    method: &Method,
+    target: &str,
+    audience: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> [u8; 32] {
+    let mut mac = new_signer(key);
+    mac.update(
+        format!(
+            "v3\n{unix_seconds}\n{method}\n{target}\n{audience}\n{}\n{}\n",
+            header_digest(headers, &CONTENT_TYPE),
+            header_digest(headers, &CONTENT_ENCODING),
+        )
+        .as_bytes(),
+    );
+    mac.update(body);
+    mac.finalize().into_bytes().into()
+}
+
+/// Lowercase hex SHA-256 of a header's value as sent: all of its lines
+/// joined with `", "`, and the empty string when it is absent.
+fn header_digest(headers: &HeaderMap, name: &HeaderName) -> String {
+    let mut hasher = Sha256::new();
+    for (i, value) in headers.get_all(name).iter().enumerate() {
+        if i > 0 {
+            hasher.update(b", ");
+        }
+        hasher.update(value.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The `v2` tag: [`sign_bytes`]'s message with the recipient inserted
@@ -114,18 +178,28 @@ impl ServiceSigner {
     /// The [`SIGNATURE_HEADER`] value for a request sent at `unix_seconds`
     /// to the recipient `audience` (the name the receiving route configured
     /// with [`SignedRequests::audience`]), with this method, request target
-    /// (`/path` or `/path?query`) and body. Send the body exactly as signed.
-    /// The header carries `v2=`, which only a route configured with that same
-    /// audience accepts.
+    /// (`/path` or `/path?query`), headers and body. Send the body exactly as
+    /// signed, and the `Content-Type` and `Content-Encoding` in `headers`
+    /// exactly as signed: they are part of the signature (only those two are
+    /// read; pass the request's header map, or an empty one when it sends
+    /// neither). The value carries `v3=` and, beside it, `v2=`, which a route
+    /// still inside its [`accept_v2_until`](SignedRequests::accept_v2_until)
+    /// window reads from a caller that predates `v3`.
     pub fn sign_for(
         &self,
         audience: &str,
         unix_seconds: i64,
         method: &Method,
         path_and_query: &str,
+        headers: &HeaderMap,
         body: &[u8],
     ) -> HeaderValue {
-        let tag = sign_bytes_v2(
+        let hex = |tag: [u8; 32]| {
+            tag.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let v2 = sign_bytes_v2(
             &self.key,
             unix_seconds,
             method,
@@ -133,10 +207,16 @@ impl ServiceSigner {
             audience,
             body,
         );
-        let mut value = format!("t={unix_seconds},v2=");
-        for byte in tag {
-            value.push_str(&format!("{byte:02x}"));
-        }
+        let v3 = sign_bytes_v3(
+            &self.key,
+            unix_seconds,
+            method,
+            path_and_query,
+            audience,
+            headers,
+            body,
+        );
+        let value = format!("t={unix_seconds},v2={},v3={}", hex(v2), hex(v3));
         HeaderValue::from_str(&value).expect("digits, letters, `=` and `,` are valid header bytes")
     }
 }
@@ -150,6 +230,7 @@ pub struct SignedRequests {
     max_remembered: usize,
     audience: Option<String>,
     unaddressed_until: Option<DateTime<Utc>>,
+    v2_until: Option<DateTime<Utc>>,
     clock: Arc<dyn Clock>,
 }
 
@@ -161,22 +242,24 @@ impl std::fmt::Debug for SignedRequests {
             .field("max_remembered", &self.max_remembered)
             .field("audience", &self.audience)
             .field("unaddressed_until", &self.unaddressed_until)
+            .field("v2_until", &self.v2_until)
             .finish_non_exhaustive()
     }
 }
 
 impl Default for SignedRequests {
-    /// Five minutes either side of the server's clock, bodies up to 1 MiB,
-    /// 100,000 remembered signatures, the system clock. It names no
+    /// Five minutes either side of the server's clock, bodies up to 256 KiB,
+    /// 100,000 remembered signatures, the system clock, `v3` only. It names no
     /// audience, so [`ServiceSecretLayer::signed`](super::ServiceSecretLayer::signed)
     /// refuses it until [`audience`](Self::audience) is set.
     fn default() -> Self {
         Self {
             tolerance: Duration::from_secs(300),
-            max_body_bytes: 1024 * 1024,
+            max_body_bytes: 256 * 1024,
             max_remembered: 100_000,
             audience: None,
             unaddressed_until: None,
+            v2_until: None,
             clock: Arc::new(SystemClock),
         }
     }
@@ -192,8 +275,19 @@ impl SignedRequests {
         self
     }
 
-    /// The largest body read to verify a signature; a longer one is
-    /// answered `413 Payload Too Large` without being read further.
+    /// The largest body read to verify a signature (default: 256 KiB); a
+    /// longer one is answered `413 Payload Too Large` without being read
+    /// further.
+    ///
+    /// The body is buffered in memory before any secret is checked, because
+    /// the handler is given it only once a signature has been accepted. A
+    /// header with a current timestamp needs no secret, so each concurrent
+    /// request on the route can hold up to this many bytes whether or not it
+    /// is signed. Set it to the largest body the route takes, and cap the
+    /// concurrency on every signed route (a `tower`
+    /// [`ConcurrencyLimitLayer`](https://docs.rs/tower/latest/tower/limit/struct.ConcurrencyLimitLayer.html)
+    /// outside this layer): with N concurrent requests the route can hold N
+    /// times this many bytes.
     #[must_use]
     pub fn max_body_bytes(mut self, limit: usize) -> Self {
         self.max_body_bytes = limit;
@@ -214,7 +308,7 @@ impl SignedRequests {
     }
 
     /// Name this route as the recipient of its signed requests. The route
-    /// accepts `v2` signatures made for exactly this name
+    /// accepts `v3` signatures made for exactly this name
     /// ([`ServiceSigner::sign_for`]), so a request signed for another service
     /// that shares the secret cannot be replayed here. Required:
     /// [`ServiceSecretLayer::signed`](super::ServiceSecretLayer::signed)
@@ -235,6 +329,21 @@ impl SignedRequests {
     #[must_use]
     pub fn accept_unaddressed_until(mut self, instant: DateTime<Utc>) -> Self {
         self.unaddressed_until = Some(instant);
+        self
+    }
+
+    /// Also accept the `v2` signature until `instant`, checked against the
+    /// configured [`clock`](Self::clock), for callers that have not moved to
+    /// a [`ServiceSigner::sign_for`] that emits `v3` yet. `v2` signs no
+    /// header, so a `Content-Type` or `Content-Encoding` can be changed on its
+    /// way without breaking it; and a header that carries only `v2` is read
+    /// as `v2` during the window, so an attacker who strips the `v3` tag
+    /// of a request in flight gets the `v2` guarantees. This is a migration
+    /// window, not a setting to leave on. A header that carries `v3` is
+    /// always judged by it. From `instant` on, `v2` is refused.
+    #[must_use]
+    pub fn accept_v2_until(mut self, instant: DateTime<Utc>) -> Self {
+        self.v2_until = Some(instant);
         self
     }
 
@@ -377,19 +486,28 @@ impl Verifier {
         req: Request<Body>,
     ) -> Result<Request<Body>, Rejection> {
         let (stamp, tags) = parse_header(req.headers()).ok_or(Rejection::Malformed)?;
-        // The schemes in force are the route's, never the sender's: `v2` when
-        // the route names an audience, `v1` only while its window is open. A
-        // header without a tag the route reads is malformed for this route.
+        // The schemes in force are the route's, never the sender's: the
+        // highest one the route enables that the header carries. `v3` when
+        // the route names an audience, `v2` only while its window is open
+        // and only when there is no `v3`, `v1` only while its window is
+        // open. A header without a tag the route reads is malformed for this
+        // route.
         let instant = self.config.clock.now();
         let now = instant.timestamp();
-        let v1_open = self
-            .config
-            .unaddressed_until
-            .is_some_and(|until| instant < until);
-        let tag = match (&self.config.audience, tags.v2, tags.v1) {
-            (Some(_), Some(v2), _) => Scheme::V2(v2),
-            (_, _, Some(v1)) if v1_open => Scheme::V1(v1),
-            _ => return Err(Rejection::Malformed),
+        let open = |until: Option<DateTime<Utc>>| until.is_some_and(|until| instant < until);
+        let (v1_open, v2_open) = (
+            open(self.config.unaddressed_until),
+            open(self.config.v2_until),
+        );
+        let addressed = self.config.audience.is_some();
+        let tag = if let (true, Some(v3)) = (addressed, tags.v3) {
+            Scheme::V3(v3)
+        } else if let (true, true, Some(v2)) = (addressed, v2_open, tags.v2) {
+            Scheme::V2(v2)
+        } else if let (true, Some(v1)) = (v1_open, tags.v1) {
+            Scheme::V1(v1)
+        } else {
+            return Err(Rejection::Malformed);
         };
         let tolerance = i64::try_from(self.config.tolerance.as_secs()).unwrap_or(i64::MAX);
         if now.abs_diff(stamp) > tolerance.unsigned_abs() {
@@ -415,6 +533,16 @@ impl Verifier {
         let caller = secrets
             .first_match(|secret: &ServiceSecret| {
                 match (&tag, &self.config.audience) {
+                    (Scheme::V3(presented), Some(audience)) => sign_bytes_v3(
+                        &secret.signing_key,
+                        stamp,
+                        &parts.method,
+                        &target,
+                        audience,
+                        &parts.headers,
+                        &body,
+                    )
+                    .ct_eq(presented),
                     (Scheme::V2(presented), Some(audience)) => sign_bytes_v2(
                         &secret.signing_key,
                         stamp,
@@ -428,8 +556,9 @@ impl Verifier {
                         sign_bytes(&secret.signing_key, stamp, &parts.method, &target, &body)
                             .ct_eq(presented)
                     }
-                    // `v2` is only chosen above when the route has an audience.
-                    (Scheme::V2(_), None) => Choice::from(0),
+                    // `v2` and `v3` are only chosen above when the route has
+                    // an audience.
+                    (Scheme::V2(_) | Scheme::V3(_), None) => Choice::from(0),
                 }
             })
             .ok_or(Rejection::BadSignature)?;
@@ -528,12 +657,13 @@ fn declared_length(headers: &HeaderMap) -> Option<usize> {
 enum Scheme {
     V1([u8; 32]),
     V2([u8; 32]),
+    V3([u8; 32]),
 }
 
 impl Scheme {
     fn bytes(&self) -> [u8; 32] {
         match self {
-            Self::V1(tag) | Self::V2(tag) => *tag,
+            Self::V1(tag) | Self::V2(tag) | Self::V3(tag) => *tag,
         }
     }
 }
@@ -542,19 +672,25 @@ impl Scheme {
 struct Tags {
     v1: Option<[u8; 32]>,
     v2: Option<[u8; 32]>,
+    v3: Option<[u8; 32]>,
 }
 
-/// `t=<seconds>,v1=<64 hex>` or `t=<seconds>,v2=<64 hex>`, in either order,
-/// other pairs ignored.
+/// `t=<seconds>` and one or more of `v1=<64 hex>`, `v2=<64 hex>`,
+/// `v3=<64 hex>`, in any order, other pairs ignored.
 fn parse_header(headers: &HeaderMap) -> Option<(i64, Tags)> {
     let value = headers.get(SIGNATURE_HEADER)?.to_str().ok()?;
     let mut stamp = None;
-    let mut tags = Tags { v1: None, v2: None };
+    let mut tags = Tags {
+        v1: None,
+        v2: None,
+        v3: None,
+    };
     for pair in value.split(',') {
         match pair.trim().split_once('=')? {
             ("t", digits) => stamp = Some(digits.parse::<i64>().ok()?),
             ("v1", hex) => tags.v1 = Some(decode_hex(hex)?),
             ("v2", hex) => tags.v2 = Some(decode_hex(hex)?),
+            ("v3", hex) => tags.v3 = Some(decode_hex(hex)?),
             _ => {}
         }
     }

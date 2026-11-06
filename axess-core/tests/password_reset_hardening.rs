@@ -5,6 +5,7 @@
 
 mod common;
 
+use axess_core::testing::AuthSessionTestExt;
 use std::time::Duration;
 
 use axess_core::authn::factor::PasswordRules;
@@ -189,11 +190,8 @@ async fn a_token_issued_before_the_tenant_was_suspended_resets_nothing_and_is_ke
         .expect("token");
 
     let mut tenant = test_tenant();
-    tenant.status = EntityState::Suspended(StatusDetail {
-        reason: "test".into(),
-        since: chrono::Utc::now(),
-        until: None,
-    });
+    tenant.status =
+        EntityState::Suspended(StatusDetail::administrative("test", chrono::Utc::now()));
     let active = test_tenant();
     let _ = identity.clone().with_tenant(tenant.clone());
 
@@ -258,11 +256,8 @@ async fn a_tenant_suspended_during_the_hash_is_refused_at_the_commit() {
     // The first status check has passed by the time the history is read for
     // the hash; the tenant is suspended right there, once.
     let mut suspended = test_tenant();
-    suspended.status = EntityState::Suspended(StatusDetail {
-        reason: "test".into(),
-        since: chrono::Utc::now(),
-        until: None,
-    });
+    suspended.status =
+        EntityState::Suspended(StatusDetail::administrative("test", chrono::Utc::now()));
     let flip = identity.clone();
     let once = AtomicBool::new(true);
     log.on("password_history", move || {

@@ -117,6 +117,13 @@ pub trait AuthnMetrics: Send + Sync + 'static {
     /// An account was locked due to too many failed attempts.
     fn account_locked(&self) {}
 
+    /// A guess was refused by the throttle: consecutive wrong guesses under
+    /// one key (see [`Throttle`](crate::authn::types::Throttle)) had earned a
+    /// delay that had not run. No verifier ran and nothing was counted. A
+    /// steady rate from one address is a guesser; the same from many is a
+    /// distributed one, which the per-account lock still caps.
+    fn attempt_throttled(&self) {}
+
     /// A recovery code matched only under the previous pepper of a rotation.
     ///
     /// The login succeeded, and the set it came from stays sealed under the

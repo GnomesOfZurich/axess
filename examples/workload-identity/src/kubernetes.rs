@@ -11,7 +11,7 @@
 //!
 //! ```ignore
 //! use axess_example_workload_identity::kubernetes::{
-//!     k8s_sa_mapper, K8sCustomClaims,
+//!     k8s_sa_mapper_pinned, K8sCustomClaims, SaUidPins,
 //! };
 //! use axess_factors::federation::workload::WorkloadResolver;
 //! use axess_factors::jwt::verifier::JwtVerifier;
@@ -25,15 +25,19 @@
 //!         .with_audience("axess-platform"),
 //! );
 //! let trust_domain = TrustDomain::new("cluster.local").unwrap();
+//! // The service accounts you trust, each with the UID the cluster gave it
+//! // (`kubectl get sa worker -n payments -o jsonpath='{.metadata.uid}'`).
+//! // A token for any other account, or for a recreated one, is refused.
+//! let pins = SaUidPins::new().pin("payments", "worker", "5f6e1c0a-...");
 //!
 //! // Per-request:
 //! let resolver = WorkloadResolver::<K8sCustomClaims, _, _>::new(
 //!     verifier.clone(),
 //!     trust_domain.clone(),
-//!     tenant_id,                          // adopter looked up from namespace
+//!     |namespace| tenants.get(namespace).copied(), // None refuses the token
 //!     Issuer::custom("kubernetes").unwrap(),
 //!     bearer_token,
-//!     k8s_sa_mapper(trust_domain),
+//!     k8s_sa_mapper_pinned(pins),
 //! );
 //! let principal = resolver.resolve().await?;
 //! ```
@@ -44,10 +48,10 @@
 //! deleted and created again by anyone who may create service accounts in
 //! that namespace; the new account's tokens then carry the name you
 //! trusted. The `uid` claim does not survive that: a recreated account gets
-//! a new UID. [`k8s_sa_mapper`] records the UID as the `sa_uid` attribute
-//! but does not require it. Use [`k8s_sa_mapper_pinned`] with
-//! [`SaUidPins`] to refuse a token whose UID is missing or not the one
-//! registered for its `(namespace, name)`.
+//! a new UID. The wire-up above therefore uses [`k8s_sa_mapper_pinned`] with
+//! [`SaUidPins`], which refuses a token whose UID is missing or not the one
+//! registered for its `(namespace, name)`. [`k8s_sa_mapper`] records the UID
+//! as the `sa_uid` attribute but does not require it; see its warning.
 //!
 //! # SPIFFE path shape
 //!
@@ -61,7 +65,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use axess_factors::federation::workload::WorkloadMapping;
 use axess_factors::jwt::verifier::VerifiedClaims;
-use axess_identity::{IdentityError, TrustDomain, WorkloadId};
+use axess_identity::IdentityError;
 use serde::Deserialize;
 
 /// Inner service-account block of the `kubernetes.io` claim namespace.
@@ -151,11 +155,10 @@ impl SaUidPins {
 /// decided it (`kubernetes.io.namespace` and `serviceaccount.name` for an
 /// unpinned account, `kubernetes.io.serviceaccount.uid` for a UID mismatch).
 pub fn k8s_sa_mapper_pinned(
-    trust_domain: TrustDomain,
     pins: SaUidPins,
 ) -> impl Fn(&VerifiedClaims<K8sCustomClaims>) -> Result<WorkloadMapping, IdentityError> + Send + Sync
 {
-    let inner = k8s_sa_mapper(trust_domain);
+    let inner = k8s_sa_mapper();
     move |claims| {
         let ns = &claims.custom.kubernetes_io;
         pins.check(
@@ -169,16 +172,22 @@ pub fn k8s_sa_mapper_pinned(
 
 /// Build the claim-mapping closure for [`WorkloadResolver`](axess_factors::federation::workload::WorkloadResolver).
 ///
-/// Captures the `trust_domain` so the synthesised `WorkloadId` lives
-/// under the SPIFFE trust domain the resolver pins.
-pub fn k8s_sa_mapper(
-    trust_domain: TrustDomain,
-) -> impl Fn(&VerifiedClaims<K8sCustomClaims>) -> Result<WorkloadMapping, IdentityError> + Send + Sync
+/// The resolver builds the `WorkloadId` itself, under the trust domain it
+/// pins, from the service name and tenant slug this mapper returns.
+///
+/// # Warning: the account is trusted by name
+///
+/// This mapper does not look at the service-account UID. Anyone who may
+/// create service accounts in a namespace can delete a trusted account and
+/// create another under the same `(namespace, name)`, and its tokens are
+/// accepted as the original's. Use [`k8s_sa_mapper_pinned`] unless the
+/// cluster's RBAC already guarantees nobody can do that, and then only with
+/// the namespace's own audit trail as the check.
+pub fn k8s_sa_mapper()
+-> impl Fn(&VerifiedClaims<K8sCustomClaims>) -> Result<WorkloadMapping, IdentityError> + Send + Sync
 {
     move |claims| {
         let ns = &claims.custom.kubernetes_io;
-
-        let workload_id = WorkloadId::build(&trust_domain, &ns.serviceaccount.name, &ns.namespace)?;
 
         let mut attributes = BTreeMap::new();
         if let Some(uid) = &ns.serviceaccount.uid {
@@ -200,7 +209,6 @@ pub fn k8s_sa_mapper(
         }
 
         Ok(WorkloadMapping {
-            workload_id,
             service_name: ns.serviceaccount.name.clone(),
             tenant_slug: ns.namespace.clone(),
             attributes,

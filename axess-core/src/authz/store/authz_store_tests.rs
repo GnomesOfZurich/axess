@@ -343,3 +343,37 @@ fn policy_store_schema_accessor_is_borrow_of_inner() {
         "schema() must borrow the stored Schema, not produce a new one"
     );
 }
+
+/// A store reports whether any of its policies reads `context`, which is what
+/// decides if a missing request-context provider is worth a warning.
+#[test]
+fn a_store_reports_whether_its_policies_read_the_context() {
+    assert!(!build_store().mentions_context());
+
+    let schema = r#"{
+        "TestApp": {
+            "entityTypes": {
+                "User": { "memberOfTypes": [] },
+                "Resource": { "memberOfTypes": [] }
+            },
+            "actions": {
+                "View": {
+                    "appliesTo": {
+                        "principalTypes": ["User"],
+                        "resourceTypes": ["Resource"],
+                        "context": {
+                            "type": "Record",
+                            "attributes": { "mfa": { "type": "Boolean", "required": false } }
+                        }
+                    }
+                }
+            }
+        }
+    }"#;
+    let policy = "permit(principal, action, resource) when { context has mfa && context.mfa };";
+    assert!(
+        PolicyStore::from_text(policy, schema)
+            .unwrap()
+            .mentions_context()
+    );
+}

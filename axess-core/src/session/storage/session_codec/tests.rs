@@ -17,7 +17,7 @@ fn sample() -> SessionData {
 }
 
 fn codec() -> SessionCodec {
-    SessionCodec::encrypted(SessionCrypto::new([8u8; 32]))
+    SessionCodec::encrypted(SessionCrypto::new(crate::testing::test_key(8)))
 }
 
 #[test]
@@ -36,14 +36,14 @@ fn new_blobs_carry_the_marker() {
 
 fn accepting_codec() -> SessionCodec {
     SessionCodec::encrypted(
-        SessionCrypto::new([8u8; 32])
+        SessionCrypto::new(crate::testing::test_key(8))
             .with_legacy_blobs(crate::session::crypto::LegacyBlobs::Accept),
     )
 }
 
 #[test]
 fn a_legacy_blob_is_refused_by_default() {
-    let legacy = SessionCrypto::new([8u8; 32])
+    let legacy = SessionCrypto::new(crate::testing::test_key(8))
         .encrypt_unbound(&rmp_serde::to_vec_named(&sample()).unwrap())
         .unwrap();
     assert!(codec().decode_bytes(&id(1), &legacy).is_err());
@@ -52,7 +52,7 @@ fn a_legacy_blob_is_refused_by_default() {
 
 #[test]
 fn legacy_blob_reads_and_is_resealed_by_the_next_encode() {
-    let crypto = SessionCrypto::new([8u8; 32]);
+    let crypto = SessionCrypto::new(crate::testing::test_key(8));
     let legacy = crypto
         .encrypt_unbound(&rmp_serde::to_vec_named(&sample()).unwrap())
         .unwrap();
@@ -71,7 +71,7 @@ fn legacy_blob_reads_and_is_resealed_by_the_next_encode() {
 /// row it was found under. It is sealed afresh by the next save.
 #[test]
 fn an_unbound_blob_is_read_but_not_marked_for_reseal() {
-    let legacy = SessionCrypto::new([8u8; 32])
+    let legacy = SessionCrypto::new(crate::testing::test_key(8))
         .encrypt_unbound(&rmp_serde::to_vec_named(&sample()).unwrap())
         .unwrap();
     let Decoded {
@@ -89,8 +89,10 @@ fn an_unbound_blob_is_read_but_not_marked_for_reseal() {
 #[test]
 fn a_blob_under_the_previous_key_is_marked_for_reseal() {
     let blob = codec().encode_bytes(&id(1), &sample()).unwrap();
-    let rotated =
-        SessionCodec::encrypted(SessionCrypto::new([9u8; 32]).with_previous_key([8u8; 32]));
+    let rotated = SessionCodec::encrypted(
+        SessionCrypto::new(crate::testing::test_key(9))
+            .with_previous_key(crate::testing::test_key(8)),
+    );
     let Decoded {
         data: loaded,
         reseal,
@@ -101,7 +103,7 @@ fn a_blob_under_the_previous_key_is_marked_for_reseal() {
 
 #[test]
 fn marked_blob_with_empty_aad_body_is_refused() {
-    let crypto = SessionCrypto::new([8u8; 32]);
+    let crypto = SessionCrypto::new(crate::testing::test_key(8));
     let body = crypto
         .encrypt_unbound(&rmp_serde::to_vec_named(&sample()).unwrap())
         .unwrap();

@@ -37,14 +37,16 @@
 //! itself, but it cannot read a row this release saved (the text column is
 //! empty): that user signs in again.
 
-use crate::session::storage::session_codec::{Decoded, SessionCodec, SqlStoreError, expires_at};
+use crate::session::storage::session_codec::{
+    DEFAULT_MAX_PAYLOAD_BYTES, Decoded, SessionCodec, SqlStoreError, expires_at,
+};
 use crate::session::storage::sql_helpers::log_cleanup_outcome;
 use crate::session::{
     data::SessionData,
     id::SessionId,
     store::{
         ConditionalUpdate, CycleOutcome, SessionStore,
-        cas::{CasRow, CasWrite, cas_by_revision},
+        cas::{CasRow, CasWrite, cas_by_revision, cycle_by_revision},
     },
 };
 use axess_clock::{Clock, SystemClock};
@@ -71,7 +73,7 @@ pub type PostgresStoreError = SqlStoreError;
 /// is encrypted before storage and decrypted on load.
 ///
 /// For local development or testing where encryption is not needed, use
-/// [`plaintext`](PostgresSessionStore::plaintext) instead.
+/// [`plaintext_insecure`](PostgresSessionStore::plaintext_insecure) instead.
 ///
 /// ```rust,ignore
 /// use axess::session::SessionCrypto;
@@ -80,13 +82,15 @@ pub type PostgresStoreError = SqlStoreError;
 /// let store = PostgresSessionStore::new(pool, SessionCrypto::new(key));
 ///
 /// // Development only: plaintext (explicit opt-out).
-/// let store = PostgresSessionStore::plaintext(pool);
+/// let store = PostgresSessionStore::plaintext_insecure(pool);
 /// ```
 #[derive(Clone)]
 pub struct PostgresSessionStore {
     pool: PgPool,
     codec: SessionCodec,
     clock: Arc<dyn Clock>,
+    /// Largest encoded payload a write accepts, in bytes.
+    max_payload_bytes: usize,
 }
 
 impl PostgresSessionStore {
@@ -96,11 +100,16 @@ impl PostgresSessionStore {
             pool,
             codec: SessionCodec::encrypted(crypto),
             clock: Arc::new(SystemClock),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
         }
     }
 
     /// Create a **plaintext** store (development/testing only).
-    pub fn plaintext(pool: PgPool) -> Self {
+    ///
+    /// Session data (including the user id) is stored **unsealed**: anyone who
+    /// can read the table can read every session. The named opt-out beside
+    /// [`new`](Self::new), which takes the key; do not use in production.
+    pub fn plaintext_insecure(pool: PgPool) -> Self {
         tracing::warn!(
             "PostgresSessionStore created without encryption; \
              do not use in production"
@@ -109,7 +118,18 @@ impl PostgresSessionStore {
             pool,
             codec: SessionCodec::plaintext(),
             clock: Arc::new(SystemClock),
+            max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
         }
+    }
+
+    /// Set the largest encoded session payload a write accepts, in bytes
+    /// (default 64 KiB, as for the Valkey store). `save`, `update`, `cycle`
+    /// and the conditional updates return
+    /// [`SqlStoreError::PayloadTooLarge`] over it, so session data an
+    /// attacker can grow does not grow the row without bound.
+    pub fn with_max_payload(mut self, max_bytes: usize) -> Self {
+        self.max_payload_bytes = max_bytes;
+        self
     }
 
     /// Inject a [`Clock`] for deterministic-simulation testing.
@@ -242,6 +262,16 @@ impl PostgresSessionStore {
 }
 
 impl SessionStore for PostgresSessionStore {
+    /// SQL rows hold the session as one sealed blob with no user column, so
+    /// they cannot be listed by user.
+    async fn find_sessions_for_user(
+        &self,
+        _user_id: &crate::authn::ids::UserId,
+        _limit: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        Err(SqlStoreError::Unsupported("find_sessions_for_user"))
+    }
+
     type Error = SqlStoreError;
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionData>, Self::Error> {
@@ -280,7 +310,9 @@ impl SessionStore for PostgresSessionStore {
             return SessionStore::delete(self, id).await;
         }
         let id_str = id.to_string();
-        let encoded = self.codec.encode_bytes(id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(id, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
 
         sqlx::query(
@@ -321,7 +353,9 @@ impl SessionStore for PostgresSessionStore {
             return Ok(false);
         }
         let id_str = id.to_string();
-        let encoded = self.codec.encode_bytes(id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(id, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
         let now = self.clock.now().timestamp();
 
@@ -369,7 +403,9 @@ impl SessionStore for PostgresSessionStore {
                 .await?;
             return Ok(CycleOutcome::SessionGone);
         }
-        let encoded = self.codec.encode_bytes(new_id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(new_id, data, self.max_payload_bytes)?;
         let exp = expires_at(&*self.clock, ttl);
         let now = self.clock.now().timestamp();
 
@@ -435,6 +471,27 @@ impl SessionStore for PostgresSessionStore {
         Ok(CycleOutcome::Rotated)
     }
 
+    async fn cycle_if_revision(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> Result<CycleOutcome, Self::Error> {
+        cycle_by_revision(
+            self,
+            old_id,
+            new_id,
+            data,
+            ttl,
+            require_old,
+            expected_revision,
+        )
+        .await
+    }
+
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         // Trait surface over the existing inherent
         // `cleanup_expired`; applications that hold a `dyn SessionStore`
@@ -492,7 +549,9 @@ impl CasRow for PostgresSessionStore {
     ) -> Result<CasWrite, Self::Error> {
         // Sealed once the row is known to be live: a session that is gone or
         // moved on costs no seal.
-        let encoded = self.codec.encode_bytes(id, data)?;
+        let encoded = self
+            .codec
+            .encode_bytes_within(id, data, self.max_payload_bytes)?;
         let replaced = sqlx::query(
             "UPDATE sessions SET data = '', data_bin = $1, expires_at = $2 \
              WHERE id = $3 AND expires_at > $4 AND data_bin IS NOT DISTINCT FROM $5 AND data = $6",
@@ -597,7 +656,7 @@ mod postgres_tests {
     }
 
     /// An encrypted store: only `plaintext_constructor_emits_warning` calls
-    /// `plaintext`, so no other test hits that warning's callsite while the
+    /// `plaintext_insecure`, so no other test hits that warning's callsite while the
     /// capture is installed.
     fn store() -> PostgresSessionStore {
         let key = std::array::from_fn(|i| u8::try_from(i).unwrap_or(0) + 1);
@@ -617,10 +676,10 @@ mod postgres_tests {
         // `Default` impl exists) AND the inline `tracing::warn!`
         // diagnostic against accidental removal during refactors.
         let capture = TracingCapture::install();
-        drop(PostgresSessionStore::plaintext(unreachable_pool()));
+        drop(PostgresSessionStore::plaintext_insecure(unreachable_pool()));
         assert!(
             capture.contains_at_level(tracing::Level::WARN, "without encryption"),
-            "plaintext() must warn operators; captured events: {:#?}",
+            "plaintext_insecure() must warn operators; captured events: {:#?}",
             capture.events()
         );
     }

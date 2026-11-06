@@ -2,12 +2,12 @@
 //!
 //! Two-step ceremony: `begin_signup` creates a `Candidate` user and
 //! transitions the session to `PendingWorkflow(Signup)`; the application
-//! sends a verification email (or any other proof-of-control step), then
-//! calls `complete_signup` to activate the user and transition the
-//! session to `Authenticated`.
+//! sends the verification secret `begin_signup` minted by email (or any
+//! other channel only the person reads), then calls `complete_signup` with
+//! it to activate the user and transition the session to `Authenticated`.
 
 use crate::authn::service::RequestAuthnService;
-use crate::authn::service::outcomes::SignupOutcome;
+use crate::authn::service::outcomes::{SignupOutcome, SignupVerification};
 use crate::authn::{
     error::AuthnError,
     event::{AuthEventBuilder, AuthEventType, AuthFailureReason},
@@ -27,10 +27,15 @@ where
     /// [`PendingWorkflow(Signup)`](WorkflowKind::Signup).
     ///
     /// The user is created in whatever [`EntityState`](crate::authn::types::EntityState) the caller provides
-    /// (typically [`Candidate`](crate::authn::types::EntityState::Candidate)). The application
-    /// is responsible for what happens next: typically sending a verification
-    /// email and calling [`complete_signup`](Self::complete_signup) after the
-    /// user confirms.
+    /// (typically [`Candidate`](crate::authn::types::EntityState::Candidate)).
+    /// The answer carries a single-use verification secret
+    /// ([`SignupVerification`]), valid for
+    /// [`DEFAULT_SIGNUP_VERIFICATION_TTL`](crate::authn::service::DEFAULT_SIGNUP_VERIFICATION_TTL)
+    /// unless the service says otherwise; the session keeps only its digest.
+    /// The application mails it to the address the person gave and calls
+    /// [`complete_signup`](Self::complete_signup) with it when they return.
+    /// Without that proof of control the session that began the signup cannot
+    /// activate itself.
     ///
     /// `tenant_identifier` is the tenant slug/domain (looked up via
     /// [`IdentityLookup::find_tenant`](crate::authn::IdentityLookup::find_tenant)).
@@ -44,6 +49,12 @@ where
     /// how the application tells the two apart privately. The session that
     /// began a signup may submit it again and gets `Started` once more, with
     /// a success row carrying reason `resumed`.
+    ///
+    /// Because `Started` covers both, the handler tells them apart with
+    /// [`AuthSession::pending_user_id`](crate::session::AuthSession::pending_user_id)
+    /// after the call: `Some` means an account is in flight, `None` means the
+    /// identifier was taken. Send the verification mail only for `Some`, and
+    /// never let the response differ between the two.
     ///
     /// # Errors
     ///
@@ -128,15 +139,7 @@ where
                 crate::authn::types::EntityState::Candidate
             ) && resuming_own
             {
-                // A row for the resubmit, so the log shows every submit and
-                // not only the first; its type says nothing was created.
-                self.emit_audit(
-                    AuthEventBuilder::success(AuthEventType::SignupResumed)
-                        .attributed_to(&existing_user.id, &existing_user.tenant_id)
-                        .with_session(session.session_id().await),
-                )
-                .await?;
-                return Ok(SignupOutcome::Started);
+                return self.resume_signup(&existing_user, session).await;
             }
             self.refuse_signup(
                 Some(&existing_user.id),
@@ -152,7 +155,7 @@ where
             if self.inner.reveal_signup_conflicts {
                 return Ok(SignupOutcome::AlreadyExists);
             }
-            return Ok(SignupOutcome::Started);
+            return Ok(SignupOutcome::Started(None));
         }
 
         // 3. Create the user in the tenant that was just validated. The
@@ -173,9 +176,13 @@ where
 
         // 4. Transition session to PendingWorkflow(Signup).
         let now = self.inner.clock.now();
-        let workflow = WorkflowState::new(WorkflowKind::Signup, 1, now);
-        session
-            .set_pending_workflow(user_id, tenant_id, workflow)
+        let verification = self
+            .arm_signup_verification(
+                session,
+                &user_id,
+                &tenant_id,
+                WorkflowState::new(WorkflowKind::Signup, 1, now),
+            )
             .await;
 
         // 5. Record audit event.
@@ -186,7 +193,63 @@ where
         )
         .await?;
 
-        Ok(SignupOutcome::Started)
+        Ok(SignupOutcome::Started(Some(verification)))
+    }
+
+    /// The session submits its own pending signup again: a row for the
+    /// resubmit, so the log shows every submit and not only the first (its
+    /// type says nothing was created), and a fresh secret that replaces the
+    /// earlier one, which cannot be recovered from its digest and so cannot
+    /// be sent again.
+    async fn resume_signup(
+        &self,
+        existing_user: &crate::authn::types::User,
+        session: &AuthSession,
+    ) -> Result<SignupOutcome, AuthnError<I::Error>> {
+        self.emit_audit(
+            AuthEventBuilder::success(AuthEventType::SignupResumed)
+                .attributed_to(&existing_user.id, &existing_user.tenant_id)
+                .with_session(session.session_id().await),
+        )
+        .await?;
+        let verification = self
+            .arm_signup_verification(
+                session,
+                &existing_user.id,
+                &existing_user.tenant_id,
+                WorkflowState::new(WorkflowKind::Signup, 1, self.inner.clock.now()),
+            )
+            .await;
+        Ok(SignupOutcome::Started(Some(verification)))
+    }
+
+    /// Mint the secret that completes this signup, store its digest and
+    /// expiry in the pending workflow, and return the secret.
+    async fn arm_signup_verification(
+        &self,
+        session: &AuthSession,
+        user_id: &crate::authn::ids::UserId,
+        tenant_id: &crate::authn::ids::TenantId,
+        workflow: WorkflowState,
+    ) -> SignupVerification {
+        use base64::Engine as _;
+        use zeroize::Zeroizing;
+        let mut raw = Zeroizing::new([0u8; 32]);
+        self.inner.rng.fill_bytes(&mut *raw);
+        let secret =
+            Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw.as_slice()));
+        let now = self.inner.clock.now();
+        let expires_at = now
+            + chrono::Duration::from_std(self.inner.signup_verification_ttl)
+                .unwrap_or(chrono::Duration::MAX / 4);
+        session
+            .set_pending_workflow(
+                *user_id,
+                *tenant_id,
+                workflow.with_verification(secret_digest(&secret), expires_at),
+            )
+            .await;
+        SignupVerification { secret, expires_at }
     }
 
     /// Leave a failed `SignupStarted` row for a refused signup, with the
@@ -208,22 +271,56 @@ where
     /// Complete a signup flow: activate the user and transition the session
     /// to [`AuthState::Authenticated`](crate::session::data::AuthState::Authenticated).
     ///
-    /// Call this after the user has completed whatever verification the
-    /// application requires (e.g. email confirmation). The session must be
-    /// in [`PendingWorkflow`](crate::session::data::AuthState::PendingWorkflow)
-    /// state with a [`Signup`](WorkflowKind::Signup) workflow.
-    #[tracing::instrument(skip(self, session))]
-    pub async fn complete_signup(&self, session: &AuthSession) -> Result<(), AuthnError<I::Error>> {
+    /// Call this when the person returns with the secret
+    /// [`begin_signup`](Self::begin_signup) minted and the application mailed
+    /// to them (a link, a code). The session must be in
+    /// [`PendingWorkflow`](crate::session::data::AuthState::PendingWorkflow)
+    /// state with a [`Signup`](WorkflowKind::Signup) workflow, and `secret`
+    /// must match the digest stored with it, compared in constant time, before
+    /// the secret's expiry. The secret is single use: completing the signup
+    /// ends the workflow, and submitting the signup again replaces it.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthnError::NoFlow`] when the session is not pending a signup;
+    /// [`AuthnError::InvalidAssertion`] when `secret` is wrong or expired, or
+    /// the pending signup holds no digest (one begun by an older release:
+    /// submit the signup again for a new secret).
+    #[tracing::instrument(skip_all)]
+    pub async fn complete_signup(
+        &self,
+        session: &AuthSession,
+        secret: &str,
+    ) -> Result<(), AuthnError<I::Error>> {
         let state = session.auth_state().await;
 
-        let (user_id, tenant_id) = match &state {
+        let (user_id, tenant_id, workflow) = match &state {
             crate::session::data::AuthState::PendingWorkflow {
                 user_id,
                 tenant_id,
                 workflow,
-            } if workflow.kind == WorkflowKind::Signup => (*user_id, *tenant_id),
+            } if workflow.kind == WorkflowKind::Signup => (*user_id, *tenant_id, workflow),
             _ => return Err(AuthnError::NoFlow),
         };
+
+        // The proof of control: a secret only the address's owner was sent.
+        let fresh = workflow
+            .verification_expires_at
+            .is_some_and(|at| self.inner.clock.now() < at);
+        let matches = workflow
+            .verification_digest
+            .as_deref()
+            .is_some_and(|stored| {
+                crate::validation::compare_secrets(
+                    stored.as_bytes(),
+                    secret_digest(secret).as_bytes(),
+                )
+            });
+        if !(fresh && matches) {
+            self.refuse_signup(Some(&user_id), Some(&tenant_id), "verification_failed")
+                .await?;
+            return Err(AuthnError::InvalidAssertion);
+        }
 
         // Only a user still waiting to be activated is activated. The
         // workflow state in the session is a snapshot; between
@@ -300,4 +397,14 @@ where
 
         Ok(())
     }
+}
+
+/// Lowercase hex SHA-256 of a verification secret: what the pending workflow
+/// stores in its place.
+fn secret_digest(secret: &str) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(secret.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }

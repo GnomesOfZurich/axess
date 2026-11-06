@@ -105,7 +105,7 @@ async fn a_miss_reads_the_users_index_only_when_asked_to_read_earlier_layouts() 
         .expect("a miss reads none of the user's other devices");
     assert_eq!(found.map(|f| f.id), None);
 
-    let reading_legacy = ValkeyDeviceStore::plaintext(s.client.clone())
+    let reading_legacy = ValkeyDeviceStore::plaintext_insecure(s.client.clone())
         .with_prefix(s.prefix.clone())
         .with_legacy_fingerprint_keys();
     assert!(

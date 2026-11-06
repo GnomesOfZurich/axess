@@ -82,13 +82,16 @@ async fn issue_and_refresh_roundtrip() {
     assert!(!record.revoked);
 
     // Use the plaintext to refresh; should produce a new session.
-    let (session, new_token) = Refresh::new(&plaintext, |_| async { true })
+    let (session, new_token) = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
 
     assert!(session.auth_state.is_authenticated());
-    assert_eq!(session.auth_state.user_id(), Some(&fixture_user()));
+    assert_eq!(
+        session.auth_state.authenticated_user_id(),
+        Some(&fixture_user())
+    );
     // Rotation enabled; should have a new token.
     assert!(new_token.is_some());
 }
@@ -121,7 +124,7 @@ async fn expired_token_rejected() {
 
     // Advance time past expiry.
     let future = ts + Duration::seconds(2);
-    let result = Refresh::new(&plaintext, |_| async { true })
+    let result = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, future)
         .await;
 
@@ -159,7 +162,7 @@ async fn revoked_token_rejected() {
         .await
         .unwrap();
 
-    let result = Refresh::new(&plaintext, |_| async { true })
+    let result = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -192,21 +195,21 @@ async fn rotation_invalidates_old_token() {
     .unwrap();
 
     // First refresh: v1 is consumed, v2 is issued.
-    let (_, new_token) = Refresh::new(&plaintext_v1, |_| async { true })
+    let (_, new_token) = Refresh::any_tenant(&plaintext_v1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
     let (plaintext_v2, _) = new_token.unwrap();
 
     // v1 should now be revoked.
-    let result = Refresh::new(&plaintext_v1, |_| async { true })
+    let result = Refresh::any_tenant(&plaintext_v1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
 
     // v1 reuse triggered family revocation; v2 is also revoked (correct
     // security behavior: token theft detected → entire family invalidated).
-    let result = Refresh::new(&plaintext_v2, |_| async { true })
+    let result = Refresh::any_tenant(&plaintext_v2, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -332,14 +335,14 @@ async fn replayed_rotated_token_revokes_entire_family() {
     .unwrap();
 
     // Step 1 (cont.): Alice's browser rotates v1 → v2.
-    let (_, alice_rotation) = Refresh::new(&alice_v1, |_| async { true })
+    let (_, alice_rotation) = Refresh::any_tenant(&alice_v1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await
         .unwrap();
     let (alice_v2, _) = alice_rotation.expect("rotation must mint v2 when rotation=true");
 
     // Step 2 + 3: Eve replays the rotated-out v1. Must fail.
-    let eve_replay = Refresh::new(&alice_v1, |_| async { true })
+    let eve_replay = Refresh::any_tenant(&alice_v1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
     assert!(
@@ -350,7 +353,7 @@ async fn replayed_rotated_token_revokes_entire_family() {
     // Step 4: Alice's still-current v2 must ALSO fail; the family
     // is now revoked. This is the contract that distinguishes axess
     // from naive "revoke just the replayed token" implementations.
-    let alice_followup = Refresh::new(&alice_v2, |_| async { true })
+    let alice_followup = Refresh::any_tenant(&alice_v2, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
     assert!(
@@ -423,7 +426,7 @@ async fn max_per_user_enforced() {
     .unwrap();
 
     // The first token should have been auto-revoked.
-    let result = Refresh::new(&pt1, |_| async { true })
+    let result = Refresh::any_tenant(&pt1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::Revoked)));
@@ -477,10 +480,10 @@ async fn revoke_user_tokens_clears_all() {
     // Revoke all.
     store.revoke_user_tokens(&fixture_user()).await.unwrap();
 
-    let result1 = Refresh::new(&pt1, |_| async { true })
+    let result1 = Refresh::any_tenant(&pt1, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
-    let result2 = Refresh::new(&pt2, |_| async { true })
+    let result2 = Refresh::any_tenant(&pt2, |_| async { true })
         .run(&store, &config, &rng, ts)
         .await;
 
@@ -518,14 +521,14 @@ async fn device_binding_mismatch_rejected() {
     .unwrap();
 
     // Refresh from a different device.
-    let result = Refresh::new(&plaintext, |_| async { true })
+    let result = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("Android/15"))
         .run(&store, &config, &rng, ts)
         .await;
     assert!(matches!(result, Err(RefreshError::DeviceMismatch)));
 
     // Correct device works.
-    let (session, _) = Refresh::new(&plaintext, |_| async { true })
+    let (session, _) = Refresh::any_tenant(&plaintext, |_| async { true })
         .device_info(Some("iPhone/16"))
         .run(&store, &config, &rng, ts)
         .await

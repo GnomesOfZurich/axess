@@ -7,6 +7,7 @@
 //! Backed by [`axess_cache::ClockTtlCache`]: every TTL decision goes
 //! through an injected [`axess_clock::Clock`], preserving DST end-to-end.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +48,14 @@ struct EntityCacheKey {
     action: EntityUid,
     discriminator: Option<String>,
     generation: Generation,
+}
+
+/// A cached entity set with the UIDs it holds, so an invalidation of a parent
+/// (a folder, group or role) finds the entries built under it.
+#[derive(Clone)]
+struct CachedEntities {
+    entities: Arc<Entities>,
+    uids: Arc<HashSet<EntityUid>>,
 }
 
 /// In-process cache decorator over a [`RequestEntityProvider`].
@@ -108,7 +117,7 @@ where
     P: RequestEntityProvider,
 {
     inner: P,
-    cache: ClockTtlCache<EntityCacheKey, Arc<Entities>>,
+    cache: ClockTtlCache<EntityCacheKey, CachedEntities>,
     /// The settings the cache was built with, kept so a fluent setter
     /// changing one carries the others instead of resetting them.
     capacity: usize,
@@ -178,6 +187,16 @@ where
     /// Because a load already in flight must not repopulate the entry, this
     /// also drops every other cached entry of `principal`; they are rebuilt
     /// on their next use.
+    ///
+    /// # Cross-pod
+    ///
+    /// This evicts on the calling pod only. Every other pod keeps serving its
+    /// cached entities until its own TTL runs out (60 seconds by default), so
+    /// a role revoked here is still in force elsewhere until then. In a
+    /// multi-pod deployment broadcast the invalidation (for example publish
+    /// the principal on a channel each pod subscribes to at startup, and call
+    /// the same method on receipt), or accept the TTL as the exposure. axess
+    /// does not broadcast for you.
     pub fn invalidate(
         &self,
         principal: &EntityUid,
@@ -194,6 +213,16 @@ where
     ///
     /// Use as a last-resort invalidation when you can't enumerate the
     /// affected keys (e.g. global Cedar policy reload).
+    ///
+    /// # Cross-pod
+    ///
+    /// This evicts on the calling pod only. Every other pod keeps serving its
+    /// cached entities until its own TTL runs out (60 seconds by default), so
+    /// a change made here is still in force elsewhere until then. In a
+    /// multi-pod deployment broadcast the invalidation (for example publish
+    /// the principal on a channel each pod subscribes to at startup, and call
+    /// the same method on receipt), or accept the TTL as the exposure. axess
+    /// does not broadcast for you.
     pub fn invalidate_all(&self) {
         self.generations.bump_all();
         self.cache.invalidate_all();
@@ -222,14 +251,23 @@ where
             .invalidate_by(|k| k.tenant.as_deref() == Some(tenant))
     }
 
-    /// Drop every entry built for `resource`, for every principal.
+    /// Drop every entry built for `resource`, for every principal, and every
+    /// entry whose entity set holds `resource` as an entity of its own.
     ///
     /// Returns the number of entries dropped. Call from code that changes a
     /// resource's authorization-relevant attributes (owner, classification,
-    /// sharing) when you cannot enumerate the principals that read it.
+    /// sharing) when you cannot enumerate the principals that read it. The
+    /// second part makes it the call for a parent entity: a folder, group or
+    /// role is not the resource of the entries built under it, but it is in
+    /// their entity sets, so changing it drops those entries too, as
+    /// `ValkeyEntityCache::invalidate_resource` does. A load for a child that started before the call may still be
+    /// stored with the old parent until the TTL.
     pub fn invalidate_resource(&self, resource: &EntityUid) -> usize {
         self.generations.bump_resource(resource);
-        self.cache.invalidate_by(|k| &k.resource == resource)
+        let own = self.cache.invalidate_by(|k| &k.resource == resource);
+        own + self
+            .cache
+            .invalidate_entries_by(|_, cached| cached.uids.contains(resource))
     }
 
     /// Borrow the inner provider for read access.
@@ -380,15 +418,21 @@ where
             // one inner-provider call instead of N parallel DB hits.
             // `get_or_try_insert_with` also handles the cache-hit fast path
             // and the "promote to cache on success" step.
-            self.cache
+            let cached = self
+                .cache
                 .get_or_try_insert_with(key, || async {
                     let entities = self
                         .inner
                         .entities_for(session, principal, resource, action)
                         .await?;
-                    Ok::<Arc<Entities>, AuthzError>(Arc::new(entities))
+                    let uids = entities.iter().map(|e| e.uid()).collect();
+                    Ok::<CachedEntities, AuthzError>(CachedEntities {
+                        entities: Arc::new(entities),
+                        uids: Arc::new(uids),
+                    })
                 })
-                .await
+                .await?;
+            Ok(cached.entities)
         })
     }
 }

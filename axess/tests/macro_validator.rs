@@ -4,6 +4,7 @@
 #![cfg(feature = "testing")]
 
 use axess::authn::AuthnService;
+use axess::testing::AuthSessionTestExt;
 use axess::testing::{MockFactorStore, MockIdentityStore};
 use axess::{
     AuthSession, MemorySessionRegistry, MemorySessionStore, SessionLayer, SessionRegistry,
@@ -29,9 +30,12 @@ fn app() -> App {
         .with_registry(registry.clone())
         .build();
     let reg = registry.clone();
-    let session_layer = SessionLayer::new(MemorySessionStore::new(), [42u8; 32])
-        .with_ttl(Duration::from_secs(3600))
-        .with_secure(false);
+    let session_layer = SessionLayer::without_registry_insecure(
+        MemorySessionStore::new(),
+        axess::testing::test_key(42),
+    )
+    .with_ttl(Duration::from_secs(3600))
+    .with_secure(false);
     let plain = Router::new()
         .route("/plain", get(|| async { "ok" }))
         .route_layer(require_authn!());

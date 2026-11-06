@@ -2,21 +2,19 @@
 
 #[cfg(any(test, feature = "memory"))]
 use crate::health::{HealthCheck, HealthStatus};
-#[cfg(any(test, feature = "memory"))]
+#[cfg(test)]
 use crate::locked::lock;
 use crate::session::{data::SessionData, id::SessionId};
 #[cfg(any(test, feature = "memory"))]
 use crate::store::{MemoryStore, Store};
 #[cfg(any(test, feature = "memory"))]
-use std::collections::HashMap;
-#[cfg(any(test, feature = "memory"))]
 use std::future::Future;
 #[cfg(any(test, feature = "memory"))]
 use std::pin::Pin;
 #[cfg(any(test, feature = "memory"))]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 #[cfg(any(test, feature = "memory"))]
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 // ── SessionStore ──────────────────────────────────────────────────────────────
@@ -30,6 +28,10 @@ pub enum CycleOutcome {
     /// The old row was required but was not live (deleted or expired since
     /// the caller loaded it). Nothing was written.
     SessionGone,
+    /// Only [`SessionStore::cycle_if_revision`] answers this: the old row
+    /// holds another revision than the caller read, because a concurrent
+    /// request wrote it. Nothing was written; read the row again and retry.
+    Conflict,
 }
 
 /// What [`SessionStore::update_if_revision`] did.
@@ -178,6 +180,37 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
         require_old: bool,
     ) -> impl std::future::Future<Output = Result<CycleOutcome, Self::Error>> + Send;
 
+    /// [`cycle`](Self::cycle), but only while the old row still holds
+    /// `expected_revision`: a concurrent write between the caller's read and
+    /// the rotation answers [`CycleOutcome::Conflict`] and writes nothing, so
+    /// the caller can merge what was written and try again instead of
+    /// carrying a copy that lost it to the new id. An old row that is not
+    /// live is [`CycleOutcome::SessionGone`] when `require_old` says it must
+    /// be, as for `cycle`.
+    ///
+    /// The shipped stores make the check part of the removal of the old row,
+    /// so no write can land between them. The default reads the row and then
+    /// calls `cycle`, which leaves that window open: a store that can compare
+    /// the revision as part of its own delete should override it.
+    fn cycle_if_revision(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> impl std::future::Future<Output = Result<CycleOutcome, Self::Error>> + Send {
+        async move {
+            if let Some(row) = self.load(old_id).await?
+                && row.revision != expected_revision
+            {
+                return Ok(CycleOutcome::Conflict);
+            }
+            self.cycle(old_id, new_id, data, ttl, require_old).await
+        }
+    }
+
     /// Bulk-delete every session row whose TTL has elapsed.
     /// Returns the number of rows reclaimed.
     ///
@@ -201,51 +234,40 @@ pub trait SessionStore: Send + Sync + Clone + 'static {
     /// Return active (non-expired) sessions for the given user, newest first.
     ///
     /// `limit` caps how many entries are returned; pass a small value
-    /// (e.g. 100) for breach-response UIs and admin "view active devices"
-    /// pages, since a malicious or curious caller could otherwise scan
-    /// every session for a high-cardinality user.
+    /// (e.g. 100) for admin "view active devices" pages, since a malicious
+    /// or curious caller could otherwise scan every session for a
+    /// high-cardinality user.
     ///
-    /// # When to override
+    /// # Required
     ///
-    /// Override on backends that can answer the query efficiently, typically
-    /// by indexing a denormalised `user_id` column extracted from
-    /// [`SessionData::auth_state`] at write time. Without an index this is
-    /// an O(N) scan over the entire session table, which is why the
-    /// default returns an empty `Vec` instead of doing the scan implicitly.
+    /// A backend that can answer the query efficiently (typically by
+    /// indexing a denormalised `user_id` column extracted from
+    /// [`SessionData::auth_state`] at write time, or by holding the data
+    /// in memory) lists the sessions. A backend that cannot returns its own
+    /// error saying so: the SQL stores return
+    /// `SqlStoreError::Unsupported`, never an empty list, because "does not
+    /// enumerate" and "the user has no sessions" must not look alike.
     ///
     /// # Use cases
     ///
-    /// - **Breach response**: list every active session for an account
-    ///   so an admin can revoke them via [`delete`](Self::delete).
-    /// - **"Devices" UI**: let a user see their own active sessions
-    ///   (mobile / desktop / tablet) and selectively log out.
-    /// - **Concurrent-session enforcement**: count active sessions
-    ///   before allowing a new login to exceed a per-user cap.
+    /// - **"Devices" UI**: on a backend that lists, let a user see their own
+    ///   active sessions (mobile / desktop / tablet) and selectively log out.
     ///
-    /// # Default
+    /// # Not for revocation or limits
     ///
-    /// Returns `Ok(Vec::new())`. **Deliberately informational, not
-    /// security-bearing.** Enumeration is hard for backends that store
-    /// sessions as encrypted blobs keyed by `SessionId` (every in-tree
-    /// SQL/Valkey backend), since the `user_id` lives inside the
-    /// ciphertext and a naive scan would need to decrypt every row.
-    /// Backends that don't support cheap enumeration return empty and
-    /// the admin UI shows "no sessions"; operationally fine because the
-    /// caller has no recovery path for "unsupported" that differs from
-    /// "no sessions found."
-    ///
-    /// The security-relevant enumeration is
-    /// [`SessionRegistry::active_sessions`], which IS required and
-    /// drives concurrent-session-limit enforcement.
+    /// **Do not build breach response or the concurrent-session cap on
+    /// this.** Most in-tree backends cannot list (their sessions are
+    /// encrypted blobs keyed by `SessionId`, with the `user_id` inside the
+    /// ciphertext, and a scan would decrypt every row). To end a user's
+    /// sessions use [`SessionRegistry::invalidate_user`] (or
+    /// [`invalidate_session`](SessionRegistry::invalidate_session)); to list
+    /// them use [`SessionRegistry::active_sessions`], which every registry
+    /// must implement and which drives concurrent-session-limit enforcement.
     fn find_sessions_for_user(
         &self,
         user_id: &crate::authn::ids::UserId,
         limit: usize,
-    ) -> impl std::future::Future<Output = Result<Vec<(SessionId, SessionData)>, Self::Error>> + Send
-    {
-        let _ = (user_id, limit);
-        std::future::ready(Ok(Vec::new()))
-    }
+    ) -> impl std::future::Future<Output = Result<Vec<(SessionId, SessionData)>, Self::Error>> + Send;
 }
 
 // ── SessionRegistry ───────────────────────────────────────────────────────────
@@ -472,6 +494,22 @@ impl SessionStore for MemorySessionStore {
         self.inner.delete(id).await
     }
 
+    async fn find_sessions_for_user(
+        &self,
+        user_id: &crate::authn::ids::UserId,
+        limit: usize,
+    ) -> Result<Vec<(SessionId, SessionData)>, Self::Error> {
+        let mut found: Vec<(SessionId, SessionData)> = self
+            .inner
+            .snapshot()
+            .into_iter()
+            .filter(|(_, data)| data.auth_state.pending_user_id() == Some(user_id))
+            .collect();
+        found.sort_by_key(|found| std::cmp::Reverse(found.1.touched_at));
+        found.truncate(limit);
+        Ok(found)
+    }
+
     async fn update(
         &self,
         id: &SessionId,
@@ -538,6 +576,27 @@ impl SessionStore for MemorySessionStore {
         Ok(CycleOutcome::Rotated)
     }
 
+    async fn cycle_if_revision(
+        &self,
+        old_id: &SessionId,
+        new_id: &SessionId,
+        data: &SessionData,
+        ttl: Duration,
+        require_old: bool,
+        expected_revision: u64,
+    ) -> Result<CycleOutcome, Self::Error> {
+        cas::cycle_by_revision(
+            self,
+            old_id,
+            new_id,
+            data,
+            ttl,
+            require_old,
+            expected_revision,
+        )
+        .await
+    }
+
     async fn prune_expired(&self) -> Result<u64, Self::Error> {
         self.inner.prune_expired().await
     }
@@ -596,188 +655,10 @@ impl HealthCheck for MemorySessionStore {
     }
 }
 
-// ── MemorySessionRegistry ─────────────────────────────────────────────────────
-
-/// In-memory session registry backed by one `Mutex<HashMap>`.
-///
-/// Maps `user_id -> Vec<SessionId>` (insertion-ordered). **For testing
-/// and single-node development only.**
-///
-/// Uses a `Vec<SessionId>` whose push order tracks insertion order so
-/// [`Self::active_sessions`] returns sessions oldest-first, satisfying
-/// the [`SessionRegistry::active_sessions`] "ordered oldest first"
-/// contract (load-bearing for the
-/// [`max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
-/// FIFO eviction in `complete_factor_step`). The cost is O(N) lookup
-/// for `is_valid` and `invalidate_session`, but N is bounded by the
-/// concurrent-session limit (typically ≤10) and the Memory registry
-/// is testing-only.
-///
-/// # Lifetime
-///
-/// Each entry carries the time it was registered or last used, and is
-/// forgotten once it is older than the registry's TTL (24 hours by default,
-/// as in `ValkeySessionRegistry`; see [`with_ttl`](Self::with_ttl)). A
-/// session that is used keeps its entry: `is_valid` moves the stamp forward
-/// once half the TTL has gone. The clock is injectable with
-/// [`with_clock`](Self::with_clock).
 #[cfg(any(test, feature = "memory"))]
-#[derive(Clone)]
-pub struct MemorySessionRegistry {
-    valid: Arc<Mutex<HashMap<Arc<str>, Vec<RegisteredSession>>>>,
-    ttl: Duration,
-    clock: Arc<dyn axess_clock::Clock>,
-}
-
-/// A session id and when it was registered or last used.
+mod memory_registry;
 #[cfg(any(test, feature = "memory"))]
-type RegisteredSession = (SessionId, chrono::DateTime<chrono::Utc>);
-
-#[cfg(any(test, feature = "memory"))]
-impl Default for MemorySessionRegistry {
-    fn default() -> Self {
-        Self {
-            valid: Arc::default(),
-            ttl: Duration::from_secs(24 * 60 * 60),
-            clock: Arc::new(axess_clock::SystemClock),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "memory"))]
-impl MemorySessionRegistry {
-    /// Create an empty in-memory session registry.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set how long an entry lives without being used. Defaults to 24 hours.
-    pub fn with_ttl(mut self, ttl: Duration) -> Self {
-        self.ttl = ttl;
-        self
-    }
-
-    /// Inject a [`Clock`](axess_clock::Clock) for deterministic simulation
-    /// testing. Defaults to [`SystemClock`](axess_clock::SystemClock).
-    pub fn with_clock(mut self, clock: Arc<dyn axess_clock::Clock>) -> Self {
-        self.clock = clock;
-        self
-    }
-
-    /// The oldest stamp that is still live at `now`.
-    fn cutoff(&self, now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
-        chrono::Duration::from_std(self.ttl)
-            .ok()
-            .and_then(|ttl| now.checked_sub_signed(ttl))
-            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
-    }
-}
-
-/// Infallible error for the in-memory registry. The in-memory backend
-/// cannot fail at the storage boundary, so callers can prove statically
-/// that no error case is possible. Aliased to `std::convert::Infallible`
-/// rather than carrying an empty enum so `?`-propagation and exhaustive
-/// matches behave the canonical way.
-#[cfg(any(test, feature = "memory"))]
-pub type MemoryRegistryError = std::convert::Infallible;
-
-#[cfg(any(test, feature = "memory"))]
-impl SessionRegistry for MemorySessionRegistry {
-    type Error = MemoryRegistryError;
-
-    async fn register(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> Result<(), Self::Error> {
-        // Dedup-on-insert preserves FIFO semantics; a re-register of an
-        // existing id keeps the original position (it renews the stamp)
-        // rather than appending a duplicate. Entries past the TTL go.
-        let now = self.clock.now();
-        let cutoff = self.cutoff(now);
-        let mut valid = lock(&self.valid);
-        let entry = valid.entry(Arc::from(user_id.to_string())).or_default();
-        entry.retain(|(_, at)| *at > cutoff);
-        match entry.iter_mut().find(|(s, _)| s == session_id) {
-            Some((_, at)) => *at = now,
-            None => entry.push((*session_id, now)),
-        }
-        Ok(())
-    }
-
-    async fn is_valid(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> Result<bool, Self::Error> {
-        let now = self.clock.now();
-        let cutoff = self.cutoff(now);
-        let mut valid = lock(&self.valid);
-        let Some(sessions) = valid.get_mut(user_id.to_string().as_str()) else {
-            return Ok(false);
-        };
-        let half = chrono::Duration::from_std(self.ttl / 2).unwrap_or(chrono::Duration::MAX);
-        Ok(sessions
-            .iter_mut()
-            .find(|(s, _)| s == session_id)
-            .is_some_and(|(_, at)| {
-                let live = *at > cutoff;
-                // A session that is used keeps its entry, as in the Valkey
-                // registry: the stamp moves forward once half the TTL has gone.
-                if live && now - *at >= half {
-                    *at = now;
-                }
-                live
-            }))
-    }
-
-    async fn invalidate_user(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-    ) -> Result<(), Self::Error> {
-        lock(&self.valid).remove(user_id.to_string().as_str());
-        Ok(())
-    }
-
-    async fn invalidate_session(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-        session_id: &SessionId,
-    ) -> Result<(), Self::Error> {
-        let key = user_id.to_string();
-        let mut valid = lock(&self.valid);
-        if let Some(sessions) = valid.get_mut(key.as_str()) {
-            sessions.retain(|(s, _)| s != session_id);
-        }
-        // A user with no session left keeps no entry.
-        valid.retain(|k, v| &**k != key.as_str() || !v.is_empty());
-        Ok(())
-    }
-
-    async fn active_sessions(
-        &self,
-        user_id: &crate::authn::ids::UserId,
-    ) -> Result<Vec<SessionId>, Self::Error> {
-        let cutoff = self.cutoff(self.clock.now());
-        Ok(lock(&self.valid)
-            .get(user_id.to_string().as_str())
-            .map(|sessions| {
-                sessions
-                    .iter()
-                    .filter(|(_, at)| *at > cutoff)
-                    .map(|(s, _)| *s)
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-}
-
-#[cfg(any(test, feature = "memory"))]
-impl HealthCheck for MemorySessionRegistry {
-    fn check(&self) -> Pin<Box<dyn Future<Output = HealthStatus> + Send + '_>> {
-        Box::pin(async { HealthStatus::Healthy })
-    }
-}
+pub use memory_registry::{MemoryRegistryError, MemorySessionRegistry};
 
 #[cfg(test)]
 mod memory_store_clock_tests;

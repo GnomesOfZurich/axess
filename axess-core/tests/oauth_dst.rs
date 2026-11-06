@@ -574,7 +574,7 @@ async fn refresh_response_id_token_with_a_rotated_key_verifies() {
     mount_token_endpoint(&server, &id_token).await;
 
     let outcome = provider
-        .refresh_token("refresh-1", Some("n-1"), None)
+        .refresh_token_unchecked("refresh-1", Some("n-1"), None)
         .await
         .expect("the rotated key is picked up on refresh too");
     let claims = outcome

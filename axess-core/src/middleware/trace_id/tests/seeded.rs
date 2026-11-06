@@ -5,6 +5,7 @@ use axess_rng::testing::MockRng;
 
 fn app(seed: u64) -> TraceContextMiddleware<axum::Router> {
     TraceContextLayer::new()
+        .trust_inbound(true)
         .with_rng(MockRng::new(seed))
         .layer(axum::Router::new().route("/", axum::routing::get(|| async { "ok" })))
 }

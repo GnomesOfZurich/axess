@@ -109,10 +109,8 @@
 //! table indexes the only field anybody queries by.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
-use axess_clock::Clock;
 #[cfg(test)]
 use chrono::TimeZone;
 use chrono::{DateTime, Utc};
@@ -146,7 +144,7 @@ use statements::SqliteSql as Sql;
 /// The primary constructor [`new`](Self::new) requires a
 /// [`SessionCrypto`] envelope key. The `bindings` column is encrypted
 /// before storage and decrypted on load. Use
-/// [`plaintext`](Self::plaintext) only for local development and
+/// [`plaintext_insecure`](Self::plaintext_insecure) only for local development and
 /// testing.
 #[derive(Clone)]
 pub struct SqliteDeviceStore {
@@ -167,7 +165,7 @@ impl SqliteDeviceStore {
 
     /// Create a plaintext store (development/testing only). Logs a
     /// warning so production builds don't accidentally pick this path.
-    pub fn plaintext(pool: SqlitePool) -> Self {
+    pub fn plaintext_insecure(pool: SqlitePool) -> Self {
         tracing::warn!(
             "SqliteDeviceStore created without encryption; \
              do not use in production"
@@ -177,14 +175,6 @@ impl SqliteDeviceStore {
             codec: BindingsCodec::plaintext(),
             sweep_config: SweepConfig::default(),
         }
-    }
-
-    /// Has no effect: every time-dependent method of the store is given the
-    /// instant it works from, so there is no clock to inject.
-    #[deprecated(note = "the store reads time only from the `now` its methods are given")]
-    pub fn with_clock(self, clock: Arc<dyn Clock>) -> Self {
-        let _ = clock;
-        self
     }
 
     /// Override the [`SweepConfig`] driving the retention ladder.

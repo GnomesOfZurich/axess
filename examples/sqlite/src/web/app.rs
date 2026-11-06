@@ -4,6 +4,7 @@ use crate::{
     models::backend::OurBackend,
     web::{auth, protected},
 };
+use axess::authn::BreachedPasswordList;
 use axess::authn::{AuthnService, FactorSecretCipher};
 use axess::csrf::{CsrfConfig, CsrfLayer};
 use axess::session::{LegacyBlobs, SessionCrypto};
@@ -75,6 +76,19 @@ pub struct AppState {
 
 /// Where the example keeps the key its TOTP secrets are sealed under.
 const FACTOR_KEY_FILE: &str = "db/factor-secret.key";
+
+/// The passwords this example treats as breached. Each meets the default
+/// rules, so the refusal a visitor sees on the signup page is the breach
+/// check's and not the rules'. A real corpus holds hundreds of millions of
+/// entries and is consulted through the range protocol; see the README.
+const BREACHED_PASSWORDS: [&str; 6] = [
+    "Password1234",
+    "Password123!",
+    "Qwerty123456",
+    "Welcome12345",
+    "Iloveyou1234",
+    "Letmein12345",
+];
 
 /// The day after which a TOTP secret still stored in plain text is no longer
 /// read. Each such secret is sealed by the login that verifies it, so the date
@@ -274,10 +288,13 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     let registry = MemorySessionRegistry::default();
 
     let secure = secure_cookies();
-    let session_layer = SessionLayer::new(session_store.clone(), signing_key)
-        .with_ttl(Duration::from_secs(86400))
-        .with_secure(secure)
-        .with_registry(Arc::new(axess::SessionRegistryAdapter(registry.clone())));
+    let session_layer = SessionLayer::new(
+        session_store.clone(),
+        signing_key,
+        Arc::new(axess::SessionRegistryAdapter(registry.clone())),
+    )
+    .with_ttl(Duration::from_secs(86400))
+    .with_secure(secure);
 
     // CSRF layer: signed double-submit cookie bound to the session id.
     // The key is a purpose-bound subkey of the session layer's master key
@@ -292,20 +309,29 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
 
     let metrics = Arc::new(AppMetrics::new());
 
-    // Rate limiting: 10 requests per minute per client IP on authentication
-    // endpoints, where the client IP is the one the `client_ip` layer below
-    // resolved (the socket peer, or the forwarded address when it came
-    // through a trusted proxy). `PeerIp` would put every client behind one
-    // proxy into a single bucket. Defense-in-depth alongside the per-user
-    // lockout policy.
-    let auth_rate_limit = RateLimitLayer::new(
-        RateLimitConfig::builder()
-            .max_requests(10)
-            .window(Duration::from_secs(60))
-            .key(KeyExtractor::ClientIp)
-            .build(),
-    )
-    .with_metrics(AppMetricsHandle(metrics.clone()));
+    // Rate limiting: per client IP, where the client IP is the one the
+    // `client_ip` layer below resolved (the socket peer, or the forwarded
+    // address when it came through a trusted proxy). `PeerIp` would put
+    // every client behind one proxy into a single bucket. Defense-in-depth
+    // alongside the per-user lockout policy.
+    //
+    // Only submissions are counted, never the GET that shows a form, and
+    // each sensitive form has a bucket of its own: a run of failed logins
+    // does not stop the same address asking for a reset, nor the reverse.
+    let limiter = |max_requests: u32| {
+        RateLimitLayer::new(
+            RateLimitConfig::builder()
+                .max_requests(max_requests)
+                .window(Duration::from_secs(60))
+                .key(KeyExtractor::ClientIp)
+                .build(),
+        )
+        .with_metrics(AppMetricsHandle(metrics.clone()))
+    };
+    let login_limit = limiter(10);
+    let forgot_limit = limiter(5);
+    // Signup, second factor, reset completion, mail verification, TOTP setup.
+    let auth_limit = limiter(10);
 
     let state_backend = backend.clone();
     let factor_cipher = factor_secret_cipher();
@@ -317,6 +343,17 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
             // Registered sessions are what a password reset or an admin
             // action can revoke; handing over the session store lets the
             // revocation delete the rows as well.
+            // One reset token per account a minute: the form cannot be used to
+            // flood an inbox, or to spend the reset budget of another user.
+            .with_password_reset_cooldown(Duration::from_secs(60))
+            // Every chosen password (signup, reset) is screened against a
+            // breach corpus and refused by name when found. This is a short
+            // fixed list so the refusal can be seen; a deployment implements
+            // `BreachedPasswordCheck` over the k-anonymity range protocol
+            // (see the README). The default refuses a password the check
+            // could not screen; `allow_unchecked_when_breach_check_unavailable`
+            // is the opt-out.
+            .with_breached_password_check(BreachedPasswordList::new(BREACHED_PASSWORDS))
             .with_registry(registry)
             .with_session_store(session_store.clone())
             .build(),
@@ -329,35 +366,48 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         factor_cipher,
     };
 
-    // Auth routes; rate-limited.
+    // Auth routes: the POSTs, and the mail link, are rate-limited.
     let auth_routes = Router::new()
-        .route("/login", get(auth::login_page).post(auth::post_login))
-        .route("/signup", get(auth::signup_page).post(auth::post_signup))
-        .route("/totp", get(auth::totp_page).post(auth::post_totp))
-        .route("/recovery-code", post(auth::post_recovery_code))
+        .route(
+            "/login",
+            get(auth::login_page).merge(post(auth::post_login).layer(login_limit)),
+        )
+        .route(
+            "/signup",
+            get(auth::signup_page).merge(post(auth::post_signup).layer(auth_limit.clone())),
+        )
+        .route(
+            "/verify-email",
+            get(auth::verify_email).layer(auth_limit.clone()),
+        )
+        .route(
+            "/totp",
+            get(auth::totp_page).merge(post(auth::post_totp).layer(auth_limit.clone())),
+        )
+        .route(
+            "/recovery-code",
+            post(auth::post_recovery_code).layer(auth_limit.clone()),
+        )
         .route(
             "/forgot-password",
-            get(auth::forgot_password_page).post(auth::post_forgot_password),
+            get(auth::forgot_password_page)
+                .merge(post(auth::post_forgot_password).layer(forgot_limit)),
         )
         .route(
             "/reset-password",
-            get(auth::reset_password_page).post(auth::post_reset_password),
-        )
-        .layer(auth_rate_limit);
+            get(auth::reset_password_page)
+                .merge(post(auth::post_reset_password).layer(auth_limit.clone())),
+        );
 
-    // Non-rate-limited routes.
+    // The rest.
     let router = Router::new()
         .merge(auth_routes)
         .route("/", get(root))
-        .route(
-            "/setup-totp",
-            get(auth::setup_totp_page).post(auth::post_setup_totp),
-        )
         .route("/logout", post(auth::logout))
         // Every route that needs a signed-in user goes through
         // `protected::router`, which guards them with `require_authn!`. A
         // handler registered here directly runs for guests too.
-        .merge(protected::router())
+        .merge(protected::router(auth_limit))
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics_endpoint))
         .with_state(state)
@@ -378,7 +428,38 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     // set wrong and the walk believes a header it should not.
     let router = axess::client_ip::layer(router, axess::client_ip::TrustedProxies::loopback_only());
 
+    // Every page here is account state or a secret (the TOTP secret, the
+    // recovery codes): nothing is cached, framed or allowed to load anything
+    // from elsewhere.
+    let router = router.layer(axum::middleware::from_fn(security_headers));
+
     (router, session_store)
+}
+
+/// The content security policy of the example's pages: they are static HTML
+/// with inline styles, no script, no external resources and one form target.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'unsafe-inline'; \
+     img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+
+/// Adds `Cache-Control: no-store`, `X-Frame-Options: DENY` and a CSP to every
+/// response, without overriding a header a handler set itself.
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{HeaderValue, header};
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::CACHE_CONTROL, "no-store"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::CONTENT_SECURITY_POLICY, CONTENT_SECURITY_POLICY),
+    ] {
+        headers
+            .entry(name)
+            .or_insert(HeaderValue::from_static(value));
+    }
+    response
 }
 
 /// Root landing: send authenticated users to their dashboard, everyone

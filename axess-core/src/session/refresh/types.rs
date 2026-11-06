@@ -155,6 +155,30 @@ impl RefreshToken {
     }
 }
 
+/// The pepper a [`RefreshTokenConfig`] replaced, kept for the rotation window.
+#[derive(Clone)]
+pub enum PreviousPepper {
+    /// A keyed pepper, held in [`Zeroizing`] so every copy wipes it on drop.
+    Keyed(Zeroizing<Vec<u8>>),
+    /// The unkeyed hash: the deployment ran without a pepper and now sets one.
+    Unkeyed,
+}
+
+impl PreviousPepper {
+    /// A keyed previous pepper.
+    pub fn keyed(pepper: impl Into<Vec<u8>>) -> Self {
+        Self::Keyed(Zeroizing::new(pepper.into()))
+    }
+
+    /// The pepper bytes, or `None` for the unkeyed state.
+    pub fn keyed_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Keyed(pepper) => Some(pepper.as_slice()),
+            Self::Unkeyed => None,
+        }
+    }
+}
+
 /// Configuration for refresh token behavior.
 ///
 /// [`Debug`] is implemented manually so `hash_pepper` prints as
@@ -193,8 +217,12 @@ pub struct RefreshTokenConfig {
     /// **Migration:** changing the pepper invalidates every existing refresh
     /// token unless the old pepper is moved to
     /// [`previous_hash_pepper`](Self::previous_hash_pepper) for the rotation
-    /// window. Switching from `None` to `Some` always invalidates them.
-    /// Default `None` for backward compat.
+    /// window. A deployment that has no pepper yet moves to one by naming the
+    /// unkeyed state as the previous pepper, [`PreviousPepper::Unkeyed`].
+    /// Default `None`: unkeyed hashes. Supplying a `device_info` with no pepper
+    /// is refused as [`RefreshError::InvalidConfig`] unless
+    /// [`allow_unkeyed_hashes`](Self::allow_unkeyed_hashes) says the unkeyed
+    /// digest is meant.
     ///
     /// Held in [`Zeroizing`] so every copy of the config wipes its pepper
     /// when it drops.
@@ -214,20 +242,28 @@ pub struct RefreshTokenConfig {
     /// live token has been refreshed (one `ttl`, at most `max_lifetime` for
     /// tokens that are never used), set this back to `None`.
     ///
-    /// Only a keyed previous pepper is expressible: a rollout from the
-    /// unkeyed hash still invalidates the tokens it replaces. An empty
-    /// value is a configuration error, like an empty `hash_pepper`. Held in
-    /// [`Zeroizing`] for the same reason.
-    pub previous_hash_pepper: Option<Zeroizing<Vec<u8>>>,
+    /// [`PreviousPepper::Unkeyed`] names the unkeyed hash as the one being
+    /// replaced, so a deployment that ran without a pepper moves to
+    /// `hash_pepper: Some(..)` without invalidating a token; it needs a
+    /// `hash_pepper`, since a current pepper of `None` is the same state. An
+    /// empty keyed value is a configuration error, like an empty
+    /// `hash_pepper`. The keyed value is held in [`Zeroizing`] for the same
+    /// reason.
+    pub previous_hash_pepper: Option<PreviousPepper>,
     /// Absolute lifetime of a token family, counted from the authentication
-    /// the family descends from. Default `None` (sliding expiry only: a
-    /// token refreshed at least once per `ttl` never expires). When set, a
-    /// refresh at or after `authenticated_at + max_lifetime` returns
-    /// [`RefreshError::Expired`] and every token's `expires_at` is clamped
-    /// to that instant, so a stolen family cannot be rotated for ever. Must
-    /// be at least `ttl`. A value such as 90 days is a sensible hardening
-    /// choice.
+    /// the family descends from. Default 90 days. A refresh at or after
+    /// `authenticated_at + max_lifetime` returns [`RefreshError::Expired`]
+    /// and every token's `expires_at` is clamped to that instant, so a stolen
+    /// family cannot be rotated for ever. Must be at least `ttl`. `None`
+    /// (see [`with_max_lifetime`](Self::with_max_lifetime)) leaves expiry
+    /// sliding only: a token refreshed at least once per `ttl` never expires.
     pub max_lifetime: Option<Duration>,
+    /// Whether a token may store the unkeyed digest of its `device_info`
+    /// (no `hash_pepper`). Default `false`: a `device_info` with no pepper is
+    /// refused as [`RefreshError::InvalidConfig`], because the unkeyed digest
+    /// lets a reader of the store confirm a guessed device string. Set with
+    /// [`allow_unkeyed_hashes`](Self::allow_unkeyed_hashes).
+    pub allow_unkeyed_hashes: bool,
     /// How long after a rotation a second presentation of the rotated-out
     /// token is read as two parallel refreshes by one client rather than as
     /// theft. Default zero: any reuse of a rotated-out token revokes the
@@ -261,9 +297,17 @@ impl RefreshTokenConfig {
         if self
             .previous_hash_pepper
             .as_ref()
-            .is_some_and(|p| p.is_empty())
+            .and_then(PreviousPepper::keyed_bytes)
+            .is_some_and(<[u8]>::is_empty)
         {
             return Err("previous_hash_pepper must not be empty; use None to stop accepting it");
+        }
+        if matches!(self.previous_hash_pepper, Some(PreviousPepper::Unkeyed))
+            && self.hash_pepper.is_none()
+        {
+            return Err(
+                "previous_hash_pepper Unkeyed needs a hash_pepper: without one the current hash is unkeyed too",
+            );
         }
         if self.reuse_grace < Duration::zero() {
             return Err("reuse_grace must not be negative");
@@ -287,6 +331,40 @@ impl RefreshTokenConfig {
             .and_then(|max| authenticated_at.checked_add_signed(max))
     }
 
+    /// Refuse a `device_info` that would be stored (or compared) as an
+    /// unkeyed digest: the config has no `hash_pepper` and has not allowed
+    /// unkeyed hashes.
+    ///
+    /// # Errors
+    ///
+    /// The reason, when `has_device_info` and the hash is unkeyed without
+    /// [`allow_unkeyed_hashes`](Self::allow_unkeyed_hashes).
+    pub fn validate_device_info(&self, has_device_info: bool) -> Result<(), &'static str> {
+        if has_device_info && self.hash_pepper.is_none() && !self.allow_unkeyed_hashes {
+            return Err(
+                "device_info needs a hash_pepper: without one its digest is unkeyed (set hash_pepper, or allow_unkeyed_hashes)",
+            );
+        }
+        Ok(())
+    }
+
+    /// Set the absolute lifetime of a token family; `None` lifts the cap
+    /// (see [`max_lifetime`](Self::max_lifetime)).
+    #[must_use]
+    pub fn with_max_lifetime(mut self, max_lifetime: Option<Duration>) -> Self {
+        self.max_lifetime = max_lifetime;
+        self
+    }
+
+    /// Allow tokens to store an unkeyed digest of `device_info` when no
+    /// `hash_pepper` is set (see
+    /// [`allow_unkeyed_hashes`](Self::allow_unkeyed_hashes), the field).
+    #[must_use]
+    pub fn allow_unkeyed_hashes(mut self) -> Self {
+        self.allow_unkeyed_hashes = true;
+        self
+    }
+
     /// [`validate`](Self::validate) as the error the refresh functions return.
     pub(super) fn check<E: std::error::Error + Send + Sync + 'static>(
         &self,
@@ -299,9 +377,13 @@ impl RefreshTokenConfig {
         self.hash_pepper.as_deref().map(Vec::as_slice)
     }
 
-    /// The pepper `hash_pepper` replaced, when the rotation window is open.
-    pub fn previous_pepper(&self) -> Option<&[u8]> {
-        self.previous_hash_pepper.as_deref().map(Vec::as_slice)
+    /// The pepper `hash_pepper` replaced, when the rotation window is open:
+    /// `None` outside it, `Some(None)` when the replaced hash was unkeyed,
+    /// `Some(Some(bytes))` when it was keyed.
+    pub fn previous_pepper(&self) -> Option<Option<&[u8]>> {
+        self.previous_hash_pepper
+            .as_ref()
+            .map(PreviousPepper::keyed_bytes)
     }
 }
 
@@ -310,11 +392,12 @@ impl std::fmt::Debug for RefreshTokenConfig {
         // `hash_pepper` is a deployment secret whose leak enables
         // offline pre-image scans of the token-hash table; the manual
         // Debug redacts it while preserving structural context.
-        struct RedactedPepper<'a>(&'a Option<Zeroizing<Vec<u8>>>);
+        struct RedactedPepper<'a>(Option<Option<&'a [u8]>>);
         impl<'a> std::fmt::Debug for RedactedPepper<'a> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self.0 {
-                    Some(p) => write!(f, "Some(<redacted {} bytes>)", p.len()),
+                    Some(Some(p)) => write!(f, "Some(<redacted {} bytes>)", p.len()),
+                    Some(None) => f.write_str("Some(Unkeyed)"),
                     None => f.write_str("None"),
                 }
             }
@@ -323,18 +406,29 @@ impl std::fmt::Debug for RefreshTokenConfig {
             .field("ttl", &self.ttl)
             .field("max_per_user", &self.max_per_user)
             .field("rotation", &self.rotation)
-            .field("hash_pepper", &RedactedPepper(&self.hash_pepper))
+            .field(
+                "hash_pepper",
+                &RedactedPepper(self.hash_pepper.as_deref().map(|p| Some(p.as_slice()))),
+            )
             .field(
                 "previous_hash_pepper",
-                &RedactedPepper(&self.previous_hash_pepper),
+                &RedactedPepper(self.previous_pepper()),
             )
             .field("max_lifetime", &self.max_lifetime)
+            .field("allow_unkeyed_hashes", &self.allow_unkeyed_hashes)
             .field("reuse_grace", &self.reuse_grace)
             .finish()
     }
 }
 
 impl Default for RefreshTokenConfig {
+    /// 30-day sliding `ttl`, rotation on, ten tokens per user and a
+    /// [`max_lifetime`](RefreshTokenConfig::max_lifetime) of 90 days: a family
+    /// ends that long after the authentication it descends from, however
+    /// often it is refreshed. `.with_max_lifetime(None)` lifts the cap, for
+    /// users meant to stay signed in indefinitely. There is no pepper: set
+    /// `hash_pepper`, or the config refuses a `device_info` (see
+    /// [`allow_unkeyed_hashes`](RefreshTokenConfig::allow_unkeyed_hashes)).
     fn default() -> Self {
         Self {
             ttl: Duration::days(30),
@@ -342,7 +436,8 @@ impl Default for RefreshTokenConfig {
             rotation: true,
             hash_pepper: None,
             previous_hash_pepper: None,
-            max_lifetime: None,
+            max_lifetime: Some(Duration::days(90)),
+            allow_unkeyed_hashes: false,
             reuse_grace: Duration::zero(),
         }
     }

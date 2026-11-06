@@ -28,7 +28,7 @@ async fn backend() -> (OurBackend, UserId) {
     seed(
         &SystemClock,
         &pool,
-        &axess::authn::FactorSecretCipher::new([7; 32]),
+        &axess::authn::FactorSecretCipher::new(*b"0123456789abcdef0123456789abcdeF"),
     )
     .await
     .expect("seed");

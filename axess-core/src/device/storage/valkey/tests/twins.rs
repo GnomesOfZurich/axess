@@ -276,7 +276,8 @@ async fn valkey_device_the_plain_set_of_the_release_before_is_read_only_on_reque
         .await
         .unwrap();
 
-    let quiet = ValkeyDeviceStore::plaintext(s.client.clone()).with_prefix(s.prefix.clone());
+    let quiet =
+        ValkeyDeviceStore::plaintext_insecure(s.client.clone()).with_prefix(s.prefix.clone());
     assert_eq!(found(&quiet, &d.fingerprint_hash).await, None);
     assert_eq!(found(&s, &d.fingerprint_hash).await, Some(d.id));
 

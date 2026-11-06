@@ -79,7 +79,7 @@ async fn revoking_a_device_revokes_its_tokens_and_only_its_tokens() {
 
     let device = devices.load(&tenant, &d1).await.unwrap().unwrap();
     assert_eq!(device.trust_level, DeviceTrustLevel::Revoked);
-    let outcome = Refresh::new(&laptop, |_| async { true })
+    let outcome = Refresh::any_tenant(&laptop, |_| async { true })
         .device_info(Some("ua-laptop"))
         .run(&refresh, &test_config(), &rng, now())
         .await;
@@ -87,7 +87,7 @@ async fn revoking_a_device_revokes_its_tokens_and_only_its_tokens() {
         matches!(outcome, Err(RefreshError::Revoked)),
         "the revoked device's token must not refresh"
     );
-    let ok = Refresh::new(&phone, |_| async { true })
+    let ok = Refresh::any_tenant(&phone, |_| async { true })
         .device_info(Some("ua-phone"))
         .run(&refresh, &test_config(), &rng, now())
         .await;
@@ -113,13 +113,13 @@ async fn the_device_check_refuses_a_token_whose_device_is_revoked() {
         .unwrap();
 
     // The plain refresh does not look at the device.
-    let plain = Refresh::new(&token, |_| async { true })
+    let plain = Refresh::any_tenant(&token, |_| async { true })
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(plain.is_ok(), "set_trust_level alone does not stop it");
     // A second token (the first was rotated) shows the checked path.
     let token = issue(&refresh, &rng, Some(d), None).await;
-    let checked = Refresh::new(&token, |_| async { true })
+    let checked = Refresh::any_tenant(&token, |_| async { true })
         .device_store(&devices)
         .run(&refresh, &test_config(), &rng, now())
         .await;
@@ -149,7 +149,7 @@ async fn the_device_check_lets_a_live_device_a_deviceless_token_and_a_missing_de
 
     let on_live = issue(&refresh, &rng, Some(live), None).await;
     assert!(
-        Refresh::new(&on_live, |_| async { true })
+        Refresh::any_tenant(&on_live, |_| async { true })
             .device_store(&devices)
             .run(&refresh, &cfg, &rng, now())
             .await
@@ -158,7 +158,7 @@ async fn the_device_check_lets_a_live_device_a_deviceless_token_and_a_missing_de
 
     let none = issue(&refresh, &rng, None, None).await;
     assert!(
-        Refresh::new(&none, |_| async { true })
+        Refresh::any_tenant(&none, |_| async { true })
             .device_store(&devices)
             .run(&refresh, &cfg, &rng, now())
             .await
@@ -168,7 +168,7 @@ async fn the_device_check_lets_a_live_device_a_deviceless_token_and_a_missing_de
 
     let gone = issue(&refresh, &rng, Some(device_id("purged")), None).await;
     assert!(matches!(
-        Refresh::new(&gone, |_| async { true })
+        Refresh::any_tenant(&gone, |_| async { true })
             .device_store(&devices)
             .run(&refresh, &cfg, &rng, now())
             .await,
@@ -220,11 +220,11 @@ async fn a_compromised_family_revokes_its_devices_through_the_decorator() {
     let v1 = issue(&refresh, &rng, Some(d), None).await;
 
     // v1 rotates to v2; presenting v1 again is reuse.
-    Refresh::new(&v1, |_| async { true })
+    Refresh::any_tenant(&v1, |_| async { true })
         .run(&refresh, &test_config(), &rng, now())
         .await
         .unwrap();
-    let reuse = Refresh::new(&v1, |_| async { true })
+    let reuse = Refresh::any_tenant(&v1, |_| async { true })
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(matches!(reuse, Err(RefreshError::Revoked)));
@@ -255,8 +255,7 @@ async fn the_device_check_in_tenant_rails_the_tenant_before_the_device() {
 
     // An empty device store for the foreign call: had the device been
     // loaded first, the answer would have been DeviceRevoked.
-    let foreign = Refresh::new(&token, |_| async { true })
-        .in_tenant(&other)
+    let foreign = Refresh::new(&token, &other, |_| async { true })
         .device_store(&MemoryDeviceStore::new())
         .run(&refresh, &cfg, &rng, now())
         .await;
@@ -271,8 +270,7 @@ async fn the_device_check_in_tenant_rails_the_tenant_before_the_device() {
         .unwrap();
     assert!(!record.revoked, "the foreign attempt rotated nothing");
 
-    let own = Refresh::new(&token, |_| async { true })
-        .in_tenant(&tenant)
+    let own = Refresh::new(&token, &tenant, |_| async { true })
         .device_store(&devices)
         .run(&refresh, &cfg, &rng, now())
         .await;
@@ -283,8 +281,7 @@ async fn the_device_check_in_tenant_rails_the_tenant_before_the_device() {
         .await
         .unwrap();
     let token = issue(&refresh, &rng, Some(d), None).await;
-    let refused = Refresh::new(&token, |_| async { true })
-        .in_tenant(&tenant)
+    let refused = Refresh::new(&token, &tenant, |_| async { true })
         .device_store(&devices)
         .run(&refresh, &cfg, &rng, now())
         .await;
@@ -316,8 +313,7 @@ async fn one_refresh_checks_tenant_status_device_and_binding_together() {
     let cfg = test_config();
     let (token, tenant_ref, devices_ref) = (token.as_str(), &tenant, &devices);
     let full = move |active: bool, info: &'static str| {
-        Refresh::new(token, move |_: &UserId| async move { active })
-            .in_tenant(tenant_ref)
+        Refresh::new(token, tenant_ref, move |_: &UserId| async move { active })
             .device_info(Some(info))
             .device_store(devices_ref)
     };
@@ -385,7 +381,7 @@ async fn reuse_of_a_token_of_a_revoked_device_is_not_theft() {
     );
     assert_eq!(row.revoked_at, Some(now()), "and when");
 
-    let reuse = Refresh::new(&plaintext, |_| async { true })
+    let reuse = Refresh::any_tenant(&plaintext, |_| async { true })
         .run(&refresh, &test_config(), &rng, now())
         .await;
     assert!(matches!(reuse, Err(RefreshError::Revoked)), "{reuse:?}");
@@ -411,7 +407,7 @@ async fn the_device_check_refuses_a_device_owned_by_another_user() {
         .unwrap();
     let token = issue(&refresh, &rng, Some(d), None).await;
 
-    let refused = Refresh::new(&token, |_| async { true })
+    let refused = Refresh::any_tenant(&token, |_| async { true })
         .device_store(&devices)
         .run(&refresh, &test_config(), &rng, now())
         .await;
@@ -437,7 +433,7 @@ async fn the_device_check_refuses_a_device_owned_by_another_user() {
             .await
             .unwrap();
         let token = issue(&refresh, &rng, Some(d2), None).await;
-        let ok = Refresh::new(&token, |_| async { true })
+        let ok = Refresh::any_tenant(&token, |_| async { true })
             .device_store(&devices)
             .run(&refresh, &test_config(), &rng, now())
             .await;
@@ -469,7 +465,7 @@ async fn the_cascade_helper_revokes_devices_and_their_tokens() {
     for (id, token, info) in [(d1, &laptop, "ua-laptop"), (d2, &phone, "ua-phone")] {
         let device = devices.load(&tenant, &id).await.unwrap().unwrap();
         assert_eq!(device.trust_level, DeviceTrustLevel::Revoked);
-        let outcome = Refresh::new(token, |_| async { true })
+        let outcome = Refresh::any_tenant(token, |_| async { true })
             .device_info(Some(info))
             .run(&refresh, &test_config(), &rng, now())
             .await;

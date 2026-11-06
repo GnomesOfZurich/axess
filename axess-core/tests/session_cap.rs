@@ -238,3 +238,155 @@ async fn at_a_cap_of_one_the_login_that_loses_the_race_fails_and_the_rival_survi
     let active = inner.active_sessions(&uid("u1")).await.unwrap();
     assert_eq!(active, vec![rival], "exactly the rival is live");
 }
+
+/// A registry whose listing fails while `down` is set.
+#[derive(Clone)]
+struct ListingDownRegistry {
+    inner: MemorySessionRegistry,
+    down: Arc<AtomicBool>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("listing is down")]
+struct ListingDown;
+
+impl SessionRegistry for ListingDownRegistry {
+    type Error = ListingDown;
+
+    async fn register(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .register(user_id, session_id)
+            .await
+            .map_err(|e| match e {})
+    }
+
+    async fn is_valid(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<bool, Self::Error> {
+        self.inner
+            .is_valid(user_id, session_id)
+            .await
+            .map_err(|e| match e {})
+    }
+
+    async fn invalidate_user(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .invalidate_user(user_id)
+            .await
+            .map_err(|e| match e {})
+    }
+
+    async fn invalidate_session(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+        session_id: &SessionId,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .invalidate_session(user_id, session_id)
+            .await
+            .map_err(|e| match e {})
+    }
+
+    async fn active_sessions(
+        &self,
+        user_id: &axess_core::authn::ids::UserId,
+    ) -> Result<Vec<SessionId>, Self::Error> {
+        if self.down.load(Ordering::SeqCst) {
+            return Err(ListingDown);
+        }
+        self.inner
+            .active_sessions(user_id)
+            .await
+            .map_err(|e| match e {})
+    }
+}
+
+async fn login_attempt<I, F>(
+    svc: &RequestAuthnService<I, F>,
+) -> (
+    Result<FactorOutcome, axess_core::authn::AuthnError<I::Error>>,
+    bool,
+)
+where
+    I: axess_core::authn::store::IdentityStore,
+    F: axess_core::authn::store::FactorStore<Error = I::Error>,
+{
+    let session = test_session();
+    svc.begin_login("alice", "default", &session).await.unwrap();
+    let cred = FactorCredential::Password(ZeroizedString::new("Gnomes2+"));
+    let outcome = svc.verify_factor(&cred, &session).await;
+    (outcome, session.is_authenticated().await)
+}
+
+/// With a cap set, a registry that cannot list the user's sessions refuses
+/// the login: counting nothing would let every login in over the cap while
+/// the registry is down.
+#[tokio::test]
+async fn with_a_cap_a_login_is_refused_when_the_registry_cannot_list_sessions() {
+    let (identity, factors) = identity_and_factors();
+    let down = Arc::new(AtomicBool::new(true));
+    let inner = MemorySessionRegistry::new();
+    let svc = AuthnService::builder(identity, factors)
+        .with_registry(ListingDownRegistry {
+            inner: inner.clone(),
+            down: down.clone(),
+        })
+        .with_max_sessions_per_user(NonZeroUsize::MIN)
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let (outcome, authenticated) = login_attempt(&svc).await;
+    assert!(outcome.is_err(), "the login must be refused: {outcome:?}");
+    assert!(!authenticated);
+    assert!(inner.active_sessions(&uid("u1")).await.unwrap().is_empty());
+}
+
+/// The service's listing reports a registry that cannot answer instead of
+/// returning no sessions.
+#[tokio::test]
+async fn active_sessions_reports_a_registry_that_cannot_list_sessions() {
+    use axess_core::authn::service::ActiveSessionsError;
+    let (identity, factors) = identity_and_factors();
+    let svc = AuthnService::builder(identity, factors)
+        .with_registry(ListingDownRegistry {
+            inner: MemorySessionRegistry::new(),
+            down: Arc::new(AtomicBool::new(true)),
+        })
+        .build()
+        .with_audit_context(AuditContext::default());
+    let listed = svc.active_sessions(&uid("u1")).await;
+    assert!(
+        matches!(listed, Err(ActiveSessionsError::Registry(_))),
+        "{listed:?}"
+    );
+}
+
+/// Without a cap nothing needs the listing, so an outage does not lock users
+/// out.
+#[tokio::test]
+async fn without_a_cap_a_login_goes_through_when_the_registry_cannot_list_sessions() {
+    let (identity, factors) = identity_and_factors();
+    let svc = AuthnService::builder(identity, factors)
+        .with_registry(ListingDownRegistry {
+            inner: MemorySessionRegistry::new(),
+            down: Arc::new(AtomicBool::new(true)),
+        })
+        .build()
+        .with_audit_context(AuditContext::default());
+
+    let (outcome, authenticated) = login_attempt(&svc).await;
+    assert!(
+        matches!(outcome, Ok(FactorOutcome::Authenticated)),
+        "{outcome:?}"
+    );
+    assert!(authenticated);
+}

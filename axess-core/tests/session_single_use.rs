@@ -12,6 +12,7 @@ use axess_core::session::{
     layer::SessionLayer,
     store::{ConditionalUpdate, MemorySessionStore, SessionStore},
 };
+use axess_core::testing::AuthSessionTestExt;
 use axum::{
     Router,
     body::Body,
@@ -35,10 +36,11 @@ struct World {
 fn world(rendezvous: Option<Arc<Barrier>>) -> World {
     let clock = MockClock::at(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap());
     let store = MemorySessionStore::new().with_clock(Arc::new(clock.clone()));
-    let layer = SessionLayer::new(store.clone(), [9u8; 32])
-        .with_secure(false)
-        .with_ttl(TTL)
-        .with_clock(clock.clone());
+    let layer =
+        SessionLayer::without_registry_insecure(store.clone(), axess_core::testing::test_key(9))
+            .with_secure(false)
+            .with_ttl(TTL)
+            .with_clock(clock.clone());
     let clock_login = clock.clone();
     let app = Router::new()
         .route(
@@ -297,10 +299,11 @@ async fn a_failing_handler_has_its_session_stored_before_the_error_returns() {
         .parse()
         .unwrap();
 
-    let layer = SessionLayer::new(w.store.clone(), [9u8; 32])
-        .with_secure(false)
-        .with_ttl(TTL)
-        .with_clock(w.clock.clone());
+    let layer =
+        SessionLayer::without_registry_insecure(w.store.clone(), axess_core::testing::test_key(9))
+            .with_secure(false)
+            .with_ttl(TTL)
+            .with_clock(w.clock.clone());
     let failing = tower::service_fn(|req: Request<Body>| async move {
         let (mut parts, _body) = req.into_parts();
         let s = AuthSession::from_request_parts(&mut parts, &())

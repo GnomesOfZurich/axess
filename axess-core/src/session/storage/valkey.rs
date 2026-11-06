@@ -8,9 +8,26 @@
 //! # Encryption at rest
 //!
 //! When an encryption key is provided via [`ValkeySessionStore::encrypted`],
-//! session data is AES-256-GCM encrypted before storage. A random 12-byte
-//! nonce is prepended to the ciphertext. On read, the nonce is split off and
-//! used for decryption.
+//! session data is AES-256-GCM encrypted before storage, bound to the row it
+//! lives in. A stored value is `marker || salt || ciphertext`: a four-byte
+//! format marker (`AXS\x01` with the top bit of its last byte set, which
+//! says the key is derived per record), a random 16-byte salt, and the
+//! AES-GCM ciphertext under a key derived from the configured key, the salt
+//! and the session id. The additional authenticated data is
+//! `axess.session.v1 || 0x00 || session id`; the id is not stored in the
+//! value but supplied again on read, so a value copied under another session
+//! id (or restored from a backup into a different row) fails authentication
+//! and reads as a decryption failure.
+//!
+//! Values written before row binding carry no marker and no binding: they
+//! open under any session id, so an attacker who can write to the store could
+//! move one between rows. [`LegacyBlobs`](crate::session::crypto::LegacyBlobs)
+//! decides what happens to them. The default, `Reject`, refuses them (the
+//! user signs in again). `AcceptUntil(instant)` reads them until the instant
+//! and refuses them afterwards; until then an unbound value can be moved
+//! between rows undetected, and a read leaves it as it is (the session's next
+//! save writes the bound form). `Accept` reads them with no end date. Set the
+//! policy with [`ValkeySessionStore::with_legacy_blobs`].
 //!
 //! Key rotation is supported: pass both the current key and the previous key.
 //! On load, the store tries the current key first; if decryption fails, it
@@ -27,10 +44,11 @@
 //!
 //! # Registry data type
 //!
-//! The registry uses a Redis **sorted set** keyed on `register`-time
-//! `clock.now().timestamp_millis()` (from the injected
-//! [`Clock`](axess_clock::Clock); default
-//! [`SystemClock`](axess_clock::SystemClock)) as the score. This is load-bearing
+//! The registry uses a Redis **sorted set** keyed on the `register`-time
+//! epoch milliseconds as the score. The time is the Valkey server's own
+//! (`TIME`), so app nodes with skewed clocks agree on scores and expiry
+//! cutoffs; a [`Clock`](axess_clock::Clock) injected with `with_clock`
+//! (tests) replaces it. This is load-bearing
 //! for [`SessionRegistry::active_sessions`](crate::session::store::SessionRegistry::active_sessions):
 //! the trait promises "ordered oldest first" so that the
 //! [`max_sessions_per_user`](crate::authn::service::AuthnServiceBuilder::with_max_sessions_per_user)
@@ -62,7 +80,11 @@
 //! );
 //!
 //! let registry = ValkeySessionRegistry::new(client);
-//! let session_layer = SessionLayer::new(store, signing_key);
+//! let session_layer = SessionLayer::new(
+//!     store,
+//!     signing_key,
+//!     std::sync::Arc::new(SessionRegistryAdapter(registry)),
+//! );
 //! ```
 
 mod encryption;
@@ -79,6 +101,12 @@ mod tests;
 mod ttl_tests;
 #[cfg(test)]
 mod watch_tests;
+
+/// The live tests that open a subscriber connection run one at a time: the
+/// watch tests count the server's pub/sub connections, and a watcher another
+/// test opens or closes meanwhile would be counted with theirs.
+#[cfg(test)]
+static SUBSCRIBER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub use internal::ValkeyStoreError;
 pub use registry::ValkeySessionRegistry;

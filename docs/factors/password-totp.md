@@ -77,6 +77,17 @@ yourself before calling `generate_password_hash`, storing the result in
 `hash`. Nothing in the type stops you; nothing in the type helps you
 either.
 
+`generate_password_hash` checks nothing. To hash a password a person has
+just chosen (signup, enrolment), call `hash_new_password(password, &rules)`:
+it refuses a password over `MAX_PASSWORD_BYTES` (`NewPasswordError::TooLong`)
+or one that fails the rules (`NewPasswordError::RulesNotMet`), then hashes.
+It does not consult a breach list; `hash_new_password_checked` does (see
+"Breached passwords" below), and a service built with a check offers
+`AuthnService::check_chosen_password` and `hash_chosen_password`, which
+run the rules and the check with the service's own policy.
+`PasswordRules::accepts` is the rules alone without the hashing, for a form
+that wants to show its own message first.
+
 What *is* configurable is the strength rules:
 
 ```rust,ignore
@@ -86,7 +97,8 @@ pub struct PasswordRules {
     pub require_lowercase: bool,  // default true
     pub require_digit: bool,      // default true
     pub require_special: bool,    // default false
-    pub history_count: usize,     // default 0, no reuse check
+    pub history_count: usize,     // default 5; 0 turns the reuse check off
+    pub breached_check: bool,     // default true; false exempts the tenant
 }
 ```
 
@@ -96,13 +108,13 @@ lower and a digit. `require_special` is off by default because the
 character-class requirement that most reliably produces `Password1!` is
 the one that demands punctuation.
 
-`history_count` is the reuse check, and it is off by default because it
-costs something to turn on: a non-zero value makes the flow call
+`history_count` is the reuse check, and it is on by default at five: a
+non-zero value makes the flow call
 `IdentityPasswordHistory::password_history` and `record_password_hash`.
 That trait has no default bodies, so the password flow is bounded on it
 and a store that does not implement it will not compile against the
 flow. Set `history_count` to `12` for the SOC2-shaped "cannot reuse the
-last twelve" rule, and implement the trait at the same time.
+last twelve" rule, or to `0` to turn the check off.
 
 Rules are resolved per tenant, through
 `IdentityLookup::password_rules_for_tenant`, which defaults to
@@ -114,6 +126,98 @@ There is no maximum length in the rules. You should want one, because
 Argon2id is deliberately expensive and an unbounded password field is a
 cheap way to burn server CPU. Impose it at the
 edge, where the request is parsed, before the value reaches the hasher.
+
+## Breached passwords
+
+A password that meets every rule above can still be `Password1234`, and
+that one is in every breach corpus. The check against such a corpus is a
+trait, because the corpus is not ours to ship:
+
+```rust,ignore
+pub trait BreachedPasswordCheck: Send + Sync + 'static {
+    fn is_breached<'a>(&'a self, password: &'a str)
+        -> Pin<Box<dyn Future<Output = Result<bool, BreachCheckError>> + Send + 'a>>;
+}
+```
+
+Answer `Ok(true)` for a password the corpus holds, `Ok(false)` for one it
+does not, and `Err(BreachCheckError::new(sentence))` when the question could
+not be put (a timeout, a status code). The sentence goes to the operator's
+log; the person choosing the password never sees it.
+
+Give the check to the service with
+`AuthnServiceBuilder::with_breached_password_check(check)`. From then on
+every path that accepts a chosen password consults it:
+`complete_password_reset` refuses a known password with the audit reason
+`password_breached`, and an application's own signup, change or enrolment
+form asks `AuthnService::check_chosen_password(password, &rules)` before it
+touches the account and `AuthnService::hash_chosen_password` when it
+stores the factor, so one configured check and one policy hold everywhere
+and the application carries a copy of neither. Both answer
+`NewPasswordError::Breached`, whose `Display` is a sentence fit for the
+form. Without a check nothing is screened, and `build` logs a warning once
+saying so. The password is sent to the check only after the rules have
+passed, so a password that fails them never leaves the host; the reset
+asks the check after the token has been checked and before it is spent, so
+an unauthenticated caller cannot make the server call the check and a
+refused password keeps the link usable.
+
+The default is fail closed. When the check errs, the password is refused
+with `NewPasswordError::BreachCheckUnavailable` (the reset audits
+`breach_check_unavailable`): an outage of the check does not admit a
+password nobody screened. A deployment that would rather accept an
+unscreened password than turn signups and resets away while the check is
+down says so by name, `allow_unchecked_when_breach_check_unavailable()`
+on the builder; each such acceptance is logged at `warn` with the check's
+sentence. The same choice is the `BreachCheckUnavailable` argument of the
+free function `hash_new_password_checked(password, &rules, check, policy)`,
+which is `hash_new_password` with the check in front of the hash, for code
+that hashes outside a service.
+
+A tenant is screened unless its `PasswordRules::breached_check` is
+`false`. The default is `true`, and a stored row written before the field
+existed reads as `true`, so a tenant is exempted only on purpose.
+
+A corpus of hundreds of millions of passwords is consulted through the
+k-anonymity range protocol: the client sends the first five upper-case hex
+digits of the password's SHA-1 digest, the service answers every digest
+suffix in that range with its count, and the client looks for its own
+suffix in the answer. SHA-1 is the protocol's identifier for a password,
+not a protection of it; only a 20-bit prefix leaves the host and the
+password never does. `axess-factors` ships the two pure halves,
+`range_prefix(password) -> (prefix, suffix)` and
+`count_in_range(&body, &suffix) -> Option<u64>`, and no HTTP client, so an
+adapter is the HTTP call alone:
+
+```rust,ignore
+struct RangeLookup { http: reqwest::Client, base: String }
+
+impl BreachedPasswordCheck for RangeLookup {
+    fn is_breached<'a>(&'a self, password: &'a str)
+        -> Pin<Box<dyn Future<Output = Result<bool, BreachCheckError>> + Send + 'a>>
+    {
+        let (prefix, suffix) = range_prefix(password);
+        Box::pin(async move {
+            let body = self.http.get(format!("{}/range/{prefix}", self.base))
+                .send().await.and_then(|r| r.error_for_status())
+                .map_err(|e| BreachCheckError::new(e.to_string()))?
+                .text().await.map_err(|e| BreachCheckError::new(e.to_string()))?;
+            Ok(count_in_range(&body, &suffix).is_some_and(|n| n > 0))
+        })
+    }
+}
+```
+
+`count_in_range` answers `None` when the suffix is not in the body, the
+common case for a password not in the corpus, and `Some(0)` for the
+padding rows a padded answer carries, so test `n > 0`, not whether an
+answer came back at all.
+`BreachedPasswordList::new([..])` is a fixed deny-list, compared exactly:
+the passwords a deployment knows to refuse (the most common ones, its own
+product names) and a floor under the range lookup, not a substitute for it.
+The SQLite example screens with six and shows the refusal on its signup
+page. `BreachCheckOutage`, under the `testing` feature, is a check that
+never answers, for tests of what a deployment does while its check is down.
 
 ## TOTP (RFC 6238)
 
@@ -424,7 +528,7 @@ use axess::session::LegacyBlobs;
 use std::sync::Arc;
 
 let cipher = Arc::new(
-    FactorSecretCipher::try_new(key)?          // refuses an all-zero or repeated-byte key
+    FactorSecretCipher::try_new(key)?          // `new` panics on, `try_new` returns an error for, an all-zero or repeated-byte key
         .with_previous_key(old_key)            // only while rotating
         .with_plain_secrets(LegacyBlobs::AcceptUntil(cutoff)),
 );
@@ -447,7 +551,9 @@ factors.save_factor(&scope, config).await?;
 template is sealed for that tenant scope; the first time a user verifies a code
 against it, the user's own row is written with the secret sealed for that user.
 
-Without a cipher nothing changes: secrets are read and written as plain text.
+Without a cipher the service refuses to write a secret: the login that would
+store a one-time-code seed fails naming `allow_plaintext_factor_secrets`, which is
+the opt-out for development and tests only.
 A sealed secret read by a service with no cipher fails the login with an
 internal error that says so, rather than treating the ciphertext as a key.
 

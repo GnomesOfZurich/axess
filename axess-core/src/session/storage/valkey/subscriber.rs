@@ -93,11 +93,14 @@ impl Slot {
             if self.revoked.swap(false, Ordering::SeqCst) {
                 return Event::Revoked;
             }
-            if self.recheck.swap(false, Ordering::SeqCst) {
-                return Event::Recheck;
-            }
+            // A loss is reported before the recheck that follows it, so a
+            // watcher that was flagged for both ends up waiting on the
+            // replacement, not polling beside it.
             if self.closed.swap(false, Ordering::SeqCst) {
                 return Event::Closed;
+            }
+            if self.recheck.swap(false, Ordering::SeqCst) {
+                return Event::Recheck;
             }
             self.notify.notified().await;
         }
@@ -107,6 +110,8 @@ impl Slot {
 struct Connection {
     client: Client,
     dispatcher: JoinHandle<()>,
+    /// Resubscribes after the client reconnects by itself.
+    reconnector: JoinHandle<()>,
     /// Which connection this is, so a joiner that saw one fail can tell a
     /// replacement made meanwhile from the one it probed.
     generation: u64,
@@ -163,6 +168,7 @@ async fn answers_ping(client: &Client) -> bool {
 impl Connection {
     fn shut_down(self) {
         self.dispatcher.abort();
+        self.reconnector.abort();
         quit_in_background(self.client);
     }
 }
@@ -322,6 +328,7 @@ impl SharedSubscriber {
     fn dispatch_closed(&self) {
         let dead = self.lock().connection.take();
         if let Some(connection) = dead {
+            connection.reconnector.abort();
             quit_in_background(connection.client);
         }
         self.connection_lost();
@@ -423,20 +430,28 @@ impl SharedSubscriber {
             .ok()?
             .ok()?;
         let messages = subscriber.message_rx();
+        let reconnects = subscriber.reconnect_rx();
         let escaped = escape_glob(prefix);
         let patterns = vec![
             format!("{escaped}:revoked-session:*"),
             format!("{escaped}:revoked-user:*"),
         ];
-        tokio::time::timeout(SETUP_TIMEOUT, subscriber.psubscribe(patterns))
+        tokio::time::timeout(SETUP_TIMEOUT, subscriber.psubscribe(patterns.clone()))
             .await
             .ok()?
             .ok()?;
         let dispatcher = tokio::spawn(dispatch(messages, Arc::downgrade(self)));
+        let reconnector = tokio::spawn(resubscribe_on_reconnect(
+            reconnects,
+            subscriber.clone(),
+            patterns,
+            Arc::downgrade(self),
+        ));
         pending.0 = None;
         Some(Connection {
             client: subscriber,
             dispatcher,
+            reconnector,
             generation: 0,
         })
     }
@@ -479,6 +494,40 @@ async fn dispatch(
                 shared.dispatch_closed();
                 return;
             }
+        }
+    }
+}
+
+/// The client reconnects by itself under the registry client's reconnect
+/// policy, and what was published while it was away is lost: the receiver
+/// neither closed nor lagged, so nothing else says so. Each reconnect is
+/// treated as a loss: the watchers are told, the patterns are subscribed
+/// again (a new connection has none), and the watchers recheck the registry.
+/// When the patterns cannot be subscribed the connection is given up, so the
+/// next join opens a replacement.
+async fn resubscribe_on_reconnect(
+    mut reconnects: tokio::sync::broadcast::Receiver<Server>,
+    client: Client,
+    patterns: Vec<String>,
+    shared: Weak<SharedSubscriber>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match reconnects.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        shared.connection_lost();
+        let subscribed =
+            tokio::time::timeout(SETUP_TIMEOUT, client.psubscribe(patterns.clone())).await;
+        if matches!(subscribed, Ok(Ok(()))) {
+            shared.finish_reconnect();
+        } else {
+            shared.dispatch_closed();
+            return;
         }
     }
 }

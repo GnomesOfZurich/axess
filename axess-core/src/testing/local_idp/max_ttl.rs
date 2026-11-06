@@ -27,7 +27,9 @@ async fn mint_within_max_ttl_succeeds() {
         .with_audience("https://api")
         .with_issued_at(now);
     let token = idp.mint(&claims);
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -80,7 +82,9 @@ async fn mint_at_exact_max_ttl_boundary_succeeds() {
         .with_audience("https://api")
         .with_issued_at(now);
     let token = idp.mint(&claims);
-    let verifier = JwtVerifier::new(idp.jwks_handle()).with_audience("https://api");
+    let verifier = JwtVerifier::new(idp.jwks_handle())
+        .with_audience("https://api")
+        .allow_any_issuer();
     verifier
         .verify::<CustomClaims>(&token)
         .await
@@ -154,6 +158,7 @@ async fn mint_jwt_svid_at_uses_the_given_instant() {
     let clock = std::sync::Arc::new(crate::testing::MockClock::at(now));
     let verifier = JwtVerifier::new(idp.jwks_handle())
         .with_audience("https://api")
+        .allow_any_issuer()
         .with_clock(clock);
     verifier
         .verify::<CustomClaims>(&token)

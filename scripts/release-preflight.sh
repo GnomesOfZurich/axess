@@ -158,6 +158,20 @@ step "Book builds" bash -c '
     echo "         A newer local mdbook accepts book.toml keys the pinned one"
     echo "         rejects, so a green build here does not prove a green CI."
   fi
+  # The Mermaid assets book.toml lists are written by `mdbook-mermaid install`
+  # and are gitignored, so a fresh clone or worktree has none and the build
+  # stops on "failed to open mermaid.min.js". Install them here when absent,
+  # the same way the docs workflow does, and say what is missing otherwise.
+  if [ ! -f docs/mermaid.min.js ] || [ ! -f docs/mermaid-init.js ]; then
+    if command -v mdbook-mermaid >/dev/null 2>&1; then
+      mdbook-mermaid install docs >/dev/null
+      echo "Mermaid assets written into docs/ (mdbook-mermaid install docs)."
+    else
+      echo "ERROR: docs/mermaid.min.js is absent and mdbook-mermaid is not installed"
+      echo "       (cargo install mdbook-mermaid, then mdbook-mermaid install docs)."
+      exit 1
+    fi
+  fi
   mdbook build docs >/dev/null
   echo "OK: mdbook build docs (local mdbook $local_v)."
 ' "$AXESS_DIR"

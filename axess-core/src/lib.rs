@@ -96,18 +96,20 @@ pub mod authn;
 pub mod device;
 
 pub use authn::{
-    Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent, AuthEventBuilder, AuthEventStatus,
-    AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend, AuthnError, AuthnScope,
-    AuthnService, AuthnServiceBuilder, CounterUnavailable, DeviceId, EmailOtpConfig, EntityState,
-    EventQueryFilter, FactorConfig, FactorCredential, FactorKind, FactorOutcome, FactorSecret,
-    FactorStep, FactorStore, FactorTemplate, FederatedProvider, Fido2Config, HotpConfig,
-    IdentityAdmin, IdentityAuthnLog, IdentityLookup, IdentityPasswordHistory,
-    IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig, LockoutPolicy,
-    LoginOutcome, NoSessionRegistryError, NoopAuthnLog, OtpAlgorithm, PasswordConfig,
-    PasswordRules, PrepareOutcome, ProvisioningError, RequestAuthnService, ResolvedFactor,
-    SealedFactorSecret, SessionValidator, SignupOutcome, StatusDetail, Tenant, TenantBootstrap,
-    TenantId, TotpConfig, User, UserId, ZeroizedString, create_tenant, default_catalog,
-    require_valid_session,
+    ActiveSessionsError, Actor, AuditContext, AuditOutcome, AuditQuery, AuthEvent,
+    AuthEventBuilder, AuthEventStatus, AuthEventType, AuthFailureReason, AuthMethod, AuthnBackend,
+    AuthnError, AuthnScope, AuthnService, AuthnServiceBuilder, BreachCheckError,
+    BreachCheckUnavailable, BreachedPasswordCheck, ChosenPasswordError, CounterUnavailable,
+    DeviceId, EmailOtpConfig, EntityState, EventQueryFilter, FactorConfig, FactorCredential,
+    FactorKind, FactorOutcome, FactorSecret, FactorStep, FactorStore, FactorTemplate,
+    FederatedProvider, Fido2Config, HotpConfig, IdentityAdmin, IdentityAuthnLog, IdentityLookup,
+    IdentityPasswordHistory, IdentityPasswordReset, IdentityStore, IpPolicy, LdapBindFactorConfig,
+    LockoutPolicy, LoginOutcome, NewPasswordError, NoSessionRegistryError, NoopAuthnLog,
+    OtpAlgorithm, PasswordConfig, PasswordRules, PrepareOutcome, ProvisioningError,
+    RequestAuthnService, ResolvedFactor, SealedFactorSecret, SessionValidator, SignupOutcome,
+    SignupVerification, StatusCause, StatusDetail, Tenant, TenantBootstrap, TenantId, Throttle,
+    ThrottleKey, ThrottleState, ThrottleSubject, TotpConfig, User, UserId, ZeroizedString,
+    create_tenant, default_catalog, require_valid_session,
 };
 
 // ── Federation; external-IdP adapters ───────────────────────────────────────
@@ -182,6 +184,13 @@ pub use axess_factors::ldap::{
 /// `testing` feature only.
 #[cfg(all(feature = "ldap", any(test, feature = "testing")))]
 pub use axess_factors::ldap::MockLdapProvider;
+
+/// A [`BreachedPasswordCheck`] that never answers, for tests of an outage;
+/// compiled under `cfg(test)` or the `testing` feature only.
+#[cfg(any(test, feature = "testing"))]
+pub use axess_factors::BreachCheckOutage;
+/// A [`BreachedPasswordCheck`] over a fixed deny-list.
+pub use axess_factors::BreachedPasswordList;
 
 #[cfg(feature = "oauth")]
 #[cfg_attr(docsrs, doc(cfg(feature = "oauth")))]

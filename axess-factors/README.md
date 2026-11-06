@@ -32,14 +32,17 @@ All enabled by default.
 
 ```rust
 use axess_factors::{
-    generate_password_hash, verify_password,
+    hash_new_password, verify_password, PasswordRules,
     generate_totp_secret, generate_totp_secret_with_rng, verify_totp, build_totp_uri,
     verify_hotp,
 };
 
 // Passwords
-let hash = generate_password_hash("my-secure-password");
-verify_password("my-secure-password", &hash).expect("should match");
+// A password a person just chose: refused if over MAX_PASSWORD_BYTES or if it
+// fails the rules, then hashed.
+let hash = hash_new_password("My-secure-password1", &PasswordRules::default())
+    .expect("meets the rules");
+verify_password("My-secure-password1", &hash).expect("should match");
 
 // TOTP
 let secret = generate_totp_secret();
@@ -57,7 +60,8 @@ let secret = generate_totp_secret_with_rng(&mut my_rng);
 
 | Function | Purpose |
 |---|---|
-| `generate_password_hash(password)` | Argon2id hash (PHC string) |
+| `hash_new_password(password, &rules)` | Refuses a password over `MAX_PASSWORD_BYTES` or failing the rules, then Argon2id-hashes it (PHC string) |
+| `generate_password_hash(password)` | Argon2id hash with no checks; for a value already accepted |
 | `verify_password(password, hash)` | Constant-time verification |
 | `generate_totp_secret()` | 160-bit random secret, base32-encoded |
 | `generate_totp_secret_with_rng(rng)` | Same, with injectable RNG for DST |

@@ -8,13 +8,13 @@ Session signing keys and encryption keys can be rotated without invalidating act
 
 ### Signing key rotation
 
-The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_key)`. HKDF-Expand derives two sub-keys from it: one for session-cookie HMAC and one for session-binding fingerprint HMAC. `SessionLayer` supports zero-downtime rotation via `with_previous_signing_key(old_master)`; sessions signed under the previous master transparently re-authenticate and their cookies + stored fingerprints are re-issued under the new master.
+The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_key, registry)`. HKDF-Expand derives two sub-keys from it: one for session-cookie HMAC and one for session-binding fingerprint HMAC. `SessionLayer` supports zero-downtime rotation via `with_previous_signing_key(old_master)`; sessions signed under the previous master transparently re-authenticate and their cookies + stored fingerprints are re-issued under the new master.
 
 **Procedure:**
 1. Generate a new 32-byte signing master in your secrets manager.
 2. Deploy with both masters wired: new as current, old as previous.
    ```rust,ignore
-   let layer = SessionLayer::new(store, new_master)
+   let layer = SessionLayer::new(store, new_master, registry)
        .with_previous_signing_key(old_master);
    ```
 3. On every request, the layer tries current-master verification first; on mismatch it falls back to the previous master. Fallback matches trigger:

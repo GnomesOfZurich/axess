@@ -52,7 +52,10 @@ async fn password_only_login_flow() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
@@ -90,6 +93,7 @@ async fn password_totp_login_flow() {
     let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -130,7 +134,10 @@ async fn wrong_password_returns_invalid_credential() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -146,7 +153,10 @@ async fn wrong_password_returns_invalid_credential() {
 async fn user_not_found_returns_invalid_credentials() {
     let identity = MockIdentityStore::new().with_tenant(test_tenant());
     let factors = MockFactorStore::new();
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     let outcome = service
@@ -163,17 +173,24 @@ async fn lockout_after_max_attempts() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "alice"))
-        .with_lockout_policy(LockoutPolicy {
-            max_attempts: 3,
-            duration: Some(std::time::Duration::from_secs(60)),
-            ..LockoutPolicy::default()
-        });
+        // The lock alone: the throttle between quick guesses has its own
+        // tests.
+        .with_lockout_policy(
+            LockoutPolicy {
+                max_attempts: 3,
+                duration: Some(std::time::Duration::from_secs(60)),
+                ..LockoutPolicy::default()
+            }
+            .without_throttle(),
+        );
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
 
     for i in 0..3 {
         let session = test_session();
@@ -206,18 +223,23 @@ async fn lockout_counter_accumulates_across_begin_login_cycles() {
     let identity = MockIdentityStore::new()
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"))
-        .with_lockout_policy(LockoutPolicy {
-            max_attempts: 4,
-            duration: Some(std::time::Duration::from_secs(60)),
-            ..LockoutPolicy::default()
-        });
+        .with_lockout_policy(
+            LockoutPolicy {
+                max_attempts: 4,
+                duration: Some(std::time::Duration::from_secs(60)),
+                ..LockoutPolicy::default()
+            }
+            .without_throttle(),
+        );
     let factors = MockFactorStore::new()
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_factor(user_scope(), totp_config(secret))
         .with_method(&uid("u1"), password_totp_method());
 
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
 
     // Cycle 1: password OK, 2 wrong TOTP.
     let s1 = test_session();
@@ -288,6 +310,7 @@ async fn totp_replay_rejected() {
     let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -354,7 +377,10 @@ async fn hotp_counter_advances_and_old_rejected() {
         )
         .with_method(&uid("u1"), hotp_method);
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let code_0 = generate_hotp_code(secret, 0);
 
     // Login with counter=0 code.
@@ -404,7 +430,10 @@ async fn session_regenerate_flag_set_on_authentication() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -441,6 +470,7 @@ async fn forced_logout_via_registry() {
     let registry = MemorySessionRegistry::new();
     let service = AuthnService::builder(identity, factors)
         .with_registry(registry.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -494,6 +524,7 @@ async fn email_otp_prepare_and_verify() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(rng)
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -542,6 +573,7 @@ async fn email_otp_cooldown_returns_already_sent() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -592,6 +624,7 @@ async fn email_otp_expired_code_rejected() {
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
         .with_rng(MockRng::new(42))
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
@@ -628,7 +661,10 @@ async fn scope_fallback_to_system() {
         .with_factor(AuthnScope::System, password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service = AuthnService::new(identity, factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity, factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -670,8 +706,10 @@ async fn audit_events_recorded_on_login() {
         .with_factor(user_scope(), password_config("Gnomes2+"))
         .with_method(&uid("u1"), password_method());
 
-    let service =
-        AuthnService::new(identity.clone(), factors).with_audit_context(AuditContext::default());
+    let service = AuthnService::builder(identity.clone(), factors)
+        .allow_plaintext_factor_secrets()
+        .build()
+        .with_audit_context(AuditContext::default());
     let session = test_session();
 
     service
@@ -725,7 +763,9 @@ fn recovery_world(
     let secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
     let set = axess_factors::generate_recovery_codes(&MockRng::new(7), 3);
     let shown: Vec<String> = set.display.iter().map(|c| c.to_string()).collect();
+    let clock = MockClock::now();
     let identity = MockIdentityStore::new()
+        .with_clock(clock.clone())
         .with_tenant(test_tenant())
         .with_user(test_user("u1", "bob"));
     let factors = MockFactorStore::new()
@@ -733,9 +773,9 @@ fn recovery_world(
         .with_factor(user_scope(), totp_config(secret))
         .with_factor(user_scope(), FactorConfig::RecoveryCodes(set.config))
         .with_method(&uid("u1"), method);
-    let clock = MockClock::now();
     let service = AuthnService::builder(identity, factors)
         .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     (service, clock, shown, secret)
@@ -766,7 +806,7 @@ async fn past_the_password(
 
 #[tokio::test]
 async fn a_recovery_code_completes_the_login_once() {
-    let (service, _clock, codes, _) = recovery_world(password_then_totp_or_recovery());
+    let (service, clock, codes, _) = recovery_world(password_then_totp_or_recovery());
 
     let s1 = past_the_password(&service).await;
     let typed = codes[1].to_lowercase().replace('-', " ");
@@ -791,7 +831,9 @@ async fn a_recovery_code_completes_the_login_once() {
         "a spent code must not verify again, got {r:?}"
     );
 
-    // Another code from the set still works.
+    // Another code from the set still works, once the wrong guess's delay
+    // has run.
+    clock.advance(chrono::Duration::seconds(1));
     let r = service
         .verify_factor(
             &FactorCredential::RecoveryCode(codes[2].as_str().into()),
@@ -849,6 +891,7 @@ async fn a_replay_that_loses_the_write_race_is_audited_and_counted() {
     let clock = MockClock::now();
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_clock(clock.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
 
@@ -926,6 +969,7 @@ async fn a_replay_that_loses_the_write_race_is_not_counted_as_a_success() {
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_clock(clock.clone())
         .with_metrics(counts.clone())
+        .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();
