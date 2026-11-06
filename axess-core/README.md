@@ -22,7 +22,7 @@ facade crate instead.** Use `axess-core` directly only if you're building a cust
 | `principal/` | `Principal { Human, Workload }`, `PrincipalResolver`, Cedar entity bridge |
 | `store/` | Shared key/value-with-TTL store abstraction (`Store<K, V>`); per-backend value codecs live with each store impl |
 | `workload/` | Inbound workload-identity hub, outbound mTLS / OAuth clients |
-| `health/`, `metrics/` | `HealthCheck`, `CompositeHealthCheck`, `AuthnMetrics` |
+| `health/`, `metrics/` | `HealthCheck`, `CompositeHealthCheck`, `MetricSinks` and the metric traits |
 | `testing/` | `MockIdentityStore`, `MockFactorStore`, `MockClock`, `MockRng`, `LocalIdpFixture` (gated by `testing` feature) |
 
 ## Usage

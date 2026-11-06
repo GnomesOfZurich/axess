@@ -83,8 +83,9 @@ carry connection strings and host names. *Operations runbook*
 in the canonical SECURITY/OPERATIONS section covers the
 deployment expectations.
 
-The metrics are exported. The `AuthnMetrics` trait is
-implemented; the metric values flow into Prometheus or
+The metrics are exported. The metric traits of the concerns you
+export (see [Observability and metrics](observability.md)) are
+implemented and wired with `MetricSinks`; the metric values flow into Prometheus or
 OpenTelemetry; the dashboards cover the auth-attempt rate, the
 failure rate, the rate-limit rejection rate, and the lockout
 trigger rate. *Operations runbook* below covers the
@@ -389,7 +390,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 }
 ```
 
-The metrics implementation (covered in `AuthnMetrics` trait)
+The metrics implementation (the concern traits, covered in [Observability and metrics](observability.md))
 exposes the counters; the endpoint serialises them in whatever
 format the deployment's metrics system expects (Prometheus
 text format, JSON, OpenMetrics).
@@ -442,7 +443,7 @@ implementation; *Audit pipeline* covers exactly how far axess goes
 here, and where you take over.
 
 Logins failing in a burst with the store reachable: check
-`AuthnMetrics::audit_store_outage` before `auth_failure`. A failed audit
+`AuditMetrics::audit_store_outage` before `auth_failure`. A failed audit
 write fails the login since 0.6.0, so an audit problem presents as an
 authentication problem. `audit_event_shed` rising instead means the sink
 is deliberately dropping events to protect itself: nothing is failing,

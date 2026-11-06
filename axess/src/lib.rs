@@ -304,7 +304,10 @@ pub mod local_idp {
 
 // Observability
 pub use axess_core::{
-    AuthnMetrics, CompositeHealthCheck, CompositeStatus, HealthCheck, HealthStatus, NoopMetrics,
+    AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, AxessMetrics, CompositeHealthCheck,
+    CompositeStatus, CsrfRefusal, FactorMetrics, HealthCheck, HealthStatus, MetricSinks,
+    NoopMetrics, ProviderCategory, ProviderRegistryMetrics, RequestGuardMetrics, RotationMetrics,
+    SessionMetrics,
 };
 
 // Rate limiting

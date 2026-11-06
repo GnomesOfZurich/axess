@@ -49,7 +49,7 @@ where
         known: Option<(&crate::authn::ids::UserId, &crate::authn::ids::TenantId)>,
         session: &AuthSession,
     ) -> AuthnError<I::Error> {
-        self.inner.metrics.auth_failure();
+        self.inner.metrics.auth_flow.auth_failure();
         let builder = AuthEventBuilder::failure(AuthEventType::FactorVerified)
             .maybe_attributed_to(known.map(|(u, _)| u), known.map(|(_, t)| t))
             .with_factor(FactorKind::Fido2)
@@ -112,7 +112,8 @@ where
         credentials: &[crate::authn::factor::Fido2Credential],
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let webauthn = match &self.inner.fido2 {
+        let fido2 = self.inner.fido2.load_full();
+        let webauthn = match &fido2 {
             Some(w) => w,
             None => return Err(AuthnError::NoFlow),
         };
@@ -159,7 +160,7 @@ where
         // as to an invalid one.
         if let Some(lock) = self.derived_lockout(&user.id, &user.tenant_id).await? {
             self.clear_discoverable_ceremony(session).await;
-            self.inner.metrics.account_locked();
+            self.inner.metrics.auth_flow.account_locked();
             self.emit_audit(
                 AuthEventBuilder::locked(AuthEventType::FactorVerified)
                     .attributed_to(&user.id, &user.tenant_id)
@@ -296,7 +297,8 @@ where
         auth_result: &webauthn_rs::prelude::AuthenticationResult,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let Some(webauthn) = &self.inner.fido2 else {
+        let fido2 = self.inner.fido2.load_full();
+        let Some(webauthn) = &fido2 else {
             return Err(AuthnError::NoFlow);
         };
         // The user's own method decides what the passkey is worth.

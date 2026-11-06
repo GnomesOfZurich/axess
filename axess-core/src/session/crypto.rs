@@ -99,6 +99,7 @@ pub struct SessionCrypto {
     clock: Arc<dyn Clock>,
     legacy: LegacyBlobs,
     seals: Arc<AtomicU64>,
+    metrics: Arc<dyn crate::metrics::RotationMetrics>,
 }
 
 pub use super::weak_key::{WeakKeyError, is_constant_key};
@@ -138,6 +139,7 @@ impl SessionCrypto {
             clock: Arc::new(SystemClock),
             legacy: LegacyBlobs::default(),
             seals: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
         }
     }
 
@@ -157,6 +159,15 @@ impl SessionCrypto {
     /// [`LegacyBlobs`]; the default is [`LegacyBlobs::Reject`].
     pub fn with_legacy_blobs(mut self, policy: LegacyBlobs) -> Self {
         self.legacy = policy;
+        self
+    }
+
+    /// Report to `sink` each time a blob opens only under the previous key
+    /// (see [`RotationMetrics::encryption_key_fallback`](crate::metrics::RotationMetrics::encryption_key_fallback)).
+    /// Get the sink from
+    /// [`MetricSinks::rotation`](crate::metrics::MetricSinks::rotation).
+    pub fn with_metrics(mut self, sink: Arc<dyn crate::metrics::RotationMetrics>) -> Self {
+        self.metrics = sink;
         self
     }
 
@@ -352,6 +363,7 @@ impl SessionCrypto {
                 },
             ) {
                 tracing::debug!("session decrypted with previous (rotated) key");
+                self.metrics.encryption_key_fallback();
                 return Ok((plaintext, true));
             }
             tracing::warn!(
@@ -583,6 +595,7 @@ impl SessionCrypto {
             && let Ok(plaintext) = subkey::open(&prev.0, aad, body)
         {
             tracing::debug!("blob opened with the previous (rotated) key");
+            self.metrics.encryption_key_fallback();
             return Ok(Opened {
                 plaintext,
                 stale: true,
@@ -844,3 +857,6 @@ mod bound_tests;
 
 #[cfg(test)]
 mod subkey_tests;
+
+#[cfg(test)]
+mod metrics_tests;

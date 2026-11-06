@@ -49,7 +49,7 @@ pub(crate) struct LoadPolicy<'a> {
     /// Source of "now" for the absolute-age check.
     pub(crate) clock: &'a dyn Clock,
     /// Metrics hook for the binding-mismatch counter.
-    pub(crate) metrics: Option<&'a dyn crate::metrics::AuthnMetrics>,
+    pub(crate) metrics: Option<&'a crate::metrics::MetricSinks>,
 }
 
 #[cfg(test)]
@@ -344,6 +344,9 @@ fn check_binding(
                 "session fingerprint verified with previous (rotated) signing key; \
                  re-storing under current key"
             );
+            if let Some(m) = policy.metrics {
+                m.rotation.fingerprint_key_fallback();
+            }
             session_data.fingerprint = Some(current_hash.to_string());
             check.fingerprint_rewritten = true;
         } else {
@@ -351,7 +354,7 @@ fn check_binding(
                 "session fingerprint mismatch; invalidating session (possible hijacking)"
             );
             if let Some(m) = policy.metrics {
-                m.session_binding_mismatch();
+                m.session.session_binding_mismatch();
             }
             *session_data = SessionData::default();
             check.invalidated = true;
@@ -366,6 +369,9 @@ fn check_binding(
         // fingerprint: the layer binds a request without material to a fixed
         // value, so none is a request the binding does not apply to.
         tracing::info!("binding an authenticated session that stored no fingerprint");
+        if let Some(m) = policy.metrics {
+            m.session.session_fingerprint_backfilled();
+        }
         session_data.fingerprint = Some(current_hash.to_string());
         check.fingerprint_rewritten = true;
     }

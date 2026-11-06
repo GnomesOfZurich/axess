@@ -20,7 +20,7 @@ The signing key is the 32-byte master fed to `SessionLayer::new(store, signing_k
 3. On every request, the layer tries current-master verification first; on mismatch it falls back to the previous master. Fallback matches trigger:
    - A fresh `Set-Cookie` header signed under the current master.
    - An update to the stored session fingerprint (computed under the current master) so the next request hits the fast path without falling back.
-4. Watch for the `"session cookie verified with previous (rotated) signing key"` and `"session fingerprint verified with previous (rotated) signing key"` `tracing::debug!` events to gauge migration progress.
+4. Watch the `fingerprint_key_fallback` counter (`RotationMetrics`), or the `"session cookie verified with previous (rotated) signing key"` and `"session fingerprint verified with previous (rotated) signing key"` `tracing::debug!` events, to gauge migration progress.
 5. After one full session-TTL window (the longest a legit cookie signed under the old master can still be in flight), retire the previous slot: either drop the `with_previous_signing_key(...)` call from the deployment, or call `SessionLayer::remove_previous_signing_key()` on the freshly-built layer (same "mutate before cloning" contract). `SessionLayer::has_previous_signing_key()` returns `false` after that.
 
 **Operational rule: only one previous slot.** Plan rotations so at most one is in flight per session-TTL window. Rotating again while the previous slot is still populated overwrites it: the pre-first-rotation master falls out of the ring and its cookies fail both current and previous verification. This is the correct security behavior for emergency chained rotations (a compromised previous master must not remain valid) but it forces re-authentication for any session still holding a pre-first-rotation cookie. In the non-emergency case, wait one full session-TTL between rotations.
@@ -41,7 +41,7 @@ let crypto = SessionCrypto::new(new_key)
 2. Deploy with both keys: new as `current`, old as `previous`.
 3. Sessions encrypted with the old key are transparently re-encrypted with the new key on next access.
 4. After all sessions have been accessed (or after the session TTL expires), remove the previous key from the deployment.
-5. Monitor the `"session decrypted with previous (rotated) key"` log message to track migration progress.
+5. Monitor the `encryption_key_fallback` counter (`RotationMetrics`, attach with `SessionCrypto::with_metrics`), or the `"session decrypted with previous (rotated) key"` log message, to track migration progress.
 
 ## Multi-instance deployment
 
@@ -202,8 +202,8 @@ The thresholds below are starting points for a single-region deployment serving 
 |--------|-----------|----------------|
 | `factor_failure / factor_attempt` (per factor kind) | `> 30%` for 15 min | Targeted factor probe (e.g. TOTP guessing) or a regression in the factor verification code. |
 | `rate_limit_rejected / (rate_limit_allowed + rate_limit_rejected)` | `> 5%` for 10 min | Either the rate limit is mis-tuned for legitimate traffic or an attacker is sustained-firing requests. |
-| `sid_map capacity reached; evicted oldest mapping` log | `> 1 / minute` | OAuth login throughput exceeds the configured `sid_map` cap (default 10 000, `DEFAULT_SID_MAP_CAPACITY`); back-channel logout precision degrades (some `sid` lookups will miss). Raise via `AuthnService::with_sid_map_capacity(N)` on startup, or shorten the TTL if the churn is real. |
-| `session decrypted with previous (rotated) key` log | persists `> 7 days` after rotation | Long-lived sessions are still on the old key. The next rotation will invalidate them; communicate the cutover. |
+| `sid_map_evicted` counter (`SessionMetrics`) | `> 1 / minute` | OAuth login throughput exceeds the configured `sid_map` cap (default 10 000, `DEFAULT_SID_MAP_CAPACITY`); back-channel logout precision degrades (some `sid` lookups will miss). Raise via `AuthnService::with_sid_map_capacity(N)` on startup, or shorten the TTL if the churn is real. |
+| `encryption_key_fallback` and `fingerprint_key_fallback` counters (`RotationMetrics`) | persists `> 7 days` after rotation | Long-lived sessions are still on the old key. The next rotation will invalidate them; communicate the cutover. |
 | `account_locked` rate | `> 1 / minute` for 5 min | Background brute force or aggressive credential stuffing. Below paging threshold but worth watching. |
 | `session custom data exceeds size limit` log | any occurrence | Application is writing too much to the session; investigate before users hit it in production. |
 
@@ -214,7 +214,7 @@ useful for trend dashboards, capacity planning, and as denominators for the rati
 
 ### Computing rates from counters
 
-`AuthnMetrics` exposes counters; alerts live in your monitoring system (Prometheus / Datadog / Grafana / CloudWatch). The standard pattern in Prometheus terms:
+The metric traits expose counters; alerts live in your monitoring system (Prometheus / Datadog / Grafana / CloudWatch). The standard pattern in Prometheus terms:
 
 ```promql
 # Auth failure rate over 5 minutes
@@ -223,15 +223,15 @@ rate(axess_auth_failure_total[5m])
 > 0.5
 ```
 
-Implement the [`AuthnMetrics`](https://docs.rs/axess) trait against your metrics client and emit `_total`-suffixed counters for the rate queries above to compose cleanly.
+Implement the metric traits of [`axess::metrics`](https://docs.rs/axess) against your metrics client, wire them with `MetricSinks`, and emit `axess_`-prefixed, `_total`-suffixed counters (see the observability page) for the rate queries above to compose cleanly.
 
 ### Key log messages
 
 | Message | Severity | Action |
 |---------|----------|--------|
-| `"session decrypted with previous (rotated) key"` | Info | Key rotation in progress; monitor until gone |
+| `"session decrypted with previous (rotated) key"` | Info | Key rotation in progress; the `encryption_key_fallback` counter carries the rate; monitor until gone |
 | `"JWKS RwLock was poisoned"` | Warn | Investigate what panicked while holding the lock |
-| `"sid_map capacity reached"` | Warn | Many OAuth logins; consider increasing capacity |
+| `"sid_map capacity reached"` | Warn | Many OAuth logins; the `sid_map_evicted` counter carries the rate; consider increasing capacity |
 | `"session custom data exceeds size limit"` | Warn | Application is writing too much to session |
 | `"login rejected by tenant IP policy"` | Warn | Legitimate user from blocked IP, or attack |
 

@@ -128,7 +128,7 @@ where
             .derived_lockout_for(user_id, tenant_id, session)
             .await?
         {
-            self.inner.metrics.account_locked();
+            self.inner.metrics.auth_flow.account_locked();
             self.record_locked_attempt_audit(user_id, tenant_id, next_kind, session)
                 .await?;
             return Ok(AccountStatusEnforcement::Locked { until: lock.until });
@@ -137,7 +137,7 @@ where
         // before anything is reserved or hashed, so a guesser pays the delay
         // and the account pays nothing.
         if let Some(retry_after) = self.throttle_for(user_id, tenant_id, session).await? {
-            self.inner.metrics.attempt_throttled();
+            self.inner.metrics.factors.attempt_throttled();
             self.record_throttled_attempt_audit(user_id, tenant_id, next_kind, session)
                 .await?;
             return Ok(AccountStatusEnforcement::Throttled { retry_after });
@@ -167,7 +167,7 @@ where
         match self.inner.identity.failed_attempts(user_id).await {
             Ok((count, last)) => Ok(policy.derived_lockout(count, last, now)),
             Err(e) => {
-                self.inner.metrics.factor_counter_store_outage();
+                self.inner.metrics.factors.factor_counter_store_outage();
                 tracing::warn!(
                     user_id = %user_id,
                     error = %e,
@@ -332,7 +332,7 @@ where
         current_kind: &FactorKind,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        self.inner.metrics.factor_failure();
+        self.inner.metrics.factors.factor_failure();
 
         let policy = self.inner.identity.lockout_policy_for_tenant(tenant_id);
 
@@ -349,7 +349,7 @@ where
                 // read-replica split puts reads on a replica and this write
                 // on the primary. Tag the metric separately so operators can
                 // alert on it without false-firing on every wrong password.
-                self.inner.metrics.factor_counter_store_outage();
+                self.inner.metrics.factors.factor_counter_store_outage();
                 let verdict = match policy.on_counter_unavailable {
                     // Fail closed. The attempt counts as locked, so brute
                     // force stays bounded while the counter is dead. This
@@ -357,7 +357,7 @@ where
                     // identifier never reaches here, having been rejected at
                     // `begin_login` with timing equalization.
                     CounterUnavailable::Lock => {
-                        self.inner.metrics.account_locked();
+                        self.inner.metrics.auth_flow.account_locked();
                         let until = policy.duration.and_then(|d| {
                             chrono::Duration::from_std(d)
                                 .ok()
@@ -397,7 +397,7 @@ where
             .await;
 
         if count >= policy.effective_max_attempts() {
-            self.inner.metrics.account_locked();
+            self.inner.metrics.auth_flow.account_locked();
             // Surface the lockout window to the caller as `now +
             // policy.duration`, computed at the verdict that creates
             // the lockout (mirrors what production stores write into

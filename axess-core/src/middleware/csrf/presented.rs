@@ -4,7 +4,7 @@
 use super::*;
 
 /// A state-changing request the CSRF check refuses.
-pub(super) struct Refused;
+pub(super) struct Refused(pub(super) crate::metrics::CsrfRefusal);
 
 /// Decide whether a state-changing request carries a valid CSRF token.
 ///
@@ -31,7 +31,7 @@ pub(super) async fn validate_state_changing(
             "csrf: no session id on state-changing request \
              (CsrfLayer must be layered inside the session layer)"
         );
-        return Err(Refused);
+        return Err(Refused(crate::metrics::CsrfRefusal::NoSession));
     };
 
     // Origin/Referer defence in depth, if configured. Runs
@@ -44,7 +44,7 @@ pub(super) async fn validate_state_changing(
             path = %req.uri().path(),
             "csrf: Origin/Referer validation failed"
         );
-        return Err(Refused);
+        return Err(Refused(crate::metrics::CsrfRefusal::OriginMismatch));
     }
 
     // Extract the presented token, possibly by buffering a
@@ -58,7 +58,7 @@ pub(super) async fn validate_state_changing(
                 reason = %reason,
                 "csrf: request rejected during token extraction"
             );
-            return Err(Refused);
+            return Err(Refused(crate::metrics::CsrfRefusal::TokenUnreadable));
         }
     };
     req = req_after;
@@ -77,7 +77,7 @@ pub(super) async fn validate_state_changing(
             header_or_form_present = presented.is_some(),
             "csrf: token validation failed"
         );
-        return Err(Refused);
+        return Err(Refused(crate::metrics::CsrfRefusal::TokenInvalid));
     }
     Ok(req)
 }

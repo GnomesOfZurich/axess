@@ -11,6 +11,8 @@ use axess_rng::{SecureRng, SystemRng};
 use std::sync::Arc;
 
 mod breached_password;
+#[cfg(feature = "oauth")]
+mod duplicate_providers;
 
 /// Configures an [`AuthnService`], and is what the built handle shares.
 ///
@@ -27,7 +29,11 @@ where
     pub(crate) identity: Arc<I>,
     pub(crate) factors: Arc<F>,
     pub(crate) registry: Option<Arc<dyn SessionRegistryHandle>>,
-    pub(crate) metrics: Arc<dyn crate::metrics::AuthnMetrics>,
+    pub(crate) metrics: crate::metrics::MetricSinks,
+    /// Providers registered under a name that was already taken; reported
+    /// to the provider-registry sink when the service is built.
+    #[cfg(feature = "oauth")]
+    pub(crate) duplicate_providers: u32,
     /// Maximum concurrent sessions per user. `None` means unlimited.
     pub(crate) max_sessions_per_user: Option<usize>,
     pub(crate) rng: Arc<dyn SecureRng>,
@@ -90,14 +96,17 @@ where
     /// refuse unless
     /// [`allow_unchecked_when_breach_check_unavailable`](Self::allow_unchecked_when_breach_check_unavailable).
     pub(crate) on_breach_check_unavailable: axess_factors::BreachCheckUnavailable,
+    /// Reload settings and the coordinator for live provider changes.
+    #[cfg(any(feature = "oauth", feature = "fido2", feature = "ldap"))]
+    pub(crate) provider_reload: super::provider_reload::ProviderReloadState,
     #[cfg(feature = "fido2")]
-    pub(crate) fido2: Option<Arc<dyn axess_factors::fido2::Fido2Provider>>,
+    pub(crate) fido2: arc_swap::ArcSwapOption<Arc<dyn axess_factors::fido2::Fido2Provider>>,
     #[cfg(feature = "fido2")]
     pub(crate) fido2_options: crate::authn::factor::Fido2Options,
     #[cfg(feature = "ldap")]
-    pub(crate) ldap: Option<Arc<dyn axess_factors::ldap::LdapProvider>>,
+    pub(crate) ldap: arc_swap::ArcSwapOption<Arc<dyn axess_factors::ldap::LdapProvider>>,
     #[cfg(feature = "oauth")]
-    pub(crate) oauth_providers: crate::federation::oauth::OAuthProviderRegistry,
+    pub(crate) oauth_providers: crate::federation::oauth::OAuthRegistrySlot,
     /// Per-tenant providers resolved at request time, when configured by
     /// [`with_tenant_oauth_providers`](AuthnServiceBuilder::with_tenant_oauth_providers).
     #[cfg(feature = "oauth")]
@@ -215,7 +224,9 @@ where
             identity: Arc::new(identity),
             factors: Arc::new(factors),
             registry: None,
-            metrics: Arc::new(crate::metrics::NoopMetrics),
+            metrics: crate::metrics::MetricSinks::noop(),
+            #[cfg(feature = "oauth")]
+            duplicate_providers: 0,
             max_sessions_per_user: None,
             rng: Arc::new(SystemRng),
             clock: Arc::new(SystemClock),
@@ -238,12 +249,14 @@ where
             allow_plaintext_factor_secrets: false,
             breached_password_check: None,
             on_breach_check_unavailable: Default::default(),
+            #[cfg(any(feature = "oauth", feature = "fido2", feature = "ldap"))]
+            provider_reload: Default::default(),
             #[cfg(feature = "fido2")]
-            fido2: None,
+            fido2: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "fido2")]
             fido2_options: Default::default(),
             #[cfg(feature = "ldap")]
-            ldap: None,
+            ldap: arc_swap::ArcSwapOption::empty(),
             #[cfg(feature = "oauth")]
             oauth_providers: Default::default(),
             #[cfg(feature = "oauth")]
@@ -308,7 +321,7 @@ where
     /// application can have them generate a new set: the persisted
     /// [`RecoveryCodesConfig::under_previous_pepper`](crate::authn::factor::RecoveryCodesConfig::under_previous_pepper)
     /// is set, a warning is logged and
-    /// [`AuthnMetrics::recovery_codes_under_previous_pepper`](crate::metrics::AuthnMetrics::recovery_codes_under_previous_pepper)
+    /// [`FactorMetrics::recovery_codes_under_previous_pepper`](crate::metrics::FactorMetrics::recovery_codes_under_previous_pepper)
     /// fires. Drop the previous pepper once no stored set uses it.
     pub fn with_previous_recovery_code_pepper(
         mut self,
@@ -352,51 +365,12 @@ where
         self
     }
 
-    /// Attach a FIDO2/WebAuthn provider.
-    ///
-    /// **Single-instance by design.** Calling `with_fido2` twice replaces
-    /// the previously attached provider silently: one deployment, one
-    /// relying-party configuration is the assumption. Multi-tenant apps
-    /// that need per-tenant relying-party ids (e.g. distinct RP-IDs per
-    /// customer domain) must wrap dispatch in the application layer;
-    /// axess-core does not maintain a per-tenant FIDO2 registry.
-    #[cfg(feature = "fido2")]
-    pub fn with_fido2(mut self, provider: impl axess_factors::fido2::Fido2Provider) -> Self {
-        self.fido2 = Some(Arc::new(provider));
-        self
-    }
-
     /// Configure the FIDO2 ceremony timeout and the recency a credential
     /// change requires of the session
     /// ([`Fido2Options::max_authn_age`](crate::authn::factor::Fido2Options::max_authn_age)).
     #[cfg(feature = "fido2")]
     pub fn with_fido2_options(mut self, options: crate::authn::factor::Fido2Options) -> Self {
         self.fido2_options = options;
-        self
-    }
-
-    /// Attach an LDAP provider for directory-based password verification.
-    ///
-    /// When a user's factor chain includes [`FactorKind::LdapBind`](crate::authn::factor::FactorKind::LdapBind), the
-    /// service will verify their password via an LDAP simple bind against
-    /// this provider instead of checking a local password hash.
-    ///
-    /// **Single-instance by design.** Calling `with_ldap` twice replaces
-    /// the previously attached provider silently: one deployment, one
-    /// directory is the assumption. Multi-tenant apps that need
-    /// per-subsidiary directories must wrap dispatch in the application
-    /// layer; axess-core does not maintain a per-tenant LDAP registry.
-    ///
-    /// ```rust,ignore
-    /// let ldap = LdapProviderConfig::new(
-    ///     "ldaps://ad.corp.example.com",
-    ///     "{user}@corp.example.com",
-    /// );
-    /// let authn = AuthnService::builder(identity, factors).with_ldap(ldap).build();
-    /// ```
-    #[cfg(feature = "ldap")]
-    pub fn with_ldap(mut self, provider: impl axess_factors::ldap::LdapProvider) -> Self {
-        self.ldap = Some(Arc::new(provider));
         self
     }
 
@@ -448,7 +422,9 @@ where
         mut self,
         provider: impl axess_factors::oauth::OAuthProvider,
     ) -> Self {
-        self.oauth_providers.add(provider);
+        if self.oauth_providers.add(provider) {
+            self.duplicate_providers += 1;
+        }
         self
     }
 
@@ -521,7 +497,7 @@ where
     fn with_jwks_refresh_started(mut self) -> Self {
         if let Some(interval) = self.jwks_refresh_interval {
             self.jwks_refresh_task = super::oauth_service::JwksRefreshTask::start(
-                self.oauth_providers.values().cloned().collect(),
+                super::oauth_service::live_providers(self.oauth_providers.handle()),
                 interval,
             );
         }
@@ -735,12 +711,12 @@ where
         self
     }
 
-    /// Attach a metrics hook for observability.
-    ///
-    /// The [`AuthnMetrics`](crate::metrics::AuthnMetrics) trait has no-op
-    /// defaults; implement only the counters you need.
-    pub fn with_metrics(mut self, metrics: impl crate::metrics::AuthnMetrics) -> Self {
-        self.metrics = Arc::new(metrics);
+    /// Attach the metric sinks the service reports to: the authentication
+    /// flow, factors, sessions, the provider registry and the audit pipeline.
+    /// Concerns left at their no-op default report nothing; see
+    /// [`MetricSinks`](crate::metrics::MetricSinks).
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricSinks) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -754,6 +730,8 @@ where
     /// the rules.
     pub fn build(self) -> AuthnService<I, F> {
         let mut this = self;
+        #[cfg(feature = "oauth")]
+        this.report_duplicate_providers();
         if this.registry.is_none() {
             tracing::warn!(
                 "AuthnService built without a session registry: suspending a user, \

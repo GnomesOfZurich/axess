@@ -66,6 +66,8 @@ pub use axess_core::authz::{
     StandardRequestContext,
     make_action_uid,
     make_entity_uid,
+    // Live policy reload: `Reloaded`, `PolicySource`, `ReloadCoordinator`, ...
+    reload,
 };
 
 // The trusted-proxy primitives left this module in 0.7.0. They sat behind

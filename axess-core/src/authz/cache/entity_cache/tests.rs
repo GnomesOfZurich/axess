@@ -239,7 +239,7 @@ struct BatchMetrics {
     hits: std::sync::atomic::AtomicU64,
 }
 
-impl crate::metrics::AuthnMetrics for BatchMetrics {
+impl crate::metrics::AuthzCacheMetrics for BatchMetrics {
     fn authz_cache_hits(&self, count: u64) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.hits.fetch_add(count, Ordering::SeqCst);
@@ -274,10 +274,10 @@ async fn flush_metrics_reports_totals_in_one_call_per_counter() {
 /// An implementation of the per-event methods alone still sees every event.
 #[test]
 fn per_event_metrics_implementations_receive_batched_totals() {
-    use crate::metrics::AuthnMetrics;
+    use crate::metrics::AuthzCacheMetrics;
     #[derive(Default)]
     struct PerEvent(AtomicUsize);
-    impl AuthnMetrics for PerEvent {
+    impl AuthzCacheMetrics for PerEvent {
         fn authz_cache_hit(&self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }

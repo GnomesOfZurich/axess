@@ -33,6 +33,12 @@ start. The defence is structural: there is no path to production
 with a broken policy file, because the process refuses to come
 up.
 
+A running service can also replace its policy set without a restart:
+`AuthzStore::reload_policies` runs the same parse and strict validation
+against the new schema, checks the entity provider against it, and only
+then swaps. A reload that fails any step leaves the previous set in force
+and names the step. See *Live policy reload*.
+
 The evaluate phase happens once per authorisation check. The
 application constructs an `AuthzSession` from the `AuthzStore`, a
 `Principal` (typically extracted from the session or from a

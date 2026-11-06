@@ -1,280 +1,96 @@
-//! Metrics hook trait for observability.
+//! Metrics hooks, one narrow trait per concern.
 //!
-//! Implement [`AuthnMetrics`] to connect axess to your metrics backend
-//! (Prometheus, StatsD, OpenTelemetry, etc.). All methods have no-op defaults
-//! so you only need to override the ones you care about.
+//! Connect axess to a metrics backend (Prometheus, StatsD, OpenTelemetry) by
+//! implementing the traits of the concerns you export, and hand them to the
+//! components through [`MetricSinks`]. Every trait method defaults to a
+//! no-op, and a concern you do not implement costs nothing, so a counter
+//! added to one concern never touches the implementors of another.
 //!
-//! # Reference implementation (atomic counters)
+//! | Trait | Concern | Fed by |
+//! |-------|---------|--------|
+//! | [`AuthFlowMetrics`] | logins and lockouts | `AuthnService` |
+//! | [`FactorMetrics`] | factor verification, throttle, lockout store | `AuthnService` |
+//! | [`SessionMetrics`] | session lifecycle, binding, the `sid` map | `AuthnService`, `SessionLayer` |
+//! | [`RotationMetrics`] | previous-key use during a rotation | `SessionCrypto`, `SessionLayer` |
+//! | [`ProviderRegistryMetrics`] | duplicate provider registrations, live provider reloads | `AuthnService` |
+//! | [`RequestGuardMetrics`] | rate limiting and CSRF | `RateLimitLayer`, `CsrfLayer` |
+//! | [`AuthzCacheMetrics`] | entity-cache hits and misses | `EntityCache::flush_metrics` |
+//! | [`AuditMetrics`] | audit store outage and shedding | `AuthnService` |
+//!
+//! # One exporter for every concern
+//!
+//! A type that implements all eight traits satisfies [`AxessMetrics`], and
+//! [`MetricSinks::all`] wires it to every concern at once. A type that
+//! implements some wires them one by one:
 //!
 //! ```rust
-//! use axess_core::metrics::AuthnMetrics;
+//! use axess_core::metrics::{AuthFlowMetrics, MetricSinks, SessionMetrics};
+//! use std::sync::Arc;
 //! use std::sync::atomic::{AtomicU64, Ordering};
 //!
-//! /// Minimal metrics using atomic counters. Replace with prometheus or
-//! /// opentelemetry counters in production.
-//! pub struct CountingMetrics {
-//!     pub login_attempts: AtomicU64,
-//!     pub login_successes: AtomicU64,
-//!     pub login_failures: AtomicU64,
-//!     pub factor_attempts: AtomicU64,
-//!     pub factor_successes: AtomicU64,
-//!     pub factor_failures: AtomicU64,
-//!     pub lockouts: AtomicU64,
-//!     pub sessions_created: AtomicU64,
-//!     pub rate_limit_rejected: AtomicU64,
+//! /// Counts logins and session creations; every other concern stays silent.
+//! #[derive(Default)]
+//! struct Counting {
+//!     logins: AtomicU64,
+//!     sessions: AtomicU64,
 //! }
 //!
-//! impl CountingMetrics {
-//!     pub fn new() -> Self {
-//!         Self {
-//!             login_attempts: AtomicU64::new(0),
-//!             login_successes: AtomicU64::new(0),
-//!             login_failures: AtomicU64::new(0),
-//!             factor_attempts: AtomicU64::new(0),
-//!             factor_successes: AtomicU64::new(0),
-//!             factor_failures: AtomicU64::new(0),
-//!             lockouts: AtomicU64::new(0),
-//!             sessions_created: AtomicU64::new(0),
-//!             rate_limit_rejected: AtomicU64::new(0),
-//!         }
-//!     }
+//! impl AuthFlowMetrics for Counting {
+//!     fn auth_attempt(&self) { self.logins.fetch_add(1, Ordering::Relaxed); }
+//! }
+//! impl SessionMetrics for Counting {
+//!     fn session_created(&self) { self.sessions.fetch_add(1, Ordering::Relaxed); }
 //! }
 //!
-//! impl AuthnMetrics for CountingMetrics {
-//!     fn auth_attempt(&self) { self.login_attempts.fetch_add(1, Ordering::Relaxed); }
-//!     fn auth_success(&self) { self.login_successes.fetch_add(1, Ordering::Relaxed); }
-//!     fn auth_failure(&self) { self.login_failures.fetch_add(1, Ordering::Relaxed); }
-//!     fn factor_attempt(&self) { self.factor_attempts.fetch_add(1, Ordering::Relaxed); }
-//!     fn factor_success(&self) { self.factor_successes.fetch_add(1, Ordering::Relaxed); }
-//!     fn factor_failure(&self) { self.factor_failures.fetch_add(1, Ordering::Relaxed); }
-//!     fn account_locked(&self) { self.lockouts.fetch_add(1, Ordering::Relaxed); }
-//!     fn session_created(&self) { self.sessions_created.fetch_add(1, Ordering::Relaxed); }
-//!     fn rate_limit_rejected(&self) { self.rate_limit_rejected.fetch_add(1, Ordering::Relaxed); }
-//! }
+//! let counting = Arc::new(Counting::default());
+//! let sinks = MetricSinks::noop()
+//!     .with_auth_flow(counting.clone())
+//!     .with_session(counting.clone());
+//! # let _ = sinks;
 //! ```
 //!
-//! Wire it in:
+//! Then pass the sinks to the component:
 //!
 //! ```rust,ignore
 //! let authn = AuthnService::builder(identity, factors)
-//!     .with_metrics(CountingMetrics::new())
+//!     .with_metrics(sinks.clone())
 //!     .build();
+//! let sessions = SessionLayer::new(store, key, registry).with_metrics(sinks);
 //! ```
+//!
+//! The rules for what is a metric, the naming scheme and the labels an
+//! exporter may add are in the observability page of the book.
 
-/// Trait for reporting authentication and session metrics.
-///
-/// All methods have no-op defaults so implementations can be incremental.
-/// Methods are `&self` and take no parameters; implementations should
-/// increment internal counters/gauges. If you need labels (user, tenant,
-/// factor kind), capture them in the implementation via thread-local or
-/// span context.
-pub trait AuthnMetrics: Send + Sync + 'static {
-    // ── Authentication ──────────────────────────────────────────────────
+mod audit;
+mod auth_flow;
+mod authz_cache;
+mod factors;
+mod guard;
+mod registry;
+mod rotation;
+mod session;
+mod sinks;
 
-    /// A login attempt was started (begin_login called).
-    fn auth_attempt(&self) {}
+pub use audit::AuditMetrics;
+pub use auth_flow::AuthFlowMetrics;
+pub use authz_cache::AuthzCacheMetrics;
+pub use factors::FactorMetrics;
+pub use guard::{CsrfRefusal, RequestGuardMetrics};
+pub use registry::{ProviderCategory, ProviderRegistryMetrics};
+pub use rotation::RotationMetrics;
+pub use session::SessionMetrics;
+pub use sinks::{AxessMetrics, MetricSinks};
 
-    /// Authentication completed successfully (all factors passed).
-    fn auth_success(&self) {}
-
-    /// Authentication failed (bad credentials, locked, etc.).
-    fn auth_failure(&self) {}
-
-    /// A factor verification was attempted.
-    fn factor_attempt(&self) {}
-
-    /// A factor verification succeeded.
-    fn factor_success(&self) {}
-
-    /// A factor verification failed.
-    fn factor_failure(&self) {}
-
-    /// The failed-attempt counter store errored on `record_failed_attempt`.
-    ///
-    /// Distinct from [`factor_failure`](Self::factor_failure): the user did
-    /// supply credentials, but the persistent counter that drives lockout
-    /// could not be incremented. What the request returns then is
-    /// [`LockoutPolicy::on_counter_unavailable`](crate::authn::types::LockoutPolicy),
-    /// which defaults to treating the attempt as locked. Alert on this
-    /// either way: under `Lock` it explains the support calls, and under
-    /// `Allow` it is the only signal that lockout is off.
-    fn factor_counter_store_outage(&self) {}
-
-    /// The audit store rejected an event, so the flow was failed rather
-    /// than allowed to proceed unrecorded. Every login is failing while
-    /// this fires: it is a page, not a dashboard line.
-    fn audit_store_outage(&self) {}
-
-    /// An audit sink deliberately dropped an event under load.
-    ///
-    /// Distinct from [`audit_store_outage`](Self::audit_store_outage):
-    /// nothing is failing, the sink is shedding to protect its storage.
-    /// A steady rate means the trail has bounded gaps and the sink's
-    /// capacity wants looking at; a spike usually means someone is
-    /// driving unauthenticated login attempts at you.
-    fn audit_event_shed(&self) {}
-
-    /// An account was locked due to too many failed attempts.
-    fn account_locked(&self) {}
-
-    /// A guess was refused by the throttle: consecutive wrong guesses under
-    /// one key (see [`Throttle`](crate::authn::types::Throttle)) had earned a
-    /// delay that had not run. No verifier ran and nothing was counted. A
-    /// steady rate from one address is a guesser; the same from many is a
-    /// distributed one, which the per-account lock still caps.
-    fn attempt_throttled(&self) {}
-
-    /// A recovery code matched only under the previous pepper of a rotation.
-    ///
-    /// The login succeeded, and the set it came from stays sealed under the
-    /// retired secret: it should be regenerated, and the previous pepper
-    /// dropped once this stops firing.
-    fn recovery_codes_under_previous_pepper(&self) {}
-
-    // ── Sessions ────────────────────────────────────────────────────────
-
-    /// A new session was created (ID cycled after auth or first visit).
-    fn session_created(&self) {}
-
-    /// A session was invalidated (logout, suspend, forced logout).
-    fn session_invalidated(&self) {}
-
-    /// Session binding mismatch detected (possible hijacking).
-    fn session_binding_mismatch(&self) {}
-
-    // ── Rate limiting ───────────────────────────────────────────────────
-
-    /// A request was allowed through the rate limiter.
-    fn rate_limit_allowed(&self) {}
-
-    /// A request was rejected by the rate limiter (429).
-    fn rate_limit_rejected(&self) {}
-
-    // ── AuthZ entity cache ──────────────────────────────────────────────
-    //
-    // Cache hit/miss signals from the Cedar entity-resolution cache on
-    // the authorization decision path. The default `EntityCache` (and
-    // the opt-in `Valkey` decorator) call these once per
-    // lookup so ops dashboards can compute hit rates without poking at
-    // the internal `axess_cache::CacheStats` snapshot.
-
-    /// An authz entity lookup found the value in cache (saved a provider call).
-    fn authz_cache_hit(&self) {}
-
-    /// An authz entity lookup missed and had to call through to the provider.
-    fn authz_cache_miss(&self) {}
-
-    /// The cache rejected a write because the capacity-bounded LRU is full
-    /// and evicted an existing entry to make room. Persistent high counts
-    /// suggest the configured capacity is too small for the working set.
-    fn authz_cache_eviction(&self) {}
-
-    /// An invalidation channel cleared one or more cache entries (e.g.
-    /// policy change, principal revocation). Useful for verifying that
-    /// downstream invalidation actually reaches the cache layer.
-    fn authz_cache_invalidation(&self) {}
-
-    /// `count` authz entity lookups were found in cache. Called by
-    /// [`EntityCache::flush_metrics`](crate::authz::cache::EntityCache::flush_metrics)
-    /// with a whole reporting window's total, so a counter backend can add
-    /// it in one step. The default calls
-    /// [`authz_cache_hit`](Self::authz_cache_hit) `count` times, so
-    /// an implementation of the per-event method alone keeps working.
-    fn authz_cache_hits(&self, count: u64) {
-        for _ in 0..count {
-            self.authz_cache_hit();
-        }
-    }
-
-    /// `count` authz entity lookups missed. Batched form of
-    /// [`authz_cache_miss`](Self::authz_cache_miss); see
-    /// [`authz_cache_hits`](Self::authz_cache_hits).
-    fn authz_cache_misses(&self, count: u64) {
-        for _ in 0..count {
-            self.authz_cache_miss();
-        }
-    }
-
-    /// `count` entries were evicted by capacity pressure. Batched form of
-    /// [`authz_cache_eviction`](Self::authz_cache_eviction); see
-    /// [`authz_cache_hits`](Self::authz_cache_hits).
-    fn authz_cache_evictions(&self, count: u64) {
-        for _ in 0..count {
-            self.authz_cache_eviction();
-        }
-    }
-
-    /// `count` entries were cleared by invalidation. Batched form of
-    /// [`authz_cache_invalidation`](Self::authz_cache_invalidation); see
-    /// [`authz_cache_hits`](Self::authz_cache_hits).
-    fn authz_cache_invalidations(&self, count: u64) {
-        for _ in 0..count {
-            self.authz_cache_invalidation();
-        }
-    }
-}
-
-/// No-op metrics implementation. Used when no metrics backend is configured.
-#[derive(Debug, Clone, Default)]
+/// No-op metrics implementation of every concern. Used when no metrics
+/// backend is configured.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct NoopMetrics;
 
-impl AuthnMetrics for NoopMetrics {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    struct CountingMetrics {
-        attempts: AtomicU32,
-        successes: AtomicU32,
-        failures: AtomicU32,
-    }
-
-    impl CountingMetrics {
-        fn new() -> Self {
-            Self {
-                attempts: AtomicU32::new(0),
-                successes: AtomicU32::new(0),
-                failures: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl AuthnMetrics for CountingMetrics {
-        fn auth_attempt(&self) {
-            self.attempts.fetch_add(1, Ordering::Relaxed);
-        }
-        fn auth_success(&self) {
-            self.successes.fetch_add(1, Ordering::Relaxed);
-        }
-        fn auth_failure(&self) {
-            self.failures.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    #[test]
-    fn noop_metrics_compiles() {
-        let m = NoopMetrics;
-        m.auth_attempt();
-        m.auth_success();
-        m.auth_failure();
-        m.factor_attempt();
-        m.session_created();
-        m.rate_limit_allowed();
-        m.rate_limit_rejected();
-    }
-
-    #[test]
-    fn counting_metrics_increments() {
-        let m = CountingMetrics::new();
-        m.auth_attempt();
-        m.auth_attempt();
-        m.auth_success();
-        m.auth_failure();
-
-        assert_eq!(m.attempts.load(Ordering::Relaxed), 2);
-        assert_eq!(m.successes.load(Ordering::Relaxed), 1);
-        assert_eq!(m.failures.load(Ordering::Relaxed), 1);
-    }
-}
+impl AuthFlowMetrics for NoopMetrics {}
+impl FactorMetrics for NoopMetrics {}
+impl SessionMetrics for NoopMetrics {}
+impl RotationMetrics for NoopMetrics {}
+impl ProviderRegistryMetrics for NoopMetrics {}
+impl RequestGuardMetrics for NoopMetrics {}
+impl AuthzCacheMetrics for NoopMetrics {}
+impl AuditMetrics for NoopMetrics {}

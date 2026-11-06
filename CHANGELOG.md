@@ -8,6 +8,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-06
+
+### Changed (breaking)
+
+- `AuthnMetrics` is replaced by one trait per concern (`AuthFlowMetrics`, `FactorMetrics`, `SessionMetrics`, `RotationMetrics`, `ProviderRegistryMetrics`, `RequestGuardMetrics`, `AuthzCacheMetrics`, `AuditMetrics`), each with no-op defaults, so an adopter implements the concerns it exports and a counter added to one never touches another's implementors; `with_metrics` on `AuthnServiceBuilder`, `SessionLayer`, `RateLimitLayer` and `CsrfLayer` takes a `MetricSinks` (`MetricSinks::all(exporter)` wires one exporter to every concern), and `EntityCache::flush_metrics` takes an `AuthzCacheMetrics`.
+- `AuthnService::oauth_providers()` returns an `Arc<OAuthProviderRegistry>` snapshot instead of a reference, and `OAuthProviderRegistry::provider_names()` returns owned names, because the registry is swapped whole when a provider is reloaded.
+- A duplicate OAuth provider name panics a debug build at `AuthnServiceBuilder::build` instead of at the repeated `with_oauth_provider` call, after it is reported to `ProviderRegistryMetrics`.
+
+### Added
+
+- Counters for what was only a log line: `RequestGuardMetrics::csrf_rejected` (with a closed `CsrfRefusal` reason, also for the session layer's WebSocket Origin refusal), `ProviderRegistryMetrics::provider_duplicate_registration`, `RotationMetrics::encryption_key_fallback` and `fingerprint_key_fallback`, `SessionMetrics::session_fingerprint_backfilled` and `sid_map_evicted`.
+- `SessionCrypto::with_metrics` reports each blob that opened only under the previous encryption key.
+- `testing::RecordingMetrics` records every metric call of every concern for assertions.
+- The observability page (`docs/production/observability.md`) holds the census of counters and counter-shaped log lines, the metric-versus-event rule, the naming scheme (`axess_<what>_total`) and the label rules; the sqlite example's `/metrics` lists the new names.
+- `AuthzStore::reload_policies(policy_text, schema_json)` replaces the Cedar policy set of a running store: the text is parsed and validated in strict mode and the entity provider is checked against the new schema before an atomic swap, a refusal leaves the previous set in force and names the step, and it returns `Reloaded { digest, cache_invalidated, announced }`; `policy_digest()` names the set in force and `with_cache_invalidator` drops the registered caches after every swap.
+- `axess::authz::reload` carries the cross-instance side: `ReloadCoordinator` (`InProcessCoordinator`, and `ValkeyReloadCoordinator` behind `valkey` on `{prefix}:authz-policy-reloaded`, or any name through `start_named`), `PolicySource` and `AuthzStore::follow_reloads(source, poll_every)`, which re-reads the source on a notice and on a poll and never applies anything a notice says.
+- `PolicyEvaluator::digest()` (defaulted), `PolicyStore::digest()` and `policy_set_digest`; `AuthzCacheMetrics::authz_policy_reloaded` and `authz_policy_reload_refused` (no-op defaults, reported through `AuthzStore::with_metrics(MetricSinks)`, exported as `axess_authz_policy_reloads_total` and `axess_authz_policy_reload_refusals_total`); a reload is an `axess::authz::reload` tracing event with the digest.
+- `AuthnService::reload_oauth_provider`, `remove_oauth_provider`, `reload_tenant_oauth_provider`, `remove_tenant_oauth_provider`, `reload_fido2` and `reload_ldap` swap a provider of a running service only after its candidate built and checked (OAuth discovery and issuer check, FIDO2 relying-party parse, LDAP reachability through the new `LdapProvider::check_reachable`) within `with_provider_validation_timeout` (default 30 seconds); a refusal is a named `ProviderReloadError` and the previous provider keeps serving, and a login begun before an OAuth swap finishes only if the issuer is unchanged.
+- `LiveTenantOAuthProviders` (with `AuthnServiceBuilder::with_live_tenant_oauth_providers`) is a tenant provider registry keyed by `(tenant, name)`, so one tenant's reload never touches another's.
+- `with_provider_coordinator` and `AuthnService::follow_provider_reloads(source, poll_every)` carry a provider change to every instance over a coordinator of its own: the follower asks a `ProviderSource` for `ProviderEntry { key, revision }`, builds only what moved, and applies nothing a notice says.
+- The reload coordinator types are in `axess::reload` (still re-exported from `axess::authz::reload`), `ValkeyReloadCoordinator::start_named` takes the channel name, and `ProviderRegistryMetrics` gains `provider_reloaded`, `provider_removed` and `provider_reload_refused` with a closed `ProviderCategory` (`axess_provider_reloads_total`, `axess_provider_removals_total`, `axess_provider_reload_refusals_total`).
+- The background JWKS refresh loop (`with_jwks_refresh`, `spawn_jwks_refresh`) reads the live provider registry at every pass, so a reloaded provider's key set is the one refreshed and a removed provider is no longer polled.
+- `AuthnService::remove_fido2` and `remove_ldap` take the FIDO2 or LDAP provider out of a running service (counted, announced, `NotFound` when none is attached), and the provider follower removes a FIDO2 or LDAP provider it installed when its source stops listing it.
+- `Fido2Provider::relying_party_id()` (required) lets a FIDO2 reload see the relying-party id, which a passkey is bound to: `reload_fido2` refuses a changed id as `ProviderReloadError::RpIdChanged`, `reload_fido2_with(candidate, ReloadFido2::allow_rp_id_change())` and `BuiltProvider::Fido2AllowingRpIdChange` acknowledge it, and an acknowledged change is counted by `ProviderRegistryMetrics::fido2_rp_id_changed` and logged with both ids; `DefaultFido2Provider::new` reads the id from the `Webauthn` it wraps and `MockFido2Provider::with_relying_party_id` sets it.
+- `ProviderFollower::reads(ReadCause)` counts how often the follower read its source for each cause (`Start`, `Notice`, `Lagged`, `Poll`).
+- New direct dependency `arc-swap` (already in the tree through `fred`) holds the policy swap slot, so the request path reads it without a lock; nothing changes for an adopter that never calls `reload_policies`.
+
 ## [0.16.0] - 2026-11-06
 
 ### Changed (breaking)

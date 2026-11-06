@@ -54,6 +54,9 @@ fn passkey(id: &str) -> Passkey {
 struct AcceptingProvider(DefaultFido2Provider);
 
 impl Fido2Provider for AcceptingProvider {
+    fn relying_party_id(&self) -> &str {
+        self.0.relying_party_id()
+    }
     fn start_authentication(
         &self,
         c: &[Passkey],

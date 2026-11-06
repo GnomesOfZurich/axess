@@ -1,6 +1,6 @@
 [package]
 name = "axess-example-fapi"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 rust-version.workspace = true
 publish = false
@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/GnomesOfZurich/axess"
 
 [dependencies]
-axess = { path = "../../axess", version = "=0.16.0", features = ["oauth", "fapi", "jwt-rust-crypto", "testing"] }
+axess = { path = "../../axess", version = "=0.17.0", features = ["oauth", "fapi", "jwt-rust-crypto", "testing"] }
 # `Algorithm` names the signing algorithm of the `private_key_jwt` key. No
 # crypto backend here: `axess`'s `jwt-rust-crypto` feature picks the one
 # provider, and a second one makes `jsonwebtoken` refuse to choose.

@@ -57,7 +57,7 @@ where
             return e;
         }
         if let crate::authn::types::EntityState::Suspended(detail) = &status {
-            self.inner.metrics.account_locked();
+            self.inner.metrics.auth_flow.account_locked();
             return AuthnError::Locked {
                 until: detail.until,
             };

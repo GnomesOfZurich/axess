@@ -52,7 +52,7 @@ where
             AuthnError::Internal(e.to_string())
         })?;
 
-        self.inner.metrics.factor_attempt();
+        self.inner.metrics.factors.factor_attempt();
         let outcome = verify_credential_blocking(
             &self.inner.kdf,
             credential,
@@ -92,7 +92,10 @@ where
             {
                 // The set is sealed under a retired secret and cannot be
                 // re-keyed; the application has the user regenerate it.
-                self.inner.metrics.recovery_codes_under_previous_pepper();
+                self.inner
+                    .metrics
+                    .factors
+                    .recovery_codes_under_previous_pepper();
                 tracing::warn!(
                     user_id = %user_id,
                     "recovery code matched under the previous pepper; the set should be regenerated"
@@ -120,7 +123,7 @@ where
 
         // Counted once the pass stands: a swap lost to a concurrent request
         // is a failure, answered above.
-        self.inner.metrics.factor_success();
+        self.inner.metrics.factors.factor_success();
 
         self.release_guess(reserved, user_id).await;
         self.clear_throttle_for(user_id, tenant_id).await;

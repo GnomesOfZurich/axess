@@ -144,7 +144,7 @@ where
                 evicted_session = %old_sid,
                 "concurrent session limit reached; evicting oldest session"
             );
-            self.inner.metrics.session_invalidated();
+            self.inner.metrics.session.session_invalidated();
         }
     }
 
@@ -182,7 +182,7 @@ where
                 // Wipe the in-memory session state so the response cookie
                 // does not ship a Set-Cookie for an authenticated session.
                 session.clear().await;
-                self.inner.metrics.account_locked();
+                self.inner.metrics.auth_flow.account_locked();
                 let until = if let crate::authn::types::EntityState::Suspended(detail) = &status {
                     detail.until
                 } else {
@@ -429,7 +429,7 @@ where
                 tracing::error!(error = %e, "failed to record last login");
             }
 
-            self.inner.metrics.auth_success();
+            self.inner.metrics.auth_flow.auth_success();
             return Ok(FactorOutcome::Authenticated);
         }
 

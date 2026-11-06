@@ -248,6 +248,20 @@ each user transition independently, and avoids the conditional in
 the state machine. The audit log records which method ran for which
 user, so the rollout is observable.
 
+## Changing the provider on a running service
+
+`reload_fido2(candidate)` swaps the FIDO2 provider. The candidate parses the
+relying party (`WebauthnBuilder::build`), so an invalid RP id or origin is
+refused before the swap and the previous provider keeps serving. Every
+registered passkey is bound to the RP id, so a candidate whose
+`relying_party_id()` differs from the provider in force is refused as
+`RpIdChanged`; `reload_fido2_with(candidate, ReloadFido2::allow_rp_id_change())`
+is the explicit acknowledgement, and it is counted
+(`fido2_rp_id_changed`) and logged with both ids. `remove_fido2()` takes the
+provider out. A ceremony begun against the old provider and finished against
+a different RP id fails the origin check. See
+[live provider reload](../authentication/live-provider-reload.md).
+
 ## Threat model
 
 A passkey login is robust against the classes of attack that

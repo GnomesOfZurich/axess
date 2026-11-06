@@ -46,7 +46,7 @@ pub struct SessionService<S, Inner> {
     /// `Layer::layer` and per-request `Service::call` cloning cheap.
     config: Arc<SessionConfig>,
     binding: Option<Arc<dyn SessionBinding>>,
-    metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    metrics: Option<crate::metrics::MetricSinks>,
     rng: Arc<dyn axess_rng::SecureRng>,
     clock: Arc<dyn axess_clock::Clock>,
     registry: Option<Arc<dyn crate::session::store::SessionRegistryHandle>>,
@@ -139,6 +139,19 @@ where
     }
 }
 
+impl<S, Inner> SessionService<S, Inner> {
+    /// [`websocket_origin_admitted`] for this service's allow-list, counting
+    /// a refusal on the request-guard sink.
+    fn websocket_admitted(&self, req: &Request<Body>) -> bool {
+        let admitted = websocket_origin_admitted(req, &self.websocket_origins, self.config.secure);
+        if !admitted && let Some(m) = &self.metrics {
+            m.guard
+                .csrf_rejected(crate::metrics::CsrfRefusal::WebSocketOrigin);
+        }
+        admitted
+    }
+}
+
 impl<S, Inner, ResBody> Service<Request<Body>> for SessionService<S, Inner>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -160,7 +173,7 @@ where
         // A WebSocket upgrade is a GET a browser sends with the session cookie
         // from any site, so its Origin is checked here, before the session is
         // read: a socket route outside the CSRF layer is covered too.
-        if !websocket_origin_admitted(&req, &self.websocket_origins, self.config.secure) {
+        if !self.websocket_admitted(&req) {
             tracing::warn!(
                 path = %req.uri().path(),
                 "session: WebSocket upgrade refused, Origin is not an allowed origin or the \
@@ -207,7 +220,7 @@ where
                     registry: registry.as_deref(),
                     unknown: unknown_liveness,
                     clock: &*clock,
-                    metrics: metrics.as_deref(),
+                    metrics: metrics.as_ref(),
                 },
             )
             .await;
@@ -389,7 +402,7 @@ where
 struct Finish<S> {
     store: S,
     config: Arc<SessionConfig>,
-    metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    metrics: Option<crate::metrics::MetricSinks>,
     clock: Arc<dyn axess_clock::Clock>,
     rng: Arc<dyn axess_rng::SecureRng>,
     registry: Option<Arc<dyn crate::session::store::SessionRegistryHandle>>,
@@ -407,7 +420,7 @@ where
         let outcome = finalize_session(
             &self.store,
             &self.config,
-            self.metrics.as_deref(),
+            self.metrics.as_ref(),
             &*self.clock,
             &self.handle,
             self.existing_id,

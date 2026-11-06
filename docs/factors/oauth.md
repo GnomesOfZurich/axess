@@ -336,6 +336,17 @@ token cannot be attributed, and the handler refuses it with
 client registration. A tenant source that fails answers 503, so the IdP
 retries.
 
+## Changing a provider on a running service
+
+`reload_oauth_provider(name, candidate)` replaces or adds a global provider and
+`remove_oauth_provider(name)` takes one out; `reload_tenant_oauth_provider` and
+`remove_tenant_oauth_provider` do the same in a registry keyed by tenant and
+name (`LiveTenantOAuthProviders`). The candidate is the future of
+`OAuthProviderConfig::discover(..)` finished with `.build()`, so discovery and
+the issuer check run before the swap, and a refusal leaves the previous
+provider serving. A login begun before the swap finishes only if the issuer is
+unchanged. See [live provider reload](../authentication/live-provider-reload.md).
+
 ## The login flow
 
 The three steps a user passes through, in order.

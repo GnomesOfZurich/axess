@@ -87,6 +87,9 @@ fn registration() -> RegisterPublicKeyCredential {
 struct AcceptingProvider(DefaultFido2Provider);
 
 impl Fido2Provider for AcceptingProvider {
+    fn relying_party_id(&self) -> &str {
+        self.0.relying_party_id()
+    }
     fn start_authentication(
         &self,
         c: &[Passkey],
@@ -866,7 +869,7 @@ async fn a_missing_ceremony_state_does_not_leave_its_timestamp_behind() {
 #[derive(Default, Clone)]
 struct FailureCount(std::sync::Arc<std::sync::atomic::AtomicU32>);
 
-impl axess_core::metrics::AuthnMetrics for FailureCount {
+impl axess_core::metrics::AuthFlowMetrics for FailureCount {
     fn auth_failure(&self) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -888,7 +891,10 @@ async fn a_cross_tenant_refusal_is_audited_and_counted() {
                 .unwrap(),
         )))
         .with_clock(f.clock.clone())
-        .with_metrics(counter.clone())
+        .with_metrics(
+            axess_core::metrics::MetricSinks::noop()
+                .with_auth_flow(std::sync::Arc::new(counter.clone())),
+        )
         .build()
         .with_audit_context(AuditContext::default());
     let session = test_session();

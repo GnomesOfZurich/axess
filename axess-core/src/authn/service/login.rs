@@ -44,7 +44,7 @@ where
     ) -> Result<LoginOutcome, AuthnError<I::Error>> {
         use crate::validation::MAX_IDENTIFIER_BYTES;
 
-        self.inner.metrics.auth_attempt();
+        self.inner.metrics.auth_flow.auth_attempt();
 
         // 0. Reject oversized identifiers before hitting the database.
         if identifier.is_empty()
@@ -52,7 +52,7 @@ where
             || tenant_identifier.is_empty()
             || tenant_identifier.len() > MAX_IDENTIFIER_BYTES
         {
-            self.inner.metrics.auth_failure();
+            self.inner.metrics.auth_flow.auth_failure();
             return Ok(LoginOutcome::InvalidCredentials);
         }
 
@@ -126,7 +126,7 @@ where
         {
             Some(u) => u,
             None => {
-                self.inner.metrics.auth_failure();
+                self.inner.metrics.auth_flow.auth_failure();
                 // Tenant-attributed but userless: the tenant is real and
                 // the identifier is not. See the unknown-tenant branch
                 // above for why this emits rather than returning quietly.
@@ -160,7 +160,7 @@ where
                 .factors
                 .available_methods(&user.id, &tenant.id)
                 .await;
-            self.inner.metrics.auth_failure();
+            self.inner.metrics.auth_flow.auth_failure();
             // Emit a `Failure(LoginAttempt)` audit row before returning so
             // a fresh session probing a known-locked account leaves a SOC
             // trail. A lockout carries `Locked` rather than `Failure`, so a
@@ -178,7 +178,7 @@ where
             self.emit_audit(builder.attributed_to(&user.id, &tenant.id))
                 .await?;
             if locked {
-                self.inner.metrics.account_locked();
+                self.inner.metrics.auth_flow.account_locked();
                 if !self.inner.reveal_lockout_on_begin {
                     // The caller has proved nothing yet; `Locked` would tell
                     // them the account exists and is being guessed at. The
@@ -238,7 +238,7 @@ where
         // signal, narrow but of exactly the shape this flow was rewritten
         // to remove.
         let Some((method_name, steps)) = usable else {
-            self.inner.metrics.auth_failure();
+            self.inner.metrics.auth_flow.auth_failure();
             self.emit_audit(
                 AuthEventBuilder::failure(AuthEventType::LoginAttempt)
                     .attributed_to(&user.id, &tenant.id)
@@ -299,7 +299,7 @@ where
         let _ = self
             .find_user_with_timing_equalization(identifier, &dummy_tenant)
             .await;
-        self.inner.metrics.auth_failure();
+        self.inner.metrics.auth_flow.auth_failure();
         self.emit_audit(
             AuthEventBuilder::failure(AuthEventType::LoginAttempt)
                 .maybe_attributed_to(None, attributed_tenant)
@@ -452,7 +452,8 @@ where
         tenant_id: &crate::authn::ids::TenantId,
         user_id: &crate::authn::ids::UserId,
     ) -> Result<PrepareOutcome, AuthnError<I::Error>> {
-        let webauthn = match &self.inner.fido2 {
+        let fido2 = self.inner.fido2.load_full();
+        let webauthn = match &fido2 {
             Some(w) => w,
             None => return Ok(PrepareOutcome::Ready),
         };
@@ -607,7 +608,7 @@ where
             session.clear().await;
             return Ok(());
         };
-        self.inner.metrics.session_invalidated();
+        self.inner.metrics.session.session_invalidated();
         let sid = session.session_id().await;
         let tenant_id = session.pending_tenant_id().await;
         if let Some(reg) = &self.inner.registry {

@@ -50,6 +50,9 @@ ROOT = pathlib.Path(".")
 # *type* had no way through the gate at all and the only recourse was
 # ALLOW, which would have been a false claim about provenance.
 REMOVED = {
+    # 0.17.0: `AuthnMetrics` is replaced by one trait per concern; the
+    # "0.16.0 to 0.17.0" section and the observability page name it.
+    "AuthnMetrics",
     # 0.16.0: the deprecated `refresh_session_with_status_check_in_tenant`
     # and its `RefreshScope` argument went with it; the "0.15.0 to 0.16.0"
     # section names them to say `Refresh::new` replaces each.

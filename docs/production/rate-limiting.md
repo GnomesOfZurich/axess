@@ -372,7 +372,7 @@ hundreds per second per workload. The pattern is
 deployment-specific.
 
 The default to start with is to measure first. The metrics from
-`AuthnMetrics::rate_limit_rejected` (covered below) tell you the
+`RequestGuardMetrics::rate_limit_rejected` (covered below) tell you the
 real reject rate; the calibration is then to set the limit just
 above the legitimate-traffic envelope.
 
@@ -398,7 +398,7 @@ configuration, which lets an attacker calibrate their attack to
 just under the limit.
 
 The application's metrics record the rejection. The
-`AuthnMetrics::rate_limit_rejected` method is the metric;
+`RequestGuardMetrics::rate_limit_rejected` method is the metric;
 applications wire it to their Prometheus or OpenTelemetry
 counter.
 
@@ -450,18 +450,19 @@ What to watch, and where the limiter sits relative to everything else.
 
 ### Metrics
 
-The layer emits two metrics through the `AuthnMetrics` trait:
+The layer emits two metrics through `RequestGuardMetrics`, attached
+with `RateLimitLayer::with_metrics(MetricSinks)`:
 
 `rate_limit_rejected` is incremented on each 429. The metric is
 the primary signal for tuning and for attack detection.
 
-`rate_limit_evaluated` (optional, off by default) is incremented
-on every request the layer sees, regardless of outcome. The
-ratio of rejected to evaluated is the reject rate; below 0.1%
-typically means the limit is set well, above 1% suggests either
-attack or misconfiguration.
+`rate_limit_allowed` is incremented on every request the layer lets
+through. The ratio of rejected to the sum of both is the reject
+rate; below 0.1% typically means the limit is set well, above 1%
+suggests either attack or misconfiguration.
 
-The `AuthnMetrics` implementation is yours; it
+The metric implementation is yours (see
+[Observability and metrics](observability.md)); it
 typically routes to Prometheus, OpenTelemetry, or whatever
 metrics system the deployment uses. The
 [`examples/sqlite/`](https://github.com/GnomesOfZurich/axess/tree/main/examples/sqlite)

@@ -93,7 +93,7 @@ where
         let retry_after = match self.inner.identity.throttle_state(&resolved.key).await {
             Ok(state) => resolved.throttle.retry_after(state.as_ref(), now),
             Err(e) => {
-                self.inner.metrics.factor_counter_store_outage();
+                self.inner.metrics.factors.factor_counter_store_outage();
                 tracing::warn!(
                     user_id = %user_id,
                     error = %e,
@@ -128,7 +128,7 @@ where
             .record_throttle_failure(&resolved.key, &resolved.throttle)
             .await
         {
-            self.inner.metrics.factor_counter_store_outage();
+            self.inner.metrics.factors.factor_counter_store_outage();
             tracing::warn!(
                 user_id = %user_id,
                 error = %e,

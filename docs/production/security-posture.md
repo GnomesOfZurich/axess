@@ -23,11 +23,11 @@ cargo feature and will not pick one for you. Anything enabling
 ```toml
 [dependencies]
 # Pure Rust, builds anywhere. The default choice.
-axess = { version = "0.16.0", features = ["jwt", "jwt-rust-crypto"] }
+axess = { version = "0.17.0", features = ["jwt", "jwt-rust-crypto"] }
 
 # aws-lc-rs: wraps the FIPS-validated aws-lc, needs a C toolchain
 # (and NASM on Windows), and does not build on every target.
-axess = { version = "0.16.0", features = ["jwt", "jwt-aws-lc"] }
+axess = { version = "0.17.0", features = ["jwt", "jwt-aws-lc"] }
 ```
 
 Naming neither is a compile error. Naming both is allowed,
@@ -156,7 +156,7 @@ decides what happens then. It defaults to `CounterUnavailable::Lock`,
 which treats the attempt as locked and keeps brute force bounded.
 `CounterUnavailable::Allow` keeps those users logging in and leaves
 lockout disabled until the counter returns. Alert on
-`AuthnMetrics::factor_counter_store_outage` either way: under `Lock` it
+`FactorMetrics::factor_counter_store_outage` either way: under `Lock` it
 explains the support calls, and under `Allow` it is the only signal
 that a control is off.
 
@@ -171,7 +171,7 @@ The cost is availability, and it is not small: **logins fail while the
 audit store does.** Put the sink behind something durable. Write
 locally and ship asynchronously, so `record_event` only fails when a
 local write fails, rather than calling a remote service on the request
-path. `AuthnMetrics::audit_store_outage` fires on this path and should
+path. `AuditMetrics::audit_store_outage` fires on this path and should
 page rather than feed a dashboard, because every login is failing while
 it does.
 

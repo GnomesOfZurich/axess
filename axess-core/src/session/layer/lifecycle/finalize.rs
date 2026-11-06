@@ -41,7 +41,7 @@ use super::{FinalizeOutcome, Rotation};
 pub(crate) async fn finalize_session<S>(
     store: &S,
     config: &SessionConfig,
-    metrics: Option<&dyn crate::metrics::AuthnMetrics>,
+    metrics: Option<&crate::metrics::MetricSinks>,
     clock: &dyn Clock,
     handle: &SessionHandle,
     existing_id: Option<SessionId>,
@@ -84,7 +84,7 @@ where
         && (guard.regenerate || existing_id.is_none())
         && let Some(m) = metrics
     {
-        m.session_created();
+        m.session.session_created();
     }
 
     let mut rotation = None;

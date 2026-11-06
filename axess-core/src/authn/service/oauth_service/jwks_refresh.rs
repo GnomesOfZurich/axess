@@ -29,7 +29,13 @@ where
     pub async fn refresh_all_jwks(
         &self,
     ) -> Vec<(std::sync::Arc<str>, axess_factors::oauth::OAuthError)> {
-        let providers: Vec<_> = self.inner.oauth_providers.values().cloned().collect();
+        let providers: Vec<_> = self
+            .inner
+            .oauth_providers
+            .load()
+            .values()
+            .cloned()
+            .collect();
         axess_factors::oauth::refresh_providers_jwks(&providers).await
     }
 
@@ -87,17 +93,30 @@ where
     /// jwks_task.abort();
     /// ```
     pub fn spawn_jwks_refresh(&self, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
-        let providers: Vec<_> = self.inner.oauth_providers.values().cloned().collect();
-        spawn_refresh_loop(providers, interval)
+        spawn_refresh_loop(
+            live_providers(self.inner.oauth_providers.handle()),
+            interval,
+        )
     }
 }
 
-/// The refresh loop: one pass over `providers` per `interval`, the first
-/// pass one interval after the start. A zero interval falls back to the
+/// A provider source that reads the live registry on every call, so a
+/// reloaded provider is the one refreshed and a removed one is no longer
+/// polled. It holds the swap slot and not the service, so the loop never
+/// keeps the service alive.
+pub(crate) fn live_providers(
+    slot: std::sync::Arc<arc_swap::ArcSwap<crate::federation::oauth::OAuthProviderRegistry>>,
+) -> impl Fn() -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>> + Send + 'static {
+    move || slot.load().values().cloned().collect()
+}
+
+/// The refresh loop: one pass over the providers `current` yields per
+/// `interval`, the first pass one interval after the start. `current` is
+/// called at the start of every pass, so the loop follows the live registry. A zero interval falls back to the
 /// 60 s debounce window, because a zero period would panic inside the task
 /// and end the loop silently.
 fn spawn_refresh_loop(
-    providers: Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>>,
+    current: impl Fn() -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>> + Send + 'static,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     let interval = if interval.is_zero() {
@@ -116,6 +135,7 @@ fn spawn_refresh_loop(
         ticker.tick().await; // Skip the immediate first tick.
         loop {
             ticker.tick().await;
+            let providers = current();
             axess_factors::oauth::refresh_providers_jwks(&providers).await;
         }
     })
@@ -133,7 +153,9 @@ impl JwksRefreshTask {
     /// Start the loop on the current tokio runtime. Without a runtime
     /// nothing is started and a warning says so.
     pub(crate) fn start(
-        providers: Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>>,
+        current: impl Fn() -> Vec<std::sync::Arc<dyn axess_factors::oauth::OAuthProvider>>
+        + Send
+        + 'static,
         interval: std::time::Duration,
     ) -> Option<Self> {
         if tokio::runtime::Handle::try_current().is_err() {
@@ -143,7 +165,7 @@ impl JwksRefreshTask {
             );
             return None;
         }
-        Some(Self(spawn_refresh_loop(providers, interval)))
+        Some(Self(spawn_refresh_loop(current, interval)))
     }
 }
 

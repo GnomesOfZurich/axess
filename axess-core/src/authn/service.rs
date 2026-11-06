@@ -46,6 +46,8 @@ mod login;
 #[cfg(feature = "oauth")]
 mod logout_audit;
 pub mod outcomes;
+#[cfg(any(feature = "oauth", feature = "fido2", feature = "ldap"))]
+pub mod provider_reload;
 mod refresh_tokens;
 mod reset_cooldown;
 mod revocation;
@@ -75,6 +77,16 @@ pub use chosen_password::ChosenPasswordError;
 pub use oauth_service::ScopedOAuth;
 pub use outcomes::{
     FactorOutcome, LoginOutcome, PrepareOutcome, SignupOutcome, SignupVerification,
+};
+#[cfg(any(feature = "oauth", feature = "fido2", feature = "ldap"))]
+pub use provider_reload::BuiltProvider;
+#[cfg(feature = "fido2")]
+pub use provider_reload::ReloadFido2;
+#[cfg(any(feature = "oauth", feature = "fido2", feature = "ldap"))]
+pub use provider_reload::{
+    DEFAULT_PROVIDER_VALIDATION_TIMEOUT, ProviderChange, ProviderChangeKind, ProviderEntry,
+    ProviderFollower, ProviderKey, ProviderReloadError, ProviderSource, ProviderSourceError,
+    ReadCause,
 };
 pub use revocation::Actor;
 pub use session_validator::{
@@ -268,13 +280,16 @@ where
         }
     }
 
-    /// Return a reference to the OAuth provider registry for introspection.
+    /// Return the OAuth provider registry as of this call, for introspection.
+    ///
+    /// The registry is a snapshot: a later reload or removal does not change
+    /// it, call again to see the current one.
     ///
     /// Use `oauth_providers().provider_names()` or `oauth_providers().provider_count()`
     /// to list or count the configured providers.
     #[cfg(feature = "oauth")]
-    pub fn oauth_providers(&self) -> &crate::federation::oauth::OAuthProviderRegistry {
-        &self.inner.oauth_providers
+    pub fn oauth_providers(&self) -> Arc<crate::federation::oauth::OAuthProviderRegistry> {
+        self.inner.oauth_providers.load()
     }
 
     /// The per-tenant provider source, when one is configured with
@@ -305,7 +320,7 @@ where
     /// for the common yes/no check.
     #[cfg(feature = "oauth")]
     pub fn has_oauth_providers(&self) -> bool {
-        self.inner.oauth_providers.provider_count() > 0
+        self.inner.oauth_providers.load().provider_count() > 0
     }
 
     /// `true` when a FIDO2/WebAuthn provider has been attached via
@@ -315,7 +330,7 @@ where
     /// their own bookkeeping in sync with the service.
     #[cfg(feature = "fido2")]
     pub fn has_fido2(&self) -> bool {
-        self.inner.fido2.is_some()
+        self.inner.fido2.load().is_some()
     }
 
     /// `true` when an LDAP provider has been attached via
@@ -323,7 +338,7 @@ where
     /// for rationale.
     #[cfg(feature = "ldap")]
     pub fn has_ldap(&self) -> bool {
-        self.inner.ldap.is_some()
+        self.inner.ldap.load().is_some()
     }
 
     /// Whether a session registry is wired on this service. Adopters checking
@@ -475,7 +490,7 @@ where
             Ok(crate::authn::store::AuditOutcome::Shed) => {
                 // A deliberate drop, not a failure: the sink is protecting
                 // its storage. Proceed, and let the metric carry it.
-                self.inner.metrics.audit_event_shed();
+                self.inner.metrics.audit.audit_event_shed();
                 Ok(())
             }
             Err(e) => {
@@ -486,7 +501,7 @@ where
                     "identity store rejected audit event; failing the flow rather \
                      than proceeding unrecorded"
                 );
-                self.inner.metrics.audit_store_outage();
+                self.inner.metrics.audit.audit_store_outage();
                 Err(crate::authn::error::AuthnError::Store(e))
             }
         }

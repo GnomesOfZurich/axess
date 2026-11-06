@@ -87,7 +87,7 @@ async fn a_stall_across_five_intervals_is_followed_by_one_run_not_five() {
         gate: gate.clone(),
     });
     let interval = Duration::from_secs(10);
-    let _loop = spawn_refresh_loop(vec![provider], interval);
+    let _loop = spawn_refresh_loop(move || vec![provider.clone()], interval);
 
     tokio::time::sleep(interval + Duration::from_millis(1)).await;
     assert_eq!(

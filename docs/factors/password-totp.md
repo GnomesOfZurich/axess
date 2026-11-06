@@ -405,7 +405,7 @@ cannot be re-keyed without its plaintext, so a set made under the old
 pepper verifies under the previous one instead and still logs the user
 in; the match sets `RecoveryCodesConfig::under_previous_pepper` on the
 stored set, logs a warning and fires
-`AuthnMetrics::recovery_codes_under_previous_pepper`, which is the
+`FactorMetrics::recovery_codes_under_previous_pepper`, which is the
 application's cue to have the user generate a new set (made under the
 current pepper, where the flag starts clear). Drop the previous pepper
 once no stored set uses it; from then on those sets fail closed.

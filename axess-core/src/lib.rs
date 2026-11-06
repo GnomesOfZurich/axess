@@ -31,7 +31,7 @@
 //! | Identity (principal, IDs) | [`principal`]`::*` (re-exports `axess-identity`) | (none) |
 //! | Clock / RNG (DST foundation) | `axess_clock::*` / `axess_rng::*` | [`Clock`], [`SecureRng`], [`SystemClock`], [`SystemRng`] |
 //! | Health checks | [`health`]`::*` | [`HealthCheck`], [`HealthStatus`], [`CompositeHealthCheck`] |
-//! | Authn metrics | [`metrics`]`::*` | [`AuthnMetrics`], [`NoopMetrics`] |
+//! | Authn metrics | [`metrics`]`::*` | [`MetricSinks`], [`AuthFlowMetrics`] and the other concern traits, [`NoopMetrics`] |
 //! | Middleware (CSRF, rate-limit, request-id, trace-id) | [`middleware`]`::*` | [`RateLimitLayer`] + helpers; [`RequestIdLayer`] (feature-gated); [`TraceIdLayer`] + [`TraceContext`] (feature-gated) |
 //! | Test fixtures | [`testing`]`::*` (gated `cfg(any(test, feature = "testing"))`) | [`MockClock`], [`MockRng`], [`MockIdentityStore`], ... |
 //!
@@ -318,8 +318,11 @@ pub use session::hmac;
 #[cfg(feature = "local-idp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "local-idp")))]
 pub mod local_idp;
-/// `AuthnMetrics` trait + `NoopMetrics` default implementation.
+/// One metrics trait per concern, [`MetricSinks`](metrics::MetricSinks) to wire
+/// them, and the `NoopMetrics` default implementation.
 pub mod metrics;
+
+pub mod reload;
 /// Mock authentication/identity stores, deterministic clocks/RNGs,
 /// fixture builders, and other test doubles. Gated behind
 /// `cfg(any(test, feature = "testing"))` so production builds cannot
@@ -355,7 +358,11 @@ pub use outbound_http::ClientBuildError;
 pub use axess_clock::{Clock, SystemClock};
 pub use axess_rng::{SecureRng, SystemRng};
 pub use health::{CompositeHealthCheck, CompositeStatus, HealthCheck, HealthStatus};
-pub use metrics::{AuthnMetrics, NoopMetrics};
+pub use metrics::{
+    AuditMetrics, AuthFlowMetrics, AuthzCacheMetrics, AxessMetrics, CsrfRefusal, FactorMetrics,
+    MetricSinks, NoopMetrics, ProviderCategory, ProviderRegistryMetrics, RequestGuardMetrics,
+    RotationMetrics, SessionMetrics,
+};
 
 #[cfg(any(test, feature = "testing"))]
 pub use testing::mock_tracing::TracingCapture;

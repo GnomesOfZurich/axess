@@ -32,6 +32,7 @@
 mod directory;
 #[cfg(all(test, feature = "testing-oauth"))]
 mod directory_tests;
+mod live;
 mod memory;
 mod record;
 #[cfg(test)]
@@ -40,6 +41,7 @@ mod record_tests;
 mod sqlite;
 
 pub use directory::StoredTenantOAuthProviders;
+pub use live::LiveTenantOAuthProviders;
 pub use memory::MemoryTenantOAuthProviderStore;
 pub use record::{TenantClientCredential, TenantDpop, TenantOAuthProviderRecord};
 #[cfg(feature = "sqlite")]

@@ -45,6 +45,7 @@
 //! authz.require("PostJournalEntry", &ledger_id).await?;
 //! ```
 
+use arc_swap::ArcSwap;
 use cedar_policy::{Context, Entities, EntityUid};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -54,6 +55,7 @@ use super::{
     context::{BuildRequestContext, NoContext},
     error::{AuthzDenied, AuthzError},
     provider::AuthzEntityProvider,
+    reload::ReloadState,
     store::{AuthzDecision, PolicyEvaluator, make_uid},
 };
 
@@ -70,8 +72,15 @@ use super::{
 /// inside a single doc-test, so a runnable end-to-end example lives in
 /// `examples/authz/` and the module-level rustdoc above shows the
 /// handler-side usage.
+///
+/// The policy evaluator sits in a swap slot: [`reload_policies`] replaces it
+/// while requests are being decided, and a decision uses the one set it read
+/// (see [`reload`](super::reload)).
+///
+/// [`reload_policies`]: Self::reload_policies
 pub struct AuthzStore<P: AuthzEntityProvider> {
-    pub(super) evaluator: Arc<dyn PolicyEvaluator>,
+    pub(super) evaluator: ArcSwap<Arc<dyn PolicyEvaluator>>,
+    pub(super) reload: ReloadState,
     pub(super) provider: Arc<P>,
     pub(super) namespace: Arc<str>,
 }
@@ -118,7 +127,8 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
         namespace: impl Into<Arc<str>>,
     ) -> Self {
         Self {
-            evaluator,
+            evaluator: ArcSwap::from_pointee(evaluator),
+            reload: ReloadState::default(),
             provider,
             namespace: namespace.into(),
         }
@@ -126,11 +136,13 @@ impl<P: AuthzEntityProvider> AuthzStore<P> {
 
     /// Validate the entity provider against the Cedar schema.
     ///
-    /// [`try_new`](Self::try_new) runs this; call it again after a policy
-    /// reload to catch type mismatches between your provider and the new
-    /// schema.
+    /// [`try_new`](Self::try_new) runs this, and
+    /// [`reload_policies`](Self::reload_policies) runs the same check against
+    /// the new schema before it swaps, so a provider that does not fit a
+    /// reloaded schema refuses the reload.
     pub fn validate(&self) -> Result<(), AuthzError> {
-        if let Some(schema) = self.evaluator.schema() {
+        let evaluator = self.evaluator.load();
+        if let Some(schema) = evaluator.schema() {
             self.provider.validate_schema(schema)?;
         }
         Ok(())
@@ -411,8 +423,10 @@ impl<P: AuthzEntityProvider, Ctx> AuthzSession<P, Ctx> {
             }
         };
 
-        // 5. Evaluate Cedar policy.
-        self.store.evaluator.is_authorized(
+        // 5. Evaluate Cedar policy against one snapshot of the swap slot: a
+        // wait-free read, dropped with the decision, so a reload that lands
+        // now applies to the next request and never splits this one.
+        self.store.evaluator.load().is_authorized(
             &entities,
             self.principal.clone(),
             action_uid,

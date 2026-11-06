@@ -21,7 +21,7 @@ pub enum AuditOutcome {
     Recorded,
     /// The event was deliberately dropped under load.
     ///
-    /// The flow continues and `AuthnMetrics::audit_event_shed` fires. A
+    /// The flow continues and `AuditMetrics::audit_event_shed` fires. A
     /// gap in the trail is the cost; it is bounded and observable, where
     /// an exhausted store is neither.
     Shed,

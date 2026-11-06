@@ -528,20 +528,21 @@ async fn finalize_session_session_changed_or_over_regenerate_alone() {
 /// Fixture: `regenerate=true, existing_id=Some(id)`. Original:
 /// `true && (true || false) = true` → emit. Mutant 766:30 (`||→&&`):
 /// `true && (true && false) = false` → no emit. Discriminate via
-/// an `AuthnMetrics` recorder that counts `session_created` calls.
+/// a `SessionMetrics` recorder that counts `session_created` calls.
 #[tokio::test]
 async fn finalize_session_emits_session_created_on_regenerate() {
     #[derive(Default)]
     struct CountingMetrics {
         session_created_calls: AtomicUsize,
     }
-    impl crate::metrics::AuthnMetrics for CountingMetrics {
+    impl crate::metrics::SessionMetrics for CountingMetrics {
         fn session_created(&self) {
             self.session_created_calls.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    let metrics = CountingMetrics::default();
+    let recorder = Arc::new(CountingMetrics::default());
+    let metrics = crate::metrics::MetricSinks::noop().with_session(recorder.clone());
     let store = CallCountingStore::new();
     let cfg = SessionConfig::default();
     let id = SessionId::new(&MockRng::new(9));
@@ -566,7 +567,7 @@ async fn finalize_session_emits_session_created_on_regenerate() {
     )
     .await;
     assert_eq!(
-        metrics.session_created_calls.load(Ordering::SeqCst),
+        recorder.session_created_calls.load(Ordering::SeqCst),
         1,
         "regenerate=true must trigger session_created (kills 766:30 `||→&&`)"
     );

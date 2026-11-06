@@ -15,39 +15,30 @@ use std::sync::Arc;
 
 /// Registry of configured OAuth/OIDC providers.
 ///
-/// Populated during `AuthnService` construction via `with_oauth_provider()`.
+/// Populated during `AuthnService` construction via `with_oauth_provider()`,
+/// and changed afterwards only by a reload or removal on the service.
 /// Provides introspection methods for listing configured providers.
-#[derive(Default)]
+///
+/// A value of this type is an immutable snapshot: a running service swaps the
+/// whole registry when a provider is reloaded or removed
+/// ([`AuthnService::reload_oauth_provider`](crate::authn::service::AuthnService::reload_oauth_provider)),
+/// so a snapshot taken from
+/// [`AuthnService::oauth_providers`](crate::authn::service::AuthnService::oauth_providers)
+/// does not change under the caller.
+#[derive(Default, Clone)]
 pub struct OAuthProviderRegistry {
     providers: std::collections::HashMap<Arc<str>, Arc<dyn OAuthProvider>>,
 }
 
 impl OAuthProviderRegistry {
-    /// Insert a provider under its `provider.name()` key.
-    ///
-    /// **Duplicate-name safety:** if the key already exists, the new
-    /// provider replaces the old one, a `tracing::warn!` is emitted, and
-    /// in debug builds the process aborts via `debug_assert!`. Silent
-    /// overwrite of a provider: especially with different `client_id`
-    /// / `client_secret`, is a real security-relevant misconfiguration
-    /// (token exchange would then execute against the wrong credentials
-    /// for that IdP name); loud-in-dev, discoverable-in-prod is the
-    /// deliberate balance chosen over an API-breaking `Result` return.
-    pub(crate) fn add(&mut self, provider: impl OAuthProvider) {
-        let name = provider.name().clone();
-        let existing = self.providers.insert(name.clone(), Arc::new(provider));
-        if existing.is_some() {
-            tracing::warn!(
-                provider_name = %name,
-                "oauth: replacing existing provider registration; \
-                 duplicate `with_oauth_provider` call: the previous \
-                 configuration (client_id, discovery, etc.) is now lost"
-            );
-            debug_assert!(
-                false,
-                "duplicate OAuth provider name `{name}` registered; silent overwrite in release builds"
-            );
-        }
+    /// Set `provider` under `name`; `true` when it replaced one.
+    pub(crate) fn set(&mut self, name: Arc<str>, provider: Arc<dyn OAuthProvider>) -> bool {
+        self.providers.insert(name, provider).is_some()
+    }
+
+    /// Drop the provider under `name`; `true` when there was one.
+    pub(crate) fn remove(&mut self, name: &str) -> bool {
+        self.providers.remove(name).is_some()
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn OAuthProvider>> {
@@ -59,8 +50,8 @@ impl OAuthProviderRegistry {
     }
 
     /// Return the names of all registered providers.
-    pub fn provider_names(&self) -> Vec<&Arc<str>> {
-        self.providers.keys().collect()
+    pub fn provider_names(&self) -> Vec<Arc<str>> {
+        self.providers.keys().cloned().collect()
     }
 
     /// Return the number of registered providers.
@@ -69,10 +60,82 @@ impl OAuthProviderRegistry {
     }
 }
 
+/// The swap slot of the global registry: readers take a snapshot with
+/// [`load`](Self::load) and never wait; writers install a changed copy.
+#[derive(Default)]
+pub(crate) struct OAuthRegistrySlot {
+    current: Arc<arc_swap::ArcSwap<OAuthProviderRegistry>>,
+}
+
+impl OAuthRegistrySlot {
+    /// The registry as of now.
+    pub(crate) fn load(&self) -> Arc<OAuthProviderRegistry> {
+        self.current.load_full()
+    }
+
+    /// A shared handle on the slot's current registry, for a background task
+    /// that must read the live registry on every pass without holding the
+    /// service that owns the slot.
+    pub(crate) fn handle(&self) -> Arc<arc_swap::ArcSwap<OAuthProviderRegistry>> {
+        self.current.clone()
+    }
+
+    /// Register `provider` under its own name at construction; `true` on a
+    /// duplicate, which is logged: at construction a repeated name is a
+    /// misconfiguration (see [`OAuthProviderRegistry::add`]).
+    pub(crate) fn add(&self, provider: impl OAuthProvider) -> bool {
+        let provider: Arc<dyn OAuthProvider> = Arc::new(provider);
+        let name = provider.name().clone();
+        let replaced = self.set(&name, provider);
+        if replaced {
+            tracing::warn!(
+                provider_name = %name,
+                "oauth: replacing existing provider registration; \
+                 duplicate `with_oauth_provider` call: the previous \
+                 configuration (client_id, discovery, etc.) is now lost"
+            );
+        }
+        replaced
+    }
+
+    /// Set `provider` under `name`; `true` when it replaced one. A reload
+    /// replaces on purpose and is reported by its caller.
+    pub(crate) fn set(&self, name: &Arc<str>, provider: Arc<dyn OAuthProvider>) -> bool {
+        let replaced = std::sync::atomic::AtomicBool::new(false);
+        self.current.rcu(|registry| {
+            let mut next = OAuthProviderRegistry::clone(registry);
+            replaced.store(
+                next.set(name.clone(), provider.clone()),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            next
+        });
+        replaced.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Drop the provider under `name`; `true` when there was one.
+    pub(crate) fn remove(&self, name: &str) -> bool {
+        let removed = std::sync::atomic::AtomicBool::new(false);
+        self.current.rcu(|registry| {
+            let mut next = OAuthProviderRegistry::clone(registry);
+            removed.store(next.remove(name), std::sync::atomic::Ordering::Relaxed);
+            next
+        });
+        removed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axess_factors::oauth::MockOAuthProvider;
+
+    impl OAuthProviderRegistry {
+        fn add(&mut self, provider: impl OAuthProvider) -> bool {
+            let provider: Arc<dyn OAuthProvider> = Arc::new(provider);
+            self.set(provider.name().clone(), provider)
+        }
+    }
 
     #[test]
     fn provider_registry_get_returns_added_provider() {
@@ -104,25 +167,13 @@ mod tests {
         assert_eq!(registry.provider_count(), 2);
     }
 
-    /// Duplicate name registration must trip `debug_assert!` so
-    /// operators discover the misconfiguration in dev / CI. Pins the
-    /// silent-overwrite regression: without the assert, two
-    /// `with_oauth_provider("google", ...)` calls quietly keep the
-    /// second one and forget the first (which would be a real
-    /// security-relevant footgun if the two carry different
-    /// `client_secret`s).
-    ///
-    /// Cfg'd on `debug_assertions` because release builds do NOT
-    /// panic: the release path emits a `tracing::warn!` and
-    /// continues, and there is no straightforward way to assert on
-    /// tracing output here without pulling in the mock-tracing
-    /// scaffolding for a one-line check.
+    /// A second registration under one name replaces the first and says so,
+    /// so the builder can count it and refuse a debug build.
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "duplicate OAuth provider name")]
-    fn provider_registry_duplicate_name_panics_in_debug() {
+    fn provider_registry_reports_a_replaced_name() {
         let mut registry = OAuthProviderRegistry::default();
-        registry.add(MockOAuthProvider::new("google"));
-        registry.add(MockOAuthProvider::new("google"));
+        assert!(!registry.add(MockOAuthProvider::new("google")));
+        assert!(registry.add(MockOAuthProvider::new("google")));
+        assert_eq!(registry.provider_count(), 1);
     }
 }

@@ -9,8 +9,10 @@ use axess::authn::{AuthnService, FactorSecretCipher};
 use axess::csrf::{CsrfConfig, CsrfLayer};
 use axess::session::{LegacyBlobs, SessionCrypto};
 use axess::{
-    AuthSession, AuthnMetrics, CompositeHealthCheck, KeyExtractor, MemorySessionRegistry,
-    RateLimitConfig, RateLimitLayer, SecureRng, SessionLayer, SystemRng,
+    AuditMetrics, AuthFlowMetrics, AuthSession, AuthzCacheMetrics, CompositeHealthCheck,
+    CsrfRefusal, FactorMetrics, KeyExtractor, MemorySessionRegistry, MetricSinks, ProviderCategory,
+    ProviderRegistryMetrics, RateLimitConfig, RateLimitLayer, RequestGuardMetrics, RotationMetrics,
+    SecureRng, SessionLayer, SessionMetrics, SystemRng,
     backends::sqlite::SessionStore as SqliteSessionStore,
 };
 use axum::response::{IntoResponse, Redirect};
@@ -21,46 +23,174 @@ use std::{sync::Arc, time::Duration};
 
 /// Example metrics implementation using atomic counters.
 ///
-/// In production, replace with Prometheus or OpenTelemetry gauges/counters.
-/// This demonstrates the pattern; the `AuthnMetrics` trait has no-op defaults
-/// so you only override what you need.
+/// In production, replace with Prometheus or OpenTelemetry counters. The
+/// example implements the concerns it exports and leaves the rest empty:
+/// each concern is its own trait, so a counter added to one concern in a
+/// later release does not touch this type's other impls. Names follow the
+/// scheme in the observability page: `axess_` prefix, snake_case, `_total`
+/// for counters.
 #[derive(Default)]
 pub struct AppMetrics {
     pub auth_attempts: AtomicU64,
     pub auth_successes: AtomicU64,
     pub auth_failures: AtomicU64,
+    pub account_locked: AtomicU64,
+    pub factor_failures: AtomicU64,
+    pub sessions_created: AtomicU64,
+    pub session_binding_mismatches: AtomicU64,
     pub rate_limit_rejections: AtomicU64,
+    pub csrf_rejections: AtomicU64,
+    pub encryption_key_fallbacks: AtomicU64,
+    pub fingerprint_key_fallbacks: AtomicU64,
+    pub sid_map_evictions: AtomicU64,
+    pub provider_duplicates: AtomicU64,
+    pub provider_reloads: AtomicU64,
+    pub provider_removals: AtomicU64,
+    pub provider_reload_refusals: AtomicU64,
+    pub policy_reloads: AtomicU64,
+    pub policy_reload_refusals: AtomicU64,
 }
 
 impl AppMetrics {
     pub fn new() -> Self {
-        Self {
-            auth_attempts: AtomicU64::new(0),
-            auth_successes: AtomicU64::new(0),
-            auth_failures: AtomicU64::new(0),
-            rate_limit_rejections: AtomicU64::new(0),
-        }
+        Self::default()
+    }
+
+    /// Every counter under its exported name.
+    pub fn snapshot(&self) -> Vec<(&'static str, u64)> {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        vec![
+            ("axess_auth_attempts_total", get(&self.auth_attempts)),
+            ("axess_auth_successes_total", get(&self.auth_successes)),
+            ("axess_auth_failures_total", get(&self.auth_failures)),
+            ("axess_account_locked_total", get(&self.account_locked)),
+            ("axess_factor_failures_total", get(&self.factor_failures)),
+            ("axess_sessions_created_total", get(&self.sessions_created)),
+            (
+                "axess_session_binding_mismatches_total",
+                get(&self.session_binding_mismatches),
+            ),
+            (
+                "axess_rate_limit_rejected_total",
+                get(&self.rate_limit_rejections),
+            ),
+            ("axess_csrf_rejected_total", get(&self.csrf_rejections)),
+            (
+                "axess_encryption_key_fallback_total",
+                get(&self.encryption_key_fallbacks),
+            ),
+            (
+                "axess_fingerprint_key_fallback_total",
+                get(&self.fingerprint_key_fallbacks),
+            ),
+            ("axess_sid_map_evicted_total", get(&self.sid_map_evictions)),
+            (
+                "axess_provider_duplicate_registration_total",
+                get(&self.provider_duplicates),
+            ),
+            ("axess_provider_reloads_total", get(&self.provider_reloads)),
+            (
+                "axess_provider_removals_total",
+                get(&self.provider_removals),
+            ),
+            (
+                "axess_provider_reload_refusals_total",
+                get(&self.provider_reload_refusals),
+            ),
+            (
+                "axess_authz_policy_reloads_total",
+                get(&self.policy_reloads),
+            ),
+            (
+                "axess_authz_policy_reload_refusals_total",
+                get(&self.policy_reload_refusals),
+            ),
+        ]
     }
 }
 
-/// Newtype wrapper to implement `AuthnMetrics` (orphan rule requires a local type).
-#[derive(Clone)]
-pub struct AppMetricsHandle(pub Arc<AppMetrics>);
-
-impl AuthnMetrics for AppMetricsHandle {
+impl AuthFlowMetrics for AppMetrics {
     fn auth_attempt(&self) {
-        self.0.auth_attempts.fetch_add(1, Ordering::Relaxed);
+        self.auth_attempts.fetch_add(1, Ordering::Relaxed);
     }
     fn auth_success(&self) {
-        self.0.auth_successes.fetch_add(1, Ordering::Relaxed);
+        self.auth_successes.fetch_add(1, Ordering::Relaxed);
     }
     fn auth_failure(&self) {
-        self.0.auth_failures.fetch_add(1, Ordering::Relaxed);
+        self.auth_failures.fetch_add(1, Ordering::Relaxed);
     }
-    fn rate_limit_rejected(&self) {
-        self.0.rate_limit_rejections.fetch_add(1, Ordering::Relaxed);
+    fn account_locked(&self) {
+        self.account_locked.fetch_add(1, Ordering::Relaxed);
     }
 }
+
+impl FactorMetrics for AppMetrics {
+    fn factor_failure(&self) {
+        self.factor_failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl SessionMetrics for AppMetrics {
+    fn session_created(&self) {
+        self.sessions_created.fetch_add(1, Ordering::Relaxed);
+    }
+    fn session_binding_mismatch(&self) {
+        self.session_binding_mismatches
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    fn sid_map_evicted(&self, count: u64) {
+        self.sid_map_evictions.fetch_add(count, Ordering::Relaxed);
+    }
+}
+
+impl RotationMetrics for AppMetrics {
+    fn encryption_key_fallback(&self) {
+        self.encryption_key_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    fn fingerprint_key_fallback(&self) {
+        self.fingerprint_key_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl ProviderRegistryMetrics for AppMetrics {
+    fn provider_duplicate_registration(&self) {
+        self.provider_duplicates.fetch_add(1, Ordering::Relaxed);
+    }
+    fn provider_reloaded(&self, _category: ProviderCategory) {
+        self.provider_reloads.fetch_add(1, Ordering::Relaxed);
+    }
+    fn provider_removed(&self, _category: ProviderCategory) {
+        self.provider_removals.fetch_add(1, Ordering::Relaxed);
+    }
+    fn provider_reload_refused(&self, _category: ProviderCategory) {
+        self.provider_reload_refusals
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl RequestGuardMetrics for AppMetrics {
+    fn rate_limit_rejected(&self) {
+        self.rate_limit_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+    fn csrf_rejected(&self, _reason: CsrfRefusal) {
+        self.csrf_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl AuthzCacheMetrics for AppMetrics {
+    fn authz_policy_reloaded(&self) {
+        self.policy_reloads.fetch_add(1, Ordering::Relaxed);
+    }
+    fn authz_policy_reload_refused(&self) {
+        self.policy_reload_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// The concern this example does not export. An empty impl is all it takes
+// for `AppMetrics` to satisfy `AxessMetrics` and wire to every concern.
+impl AuditMetrics for AppMetrics {}
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
@@ -258,9 +388,15 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     let mut previous_key = [0u8; 32];
     SystemRng.fill_bytes(&mut encryption_key);
     SystemRng.fill_bytes(&mut previous_key); // In production: the prior key from secrets.
+    // One exporter, wired to every concern. The session crypto is built first
+    // and takes the rotation sink directly.
+    let metrics = Arc::new(AppMetrics::new());
+    let sinks = MetricSinks::all(metrics.clone());
     let session_store = SqliteSessionStore::new(
         pool.clone(),
-        SessionCrypto::new(encryption_key).with_previous_key(previous_key),
+        SessionCrypto::new(encryption_key)
+            .with_previous_key(previous_key)
+            .with_metrics(sinks.rotation()),
     );
     session_store
         .init_schema()
@@ -294,7 +430,8 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         Arc::new(axess::SessionRegistryAdapter(registry.clone())),
     )
     .with_ttl(Duration::from_secs(86400))
-    .with_secure(secure);
+    .with_secure(secure)
+    .with_metrics(sinks.clone());
 
     // CSRF layer: signed double-submit cookie bound to the session id.
     // The key is a purpose-bound subkey of the session layer's master key
@@ -305,9 +442,8 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
     // extension. In production, load the master key from a secrets
     // manager so both survive a restart.
     let csrf_key = session_layer.derive_subkey(b"axess.v1.csrf");
-    let csrf_layer = CsrfLayer::new(CsrfConfig::new(*csrf_key).secure(secure));
-
-    let metrics = Arc::new(AppMetrics::new());
+    let csrf_layer =
+        CsrfLayer::new(CsrfConfig::new(*csrf_key).secure(secure)).with_metrics(sinks.clone());
 
     // Rate limiting: per client IP, where the client IP is the one the
     // `client_ip` layer below resolved (the socket peer, or the forwarded
@@ -326,7 +462,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
                 .key(KeyExtractor::ClientIp)
                 .build(),
         )
-        .with_metrics(AppMetricsHandle(metrics.clone()))
+        .with_metrics(sinks.clone())
     };
     let login_limit = limiter(10);
     let forgot_limit = limiter(5);
@@ -339,7 +475,7 @@ pub async fn build_router(pool: SqlitePool) -> (Router, SqliteSessionStore) {
         AuthnService::builder(backend.clone(), backend)
             // TOTP secrets are opened to check a code and kept sealed at rest.
             .with_factor_secret_cipher(factor_cipher.clone())
-            .with_metrics(AppMetricsHandle(metrics.clone()))
+            .with_metrics(sinks.clone())
             // Registered sessions are what a password reset or an admin
             // action can revoke; handing over the session store lets the
             // revocation delete the rows as well.
@@ -505,18 +641,19 @@ async fn healthz(axum::extract::State(state): axum::extract::State<AppState>) ->
 /// public port: the counters tell an attacker how hard the rate limiter and
 /// lockout are being hit.
 ///
-/// These are axess-specific metrics (auth attempts, failures, rate limit
-/// rejections). In production, merge these into your application's metrics
-/// endpoint (Prometheus, OpenTelemetry) alongside your own business metrics.
-/// The route name follows the Prometheus `/metrics` convention.
+/// The counters are named `axess_<what>_total`; see the observability page
+/// for the scheme. In production, export them through your Prometheus or
+/// OpenTelemetry registry alongside your own business metrics. The route name
+/// follows the Prometheus `/metrics` convention.
 async fn metrics_endpoint(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    let m = &state.metrics;
-    axum::Json(serde_json::json!({
-        "auth_attempts": m.auth_attempts.load(Ordering::Relaxed),
-        "auth_successes": m.auth_successes.load(Ordering::Relaxed),
-        "auth_failures": m.auth_failures.load(Ordering::Relaxed),
-        "rate_limit_rejections": m.rate_limit_rejections.load(Ordering::Relaxed),
-    }))
+    axum::Json(serde_json::Value::Object(
+        state
+            .metrics
+            .snapshot()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.into()))
+            .collect(),
+    ))
 }

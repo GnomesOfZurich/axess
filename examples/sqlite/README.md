@@ -91,7 +91,7 @@ templates/             HTML templates
 
 **Recovery codes.** Enrollment generates them with `axess::generate_recovery_codes`, stores only the Argon2id hashes as `FactorConfig::RecoveryCodes`, and shows the plaintext once. Each code is spent through the factor store's compare-and-swap, so it works exactly once. `tests/backend_tests.rs` drives the whole flow through the router.
 
-**Metrics hook.** `AppMetrics` implements `AuthnMetrics` via a newtype wrapper (orphan rule). Counters are `AtomicU64`. The `/metrics` endpoint reads them. In production you would bridge this to Prometheus or OpenTelemetry.
+**Metrics hook.** `AppMetrics` implements the metric traits of the concerns it exports (`AuthFlowMetrics`, `FactorMetrics`, `SessionMetrics`, `RotationMetrics`, `ProviderRegistryMetrics`, `RequestGuardMetrics`) and wires itself to every concern with `MetricSinks::all`. Counters are `AtomicU64`, named `axess_<what>_total`. The `/metrics` endpoint lists them. In production you would bridge this to Prometheus or OpenTelemetry.
 
 ## License
 

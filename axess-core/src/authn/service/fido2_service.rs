@@ -225,7 +225,8 @@ where
         &self,
         session: &AuthSession,
     ) -> Result<serde_json::Value, AuthnError<I::Error>> {
-        let webauthn = match &self.inner.fido2 {
+        let fido2 = self.inner.fido2.load_full();
+        let webauthn = match &fido2 {
             Some(w) => w,
             None => return Err(AuthnError::NoFlow),
         };
@@ -320,7 +321,8 @@ where
         tenant_id: &TenantId,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let webauthn = match &self.inner.fido2 {
+        let fido2 = self.inner.fido2.load_full();
+        let webauthn = match &fido2 {
             Some(w) => w,
             None => return Ok(FactorOutcome::InvalidCredential),
         };

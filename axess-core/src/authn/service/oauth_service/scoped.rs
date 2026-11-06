@@ -151,6 +151,7 @@ where
             None => self
                 .inner
                 .oauth_providers
+                .load()
                 .get(name)
                 .cloned()
                 .ok_or_else(unknown),

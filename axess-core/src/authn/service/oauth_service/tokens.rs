@@ -39,7 +39,12 @@ where
         post_logout_redirect_uri: Option<&str>,
         state: Option<&str>,
     ) -> Option<url::Url> {
-        let provider = self.inner.oauth_providers.get(provider_name)?;
+        let provider = self
+            .inner
+            .oauth_providers
+            .load()
+            .get(provider_name)?
+            .clone();
         provider.build_end_session_url(id_token_hint, post_logout_redirect_uri, state)
     }
 
@@ -129,6 +134,7 @@ where
         let provider = self
             .inner
             .oauth_providers
+            .load()
             .get(provider_name)
             .ok_or_else(|| OAuthError::UnknownProvider(provider_name.to_string()))?
             .clone();

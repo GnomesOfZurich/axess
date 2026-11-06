@@ -9,7 +9,7 @@
 //!
 //! ```toml
 //! [dev-dependencies]
-//! axess = { version = "0.16.0", features = ["testing"] }
+//! axess = { version = "0.17.0", features = ["testing"] }
 //! ```
 //!
 //! Individual mocks inside this module may carry *additional* gates tied
@@ -65,6 +65,7 @@ pub mod mock_random;
 pub mod mock_refresh_store;
 
 pub mod mock_tracing;
+pub mod recording_metrics;
 pub mod store_contract;
 
 #[cfg(all(test, any(feature = "postgres", feature = "mysql")))]
@@ -103,6 +104,7 @@ pub use mock_authn::{CallLog, MockFactorStore, MockIdentityStore, MockStoreError
 pub use mock_clock::MockClock;
 pub use mock_random::MockRng;
 pub use mock_refresh_store::{MemoryRefreshStoreError, MemoryRefreshTokenStore};
+pub use recording_metrics::RecordingMetrics;
 
 // `MockResolver` lives in the leaf `axess-identity` crate so
 // adopters who depend on `axess-identity` directly (without all of

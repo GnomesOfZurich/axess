@@ -103,7 +103,7 @@ pub struct SessionLayer<S> {
     /// the middleware hot path.
     pub(super) config: Arc<SessionConfig>,
     pub(super) binding: Option<Arc<dyn SessionBinding>>,
-    pub(super) metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    pub(super) metrics: Option<crate::metrics::MetricSinks>,
     /// Source of every session id the layer mints (new sessions and
     /// rotations). Defaults to [`SystemRng`]; see [`with_rng`](Self::with_rng).
     pub(super) rng: Arc<dyn SecureRng>,
@@ -605,9 +605,11 @@ impl<S: SessionStore> SessionLayer<S> {
         self
     }
 
-    /// Attach a metrics hook for session-level observability.
-    pub fn with_metrics(mut self, metrics: impl crate::metrics::AuthnMetrics) -> Self {
-        self.metrics = Some(Arc::new(metrics));
+    /// Attach the metric sinks the layer reports to: the session concern
+    /// (created, invalidated, binding mismatch, fingerprint backfill) and the
+    /// rotation concern (a fingerprint that matched only the previous key).
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricSinks) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

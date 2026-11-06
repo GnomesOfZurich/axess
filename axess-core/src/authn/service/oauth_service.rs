@@ -20,7 +20,7 @@
 //! monolith.
 
 mod jwks_refresh;
-pub(crate) use jwks_refresh::JwksRefreshTask;
+pub(crate) use jwks_refresh::{JwksRefreshTask, live_providers};
 mod login;
 mod refresh;
 mod scoped;

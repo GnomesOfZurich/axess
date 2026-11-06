@@ -168,6 +168,17 @@ use webauthn_rs::prelude::*;
 /// the `Fido2Provider` trait is already designed to support it.
 #[cfg(feature = "fido2")]
 pub trait Fido2Provider: Send + Sync + 'static {
+    /// The relying-party id this provider's ceremonies are bound to.
+    ///
+    /// A passkey is bound to the relying-party id it was registered under, so
+    /// changing it orphans every registered credential. A live reload
+    /// (`AuthnService::reload_fido2`) compares the id of the provider it
+    /// replaces with the candidate's and refuses a change unless the caller
+    /// acknowledged it. An implementation that cannot tell returns an empty
+    /// string, which equals no real id, so a reload to or from it is refused
+    /// until acknowledged.
+    fn relying_party_id(&self) -> &str;
+
     /// Start a passkey authentication ceremony.
     fn start_authentication(
         &self,
@@ -259,18 +270,36 @@ pub trait Fido2Provider: Send + Sync + 'static {
 #[cfg(feature = "fido2")]
 pub struct DefaultFido2Provider {
     inner: Webauthn,
+    rp_id: String,
 }
 
 #[cfg(feature = "fido2")]
 impl DefaultFido2Provider {
     /// Wrap an existing `Webauthn` instance.
+    ///
+    /// The relying-party id is read from the instance itself (the challenge
+    /// a discoverable authentication would send names it), so it cannot
+    /// disagree with the ceremonies. If that read fails, which the library
+    /// does not do for a built instance, the id is empty and a reload is
+    /// refused until acknowledged.
     pub fn new(webauthn: Webauthn) -> Self {
-        Self { inner: webauthn }
+        let rp_id = webauthn
+            .start_discoverable_authentication()
+            .map(|(challenge, _)| challenge.public_key.rp_id)
+            .unwrap_or_default();
+        Self {
+            inner: webauthn,
+            rp_id,
+        }
     }
 }
 
 #[cfg(feature = "fido2")]
 impl Fido2Provider for DefaultFido2Provider {
+    fn relying_party_id(&self) -> &str {
+        &self.rp_id
+    }
+
     fn start_authentication(
         &self,
         credentials: &[Passkey],
@@ -329,13 +358,26 @@ impl Fido2Provider for DefaultFido2Provider {
 /// end-to-end FIDO2 tests, use [`DefaultFido2Provider`] against a
 /// `WebauthnBuilder` configured for a test origin.
 #[cfg(all(feature = "fido2", any(test, feature = "testing")))]
-pub struct MockFido2Provider;
+pub struct MockFido2Provider {
+    rp_id: String,
+}
 
 #[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 impl MockFido2Provider {
-    /// Construct a new mock provider that always fails ceremony calls.
+    /// Construct a new mock provider that always fails ceremony calls. Its
+    /// relying-party id is `localhost`; change it with
+    /// [`with_relying_party_id`](Self::with_relying_party_id).
     pub fn new() -> Self {
-        Self
+        Self {
+            rp_id: "localhost".to_string(),
+        }
+    }
+
+    /// The relying-party id [`Fido2Provider::relying_party_id`] reports.
+    #[must_use]
+    pub fn with_relying_party_id(mut self, rp_id: impl Into<String>) -> Self {
+        self.rp_id = rp_id.into();
+        self
     }
 }
 
@@ -348,6 +390,10 @@ impl Default for MockFido2Provider {
 
 #[cfg(all(feature = "fido2", any(test, feature = "testing")))]
 impl Fido2Provider for MockFido2Provider {
+    fn relying_party_id(&self) -> &str {
+        &self.rp_id
+    }
+
     fn start_authentication(
         &self,
         credentials: &[Passkey],
@@ -458,6 +504,9 @@ mod verifier_tests {
             captured: Mutex<Vec<(Vec<u8>, DeviceId)>>,
         }
         impl Fido2Provider for CountingProvider {
+            fn relying_party_id(&self) -> &str {
+                self.inner.relying_party_id()
+            }
             fn start_authentication(
                 &self,
                 credentials: &[Passkey],

@@ -406,6 +406,7 @@ pub use issuer::{CsrfIssuer, CsrfToken};
 #[derive(Clone)]
 pub struct CsrfLayer {
     config: CsrfConfig,
+    metrics: Arc<dyn crate::metrics::RequestGuardMetrics>,
 }
 
 impl CsrfLayer {
@@ -425,7 +426,18 @@ impl CsrfLayer {
             &config.path,
             config.same_site,
         );
-        Self { config }
+        Self {
+            config,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        }
+    }
+
+    /// Attach the metric sinks; the layer reports the request-guard concern
+    /// (`csrf_rejected`, with the [`CsrfRefusal`](crate::metrics::CsrfRefusal)
+    /// that names why).
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricSinks) -> Self {
+        self.metrics = metrics.guard;
+        self
     }
 }
 
@@ -436,6 +448,7 @@ impl<S> Layer<S> for CsrfLayer {
         CsrfService {
             inner,
             config: self.config.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -445,6 +458,7 @@ impl<S> Layer<S> for CsrfLayer {
 pub struct CsrfService<S> {
     inner: S,
     config: CsrfConfig,
+    metrics: Arc<dyn crate::metrics::RequestGuardMetrics>,
 }
 
 impl<S> Service<Request<Body>> for CsrfService<S>
@@ -463,6 +477,7 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let config = self.config.clone();
+        let metrics = self.metrics.clone();
         let mut inner = self.inner.clone();
         std::mem::swap(&mut inner, &mut self.inner);
 
@@ -493,6 +508,7 @@ where
                     true
                 };
                 if !admitted {
+                    metrics.csrf_rejected(crate::metrics::CsrfRefusal::WebSocketOrigin);
                     tracing::warn!(
                         path = %req.uri().path(),
                         "csrf: WebSocket upgrade refused, Origin is not an allowed origin or the \
@@ -515,7 +531,10 @@ where
                 .await
                 {
                     Ok(req) => req,
-                    Err(Refused) => return Ok(forbidden()),
+                    Err(Refused(reason)) => {
+                        metrics.csrf_rejected(reason);
+                        return Ok(forbidden());
+                    }
                 };
             }
 

@@ -147,6 +147,16 @@ A variation is LDAP followed by `AnyOf(vec![Totp, Fido2])`,
 allowing the user to register a passkey alongside or instead of
 TOTP. The flow is otherwise unchanged.
 
+## Changing the provider on a running service
+
+`reload_ldap(candidate)` swaps the LDAP provider after the candidate's
+`check_reachable` connected to the directory with the configured transport
+(TLS or StartTLS, and the cleartext refusal) and unbound, without sending a
+credential, within `with_provider_validation_timeout`. A directory that does not
+answer, or a custom provider that does not implement the check, is refused by
+name and the previous provider keeps serving. See
+[live provider reload](../authentication/live-provider-reload.md).
+
 ## Threat model
 
 LDAP bind is robust against the same attacks any second-factor

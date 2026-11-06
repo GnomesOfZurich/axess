@@ -4,7 +4,9 @@ A Cedar policy evaluates against three inputs: a principal, an
 action, a resource, plus an entity graph that gives the policies
 the data they need to reason about (which roles the principal is in,
 which group owns the resource, what the principal's MFA status is).
-The policy set is loaded once at startup. The principal and action
+The policy set is loaded at startup and can be replaced live (see
+*Live policy reload*; register your entity caches there so a reload
+drops them). The principal and action
 come from the request. The entity graph and the request context
 come from you, per request, through two interfaces this
 chapter covers: the `AuthzEntityProvider` trait and the
@@ -411,7 +413,9 @@ that show the three styles composed in real policies.
 
 ## Further reading
 
-*Cedar policy fundamentals* covers the policy lifecycle and the
+*Live policy reload* covers replacing the policy set in a running
+service and keeping instances in step. *Cedar policy fundamentals*
+covers the policy lifecycle and the
 evaluator surface this chapter feeds. *RBAC, ReBAC, and ABAC
 patterns* covers the policy authoring style with concrete examples
 for each pattern. *Identity store implementation* covers how the

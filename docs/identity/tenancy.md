@@ -263,7 +263,7 @@ rate limiter in front of the route.
 One interaction to watch: `Lock` together with `duration: None` means a
 persistently broken counter store needs an administrator to clear each
 affected account. Deployments running indefinite lockouts should alert
-on `AuthnMetrics::factor_counter_store_outage`, which fires on exactly
+on `FactorMetrics::factor_counter_store_outage`, which fires on exactly
 this path, or pick `Allow` knowingly.
 
 Neither setting changes what an attacker sees for an identifier that

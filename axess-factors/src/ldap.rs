@@ -123,6 +123,24 @@ pub trait LdapProvider: Send + Sync + 'static {
     /// Uses the provider's `bind_dn_template` to map a login identifier
     /// (e.g. `"alice"`) to a bind DN (e.g. `"alice@corp.example.com"`).
     fn build_bind_dn(&self, identifier: &str) -> String;
+
+    /// Whether the directory can be reached with this provider's transport
+    /// settings, without sending a credential.
+    ///
+    /// Consulted before a running service swaps this provider in
+    /// (`AuthnService::reload_ldap`). The default refuses: a provider that
+    /// cannot say whether its directory answers is not swapped in unchecked,
+    /// so override it to connect (and unbind) or to return `Ok(())` where a
+    /// check is not meaningful. Nothing on the login path calls it.
+    fn check_reachable(&self) -> Pin<Box<dyn Future<Output = Result<(), LdapError>> + Send + '_>> {
+        Box::pin(async {
+            Err(LdapError::Config(
+                "this LDAP provider does not implement check_reachable; \
+                 a reload cannot verify its directory"
+                    .into(),
+            ))
+        })
+    }
 }
 
 // ── Group search config ──────────────────────────────────────────────────────
@@ -419,6 +437,31 @@ impl LdapProvider for LdapProviderConfig {
         self.bind_dn_template
             .replace("{user}", &ldap_dn_escape(identifier))
     }
+
+    fn check_reachable(&self) -> Pin<Box<dyn Future<Output = Result<(), LdapError>> + Send + '_>> {
+        Box::pin(async move {
+            if self.refuses_cleartext() {
+                return Err(LdapError::Config(
+                    "plain ldap:// to a non-loopback host would send the password in \
+                     cleartext; use ldaps://, with_starttls(), or allow_cleartext()"
+                        .into(),
+                ));
+            }
+            let settings = ldap3::LdapConnSettings::new()
+                .set_conn_timeout(self.connection_timeout)
+                .set_starttls(self.starttls);
+            let (conn, mut ldap) = tokio::time::timeout(
+                self.connection_timeout,
+                ldap3::LdapConnAsync::with_settings(settings, &self.url),
+            )
+            .await
+            .map_err(|_| LdapError::Timeout)?
+            .map_err(|e| LdapError::Connection(e.to_string()))?;
+            tokio::spawn(async move { conn.drive().await });
+            let _ = ldap.unbind().await;
+            Ok(())
+        })
+    }
 }
 
 // ── MockLdapProvider ─────────────────────────────────────────────────────────
@@ -511,6 +554,10 @@ impl LdapProvider for MockLdapProvider {
     fn build_bind_dn(&self, identifier: &str) -> String {
         self.bind_dn_template
             .replace("{user}", &ldap_dn_escape(identifier))
+    }
+
+    fn check_reachable(&self) -> Pin<Box<dyn Future<Output = Result<(), LdapError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
     }
 }
 

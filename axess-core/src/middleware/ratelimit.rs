@@ -547,7 +547,7 @@ pub struct RateLimitLayer {
     allow_shared_bucket: bool,
     /// Key for the debug-log fingerprints: random per layer instance.
     log_key: Arc<Zeroizing<[u8; 32]>>,
-    metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    metrics: Option<Arc<dyn crate::metrics::RequestGuardMetrics>>,
 }
 
 impl RateLimitLayer {
@@ -586,9 +586,10 @@ impl RateLimitLayer {
         keys::fingerprint(&**self.log_key, key)
     }
 
-    /// Attach a metrics hook for rate-limit observability.
-    pub fn with_metrics(mut self, metrics: impl crate::metrics::AuthnMetrics) -> Self {
-        self.metrics = Some(Arc::new(metrics));
+    /// Attach the metric sinks; the layer reports the request-guard concern
+    /// (`rate_limit_allowed`, `rate_limit_rejected`).
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricSinks) -> Self {
+        self.metrics = Some(metrics.guard);
         self
     }
 }
@@ -618,7 +619,7 @@ pub struct RateLimitService<S> {
     retry_after: bool,
     allow_shared_bucket: bool,
     log_key: Arc<Zeroizing<[u8; 32]>>,
-    metrics: Option<Arc<dyn crate::metrics::AuthnMetrics>>,
+    metrics: Option<Arc<dyn crate::metrics::RequestGuardMetrics>>,
 }
 
 impl<S, ResBody> Service<Request<Body>> for RateLimitService<S>

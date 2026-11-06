@@ -94,7 +94,7 @@ where
 ///
 /// A store that must shed a regulatory event under load says so by
 /// returning `AuditOutcome::Shed`, which lets the login proceed and
-/// counts the drop on `AuthnMetrics::audit_event_shed`. Dropping one
+/// counts the drop on `AuditMetrics::audit_event_shed`. Dropping one
 /// is allowed; dropping one silently is not.
 #[derive(Debug)]
 pub struct LogAndSwallow<S>(pub S);

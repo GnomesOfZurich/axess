@@ -28,7 +28,8 @@ use super::error::AuthzError;
 /// [`AuthzError::SchemaParse`]); both are required.
 ///
 /// Extracted as a free function so it is callable both at startup (from
-/// [`PolicyStore::from_text`]) **and** at future policy hot-swap time,
+/// [`PolicyStore::from_text`]) **and** at policy reload time
+/// ([`AuthzStore::reload_policies`][super::session::AuthzStore::reload_policies]),
 /// where the invariant is **validate-before-swap**: never leave the
 /// authorizer holding a policy set that fails validation.
 ///
@@ -43,6 +44,28 @@ pub fn validate_policies(policies: &PolicySet, schema: &Schema) -> Result<(), Au
     }
     let errors: Vec<String> = result.validation_errors().map(|e| e.to_string()).collect();
     Err(AuthzError::PolicyValidation(errors.join("; ")))
+}
+
+/// The digest of a policy set: the SHA-256 (lowercase hex) of the policy
+/// text and the schema JSON, each preceded by its byte length so that moving
+/// a byte from one to the other changes the digest.
+///
+/// It names what is in force: [`PolicyStore::digest`] returns it for a store
+/// built from the same two strings, a reload reports it, and instances compare
+/// it to decide whether a re-read changed anything.
+pub fn policy_set_digest(policy_text: &str, schema_json: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"axess-policy-set-v1");
+    for part in [policy_text, schema_json] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 // ── AuthzDecision ─────────────────────────────────────────────────────────────
@@ -94,6 +117,13 @@ pub trait PolicyEvaluator: Send + Sync {
     fn schema(&self) -> Option<&Schema> {
         None
     }
+
+    /// The digest of the policy set this evaluator holds, when it has one
+    /// (see [`policy_set_digest`]). An evaluator that is not built from
+    /// policy text, such as a mock, answers `None`.
+    fn digest(&self) -> Option<String> {
+        None
+    }
 }
 
 // ── PolicyStore ───────────────────────────────────────────────────────────────
@@ -123,6 +153,8 @@ pub struct PolicyStore {
     action_types: HashSet<EntityTypeName>,
     /// Whether any policy mentions `context`.
     mentions_context: bool,
+    /// [`policy_set_digest`] of the text this store was built from.
+    digest: String,
 }
 
 /// Why the provider's entities could not be evaluated with the schema's
@@ -166,11 +198,18 @@ impl PolicyStore {
         Ok(Self {
             policy_set,
             mentions_context,
+            digest: policy_set_digest(policy_text, schema_json),
             schema,
             authorizer: Authorizer::new(),
             action_entities,
             action_types,
         })
+    }
+
+    /// The digest of the text this store was built from, see
+    /// [`policy_set_digest`].
+    pub fn digest(&self) -> &str {
+        &self.digest
     }
 
     /// Whether any policy mentions `context`. A request evaluated on an empty
@@ -390,6 +429,10 @@ impl PolicyEvaluator for PolicyStore {
 
     fn schema(&self) -> Option<&Schema> {
         Some(&self.schema)
+    }
+
+    fn digest(&self) -> Option<String> {
+        Some(self.digest.clone())
     }
 }
 

@@ -38,6 +38,10 @@ struct Harness {
 }
 
 fn harness(capacity: usize) -> Harness {
+    harness_with(capacity, crate::metrics::MetricSinks::noop())
+}
+
+fn harness_with(capacity: usize, sinks: crate::metrics::MetricSinks) -> Harness {
     let user = user_record("u1", "t1");
     let identity = MockIdentityStore::new()
         .with_tenant(tenant_record("t1"))
@@ -48,6 +52,7 @@ fn harness(capacity: usize) -> Harness {
         .with_registry(registry.clone())
         .with_clock(clock.clone())
         .with_sid_map_capacity(capacity)
+        .with_metrics(sinks)
         .build();
     Harness {
         svc,
@@ -107,6 +112,41 @@ async fn capacity_eviction_drops_the_mapping_and_keeps_the_session() {
         h.live_sessions().await,
         4,
         "no session was ended to make room in the map"
+    );
+}
+
+/// A capacity eviction is counted by the number of mappings it dropped; the
+/// TTL prune of routine housekeeping is not.
+#[tokio::test]
+async fn capacity_eviction_is_counted_and_the_ttl_prune_is_not() {
+    let recorder = std::sync::Arc::new(crate::testing::RecordingMetrics::default());
+    let h = harness_with(
+        3,
+        crate::metrics::MetricSinks::noop().with_session(recorder.clone()),
+    );
+    for n in 0..3 {
+        h.login(&format!("sid-{n}")).await;
+        h.clock.advance_secs(1);
+    }
+    assert_eq!(
+        recorder.count("sid_map_evicted"),
+        0,
+        "the map is not full yet"
+    );
+
+    h.login("sid-3").await;
+    assert_eq!(
+        recorder.count("sid_map_evicted"),
+        3,
+        "the batch dropped all three oldest mappings"
+    );
+
+    h.clock.advance_secs(25 * 3600);
+    h.login("sid-4").await;
+    assert_eq!(
+        recorder.count("sid_map_evicted"),
+        3,
+        "an aged-out mapping is pruned, not evicted at capacity"
     );
 }
 

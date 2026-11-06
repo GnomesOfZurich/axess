@@ -67,7 +67,7 @@ where
                 Ok(GuessSlot::Unmetered)
             }
             Ok(None) => {
-                self.inner.metrics.account_locked();
+                self.inner.metrics.auth_flow.account_locked();
                 self.record_locked_attempt_audit(user_id, tenant_id, Some(kind.clone()), session)
                     .await?;
                 let until = match self.derived_lockout(user_id, tenant_id).await? {
@@ -77,7 +77,7 @@ where
                 Ok(GuessSlot::Refused(FactorOutcome::Locked { until }))
             }
             Err(e) => {
-                self.inner.metrics.factor_counter_store_outage();
+                self.inner.metrics.factors.factor_counter_store_outage();
                 tracing::warn!(
                     user_id = %user_id,
                     error = %e,
@@ -87,7 +87,7 @@ where
                 );
                 Ok(match policy.on_counter_unavailable {
                     CounterUnavailable::Lock => {
-                        self.inner.metrics.account_locked();
+                        self.inner.metrics.auth_flow.account_locked();
                         GuessSlot::Refused(FactorOutcome::Locked {
                             until: fallback_until(),
                         })

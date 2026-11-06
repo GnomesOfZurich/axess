@@ -203,7 +203,7 @@ where
                     "OAuth completion: account status does not allow login; refusing"
                 );
                 revoke.await;
-                self.inner.metrics.account_locked();
+                self.inner.metrics.auth_flow.account_locked();
                 Err(match status {
                     crate::authn::types::EntityState::Suspended(detail) => AuthnError::Locked {
                         until: detail.until,
@@ -307,7 +307,13 @@ where
         // A tenant's provider is not in the global registry; the verified ID
         // token's own `iss` names its issuer.
         let global = (!tenant_provider)
-            .then(|| self.inner.oauth_providers.get(claims.provider.as_ref()))
+            .then(|| {
+                self.inner
+                    .oauth_providers
+                    .load()
+                    .get(claims.provider.as_ref())
+                    .cloned()
+            })
             .flatten();
         let issuer = global
             .and_then(|p| p.issuer().map(|s| s.to_string()))
@@ -367,6 +373,10 @@ where
         // not answer. The liveness checks of the batch run concurrently.
         if self.inner.sid_map.len() >= max_sid_map_entries {
             let evicted = self.inner.sid_map.evict_oldest(EVICT_BATCH);
+            self.inner
+                .metrics
+                .session
+                .sid_map_evicted(evicted.len() as u64);
             for (evict_key, (evict_user, _, _)) in &evicted {
                 tracing::warn!(
                     evicted_iss = %evict_key.0,

@@ -942,7 +942,7 @@ struct FactorCounts {
     failures: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
-impl axess_core::metrics::AuthnMetrics for FactorCounts {
+impl axess_core::metrics::FactorMetrics for FactorCounts {
     fn factor_success(&self) {
         self.successes
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -968,7 +968,10 @@ async fn a_replay_that_loses_the_write_race_is_not_counted_as_a_success() {
     let counts = FactorCounts::default();
     let service = AuthnService::builder(identity.clone(), factors.clone())
         .with_clock(clock.clone())
-        .with_metrics(counts.clone())
+        .with_metrics(
+            axess_core::metrics::MetricSinks::noop()
+                .with_factors(std::sync::Arc::new(counts.clone())),
+        )
         .allow_plaintext_factor_secrets()
         .build()
         .with_audit_context(AuditContext::default());

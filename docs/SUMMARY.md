@@ -13,6 +13,7 @@
 - [Factors and methods](authentication/factors.md)
 - [Scope hierarchy](authentication/scope.md)
 - [Refresh tokens and session continuity](authentication/refresh-tokens.md)
+- [Live provider reload](authentication/live-provider-reload.md)
 
 # Part III: Authn protocols and verifiers
 
@@ -28,6 +29,7 @@
 - [Cedar policy fundamentals](authorization/cedar-fundamentals.md)
 - [Entity providers and request context](authorization/cedar-providers.md)
 - [RBAC, ReBAC, and ABAC patterns](authorization/cedar-patterns.md)
+- [Live policy reload](authorization/live-policy-reload.md)
 
 # Part V: Sessions and storage
 
@@ -63,10 +65,12 @@
 - [Audit events](production/audit-events.md)
 - [Audit pipeline](production/audit-pipeline.md)
 - [Rate limiting](production/rate-limiting.md)
+- [Observability and metrics](production/observability.md)
 - [Security posture](production/security-posture.md)
 - [Behind an mTLS terminator](production/mtls.md)
 - [Operations runbook](production/operations.md)
 - [Migration guide](production/migrating.md)
+  - [0.16.0 to 0.17.0](production/migrating/0.16.0-to-0.17.0.md)
   - [0.15.0 to 0.16.0](production/migrating/0.15.0-to-0.16.0.md)
   - [0.14.0 to 0.15.0](production/migrating/0.14.0-to-0.15.0.md)
   - [0.13.0 to 0.14.0](production/migrating/0.13.0-to-0.14.0.md)

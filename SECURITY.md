@@ -90,7 +90,7 @@ let app = Router::new()
 #### Rate limiting is required in front of login routes
 
 - [ ] Apply the rate-limit layer to every route that reaches `begin_login`. Axess does **not** enforce it inside the service, and since 0.6.0 every failed login, including for identifiers that do not exist, writes an audit row, while a failed audit write fails the login. Without a limit, an unauthenticated caller can drive unbounded writes at your audit store, and exhausting it turns every login into a failure for every user. Your sink can also shed under load by returning `AuditOutcome::Shed`, but shed on a global rate or watermark, never on anything derived from which identifier was tried, or the drop becomes a user-enumeration signal.
-- [ ] Alert on `AuthnMetrics::audit_store_outage`. It fires on exactly that path.
+- [ ] Alert on `AuditMetrics::audit_store_outage`. It fires on exactly that path.
 - [ ] Put the audit sink behind something durable: write locally, ship asynchronously, rather than a remote service on the request path.
 
 #### Identity store lookup latency
@@ -288,7 +288,7 @@ The shipped security surface, grouped by area. Caveats live in the Notes column.
 | Feature | Notes |
 |---|---|
 | `AuthEvent` regulatory audit trail | Six device-identity event variants + the full authn event surface. |
-| `AuthnMetrics` | 17-method trait (counters + timers) with no-op defaults. |
+| `AuthFlowMetrics`, `FactorMetrics`, `SessionMetrics`, `RotationMetrics`, `ProviderRegistryMetrics`, `RequestGuardMetrics`, `AuthzCacheMetrics`, `AuditMetrics` | One trait per concern, counters with no-op defaults, wired by `MetricSinks`. |
 | `AuditArchiver` + `AuditRetentionPolicy` | Hot / cold tiering with two-stage retention (90d / 7d defaults, the cold sink owns its own expiry). `FilesystemAuditArchiver` reference impl behind `audit-archive-fs`. |
 | `AuthnAnalyticsSink` + `RichAuthnEvent` | Denormalised analytics path parallel to the regulatory `AuthEvent`. serde + rkyv derives for Apache Iggy / ClickHouse / DuckDB / Snowflake. |
 | `TracingCapture` | Test subscriber for asserting on emitted `tracing` events. |
@@ -356,7 +356,7 @@ Axess processes personal data as part of authentication. This section documents 
 |---|---|
 | CC6.1; Logical access security | MFA, session binding, Cedar policy authorization |
 | CC6.3; Access revocation | `SessionRegistry::invalidate_user()`, session TTL |
-| CC7.2; Monitoring | `AuthnMetrics` trait (17 hooks), `AuthEvent` audit trail, tracing |
+| CC7.2; Monitoring | metric traits per concern, `AuthEvent` audit trail, tracing |
 | CC8.1; Change management | Application responsibility (CI/CD, version pinning) |
 
 ### PCI-DSS

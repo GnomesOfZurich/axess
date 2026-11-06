@@ -34,7 +34,8 @@ where
         session: &AuthSession,
         reserved: Option<u32>,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        let ldap = match &self.inner.ldap {
+        let ldap_provider = self.inner.ldap.load_full();
+        let ldap = match &ldap_provider {
             Some(l) => l,
             None => {
                 tracing::error!("LdapBind factor configured but no LdapProvider attached");
@@ -70,11 +71,11 @@ where
             .ok_or(AuthnError::NoFlow)?;
 
         // Determine the bind DN: per-user override or provider template.
-        let Some(bind_dn) = Self::ldap_bind_dn(ldap.as_ref(), config, &user, user_id) else {
+        let Some(bind_dn) = Self::ldap_bind_dn(&***ldap, config, &user, user_id) else {
             return Ok(FactorOutcome::InvalidCredential);
         };
 
-        self.inner.metrics.factor_attempt();
+        self.inner.metrics.factors.factor_attempt();
 
         // Attempt the LDAP bind. Pass the clean identifier for group search.
         match ldap.verify_bind(&user.identifier, &bind_dn, password).await {
@@ -156,7 +157,7 @@ where
         tenant_id: &TenantId,
         session: &AuthSession,
     ) -> Result<FactorOutcome, AuthnError<I::Error>> {
-        self.inner.metrics.factor_success();
+        self.inner.metrics.factors.factor_success();
         self.release_guess(reserved, user_id).await;
         self.clear_throttle_for(user_id, tenant_id).await;
 
@@ -205,7 +206,7 @@ where
         // The DN is the user's directory identity: it identifies the
         // person in a log line, so the user id stands in for it.
         tracing::error!(error = %e, user_id = %user_id, "LDAP bind failed (non-credential error)");
-        self.inner.metrics.factor_failure();
+        self.inner.metrics.factors.factor_failure();
         // An outage says nothing about the credential: the guess it
         // reserved is given back.
         self.release_guess(reserved, user_id).await;

@@ -507,7 +507,7 @@ pub enum CounterUnavailable {
     /// Note the interaction with `duration: None`: an indefinite lockout
     /// plus a persistently broken counter store needs an administrator to
     /// clear each affected account. Deployments running indefinite lockouts
-    /// should either monitor [`AuthnMetrics::factor_counter_store_outage`](crate::metrics::AuthnMetrics::factor_counter_store_outage)
+    /// should either monitor [`FactorMetrics::factor_counter_store_outage`](crate::metrics::FactorMetrics::factor_counter_store_outage)
     /// or choose [`Allow`](Self::Allow) knowingly.
     #[default]
     Lock,

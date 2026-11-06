@@ -93,7 +93,7 @@ This trades availability for evidence, and the trade has a sharp edge:
 **logins fail while your audit store does**. Put the sink behind
 something durable: write locally, ship onward in the background
 rather than a remote service on the request path, and page on
-`AuthnMetrics::audit_store_outage`.
+`AuditMetrics::audit_store_outage`.
 
 **To drop an event without failing the login, return
 `AuditOutcome::Shed`.** That is the valve for the hazard this creates:
@@ -101,7 +101,7 @@ every failed login writes a row, including for identifiers that do not
 exist, so an unauthenticated caller can drive writes at your storage
 without bound, and exhausting it would otherwise fail every login for
 every user. A shed event continues the flow and fires
-`AuthnMetrics::audit_event_shed`.
+`AuditMetrics::audit_event_shed`.
 
 **Shed on a criterion independent of the identifier**: a global rate,
 a queue depth, a disk watermark. Shedding based on anything derived

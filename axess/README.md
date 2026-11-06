@@ -19,14 +19,14 @@ This is the crate most applications should depend on. It re-exports the curated 
 - Session binding, concurrent-session limits, forced logout via registry
 - Workload identity (SPIFFE, K8s SA, GitHub Actions OIDC); unified `Principal` with humans
 - Token-bucket rate limiting per IP / user / tenant / header
-- Metrics hooks (`AuthnMetrics`) and health checks (`HealthCheck`, `CompositeHealthCheck`)
+- Metrics hooks (one trait per concern, wired with `MetricSinks`) and health checks (`HealthCheck`, `CompositeHealthCheck`)
 - Deterministic simulation testing throughout (injectable RNG, clock, mock stores)
 
 ## Quick start
 
 ```toml
 [dependencies]
-axess = { version = "0.16.0", features = ["sqlite", "authz"] }
+axess = { version = "0.17.0", features = ["sqlite", "authz"] }
 ```
 
 ```rust,no_run

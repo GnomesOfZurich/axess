@@ -280,7 +280,7 @@ where
     /// Counters are cumulative since construction (or the last
     /// [`reset_stats`](Self::reset_stats)). Pair with
     /// [`flush_metrics`](Self::flush_metrics) to forward deltas into
-    /// an [`AuthnMetrics`](crate::metrics::AuthnMetrics) sink on a
+    /// an [`AuthzCacheMetrics`](crate::metrics::AuthzCacheMetrics) sink on a
     /// schedule.
     pub fn stats(&self) -> axess_cache::CacheStats {
         self.cache.stats()
@@ -296,7 +296,7 @@ where
     }
 
     /// Forward the cumulative cache counters as `delta_*` events to an
-    /// [`AuthnMetrics`](crate::metrics::AuthnMetrics) sink, then reset
+    /// [`AuthzCacheMetrics`](crate::metrics::AuthzCacheMetrics) sink, then reset
     /// the internal counters to zero so the next call reports only
     /// events accumulated since this one.
     ///
@@ -310,17 +310,17 @@ where
     ///
     /// ```rust,ignore
     /// let cache = Arc::new(EntityCache::new(provider));
-    /// let metrics_clone = metrics.clone();
+    /// let sinks = MetricSinks::all(exporter);
     /// let cache_clone = Arc::clone(&cache);
     /// tokio::spawn(async move {
     ///     let mut tick = tokio::time::interval(Duration::from_secs(10));
     ///     loop {
     ///         tick.tick().await;
-    ///         cache_clone.flush_metrics(&*metrics_clone);
+    ///         cache_clone.flush_metrics(sinks.authz_cache());
     ///     }
     /// });
     /// ```
-    pub fn flush_metrics(&self, metrics: &dyn crate::metrics::AuthnMetrics) {
+    pub fn flush_metrics(&self, metrics: &dyn crate::metrics::AuthzCacheMetrics) {
         let snapshot = self.stats();
         // One call per counter, carrying the window's total: a busy cache
         // accumulates millions of hits between flushes, and one virtual call

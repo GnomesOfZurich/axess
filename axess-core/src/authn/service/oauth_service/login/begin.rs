@@ -60,6 +60,7 @@ where
     > {
         self.inner
             .oauth_providers
+            .load()
             .get(provider_name)
             .cloned()
             .ok_or_else(|| {
