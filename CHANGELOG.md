@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 ### Changed
 
 - The publishing runbook enables auto-merge for the release pull request and describes the tag ruleset as immutability only, with the organisation-app route to restricted creation.
+- The per-change mutation sweep runs on pull requests into `release/next` and `release/X.Y.x`, where a change arrives on its own, and no longer on the release pull request into `main`, which carries a whole round the weekly sweep covers.
 
 ## [0.18.0] - 2026-11-07
 

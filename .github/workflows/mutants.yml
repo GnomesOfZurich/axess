@@ -15,8 +15,12 @@ name: Mutants
 # proves them with `--self-test` in the plan job.
 
 on:
+  # Pull requests into the working branches, where a change arrives one at a
+  # time. A release pull request into main carries a whole round, already
+  # swept change by change here and whole by the weekly schedule; sweeping it
+  # again planned over a thousand mutants on the first release.
   pull_request:
-    branches: [main, develop]
+    branches: [release/next, 'release/*.x']
   schedule:
     # Sunday 03:00 UTC.
     - cron: '0 3 * * 0'
