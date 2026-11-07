@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -208,7 +210,10 @@ def self_test() -> int:
     saved = os.environ.pop("GITHUB_STEP_SUMMARY", None)
     try:
         for name, build, shards, expected, fail_on_missed, want in cases:
-            with tempfile.TemporaryDirectory() as tmp:
+            # The fixture runs print their reports and `::error::` lines to
+            # stdout; on GitHub those lines would become annotations on a
+            # passing step, so the self-test keeps them to itself.
+            with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
                 root = pathlib.Path(tmp)
                 build(root)
                 got = run(root, shards, expected, fail_on_missed)
