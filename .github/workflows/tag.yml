@@ -58,7 +58,11 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -eu
-          if at=$(git ls-remote --exit-code --tags origin "refs/tags/${TAG}" | cut -f1); then
+          # Not a pipeline: a pipeline's status is its last command's, which
+          # once read an absent tag as present and tagged nothing.
+          at=$(git ls-remote --tags origin "refs/tags/${TAG}")
+          at=${at%%[[:space:]]*}
+          if [ -n "$at" ]; then
             echo "already tagged: ${TAG} is at ${at}; nothing to do."
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
