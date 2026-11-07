@@ -8,6 +8,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); ver
 
 ## [Unreleased]
 
+### Fixed
+
+- The tag workflow created no tag after a merge into `main` (its existence test read an absent tag as present), and the mutation summary's self-test printed its refusal lines as error annotations on a passing step.
+
+### Changed
+
+- The publishing runbook enables auto-merge for the release pull request and describes the tag ruleset as immutability only, with the organisation-app route to restricted creation.
+
 ## [0.18.0] - 2026-11-07
 
 ### Changed (breaking)

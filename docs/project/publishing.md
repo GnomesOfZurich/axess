@@ -385,15 +385,18 @@ organisation owners can create release tags; accounts with write
 access can merge pull requests. The GitHub Actions app, which
 reports every check below, has integration id 15368.
 
-### 1. Merge settings: squash only
+### 1. Merge settings: squash only, auto-merge allowed
 
 UI: Settings, General, Pull Requests: tick "Allow squash merging" with
 the default commit message "Pull request title and description";
-untick "Allow merge commits" and "Allow rebase merging".
+untick "Allow merge commits" and "Allow rebase merging"; tick "Allow
+auto-merge", so that `gh pr merge --squash --auto` can arm the release
+pull request to merge by itself when its required checks pass.
 
 ```bash
 gh api -X PATCH repos/GnomesOfZurich/axess \
   -F allow_squash_merge=true -F allow_merge_commit=false -F allow_rebase_merge=false \
+  -F allow_auto_merge=true \
   -f squash_merge_commit_title=PR_TITLE -f squash_merge_commit_message=PR_BODY
 ```
 
@@ -486,36 +489,31 @@ editing `ci.yml` itself, since a pull request runs the workflow as the
 pull request has it. Read a release pull request's changes under
 `.github/` before merging.
 
-### 3. Tag rulesets: only the maintainer and `tag.yml` create `v*`, nobody moves or deletes one
+### 3. Tag ruleset: nobody moves or deletes a `v*` tag
 
-Two rulesets, because a bypass actor bypasses every rule of its
-ruleset: creation names two bypasses (repository admins, and GitHub
-Actions so that `tag.yml` can create the tag after a merge into
-`main`), immutability names none.
+One ruleset, with no bypass actor, makes a release tag immutable:
+nobody updates, deletes or force-pushes one, `tag.yml` included.
 
-UI: Settings, Rules, Rulesets, New ruleset, New tag ruleset. First:
-name "release tags: created by admins"; Active; Bypass list: Add
-bypass, Repository admin, Always allow, then Add bypass, GitHub
-Actions (under Apps), Always allow; Target tags: Include by pattern,
-`v*`; Rules: tick "Restrict creations". Second: name "release tags:
-immutable"; Active; Bypass list empty; the same target; Rules: tick
-"Restrict updates", "Restrict deletions" and "Block force pushes".
+Creating a tag is not restricted. `tag.yml` creates the tag with the
+workflow token after a merge into `main`, and GitHub refuses the GitHub
+Actions app as a bypass actor on a repository ruleset ("must be part of
+the ruleset source or owner organization"), so a creation rule would
+only ever refuse the workflow. What a stray tag can do is bounded
+elsewhere: `release.yml` refuses a tag that is not on `main` or a
+`release/X.Y.x` branch or that disagrees with the workspace version and
+its dated changelog section, and publishes nothing without the
+maintainer's approval in the `crates-io` environment. To restrict
+creation again, register a GitHub App owned by the organisation, mint
+its installation token in `tag.yml` (`actions/create-github-app-token`)
+and name the app as the creation rule's bypass actor; a tag pushed with
+that token also starts `release.yml` by itself.
+
+UI: Settings, Rules, Rulesets, New ruleset, New tag ruleset: name
+"release tags: immutable"; Active; Bypass list empty; Target tags:
+Include by pattern, `v*`; Rules: tick "Restrict updates", "Restrict
+deletions" and "Block force pushes".
 
 ```bash
-gh api -X POST repos/GnomesOfZurich/axess/rulesets --input - <<'JSON'
-{
-  "name": "release tags: created by admins",
-  "target": "tag",
-  "enforcement": "active",
-  "bypass_actors": [
-    { "actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always" },
-    { "actor_id": 15368, "actor_type": "Integration", "bypass_mode": "always" }
-  ],
-  "conditions": { "ref_name": { "include": ["refs/tags/v*"], "exclude": [] } },
-  "rules": [ { "type": "creation" } ]
-}
-JSON
-
 gh api -X POST repos/GnomesOfZurich/axess/rulesets --input - <<'JSON'
 {
   "name": "release tags: immutable",

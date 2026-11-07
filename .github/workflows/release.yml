@@ -2,9 +2,8 @@ name: Release
 
 # A release starts from a tag `vX.Y.Z`: tag.yml creates it when the release
 # pull request merges into main and starts this workflow from it, or a
-# maintainer pushes it by hand (the tag ruleset lets only repository admins
-# and tag.yml create one, and nobody move or delete it). Nothing is published
-# until, in order:
+# maintainer pushes it by hand (the tag ruleset lets nobody move or delete
+# one). Nothing is published until, in order:
 #
 #   1. "Verify release tag": the run is for a tag, the tag's commit is on
 #      main or on a release/X.Y.x branch, the tag equals the workspace

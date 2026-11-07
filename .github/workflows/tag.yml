@@ -11,9 +11,10 @@ name: Tag release
 # fires no `on: push: tags` run by itself, hence the explicit dispatch of
 # release.yml from the tag; release.yml's verify job then reads it as a tag
 # run and the `crates-io` environment admits it (deployments from `v*` tags
-# only). The tag ruleset "release tags: created by admins" lists GitHub
-# Actions as a bypass actor for the creation; the immutability ruleset lets
-# nobody move or delete a tag, this workflow included.
+# only). Tag creation is not restricted by a ruleset (GitHub admits no
+# Actions bypass actor on a repository ruleset; publishing.md, settings
+# step 3); the immutability ruleset lets nobody move or delete a tag, this
+# workflow included, and release.yml refuses a tag that is not a release.
 #
 # If this workflow fails, the maintainer tags by hand (publishing.md, the
 # release workflow), which is what it replaces.
